@@ -1,7 +1,7 @@
 //! Combined / merge-commit diff (`-c` / `--cc` / `--combined-all-paths`).
 //!
 //! This is the single CLI-side wiring of the combined-diff renderer
-//! ([`sley_diff_merge::render::render_combined_with`]) shared by `diff-tree`,
+//! ([`sley::plumbing::sley_diff_merge::render::render_combined_with`]) shared by `diff-tree`,
 //! `show`, `log`, and `whatchanged`. It owns the repository-coupled half of
 //! git's `combine-diff.c`: discovering the set of paths that EVERY parent
 //! touches (`intersect_paths` / `find_paths_multitree`), reading the result and
@@ -45,19 +45,19 @@ pub(crate) fn combined_paths(
     let Some(first_parent_tree) = parent_trees.first() else {
         return Ok(Vec::new());
     };
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
-        base: sley_diff_merge::DiffNameStatusOptions {
+    let rename_options = sley::plumbing::sley_diff_merge::RenameDetectionOptions {
+        base: sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
             detect_renames: false,
             detect_copies: false,
             find_copies_harder: false,
             rename_empty: true,
         },
         detect_inexact: false,
-        rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-        copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+        rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+        copy_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
     };
 
-    let mut first_parent_entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+    let mut first_parent_entries = sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
         db,
         format,
         first_parent_tree,
@@ -107,14 +107,14 @@ struct TreePathEntry {
 }
 
 impl TreePathEntry {
-    fn from_old_side(entry: &sley_diff_merge::NameStatusEntry) -> Option<Self> {
+    fn from_old_side(entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) -> Option<Self> {
         Some(Self {
             mode: entry.old_mode?,
             oid: entry.old_oid?,
         })
     }
 
-    fn from_new_side(entry: &sley_diff_merge::NameStatusEntry) -> Option<Self> {
+    fn from_new_side(entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) -> Option<Self> {
         Some(Self {
             mode: entry.new_mode?,
             oid: entry.new_oid?,
@@ -194,8 +194,8 @@ pub(crate) struct CombinedRenderCtx<'a> {
     pub all_paths: bool,
     /// Unified-context (always 3 for combined diffs today).
     pub context: usize,
-    pub ws_ignore: sley_diff_merge::WsIgnore,
-    pub diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    pub ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore,
+    pub diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm,
     pub src_prefix: &'a str,
     pub dst_prefix: &'a str,
     /// Patch index-line abbreviation width.
@@ -313,13 +313,13 @@ pub(crate) fn write_combined_patch(
     let mode_differs = path.parents.iter().any(|p| p.mode != path.result_mode);
 
     let mut body = Vec::new();
-    let render_options = sley_diff_merge::render::CombinedRenderOptions {
+    let render_options = sley::plumbing::sley_diff_merge::render::CombinedRenderOptions {
         dense: ctx.dense,
         context: ctx.context,
         algorithm: ctx.diff_algorithm,
         ws_ignore: ctx.ws_ignore,
     };
-    let show_hunks = sley_diff_merge::render::render_combined_with(
+    let show_hunks = sley::plumbing::sley_diff_merge::render::render_combined_with(
         &mut body,
         &result_blob,
         &parent_refs,

@@ -3,7 +3,7 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley_pathspec::normalized_revwalk_pathspec;
+use sley::plumbing::sley_pathspec::normalized_revwalk_pathspec;
 
 pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut setup_args = Vec::new();
@@ -404,9 +404,9 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     {
         setup_args.push("--ignore-missing".to_string());
     }
-    let setup = sley_rev::setup_revisions(
+    let setup = sley::plumbing::sley_rev::setup_revisions(
         &setup_args,
-        &sley_rev::RevisionSetupContext {
+        &sley::plumbing::sley_rev::RevisionSetupContext {
             git_dir: &git_dir,
             worktree_root: worktree_root.as_deref(),
             cwd: &cwd,
@@ -439,15 +439,15 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let min_age = revision_options.date_window.max_time;
     let reverse = revision_options.reverse;
     let ordering = match revision_options.order {
-        sley_rev::RevisionOrder::Default => RevListOrdering::Default,
-        sley_rev::RevisionOrder::Topo => RevListOrdering::Topo,
-        sley_rev::RevisionOrder::Date => RevListOrdering::Date,
-        sley_rev::RevisionOrder::AuthorDate => RevListOrdering::AuthorDate,
+        sley::plumbing::sley_rev::RevisionOrder::Default => RevListOrdering::Default,
+        sley::plumbing::sley_rev::RevisionOrder::Topo => RevListOrdering::Topo,
+        sley::plumbing::sley_rev::RevisionOrder::Date => RevListOrdering::Date,
+        sley::plumbing::sley_rev::RevisionOrder::AuthorDate => RevListOrdering::AuthorDate,
     };
     let walk_mode = match revision_options.no_walk {
-        sley_rev::NoWalkMode::Walk => RevListWalkMode::Walk,
-        sley_rev::NoWalkMode::Sorted => RevListWalkMode::NoWalkSorted,
-        sley_rev::NoWalkMode::Unsorted => RevListWalkMode::NoWalkUnsorted,
+        sley::plumbing::sley_rev::NoWalkMode::Walk => RevListWalkMode::Walk,
+        sley::plumbing::sley_rev::NoWalkMode::Sorted => RevListWalkMode::NoWalkSorted,
+        sley::plumbing::sley_rev::NoWalkMode::Unsorted => RevListWalkMode::NoWalkUnsorted,
     };
     let first_parent = revision_options.first_parent;
     let pathspecs = setup.pathspecs;
@@ -732,7 +732,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             let total = if quiet {
                 0
             } else {
-                sley_rev::count_commit_metadata(
+                sley::plumbing::sley_rev::count_commit_metadata(
                     &git_dir,
                     format,
                     &db,
@@ -745,7 +745,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         }
         let limit = max_count.map(|max| skip_count.saturating_add(max));
         let metadata = if let Some(limit) = limit.filter(|limit| *limit > 0) {
-            sley_rev::walk_commit_metadata_date_ordered_limited(
+            sley::plumbing::sley_rev::walk_commit_metadata_date_ordered_limited(
                 &git_dir,
                 format,
                 &db,
@@ -754,7 +754,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 limit,
             )?
         } else {
-            sley_rev::walk_commit_metadata(
+            sley::plumbing::sley_rev::walk_commit_metadata(
                 &git_dir,
                 format,
                 &db,
@@ -946,7 +946,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     // boundary (bottom) commit up to the tips. Applied before simplification,
     // matching git's `limit_to_ancestry` (which runs in `limit_list`).
     if revision_options.ancestry_path && !exclude_tip_oids.is_empty() {
-        let on_path = sley_rev::ancestry_path_on_set(
+        let on_path = sley::plumbing::sley_rev::ancestry_path_on_set(
             selected.iter().map(|r| (r.oid, r.parents.clone())),
             &exclude_tip_oids,
         );
@@ -963,17 +963,17 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             &pathspecs,
             effective_pathspec_flags(),
         )?;
-        let ordered_owned: Vec<sley_rev::CommitRecord> =
+        let ordered_owned: Vec<sley::plumbing::sley_rev::CommitRecord> =
             selected.iter().map(|r| (*r).clone()).collect();
         // The `^`-excluded boundary tips are git's BOTTOM commits: relevant for
         // topology-keep decisions even though they aren't shown.
         let bottoms: HashSet<ObjectId> = exclude_tip_oids.iter().copied().collect();
-        simplified_storage = sley_rev::simplify_history_with_bottoms(
+        simplified_storage = sley::plumbing::sley_rev::simplify_history_with_bottoms(
             &db,
             format,
             ordered_owned,
             &pathspec,
-            sley_rev::SimplifyOptions {
+            sley::plumbing::sley_rev::SimplifyOptions {
                 full_history,
                 first_parent,
                 simplify_merges: revision_options.simplify_merges,
@@ -1411,20 +1411,20 @@ fn rev_list_verify_objects(
         }
         match object.object_type {
             ObjectType::Commit => {
-                if let Ok(commit) = sley_object::Commit::parse_ref(format, &object.body) {
+                if let Ok(commit) = sley::plumbing::sley_object::Commit::parse_ref(format, &object.body) {
                     pending.push_back(commit.tree);
                     pending.extend(commit.parents);
                 }
             }
             ObjectType::Tree => {
-                if let Ok(entries) = sley_object::TreeEntries::new(format, &object.body)
+                if let Ok(entries) = sley::plumbing::sley_object::TreeEntries::new(format, &object.body)
                     .collect::<std::result::Result<Vec<_>, _>>()
                 {
                     pending.extend(entries.into_iter().map(|entry| entry.oid));
                 }
             }
             ObjectType::Tag => {
-                if let Ok(tag) = sley_object::Tag::parse_ref(format, &object.body) {
+                if let Ok(tag) = sley::plumbing::sley_object::Tag::parse_ref(format, &object.body) {
                     pending.push_back(tag.object);
                 }
             }
@@ -1445,7 +1445,7 @@ struct BisectDefaultRevs {
 fn rev_list_bisect_default_revs(git_dir: &Path, format: ObjectFormat) -> Result<BisectDefaultRevs> {
     // Same selection as `bisect next`: the single `refs/bisect/<bad>` and every
     // `refs/bisect/<good>-<oid>` ref (`bad`/`good` from BISECT_TERMS).
-    let terms = sley_rev::read_bisect_terms(git_dir)?;
+    let terms = sley::plumbing::sley_rev::read_bisect_terms(git_dir)?;
     let good_prefix = format!("{}-", terms.good);
     let store = FileRefStore::new(git_dir, format);
     let mut bad = None;
@@ -1474,12 +1474,12 @@ fn rev_list_emit_bisection(
     git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    selected: &[&sley_rev::CommitRecord],
+    selected: &[&sley::plumbing::sley_rev::CommitRecord],
     bisect_vars: bool,
     bisect_all: bool,
     first_parent: bool,
 ) -> Result<()> {
-    let result = sley_rev::bisect::find_bisection(selected, bisect_all, first_parent);
+    let result = sley::plumbing::sley_rev::bisect::find_bisection(selected, bisect_all, first_parent);
     let mut stdout = io::stdout();
 
     if bisect_vars {
@@ -1499,7 +1499,7 @@ fn rev_list_emit_bisection(
         writeln!(
             stdout,
             "bisect_steps={}",
-            sley_rev::bisect::estimate_bisect_steps(all)
+            sley::plumbing::sley_rev::bisect::estimate_bisect_steps(all)
         )?;
         stdout.flush()?;
         return Ok(());
@@ -1552,7 +1552,7 @@ enum RevListCherryMode {
     Mark,
 }
 
-fn write_rev_list_header(record: &sley_rev::CommitRecord) -> Result<()> {
+fn write_rev_list_header(record: &sley::plumbing::sley_rev::CommitRecord) -> Result<()> {
     let mut stdout = io::stdout();
     writeln!(stdout, "tree {}", record.commit.tree)?;
     for parent in &record.parents {
@@ -1573,7 +1573,7 @@ fn write_rev_list_header(record: &sley_rev::CommitRecord) -> Result<()> {
 }
 
 fn write_rev_list_short(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     left_right_prefix: Option<char>,
     parents: bool,
     abbrev_commit: bool,
@@ -1624,7 +1624,7 @@ fn rev_list_output_prefix(
 }
 
 fn write_rev_list_commit_header_line(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     left_right_prefix: Option<char>,
     parents: bool,
     abbrev_commit: bool,
@@ -1660,7 +1660,7 @@ fn write_rev_list_commit_header_line(
 fn rev_list_patchsame_oids(
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    selected: &[&sley_rev::CommitRecord],
+    selected: &[&sley::plumbing::sley_rev::CommitRecord],
     left_right_sides: &HashMap<ObjectId, char>,
     cwd: &Path,
     worktree_root: Option<&Path>,
@@ -1702,8 +1702,7 @@ fn rev_list_patchsame_oids(
         if left_first == on_left {
             continue;
         }
-        let Some(id) = rev_list_commit_patch_id(db, format, record, diff_pathspec.as_ref())?
-        else {
+        let Some(id) = rev_list_commit_patch_id(db, format, record, diff_pathspec.as_ref())? else {
             continue;
         };
         let Some(matches) = ids.get(&id) else {
@@ -1719,7 +1718,7 @@ fn rev_list_patchsame_oids(
 fn rev_list_commit_patch_id(
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     diff_pathspec: Option<&DiffPathspec>,
 ) -> Result<Option<Vec<u8>>> {
     if record.parents.len() > 1 {
@@ -1737,10 +1736,8 @@ fn rev_list_commit_patch_id(
             &record.commit.tree,
             pathspec,
         )?,
-        None => {
-            render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree)
-                .unwrap_or_default()
-        }
+        None => render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree)
+            .unwrap_or_default(),
     };
     Ok(commands::patch_id::patch_id_for_diff(&diff, format))
 }
@@ -1752,12 +1749,12 @@ fn rev_list_render_tree_to_tree_patch(
     new_tree: &ObjectId,
     pathspec: &DiffPathspec,
 ) -> Result<Vec<u8>> {
-    let entries = sley_diff_merge::diff_name_status_trees_with_options(
+    let entries = sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         old_tree,
         new_tree,
-        sley_diff_merge::DiffNameStatusOptions::default(),
+        sley::plumbing::sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     let entries = apply_diff_pathspec(entries, pathspec);
     let mut out = Vec::new();
@@ -1783,8 +1780,8 @@ fn rev_list_render_tree_to_tree_patch(
                 ws_error: None,
                 color_moved: None,
                 interhunk: 0,
-                ws_ignore: sley_diff_merge::WsIgnore::default(),
-                diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+                ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
+                diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
                 ignore_blank_lines: false,
                 ignore_regexes: &[],
                 line_ranges: None,
@@ -1796,7 +1793,7 @@ fn rev_list_render_tree_to_tree_patch(
 }
 
 fn rev_list_edge_oids(
-    records: &[&sley_rev::CommitRecord],
+    records: &[&sley::plumbing::sley_rev::CommitRecord],
     excluded: &HashSet<ObjectId>,
 ) -> Vec<ObjectId> {
     let mut seen = HashSet::new();
@@ -1814,9 +1811,9 @@ fn rev_list_edge_oids(
 fn rev_list_boundary_records(
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    records: &[&sley_rev::CommitRecord],
+    records: &[&sley::plumbing::sley_rev::CommitRecord],
     excluded: &HashSet<ObjectId>,
-) -> Result<Vec<sley_rev::CommitRecord>> {
+) -> Result<Vec<sley::plumbing::sley_rev::CommitRecord>> {
     let mut out = Vec::new();
     for oid in rev_list_edge_oids(records, excluded) {
         out.push(read_rev_list_commit_record(db, format, oid)?);
@@ -1838,7 +1835,7 @@ struct RevListBoundaryOptions<'a> {
 }
 
 fn write_rev_list_boundary_record(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     options: RevListBoundaryOptions<'_>,
 ) -> Result<()> {
     let RevListBoundaryOptions {
@@ -2011,7 +2008,7 @@ fn rev_list_extract_non_commit_excludes(
             kept.push(arg);
             continue;
         };
-        let oid = match sley_rev::resolve_revision_with_reader(git_dir, format, db, rev) {
+        let oid = match sley::plumbing::sley_rev::resolve_revision_with_reader(git_dir, format, db, rev) {
             Ok(oid) => oid,
             Err(_) => {
                 kept.push(arg);
@@ -2058,7 +2055,7 @@ fn rev_list_missing_tip_objects(
     let mut provided_seen = HashSet::new();
     let mut missing_seen = HashSet::new();
     for candidate in candidates {
-        let Ok(oid) = sley_rev::resolve_revision_with_reader(git_dir, format, db, candidate) else {
+        let Ok(oid) = sley::plumbing::sley_rev::resolve_revision_with_reader(git_dir, format, db, candidate) else {
             continue;
         };
         if selected_commit_oids.contains(&oid) || known_direct_object_oids.contains(&oid) {
@@ -2179,9 +2176,9 @@ impl RevListObjectFilter {
         match self {
             Self::SparseOid(value) => {
                 let oid = if let Some((rev, path)) = value.split_once(':') {
-                    sley_rev::resolve_rev_path(git_dir, format, db, rev, path)?
+                    sley::plumbing::sley_rev::resolve_rev_path(git_dir, format, db, rev, path)?
                 } else {
-                    sley_rev::resolve_revision_with_reader(git_dir, format, db, &value)?
+                    sley::plumbing::sley_rev::resolve_revision_with_reader(git_dir, format, db, &value)?
                 };
                 let object = db.read_object(&oid)?;
                 if object.object_type != ObjectType::Blob {
@@ -2257,7 +2254,7 @@ impl RevListObjectFilter {
 }
 
 fn rev_list_should_print_commit(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     filter: &RevListObjectFilter,
     tip_oids: &HashSet<ObjectId>,
 ) -> bool {
@@ -2326,7 +2323,7 @@ fn rev_list_sparse_patterns_include(
 }
 
 fn rev_list_selected_tag_objects(
-    selected: &[&sley_rev::CommitRecord],
+    selected: &[&sley::plumbing::sley_rev::CommitRecord],
     tag_objects: &[RevListTagObject],
 ) -> Vec<RevListObject> {
     let selected_oids = selected
@@ -2345,7 +2342,7 @@ fn rev_list_selected_tag_objects(
 fn rev_list_objects(
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    records: &[&sley_rev::CommitRecord],
+    records: &[&sley::plumbing::sley_rev::CommitRecord],
     excluded: &HashSet<ObjectId>,
     exclude_objects: &[RevListObject],
     filter: &RevListObjectFilter,
@@ -2773,8 +2770,8 @@ fn rev_list_quote_missing_path(path: &[u8]) -> Vec<u8> {
 
 fn rev_list_disk_usage(
     git_dir: &Path,
-    records: &[&sley_rev::CommitRecord],
-    boundary_records: &[sley_rev::CommitRecord],
+    records: &[&sley::plumbing::sley_rev::CommitRecord],
+    boundary_records: &[sley::plumbing::sley_rev::CommitRecord],
     tag_objects: &[RevListObject],
     objects: &[RevListObject],
     human_readable: bool,
@@ -2833,7 +2830,7 @@ fn rev_list_start_from_oid(
     } else {
         None
     };
-    match sley_rev::peel_to_commit(db, format, &oid) {
+    match sley::plumbing::sley_rev::peel_to_commit(db, format, &oid) {
         Ok(commit) => Ok(Some(RevListStart { commit, tag_object })),
         Err(_) if ignore_missing => Ok(None),
         Err(err) => Err(err),
@@ -2907,8 +2904,8 @@ fn rev_list_try_bitmap(
     format: ObjectFormat,
     query: &RevListBitmapQuery<'_>,
 ) -> Result<bool> {
-    let objects_dir = sley_odb::repository_objects_dir(git_dir);
-    let Some(bitmap) = sley_odb::load_pack_bitmap(&objects_dir, format)? else {
+    let objects_dir = sley::plumbing::sley_odb::repository_objects_dir(git_dir);
+    let Some(bitmap) = sley::plumbing::sley_odb::load_pack_bitmap(&objects_dir, format)? else {
         return Ok(false);
     };
 
@@ -2924,10 +2921,10 @@ fn rev_list_try_bitmap(
     }
 
     let mut result =
-        sley_odb::bitmap_reachable(&bitmap, db, format, query.want_roots, query.objects)?;
+        sley::plumbing::sley_odb::bitmap_reachable(&bitmap, db, format, query.want_roots, query.objects)?;
     if !query.exclude_tips.is_empty() {
         let haves =
-            sley_odb::bitmap_reachable(&bitmap, db, format, query.exclude_tips, query.objects)?;
+            sley::plumbing::sley_odb::bitmap_reachable(&bitmap, db, format, query.exclude_tips, query.objects)?;
         result.subtract(&haves);
     }
     rev_list_bitmap_apply_filter(&bitmap, db, &mut result, query)?;
@@ -2937,7 +2934,7 @@ fn rev_list_try_bitmap(
         // bitmapped pack is packed by definition; extended objects are kept
         // only when no pack (bitmapped or otherwise) holds them.
         result.words.iter_mut().for_each(|word| *word = 0);
-        let packed = sley_odb::packed_object_ids(&objects_dir, format)?;
+        let packed = sley::plumbing::sley_odb::packed_object_ids(&objects_dir, format)?;
         result.extended.retain(|(oid, _)| !packed.contains(oid));
     }
 
@@ -3002,9 +2999,9 @@ fn rev_list_try_bitmap(
 /// directly (the want tips) are exempt unless `--filter-provided-objects`, and
 /// the extended (non-pack) objects are filtered individually.
 fn rev_list_bitmap_apply_filter(
-    bitmap: &sley_odb::LoadedPackBitmap,
+    bitmap: &sley::plumbing::sley_odb::LoadedPackBitmap,
     db: &FileObjectDatabase,
-    result: &mut sley_odb::BitmapWalkResult,
+    result: &mut sley::plumbing::sley_odb::BitmapWalkResult,
     query: &RevListBitmapQuery<'_>,
 ) -> Result<()> {
     if query.object_filter == RevListObjectFilter::None {
@@ -3031,7 +3028,7 @@ fn rev_list_bitmap_apply_filter(
         }
     }
 
-    let exclude_type = |result: &mut sley_odb::BitmapWalkResult, object_type: ObjectType| {
+    let exclude_type = |result: &mut sley::plumbing::sley_odb::BitmapWalkResult, object_type: ObjectType| {
         for (word, (type_word, tip_word)) in result
             .words
             .iter_mut()
@@ -3121,8 +3118,8 @@ fn rev_list_test_bitmap(
     include_commits: &[ObjectId],
     exclude_tips: &[ObjectId],
 ) -> Result<()> {
-    let objects_dir = sley_odb::repository_objects_dir(git_dir);
-    let Some(bitmap) = sley_odb::load_pack_bitmap(&objects_dir, format)? else {
+    let objects_dir = sley::plumbing::sley_odb::repository_objects_dir(git_dir);
+    let Some(bitmap) = sley::plumbing::sley_odb::load_pack_bitmap(&objects_dir, format)? else {
         eprintln!("fatal: failed to load bitmap indexes");
         return Err(GitError::Exit(128));
     };
@@ -3141,7 +3138,7 @@ fn rev_list_test_bitmap(
     };
     let stored = std::sync::Arc::clone(stored);
     eprintln!("Found bitmap for '{tip}'. {} bits", bitmap.object_count());
-    let walked = sley_odb::bitmap_reachable(&bitmap, db, format, &[tip], true)?;
+    let walked = sley::plumbing::sley_odb::bitmap_reachable(&bitmap, db, format, &[tip], true)?;
     if walked.extended.is_empty() && walked.words == *stored {
         eprintln!("OK!");
         Ok(())

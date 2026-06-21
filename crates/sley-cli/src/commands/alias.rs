@@ -4,8 +4,8 @@
 //! the `alias.*` config namespace, expanded (simple or shell `!` aliases), and
 //! re-dispatched with a recursion limit.
 
-use sley_config::{ConfigIncludeContext, GitConfig};
-use sley_core::{GitError, Result};
+use sley::plumbing::sley_config::{ConfigIncludeContext, GitConfig};
+use sley::plumbing::sley_core::{GitError, Result};
 use std::env;
 use std::fs;
 use std::mem;
@@ -64,7 +64,7 @@ fn load_alias_file_config() -> Result<GitConfig> {
         .as_ref()
         .and_then(|dir| repo_current_branch_name(dir));
     let context = ConfigIncludeContext::new(common_git_dir.clone(), branch);
-    sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)
+    sley::plumbing::sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)
 }
 
 /// Execute a `!`-prefixed alias through git's shell path.

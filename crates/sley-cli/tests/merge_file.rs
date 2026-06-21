@@ -3,7 +3,7 @@
 //! Each case runs the same invocation through the system `git` and through
 //! `sley` and asserts identical stdout, stderr (where relevant) and exit
 //! status. The fixtures stay on the "agreement set" where sley' merge engine
-//! (`sley_diff_merge::merge_blobs` and its primitives) reproduces upstream git
+//! (`sley::plumbing::sley_diff_merge::merge_blobs` and its primitives) reproduces upstream git
 //! byte-for-byte: clean merges and conflicts whose changed regions are
 //! well-separated and do not share context lines with the other side. (git's
 //! zealous trimming and sub-marker-size conflict coalescing are deliberately

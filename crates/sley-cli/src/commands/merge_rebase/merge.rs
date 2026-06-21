@@ -23,12 +23,12 @@ fn write_merge_result_diffstat(
     if mode == MergeDiffstat::Off {
         return Ok(());
     }
-    let entries = sley_diff_merge::diff_name_status_trees_with_options(
+    let entries = sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         old_tree,
         new_tree,
-        sley_diff_merge::DiffNameStatusOptions::default(),
+        sley::plumbing::sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     let compact = mode == MergeDiffstat::Compact;
     write_diff_stat(
@@ -100,9 +100,9 @@ fn merge_commit_and_advance(
         options,
     )?;
     let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let oid = sley_sequencer::create_commit(
+    let oid = sley::plumbing::sley_sequencer::create_commit(
         &mut db,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree,
             parents: vec![*head_oid, *other_oid],
             author,
@@ -163,9 +163,9 @@ fn merge_ours_commit_and_advance(
         options,
     )?;
     let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let oid = sley_sequencer::create_commit(
+    let oid = sley::plumbing::sley_sequencer::create_commit(
         &mut db,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree,
             parents: vec![*head_oid, *other_oid],
             author,
@@ -529,10 +529,10 @@ fn merge_octopus(
         checksum: None,
     };
     fs::write(
-        sley_worktree::repository_index_path(git_dir),
+        sley::plumbing::sley_worktree::repository_index_path(git_dir),
         index.write(format)?,
     )?;
-    let merged_tree = sley_worktree::write_tree_from_index(git_dir, format)?;
+    let merged_tree = sley::plumbing::sley_worktree::write_tree_from_index(git_dir, format)?;
 
     let message = build_merge_message(refs, git_dir, &db, format, options, &head_oid, &reduced)?;
 
@@ -617,9 +617,9 @@ fn merge_octopus(
         parents.push(head_oid);
     }
     parents.extend(reduced.iter().map(|(_, oid)| *oid));
-    let merged_oid = sley_sequencer::create_commit(
+    let merged_oid = sley::plumbing::sley_sequencer::create_commit(
         &mut write_db,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree: merged_tree,
             parents,
             author,
@@ -646,7 +646,7 @@ fn merge_octopus(
         }),
     });
     tx.commit()?;
-    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &merged_oid)?;
+    sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &merged_oid)?;
     Ok(())
 }
 
@@ -952,7 +952,7 @@ fn merge_message_target_name(git_dir: &Path, format: ObjectFormat, target: &str)
     if !target.contains("@{") {
         return target.to_string();
     }
-    match sley_rev::resolve_revision_symbolic_full_name(git_dir, format, target) {
+    match sley::plumbing::sley_rev::resolve_revision_symbolic_full_name(git_dir, format, target) {
         Ok(Some(refname)) => refname
             .strip_prefix("refs/remotes/")
             .or_else(|| refname.strip_prefix("refs/heads/"))
@@ -989,7 +989,7 @@ fn merge_log_shortlog(
 ) -> Result<String> {
     let mut out = String::new();
     let head_reachable: std::collections::HashSet<ObjectId> =
-        sley_rev::walk_commits(db, format, [*head_oid])?
+        sley::plumbing::sley_rev::walk_commits(db, format, [*head_oid])?
             .into_iter()
             .map(|record| record.oid)
             .collect();
@@ -1000,7 +1000,7 @@ fn merge_log_shortlog(
         // walk with `^HEAD <ref>`. Sort newest-first by committer time (git's
         // default commit-date order) and skip merges (`shortlog` lists only the
         // non-merge tip subjects).
-        let mut walked: Vec<sley_rev::CommitRecord> = sley_rev::walk_commits(db, format, [*oid])?
+        let mut walked: Vec<sley::plumbing::sley_rev::CommitRecord> = sley::plumbing::sley_rev::walk_commits(db, format, [*oid])?
             .into_iter()
             .filter(|record| !head_reachable.contains(&record.oid))
             .filter(|record| record.parents.len() <= 1)
@@ -1164,7 +1164,7 @@ struct MergeOptions {
     /// = 20 when the config turns it on as a bool).
     shortlog_len: Option<usize>,
     /// `-X ours` / `-X theirs` conflict favouring for textual conflicts.
-    favor: sley_diff_merge::MergeFavor,
+    favor: sley::plumbing::sley_diff_merge::MergeFavor,
     /// `--allow-unrelated-histories`: merge two branches with no common ancestor
     /// using the empty tree as the virtual base (git refuses by default).
     allow_unrelated_histories: bool,
@@ -1235,7 +1235,7 @@ impl Default for MergeOptions {
             no_commit: false,
             quiet: false,
             shortlog_len: None,
-            favor: sley_diff_merge::MergeFavor::None,
+            favor: sley::plumbing::sley_diff_merge::MergeFavor::None,
             allow_unrelated_histories: false,
             diffstat: None,
             ours_strategy: false,
@@ -1597,7 +1597,7 @@ fn fmt_merge_origin_from_desc(
     given_oid: ObjectId,
     desc: &str,
 ) -> Result<Option<FmtMergeOrigin>> {
-    let commit_oid = match sley_rev::peel_to_commit(db, format, &given_oid) {
+    let commit_oid = match sley::plumbing::sley_rev::peel_to_commit(db, format, &given_oid) {
         Ok(oid) => oid,
         Err(_) => return Ok(None),
     };
@@ -1681,13 +1681,13 @@ fn reduce_fmt_merge_origins(
     }
     let mut reachables: Vec<(ObjectId, HashSet<ObjectId>)> = Vec::new();
     for origin in &origins {
-        let reachable = sley_rev::walk_commits(db, format, [origin.commit_oid])?
+        let reachable = sley::plumbing::sley_rev::walk_commits(db, format, [origin.commit_oid])?
             .into_iter()
             .map(|record| record.oid)
             .collect();
         reachables.push((origin.commit_oid, reachable));
     }
-    let head_reachable: HashSet<ObjectId> = sley_rev::walk_commits(db, format, [*head_oid])?
+    let head_reachable: HashSet<ObjectId> = sley::plumbing::sley_rev::walk_commits(db, format, [*head_oid])?
         .into_iter()
         .map(|record| record.oid)
         .collect();
@@ -1926,7 +1926,7 @@ fn fmt_merge_log_shortlog(
     comment: &str,
 ) -> Result<String> {
     let mut out = String::new();
-    let head_reachable: HashSet<ObjectId> = sley_rev::walk_commits(db, format, [*head_oid])?
+    let head_reachable: HashSet<ObjectId> = sley::plumbing::sley_rev::walk_commits(db, format, [*head_oid])?
         .into_iter()
         .map(|record| record.oid)
         .collect();
@@ -1937,8 +1937,8 @@ fn fmt_merge_log_shortlog(
         .ok()
         .and_then(identity_name);
     for origin in origins {
-        let mut walked: Vec<sley_rev::CommitRecord> =
-            sley_rev::walk_commits(db, format, [origin.commit_oid])?
+        let mut walked: Vec<sley::plumbing::sley_rev::CommitRecord> =
+            sley::plumbing::sley_rev::walk_commits(db, format, [origin.commit_oid])?
                 .into_iter()
                 .filter(|record| !head_reachable.contains(&record.oid))
                 .collect();
@@ -2018,7 +2018,7 @@ fn fmt_merge_log_shortlog(
 }
 
 fn identity_name(raw: Vec<u8>) -> Option<String> {
-    sley_core::Signature::from_ident_line(&raw)
+    sley::plumbing::sley_core::Signature::from_ident_line(&raw)
         .map(|sig| String::from_utf8_lossy(sig.name.as_bytes()).into_owned())
 }
 
@@ -2341,17 +2341,17 @@ pub(crate) fn effective_config_with_overrides() -> Option<GitConfig> {
     if let Ok(parameters) = crate::injected_config_parameters() {
         config
             .sections
-            .extend(sley_config::injected_config_sections(&parameters));
+            .extend(sley::plumbing::sley_config::injected_config_sections(&parameters));
     }
     Some(config)
 }
 
 /// Read `merge.directoryRenames` from the effective config, mapping it to the
-/// library's [`sley_diff_merge::DirectoryRenames`]. git's default (when unset or
+/// library's [`sley::plumbing::sley_diff_merge::DirectoryRenames`]. git's default (when unset or
 /// unrecognised) is `conflict`: directory renames are detected but each re-homed
 /// path is flagged rather than applied silently.
-pub(crate) fn directory_renames_config() -> sley_diff_merge::DirectoryRenames {
-    use sley_diff_merge::DirectoryRenames;
+pub(crate) fn directory_renames_config() -> sley::plumbing::sley_diff_merge::DirectoryRenames {
+    use sley::plumbing::sley_diff_merge::DirectoryRenames;
     let value = effective_config_with_overrides().and_then(|config| {
         config
             .get("merge", None, "directoryRenames")
@@ -3149,7 +3149,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         &theirs_label,
         "merged common ancestors",
         options.favor,
-        sley_diff_merge::ConflictStyle::Merge,
+        sley::plumbing::sley_diff_merge::ConflictStyle::Merge,
     )?;
 
     // git's pre-merge `verify_uptodate` (unpack-trees): a real 3-way merge
@@ -3190,10 +3190,10 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             checksum: None,
         };
         fs::write(
-            sley_worktree::repository_index_path(&git_dir),
+            sley::plumbing::sley_worktree::repository_index_path(&git_dir),
             index.write(format)?,
         )?;
-        let merged_tree = sley_worktree::write_tree_from_index(&git_dir, format)?;
+        let merged_tree = sley::plumbing::sley_worktree::write_tree_from_index(&git_dir, format)?;
 
         // Materialize the merged result into the worktree (shared by the
         // --squash and --no-commit early-exit paths below). git's unpack-trees
@@ -3345,8 +3345,8 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 ours,
                 kind:
                     Some(
-                        sley_diff_merge::MergeConflictKind::DirRenameLocation { .. }
-                        | sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { .. },
+                        sley::plumbing::sley_diff_merge::MergeConflictKind::DirRenameLocation { .. }
+                        | sley::plumbing::sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { .. },
                     ),
                 ..
             } => {
@@ -3394,7 +3394,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         checksum: None,
     };
     fs::write(
-        sley_worktree::repository_index_path(&git_dir),
+        sley::plumbing::sley_worktree::repository_index_path(&git_dir),
         index.write(format)?,
     )?;
 
@@ -3424,7 +3424,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 None if matches!(
                     result,
                     MergePathResult::Conflict {
-                        kind: Some(sley_diff_merge::MergeConflictKind::DirRenameSplit { .. }),
+                        kind: Some(sley::plumbing::sley_diff_merge::MergeConflictKind::DirRenameSplit { .. }),
                         ..
                     }
                 ) => {}
@@ -3500,10 +3500,10 @@ pub(crate) fn cmd_merge_recursive(args: &[String]) -> Result<()> {
     result
 }
 
-fn print_merge_info_messages(messages: &[sley_diff_merge::MergeInfoMessage]) {
+fn print_merge_info_messages(messages: &[sley::plumbing::sley_diff_merge::MergeInfoMessage]) {
     for message in messages {
         match message {
-            sley_diff_merge::MergeInfoMessage::DirRenameSkippedDueToRerename {
+            sley::plumbing::sley_diff_merge::MergeInfoMessage::DirRenameSkippedDueToRerename {
                 old_dir,
                 path,
                 new_dir,
@@ -3516,7 +3516,7 @@ fn print_merge_info_messages(messages: &[sley_diff_merge::MergeInfoMessage]) {
                     String::from_utf8_lossy(new_dir),
                 );
             }
-            sley_diff_merge::MergeInfoMessage::DirRenameApplied {
+            sley::plumbing::sley_diff_merge::MergeInfoMessage::DirRenameApplied {
                 old_path,
                 new_path,
                 renamed_from,
@@ -3539,7 +3539,7 @@ fn print_merge_info_messages(messages: &[sley_diff_merge::MergeInfoMessage]) {
                     String::from_utf8_lossy(new_path),
                 ),
             },
-            sley_diff_merge::MergeInfoMessage::DirRenameLocationConflict {
+            sley::plumbing::sley_diff_merge::MergeInfoMessage::DirRenameLocationConflict {
                 old_path,
                 new_path,
                 renamed_from,
@@ -3562,7 +3562,7 @@ fn print_merge_info_messages(messages: &[sley_diff_merge::MergeInfoMessage]) {
                     String::from_utf8_lossy(new_path),
                 ),
             },
-            sley_diff_merge::MergeInfoMessage::RenameDeleteConflict {
+            sley::plumbing::sley_diff_merge::MergeInfoMessage::RenameDeleteConflict {
                 old_path,
                 new_path,
                 renamed_in,
@@ -3597,14 +3597,14 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
             println!("Auto-merging {path_str}");
         }
         match kind {
-            Some(sley_diff_merge::MergeConflictKind::Content { add_add }) => {
+            Some(sley::plumbing::sley_diff_merge::MergeConflictKind::Content { add_add }) => {
                 let reason = if *add_add { "add/add" } else { "content" };
                 println!("CONFLICT ({reason}): Merge conflict in {path_str}");
             }
-            Some(sley_diff_merge::MergeConflictKind::RenameContent { .. }) => {
+            Some(sley::plumbing::sley_diff_merge::MergeConflictKind::RenameContent { .. }) => {
                 println!("CONFLICT (content): Merge conflict in {path_str}");
             }
-            Some(sley_diff_merge::MergeConflictKind::RenameRenameTwoToOne {
+            Some(sley::plumbing::sley_diff_merge::MergeConflictKind::RenameRenameTwoToOne {
                 ours_path,
                 theirs_path,
             }) => {
@@ -3614,7 +3614,7 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
                     String::from_utf8_lossy(theirs_path),
                 );
             }
-            Some(sley_diff_merge::MergeConflictKind::RenameRenameOneToTwo {
+            Some(sley::plumbing::sley_diff_merge::MergeConflictKind::RenameRenameOneToTwo {
                 old_path,
                 ours_path,
                 theirs_path,
@@ -3628,14 +3628,14 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
                     String::from_utf8_lossy(theirs_path),
                 );
             }
-            Some(sley_diff_merge::MergeConflictKind::RenameRenameOneToTwoStage) => {}
-            Some(sley_diff_merge::MergeConflictKind::DirRenameSplit { source_dir }) => {
+            Some(sley::plumbing::sley_diff_merge::MergeConflictKind::RenameRenameOneToTwoStage) => {}
+            Some(sley::plumbing::sley_diff_merge::MergeConflictKind::DirRenameSplit { source_dir }) => {
                 println!(
                     "CONFLICT (directory rename split): Unclear where to rename {} to; it was renamed to multiple other directories, with no destination getting a majority of the files.",
                     String::from_utf8_lossy(source_dir),
                 );
             }
-            Some(sley_diff_merge::MergeConflictKind::ModifyDelete {
+            Some(sley::plumbing::sley_diff_merge::MergeConflictKind::ModifyDelete {
                 deleted_in,
                 modified_in,
             }) => {
@@ -3643,7 +3643,7 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
                     "CONFLICT (modify/delete): {path_str} deleted in {deleted_in} and modified in {modified_in}.  Version {modified_in} of {path_str} left in tree."
                 );
             }
-            Some(sley_diff_merge::MergeConflictKind::RenameDelete {
+            Some(sley::plumbing::sley_diff_merge::MergeConflictKind::RenameDelete {
                 old_path,
                 renamed_in,
                 deleted_in,
@@ -3653,7 +3653,7 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
                     String::from_utf8_lossy(old_path)
                 );
             }
-            Some(sley_diff_merge::MergeConflictKind::FileDirectory {
+            Some(sley::plumbing::sley_diff_merge::MergeConflictKind::FileDirectory {
                 original_path,
                 moved_from,
             }) => {
@@ -3662,7 +3662,7 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
                     String::from_utf8_lossy(original_path)
                 );
             }
-            Some(sley_diff_merge::MergeConflictKind::DirRenameLocation {
+            Some(sley::plumbing::sley_diff_merge::MergeConflictKind::DirRenameLocation {
                 old_path,
                 renamed_from,
                 added_in,
@@ -3678,7 +3678,7 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
                     old = String::from_utf8_lossy(old_path),
                 ),
             },
-            Some(sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { sources }) => {
+            Some(sley::plumbing::sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { sources }) => {
                 let source_list = sources
                     .iter()
                     .map(|s| String::from_utf8_lossy(s).into_owned())
@@ -3798,7 +3798,7 @@ fn verify_merge_uptodate(
             } if base
                 .or(*ours)
                 .or(*theirs)
-                .is_some_and(|(mode, _)| sley_index::is_gitlink(mode)) =>
+                .is_some_and(|(mode, _)| sley::plumbing::sley_index::is_gitlink(mode)) =>
             {
                 Some(path.clone())
             }
@@ -3811,7 +3811,7 @@ fn verify_merge_uptodate(
         let gitlink_worktree_status_is_safe = (conflicted_gitlinks.contains(&entry.path)
             || ours_map
                 .get(&entry.path)
-                .is_some_and(|(mode, _)| sley_index::is_gitlink(*mode)))
+                .is_some_and(|(mode, _)| sley::plumbing::sley_index::is_gitlink(*mode)))
             && changed.contains(&entry.path);
         if entry.index == b'?'
             && entry.worktree == b'?'
@@ -3833,7 +3833,7 @@ fn verify_merge_uptodate(
                 entry.head_mode != entry.index_mode || entry.head_oid != entry.index_oid;
             let gitlink_index_status_is_worktree_dirt = ours_map
                 .get(&entry.path)
-                .is_some_and(|(mode, _)| sley_index::is_gitlink(*mode))
+                .is_some_and(|(mode, _)| sley::plumbing::sley_index::is_gitlink(*mode))
                 && !staged_superproject_change;
             if gitlink_index_status_is_worktree_dirt {
                 continue;
@@ -3888,7 +3888,7 @@ pub(crate) fn verify_fast_forward_untracked_safe(
         }
         if target_map
             .get(path)
-            .is_some_and(|(mode, _)| sley_index::is_gitlink(*mode))
+            .is_some_and(|(mode, _)| sley::plumbing::sley_index::is_gitlink(*mode))
             && gitlink_target_dir_is_safe(worktree_root, path, &head_map, &untracked)?
         {
             continue;
@@ -3950,7 +3950,7 @@ fn verify_no_populated_gitlink_directory_overwrite(
     head_map: &MergeTreeMap,
 ) -> Result<()> {
     for (path, (mode, _)) in head_map {
-        if !sley_index::is_gitlink(*mode) {
+        if !sley::plumbing::sley_index::is_gitlink(*mode) {
             continue;
         }
         let prefix = path_with_trailing_slash(path);
@@ -4016,7 +4016,7 @@ fn reset_index_and_worktree_to_commit_for_merge(
             true,
         )
     } else {
-        sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, commit)?;
+        sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, commit)?;
         Ok(())
     }
 }
@@ -4103,7 +4103,7 @@ fn reset_merge_to_head(git_dir: &Path, worktree_root: &Path, format: ObjectForma
         .collect();
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     fs::write(
-        sley_worktree::repository_index_path(git_dir),
+        sley::plumbing::sley_worktree::repository_index_path(git_dir),
         Index {
             version: 2,
             entries,
@@ -4155,15 +4155,15 @@ pub(crate) fn conclude_in_progress_merge(
             merge_head_contents.trim()
         ))
     })?;
-    let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
+    let tree = sley::plumbing::sley_worktree::write_tree_from_index(git_dir, format)?;
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
     let message = commit_cleanup_message(message, CommitCleanupMode::Whitespace, "#", false);
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let mut writer = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    let commit_oid = sley_sequencer::create_commit(
+    let commit_oid = sley::plumbing::sley_sequencer::create_commit(
         &mut writer,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree,
             parents: vec![ours_oid, theirs_oid],
             author,
@@ -4241,12 +4241,12 @@ pub(crate) fn print_commit_shortstat_between_trees(
     old_tree: &ObjectId,
     new_tree: &ObjectId,
 ) -> Result<()> {
-    let entries = sley_diff_merge::diff_name_status_trees_with_options(
+    let entries = sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         old_tree,
         new_tree,
-        sley_diff_merge::DiffNameStatusOptions::default(),
+        sley::plumbing::sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     if entries.is_empty() {
         return Ok(());
@@ -4274,7 +4274,7 @@ pub(crate) fn conclude_rebase_step_via_commit(
     let parent_oid = resolve_revision(git_dir, format, "HEAD")?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let parent_tree = read_commit_tree(&db, format, &parent_oid)?;
-    let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
+    let tree = sley::plumbing::sley_worktree::write_tree_from_index(git_dir, format)?;
     if !allow_empty && tree == parent_tree {
         eprintln!("nothing to commit, working tree clean");
         return Err(GitError::Exit(1));
@@ -4283,9 +4283,9 @@ pub(crate) fn conclude_rebase_step_via_commit(
         author = script_author;
     }
     let mut writer = FileObjectDatabase::from_git_dir(git_dir, format);
-    let commit_oid = sley_sequencer::create_commit(
+    let commit_oid = sley::plumbing::sley_sequencer::create_commit(
         &mut writer,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree,
             parents: vec![parent_oid],
             author,
@@ -4316,10 +4316,10 @@ fn read_rebase_author_script_identity(git_dir: &Path) -> Result<Option<Vec<u8>>>
     let Ok(text) = fs::read_to_string(path) else {
         return Ok(None);
     };
-    let Some((name, email, date)) = sley_sequencer::rebase::parse_author_script(&text) else {
+    let Some((name, email, date)) = sley::plumbing::sley_sequencer::rebase::parse_author_script(&text) else {
         return Ok(None);
     };
-    Ok(Some(sley_sequencer::format_commit_identity(
+    Ok(Some(sley::plumbing::sley_sequencer::format_commit_identity(
         &name, &email, &date,
     )?))
 }
@@ -4335,7 +4335,7 @@ fn peel_merge_target_to_commit(
     format: ObjectFormat,
     oid: ObjectId,
 ) -> Result<ObjectId> {
-    sley_rev::peel_to_commit(db, format, &oid)
+    sley::plumbing::sley_rev::peel_to_commit(db, format, &oid)
 }
 
 fn create_merge_autostash(
@@ -4357,7 +4357,7 @@ fn create_merge_autostash(
     fs::write(git_dir.join("MERGE_AUTOSTASH"), format!("{oid}\n"))?;
     println!("Created autostash: {}", format_log_abbrev_oid(&oid));
     let head = resolve_revision(git_dir, format, "HEAD")?;
-    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &head)?;
+    sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &head)?;
     Ok(true)
 }
 
@@ -4458,7 +4458,7 @@ fn write_merge_state(
 }
 
 pub(crate) fn read_worktree_index(git_dir: &Path, format: ObjectFormat) -> Result<Index> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     Index::parse(&fs::read(index_path)?, format)
 }
 

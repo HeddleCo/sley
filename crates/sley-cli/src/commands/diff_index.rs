@@ -18,7 +18,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley::plumbing::sley_core::{GitError, ObjectFormat, ObjectId, Result};
 
 // Pull in the crate-root helpers this command shares with `cmd_diff`
 // (RepositoryContext, FileObjectDatabase, the
@@ -56,8 +56,8 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let mut find_copies_harder = false;
     let mut rename_empty = true;
     let mut inexact_renames = false;
-    let mut rename_threshold = sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
-    let mut copy_threshold = sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
+    let mut rename_threshold = sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
+    let mut copy_threshold = sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
     let mut diff_filter = DiffFilter::default();
     let mut abbrev = AbbrevRequest::Default;
     let mut patch_full_index = false;
@@ -242,9 +242,9 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let git_dir = repo.git_dir();
     let format = repo.format();
     let db = repo.objects();
-    let setup = sley_rev::setup_revisions(
+    let setup = sley::plumbing::sley_rev::setup_revisions(
         &setup_args,
-        &sley_rev::RevisionSetupContext {
+        &sley::plumbing::sley_rev::RevisionSetupContext {
             git_dir,
             worktree_root: repo.worktree_root().ok(),
             cwd,
@@ -265,7 +265,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         let head = commands::diff::diff_resolve_commit_arg(git_dir, format, db, "HEAD")?;
         let other = commands::diff::diff_resolve_commit_arg(git_dir, format, db, &tree_tip.rev)?;
         let base = commands::diff::diff_single_merge_base(git_dir, format, db, &head, &other)?;
-        sley_rev::peel_to_tree(db, format, &base)?
+        sley::plumbing::sley_rev::peel_to_tree(db, format, &base)?
     } else {
         resolve_tree_ish_oid(&repo, tree_tip.oid, &tree_tip.rev)?
     };
@@ -274,7 +274,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     // requested, but unlike porcelain `git diff` the plumbing `diff-index`
     // shows *full* oids in the raw listing unless `--abbrev` is given, and
     // `core.abbrev` alone never abbreviates the raw output.
-    let configured_abbrev = repo.abbrev()?.unwrap_or(DEFAULT_ABBREV);
+    let configured_abbrev = repository_abbrev(repo.git_dir(), repo.format())?.unwrap_or(DEFAULT_ABBREV);
     let raw_abbrev: Option<usize> = match abbrev {
         AbbrevRequest::Default | AbbrevRequest::None => None,
         AbbrevRequest::Auto => Some(configured_abbrev.min(format.hex_len())),
@@ -307,13 +307,13 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         DiffPathspec::new(cwd, worktree_root, &setup.pathspecs)?
     };
 
-    let base_options = sley_diff_merge::DiffNameStatusOptions {
+    let base_options = sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
         detect_renames,
         detect_copies,
         find_copies_harder,
         rename_empty,
     };
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
+    let rename_options = sley::plumbing::sley_diff_merge::RenameDetectionOptions {
         base: base_options,
         detect_inexact: true,
         rename_threshold,
@@ -322,14 +322,14 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
 
     let entries = if cached {
         if inexact_renames {
-            sley_diff_merge::diff_name_status_tree_index_with_rename_options(
+            sley::plumbing::sley_diff_merge::diff_name_status_tree_index_with_rename_options(
                 git_dir,
                 format,
                 &tree_oid,
                 rename_options,
             )?
         } else {
-            sley_diff_merge::diff_name_status_tree_index_with_options(
+            sley::plumbing::sley_diff_merge::diff_name_status_tree_index_with_options(
                 git_dir,
                 format,
                 &tree_oid,
@@ -340,7 +340,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         let worktree_root = worktree_root
             .ok_or_else(|| GitError::Command("diff-index requires a worktree".into()))?;
         if inexact_renames {
-            sley_diff_merge::diff_name_status_tree_worktree_with_rename_options(
+            sley::plumbing::sley_diff_merge::diff_name_status_tree_worktree_with_rename_options(
                 worktree_root,
                 git_dir,
                 format,
@@ -348,7 +348,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
                 rename_options,
             )?
         } else {
-            sley_diff_merge::diff_name_status_tree_worktree_with_options(
+            sley::plumbing::sley_diff_merge::diff_name_status_tree_worktree_with_options(
                 worktree_root,
                 git_dir,
                 format,
@@ -374,7 +374,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let entries = if match_missing && !cached {
         entries
             .into_iter()
-            .filter(|entry| entry.status != sley_diff_merge::NameStatus::Deleted)
+            .filter(|entry| entry.status != sley::plumbing::sley_diff_merge::NameStatus::Deleted)
             .collect()
     } else {
         entries
@@ -456,10 +456,10 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
 /// status is selected. Pathspec filtering has already run, so the `*` form's
 /// pathspec re-check here is a no-op kept for parity.
 fn apply_diff_index_filter(
-    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     diff_filter: &DiffFilter,
     pathspec: &DiffPathspec,
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+) -> Vec<sley::plumbing::sley_diff_merge::NameStatusEntry> {
     if diff_filter.all_or_none {
         if !diff_filter.includes.is_empty()
             && entries.iter().any(|entry| {
@@ -497,7 +497,7 @@ struct RenderContext<'a> {
 }
 
 fn render(
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
     output: &DiffIndexOutput,
     ctx: RenderContext<'_>,
 ) -> Result<()> {
@@ -601,8 +601,8 @@ fn render(
                 ws_error: None,
                 color_moved: None,
                 interhunk: 0,
-                ws_ignore: sley_diff_merge::WsIgnore::default(),
-                diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+                ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
+                diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
                 ignore_blank_lines: false,
                 ignore_regexes: &[],
                 line_ranges: None,
@@ -616,7 +616,7 @@ fn render(
 
 fn write_name_status_entry(
     stdout: &mut io::Stdout,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     z: bool,
 ) -> Result<()> {
     if z {
@@ -642,7 +642,7 @@ fn write_name_status_entry(
 
 fn write_name_only_entry(
     stdout: &mut io::Stdout,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     z: bool,
 ) -> Result<()> {
     if z {
@@ -667,11 +667,11 @@ fn resolve_tree_ish_oid(repo: &RepositoryContext, oid: ObjectId, rev: &str) -> R
     // The canonical empty tree need not be present in the object database; git
     // always accepts it. Skip peeling (which would try to read the object) so
     // `diff-index <empty-tree-sha>` works in a fresh repository.
-    if sley_core::object_id_for_bytes(format, "tree", b"").is_ok_and(|empty| empty == oid) {
+    if sley::plumbing::sley_core::object_id_for_bytes(format, "tree", b"").is_ok_and(|empty| empty == oid) {
         return Ok(oid);
     }
-    sley_rev::peel_to_tree(repo.objects(), format, &oid)
-        .map_err(|_| sley_rev::ambiguous_argument_error(rev))
+    sley::plumbing::sley_rev::peel_to_tree(repo.objects(), format, &oid)
+        .map_err(|_| sley::plumbing::sley_rev::ambiguous_argument_error(rev))
 }
 
 fn parse_diff_index_abbrev(value: &str) -> Result<usize> {

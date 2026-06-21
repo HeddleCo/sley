@@ -9,6 +9,14 @@ selected behavior with the system `git` binary.
 This repository is not a complete Git replacement yet. Tracked gaps are explicit
 in [`PARITY.md`](PARITY.md).
 
+## Library Consumers
+
+Downstream tools should depend on the `sley` facade crate instead of the CLI
+crate. See [`docs/consumer-guide.md`](docs/consumer-guide.md) for examples that
+open a repository context, stream cat-file style object reads, apply
+`update-ref --stdin` style batches, render diffs, run fetch/push, and stream
+status rows.
+
 ## Current Commands
 
 ```sh
@@ -181,39 +189,4 @@ cargo run -p git-cli -- tag -f <name> [<target>]
 cargo run -p git-cli -- tag -a <name> -m <message> [<target>]
 cargo run -p git-cli -- tag -f -a <name> -m <message> [<target>]
 cargo run -p git-cli -- tag -d <name>...
-cargo run -p git-cli -- testkit hash-object
-cargo run -p git-cli -- testkit hash-object-sha256
-cargo run -p git-cli -- testkit loose-sha256
-cargo run -p git-cli -- testkit config
-cargo run -p git-cli -- testkit commit
-cargo run -p git-cli -- testkit commit-tree
-cargo run -p git-cli -- testkit branch
-cargo run -p git-cli -- testkit branch-current
-cargo run -p git-cli -- testkit branch-delete
-cargo run -p git-cli -- testkit checkout
-cargo run -p git-cli -- testkit tag
-cargo run -p git-cli -- testkit tag-delete
-cargo run -p git-cli -- testkit annotated-tag
-cargo run -p git-cli -- testkit diff
-cargo run -p git-cli -- testkit rev-parse
-cargo run -p git-cli -- testkit rev-parse-parents
-cargo run -p git-cli -- testkit rev-parse-peel
-cargo run -p git-cli -- testkit rev-parse-object-format
-cargo run -p git-cli -- testkit add-status
-cargo run -p git-cli -- testkit index
-cargo run -p git-cli -- testkit update-index
-cargo run -p git-cli -- testkit ls-files
-cargo run -p git-cli -- testkit update-ref-delete
-cargo run -p git-cli -- testkit write-tree
-cargo run -p git-cli -- testkit ls-tree
-cargo run -p git-cli -- testkit cat-file
-cargo run -p git-cli -- testkit log
-cargo run -p git-cli -- testkit pack-read
-cargo run -p git-cli -- testkit packed-odb
-cargo run -p git-cli -- testkit pack-index
-cargo run -p git-cli -- testkit pack-write
-cargo run -p git-cli -- testkit refs
-cargo run -p git-cli -- testkit show-ref
-cargo run -p git-cli -- testkit show-ref-verify
-cargo run -p git-cli -- testkit symbolic-ref
 ```

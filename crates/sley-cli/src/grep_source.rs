@@ -1,6 +1,6 @@
 //! Shared grep-source matching engine.
 
-use sley_core::{GitError, Result};
+use sley::plumbing::sley_core::{GitError, Result};
 
 pub(crate) const INVALID_REGEX_MESSAGE: &str = "Invalid regular expression";
 pub(crate) const UNBALANCED_BRACKETS_MESSAGE: &str = "brackets ([ ]) not balanced";

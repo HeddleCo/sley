@@ -336,9 +336,9 @@ fn hook_config() -> Vec<ScopedSection> {
         discover_git_dir(env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
             .ok()
             .and_then(|git_dir| common_git_dir_for_git_dir(&git_dir).ok());
-    let context = sley_config::ConfigIncludeContext::new(common_git_dir.clone(), None);
+    let context = sley::plumbing::sley_config::ConfigIncludeContext::new(common_git_dir.clone(), None);
     let mut out = Vec::new();
-    if let Ok(config) = sley_config::load_pre_dispatch_config(None, &context) {
+    if let Ok(config) = sley::plumbing::sley_config::load_pre_dispatch_config(None, &context) {
         out.extend(config.sections.into_iter().map(|section| ScopedSection {
             scope: "global",
             section,
@@ -346,7 +346,7 @@ fn hook_config() -> Vec<ScopedSection> {
     }
     if let Some(common_git_dir) = common_git_dir.as_deref()
         && let Ok(config) =
-            sley_config::load_config_with_includes(&common_git_dir.join("config"), &context)
+            sley::plumbing::sley_config::load_config_with_includes(&common_git_dir.join("config"), &context)
     {
         out.extend(config.sections.into_iter().map(|section| ScopedSection {
             scope: "local",
@@ -355,7 +355,7 @@ fn hook_config() -> Vec<ScopedSection> {
     }
     if let Ok(parameters) = crate::injected_config_parameters() {
         out.extend(
-            sley_config::injected_config_sections(&parameters)
+            sley::plumbing::sley_config::injected_config_sections(&parameters)
                 .into_iter()
                 .map(|section| ScopedSection {
                     scope: "command",
@@ -421,7 +421,7 @@ fn configured_hooks(config: &[ScopedSection], hook_name: &str) -> Result<Vec<Hoo
                 match entry
                     .value
                     .as_deref()
-                    .and_then(sley_config::parse_config_bool)
+                    .and_then(sley::plumbing::sley_config::parse_config_bool)
                 {
                     Some(false) => state.disabled = true,
                     Some(true) => state.disabled = false,
@@ -533,7 +533,7 @@ fn hook_failure_code(code: Option<i32>, options: &HookRun) -> i32 {
 
 fn advise_ignored_hook(path: &Path, config: &[ScopedSection]) {
     let advice_enabled = scoped_config_get(config, "advice", None, "ignoredHook")
-        .and_then(|value| sley_config::parse_config_bool(&value))
+        .and_then(|value| sley::plumbing::sley_config::parse_config_bool(&value))
         .unwrap_or(true);
     if !advice_enabled {
         return;

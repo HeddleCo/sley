@@ -330,21 +330,21 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         .iter()
         .map(|rev| {
             let oid = resolve_revision(&git_dir, format, rev)?;
-            sley_rev::peel_to_commit(&db, format, &oid)
+            sley::plumbing::sley_rev::peel_to_commit(&db, format, &oid)
         })
         .collect::<Result<Vec<_>>>()?;
     let no_contains_targets = no_contains_revs
         .iter()
         .map(|rev| {
             let oid = resolve_revision(&git_dir, format, rev)?;
-            sley_rev::peel_to_commit(&db, format, &oid)
+            sley::plumbing::sley_rev::peel_to_commit(&db, format, &oid)
         })
         .collect::<Result<Vec<_>>>()?;
     let merged_filter = merged_filter
         .map(|(rev, include)| {
             let oid = resolve_revision(&git_dir, format, &rev)?;
-            let commit = sley_rev::peel_to_commit(&db, format, &oid)?;
-            let reachable = sley_rev::walk_commits(&db, format, [commit])?
+            let commit = sley::plumbing::sley_rev::peel_to_commit(&db, format, &oid)?;
+            let reachable = sley::plumbing::sley_rev::walk_commits(&db, format, [commit])?
                 .into_iter()
                 .map(|record| record.oid)
                 .collect::<HashSet<_>>();
@@ -391,7 +391,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         .get_bool("core", None, "warnambiguousrefs")
         .unwrap_or(true);
     if include_root_refs && let Some(target) = store.read_ref("HEAD")? {
-        refs.push(sley_refs::Ref {
+        refs.push(sley::plumbing::sley_refs::Ref {
             name: "HEAD".to_string(),
             target,
         });
@@ -424,7 +424,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             continue;
         }
         if let Some((reachable, include)) = &merged_filter {
-            let merged = sley_rev::peel_to_commit(&db, format, &oid)
+            let merged = sley::plumbing::sley_rev::peel_to_commit(&db, format, &oid)
                 .map(|tip| reachable.contains(&tip))
                 .unwrap_or(false);
             if merged != *include {
@@ -432,10 +432,10 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             }
         }
         if !contains_targets.is_empty() || !no_contains_targets.is_empty() {
-            let reachable = sley_rev::peel_to_commit(&db, format, &oid)
+            let reachable = sley::plumbing::sley_rev::peel_to_commit(&db, format, &oid)
                 .ok()
                 .map(|tip| {
-                    sley_rev::walk_commits(&db, format, [tip]).map(|records| {
+                    sley::plumbing::sley_rev::walk_commits(&db, format, [tip]).map(|records| {
                         records
                             .into_iter()
                             .map(|record| record.oid)
@@ -1577,7 +1577,7 @@ struct ForEachRefSortContext<'a> {
 type ForEachRefObjectHeaderCache = HashMap<ObjectId, (ObjectType, usize)>;
 
 fn sort_for_each_refs(
-    refs: &mut Vec<sley_refs::Ref>,
+    refs: &mut Vec<sley::plumbing::sley_refs::Ref>,
     sorts: &[ForEachRefSort],
     context: ForEachRefSortContext<'_>,
     object_headers: &mut ForEachRefObjectHeaderCache,
@@ -1702,7 +1702,7 @@ fn for_each_ref_read_object_header(
 }
 
 fn for_each_ref_sort_key(
-    reference: &sley_refs::Ref,
+    reference: &sley::plumbing::sley_refs::Ref,
     sort: ForEachRefSort,
     context: &ForEachRefSortContext<'_>,
     object_headers: &mut ForEachRefObjectHeaderCache,
@@ -2023,7 +2023,7 @@ fn for_each_ref_sort_key(
 }
 
 fn for_each_ref_sort_tag_contents(
-    reference: &sley_refs::Ref,
+    reference: &sley::plumbing::sley_refs::Ref,
     context: &ForEachRefSortContext<'_>,
 ) -> Result<Option<ForEachRefContents<'static>>> {
     let Some(contents) = for_each_ref_sort_contents(reference, context)? else {
@@ -2036,7 +2036,7 @@ fn for_each_ref_sort_tag_contents(
 }
 
 fn for_each_ref_sort_contents(
-    reference: &sley_refs::Ref,
+    reference: &sley::plumbing::sley_refs::Ref,
     context: &ForEachRefSortContext<'_>,
 ) -> Result<Option<ForEachRefContents<'static>>> {
     let Some((oid, _)) = resolve_for_each_ref_target(context.store, reference)? else {
@@ -2047,9 +2047,9 @@ fn for_each_ref_sort_contents(
 }
 
 fn for_each_ref_sort_peeled_object(
-    reference: &sley_refs::Ref,
+    reference: &sley::plumbing::sley_refs::Ref,
     context: &ForEachRefSortContext<'_>,
-) -> Result<Option<(ObjectId, sley_object::EncodedObject)>> {
+) -> Result<Option<(ObjectId, sley::plumbing::sley_object::EncodedObject)>> {
     let Some(contents) = for_each_ref_sort_tag_contents(reference, context)? else {
         return Ok(None);
     };
@@ -2061,7 +2061,7 @@ fn for_each_ref_sort_peeled_object(
 }
 
 fn for_each_ref_sort_peeled_contents(
-    reference: &sley_refs::Ref,
+    reference: &sley::plumbing::sley_refs::Ref,
     context: &ForEachRefSortContext<'_>,
 ) -> Result<Option<ForEachRefContents<'static>>> {
     let Some((_, object)) = for_each_ref_sort_peeled_object(reference, context)? else {
@@ -2120,7 +2120,7 @@ fn for_each_ref_points_at(
     if targets.iter().any(|target| target == oid) {
         return Ok(true);
     }
-    let peeled = sley_rev::peel_tags(db, format, oid)?;
+    let peeled = sley::plumbing::sley_rev::peel_tags(db, format, oid)?;
     Ok(peeled != *oid && targets.iter().any(|target| target == &peeled))
 }
 
@@ -2201,7 +2201,7 @@ fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'
 
 fn for_each_ref_contents_owned(
     format: ObjectFormat,
-    object: &sley_object::EncodedObject,
+    object: &sley::plumbing::sley_object::EncodedObject,
 ) -> Result<Option<ForEachRefContents<'static>>> {
     Ok(for_each_ref_contents(format, object)?.map(ForEachRefContents::into_owned))
 }

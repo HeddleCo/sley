@@ -59,7 +59,7 @@ pub(crate) fn describe_for_format(
     let object = db.read_object(target)?;
     let target = &match object.object_type {
         ObjectType::Commit => *target,
-        ObjectType::Tag => sley_rev::peel_to_commit(db, format, target)?,
+        ObjectType::Tag => sley::plumbing::sley_rev::peel_to_commit(db, format, target)?,
         _ => return Ok(None),
     };
 
@@ -563,7 +563,7 @@ fn describe_peel_commit(
         ObjectType::Tag => {
             let tag = Tag::parse(format, &object.body)?;
             // Prefer the tagger date; fall back to the peeled commit's date.
-            let Ok(commit) = sley_rev::peel_to_commit(db, format, &tag.object) else {
+            let Ok(commit) = sley::plumbing::sley_rev::peel_to_commit(db, format, &tag.object) else {
                 return Ok(DescribePeel::NotACommit);
             };
             let peeled = db.read_object(&commit)?;
@@ -1037,7 +1037,7 @@ fn resolve_describe_commit(repo: &RepositoryContext, rev: &str) -> Result<Object
     let object = repo.objects().read_object(&oid)?;
     match object.object_type {
         ObjectType::Commit => Ok(oid),
-        ObjectType::Tag => sley_rev::peel_to_commit(repo.objects(), repo.format(), &oid),
+        ObjectType::Tag => sley::plumbing::sley_rev::peel_to_commit(repo.objects(), repo.format(), &oid),
         other => {
             eprintln!("fatal: {} is neither a commit nor blob", oid.to_hex());
             let _ = other;
@@ -1064,7 +1064,7 @@ fn resolve_describe_target(repo: &RepositoryContext, rev: &str) -> Result<Descri
     match object.object_type {
         ObjectType::Commit => Ok(DescribeTarget::Commit(oid)),
         ObjectType::Blob => Ok(DescribeTarget::Blob(oid)),
-        ObjectType::Tag => match sley_rev::peel_to_commit(repo.objects(), repo.format(), &oid) {
+        ObjectType::Tag => match sley::plumbing::sley_rev::peel_to_commit(repo.objects(), repo.format(), &oid) {
             Ok(commit) => Ok(DescribeTarget::Commit(commit)),
             Err(_) => {
                 eprintln!("fatal: {rev} is neither a commit nor blob");
@@ -1202,15 +1202,15 @@ fn describe_dirty_suffix(
     }
     let worktree_root = worktree_root_for_git_dir(git_dir)?;
     let mut dirty = false;
-    match sley_worktree::stream_short_status(&worktree_root, git_dir, format, |entry| {
+    match sley::plumbing::sley_worktree::stream_short_status(&worktree_root, git_dir, format, |entry| {
         let index_dirty = entry.index != b' ' && entry.index != b'?' && entry.index != b'!';
         let worktree_dirty =
             entry.worktree != b' ' && entry.worktree != b'?' && entry.worktree != b'!';
         if index_dirty || worktree_dirty {
             dirty = true;
-            return Ok(sley_worktree::StreamControl::Stop);
+            return Ok(sley::plumbing::sley_worktree::StreamControl::Stop);
         }
-        Ok(sley_worktree::StreamControl::Continue)
+        Ok(sley::plumbing::sley_worktree::StreamControl::Continue)
     }) {
         Ok(()) => {
             if options.dirty.is_some() && dirty {

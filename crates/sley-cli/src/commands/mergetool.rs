@@ -113,7 +113,7 @@ fn parse_mergetool_args(args: &[String]) -> Result<MergetoolOptions> {
 }
 
 fn collect_unmerged_paths(git_dir: &Path, format: ObjectFormat) -> Result<Vec<UnmergedPath>> {
-    let index = sley_worktree::read_repository_index(git_dir, format)?.unwrap_or(Index {
+    let index = sley::plumbing::sley_worktree::read_repository_index(git_dir, format)?.unwrap_or(Index {
         version: 2,
         entries: Vec::new(),
         extensions: Vec::new(),
@@ -407,18 +407,18 @@ fn resolve_gitlink_conflict(
 
 fn stage_worktree_path(repo: &RepositoryContext, path: &[u8]) -> Result<()> {
     let config = read_repo_config(repo.git_dir())?;
-    sley_worktree::update_index_ordered_paths_filtered(
+    sley::plumbing::sley_worktree::update_index_ordered_paths_filtered(
         repo.worktree_root()?,
         repo.git_dir().to_path_buf(),
         repo.format(),
-        &[sley_worktree::UpdateIndexPath {
+        &[sley::plumbing::sley_worktree::UpdateIndexPath {
             path: repo_path_to_path(path),
-            mode: sley_worktree::UpdateIndexPathMode {
+            mode: sley::plumbing::sley_worktree::UpdateIndexPathMode {
                 add: true,
                 ..Default::default()
             },
         }],
-        sley_worktree::UpdateIndexOptions {
+        sley::plumbing::sley_worktree::UpdateIndexOptions {
             add: true,
             remove: false,
             force_remove: false,
@@ -434,14 +434,14 @@ fn stage_worktree_path(repo: &RepositoryContext, path: &[u8]) -> Result<()> {
 }
 
 fn stage_cacheinfo(repo: &RepositoryContext, path: &[u8], mode: u32, oid: ObjectId) -> Result<()> {
-    sley_worktree::update_index_index_info(
+    sley::plumbing::sley_worktree::update_index_index_info(
         repo.git_dir(),
         repo.format(),
         &[
-            sley_worktree::IndexInfoRecord::Remove {
+            sley::plumbing::sley_worktree::IndexInfoRecord::Remove {
                 path: path.to_vec(),
             },
-            sley_worktree::IndexInfoRecord::Add(sley_worktree::CacheInfoEntry {
+            sley::plumbing::sley_worktree::IndexInfoRecord::Add(sley::plumbing::sley_worktree::CacheInfoEntry {
                 mode,
                 oid,
                 path: path.to_vec(),
@@ -453,10 +453,10 @@ fn stage_cacheinfo(repo: &RepositoryContext, path: &[u8], mode: u32, oid: Object
 }
 
 fn remove_index_path(repo: &RepositoryContext, path: &[u8]) -> Result<()> {
-    sley_worktree::update_index_index_info(
+    sley::plumbing::sley_worktree::update_index_index_info(
         repo.git_dir(),
         repo.format(),
-        &[sley_worktree::IndexInfoRecord::Remove {
+        &[sley::plumbing::sley_worktree::IndexInfoRecord::Remove {
             path: path.to_vec(),
         }],
     )?;

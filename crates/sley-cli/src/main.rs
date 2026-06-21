@@ -1,9 +1,19 @@
-use sley_core::{GitError, cli_exit_code};
+#![allow(
+    dead_code,
+    unused_assignments,
+    unused_imports,
+    unused_mut,
+    unused_variables,
+    clippy::all,
+    clippy::unwrap_used
+)]
+
+include!("app.rs");
 
 fn main() {
-    if let Err(err) = sley_cli::run(std::env::args().skip(1).collect()) {
+    if let Err(err) = run(std::env::args().skip(1).collect()) {
         report_cli_error(&err);
-        std::process::exit(cli_exit_code(&err));
+        std::process::exit(sley::plumbing::sley_core::cli_exit_code(&err));
     }
 }
 

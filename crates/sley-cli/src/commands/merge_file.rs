@@ -11,7 +11,7 @@
 //!
 //! The merge engine reuses `sley_diff_merge`: the common path (default conflict
 //! style, default marker size, no conflict-resolution favoring) is produced by
-//! [`sley_diff_merge::merge_blobs`] directly. The extended flags — `--ours`,
+//! [`sley::plumbing::sley_diff_merge::merge_blobs`] directly. The extended flags — `--ours`,
 //! `--theirs`, `--union`, `--diff3`/`--zdiff3` and `--marker-size` — are served
 //! by a region walk built from the very same lower-level primitives
 //! `merge_blobs` is built on (`split_lines` + `myers_diff_lines`), so conflict
@@ -468,7 +468,7 @@ struct MergeOutcome {
 /// Run the three-way merge, honouring style, favoring and marker size.
 ///
 /// For the default configuration (plain `Merge` style, default marker size, no
-/// favoring) the work is delegated straight to [`sley_diff_merge::merge_blobs`];
+/// favoring) the work is delegated straight to [`sley::plumbing::sley_diff_merge::merge_blobs`];
 /// the conflict count is then recovered from the identical region walk so the
 /// exit status is exact. Every other configuration is rendered from the region
 /// walk directly.
@@ -503,15 +503,15 @@ fn merge_three_way(
     let content = if default_config {
         // Reuse merge_blobs for the common case; byte-for-byte equivalent to the
         // region renderer below but the canonical engine.
-        sley_diff_merge::merge_blobs(
+        sley::plumbing::sley_diff_merge::merge_blobs(
             base,
             ours,
             theirs,
-            &sley_diff_merge::MergeBlobOptions {
+            &sley::plumbing::sley_diff_merge::MergeBlobOptions {
                 ours_label,
                 theirs_label,
                 base_label,
-                style: sley_diff_merge::ConflictStyle::Merge,
+                style: sley::plumbing::sley_diff_merge::ConflictStyle::Merge,
             },
         )
         .content
@@ -526,22 +526,22 @@ fn merge_three_way(
 /// changed on only one side / changed identically) or a true conflict carrying
 /// each side's lines.
 enum Region<'a> {
-    Stable(Vec<sley_diff_merge::DiffLine<'a>>),
+    Stable(Vec<sley::plumbing::sley_diff_merge::DiffLine<'a>>),
     Conflict {
-        ours: Vec<sley_diff_merge::DiffLine<'a>>,
-        base: Vec<sley_diff_merge::DiffLine<'a>>,
-        theirs: Vec<sley_diff_merge::DiffLine<'a>>,
+        ours: Vec<sley::plumbing::sley_diff_merge::DiffLine<'a>>,
+        base: Vec<sley::plumbing::sley_diff_merge::DiffLine<'a>>,
+        theirs: Vec<sley::plumbing::sley_diff_merge::DiffLine<'a>>,
     },
 }
 
 /// Walk base/ours/theirs in lockstep and classify each span, mirroring
-/// `sley_diff_merge::merge_blobs`' own algorithm so conflict counting and region
+/// `sley::plumbing::sley_diff_merge::merge_blobs`' own algorithm so conflict counting and region
 /// boundaries match it exactly. Reuses `split_lines` + `myers_diff_lines`, the
 /// same primitives `merge_blobs` is built on.
 fn build_regions<'a>(base: &'a [u8], ours: &'a [u8], theirs: &'a [u8]) -> Vec<Region<'a>> {
-    let base_lines = sley_diff_merge::split_lines(base);
-    let ours_lines = sley_diff_merge::split_lines(ours);
-    let theirs_lines = sley_diff_merge::split_lines(theirs);
+    let base_lines = sley::plumbing::sley_diff_merge::split_lines(base);
+    let ours_lines = sley::plumbing::sley_diff_merge::split_lines(ours);
+    let theirs_lines = sley::plumbing::sley_diff_merge::split_lines(theirs);
 
     let ours_matches = matching_regions(&base_lines, &ours_lines);
     let theirs_matches = matching_regions(&base_lines, &theirs_lines);
@@ -581,7 +581,7 @@ fn build_regions<'a>(base: &'a [u8], ours: &'a [u8], theirs: &'a [u8]) -> Vec<Re
 /// Append `lines` to the trailing `Stable` region, creating one if needed, so
 /// consecutive stable spans coalesce (matching merge_blobs' single output
 /// stream).
-fn push_stable<'a>(regions: &mut Vec<Region<'a>>, lines: &[sley_diff_merge::DiffLine<'a>]) {
+fn push_stable<'a>(regions: &mut Vec<Region<'a>>, lines: &[sley::plumbing::sley_diff_merge::DiffLine<'a>]) {
     if lines.is_empty() {
         return;
     }
@@ -596,9 +596,9 @@ fn push_stable<'a>(regions: &mut Vec<Region<'a>>, lines: &[sley_diff_merge::Diff
 /// diff3 rules as `merge_blobs::emit_region`.
 fn classify_changed_region<'a>(
     regions: &mut Vec<Region<'a>>,
-    base_region: &[sley_diff_merge::DiffLine<'a>],
-    our_region: &[sley_diff_merge::DiffLine<'a>],
-    their_region: &[sley_diff_merge::DiffLine<'a>],
+    base_region: &[sley::plumbing::sley_diff_merge::DiffLine<'a>],
+    our_region: &[sley::plumbing::sley_diff_merge::DiffLine<'a>],
+    their_region: &[sley::plumbing::sley_diff_merge::DiffLine<'a>],
 ) {
     if our_region.is_empty() && their_region.is_empty() {
         return;
@@ -641,16 +641,16 @@ struct StableSegment {
 }
 
 fn matching_regions(
-    base: &[sley_diff_merge::DiffLine<'_>],
-    side: &[sley_diff_merge::DiffLine<'_>],
+    base: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
+    side: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
 ) -> Vec<MatchRegion> {
-    let ops = sley_diff_merge::myers_diff_lines(base, side);
+    let ops = sley::plumbing::sley_diff_merge::myers_diff_lines(base, side);
     let mut regions = Vec::new();
     let mut base_idx = 0usize;
     let mut side_idx = 0usize;
     for op in ops {
         match op {
-            sley_diff_merge::DiffOp::Equal(n) => {
+            sley::plumbing::sley_diff_merge::DiffOp::Equal(n) => {
                 regions.push(MatchRegion {
                     base_start: base_idx,
                     side_start: side_idx,
@@ -659,8 +659,8 @@ fn matching_regions(
                 base_idx += n;
                 side_idx += n;
             }
-            sley_diff_merge::DiffOp::Delete(n) => base_idx += n,
-            sley_diff_merge::DiffOp::Insert(n) => side_idx += n,
+            sley::plumbing::sley_diff_merge::DiffOp::Delete(n) => base_idx += n,
+            sley::plumbing::sley_diff_merge::DiffOp::Insert(n) => side_idx += n,
         }
     }
     regions
@@ -733,7 +733,7 @@ fn render_regions(
     out
 }
 
-fn emit_lines(out: &mut Vec<u8>, lines: &[sley_diff_merge::DiffLine<'_>]) {
+fn emit_lines(out: &mut Vec<u8>, lines: &[sley::plumbing::sley_diff_merge::DiffLine<'_>]) {
     for line in lines {
         out.extend_from_slice(line.content);
     }
@@ -742,8 +742,8 @@ fn emit_lines(out: &mut Vec<u8>, lines: &[sley_diff_merge::DiffLine<'_>]) {
 /// Count the lines shared, in order, at the start of `a` and `b` (used by zdiff3
 /// to hoist common context out of a conflict).
 fn common_prefix_len(
-    a: &[sley_diff_merge::DiffLine<'_>],
-    b: &[sley_diff_merge::DiffLine<'_>],
+    a: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
+    b: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
 ) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
@@ -752,8 +752,8 @@ fn common_prefix_len(
 /// what remains after an already-counted prefix of length `reserve` on either
 /// side.
 fn common_suffix_len(
-    a: &[sley_diff_merge::DiffLine<'_>],
-    b: &[sley_diff_merge::DiffLine<'_>],
+    a: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
+    b: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
     reserve: usize,
 ) -> usize {
     let max = a.len().min(b.len()).saturating_sub(reserve);
@@ -765,9 +765,9 @@ fn common_suffix_len(
 }
 
 struct ConflictLines<'a, 'line> {
-    ours: &'a [sley_diff_merge::DiffLine<'line>],
-    base: &'a [sley_diff_merge::DiffLine<'line>],
-    theirs: &'a [sley_diff_merge::DiffLine<'line>],
+    ours: &'a [sley::plumbing::sley_diff_merge::DiffLine<'line>],
+    base: &'a [sley::plumbing::sley_diff_merge::DiffLine<'line>],
+    theirs: &'a [sley::plumbing::sley_diff_merge::DiffLine<'line>],
 }
 
 struct ConflictMarkers<'a> {

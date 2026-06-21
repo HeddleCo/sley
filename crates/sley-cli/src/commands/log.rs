@@ -3,8 +3,8 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley_notes::{NotesRef, read_note_bytes};
-use sley_pathspec::normalized_revwalk_pathspec;
+use sley::plumbing::sley_notes::{NotesRef, read_note_bytes};
+use sley::plumbing::sley_pathspec::normalized_revwalk_pathspec;
 
 mod diff;
 mod graph;
@@ -222,7 +222,7 @@ fn render_notes_block(
             body.pop();
         }
         // Label: bare `Notes:` only for the literal default ref.
-        if handle.as_str() == sley_notes::DEFAULT_NOTES_REF {
+        if handle.as_str() == sley::plumbing::sley_notes::DEFAULT_NOTES_REF {
             out.extend_from_slice(b"\nNotes:\n");
         } else {
             let name = handle
@@ -267,7 +267,7 @@ fn emit_compiled_log_format_with_notes(
     format: ObjectFormat,
     store: &FileRefStore,
     display_refs: &[String],
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     compiled: &CompiledLogFormat,
     context: &LogFormatContext<'_>,
     out: &mut Vec<u8>,
@@ -333,7 +333,7 @@ fn emit_encoded_compiled_log_format_with_notes(
     format: ObjectFormat,
     store: &FileRefStore,
     display_refs: &[String],
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     compiled: &CompiledLogFormat,
     context: &LogFormatContext<'_>,
     out: &mut Vec<u8>,
@@ -355,7 +355,7 @@ fn emit_encoded_compiled_log_format_with_notes(
 }
 
 fn emit_encoded_compiled_log_format_no_notes(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     compiled: &CompiledLogFormat,
     context: &LogFormatContext<'_>,
     out: &mut Vec<u8>,
@@ -378,7 +378,7 @@ struct LogFormatNoteResolver<'a, 'b> {
     format: ObjectFormat,
     store: &'a FileRefStore,
     display_refs: &'a [String],
-    record: &'a sley_rev::CommitRecord,
+    record: &'a sley::plumbing::sley_rev::CommitRecord,
     context: &'a LogFormatContext<'b>,
     author_name: &'a str,
     author_email: &'a str,
@@ -389,7 +389,7 @@ struct LogFormatNoteResolver<'a, 'b> {
     auto_color: bool,
 }
 
-impl sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatNoteResolver<'_, '_> {
+impl sley::plumbing::sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatNoteResolver<'_, '_> {
     fn resolve_atom(&mut self, out: &mut Vec<u8>, atom: &FormatToken) -> Result<()> {
         if matches!(atom, FormatToken::NoteName)
             && matches!(self.context.dialect, LogFormatDialect::Log)
@@ -564,7 +564,7 @@ fn log_cached_mailmap<'a>(
     Ok(cache.as_ref().expect("mailmap cache was just initialized"))
 }
 
-fn render_log_raw_pretty(record: &sley_rev::CommitRecord) -> Vec<u8> {
+fn render_log_raw_pretty(record: &sley::plumbing::sley_rev::CommitRecord) -> Vec<u8> {
     let mut out = Vec::new();
     writeln!(out, "commit {}", record.oid).expect("write to Vec cannot fail");
     writeln!(out, "tree {}", record.commit.tree).expect("write to Vec cannot fail");
@@ -596,7 +596,7 @@ fn log_source_label<'a>(
 }
 
 fn log_source_labels_for_selected(
-    selected: &[&sley_rev::CommitRecord],
+    selected: &[&sley::plumbing::sley_rev::CommitRecord],
     source_starts: &[(ObjectId, String)],
     first_parent: bool,
 ) -> HashMap<ObjectId, String> {
@@ -657,7 +657,7 @@ fn log_follow_unsupported_pathspec_magic(value: &str) -> Option<String> {
 
 fn emit_plain_oneline_limited_commit(
     db: &FileObjectDatabase,
-    record: &sley_rev::CommitMetadata,
+    record: &sley::plumbing::sley_rev::CommitMetadata,
     abbrev_len: Option<usize>,
     output_encoding: &str,
     output_encoding_is_utf8: bool,
@@ -1127,9 +1127,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 diff_opts.indent_heuristic = false;
                 indent_heuristic_explicit = true;
             }
-            "--minimal" => diff_opts.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
-            "--patience" => diff_opts.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
-            "--histogram" => diff_opts.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram,
+            "--minimal" => diff_opts.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Minimal,
+            "--patience" => diff_opts.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Patience,
+            "--histogram" => diff_opts.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Histogram,
             "--ignore-all-space" | "-w" => diff_opts.ws_ignore.all_space = true,
             "--ignore-space-change" | "-b" => diff_opts.ws_ignore.space_change = true,
             "-bw" | "-wb" => diff_opts.ws_ignore.all_space = true,
@@ -1956,9 +1956,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     });
     let empty_mailmap = commands::utility::Mailmap::default();
     let mut mailmap_cache = None;
-    let setup = match sley_rev::setup_revisions(
+    let setup = match sley::plumbing::sley_rev::setup_revisions(
         &setup_args,
-        &sley_rev::RevisionSetupContext {
+        &sley::plumbing::sley_rev::RevisionSetupContext {
             git_dir: &git_dir,
             worktree_root: worktree_root.as_deref(),
             cwd: &cwd,
@@ -1996,15 +1996,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let min_age = revision_options.date_window.max_time;
     let reverse = revision_options.reverse;
     let ordering = match revision_options.order {
-        sley_rev::RevisionOrder::Default => RevListOrdering::Default,
-        sley_rev::RevisionOrder::Topo => RevListOrdering::Topo,
-        sley_rev::RevisionOrder::Date => RevListOrdering::Date,
-        sley_rev::RevisionOrder::AuthorDate => RevListOrdering::AuthorDate,
+        sley::plumbing::sley_rev::RevisionOrder::Default => RevListOrdering::Default,
+        sley::plumbing::sley_rev::RevisionOrder::Topo => RevListOrdering::Topo,
+        sley::plumbing::sley_rev::RevisionOrder::Date => RevListOrdering::Date,
+        sley::plumbing::sley_rev::RevisionOrder::AuthorDate => RevListOrdering::AuthorDate,
     };
     let (walk, no_walk_unsorted) = match revision_options.no_walk {
-        sley_rev::NoWalkMode::Walk => (true, true),
-        sley_rev::NoWalkMode::Sorted => (false, false),
-        sley_rev::NoWalkMode::Unsorted => (false, true),
+        sley::plumbing::sley_rev::NoWalkMode::Walk => (true, true),
+        sley::plumbing::sley_rev::NoWalkMode::Sorted => (false, false),
+        sley::plumbing::sley_rev::NoWalkMode::Unsorted => (false, true),
     };
     let first_parent = revision_options.first_parent;
     let pathspecs = setup.pathspecs;
@@ -2318,7 +2318,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // build the `%S` per-commit source map (later starts override earlier ones).
     let mut source_starts: Vec<(ObjectId, String)> = Vec::new();
     for tip in &revision_options.positives {
-        let commit = match sley_rev::peel_to_commit(&db, format, &tip.oid) {
+        let commit = match sley::plumbing::sley_rev::peel_to_commit(&db, format, &tip.oid) {
             Ok(commit) => commit,
             Err(err) if tip.from_ref_selector => {
                 let Ok(object) = db.read_object(&tip.oid) else {
@@ -2437,8 +2437,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         let mut stdout = io::BufWriter::new(stdout.lock());
         let mut line = Vec::with_capacity(128);
         let output_encoding_is_utf8 = encoding_is_utf8(&output_encoding);
-        let mut walk = sley_rev::RevWalk::new(&git_dir, format, &db, starts)
-            .order(sley_rev::RevWalkOrder::CommitDate)
+        let mut walk = sley::plumbing::sley_rev::RevWalk::new(&git_dir, format, &db, starts)
+            .order(sley::plumbing::sley_rev::RevWalkOrder::CommitDate)
             .max_count(Some(max_count));
         while let Some(metadata) = walk.try_next()? {
             line.clear();
@@ -2484,7 +2484,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     {
         let limit = max_count.map(|max| skip.saturating_add(max));
         let metadata = if let Some(limit) = limit.filter(|limit| *limit > 0) {
-            sley_rev::walk_commit_metadata_date_ordered_limited(
+            sley::plumbing::sley_rev::walk_commit_metadata_date_ordered_limited(
                 &git_dir,
                 format,
                 &db,
@@ -2493,7 +2493,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 limit,
             )?
         } else {
-            sley_rev::walk_commit_metadata(&git_dir, format, &db, starts.clone(), first_parent)?
+            sley::plumbing::sley_rev::walk_commit_metadata(&git_dir, format, &db, starts.clone(), first_parent)?
         };
         let mut selected = metadata
             .into_iter()
@@ -2615,7 +2615,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             mailmap: &empty_mailmap,
             use_mailmap,
         };
-        let metadata = sley_rev::walk_commit_metadata_date_ordered_limited(
+        let metadata = sley::plumbing::sley_rev::walk_commit_metadata_date_ordered_limited(
             &git_dir,
             format,
             &db,
@@ -2769,7 +2769,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // (bottom) commit up to the tips (git's `limit_to_ancestry`). Runs before
     // simplification.
     if revision_options.ancestry_path && !revision_options.negatives.is_empty() {
-        let on_path = sley_rev::ancestry_path_on_set(
+        let on_path = sley::plumbing::sley_rev::ancestry_path_on_set(
             selected.iter().map(|r| (r.oid, r.parents.clone())),
             &revision_options.negatives,
         );
@@ -2782,14 +2782,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             &pathspecs,
             effective_pathspec_flags(),
         )?;
-        let ordered_owned: Vec<sley_rev::CommitRecord> = commits.clone();
+        let ordered_owned: Vec<sley::plumbing::sley_rev::CommitRecord> = commits.clone();
         let bottoms: HashSet<ObjectId> = revision_options.negatives.iter().copied().collect();
-        let _ = sley_rev::simplify_history_with_bottoms(
+        let _ = sley::plumbing::sley_rev::simplify_history_with_bottoms(
             &db,
             format,
             ordered_owned,
             &pathspec,
-            sley_rev::SimplifyOptions {
+            sley::plumbing::sley_rev::SimplifyOptions {
                 full_history,
                 first_parent,
                 simplify_merges: revision_options.simplify_merges,
@@ -2821,17 +2821,17 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             &pathspecs,
             effective_pathspec_flags(),
         )?;
-        let ordered_owned: Vec<sley_rev::CommitRecord> =
+        let ordered_owned: Vec<sley::plumbing::sley_rev::CommitRecord> =
             selected.iter().map(|r| (*r).clone()).collect();
         // The `^`-excluded boundary tips are git's BOTTOM commits: relevant for
         // topology-keep decisions even though they aren't shown.
         let bottoms: HashSet<ObjectId> = revision_options.negatives.iter().copied().collect();
-        simplified_storage = sley_rev::simplify_history_with_bottoms(
+        simplified_storage = sley::plumbing::sley_rev::simplify_history_with_bottoms(
             &db,
             format,
             ordered_owned,
             &pathspec,
-            sley_rev::SimplifyOptions {
+            sley::plumbing::sley_rev::SimplifyOptions {
                 full_history,
                 first_parent,
                 simplify_merges: revision_options.simplify_merges,
@@ -2980,7 +2980,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
 
     if let Some(shown) = &graph_shown {
         let palette = log_graph_color_palette(&config);
-        let mut graph_state = sley_rev::graph::Graph::new(palette, color_always);
+        let mut graph_state = sley::plumbing::sley_rev::graph::Graph::new(palette, color_always);
         let prefix: &str = line_prefix.as_deref().unwrap_or("");
         let mut out = io::stdout();
         // Whether the previous entry's message ended without a newline
@@ -3735,7 +3735,7 @@ fn log_output_needs_abbrev(output: &LogOutput, abbrev_commit: bool, show_childre
 }
 
 fn log_age_filters_match(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     max_age: Option<i64>,
     min_age: Option<i64>,
 ) -> Result<bool> {
@@ -3747,7 +3747,7 @@ fn log_age_filters_match(
 }
 
 fn print_log_selected_child_oids(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     child_oids: &HashMap<ObjectId, Vec<ObjectId>>,
     show_children: bool,
     abbrev_len: Option<usize>,
@@ -3763,7 +3763,7 @@ fn log_signature_human_output(
     git_dir: &Path,
     db: &FileObjectDatabase,
     config: &GitConfig,
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
 ) -> Result<Vec<u8>> {
     let object = db.read_object(&record.oid)?;
     let Some((payload, signature)) = commands::signing::commit_signature_payload(&object.body)
@@ -3776,7 +3776,7 @@ fn log_signature_human_output(
 }
 
 fn print_log_format_with_children(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     compiled: &CompiledLogFormat,
     context: LogFormatContext<'_>,
     child_oids: &HashMap<ObjectId, Vec<ObjectId>>,

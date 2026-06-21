@@ -92,9 +92,9 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
     // FULL ancestry to map ranges; `--since`/`--until` only prune which of the
     // resulting interesting commits are displayed (applied to `selected` below).
     let reachable = rev_list_walk_commits(db, format, [tip], first_parent)?;
-    let refs: Vec<&sley_rev::CommitRecord> = reachable.iter().collect();
+    let refs: Vec<&sley::plumbing::sley_rev::CommitRecord> = reachable.iter().collect();
     let ordered_refs = rev_list_topo_order(refs)?;
-    let ordered: Vec<sley_rev::CommitRecord> = ordered_refs.into_iter().cloned().collect();
+    let ordered: Vec<sley::plumbing::sley_rev::CommitRecord> = ordered_refs.into_iter().cloned().collect();
 
     let result = crate::commands::line_log::run_line_log(
         db,
@@ -108,8 +108,8 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
 
     // The interesting list is already in topo order (newest first). Apply
     // `-n`/`--reverse`.
-    let mut selected: Vec<&sley_rev::CommitRecord> = {
-        let by_oid: HashMap<ObjectId, &sley_rev::CommitRecord> =
+    let mut selected: Vec<&sley::plumbing::sley_rev::CommitRecord> = {
+        let by_oid: HashMap<ObjectId, &sley::plumbing::sley_rev::CommitRecord> =
             ordered.iter().map(|r| (r.oid, r)).collect();
         result
             .interesting
@@ -137,7 +137,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
     // range collapse out of the displayed parent chain.
     let rewritten_parents: Option<HashMap<ObjectId, Vec<ObjectId>>> = if show_parents {
         let interesting_set: HashSet<ObjectId> = result.interesting.iter().copied().collect();
-        let by_oid: HashMap<ObjectId, &sley_rev::CommitRecord> =
+        let by_oid: HashMap<ObjectId, &sley::plumbing::sley_rev::CommitRecord> =
             ordered.iter().map(|r| (r.oid, r)).collect();
         // Nearest interesting ancestors of `oid` (exclusive of `oid` itself),
         // dedup-preserving order. Walks parent edges, collapsing uninteresting
@@ -145,7 +145,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
         fn nearest_interesting(
             oid: &ObjectId,
             interesting: &HashSet<ObjectId>,
-            by_oid: &HashMap<ObjectId, &sley_rev::CommitRecord>,
+            by_oid: &HashMap<ObjectId, &sley::plumbing::sley_rev::CommitRecord>,
             out: &mut Vec<ObjectId>,
             seen: &mut HashSet<ObjectId>,
         ) {
@@ -246,7 +246,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
             .as_ref()
             .and_then(|map| map.get(&record.oid));
         let owned_record;
-        let record: &sley_rev::CommitRecord = match rewritten {
+        let record: &sley::plumbing::sley_rev::CommitRecord = match rewritten {
             Some(parents) if parents.as_slice() != record.parents.as_slice() => {
                 let mut clone = (*record).clone();
                 clone.parents = parents.clone();
@@ -406,11 +406,11 @@ fn render_line_log_patch(
         _ => return Ok(()),
     };
     for file in files {
-        let entry = sley_diff_merge::NameStatusEntry {
+        let entry = sley::plumbing::sley_diff_merge::NameStatusEntry {
             status: file.status,
-            path: sley_rev::BString::from(file.new_path.as_bytes().to_vec()),
+            path: sley::plumbing::sley_rev::BString::from(file.new_path.as_bytes().to_vec()),
             old_path: if file.old_path != file.new_path {
-                Some(sley_rev::BString::from(file.old_path.as_bytes().to_vec()))
+                Some(sley::plumbing::sley_rev::BString::from(file.old_path.as_bytes().to_vec()))
             } else {
                 None
             },

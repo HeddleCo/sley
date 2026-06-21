@@ -688,9 +688,12 @@ fn zlib_stored(raw: &[u8]) -> Vec<u8> {
 fn write_loose_object(root: &Path, otype: &str, content: &[u8]) -> String {
     let mut raw = format!("{otype} {}\0", content.len()).into_bytes();
     raw.extend_from_slice(content);
-    let oid = sley_core::digest_bytes(sley_core::ObjectFormat::Sha1, &raw)
-        .expect("sha1 over framed bytes")
-        .to_hex();
+    let oid = sley::plumbing::sley_core::digest_bytes(
+        sley::plumbing::sley_core::ObjectFormat::Sha1,
+        &raw,
+    )
+    .expect("sha1 over framed bytes")
+    .to_hex();
     let (fanout, rest) = oid.split_at(2);
     let dir = root.join(".git").join("objects").join(fanout);
     fs::create_dir_all(&dir).expect("create object fanout dir");

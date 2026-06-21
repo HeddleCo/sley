@@ -143,7 +143,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     // `commit -u<mode>` / `--untracked-files=<mode>` overrides
     // `status.showUntrackedFiles` for the dry-run / status preview. `None` means
     // the flag was not given, so config / default applies.
-    let mut commit_untracked: Option<sley_worktree::StatusUntrackedMode> = None;
+    let mut commit_untracked: Option<sley::plumbing::sley_worktree::StatusUntrackedMode> = None;
     let mut dry_run = false;
     let mut no_verify = false;
     let mut no_post_rewrite = false;
@@ -590,24 +590,24 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                 return commit_option_takes_no_value_error("no-verbose");
             }
             "-u" | "-unormal" | "--untracked-files" => {
-                commit_untracked = Some(sley_worktree::StatusUntrackedMode::Normal);
+                commit_untracked = Some(sley::plumbing::sley_worktree::StatusUntrackedMode::Normal);
             }
-            "-uno" => commit_untracked = Some(sley_worktree::StatusUntrackedMode::None),
-            "-uall" => commit_untracked = Some(sley_worktree::StatusUntrackedMode::All),
+            "-uno" => commit_untracked = Some(sley::plumbing::sley_worktree::StatusUntrackedMode::None),
+            "-uall" => commit_untracked = Some(sley::plumbing::sley_worktree::StatusUntrackedMode::All),
             value if value.starts_with("-u") && value.len() > 2 => {
                 return commit_invalid_untracked_files_mode_error(&value[2..]);
             }
             value if value.starts_with("--untracked-files=") => {
                 let mode = &value["--untracked-files=".len()..];
                 commit_untracked = Some(match mode {
-                    "no" => sley_worktree::StatusUntrackedMode::None,
-                    "normal" => sley_worktree::StatusUntrackedMode::Normal,
-                    "all" => sley_worktree::StatusUntrackedMode::All,
+                    "no" => sley::plumbing::sley_worktree::StatusUntrackedMode::None,
+                    "normal" => sley::plumbing::sley_worktree::StatusUntrackedMode::Normal,
+                    "all" => sley::plumbing::sley_worktree::StatusUntrackedMode::All,
                     _ => return commit_invalid_untracked_files_mode_error(mode),
                 });
             }
             "--no-untracked-files" => {
-                commit_untracked = Some(sley_worktree::StatusUntrackedMode::None);
+                commit_untracked = Some(sley::plumbing::sley_worktree::StatusUntrackedMode::None);
             }
             value if value.starts_with("--no-untracked-files=") => {
                 return commit_option_takes_no_value_error("no-untracked-files");
@@ -1372,7 +1372,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         } else if let Some(tree) = precomputed_index_tree.as_ref() {
             *tree
         } else {
-            sley_worktree::write_tree_from_index(&git_dir, format)?
+            sley::plumbing::sley_worktree::write_tree_from_index(&git_dir, format)?
         };
         let signed_parents = if amend {
             amended_commit
@@ -1405,7 +1405,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     } else {
         None
     };
-    let options = sley_sequencer::CommitIndexOptions {
+    let options = sley::plumbing::sley_sequencer::CommitIndexOptions {
         author,
         committer,
         reflog_message: commit_reflog_message(&message, amend),
@@ -1414,13 +1414,13 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         signature,
     };
     let result = if amend {
-        sley_sequencer::amend_index(&git_dir, format, options)
+        sley::plumbing::sley_sequencer::amend_index(&git_dir, format, options)
     } else if let Some(tree) = fixup_reword_tree {
-        sley_sequencer::commit_tree_at_head(&git_dir, format, tree, options)
+        sley::plumbing::sley_sequencer::commit_tree_at_head(&git_dir, format, tree, options)
     } else if let Some(tree) = precomputed_index_tree {
-        sley_sequencer::commit_tree_at_head_with_odb(&git_dir, format, tree, options, &commit_odb)
+        sley::plumbing::sley_sequencer::commit_tree_at_head_with_odb(&git_dir, format, tree, options, &commit_odb)
     } else {
-        sley_sequencer::commit_index(&git_dir, format, options)
+        sley::plumbing::sley_sequencer::commit_index(&git_dir, format, options)
     }?;
     commands::rerere::record_resolved_after_commit(&git_dir, format)?;
     remove_commit_state_files(&git_dir);
@@ -1528,12 +1528,12 @@ fn print_commit_summary(
         Some(p) => read_commit_tree_for_summary(db, format, p)?,
         None => ObjectId::empty_tree(format),
     };
-    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+    let entries = sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
         db,
         format,
         &old_tree,
         &new_tree,
-        sley_diff_merge::RenameDetectionOptions::default(),
+        sley::plumbing::sley_diff_merge::RenameDetectionOptions::default(),
     )?;
     if !entries.is_empty() {
         write_diff_shortstat(&mut out, &entries, db, None, false)?;
@@ -1582,28 +1582,28 @@ fn read_commit_tree_for_summary(
 /// line for one diff entry, matching git's `DIFF_FORMAT_SUMMARY`.
 fn write_commit_summary_entry(
     out: &mut dyn Write,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
 ) -> Result<()> {
     match entry.status {
-        sley_diff_merge::NameStatus::Added => {
+        sley::plumbing::sley_diff_merge::NameStatus::Added => {
             let mode = entry.new_mode.unwrap_or(0);
             writeln!(out, " create mode {mode:06o} {}", entry.path)?;
         }
-        sley_diff_merge::NameStatus::Deleted => {
+        sley::plumbing::sley_diff_merge::NameStatus::Deleted => {
             let mode = entry.old_mode.unwrap_or(0);
             writeln!(out, " delete mode {mode:06o} {}", entry.path)?;
         }
-        sley_diff_merge::NameStatus::Renamed(score) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Renamed(score) => {
             if let Some(old_path) = &entry.old_path {
                 writeln!(out, " rename {old_path} => {} ({score}%)", entry.path)?;
             }
         }
-        sley_diff_merge::NameStatus::Copied(score) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Copied(score) => {
             if let Some(old_path) = &entry.old_path {
                 writeln!(out, " copy {old_path} => {} ({score}%)", entry.path)?;
             }
         }
-        sley_diff_merge::NameStatus::Modified => {
+        sley::plumbing::sley_diff_merge::NameStatus::Modified => {
             if let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
                 && old_mode != new_mode
             {
@@ -1657,7 +1657,7 @@ fn conclude_replay_via_commit(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let refs = FileRefStore::new(git_dir, format);
     let head = commands::merge_rebase::head_commit_oid(&refs)?;
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     if let Ok(bytes) = fs::read(&index_path) {
         let index = Index::parse(&bytes, format)?;
         let unmerged: BTreeSet<String> = index
@@ -1681,7 +1681,7 @@ fn conclude_replay_via_commit(
         Some(oid) => commands::merge_rebase::commit_tree_oid(&db, format, oid)?,
         None => ObjectId::empty_tree(format),
     };
-    let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
+    let tree = sley::plumbing::sley_worktree::write_tree_from_index(git_dir, format)?;
     let cherry_pick_head = git_dir.join("CHERRY_PICK_HEAD");
     if !allow_empty && tree == head_tree {
         let action = if cherry_pick_head.is_file() {
@@ -1710,9 +1710,9 @@ fn conclude_replay_via_commit(
         env_author
     };
     let committer = commit_identity_from_env("COMMITTER")?;
-    let new_oid = sley_sequencer::create_commit(
+    let new_oid = sley::plumbing::sley_sequencer::create_commit(
         &mut FileObjectDatabase::from_git_dir(git_dir, format),
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree,
             parents: head.iter().copied().collect(),
             author,
@@ -1740,7 +1740,7 @@ fn conclude_replay_via_commit(
         }),
     });
     tx.commit()?;
-    sley_sequencer::replay::post_commit_cleanup(git_dir);
+    sley::plumbing::sley_sequencer::replay::post_commit_cleanup(git_dir);
     remove_commit_state_files(git_dir);
     if !quiet {
         println!("{new_oid}");
@@ -1767,7 +1767,7 @@ fn commit_partial_paths(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let refs = FileRefStore::new(git_dir, format);
     let rel_paths = stage_partial_commit_paths(git_dir, format, paths, &tree_map)?;
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     // Overlay the staged state of the matched paths onto HEAD's tree.
     let updated_index = Index::parse(&fs::read(&index_path)?, format)?;
     let staged: BTreeMap<Vec<u8>, (u32, ObjectId)> = updated_index
@@ -1787,9 +1787,9 @@ fn commit_partial_paths(
         }
     }
     let tree = write_tree_from_entry_map(&db, format, &tree_map)?;
-    let new_oid = sley_sequencer::create_commit(
+    let new_oid = sley::plumbing::sley_sequencer::create_commit(
         &mut FileObjectDatabase::from_git_dir(git_dir, format),
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree,
             parents: head.iter().copied().collect(),
             author,
@@ -1817,7 +1817,7 @@ fn commit_partial_paths(
         }),
     });
     tx.commit()?;
-    sley_sequencer::replay::post_commit_cleanup(git_dir);
+    sley::plumbing::sley_sequencer::replay::post_commit_cleanup(git_dir);
     remove_commit_state_files(git_dir);
     if !quiet {
         println!("{new_oid}");
@@ -1834,7 +1834,7 @@ fn stage_partial_commit_paths(
 ) -> Result<Vec<Vec<u8>>> {
     let worktree_root = worktree_root_for_git_dir(git_dir)?;
     let cwd = env::current_dir()?;
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     let index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?
     } else {
@@ -1907,26 +1907,26 @@ fn stage_partial_commit_paths(
     let config = read_repo_config(git_dir)?;
     // Partial-commit staging applies one uniform mode (`--add --remove`) to
     // every matched path, so stamp that mode onto each `UpdateIndexPath`.
-    let commit_mode = sley_worktree::UpdateIndexPathMode {
+    let commit_mode = sley::plumbing::sley_worktree::UpdateIndexPathMode {
         add: true,
         remove: true,
         force_remove: false,
         info_only: false,
         chmod: None,
     };
-    let ordered: Vec<sley_worktree::UpdateIndexPath> = rel_paths
+    let ordered: Vec<sley::plumbing::sley_worktree::UpdateIndexPath> = rel_paths
         .iter()
-        .map(|rel| sley_worktree::UpdateIndexPath {
+        .map(|rel| sley::plumbing::sley_worktree::UpdateIndexPath {
             path: worktree_root.join(String::from_utf8_lossy(rel).as_ref()),
             mode: commit_mode,
         })
         .collect();
-    sley_worktree::update_index_ordered_paths_filtered(
+    sley::plumbing::sley_worktree::update_index_ordered_paths_filtered(
         &worktree_root,
         git_dir,
         format,
         &ordered,
-        sley_worktree::UpdateIndexOptions {
+        sley::plumbing::sley_worktree::UpdateIndexOptions {
             add: true,
             remove: true,
             force_remove: false,
@@ -1942,7 +1942,7 @@ fn stage_partial_commit_paths(
 }
 
 fn read_index_snapshot(git_dir: &Path) -> Result<Option<Vec<u8>>> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     match fs::read(&index_path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -1951,7 +1951,7 @@ fn read_index_snapshot(git_dir: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 fn restore_index_snapshot(git_dir: &Path, snapshot: &Option<Vec<u8>>) -> Result<()> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     match snapshot {
         Some(bytes) => fs::write(index_path, bytes)?,
         None => match fs::remove_file(index_path) {
@@ -1996,7 +1996,7 @@ fn write_entry_map_level(
     entries: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
     prefix: &[u8],
 ) -> Result<ObjectId> {
-    let mut tree_entries: Vec<sley_object::TreeEntry> = Vec::new();
+    let mut tree_entries: Vec<sley::plumbing::sley_object::TreeEntry> = Vec::new();
     let mut subdirs: BTreeSet<Vec<u8>> = BTreeSet::new();
     let prefix_len = if prefix.is_empty() {
         0
@@ -2037,7 +2037,7 @@ fn write_entry_map_level(
         }
         sub_prefix.extend_from_slice(&dir);
         let sub_oid = write_entry_map_level(db, entries, &sub_prefix)?;
-        tree_entries.push(sley_object::TreeEntry {
+        tree_entries.push(sley::plumbing::sley_object::TreeEntry {
             mode: 0o040000,
             name: BString::from(dir),
             oid: sub_oid,
@@ -2053,7 +2053,7 @@ fn write_entry_map_level(
     });
     db.write_object(EncodedObject::new(
         ObjectType::Tree,
-        sley_object::Tree {
+        sley::plumbing::sley_object::Tree {
             entries: tree_entries,
         }
         .write(),
@@ -2061,7 +2061,7 @@ fn write_entry_map_level(
 }
 
 fn add_entry_map_tree_item(
-    tree_entries: &mut Vec<sley_object::TreeEntry>,
+    tree_entries: &mut Vec<sley::plumbing::sley_object::TreeEntry>,
     subdirs: &mut BTreeSet<Vec<u8>>,
     rel: &[u8],
     mode: u32,
@@ -2070,7 +2070,7 @@ fn add_entry_map_tree_item(
     if let Some(slash) = rel.iter().position(|b| *b == b'/') {
         subdirs.insert(rel[..slash].to_vec());
     } else {
-        tree_entries.push(sley_object::TreeEntry {
+        tree_entries.push(sley::plumbing::sley_object::TreeEntry {
             mode,
             name: BString::from(rel.to_vec()),
             oid,
@@ -2095,7 +2095,7 @@ fn cmd_commit_status_preview(
     mode: CommitStatusMode,
     null: bool,
     amend: bool,
-    untracked: Option<sley_worktree::StatusUntrackedMode>,
+    untracked: Option<sley::plumbing::sley_worktree::StatusUntrackedMode>,
 ) -> Result<()> {
     let mut args = Vec::new();
     match mode {
@@ -2109,9 +2109,9 @@ fn cmd_commit_status_preview(
     }
     if let Some(mode) = untracked {
         args.push(match mode {
-            sley_worktree::StatusUntrackedMode::None => "--untracked-files=no".to_string(),
-            sley_worktree::StatusUntrackedMode::Normal => "--untracked-files=normal".to_string(),
-            sley_worktree::StatusUntrackedMode::All => "--untracked-files=all".to_string(),
+            sley::plumbing::sley_worktree::StatusUntrackedMode::None => "--untracked-files=no".to_string(),
+            sley::plumbing::sley_worktree::StatusUntrackedMode::Normal => "--untracked-files=normal".to_string(),
+            sley::plumbing::sley_worktree::StatusUntrackedMode::All => "--untracked-files=all".to_string(),
         });
     }
     cmd_status(&args)
@@ -2119,7 +2119,7 @@ fn cmd_commit_status_preview(
 
 fn cmd_commit_long_status_preview(
     amend: bool,
-    untracked_override: Option<sley_worktree::StatusUntrackedMode>,
+    untracked_override: Option<sley::plumbing::sley_worktree::StatusUntrackedMode>,
 ) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
@@ -2131,19 +2131,19 @@ fn cmd_commit_long_status_preview(
     let untracked_mode = untracked_override.unwrap_or_else(|| {
         match config.get("status", None, "showUntrackedFiles") {
             Some("no") | Some("false") | Some("0") | Some("off") => {
-                sley_worktree::StatusUntrackedMode::None
+                sley::plumbing::sley_worktree::StatusUntrackedMode::None
             }
-            Some("all") => sley_worktree::StatusUntrackedMode::All,
-            _ => sley_worktree::StatusUntrackedMode::Normal,
+            Some("all") => sley::plumbing::sley_worktree::StatusUntrackedMode::All,
+            _ => sley::plumbing::sley_worktree::StatusUntrackedMode::Normal,
         }
     });
     let mut entries = crate::collect_short_status_with_options(
         &worktree_root,
         &git_dir,
         format,
-        sley_worktree::ShortStatusOptions {
+        sley::plumbing::sley_worktree::ShortStatusOptions {
             include_ignored: false,
-            ignored_mode: sley_worktree::StatusIgnoredMode::Traditional,
+            ignored_mode: sley::plumbing::sley_worktree::StatusIgnoredMode::Traditional,
             untracked_mode,
         },
     )?;
@@ -2172,7 +2172,7 @@ fn cmd_commit_long_status_preview(
         hints: config
             .get_bool("advice", None, "statusHints")
             .unwrap_or(true),
-        untracked_suppressed: untracked_mode == sley_worktree::StatusUntrackedMode::None,
+        untracked_suppressed: untracked_mode == sley::plumbing::sley_worktree::StatusUntrackedMode::None,
         comment_prefix: status_comment_prefix(&config),
         submodule_summary,
         sparse_footer: None,
@@ -2596,7 +2596,7 @@ fn build_reused_commit_author_identity(
         Some(date) => canonicalize_commit_date(date),
         None => reused_date,
     };
-    sley_sequencer::format_commit_identity(&name, &email, &date)
+    sley::plumbing::sley_sequencer::format_commit_identity(&name, &email, &date)
 }
 
 fn validate_reused_commit_author_identity(identity: &[u8]) -> Result<()> {
@@ -2643,7 +2643,7 @@ fn commit_stage_tracked_changes(git_dir: &Path, format: ObjectFormat) -> Result<
             action_paths.push(path.clone());
         }
     }
-    if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
+    if let Some(index) = sley::plumbing::sley_worktree::read_repository_index(git_dir, format)? {
         for path in index
             .entries
             .iter()
@@ -2659,12 +2659,12 @@ fn commit_stage_tracked_changes(git_dir: &Path, format: ObjectFormat) -> Result<
         return Ok(());
     }
     let config = read_repo_config(git_dir)?;
-    sley_worktree::update_index_paths_filtered(
+    sley::plumbing::sley_worktree::update_index_paths_filtered(
         &worktree_root,
         git_dir,
         format,
         &action_paths,
-        sley_worktree::UpdateIndexOptions {
+        sley::plumbing::sley_worktree::UpdateIndexOptions {
             add: true,
             remove: true,
             force_remove: false,
@@ -2679,7 +2679,7 @@ fn commit_stage_tracked_changes(git_dir: &Path, format: ObjectFormat) -> Result<
 }
 
 fn commit_index_has_unmerged_entries(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     let Ok(bytes) = fs::read(&index_path) else {
         return Ok(false);
     };
@@ -2695,7 +2695,7 @@ fn commit_index_tree_if_changed(
     format: ObjectFormat,
     db: &FileObjectDatabase,
 ) -> Result<Option<ObjectId>> {
-    let tree = sley_worktree::write_tree_from_index_with_odb(git_dir, format, db)?;
+    let tree = sley::plumbing::sley_worktree::write_tree_from_index_with_odb(git_dir, format, db)?;
     let store = FileRefStore::new(git_dir, format);
     let head = match store.read_ref("HEAD")? {
         Some(RefTarget::Symbolic(name)) => store.read_ref(&name)?,
@@ -2795,13 +2795,13 @@ fn append_commit_diff_index_patch(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let base_tree = commit_verbose_base_tree(git_dir, format, amend)?;
     let entries = if worktree {
-        sley_diff_merge::diff_name_status_index_worktree(&worktree_root, git_dir, format)?
+        sley::plumbing::sley_diff_merge::diff_name_status_index_worktree(&worktree_root, git_dir, format)?
     } else {
-        sley_diff_merge::diff_name_status_tree_index_with_options(
+        sley::plumbing::sley_diff_merge::diff_name_status_tree_index_with_options(
             git_dir,
             format,
             &base_tree,
-            sley_diff_merge::DiffNameStatusOptions::default(),
+            sley::plumbing::sley_diff_merge::DiffNameStatusOptions::default(),
         )?
     };
     let abbrev = repository_abbrev(git_dir, format)?.unwrap_or(format.hex_len());
@@ -2830,8 +2830,8 @@ fn append_commit_diff_index_patch(
                 ws_error: None,
                 color_moved: None,
                 interhunk: 0,
-                ws_ignore: sley_diff_merge::WsIgnore::default(),
-                diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+                ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
+                diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
                 ignore_blank_lines: false,
                 ignore_regexes: &[],
                 line_ranges: None,
@@ -2877,7 +2877,7 @@ struct CommitTemplateBlock<'a> {
     author_date_interesting: bool,
     /// `--amend` ⇒ the staged summary compares against `HEAD^`.
     amend: bool,
-    untracked_override: Option<sley_worktree::StatusUntrackedMode>,
+    untracked_override: Option<sley::plumbing::sley_worktree::StatusUntrackedMode>,
 }
 
 /// Build the comment-prefixed block git appends to COMMIT_EDITMSG when an editor
@@ -3043,26 +3043,26 @@ fn render_commit_template_status(
     format: ObjectFormat,
     comment_char: &str,
     amend: bool,
-    untracked_override: Option<sley_worktree::StatusUntrackedMode>,
+    untracked_override: Option<sley::plumbing::sley_worktree::StatusUntrackedMode>,
 ) -> Result<Vec<u8>> {
     let config = read_repo_config(git_dir).map_err(report_config_setup_error)?;
     let worktree_root = worktree_root_for_git_dir(git_dir)?;
     let untracked_mode = untracked_override.unwrap_or_else(|| {
         match config.get("status", None, "showUntrackedFiles") {
             Some("no") | Some("false") | Some("0") | Some("off") => {
-                sley_worktree::StatusUntrackedMode::None
+                sley::plumbing::sley_worktree::StatusUntrackedMode::None
             }
-            Some("all") => sley_worktree::StatusUntrackedMode::All,
-            _ => sley_worktree::StatusUntrackedMode::Normal,
+            Some("all") => sley::plumbing::sley_worktree::StatusUntrackedMode::All,
+            _ => sley::plumbing::sley_worktree::StatusUntrackedMode::Normal,
         }
     });
     let mut entries = crate::collect_short_status_with_options(
         &worktree_root,
         git_dir,
         format,
-        sley_worktree::ShortStatusOptions {
+        sley::plumbing::sley_worktree::ShortStatusOptions {
             include_ignored: false,
-            ignored_mode: sley_worktree::StatusIgnoredMode::Traditional,
+            ignored_mode: sley::plumbing::sley_worktree::StatusIgnoredMode::Traditional,
             untracked_mode,
         },
     )?;
@@ -3086,7 +3086,7 @@ fn render_commit_template_status(
         // parenthetical `(use "git ...")` guidance is suppressed regardless of
         // advice.statusHints.
         hints: false,
-        untracked_suppressed: untracked_mode == sley_worktree::StatusUntrackedMode::None,
+        untracked_suppressed: untracked_mode == sley::plumbing::sley_worktree::StatusUntrackedMode::None,
         // The template ALWAYS comments the status, regardless of
         // status.displayCommentPrefix.
         comment_prefix: Some(comment_char.to_string()),
@@ -3131,7 +3131,7 @@ fn build_commit_author_identity(author: Option<&str>, date: Option<&str>) -> Res
         .map(str::to_string)
         .unwrap_or_else(|| env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| "@0 +0000".into()));
     let date = canonicalize_commit_date(&date);
-    sley_sequencer::format_commit_identity(&name, &email, &date)
+    sley::plumbing::sley_sequencer::format_commit_identity(&name, &email, &date)
 }
 
 fn parse_commit_author(author: &str) -> Result<(String, String)> {

@@ -385,7 +385,9 @@ fn prune_worktree_admins(
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         match should_prune_worktree_admin(&path, &name, options.expire)? {
-            PruneAdminDecision::Prune(reason) => prune_worktree_admin(&path, &name, &reason, options),
+            PruneAdminDecision::Prune(reason) => {
+                prune_worktree_admin(&path, &name, &reason, options)
+            }
             PruneAdminDecision::Keep { gitdir } => kept.push(PruneKeptWorktree {
                 path: gitdir,
                 admin_name: Some(name),
@@ -443,9 +445,7 @@ fn should_prune_worktree_admin(
         path.pop();
     }
     if path.is_empty() {
-        return Ok(PruneAdminDecision::Prune(
-            "invalid gitdir file".to_string(),
-        ));
+        return Ok(PruneAdminDecision::Prune("invalid gitdir file".to_string()));
     }
     let gitdir = resolve_admin_path_forgiving(admin_dir, &path);
     if !gitdir.exists() {
@@ -1053,7 +1053,7 @@ fn collect_worktree_list_entries(
     expire: bool,
 ) -> Result<Vec<WorktreeListEntry>> {
     let mut entries = Vec::new();
-    let main_bare = sley_worktree::worktree_root_for_git_dir(common_git_dir)?.is_none();
+    let main_bare = sley::plumbing::sley_worktree::worktree_root_for_git_dir(common_git_dir)?.is_none();
     let main_path = main_worktree_list_path(common_git_dir);
     entries.push(read_worktree_list_entry(
         common_git_dir,
@@ -1600,7 +1600,7 @@ fn can_use_remote_refs(
     }
     if options.force == 0 {
         let config = GitConfig::read(common_git_dir.join("config")).unwrap_or_default();
-        if !sley_config::remotes::remote_names(&config).is_empty() {
+        if !sley::plumbing::sley_config::remotes::remote_names(&config).is_empty() {
             eprintln!(
                 "fatal: No local or remote refs exist despite at least one remote\npresent, stopping; use 'add -f' to override or fetch a remote first"
             );
@@ -1628,7 +1628,7 @@ fn worktree_unique_tracking_name(
     let mut unique: Option<String> = None;
     let mut num_matches = 0usize;
     let mut default_match: Option<String> = None;
-    for remote in sley_config::remotes::remote_names(&config) {
+    for remote in sley::plumbing::sley_config::remotes::remote_names(&config) {
         let Some(fetch) = config.get("remote", Some(&remote), "fetch") else {
             continue;
         };
@@ -2229,14 +2229,14 @@ fn set_config_simple(config: &mut GitConfig, section: &str, key: &str, value: &s
         } else {
             existing
                 .entries
-                .push(sley_config::ConfigEntry::new(key, Some(value.to_string())));
+                .push(sley::plumbing::sley_config::ConfigEntry::new(key, Some(value.to_string())));
         }
         return;
     }
-    config.sections.push(sley_config::ConfigSection::new(
+    config.sections.push(sley::plumbing::sley_config::ConfigSection::new(
         section,
         None,
-        vec![sley_config::ConfigEntry::new(key, Some(value.to_string()))],
+        vec![sley::plumbing::sley_config::ConfigEntry::new(key, Some(value.to_string()))],
     ));
 }
 
@@ -2448,7 +2448,7 @@ fn write_linked_worktree_checkout(
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
     fs::write(
-        sley_worktree::repository_index_path(admin_dir),
+        sley::plumbing::sley_worktree::repository_index_path(admin_dir),
         Index {
             version: 2,
             entries: index_entries,
@@ -2470,13 +2470,13 @@ fn write_empty_worktree_index(admin_dir: &Path, format: ObjectFormat) -> Result<
         extensions: Vec::new(),
         checksum: None,
     };
-    index.set_cache_tree(Some(&sley_index::CacheTree {
+    index.set_cache_tree(Some(&sley::plumbing::sley_index::CacheTree {
         entry_count: 0,
         oid: Some(ObjectId::empty_tree(format)),
         subtrees: Vec::new(),
     }))?;
     fs::write(
-        sley_worktree::repository_index_path(admin_dir),
+        sley::plumbing::sley_worktree::repository_index_path(admin_dir),
         index.write(format)?,
     )?;
     Ok(())
@@ -2488,12 +2488,12 @@ fn worktree_index_entry(
     mode: u32,
     size: u64,
     modified: Option<std::time::SystemTime>,
-) -> sley_index::IndexEntry {
+) -> sley::plumbing::sley_index::IndexEntry {
     let duration = modified
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .unwrap_or_default();
     let flags = path.len().min(0x0fff) as u16;
-    sley_index::IndexEntry {
+    sley::plumbing::sley_index::IndexEntry {
         ctime_seconds: duration.as_secs().min(u32::MAX as u64) as u32,
         ctime_nanoseconds: duration.subsec_nanos(),
         mtime_seconds: duration.as_secs().min(u32::MAX as u64) as u32,
@@ -2540,7 +2540,7 @@ fn worktree_remove_has_local_changes(
         }
         if entry.mode == 0o100644 || entry.mode == 0o100755 {
             let body = fs::read(&path)?;
-            let oid = sley_core::object_id_for_bytes(format, "blob", &body)?;
+            let oid = sley::plumbing::sley_core::object_id_for_bytes(format, "blob", &body)?;
             if oid != entry.oid {
                 return Ok(true);
             }
@@ -2689,7 +2689,11 @@ fn read_common_ref_oid(
     )))
 }
 
-fn print_worktree_list_default(entries: &[WorktreeListEntry], common_git_dir: &Path, verbose: bool) {
+fn print_worktree_list_default(
+    entries: &[WorktreeListEntry],
+    common_git_dir: &Path,
+    verbose: bool,
+) {
     let quote_path = worktree_list_quote_path(common_git_dir);
     let display_paths: Vec<String> = entries
         .iter()
@@ -2822,10 +2826,9 @@ fn print_worktree_list_porcelain(entries: &[WorktreeListEntry], z: bool) -> Resu
 
 fn worktree_list_quote_reason(reason: &str) -> String {
     let bytes = reason.as_bytes();
-    if !bytes
-        .iter()
-        .any(|byte| matches!(byte, b'"' | b'\\' | b'\n' | b'\r' | b'\t') || !(0x20..0x7f).contains(byte))
-    {
+    if !bytes.iter().any(|byte| {
+        matches!(byte, b'"' | b'\\' | b'\n' | b'\r' | b'\t') || !(0x20..0x7f).contains(byte)
+    }) {
         return reason.to_string();
     }
     let mut out = String::from("\"");

@@ -16,7 +16,7 @@
 //! re-listing them.
 
 use crate::*;
-use sley_object::TreeEntries;
+use sley::plumbing::sley_object::TreeEntries;
 use std::cell::{Ref, RefCell};
 
 /// How the per-object diff (for commits) is rendered.
@@ -137,9 +137,9 @@ struct ShowOptions {
     show_root: Option<bool>,
     /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
     /// `--ignore-cr-at-eol`).
-    ws_ignore: sley_diff_merge::WsIgnore,
+    ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore,
     /// The line-diff algorithm (`--patience` / `--histogram` / Myers default).
-    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm,
     /// `--ignore-blank-lines`.
     ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
@@ -262,16 +262,16 @@ impl Default for ShowOptions {
             renames_explicit: false,
             detect_copies: false,
             find_copies_harder: false,
-            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            copy_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             date_mode: DateMode::Default,
             output_encoding: None,
             decorate: LogDecorationMode::Off,
             // Default `git show` (medium, no `--pretty`) displays notes.
             show_notes: true,
             show_root: None,
-            ws_ignore: sley_diff_merge::WsIgnore::default(),
-            diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+            ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
+            diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
             word_diff_mode: None,
@@ -423,9 +423,9 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
 
     let mut setup_args = vec!["--default".to_string(), "HEAD".to_string()];
     setup_args.extend(options.setup_args.iter().cloned());
-    let setup = sley_rev::setup_revisions(
+    let setup = sley::plumbing::sley_rev::setup_revisions(
         &setup_args,
-        &sley_rev::RevisionSetupContext {
+        &sley::plumbing::sley_rev::RevisionSetupContext {
             git_dir,
             worktree_root: repo.worktree_root().ok(),
             cwd: repo.cwd(),
@@ -660,7 +660,7 @@ fn show_commit(
     };
     let mailmap = mailmap_guard.as_deref();
     let empty_mailmap = commands::utility::Mailmap::default();
-    let record = sley_rev::CommitRecord {
+    let record = sley::plumbing::sley_rev::CommitRecord {
         oid: *oid,
         parents: commit.parents.clone(),
         commit: commit.clone(),
@@ -1036,7 +1036,7 @@ fn write_commit_trailer(
     context: &ShowContext<'_>,
     layout: CommitTrailerLayout,
     commit: &Commit,
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
     let options = context.options;
     let diff_active = options.diff_mode != ShowDiffMode::None;
@@ -1142,7 +1142,7 @@ fn write_merge_stat(
     db: &FileObjectDatabase,
     config: &GitConfig,
     options: &ShowOptions,
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
     let color = diff_color_enabled(config);
     if options.numstat {
@@ -1187,7 +1187,7 @@ fn write_show_combined(
     context: &ShowContext<'_>,
     layout: &CommitTrailerLayout,
     commit: &Commit,
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
     let options = context.options;
     let db = context.db;
@@ -1273,15 +1273,15 @@ fn commit_diff_entries(
     options: &ShowOptions,
     pathspec: Option<&DiffPathspec>,
     commit: &Commit,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+) -> Result<Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>> {
     let (detect_renames, detect_copies) = show_effective_rename_detection(options, config);
-    let base = sley_diff_merge::DiffNameStatusOptions {
+    let base = sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
         detect_renames,
         detect_copies,
         find_copies_harder: options.find_copies_harder,
         rename_empty: true,
     };
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
+    let rename_options = sley::plumbing::sley_diff_merge::RenameDetectionOptions {
         base,
         detect_inexact: true,
         rename_threshold: options.rename_threshold,
@@ -1291,7 +1291,7 @@ fn commit_diff_entries(
         Some(parent_oid) => {
             let parent_object = db.read_object(parent_oid)?;
             let parent_commit = Commit::parse_ref(format, &parent_object.body)?;
-            sley_diff_merge::diff_name_status_trees_with_rename_options(
+            sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
                 db,
                 format,
                 &parent_commit.tree,
@@ -1299,7 +1299,7 @@ fn commit_diff_entries(
                 rename_options,
             )
         }
-        None => sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
+        None => sley::plumbing::sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
             db,
             format,
             &commit.tree,
@@ -1338,7 +1338,7 @@ fn write_commit_diff(
     format: ObjectFormat,
     config: &GitConfig,
     options: &ShowOptions,
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
     match options.diff_mode {
         ShowDiffMode::None => Ok(()),
@@ -1376,7 +1376,7 @@ fn write_commit_diff_patch(
     format: ObjectFormat,
     config: &GitConfig,
     options: &ShowOptions,
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
     let repository_abbrev = repository_abbrev(git_dir, format)?;
     let raw_abbrev = repository_abbrev;
@@ -1445,7 +1445,7 @@ fn write_commit_diff_patch(
         }
         let userdiff_attributes = worktree_root_for_git_dir(git_dir)
             .ok()
-            .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+            .map(sley::plumbing::sley_worktree::StandardAttributeMatcher::from_worktree_root)
             .transpose()?;
         let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
             userdiff_attributes,
@@ -1784,9 +1784,9 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             // --- accepted-but-inert diff knobs ----------------------------------
             // These influence rendering details sley does not yet model; accept
             // them so common invocations parse, matching how cmd_log treats them.
-            "--minimal" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
-            "--patience" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
-            "--histogram" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram,
+            "--minimal" => options.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Minimal,
+            "--patience" => options.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Patience,
+            "--histogram" => options.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Histogram,
             "--ignore-all-space" | "-w" => options.ws_ignore.all_space = true,
             "--ignore-space-change" | "-b" => options.ws_ignore.space_change = true,
             "--ignore-space-at-eol" => options.ws_ignore.space_at_eol = true,
@@ -1964,7 +1964,7 @@ fn show_parse_abbrev_width(value: &str) -> usize {
 /// 0..=100 percentage. Accepts a bare integer percentage or a trailing `%`.
 fn show_parse_similarity(value: &str) -> Result<u8> {
     if value.is_empty() {
-        return Ok(sley_diff_merge::DEFAULT_RENAME_THRESHOLD);
+        return Ok(sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD);
     }
     let digits = value.strip_suffix('%').unwrap_or(value);
     let parsed = digits

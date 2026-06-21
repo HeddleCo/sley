@@ -561,7 +561,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 .iter()
                 .any(|advertisement| advertisement.name == "HEAD")
                 && let Some(RefTarget::Symbolic(target)) =
-                FileRefStore::new(remote_git_dir, request.format).read_ref("HEAD")?
+                    FileRefStore::new(remote_git_dir, request.format).read_ref("HEAD")?
             {
                 outcome.head_symref = Some(target);
             }
@@ -1749,7 +1749,10 @@ fn stale_refs_for_prune(
         if sources.is_empty() {
             continue;
         }
-        if sources.iter().all(|source| !remote_refs.contains(source.as_str())) {
+        if sources
+            .iter()
+            .all(|source| !remote_refs.contains(source.as_str()))
+        {
             stale.push(reference.name.clone());
         }
     }

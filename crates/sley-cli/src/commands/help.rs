@@ -2,8 +2,8 @@ use crate::{
     common_git_dir_for_git_dir, discover_git_dir, global_config_value, injected_config_parameters,
     report_config_setup_error,
 };
-use sley_config::ConfigIncludeContext;
-use sley_core::{GitError, Result};
+use sley::plumbing::sley_config::ConfigIncludeContext;
+use sley::plumbing::sley_core::{GitError, Result};
 use std::collections::BTreeSet;
 use std::env;
 use std::path::Path;
@@ -116,7 +116,6 @@ pub(crate) const BUILTIN_COMMANDS: &[&str] = &[
     "switch",
     "symbolic-ref",
     "tag",
-    "testkit",
     "unpack-file",
     "unpack-objects",
     "update-index",
@@ -530,10 +529,10 @@ fn config_value(key: &str) -> Result<Option<String>> {
         .as_ref()
         .and_then(|dir| common_git_dir_for_git_dir(dir).ok());
     let context = ConfigIncludeContext::new(common_git_dir.clone(), None);
-    let mut config = sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)
+    let mut config = sley::plumbing::sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)
         .map_err(report_config_setup_error)?;
     let parameters = injected_config_parameters()?;
-    sley_config::append_injected_config_sections_with_includes(
+    sley::plumbing::sley_config::append_injected_config_sections_with_includes(
         &mut config,
         &parameters,
         &context,

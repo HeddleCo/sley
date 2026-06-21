@@ -3,7 +3,7 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley_pathspec::{LsFilesPathFilter, parse_normalized_pathspec_element, pathspec_filters_match};
+use sley::plumbing::sley_pathspec::{LsFilesPathFilter, parse_normalized_pathspec_element, pathspec_filters_match};
 
 pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     // `-h`/`--help` short-circuits before any repository state is read, so it
@@ -23,9 +23,9 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     let mut explicit_short = false;
     let mut explicit_branch: Option<bool> = None;
     let mut explicit_untracked = false;
-    let mut untracked_mode = sley_worktree::StatusUntrackedMode::Normal;
+    let mut untracked_mode = sley::plumbing::sley_worktree::StatusUntrackedMode::Normal;
     let mut show_ignored = false;
-    let mut ignored_mode = sley_worktree::StatusIgnoredMode::Traditional;
+    let mut ignored_mode = sley::plumbing::sley_worktree::StatusIgnoredMode::Traditional;
     let mut show_stash = false;
     let mut column_untracked = false;
     let mut ahead_behind = true;
@@ -92,7 +92,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 porcelain_v1 = false;
                 porcelain_v2 = false;
                 explicit_long = false;
-                untracked_mode = sley_worktree::StatusUntrackedMode::All;
+                untracked_mode = sley::plumbing::sley_worktree::StatusUntrackedMode::All;
                 explicit_untracked = true;
             }
             "--no-short" => {
@@ -109,11 +109,11 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 // `--untracked-files` is an OPTION_STRING with PARSE_OPT_OPTARG;
                 // its `--no-` form clears the override (NULL arg), so the config
                 // / default applies rather than forcing "no".
-                untracked_mode = sley_worktree::StatusUntrackedMode::Normal;
+                untracked_mode = sley::plumbing::sley_worktree::StatusUntrackedMode::Normal;
                 explicit_untracked = false;
             }
             "-u" | "--untracked-files" => {
-                untracked_mode = sley_worktree::StatusUntrackedMode::All;
+                untracked_mode = sley::plumbing::sley_worktree::StatusUntrackedMode::All;
                 explicit_untracked = true;
             }
             value if value.starts_with("-u") && value.len() > 2 => {
@@ -134,15 +134,15 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             "--no-null" => z = false,
             "--ignored" | "--ignored=traditional" => {
                 show_ignored = true;
-                ignored_mode = sley_worktree::StatusIgnoredMode::Traditional;
+                ignored_mode = sley::plumbing::sley_worktree::StatusIgnoredMode::Traditional;
             }
             "--ignored=matching" => {
                 show_ignored = true;
-                ignored_mode = sley_worktree::StatusIgnoredMode::Matching;
+                ignored_mode = sley::plumbing::sley_worktree::StatusIgnoredMode::Matching;
             }
             "--ignored=no" | "--no-ignored" => {
                 show_ignored = false;
-                ignored_mode = sley_worktree::StatusIgnoredMode::Traditional;
+                ignored_mode = sley::plumbing::sley_worktree::StatusIgnoredMode::Traditional;
             }
             value if value.starts_with("--ignored=") => {
                 return status_invalid_ignored_mode_error(&value["--ignored=".len()..]);
@@ -328,9 +328,9 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     if !explicit_untracked {
         match config.get("status", None, "showUntrackedFiles") {
             Some("no") | Some("false") | Some("0") | Some("off") => {
-                untracked_mode = sley_worktree::StatusUntrackedMode::None;
+                untracked_mode = sley::plumbing::sley_worktree::StatusUntrackedMode::None;
             }
-            Some("all") => untracked_mode = sley_worktree::StatusUntrackedMode::All,
+            Some("all") => untracked_mode = sley::plumbing::sley_worktree::StatusUntrackedMode::All,
             // "normal"/"true"/unset keep the Normal default.
             _ => {}
         }
@@ -352,7 +352,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     let worktree_root = require_work_tree(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     commands::submodule::ensure_populated_gitlinks_readable(&worktree_root, &git_dir, format)?;
-    let status_options = sley_worktree::ShortStatusOptions {
+    let status_options = sley::plumbing::sley_worktree::ShortStatusOptions {
         include_ignored: show_ignored,
         ignored_mode,
         untracked_mode,
@@ -377,9 +377,9 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             },
         )?;
         if !pathspec.has_filters() && !show_ignored && explicit_untracked {
-            sley_worktree::emit_untracked_cache_bypass_trace();
+            sley::plumbing::sley_worktree::emit_untracked_cache_bypass_trace();
         } else if !pathspec.has_filters() && !show_ignored {
-            sley_worktree::refresh_untracked_cache_after_status(
+            sley::plumbing::sley_worktree::refresh_untracked_cache_after_status(
                 &worktree_root,
                 &git_dir,
                 format,
@@ -475,7 +475,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             show_stash,
             ahead_behind,
             hints: status_hints,
-            untracked_suppressed: untracked_mode == sley_worktree::StatusUntrackedMode::None,
+            untracked_suppressed: untracked_mode == sley::plumbing::sley_worktree::StatusUntrackedMode::None,
             comment_prefix,
             submodule_summary,
             sparse_footer: status_sparse_footer(&git_dir, format)?,
@@ -509,9 +509,9 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
         }
     }
     if !pathspec.has_filters() && !show_ignored && explicit_untracked {
-        sley_worktree::emit_untracked_cache_bypass_trace();
+        sley::plumbing::sley_worktree::emit_untracked_cache_bypass_trace();
     } else if !pathspec.has_filters() && !show_ignored {
-        sley_worktree::refresh_untracked_cache_after_status(
+        sley::plumbing::sley_worktree::refresh_untracked_cache_after_status(
             &worktree_root,
             &git_dir,
             format,
@@ -529,8 +529,8 @@ fn apply_status_split_index_config(
     config: &GitConfig,
 ) -> Result<()> {
     match config.get_bool("core", None, "splitIndex") {
-        Some(true) => sley_worktree::enable_split_index(git_dir, format).map(|_| ()),
-        Some(false) => sley_worktree::disable_split_index(git_dir, format).map(|_| ()),
+        Some(true) => sley::plumbing::sley_worktree::enable_split_index(git_dir, format).map(|_| ()),
+        Some(false) => sley::plumbing::sley_worktree::disable_split_index(git_dir, format).map(|_| ()),
         None => Ok(()),
     }
 }
@@ -575,7 +575,7 @@ pub(crate) enum StatusSparseFooter {
 /// Upstream wt-status.c short_submodule_status(): in `--short` output a
 /// changed submodule's worktree column shows 'M' for new commits, 'm' for
 /// modified content, '?' for untracked content (priority in that order).
-fn status_short_submodule_code(entry: &sley_worktree::ShortStatusEntry) -> u8 {
+fn status_short_submodule_code(entry: &sley::plumbing::sley_worktree::ShortStatusEntry) -> u8 {
     let Some(submodule) = entry.submodule else {
         return entry.worktree;
     };
@@ -605,7 +605,7 @@ fn print_status_short_stream(
     git_dir: &Path,
     format: ObjectFormat,
     config: &GitConfig,
-    options: sley_worktree::ShortStatusOptions,
+    options: sley::plumbing::sley_worktree::ShortStatusOptions,
     pathspec: &StatusPathspec,
     ignore_submodules_arg: Option<IgnoreSubmodules>,
     display: StatusShortStreamDisplay,
@@ -619,14 +619,14 @@ fn print_status_short_stream(
             stdout.write_all(&[0])?;
         }
         let mut ignore_resolver = None;
-        sley_worktree::stream_short_status_with_options(
+        sley::plumbing::sley_worktree::stream_short_status_with_options(
             worktree_root,
             git_dir,
             format,
             options,
             |entry| {
                 if pathspec.has_filters() && !pathspec.matches(entry.path) {
-                    return Ok(sley_worktree::StreamControl::Continue);
+                    return Ok(sley::plumbing::sley_worktree::StreamControl::Continue);
                 }
                 let mut entry = entry.to_owned_entry();
                 if status_entry_needs_submodule_ignore(&entry)
@@ -640,12 +640,12 @@ fn print_status_short_stream(
                         )?,
                     )
                 {
-                    return Ok(sley_worktree::StreamControl::Continue);
+                    return Ok(sley::plumbing::sley_worktree::StreamControl::Continue);
                 }
                 write!(stdout, "{}{} ", entry.index as char, entry.worktree as char)?;
                 stdout.write_all(&entry.path)?;
                 stdout.write_all(&[0])?;
-                Ok(sley_worktree::StreamControl::Continue)
+                Ok(sley::plumbing::sley_worktree::StreamControl::Continue)
             },
         )?;
         stdout.flush()?;
@@ -712,14 +712,14 @@ fn print_status_short_stream(
         }
         return Ok(());
     }
-    sley_worktree::stream_short_status_with_options(
+    sley::plumbing::sley_worktree::stream_short_status_with_options(
         worktree_root,
         git_dir,
         format,
         options,
         |entry| {
             if pathspec.has_filters() && !pathspec.matches(entry.path) {
-                return Ok(sley_worktree::StreamControl::Continue);
+                return Ok(sley::plumbing::sley_worktree::StreamControl::Continue);
             }
             let mut entry = entry.to_owned_entry();
             if status_entry_needs_submodule_ignore(&entry)
@@ -733,7 +733,7 @@ fn print_status_short_stream(
                     )?,
                 )
             {
-                return Ok(sley_worktree::StreamControl::Continue);
+                return Ok(sley::plumbing::sley_worktree::StreamControl::Continue);
             }
             if !display.porcelain_v1 && display.relative_paths {
                 entry.path = pathspec.display(&entry.path);
@@ -749,37 +749,37 @@ fn print_status_short_stream(
                 worktree_code as char,
                 status_quote_path(&entry.path, true)
             );
-            Ok(sley_worktree::StreamControl::Continue)
+            Ok(sley::plumbing::sley_worktree::StreamControl::Continue)
         },
     )
 }
 
 fn status_collection_options_for_pathspec(
-    mut options: sley_worktree::ShortStatusOptions,
+    mut options: sley::plumbing::sley_worktree::ShortStatusOptions,
     pathspec: &StatusPathspec,
-) -> sley_worktree::ShortStatusOptions {
+) -> sley::plumbing::sley_worktree::ShortStatusOptions {
     if options.include_ignored
         && pathspec.has_filters()
         && matches!(
             options.untracked_mode,
-            sley_worktree::StatusUntrackedMode::Normal
+            sley::plumbing::sley_worktree::StatusUntrackedMode::Normal
         )
     {
-        options.untracked_mode = sley_worktree::StatusUntrackedMode::All;
+        options.untracked_mode = sley::plumbing::sley_worktree::StatusUntrackedMode::All;
     }
     options
 }
 
 fn status_collapse_pathspec_untracked_entries(
-    entries: Vec<sley_worktree::ShortStatusEntry>,
-    options: sley_worktree::ShortStatusOptions,
+    entries: Vec<sley::plumbing::sley_worktree::ShortStatusEntry>,
+    options: sley::plumbing::sley_worktree::ShortStatusOptions,
     pathspec: &StatusPathspec,
-) -> Vec<sley_worktree::ShortStatusEntry> {
+) -> Vec<sley::plumbing::sley_worktree::ShortStatusEntry> {
     if !options.include_ignored
         || !pathspec.has_filters()
         || !matches!(
             options.untracked_mode,
-            sley_worktree::StatusUntrackedMode::Normal
+            sley::plumbing::sley_worktree::StatusUntrackedMode::Normal
         )
     {
         return entries;
@@ -805,7 +805,7 @@ fn status_collapse_pathspec_untracked_entries(
     entries
 }
 
-fn status_output_sort_category(entry: &sley_worktree::ShortStatusEntry) -> u8 {
+fn status_output_sort_category(entry: &sley::plumbing::sley_worktree::ShortStatusEntry) -> u8 {
     match (entry.index, entry.worktree) {
         (b'?', b'?') => 1,
         (b'!', b'!') => 2,
@@ -814,7 +814,7 @@ fn status_output_sort_category(entry: &sley_worktree::ShortStatusEntry) -> u8 {
 }
 
 struct StatusOutputEntry {
-    entry: sley_worktree::ShortStatusEntry,
+    entry: sley::plumbing::sley_worktree::ShortStatusEntry,
     rename_from: Option<Vec<u8>>,
 }
 
@@ -822,12 +822,12 @@ fn status_entries_with_exact_renames(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
-    entries: Vec<sley_worktree::ShortStatusEntry>,
+    entries: Vec<sley::plumbing::sley_worktree::ShortStatusEntry>,
 ) -> Result<Vec<StatusOutputEntry>> {
     let mut used = vec![false; entries.len()];
-    let mut staged_deletes = Vec::<sley_worktree::ShortStatusEntry>::new();
+    let mut staged_deletes = Vec::<sley::plumbing::sley_worktree::ShortStatusEntry>::new();
     let mut staged_used = Vec::<bool>::new();
-    let mut residual_deletes = Vec::<sley_worktree::ShortStatusEntry>::new();
+    let mut residual_deletes = Vec::<sley::plumbing::sley_worktree::ShortStatusEntry>::new();
     let mut residual_used = Vec::<bool>::new();
     let mut output = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
@@ -1007,8 +1007,8 @@ fn status_entries_with_exact_renames(
 }
 
 fn status_entries_are_exact_rename(
-    deleted: &sley_worktree::ShortStatusEntry,
-    added: &sley_worktree::ShortStatusEntry,
+    deleted: &sley::plumbing::sley_worktree::ShortStatusEntry,
+    added: &sley::plumbing::sley_worktree::ShortStatusEntry,
 ) -> bool {
     deleted.index == b'D'
         && deleted.worktree == b' '
@@ -1021,8 +1021,8 @@ fn status_entries_are_exact_worktree_rename(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
-    deleted: &sley_worktree::ShortStatusEntry,
-    added: &sley_worktree::ShortStatusEntry,
+    deleted: &sley::plumbing::sley_worktree::ShortStatusEntry,
+    added: &sley::plumbing::sley_worktree::ShortStatusEntry,
 ) -> Result<bool> {
     if deleted.index != b' '
         || deleted.worktree != b'D'
@@ -1085,11 +1085,11 @@ fn status_worktree_blob_oid(
     ))
 }
 
-fn status_entry_needs_submodule_ignore(entry: &sley_worktree::ShortStatusEntry) -> bool {
+fn status_entry_needs_submodule_ignore(entry: &sley::plumbing::sley_worktree::ShortStatusEntry) -> bool {
     entry.submodule.is_some()
-        || entry.head_mode.is_some_and(sley_index::is_gitlink)
-        || entry.index_mode.is_some_and(sley_index::is_gitlink)
-        || entry.worktree_mode.is_some_and(sley_index::is_gitlink)
+        || entry.head_mode.is_some_and(sley::plumbing::sley_index::is_gitlink)
+        || entry.index_mode.is_some_and(sley::plumbing::sley_index::is_gitlink)
+        || entry.worktree_mode.is_some_and(sley::plumbing::sley_index::is_gitlink)
 }
 
 fn lazy_submodule_ignore_resolver<'a>(
@@ -1123,11 +1123,11 @@ fn status_invalid_untracked_files_mode_error(mode: &str) -> Result<()> {
 /// Parse a `-u<mode>` / `--untracked-files=<mode>` value. Upstream accepts the
 /// keywords `no`/`normal`/`all` and the git-boolean forms (`true`/`yes`/`on`/`1`
 /// → normal, `false`/`no`/`off`/`0`/empty → no), erroring otherwise.
-fn parse_status_untracked_mode(value: &str) -> Result<sley_worktree::StatusUntrackedMode> {
+fn parse_status_untracked_mode(value: &str) -> Result<sley::plumbing::sley_worktree::StatusUntrackedMode> {
     match value.to_ascii_lowercase().as_str() {
-        "all" => Ok(sley_worktree::StatusUntrackedMode::All),
-        "normal" | "true" | "yes" | "on" | "1" => Ok(sley_worktree::StatusUntrackedMode::Normal),
-        "no" | "false" | "off" | "0" | "" => Ok(sley_worktree::StatusUntrackedMode::None),
+        "all" => Ok(sley::plumbing::sley_worktree::StatusUntrackedMode::All),
+        "normal" | "true" | "yes" | "on" | "1" => Ok(sley::plumbing::sley_worktree::StatusUntrackedMode::Normal),
+        "no" | "false" | "off" | "0" | "" => Ok(sley::plumbing::sley_worktree::StatusUntrackedMode::None),
         other => {
             status_invalid_untracked_files_mode_error(other)?;
             unreachable!()
@@ -1175,7 +1175,7 @@ impl StatusPathspec {
         for arg in path_args {
             let element = parse_normalized_pathspec_element(&prefix, arg, magic)?;
             let is_glob =
-                !element.magic().literal && sley_worktree::pathspec_is_glob(element.pattern());
+                !element.magic().literal && sley::plumbing::sley_worktree::pathspec_is_glob(element.pattern());
             let arg_path = Path::new(arg);
             let absolute = if arg_path.is_absolute() {
                 arg_path.to_path_buf()
@@ -1249,7 +1249,7 @@ fn print_status_porcelain_v2(
     git_dir: &Path,
     format: ObjectFormat,
     config: &GitConfig,
-    entries: Vec<sley_worktree::ShortStatusEntry>,
+    entries: Vec<sley::plumbing::sley_worktree::ShortStatusEntry>,
     branch: bool,
     ahead_behind: bool,
     z: bool,
@@ -1264,7 +1264,9 @@ fn print_status_porcelain_v2(
     }
     let zero = zero_oid(format)?;
     let entries = match worktree_root_for_git_dir(git_dir) {
-        Ok(worktree_root) => status_entries_with_exact_renames(&worktree_root, git_dir, format, entries)?,
+        Ok(worktree_root) => {
+            status_entries_with_exact_renames(&worktree_root, git_dir, format, entries)?
+        }
         Err(_) => entries
             .into_iter()
             .map(|entry| StatusOutputEntry {
@@ -1317,8 +1319,8 @@ fn print_status_porcelain_v2(
                     '.'
                 },
             )?,
-            None if entry.index_mode.is_some_and(sley_index::is_gitlink)
-                || entry.worktree_mode.is_some_and(sley_index::is_gitlink) =>
+            None if entry.index_mode.is_some_and(sley::plumbing::sley_index::is_gitlink)
+                || entry.worktree_mode.is_some_and(sley::plumbing::sley_index::is_gitlink) =>
             {
                 stdout.write_all(b"S... ")?;
             }
@@ -1470,7 +1472,7 @@ impl SubmoduleIgnoreResolver {
 /// `.path` are dropped — without a path binding there is nothing to match a
 /// status entry against.
 fn submodule_ignore_by_path(config: &GitConfig) -> BTreeMap<Vec<u8>, IgnoreSubmodules> {
-    let set = sley_submodule::SubmoduleConfigSet::parse(config);
+    let set = sley::plumbing::sley_submodule::SubmoduleConfigSet::parse(config);
     let mut map = BTreeMap::new();
     for sub in set.iter() {
         let (Some(path), Some(ignore)) = (
@@ -1491,14 +1493,14 @@ fn submodule_ignore_by_path(config: &GitConfig) -> BTreeMap<Vec<u8>, IgnoreSubmo
 /// worktree code and all three detail bits). New commits survive `dirty`/
 /// `untracked` and are only hidden by `all`.
 pub(crate) fn apply_submodule_ignore(
-    entries: &mut Vec<sley_worktree::ShortStatusEntry>,
+    entries: &mut Vec<sley::plumbing::sley_worktree::ShortStatusEntry>,
     resolver: &SubmoduleIgnoreResolver,
 ) {
     entries.retain_mut(|entry| apply_submodule_ignore_entry(entry, resolver));
 }
 
 fn apply_submodule_ignore_entry(
-    entry: &mut sley_worktree::ShortStatusEntry,
+    entry: &mut sley::plumbing::sley_worktree::ShortStatusEntry,
     resolver: &SubmoduleIgnoreResolver,
 ) -> bool {
     // A bare `--ignore-submodules=all` on the COMMAND LINE sets the diffopt
@@ -1508,9 +1510,9 @@ fn apply_submodule_ignore_entry(
     // only touches the worktree-side detail and the summary (cells #93/#94 keep
     // the staged line).
     let cli_all = resolver.cli == Some(IgnoreSubmodules::All);
-    let is_gitlink = entry.head_mode.is_some_and(sley_index::is_gitlink)
-        || entry.index_mode.is_some_and(sley_index::is_gitlink)
-        || entry.worktree_mode.is_some_and(sley_index::is_gitlink);
+    let is_gitlink = entry.head_mode.is_some_and(sley::plumbing::sley_index::is_gitlink)
+        || entry.index_mode.is_some_and(sley::plumbing::sley_index::is_gitlink)
+        || entry.worktree_mode.is_some_and(sley::plumbing::sley_index::is_gitlink);
     if cli_all && is_gitlink {
         return false;
     }
@@ -1581,9 +1583,9 @@ pub(crate) fn status_submodule_summary(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
 
     // "old" gitlinks: the base commit's tree (HEAD / HEAD^).
-    let base_gitlinks = match sley_rev::resolve_revision(git_dir, format, base_ref) {
+    let base_gitlinks = match sley::plumbing::sley_rev::resolve_revision(git_dir, format, base_ref) {
         Ok(commit_oid) => {
-            let tree = sley_rev::peel_to_tree(&db, format, &commit_oid)?;
+            let tree = sley::plumbing::sley_rev::peel_to_tree(&db, format, &commit_oid)?;
             tree_gitlinks(&db, format, &tree)?
         }
         // No base commit yet (unborn HEAD): every staged gitlink is "added".
@@ -1645,17 +1647,17 @@ fn tree_gitlinks(
     format: ObjectFormat,
     tree_oid: &ObjectId,
 ) -> Result<BTreeMap<Vec<u8>, ObjectId>> {
-    let flat = sley_diff_merge::flatten_tree(db, format, tree_oid)?;
+    let flat = sley::plumbing::sley_diff_merge::flatten_tree(db, format, tree_oid)?;
     Ok(flat
         .into_iter()
-        .filter(|(_, (mode, _))| sley_index::is_gitlink(*mode))
+        .filter(|(_, (mode, _))| sley::plumbing::sley_index::is_gitlink(*mode))
         .map(|(path, (_, oid))| (path, oid))
         .collect())
 }
 
 /// The gitlink entries in the index (stage-0), path → staged commit oid.
 fn index_gitlinks(git_dir: &Path, format: ObjectFormat) -> Result<BTreeMap<Vec<u8>, ObjectId>> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     if !index_path.exists() {
         return Ok(BTreeMap::new());
     }
@@ -1664,7 +1666,7 @@ fn index_gitlinks(git_dir: &Path, format: ObjectFormat) -> Result<BTreeMap<Vec<u
         .entries
         .iter()
         .filter(|entry| {
-            entry.stage() == sley_index::Stage::Normal && sley_index::is_gitlink(entry.mode)
+            entry.stage() == sley::plumbing::sley_index::Stage::Normal && sley::plumbing::sley_index::is_gitlink(entry.mode)
         })
         .map(|entry| (entry.path.to_vec(), entry.oid))
         .collect())
@@ -1686,8 +1688,8 @@ fn worktree_gitlinks(
         let sub_root = worktree_root.join(path_str);
         // The submodule's repo always uses the super-repo's hash for its gitlink
         // oids in this corpus; read its HEAD with the same format.
-        let oid = sley_diff_merge::gitlink_head_oid(&sub_root, ObjectFormat::Sha1)
-            .or_else(|| sley_diff_merge::gitlink_head_oid(&sub_root, ObjectFormat::Sha256))
+        let oid = sley::plumbing::sley_diff_merge::gitlink_head_oid(&sub_root, ObjectFormat::Sha1)
+            .or_else(|| sley::plumbing::sley_diff_merge::gitlink_head_oid(&sub_root, ObjectFormat::Sha256))
             .unwrap_or(*index_oid);
         map.insert(path.clone(), oid);
     }
@@ -1780,7 +1782,7 @@ fn render_one_submodule(
     let sub_root = worktree_root.join(path_str);
     // git: `prepare_submodule_summary` only summarises submodules whose worktree
     // is a non-bare repository (is_nonbare_repository_dir); skip otherwise.
-    let Some(sub_git_dir) = sley_diff_merge::gitlink_git_dir(&sub_root) else {
+    let Some(sub_git_dir) = sley::plumbing::sley_diff_merge::gitlink_git_dir(&sub_root) else {
         return Ok(None);
     };
     let sub_db = FileObjectDatabase::from_git_dir(&sub_git_dir, format);
@@ -1962,7 +1964,7 @@ fn first_parent_chain(
         if object.object_type != ObjectType::Commit {
             break;
         }
-        let commit = sley_object::Commit::parse(format, &object.body)?;
+        let commit = sley::plumbing::sley_object::Commit::parse(format, &object.body)?;
         let first_parent = commit.parents.first().copied();
         chain.push(FpCommit {
             oid,
@@ -2111,7 +2113,7 @@ impl StatusLineSink {
 pub(crate) fn print_status_long(
     git_dir: &Path,
     format: ObjectFormat,
-    entries: Vec<sley_worktree::ShortStatusEntry>,
+    entries: Vec<sley::plumbing::sley_worktree::ShortStatusEntry>,
     display: &StatusLongDisplay,
 ) -> Result<()> {
     let sink = build_status_long_sink_inner(git_dir, format, entries, display, false)?;
@@ -2122,7 +2124,7 @@ pub(crate) fn print_status_long(
 fn print_status_long_with_column(
     git_dir: &Path,
     format: ObjectFormat,
-    entries: Vec<sley_worktree::ShortStatusEntry>,
+    entries: Vec<sley::plumbing::sley_worktree::ShortStatusEntry>,
     display: &StatusLongDisplay,
     column_untracked: bool,
 ) -> Result<()> {
@@ -2145,7 +2147,7 @@ impl StatusUnmergedPath {
 }
 
 fn status_unmerged_paths(git_dir: &Path, format: ObjectFormat) -> Result<Vec<StatusUnmergedPath>> {
-    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+    let Some(index) = sley::plumbing::sley_worktree::read_repository_index(git_dir, format)? else {
         return Ok(Vec::new());
     };
     let mut by_path: BTreeMap<Vec<u8>, BTreeSet<u16>> = BTreeMap::new();
@@ -2534,7 +2536,7 @@ fn status_sequencer_action(git_dir: &Path) -> Option<SequencerAction> {
 pub(crate) fn build_status_long_sink(
     git_dir: &Path,
     format: ObjectFormat,
-    entries: Vec<sley_worktree::ShortStatusEntry>,
+    entries: Vec<sley::plumbing::sley_worktree::ShortStatusEntry>,
     display: &StatusLongDisplay,
 ) -> Result<StatusLineSink> {
     build_status_long_sink_inner(git_dir, format, entries, display, false)
@@ -2543,7 +2545,7 @@ pub(crate) fn build_status_long_sink(
 fn build_status_long_sink_inner(
     git_dir: &Path,
     format: ObjectFormat,
-    entries: Vec<sley_worktree::ShortStatusEntry>,
+    entries: Vec<sley::plumbing::sley_worktree::ShortStatusEntry>,
     display: &StatusLongDisplay,
     column_untracked: bool,
 ) -> Result<StatusLineSink> {
@@ -2586,7 +2588,9 @@ fn build_status_long_sink_inner(
     let unmerged_paths: BTreeSet<Vec<u8>> =
         unmerged.iter().map(|entry| entry.path.clone()).collect();
     let entries = match worktree_root_for_git_dir(git_dir) {
-        Ok(worktree_root) => status_entries_with_exact_renames(&worktree_root, git_dir, format, entries)?,
+        Ok(worktree_root) => {
+            status_entries_with_exact_renames(&worktree_root, git_dir, format, entries)?
+        }
         Err(_) => entries
             .into_iter()
             .map(|entry| StatusOutputEntry {
@@ -2864,25 +2868,25 @@ fn status_sparse_footer(
     if !sparse_enabled {
         return Ok(None);
     }
-    let Some(mut index) = sley_worktree::read_repository_index(git_dir, format)? else {
+    let Some(mut index) = sley::plumbing::sley_worktree::read_repository_index(git_dir, format)? else {
         return Ok(None);
     };
     if index.is_sparse()
         || index
             .entries
             .iter()
-            .any(|entry| entry.mode == sley_index::SPARSE_DIR_MODE && entry.is_skip_worktree())
+            .any(|entry| entry.mode == sley::plumbing::sley_index::SPARSE_DIR_MODE && entry.is_skip_worktree())
     {
         if !status_sparse_index_has_materialized_sparse_dir(git_dir, &index)? {
             return Ok(Some(StatusSparseFooter::SparseIndex));
         }
         let db = FileObjectDatabase::from_git_dir(git_dir, format);
-        sley_worktree::expand_sparse_index(&mut index, &db, format)?;
+        sley::plumbing::sley_worktree::expand_sparse_index(&mut index, &db, format)?;
     }
     let total = index
         .entries
         .iter()
-        .filter(|entry| entry.stage() == sley_index::Stage::Normal)
+        .filter(|entry| entry.stage() == sley::plumbing::sley_index::Stage::Normal)
         .count();
     if total == 0 {
         return Ok(None);
@@ -2890,7 +2894,7 @@ fn status_sparse_footer(
     let present = index
         .entries
         .iter()
-        .filter(|entry| entry.stage() == sley_index::Stage::Normal && !entry.is_skip_worktree())
+        .filter(|entry| entry.stage() == sley::plumbing::sley_index::Stage::Normal && !entry.is_skip_worktree())
         .count();
     let percent = ((present * 100) / total).min(100) as u8;
     Ok(Some(StatusSparseFooter::Percentage(percent)))
@@ -2901,7 +2905,7 @@ fn status_sparse_index_has_materialized_sparse_dir(git_dir: &Path, index: &Index
     for entry in index
         .entries
         .iter()
-        .filter(|entry| entry.mode == sley_index::SPARSE_DIR_MODE && entry.is_skip_worktree())
+        .filter(|entry| entry.mode == sley::plumbing::sley_index::SPARSE_DIR_MODE && entry.is_skip_worktree())
     {
         let path_bytes = entry.path.as_bytes();
         let path_bytes = path_bytes.strip_suffix(b"/").unwrap_or(path_bytes);
@@ -3383,7 +3387,7 @@ fn status_long_change_label(code: u8) -> Option<&'static str> {
 }
 
 pub(crate) fn status_entries_have_index_changes(
-    entries: &[sley_worktree::ShortStatusEntry],
+    entries: &[sley::plumbing::sley_worktree::ShortStatusEntry],
 ) -> bool {
     entries
         .iter()
@@ -3535,7 +3539,7 @@ fn status_branch_tracking(
         match store.read_ref(&upstream.refname)? {
             None => StatusBranchTrackingState::Gone,
             Some(upstream_target) => {
-                let upstream_ref = sley_refs::Ref {
+                let upstream_ref = sley::plumbing::sley_refs::Ref {
                     name: upstream.refname.clone(),
                     target: upstream_target,
                 };

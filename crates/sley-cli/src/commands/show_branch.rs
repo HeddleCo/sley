@@ -1093,10 +1093,10 @@ fn resolve_to_commit(
     rev: &str,
 ) -> Option<ObjectId> {
     if let Some(oid) = resolve_ref_by_search_path(refs, rev) {
-        return sley_rev::peel_to_commit(db, format, &oid).ok();
+        return sley::plumbing::sley_rev::peel_to_commit(db, format, &oid).ok();
     }
     let oid = resolve_revision(git_dir, format, rev).ok()?;
-    sley_rev::peel_to_commit(db, format, &oid).ok()
+    sley::plumbing::sley_rev::peel_to_commit(db, format, &oid).ok()
 }
 
 /// Look up a plain ref name via git's ref search path, returning the resolved

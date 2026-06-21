@@ -182,7 +182,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             ..commands::add_patch::PatchConfig::default()
         };
         cfg.reset_interactive =
-            sley_config::read_repo_config(&discover_git_dir(&env::current_dir()?)?, None)
+            sley::plumbing::sley_config::read_repo_config(&discover_git_dir(&env::current_dir()?)?, None)
                 .ok()
                 .and_then(|config| {
                     config
@@ -230,7 +230,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         };
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
-        let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
+        let target_commit = sley::plumbing::sley_rev::peel_to_commit(&db, format, &target_oid)?;
         return commands::replay::reset_merge_in(
             &git_dir,
             &worktree_root,
@@ -277,7 +277,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         let old_head = head_oid;
         let head_tree = commands::merge_rebase::commit_tree_oid(&db, format, &head_oid)?;
         let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
-        let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
+        let target_commit = sley::plumbing::sley_rev::peel_to_commit(&db, format, &target_oid)?;
         let target_tree = commands::merge_rebase::commit_tree_oid(&db, format, &target_commit)?;
         write_reset_orig_head(&git_dir, &old_head, format)?;
         // The structural lever: route `--keep` through the SAME twoway_merge
@@ -300,7 +300,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         // — an index-only reset to the target tree, so the resulting index
         // matches the target exactly (a staged-but-untouched change is dropped
         // from the index while its worktree content is preserved by pass 1).
-        sley_worktree::reset_index_to_commit(
+        sley::plumbing::sley_worktree::reset_index_to_commit(
             worktree_root.clone(),
             git_dir.clone(),
             format,
@@ -315,7 +315,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             target,
             commit_identity_from_env("COMMITTER")?,
         )?;
-        sley_sequencer::replay::remove_branch_state(&git_dir);
+        sley::plumbing::sley_sequencer::replay::remove_branch_state(&git_dir);
         return Ok(());
     }
     if matches!(mode, ResetMode::Soft | ResetMode::Hard) {
@@ -355,7 +355,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         {
             // `git reset --hard` on an unborn branch: empty the index and
             // remove the (previously tracked) worktree files.
-            let index_path = sley_worktree::repository_index_path(&git_dir);
+            let index_path = sley::plumbing::sley_worktree::repository_index_path(&git_dir);
             if index_path.exists() {
                 let index = Index::parse(&fs::read(&index_path)?, format)?;
                 for entry in &index.entries {
@@ -375,11 +375,11 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
                     .write(format)?,
                 )?;
             }
-            sley_sequencer::replay::remove_branch_state(&git_dir);
+            sley::plumbing::sley_sequencer::replay::remove_branch_state(&git_dir);
             return Ok(());
         }
         let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
-        let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
+        let target_commit = sley::plumbing::sley_rev::peel_to_commit(&db, format, &target_oid)?;
         write_reset_orig_head(&git_dir, &old_head, format)?;
         if mode == ResetMode::Hard {
             if recurse_submodules {
@@ -391,7 +391,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
                     true,
                 )?;
             } else {
-                sley_worktree::reset_index_and_worktree_to_commit(
+                sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(
                     worktree_root.clone(),
                     git_dir.clone(),
                     format,
@@ -414,7 +414,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         if mode == ResetMode::Hard {
             commands::merge_rebase::save_merge_autostash(&git_dir, format);
         }
-        sley_sequencer::replay::remove_branch_state(&git_dir);
+        sley::plumbing::sley_sequencer::replay::remove_branch_state(&git_dir);
         return Ok(());
     }
 
@@ -427,7 +427,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             Ok(oid) => oid,
             Err(_) => zero_oid(format)?,
         };
-        let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
+        let target_commit = sley::plumbing::sley_rev::peel_to_commit(&db, format, &target_oid)?;
         // For `git reset -N` capture the paths the *current* index tracks that the
         // target tree does NOT, so they can be re-recorded as intent-to-add after
         // the index is reset (git: removed paths "will be added later").
@@ -437,7 +437,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             Vec::new()
         };
         write_reset_orig_head(&git_dir, &old_head, format)?;
-        sley_worktree::reset_index_to_commit(
+        sley::plumbing::sley_worktree::reset_index_to_commit(
             worktree_root.clone(),
             git_dir.clone(),
             format,
@@ -462,7 +462,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             &positionals[0],
             commit_identity_from_env("COMMITTER")?,
         )?;
-        sley_sequencer::replay::remove_branch_state(&git_dir);
+        sley::plumbing::sley_sequencer::replay::remove_branch_state(&git_dir);
         if !quiet {
             print_reset_unstaged_changes(&worktree_root, &git_dir, format)?;
         }
@@ -477,7 +477,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             [target] => {
                 let db = FileObjectDatabase::from_git_dir(&git_dir, format);
                 let target_oid = resolve_revision_treeish(&git_dir, format, target)?;
-                source_tree = Some(sley_rev::peel_to_tree(&db, format, &target_oid)?);
+                source_tree = Some(sley::plumbing::sley_rev::peel_to_tree(&db, format, &target_oid)?);
             }
             _ => {
                 eprintln!("fatal: Cannot do mixed reset with multiple trees.");
@@ -494,7 +494,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             && let Ok(target_oid) = resolve_revision_treeish(&git_dir, format, &values[0])
         {
             let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-            source_tree = Some(sley_rev::peel_to_tree(&db, format, &target_oid)?);
+            source_tree = Some(sley::plumbing::sley_rev::peel_to_tree(&db, format, &target_oid)?);
             values.remove(0);
         }
         values
@@ -518,7 +518,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
                 cwd.join(path)
             };
             if !absolute.exists() {
-                return Err(sley_rev::ambiguous_argument_error(
+                return Err(sley::plumbing::sley_rev::ambiguous_argument_error(
                     &path.display().to_string(),
                 ));
             }
@@ -535,7 +535,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         })
         .collect::<Vec<_>>();
     if let Some(tree_oid) = source_tree.as_ref() {
-        sley_worktree::restore_index_paths_from_tree_allow_unmatched(
+        sley::plumbing::sley_worktree::restore_index_paths_from_tree_allow_unmatched(
             worktree_root.clone(),
             git_dir.clone(),
             format,
@@ -543,7 +543,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             &resolved_paths,
         )?;
     } else {
-        sley_worktree::restore_index_paths_from_head(
+        sley::plumbing::sley_worktree::restore_index_paths_from_head(
             worktree_root.clone(),
             git_dir.clone(),
             format,
@@ -561,7 +561,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         if refresh {
             refresh_reset_index(&worktree_root, &git_dir, format)?;
         }
-        sley_sequencer::replay::remove_branch_state(&git_dir);
+        sley::plumbing::sley_sequencer::replay::remove_branch_state(&git_dir);
     }
     if !quiet {
         print_reset_unstaged_changes(&worktree_root, &git_dir, format)?;
@@ -577,7 +577,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
 /// content mismatches are not an error — they are genuine worktree changes) and
 /// tolerant of missing files (those are deletions, reported elsewhere).
 fn refresh_reset_index(worktree_root: &Path, git_dir: &Path, format: ObjectFormat) -> Result<()> {
-    sley_worktree::refresh_index_paths(
+    sley::plumbing::sley_worktree::refresh_index_paths(
         worktree_root,
         git_dir,
         format,
@@ -611,13 +611,13 @@ fn reset_intent_to_add_candidates(
     format: ObjectFormat,
     target_commit: &ObjectId,
 ) -> Result<Vec<BString>> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     if !index_path.exists() {
         return Ok(Vec::new());
     }
     let index = Index::parse(&fs::read(&index_path)?, format)?;
-    let target_tree = sley_rev::peel_to_tree(db, format, target_commit)?;
-    let target_index = sley_worktree::index_from_tree(db, format, &target_tree)?;
+    let target_tree = sley::plumbing::sley_rev::peel_to_tree(db, format, target_commit)?;
+    let target_index = sley::plumbing::sley_worktree::index_from_tree(db, format, &target_tree)?;
     let target_paths: std::collections::BTreeSet<&BString> = target_index
         .entries
         .iter()
@@ -627,7 +627,7 @@ fn reset_intent_to_add_candidates(
         .entries
         .iter()
         .filter(|entry| {
-            entry.stage() == sley_index::Stage::Normal && !target_paths.contains(&entry.path)
+            entry.stage() == sley::plumbing::sley_index::Stage::Normal && !target_paths.contains(&entry.path)
         })
         .map(|entry| entry.path.clone())
         .collect())
@@ -641,7 +641,7 @@ fn apply_reset_intent_to_add(
     format: ObjectFormat,
     paths: &[BString],
 ) -> Result<()> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
     let existing: std::collections::BTreeSet<&BString> =
         index.entries.iter().map(|entry| &entry.path).collect();
@@ -668,7 +668,7 @@ fn reset_skip_worktree_paths(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<std::collections::BTreeSet<Vec<u8>>> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     if !index_path.exists() {
         return Ok(std::collections::BTreeSet::new());
     }
@@ -689,7 +689,7 @@ fn reset_soft_blocked_by_merge(git_dir: &Path, format: ObjectFormat) -> Result<b
     if git_dir.join("MERGE_HEAD").is_file() {
         return Ok(true);
     }
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     if !index_path.exists() {
         return Ok(false);
     }
@@ -697,7 +697,7 @@ fn reset_soft_blocked_by_merge(git_dir: &Path, format: ObjectFormat) -> Result<b
     Ok(index
         .entries
         .iter()
-        .any(|entry| entry.stage() != sley_index::Stage::Normal))
+        .any(|entry| entry.stage() != sley::plumbing::sley_index::Stage::Normal))
 }
 
 fn apply_reset_sparse_checkout(
@@ -736,15 +736,15 @@ fn apply_reset_sparse_checkout(
         patterns.pop();
     }
     let mode = if cone && commands::sparse_checkout::cone_patterns_are_valid(&patterns, true) {
-        sley_worktree::SparseCheckoutMode::Cone
+        sley::plumbing::sley_worktree::SparseCheckoutMode::Cone
     } else {
-        sley_worktree::SparseCheckoutMode::Full
+        sley::plumbing::sley_worktree::SparseCheckoutMode::Full
     };
-    let sparse = sley_worktree::SparseCheckout {
+    let sparse = sley::plumbing::sley_worktree::SparseCheckout {
         patterns,
         sparse_index,
     };
-    sley_worktree::apply_sparse_checkout_with_mode(worktree_root, git_dir, format, &sparse, mode)?;
+    sley::plumbing::sley_worktree::apply_sparse_checkout_with_mode(worktree_root, git_dir, format, &sparse, mode)?;
     Ok(())
 }
 

@@ -6,10 +6,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[lib]
-name = "sley_cli"
-path = "src/lib.rs"
-
 [[bin]]
 name = "sley"
 path = "src/main.rs"
@@ -17,32 +13,10 @@ path = "src/main.rs"
 [dependencies]
 encoding_rs = "0.8"
 filetime = "0.2"
-sley-archive = { path = "../sley-archive" }
-sley-config = { path = "../sley-config" }
-sley-core = { path = "../sley-core" }
-sley-diff-merge = { path = "../sley-diff-merge" }
-sley-fetch = { path = "../sley-fetch" }
-sley-formats = { path = "../sley-formats" }
-sley-fsck = { path = "../sley-fsck" }
-sley-index = { path = "../sley-index" }
-sley-notes = { path = "../sley-notes" }
-sley-object = { path = "../sley-object" }
-sley-odb = { path = "../sley-odb" }
-sley-options = { path = "../sley-options" }
-sley-pack = { path = "../sley-pack" }
-sley-pathspec = { path = "../sley-pathspec" }
-sley-protocol = { path = "../sley-protocol" }
-sley-ref-filter = { path = "../sley-ref-filter" }
-sley-refs = { path = "../sley-refs" }
-sley-remote = { path = "../sley-remote" }
-sley-rev = { path = "../sley-rev" }
-sley-sequencer = { path = "../sley-sequencer" }
-sley-strbuf-expand = { path = "../sley-strbuf-expand" }
-sley-submodule = { path = "../sley-submodule" }
+sley = { path = "../sley" }
+
+[dev-dependencies]
 sley-testkit = { path = "../sley-testkit" }
-sley-transport = { path = "../sley-transport", features = ["http-client", "tls-rustls"] }
-sley-unpack-trees = { path = "../sley-unpack-trees" }
-sley-worktree = { path = "../sley-worktree" }
 
 [features]
 default = ["mmap", "fast-sha1"]
@@ -56,14 +30,14 @@ default = ["mmap", "fast-sha1"]
 #
 # Build the sley binary with the hardware-accelerated SHA-1 backend (forwarded to
 # sley-core). Default-on for CLI builds; OIDs are byte-identical either way.
-fast-sha1 = ["sley-core/fast-sha1", "sley-odb/fast-sha1", "sley-pack/fast-sha1"]
+fast-sha1 = ["sley/fast-sha1"]
 # Build the sley binary with memory-mapped pack reads (forwarded to sley-odb).
 # Pulls in sley-mmap (the only unsafe); default-on for CLI/facade builds.
-mmap = ["sley-odb/mmap"]
+mmap = ["sley/mmap"]
 # TLS backend for HTTPS remotes (forwarded to sley-transport via sley-remote).
-tls-rustls = ["sley-transport/tls-rustls"]
-tls-native-tls = ["sley-transport/tls-native-tls"]
-tls-platform-verifier = ["sley-transport/tls-platform-verifier"]
+tls-rustls = ["sley/tls-rustls"]
+tls-native-tls = ["sley/tls-native-tls"]
+tls-platform-verifier = ["sley/tls-platform-verifier"]
 
 [lints]
 workspace = true

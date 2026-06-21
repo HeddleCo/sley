@@ -76,7 +76,7 @@ impl BisectRepo {
     fn open() -> Result<Self> {
         let cwd = env::current_dir()?;
         let git_dir = discover_git_dir(&cwd)?;
-        let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?;
+        let worktree_root = sley::plumbing::sley_worktree::worktree_root_for_git_dir(&git_dir)?;
         let format = repository_object_format(&git_dir)?;
         Ok(Self {
             git_dir,
@@ -374,7 +374,7 @@ fn append_to_bisect_log(repo: &BisectRepo, text: &str) -> Result<()> {
 
 fn commit_subject_of(repo: &BisectRepo, oid: &ObjectId) -> Result<String> {
     let db = repo.db();
-    let peeled = sley_rev::peel_to_commit(&db, repo.format, oid)?;
+    let peeled = sley::plumbing::sley_rev::peel_to_commit(&db, repo.format, oid)?;
     let object = db.read_object(&peeled)?;
     let commit = Commit::parse(repo.format, &object.body)?;
     Ok(commit_subject(&commit.message))
@@ -611,7 +611,7 @@ fn bisect_state(
                 return Ok(BISECT_FAILED);
             }
         };
-        let commit = match sley_rev::peel_to_commit(&db, repo.format, &oid) {
+        let commit = match sley::plumbing::sley_rev::peel_to_commit(&db, repo.format, &oid) {
             Ok(commit) => commit,
             Err(_) => {
                 eprintln!("fatal: Bad rev input (not a commit): {arg}");
@@ -655,18 +655,18 @@ fn cmd_bisect_skip(args: &[String]) -> Result<()> {
             let left = if left.is_empty() { "HEAD" } else { left };
             let right = if right.is_empty() { "HEAD" } else { right };
             let left_oid = resolve_revision(&repo.git_dir, repo.format, left)
-                .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid));
+                .and_then(|oid| sley::plumbing::sley_rev::peel_to_commit(&db, repo.format, &oid));
             let right_oid = resolve_revision(&repo.git_dir, repo.format, right)
-                .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid));
+                .and_then(|oid| sley::plumbing::sley_rev::peel_to_commit(&db, repo.format, &oid));
             let (Ok(left_oid), Ok(right_oid)) = (left_oid, right_oid) else {
                 eprintln!("fatal: Bad rev input: {arg}");
                 return Err(GitError::Exit(128));
             };
             let mut excluded: HashSet<ObjectId> = HashSet::new();
-            for record in sley_rev::walk_commits(&db, repo.format, [left_oid])? {
+            for record in sley::plumbing::sley_rev::walk_commits(&db, repo.format, [left_oid])? {
                 excluded.insert(record.oid);
             }
-            for record in sley_rev::walk_commits(&db, repo.format, [right_oid])? {
+            for record in sley::plumbing::sley_rev::walk_commits(&db, repo.format, [right_oid])? {
                 if !excluded.contains(&record.oid) {
                     argv_state.push(record.oid.to_hex());
                 }
@@ -837,7 +837,7 @@ fn bisect_start(
             eprintln!("error: unrecognized option: '{arg}'");
             return Ok(BISECT_FAILED);
         } else if let Ok(oid) = resolve_revision(&repo.git_dir, repo.format, arg)
-            .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid))
+            .and_then(|oid| sley::plumbing::sley_rev::peel_to_commit(&db, repo.format, &oid))
         {
             revs.push(oid);
         } else if has_double_dash {
@@ -995,7 +995,7 @@ fn bisect_reset(repo: &BisectRepo, commit: Option<&str>) -> Result<i32> {
         Some(commit) => {
             let db = repo.db();
             if resolve_revision(&repo.git_dir, repo.format, commit)
-                .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid))
+                .and_then(|oid| sley::plumbing::sley_rev::peel_to_commit(&db, repo.format, &oid))
                 .is_err()
             {
                 eprintln!("error: '{commit}' is not a valid commit");
@@ -1358,26 +1358,26 @@ fn bisect_candidate_records(
     bad: &ObjectId,
     goods: &[ObjectId],
     first_parent: bool,
-) -> Result<Vec<sley_rev::CommitRecord>> {
+) -> Result<Vec<sley::plumbing::sley_rev::CommitRecord>> {
     let db = repo.db();
     let mut excluded: HashSet<ObjectId> = HashSet::new();
     for good in goods {
-        for record in sley_rev::walk_commits(&db, repo.format, [*good])? {
+        for record in sley::plumbing::sley_rev::walk_commits(&db, repo.format, [*good])? {
             excluded.insert(record.oid);
         }
     }
     let records = rev_list_walk_commits(&db, repo.format, [*bad], first_parent)?;
-    let kept: Vec<sley_rev::CommitRecord> = records
+    let kept: Vec<sley::plumbing::sley_rev::CommitRecord> = records
         .into_iter()
         .filter(|record| !excluded.contains(&record.oid))
         .collect();
-    let refs: Vec<&sley_rev::CommitRecord> = kept.iter().collect();
+    let refs: Vec<&sley::plumbing::sley_rev::CommitRecord> = kept.iter().collect();
     let ordered = rev_list_date_order(refs)?;
     Ok(ordered.into_iter().cloned().collect())
 }
 
 /// Read the BISECT_NAMES pathspec restriction (sq-quoted; `--` tokens dropped).
-fn bisect_pathspec(repo: &BisectRepo) -> Result<Option<sley_rev::Pathspec>> {
+fn bisect_pathspec(repo: &BisectRepo) -> Result<Option<sley::plumbing::sley_rev::Pathspec>> {
     let contents = match fs::read_to_string(repo.state_path("BISECT_NAMES")) {
         Ok(contents) => contents,
         Err(_) => return Ok(None),
@@ -1393,9 +1393,9 @@ fn bisect_pathspec(repo: &BisectRepo) -> Result<Option<sley_rev::Pathspec>> {
     if specs.is_empty() {
         return Ok(None);
     }
-    let pathspec = sley_rev::Pathspec::parse(
+    let pathspec = sley::plumbing::sley_rev::Pathspec::parse(
         specs.iter().map(|spec| spec.as_bytes()),
-        sley_rev::PathspecMatchMagic::default(),
+        sley::plumbing::sley_rev::PathspecMatchMagic::default(),
     )
     .map_err(|err| GitError::Command(format!("bad pathspec: {err:?}")))?;
     Ok(Some(pathspec))
@@ -1403,9 +1403,9 @@ fn bisect_pathspec(repo: &BisectRepo) -> Result<Option<sley_rev::Pathspec>> {
 
 /// The weighted-midpoint bisection core (`do_find_bisection`, `count_distance`,
 /// the `approx_halfway` early exit, and the `filter_skipped` + `skip_away` skip
-/// machinery) lives in [`sley_rev::bisect`] — a shared primitive used both here
+/// machinery) lives in [`sley::plumbing::sley_rev::bisect`] — a shared primitive used both here
 /// and by `rev-list --bisect`.
-use sley_rev::bisect::{SkipFilter, do_find_bisection, estimate_bisect_steps, managed_skipped};
+use sley::plumbing::sley_rev::bisect::{SkipFilter, do_find_bisection, estimate_bisect_steps, managed_skipped};
 
 fn error_if_skipped_commits(
     repo: &BisectRepo,
@@ -1459,7 +1459,7 @@ fn bisect_checkout(
             .map(|oid| oid.to_hex())
             .unwrap_or_else(|_| "HEAD".to_string());
         let message = format!("checkout: moving from {old} to {}", rev.to_hex());
-        if let Err(err) = sley_worktree::checkout_detached(
+        if let Err(err) = sley::plumbing::sley_worktree::checkout_detached(
             worktree_root,
             &repo.git_dir,
             repo.format,
@@ -1509,7 +1509,7 @@ fn bisect_merge_bases(
             let mut dominated = false;
             for (other_idx, other) in bases.iter().enumerate() {
                 if idx != other_idx
-                    && sley_rev::is_ancestor(&repo.git_dir, repo.format, &db, base, other)?
+                    && sley::plumbing::sley_rev::is_ancestor(&repo.git_dir, repo.format, &db, base, other)?
                 {
                     dominated = true;
                     break;
@@ -1622,7 +1622,7 @@ fn check_good_are_ancestors_of_bad(
     let db = repo.db();
     let mut all_ancestors = true;
     for good in goods {
-        if !sley_rev::is_ancestor(&repo.git_dir, repo.format, &db, good, bad)? {
+        if !sley::plumbing::sley_rev::is_ancestor(&repo.git_dir, repo.format, &db, good, bad)? {
             all_ancestors = false;
             break;
         }
@@ -1664,13 +1664,13 @@ fn bisect_next_all(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Write) 
     // Candidate list: `bad ^goods` (newest-first), restricted by BISECT_NAMES.
     let candidates = bisect_candidate_records(repo, &bad, &goods, first_parent)?;
     let db = repo.db();
-    let kept: Vec<sley_rev::CommitRecord> = match bisect_pathspec(repo)? {
-        Some(pathspec) => sley_rev::simplify_history(
+    let kept: Vec<sley::plumbing::sley_rev::CommitRecord> = match bisect_pathspec(repo)? {
+        Some(pathspec) => sley::plumbing::sley_rev::simplify_history(
             &db,
             repo.format,
             candidates.clone(),
             &pathspec,
-            sley_rev::SimplifyOptions {
+            sley::plumbing::sley_rev::SimplifyOptions {
                 full_history: false,
                 first_parent,
                 ..Default::default()
@@ -1696,7 +1696,7 @@ fn bisect_next_all(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Write) 
     }
 
     // Oldest-first list with intra-set parent adjacency.
-    let mut list: Vec<&sley_rev::CommitRecord> = kept.iter().collect();
+    let mut list: Vec<&sley::plumbing::sley_rev::CommitRecord> = kept.iter().collect();
     list.reverse();
     let oids: Vec<ObjectId> = list.iter().map(|record| record.oid).collect();
     let index_by_oid: HashMap<ObjectId, usize> = oids
@@ -1818,19 +1818,19 @@ fn bisect_show_commit(repo: &BisectRepo, oid: &ObjectId, out: &mut dyn Write) ->
         Some(parent) => {
             let parent_object = db.read_object(parent)?;
             let parent_commit = Commit::parse(repo.format, &parent_object.body)?;
-            sley_diff_merge::diff_name_status_trees_with_rename_options(
+            sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
                 &db,
                 repo.format,
                 &parent_commit.tree,
                 &new_tree,
-                sley_diff_merge::RenameDetectionOptions::default(),
+                sley::plumbing::sley_diff_merge::RenameDetectionOptions::default(),
             )?
         }
-        None => sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
+        None => sley::plumbing::sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
             &db,
             repo.format,
             &new_tree,
-            sley_diff_merge::RenameDetectionOptions::default(),
+            sley::plumbing::sley_diff_merge::RenameDetectionOptions::default(),
         )?,
     };
     write_diff_stat(
@@ -1848,13 +1848,13 @@ fn bisect_show_commit(repo: &BisectRepo, oid: &ObjectId, out: &mut dyn Write) ->
     // `--summary`: creation/deletion/mode lines after the stat.
     for entry in &entries {
         match entry.status {
-            sley_diff_merge::NameStatus::Added => writeln!(
+            sley::plumbing::sley_diff_merge::NameStatus::Added => writeln!(
                 out,
                 " create mode {:o} {}",
                 entry.new_mode.unwrap_or(0o100644),
                 String::from_utf8_lossy(&entry.path)
             )?,
-            sley_diff_merge::NameStatus::Deleted => writeln!(
+            sley::plumbing::sley_diff_merge::NameStatus::Deleted => writeln!(
                 out,
                 " delete mode {:o} {}",
                 entry.old_mode.unwrap_or(0o100644),

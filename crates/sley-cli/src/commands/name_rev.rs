@@ -630,7 +630,7 @@ fn emit_positional(
             continue;
         }
         let object_for_name = if options.peel_tag {
-            match sley_rev::peel_to_commit(db, format, &oid) {
+            match sley::plumbing::sley_rev::peel_to_commit(db, format, &oid) {
                 Ok(commit) => commit,
                 Err(_) => {
                     eprintln!("Could not get commit for {rev}. Skipping.");

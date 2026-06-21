@@ -20,7 +20,7 @@ pub(crate) fn merge_worktree_content(
     mode: u32,
     oid: &ObjectId,
 ) -> Result<Vec<u8>> {
-    if sley_index::is_gitlink(mode) {
+    if sley::plumbing::sley_index::is_gitlink(mode) {
         Ok(Vec::new())
     } else {
         merge_read_blob(db, oid)
@@ -65,7 +65,7 @@ pub(crate) fn merge_write_worktree_file(
         remove_blocking_file_ancestors(worktree_root, rel)?;
         fs::create_dir_all(parent)?;
     }
-    if sley_index::is_gitlink(mode) {
+    if sley::plumbing::sley_index::is_gitlink(mode) {
         // Gitlink (submodule) entry: the `oid` is a *commit*, not a blob, so it
         // must NOT be written as file content (the prior unconditional blob write
         // produced an "Is a directory"/garbage-content failure that gated the
@@ -134,7 +134,7 @@ fn merge_unlink_path_in_the_way(full: &Path) -> Result<()> {
 
 /// Clear worktree files that block any directory path in the merged result.
 /// Used on the clean-merge checkout path before
-/// [`sley_worktree::reset_index_and_worktree_to_commit`], which would otherwise
+/// [`sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit`], which would otherwise
 /// fail when a HEAD file occupies a path the merged tree now needs as a
 /// directory (directory-rename D/F). Best-effort: errors are swallowed so a
 /// genuine I/O problem surfaces from the subsequent checkout instead.
@@ -201,7 +201,7 @@ pub(crate) fn worktree_file_matches_ours(
         return Ok(false);
     };
     let format = ours_oid.format();
-    let on_disk = sley_core::object_id_for_bytes(format, "blob", &bytes)?;
+    let on_disk = sley::plumbing::sley_core::object_id_for_bytes(format, "blob", &bytes)?;
     Ok(&on_disk == ours_oid)
 }
 
@@ -255,7 +255,7 @@ pub(crate) fn merge_refuse_if_current_working_directory_becomes_file(
         return Ok(());
     };
     if target_entries.iter().any(|(path, (mode, _))| {
-        path == &cwd && !sley_index::is_gitlink(*mode) && (mode & 0o170000) != 0o040000
+        path == &cwd && !sley::plumbing::sley_index::is_gitlink(*mode) && (mode & 0o170000) != 0o040000
     }) {
         let full = worktree_root.join(path_from_git_bytes_lossy(&cwd));
         if fs::symlink_metadata(&full).is_ok_and(|metadata| metadata.is_dir()) {
@@ -266,7 +266,7 @@ pub(crate) fn merge_refuse_if_current_working_directory_becomes_file(
 }
 
 fn merge_original_cwd_absolute() -> Option<PathBuf> {
-    let cwd = sley_core::original_cwd().or_else(|| env::current_dir().ok())?;
+    let cwd = sley::plumbing::sley_core::original_cwd().or_else(|| env::current_dir().ok())?;
     Some(fs::canonicalize(&cwd).unwrap_or(cwd))
 }
 
@@ -334,7 +334,7 @@ pub(crate) enum MergePathResult {
         /// The conflict classification, so the porcelain renders the correct
         /// `CONFLICT (…)` message line (content / modify-delete / rename-delete /
         /// file-directory) instead of always claiming a content conflict.
-        kind: Option<sley_diff_merge::MergeConflictKind>,
+        kind: Option<sley::plumbing::sley_diff_merge::MergeConflictKind>,
         /// True when a textual 3-way content merge ran for this path; drives the
         /// `Auto-merging <path>` info line (git emits it only for content merges).
         auto_merged: bool,
@@ -343,14 +343,14 @@ pub(crate) enum MergePathResult {
 
 pub(crate) type MergePathResults = BTreeMap<Vec<u8>, MergePathResult>;
 pub(crate) type MergeConflictPaths = Vec<Vec<u8>>;
-pub(crate) type MergeInfoMessages = Vec<sley_diff_merge::MergeInfoMessage>;
+pub(crate) type MergeInfoMessages = Vec<sley::plumbing::sley_diff_merge::MergeInfoMessage>;
 
 /// 3-way merge of three flattened trees. Writes any cleanly-merged blob content
 /// to the ODB and returns per-path results plus the sorted list of conflicted
 /// paths.
 ///
 /// This is a thin adapter over the library seam
-/// [`sley_diff_merge::merge_entry_maps`]: the resolution logic lives there, and
+/// [`sley::plumbing::sley_diff_merge::merge_entry_maps`]: the resolution logic lives there, and
 /// this function only re-shapes the per-path library result into the
 /// index/worktree-oriented [`MergePathResult`] the merge / cherry-pick / revert
 /// porcelains consume. It is rename-aware (the merge-ort non-recursive rename
@@ -372,7 +372,7 @@ pub(crate) fn three_way_merge_trees(
         theirs,
         ours_label,
         theirs_label,
-        sley_diff_merge::MergeFavor::None,
+        sley::plumbing::sley_diff_merge::MergeFavor::None,
     )
 }
 
@@ -389,7 +389,7 @@ pub(crate) fn three_way_merge_trees_styled(
     ours_label: &str,
     theirs_label: &str,
     ancestor_label: &str,
-    style: sley_diff_merge::ConflictStyle,
+    style: sley::plumbing::sley_diff_merge::ConflictStyle,
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
     three_way_merge_trees_inner(
         db,
@@ -400,7 +400,7 @@ pub(crate) fn three_way_merge_trees_styled(
         ours_label,
         theirs_label,
         ancestor_label,
-        sley_diff_merge::MergeFavor::None,
+        sley::plumbing::sley_diff_merge::MergeFavor::None,
         style,
     )
 }
@@ -503,7 +503,7 @@ pub(crate) fn three_way_merge_trees_with_favor(
     theirs: &MergeTreeMap,
     ours_label: &str,
     theirs_label: &str,
-    favor: sley_diff_merge::MergeFavor,
+    favor: sley::plumbing::sley_diff_merge::MergeFavor,
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
     three_way_merge_trees_inner(
         db,
@@ -515,20 +515,20 @@ pub(crate) fn three_way_merge_trees_with_favor(
         theirs_label,
         "merged common ancestors",
         favor,
-        sley_diff_merge::ConflictStyle::Merge,
+        sley::plumbing::sley_diff_merge::ConflictStyle::Merge,
     )
 }
 
-pub(crate) fn merge_favor_from_strategy_opt(value: &str) -> Option<sley_diff_merge::MergeFavor> {
+pub(crate) fn merge_favor_from_strategy_opt(value: &str) -> Option<sley::plumbing::sley_diff_merge::MergeFavor> {
     match value {
-        "ours" => Some(sley_diff_merge::MergeFavor::Ours),
-        "theirs" => Some(sley_diff_merge::MergeFavor::Theirs),
+        "ours" => Some(sley::plumbing::sley_diff_merge::MergeFavor::Ours),
+        "theirs" => Some(sley::plumbing::sley_diff_merge::MergeFavor::Theirs),
         _ => None,
     }
 }
 
-pub(crate) fn merge_favor_from_strategy_opts(opts: &[String]) -> sley_diff_merge::MergeFavor {
-    let mut favor = sley_diff_merge::MergeFavor::None;
+pub(crate) fn merge_favor_from_strategy_opts(opts: &[String]) -> sley::plumbing::sley_diff_merge::MergeFavor {
+    let mut favor = sley::plumbing::sley_diff_merge::MergeFavor::None;
     for opt in opts {
         if let Some(next) = merge_favor_from_strategy_opt(opt) {
             favor = next;
@@ -547,8 +547,8 @@ fn three_way_merge_trees_inner(
     ours_label: &str,
     theirs_label: &str,
     ancestor_label: &str,
-    favor: sley_diff_merge::MergeFavor,
-    style: sley_diff_merge::ConflictStyle,
+    favor: sley::plumbing::sley_diff_merge::MergeFavor,
+    style: sley::plumbing::sley_diff_merge::ConflictStyle,
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
     let (results, conflicts, _) = three_way_merge_trees_inner_with_info(
         db,
@@ -575,16 +575,16 @@ pub(crate) fn three_way_merge_trees_inner_with_info(
     ours_label: &str,
     theirs_label: &str,
     ancestor_label: &str,
-    favor: sley_diff_merge::MergeFavor,
-    style: sley_diff_merge::ConflictStyle,
+    favor: sley::plumbing::sley_diff_merge::MergeFavor,
+    style: sley::plumbing::sley_diff_merge::ConflictStyle,
 ) -> Result<(MergePathResults, MergeConflictPaths, MergeInfoMessages)> {
-    let merge = sley_diff_merge::merge_entry_maps(
+    let merge = sley::plumbing::sley_diff_merge::merge_entry_maps(
         db,
         format,
         base,
         ours,
         theirs,
-        &sley_diff_merge::MergeTreesOptions {
+        &sley::plumbing::sley_diff_merge::MergeTreesOptions {
             ours_label,
             theirs_label,
             ancestor_label,
@@ -592,7 +592,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info(
             // Rename-aware merge: a file renamed on one side and modified on the
             // other follows the rename (the merge-ort single-base rename case).
             detect_renames: true,
-            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             // Directory-rename detection honours `merge.directoryRenames` (git's
             // default is `conflict`). When one side renames a directory and the
             // other adds files under the old directory, those files re-home into
@@ -614,8 +614,8 @@ pub(crate) fn three_way_merge_trees_inner_with_info(
         // index/worktree writers to stage `DirRenameLocation` at stage 0.
         let advisory_location = matches!(
             entry.conflict,
-            Some(sley_diff_merge::MergeConflictKind::DirRenameLocation { .. })
-                | Some(sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { .. })
+            Some(sley::plumbing::sley_diff_merge::MergeConflictKind::DirRenameLocation { .. })
+                | Some(sley::plumbing::sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { .. })
         );
         if entry.conflict.is_some() {
             conflicts.push(entry.path.clone());

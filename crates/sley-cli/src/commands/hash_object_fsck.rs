@@ -35,8 +35,8 @@
 //!
 //! Blobs are never validated (any byte sequence is a valid blob), matching git.
 
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use sley_object::ObjectType;
+use sley::plumbing::sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley::plumbing::sley_object::ObjectType;
 
 /// The fatal line git prints (via `die()`) once an object fails fsck.
 const REFUSING_MALFORMED: &str = "fatal: refusing to create malformed object";

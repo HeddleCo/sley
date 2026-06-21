@@ -1,7 +1,7 @@
 //! `git rebase` — the merge backend driven by the sequencer todo machine.
 //!
 //! The on-disk contract (`.git/rebase-merge/`) and the todo instruction sheet
-//! live in `sley_sequencer::rebase`; this module is the porcelain: option
+//! live in `sley::plumbing::sley_sequencer::rebase`; this module is the porcelain: option
 //! parsing, todo generation (`sequencer_make_script`), the
 //! `complete_action`/`pick_commits` drive loop, `--continue` / `--abort` /
 //! `--skip` / `--quit` / `--edit-todo`, and autostash handling.
@@ -14,8 +14,8 @@ use crate::commands::merge_rebase::{
 };
 use crate::commands::replay::{comment_char, launch_editor, strip_comment_lines};
 use crate::*;
-use sley_sequencer::rebase as seq;
-use sley_sequencer::rebase::{RebaseTodoItem, TodoCommand};
+use sley::plumbing::sley_sequencer::rebase as seq;
+use sley::plumbing::sley_sequencer::rebase::{RebaseTodoItem, TodoCommand};
 
 // ---------------------------------------------------------------------------
 // Options
@@ -444,7 +444,7 @@ fn reset_index_and_worktree_to_commit_for_rebase(ctx: &Ctx, commit: &ObjectId) -
             true,
         )
     } else {
-        sley_worktree::reset_index_and_worktree_to_commit(
+        sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(
             &ctx.worktree_root,
             &ctx.git_dir,
             ctx.format,
@@ -611,7 +611,7 @@ fn make_resolver<'a>(
         let Ok(oid) = resolve_revision(&ctx.git_dir, ctx.format, token) else {
             return seq::TodoOidLookup::Missing;
         };
-        let Ok(peeled) = sley_rev::peel_to_commit(db, ctx.format, &oid) else {
+        let Ok(peeled) = sley::plumbing::sley_rev::peel_to_commit(db, ctx.format, &oid) else {
             return seq::TodoOidLookup::Missing;
         };
         let Ok(record) = read_rev_list_commit_record(db, ctx.format, peeled) else {
@@ -678,7 +678,7 @@ fn find_unique_abbrev_hex_with_width(
     let mut width = width.min(hex.len());
     while width < hex.len() {
         match db.resolve_prefix(&hex[..width]) {
-            Ok(sley_odb::ObjectPrefixResolution::Ambiguous(_)) => width += 1,
+            Ok(sley::plumbing::sley_odb::ObjectPrefixResolution::Ambiguous(_)) => width += 1,
             _ => break,
         }
     }
@@ -1061,7 +1061,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         None
     } else {
         let resolved = resolve_revision(&ctx.git_dir, ctx.format, &upstream_name)
-            .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid));
+            .and_then(|oid| sley::plumbing::sley_rev::peel_to_commit(&db, ctx.format, &oid));
         match resolved {
             Ok(oid) => Some(oid),
             Err(_) => {
@@ -1078,7 +1078,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             if let Ok(Some(RefTarget::Direct(oid))) = refs.read_ref(&full) {
                 (branch.clone(), Some(full), oid, Some(branch.clone()))
             } else if let Ok(oid) = resolve_revision(&ctx.git_dir, ctx.format, branch)
-                .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid))
+                .and_then(|oid| sley::plumbing::sley_rev::peel_to_commit(&db, ctx.format, &oid))
             {
                 (branch.clone(), None, oid, Some(branch.clone()))
             } else {
@@ -1158,13 +1158,13 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             ctx.format,
             if left.is_empty() { "HEAD" } else { left },
         )
-        .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid));
+        .and_then(|oid| sley::plumbing::sley_rev::peel_to_commit(&db, ctx.format, &oid));
         let right_oid = resolve_revision(
             &ctx.git_dir,
             ctx.format,
             if right.is_empty() { "HEAD" } else { right },
         )
-        .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid));
+        .and_then(|oid| sley::plumbing::sley_rev::peel_to_commit(&db, ctx.format, &oid));
         match (left_oid, right_oid) {
             (Ok(left), Ok(right)) => {
                 let bases = merge_bases(&ctx.common_git_dir, &db, ctx.format, &left, &right)?;
@@ -1183,7 +1183,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         }
     } else {
         match resolve_revision(&ctx.git_dir, ctx.format, &onto_name)
-            .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid))
+            .and_then(|oid| sley::plumbing::sley_rev::peel_to_commit(&db, ctx.format, &oid))
         {
             Ok(oid) => oid,
             Err(_) => {
@@ -1767,12 +1767,12 @@ fn print_rebase_diffstat(
     new_tree: &ObjectId,
     with_summary: bool,
 ) -> Result<()> {
-    let entries = sley_diff_merge::diff_name_status_trees_with_options(
+    let entries = sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         old_tree,
         new_tree,
-        sley_diff_merge::DiffNameStatusOptions {
+        sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
             detect_renames: true,
             ..Default::default()
         },
@@ -1814,9 +1814,9 @@ fn print_rebase_diffstat(
 fn create_squash_onto(ctx: &Ctx) -> Result<ObjectId> {
     let ident = commit_identity_from_env("COMMITTER")?;
     let mut writer = ctx.db();
-    sley_sequencer::create_commit(
+    sley::plumbing::sley_sequencer::create_commit(
         &mut writer,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree: ObjectId::empty_tree(ctx.format),
             parents: Vec::new(),
             author: ident.clone(),
@@ -1874,7 +1874,7 @@ fn make_script_commits(
     orig_head: &ObjectId,
     keep_empty: bool,
     reapply_cherry_picks: bool,
-) -> Result<Vec<sley_rev::CommitRecord>> {
+) -> Result<Vec<sley::plumbing::sley_rev::CommitRecord>> {
     // Mark everything reachable from upstream.
     let mut excluded = std::collections::HashSet::new();
     if let Some(upstream) = upstream {
@@ -1931,7 +1931,7 @@ fn make_script_commits(
         std::collections::HashSet::new()
     };
     // Collect the right side.
-    let mut records: BTreeMap<ObjectId, sley_rev::CommitRecord> = BTreeMap::new();
+    let mut records: BTreeMap<ObjectId, sley::plumbing::sley_rev::CommitRecord> = BTreeMap::new();
     let mut order = Vec::new();
     let mut queue = vec![*orig_head];
     while let Some(oid) = queue.pop() {
@@ -2059,7 +2059,7 @@ fn make_script_with_merges(
         std::collections::HashSet::new()
     };
 
-    let mut records: BTreeMap<ObjectId, sley_rev::CommitRecord> = BTreeMap::new();
+    let mut records: BTreeMap<ObjectId, sley::plumbing::sley_rev::CommitRecord> = BTreeMap::new();
     let mut queue = vec![*orig_head];
     while let Some(oid) = queue.pop() {
         if excluded.contains(&oid) || records.contains_key(&oid) {
@@ -2378,7 +2378,7 @@ fn merge_label_from_message(message: &[u8]) -> String {
 fn commit_patch_id(
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
 ) -> Result<Option<Vec<u8>>> {
     if record.parents.len() > 1 {
         return Ok(None);
@@ -2481,7 +2481,7 @@ fn rearrange_squash(
                 i2 = found as i64;
             } else if !p.contains(' ')
                 && let Ok(oid) = resolve_revision(&ctx.git_dir, ctx.format, p)
-                && let Ok(peeled) = sley_rev::peel_to_commit(db, ctx.format, &oid)
+                && let Ok(peeled) = sley::plumbing::sley_rev::peel_to_commit(db, ctx.format, &oid)
                 && let Some(&found) = commit2item.get(&peeled)
             {
                 // found by commit name (sha/ref)
@@ -2580,7 +2580,7 @@ fn add_exec_commands(items: Vec<RebaseTodoItem>, commands: &[String]) -> Vec<Reb
 }
 
 fn add_update_ref_commands(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<Vec<RebaseTodoItem>> {
-    let protected = sley_worktree::worktree_refs_in_use(&ctx.git_dir)?;
+    let protected = sley::plumbing::sley_worktree::worktree_refs_in_use(&ctx.git_dir)?;
     let wanted_oids = items
         .iter()
         .filter_map(|item| item.oid)
@@ -2595,7 +2595,7 @@ fn add_update_ref_commands(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<Vec<Re
         if protected.contains(&reference.name) {
             continue;
         }
-        let Some(oid) = sley_refs::resolve_ref_peeled(&store, &reference.name)? else {
+        let Some(oid) = sley::plumbing::sley_refs::resolve_ref_peeled(&store, &reference.name)? else {
             continue;
         };
         if wanted_oids.contains(&oid) {
@@ -2645,7 +2645,7 @@ fn write_rebase_update_refs_state(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result
     let zero = ObjectId::null(ctx.format);
     let mut text = String::new();
     for refname in refs {
-        let old = sley_refs::resolve_ref_peeled(&store, refname)?.unwrap_or(zero);
+        let old = sley::plumbing::sley_refs::resolve_ref_peeled(&store, refname)?.unwrap_or(zero);
         text.push_str(refname);
         text.push('\n');
         text.push_str(&old.to_hex());
@@ -2949,11 +2949,11 @@ fn checkout_would_overwrite_untracked(
 ) -> Result<Vec<Vec<u8>>> {
     let target = stash_tree_entry_map(db, ctx.format, target_tree)?;
     let tracked: std::collections::BTreeSet<Vec<u8>> =
-        match sley_worktree::read_repository_index(&ctx.git_dir, ctx.format)? {
+        match sley::plumbing::sley_worktree::read_repository_index(&ctx.git_dir, ctx.format)? {
             Some(index) => index
                 .entries
                 .iter()
-                .filter(|entry| entry.stage() == sley_index::Stage::Normal)
+                .filter(|entry| entry.stage() == sley::plumbing::sley_index::Stage::Normal)
                 .map(|entry| entry.path.clone().into_bytes())
                 .collect(),
             None => std::collections::BTreeSet::new(),
@@ -2974,7 +2974,7 @@ fn checkout_would_overwrite_untracked(
         let Ok(bytes) = fs::read(&worktree_path) else {
             continue;
         };
-        let on_disk = sley_core::object_id_for_bytes(ctx.format, "blob", &bytes)?;
+        let on_disk = sley::plumbing::sley_core::object_id_for_bytes(ctx.format, "blob", &bytes)?;
         if on_disk != *oid {
             overwritten.push(path.clone());
         }
@@ -3418,7 +3418,7 @@ fn do_merge(
     }
 
     let (label, merge_head) = &merge_heads[0];
-    if sley_rev::is_ancestor(&ctx.common_git_dir, ctx.format, db, merge_head, &head)? {
+    if sley::plumbing::sley_rev::is_ancestor(&ctx.common_git_dir, ctx.format, db, merge_head, &head)? {
         return Ok(PickOutcome::Continue);
     }
 
@@ -3479,7 +3479,7 @@ fn do_merge(
 
     apply_merge_results(ctx, db, &results, &ours_map, !conflicts.is_empty())?;
     if !conflicts.is_empty() {
-        let merged_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
+        let merged_tree = sley::plumbing::sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
         fs::write(ctx.git_dir.join("AUTO_MERGE"), format!("{merged_tree}\n"))?;
         for path in &conflicts {
             let display = String::from_utf8_lossy(path);
@@ -3493,7 +3493,7 @@ fn do_merge(
         return Ok(PickOutcome::Fail(1));
     }
 
-    let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
+    let tree = sley::plumbing::sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
     create_merge_commit_from_index(
         ctx,
         original.as_ref(),
@@ -3535,7 +3535,7 @@ fn do_custom_strategy_merge(
     opts: &MachineOpts,
     todo: &mut TodoList,
     item: &RebaseTodoItem,
-    original: Option<&sley_rev::CommitRecord>,
+    original: Option<&sley::plumbing::sley_rev::CommitRecord>,
     labels: &[String],
     oneline: Option<&str>,
     head: ObjectId,
@@ -3566,7 +3566,7 @@ fn do_custom_strategy_merge(
         return Ok(PickOutcome::Fail(status));
     }
 
-    let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
+    let tree = sley::plumbing::sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
     create_merge_commit_from_index(ctx, original, tree, vec![head, merge_head], &message)?;
     if let Some(record) = original {
         record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
@@ -3610,7 +3610,7 @@ fn resolve_reset_target(ctx: &Ctx, db: &FileObjectDatabase, name: &str) -> Resul
         Ok(oid) => oid,
         Err(err) => return Err(err),
     };
-    match sley_rev::peel_to_commit(db, ctx.format, &oid) {
+    match sley::plumbing::sley_rev::peel_to_commit(db, ctx.format, &oid) {
         Ok(commit) => Ok(commit),
         Err(_) => {
             if let Ok(object) = db.read_object(&oid) {
@@ -3646,7 +3646,7 @@ fn resolve_merge_label(
         return Ok(Some(oid));
     }
     match resolve_revision(&ctx.git_dir, ctx.format, label)
-        .and_then(|oid| sley_rev::peel_to_commit(db, ctx.format, &oid))
+        .and_then(|oid| sley::plumbing::sley_rev::peel_to_commit(db, ctx.format, &oid))
     {
         Ok(oid) => Ok(Some(oid)),
         Err(_) => Ok(None),
@@ -3656,7 +3656,7 @@ fn resolve_merge_label(
 fn merge_todo_message(
     ctx: &Ctx,
     item: &RebaseTodoItem,
-    original: Option<&sley_rev::CommitRecord>,
+    original: Option<&sley::plumbing::sley_rev::CommitRecord>,
     labels: &[String],
     oneline: Option<&str>,
 ) -> Result<Vec<u8>> {
@@ -3682,7 +3682,7 @@ fn merge_todo_message(
 
 fn create_merge_commit_from_index(
     ctx: &Ctx,
-    original: Option<&sley_rev::CommitRecord>,
+    original: Option<&sley::plumbing::sley_rev::CommitRecord>,
     tree: ObjectId,
     parents: Vec<ObjectId>,
     message: &[u8],
@@ -3699,9 +3699,9 @@ fn create_merge_commit_from_index(
     };
     let committer = commit_identity_from_env("COMMITTER")?;
     let mut writer = ctx.db();
-    let new_oid = sley_sequencer::create_commit(
+    let new_oid = sley::plumbing::sley_sequencer::create_commit(
         &mut writer,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree,
             parents,
             author,
@@ -3733,7 +3733,7 @@ fn do_octopus_merge_commit(
     todo: &mut TodoList,
     item: &RebaseTodoItem,
     merge_heads: &[(String, ObjectId)],
-    original: Option<&sley_rev::CommitRecord>,
+    original: Option<&sley::plumbing::sley_rev::CommitRecord>,
     oneline: Option<String>,
 ) -> Result<PickOutcome> {
     let refs = ctx.refs();
@@ -3742,7 +3742,7 @@ fn do_octopus_merge_commit(
     let mut merged_tree = commit_tree_oid(db, ctx.format, &head)?;
     let mut parents = vec![head];
     for (label, oid) in merge_heads {
-        if sley_rev::is_ancestor(&ctx.common_git_dir, ctx.format, db, oid, &head)? {
+        if sley::plumbing::sley_rev::is_ancestor(&ctx.common_git_dir, ctx.format, db, oid, &head)? {
             continue;
         }
         let base = merge_bases(&ctx.common_git_dir, db, ctx.format, &head, oid)?
@@ -3769,7 +3769,7 @@ fn do_octopus_merge_commit(
         if !conflicts.is_empty() {
             return Ok(PickOutcome::Fail(1));
         }
-        merged_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
+        merged_tree = sley::plumbing::sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
         parents.push(*oid);
     }
     if parents.len() == 1 {
@@ -3949,7 +3949,7 @@ fn pick_one_commit(
 
     if !conflicts.is_empty() {
         // Conflict stop.
-        let merged_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
+        let merged_tree = sley::plumbing::sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
         fs::write(ctx.git_dir.join("AUTO_MERGE"), format!("{merged_tree}\n"))?;
         let conflict_set: BTreeSet<Vec<u8>> = conflicts.iter().cloned().collect();
         for path in &auto_merged_paths {
@@ -4002,7 +4002,7 @@ fn pick_one_commit(
         println!("Auto-merging {}", String::from_utf8_lossy(path));
     }
 
-    let merged_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
+    let merged_tree = sley::plumbing::sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
 
     // Empty handling.
     let index_unchanged = merged_tree == head_tree;
@@ -4228,7 +4228,7 @@ fn apply_merge_results(
             .then_with(|| index_entry_stage(left).cmp(&index_entry_stage(right)))
     });
     fs::write(
-        sley_worktree::repository_index_path(&ctx.git_dir),
+        sley::plumbing::sley_worktree::repository_index_path(&ctx.git_dir),
         Index {
             version: 2,
             entries,
@@ -4241,7 +4241,7 @@ fn apply_merge_results(
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = if sley_index::is_gitlink(*mode) {
+                    let content = if sley::plumbing::sley_index::is_gitlink(*mode) {
                         Vec::new()
                     } else {
                         merge_read_blob(db, oid)?
@@ -4292,7 +4292,7 @@ fn stop_with_patch(
     ctx: &Ctx,
     db: &FileObjectDatabase,
     opts: &MachineOpts,
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     _item: &RebaseTodoItem,
     exit_code: i32,
     to_amend: bool,
@@ -4555,7 +4555,7 @@ fn update_squash_messages(
     ctx: &Ctx,
     db: &FileObjectDatabase,
     item: &RebaseTodoItem,
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
 ) -> Result<()> {
     let comment = comment_char(&ctx.git_dir);
     let comment_str = (comment as char).to_string();
@@ -4664,7 +4664,7 @@ struct MachineCommit<'a> {
     message_file: Option<PathBuf>,
     reflog_sub: &'a str,
     /// The original commit being replayed (authorship source).
-    original: Option<&'a sley_rev::CommitRecord>,
+    original: Option<&'a sley::plumbing::sley_rev::CommitRecord>,
 }
 
 enum CommitOutcome {
@@ -4723,7 +4723,7 @@ fn machine_commit(
         message = strip_comment_lines(&message, comment_char(&ctx.git_dir));
     }
 
-    let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
+    let tree = sley::plumbing::sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
     let old_tree_for_summary = if commit.reflog_sub == "continue" && !opts.quiet {
         Some(if commit.amend {
             head_record.commit.tree
@@ -4798,9 +4798,9 @@ fn machine_commit(
         encoding.clone(),
     )?;
     let mut writer = ctx.db();
-    let new_oid = sley_sequencer::create_commit(
+    let new_oid = sley::plumbing::sley_sequencer::create_commit(
         &mut writer,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree,
             parents,
             author,
@@ -4880,7 +4880,7 @@ fn read_author_script_identity(ctx: &Ctx) -> Result<Option<Vec<u8>>> {
     let Some((name, email, date)) = seq::parse_author_script(&text) else {
         return Ok(None);
     };
-    let identity = sley_sequencer::format_commit_identity(&name, &email, &date)?;
+    let identity = sley::plumbing::sley_sequencer::format_commit_identity(&name, &email, &date)?;
     Ok(Some(identity))
 }
 
@@ -5071,11 +5071,11 @@ fn rebase_continue(ctx: &Ctx) -> Result<()> {
     pick_commits(ctx, &db, &opts, &mut todo)
 }
 
-fn is_submodule_only_status(entry: &sley_worktree::ShortStatusEntry) -> bool {
+fn is_submodule_only_status(entry: &sley::plumbing::sley_worktree::ShortStatusEntry) -> bool {
     entry.submodule.is_some()
         && entry.index == b' '
         && entry.worktree == b'M'
-        && entry.index_mode.is_some_and(sley_index::is_gitlink)
+        && entry.index_mode.is_some_and(sley::plumbing::sley_index::is_gitlink)
 }
 
 fn record_stopped_sha_rewritten(ctx: &Ctx, todo: &TodoList) -> Result<()> {
@@ -5098,7 +5098,7 @@ fn commit_staged_changes(
     let head =
         head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     let head_tree = commit_tree_oid(db, ctx.format, &head)?;
-    let index_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
+    let index_tree = sley::plumbing::sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
     let is_clean = index_tree == head_tree;
 
     let message_path = ctx.state_path("message");
@@ -5239,7 +5239,7 @@ fn rebase_skip(ctx: &Ctx) -> Result<()> {
 fn rebase_abort(ctx: &Ctx) -> Result<()> {
     let opts = read_basic_state(ctx)?;
     let db = ctx.db();
-    let target = sley_rev::peel_to_commit(&db, ctx.format, &opts.orig_head)?;
+    let target = sley::plumbing::sley_rev::peel_to_commit(&db, ctx.format, &opts.orig_head)?;
     reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
     let refs = ctx.refs();
     let committer = commit_identity_from_env("COMMITTER")?;

@@ -20,6 +20,14 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod update_ref_stdin;
+pub use update_ref_stdin::{
+    UpdateRefStdinCommand, UpdateRefStdinOid, UpdateRefStdinOption, UpdateRefStdinParseError,
+    UpdateRefStdinSymrefOld, UpdateRefStdinTerminator, UpdateRefStdinVerb,
+    parse_update_ref_stdin_line, parse_update_ref_stdin_nul,
+    update_ref_stdin_nul_additional_records,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefTarget {
     Direct(ObjectId),

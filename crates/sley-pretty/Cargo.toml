@@ -1,0 +1,13 @@
+[package]
+name = "sley-pretty"
+version.workspace = true
+description = "Public pre-1.0 pretty-format compilation API surface for borrowed, streaming sley output."
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

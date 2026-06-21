@@ -261,7 +261,7 @@ fn tag_signature_is_valid(format: ObjectFormat, body: &[u8]) -> Result<bool> {
     else {
         return Ok(true);
     };
-    Ok(line == sley_core::digest_bytes(format, unsigned)?.to_hex())
+    Ok(line == sley::plumbing::sley_core::digest_bytes(format, unsigned)?.to_hex())
 }
 
 fn write_verify_tag_format(format: &str, body: &[u8]) -> Result<()> {

@@ -55,7 +55,7 @@ pub(crate) enum ConfigSource {
     /// the given scope. Includes are not resolved unless `--includes`.
     ScopedFile {
         path: PathBuf,
-        scope: sley_config::ConfigScope,
+        scope: sley::plumbing::sley_config::ConfigScope,
     },
     /// `--file <path>` / `GIT_CONFIG`: scope `command`.
     File(PathBuf),
@@ -70,12 +70,12 @@ pub(crate) enum ConfigSource {
 /// (`--default`) are attributed to the command line.
 #[derive(Debug, Clone)]
 struct ConfigValueMeta {
-    scope: sley_config::ConfigScope,
-    origin: sley_config::ConfigOrigin,
+    scope: sley::plumbing::sley_config::ConfigScope,
+    origin: sley::plumbing::sley_config::ConfigOrigin,
 }
 
 impl ConfigValueMeta {
-    fn of(entry: &sley_config::ConfigStackEntry) -> Self {
+    fn of(entry: &sley::plumbing::sley_config::ConfigStackEntry) -> Self {
         Self {
             scope: entry.scope,
             origin: entry.origin.clone(),
@@ -85,8 +85,8 @@ impl ConfigValueMeta {
     /// git attributes `--default` fallbacks to the command line.
     fn command_line() -> Self {
         Self {
-            scope: sley_config::ConfigScope::Command,
-            origin: sley_config::ConfigOrigin::command_line(),
+            scope: sley::plumbing::sley_config::ConfigScope::Command,
+            origin: sley::plumbing::sley_config::ConfigOrigin::command_line(),
         }
     }
 }
@@ -709,19 +709,19 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     let source = if use_global {
         ConfigSource::ScopedFile {
             path: global_config_file_path()?,
-            scope: sley_config::ConfigScope::Global,
+            scope: sley::plumbing::sley_config::ConfigScope::Global,
         }
     } else if use_system {
         ConfigSource::ScopedFile {
             path: system_config_file_path(),
-            scope: sley_config::ConfigScope::System,
+            scope: sley::plumbing::sley_config::ConfigScope::System,
         }
     } else if use_local {
         let git_dir = repo_git_dir?;
         let common = common_git_dir_for_git_dir(&git_dir).unwrap_or_else(|_| git_dir.clone());
         ConfigSource::ScopedFile {
             path: config_display_path(common.join("config")),
-            scope: sley_config::ConfigScope::Local,
+            scope: sley::plumbing::sley_config::ConfigScope::Local,
         }
     } else if use_worktree {
         // git: with the worktreeConfig extension this is `config.worktree`;
@@ -742,7 +742,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         };
         ConfigSource::ScopedFile {
             path: config_display_path(path),
-            scope: sley_config::ConfigScope::Local,
+            scope: sley::plumbing::sley_config::ConfigScope::Local,
         }
     } else if let Some(value) = effective_file {
         if value == "-" {
@@ -883,7 +883,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     let mut entries = loaded.entries;
     if matches!(source, ConfigSource::Repository(_)) {
         let parameters = crate::injected_config_parameters()?;
-        let mut stack = sley_config::ConfigStack { entries };
+        let mut stack = sley::plumbing::sley_config::ConfigStack { entries };
         stack.push_parameters(&parameters);
         entries = stack.entries;
     }
@@ -995,7 +995,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                     let value = match entry {
                         Some(entry) => match entry.value.as_deref() {
                             None => true,
-                            Some(value) => match sley_config::parse_config_bool(value) {
+                            Some(value) => match sley::plumbing::sley_config::parse_config_bool(value) {
                                 Some(parsed) => parsed,
                                 None => {
                                     eprintln!(
@@ -1008,7 +1008,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                         None => {
                             let Some(value) = default_value
                                 .as_deref()
-                                .and_then(sley_config::parse_config_bool)
+                                .and_then(sley::plumbing::sley_config::parse_config_bool)
                             else {
                                 return Err(GitError::Exit(1));
                             };
@@ -1090,7 +1090,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             let key = parse_config_key(positional[0])?;
             let stdout_tty_hint = match positional.get(1) {
                 Some(stdout_is_tty) => {
-                    let Some(parsed) = sley_config::parse_config_bool(stdout_is_tty) else {
+                    let Some(parsed) = sley::plumbing::sley_config::parse_config_bool(stdout_is_tty) else {
                         eprintln!(
                             "fatal: bad boolean config value '{stdout_is_tty}' for 'command line'"
                         );
@@ -1212,7 +1212,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
 }
 
 struct LoadedEntries {
-    entries: Vec<sley_config::ConfigStackEntry>,
+    entries: Vec<sley::plumbing::sley_config::ConfigStackEntry>,
     tail_error: Option<GitError>,
 }
 
@@ -1231,11 +1231,11 @@ fn load_read_entries(
     respect_includes_opt: Option<bool>,
 ) -> Result<LoadedEntries> {
     let context = config_include_context();
-    let mut stack = sley_config::ConfigStack::new();
+    let mut stack = sley::plumbing::sley_config::ConfigStack::new();
     let mut tail_error = None;
     match source {
         ConfigSource::Repository(git_dir) => {
-            for (path, scope) in sley_config::default_config_layer_paths() {
+            for (path, scope) in sley::plumbing::sley_config::default_config_layer_paths() {
                 stack
                     .push_file(&path, scope, true, &context)
                     .map_err(|err| report_config_parse_error(err, Some(&path)))?;
@@ -1248,14 +1248,14 @@ fn load_read_entries(
             };
             let local_path = config_display_path(common.join("config"));
             stack
-                .push_file(&local_path, sley_config::ConfigScope::Local, true, &context)
+                .push_file(&local_path, sley::plumbing::sley_config::ConfigScope::Local, true, &context)
                 .map_err(|err| report_config_parse_error(err, Some(&local_path)))?;
             if worktree_config_extension_enabled(&common) {
                 let worktree_path = config_display_path(git_dir.join("config.worktree"));
                 stack
                     .push_file(
                         &worktree_path,
-                        sley_config::ConfigScope::Worktree,
+                        sley::plumbing::sley_config::ConfigScope::Worktree,
                         true,
                         &context,
                     )
@@ -1276,7 +1276,7 @@ fn load_read_entries(
             tail_error = load_entries_from_file(
                 &mut stack,
                 path,
-                sley_config::ConfigScope::Command,
+                sley::plumbing::sley_config::ConfigScope::Command,
                 action,
                 respect_includes_opt.unwrap_or(false),
                 &context,
@@ -1290,8 +1290,8 @@ fn load_read_entries(
             stack
                 .push_parsed(
                     &parsed,
-                    sley_config::ConfigOrigin::stdin(),
-                    sley_config::ConfigScope::Command,
+                    sley::plumbing::sley_config::ConfigOrigin::stdin(),
+                    sley::plumbing::sley_config::ConfigScope::Command,
                     respect_includes_opt.unwrap_or(true),
                     &context,
                 )
@@ -1304,8 +1304,8 @@ fn load_read_entries(
             stack
                 .push_parsed(
                     &parsed,
-                    sley_config::ConfigOrigin::blob(spec.clone()),
-                    sley_config::ConfigScope::Command,
+                    sley::plumbing::sley_config::ConfigOrigin::blob(spec.clone()),
+                    sley::plumbing::sley_config::ConfigScope::Command,
                     respect_includes_opt.unwrap_or(true),
                     &context,
                 )
@@ -1321,12 +1321,12 @@ fn load_read_entries(
 /// Read one explicit config file into the stack. A missing file is fatal for
 /// `--list` (git: "unable to read config file") and empty otherwise.
 fn load_entries_from_file(
-    stack: &mut sley_config::ConfigStack,
+    stack: &mut sley::plumbing::sley_config::ConfigStack,
     path: &Path,
-    scope: sley_config::ConfigScope,
+    scope: sley::plumbing::sley_config::ConfigScope,
     action: ConfigAction,
     respect_includes: bool,
-    context: &sley_config::ConfigIncludeContext,
+    context: &sley::plumbing::sley_config::ConfigIncludeContext,
 ) -> Result<Option<GitError>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -1345,7 +1345,7 @@ fn load_entries_from_file(
     stack
         .push_parsed(
             &parsed,
-            sley_config::ConfigOrigin::file(path.to_string_lossy().into_owned()),
+            sley::plumbing::sley_config::ConfigOrigin::file(path.to_string_lossy().into_owned()),
             scope,
             respect_includes,
             context,
@@ -1474,8 +1474,8 @@ fn config_core_editor(repo_git_dir: Option<&Path>) -> Result<Option<String>> {
 
 fn config_core_editor_from_default_layers() -> Result<Option<String>> {
     let context = config_include_context();
-    let mut stack = sley_config::ConfigStack::new();
-    for (path, scope) in sley_config::default_config_layer_paths() {
+    let mut stack = sley::plumbing::sley_config::ConfigStack::new();
+    for (path, scope) in sley::plumbing::sley_config::default_config_layer_paths() {
         stack
             .push_file(&path, scope, true, &context)
             .map_err(|err| report_config_parse_error(err, Some(&path)))?;
@@ -1483,7 +1483,7 @@ fn config_core_editor_from_default_layers() -> Result<Option<String>> {
     Ok(config_core_editor_from_entries(&stack.entries))
 }
 
-fn config_core_editor_from_entries(entries: &[sley_config::ConfigStackEntry]) -> Option<String> {
+fn config_core_editor_from_entries(entries: &[sley::plumbing::sley_config::ConfigStackEntry]) -> Option<String> {
     entries
         .iter()
         .rev()
@@ -1529,15 +1529,15 @@ fn config_raw_edit(
             return Err(GitError::Exit(128));
         }
     };
-    let mut editor = sley_config::raw_edit::RawConfigEditor::new(
+    let mut editor = sley::plumbing::sley_config::raw_edit::RawConfigEditor::new(
         contents,
         &key.section,
         key.subsection.as_deref(),
         &key.key,
     );
     match editor.set_multivar(value, comment, value_matches, multi_replace) {
-        sley_config::raw_edit::RawEditOutcome::NothingSet => Ok(false),
-        sley_config::raw_edit::RawEditOutcome::Changed => {
+        sley::plumbing::sley_config::raw_edit::RawEditOutcome::NothingSet => Ok(false),
+        sley::plumbing::sley_config::raw_edit::RawEditOutcome::Changed => {
             write_raw_config_file(&path, editor.into_bytes())?;
             Ok(true)
         }
@@ -1545,10 +1545,10 @@ fn config_raw_edit(
 }
 
 fn write_raw_config_file(path: &std::path::Path, bytes: Vec<u8>) -> Result<()> {
-    sley_config::raw_edit::write_config_file_locked(
+    sley::plumbing::sley_config::raw_edit::write_config_file_locked(
         path,
         &bytes,
-        sley_config::raw_edit::ConfigFileWriteOptions::default(),
+        sley::plumbing::sley_config::raw_edit::ConfigFileWriteOptions::default(),
     )
     .map_err(|err| GitError::Io(err.to_string()))
 }
@@ -1624,20 +1624,20 @@ fn config_rename_or_remove_section(
             return Err(GitError::Exit(128));
         }
     };
-    match sley_config::raw_edit::rename_or_remove_section(
+    match sley::plumbing::sley_config::raw_edit::rename_or_remove_section(
         &contents,
         &old_rendered,
         new_name.as_deref(),
     ) {
-        sley_config::raw_edit::SectionEditOutcome::Changed(out) => {
+        sley::plumbing::sley_config::raw_edit::SectionEditOutcome::Changed(out) => {
             write_raw_config_file(&path, out)?;
             Ok(())
         }
-        sley_config::raw_edit::SectionEditOutcome::NotFound => {
+        sley::plumbing::sley_config::raw_edit::SectionEditOutcome::NotFound => {
             eprintln!("fatal: no such section: {old_rendered}");
             Err(GitError::Exit(128))
         }
-        sley_config::raw_edit::SectionEditOutcome::LineTooLong(line) => {
+        sley::plumbing::sley_config::raw_edit::SectionEditOutcome::LineTooLong(line) => {
             eprintln!(
                 "error: refusing to work with overly long line in '{display_path}' on line {line}"
             );
@@ -1657,19 +1657,19 @@ fn config_source_display_name(source: &ConfigSource, path: &Path) -> String {
 
 /// Include-condition context shared by every layer: the repository (when one
 /// is discoverable) supplies `gitdir:` and `onbranch:`.
-fn config_include_context() -> sley_config::ConfigIncludeContext {
+fn config_include_context() -> sley::plumbing::sley_config::ConfigIncludeContext {
     let Ok(cwd) = env::current_dir() else {
-        return sley_config::ConfigIncludeContext::default();
+        return sley::plumbing::sley_config::ConfigIncludeContext::default();
     };
     match discover_git_dir(&cwd) {
         Ok(git_dir) => {
             let git_dir_abs = fs::canonicalize(&git_dir).unwrap_or_else(|_| git_dir.clone());
-            sley_config::ConfigIncludeContext::new(
+            sley::plumbing::sley_config::ConfigIncludeContext::new(
                 Some(git_dir_abs),
                 repo_current_branch_name(&git_dir),
             )
         }
-        Err(_) => sley_config::ConfigIncludeContext::default(),
+        Err(_) => sley::plumbing::sley_config::ConfigIncludeContext::default(),
     }
 }
 
@@ -1696,7 +1696,7 @@ fn global_config_file_path() -> Result<PathBuf> {
     {
         return Ok(PathBuf::from(path));
     }
-    let Some(home) = sley_config::home_dir() else {
+    let Some(home) = sley::plumbing::sley_config::home_dir() else {
         eprintln!("fatal: $HOME not set");
         return Err(GitError::Exit(128));
     };
@@ -1748,7 +1748,7 @@ fn has_multiple_worktrees(common_git_dir: &Path) -> bool {
 /// Read the config blob for `--blob=<spec>` (a blob id or `<rev>:<path>`).
 fn read_config_blob(spec: &str) -> Result<Vec<u8>> {
     let repo = crate::repository::RepositoryContext::discover_current()?;
-    let oid = if let Some((rev, path)) = sley_rev::split_rev_path_spec(spec) {
+    let oid = if let Some((rev, path)) = sley::plumbing::sley_rev::split_rev_path_spec(spec) {
         match repo.resolve_path(rev, path) {
             Ok(resolved) => resolved.oid,
             Err(_) => return config_blob_resolve_error(spec),
@@ -1854,9 +1854,9 @@ fn format_config_value(value: &str, value_type: ConfigValueType) -> Result<Strin
 fn value_canonicalizes_as(value: &str, value_type: ConfigValueType) -> bool {
     match value_type {
         ConfigValueType::Raw => true,
-        ConfigValueType::Bool => sley_config::parse_config_bool(value).is_some(),
-        ConfigValueType::Int => sley_config::parse_config_int(value).is_some(),
-        ConfigValueType::BoolOrInt => sley_config::parse_config_bool_or_int(value).is_some(),
+        ConfigValueType::Bool => sley::plumbing::sley_config::parse_config_bool(value).is_some(),
+        ConfigValueType::Int => sley::plumbing::sley_config::parse_config_int(value).is_some(),
+        ConfigValueType::BoolOrInt => sley::plumbing::sley_config::parse_config_bool_or_int(value).is_some(),
         ConfigValueType::Color => try_format_config_color_value(value).is_ok(),
         ConfigValueType::Path => config_path_value_can_expand(value),
         ConfigValueType::ExpiryDate => {
@@ -1882,19 +1882,19 @@ fn format_config_value_with(
     value: &str,
     value_type: ConfigValueType,
     name: Option<&str>,
-    origin: Option<&sley_config::ConfigOrigin>,
+    origin: Option<&sley::plumbing::sley_config::ConfigOrigin>,
 ) -> Result<String> {
     match value_type {
         ConfigValueType::Raw => Ok(value.to_string()),
-        ConfigValueType::Bool => match sley_config::parse_config_bool(value) {
+        ConfigValueType::Bool => match sley::plumbing::sley_config::parse_config_bool(value) {
             Some(true) => Ok("true".into()),
             Some(false) => Ok("false".into()),
             None => config_bad_bool_value(value, name),
         },
-        ConfigValueType::Int => sley_config::parse_config_int(value)
+        ConfigValueType::Int => sley::plumbing::sley_config::parse_config_int(value)
             .map(|value| value.to_string())
             .ok_or_else(|| config_bad_numeric_value(value, name, origin)),
-        ConfigValueType::BoolOrInt => match sley_config::parse_config_bool_or_int(value) {
+        ConfigValueType::BoolOrInt => match sley::plumbing::sley_config::parse_config_bool_or_int(value) {
             Some(ConfigBoolOrInt::Bool(true)) => Ok("true".into()),
             Some(ConfigBoolOrInt::Bool(false)) => Ok("false".into()),
             Some(ConfigBoolOrInt::Int(value)) => Ok(value.to_string()),
@@ -1919,16 +1919,16 @@ fn config_bad_bool_value<T>(value: &str, name: Option<&str>) -> Result<T> {
 fn config_bad_numeric_value(
     value: &str,
     name: Option<&str>,
-    origin: Option<&sley_config::ConfigOrigin>,
+    origin: Option<&sley::plumbing::sley_config::ConfigOrigin>,
 ) -> GitError {
     let location = origin.and_then(|origin| match origin.kind {
-        sley_config::ConfigOriginKind::File if !origin.name.is_empty() => {
+        sley::plumbing::sley_config::ConfigOriginKind::File if !origin.name.is_empty() => {
             Some(format!(" in file {}", origin.name))
         }
-        sley_config::ConfigOriginKind::Blob if !origin.name.is_empty() => {
+        sley::plumbing::sley_config::ConfigOriginKind::Blob if !origin.name.is_empty() => {
             Some(format!(" in blob {}", origin.name))
         }
-        sley_config::ConfigOriginKind::Stdin => Some(" in standard input".to_string()),
+        sley::plumbing::sley_config::ConfigOriginKind::Stdin => Some(" in standard input".to_string()),
         _ => None,
     });
     match (name, location) {
@@ -1982,7 +1982,7 @@ fn config_colorbool_setting(key: &ConfigKey, value: &str) -> Result<ConfigColorB
     if value.eq_ignore_ascii_case("auto") {
         return Ok(ConfigColorBoolSetting::Auto);
     }
-    match sley_config::parse_config_bool(value) {
+    match sley::plumbing::sley_config::parse_config_bool(value) {
         Some(false) => Ok(ConfigColorBoolSetting::Never),
         Some(true) => Ok(ConfigColorBoolSetting::Auto),
         None => {
@@ -2170,10 +2170,10 @@ fn expand_config_home_path<'a>(original: &str, rest: &str) -> Result<std::borrow
     ))
 }
 
-fn config_missing_path_value<T>(name: &str, entry: &sley_config::ConfigStackEntry) -> Result<T> {
+fn config_missing_path_value<T>(name: &str, entry: &sley::plumbing::sley_config::ConfigStackEntry) -> Result<T> {
     eprintln!("error: missing value for '{name}'");
     match entry.origin.kind {
-        sley_config::ConfigOriginKind::File if !entry.origin.name.is_empty() => {
+        sley::plumbing::sley_config::ConfigOriginKind::File if !entry.origin.name.is_empty() => {
             if let Some(line) = config_entry_physical_line(Path::new(&entry.origin.name), entry) {
                 eprintln!(
                     "fatal: bad config line {line} in file {}",
@@ -2183,7 +2183,7 @@ fn config_missing_path_value<T>(name: &str, entry: &sley_config::ConfigStackEntr
                 eprintln!("fatal: bad config line in file {}", entry.origin.name);
             }
         }
-        sley_config::ConfigOriginKind::Stdin => {
+        sley::plumbing::sley_config::ConfigOriginKind::Stdin => {
             eprintln!("fatal: bad config line in standard input");
         }
         _ => {
@@ -2195,7 +2195,7 @@ fn config_missing_path_value<T>(name: &str, entry: &sley_config::ConfigStackEntr
 
 fn config_entry_physical_line(
     path: &Path,
-    target: &sley_config::ConfigStackEntry,
+    target: &sley::plumbing::sley_config::ConfigStackEntry,
 ) -> Option<usize> {
     let text = fs::read_to_string(path).ok()?;
     let mut section = String::new();
@@ -2407,7 +2407,7 @@ fn config_section_matches(section: &ConfigSection, key: &ConfigKey) -> bool {
 }
 
 fn config_get_urlmatch(
-    entries: &[sley_config::ConfigStackEntry],
+    entries: &[sley::plumbing::sley_config::ConfigStackEntry],
     target: &ConfigUrlMatchTarget,
     url: &str,
     null_terminate: bool,
@@ -2670,7 +2670,7 @@ fn config_url_hex_value(byte: u8) -> Option<u8> {
 
 #[allow(clippy::too_many_arguments)]
 fn config_get_regexp(
-    entries: &[sley_config::ConfigStackEntry],
+    entries: &[sley::plumbing::sley_config::ConfigStackEntry],
     pattern: &str,
     value_filter: Option<&ConfigValuePatternFilter>,
     display: ConfigDisplayOptions,
@@ -2766,7 +2766,7 @@ impl ConfigValuePatternFilter {
 /// Returns `false` (mapped by the caller to exit code 1) when nothing matched.
 #[allow(clippy::too_many_arguments)]
 fn config_subcommand_get(
-    entries: &[sley_config::ConfigStackEntry],
+    entries: &[sley::plumbing::sley_config::ConfigStackEntry],
     key: SubcommandGetKey,
     value_filter: Option<&ConfigValuePatternFilter>,
     display: ConfigDisplayOptions,
@@ -3091,7 +3091,7 @@ pub(crate) fn has_unescaped_trailing_dollar(bytes: &[u8]) -> bool {
 }
 
 fn config_list(
-    entries: &[sley_config::ConfigStackEntry],
+    entries: &[sley::plumbing::sley_config::ConfigStackEntry],
     display: ConfigDisplayOptions,
     name_only: bool,
     null_terminate: bool,
@@ -3133,9 +3133,9 @@ fn config_list(
 /// The last (highest-precedence) entry matching the key, including value-less
 /// boolean-true entries.
 fn entries_get<'a>(
-    entries: &'a [sley_config::ConfigStackEntry],
+    entries: &'a [sley::plumbing::sley_config::ConfigStackEntry],
     key: &ConfigKey,
-) -> Option<&'a sley_config::ConfigStackEntry> {
+) -> Option<&'a sley::plumbing::sley_config::ConfigStackEntry> {
     entries
         .iter()
         .rev()
@@ -3144,9 +3144,9 @@ fn entries_get<'a>(
 
 /// Every entry matching the key, in precedence order (lowest first).
 fn entries_get_all<'a>(
-    entries: &'a [sley_config::ConfigStackEntry],
+    entries: &'a [sley::plumbing::sley_config::ConfigStackEntry],
     key: &ConfigKey,
-) -> Vec<&'a sley_config::ConfigStackEntry> {
+) -> Vec<&'a sley::plumbing::sley_config::ConfigStackEntry> {
     entries
         .iter()
         .filter(|entry| entry.matches(&key.section, key.subsection.as_deref(), &key.key))
@@ -3266,7 +3266,7 @@ fn write_config_metadata_field(
 
 /// `--show-origin` rendering: `<kind>:<name>`, with the name C-quoted exactly
 /// as git's `quote_c_style` does — except under `-z`, where git emits it raw.
-fn config_origin_display(origin: &sley_config::ConfigOrigin, null_terminate: bool) -> String {
+fn config_origin_display(origin: &sley::plumbing::sley_config::ConfigOrigin, null_terminate: bool) -> String {
     if null_terminate {
         format!("{}:{}", origin.kind.name(), origin.name)
     } else {
@@ -3280,7 +3280,7 @@ fn config_origin_display(origin: &sley_config::ConfigOrigin, null_terminate: boo
 
 /// The display name of a stack entry: section and key lower-cased, the
 /// subsection byte-for-byte as written — git's canonical `--list` form.
-fn stack_entry_name(entry: &sley_config::ConfigStackEntry) -> String {
+fn stack_entry_name(entry: &sley::plumbing::sley_config::ConfigStackEntry) -> String {
     let section = entry.section.to_ascii_lowercase();
     let key = entry.key.to_ascii_lowercase();
     match &entry.subsection {

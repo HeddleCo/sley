@@ -12,7 +12,7 @@ fn diff_peel_rev_tree(
     rev: &str,
 ) -> Result<ObjectId> {
     let oid = resolve_revision(git_dir, format, rev)?;
-    sley_rev::peel_to_tree(db, format, &oid)
+    sley::plumbing::sley_rev::peel_to_tree(db, format, &oid)
 }
 
 pub(crate) fn diff_resolve_commit_arg(
@@ -22,7 +22,7 @@ pub(crate) fn diff_resolve_commit_arg(
     rev: &str,
 ) -> Result<ObjectId> {
     let oid = resolve_revision(git_dir, format, rev)?;
-    match sley_rev::peel_to_commit(db, format, &oid) {
+    match sley::plumbing::sley_rev::peel_to_commit(db, format, &oid) {
         Ok(commit) => Ok(commit),
         Err(err) => {
             if let Ok(object) = db.read_object(&oid) {
@@ -45,7 +45,7 @@ pub(crate) fn diff_single_merge_base(
     left: &ObjectId,
     right: &ObjectId,
 ) -> Result<ObjectId> {
-    let bases = sley_rev::merge_bases(git_dir, format, db, left, right)?;
+    let bases = sley::plumbing::sley_rev::merge_bases(git_dir, format, db, left, right)?;
     match bases.as_slice() {
         [] => {
             eprintln!("fatal: no merge base found");
@@ -88,7 +88,7 @@ fn diff_split_revisions(
             {
                 return diff_usage_error();
             }
-            let bases = sley_rev::merge_bases(git_dir, format, db, &left_oid, &right_oid)?;
+            let bases = sley::plumbing::sley_rev::merge_bases(git_dir, format, db, &left_oid, &right_oid)?;
             let Some(base) = bases.first() else {
                 eprintln!("fatal: {first}: no merge base");
                 return Err(GitError::Exit(128));
@@ -96,8 +96,8 @@ fn diff_split_revisions(
             if bases.len() > 1 {
                 eprintln!("warning: {first}: multiple merge bases, using {base}");
             }
-            let base_tree = sley_rev::peel_to_tree(db, format, base)?;
-            let right_tree = sley_rev::peel_to_tree(db, format, &right_oid)?;
+            let base_tree = sley::plumbing::sley_rev::peel_to_tree(db, format, base)?;
+            let right_tree = sley::plumbing::sley_rev::peel_to_tree(db, format, &right_oid)?;
             return Ok((vec![base_tree, right_tree], path_args[1..].to_vec()));
         }
     }
@@ -187,11 +187,11 @@ fn diff_split_merge_base(
         (&commits[0].0, &commits[1].0)
     };
     let base = diff_single_merge_base(git_dir, format, db, left, right)?;
-    let base_tree = sley_rev::peel_to_tree(db, format, &base)?;
+    let base_tree = sley::plumbing::sley_rev::peel_to_tree(db, format, &base)?;
     if commits.len() == 1 {
         Ok((vec![base_tree], rest))
     } else {
-        let right_tree = sley_rev::peel_to_tree(db, format, right)?;
+        let right_tree = sley::plumbing::sley_rev::peel_to_tree(db, format, right)?;
         Ok((vec![base_tree, right_tree], rest))
     }
 }
@@ -253,7 +253,7 @@ fn diff_index_blob_pair(
     if args.len() != 2 || !args.iter().all(|arg| arg.starts_with(':')) {
         return Ok(None);
     }
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     let index = Index::parse(&fs::read(index_path)?, format)?;
     let left = resolve_stage0_index_blob(&index, &args[0])?;
     let right = resolve_stage0_index_blob(&index, &args[1])?;
@@ -269,7 +269,7 @@ fn resolve_stage0_index_blob(index: &Index, spec: &str) -> Result<IndexBlobSpec>
     let entry = index
         .entries
         .iter()
-        .find(|entry| entry.stage() == sley_index::Stage::Normal && entry.path.as_bytes() == path)
+        .find(|entry| entry.stage() == sley::plumbing::sley_index::Stage::Normal && entry.path.as_bytes() == path)
         .ok_or_else(|| {
             GitError::Command(format!(
                 "path '{}' is not in the index",
@@ -337,8 +337,8 @@ fn diff_usage_error<T>() -> Result<T> {
 /// (read from the real worktree's `.gitattributes`) overrides it the way git's
 /// `whitespace_rule` does.
 pub(crate) struct WhitespaceRuleResolver {
-    config_rule: sley_diff_merge::ws::WsRule,
-    matcher: Option<sley_worktree::StandardAttributeMatcher>,
+    config_rule: sley::plumbing::sley_diff_merge::ws::WsRule,
+    matcher: Option<sley::plumbing::sley_worktree::StandardAttributeMatcher>,
 }
 
 impl WhitespaceRuleResolver {
@@ -360,14 +360,14 @@ impl WhitespaceRuleResolver {
         let config_rule = match config
             .and_then(|config| config.get("core", None, "whitespace").map(str::to_owned))
         {
-            Some(value) => match sley_diff_merge::ws::parse_whitespace_rule(&value) {
+            Some(value) => match sley::plumbing::sley_diff_merge::ws::parse_whitespace_rule(&value) {
                 Some(rule) => rule,
                 None => return Err(whitespace_conflict_error()),
             },
-            None => sley_diff_merge::ws::WS_DEFAULT_RULE,
+            None => sley::plumbing::sley_diff_merge::ws::WS_DEFAULT_RULE,
         };
         let matcher = worktree_root_for_git_dir(git_dir).ok().and_then(|root| {
-            sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok()
+            sley::plumbing::sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok()
         });
         Ok(Self {
             config_rule,
@@ -377,8 +377,8 @@ impl WhitespaceRuleResolver {
 
     /// Resolve the effective rule for `path`. A conflicting attribute *value*
     /// is fatal (git `die`s), like a conflicting `core.whitespace`.
-    pub(crate) fn rule_for_path(&self, path: &[u8]) -> Result<sley_diff_merge::ws::WsRule> {
-        use sley_diff_merge::ws::{WsAttr, resolve_whitespace_rule};
+    pub(crate) fn rule_for_path(&self, path: &[u8]) -> Result<sley::plumbing::sley_diff_merge::ws::WsRule> {
+        use sley::plumbing::sley_diff_merge::ws::{WsAttr, resolve_whitespace_rule};
         let Some(matcher) = &self.matcher else {
             return Ok(self.config_rule);
         };
@@ -386,9 +386,9 @@ impl WhitespaceRuleResolver {
         let checks = matcher.attributes_for_path(path, &requested, false);
         let value_storage;
         let attr = match checks.first().and_then(|check| check.state.as_ref()) {
-            Some(sley_worktree::AttributeState::Set) => WsAttr::True,
-            Some(sley_worktree::AttributeState::Unset) => WsAttr::False,
-            Some(sley_worktree::AttributeState::Value(value)) => {
+            Some(sley::plumbing::sley_worktree::AttributeState::Set) => WsAttr::True,
+            Some(sley::plumbing::sley_worktree::AttributeState::Unset) => WsAttr::False,
+            Some(sley::plumbing::sley_worktree::AttributeState::Value(value)) => {
                 value_storage = String::from_utf8_lossy(value).into_owned();
                 WsAttr::Value(&value_storage)
             }
@@ -410,7 +410,7 @@ fn whitespace_conflict_error() -> GitError {
 /// mirroring git's `checkdiff`. Returns `true` if any whitespace error (or
 /// leftover conflict marker) was found.
 pub(crate) fn run_diff_check(
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_old: bool,
@@ -440,7 +440,7 @@ pub(crate) fn run_diff_check(
         // exercise a symlink incomplete-line case in t4015.
         let mut rule = resolver.rule_for_path(&entry.path)?;
         if entry.new_mode == Some(0o120000) {
-            rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
+            rule &= !sley::plumbing::sley_diff_merge::ws::WS_INCOMPLETE_LINE;
         }
         if check_one_diff(&mut stdout, &old_content, &new_content, &path, rule)? {
             status = true;
@@ -450,7 +450,7 @@ pub(crate) fn run_diff_check(
 }
 
 fn diff_entry_old_content_for_diff(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_old: bool,
@@ -502,12 +502,12 @@ fn check_one_diff(
     old_content: &[u8],
     new_content: &[u8],
     path: &str,
-    rule: sley_diff_merge::ws::WsRule,
+    rule: sley::plumbing::sley_diff_merge::ws::WsRule,
 ) -> Result<bool> {
-    use sley_diff_merge::ws;
-    let old = sley_diff_merge::split_lines(old_content);
-    let new = sley_diff_merge::split_lines(new_content);
-    let ops = sley_diff_merge::myers_diff_lines(&old, &new);
+    use sley::plumbing::sley_diff_merge::ws;
+    let old = sley::plumbing::sley_diff_merge::split_lines(old_content);
+    let new = sley::plumbing::sley_diff_merge::split_lines(new_content);
+    let ops = sley::plumbing::sley_diff_merge::myers_diff_lines(&old, &new);
 
     let mut status = false;
     let mut new_lineno = 0usize; // 1-based number of the current new-side line
@@ -515,17 +515,17 @@ fn check_one_diff(
     let mut last_kind = b' ';
     for op in ops {
         match op {
-            sley_diff_merge::DiffOp::Equal(n) => {
+            sley::plumbing::sley_diff_merge::DiffOp::Equal(n) => {
                 for _ in 0..n {
                     new_lineno += 1;
                     new_idx += 1;
                     last_kind = b' ';
                 }
             }
-            sley_diff_merge::DiffOp::Delete(_) => {
+            sley::plumbing::sley_diff_merge::DiffOp::Delete(_) => {
                 // Removed lines don't advance the new-side counter.
             }
-            sley_diff_merge::DiffOp::Insert(n) => {
+            sley::plumbing::sley_diff_merge::DiffOp::Insert(n) => {
                 for _ in 0..n {
                     new_lineno += 1;
                     let line = new[new_idx].content;
@@ -585,7 +585,7 @@ fn global_external_diff_command(config: Option<&GitConfig>) -> Option<ExternalDi
     {
         let trust_exit_code = env::var("GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE")
             .ok()
-            .and_then(|value| sley_config::parse_config_bool(&value))
+            .and_then(|value| sley::plumbing::sley_config::parse_config_bool(&value))
             .unwrap_or(false);
         return Some(ExternalDiffCommand {
             command,
@@ -604,7 +604,7 @@ fn global_external_diff_command(config: Option<&GitConfig>) -> Option<ExternalDi
 }
 
 fn run_external_diff_entries(
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
@@ -668,7 +668,7 @@ fn run_external_diff_entries(
 }
 
 fn external_diff_for_entry(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     userdiff: &commands::userdiff::UserdiffResolver,
     global: Option<&ExternalDiffCommand>,
 ) -> Result<Option<ExternalDiffCommand>> {
@@ -694,7 +694,7 @@ struct ExternalDiffProcessContext<'a> {
 }
 
 fn run_one_external_diff(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     command: &ExternalDiffCommand,
     counter: usize,
     total: usize,
@@ -780,7 +780,7 @@ impl Drop for ExternalDiffFile {
 }
 
 fn prepare_external_diff_file(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
@@ -834,7 +834,7 @@ fn prepare_external_diff_file(
 }
 
 fn external_temp_should_crlf(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     new_side: bool,
     content: &[u8],
 ) -> bool {
@@ -977,7 +977,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         ));
     }
     let patch_context = if diff_patch_context_control {
-        sley_diff_merge::render::enable_function_context(context.unwrap_or(3))
+        sley::plumbing::sley_diff_merge::render::enable_function_context(context.unwrap_or(3))
     } else {
         context.unwrap_or(3)
     };
@@ -1083,10 +1083,10 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .and_then(|config| config.get("diff", None, "colormovedws").map(str::to_owned))
         {
             Some(value) => commands::diff_options::parse_color_moved_ws(&value)?,
-            None => sley_diff_merge::render::ColorMovedWs::default(),
+            None => sley::plumbing::sley_diff_merge::render::ColorMovedWs::default(),
         },
     };
-    let color_moved = color_moved_mode.map(|mode| sley_diff_merge::render::ColorMoved {
+    let color_moved = color_moved_mode.map(|mode| sley::plumbing::sley_diff_merge::render::ColorMoved {
         mode,
         ws: color_moved_ws,
     });
@@ -1348,7 +1348,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
-    let name_status_options = sley_diff_merge::DiffNameStatusOptions {
+    let name_status_options = sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
         detect_renames,
         detect_copies,
         find_copies_harder,
@@ -1366,7 +1366,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     // tree and we're not diffing the index (`--cached`). A two-tree `diff A B` takes
     // its new content from tree B's blobs, never the worktree.
     let use_worktree_new = !cached && diff_trees.len() != 2;
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
+    let rename_options = sley::plumbing::sley_diff_merge::RenameDetectionOptions {
         base: name_status_options,
         detect_inexact: true,
         rename_threshold,
@@ -1379,14 +1379,14 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             [tree] => {
                 if cached {
                     if inexact_renames {
-                        sley_diff_merge::diff_name_status_tree_index_with_rename_options(
+                        sley::plumbing::sley_diff_merge::diff_name_status_tree_index_with_rename_options(
                             &git_dir,
                             format,
                             tree,
                             rename_options,
                         )?
                     } else {
-                        sley_diff_merge::diff_name_status_tree_index_with_options(
+                        sley::plumbing::sley_diff_merge::diff_name_status_tree_index_with_options(
                             &git_dir,
                             format,
                             tree,
@@ -1398,7 +1398,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         .as_ref()
                         .expect("worktree root set for diff <rev>");
                     if inexact_renames {
-                        sley_diff_merge::diff_name_status_tree_worktree_with_rename_options(
+                        sley::plumbing::sley_diff_merge::diff_name_status_tree_worktree_with_rename_options(
                             worktree_root,
                             &git_dir,
                             format,
@@ -1406,7 +1406,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                             rename_options,
                         )?
                     } else {
-                        sley_diff_merge::diff_name_status_tree_worktree_with_options(
+                        sley::plumbing::sley_diff_merge::diff_name_status_tree_worktree_with_options(
                             worktree_root,
                             &git_dir,
                             format,
@@ -1419,7 +1419,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             // `diff <rev> <rev>` / `<rev>..<rev>` / `<rev>...<rev>`: tree vs tree.
             [left, right] => {
                 if inexact_renames {
-                    sley_diff_merge::diff_name_status_trees_with_rename_options(
+                    sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
                         &db,
                         format,
                         left,
@@ -1427,7 +1427,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         rename_options,
                     )?
                 } else {
-                    sley_diff_merge::diff_name_status_trees_with_options(
+                    sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
                         &db,
                         format,
                         left,
@@ -1444,13 +1444,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
     } else if cached {
         if inexact_renames {
-            sley_diff_merge::diff_name_status_head_index_with_rename_options(
+            sley::plumbing::sley_diff_merge::diff_name_status_head_index_with_rename_options(
                 &git_dir,
                 format,
                 rename_options,
             )?
         } else {
-            sley_diff_merge::diff_name_status_head_index_with_options(
+            sley::plumbing::sley_diff_merge::diff_name_status_head_index_with_options(
                 &git_dir,
                 format,
                 name_status_options,
@@ -1461,14 +1461,14 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .as_ref()
             .expect("worktree root set for diff HEAD");
         if inexact_renames {
-            sley_diff_merge::diff_name_status_head_worktree_with_rename_options(
+            sley::plumbing::sley_diff_merge::diff_name_status_head_worktree_with_rename_options(
                 worktree_root,
                 &git_dir,
                 format,
                 rename_options,
             )?
         } else {
-            sley_diff_merge::diff_name_status_head_worktree_with_options(
+            sley::plumbing::sley_diff_merge::diff_name_status_head_worktree_with_options(
                 worktree_root,
                 &git_dir,
                 format,
@@ -1478,14 +1478,14 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     } else {
         let worktree_root = worktree_root.as_ref().expect("worktree root set for diff");
         let diff = if inexact_renames {
-            sley_diff_merge::diff_name_status_index_worktree_with_rename_options_and_gitlinks(
+            sley::plumbing::sley_diff_merge::diff_name_status_index_worktree_with_rename_options_and_gitlinks(
                 worktree_root,
                 &git_dir,
                 format,
                 rename_options,
             )?
         } else {
-            sley_diff_merge::diff_name_status_index_worktree_with_options_and_gitlinks(
+            sley::plumbing::sley_diff_merge::diff_name_status_index_worktree_with_options_and_gitlinks(
                 worktree_root,
                 &git_dir,
                 format,
@@ -1634,7 +1634,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     if allow_external && show_patch_for_external && !no_patch {
         let userdiff_attributes = worktree_root_for_git_dir(&git_dir)
             .ok()
-            .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+            .map(sley::plumbing::sley_worktree::StandardAttributeMatcher::from_worktree_root)
             .transpose()?;
         let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
             userdiff_attributes,
@@ -1708,7 +1708,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 && !zero_all_worktree_oids
                 && entries.iter().any(|entry| entry.new_oid.is_some());
             let index_oids: HashMap<Vec<u8>, ObjectId> = if needs_index_oids {
-                let index_path = sley_worktree::repository_index_path(&git_dir);
+                let index_path = sley::plumbing::sley_worktree::repository_index_path(&git_dir);
                 match fs::read(&index_path) {
                     Ok(bytes) => Index::parse(&bytes, format)?
                         .entries
@@ -1806,7 +1806,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             // `--cached`.
             let userdiff_attributes = worktree_root_for_git_dir(&git_dir)
                 .ok()
-                .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+                .map(sley::plumbing::sley_worktree::StandardAttributeMatcher::from_worktree_root)
                 .transpose()?;
             let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
                 userdiff_attributes,
@@ -1841,7 +1841,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         } else {
                             resolver.rule_for_path(&entry.path)?
                         };
-                        Some(sley_diff_merge::render::WsErrorHighlight {
+                        Some(sley::plumbing::sley_diff_merge::render::WsErrorHighlight {
                             rule,
                             old: kinds.old,
                             new: kinds.new,
@@ -1957,8 +1957,8 @@ struct CombinedDiffOptions<'a> {
     src_prefix: &'a str,
     dst_prefix: &'a str,
     context: usize,
-    ws_ignore: sley_diff_merge::WsIgnore,
-    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore,
+    diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm,
     line_prefix: Option<&'a str>,
 }
 
@@ -2061,7 +2061,7 @@ fn diff_unmerged_worktree_combined_paths(
     let Some(worktree_root) = worktree_root else {
         return Ok(BTreeMap::new());
     };
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     if !index_path.exists() {
         return Ok(BTreeMap::new());
     }
@@ -2072,8 +2072,8 @@ fn diff_unmerged_worktree_combined_paths(
             .entry(entry.path.as_bytes().to_vec())
             .or_insert((None, None));
         match entry.stage() {
-            sley_index::Stage::Ours => slot.0 = Some(entry.oid),
-            sley_index::Stage::Theirs => slot.1 = Some(entry.oid),
+            sley::plumbing::sley_index::Stage::Ours => slot.0 = Some(entry.oid),
+            sley::plumbing::sley_index::Stage::Theirs => slot.1 = Some(entry.oid),
             _ => {}
         }
     }
@@ -2229,13 +2229,13 @@ fn parse_ws_error_highlight_kinds(value: Option<&str>) -> Option<WsErrorHighligh
 }
 
 fn apply_diff_pickaxe(
-    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     needle: &[u8],
     pickaxe_all: bool,
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+) -> Result<Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>> {
     if needle.is_empty() {
         return Ok(Vec::new());
     }
@@ -2258,7 +2258,7 @@ fn apply_diff_pickaxe(
 }
 
 fn diff_entry_matches_pickaxe(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     needle: &[u8],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
@@ -2296,9 +2296,9 @@ fn resolve_diff_find_object(git_dir: &Path, format: ObjectFormat, value: &str) -
 }
 
 fn apply_diff_find_objects(
-    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     targets: &[ObjectId],
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+) -> Vec<sley::plumbing::sley_diff_merge::NameStatusEntry> {
     if targets.is_empty() {
         return entries;
     }
@@ -2332,8 +2332,8 @@ fn count_non_overlapping_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
 }
 
 fn sort_diff_entries_by_path(
-    mut entries: Vec<sley_diff_merge::NameStatusEntry>,
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+    mut entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
+) -> Vec<sley::plumbing::sley_diff_merge::NameStatusEntry> {
     entries.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
@@ -2381,25 +2381,25 @@ fn diff_relative_prefix_arg(prefix: &str) -> String {
 }
 
 fn apply_diff_relative(
-    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     prefix: &[u8],
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+) -> Vec<sley::plumbing::sley_diff_merge::NameStatusEntry> {
     let mut filtered = Vec::new();
     for entry in entries {
         if let Some(old_path) = &entry.old_path {
             let old_display = diff_relative_display_path(old_path, prefix);
             let new_display = diff_relative_display_path(&entry.path, prefix);
-            if matches!(entry.status, sley_diff_merge::NameStatus::Copied(_)) {
+            if matches!(entry.status, sley::plumbing::sley_diff_merge::NameStatus::Copied(_)) {
                 match (old_display, new_display) {
                     (Some(old_path), Some(path)) => {
-                        filtered.push(sley_diff_merge::NameStatusEntry {
+                        filtered.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
                             path: BString::from(path),
                             old_path: Some(BString::from(old_path)),
                             ..entry
                         })
                     }
-                    (None, Some(path)) => filtered.push(sley_diff_merge::NameStatusEntry {
-                        status: sley_diff_merge::NameStatus::Added,
+                    (None, Some(path)) => filtered.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
+                        status: sley::plumbing::sley_diff_merge::NameStatus::Added,
                         path: BString::from(path),
                         old_path: None,
                         old_mode: None,
@@ -2412,14 +2412,14 @@ fn apply_diff_relative(
             } else {
                 match (old_display, new_display) {
                     (Some(old_path), Some(path)) => {
-                        filtered.push(sley_diff_merge::NameStatusEntry {
+                        filtered.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
                             path: BString::from(path),
                             old_path: Some(BString::from(old_path)),
                             ..entry
                         });
                     }
-                    (Some(path), None) => filtered.push(sley_diff_merge::NameStatusEntry {
-                        status: sley_diff_merge::NameStatus::Deleted,
+                    (Some(path), None) => filtered.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
+                        status: sley::plumbing::sley_diff_merge::NameStatus::Deleted,
                         path: BString::from(path),
                         old_path: None,
                         old_mode: entry.old_mode,
@@ -2427,8 +2427,8 @@ fn apply_diff_relative(
                         old_oid: entry.old_oid,
                         new_oid: None,
                     }),
-                    (None, Some(path)) => filtered.push(sley_diff_merge::NameStatusEntry {
-                        status: sley_diff_merge::NameStatus::Added,
+                    (None, Some(path)) => filtered.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
+                        status: sley::plumbing::sley_diff_merge::NameStatus::Added,
                         path: BString::from(path),
                         old_path: None,
                         old_mode: None,
@@ -2440,7 +2440,7 @@ fn apply_diff_relative(
                 }
             }
         } else if let Some(path) = diff_relative_display_path(&entry.path, prefix) {
-            filtered.push(sley_diff_merge::NameStatusEntry {
+            filtered.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
                 path: BString::from(path),
                 ..entry
             });
@@ -2456,10 +2456,10 @@ fn apply_diff_relative(
 }
 
 struct DiffStatIgnoreOptions<'a> {
-    ws_ignore: sley_diff_merge::WsIgnore,
+    ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore,
     ignore_blank_lines: bool,
     ignore_regexes: &'a [grep_source::Regex],
-    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm,
     indent_heuristic: bool,
 }
 
@@ -2478,7 +2478,7 @@ fn diff_relative_display_path(path: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn collect_diff_stat_entries_with_ignore<'a>(
-    entries: &'a [sley_diff_merge::NameStatusEntry],
+    entries: &'a [sley::plumbing::sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
@@ -2511,10 +2511,10 @@ fn collect_diff_stat_entries_with_ignore<'a>(
 fn diff_line_stats_from_ignored_hunks(
     old_content: Option<&[u8]>,
     new_content: Option<&[u8]>,
-    ws_ignore: sley_diff_merge::WsIgnore,
+    ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore,
     ignore_blank_lines: bool,
     ignore_regexes: &[grep_source::Regex],
-    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm,
     indent_heuristic: bool,
 ) -> DiffLineStats {
     let regex_match = (!ignore_regexes.is_empty()).then_some(move |line: &[u8]| {
@@ -2523,12 +2523,12 @@ fn diff_line_stats_from_ignored_hunks(
             .any(|re| re.is_match_with_case(line, false))
     });
     let change_ignore = (ignore_blank_lines || !ignore_regexes.is_empty()).then(|| {
-        sley_diff_merge::render::ChangeIgnore {
+        sley::plumbing::sley_diff_merge::render::ChangeIgnore {
             ignore_blank_lines,
             regex_match: regex_match.as_ref().map(|f| f as &dyn Fn(&[u8]) -> bool),
         }
     });
-    let mut render_options = sley_diff_merge::render::HunkRenderOptions {
+    let mut render_options = sley::plumbing::sley_diff_merge::render::HunkRenderOptions {
         context: 0,
         interhunk: 0,
         ws_ignore,
@@ -2538,7 +2538,7 @@ fn diff_line_stats_from_ignored_hunks(
         ..Default::default()
     };
     let mut hunks = Vec::new();
-    sley_diff_merge::render::render_hunks(
+    sley::plumbing::sley_diff_merge::render::render_hunks(
         &mut hunks,
         old_content,
         new_content,
@@ -2560,8 +2560,8 @@ fn diff_line_stats_from_ignored_hunks(
 struct DiffNoIndexParams<'a> {
     context: usize,
     color: bool,
-    color_moved_cli: Option<Option<sley_diff_merge::render::ColorMovedMode>>,
-    color_moved_ws_cli: Option<sley_diff_merge::render::ColorMovedWs>,
+    color_moved_cli: Option<Option<sley::plumbing::sley_diff_merge::render::ColorMovedMode>>,
+    color_moved_ws_cli: Option<sley::plumbing::sley_diff_merge::render::ColorMovedWs>,
     output_format: commands::diff_options::DiffOutputFormat,
     raw_abbrev: Option<Option<usize>>,
     z: bool,
@@ -2571,8 +2571,8 @@ struct DiffNoIndexParams<'a> {
     dst_prefix: &'a str,
     quiet: bool,
     interhunk: usize,
-    ws_ignore: sley_diff_merge::WsIgnore,
-    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore,
+    diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm,
     ignore_blank_lines: bool,
     ignore_regexes: &'a [crate::grep_source::Regex],
     indent_heuristic: bool,
@@ -2585,7 +2585,7 @@ struct NoIndexSide {
 }
 
 struct NoIndexEntry {
-    entry: sley_diff_merge::NameStatusEntry,
+    entry: sley::plumbing::sley_diff_merge::NameStatusEntry,
     old_content: Option<Vec<u8>>,
     new_content: Option<Vec<u8>>,
 }
@@ -2635,10 +2635,10 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             .and_then(|config| config.get("diff", None, "colormovedws").map(str::to_owned))
         {
             Some(value) => commands::diff_options::parse_color_moved_ws(&value)?,
-            None => sley_diff_merge::render::ColorMovedWs::default(),
+            None => sley::plumbing::sley_diff_merge::render::ColorMovedWs::default(),
         },
     };
-    let color_moved = color_moved_mode.map(|mode| sley_diff_merge::render::ColorMoved {
+    let color_moved = color_moved_mode.map(|mode| sley::plumbing::sley_diff_merge::render::ColorMoved {
         mode,
         ws: color_moved_ws,
     });
@@ -2715,7 +2715,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             return Err(GitError::Exit(1));
         }
         let userdiff_attributes = worktree_root
-            .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+            .map(sley::plumbing::sley_worktree::StandardAttributeMatcher::from_worktree_root)
             .transpose()?;
         let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
             userdiff_attributes,
@@ -2746,9 +2746,9 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                     let rule = config
                         .as_ref()
                         .and_then(|cfg| cfg.get("core", None, "whitespace"))
-                        .and_then(sley_diff_merge::ws::parse_whitespace_rule)
-                        .unwrap_or(sley_diff_merge::ws::WS_DEFAULT_RULE);
-                    sley_diff_merge::render::WsErrorHighlight {
+                        .and_then(sley::plumbing::sley_diff_merge::ws::parse_whitespace_rule)
+                        .unwrap_or(sley::plumbing::sley_diff_merge::ws::WS_DEFAULT_RULE);
+                    sley::plumbing::sley_diff_merge::render::WsErrorHighlight {
                         rule,
                         old: false,
                         new: true,
@@ -2880,16 +2880,16 @@ fn no_index_access_error(spec: &str) -> GitError {
 
 fn no_index_entry_from_sides(old: Option<&NoIndexSide>, new: Option<&NoIndexSide>) -> NoIndexEntry {
     let status = match (old, new) {
-        (None, Some(_)) => sley_diff_merge::NameStatus::Added,
-        (Some(_), None) => sley_diff_merge::NameStatus::Deleted,
-        _ => sley_diff_merge::NameStatus::Modified,
+        (None, Some(_)) => sley::plumbing::sley_diff_merge::NameStatus::Added,
+        (Some(_), None) => sley::plumbing::sley_diff_merge::NameStatus::Deleted,
+        _ => sley::plumbing::sley_diff_merge::NameStatus::Modified,
     };
     let path = new
         .or(old)
         .map(|side| side.path.clone())
         .unwrap_or_default();
     NoIndexEntry {
-        entry: sley_diff_merge::NameStatusEntry {
+        entry: sley::plumbing::sley_diff_merge::NameStatusEntry {
             status,
             path: BString::from(path),
             old_path: match (old, new) {

@@ -1096,18 +1096,33 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 name = "sley"
 version = "0.1.0"
 dependencies = [
+ "sley-archive",
  "sley-config",
  "sley-core",
+ "sley-diff-format",
  "sley-diff-merge",
+ "sley-fetch",
  "sley-formats",
+ "sley-fsck",
+ "sley-grep",
  "sley-index",
  "sley-notes",
  "sley-object",
  "sley-odb",
+ "sley-options",
+ "sley-pack",
+ "sley-pathspec",
+ "sley-pretty",
+ "sley-protocol",
+ "sley-ref-filter",
  "sley-refs",
  "sley-remote",
  "sley-rev",
  "sley-sequencer",
+ "sley-strbuf-expand",
+ "sley-submodule",
+ "sley-transport",
+ "sley-unpack-trees",
  "sley-worktree",
 ]
 
@@ -1131,7 +1146,6 @@ name = "sley-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "sley-cli",
  "sley-core",
  "sley-formats",
  "sley-object",
@@ -1148,32 +1162,8 @@ version = "0.1.0"
 dependencies = [
  "encoding_rs",
  "filetime",
- "sley-archive",
- "sley-config",
- "sley-core",
- "sley-diff-merge",
- "sley-fetch",
- "sley-formats",
- "sley-fsck",
- "sley-index",
- "sley-notes",
- "sley-object",
- "sley-odb",
- "sley-options",
- "sley-pack",
- "sley-pathspec",
- "sley-protocol",
- "sley-ref-filter",
- "sley-refs",
- "sley-remote",
- "sley-rev",
- "sley-sequencer",
- "sley-strbuf-expand",
- "sley-submodule",
+ "sley",
  "sley-testkit",
- "sley-transport",
- "sley-unpack-trees",
- "sley-worktree",
 ]
 
 [[package]]
@@ -1189,6 +1179,10 @@ version = "0.1.0"
 dependencies = [
  "sha1",
 ]
+
+[[package]]
+name = "sley-diff-format"
+version = "0.1.0"
 
 [[package]]
 name = "sley-diff-merge"
@@ -1237,6 +1231,10 @@ dependencies = [
  "sley-odb",
  "sley-submodule",
 ]
+
+[[package]]
+name = "sley-grep"
+version = "0.1.0"
 
 [[package]]
 name = "sley-index"
@@ -1304,6 +1302,10 @@ version = "0.1.0"
 dependencies = [
  "sley-core",
 ]
+
+[[package]]
+name = "sley-pretty"
+version = "0.1.0"
 
 [[package]]
 name = "sley-protocol"

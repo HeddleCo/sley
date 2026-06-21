@@ -1,12 +1,11 @@
 //! `git` — the ergonomic facade over the sley engine.
 //!
-//! Downstream code that wants a "just open a repository and read things" entry
-//! point should reach for [`Repository`] rather than wiring the plumbing crates
-//! together by hand. A [`Repository`] is a lightweight handle around a resolved
-//! git directory: it remembers the `git_dir`, the common directory (for linked
-//! worktrees), and the repository's object format, and hands back the
-//! underlying plumbing objects ([`sley_odb::FileObjectDatabase`],
-//! [`sley_refs::FileRefStore`], [`sley_config::GitConfig`]) on demand.
+//! Downstream code that wants a command/session handle should reach for
+//! [`RepositoryContext`] rather than wiring the plumbing crates together by
+//! hand. [`Repository`] remains repository-intrinsic: it remembers the
+//! `git_dir`, the common directory (for linked worktrees), and the repository's
+//! object format. [`RepositoryContext`] adds cwd, setup policy, effective config,
+//! refs, objects, and revision setup for streaming command engines.
 //!
 //! **Heddle / embedder surface** (feature `remote`, on by default):
 //!
@@ -27,13 +26,14 @@
 //! `git = { path = ... }` dependency is enough to reach the whole stack.
 //!
 //! ```no_run
-//! use sley::Repository;
+//! use sley::{RepositoryContext, RepositorySetup};
 //!
 //! # fn main() -> sley::Result<()> {
-//! let repo = Repository::discover(".")?;
-//! let head = repo.head()?;
+//! let setup = RepositorySetup::new(".");
+//! let ctx = RepositoryContext::discover(&setup)?;
+//! let head = ctx.repository().head()?;
 //! if let Some(oid) = head.oid {
-//!     let commit = repo.read_commit(&oid)?;
+//!     let commit = ctx.repository().read_commit(&oid)?;
 //!     let _ = commit.tree;
 //! }
 //! # Ok(())
@@ -53,6 +53,7 @@ mod status_plan;
 #[cfg(feature = "remote")]
 pub mod remote;
 
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -72,19 +73,34 @@ pub mod notes {
 /// from these, and they remain available for the operations the facade does not
 /// (yet) wrap.
 pub mod plumbing {
+    pub use sley_archive;
     pub use sley_config;
     pub use sley_core;
+    pub use sley_diff_format;
     pub use sley_diff_merge;
+    pub use sley_fetch;
     pub use sley_formats;
+    pub use sley_fsck;
+    pub use sley_grep;
     pub use sley_index;
     pub use sley_notes;
     pub use sley_object;
     pub use sley_odb;
+    pub use sley_options;
+    pub use sley_pack;
+    pub use sley_pathspec;
+    pub use sley_pretty;
+    pub use sley_protocol;
+    pub use sley_ref_filter;
     pub use sley_refs;
     #[cfg(feature = "remote")]
     pub use sley_remote;
     pub use sley_rev;
     pub use sley_sequencer;
+    pub use sley_strbuf_expand;
+    pub use sley_submodule;
+    pub use sley_transport;
+    pub use sley_unpack_trees;
     pub use sley_worktree;
 }
 
@@ -93,17 +109,22 @@ pub mod plumbing {
 pub use sley_config::GitConfig;
 pub use sley_core::{
     BString, FullName, GitError, GitTime, MissingObjectContext, MissingObjectKind, NotFoundKind,
-    ObjectFormat, ObjectId, Result, Signature,
+    ObjectFormat, ObjectId, RecordReader, Result, Signature,
 };
+pub use sley_diff_format as diff_format;
 pub use sley_diff_merge::{DiffNameStatusOptions, NameStatusEntry};
+pub use sley_grep as grep;
 pub use sley_index::{Index, IndexEntry, Stage as IndexStage};
 pub use sley_object::{
     Commit as CommitObject, ObjectType as GitObjectType, Tag as TagObject, Tree as TreeObject,
 };
 pub use sley_object::{EntryKind, TreeBuilder as TreeEditor};
-pub use sley_odb::FileObjectDatabase as ObjectDatabase;
+pub use sley_odb::{FileObjectDatabase as ObjectDatabase, ObjectHeader};
+pub use sley_pretty as pretty;
 pub use sley_refs::{
     FileRefStore as RefStore, RefDeleteError, RefPrecondition, RefTarget as ReferenceTarget,
+    UpdateRefStdinCommand, UpdateRefStdinOid, UpdateRefStdinOption, UpdateRefStdinParseError,
+    UpdateRefStdinSymrefOld, UpdateRefStdinTerminator, UpdateRefStdinVerb,
 };
 pub use sley_sequencer::TagCreate;
 pub use sley_worktree::{
@@ -126,6 +147,280 @@ pub use refs::{
     RefUpdateOptions, ReflogMessage,
 };
 pub use status_plan::{StatusCacheKey, StatusPlan, StatusPlanBuilder};
+
+/// Borrowed stdio for command-like engine calls.
+///
+/// Public command engines should accept this shape instead of reaching for
+/// process global stdin/stdout/stderr. Callers can pass real stdio, pipes,
+/// in-memory buffers, or network-backed streams without extra allocation.
+pub struct CommandIo<'a> {
+    pub stdin: &'a mut dyn BufRead,
+    pub stdout: &'a mut dyn Write,
+    pub stderr: &'a mut dyn Write,
+}
+
+impl<'a> CommandIo<'a> {
+    pub fn new(
+        stdin: &'a mut dyn BufRead,
+        stdout: &'a mut dyn Write,
+        stderr: &'a mut dyn Write,
+    ) -> Self {
+        Self {
+            stdin,
+            stdout,
+            stderr,
+        }
+    }
+}
+
+/// Worktree policy for a [`RepositoryContext`] session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorktreePolicy {
+    /// Accept bare and non-bare repositories.
+    #[default]
+    Any,
+    /// Require a working tree to be available.
+    RequireWorktree,
+    /// Require a bare repository.
+    RequireBare,
+}
+
+/// Setup options for [`RepositoryContext`].
+///
+/// This is intentionally owned: parse CLI flags or application settings once,
+/// then pass the resulting value by reference to create a reusable repository
+/// session. Pathspec defaults and config overlays will grow here as additional
+/// command engines move out of the binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositorySetup {
+    cwd: PathBuf,
+    git_dir: Option<PathBuf>,
+    work_tree: Option<PathBuf>,
+    replace_objects: bool,
+    worktree_policy: WorktreePolicy,
+}
+
+impl RepositorySetup {
+    pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            git_dir: None,
+            work_tree: None,
+            replace_objects: true,
+            worktree_policy: WorktreePolicy::Any,
+        }
+    }
+
+    pub fn current_dir() -> Result<Self> {
+        Ok(Self::new(std::env::current_dir()?))
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub fn git_dir(&self) -> Option<&Path> {
+        self.git_dir.as_deref()
+    }
+
+    pub fn work_tree(&self) -> Option<&Path> {
+        self.work_tree.as_deref()
+    }
+
+    pub fn replace_objects(&self) -> bool {
+        self.replace_objects
+    }
+
+    pub fn worktree_policy(&self) -> WorktreePolicy {
+        self.worktree_policy
+    }
+
+    #[must_use]
+    pub fn with_git_dir(mut self, git_dir: impl Into<PathBuf>) -> Self {
+        self.git_dir = Some(git_dir.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_work_tree(mut self, work_tree: impl Into<PathBuf>) -> Self {
+        self.work_tree = Some(work_tree.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_replace_objects(mut self, replace_objects: bool) -> Self {
+        self.replace_objects = replace_objects;
+        self
+    }
+
+    #[must_use]
+    pub fn with_worktree_policy(mut self, policy: WorktreePolicy) -> Self {
+        self.worktree_policy = policy;
+        self
+    }
+}
+
+/// Command/session handle over a discovered repository.
+///
+/// [`Repository`] remains repository-intrinsic: git dir, common dir, object
+/// format, and object database. `RepositoryContext` adds command/session state:
+/// cwd, setup policy, an effective config snapshot, refs, and a shared object
+/// database handle that can be borrowed by streaming engines.
+#[derive(Debug, Clone)]
+pub struct RepositoryContext {
+    repo: Repository,
+    cwd: PathBuf,
+    work_tree: Option<PathBuf>,
+    replace_objects: bool,
+    config: GitConfig,
+    objects: Arc<FileObjectDatabase>,
+    refs: FileRefStore,
+}
+
+impl RepositoryContext {
+    pub fn discover_current() -> Result<Self> {
+        Self::discover(&RepositorySetup::current_dir()?)
+    }
+
+    pub fn discover(setup: &RepositorySetup) -> Result<Self> {
+        let repo = match setup.git_dir() {
+            Some(git_dir) => Repository::open(git_dir),
+            None => Repository::discover(setup.cwd()),
+        }?;
+        Self::from_repository(repo, setup)
+    }
+
+    pub fn from_repository(repo: Repository, setup: &RepositorySetup) -> Result<Self> {
+        let work_tree = setup.work_tree.clone().or_else(|| repo.workdir());
+        match setup.worktree_policy {
+            WorktreePolicy::Any => {}
+            WorktreePolicy::RequireWorktree if work_tree.is_none() => {
+                return Err(GitError::Unsupported(
+                    "operation requires a repository worktree".into(),
+                ));
+            }
+            WorktreePolicy::RequireBare if work_tree.is_some() => {
+                return Err(GitError::Unsupported(
+                    "operation requires a bare repository".into(),
+                ));
+            }
+            WorktreePolicy::RequireWorktree | WorktreePolicy::RequireBare => {}
+        }
+        let config = repo.config_snapshot()?;
+        let objects = repo.objects();
+        let refs = repo.references();
+        Ok(Self {
+            repo,
+            cwd: setup.cwd.clone(),
+            work_tree,
+            replace_objects: setup.replace_objects,
+            config,
+            objects,
+            refs,
+        })
+    }
+
+    pub fn repository(&self) -> &Repository {
+        &self.repo
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub fn git_dir(&self) -> &Path {
+        self.repo.git_dir()
+    }
+
+    pub fn common_dir(&self) -> &Path {
+        self.repo.common_dir()
+    }
+
+    pub fn object_format(&self) -> ObjectFormat {
+        self.repo.object_format()
+    }
+
+    pub fn format(&self) -> ObjectFormat {
+        self.object_format()
+    }
+
+    pub fn work_tree(&self) -> Option<&Path> {
+        self.work_tree.as_deref()
+    }
+
+    pub fn require_work_tree(&self) -> Result<&Path> {
+        self.work_tree
+            .as_deref()
+            .ok_or_else(|| GitError::Unsupported("operation requires a repository worktree".into()))
+    }
+
+    pub fn worktree_root(&self) -> Result<&Path> {
+        self.require_work_tree()
+    }
+
+    pub fn abbrev(&self) -> Result<Option<usize>> {
+        let format = self.object_format();
+        let width = match self.config.get("core", None, "abbrev") {
+            Some(value) if value.eq_ignore_ascii_case("no") => return Ok(None),
+            Some(value) if value.eq_ignore_ascii_case("auto") => self.auto_abbrev_width()?,
+            Some(value) => {
+                let width = value
+                    .parse::<usize>()
+                    .map_err(|_| GitError::Command(format!("invalid core.abbrev value {value}")))?;
+                if width < 4 {
+                    return Err(GitError::Command(format!(
+                        "core.abbrev length out of range: {width}"
+                    )));
+                }
+                width
+            }
+            None => self.auto_abbrev_width()?,
+        };
+        Ok(Some(width.min(format.hex_len())))
+    }
+
+    fn auto_abbrev_width(&self) -> Result<usize> {
+        let format = self.object_format();
+        let count = self.objects.object_ids()?.len();
+        if count == 0 {
+            return Ok(7.min(format.hex_len()));
+        }
+        let bits = usize::BITS as usize - count.saturating_sub(1).leading_zeros() as usize;
+        Ok(((bits + 1) / 2).max(7).min(format.hex_len()))
+    }
+
+    pub fn replace_objects(&self) -> bool {
+        self.replace_objects
+    }
+
+    pub fn config(&self) -> &GitConfig {
+        &self.config
+    }
+
+    pub fn objects(&self) -> &FileObjectDatabase {
+        self.objects.as_ref()
+    }
+
+    pub fn objects_arc(&self) -> Arc<FileObjectDatabase> {
+        Arc::clone(&self.objects)
+    }
+
+    pub fn refs(&self) -> &FileRefStore {
+        &self.refs
+    }
+
+    pub fn revision_resolver(&self) -> sley_rev::RevisionResolver<'_, FileObjectDatabase> {
+        sley_rev::RevisionResolver::new(self.git_dir(), self.object_format(), self.objects())
+    }
+
+    pub fn resolve_revision(&self, rev: &str) -> Result<ObjectId> {
+        self.revision_resolver().resolve(rev)
+    }
+
+    pub fn resolve_path(&self, rev: &str, path: &str) -> Result<ResolvedTreePath> {
+        self.revision_resolver().resolve_path(rev, path)
+    }
+}
 
 /// A resolved reference: its full name plus the target it points at.
 ///

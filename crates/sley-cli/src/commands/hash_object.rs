@@ -7,10 +7,10 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use sley_config::GitConfig;
-use sley_core::{GitError, ObjectFormat, Result};
-use sley_object::ObjectType;
-use sley_odb::LooseObjectStore;
+use sley::plumbing::sley_config::GitConfig;
+use sley::plumbing::sley_core::{GitError, ObjectFormat, Result};
+use sley::plumbing::sley_object::ObjectType;
+use sley::plumbing::sley_odb::LooseObjectStore;
 
 use super::args::{
     GitArgCursor, LongOption, Terminator, option_takes_no_value, switch_requires_value, usage_error,
@@ -432,7 +432,7 @@ struct HashObjectFilterContext {
     // --stdin-paths` hashes many paths in one process; without this the clean
     // filter re-walked the entire worktree and re-read every `.gitattributes`
     // per path (sley#25: ~163x slower than git for 200 paths).
-    attributes: Option<sley_worktree::WorktreeAttributes>,
+    attributes: Option<sley::plumbing::sley_worktree::WorktreeAttributes>,
 }
 
 impl HashObjectFilterContext {
@@ -452,7 +452,7 @@ impl HashObjectFilterContext {
             return Ok(None);
         };
         let attributes = cache_attributes
-            .then(|| sley_worktree::WorktreeAttributes::from_worktree_root(&worktree_root))
+            .then(|| sley::plumbing::sley_worktree::WorktreeAttributes::from_worktree_root(&worktree_root))
             .transpose()?;
         Ok(Some(Self {
             git_dir: git_dir.to_path_buf(),
@@ -465,7 +465,7 @@ impl HashObjectFilterContext {
     fn apply_clean_filter(&self, path: &[u8], content: &[u8]) -> Result<Vec<u8>> {
         match &self.attributes {
             Some(attributes) => attributes.apply_clean_filter(&self.config, path, content),
-            None => sley_worktree::apply_clean_filter(
+            None => sley::plumbing::sley_worktree::apply_clean_filter(
                 &self.worktree_root,
                 &self.git_dir,
                 &self.config,
@@ -575,7 +575,7 @@ fn print_hash_object(
     if !literally {
         super::hash_object_fsck::check_object(object_type, format, &body)?;
     }
-    let object = sley_object::EncodedObject::new(object_type, body);
+    let object = sley::plumbing::sley_object::EncodedObject::new(object_type, body);
     let oid = if let Some(store) = store {
         store.write_object(object)?
     } else {

@@ -663,7 +663,7 @@ fn fast_import_log_all_ref_updates_matches(name: &str, value: &str) -> bool {
     if value.eq_ignore_ascii_case("always") {
         return true;
     }
-    if !sley_config::parse_config_bool(value).unwrap_or(false) {
+    if !sley::plumbing::sley_config::parse_config_bool(value).unwrap_or(false) {
         return false;
     }
     name == "HEAD"

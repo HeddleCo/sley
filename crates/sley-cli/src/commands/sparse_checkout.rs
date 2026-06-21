@@ -6,7 +6,7 @@
 //! config, with the `extensions.worktreeConfig` extension enabled in the main
 //! config exactly as upstream does), maintains the `$GIT_DIR/info/sparse-checkout`
 //! pattern file, and reconciles the index + worktree through the committed sparse
-//! engine in [`sley_worktree::apply_sparse_checkout_with_mode`].
+//! engine in [`sley::plumbing::sley_worktree::apply_sparse_checkout_with_mode`].
 //!
 //! In *cone* mode (the modern default) the user supplies directory names and the
 //! pattern file is generated as the restricted cone grammar Git emits (a `/*`
@@ -21,7 +21,7 @@
 use crate::*;
 
 use crate::commands::ref_command_stream::unquote_c_style;
-use sley_worktree::{
+use sley::plumbing::sley_worktree::{
     SparseCheckout, SparseCheckoutMode, apply_sparse_checkout_with_mode, path_in_sparse_checkout,
 };
 
@@ -548,7 +548,7 @@ fn clean_require_force(ctx: &SparseContext) -> Result<bool> {
 /// hence the directories `clean` removes.
 fn sparse_directories(ctx: &SparseContext, patterns: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
     use std::collections::BTreeMap;
-    let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(&ctx.git_dir);
     if !index_path.exists() {
         return Ok(Vec::new());
     }
@@ -779,7 +779,7 @@ fn sanitize_set_paths(
 /// `sanitize_set_paths` to detect a directory argument that is actually a file.
 fn tracked_file_paths(ctx: &SparseContext) -> Result<std::collections::HashSet<Vec<u8>>> {
     use std::collections::HashSet;
-    let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(&ctx.git_dir);
     let mut set = HashSet::new();
     if !index_path.exists() {
         return Ok(set);
@@ -1217,7 +1217,7 @@ fn sparse_context_no_worktree() -> Result<SparseContext> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
-    let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?
+    let worktree_root = sley::plumbing::sley_worktree::worktree_root_for_git_dir(&git_dir)?
         .unwrap_or_else(|| git_dir.parent().unwrap_or(&git_dir).to_path_buf());
     Ok(SparseContext {
         git_dir,

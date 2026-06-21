@@ -92,10 +92,10 @@ pub(crate) fn cmd_merge_base(args: &[String]) -> Result<()> {
     if fork_point {
         let commit = if let Some(commit) = revs.get(1) {
             let oid = resolve_revision(&git_dir, format, commit)?;
-            sley_rev::peel_to_commit(&db, format, &oid)?
+            sley::plumbing::sley_rev::peel_to_commit(&db, format, &oid)?
         } else {
             let oid = resolve_revision(&git_dir, format, "HEAD")?;
-            sley_rev::peel_to_commit(&db, format, &oid)?
+            sley::plumbing::sley_rev::peel_to_commit(&db, format, &oid)?
         };
         if let Some(base) = merge_base_fork_point(&git_dir, format, &db, revs[0], &commit)? {
             println!("{base}");
@@ -106,12 +106,12 @@ pub(crate) fn cmd_merge_base(args: &[String]) -> Result<()> {
     let mut commits = Vec::with_capacity(revs.len());
     for rev in &revs {
         let oid = resolve_revision(&git_dir, format, rev)?;
-        commits.push(sley_rev::peel_to_commit(&db, format, &oid)?);
+        commits.push(sley::plumbing::sley_rev::peel_to_commit(&db, format, &oid)?);
     }
     if is_ancestor {
         // Graph-accelerated reachability (generation-number pruning + parents from
         // the commit-graph) instead of walking every ancestor's object.
-        if sley_rev::is_ancestor(&git_dir, format, &db, &commits[0], &commits[1])? {
+        if sley::plumbing::sley_rev::is_ancestor(&git_dir, format, &db, &commits[0], &commits[1])? {
             return Ok(());
         }
         return Err(GitError::Exit(1));
@@ -129,7 +129,7 @@ pub(crate) fn cmd_merge_base(args: &[String]) -> Result<()> {
     } else {
         // Two-commit merge base via the commit-graph (parents + generation numbers
         // from the graph) rather than the object-reading ancestor walk.
-        sley_rev::merge_bases(&git_dir, format, &db, &commits[0], &commits[1])?
+        sley::plumbing::sley_rev::merge_bases(&git_dir, format, &db, &commits[0], &commits[1])?
     };
     if bases.is_empty() {
         return Err(GitError::Exit(1));
@@ -145,9 +145,9 @@ pub(crate) fn cmd_merge_base(args: &[String]) -> Result<()> {
 }
 
 /// Two-commit merge bases. Delegates to the single graph-aware implementation in
-/// [`sley_rev::merge_bases`] (parents/generations come from the commit-graph when
+/// [`sley::plumbing::sley_rev::merge_bases`] (parents/generations come from the commit-graph when
 /// present), so the CLI no longer carries a duplicate, graph-blind copy. The
-/// canonical `merge-base` command already routed through `sley_rev::merge_bases`;
+/// canonical `merge-base` command already routed through `sley::plumbing::sley_rev::merge_bases`;
 /// this folds the remaining internal callers (merge / rebase / octopus
 /// virtual-ancestor / log / rev-list / shortlog / format-patch) onto it too, for
 /// one ancestry implementation. `git_dir` is required to locate the
@@ -159,7 +159,7 @@ pub(crate) fn merge_bases(
     left: &ObjectId,
     right: &ObjectId,
 ) -> Result<Vec<ObjectId>> {
-    sley_rev::merge_bases(git_dir, format, db, left, right)
+    sley::plumbing::sley_rev::merge_bases(git_dir, format, db, left, right)
 }
 
 pub(crate) fn merge_bases_default_many(

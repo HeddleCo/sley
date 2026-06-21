@@ -18,8 +18,8 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use sley_core::{GitError, Result};
-use sley_protocol::{PktLineFrame, read_pkt_line_frame};
+use sley::plumbing::sley_core::{GitError, Result};
+use sley::plumbing::sley_protocol::{PktLineFrame, read_pkt_line_frame};
 
 /// Parsed `git daemon` invocation.
 struct DaemonOptions {
@@ -349,7 +349,7 @@ fn receive_pack_enabled(opts: &DaemonOptions, repo: &Path) -> bool {
     } else {
         repo.join(".git")
     };
-    sley_config::read_repo_config(&git_dir, None)
+    sley::plumbing::sley_config::read_repo_config(&git_dir, None)
         .ok()
         .and_then(|config| config.get_bool("daemon", None, "receivepack"))
         .unwrap_or(false)

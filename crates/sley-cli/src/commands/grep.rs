@@ -15,7 +15,7 @@ use crate::grep_source::{
     RegexDiagnosticVerbosity,
 };
 use crate::*;
-use sley_pathspec::{parse_normalized_pathspec_element, pathspec_attrs_match_with};
+use sley::plumbing::sley_pathspec::{parse_normalized_pathspec_element, pathspec_attrs_match_with};
 use std::borrow::Cow;
 
 /// Parsed command-line options for `git grep`.
@@ -600,7 +600,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
     } else {
         for rev in &opts.revs {
             let oid = repo.resolve_revision(rev)?;
-            let tree_oid = sley_rev::peel_to_tree(db, format, &oid)?;
+            let tree_oid = sley::plumbing::sley_rev::peel_to_tree(db, format, &oid)?;
             let matched = grep_tree_source(
                 GrepTreeSource {
                     db,
@@ -1128,7 +1128,7 @@ fn grep_index_source(
     plan: &GrepPlan<'_>,
     out: &mut impl Write,
 ) -> Result<bool> {
-    let Some(index) = sley_worktree::read_repository_index(source.git_dir, source.format)? else {
+    let Some(index) = sley::plumbing::sley_worktree::read_repository_index(source.git_dir, source.format)? else {
         return Ok(false);
     };
     const CE_VALID: u16 = 0x8000;
@@ -1202,7 +1202,7 @@ fn grep_tree_source(
     // gitlinks (mode 0o160000). `flatten_tree` yields a path-sorted map, which
     // is the order `git grep <tree-ish>` prints in.
     let entries: Vec<(Vec<u8>, ObjectId)> =
-        sley_diff_merge::flatten_tree(source.db, source.format, source.tree_oid)?
+        sley::plumbing::sley_diff_merge::flatten_tree(source.db, source.format, source.tree_oid)?
             .into_iter()
             .filter(|(_, (mode, _))| *mode != 0o160000)
             .map(|(path, (_mode, oid))| (path, oid))
@@ -1897,7 +1897,7 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 
 struct GrepPathFilter {
     original: String,
-    element: sley_pathspec::PathspecElement,
+    element: sley::plumbing::sley_pathspec::PathspecElement,
     /// Whether this pathspec is a bare directory-restricting spec (used by
     /// `--max-depth`, where depth is measured relative to the spec's directory).
     is_dir_spec: bool,
@@ -1909,7 +1909,7 @@ struct GrepPathspec {
     cwd_depth: usize,
     full_name: bool,
     filters: Vec<GrepPathFilter>,
-    attributes: Option<sley_worktree::StandardAttributeMatcher>,
+    attributes: Option<sley::plumbing::sley_worktree::StandardAttributeMatcher>,
     worktree_root: Option<PathBuf>,
 }
 
@@ -1954,7 +1954,7 @@ impl GrepPathspec {
             .any(|filter| !filter.element.attr_requirements().is_empty());
         let attributes = if needs_attrs {
             worktree_root
-                .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+                .map(sley::plumbing::sley_worktree::StandardAttributeMatcher::from_worktree_root)
                 .transpose()?
         } else {
             None
@@ -1997,7 +1997,7 @@ impl GrepPathspec {
             grep_pathspec_match(&filter.element, path)
                 && pathspec_attrs_match_with(&filter.element, |requested| {
                     attribute_checks_for_matching(
-                        sley_worktree::standard_attributes_for_path_from_tree(
+                        sley::plumbing::sley_worktree::standard_attributes_for_path_from_tree(
                             root,
                             root.join(".git"),
                             db,
@@ -2143,7 +2143,7 @@ fn strip_dir_prefix<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     if rest.is_empty() { None } else { Some(rest) }
 }
 
-fn grep_pathspec_match(spec: &sley_pathspec::PathspecElement, path: &[u8]) -> bool {
+fn grep_pathspec_match(spec: &sley::plumbing::sley_pathspec::PathspecElement, path: &[u8]) -> bool {
     spec.matches_path(path)
 }
 
@@ -2283,8 +2283,8 @@ mod tests {
         ));
     }
 
-    fn grep_test_pathspec(pattern: &[u8]) -> sley_pathspec::PathspecElement {
-        sley_pathspec::PathspecElement::parse(pattern, sley_pathspec::PathspecMatchMagic::default())
+    fn grep_test_pathspec(pattern: &[u8]) -> sley::plumbing::sley_pathspec::PathspecElement {
+        sley::plumbing::sley_pathspec::PathspecElement::parse(pattern, sley::plumbing::sley_pathspec::PathspecMatchMagic::default())
             .expect("test pathspec parses")
     }
 

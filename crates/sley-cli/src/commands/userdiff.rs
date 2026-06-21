@@ -320,14 +320,14 @@ pub(crate) struct ExternalDiffCommand {
 /// builtins wholesale, as in `userdiff_find_by_namelen`), then the builtin
 /// table.
 pub(crate) struct UserdiffResolver {
-    attributes: Option<sley_worktree::StandardAttributeMatcher>,
+    attributes: Option<sley::plumbing::sley_worktree::StandardAttributeMatcher>,
     config: Option<GitConfig>,
     drivers: RefCell<HashMap<Vec<u8>, Option<Rc<ResolvedDriver>>>>,
 }
 
 impl UserdiffResolver {
     pub(crate) fn with_attributes(
-        attributes: Option<sley_worktree::StandardAttributeMatcher>,
+        attributes: Option<sley::plumbing::sley_worktree::StandardAttributeMatcher>,
         config: Option<GitConfig>,
     ) -> Self {
         Self {
@@ -356,7 +356,7 @@ impl UserdiffResolver {
         let state = attrs.into_iter().next().and_then(|check| check.state);
         match state {
             None => Ok(None),
-            Some(sley_worktree::AttributeState::Set) => {
+            Some(sley::plumbing::sley_worktree::AttributeState::Set) => {
                 // ATTR_TRUE: driver_true — text, no patterns.
                 Ok(Some(Rc::new(ResolvedDriver {
                     funcname: None,
@@ -365,7 +365,7 @@ impl UserdiffResolver {
                     binary: Some(false),
                 })))
             }
-            Some(sley_worktree::AttributeState::Unset) => {
+            Some(sley::plumbing::sley_worktree::AttributeState::Unset) => {
                 // ATTR_FALSE: driver_false — binary.
                 Ok(Some(Rc::new(ResolvedDriver {
                     funcname: None,
@@ -374,7 +374,7 @@ impl UserdiffResolver {
                     binary: Some(true),
                 })))
             }
-            Some(sley_worktree::AttributeState::Value(name)) => self.driver_by_name(&name),
+            Some(sley::plumbing::sley_worktree::AttributeState::Value(name)) => self.driver_by_name(&name),
         }
     }
 
@@ -475,7 +475,7 @@ impl UserdiffResolver {
                         trust_exit_code = entry
                             .value
                             .as_deref()
-                            .and_then(sley_config::parse_config_bool)
+                            .and_then(sley::plumbing::sley_config::parse_config_bool)
                             .unwrap_or(true);
                     }
                     "textconv" | "cachetextconv" | "algorithm" => {

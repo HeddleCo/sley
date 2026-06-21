@@ -21,7 +21,7 @@
 //! `parse_next_oid`-shaped primitives git uses, so the dispatch layer in
 //! `refs.rs` can walk arguments exactly as the C builtin does.
 
-use sley_core::{GitError, Result};
+use sley::plumbing::sley_core::{GitError, Result};
 
 /// Terminator that ends a logical command stream record.
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -4,14 +4,15 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley_options::{
+use sley::plumbing::sley_options::{
     CallbackValue, OptFlags, OptValue, OptionName, OptionSpec, Parsed, ParsedOption, ParsedValue,
     UsageError, parse_options,
 };
 
 pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let repo = RepositoryContext::discover(&cwd)?;
+    let setup = sley::RepositorySetup::new(cwd);
+    let repo = RepositoryContext::discover(&setup)?;
     let git_dir = repo.git_dir();
     let format = repo.format();
     let store = repo.refs();
@@ -6685,7 +6686,7 @@ fn run_branch_move_options(
     // A dangling symref destination does not "exist" for the purposes of the
     // rename collision check (git's validate_branchname uses RESOLVE_REF_READING),
     // so `branch -m m broken_symref` overwrites it without --force (t3200 #16).
-    if !options.force && sley_refs::resolve_ref_peeled(store, &new_ref)?.is_some() {
+    if !options.force && sley::plumbing::sley_refs::resolve_ref_peeled(store, &new_ref)?.is_some() {
         eprintln!("fatal: a branch named '{new_branch}' already exists");
         return Err(GitError::Exit(128));
     }
@@ -6778,7 +6779,7 @@ fn branch_reflog_committer_identity(store: &FileRefStore, branch: &str) -> Resul
     let date = format!("@{} +0000", now.max(max_existing + 1));
     let name = env::var("GIT_COMMITTER_NAME").unwrap_or_else(|_| "Git Rs".into());
     let email = env::var("GIT_COMMITTER_EMAIL").unwrap_or_else(|_| "sley@example.invalid".into());
-    sley_sequencer::format_commit_identity(&name, &email, &date)
+    sley::plumbing::sley_sequencer::format_commit_identity(&name, &email, &date)
 }
 
 fn branch_move_branches(
@@ -6948,7 +6949,7 @@ fn branch_upstream_resolve_previous_checkout(git_dir: &Path, upstream: &str) -> 
         .map_err(|_| GitError::InvalidFormat(format!("invalid branch name: '{upstream}'")))?;
     let format = repository_object_format(git_dir)?;
     Ok(
-        sley_rev::nth_prior_checkout_branch_name(git_dir, format, n)?
+        sley::plumbing::sley_rev::nth_prior_checkout_branch_name(git_dir, format, n)?
             .unwrap_or_else(|| upstream.to_string()),
     )
 }
@@ -7062,7 +7063,7 @@ fn resolve_branch_upstream(
     upstream: &str,
 ) -> Result<Option<ResolvedBranchUpstream>> {
     let resolved_upstream = if upstream.contains("@{") {
-        sley_rev::resolve_revision_symbolic_full_name(git_dir, format, upstream)
+        sley::plumbing::sley_rev::resolve_revision_symbolic_full_name(git_dir, format, upstream)
             .ok()
             .flatten()
     } else {
@@ -7847,7 +7848,7 @@ fn branch_log_all_ref_updates_matches(name: &str, value: &str) -> bool {
     if value.eq_ignore_ascii_case("always") {
         return true;
     }
-    if !sley_config::parse_config_bool(value).unwrap_or(false) {
+    if !sley::plumbing::sley_config::parse_config_bool(value).unwrap_or(false) {
         return false;
     }
     name == "HEAD"
@@ -7865,7 +7866,7 @@ fn validate_branch_creation_name(branch: &str) -> Result<String> {
         return Err(GitError::Exit(128));
     }
     match branch_ref_name(branch)
-        .and_then(|refname| sley_refs::check_refname_format(&refname, false).map(|()| refname))
+        .and_then(|refname| sley::plumbing::sley_refs::check_refname_format(&refname, false).map(|()| refname))
     {
         Ok(refname) => Ok(refname),
         Err(GitError::InvalidPath(_)) => {
@@ -7878,7 +7879,7 @@ fn validate_branch_creation_name(branch: &str) -> Result<String> {
 }
 
 fn validate_branch_source_name(branch: &str) -> Result<String> {
-    match sley_refs::branch_ref_name_for_source(branch) {
+    match sley::plumbing::sley_refs::branch_ref_name_for_source(branch) {
         Ok(refname) => Ok(refname),
         Err(GitError::InvalidPath(_)) => {
             eprintln!("fatal: invalid branch name: '{branch}'");
@@ -7986,7 +7987,7 @@ fn branch_checked_out_worktree_path(
     _store: &FileRefStore,
     refname: &str,
 ) -> Result<Option<String>> {
-    Ok(sley_worktree::find_shared_symref(git_dir, "HEAD", refname)?
+    Ok(sley::plumbing::sley_worktree::find_shared_symref(git_dir, "HEAD", refname)?
         .map(|worktree| worktree.path.to_string_lossy().into_owned()))
 }
 
@@ -8042,7 +8043,7 @@ fn branch_delete_resolve_local_branch_arg(
 ) -> Result<(String, String)> {
     if branch.contains("@{")
         && let Ok(Some(refname)) =
-            sley_rev::resolve_revision_symbolic_full_name(git_dir, format, branch)
+            sley::plumbing::sley_rev::resolve_revision_symbolic_full_name(git_dir, format, branch)
         && let Some(local) = refname.strip_prefix("refs/heads/")
         && store.read_ref(&refname)?.is_some()
     {
@@ -8150,9 +8151,9 @@ fn delete_merged_branches(
     let config = read_repo_config(git_dir)?;
     let head_reachable = resolve_revision(git_dir, format, "HEAD")
         .ok()
-        .and_then(|head| sley_rev::peel_to_commit(&db, format, &head).ok())
+        .and_then(|head| sley::plumbing::sley_rev::peel_to_commit(&db, format, &head).ok())
         .map(|head| {
-            sley_rev::walk_commits(&db, format, [head]).map(|records| {
+            sley::plumbing::sley_rev::walk_commits(&db, format, [head]).map(|records| {
                 records
                     .into_iter()
                     .map(|record| record.oid)
@@ -8188,7 +8189,7 @@ fn delete_merged_branches(
             failed = true;
             continue;
         };
-        let Ok(tip) = sley_rev::peel_to_commit(&db, format, &oid) else {
+        let Ok(tip) = sley::plumbing::sley_rev::peel_to_commit(&db, format, &oid) else {
             eprintln!("error: branch '{branch}' not found");
             failed = true;
             continue;
@@ -8225,7 +8226,7 @@ fn delete_merged_branches(
 }
 
 fn branch_delete_display(branch: &str, refname: &str, oid: &ObjectId) -> String {
-    if sley_refs::validate_ref_name(refname).is_err()
+    if sley::plumbing::sley_refs::validate_ref_name(refname).is_err()
         && let Some((display, _)) = branch.split_once("...")
         && !display.is_empty()
     {
@@ -8245,14 +8246,14 @@ fn branch_delete_reachable_base<'a>(
     if let Some(upstream) = for_each_ref_upstream(config, refname)
         && let Some(target) = store.read_ref(&upstream.refname)?
     {
-        let upstream_ref = sley_refs::Ref {
+        let upstream_ref = sley::plumbing::sley_refs::Ref {
             name: upstream.refname,
             target,
         };
         if let Some((oid, _)) = resolve_for_each_ref_target(store, &upstream_ref)?
-            && let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid)
+            && let Ok(commit) = sley::plumbing::sley_rev::peel_to_commit(db, format, &oid)
         {
-            let reachable = sley_rev::walk_commits(db, format, [commit])?
+            let reachable = sley::plumbing::sley_rev::walk_commits(db, format, [commit])?
                 .into_iter()
                 .map(|record| record.oid)
                 .collect::<HashSet<_>>();
@@ -8269,7 +8270,7 @@ enum BranchListMode {
     All,
 }
 
-fn branch_refs_for_mode(store: &FileRefStore, mode: BranchListMode) -> Result<Vec<sley_refs::Ref>> {
+fn branch_refs_for_mode(store: &FileRefStore, mode: BranchListMode) -> Result<Vec<sley::plumbing::sley_refs::Ref>> {
     match mode {
         BranchListMode::Local => store.list_refs_with_prefix("refs/heads/"),
         BranchListMode::Remote => store.list_refs_with_prefix("refs/remotes/"),
@@ -8445,7 +8446,7 @@ fn branch_sorted_refs(
     store: &FileRefStore,
     mode: BranchListMode,
     sort: Option<BranchSort>,
-) -> Result<Vec<sley_refs::Ref>> {
+) -> Result<Vec<sley::plumbing::sley_refs::Ref>> {
     let mut refs = branch_refs_for_mode(store, mode)?;
     match sort.unwrap_or(BranchSort::Refname(false)) {
         BranchSort::Refname(descending) => {
@@ -8588,7 +8589,7 @@ fn branch_ref_ahead_behind_sort_key(
     git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    reference: &sley_refs::Ref,
+    reference: &sley::plumbing::sley_refs::Ref,
     target: &ObjectId,
 ) -> Result<(usize, usize)> {
     let Some((oid, _)) = resolve_for_each_ref_target(store, reference)? else {
@@ -8698,21 +8699,21 @@ fn print_branch_list_contains_filters_matching(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let contains_targets = contains_oids
         .iter()
-        .map(|oid| sley_rev::peel_to_commit(&db, format, oid))
+        .map(|oid| sley::plumbing::sley_rev::peel_to_commit(&db, format, oid))
         .collect::<Result<Vec<_>>>()?;
     let no_contains_targets = no_contains_oids
         .iter()
-        .map(|oid| sley_rev::peel_to_commit(&db, format, oid))
+        .map(|oid| sley::plumbing::sley_rev::peel_to_commit(&db, format, oid))
         .collect::<Result<Vec<_>>>()?;
     let mut included = HashSet::new();
     for reference in branch_refs_for_mode(store, mode)? {
         let RefTarget::Direct(tip) = &reference.target else {
             continue;
         };
-        let Ok(tip) = sley_rev::peel_to_commit(&db, format, tip) else {
+        let Ok(tip) = sley::plumbing::sley_rev::peel_to_commit(&db, format, tip) else {
             continue;
         };
-        let reachable = sley_rev::walk_commits(&db, format, [tip])?
+        let reachable = sley::plumbing::sley_rev::walk_commits(&db, format, [tip])?
             .into_iter()
             .map(|record| record.oid)
             .collect::<HashSet<_>>();
@@ -8793,8 +8794,8 @@ fn print_branch_list_merged_filters_matching(
     let merged_reachable = merged_oids
         .iter()
         .map(|oid| {
-            let target = sley_rev::peel_to_commit(&db, format, oid)?;
-            sley_rev::walk_commits(&db, format, [target]).map(|records| {
+            let target = sley::plumbing::sley_rev::peel_to_commit(&db, format, oid)?;
+            sley::plumbing::sley_rev::walk_commits(&db, format, [target]).map(|records| {
                 records
                     .into_iter()
                     .map(|record| record.oid)
@@ -8805,8 +8806,8 @@ fn print_branch_list_merged_filters_matching(
     let no_merged_reachable = no_merged_oids
         .iter()
         .map(|oid| {
-            let target = sley_rev::peel_to_commit(&db, format, oid)?;
-            sley_rev::walk_commits(&db, format, [target]).map(|records| {
+            let target = sley::plumbing::sley_rev::peel_to_commit(&db, format, oid)?;
+            sley::plumbing::sley_rev::walk_commits(&db, format, [target]).map(|records| {
                 records
                     .into_iter()
                     .map(|record| record.oid)
@@ -8819,7 +8820,7 @@ fn print_branch_list_merged_filters_matching(
         let RefTarget::Direct(tip) = &reference.target else {
             continue;
         };
-        let Ok(tip) = sley_rev::peel_to_commit(&db, format, tip) else {
+        let Ok(tip) = sley::plumbing::sley_rev::peel_to_commit(&db, format, tip) else {
             continue;
         };
         let merged_match =
@@ -9268,7 +9269,7 @@ fn print_branch_list_format_omit_empty_with_sort_color(
         && let Some(refname) = detached_head_branch_line()
         && let Some((oid, _)) = resolve_for_each_ref_target(
             store,
-            &sley_refs::Ref {
+            &sley::plumbing::sley_refs::Ref {
                 name: "HEAD".into(),
                 target: store
                     .read_ref("HEAD")?
@@ -9441,7 +9442,7 @@ fn branch_pattern_name(name: &str, mode: BranchListMode) -> Option<String> {
 fn print_branch_list_filtered(
     store: &FileRefStore,
     mode: BranchListMode,
-    mut include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+    mut include: impl FnMut(&sley::plumbing::sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     print_branch_list_filtered_with_color(store, mode, false, |reference, name| {
         include(reference, name)
@@ -9452,7 +9453,7 @@ fn print_branch_list_filtered_detached(
     store: &FileRefStore,
     mode: BranchListMode,
     show_detached: bool,
-    mut include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+    mut include: impl FnMut(&sley::plumbing::sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     print_branch_list_filtered_sorted_with_color_detached(
         store,
@@ -9468,7 +9469,7 @@ fn print_branch_list_filtered_with_color(
     store: &FileRefStore,
     mode: BranchListMode,
     color: bool,
-    include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+    include: impl FnMut(&sley::plumbing::sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     print_branch_list_filtered_sorted_with_color(store, mode, color, false, include)
 }
@@ -9478,7 +9479,7 @@ fn print_branch_list_filtered_sorted_with_color(
     mode: BranchListMode,
     color: bool,
     descending: bool,
-    include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+    include: impl FnMut(&sley::plumbing::sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     print_branch_list_filtered_sorted_with_color_detached(
         store, mode, color, descending, true, include,
@@ -9491,7 +9492,7 @@ fn print_branch_list_filtered_sorted_with_color_detached(
     color: bool,
     descending: bool,
     show_detached: bool,
-    include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+    include: impl FnMut(&sley::plumbing::sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     let current = store.current_branch_ref()?;
     let mut refs = branch_refs_for_mode(store, mode)?;
@@ -9514,7 +9515,7 @@ fn print_branch_list_filtered_version_sorted_with_color(
     mode: BranchListMode,
     color: bool,
     descending: bool,
-    include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+    include: impl FnMut(&sley::plumbing::sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     let current = store.current_branch_ref()?;
     let mut refs = branch_refs_for_mode(store, mode)?;
@@ -9530,7 +9531,7 @@ fn print_branch_list_filtered_objectname_sorted_with_color(
     mode: BranchListMode,
     color: bool,
     descending: bool,
-    include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+    include: impl FnMut(&sley::plumbing::sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     let current = store.current_branch_ref()?;
     let mut refs = branch_refs_for_mode(store, mode)?;
@@ -9547,7 +9548,7 @@ fn print_branch_list_filtered_objectname_sorted_with_color(
     print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
 }
 
-fn branch_ref_objectname_sort_key(reference: &sley_refs::Ref) -> String {
+fn branch_ref_objectname_sort_key(reference: &sley::plumbing::sley_refs::Ref) -> String {
     match &reference.target {
         RefTarget::Direct(oid) => oid.to_hex(),
         RefTarget::Symbolic(target) => target.clone(),
@@ -9561,7 +9562,7 @@ fn print_branch_list_filtered_objecttype_sorted_with_color(
     mode: BranchListMode,
     color: bool,
     descending: bool,
-    include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+    include: impl FnMut(&sley::plumbing::sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     let current = store.current_branch_ref()?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -9588,7 +9589,7 @@ fn print_branch_list_filtered_objecttype_sorted_with_color(
 fn branch_ref_objecttype_sort_key(
     store: &FileRefStore,
     db: &FileObjectDatabase,
-    reference: &sley_refs::Ref,
+    reference: &sley::plumbing::sley_refs::Ref,
 ) -> Result<String> {
     let Some((oid, _)) = resolve_for_each_ref_target(store, reference)? else {
         return Ok(String::new());
@@ -9603,7 +9604,7 @@ fn print_branch_list_filtered_objectsize_sorted_with_color(
     mode: BranchListMode,
     color: bool,
     descending: bool,
-    include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+    include: impl FnMut(&sley::plumbing::sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     let current = store.current_branch_ref()?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -9630,7 +9631,7 @@ fn print_branch_list_filtered_objectsize_sorted_with_color(
 fn branch_ref_objectsize_sort_key(
     store: &FileRefStore,
     db: &FileObjectDatabase,
-    reference: &sley_refs::Ref,
+    reference: &sley::plumbing::sley_refs::Ref,
 ) -> Result<usize> {
     let Some((oid, _)) = resolve_for_each_ref_target(store, reference)? else {
         return Ok(0);
@@ -9645,7 +9646,7 @@ fn print_branch_list_filtered_date_sorted_with_color(
     mode: BranchListMode,
     color: bool,
     sort: (ForEachRefDateSortField, bool),
-    include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+    include: impl FnMut(&sley::plumbing::sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     let current = store.current_branch_ref()?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -9674,7 +9675,7 @@ fn branch_ref_date_sort_key(
     store: &FileRefStore,
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    reference: &sley_refs::Ref,
+    reference: &sley::plumbing::sley_refs::Ref,
     field: ForEachRefDateSortField,
 ) -> Result<i128> {
     let Some((oid, _)) = resolve_for_each_ref_target(store, reference)? else {
@@ -9691,7 +9692,7 @@ fn print_branch_list_filtered_upstream_sorted_with_color(
     mode: BranchListMode,
     color: bool,
     descending: bool,
-    include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+    include: impl FnMut(&sley::plumbing::sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     let current = store.current_branch_ref()?;
     let config = read_repo_config(git_dir)?;
@@ -9709,7 +9710,7 @@ fn print_branch_list_filtered_upstream_sorted_with_color(
     print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
 }
 
-fn branch_ref_upstream_sort_key(config: &GitConfig, reference: &sley_refs::Ref) -> String {
+fn branch_ref_upstream_sort_key(config: &GitConfig, reference: &sley::plumbing::sley_refs::Ref) -> String {
     for_each_ref_upstream(config, &reference.name)
         .map(|upstream| upstream.refname)
         .unwrap_or_default()
@@ -9721,7 +9722,7 @@ fn print_branch_list_filtered_push_sorted_with_color(
     mode: BranchListMode,
     color: bool,
     descending: bool,
-    include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+    include: impl FnMut(&sley::plumbing::sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     let current = store.current_branch_ref()?;
     let config = read_repo_config(git_dir)?;
@@ -9739,7 +9740,7 @@ fn print_branch_list_filtered_push_sorted_with_color(
     print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
 }
 
-fn branch_ref_push_sort_key(config: &GitConfig, reference: &sley_refs::Ref) -> String {
+fn branch_ref_push_sort_key(config: &GitConfig, reference: &sley::plumbing::sley_refs::Ref) -> String {
     for_each_ref_push(config, &reference.name)
         .and_then(|push| push.refname)
         .unwrap_or_default()
@@ -9813,13 +9814,13 @@ fn detached_checkout_label(destination: &str, oid: &ObjectId) -> String {
 }
 
 fn print_branch_refs(
-    refs: Vec<sley_refs::Ref>,
+    refs: Vec<sley::plumbing::sley_refs::Ref>,
     current: Option<&str>,
     mode: BranchListMode,
     color: bool,
     show_detached: bool,
     worktree_paths: Option<&HashMap<String, String>>,
-    mut include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+    mut include: impl FnMut(&sley::plumbing::sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     if matches!(mode, BranchListMode::Local | BranchListMode::All)
         && current.is_none()
@@ -9904,12 +9905,12 @@ fn print_branch_refs(
 }
 
 fn collect_branch_rows(
-    refs: Vec<sley_refs::Ref>,
+    refs: Vec<sley::plumbing::sley_refs::Ref>,
     current: Option<&str>,
     mode: BranchListMode,
     color: bool,
     show_detached: bool,
-    mut include: impl FnMut(&sley_refs::Ref, &str) -> bool,
+    mut include: impl FnMut(&sley::plumbing::sley_refs::Ref, &str) -> bool,
 ) -> Result<Vec<String>> {
     let mut rows = Vec::new();
     if matches!(mode, BranchListMode::Local | BranchListMode::All)
@@ -9983,7 +9984,7 @@ fn collect_branch_rows(
     Ok(rows)
 }
 
-fn local_symbolic_branch_target(reference: &sley_refs::Ref) -> Option<String> {
+fn local_symbolic_branch_target(reference: &sley::plumbing::sley_refs::Ref) -> Option<String> {
     let RefTarget::Symbolic(target) = &reference.target else {
         return None;
     };
@@ -9994,7 +9995,7 @@ fn local_symbolic_branch_target(reference: &sley_refs::Ref) -> Option<String> {
 }
 
 fn remote_symbolic_ref_is_dangling(
-    reference: &sley_refs::Ref,
+    reference: &sley::plumbing::sley_refs::Ref,
     ref_names: &HashSet<String>,
 ) -> bool {
     match &reference.target {
@@ -10003,7 +10004,7 @@ fn remote_symbolic_ref_is_dangling(
     }
 }
 
-fn remote_branch_display(reference: &sley_refs::Ref, name: &str, mode: BranchListMode) -> String {
+fn remote_branch_display(reference: &sley::plumbing::sley_refs::Ref, name: &str, mode: BranchListMode) -> String {
     let display = if matches!(mode, BranchListMode::All) {
         format!("remotes/{name}")
     } else {
@@ -10091,7 +10092,7 @@ fn print_branch_list_verbose(
         && let Some(display) = detached_head_branch_line()
         && let Some((oid, _)) = resolve_for_each_ref_target(
             store,
-            &sley_refs::Ref {
+            &sley::plumbing::sley_refs::Ref {
                 name: "HEAD".into(),
                 target: store
                     .read_ref("HEAD")?

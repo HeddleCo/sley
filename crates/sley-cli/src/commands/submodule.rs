@@ -129,7 +129,7 @@ struct SubmoduleUpdateOptions<'a> {
     nofetch: bool,
     /// The strategy forced by `--checkout`/`--merge`/`--rebase` on the command
     /// line; `Unspecified` when none was given.
-    cli_default: sley_submodule::UpdateType,
+    cli_default: sley::plumbing::sley_submodule::UpdateType,
     /// `--depth <n>` for a shallow clone of a just-cloned submodule.
     depth: Option<u32>,
     /// `--filter <spec>` partial-clone filter (requires `--init`).
@@ -248,7 +248,7 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
     }
 
     let existing_repo =
-        destination.is_dir() && sley_diff_merge::gitlink_git_dir(&destination).is_some();
+        destination.is_dir() && sley::plumbing::sley_diff_merge::gitlink_git_dir(&destination).is_some();
     if existing_repo && submodule_head(&destination).is_err() {
         eprintln!("fatal: '{normalized_path}' does not have a commit checked out");
         return Err(GitError::Exit(128));
@@ -270,7 +270,7 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     if !options.force
-        && sley_worktree::path_matches_standard_ignore(
+        && sley::plumbing::sley_worktree::path_matches_standard_ignore(
             &worktree_root,
             normalized_path.as_bytes(),
             true,
@@ -546,7 +546,7 @@ fn update_one_submodule(
     // .git/config OR .gitmodules) is skipped BEFORE the initialized check, with
     // a "Skipping submodule '<displaypath>'" notice — UNLESS the CLI forced a
     // mode (`--checkout`/`--merge`/`--rebase`), which overrides update=none.
-    if options.cli_default == sley_submodule::UpdateType::Unspecified {
+    if options.cli_default == sley::plumbing::sley_submodule::UpdateType::Unspecified {
         let config_none = config
             .get("submodule", Some(&submodule.name), "update")
             .map(|v| v == "none");
@@ -600,10 +600,10 @@ fn update_one_submodule(
     let gitmodules_strategy = submodule
         .update
         .as_deref()
-        .and_then(sley_submodule::parse_update_strategy)
+        .and_then(sley::plumbing::sley_submodule::parse_update_strategy)
         .unwrap_or_default();
     let config_update = config.get("submodule", Some(&submodule.name), "update");
-    let strategy = match sley_submodule::determine_update_strategy(
+    let strategy = match sley::plumbing::sley_submodule::determine_update_strategy(
         options.cli_default,
         config_update,
         &gitmodules_strategy,
@@ -832,7 +832,7 @@ fn submodule_default_remote(sub_git_dir: &Path, sub_format: ObjectFormat) -> Res
 
 /// True when the index carries an unmerged (stage > 0) gitlink at `path`.
 fn submodule_index_is_unmerged(index: &Option<Index>, path: &str) -> bool {
-    use sley_index::Stage;
+    use sley::plumbing::sley_index::Stage;
     let path = path.as_bytes();
     index.as_ref().is_some_and(|index| {
         index
@@ -853,13 +853,13 @@ fn submodule_index_is_unmerged(index: &Option<Index>, path: &str) -> bool {
 fn run_submodule_update_command(
     path: &Path,
     sub_git_dir: &Path,
-    strategy: &sley_submodule::UpdateStrategy,
+    strategy: &sley::plumbing::sley_submodule::UpdateStrategy,
     target_oid: &ObjectId,
     subforce: bool,
     quiet: bool,
     display: &str,
 ) -> Result<UpdateOutcome> {
-    use sley_submodule::UpdateType;
+    use sley::plumbing::sley_submodule::UpdateType;
     let oid = target_oid.to_string();
 
     // Build the subcommand (sley) or shell command to run in the submodule.
@@ -1012,7 +1012,7 @@ fn parse_submodule_update_options(
     args: &[String],
     mut quiet: bool,
 ) -> Result<SubmoduleUpdateOptions<'_>> {
-    use sley_submodule::UpdateType;
+    use sley::plumbing::sley_submodule::UpdateType;
     let mut init = false;
     let mut recursive = false;
     let mut force = false;
@@ -1176,7 +1176,7 @@ fn submodule_add_name(
     name_override: Option<&str>,
 ) -> Result<String> {
     if let Some(name) = name_override {
-        if !sley_submodule::check_submodule_name(name) {
+        if !sley::plumbing::sley_submodule::check_submodule_name(name) {
             eprintln!("fatal: '{name}' is not a valid submodule name");
             return Err(GitError::Exit(128));
         }
@@ -1185,7 +1185,7 @@ fn submodule_add_name(
     let gitmodules_path = worktree_root.join(".gitmodules");
     let gitmodules = GitConfig::read(&gitmodules_path).unwrap_or_default();
     let name = submodule_name_for_exact_path(&gitmodules, path).unwrap_or_else(|| path.to_string());
-    if !sley_submodule::check_submodule_name(&name) {
+    if !sley::plumbing::sley_submodule::check_submodule_name(&name) {
         eprintln!("fatal: '{name}' is not a valid submodule name");
         return Err(GitError::Exit(128));
     }
@@ -1203,7 +1203,7 @@ fn validate_submodule_add_name_available(
     }
     let gitmodules_path = worktree_root.join(".gitmodules");
     let gitmodules = GitConfig::read(&gitmodules_path).unwrap_or_default();
-    let set = sley_submodule::SubmoduleConfigSet::parse(&gitmodules);
+    let set = sley::plumbing::sley_submodule::SubmoduleConfigSet::parse(&gitmodules);
     if let Some(existing) = set.from_name(name)
         && existing.path.is_some()
         && existing.path.as_deref() != Some(path)
@@ -1281,10 +1281,10 @@ fn stage_submodule_paths(
     oid: ObjectId,
 ) -> Result<()> {
     super::plumbing::cmd_add(&[worktree_root.join(".gitmodules").display().to_string()])?;
-    sley_worktree::update_index_cacheinfo(
+    sley::plumbing::sley_worktree::update_index_cacheinfo(
         git_dir,
         format,
-        &[sley_worktree::CacheInfoEntry {
+        &[sley::plumbing::sley_worktree::CacheInfoEntry {
             mode: 0o160000,
             oid,
             path: path.as_bytes().to_vec(),
@@ -1749,7 +1749,7 @@ fn index_relevant_paths_for_files(
     format: ObjectFormat,
     index: &Option<Index>,
 ) -> Result<BTreeMap<String, (u32, ObjectId)>> {
-    use sley_index::Stage;
+    use sley::plumbing::sley_index::Stage;
     let mut out = BTreeMap::new();
     if let Some(index) = index {
         for entry in &index.entries {
@@ -1828,7 +1828,7 @@ fn index_relevant_paths(
     index: &Option<Index>,
     tree_side: &BTreeMap<String, (u32, ObjectId)>,
 ) -> BTreeMap<String, (u32, ObjectId)> {
-    use sley_index::Stage;
+    use sley::plumbing::sley_index::Stage;
     let mut out = BTreeMap::new();
     if let Some(index) = index {
         for entry in &index.entries {
@@ -2275,7 +2275,7 @@ fn submodule_name_for_exact_path(config: &GitConfig, path: &str) -> Option<Strin
     // PILOT (sley-submodule): route the exact-path → name lookup through the
     // typed parser's `from_path`, which is git's `submodule_from_path` keyed on
     // the (first-wins) `path` binding.
-    sley_submodule::SubmoduleConfigSet::parse(config)
+    sley::plumbing::sley_submodule::SubmoduleConfigSet::parse(config)
         .from_path(path)
         .map(|submodule| submodule.name.clone())
 }
@@ -2327,7 +2327,7 @@ fn validate_status_submodule_mappings(
         return Ok(());
     };
     for entry in &index.entries {
-        if entry.stage() != sley_index::Stage::Normal || !sley_index::is_gitlink(entry.mode) {
+        if entry.stage() != sley::plumbing::sley_index::Stage::Normal || !sley::plumbing::sley_index::is_gitlink(entry.mode) {
             continue;
         }
         let path = String::from_utf8_lossy(&entry.path);
@@ -2384,8 +2384,8 @@ fn filter_update_submodule_configs<'a>(
 fn index_has_gitlink_matching(index: &Option<Index>, pathspec: &str) -> bool {
     index.as_ref().is_some_and(|index| {
         index.entries.iter().any(|entry| {
-            sley_index::is_gitlink(entry.mode)
-                && entry.stage() == sley_index::Stage::Normal
+            sley::plumbing::sley_index::is_gitlink(entry.mode)
+                && entry.stage() == sley::plumbing::sley_index::Stage::Normal
                 && submodule_path_matches_pathspec(&String::from_utf8_lossy(&entry.path), pathspec)
         })
     })
@@ -2411,7 +2411,7 @@ fn resolve_submodule_relative_url(
         );
     }
     let cwd_fallback = worktree_root.to_string_lossy();
-    sley_submodule::resolve_relative_url(url, base, &cwd_fallback, None)
+    sley::plumbing::sley_submodule::resolve_relative_url(url, base, &cwd_fallback, None)
 }
 
 fn resolve_submodule_init_url(worktree_root: &Path, config: &GitConfig, url: &str) -> String {
@@ -2525,7 +2525,7 @@ fn submodule_worktree_has_local_changes(
         }
         if entry.mode == 0o100644 || entry.mode == 0o100755 {
             let body = fs::read(&path)?;
-            let oid = sley_core::object_id_for_bytes(format, "blob", &body)?;
+            let oid = sley::plumbing::sley_core::object_id_for_bytes(format, "blob", &body)?;
             if oid != entry.oid {
                 return Ok(true);
             }
@@ -3050,16 +3050,16 @@ pub(crate) fn read_submodule_configs(worktree_root: &Path) -> Result<Vec<Submodu
     let Ok(config) = GitConfig::read(path) else {
         return Ok(Vec::new());
     };
-    let set = sley_submodule::SubmoduleConfigSet::parse(&config);
+    let set = sley::plumbing::sley_submodule::SubmoduleConfigSet::parse(&config);
     // git die()s "invalid value for 'submodule.<name>.update'" the moment any
     // command parses a `.gitmodules` with a bad update value (an unrecognized
     // mode or a forbidden `!command`). The typed parser surfaces that as an
     // `InvalidUpdate` warning; promote the FIRST one to git's fatal here so
     // status / init / update all reject it identically.
-    if let Some(sley_submodule::ParseWarning::InvalidUpdate { name }) = set
+    if let Some(sley::plumbing::sley_submodule::ParseWarning::InvalidUpdate { name }) = set
         .warnings
         .iter()
-        .find(|w| matches!(w, sley_submodule::ParseWarning::InvalidUpdate { .. }))
+        .find(|w| matches!(w, sley::plumbing::sley_submodule::ParseWarning::InvalidUpdate { .. }))
     {
         eprintln!("fatal: invalid value for 'submodule.{name}.update'");
         return Err(GitError::Exit(128));
@@ -3095,7 +3095,7 @@ pub(crate) fn index_gitlink_submodule_configs(
         .collect::<std::collections::BTreeSet<_>>();
     let mut submodules = Vec::new();
     for entry in index.entries {
-        if !sley_index::is_gitlink(entry.mode) {
+        if !sley::plumbing::sley_index::is_gitlink(entry.mode) {
             continue;
         }
         let Ok(path) = String::from_utf8(entry.path.to_vec()) else {
@@ -3123,14 +3123,14 @@ pub(crate) fn ensure_populated_gitlinks_readable(
         return Ok(());
     };
     for entry in index.entries {
-        if !sley_index::is_gitlink(entry.mode) {
+        if !sley::plumbing::sley_index::is_gitlink(entry.mode) {
             continue;
         }
         let Ok(path) = String::from_utf8(entry.path.to_vec()) else {
             continue;
         };
         let sub_root = worktree_root.join(path);
-        if sley_diff_merge::gitlink_git_dir(&sub_root).is_some() {
+        if sley::plumbing::sley_diff_merge::gitlink_git_dir(&sub_root).is_some() {
             ensure_gitlink_head_readable(&sub_root, format)?;
         }
     }
@@ -3138,7 +3138,7 @@ pub(crate) fn ensure_populated_gitlinks_readable(
 }
 
 fn ensure_gitlink_head_readable(sub_root: &Path, format: ObjectFormat) -> Result<()> {
-    let Some(git_dir) = sley_diff_merge::gitlink_git_dir(sub_root) else {
+    let Some(git_dir) = sley::plumbing::sley_diff_merge::gitlink_git_dir(sub_root) else {
         return Ok(());
     };
     let store = FileRefStore::new(&git_dir, format);
@@ -3176,15 +3176,15 @@ fn broken_submodule_repository(git_dir: &Path) -> GitError {
 /// init path copies into `.git/config`. `Unspecified` (never set, or an
 /// invalid value the typed parser rejected) maps to `None`, matching the old
 /// behavior where only a present, recognized `update =` line was copied.
-fn submodule_update_to_raw(strategy: &sley_submodule::UpdateStrategy) -> Option<String> {
-    use sley_submodule::UpdateType;
+fn submodule_update_to_raw(strategy: &sley::plumbing::sley_submodule::UpdateStrategy) -> Option<String> {
+    use sley::plumbing::sley_submodule::UpdateType;
     match strategy.kind {
         UpdateType::Unspecified => None,
         UpdateType::Command => strategy
             .command
             .as_ref()
             .map(|command| format!("!{command}")),
-        other => sley_submodule::update_type_to_string(other).map(str::to_string),
+        other => sley::plumbing::sley_submodule::update_type_to_string(other).map(str::to_string),
     }
 }
 
@@ -3404,7 +3404,7 @@ fn submodule_head(submodule_root: &Path) -> Result<(PathBuf, ObjectId)> {
         return Err(GitError::not_found("submodule gitdir"));
     };
     let format = repository_object_format(&git_dir)?;
-    let oid = sley_rev::resolve_revision(&git_dir, format, "HEAD")?;
+    let oid = sley::plumbing::sley_rev::resolve_revision(&git_dir, format, "HEAD")?;
     Ok((git_dir, oid))
 }
 

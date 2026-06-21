@@ -5,7 +5,7 @@ The matrix compares:
 
 * git: system git as the baseline
 * sley_cli: release `sley` process, including process startup
-* sley_harness: `sley_cli::run` invoked repeatedly inside one process
+* sley_harness: removed with the pre-1.0 thin-CLI sweep
 
 By default repositories are cached under /private/tmp/sley-human-common-repos and
 results are written under /private/tmp/sley-human-common-results-<timestamp>.

@@ -194,7 +194,7 @@ fn should_prompt(config: &GitConfig, options: &DifftoolOptions) -> bool {
 fn collect_difftool_entries(
     repo: &RepositoryContext,
     options: &DifftoolOptions,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+) -> Result<Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>> {
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
@@ -206,26 +206,26 @@ fn collect_difftool_entries(
     } else {
         DiffPathspec::new(cwd, worktree_root, &paths)?
     };
-    let base_options = sley_diff_merge::DiffNameStatusOptions::default();
+    let base_options = sley::plumbing::sley_diff_merge::DiffNameStatusOptions::default();
     let mut entries = match (options.cached, revs.as_slice()) {
-        (true, []) => sley_diff_merge::diff_name_status_head_index(git_dir, format)?,
-        (true, [tree]) => sley_diff_merge::diff_name_status_tree_index_with_options(
+        (true, []) => sley::plumbing::sley_diff_merge::diff_name_status_head_index(git_dir, format)?,
+        (true, [tree]) => sley::plumbing::sley_diff_merge::diff_name_status_tree_index_with_options(
             git_dir,
             format,
             tree,
             base_options,
         )?,
         (false, []) => {
-            sley_diff_merge::diff_name_status_index_worktree(worktree_root, git_dir, format)?
+            sley::plumbing::sley_diff_merge::diff_name_status_index_worktree(worktree_root, git_dir, format)?
         }
-        (false, [tree]) => sley_diff_merge::diff_name_status_tree_worktree_with_options(
+        (false, [tree]) => sley::plumbing::sley_diff_merge::diff_name_status_tree_worktree_with_options(
             worktree_root,
             git_dir,
             format,
             tree,
             base_options,
         )?,
-        (_, [left, right]) => sley_diff_merge::diff_name_status_trees_with_options(
+        (_, [left, right]) => sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
             db,
             format,
             left,
@@ -235,7 +235,7 @@ fn collect_difftool_entries(
         _ => Vec::new(),
     };
     if options.cached {
-        entries.retain(|entry| entry.status != sley_diff_merge::NameStatus::Unmerged);
+        entries.retain(|entry| entry.status != sley::plumbing::sley_diff_merge::NameStatus::Unmerged);
     }
     Ok(apply_diff_pathspec(entries, &pathspec))
 }
@@ -260,7 +260,7 @@ fn split_difftool_revs(
         }
         if revs.len() < 2
             && let Ok(oid) = resolve_revision(git_dir, format, arg)
-            && let Ok(tree) = sley_rev::peel_to_tree(db, format, &oid)
+            && let Ok(tree) = sley::plumbing::sley_rev::peel_to_tree(db, format, &oid)
         {
             revs.push(tree);
             continue;
@@ -272,10 +272,10 @@ fn split_difftool_revs(
 }
 
 fn order_difftool_entries(
-    mut entries: Vec<sley_diff_merge::NameStatusEntry>,
+    mut entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     rotate_to: Option<&str>,
     skip_to: Option<&str>,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+) -> Result<Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>> {
     if let Some(path) = rotate_to {
         let Some(pos) = entries
             .iter()
@@ -300,7 +300,7 @@ fn order_difftool_entries(
 fn materialize_difftool_entry(
     db: &FileObjectDatabase,
     worktree_root: &Path,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     temp: &Path,
 ) -> Result<ToolEnvironment> {
     let rel = repo_path_to_path(&entry.path);
@@ -344,7 +344,7 @@ fn write_materialized(path: &Path, content: Option<&[u8]>, mode: Option<u32>) ->
 fn run_difftool_command(
     options: &DifftoolOptions,
     tool: &ToolCommand,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     envs: &ToolEnvironment,
 ) -> Result<i32> {
     if let Some(extcmd) = &options.extcmd {
@@ -369,7 +369,7 @@ fn run_dir_difftool(
     repo: &RepositoryContext,
     options: &DifftoolOptions,
     tool: &ToolCommand,
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
@@ -486,7 +486,7 @@ fn write_dir_materialized(path: &Path, content: Option<&[u8]>, mode: Option<u32>
 
 fn dir_diff_new_content(
     repo: &RepositoryContext,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
 ) -> Result<Option<Vec<u8>>> {
     if entry.new_mode == Some(0o120000) && entry.new_oid.is_none() {
         let path = repo.worktree_root()?.join(repo_path_to_path(&entry.path));
@@ -504,7 +504,7 @@ fn dir_diff_new_content(
 
 fn can_symlink_right_side(
     repo: &RepositoryContext,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
 ) -> Result<bool> {
     if !is_regular_file_mode(entry.new_mode) {
         return Ok(false);
@@ -579,8 +579,8 @@ fn run_no_index_difftool(options: &DifftoolOptions) -> Result<()> {
     let status = run_difftool_command(
         options,
         &tool,
-        &sley_diff_merge::NameStatusEntry {
-            status: sley_diff_merge::NameStatus::Modified,
+        &sley::plumbing::sley_diff_merge::NameStatusEntry {
+            status: sley::plumbing::sley_diff_merge::NameStatus::Modified,
             path: paths[0].as_bytes().to_vec().into(),
             old_path: None,
             old_mode: Some(0o100644),
@@ -602,13 +602,13 @@ fn load_no_index_difftool_config() -> Result<GitConfig> {
         return Ok(repo.config().clone());
     }
 
-    let context = sley_config::ConfigIncludeContext::default();
-    let mut config = sley_config::load_pre_dispatch_config(None, &context)?;
+    let context = sley::plumbing::sley_config::ConfigIncludeContext::default();
+    let mut config = sley::plumbing::sley_config::load_pre_dispatch_config(None, &context)?;
     if let Ok(parameters) =
-        sley_config::injected_config_parameters(effective_config_parameters_env().as_deref())
+        sley::plumbing::sley_config::injected_config_parameters(effective_config_parameters_env().as_deref())
     {
         let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        sley_config::append_injected_config_sections_with_includes(
+        sley::plumbing::sley_config::append_injected_config_sections_with_includes(
             &mut config,
             &parameters,
             &context,

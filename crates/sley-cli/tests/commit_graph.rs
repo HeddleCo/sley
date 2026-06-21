@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sley_core::ObjectFormat;
-use sley_formats::CommitGraph;
+use sley::plumbing::sley_core::ObjectFormat;
+use sley::plumbing::sley_formats::CommitGraph;
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()

@@ -365,7 +365,10 @@ fn maintenance_run_aborts_when_lock_exists() {
     fs::write(repo.join(".git/objects/maintenance.lock"), b"in use\n").expect("write lock");
 
     let out = git_rs(&repo, &["maintenance", "run"]);
-    assert!(!out.status.success(), "maintenance run unexpectedly succeeded");
+    assert!(
+        !out.status.success(),
+        "maintenance run unexpectedly succeeded"
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("'maintenance' lock held by another process"),
         "unexpected stderr: {}",

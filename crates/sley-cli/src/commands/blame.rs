@@ -34,8 +34,8 @@
 // reach its ancestor module's private items, so everything visible at the crate
 // root is in scope here without re-listing it.
 use crate::*;
-use sley_core::Signature;
-use sley_object::TreeEntries;
+use sley::Signature;
+use sley::plumbing::sley_object::TreeEntries;
 
 /// What to print in the metadata column for each line's author.
 #[derive(Clone, Copy)]
@@ -206,7 +206,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         Some(r) if r.starts_with('^') => {
             let core = &r[1..];
             let oid = repo.resolve_revision(core)?;
-            let tip = sley_rev::peel_to_commit(db, format, &oid)?;
+            let tip = sley::plumbing::sley_rev::peel_to_commit(db, format, &oid)?;
             ("HEAD".to_string(), Some(tip))
         }
         Some(r) if r.contains("..") => {
@@ -216,7 +216,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
                 None
             } else {
                 let oid = repo.resolve_revision(left)?;
-                Some(sley_rev::peel_to_commit(db, format, &oid)?)
+                Some(sley::plumbing::sley_rev::peel_to_commit(db, format, &oid)?)
             };
             (start.to_string(), boundary)
         }
@@ -226,7 +226,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
 
     // Resolve the requested revision (default HEAD) to a commit.
     let start_oid = repo.resolve_revision(&rev_spec)?;
-    let start_commit = sley_rev::peel_to_commit(db, format, &start_oid)?;
+    let start_commit = sley::plumbing::sley_rev::peel_to_commit(db, format, &start_oid)?;
 
     // Turn the cwd-relative path into a repository-root-relative path the way
     // git's pathspec handling does, then locate the blob at the start commit.
@@ -241,7 +241,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
     // unimplemented; see the module doc), so there is nothing to convert here
     // and applying smudge would diverge from git. When the working-tree overlay
     // lands, route that worktree-sourced content through
-    // `sley_worktree::apply_clean_filter` before it enters `compute_blame`.
+    // `sley::plumbing::sley_worktree::apply_clean_filter` before it enters `compute_blame`.
     let repo_path = blame_repo_relative_path(cwd, git_dir, &path)?;
     let (final_blob, virtual_final) = match read_path_blob(db, format, &start_commit, &repo_path)? {
         Some(blob) => (blob, false),
@@ -647,7 +647,7 @@ fn read_path_blob(
     commit: &ObjectId,
     repo_path: &str,
 ) -> Result<Option<Vec<u8>>> {
-    let tree_oid = sley_rev::peel_to_tree(db, format, commit)?;
+    let tree_oid = sley::plumbing::sley_rev::peel_to_tree(db, format, commit)?;
     let Some(blob_oid) = lookup_tree_path(db, format, &tree_oid, repo_path)? else {
         return Ok(None);
     };
@@ -664,13 +664,13 @@ fn read_index_blob(
     format: ObjectFormat,
     repo_path: &str,
 ) -> Result<Option<Vec<u8>>> {
-    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+    let Some(index) = sley::plumbing::sley_worktree::read_repository_index(git_dir, format)? else {
         return Ok(None);
     };
     let Some(entry) = index
         .entries
         .iter()
-        .find(|entry| entry.stage() == sley_index::Stage::Normal && entry.path.as_bytes() == repo_path.as_bytes())
+        .find(|entry| entry.stage() == sley::plumbing::sley_index::Stage::Normal && entry.path.as_bytes() == repo_path.as_bytes())
     else {
         return Ok(None);
     };
@@ -714,7 +714,7 @@ fn lookup_tree_path(
         if idx == last {
             return Ok(Some(oid));
         }
-        if sley_object::tree_entry_object_type(mode) != ObjectType::Tree {
+        if sley::plumbing::sley_object::tree_entry_object_type(mode) != ObjectType::Tree {
             return Ok(None);
         }
         current = oid;
@@ -771,7 +771,7 @@ fn compute_blame(
     copy_score: usize,
     virtual_final: bool,
 ) -> Result<Vec<LineBlame>> {
-    let final_lines = sley_diff_merge::split_lines(final_blob);
+    let final_lines = sley::plumbing::sley_diff_merge::split_lines(final_blob);
     let line_count = final_lines.len();
 
     // Final attribution per line, filled in as commits are found guilty.
@@ -835,7 +835,7 @@ fn compute_blame(
             charge_remaining(&mut result, &final_lines, &origin, false, owned);
             continue;
         };
-        let child_lines = sley_diff_merge::split_lines(&child_blob);
+        let child_lines = sley::plumbing::sley_diff_merge::split_lines(&child_blob);
 
         let mut parents = if origin.virtual_worktree {
             vec![origin.commit]
@@ -880,7 +880,7 @@ fn compute_blame(
                 break;
             }
 
-            let parent_lines = sley_diff_merge::split_lines(&parent_blob);
+            let parent_lines = sley::plumbing::sley_diff_merge::split_lines(&parent_blob);
             let mut still_ours = Vec::new();
             let passed = pass_blame_to_parent(&parent_lines, &child_lines, &mut owned);
             still_ours.append(&mut owned);
@@ -953,8 +953,8 @@ fn compute_blame(
 /// `offset = start_a - start_b` is how far the parent's line numbers lead the
 /// child's across a common run.
 fn pass_blame_to_parent(
-    parent_lines: &[sley_diff_merge::DiffLine<'_>],
-    child_lines: &[sley_diff_merge::DiffLine<'_>],
+    parent_lines: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
+    child_lines: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
     owned: &mut Vec<BlameEntry>,
 ) -> Vec<BlameEntry> {
     let hunks = diff_hunks(parent_lines, child_lines);
@@ -1031,28 +1031,28 @@ struct DiffHunk {
 /// into a single `(start_a, count_a, start_b, count_b)` hunk; `Equal` runs are
 /// the common stretches between hunks.
 fn diff_hunks(
-    parent_lines: &[sley_diff_merge::DiffLine<'_>],
-    child_lines: &[sley_diff_merge::DiffLine<'_>],
+    parent_lines: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
+    child_lines: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
 ) -> Vec<DiffHunk> {
     if let Some(hunks) = contiguous_parent_hunks(parent_lines, child_lines) {
         return hunks;
     }
 
-    let ops = sley_diff_merge::myers_diff_lines(parent_lines, child_lines);
+    let ops = sley::plumbing::sley_diff_merge::myers_diff_lines(parent_lines, child_lines);
     let mut hunks = Vec::new();
     let mut a = 0usize; // parent line cursor
     let mut b = 0usize; // child line cursor
     let mut pending: Option<DiffHunk> = None;
     for op in ops {
         match op {
-            sley_diff_merge::DiffOp::Equal(n) => {
+            sley::plumbing::sley_diff_merge::DiffOp::Equal(n) => {
                 if let Some(h) = pending.take() {
                     hunks.push(h);
                 }
                 a += n;
                 b += n;
             }
-            sley_diff_merge::DiffOp::Delete(n) => {
+            sley::plumbing::sley_diff_merge::DiffOp::Delete(n) => {
                 let h = pending.get_or_insert(DiffHunk {
                     start_a: a,
                     count_a: 0,
@@ -1062,7 +1062,7 @@ fn diff_hunks(
                 h.count_a += n;
                 a += n;
             }
-            sley_diff_merge::DiffOp::Insert(n) => {
+            sley::plumbing::sley_diff_merge::DiffOp::Insert(n) => {
                 let h = pending.get_or_insert(DiffHunk {
                     start_a: a,
                     count_a: 0,
@@ -1086,8 +1086,8 @@ fn diff_hunks(
 /// otherwise tempt Myers into matching the parent's closing brace to the later
 /// appended function.
 fn contiguous_parent_hunks(
-    parent_lines: &[sley_diff_merge::DiffLine<'_>],
-    child_lines: &[sley_diff_merge::DiffLine<'_>],
+    parent_lines: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
+    child_lines: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
 ) -> Option<Vec<DiffHunk>> {
     if parent_lines.is_empty() || child_lines.len() < parent_lines.len() {
         return None;
@@ -1205,7 +1205,7 @@ fn queue_entries(
 /// Charge every remaining chunk to `commit_oid` as a final attribution.
 fn charge_remaining(
     result: &mut [Option<LineBlame>],
-    final_lines: &[sley_diff_merge::DiffLine<'_>],
+    final_lines: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
     origin: &OriginKey,
     boundary: bool,
     owned: Vec<BlameEntry>,
@@ -1243,23 +1243,23 @@ fn find_parent_origin(
         }));
     }
 
-    let parent_tree = sley_rev::peel_to_tree(db, format, parent)?;
-    let child_tree = sley_rev::peel_to_tree(db, format, &origin.commit)?;
-    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+    let parent_tree = sley::plumbing::sley_rev::peel_to_tree(db, format, parent)?;
+    let child_tree = sley::plumbing::sley_rev::peel_to_tree(db, format, &origin.commit)?;
+    let entries = sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
         db,
         format,
         &parent_tree,
         &child_tree,
-        sley_diff_merge::RenameDetectionOptions {
-            base: sley_diff_merge::DiffNameStatusOptions {
+        sley::plumbing::sley_diff_merge::RenameDetectionOptions {
+            base: sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
                 detect_renames: true,
                 detect_copies: allow_whole_copy,
                 find_copies_harder: allow_whole_copy,
                 rename_empty: true,
             },
             detect_inexact: true,
-            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            copy_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
         },
     )?;
 
@@ -1267,8 +1267,8 @@ fn find_parent_origin(
         if entry.path.as_bytes() != origin.path.as_bytes() {
             continue;
         }
-        let is_origin = matches!(entry.status, sley_diff_merge::NameStatus::Renamed(_))
-            || (allow_whole_copy && matches!(entry.status, sley_diff_merge::NameStatus::Copied(_)));
+        let is_origin = matches!(entry.status, sley::plumbing::sley_diff_merge::NameStatus::Renamed(_))
+            || (allow_whole_copy && matches!(entry.status, sley::plumbing::sley_diff_merge::NameStatus::Copied(_)));
         if is_origin
             && let Some(old_path) = entry.old_path
         {
@@ -1290,7 +1290,7 @@ fn find_copies_in_parents(
     copy_level: u8,
     copy_score: usize,
     owned: &mut Vec<BlameEntry>,
-    final_lines: &[sley_diff_merge::DiffLine<'_>],
+    final_lines: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
 ) -> Result<Vec<(OriginKey, Vec<BlameEntry>)>> {
     let mut copied_by_origin: Vec<(OriginKey, Vec<BlameEntry>)> = Vec::new();
     for parent in parents {
@@ -1308,7 +1308,7 @@ fn find_copies_in_parents(
             let Some(blob) = read_path_blob(db, format, parent, &path)? else {
                 continue;
             };
-            let source_lines = sley_diff_merge::split_lines(&blob);
+            let source_lines = sley::plumbing::sley_diff_merge::split_lines(&blob);
             let mut next_owned = Vec::new();
             let mut copied = Vec::new();
             for entry in std::mem::take(owned) {
@@ -1344,7 +1344,7 @@ fn copy_candidate_paths(
     parent: &ObjectId,
     copy_level: u8,
 ) -> Result<Vec<String>> {
-    let parent_tree = sley_rev::peel_to_tree(db, format, parent)?;
+    let parent_tree = sley::plumbing::sley_rev::peel_to_tree(db, format, parent)?;
     let use_all = copy_level >= 3
         || (copy_level >= 2 && read_path_blob(db, format, parent, &origin.path)?.is_none());
     if use_all {
@@ -1353,13 +1353,13 @@ fn copy_candidate_paths(
         return Ok(out);
     }
 
-    let child_tree = sley_rev::peel_to_tree(db, format, &origin.commit)?;
-    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+    let child_tree = sley::plumbing::sley_rev::peel_to_tree(db, format, &origin.commit)?;
+    let entries = sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
         db,
         format,
         &parent_tree,
         &child_tree,
-        sley_diff_merge::RenameDetectionOptions::default(),
+        sley::plumbing::sley_diff_merge::RenameDetectionOptions::default(),
     )?;
     let mut out = Vec::new();
     for entry in entries {
@@ -1367,7 +1367,7 @@ fn copy_candidate_paths(
             out.push(String::from_utf8_lossy(old_path.as_bytes()).into_owned());
         } else if matches!(
             entry.status,
-            sley_diff_merge::NameStatus::Deleted | sley_diff_merge::NameStatus::Modified
+            sley::plumbing::sley_diff_merge::NameStatus::Deleted | sley::plumbing::sley_diff_merge::NameStatus::Modified
         ) {
             out.push(String::from_utf8_lossy(entry.path.as_bytes()).into_owned());
         }
@@ -1393,7 +1393,7 @@ fn collect_tree_blob_paths(
             path.push(b'/');
         }
         path.extend_from_slice(&entry.name);
-        match sley_object::tree_entry_object_type(entry.mode) {
+        match sley::plumbing::sley_object::tree_entry_object_type(entry.mode) {
             ObjectType::Tree => collect_tree_blob_paths(db, format, &entry.oid, path, out)?,
             ObjectType::Blob => out.push(String::from_utf8_lossy(&path).into_owned()),
             _ => {}
@@ -1404,8 +1404,8 @@ fn collect_tree_blob_paths(
 
 fn split_copy_matches(
     entry: BlameEntry,
-    final_lines: &[sley_diff_merge::DiffLine<'_>],
-    source_lines: &[sley_diff_merge::DiffLine<'_>],
+    final_lines: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
+    source_lines: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
     copy_score: usize,
     copied: &mut Vec<BlameEntry>,
     remaining: &mut Vec<BlameEntry>,
@@ -1457,7 +1457,7 @@ fn push_entry_slice(
 }
 
 fn blame_entry_score(
-    final_lines: &[sley_diff_merge::DiffLine<'_>],
+    final_lines: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
     start: usize,
     len: usize,
 ) -> usize {
@@ -2212,8 +2212,8 @@ fn blame_option_requires_value(option: &str) -> GitError {
 mod tests {
     use super::*;
 
-    fn lines(blob: &[u8]) -> Vec<sley_diff_merge::DiffLine<'_>> {
-        sley_diff_merge::split_lines(blob)
+    fn lines(blob: &[u8]) -> Vec<sley::plumbing::sley_diff_merge::DiffLine<'_>> {
+        sley::plumbing::sley_diff_merge::split_lines(blob)
     }
 
     #[test]

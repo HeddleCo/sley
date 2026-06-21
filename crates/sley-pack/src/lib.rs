@@ -3916,13 +3916,10 @@ fn compress_planned_payloads(
             handles.push(scope.spawn(move || -> Result<Vec<(usize, Vec<u8>)>> {
                 let mut chunk_payloads = Vec::with_capacity(chunk.len());
                 for (offset, &idx) in chunk.iter().enumerate() {
-                        chunk_payloads.push((
-                            chunk_start + offset,
-                            compressed_payload(
-                                planned_payload(objects, plan, idx),
-                                compression_level,
-                            )?,
-                        ));
+                    chunk_payloads.push((
+                        chunk_start + offset,
+                        compressed_payload(planned_payload(objects, plan, idx), compression_level)?,
+                    ));
                 }
                 Ok(chunk_payloads)
             }));

@@ -72,9 +72,9 @@ pub(super) struct LogDiffOptions {
     pub(super) merges_imply_patch: bool,
     /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
     /// `--ignore-cr-at-eol`).
-    pub(super) ws_ignore: sley_diff_merge::WsIgnore,
+    pub(super) ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore,
     /// The line-diff algorithm (`--patience` / `--histogram` / Myers default).
-    pub(super) diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    pub(super) diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm,
     /// `--ignore-blank-lines`.
     pub(super) ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
@@ -104,8 +104,8 @@ impl Default for LogDiffOptions {
             stat_count: None,
             merges: None,
             merges_imply_patch: false,
-            ws_ignore: sley_diff_merge::WsIgnore::default(),
-            diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+            ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
+            diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
             text: false,
@@ -130,7 +130,7 @@ impl LogDiffOptions {
     /// Per-record variant of [`block_separator`](Self::block_separator). A
     /// combined merge always uses a blank-line separator before its block (git
     /// never prefixes a combined stat-then-patch block with `---`).
-    pub(super) fn block_separator_for(&self, record: &sley_rev::CommitRecord) -> &'static [u8] {
+    pub(super) fn block_separator_for(&self, record: &sley::plumbing::sley_rev::CommitRecord) -> &'static [u8] {
         if record.commit.parents.len() > 1
             && matches!(self.merges, Some(LogDiffMerges::Combined { .. }))
         {
@@ -179,21 +179,21 @@ impl LogDiffContext<'_> {
     /// differ between the default and oneline/format outputs).
     pub(super) fn render(
         &self,
-        record: &sley_rev::CommitRecord,
+        record: &sley::plumbing::sley_rev::CommitRecord,
         line_prefix_width: i64,
         out: &mut Vec<u8>,
     ) -> Result<()> {
         self.render_against_parent(record, None, line_prefix_width, out)
     }
 
-    pub(super) fn separate_parent_count(&self, record: &sley_rev::CommitRecord) -> Option<usize> {
+    pub(super) fn separate_parent_count(&self, record: &sley::plumbing::sley_rev::CommitRecord) -> Option<usize> {
         (record.commit.parents.len() > 1 && self.merges == LogDiffMerges::Separate)
             .then_some(record.commit.parents.len())
     }
 
     pub(super) fn render_parent(
         &self,
-        record: &sley_rev::CommitRecord,
+        record: &sley::plumbing::sley_rev::CommitRecord,
         parent_index: usize,
         line_prefix_width: i64,
         out: &mut Vec<u8>,
@@ -203,7 +203,7 @@ impl LogDiffContext<'_> {
 
     fn render_against_parent(
         &self,
-        record: &sley_rev::CommitRecord,
+        record: &sley::plumbing::sley_rev::CommitRecord,
         parent_index: Option<usize>,
         line_prefix_width: i64,
         out: &mut Vec<u8>,
@@ -248,7 +248,7 @@ impl LogDiffContext<'_> {
                 },
             }
         };
-        let base = sley_diff_merge::DiffNameStatusOptions {
+        let base = sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
             detect_renames: self.detect_renames,
             detect_copies: self.detect_copies,
             find_copies_harder: false,
@@ -256,26 +256,26 @@ impl LogDiffContext<'_> {
         };
         let tree = &record.commit.tree;
         let entries = match (&parent_tree, self.detect_renames) {
-            (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+            (Some(parent), true) => sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
                 self.db,
                 self.format,
                 parent,
                 tree,
-                sley_diff_merge::RenameDetectionOptions {
+                sley::plumbing::sley_diff_merge::RenameDetectionOptions {
                     base,
                     detect_inexact: true,
-                    rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-                    copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                    rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                    copy_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 },
             )?,
-            (Some(parent), false) => sley_diff_merge::diff_name_status_trees_with_options(
+            (Some(parent), false) => sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
                 self.db,
                 self.format,
                 parent,
                 tree,
                 base,
             )?,
-            (None, _) => sley_diff_merge::diff_name_status_empty_tree_with_options(
+            (None, _) => sley::plumbing::sley_diff_merge::diff_name_status_empty_tree_with_options(
                 self.db,
                 self.format,
                 tree,
@@ -405,7 +405,7 @@ impl LogDiffContext<'_> {
     /// owns separators).
     fn render_combined_merge(
         &self,
-        record: &sley_rev::CommitRecord,
+        record: &sley::plumbing::sley_rev::CommitRecord,
         dense: bool,
         line_prefix_width: i64,
         out: &mut Vec<u8>,
@@ -431,13 +431,13 @@ impl LogDiffContext<'_> {
             || opts.shortstat
             || opts.summary;
         let first_parent_entries = if stat_active {
-            let base = sley_diff_merge::DiffNameStatusOptions {
+            let base = sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
                 detect_renames: self.detect_renames,
                 detect_copies: self.detect_copies,
                 find_copies_harder: false,
                 rename_empty: true,
             };
-            sley_diff_merge::diff_name_status_trees_with_options(
+            sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
                 self.db,
                 self.format,
                 &parent_trees[0],

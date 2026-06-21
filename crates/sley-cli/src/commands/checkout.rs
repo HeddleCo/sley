@@ -16,8 +16,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut guess = None::<bool>;
     let mut path_merge = false;
     let mut conflict_implies_merge = false;
-    let mut conflict_style = None::<sley_worktree::CheckoutConflictStyle>;
-    let mut checkout_stage = None::<sley_worktree::CheckoutStage>;
+    let mut conflict_style = None::<sley::plumbing::sley_worktree::CheckoutConflictStyle>;
+    let mut checkout_stage = None::<sley::plumbing::sley_worktree::CheckoutStage>;
     let mut branch_mode = CheckoutBranchMode::Existing;
     let mut ignore_other_worktrees = false;
     let mut track = None::<crate::commands::branch::BranchTrackMode>;
@@ -53,8 +53,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 conflict_style = None;
                 conflict_implies_merge = false;
             }
-            "--ours" => checkout_stage = Some(sley_worktree::CheckoutStage::Ours),
-            "--theirs" => checkout_stage = Some(sley_worktree::CheckoutStage::Theirs),
+            "--ours" => checkout_stage = Some(sley::plumbing::sley_worktree::CheckoutStage::Ours),
+            "--theirs" => checkout_stage = Some(sley::plumbing::sley_worktree::CheckoutStage::Theirs),
             "-p" | "--patch" => patch = true,
             "--no-patch" => patch = false,
             "--no-auto-advance" => no_auto_advance = true,
@@ -278,7 +278,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 let store = FileRefStore::new(&git_dir, format);
                 let is_branch = branch_ref_name(value)
                     .ok()
-                    .and_then(|name| sley_refs::resolve_ref_peeled(&store, &name).ok().flatten())
+                    .and_then(|name| sley::plumbing::sley_refs::resolve_ref_peeled(&store, &name).ok().flatten())
                     .is_some();
                 if !is_branch
                     && checkout_resolve_start_oid(&git_dir, format, value).is_err()
@@ -324,8 +324,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     }
                     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
                     let oid = checkout_resolve_start_oid(&git_dir, format, rev)?;
-                    let tree = sley_rev::peel_to_tree(&db, format, &oid)?;
-                    sley_worktree::restore_index_and_worktree_paths_from_tree(
+                    let tree = sley::plumbing::sley_rev::peel_to_tree(&db, format, &oid)?;
+                    sley::plumbing::sley_worktree::restore_index_and_worktree_paths_from_tree(
                         worktree_root,
                         git_dir,
                         format,
@@ -338,17 +338,17 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     let conflict_style = conflict_style.unwrap_or_else(|| {
                         match checkout_config.get("merge", None, "conflictstyle") {
                             Some("diff3") | Some("zdiff3") => {
-                                sley_worktree::CheckoutConflictStyle::Diff3
+                                sley::plumbing::sley_worktree::CheckoutConflictStyle::Diff3
                             }
-                            _ => sley_worktree::CheckoutConflictStyle::Merge,
+                            _ => sley::plumbing::sley_worktree::CheckoutConflictStyle::Merge,
                         }
                     });
-                    sley_worktree::checkout_index_paths(
+                    sley::plumbing::sley_worktree::checkout_index_paths(
                         worktree_root,
                         &git_dir,
                         format,
                         &resolved_paths,
-                        sley_worktree::CheckoutIndexPathOptions {
+                        sley::plumbing::sley_worktree::CheckoutIndexPathOptions {
                             force,
                             merge: path_merge || conflict_implies_merge,
                             stage: checkout_stage,
@@ -378,7 +378,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             let switches_to_other_branch = branch_ref_name(target)
                 .ok()
                 .filter(|name| {
-                    sley_refs::resolve_ref_peeled(&store, name)
+                    sley::plumbing::sley_refs::resolve_ref_peeled(&store, name)
                         .ok()
                         .flatten()
                         .is_some()
@@ -390,13 +390,13 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     )
                 });
             if !switches_to_other_branch {
-                sley_worktree::reset_index_and_worktree_to_commit(
+                sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(
                     &worktree_root,
                     &git_dir,
                     format,
                     &target_oid,
                 )?;
-                sley_sequencer::replay::remove_branch_state(&git_dir);
+                sley::plumbing::sley_sequencer::replay::remove_branch_state(&git_dir);
                 return Ok(());
             }
         }
@@ -408,7 +408,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     if force {
         let store = FileRefStore::new(&git_dir, format);
         if let Ok(Some(head_oid)) = resolve_ref_peeled(&store, "HEAD") {
-            sley_worktree::reset_index_and_worktree_to_commit(
+            sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(
                 &worktree_root,
                 &git_dir,
                 format,
@@ -416,7 +416,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             )?;
         } else {
             // Unborn HEAD: discard the staged state entirely.
-            let index_path = sley_worktree::repository_index_path(&git_dir);
+            let index_path = sley::plumbing::sley_worktree::repository_index_path(&git_dir);
             if index_path.exists() {
                 let index = Index::parse(&fs::read(&index_path)?, format)?;
                 for entry in &index.entries {
@@ -450,7 +450,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             let target = positional.first().map(String::as_str).unwrap_or("HEAD");
             let target_oid = checkout_resolve_start_oid(&git_dir, format, target)?;
             let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-            let target_oid = sley_rev::peel_to_commit(&db, format, &target_oid)?;
+            let target_oid = sley::plumbing::sley_rev::peel_to_commit(&db, format, &target_oid)?;
             let store = FileRefStore::new(&git_dir, format);
             let from = checkout_reflog_from_name(&store);
             let config = read_repo_config(&git_dir)?;
@@ -469,7 +469,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 )?;
                 detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
             } else {
-                match sley_worktree::checkout_detached_filtered(
+                match sley::plumbing::sley_worktree::checkout_detached_filtered(
                     &worktree_root,
                     &git_dir,
                     format,
@@ -493,7 +493,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     Err(err) => return Err(err),
                 }
             }
-            sley_sequencer::replay::remove_branch_state(&git_dir);
+            sley::plumbing::sley_sequencer::replay::remove_branch_state(&git_dir);
             if !quiet {
                 checkout_print_previous_detached_head(
                     &git_dir,
@@ -543,7 +543,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             };
             let is_branch = branch_ref_name(branch)
                 .ok()
-                .and_then(|name| sley_refs::resolve_ref_peeled(&store, &name).ok().flatten())
+                .and_then(|name| sley::plumbing::sley_refs::resolve_ref_peeled(&store, &name).ok().flatten())
                 .is_some();
             if let Some(current_branch) = attached_current_branch {
                 CheckoutMessage::Existing {
@@ -552,7 +552,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             } else if !is_branch
                 && branch.contains("@{")
                 && let Ok(Some(refname)) =
-                    sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, branch)
+                    sley::plumbing::sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, branch)
                 && let Some(local_branch) = refname.strip_prefix("refs/heads/")
                 && store.read_ref(&refname)?.is_some()
             {
@@ -579,7 +579,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     )?;
                     detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
                 } else {
-                    match sley_worktree::checkout_detached_filtered(
+                    match sley::plumbing::sley_worktree::checkout_detached_filtered(
                         &worktree_root,
                         &git_dir,
                         format,
@@ -603,7 +603,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         Err(err) => return Err(err),
                     }
                 }
-                sley_sequencer::replay::remove_branch_state(&git_dir);
+                sley::plumbing::sley_sequencer::replay::remove_branch_state(&git_dir);
                 if !quiet {
                     if old_head_direct.is_none() {
                         checkout_print_detached_head_advice(&config, branch);
@@ -704,7 +704,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         );
                         return Err(GitError::Exit(128));
                     };
-                    sley_worktree::reset_index_and_worktree_to_commit(
+                    sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(
                         &worktree_root,
                         &git_dir,
                         format,
@@ -712,7 +712,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     )?;
                 }
                 checkout_switch_to_unborn_branch(&git_dir, &branch)?;
-                sley_sequencer::replay::remove_branch_state(&git_dir);
+                sley::plumbing::sley_sequencer::replay::remove_branch_state(&git_dir);
                 if !quiet {
                     eprintln!("Switched to a new branch '{branch}'");
                 }
@@ -754,7 +754,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             )?;
             let tracking_start = positional.first().map(|start| {
                 if start.contains("@{") {
-                    sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, start)
+                    sley::plumbing::sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, start)
                         .ok()
                         .flatten()
                         .or_else(|| checkout_tracking_start_ref(&store, start))
@@ -788,7 +788,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             store.read_ref("HEAD"),
             Ok(Some(RefTarget::Symbolic(current))) if current == branch_ref
         )
-        && let Some(worktree) = sley_worktree::find_shared_symref(&git_dir, "HEAD", &branch_ref)?
+        && let Some(worktree) = sley::plumbing::sley_worktree::find_shared_symref(&git_dir, "HEAD", &branch_ref)?
     {
         eprintln!(
             "fatal: '{}' is already used by worktree at '{}'",
@@ -799,7 +799,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     let branch_target = if store.read_ref(&branch_ref)?.is_some() {
-        sley_refs::resolve_ref_peeled(&store, &branch_ref)?
+        sley::plumbing::sley_refs::resolve_ref_peeled(&store, &branch_ref)?
     } else {
         None
     };
@@ -808,7 +808,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         if resolve_ref_peeled(&store, "HEAD")? == Some(target)
             && checkout_index_empty(&git_dir, format)?
         {
-            sley_worktree::reset_index_and_worktree_to_commit(
+            sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(
                 &worktree_root,
                 &git_dir,
                 format,
@@ -817,7 +817,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         }
     }
     if branch_target.is_none() {
-        sley_sequencer::replay::remove_branch_state(&git_dir);
+        sley::plumbing::sley_sequencer::replay::remove_branch_state(&git_dir);
         if !quiet {
             checkout_message.print();
         }
@@ -843,7 +843,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             return Err(err);
         }
     } else {
-        match sley_worktree::checkout_branch_filtered(
+        match sley::plumbing::sley_worktree::checkout_branch_filtered(
             &worktree_root,
             git_dir.clone(),
             format,
@@ -855,7 +855,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             Err(err) if checkout_is_dirty_tree_error(&err) => {
                 let store = FileRefStore::new(&git_dir, format);
                 let from = checkout_reflog_from_name(&store);
-                let target = sley_refs::resolve_ref_peeled(&store, &branch_ref_name(branch)?)?
+                let target = sley::plumbing::sley_refs::resolve_ref_peeled(&store, &branch_ref_name(branch)?)?
                     .ok_or_else(|| GitError::reference_not_found("branch"))?;
                 if let Err(err) = checkout_twoway_dirty(
                     &git_dir,
@@ -881,7 +881,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             }
         }
     }
-    sley_sequencer::replay::remove_branch_state(&git_dir);
+    sley::plumbing::sley_sequencer::replay::remove_branch_state(&git_dir);
     let checkout_new_head = resolve_ref_peeled(&FileRefStore::new(&git_dir, format), "HEAD")?
         .unwrap_or(checkout_old_head);
     run_post_checkout_hook(&checkout_old_head, &checkout_new_head, true)?;
@@ -939,7 +939,7 @@ fn checkout_index_has_path(
     })?;
     let git_path = relative.to_string_lossy().replace('\\', "/").into_bytes();
     Ok(
-        sley_worktree::read_repository_index(git_dir, format)?.is_some_and(|index| {
+        sley::plumbing::sley_worktree::read_repository_index(git_dir, format)?.is_some_and(|index| {
             index
                 .entries
                 .iter()
@@ -948,10 +948,10 @@ fn checkout_index_has_path(
     )
 }
 
-fn checkout_conflict_style(value: &str) -> Result<sley_worktree::CheckoutConflictStyle> {
+fn checkout_conflict_style(value: &str) -> Result<sley::plumbing::sley_worktree::CheckoutConflictStyle> {
     match value {
-        "merge" => Ok(sley_worktree::CheckoutConflictStyle::Merge),
-        "diff3" | "zdiff3" => Ok(sley_worktree::CheckoutConflictStyle::Diff3),
+        "merge" => Ok(sley::plumbing::sley_worktree::CheckoutConflictStyle::Merge),
+        "diff3" | "zdiff3" => Ok(sley::plumbing::sley_worktree::CheckoutConflictStyle::Diff3),
         other => {
             eprintln!("error: unknown conflict style '{other}'");
             Err(GitError::Exit(129))
@@ -1024,7 +1024,7 @@ fn checkout_warn_orphaned_detached_commits(
     new_head: &ObjectId,
 ) -> Result<bool> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let old_commits = match sley_rev::walk_commit_metadata(git_dir, format, &db, [*old_head], false)
+    let old_commits = match sley::plumbing::sley_rev::walk_commit_metadata(git_dir, format, &db, [*old_head], false)
     {
         Ok(commits) => commits,
         Err(_) => return Ok(false),
@@ -1035,13 +1035,13 @@ fn checkout_warn_orphaned_detached_commits(
         if reference.name == "HEAD" {
             continue;
         }
-        if let Some(oid) = sley_refs::resolve_ref_peeled(store, &reference.name)?
-            && let Ok(commit_oid) = sley_rev::peel_to_commit(&db, format, &oid)
+        if let Some(oid) = sley::plumbing::sley_refs::resolve_ref_peeled(store, &reference.name)?
+            && let Ok(commit_oid) = sley::plumbing::sley_rev::peel_to_commit(&db, format, &oid)
         {
             protected_roots.push(commit_oid);
         }
     }
-    let protected = sley_rev::walk_commit_metadata(git_dir, format, &db, protected_roots, false)?
+    let protected = sley::plumbing::sley_rev::walk_commit_metadata(git_dir, format, &db, protected_roots, false)?
         .into_iter()
         .map(|commit| commit.oid)
         .collect::<HashSet<_>>();
@@ -1080,7 +1080,7 @@ fn checkout_print_multi_orphan_warning(
     git_dir: &Path,
     format: ObjectFormat,
     config: &GitConfig,
-    orphaned: &[sley_rev::CommitMetadata],
+    orphaned: &[sley::plumbing::sley_rev::CommitMetadata],
 ) -> Result<bool> {
     eprintln!(
         "Warning: you are leaving {} commits behind, not connected to",
@@ -1139,7 +1139,7 @@ fn checkout_expand_previous_branch_arg(
     store: &FileRefStore,
     n: usize,
 ) -> Result<Option<String>> {
-    let Some(name) = sley_rev::nth_prior_checkout_branch_name(git_dir, format, n)? else {
+    let Some(name) = sley::plumbing::sley_rev::nth_prior_checkout_branch_name(git_dir, format, n)? else {
         return Ok(None);
     };
     let branch = name.strip_prefix("refs/heads/").unwrap_or(&name);
@@ -1175,14 +1175,11 @@ fn checkout_expand_creation_branch_name(
         let n = inner
             .parse::<usize>()
             .map_err(|_| GitError::InvalidFormat(format!("invalid branch name: '{branch}'")))?;
-        return Ok(
-            sley_rev::nth_prior_checkout_branch_name(git_dir, format, n)?
-                .unwrap_or(branch),
-        );
+        return Ok(sley::plumbing::sley_rev::nth_prior_checkout_branch_name(git_dir, format, n)?.unwrap_or(branch));
     }
     if branch.contains("@{")
         && let Ok(Some(refname)) =
-            sley_rev::resolve_revision_symbolic_full_name(git_dir, format, &branch)
+            sley::plumbing::sley_rev::resolve_revision_symbolic_full_name(git_dir, format, &branch)
         && let Some(local) = refname.strip_prefix("refs/heads/")
         && store.read_ref(&refname)?.is_some()
     {
@@ -1321,10 +1318,10 @@ fn checkout_dwim_remote_branch(
             return Err(GitError::Exit(128));
         }
         let remote_ref = matches.remove(0);
-        let oid = sley_refs::resolve_ref_peeled(store, &remote_ref)?
+        let oid = sley::plumbing::sley_refs::resolve_ref_peeled(store, &remote_ref)?
             .ok_or_else(|| GitError::reference_not_found(&remote_ref))?;
         let db = FileObjectDatabase::from_git_dir(git_dir, format);
-        let _ = sley_rev::peel_to_commit(&db, format, &oid)?;
+        let _ = sley::plumbing::sley_rev::peel_to_commit(&db, format, &oid)?;
         return Ok(Some(CheckoutDwimRemoteBranch { remote_ref }));
     }
 
@@ -1424,7 +1421,7 @@ pub(crate) fn cmd_switch(args: &[String]) -> Result<()> {
         let format = repository_object_format(&git_dir)?;
         checkout_twoway_dirty(&git_dir, &worktree_root, format, None, false, false)?;
         checkout_switch_to_unborn_branch(&git_dir, branch)?;
-        sley_sequencer::replay::remove_branch_state(&git_dir);
+        sley::plumbing::sley_sequencer::replay::remove_branch_state(&git_dir);
         if !args.iter().any(|arg| arg == "-q" || arg == "--quiet") {
             eprintln!("Switched to a new branch '{branch}'");
         }
@@ -1486,8 +1483,8 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
     let mut ignore_unmerged = false;
     let mut path_merge = false;
     let mut conflict_implies_merge = false;
-    let mut conflict_style = None::<sley_worktree::CheckoutConflictStyle>;
-    let mut checkout_stage = None::<sley_worktree::CheckoutStage>;
+    let mut conflict_style = None::<sley::plumbing::sley_worktree::CheckoutConflictStyle>;
+    let mut checkout_stage = None::<sley::plumbing::sley_worktree::CheckoutStage>;
     let mut patch = false;
     let mut unified_context = false;
     let mut inter_hunk_context = false;
@@ -1535,8 +1532,8 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
                 conflict_style = None;
                 conflict_implies_merge = false;
             }
-            "--ours" => checkout_stage = Some(sley_worktree::CheckoutStage::Ours),
-            "--theirs" => checkout_stage = Some(sley_worktree::CheckoutStage::Theirs),
+            "--ours" => checkout_stage = Some(sley::plumbing::sley_worktree::CheckoutStage::Ours),
+            "--theirs" => checkout_stage = Some(sley::plumbing::sley_worktree::CheckoutStage::Theirs),
             "-p" | "--patch" => patch = true,
             "--no-patch" => patch = false,
             "-U" => {
@@ -1732,13 +1729,13 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
     let source_tree = if let Some(source) = source.as_deref() {
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let oid = resolve_revision(&git_dir, format, source)?;
-        Some(sley_rev::peel_to_tree(&db, format, &oid)?)
+        Some(sley::plumbing::sley_rev::peel_to_tree(&db, format, &oid)?)
     } else {
         None
     };
     if staged && worktree {
         if let Some(tree_oid) = source_tree.as_ref() {
-            sley_worktree::restore_index_and_worktree_paths_from_tree(
+            sley::plumbing::sley_worktree::restore_index_and_worktree_paths_from_tree(
                 worktree_root,
                 git_dir,
                 format,
@@ -1746,7 +1743,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
                 &resolved_paths,
             )?;
         } else {
-            sley_worktree::restore_index_and_worktree_paths_from_head(
+            sley::plumbing::sley_worktree::restore_index_and_worktree_paths_from_head(
                 worktree_root,
                 git_dir,
                 format,
@@ -1755,7 +1752,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         }
     } else if staged {
         if let Some(tree_oid) = source_tree.as_ref() {
-            sley_worktree::restore_index_paths_from_tree(
+            sley::plumbing::sley_worktree::restore_index_paths_from_tree(
                 worktree_root,
                 git_dir,
                 format,
@@ -1763,7 +1760,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
                 &resolved_paths,
             )?;
         } else {
-            sley_worktree::restore_index_paths_from_head(
+            sley::plumbing::sley_worktree::restore_index_paths_from_head(
                 worktree_root,
                 git_dir,
                 format,
@@ -1771,7 +1768,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
             )?;
         }
     } else if let Some(tree_oid) = source_tree.as_ref() {
-        sley_worktree::restore_worktree_paths_from_tree(
+        sley::plumbing::sley_worktree::restore_worktree_paths_from_tree(
             worktree_root,
             git_dir,
             format,
@@ -1782,15 +1779,15 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         let config = read_repo_config(&git_dir)?;
         let conflict_style =
             conflict_style.unwrap_or_else(|| match config.get("merge", None, "conflictstyle") {
-                Some("diff3") | Some("zdiff3") => sley_worktree::CheckoutConflictStyle::Diff3,
-                _ => sley_worktree::CheckoutConflictStyle::Merge,
+                Some("diff3") | Some("zdiff3") => sley::plumbing::sley_worktree::CheckoutConflictStyle::Diff3,
+                _ => sley::plumbing::sley_worktree::CheckoutConflictStyle::Merge,
             });
-        sley_worktree::checkout_index_paths(
+        sley::plumbing::sley_worktree::checkout_index_paths(
             worktree_root,
             &git_dir,
             format,
             &resolved_paths,
-            sley_worktree::CheckoutIndexPathOptions {
+            sley::plumbing::sley_worktree::CheckoutIndexPathOptions {
                 force: ignore_unmerged,
                 merge: path_merge || conflict_implies_merge,
                 stage: checkout_stage,
@@ -1802,7 +1799,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Two-way checkout through the shared `sley_unpack_trees::twoway_merge`
+/// Two-way checkout through the shared `sley::plumbing::sley_unpack_trees::twoway_merge`
 /// engine (git's `merge_working_tree` in `builtin/checkout.c`): switch the
 /// index + working tree from the current HEAD's tree to `target`'s tree,
 /// carrying forward local modifications where the merge is safe and aborting
@@ -1890,8 +1887,8 @@ fn prefetch_local_promisor_checkout_blobs(
     if wants.is_empty() {
         return Ok(true);
     }
-    sley_protocol::set_packet_trace_identity("fetch");
-    sley_remote::install_fetch_pack_via_local_upload_pack(
+    sley::plumbing::sley_protocol::set_packet_trace_identity("fetch");
+    sley::plumbing::sley_remote::install_fetch_pack_via_local_upload_pack(
         git_dir,
         &remote_git_dir,
         format,
@@ -1903,7 +1900,7 @@ fn prefetch_local_promisor_checkout_blobs(
         false,
         None,
     )?;
-    sley_protocol::set_packet_trace_identity("checkout");
+    sley::plumbing::sley_protocol::set_packet_trace_identity("checkout");
     Ok(true)
 }
 

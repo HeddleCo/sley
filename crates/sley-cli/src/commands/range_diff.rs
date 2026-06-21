@@ -1,8 +1,8 @@
 //! `git range-diff` — compare two commit series by patch similarity.
 
 use crate::*;
-use sley_diff_merge::range::{PatchRef, assign_patch_series};
-use sley_notes::{NotesRef, read_note_bytes};
+use sley::plumbing::sley_diff_merge::range::{PatchRef, assign_patch_series};
+use sley::plumbing::sley_notes::{NotesRef, read_note_bytes};
 
 const DEFAULT_CREATION_FACTOR: i32 = 60;
 
@@ -74,7 +74,9 @@ pub(crate) fn cmd_range_diff(args: &[String]) -> Result<()> {
 fn default_options(repo: &RepositoryContext) -> Result<RangeDiffOptions> {
     Ok(RangeDiffOptions {
         creation_factor: DEFAULT_CREATION_FACTOR,
-        abbrev: repo.abbrev()?.unwrap_or(7).min(repo.format().hex_len()),
+        abbrev: repository_abbrev(repo.git_dir(), repo.format())?
+            .unwrap_or(7)
+            .min(repo.format().hex_len()),
         color: false,
         dual_color: false,
         left_only: false,
@@ -127,9 +129,9 @@ pub(crate) fn render_format_patch_range_diff(
 }
 
 fn range_tip(repo: &RepositoryContext, setup_args: &[String]) -> Result<ObjectId> {
-    let setup = sley_rev::setup_revisions(
+    let setup = sley::plumbing::sley_rev::setup_revisions(
         setup_args,
-        &sley_rev::RevisionSetupContext {
+        &sley::plumbing::sley_rev::RevisionSetupContext {
             git_dir: repo.git_dir(),
             worktree_root: repo.worktree_root().ok(),
             cwd: repo.cwd(),
@@ -339,13 +341,13 @@ fn read_commit_record(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     oid: &ObjectId,
-) -> Result<sley_rev::CommitRecord> {
+) -> Result<sley::plumbing::sley_rev::CommitRecord> {
     let object = db.read_object(oid)?;
     if object.object_type != ObjectType::Commit {
         return Err(GitError::InvalidObject(format!("{oid} is not a commit")));
     }
     let commit = Commit::parse(format, &object.body)?;
-    Ok(sley_rev::CommitRecord {
+    Ok(sley::plumbing::sley_rev::CommitRecord {
         oid: *oid,
         parents: commit.parents.clone(),
         commit,
@@ -353,9 +355,9 @@ fn read_commit_record(
 }
 
 fn is_commit_range(repo: &RepositoryContext, arg: &str) -> bool {
-    let setup = sley_rev::setup_revisions(
+    let setup = sley::plumbing::sley_rev::setup_revisions(
         &[arg.to_string()],
-        &sley_rev::RevisionSetupContext {
+        &sley::plumbing::sley_rev::RevisionSetupContext {
             git_dir: repo.git_dir(),
             worktree_root: repo.worktree_root().ok(),
             cwd: repo.cwd(),
@@ -396,9 +398,9 @@ fn read_patches(
         args.push("--".to_string());
         args.extend(pathspecs.iter().cloned());
     }
-    let setup = sley_rev::setup_revisions(
+    let setup = sley::plumbing::sley_rev::setup_revisions(
         &args,
-        &sley_rev::RevisionSetupContext {
+        &sley::plumbing::sley_rev::RevisionSetupContext {
             git_dir: repo.git_dir(),
             worktree_root: repo.worktree_root().ok(),
             cwd: repo.cwd(),
@@ -411,7 +413,7 @@ fn read_patches(
         .options
         .positives
         .iter()
-        .map(|tip| sley_rev::peel_to_commit(db, format, &tip.oid))
+        .map(|tip| sley::plumbing::sley_rev::peel_to_commit(db, format, &tip.oid))
         .collect::<Result<Vec<_>>>()?;
     let mut excluded = HashSet::new();
     for negative in setup.options.negatives {
@@ -419,24 +421,24 @@ fn read_patches(
             excluded.insert(record.oid);
         }
     }
-    let mut selected: Vec<sley_rev::CommitRecord> =
+    let mut selected: Vec<sley::plumbing::sley_rev::CommitRecord> =
         rev_list_walk_commits(db, format, starts, false)?
             .into_iter()
             .filter(|record| !excluded.contains(&record.oid))
             .filter(|record| options.include_merges || record.parents.len() <= 1)
             .collect();
     if !setup.pathspecs.is_empty() {
-        let pathspec = sley_rev::Pathspec::parse(
+        let pathspec = sley::plumbing::sley_rev::Pathspec::parse(
             setup.pathspecs.iter().map(|spec| spec.as_bytes()),
-            sley_rev::PathspecMatchMagic::default(),
+            sley::plumbing::sley_rev::PathspecMatchMagic::default(),
         )
         .map_err(|err| GitError::Command(format!("bad pathspec: {err:?}")))?;
-        selected = sley_rev::simplify_history(
+        selected = sley::plumbing::sley_rev::simplify_history(
             db,
             format,
             selected,
             &pathspec,
-            sley_rev::SimplifyOptions {
+            sley::plumbing::sley_rev::SimplifyOptions {
                 full_history: false,
                 first_parent: false,
                 ..Default::default()
@@ -465,7 +467,7 @@ fn read_patches(
 
 fn build_patch_text(
     repo: &RepositoryContext,
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     pathspecs: &[String],
     options: &RangeDiffOptions,
     notes_refs: &[String],
@@ -509,30 +511,30 @@ fn build_patch_text(
         Some(parent) => commit_tree_oid(db, format, parent)?,
         None => ObjectId::empty_tree(format),
     };
-    let base = sley_diff_merge::DiffNameStatusOptions {
+    let base = sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
         detect_renames: true,
         detect_copies: false,
         find_copies_harder: false,
         rename_empty: true,
     };
     let entries = if record.parents.is_empty() {
-        sley_diff_merge::diff_name_status_empty_tree_with_options(
+        sley::plumbing::sley_diff_merge::diff_name_status_empty_tree_with_options(
             db,
             format,
             &record.commit.tree,
             base,
         )?
     } else {
-        sley_diff_merge::diff_name_status_trees_with_rename_options(
+        sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
             db,
             format,
             &parent_tree,
             &record.commit.tree,
-            sley_diff_merge::RenameDetectionOptions {
+            sley::plumbing::sley_diff_merge::RenameDetectionOptions {
                 base,
                 detect_inexact: true,
-                rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-                copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                copy_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             },
         )?
     };
@@ -569,8 +571,8 @@ fn build_patch_text(
                 ws_error: None,
                 color_moved: None,
                 interhunk: 0,
-                ws_ignore: sley_diff_merge::WsIgnore::default(),
-                diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+                ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
+                diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
                 ignore_blank_lines: false,
                 ignore_regexes: &[],
                 line_ranges: None,
@@ -591,19 +593,19 @@ fn trim_ascii_end(line: &[u8]) -> &[u8] {
     &line[..end]
 }
 
-fn write_section_header(out: &mut Vec<u8>, entry: &sley_diff_merge::NameStatusEntry) {
+fn write_section_header(out: &mut Vec<u8>, entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) {
     out.extend_from_slice(b" ## ");
     let path = status_quote_path(section_path(entry), false);
     match entry.status {
-        sley_diff_merge::NameStatus::Added => {
+        sley::plumbing::sley_diff_merge::NameStatus::Added => {
             out.extend_from_slice(path.as_bytes());
             out.extend_from_slice(b" (new)");
         }
-        sley_diff_merge::NameStatus::Deleted => {
+        sley::plumbing::sley_diff_merge::NameStatus::Deleted => {
             out.extend_from_slice(path.as_bytes());
             out.extend_from_slice(b" (deleted)");
         }
-        sley_diff_merge::NameStatus::Renamed(_) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Renamed(_) => {
             let old = status_quote_path(entry.old_path.as_deref().unwrap_or(&entry.path), false);
             let new = status_quote_path(&entry.path, false);
             out.extend_from_slice(format!("{old} => {new}").as_bytes());
@@ -618,8 +620,8 @@ fn write_section_header(out: &mut Vec<u8>, entry: &sley_diff_merge::NameStatusEn
     out.extend_from_slice(b" ##\n");
 }
 
-fn section_path(entry: &sley_diff_merge::NameStatusEntry) -> &[u8] {
-    if matches!(entry.status, sley_diff_merge::NameStatus::Deleted) {
+fn section_path(entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) -> &[u8] {
+    if matches!(entry.status, sley::plumbing::sley_diff_merge::NameStatus::Deleted) {
         entry.old_path.as_deref().unwrap_or(&entry.path)
     } else {
         &entry.path
@@ -692,7 +694,7 @@ fn render_range_diff_notes(
         if body.last() == Some(&b'\n') {
             body.pop();
         }
-        let header = if handle.as_str() == sley_notes::DEFAULT_NOTES_REF {
+        let header = if handle.as_str() == sley::plumbing::sley_notes::DEFAULT_NOTES_REF {
             " ## Notes ##".to_string()
         } else {
             let name = handle
@@ -844,12 +846,12 @@ fn decimal_width(value: usize) -> usize {
 fn write_interdiff(out: &mut dyn Write, left: &[u8], right: &[u8], context: usize) -> Result<()> {
     let mut rendered = Vec::new();
     let mut heading = section_heading_classifier();
-    let mut opts = sley_diff_merge::render::HunkRenderOptions {
+    let mut opts = sley::plumbing::sley_diff_merge::render::HunkRenderOptions {
         context,
         heading: Some(&mut heading),
         ..Default::default()
     };
-    sley_diff_merge::render::render_hunks(&mut rendered, Some(left), Some(right), &mut opts);
+    sley::plumbing::sley_diff_merge::render::render_hunks(&mut rendered, Some(left), Some(right), &mut opts);
     for line in rendered.split_inclusive(|b| *b == b'\n') {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         out.write_all(b"    ")?;

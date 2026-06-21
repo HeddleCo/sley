@@ -6,7 +6,7 @@
 // private ones), so every helper, type, and re-export visible at the crate root
 // is in scope here without re-listing it.
 use crate::*;
-use sley_object::TreeEntries;
+use sley::plumbing::sley_object::TreeEntries;
 #[derive(Debug)]
 struct StashListOptions {
     format: StashListFormat,
@@ -709,7 +709,7 @@ fn unstage_changes_unless_new(
     ours_map: &MergeTreeMap,
     results: &BTreeMap<Vec<u8>, MergePathResult>,
 ) -> Result<()> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     if !index_path.exists() {
         return Ok(());
     }
@@ -764,7 +764,7 @@ fn reinstate_stash_index(
     format: ObjectFormat,
     index_map: &MergeTreeMap,
 ) -> Result<()> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     let prior: BTreeMap<Vec<u8>, IndexEntry> = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?
             .entries
@@ -815,14 +815,14 @@ fn worktree_blob_oid(format: ObjectFormat, full: &Path) -> Result<Option<(u32, O
         use std::os::unix::ffi::OsStrExt;
         let target = fs::read_link(full)?;
         let body = target.as_os_str().as_bytes().to_vec();
-        let oid = sley_core::object_id_for_bytes(format, "blob", &body)?;
+        let oid = sley::plumbing::sley_core::object_id_for_bytes(format, "blob", &body)?;
         return Ok(Some((0o120000, oid)));
     }
     if metadata.is_dir() {
         return Ok(None);
     }
     let bytes = fs::read(full)?;
-    let oid = sley_core::object_id_for_bytes(format, "blob", &bytes)?;
+    let oid = sley::plumbing::sley_core::object_id_for_bytes(format, "blob", &bytes)?;
     #[cfg(unix)]
     let mode = {
         use std::os::unix::fs::PermissionsExt;
@@ -915,7 +915,7 @@ fn apply_stash_merge_results(
     ours_map: &MergeTreeMap,
     results: &BTreeMap<Vec<u8>, MergePathResult>,
 ) -> Result<()> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     let old_index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?
     } else {
@@ -1720,21 +1720,21 @@ fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> 
         } else {
             &created.head_oid
         };
-        sley_worktree::reset_index_and_worktree_to_commit(
+        sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(
             &created.worktree_root,
             &created.git_dir,
             created.format,
             reset_oid,
         )?;
     } else if keep_index {
-        sley_worktree::restore_worktree_paths(
+        sley::plumbing::sley_worktree::restore_worktree_paths(
             &created.worktree_root,
             &created.git_dir,
             created.format,
             &created.pathspec_paths,
         )?;
     } else {
-        sley_worktree::restore_index_and_worktree_paths_from_head(
+        sley::plumbing::sley_worktree::restore_index_and_worktree_paths_from_head(
             &created.worktree_root,
             &created.git_dir,
             created.format,
@@ -1830,11 +1830,11 @@ fn create_stash_commit(
     )?;
     let worktree_tree = stash_write_tree_from_entries(&mut db, &worktree_entries)?;
     let mut untracked_paths = if include_untracked {
-        sley_worktree::untracked_paths_with_options(
+        sley::plumbing::sley_worktree::untracked_paths_with_options(
             &worktree_root,
             &git_dir,
             format,
-            sley_worktree::UntrackedPathOptions {
+            sley::plumbing::sley_worktree::UntrackedPathOptions {
                 directory: false,
                 no_empty_directory: false,
                 preserve_ignored_directories: false,
@@ -1907,9 +1907,9 @@ fn create_stash_commit(
     let head_subject = commit_subject(&head_commit.message);
     let author = stash_identity_from_env("AUTHOR")?;
     let committer = stash_identity_from_env("COMMITTER")?;
-    let index_commit = sley_sequencer::create_commit(
+    let index_commit = sley::plumbing::sley_sequencer::create_commit(
         &mut db,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree: index_tree.clone(),
             parents: vec![head_oid],
             author: author.clone(),
@@ -1920,9 +1920,9 @@ fn create_stash_commit(
         },
     )?;
     let untracked_commit = if let Some(tree) = untracked_tree {
-        Some(sley_sequencer::create_commit(
+        Some(sley::plumbing::sley_sequencer::create_commit(
             &mut db,
-            sley_sequencer::CommitCreate {
+            sley::plumbing::sley_sequencer::CommitCreate {
                 tree,
                 parents: Vec::new(),
                 author: author.clone(),
@@ -1945,9 +1945,9 @@ fn create_stash_commit(
     if let Some(untracked_commit) = untracked_commit {
         parents.push(untracked_commit);
     }
-    let stash_oid = sley_sequencer::create_commit(
+    let stash_oid = sley::plumbing::sley_sequencer::create_commit(
         &mut db,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree: if mode == StashCreateMode::Staged {
                 index_tree
             } else {
@@ -1982,7 +1982,7 @@ fn stash_check_index_lock(git_dir: &Path) -> Result<()> {
 }
 
 fn stash_check_index_lock_quiet(git_dir: &Path, quiet: bool) -> Result<()> {
-    let lock_path = sley_worktree::repository_index_path(git_dir).with_file_name("index.lock");
+    let lock_path = sley::plumbing::sley_worktree::repository_index_path(git_dir).with_file_name("index.lock");
     if lock_path.exists() {
         if !quiet {
             eprintln!("error: could not write index");
@@ -2012,26 +2012,26 @@ fn stash_identity_from_env(role: &str) -> Result<Vec<u8>> {
         .unwrap_or_else(|| "git@stash".into());
     let date = env::var(format!("GIT_{role}_DATE")).unwrap_or_else(|_| "@0 +0000".into());
     let date = canonicalize_commit_date(&date);
-    sley_sequencer::format_commit_identity(&name, &email, &date)
+    sley::plumbing::sley_sequencer::format_commit_identity(&name, &email, &date)
 }
 
 fn stash_index_config_default() -> Result<bool> {
     if let Some(value) = global_config_value("stash.index")? {
-        return Ok(sley_config::parse_config_bool(&value).unwrap_or(false));
+        return Ok(sley::plumbing::sley_config::parse_config_bool(&value).unwrap_or(false));
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let context = sley_config::ConfigIncludeContext::new(
+    let context = sley::plumbing::sley_config::ConfigIncludeContext::new(
         Some(common_git_dir.clone()),
         repo_current_branch_name(&git_dir),
     );
-    let Ok(mut config) = sley_config::load_effective_config(&common_git_dir, &context) else {
+    let Ok(mut config) = sley::plumbing::sley_config::load_effective_config(&common_git_dir, &context) else {
         return Ok(false);
     };
     let parameters_env = effective_config_parameters_env();
-    if let Ok(parameters) = sley_config::injected_config_parameters(parameters_env.as_deref()) {
-        let _ = sley_config::append_injected_config_sections_with_includes(
+    if let Ok(parameters) = sley::plumbing::sley_config::injected_config_parameters(parameters_env.as_deref()) {
+        let _ = sley::plumbing::sley_config::append_injected_config_sections_with_includes(
             &mut config,
             &parameters,
             &context,
@@ -2299,7 +2299,7 @@ fn remove_stashed_untracked_path(worktree_root: &Path, path: &[u8]) -> Result<()
 }
 
 fn stash_path_is_original_cwd(path: &Path) -> bool {
-    let Some(cwd) = sley_core::original_cwd().or_else(|| env::current_dir().ok()) else {
+    let Some(cwd) = sley::plumbing::sley_core::original_cwd().or_else(|| env::current_dir().ok()) else {
         return false;
     };
     let cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
@@ -2996,11 +2996,11 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
         )));
     }
     let base_commit = Commit::parse(format, &base_object.body)?;
-    let diff_options = sley_diff_merge::DiffNameStatusOptions::default();
+    let diff_options = sley::plumbing::sley_diff_merge::DiffNameStatusOptions::default();
     let mut entries = if only_untracked {
         Vec::new()
     } else {
-        sley_diff_merge::diff_name_status_trees_with_options(
+        sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
             &db,
             format,
             &base_commit.tree,
@@ -3016,7 +3016,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
             )));
         }
         let untracked_commit = Commit::parse(format, &untracked_object.body)?;
-        entries.extend(sley_diff_merge::diff_name_status_empty_tree_with_options(
+        entries.extend(sley::plumbing::sley_diff_merge::diff_name_status_empty_tree_with_options(
             &db,
             format,
             &untracked_commit.tree,
@@ -3134,8 +3134,8 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                         ws_error: None,
                         color_moved: None,
                         interhunk: 0,
-                        ws_ignore: sley_diff_merge::WsIgnore::default(),
-                        diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+                        ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
+                        diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
                         ignore_blank_lines: false,
                         ignore_regexes: &[],
                         line_ranges: None,
@@ -3169,14 +3169,14 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn stash_show_summary_outputs_entry(entry: &sley_diff_merge::NameStatusEntry) -> bool {
+fn stash_show_summary_outputs_entry(entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) -> bool {
     match entry.status {
-        sley_diff_merge::NameStatus::Added
-        | sley_diff_merge::NameStatus::Deleted
-        | sley_diff_merge::NameStatus::Renamed(_)
-        | sley_diff_merge::NameStatus::Copied(_) => true,
-        sley_diff_merge::NameStatus::Modified => entry.old_mode != entry.new_mode,
-        sley_diff_merge::NameStatus::Unmerged => false,
+        sley::plumbing::sley_diff_merge::NameStatus::Added
+        | sley::plumbing::sley_diff_merge::NameStatus::Deleted
+        | sley::plumbing::sley_diff_merge::NameStatus::Renamed(_)
+        | sley::plumbing::sley_diff_merge::NameStatus::Copied(_) => true,
+        sley::plumbing::sley_diff_merge::NameStatus::Modified => entry.old_mode != entry.new_mode,
+        sley::plumbing::sley_diff_merge::NameStatus::Unmerged => false,
     }
 }
 
@@ -4094,7 +4094,7 @@ fn parse_stash_list_filter_patterns(
     parse_log_filter_patterns_with_diagnostic_verbosity(
         patterns,
         mode,
-        grep_source::RegexDiagnosticVerbosity::Default,
+        grep_source::RegexDiagnosticVerbosity::Verbose,
     )
     .map_err(|err| match err {
         GitError::Exit(128) => GitError::Exit(1),
@@ -4210,12 +4210,12 @@ fn write_stash_list_patch(
         return Ok(());
     };
     let base = Commit::parse(format, &db.read_object(base_oid)?.body)?;
-    let entries = sley_diff_merge::diff_name_status_trees_with_options(
+    let entries = sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         &base.tree,
         &commit.tree,
-        sley_diff_merge::DiffNameStatusOptions::default(),
+        sley::plumbing::sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     let abbrev = repository_abbrev(
         &common_git_dir_for_git_dir(&discover_git_dir(&env::current_dir()?)?)?,
@@ -4242,8 +4242,8 @@ fn write_stash_list_patch(
             ws_error: None,
             color_moved: None,
             interhunk: 0,
-            ws_ignore: sley_diff_merge::WsIgnore::default(),
-            diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+            ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
+            diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
             ignore_regexes: &[],
             line_ranges: None,
@@ -4293,7 +4293,7 @@ fn write_stash_list_combined_patch(
         let index_content = merge_read_blob(db, index_oid)?;
         let result_content = merge_read_blob(db, result_oid)?;
         let mut body = Vec::new();
-        if !sley_diff_merge::render::render_combined(
+        if !sley::plumbing::sley_diff_merge::render::render_combined(
             &mut body,
             &result_content,
             &[base_content.as_slice(), index_content.as_slice()],
@@ -4421,9 +4421,9 @@ fn write_stash_export_chain(
         .write(),
     ))?;
     let ident = stash_export_identity();
-    let mut previous = sley_sequencer::create_commit(
+    let mut previous = sley::plumbing::sley_sequencer::create_commit(
         db,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree: empty_tree,
             parents: Vec::new(),
             author: ident.clone(),
@@ -4441,9 +4441,9 @@ fn write_stash_export_chain(
         if !message.ends_with(b"\n") {
             message.push(b'\n');
         }
-        previous = sley_sequencer::create_commit(
+        previous = sley::plumbing::sley_sequencer::create_commit(
             db,
-            sley_sequencer::CommitCreate {
+            sley::plumbing::sley_sequencer::CommitCreate {
                 tree: empty_tree,
                 parents: vec![previous, *stash_oid],
                 author: stash.author,
@@ -4526,7 +4526,7 @@ fn read_stash_export_chain(
 }
 
 fn empty_tree_oid(db: &FileObjectDatabase, format: ObjectFormat) -> Result<ObjectId> {
-    sley_core::object_id_for_bytes(format, "tree", &[]).and_then(|oid| {
+    sley::plumbing::sley_core::object_id_for_bytes(format, "tree", &[]).and_then(|oid| {
         if db.read_object(&oid).is_ok() {
             Ok(oid)
         } else {

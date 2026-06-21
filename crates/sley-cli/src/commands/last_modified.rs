@@ -84,7 +84,7 @@ pub(crate) fn cmd_last_modified(args: &[String]) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let excluded = excluded_ancestors(db, format, &exclude_tips)?;
 
-    let pathspec = sley_pathspec::normalized_revwalk_pathspec(
+    let pathspec = sley::plumbing::sley_pathspec::normalized_revwalk_pathspec(
         repo.cwd(),
         Some(repo.worktree_root()?),
         &options.pathspecs,
@@ -252,7 +252,7 @@ fn peel_last_modified_commit(
     rev: &str,
     oid: &ObjectId,
 ) -> Result<ObjectId> {
-    match sley_rev::peel_to_commit(repo.objects(), repo.format(), oid) {
+    match sley::plumbing::sley_rev::peel_to_commit(repo.objects(), repo.format(), oid) {
         Ok(commit) => Ok(commit),
         Err(_) => {
             let object = repo.objects().read_object(oid)?;
@@ -461,7 +461,7 @@ fn collect_last_modified_paths(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: &ObjectId,
-    pathspec: &sley_pathspec::Pathspec,
+    pathspec: &sley::plumbing::sley_pathspec::Pathspec,
     max_depth: i64,
     show_trees: bool,
 ) -> Result<Vec<PathEntry>> {
@@ -475,7 +475,7 @@ fn collect_visible_tree_entries(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: &ObjectId,
-    pathspec: &sley_pathspec::Pathspec,
+    pathspec: &sley::plumbing::sley_pathspec::Pathspec,
     max_depth: i64,
     show_trees: bool,
 ) -> Result<Vec<PathEntry>> {
@@ -498,7 +498,7 @@ fn collect_visible_tree_entries_inner(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: &ObjectId,
-    pathspec: &sley_pathspec::Pathspec,
+    pathspec: &sley::plumbing::sley_pathspec::Pathspec,
     max_depth: i64,
     show_trees: bool,
     prefix: Vec<u8>,
@@ -557,7 +557,7 @@ fn collect_visible_tree_entries_inner(
     Ok(())
 }
 
-fn pathspec_needs_descent(pathspec: &sley_pathspec::Pathspec, path: &[u8]) -> bool {
+fn pathspec_needs_descent(pathspec: &sley::plumbing::sley_pathspec::Pathspec, path: &[u8]) -> bool {
     if pathspec.is_empty() {
         return false;
     }
@@ -576,12 +576,12 @@ fn changed_paths_between_trees(
     right_tree: &ObjectId,
 ) -> Result<HashSet<Vec<u8>>> {
     let mut out = HashSet::new();
-    let changes = sley_diff_merge::diff_name_status_trees_with_options(
+    let changes = sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         left_tree,
         right_tree,
-        sley_diff_merge::DiffNameStatusOptions {
+        sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
             detect_renames: false,
             detect_copies: false,
             find_copies_harder: false,

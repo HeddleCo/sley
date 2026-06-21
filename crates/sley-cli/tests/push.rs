@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sley_core::{Capability, ObjectFormat, ObjectId};
-use sley_fetch::install_upload_pack_raw_response;
-use sley_odb::FileObjectDatabase;
-use sley_protocol::{
+use sley::plumbing::sley_core::{Capability, ObjectFormat, ObjectId};
+use sley::plumbing::sley_fetch::install_upload_pack_raw_response;
+use sley::plumbing::sley_odb::FileObjectDatabase;
+use sley::plumbing::sley_protocol::{
     ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures,
     ReceivePackPushRequestOptions, ReceivePackUnpackStatus, UploadPackAcknowledgment,
     UploadPackNegotiationRequest, UploadPackRequest, build_receive_pack_push_request,
@@ -363,7 +363,7 @@ fn receive_pack_service_updates_bare_repo_with_raw_pack() {
     )
     .expect("build receive-pack request");
     let mut encoded_request = Vec::new();
-    sley_protocol::write_receive_pack_push_request(&mut encoded_request, &request)
+    sley::plumbing::sley_protocol::write_receive_pack_push_request(&mut encoded_request, &request)
         .expect("encode receive-pack request");
 
     let output = run_with_stdin(
@@ -503,7 +503,7 @@ fn receive_pack_service_accepts_push_options() {
     )
     .expect("build receive-pack request with push-options");
     let mut encoded_request = Vec::new();
-    sley_protocol::write_receive_pack_push_request(&mut encoded_request, &request)
+    sley::plumbing::sley_protocol::write_receive_pack_push_request(&mut encoded_request, &request)
         .expect("encode receive-pack request");
 
     let output = run_with_stdin(
@@ -604,8 +604,8 @@ fn receive_pack_service_accepts_empty_push_options_section() {
         ),
     );
     let packfile = pack_objects(&work, &format!("{new_id}\n"));
-    let request = sley_protocol::ReceivePackPushRequest {
-        commands: sley_protocol::ReceivePackRequest {
+    let request = sley::plumbing::sley_protocol::ReceivePackPushRequest {
+        commands: sley::plumbing::sley_protocol::ReceivePackRequest {
             shallow: Vec::new(),
             commands: vec![ReceivePackCommand {
                 old_id,
@@ -635,7 +635,7 @@ fn receive_pack_service_accepts_empty_push_options_section() {
         packfile,
     };
     let mut encoded_request = Vec::new();
-    sley_protocol::write_receive_pack_push_request(&mut encoded_request, &request)
+    sley::plumbing::sley_protocol::write_receive_pack_push_request(&mut encoded_request, &request)
         .expect("encode receive-pack request");
 
     let output = run_with_stdin(

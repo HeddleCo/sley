@@ -4,9 +4,9 @@ use std::fmt::Write as _;
 use std::io::{self, BufRead, BufWriter, Write};
 use std::path::Path;
 
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use sley_object::ObjectType;
-use sley_odb::{FileObjectDatabase, ObjectStorageInfo};
+use sley::plumbing::sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley::plumbing::sley_object::ObjectType;
+use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectStorageInfo};
 
 use super::args::{GitArgCursor, LongOption, option_takes_no_value, switch_requires_value};
 use crate::*;
@@ -428,22 +428,22 @@ impl RepositoryObjectView {
 
     fn resolve(&self, name: &str) -> Result<ObjectId> {
         warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, name);
-        sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db).resolve(name)
+        sley::plumbing::sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db).resolve(name)
     }
 
     fn replacement_oid(&self, oid: &ObjectId) -> Result<ObjectId> {
         apply_replace_object(&self.refs, oid)
     }
 
-    fn resolve_path(&self, rev: &str, path: &str) -> Result<sley_rev::ResolvedTreePath> {
+    fn resolve_path(&self, rev: &str, path: &str) -> Result<sley::plumbing::sley_rev::ResolvedTreePath> {
         warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, rev);
-        sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db)
+        sley::plumbing::sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db)
             .resolve_path(rev, path)
     }
 
-    fn resolve_path_follow_symlinks(&self, rev: &str, path: &str) -> sley_rev::SymlinkedTreePath {
+    fn resolve_path_follow_symlinks(&self, rev: &str, path: &str) -> sley::plumbing::sley_rev::SymlinkedTreePath {
         warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, rev);
-        sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db)
+        sley::plumbing::sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db)
             .resolve_path_follow_symlinks(rev, path)
     }
 
@@ -618,10 +618,10 @@ impl ObjectQuery<'_> {
         let oid = self.view.resolve(self.name)?;
         let oid = self.view.replacement_oid(&oid)?;
         let peeled = match object_type {
-            ObjectType::Blob => sley_rev::peel_tags(self.view.db(), self.view.format(), &oid),
-            ObjectType::Tree => sley_rev::peel_to_tree(self.view.db(), self.view.format(), &oid),
+            ObjectType::Blob => sley::plumbing::sley_rev::peel_tags(self.view.db(), self.view.format(), &oid),
+            ObjectType::Tree => sley::plumbing::sley_rev::peel_to_tree(self.view.db(), self.view.format(), &oid),
             ObjectType::Commit => {
-                sley_rev::peel_to_commit(self.view.db(), self.view.format(), &oid)
+                sley::plumbing::sley_rev::peel_to_commit(self.view.db(), self.view.format(), &oid)
             }
             ObjectType::Tag => Ok(oid),
         };
@@ -1192,14 +1192,14 @@ fn print_cat_file_batch_record(
     // branch of `get_oid_with_context`); every other spelling resolves as
     // usual.
     let resolved_through_symlinks = if record.follow_symlinks
-        && let Some((rev, path)) = sley_rev::split_rev_path_spec(record.object_name)
+        && let Some((rev, path)) = sley::plumbing::sley_rev::split_rev_path_spec(record.object_name)
     {
         match record.view.resolve_path_follow_symlinks(rev, path) {
-            sley_rev::SymlinkedTreePath::Found(oid) => Some(oid),
-            sley_rev::SymlinkedTreePath::OutOfRepo(link_path) => {
+            sley::plumbing::sley_rev::SymlinkedTreePath::Found(oid) => Some(oid),
+            sley::plumbing::sley_rev::SymlinkedTreePath::OutOfRepo(link_path) => {
                 return print_cat_file_symlink_status(stdout, &record, "symlink", &link_path);
             }
-            sley_rev::SymlinkedTreePath::Missing => {
+            sley::plumbing::sley_rev::SymlinkedTreePath::Missing => {
                 // Upstream's `MISSING_OBJECT` branch in `batch_one_object`
                 // reports the input name directly, with no gitlink/submodule
                 // dispatch (a gitlink reached through the symlink walk reports
@@ -1208,7 +1208,7 @@ fn print_cat_file_batch_record(
                 stdout.write_all(&[record.terminator])?;
                 return Ok(());
             }
-            sley_rev::SymlinkedTreePath::Dangling => {
+            sley::plumbing::sley_rev::SymlinkedTreePath::Dangling => {
                 return print_cat_file_symlink_status(
                     stdout,
                     &record,
@@ -1216,7 +1216,7 @@ fn print_cat_file_batch_record(
                     record.object_name.as_bytes(),
                 );
             }
-            sley_rev::SymlinkedTreePath::Loop => {
+            sley::plumbing::sley_rev::SymlinkedTreePath::Loop => {
                 return print_cat_file_symlink_status(
                     stdout,
                     &record,
@@ -1224,7 +1224,7 @@ fn print_cat_file_batch_record(
                     record.object_name.as_bytes(),
                 );
             }
-            sley_rev::SymlinkedTreePath::NotDir => {
+            sley::plumbing::sley_rev::SymlinkedTreePath::NotDir => {
                 return print_cat_file_symlink_status(
                     stdout,
                     &record,
@@ -1240,7 +1240,7 @@ fn print_cat_file_batch_record(
         Some(oid) => oid,
         None => match record.view.resolve_object_name(record.object_name) {
             Ok(oid) => oid,
-            Err(err) if sley_rev::is_short_object_id_ambiguous_error(&err) => {
+            Err(err) if sley::plumbing::sley_rev::is_short_object_id_ambiguous_error(&err) => {
                 return report_object_ambiguous(stdout, &record, &err);
             }
             Err(_) => return report_object_missing(stdout, &record, &query),
@@ -1410,11 +1410,11 @@ fn report_object_ambiguous(
 ) -> Result<()> {
     let prefix = short_object_id_prefix_from_error(err).unwrap_or(record.object_name);
     eprintln!("error: short object ID {prefix} is ambiguous");
-    let hints = sley_rev::ambiguous_short_object_id_hint(
+    let hints = sley::plumbing::sley_rev::ambiguous_short_object_id_hint(
         record.view.common_git_dir(),
         record.view.format(),
         prefix,
-        sley_rev::ObjectDisambiguation::Any,
+        sley::plumbing::sley_rev::ObjectDisambiguation::Any,
     )?;
     if !hints.is_empty() {
         eprintln!("hint: The candidates are:");
@@ -1470,7 +1470,7 @@ fn print_cat_file_excluded(stdout: &mut dyn Write, record: &CatFileBatchRecord<'
 
 impl ObjectQuery<'_> {
     fn object_mode(&self) -> Result<Option<String>> {
-        let Some((rev, path)) = sley_rev::split_rev_path_spec(self.name) else {
+        let Some((rev, path)) = sley::plumbing::sley_rev::split_rev_path_spec(self.name) else {
             return Ok(None);
         };
         let entry = self.view.resolve_path(rev, path)?;
@@ -1481,7 +1481,7 @@ impl ObjectQuery<'_> {
     /// return the gitlink's recorded oid. Upstream uses the resolved entry's `S_IFGITLINK`
     /// mode to report a missing gitlink target as `<oid> submodule` rather than `missing`.
     fn submodule_oid(&self) -> Option<ObjectId> {
-        let (rev, path) = sley_rev::split_rev_path_spec(self.name)?;
+        let (rev, path) = sley::plumbing::sley_rev::split_rev_path_spec(self.name)?;
         let entry = self.view.resolve_path(rev, path).ok()?;
         match entry.mode {
             Some(0o160000) => Some(entry.oid),

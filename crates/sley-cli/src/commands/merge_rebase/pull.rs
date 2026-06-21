@@ -251,7 +251,7 @@ fn update_worktree_after_fetch_moved_head(
         return Err(GitError::Exit(128));
     }
     verify_fast_forward_untracked_safe(worktree_root, git_dir, db, format, &orig_tree, &curr_tree)?;
-    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &curr_head)?;
+    sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &curr_head)?;
     Ok(())
 }
 
@@ -303,7 +303,7 @@ fn worktree_blob_identity(format: ObjectFormat, path: &Path) -> Result<Option<(u
             let body = target.as_os_str().as_bytes().to_vec();
             return Ok(Some((
                 0o120000,
-                sley_core::object_id_for_bytes(format, "blob", &body)?,
+                sley::plumbing::sley_core::object_id_for_bytes(format, "blob", &body)?,
             )));
         }
         #[cfg(not(unix))]
@@ -323,7 +323,7 @@ fn worktree_blob_identity(format: ObjectFormat, path: &Path) -> Result<Option<(u
     let mode = 0o100644;
     Ok(Some((
         mode,
-        sley_core::object_id_for_bytes(format, "blob", &body)?,
+        sley::plumbing::sley_core::object_id_for_bytes(format, "blob", &body)?,
     )))
 }
 
@@ -614,7 +614,7 @@ fn pull_fetch(
         let config = read_repo_config(git_dir)?;
         let remote_git_dir = ls_remote_git_dir(remote)?;
         let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
-        let fetch_source = sley_remote::FetchSource::Local {
+        let fetch_source = sley::plumbing::sley_remote::FetchSource::Local {
             git_dir: remote_git_dir,
             common_git_dir: remote_common_git_dir,
         };
@@ -649,14 +649,14 @@ fn run_fetch_with_outcome(
     format: ObjectFormat,
     config: &GitConfig,
     source: &str,
-    fetch_source: &sley_remote::FetchSource,
+    fetch_source: &sley::plumbing::sley_remote::FetchSource,
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<FetchOutcome> {
-    let mut credentials = sley_remote::CredentialHelperProvider::new(Some(config));
+    let mut credentials = sley::plumbing::sley_remote::CredentialHelperProvider::new(Some(config));
     let mut progress = StdoutProgress;
-    sley_remote::fetch(
-        sley_remote::FetchRequest {
+    sley::plumbing::sley_remote::fetch(
+        sley::plumbing::sley_remote::FetchRequest {
             git_dir,
             format,
             config,
@@ -665,7 +665,7 @@ fn run_fetch_with_outcome(
             refspecs,
             options: &options,
         },
-        sley_remote::FetchServices {
+        sley::plumbing::sley_remote::FetchServices {
             credentials: &mut credentials,
             progress: &mut progress,
         },
@@ -682,7 +682,7 @@ fn pull_checkout_into_void(
     let object = db.read_object(commit_oid)?;
     let commit = Commit::parse_ref(format, &object.body)?;
     let target_map = stash_tree_entry_map(db, format, &commit.tree)?;
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     let mut index_entries = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?.entries
     } else {
@@ -732,7 +732,7 @@ fn pull_checkout_into_void(
 
     index_entries.retain(|entry| !target_map.contains_key(entry.path.as_ref()));
     for (path, (mode, oid)) in &target_map {
-        let content = if sley_index::is_gitlink(*mode) {
+        let content = if sley::plumbing::sley_index::is_gitlink(*mode) {
             Vec::new()
         } else {
             merge_read_blob(db, oid)?
@@ -834,10 +834,24 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             "--no-write-fetch-head" => no_write_fetch_head = true,
             "--tags" => tags = Some(true),
             "--no-tags" => tags = Some(false),
-            "-n" | "--no-stat" | "--stat" | "--summary" | "--no-summary" | "--compact-summary"
-            | "--no-compact-summary" | "--log" | "--no-log" | "--commit" | "--no-commit"
-            | "--squash" | "--no-squash" | "--allow-unrelated-histories"
-            | "--no-allow-unrelated-histories" | "--signoff" | "--no-signoff" | "--no-verify"
+            "-n"
+            | "--no-stat"
+            | "--stat"
+            | "--summary"
+            | "--no-summary"
+            | "--compact-summary"
+            | "--no-compact-summary"
+            | "--log"
+            | "--no-log"
+            | "--commit"
+            | "--no-commit"
+            | "--squash"
+            | "--no-squash"
+            | "--allow-unrelated-histories"
+            | "--no-allow-unrelated-histories"
+            | "--signoff"
+            | "--no-signoff"
+            | "--no-verify"
             | "--verify" => merge_passthrough.push(arg.clone()),
             value if value.starts_with("--log=") || value.starts_with("--cleanup=") => {
                 merge_passthrough.push(value.to_string());
@@ -1087,7 +1101,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let ours_oid = resolve_revision(&git_dir, format, "HEAD")?;
     let merge_oids = merge_records
         .iter()
-        .map(|record| sley_rev::peel_to_commit(&db, format, &record.oid))
+        .map(|record| sley::plumbing::sley_rev::peel_to_commit(&db, format, &record.oid))
         .collect::<Result<Vec<_>>>()?;
     if merge_oids.len() > 1 {
         if effective_rebase.enabled() {
@@ -1100,7 +1114,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         }
     }
     let theirs_oid = merge_oids[0];
-    let ours_commit = sley_rev::peel_to_commit(&db, format, &ours_oid)?;
+    let ours_commit = sley::plumbing::sley_rev::peel_to_commit(&db, format, &ours_oid)?;
     let already_up_to_date = merge_oids.iter().all(|theirs_commit| {
         *theirs_commit == ours_commit
             || ancestor_depths(&db, format, &ours_commit)

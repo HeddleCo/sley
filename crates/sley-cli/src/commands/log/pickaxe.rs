@@ -107,7 +107,7 @@ pub(super) fn resolve_diff_filter_mask(filter: u32, filter_not: u32) -> u32 {
 
 /// The status bit for a name-status entry (git `match_filter`: a `Modified`
 /// entry with a break score counts as Broken).
-fn diff_filter_entry_bit(entry: &sley_diff_merge::NameStatusEntry) -> u32 {
+fn diff_filter_entry_bit(entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) -> u32 {
     diff_filter_letter_bit(entry.status.code())
 }
 
@@ -125,7 +125,7 @@ pub(super) struct DiffFilterMatchOptions<'a> {
 pub(super) fn diff_filter_commit_matches(
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     opts: DiffFilterMatchOptions<'_>,
 ) -> Result<bool> {
     let parents = &record.commit.parents;
@@ -137,30 +137,30 @@ pub(super) fn diff_filter_commit_matches(
         None => None,
     };
     let tree = &record.commit.tree;
-    let base = sley_diff_merge::DiffNameStatusOptions {
+    let base = sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
         detect_renames: opts.detect_renames,
         detect_copies: opts.detect_copies,
         find_copies_harder: opts.find_copies_harder,
         rename_empty: true,
     };
     let entries = match (&parent_tree, opts.detect_renames) {
-        (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+        (Some(parent), true) => sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
             db,
             format,
             parent,
             tree,
-            sley_diff_merge::RenameDetectionOptions {
+            sley::plumbing::sley_diff_merge::RenameDetectionOptions {
                 base,
                 detect_inexact: true,
-                rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-                copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                copy_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             },
         )?,
         (Some(parent), false) => {
-            sley_diff_merge::diff_name_status_trees_with_options(db, format, parent, tree, base)?
+            sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(db, format, parent, tree, base)?
         }
         (None, _) => {
-            sley_diff_merge::diff_name_status_empty_tree_with_options(db, format, tree, base)?
+            sley::plumbing::sley_diff_merge::diff_name_status_empty_tree_with_options(db, format, tree, base)?
         }
     };
     let entries = match opts.pathspec {
@@ -179,10 +179,10 @@ pub(super) fn diff_filter_commit_matches(
 pub(super) fn log_follow_single_path<'a>(
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    selected: Vec<&'a sley_rev::CommitRecord>,
+    selected: Vec<&'a sley::plumbing::sley_rev::CommitRecord>,
     start_path: &[u8],
     detect_renames: bool,
-) -> Result<Vec<&'a sley_rev::CommitRecord>> {
+) -> Result<Vec<&'a sley::plumbing::sley_rev::CommitRecord>> {
     let mut path = start_path.to_vec();
     let mut kept = Vec::new();
     for record in selected {
@@ -193,33 +193,33 @@ pub(super) fn log_follow_single_path<'a>(
             }
             None => None,
         };
-        let base = sley_diff_merge::DiffNameStatusOptions {
+        let base = sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
             detect_renames,
             detect_copies: false,
             find_copies_harder: false,
             rename_empty: true,
         };
         let entries = match (&parent_tree, detect_renames) {
-            (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+            (Some(parent), true) => sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
                 db,
                 format,
                 parent,
                 &record.commit.tree,
-                sley_diff_merge::RenameDetectionOptions {
+                sley::plumbing::sley_diff_merge::RenameDetectionOptions {
                     base,
                     detect_inexact: true,
-                    rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-                    copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                    rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                    copy_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 },
             )?,
-            (Some(parent), false) => sley_diff_merge::diff_name_status_trees_with_options(
+            (Some(parent), false) => sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
                 db,
                 format,
                 parent,
                 &record.commit.tree,
                 base,
             )?,
-            (None, _) => sley_diff_merge::diff_name_status_empty_tree_with_options(
+            (None, _) => sley::plumbing::sley_diff_merge::diff_name_status_empty_tree_with_options(
                 db,
                 format,
                 &record.commit.tree,
@@ -230,7 +230,7 @@ pub(super) fn log_follow_single_path<'a>(
         for entry in entries {
             if entry.path.as_bytes() == path.as_slice() {
                 matched = true;
-                if matches!(entry.status, sley_diff_merge::NameStatus::Renamed(_))
+                if matches!(entry.status, sley::plumbing::sley_diff_merge::NameStatus::Renamed(_))
                     && let Some(old_path) = entry.old_path
                 {
                     path = old_path.as_bytes().to_vec();
@@ -253,7 +253,7 @@ pub(super) fn log_follow_single_path<'a>(
 pub(super) fn pickaxe_commit_matches(
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     pickaxe: &CompiledPickaxe,
     ignore_case: bool,
     text: bool,
@@ -269,30 +269,30 @@ pub(super) fn pickaxe_commit_matches(
         None => None,
     };
     let tree = &record.commit.tree;
-    let base = sley_diff_merge::DiffNameStatusOptions {
+    let base = sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
         detect_renames,
         detect_copies: false,
         find_copies_harder: false,
         rename_empty: true,
     };
     let entries = match (&parent_tree, detect_renames) {
-        (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+        (Some(parent), true) => sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
             db,
             format,
             parent,
             tree,
-            sley_diff_merge::RenameDetectionOptions {
+            sley::plumbing::sley_diff_merge::RenameDetectionOptions {
                 base,
                 detect_inexact: true,
-                rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-                copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                copy_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             },
         )?,
         (Some(parent), false) => {
-            sley_diff_merge::diff_name_status_trees_with_options(db, format, parent, tree, base)?
+            sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(db, format, parent, tree, base)?
         }
         (None, _) => {
-            sley_diff_merge::diff_name_status_empty_tree_with_options(db, format, tree, base)?
+            sley::plumbing::sley_diff_merge::diff_name_status_empty_tree_with_options(db, format, tree, base)?
         }
     };
     let entries = match pathspec {
@@ -332,11 +332,11 @@ pub(super) fn pickaxe_commit_matches(
 
 pub(super) fn pickaxe_filter_entries(
     db: &FileObjectDatabase,
-    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     pickaxe: &CompiledPickaxe,
     ignore_case: bool,
     text: bool,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+) -> Result<Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>> {
     let mut kept = Vec::new();
     for entry in entries {
         if pickaxe_entry_matches(db, &entry, pickaxe, ignore_case, text)? {
@@ -348,7 +348,7 @@ pub(super) fn pickaxe_filter_entries(
 
 fn pickaxe_entry_matches(
     db: &FileObjectDatabase,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     pickaxe: &CompiledPickaxe,
     ignore_case: bool,
     text: bool,
@@ -391,17 +391,17 @@ fn pickaxe_is_binary(bytes: &[u8]) -> bool {
 /// the regex matches any added or removed line (the leading `+`/`-` is trimmed
 /// before matching, like git's `diffgrep_consume`).
 fn pickaxe_diff_grep(old: &[u8], new: &[u8], regex: &crate::grep_source::Regex) -> bool {
-    let old_lines = sley_diff_merge::split_lines(old);
-    let new_lines = sley_diff_merge::split_lines(new);
+    let old_lines = sley::plumbing::sley_diff_merge::split_lines(old);
+    let new_lines = sley::plumbing::sley_diff_merge::split_lines(new);
     let mut old_idx = 0;
     let mut new_idx = 0;
-    for op in sley_diff_merge::myers_diff_lines(&old_lines, &new_lines) {
+    for op in sley::plumbing::sley_diff_merge::myers_diff_lines(&old_lines, &new_lines) {
         match op {
-            sley_diff_merge::DiffOp::Equal(n) => {
+            sley::plumbing::sley_diff_merge::DiffOp::Equal(n) => {
                 old_idx += n;
                 new_idx += n;
             }
-            sley_diff_merge::DiffOp::Delete(n) => {
+            sley::plumbing::sley_diff_merge::DiffOp::Delete(n) => {
                 for line in &old_lines[old_idx..old_idx + n] {
                     if regex.is_match_with_case(line.bytes_without_newline(), false) {
                         return true;
@@ -409,7 +409,7 @@ fn pickaxe_diff_grep(old: &[u8], new: &[u8], regex: &crate::grep_source::Regex) 
                 }
                 old_idx += n;
             }
-            sley_diff_merge::DiffOp::Insert(n) => {
+            sley::plumbing::sley_diff_merge::DiffOp::Insert(n) => {
                 for line in &new_lines[new_idx..new_idx + n] {
                     if regex.is_match_with_case(line.bytes_without_newline(), false) {
                         return true;

@@ -1,35 +1,26 @@
-#![allow(
-    dead_code,
-    unused_assignments,
-    unused_mut,
-    unused_variables,
-    clippy::all,
-    clippy::unwrap_used
-)]
-
-use sley_config::{ConfigBoolOrInt, ConfigEntry, ConfigSection, GitConfig};
-use sley_core::{BString, DateMode, GitError, ObjectFormat, ObjectId, Result};
-use sley_formats::{
+use sley::plumbing::sley_config::{ConfigBoolOrInt, ConfigEntry, ConfigSection, GitConfig};
+use sley::plumbing::sley_core::{BString, DateMode, GitError, ObjectFormat, ObjectId, Result};
+use sley::plumbing::sley_formats::{
     Bundle, BundleCapability, BundlePrerequisite, BundleReference, CommitGraph,
     CommitGraphWriteEntry, InitOptions, RefStorageFormat, RepositoryBootstrap,
 };
-use sley_index::{Index, IndexEntry};
-use sley_object::{
+use sley::plumbing::sley_index::{Index, IndexEntry};
+use sley::plumbing::sley_object::{
     Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntries, TreeEntry, TreeEntryRef,
     tree_entry_object_type,
 };
-use sley_odb::{
+use sley::plumbing::sley_odb::{
     FileObjectDatabase, LooseObjectIntegrity, ObjectPrefixResolution, ObjectReader, ObjectWriter,
     build_reachable_pack, collect_reachable_object_ids, install_bundle_pack,
     install_reachable_pack, prune_unreachable_loose, repository_object_ids, repository_objects_dir,
 };
-use sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
-use sley_pathspec::{
+use sley::plumbing::sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
+use sley::plumbing::sley_pathspec::{
     LsFilesPathFilter, PathspecAttributeCheck, PathspecAttributeState,
     parse_normalized_pathspec_element, pathspec_attrs_match_with, pathspec_filters_have_include,
     pathspec_filters_match, pathspec_filters_match_with,
 };
-use sley_protocol::{
+use sley::plumbing::sley_protocol::{
     FetchHeadRecord, FetchRefUpdate, ProtocolVersion, ReceivePackCommand, ReceivePackPushRequest,
     RefAdvertisement, RefAdvertisementSet, UploadPackFeatures, parse_refspec, read_fetch_head,
     read_receive_pack_push_options, read_receive_pack_request, read_ref_advertisement_set,
@@ -37,16 +28,16 @@ use sley_protocol::{
     write_receive_pack_report_status, write_ref_advertisement_set,
     write_upload_pack_packfile_response, write_upload_pack_raw_packfile_response,
 };
-pub(crate) use sley_ref_filter::*;
-use sley_refs::{
+pub(crate) use sley::plumbing::sley_ref_filter::*;
+use sley::plumbing::sley_refs::{
     FileRefStore, PackRefDecision, Ref, RefPrecondition, RefTarget, RefTransactionHookUpdate,
     RefTransactionPhase, RefUpdate, ReferenceTransactionHook, ReflogEntry, branch_ref_name,
     check_refname_format, parse_packed_refs, resolve_ref_peeled, tag_ref_name, validate_ref_name,
     validate_symref_name, validate_symref_target,
 };
-use sley_remote::FetchOutcome;
-pub(crate) use sley_rev::revlist::*;
-use sley_transport::{RemoteTransport, RemoteUrl, parse_remote_url};
+use sley::plumbing::sley_remote::FetchOutcome;
+pub(crate) use sley::plumbing::sley_rev::revlist::*;
+use sley::plumbing::sley_transport::{RemoteTransport, RemoteUrl, parse_remote_url};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -93,12 +84,12 @@ pub(crate) fn collect_short_status(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
-) -> Result<Vec<sley_worktree::ShortStatusEntry>> {
+) -> Result<Vec<sley::plumbing::sley_worktree::ShortStatusEntry>> {
     collect_short_status_with_options(
         worktree_root,
         git_dir,
         format,
-        sley_worktree::ShortStatusOptions::default(),
+        sley::plumbing::sley_worktree::ShortStatusOptions::default(),
     )
 }
 
@@ -106,17 +97,17 @@ pub(crate) fn collect_short_status_with_options(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
-    options: sley_worktree::ShortStatusOptions,
-) -> Result<Vec<sley_worktree::ShortStatusEntry>> {
+    options: sley::plumbing::sley_worktree::ShortStatusOptions,
+) -> Result<Vec<sley::plumbing::sley_worktree::ShortStatusEntry>> {
     let mut entries = Vec::new();
-    sley_worktree::stream_short_status_with_options(
+    sley::plumbing::sley_worktree::stream_short_status_with_options(
         worktree_root,
         git_dir,
         format,
         options,
         |entry| {
             entries.push(entry.to_owned_entry());
-            Ok(sley_worktree::StreamControl::Continue)
+            Ok(sley::plumbing::sley_worktree::StreamControl::Continue)
         },
     )?;
     Ok(entries)
@@ -151,9 +142,9 @@ pub(crate) use repo_path::RepoPathBuf;
 pub(crate) use repository::RepositoryContext;
 
 pub fn run(args: Vec<String>) -> Result<()> {
-    sley_core::set_original_cwd(env::current_dir().ok());
+    sley::plumbing::sley_core::set_original_cwd(env::current_dir().ok());
     let global = apply_global_options(&args)?;
-    sley_core::trace2::touch();
+    sley::plumbing::sley_core::trace2::touch();
     // `-c` / `--config-env` overrides are folded into the process
     // `GIT_CONFIG_PARAMETERS` env var during option parsing, so the single
     // `injected_config_parameters()` reader is the source of truth for every
@@ -246,7 +237,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
     // program's basename (the subcommand here). The transports' pkt-line traces
     // are prefixed `packet: %12s` with this value (e.g. `ls-remote`, `clone`,
     // `fetch`, `upload-pack`).
-    sley_protocol::set_packet_trace_identity(command);
+    sley::plumbing::sley_protocol::set_packet_trace_identity(command);
     if command != "help"
         && args.len() == 2
         && args.get(1).is_some_and(|arg| arg == "-h")
@@ -355,7 +346,6 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "status" => commands::status::cmd_status(&args[1..]),
         "switch" => commands::checkout::cmd_switch(&args[1..]),
         "tag" => commands::tag::cmd_tag(&args[1..]),
-        "testkit" => commands::utility::cmd_testkit(&args[1..]),
         "unpack-file" => commands::utility::cmd_unpack_file(&args[1..]),
         "update-server-info" => commands::refs::cmd_update_server_info(&args[1..]),
         "var" => commands::utility::cmd_var(&args[1..]),
@@ -648,10 +638,10 @@ fn push_split_parameter(key: &str, value: Option<&str>) {
         if !fragment.is_empty() {
             fragment.push(' ');
         }
-        fragment.push_str(&sley_config::sq_quote(key));
+        fragment.push_str(&sley::plumbing::sley_config::sq_quote(key));
         fragment.push('=');
         if let Some(value) = value {
-            fragment.push_str(&sley_config::sq_quote(value));
+            fragment.push_str(&sley::plumbing::sley_config::sq_quote(value));
         }
     }
 }
@@ -684,7 +674,7 @@ pub(crate) fn effective_config_parameters_env() -> Option<String> {
 /// entry yields `"true"`). Used by command-side consumers (init, rev-parse's
 /// `core.abbrev`, etc.) that need a single injected value before a full config load.
 fn global_config_value(key: &str) -> Result<Option<String>> {
-    let canonical = match sley_config::canonicalize_config_key(key) {
+    let canonical = match sley::plumbing::sley_config::canonicalize_config_key(key) {
         Ok(canonical) => canonical,
         // The lookup key is a fixed internal key; if it fails to canonicalise
         // there can be no matching override.
@@ -705,9 +695,9 @@ fn global_config_value(key: &str) -> Result<Option<String>> {
 /// `GIT_CONFIG_PARAMETERS` = inherited env + command-line `-c`/`--config-env`),
 /// converting any parse failure into git's `error: <msg>\nfatal: unable to parse
 /// command-line config` two-line diagnostic with exit 128.
-pub(crate) fn injected_config_parameters() -> Result<Vec<sley_config::ConfigParameter>> {
+pub(crate) fn injected_config_parameters() -> Result<Vec<sley::plumbing::sley_config::ConfigParameter>> {
     let params_env = effective_config_parameters_env();
-    sley_config::injected_config_parameters(params_env.as_deref())
+    sley::plumbing::sley_config::injected_config_parameters(params_env.as_deref())
         .map_err(report_config_parameter_error)
 }
 
@@ -720,21 +710,21 @@ pub(crate) fn core_big_file_threshold(git_dir: Option<&Path>) -> Result<u64> {
                 Ok(path) => path,
                 Err(_) => git_dir.to_path_buf(),
             };
-            sley_config::ConfigIncludeContext::new(
+            sley::plumbing::sley_config::ConfigIncludeContext::new(
                 Some(git_dir_abs),
-                sley_config::repo_current_branch_name(git_dir),
+                sley::plumbing::sley_config::repo_current_branch_name(git_dir),
             )
         }
-        None => sley_config::ConfigIncludeContext::new(None, None),
+        None => sley::plumbing::sley_config::ConfigIncludeContext::new(None, None),
     };
-    let mut config =
-        sley_config::load_pre_dispatch_config(git_dir, &context).map_err(report_config_setup_error)?;
+    let mut config = sley::plumbing::sley_config::load_pre_dispatch_config(git_dir, &context)
+        .map_err(report_config_setup_error)?;
     let parameters = injected_config_parameters()?;
     let base = match env::current_dir() {
         Ok(path) => path,
         Err(_) => PathBuf::from("."),
     };
-    sley_config::append_injected_config_sections_with_includes(
+    sley::plumbing::sley_config::append_injected_config_sections_with_includes(
         &mut config,
         &parameters,
         &context,
@@ -744,7 +734,7 @@ pub(crate) fn core_big_file_threshold(git_dir: Option<&Path>) -> Result<u64> {
     let Some(value) = config.get("core", None, "bigfilethreshold") else {
         return Ok(DEFAULT_BIG_FILE_THRESHOLD);
     };
-    match sley_config::parse_config_int(value) {
+    match sley::plumbing::sley_config::parse_config_int(value) {
         Some(value) if value >= 0 => Ok(value as u64),
         _ => {
             eprintln!(
@@ -758,7 +748,7 @@ pub(crate) fn core_big_file_threshold(git_dir: Option<&Path>) -> Result<u64> {
 /// Print git's exact diagnostic for a config-injection parse failure and return
 /// the matching exit status. Git prints the specific `error:` line followed by a
 /// generic `fatal: unable to parse command-line config` and exits 128.
-fn report_config_parameter_error(err: sley_config::ConfigParameterError) -> GitError {
+fn report_config_parameter_error(err: sley::plumbing::sley_config::ConfigParameterError) -> GitError {
     eprintln!("error: {}", err.message());
     eprintln!("fatal: unable to parse command-line config");
     GitError::Exit(128)
@@ -804,7 +794,7 @@ fn set_global_pathspec_flags(flags: PathspecFlags) {
 /// `GIT_*_PATHSPECS` environment variables (git reads both). Literal magic
 /// (`--literal-pathspecs`/`--noglob-pathspecs`/`GIT_LITERAL_PATHSPECS`/
 /// `GIT_NOGLOB_PATHSPECS`) suppresses glob magic.
-pub(crate) fn effective_pathspec_flags() -> sley_worktree::PathspecMatchMagic {
+pub(crate) fn effective_pathspec_flags() -> sley::plumbing::sley_worktree::PathspecMatchMagic {
     let mut flags = GLOBAL_PATHSPEC_FLAGS
         .lock()
         .map(|value| *value)
@@ -821,7 +811,7 @@ pub(crate) fn effective_pathspec_flags() -> sley_worktree::PathspecMatchMagic {
     if git_env_bool("GIT_ICASE_PATHSPECS") {
         flags.icase = true;
     }
-    sley_worktree::PathspecMatchMagic {
+    sley::plumbing::sley_worktree::PathspecMatchMagic {
         literal: flags.literal,
         glob: flags.glob && !flags.literal,
         icase: flags.icase,
@@ -829,16 +819,16 @@ pub(crate) fn effective_pathspec_flags() -> sley_worktree::PathspecMatchMagic {
 }
 
 pub(crate) fn attribute_checks_for_matching(
-    checks: Vec<sley_worktree::AttributeCheck>,
+    checks: Vec<sley::plumbing::sley_worktree::AttributeCheck>,
 ) -> Vec<PathspecAttributeCheck> {
     checks
         .into_iter()
         .map(|check| PathspecAttributeCheck {
             attribute: check.attribute,
             state: check.state.map(|state| match state {
-                sley_worktree::AttributeState::Set => PathspecAttributeState::Set,
-                sley_worktree::AttributeState::Unset => PathspecAttributeState::Unset,
-                sley_worktree::AttributeState::Value(value) => PathspecAttributeState::Value(value),
+                sley::plumbing::sley_worktree::AttributeState::Set => PathspecAttributeState::Set,
+                sley::plumbing::sley_worktree::AttributeState::Unset => PathspecAttributeState::Unset,
+                sley::plumbing::sley_worktree::AttributeState::Value(value) => PathspecAttributeState::Value(value),
             }),
         })
         .collect()
@@ -1003,21 +993,21 @@ fn init_config_value(
                 Ok(path) => path,
                 Err(_) => git_dir.to_path_buf(),
             };
-            sley_config::ConfigIncludeContext::new(
+            sley::plumbing::sley_config::ConfigIncludeContext::new(
                 Some(git_dir_abs),
-                sley_config::repo_current_branch_name(git_dir),
+                sley::plumbing::sley_config::repo_current_branch_name(git_dir),
             )
         }
-        None => sley_config::ConfigIncludeContext::new(None, None),
+        None => sley::plumbing::sley_config::ConfigIncludeContext::new(None, None),
     };
-    let mut config = sley_config::load_pre_dispatch_config(config_git_dir, &context)
+    let mut config = sley::plumbing::sley_config::load_pre_dispatch_config(config_git_dir, &context)
         .map_err(report_config_setup_error)?;
     let parameters = injected_config_parameters()?;
     let base = match env::current_dir() {
         Ok(path) => path,
         Err(_) => PathBuf::from("."),
     };
-    sley_config::append_injected_config_sections_with_includes(
+    sley::plumbing::sley_config::append_injected_config_sections_with_includes(
         &mut config,
         &parameters,
         &context,
@@ -1131,8 +1121,8 @@ fn resolve_add_update_actions(
             worktree_root,
             git_dir,
             format,
-            sley_worktree::ShortStatusOptions {
-                untracked_mode: sley_worktree::StatusUntrackedMode::None,
+            sley::plumbing::sley_worktree::ShortStatusOptions {
+                untracked_mode: sley::plumbing::sley_worktree::StatusUntrackedMode::None,
                 ..Default::default()
             },
         )?
@@ -1182,12 +1172,12 @@ fn resolve_add_update_actions(
 
 fn add_path_matches(path: &Path, pathspec: &Path) -> bool {
     let pathspec_text = pathspec.to_string_lossy();
-    if sley_worktree::pathspec_is_glob(pathspec_text.as_bytes()) {
+    if sley::plumbing::sley_worktree::pathspec_is_glob(pathspec_text.as_bytes()) {
         let path_text = path.to_string_lossy();
-        return sley_worktree::pathspec_item_matches(
+        return sley::plumbing::sley_worktree::pathspec_item_matches(
             pathspec_text.as_bytes(),
             path_text.as_bytes(),
-            sley_worktree::PathspecMatchMagic::default(),
+            sley::plumbing::sley_worktree::PathspecMatchMagic::default(),
         );
     }
     path == pathspec || path.starts_with(pathspec)
@@ -1344,7 +1334,7 @@ fn reflog_reference_name(value: Option<&str>) -> Result<String> {
         && let Ok(format) = repository_object_format(&git_dir)
     {
         if let Ok(Some(refname)) =
-            sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, value)
+            sley::plumbing::sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, value)
         {
             return Ok(refname);
         }
@@ -1359,14 +1349,14 @@ fn reflog_reference_name(value: Option<&str>) -> Result<String> {
 /// Recursively map a tree's blob entries to `(mode, oid)` keyed by full path.
 /// Shared by the stash and merge/cherry-pick/revert replay machinery.
 ///
-/// Thin wrapper over the canonical [`sley_diff_merge::flatten_tree`]; the local
+/// Thin wrapper over the canonical [`sley::plumbing::sley_diff_merge::flatten_tree`]; the local
 /// recursive flattener was a byte-identical copy.
 fn stash_tree_entry_map(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: &ObjectId,
 ) -> Result<BTreeMap<Vec<u8>, (u32, ObjectId)>> {
-    sley_diff_merge::flatten_tree(db, format, tree_oid)
+    sley::plumbing::sley_diff_merge::flatten_tree(db, format, tree_oid)
 }
 
 fn ancestor_depths(
@@ -1415,12 +1405,12 @@ fn count_objects_human_bytes(size_bytes: u64) -> String {
 
 fn write_check_attr_state(
     stdout: &mut impl Write,
-    state: Option<&sley_worktree::AttributeState>,
+    state: Option<&sley::plumbing::sley_worktree::AttributeState>,
 ) -> Result<()> {
     match state {
-        Some(sley_worktree::AttributeState::Set) => stdout.write_all(b"set")?,
-        Some(sley_worktree::AttributeState::Unset) => stdout.write_all(b"unset")?,
-        Some(sley_worktree::AttributeState::Value(value)) => stdout.write_all(value)?,
+        Some(sley::plumbing::sley_worktree::AttributeState::Set) => stdout.write_all(b"set")?,
+        Some(sley::plumbing::sley_worktree::AttributeState::Unset) => stdout.write_all(b"unset")?,
+        Some(sley::plumbing::sley_worktree::AttributeState::Value(value)) => stdout.write_all(value)?,
         None => stdout.write_all(b"unspecified")?,
     }
     Ok(())
@@ -1430,14 +1420,14 @@ fn check_ignore_tracked_paths(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<(BTreeSet<Vec<u8>>, Vec<Vec<u8>>)> {
-    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+    let Some(index) = sley::plumbing::sley_worktree::read_repository_index(git_dir, format)? else {
         return Ok((BTreeSet::new(), Vec::new()));
     };
     let mut tracked = BTreeSet::new();
     let mut gitlinks = Vec::new();
     for entry in index.entries {
         let path = entry.path.into_bytes();
-        if sley_index::is_gitlink(entry.mode) {
+        if sley::plumbing::sley_index::is_gitlink(entry.mode) {
             gitlinks.push(path.clone());
         }
         tracked.insert(path);
@@ -1595,7 +1585,7 @@ fn checkout_create_or_reset_branch(
         Err(err) => return Err(err),
     };
     let db = FileObjectDatabase::from_git_dir(start_git_dir, format);
-    let start_oid = sley_rev::peel_to_commit(&db, format, &start_oid)?;
+    let start_oid = sley::plumbing::sley_rev::peel_to_commit(&db, format, &start_oid)?;
     if let Some(existing) = existing {
         let old_oid = match existing {
             RefTarget::Direct(oid) => oid,
@@ -1665,10 +1655,9 @@ fn resolve_checkout_merge_base_start_oid(
     let left = if left.is_empty() { "HEAD" } else { left };
     let right = if right.is_empty() { "HEAD" } else { right };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let left = sley_rev::peel_to_commit(&db, format, &resolve_revision(git_dir, format, left)?)?;
-    let right =
-        sley_rev::peel_to_commit(&db, format, &resolve_revision(git_dir, format, right)?)?;
-    let bases = sley_rev::merge_bases(git_dir, format, &db, &left, &right)?;
+    let left = sley::plumbing::sley_rev::peel_to_commit(&db, format, &resolve_revision(git_dir, format, left)?)?;
+    let right = sley::plumbing::sley_rev::peel_to_commit(&db, format, &resolve_revision(git_dir, format, right)?)?;
+    let bases = sley::plumbing::sley_rev::merge_bases(git_dir, format, &db, &left, &right)?;
     match bases.as_slice() {
         [base] => Ok(Some(*base)),
         [] => {
@@ -1948,7 +1937,7 @@ fn find_tree_entry(
     format: ObjectFormat,
     body: &[u8],
     components: &[&str],
-) -> Result<Option<sley_object::TreeEntry>> {
+) -> Result<Option<sley::plumbing::sley_object::TreeEntry>> {
     let Some((component, rest)) = components.split_first() else {
         return Ok(None);
     };
@@ -2302,7 +2291,7 @@ fn read_reused_commit(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result
     let result = (|| {
         let oid = resolve_revision(git_dir, format, rev)?;
         let db = FileObjectDatabase::from_git_dir(git_dir, format);
-        let commit_oid = sley_rev::peel_to_commit(&db, format, &oid)?;
+        let commit_oid = sley::plumbing::sley_rev::peel_to_commit(&db, format, &oid)?;
         let object = db.read_object(&commit_oid)?;
         if object.object_type != ObjectType::Commit {
             return Err(GitError::InvalidObject(format!(
@@ -2335,7 +2324,7 @@ fn parse_similarity_threshold(spec: &str) -> u8 {
             };
             pct.round().clamp(0.0, 100.0) as u8
         }
-        Err(_) => sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+        Err(_) => sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
     }
 }
 
@@ -2350,34 +2339,34 @@ fn parse_similarity_threshold(spec: &str) -> u8 {
 
 fn write_diff_summary_entry(
     stdout: &mut dyn Write,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
 ) -> Result<()> {
     match entry.status {
-        sley_diff_merge::NameStatus::Added => {
+        sley::plumbing::sley_diff_merge::NameStatus::Added => {
             let mode = entry.new_mode.unwrap_or(0);
             let path = status_quote_path(&entry.path, false);
             writeln!(stdout, " create mode {mode:06o} {path}")?;
         }
-        sley_diff_merge::NameStatus::Deleted => {
+        sley::plumbing::sley_diff_merge::NameStatus::Deleted => {
             let mode = entry.old_mode.unwrap_or(0);
             let path = status_quote_path(&entry.path, false);
             writeln!(stdout, " delete mode {mode:06o} {path}")?;
         }
-        sley_diff_merge::NameStatus::Renamed(score) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Renamed(score) => {
             if let Some(old_path) = &entry.old_path {
                 let old_path = status_quote_path(old_path, false);
                 let path = status_quote_path(&entry.path, false);
                 writeln!(stdout, " rename {old_path} => {path} ({score}%)")?;
             }
         }
-        sley_diff_merge::NameStatus::Copied(score) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Copied(score) => {
             if let Some(old_path) = &entry.old_path {
                 let old_path = status_quote_path(old_path, false);
                 let path = status_quote_path(&entry.path, false);
                 writeln!(stdout, " copy {old_path} => {path} ({score}%)")?;
             }
         }
-        sley_diff_merge::NameStatus::Modified => {
+        sley::plumbing::sley_diff_merge::NameStatus::Modified => {
             if entry.old_mode != entry.new_mode
                 && let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
             {
@@ -2389,14 +2378,14 @@ fn write_diff_summary_entry(
             }
         }
         // Unmerged paths produce no `--summary` line.
-        sley_diff_merge::NameStatus::Unmerged => {}
+        sley::plumbing::sley_diff_merge::NameStatus::Unmerged => {}
     }
     Ok(())
 }
 
 fn write_diff_raw_entry(
     stdout: &mut dyn Write,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     z: bool,
     zero_worktree_oids: bool,
     abbrev: Option<usize>,
@@ -2484,21 +2473,21 @@ pub(crate) struct DiffPatchOptions<'a> {
     pub(crate) submodule_format: commands::diff_options::SubmoduleDiffFormat,
     /// Gitlink paths whose worktree-side submodule dirt is visible after
     /// `--ignore-submodules` filtering. The bitmask uses
-    /// `sley_worktree::DIRTY_SUBMODULE_*`.
+    /// `sley::plumbing::sley_worktree::DIRTY_SUBMODULE_*`.
     pub(crate) submodule_dirt: Option<&'a HashMap<Vec<u8>, u8>>,
     /// Whitespace-error highlighting (`--ws-error-highlight` /
     /// `diff.wsErrorHighlight`) when color is enabled. `None` disables it.
-    pub(crate) ws_error: Option<sley_diff_merge::render::WsErrorHighlight>,
+    pub(crate) ws_error: Option<sley::plumbing::sley_diff_merge::render::WsErrorHighlight>,
     /// Moved-code coloring (`--color-moved`) when color is enabled and
     /// word-diff is disabled. `None` disables it.
-    pub(crate) color_moved: Option<sley_diff_merge::render::ColorMoved>,
+    pub(crate) color_moved: Option<sley::plumbing::sley_diff_merge::render::ColorMoved>,
     /// Extra inter-hunk merge distance (`--inter-hunk-context`).
     pub(crate) interhunk: usize,
     /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
     /// `--ignore-cr-at-eol`) applied to the line comparison.
-    pub(crate) ws_ignore: sley_diff_merge::WsIgnore,
+    pub(crate) ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore,
     /// The line-diff algorithm (`--patience` / `--histogram` / default Myers).
-    pub(crate) diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    pub(crate) diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm,
     /// `--ignore-blank-lines`: drop change groups whose lines are all blank.
     pub(crate) ignore_blank_lines: bool,
     /// `-I<regex>` / `--ignore-matching-lines`: drop change groups all of whose
@@ -2506,7 +2495,7 @@ pub(crate) struct DiffPatchOptions<'a> {
     pub(crate) ignore_regexes: &'a [grep_source::Regex],
     /// `log -L`: restrict the emitted hunks to these post-image line ranges.
     /// `None` (every non-line-log caller) renders the full patch.
-    pub(crate) line_ranges: Option<&'a [sley_diff_merge::render::LineRange]>,
+    pub(crate) line_ranges: Option<&'a [sley::plumbing::sley_diff_merge::render::LineRange]>,
     /// `--indent-heuristic` / `diff.indentHeuristic`: shift slidable change
     /// groups to the most readable boundary. Enabled by default, matching git.
     pub(crate) indent_heuristic: bool,
@@ -2633,9 +2622,9 @@ fn submodule_diff_config(
 
 /// Drop gitlink entries whose effective ignore mode is `all`.
 fn apply_submodule_ignore_filter(
-    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     config: &SubmoduleDiffConfig,
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+) -> Vec<sley::plumbing::sley_diff_merge::NameStatusEntry> {
     entries
         .into_iter()
         .filter(|entry| {
@@ -2650,24 +2639,24 @@ fn apply_submodule_ignore_filter(
 /// and append a Modified pair for dirty submodules whose checked-out commit
 /// still matches the staged oid (which the map comparison alone would skip).
 fn collect_dirty_submodules(
-    entries: &mut Vec<sley_diff_merge::NameStatusEntry>,
+    entries: &mut Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     git_dir: &Path,
     format: ObjectFormat,
     worktree_root: &Path,
     config: &SubmoduleDiffConfig,
-    precomputed_gitlinks: Option<&[sley_diff_merge::IndexGitlinkEntry]>,
+    precomputed_gitlinks: Option<&[sley::plumbing::sley_diff_merge::IndexGitlinkEntry]>,
 ) -> Result<HashMap<Vec<u8>, u8>> {
     if let Some(gitlinks) = precomputed_gitlinks {
         return collect_dirty_submodules_from_gitlinks(entries, worktree_root, config, gitlinks);
     }
-    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+    let Some(index) = sley::plumbing::sley_worktree::read_repository_index(git_dir, format)? else {
         return Ok(HashMap::new());
     };
     let gitlinks = index
         .entries
         .iter()
         .filter(|entry| entry.mode == 0o160000)
-        .map(|entry| sley_diff_merge::IndexGitlinkEntry {
+        .map(|entry| sley::plumbing::sley_diff_merge::IndexGitlinkEntry {
             path: BString::from_bytes(entry.path.as_bytes()),
             oid: entry.oid,
         })
@@ -2676,10 +2665,10 @@ fn collect_dirty_submodules(
 }
 
 fn collect_dirty_submodules_from_gitlinks(
-    entries: &mut Vec<sley_diff_merge::NameStatusEntry>,
+    entries: &mut Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     worktree_root: &Path,
     config: &SubmoduleDiffConfig,
-    gitlinks: &[sley_diff_merge::IndexGitlinkEntry],
+    gitlinks: &[sley::plumbing::sley_diff_merge::IndexGitlinkEntry],
 ) -> Result<HashMap<Vec<u8>, u8>> {
     let mut dirty = HashMap::new();
     let mut injected = false;
@@ -2690,16 +2679,16 @@ fn collect_dirty_submodules_from_gitlinks(
             continue;
         }
         let sub_root = worktree_root.join(repo_path_to_path(path));
-        let dirt = sley_worktree::submodule_dirt(&sub_root);
-        let counts = dirt & sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0
+        let dirt = sley::plumbing::sley_worktree::submodule_dirt(&sub_root);
+        let counts = dirt & sley::plumbing::sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0
             || (mode == SubmoduleIgnoreMode::None
-                && dirt & sley_worktree::DIRTY_SUBMODULE_UNTRACKED != 0);
+                && dirt & sley::plumbing::sley_worktree::DIRTY_SUBMODULE_UNTRACKED != 0);
         if !counts {
             continue;
         }
         let visible_dirt = match mode {
             SubmoduleIgnoreMode::None => dirt,
-            SubmoduleIgnoreMode::Untracked => dirt & !sley_worktree::DIRTY_SUBMODULE_UNTRACKED,
+            SubmoduleIgnoreMode::Untracked => dirt & !sley::plumbing::sley_worktree::DIRTY_SUBMODULE_UNTRACKED,
             SubmoduleIgnoreMode::Dirty | SubmoduleIgnoreMode::All => 0,
         };
         if visible_dirt == 0 {
@@ -2707,8 +2696,8 @@ fn collect_dirty_submodules_from_gitlinks(
         }
         dirty.insert(path.to_vec(), visible_dirt);
         if !entries.iter().any(|existing| existing.path[..] == *path) {
-            entries.push(sley_diff_merge::NameStatusEntry {
-                status: sley_diff_merge::NameStatus::Modified,
+            entries.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
+                status: sley::plumbing::sley_diff_merge::NameStatus::Modified,
                 path: path.to_vec().into(),
                 old_path: None,
                 old_mode: Some(0o160000),
@@ -2741,12 +2730,12 @@ pub(crate) fn render_tree_to_tree_patch(
     old_tree: &ObjectId,
     new_tree: &ObjectId,
 ) -> Result<Vec<u8>> {
-    let entries = sley_diff_merge::diff_name_status_trees_with_options(
+    let entries = sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         old_tree,
         new_tree,
-        sley_diff_merge::DiffNameStatusOptions::default(),
+        sley::plumbing::sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     let mut out: Vec<u8> = Vec::new();
     for entry in &entries {
@@ -2771,8 +2760,8 @@ pub(crate) fn render_tree_to_tree_patch(
                 ws_error: None,
                 color_moved: None,
                 interhunk: 0,
-                ws_ignore: sley_diff_merge::WsIgnore::default(),
-                diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+                ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
+                diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
                 ignore_blank_lines: false,
                 ignore_regexes: &[],
                 line_ranges: None,
@@ -2784,9 +2773,9 @@ pub(crate) fn render_tree_to_tree_patch(
 }
 
 pub(crate) fn apply_diff_order_file(
-    mut entries: Vec<sley_diff_merge::NameStatusEntry>,
+    mut entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     order_file: Option<&str>,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+) -> Result<Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>> {
     let Some(order_file) = order_file else {
         return Ok(entries);
     };
@@ -2814,7 +2803,7 @@ pub(crate) fn apply_diff_order_file(
 }
 
 fn diff_order_rank(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     patterns: &[Vec<u8>],
 ) -> Option<usize> {
     patterns.iter().position(|pattern| {
@@ -2878,7 +2867,7 @@ pub(crate) fn compile_ignore_matching_regexes(
 
 pub(crate) fn write_diff_patch_entry(
     stdout: &mut dyn Write,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     options: DiffPatchOptions<'_>,
 ) -> Result<()> {
     if is_gitlink_pair(entry)
@@ -2932,8 +2921,8 @@ pub(crate) fn write_diff_patch_entry(
         .as_ref()
         .and_then(|driver| driver.binary)
         .or_else(|| new_driver.as_ref().and_then(|driver| driver.binary));
-    let big_file_threshold =
-        core_big_file_threshold(options.db.objects_dir().parent()).unwrap_or(DEFAULT_BIG_FILE_THRESHOLD);
+    let big_file_threshold = core_big_file_threshold(options.db.objects_dir().parent())
+        .unwrap_or(DEFAULT_BIG_FILE_THRESHOLD);
     let treat_as_binary = match binary_override {
         Some(binary) => binary,
         None => {
@@ -2960,7 +2949,7 @@ pub(crate) fn write_diff_patch_entry(
         (Some(old_mode), Some(new_mode)) => old_mode == new_mode,
         _ => true,
     };
-    if matches!(entry.status, sley_diff_merge::NameStatus::Modified)
+    if matches!(entry.status, sley::plumbing::sley_diff_merge::NameStatus::Modified)
         && !content_changed
         && mode_unchanged
     {
@@ -2980,7 +2969,7 @@ pub(crate) fn write_diff_patch_entry(
     if ignore_active
         && content_changed
         && mode_unchanged
-        && matches!(entry.status, sley_diff_merge::NameStatus::Modified)
+        && matches!(entry.status, sley::plumbing::sley_diff_merge::NameStatus::Modified)
         && old_content.is_some()
         && new_content.is_some()
     {
@@ -2991,12 +2980,12 @@ pub(crate) fn write_diff_patch_entry(
                 .any(|re| re.is_match_with_case(line, false))
         });
         let change_ignore = (options.ignore_blank_lines || !ignore_regexes.is_empty()).then(|| {
-            sley_diff_merge::render::ChangeIgnore {
+            sley::plumbing::sley_diff_merge::render::ChangeIgnore {
                 ignore_blank_lines: options.ignore_blank_lines,
                 regex_match: regex_match.as_ref().map(|f| f as &dyn Fn(&[u8]) -> bool),
             }
         });
-        let mut probe_options = sley_diff_merge::render::HunkRenderOptions {
+        let mut probe_options = sley::plumbing::sley_diff_merge::render::HunkRenderOptions {
             context: options.context,
             interhunk: options.interhunk,
             ws_ignore: options.ws_ignore,
@@ -3005,7 +2994,7 @@ pub(crate) fn write_diff_patch_entry(
             ..Default::default()
         };
         let mut probe = Vec::new();
-        sley_diff_merge::render::render_hunks(
+        sley::plumbing::sley_diff_merge::render::render_hunks(
             &mut probe,
             old_content.as_deref(),
             new_content.as_deref(),
@@ -3021,19 +3010,19 @@ pub(crate) fn write_diff_patch_entry(
         &format!("diff --git {diff_old_path} {diff_path}"),
     )?;
     match entry.status {
-        sley_diff_merge::NameStatus::Added => {
+        sley::plumbing::sley_diff_merge::NameStatus::Added => {
             if let Some(mode) = entry.new_mode {
                 write_diff_meta_line(stdout, colors, &format!("new file mode {mode:06o}"))?;
             }
         }
-        sley_diff_merge::NameStatus::Deleted => {
+        sley::plumbing::sley_diff_merge::NameStatus::Deleted => {
             if let Some(mode) = entry.old_mode {
                 write_diff_meta_line(stdout, colors, &format!("deleted file mode {mode:06o}"))?;
             }
         }
-        sley_diff_merge::NameStatus::Modified
-        | sley_diff_merge::NameStatus::Renamed(_)
-        | sley_diff_merge::NameStatus::Copied(_) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Modified
+        | sley::plumbing::sley_diff_merge::NameStatus::Renamed(_)
+        | sley::plumbing::sley_diff_merge::NameStatus::Copied(_) => {
             if let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
                 && old_mode != new_mode
             {
@@ -3043,7 +3032,7 @@ pub(crate) fn write_diff_patch_entry(
         }
         // Unmerged paths are surfaced via the raw/name-status `U` line, not a
         // patch hunk, so they carry no meta header here.
-        sley_diff_merge::NameStatus::Unmerged => {}
+        sley::plumbing::sley_diff_merge::NameStatus::Unmerged => {}
     }
     write_diff_similarity_headers(&mut *stdout, entry, &old_similarity_path, &similarity_path)?;
     if !content_changed {
@@ -3071,7 +3060,7 @@ pub(crate) fn write_diff_patch_entry(
     )?;
     let empty_add_or_delete = matches!(
         entry.status,
-        sley_diff_merge::NameStatus::Added | sley_diff_merge::NameStatus::Deleted
+        sley::plumbing::sley_diff_merge::NameStatus::Added | sley::plumbing::sley_diff_merge::NameStatus::Deleted
     ) && old_content.as_deref().unwrap_or_default().is_empty()
         && new_content.as_deref().unwrap_or_default().is_empty();
     if empty_add_or_delete {
@@ -3149,19 +3138,19 @@ pub(crate) fn write_diff_patch_entry(
             .any(|re| re.is_match_with_case(line, false))
     });
     let change_ignore = (options.ignore_blank_lines || !ignore_regexes.is_empty()).then(|| {
-        sley_diff_merge::render::ChangeIgnore {
+        sley::plumbing::sley_diff_merge::render::ChangeIgnore {
             ignore_blank_lines: options.ignore_blank_lines,
             regex_match: regex_match.as_ref().map(|f| f as &dyn Fn(&[u8]) -> bool),
         }
     });
-    let mut render_options = sley_diff_merge::render::HunkRenderOptions {
+    let mut render_options = sley::plumbing::sley_diff_merge::render::HunkRenderOptions {
         context: options.context,
         interhunk: options.interhunk,
         heading: Some(&mut heading),
         colors: colors.map(commands::format_patch::render_colors),
         word_diff: word_diff_adapter
             .as_mut()
-            .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
+            .map(|adapter| adapter as &mut dyn sley::plumbing::sley_diff_merge::render::HunkWordDiff),
         ws_error,
         color_moved: colors
             .and(options.color_moved)
@@ -3174,7 +3163,7 @@ pub(crate) fn write_diff_patch_entry(
         ..Default::default()
     };
     let mut hunks = Vec::new();
-    sley_diff_merge::render::render_hunks(
+    sley::plumbing::sley_diff_merge::render::render_hunks(
         &mut hunks,
         old_content.as_deref(),
         new_content.as_deref(),
@@ -3184,7 +3173,7 @@ pub(crate) fn write_diff_patch_entry(
         return Ok(());
     }
     match entry.status {
-        sley_diff_merge::NameStatus::Added => {
+        sley::plumbing::sley_diff_merge::NameStatus::Added => {
             write_diff_meta_line(stdout, colors, "--- /dev/null")?;
         }
         _ => {
@@ -3192,7 +3181,7 @@ pub(crate) fn write_diff_patch_entry(
         }
     }
     match entry.status {
-        sley_diff_merge::NameStatus::Deleted => {
+        sley::plumbing::sley_diff_merge::NameStatus::Deleted => {
             write_diff_meta_line(stdout, colors, "+++ /dev/null")?;
         }
         _ => {
@@ -3205,7 +3194,7 @@ pub(crate) fn write_diff_patch_entry(
 
 fn write_diff_binary_patch_entry(
     stdout: &mut dyn Write,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     old_content: Option<Vec<u8>>,
     new_content: Option<Vec<u8>>,
     options: DiffPatchOptions<'_>,
@@ -3217,19 +3206,19 @@ fn write_diff_binary_patch_entry(
     let similarity_path = status_quote_path(&entry.path, false);
     writeln!(stdout, "diff --git {diff_old_path} {diff_path}",)?;
     match entry.status {
-        sley_diff_merge::NameStatus::Added => {
+        sley::plumbing::sley_diff_merge::NameStatus::Added => {
             if let Some(mode) = entry.new_mode {
                 writeln!(stdout, "new file mode {mode:06o}")?;
             }
         }
-        sley_diff_merge::NameStatus::Deleted => {
+        sley::plumbing::sley_diff_merge::NameStatus::Deleted => {
             if let Some(mode) = entry.old_mode {
                 writeln!(stdout, "deleted file mode {mode:06o}")?;
             }
         }
-        sley_diff_merge::NameStatus::Modified
-        | sley_diff_merge::NameStatus::Renamed(_)
-        | sley_diff_merge::NameStatus::Copied(_) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Modified
+        | sley::plumbing::sley_diff_merge::NameStatus::Renamed(_)
+        | sley::plumbing::sley_diff_merge::NameStatus::Copied(_) => {
             if let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
                 && old_mode != new_mode
             {
@@ -3238,7 +3227,7 @@ fn write_diff_binary_patch_entry(
             }
         }
         // Unmerged paths carry no patch meta header.
-        sley_diff_merge::NameStatus::Unmerged => {}
+        sley::plumbing::sley_diff_merge::NameStatus::Unmerged => {}
     }
     write_diff_similarity_headers(&mut *stdout, entry, &old_similarity_path, &similarity_path)?;
     if old_content.as_deref() == new_content.as_deref() {
@@ -3275,17 +3264,17 @@ fn write_diff_binary_patch_entry(
 
 fn write_diff_similarity_headers(
     stdout: &mut dyn Write,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     old_path: &str,
     path: &str,
 ) -> Result<()> {
     match entry.status {
-        sley_diff_merge::NameStatus::Renamed(score) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Renamed(score) => {
             writeln!(stdout, "similarity index {score}%")?;
             writeln!(stdout, "rename from {old_path}")?;
             writeln!(stdout, "rename to {path}")?;
         }
-        sley_diff_merge::NameStatus::Copied(score) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Copied(score) => {
             writeln!(stdout, "similarity index {score}%")?;
             writeln!(stdout, "copy from {old_path}")?;
             writeln!(stdout, "copy to {path}")?;
@@ -3324,14 +3313,14 @@ fn diff_patch_oid(
     let hex = oid
         .cloned()
         .or_else(|| {
-            content.and_then(|content| sley_core::object_id_for_bytes(format, "blob", content).ok())
+            content.and_then(|content| sley::plumbing::sley_core::object_id_for_bytes(format, "blob", content).ok())
         })
         .map(|oid| oid.to_hex())
         .unwrap_or_else(|| "0".repeat(format.hex_len()));
     hex[..abbrev.min(hex.len())].to_string()
 }
 
-fn diff_patch_mode_suffix(entry: &sley_diff_merge::NameStatusEntry) -> String {
+fn diff_patch_mode_suffix(entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) -> String {
     match (entry.old_mode, entry.new_mode) {
         (Some(old_mode), Some(new_mode)) if old_mode == new_mode => format!(" {old_mode:06o}"),
         _ => String::new(),
@@ -3340,7 +3329,7 @@ fn diff_patch_mode_suffix(entry: &sley_diff_merge::NameStatusEntry) -> String {
 
 fn write_diff_numstat_entry(
     stdout: &mut dyn Write,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     z: bool,
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
@@ -3354,7 +3343,7 @@ fn write_diff_numstat_entry(
 
 fn write_diff_numstat_materialized_entry(
     stdout: &mut dyn Write,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     stats: DiffLineStats,
     z: bool,
 ) -> Result<()> {
@@ -3393,7 +3382,7 @@ fn write_diff_numstat_counts(stdout: &mut dyn Write, stats: DiffLineStats) -> Re
 
 fn write_diff_shortstat(
     stdout: &mut dyn Write,
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
@@ -3415,7 +3404,7 @@ fn write_diff_shortstat_materialized(
 
 fn write_diff_stat(
     stdout: &mut dyn Write,
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
@@ -3545,7 +3534,7 @@ fn diff_stat_display_width(name: &str) -> i64 {
 /// Faithful port of git diff.c `show_stats()`.
 fn write_diff_stat_with_widths(
     stdout: &mut dyn Write,
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
@@ -3851,7 +3840,7 @@ struct DirstatFile {
 /// `gather_dirstat()`.
 fn write_diff_dirstat(
     stdout: &mut dyn Write,
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
@@ -3888,7 +3877,7 @@ fn write_diff_dirstat(
                         diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
                     let damage = match (old_content.as_deref(), new_content.as_deref()) {
                         (Some(old), Some(new)) => {
-                            let (copied, added) = sley_diff_merge::count_changes(old, new);
+                            let (copied, added) = sley::plumbing::sley_diff_merge::count_changes(old, new);
                             ((old.len() - copied) + added) as u64
                         }
                         (Some(old), None) => old.len() as u64,
@@ -4008,7 +3997,7 @@ struct DiffStatOptions {
 }
 
 struct DiffStatEntryData<'a> {
-    entry: &'a sley_diff_merge::NameStatusEntry,
+    entry: &'a sley::plumbing::sley_diff_merge::NameStatusEntry,
     stats: DiffLineStats,
 }
 
@@ -4027,7 +4016,7 @@ impl DiffBlobContent {
 }
 
 fn collect_diff_stat_entries<'a>(
-    entries: &'a [sley_diff_merge::NameStatusEntry],
+    entries: &'a [sley::plumbing::sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
@@ -4112,7 +4101,7 @@ enum DiffStatStats {
     },
 }
 
-fn diff_stat_path(entry: &sley_diff_merge::NameStatusEntry, compact_summary: bool) -> String {
+fn diff_stat_path(entry: &sley::plumbing::sley_diff_merge::NameStatusEntry, compact_summary: bool) -> String {
     let mut path = if let Some(old_path) = &entry.old_path {
         diff_stat_pprint_rename(old_path, &entry.path)
     } else {
@@ -4200,7 +4189,7 @@ fn diff_stat_pprint_rename(a: &[u8], b: &[u8]) -> String {
     name
 }
 
-fn diff_compact_summary_label(entry: &sley_diff_merge::NameStatusEntry) -> Option<&'static str> {
+fn diff_compact_summary_label(entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) -> Option<&'static str> {
     match (entry.old_mode, entry.new_mode) {
         (None, Some(_)) => Some("(new)"),
         (Some(_), None) => Some("(gone)"),
@@ -4300,12 +4289,12 @@ fn gitlink_diff_content(oid: &ObjectId, dirty: bool) -> Vec<u8> {
     format!("Subproject commit {oid}{suffix}\n").into_bytes()
 }
 
-fn is_gitlink_pair(entry: &sley_diff_merge::NameStatusEntry) -> bool {
+fn is_gitlink_pair(entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) -> bool {
     entry.old_mode == Some(0o160000) || entry.new_mode == Some(0o160000)
 }
 
 fn visible_submodule_dirt(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     options: &DiffPatchOptions<'_>,
 ) -> u8 {
     options
@@ -4324,7 +4313,7 @@ fn submodule_git_dir_for_path(
     sub_root: &Path,
     path: &[u8],
 ) -> Option<PathBuf> {
-    sley_diff_merge::gitlink_git_dir(sub_root).or_else(|| {
+    sley::plumbing::sley_diff_merge::gitlink_git_dir(sub_root).or_else(|| {
         let git_dir = database_git_dir(parent_db)?;
         let modules_dir = git_dir.join("modules").join(repo_path_to_path(path));
         modules_dir.is_dir().then_some(modules_dir)
@@ -4333,14 +4322,14 @@ fn submodule_git_dir_for_path(
 
 fn write_submodule_patch_entry(
     stdout: &mut dyn Write,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     options: DiffPatchOptions<'_>,
 ) -> Result<()> {
     let old_is_gitlink = entry.old_mode == Some(0o160000);
     let new_is_gitlink = entry.new_mode == Some(0o160000);
     if old_is_gitlink && entry.new_mode.is_some() && !new_is_gitlink {
-        let sub_entry = sley_diff_merge::NameStatusEntry {
-            status: sley_diff_merge::NameStatus::Deleted,
+        let sub_entry = sley::plumbing::sley_diff_merge::NameStatusEntry {
+            status: sley::plumbing::sley_diff_merge::NameStatus::Deleted,
             path: entry.path.clone(),
             old_path: None,
             old_mode: entry.old_mode,
@@ -4349,8 +4338,8 @@ fn write_submodule_patch_entry(
             new_oid: None,
         };
         write_submodule_patch_entry(stdout, &sub_entry, options)?;
-        let blob_entry = sley_diff_merge::NameStatusEntry {
-            status: sley_diff_merge::NameStatus::Added,
+        let blob_entry = sley::plumbing::sley_diff_merge::NameStatusEntry {
+            status: sley::plumbing::sley_diff_merge::NameStatus::Added,
             path: entry.path.clone(),
             old_path: None,
             old_mode: None,
@@ -4368,8 +4357,8 @@ fn write_submodule_patch_entry(
         );
     }
     if !old_is_gitlink && entry.old_mode.is_some() && new_is_gitlink {
-        let blob_entry = sley_diff_merge::NameStatusEntry {
-            status: sley_diff_merge::NameStatus::Deleted,
+        let blob_entry = sley::plumbing::sley_diff_merge::NameStatusEntry {
+            status: sley::plumbing::sley_diff_merge::NameStatus::Deleted,
             path: entry.path.clone(),
             old_path: None,
             old_mode: entry.old_mode,
@@ -4385,8 +4374,8 @@ fn write_submodule_patch_entry(
                 ..options
             },
         )?;
-        let sub_entry = sley_diff_merge::NameStatusEntry {
-            status: sley_diff_merge::NameStatus::Added,
+        let sub_entry = sley::plumbing::sley_diff_merge::NameStatusEntry {
+            status: sley::plumbing::sley_diff_merge::NameStatus::Added,
             path: entry.path.clone(),
             old_path: None,
             old_mode: None,
@@ -4399,10 +4388,10 @@ fn write_submodule_patch_entry(
 
     let dirt = visible_submodule_dirt(entry, &options);
     let path = String::from_utf8_lossy(&entry.path);
-    if dirt & sley_worktree::DIRTY_SUBMODULE_UNTRACKED != 0 {
+    if dirt & sley::plumbing::sley_worktree::DIRTY_SUBMODULE_UNTRACKED != 0 {
         writeln!(stdout, "Submodule {path} contains untracked content")?;
     }
-    if dirt & sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0 {
+    if dirt & sley::plumbing::sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0 {
         writeln!(stdout, "Submodule {path} contains modified content")?;
     }
 
@@ -4421,7 +4410,7 @@ fn write_submodule_patch_entry(
 
     let diff_dirty_only = options.submodule_format
         == commands::diff_options::SubmoduleDiffFormat::Diff
-        && dirt & sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0;
+        && dirt & sley::plumbing::sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0;
     if old_oid == new_oid && !diff_dirty_only {
         return Ok(());
     }
@@ -4556,7 +4545,7 @@ fn submodule_range_marker(
     if old_oid.is_null() || new_oid.is_null() {
         return Ok(("...", false));
     }
-    let bases = sley_rev::merge_bases(git_dir, format, db, old_oid, new_oid)?;
+    let bases = sley::plumbing::sley_rev::merge_bases(git_dir, format, db, old_oid, new_oid)?;
     let fast_forward = bases.iter().any(|base| base == old_oid);
     let rewind = bases.iter().any(|base| base == new_oid);
     Ok((if fast_forward || rewind { ".." } else { "..." }, rewind))
@@ -4566,12 +4555,12 @@ fn submodule_symmetric_records(
     db: &FileObjectDatabase,
     old_oid: &ObjectId,
     new_oid: &ObjectId,
-) -> Result<Vec<(char, sley_rev::CommitRecord)>> {
+) -> Result<Vec<(char, sley::plumbing::sley_rev::CommitRecord)>> {
     if old_oid.is_null() || new_oid.is_null() {
         return Ok(Vec::new());
     }
-    let left = sley_rev::walk_commits(db, db.object_format(), [*old_oid])?;
-    let right = sley_rev::walk_commits(db, db.object_format(), [*new_oid])?;
+    let left = sley::plumbing::sley_rev::walk_commits(db, db.object_format(), [*old_oid])?;
+    let right = sley::plumbing::sley_rev::walk_commits(db, db.object_format(), [*new_oid])?;
     let left_set = left.iter().map(|record| record.oid).collect::<HashSet<_>>();
     let right_set = right
         .iter()
@@ -4606,7 +4595,7 @@ fn write_submodule_log(
     let bases = if old_oid.is_null() || new_oid.is_null() {
         HashSet::new()
     } else {
-        sley_rev::merge_bases(git_dir, format, db, old_oid, new_oid)?
+        sley::plumbing::sley_rev::merge_bases(git_dir, format, db, old_oid, new_oid)?
             .into_iter()
             .collect()
     };
@@ -4628,7 +4617,7 @@ fn submodule_commit_subject(commit: &Commit) -> String {
 
 fn write_submodule_inline_diff(
     stdout: &mut dyn Write,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     options: DiffPatchOptions<'_>,
     sub_db: &FileObjectDatabase,
     sub_format: ObjectFormat,
@@ -4639,19 +4628,19 @@ fn write_submodule_inline_diff(
     let old_tree = submodule_commit_tree(sub_db, old_oid)?;
     let new_tree = submodule_commit_tree(sub_db, new_oid)?;
     let entries = if old_oid.is_null() {
-        sley_diff_merge::diff_name_status_empty_tree_with_options(
+        sley::plumbing::sley_diff_merge::diff_name_status_empty_tree_with_options(
             sub_db,
             sub_format,
             &new_tree,
-            sley_diff_merge::DiffNameStatusOptions::default(),
+            sley::plumbing::sley_diff_merge::DiffNameStatusOptions::default(),
         )?
     } else {
-        sley_diff_merge::diff_name_status_trees_with_options(
+        sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
             sub_db,
             sub_format,
             &old_tree,
             &new_tree,
-            sley_diff_merge::DiffNameStatusOptions::default(),
+            sley::plumbing::sley_diff_merge::DiffNameStatusOptions::default(),
         )?
     };
     let sub_path = String::from_utf8_lossy(&entry.path);
@@ -4660,7 +4649,7 @@ fn write_submodule_inline_diff(
     let nested_worktree_root = options
         .worktree_root
         .map(|root| root.join(repo_path_to_path(&entry.path)));
-    if dirt & sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0
+    if dirt & sley::plumbing::sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0
         && let Some(sub_root) = nested_worktree_root.as_deref()
     {
         let Some(sub_git_dir) = submodule_git_dir_for_path(options.db, sub_root, &entry.path)
@@ -4668,12 +4657,12 @@ fn write_submodule_inline_diff(
             return Ok(());
         };
         let submodule_dirt = submodule_collect_patch_dirt(sub_root, &sub_git_dir, sub_format)?;
-        let dirty_entries = sley_diff_merge::diff_name_status_tree_worktree_with_options(
+        let dirty_entries = sley::plumbing::sley_diff_merge::diff_name_status_tree_worktree_with_options(
             sub_root,
             &sub_git_dir,
             sub_format,
             &old_tree,
-            sley_diff_merge::DiffNameStatusOptions::default(),
+            sley::plumbing::sley_diff_merge::DiffNameStatusOptions::default(),
         )?;
         for dirty_entry in &dirty_entries {
             write_diff_patch_entry(
@@ -4697,7 +4686,7 @@ fn write_submodule_inline_diff(
                     ws_error: None,
                     color_moved: None,
                     interhunk: options.interhunk,
-                    ws_ignore: sley_diff_merge::WsIgnore::default(),
+                    ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
                     diff_algorithm: options.diff_algorithm,
                     ignore_blank_lines: false,
                     ignore_regexes: &[],
@@ -4740,7 +4729,7 @@ fn write_submodule_inline_diff(
                 ws_error: None,
                 color_moved: None,
                 interhunk: options.interhunk,
-                ws_ignore: sley_diff_merge::WsIgnore::default(),
+                ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
                 diff_algorithm: options.diff_algorithm,
                 ignore_blank_lines: false,
                 ignore_regexes: &[],
@@ -4757,14 +4746,14 @@ fn submodule_collect_patch_dirt(
     sub_git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<HashMap<Vec<u8>, u8>> {
-    let Some(index) = sley_worktree::read_repository_index(sub_git_dir, format)? else {
+    let Some(index) = sley::plumbing::sley_worktree::read_repository_index(sub_git_dir, format)? else {
         return Ok(HashMap::new());
     };
     let mut dirt = HashMap::new();
     for entry in index.entries.iter().filter(|entry| entry.mode == 0o160000) {
         let path = entry.path.as_bytes();
         let submodule_root = sub_root.join(repo_path_to_path(path));
-        let bits = sley_worktree::submodule_dirt(&submodule_root);
+        let bits = sley::plumbing::sley_worktree::submodule_dirt(&submodule_root);
         if bits != 0 {
             dirt.insert(path.to_vec(), bits);
         }
@@ -4780,13 +4769,13 @@ fn submodule_collect_patch_dirt(
 /// same-mode pure content modification counts only if a hunk survives the
 /// ignore filters.
 pub(crate) fn diff_entry_produces_output(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
     interhunk: usize,
     context: usize,
-    ws_ignore: sley_diff_merge::WsIgnore,
+    ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore,
     ignore_blank_lines: bool,
     ignore_regexes: &[grep_source::Regex],
 ) -> Result<bool> {
@@ -4795,7 +4784,7 @@ pub(crate) fn diff_entry_produces_output(
         (Some(old_mode), Some(new_mode)) => old_mode == new_mode,
         _ => true,
     };
-    if !matches!(entry.status, sley_diff_merge::NameStatus::Modified) || !mode_unchanged {
+    if !matches!(entry.status, sley::plumbing::sley_diff_merge::NameStatus::Modified) || !mode_unchanged {
         return Ok(true);
     }
     let old_content = diff_entry_old_content(entry, db)?;
@@ -4815,21 +4804,21 @@ pub(crate) fn diff_entry_produces_output(
             .any(|re| re.is_match_with_case(line, false))
     });
     let change_ignore = (ignore_blank_lines || !ignore_regexes.is_empty()).then(|| {
-        sley_diff_merge::render::ChangeIgnore {
+        sley::plumbing::sley_diff_merge::render::ChangeIgnore {
             ignore_blank_lines,
             regex_match: regex_match.as_ref().map(|f| f as &dyn Fn(&[u8]) -> bool),
         }
     });
-    let mut probe_options = sley_diff_merge::render::HunkRenderOptions {
+    let mut probe_options = sley::plumbing::sley_diff_merge::render::HunkRenderOptions {
         context,
         interhunk,
         ws_ignore,
-        algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+        algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
         change_ignore: change_ignore.as_ref(),
         ..Default::default()
     };
     let mut probe = Vec::new();
-    sley_diff_merge::render::render_hunks(
+    sley::plumbing::sley_diff_merge::render::render_hunks(
         &mut probe,
         old_content.as_deref(),
         new_content.as_deref(),
@@ -4839,7 +4828,7 @@ pub(crate) fn diff_entry_produces_output(
 }
 
 fn diff_entry_old_stat_content(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
 ) -> Result<Option<DiffBlobContent>> {
     if entry.old_mode == Some(0o160000) {
@@ -4856,7 +4845,7 @@ fn diff_entry_old_stat_content(
 }
 
 fn diff_entry_new_stat_content(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree: bool,
@@ -4874,7 +4863,7 @@ fn diff_entry_new_stat_content(
             None => match (use_worktree, worktree_root) {
                 (true, Some(root)) => {
                     let sub_root = root.join(repo_path_to_path(&entry.path));
-                    sley_diff_merge::gitlink_head_oid(&sub_root, db.object_format())
+                    sley::plumbing::sley_diff_merge::gitlink_head_oid(&sub_root, db.object_format())
                         .or(entry.old_oid)
                 }
                 _ => entry.old_oid,
@@ -4900,7 +4889,7 @@ fn diff_entry_new_stat_content(
 }
 
 fn diff_entry_old_content(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
 ) -> Result<Option<Vec<u8>>> {
     if entry.old_mode == Some(0o160000) {
@@ -4917,7 +4906,7 @@ fn diff_entry_old_content(
 }
 
 fn diff_entry_new_content(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree: bool,
@@ -4935,7 +4924,7 @@ fn diff_entry_new_content(
             None => match (use_worktree, worktree_root) {
                 (true, Some(root)) => {
                     let sub_root = root.join(repo_path_to_path(&entry.path));
-                    sley_diff_merge::gitlink_head_oid(&sub_root, db.object_format())
+                    sley::plumbing::sley_diff_merge::gitlink_head_oid(&sub_root, db.object_format())
                         .or(entry.old_oid)
                 }
                 _ => entry.old_oid,
@@ -4961,7 +4950,7 @@ fn diff_entry_new_content(
 }
 
 fn diff_entry_new_gitlink_oid(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree: bool,
@@ -4974,7 +4963,7 @@ fn diff_entry_new_gitlink_oid(
         None => match (use_worktree, worktree_root) {
             (true, Some(root)) => {
                 let sub_root = root.join(repo_path_to_path(&entry.path));
-                sley_diff_merge::gitlink_head_oid(&sub_root, db.object_format()).or(entry.old_oid)
+                sley::plumbing::sley_diff_merge::gitlink_head_oid(&sub_root, db.object_format()).or(entry.old_oid)
             }
             _ => entry.old_oid,
         },
@@ -5055,7 +5044,7 @@ fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Re
     let Ok(remote_git_dir) = commands::remote_cmds::ls_remote_git_dir(url) else {
         return Ok(false);
     };
-    sley_remote::install_fetch_pack_via_local_upload_pack(
+    sley::plumbing::sley_remote::install_fetch_pack_via_local_upload_pack(
         &git_dir,
         &remote_git_dir,
         db.object_format(),
@@ -5140,8 +5129,8 @@ fn is_binary_or_large_content(bytes: &[u8], big_file_threshold: u64) -> bool {
 /// `new_len - lcs` and the count of `Delete` lines is `old_len - lcs` — exactly
 /// the values the removed local LCS counter returned.
 fn count_line_diff(old: &[u8], new: &[u8]) -> (usize, usize) {
-    let old_lines = sley_diff_merge::split_lines(old);
-    let new_lines = sley_diff_merge::split_lines(new);
+    let old_lines = sley::plumbing::sley_diff_merge::split_lines(old);
+    let new_lines = sley::plumbing::sley_diff_merge::split_lines(new);
     let mut prefix = 0usize;
     while prefix < old_lines.len()
         && prefix < new_lines.len()
@@ -5169,19 +5158,19 @@ fn count_line_diff(old: &[u8], new: &[u8]) -> (usize, usize) {
 
     let mut inserted = 0usize;
     let mut deleted = 0usize;
-    for op in sley_diff_merge::myers_diff_lines(&old_lines, &new_lines) {
+    for op in sley::plumbing::sley_diff_merge::myers_diff_lines(&old_lines, &new_lines) {
         match op {
-            sley_diff_merge::DiffOp::Insert(n) => inserted += n,
-            sley_diff_merge::DiffOp::Delete(n) => deleted += n,
-            sley_diff_merge::DiffOp::Equal(_) => {}
+            sley::plumbing::sley_diff_merge::DiffOp::Insert(n) => inserted += n,
+            sley::plumbing::sley_diff_merge::DiffOp::Delete(n) => deleted += n,
+            sley::plumbing::sley_diff_merge::DiffOp::Equal(_) => {}
         }
     }
     (inserted, deleted)
 }
 
 fn trivial_lcs_len(
-    old: &[sley_diff_merge::DiffLine<'_>],
-    new: &[sley_diff_merge::DiffLine<'_>],
+    old: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
+    new: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
 ) -> Option<usize> {
     if old.is_empty() || new.is_empty() {
         return Some(0);
@@ -5196,8 +5185,8 @@ fn trivial_lcs_len(
 }
 
 fn diff_lines_have_any_common(
-    old: &[sley_diff_merge::DiffLine<'_>],
-    new: &[sley_diff_merge::DiffLine<'_>],
+    old: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
+    new: &[sley::plumbing::sley_diff_merge::DiffLine<'_>],
 ) -> bool {
     let (small, large) = if old.len() <= new.len() {
         (old, new)
@@ -5236,9 +5225,9 @@ fn diff_lines(bytes: &[u8]) -> Vec<&[u8]> {
 }
 
 fn apply_diff_pathspec(
-    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     pathspec: &DiffPathspec,
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+) -> Vec<sley::plumbing::sley_diff_merge::NameStatusEntry> {
     if pathspec.is_empty() {
         return entries;
     }
@@ -5247,11 +5236,11 @@ fn apply_diff_pathspec(
         if let Some(old_path) = &entry.old_path {
             let old_matches = pathspec.matches(old_path);
             let new_matches = pathspec.matches(&entry.path);
-            if matches!(entry.status, sley_diff_merge::NameStatus::Copied(_)) {
+            if matches!(entry.status, sley::plumbing::sley_diff_merge::NameStatus::Copied(_)) {
                 match (old_matches, new_matches) {
                     (true, true) => filtered.push(entry),
-                    (false, true) => filtered.push(sley_diff_merge::NameStatusEntry {
-                        status: sley_diff_merge::NameStatus::Added,
+                    (false, true) => filtered.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
+                        status: sley::plumbing::sley_diff_merge::NameStatus::Added,
                         path: entry.path,
                         old_path: None,
                         old_mode: None,
@@ -5264,8 +5253,8 @@ fn apply_diff_pathspec(
             } else {
                 match (old_matches, new_matches) {
                     (true, true) => filtered.push(entry),
-                    (true, false) => filtered.push(sley_diff_merge::NameStatusEntry {
-                        status: sley_diff_merge::NameStatus::Deleted,
+                    (true, false) => filtered.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
+                        status: sley::plumbing::sley_diff_merge::NameStatus::Deleted,
                         path: old_path.clone(),
                         old_path: None,
                         old_mode: entry.old_mode,
@@ -5273,8 +5262,8 @@ fn apply_diff_pathspec(
                         old_oid: entry.old_oid,
                         new_oid: None,
                     }),
-                    (false, true) => filtered.push(sley_diff_merge::NameStatusEntry {
-                        status: sley_diff_merge::NameStatus::Added,
+                    (false, true) => filtered.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
+                        status: sley::plumbing::sley_diff_merge::NameStatus::Added,
                         path: entry.path,
                         old_path: None,
                         old_mode: None,
@@ -5293,10 +5282,10 @@ fn apply_diff_pathspec(
 }
 
 fn apply_diff_max_depth(
-    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     pathspec: &DiffPathspec,
     max_depth: Option<i64>,
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+) -> Vec<sley::plumbing::sley_diff_merge::NameStatusEntry> {
     let Some(max_depth) = max_depth else {
         return entries;
     };
@@ -5317,8 +5306,8 @@ fn parse_diff_max_depth(value: &str) -> Result<i64> {
 }
 
 fn reverse_diff_entries(
-    entries: Vec<sley_diff_merge::NameStatusEntry>,
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+    entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
+) -> Vec<sley::plumbing::sley_diff_merge::NameStatusEntry> {
     let mut reversed = entries
         .into_iter()
         .map(reverse_diff_entry)
@@ -5332,38 +5321,38 @@ fn reverse_diff_entries(
     reversed
 }
 
-fn reverse_diff_entry(entry: sley_diff_merge::NameStatusEntry) -> sley_diff_merge::NameStatusEntry {
+fn reverse_diff_entry(entry: sley::plumbing::sley_diff_merge::NameStatusEntry) -> sley::plumbing::sley_diff_merge::NameStatusEntry {
     match entry.status {
-        sley_diff_merge::NameStatus::Added => sley_diff_merge::NameStatusEntry {
-            status: sley_diff_merge::NameStatus::Deleted,
+        sley::plumbing::sley_diff_merge::NameStatus::Added => sley::plumbing::sley_diff_merge::NameStatusEntry {
+            status: sley::plumbing::sley_diff_merge::NameStatus::Deleted,
             old_mode: entry.new_mode,
             new_mode: None,
             old_oid: entry.new_oid,
             new_oid: None,
             ..entry
         },
-        sley_diff_merge::NameStatus::Deleted => sley_diff_merge::NameStatusEntry {
-            status: sley_diff_merge::NameStatus::Added,
+        sley::plumbing::sley_diff_merge::NameStatus::Deleted => sley::plumbing::sley_diff_merge::NameStatusEntry {
+            status: sley::plumbing::sley_diff_merge::NameStatus::Added,
             old_mode: None,
             new_mode: entry.old_mode,
             old_oid: None,
             new_oid: entry.old_oid,
             ..entry
         },
-        sley_diff_merge::NameStatus::Modified => sley_diff_merge::NameStatusEntry {
+        sley::plumbing::sley_diff_merge::NameStatus::Modified => sley::plumbing::sley_diff_merge::NameStatusEntry {
             old_mode: entry.new_mode,
             new_mode: entry.old_mode,
             old_oid: entry.new_oid,
             new_oid: entry.old_oid,
             ..entry
         },
-        sley_diff_merge::NameStatus::Renamed(score) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Renamed(score) => {
             let new_path = entry
                 .old_path
                 .clone()
                 .expect("rename entries include old_path");
-            sley_diff_merge::NameStatusEntry {
-                status: sley_diff_merge::NameStatus::Renamed(score),
+            sley::plumbing::sley_diff_merge::NameStatusEntry {
+                status: sley::plumbing::sley_diff_merge::NameStatus::Renamed(score),
                 path: new_path,
                 old_path: Some(entry.path),
                 old_mode: entry.new_mode,
@@ -5372,8 +5361,8 @@ fn reverse_diff_entry(entry: sley_diff_merge::NameStatusEntry) -> sley_diff_merg
                 new_oid: entry.old_oid,
             }
         }
-        sley_diff_merge::NameStatus::Copied(_) => sley_diff_merge::NameStatusEntry {
-            status: sley_diff_merge::NameStatus::Deleted,
+        sley::plumbing::sley_diff_merge::NameStatus::Copied(_) => sley::plumbing::sley_diff_merge::NameStatusEntry {
+            status: sley::plumbing::sley_diff_merge::NameStatus::Deleted,
             old_path: None,
             old_mode: entry.new_mode,
             new_mode: None,
@@ -5382,7 +5371,7 @@ fn reverse_diff_entry(entry: sley_diff_merge::NameStatusEntry) -> sley_diff_merg
             ..entry
         },
         // An unmerged marker has no directional content to flip.
-        sley_diff_merge::NameStatus::Unmerged => entry,
+        sley::plumbing::sley_diff_merge::NameStatus::Unmerged => entry,
     }
 }
 
@@ -5415,7 +5404,7 @@ impl DiffPathspec {
                 original: arg.clone(),
                 recursive,
                 is_glob: !element.magic().literal
-                    && sley_worktree::pathspec_is_glob(element.pattern()),
+                    && sley::plumbing::sley_worktree::pathspec_is_glob(element.pattern()),
                 element,
                 matched: Cell::new(false),
             });
@@ -5837,7 +5826,7 @@ fn for_each_ref_sort_date_key(
 
 fn resolve_for_each_ref_target(
     store: &FileRefStore,
-    reference: &sley_refs::Ref,
+    reference: &sley::plumbing::sley_refs::Ref,
 ) -> Result<Option<(ObjectId, Option<String>)>> {
     let mut target = reference.target.clone();
     let mut symref = None;
@@ -5846,7 +5835,7 @@ fn resolve_for_each_ref_target(
             RefTarget::Direct(oid) => return Ok(Some((oid, symref))),
             RefTarget::Symbolic(name) => {
                 symref.get_or_insert_with(|| name.clone());
-                if sley_refs::validate_ref_name(&name).is_err() {
+                if sley::plumbing::sley_refs::validate_ref_name(&name).is_err() {
                     return Ok(None);
                 }
                 let Some(next) = store.read_ref(&name)? else {
@@ -6152,7 +6141,7 @@ fn for_each_ref_upstream_track(
     let Some(upstream_target) = store.read_ref(upstream)? else {
         return Ok(Some(gone_track));
     };
-    let upstream_ref = sley_refs::Ref {
+    let upstream_ref = sley::plumbing::sley_refs::Ref {
         name: upstream.to_string(),
         target: upstream_target,
     };
@@ -6169,14 +6158,14 @@ fn for_each_ref_ahead_behind(
     oid: &ObjectId,
     target: &ObjectId,
 ) -> Result<Option<ForEachRefTrack>> {
-    let Ok(local_commit) = sley_rev::peel_to_commit(db, format, oid) else {
+    let Ok(local_commit) = sley::plumbing::sley_rev::peel_to_commit(db, format, oid) else {
         return Ok(None);
     };
-    let Ok(target_commit) = sley_rev::peel_to_commit(db, format, target) else {
+    let Ok(target_commit) = sley::plumbing::sley_rev::peel_to_commit(db, format, target) else {
         return Ok(None);
     };
     let (ahead, behind) =
-        sley_rev::ahead_behind_counts(git_dir, format, db, &local_commit, &target_commit)?;
+        sley::plumbing::sley_rev::ahead_behind_counts(git_dir, format, db, &local_commit, &target_commit)?;
     Ok(Some(ForEachRefTrack {
         ahead,
         behind,
@@ -6218,7 +6207,7 @@ impl ForEachRefContents<'_> {
 
 fn for_each_ref_contents<'a>(
     format: ObjectFormat,
-    object: &'a sley_object::EncodedObject,
+    object: &'a sley::plumbing::sley_object::EncodedObject,
 ) -> Result<Option<ForEachRefContents<'a>>> {
     let contents = match object.object_type {
         ObjectType::Commit => {
@@ -6291,7 +6280,7 @@ impl ForEachRefFormatContext<'_> {
     /// Shorten a fully-qualified refname to its unambiguous abbreviation, the
     /// way git's `%(refname:short)` / `%(symref:short)` / `%(upstream:short)` do.
     fn shorten_ref(&self, refname: &str) -> String {
-        sley_ref_filter::shorten_unambiguous_ref(refname, self.warn_ambiguous_refs, |candidate| {
+        sley::plumbing::sley_ref_filter::shorten_unambiguous_ref(refname, self.warn_ambiguous_refs, |candidate| {
             self.ref_names.contains(candidate)
         })
     }
@@ -7628,7 +7617,7 @@ fn for_each_ref_push_color_code(
     Ok(())
 }
 
-fn index_entry_stage(entry: &sley_index::IndexEntry) -> u16 {
+fn index_entry_stage(entry: &sley::plumbing::sley_index::IndexEntry) -> u16 {
     (entry.flags >> 12) & 0x3
 }
 
@@ -7637,7 +7626,7 @@ struct LsFilesPathspec {
     full_name: bool,
     filters: Vec<LsFilesPathFilter>,
     cwd_depth: usize,
-    attributes: Option<sley_worktree::StandardAttributeMatcher>,
+    attributes: Option<sley::plumbing::sley_worktree::StandardAttributeMatcher>,
 }
 
 impl LsFilesPathspec {
@@ -7669,7 +7658,7 @@ impl LsFilesPathspec {
             let element = parse_normalized_pathspec_element(&prefix, &parse_arg, magic)?;
             // Under literal magic, wildcard characters carry no special meaning.
             let is_glob =
-                !element.magic().literal && sley_worktree::pathspec_is_glob(element.pattern());
+                !element.magic().literal && sley::plumbing::sley_worktree::pathspec_is_glob(element.pattern());
             let arg_path = Path::new(arg);
             let absolute = if arg_path.is_absolute() {
                 arg_path.to_path_buf()
@@ -7688,7 +7677,7 @@ impl LsFilesPathspec {
             .iter()
             .any(|filter| !filter.element.attr_requirements().is_empty());
         let attributes = if needs_attrs {
-            Some(sley_worktree::StandardAttributeMatcher::from_worktree_root(
+            Some(sley::plumbing::sley_worktree::StandardAttributeMatcher::from_worktree_root(
                 &root,
             )?)
         } else {
@@ -7703,11 +7692,11 @@ impl LsFilesPathspec {
         })
     }
 
-    fn untracked_pathspecs(&self) -> Vec<sley_worktree::UntrackedPathspecFilter> {
+    fn untracked_pathspecs(&self) -> Vec<sley::plumbing::sley_worktree::UntrackedPathspecFilter> {
         self.filters
             .iter()
             .filter(|filter| !filter.is_exclude())
-            .map(|filter| sley_worktree::UntrackedPathspecFilter {
+            .map(|filter| sley::plumbing::sley_worktree::UntrackedPathspecFilter {
                 path: filter.element.pattern().to_vec(),
                 recursive: filter.recursive,
                 is_glob: filter.is_glob,
@@ -8123,12 +8112,12 @@ pub(crate) fn log_validate_diff_algorithm(value: &str) -> Result<()> {
 }
 
 /// Map a validated `--diff-algorithm=<name>` value to a [`DiffAlgorithm`].
-pub(crate) fn log_parse_diff_algorithm(value: &str) -> sley_diff_merge::DiffAlgorithm {
+pub(crate) fn log_parse_diff_algorithm(value: &str) -> sley::plumbing::sley_diff_merge::DiffAlgorithm {
     match value {
-        "minimal" => sley_diff_merge::DiffAlgorithm::Minimal,
-        "patience" => sley_diff_merge::DiffAlgorithm::Patience,
-        "histogram" => sley_diff_merge::DiffAlgorithm::Histogram,
-        _ => sley_diff_merge::DiffAlgorithm::Myers,
+        "minimal" => sley::plumbing::sley_diff_merge::DiffAlgorithm::Minimal,
+        "patience" => sley::plumbing::sley_diff_merge::DiffAlgorithm::Patience,
+        "histogram" => sley::plumbing::sley_diff_merge::DiffAlgorithm::Histogram,
+        _ => sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
     }
 }
 
@@ -8168,7 +8157,11 @@ fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
 }
 
 fn log_validate_output_indicator_for_log(option: &str, value: &str) -> Result<()> {
-    log_validate_output_indicator(option, value)
+    if value.len() <= 1 {
+        return Ok(());
+    }
+    eprintln!("error: {option} expects a character, got '{value}'");
+    Err(GitError::Exit(129))
 }
 
 fn log_validate_submodule_format(value: &str) -> Result<()> {
@@ -8301,7 +8294,7 @@ impl DecorationPattern {
 
     fn matches(&self, refname: &str) -> bool {
         if self.is_glob {
-            sley_pathspec::wildmatch(self.normalized.as_bytes(), refname.as_bytes(), 0)
+            sley::plumbing::sley_pathspec::wildmatch(self.normalized.as_bytes(), refname.as_bytes(), 0)
         } else {
             // Prefix match: refname == pattern, or refname starts with
             // "pattern/".
@@ -8371,7 +8364,7 @@ pub(crate) fn log_decoration_map(
         match head_target {
             RefTarget::Symbolic(name) => {
                 if let Some(RefTarget::Direct(oid)) = store.read_ref(&name)?
-                    && let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid)
+                    && let Ok(commit) = sley::plumbing::sley_rev::peel_to_commit(db, format, &oid)
                 {
                     let branch_kept = filter.matches(&name);
                     if head_kept && branch_kept {
@@ -8384,7 +8377,7 @@ pub(crate) fn log_decoration_map(
                 }
             }
             RefTarget::Direct(oid) => {
-                if head_kept && let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid) {
+                if head_kept && let Ok(commit) = sley::plumbing::sley_rev::peel_to_commit(db, format, &oid) {
                     head_decoration = Some((commit, "HEAD".to_string()));
                 }
             }
@@ -8400,7 +8393,7 @@ pub(crate) fn log_decoration_map(
         let RefTarget::Direct(oid) = reference.target else {
             continue;
         };
-        let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid) else {
+        let Ok(commit) = sley::plumbing::sley_rev::peel_to_commit(db, format, &oid) else {
             continue;
         };
         let label = log_decoration_label(&reference.name, mode);
@@ -8863,7 +8856,7 @@ fn log_regex_unterminated_class_error(
 }
 
 fn log_author_filters_match(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     filters: &[SimpleLogRegex],
     ignore_case: bool,
 ) -> bool {
@@ -8877,7 +8870,7 @@ fn log_author_filters_match(
 }
 
 fn log_committer_filters_match(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     filters: &[SimpleLogRegex],
     ignore_case: bool,
 ) -> bool {
@@ -8891,7 +8884,7 @@ fn log_committer_filters_match(
 }
 
 fn log_grep_filters_match(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     filters: &[SimpleLogRegex],
     all_match: bool,
     invert: bool,
@@ -9087,7 +9080,7 @@ fn format_log_commit_header_oid(
     }
 }
 
-fn format_log_parent_oids(record: &sley_rev::CommitRecord, abbrev_len: Option<usize>) -> String {
+fn format_log_parent_oids(record: &sley::plumbing::sley_rev::CommitRecord, abbrev_len: Option<usize>) -> String {
     record
         .parents
         .iter()
@@ -9180,7 +9173,7 @@ struct LogSignatureContext<'a> {
 }
 
 fn print_log_format(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     compiled: &CompiledLogFormat,
     context: LogFormatContext<'_>,
 ) -> Result<usize> {
@@ -9206,7 +9199,7 @@ fn print_log_format(
 /// placeholders as `git log --pretty=format:`). `fmt` is the text between
 /// `$Format:` and the closing `$`.
 pub(crate) fn format_subst_for_commit(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     fmt: &[u8],
 ) -> Result<Vec<u8>> {
     let fmt = String::from_utf8_lossy(fmt);
@@ -9242,7 +9235,7 @@ pub(crate) fn format_subst_for_commit(
 }
 
 fn emit_compiled_log_format(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     compiled: &CompiledLogFormat,
     context: &LogFormatContext<'_>,
     out: &mut Vec<u8>,
@@ -9311,7 +9304,7 @@ fn log_rewrap(out: &mut Vec<u8>, pos: usize, width: i32, indent1: i32, indent2: 
 }
 
 struct LogFormatAtomResolver<'a, 'b> {
-    record: &'a sley_rev::CommitRecord,
+    record: &'a sley::plumbing::sley_rev::CommitRecord,
     context: &'a LogFormatContext<'b>,
     author_name: &'a str,
     author_email: &'a str,
@@ -9322,7 +9315,7 @@ struct LogFormatAtomResolver<'a, 'b> {
     auto_color: bool,
 }
 
-impl sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatAtomResolver<'_, '_> {
+impl sley::plumbing::sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatAtomResolver<'_, '_> {
     fn resolve_atom(&mut self, out: &mut Vec<u8>, atom: &FormatToken) -> Result<()> {
         if self.auto_color && matches!(atom, FormatToken::OidFull | FormatToken::OidAbbrev) {
             self.auto_color = false;
@@ -9373,7 +9366,7 @@ impl sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatAtomResolver<'_,
 #[allow(clippy::too_many_arguments)]
 fn emit_log_one_token(
     token: &FormatToken,
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     context: &LogFormatContext<'_>,
     out: &mut Vec<u8>,
     author_name: &str,
@@ -9655,7 +9648,7 @@ fn emit_log_one_token(
 fn emit_log_signature_atom(
     out: &mut Vec<u8>,
     token: &FormatToken,
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     context: Option<&LogSignatureContext<'_>>,
 ) -> Result<()> {
     let verification = log_signature_verification(record, context)?;
@@ -9677,7 +9670,7 @@ fn emit_log_signature_atom(
 }
 
 fn log_signature_verification(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     context: Option<&LogSignatureContext<'_>>,
 ) -> Result<commands::signing::GpgVerification> {
     let Some(context) = context else {
@@ -9987,7 +9980,7 @@ fn format_metadata_parent_oids(parents: &[ObjectId], abbrev_len: Option<usize>) 
 }
 
 fn emit_compiled_log_format_metadata(
-    record: &sley_rev::CommitMetadata,
+    record: &sley::plumbing::sley_rev::CommitMetadata,
     compiled: &CompiledLogFormat,
     context: &LogFormatContext<'_>,
     out: &mut Vec<u8>,
@@ -9996,7 +9989,7 @@ fn emit_compiled_log_format_metadata(
 }
 
 fn emit_compiled_log_format_metadata_with_message(
-    record: &sley_rev::CommitMetadata,
+    record: &sley::plumbing::sley_rev::CommitMetadata,
     compiled: &CompiledLogFormat,
     context: &LogFormatContext<'_>,
     message: &[u8],
@@ -10007,7 +10000,7 @@ fn emit_compiled_log_format_metadata_with_message(
 
 fn emit_compiled_log_format_limited_commit(
     db: &FileObjectDatabase,
-    record: &sley_rev::CommitMetadata,
+    record: &sley::plumbing::sley_rev::CommitMetadata,
     compiled: &CompiledLogFormat,
     context: &LogFormatContext<'_>,
     out: &mut Vec<u8>,
@@ -10062,7 +10055,7 @@ fn commit_object_message_and_optional_encoding(
 }
 
 fn emit_compiled_log_format_metadata_inner(
-    record: &sley_rev::CommitMetadata,
+    record: &sley::plumbing::sley_rev::CommitMetadata,
     compiled: &CompiledLogFormat,
     context: &LogFormatContext<'_>,
     out: &mut Vec<u8>,
@@ -10640,7 +10633,7 @@ fn rev_parse_symbolic_full_name(
     format: ObjectFormat,
     rev: &str,
 ) -> Result<Option<String>> {
-    sley_rev::resolve_revision_symbolic_full_name(git_dir, format, rev)
+    sley::plumbing::sley_rev::resolve_revision_symbolic_full_name(git_dir, format, rev)
 }
 
 /// `git rev-parse --bisect`: emit the `refs/bisect/bad*` refs as positive
@@ -10785,7 +10778,7 @@ fn submodule_worktree_has_untracked_entries(
 }
 
 fn read_repository_index(git_dir: &Path, format: ObjectFormat) -> Result<Option<Index>> {
-    sley_worktree::read_repository_index(git_dir, format)
+    sley::plumbing::sley_worktree::read_repository_index(git_dir, format)
 }
 
 fn resolve_ref_to_oid(store: &FileRefStore, name: &str) -> Result<Option<ObjectId>> {
@@ -11321,7 +11314,7 @@ fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {
     };
     let date = env::var(format!("GIT_{role}_DATE")).unwrap_or_else(|_| "@0 +0000".into());
     let date = canonicalize_commit_date(&date);
-    sley_sequencer::format_commit_identity(&name, &email, &date)
+    sley::plumbing::sley_sequencer::format_commit_identity(&name, &email, &date)
 }
 
 /// Like [`commit_identity_from_env`] but with the date forced to `date_override`
@@ -11347,7 +11340,7 @@ fn commit_identity_from_env_with_date(role: &str, date_override: &str) -> Result
         return identity_use_config_only_error();
     };
     let date = canonicalize_commit_date(date_override);
-    sley_sequencer::format_commit_identity(&name, &email, &date)
+    sley::plumbing::sley_sequencer::format_commit_identity(&name, &email, &date)
 }
 
 /// Canonicalise a `GIT_*_DATE`/`--date=` value to git's raw `<seconds> +HHMM`
@@ -11404,7 +11397,7 @@ fn identity_default_value(value: &str, config: &mut IdentityConfig) -> Option<St
 fn identity_use_config_only(config: &mut IdentityConfig) -> bool {
     identity_config_value("user.useconfigonly", config)
         .as_deref()
-        .and_then(sley_config::parse_config_bool)
+        .and_then(sley::plumbing::sley_config::parse_config_bool)
         .unwrap_or(false)
 }
 
@@ -11422,18 +11415,18 @@ fn identity_effective_config() -> Option<GitConfig> {
     // `explicit_git_dir`) before walking up from the current directory.
     let git_dir = discover_git_dir(env::current_dir().ok()?).ok()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir).ok()?;
-    let context = sley_config::ConfigIncludeContext::new(
+    let context = sley::plumbing::sley_config::ConfigIncludeContext::new(
         Some(common_git_dir.clone()),
         repo_current_branch_name(&git_dir),
     );
-    let mut config = sley_config::load_effective_config(&common_git_dir, &context).ok()?;
+    let mut config = sley::plumbing::sley_config::load_effective_config(&common_git_dir, &context).ok()?;
     // Layer the command-line `-c`/`--config-env` overrides on top, so reads like
     // `mailmap.blob`/`mailmap.file` see the same values `git config` would (the
     // CLI cannot push `-c` into the process env, so reconstruct it here).
     let parameters_env = effective_config_parameters_env();
-    if let Ok(parameters) = sley_config::injected_config_parameters(parameters_env.as_deref()) {
+    if let Ok(parameters) = sley::plumbing::sley_config::injected_config_parameters(parameters_env.as_deref()) {
         let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let _ = sley_config::append_injected_config_sections_with_includes(
+        let _ = sley::plumbing::sley_config::append_injected_config_sections_with_includes(
             &mut config,
             &parameters,
             &context,
@@ -11461,7 +11454,7 @@ fn commit_signoff_from_env() -> Result<Vec<u8>> {
         .unwrap_or_else(|| "sley@example.invalid".into());
     let date = env::var("GIT_COMMITTER_DATE").unwrap_or_else(|_| "@0 +0000".into());
     let date = canonicalize_commit_date(&date);
-    sley_sequencer::format_commit_identity(&name, &email, &date)?;
+    sley::plumbing::sley_sequencer::format_commit_identity(&name, &email, &date)?;
     Ok(format!("Signed-off-by: {name} <{email}>").into_bytes())
 }
 
@@ -11508,7 +11501,7 @@ fn worktree_root_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
     }
     // The rest (core.worktree, linked worktrees, parent-of-.git) is shared with
     // the library; a bare repository (None) is unsupported here.
-    match sley_worktree::worktree_root_for_git_dir(git_dir)? {
+    match sley::plumbing::sley_worktree::worktree_root_for_git_dir(git_dir)? {
         Some(root) => Ok(root),
         None => Err(GitError::Unsupported(
             "update-index currently requires a non-bare worktree".into(),
@@ -11544,7 +11537,7 @@ fn require_work_tree(git_dir: &Path) -> Result<PathBuf> {
         eprintln!("fatal: this operation must be run in a work tree");
         return Err(GitError::Exit(128));
     }
-    match sley_worktree::worktree_root_for_git_dir(git_dir)? {
+    match sley::plumbing::sley_worktree::worktree_root_for_git_dir(git_dir)? {
         Some(root) => Ok(root),
         None => {
             eprintln!("fatal: this operation must be run in a work tree");
@@ -11573,35 +11566,35 @@ fn read_gitdir_file(path: &Path) -> Result<Option<PathBuf>> {
 
 fn resolve_revision(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<ObjectId> {
     warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
-    sley_rev::resolve_revision(git_dir, format, rev)
+    sley::plumbing::sley_rev::resolve_revision(git_dir, format, rev)
 }
 
 fn resolve_revision_commitish(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<ObjectId> {
     warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
     if is_short_hex_object_prefix(format, rev) {
-        return sley_rev::resolve_short_object_id(
+        return sley::plumbing::sley_rev::resolve_short_object_id(
             git_dir,
             format,
             rev,
-            sley_rev::ObjectDisambiguation::Commitish,
+            sley::plumbing::sley_rev::ObjectDisambiguation::Commitish,
         )?
         .into_result(rev);
     }
-    sley_rev::resolve_revision(git_dir, format, rev)
+    sley::plumbing::sley_rev::resolve_revision(git_dir, format, rev)
 }
 
 fn resolve_revision_treeish(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<ObjectId> {
     warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
     if is_short_hex_object_prefix(format, rev) {
-        return sley_rev::resolve_short_object_id(
+        return sley::plumbing::sley_rev::resolve_short_object_id(
             git_dir,
             format,
             rev,
-            sley_rev::ObjectDisambiguation::Treeish,
+            sley::plumbing::sley_rev::ObjectDisambiguation::Treeish,
         )?
         .into_result(rev);
     }
-    sley_rev::resolve_revision(git_dir, format, rev)
+    sley::plumbing::sley_rev::resolve_revision(git_dir, format, rev)
 }
 
 fn is_short_hex_object_prefix(format: ObjectFormat, rev: &str) -> bool {

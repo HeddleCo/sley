@@ -202,7 +202,7 @@ pub(super) fn compile_log_filter_matcher(
             ignore_case,
             word: false,
             line_regexp: false,
-            diagnostic_verbosity: crate::grep_source::RegexDiagnosticVerbosity::Default,
+            diagnostic_verbosity: crate::grep_source::RegexDiagnosticVerbosity::Verbose,
         },
         error_context,
     )
@@ -277,7 +277,7 @@ pub(super) fn log_highlight_matches(
 }
 
 pub(super) fn log_author_matcher_matches(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     filter: Option<&crate::grep_source::GrepMatcher>,
     mailmap: Option<&commands::utility::Mailmap>,
 ) -> bool {
@@ -290,7 +290,7 @@ pub(super) fn log_author_matcher_matches(
 }
 
 pub(super) fn log_committer_matcher_matches(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     filter: Option<&crate::grep_source::GrepMatcher>,
     mailmap: Option<&commands::utility::Mailmap>,
 ) -> bool {
@@ -330,7 +330,7 @@ fn log_mailmapped_identity_header(
 }
 
 pub(super) fn log_grep_matcher_matches(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     filter: Option<&crate::grep_source::GrepMatcher>,
     all_match: bool,
     invert: bool,
@@ -439,14 +439,14 @@ fn reflog_walk_commit_record(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     entry: &ReflogEntry,
-) -> Result<Option<sley_rev::CommitRecord>> {
+) -> Result<Option<sley::plumbing::sley_rev::CommitRecord>> {
     let object = match db.read_object(&entry.new_oid) {
         Ok(object) if object.object_type == ObjectType::Commit => object,
         Ok(_) => return Ok(None),
         Err(_) => return Ok(None),
     };
     let commit = Commit::parse(format, &object.body)?;
-    Ok(Some(sley_rev::CommitRecord {
+    Ok(Some(sley::plumbing::sley_rev::CommitRecord {
         oid: entry.new_oid,
         parents: commit.parents.clone(),
         commit,

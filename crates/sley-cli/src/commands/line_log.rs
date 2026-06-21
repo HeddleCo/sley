@@ -11,7 +11,7 @@
 //!    hunks that touched a tracked range (`process_ranges_*`).
 //! 3. Emits each surviving commit with the standard log header followed by a
 //!    `diff --git` whose hunks are clipped to the tracked ranges (the
-//!    `line_ranges` hook in `sley_diff_merge::render`).
+//!    `line_ranges` hook in `sley::plumbing::sley_diff_merge::render`).
 //!
 //! The range-mapping core (`range_set_map_across_diff`,
 //! `diff_ranges_filter_touched`, `range_set_shift_diff`) is a direct port; the
@@ -19,9 +19,9 @@
 //! the per-line diff that drives range mapping uses sley's Myers diff.
 
 use crate::*;
-use sley_diff_merge::render::LineRange;
-use sley_odb::FileObjectDatabase;
-use sley_rev::{CommitRecord, resolve_tree_path_entry};
+use sley::plumbing::sley_diff_merge::render::LineRange;
+use sley::plumbing::sley_odb::FileObjectDatabase;
+use sley::plumbing::sley_rev::{CommitRecord, resolve_tree_path_entry};
 use std::collections::HashMap;
 
 /// One `-L` argument before resolution: the raw `<range>:<file>` string.
@@ -242,7 +242,7 @@ struct DiffPair {
     new_oid: Option<ObjectId>,
     old_mode: Option<u32>,
     new_mode: Option<u32>,
-    status: sley_diff_merge::NameStatus,
+    status: sley::plumbing::sley_diff_merge::NameStatus,
 }
 
 impl FileRange {
@@ -760,9 +760,9 @@ fn parse_lines(
 /// [`DiffRanges`] (git's `collect_diff`: ctxlen=0, one hunk = one change). The
 /// ranges are 0-based half-open on each side.
 fn collect_diff(parent: &[u8], target: &[u8]) -> DiffRanges {
-    let old = sley_diff_merge::split_lines(parent);
-    let new = sley_diff_merge::split_lines(target);
-    let ops = sley_diff_merge::myers_diff_lines(&old, &new);
+    let old = sley::plumbing::sley_diff_merge::split_lines(parent);
+    let new = sley::plumbing::sley_diff_merge::split_lines(target);
+    let ops = sley::plumbing::sley_diff_merge::myers_diff_lines(&old, &new);
     let mut out = DiffRanges::default();
     let mut old_idx = 0i64;
     let mut new_idx = 0i64;
@@ -772,7 +772,7 @@ fn collect_diff(parent: &[u8], target: &[u8]) -> DiffRanges {
     let mut i = 0usize;
     while i < ops.len() {
         match ops[i] {
-            sley_diff_merge::DiffOp::Equal(n) => {
+            sley::plumbing::sley_diff_merge::DiffOp::Equal(n) => {
                 old_idx += n as i64;
                 new_idx += n as i64;
                 i += 1;
@@ -783,15 +783,15 @@ fn collect_diff(parent: &[u8], target: &[u8]) -> DiffRanges {
                 let new_start = new_idx;
                 while i < ops.len() {
                     match ops[i] {
-                        sley_diff_merge::DiffOp::Delete(n) => {
+                        sley::plumbing::sley_diff_merge::DiffOp::Delete(n) => {
                             old_idx += n as i64;
                             i += 1;
                         }
-                        sley_diff_merge::DiffOp::Insert(n) => {
+                        sley::plumbing::sley_diff_merge::DiffOp::Insert(n) => {
                             new_idx += n as i64;
                             i += 1;
                         }
-                        sley_diff_merge::DiffOp::Equal(_) => break,
+                        sley::plumbing::sley_diff_merge::DiffOp::Equal(_) => break,
                     }
                 }
                 out.parent.append_raw(old_start, old_idx);
@@ -826,9 +826,9 @@ fn process_file_diff(
 
 /// Lookup a name-status entry for `path` (matching git's `pair->two->path`).
 fn find_entry<'a>(
-    entries: &'a [sley_diff_merge::NameStatusEntry],
+    entries: &'a [sley::plumbing::sley_diff_merge::NameStatusEntry],
     path: &str,
-) -> Option<&'a sley_diff_merge::NameStatusEntry> {
+) -> Option<&'a sley::plumbing::sley_diff_merge::NameStatusEntry> {
     entries
         .iter()
         .find(|e| e.path.as_bytes() == path.as_bytes())
@@ -841,31 +841,31 @@ fn commit_name_status(
     parent_tree: Option<&ObjectId>,
     tree: &ObjectId,
     detect_renames: bool,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
-    let base = sley_diff_merge::DiffNameStatusOptions {
+) -> Result<Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>> {
+    let base = sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
         detect_renames,
         detect_copies: false,
         find_copies_harder: false,
         rename_empty: true,
     };
     let entries = match (parent_tree, detect_renames) {
-        (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+        (Some(parent), true) => sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
             db,
             format,
             parent,
             tree,
-            sley_diff_merge::RenameDetectionOptions {
+            sley::plumbing::sley_diff_merge::RenameDetectionOptions {
                 base,
                 detect_inexact: true,
-                rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-                copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                copy_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             },
         )?,
         (Some(parent), false) => {
-            sley_diff_merge::diff_name_status_trees_with_options(db, format, parent, tree, base)?
+            sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(db, format, parent, tree, base)?
         }
         (None, _) => {
-            sley_diff_merge::diff_name_status_empty_tree_with_options(db, format, tree, base)?
+            sley::plumbing::sley_diff_merge::diff_name_status_empty_tree_with_options(db, format, tree, base)?
         }
     };
     Ok(entries)
@@ -978,7 +978,7 @@ fn parent_tree_oid(
     Ok(Commit::parse_ref(format, &object.body)?.tree)
 }
 
-fn entry_path_string(entry: &sley_diff_merge::NameStatusEntry) -> String {
+fn entry_path_string(entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) -> String {
     String::from_utf8_lossy(entry.path.as_bytes()).into_owned()
 }
 
@@ -992,7 +992,7 @@ pub(crate) struct PrintedFile {
     pub(crate) new_oid: Option<ObjectId>,
     pub(crate) old_mode: Option<u32>,
     pub(crate) new_mode: Option<u32>,
-    pub(crate) status: sley_diff_merge::NameStatus,
+    pub(crate) status: sley::plumbing::sley_diff_merge::NameStatus,
     pub(crate) line_ranges: Vec<LineRange>,
 }
 

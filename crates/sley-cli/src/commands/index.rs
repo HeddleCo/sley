@@ -526,9 +526,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             }
             "-t" => tag = true,
             "--no-t" => tag = false,
-            "--recurse-submodules"
-            | "--no-recurse-submodules"
-            | "--no-killed" => {}
+            "--recurse-submodules" | "--no-recurse-submodules" | "--no-killed" => {}
             "--no-resolve-undo" => resolve_undo = false,
             "--abbrev" => oid_abbrev = Some(7),
             "--no-abbrev" => oid_abbrev = None,
@@ -652,15 +650,15 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     {
         let stdout = io::stdout();
         let mut stdout = io::BufWriter::new(stdout.lock());
-        let index_path = sley_worktree::repository_index_path(&git_dir);
+        let index_path = sley::plumbing::sley_worktree::repository_index_path(&git_dir);
         match fs::read(index_path) {
             Ok(index_bytes) => {
-                if sley_index::Index::bytes_have_extension(
+                if sley::plumbing::sley_index::Index::bytes_have_extension(
                     &index_bytes,
                     format,
-                    &sley_index::INDEX_EXT_LINK,
+                    &sley::plumbing::sley_index::INDEX_EXT_LINK,
                 )? {
-                    if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
+                    if let Some(index) = sley::plumbing::sley_worktree::read_repository_index(&git_dir, format)? {
                         for entry in &index.entries {
                             write_ls_files_path(&mut stdout, &entry.path, terminator)?;
                             stdout.write_all(&[terminator])?;
@@ -688,7 +686,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     };
     let eol = eol_context.as_ref();
     if let Some(format_spec) = format_spec.as_deref() {
-        if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
+        if let Some(index) = sley::plumbing::sley_worktree::read_repository_index(&git_dir, format)? {
             let index =
                 ls_files_display_index(&git_dir, format, index, sparse && !(deleted || modified))?;
             write_ls_files_formatted(
@@ -706,7 +704,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         return Ok(());
     }
     if resolve_undo {
-        if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
+        if let Some(index) = sley::plumbing::sley_worktree::read_repository_index(&git_dir, format)? {
             write_ls_files_resolve_undo(&mut stdout, &index, format, terminator, &pathspec)?;
         }
         stdout.flush()?;
@@ -716,11 +714,11 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         return Ok(());
     }
     if others {
-        let untracked = sley_worktree::untracked_paths_with_options(
+        let untracked = sley::plumbing::sley_worktree::untracked_paths_with_options(
             &worktree_root,
             &git_dir,
             format,
-            sley_worktree::UntrackedPathOptions {
+            sley::plumbing::sley_worktree::UntrackedPathOptions {
                 directory,
                 no_empty_directory,
                 preserve_ignored_directories: false,
@@ -743,24 +741,24 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         }
     }
     let deleted_entries = if deleted {
-        sley_worktree::deleted_index_entries(&worktree_root, &git_dir, format)?
+        sley::plumbing::sley_worktree::deleted_index_entries(&worktree_root, &git_dir, format)?
     } else {
         Vec::new()
     };
     let modified_entries = if modified {
-        sley_worktree::modified_index_entries(&worktree_root, &git_dir, format)?
+        sley::plumbing::sley_worktree::modified_index_entries(&worktree_root, &git_dir, format)?
     } else {
         Vec::new()
     };
     if selected && !output_stage {
         if (cached || deleted || modified)
-            && let Some(index) = sley_worktree::read_repository_index(&git_dir, format)?
+            && let Some(index) = sley::plumbing::sley_worktree::read_repository_index(&git_dir, format)?
         {
             let index =
                 ls_files_display_index(&git_dir, format, index, sparse && !(deleted || modified))?;
             let oid_candidates = ls_files_oid_candidates(&index);
             if ignored && cached {
-                let ignored_entries = sley_worktree::ignored_index_entries(
+                let ignored_entries = sley::plumbing::sley_worktree::ignored_index_entries(
                     &worktree_root,
                     &index.entries,
                     exclude_standard,
@@ -812,7 +810,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
-    if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
+    if let Some(index) = sley::plumbing::sley_worktree::read_repository_index(&git_dir, format)? {
         let index =
             ls_files_display_index(&git_dir, format, index, sparse && !(deleted || modified))?;
         let oid_candidates = ls_files_oid_candidates(&index);
@@ -875,7 +873,7 @@ fn write_ls_files_index_root_fast(
     format: ObjectFormat,
     terminator: u8,
 ) -> Result<()> {
-    sley_index::Index::for_each_path(index_bytes, format, |path| {
+    sley::plumbing::sley_index::Index::for_each_path(index_bytes, format, |path| {
         write_ls_files_path(stdout, path, terminator)?;
         stdout.write_all(&[terminator])?;
         Ok(())
@@ -884,7 +882,7 @@ fn write_ls_files_index_root_fast(
 
 fn write_ls_files_formatted<'a>(
     stdout: &mut io::Stdout,
-    entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
+    entries: impl IntoIterator<Item = &'a sley::plumbing::sley_index::IndexEntry>,
     format_spec: &str,
     terminator: u8,
     pathspec: &LsFilesPathspec,
@@ -901,7 +899,7 @@ fn write_ls_files_formatted<'a>(
 
 fn write_ls_files_format(
     stdout: &mut io::Stdout,
-    entry: &sley_index::IndexEntry,
+    entry: &sley::plumbing::sley_index::IndexEntry,
     display_path: &[u8],
     format_spec: &str,
 ) -> Result<()> {
@@ -953,7 +951,7 @@ fn ls_files_display_index(
 ) -> Result<Index> {
     if !sparse && index.entries.iter().any(IndexEntry::is_sparse_dir) {
         let db = FileObjectDatabase::from_git_dir(git_dir, format);
-        sley_worktree::expand_sparse_index(&mut index, &db, format)?;
+        sley::plumbing::sley_worktree::expand_sparse_index(&mut index, &db, format)?;
     }
     Ok(index)
 }
@@ -1040,7 +1038,7 @@ fn write_ls_files_resolve_undo(
 #[allow(clippy::too_many_arguments)]
 fn write_ls_files_unmerged<'a>(
     stdout: &mut io::Stdout,
-    entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
+    entries: impl IntoIterator<Item = &'a sley::plumbing::sley_index::IndexEntry>,
     terminator: u8,
     pathspec: &LsFilesPathspec,
     oid_abbrev: Option<usize>,
@@ -1072,7 +1070,7 @@ fn write_ls_files_unmerged<'a>(
 #[allow(clippy::too_many_arguments)]
 fn write_ls_files_index<'a>(
     stdout: &mut io::Stdout,
-    entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
+    entries: impl IntoIterator<Item = &'a sley::plumbing::sley_index::IndexEntry>,
     stage: bool,
     terminator: u8,
     pathspec: &LsFilesPathspec,
@@ -1113,7 +1111,7 @@ fn write_ls_files_index<'a>(
     Ok(())
 }
 
-fn write_ls_files_debug(stdout: &mut io::Stdout, entry: &sley_index::IndexEntry) -> Result<()> {
+fn write_ls_files_debug(stdout: &mut io::Stdout, entry: &sley::plumbing::sley_index::IndexEntry) -> Result<()> {
     let flags = entry.flags & !0x0fff;
     write!(
         stdout,
@@ -1140,9 +1138,9 @@ fn is_regular_file_mode(mode: u32) -> bool {
 
 fn write_ls_files_index_with_selected<'a>(
     stdout: &mut io::Stdout,
-    entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
-    deleted_entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
-    modified_entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
+    entries: impl IntoIterator<Item = &'a sley::plumbing::sley_index::IndexEntry>,
+    deleted_entries: impl IntoIterator<Item = &'a sley::plumbing::sley_index::IndexEntry>,
+    modified_entries: impl IntoIterator<Item = &'a sley::plumbing::sley_index::IndexEntry>,
     pathspec: &LsFilesPathspec,
     options: LsFilesWriteOptions,
 ) -> Result<()> {
@@ -1171,9 +1169,9 @@ fn write_ls_files_index_with_selected<'a>(
 
 fn write_ls_files_selected<'a>(
     stdout: &mut io::Stdout,
-    entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
-    deleted_entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
-    modified_entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
+    entries: impl IntoIterator<Item = &'a sley::plumbing::sley_index::IndexEntry>,
+    deleted_entries: impl IntoIterator<Item = &'a sley::plumbing::sley_index::IndexEntry>,
+    modified_entries: impl IntoIterator<Item = &'a sley::plumbing::sley_index::IndexEntry>,
     pathspec: &LsFilesPathspec,
     options: LsFilesWriteOptions,
 ) -> Result<()> {
@@ -1190,9 +1188,9 @@ fn write_ls_files_selected<'a>(
 
 fn write_ls_files_entry_if_selected(
     stdout: &mut io::Stdout,
-    entry: &sley_index::IndexEntry,
-    deleted: &[&sley_index::IndexEntry],
-    modified: &[&sley_index::IndexEntry],
+    entry: &sley::plumbing::sley_index::IndexEntry,
+    deleted: &[&sley::plumbing::sley_index::IndexEntry],
+    modified: &[&sley::plumbing::sley_index::IndexEntry],
     pathspec: &LsFilesPathspec,
     options: LsFilesWriteOptions,
     seen: &mut BTreeSet<Vec<u8>>,
@@ -1217,7 +1215,7 @@ fn write_ls_files_entry_if_selected(
 
 fn write_ls_files_entry(
     stdout: &mut io::Stdout,
-    entry: &sley_index::IndexEntry,
+    entry: &sley::plumbing::sley_index::IndexEntry,
     pathspec: &LsFilesPathspec,
     options: LsFilesWriteOptions,
     seen: &mut BTreeSet<Vec<u8>>,
@@ -1290,8 +1288,8 @@ impl EolContext {
         index_oid: Option<&ObjectId>,
     ) -> Result<()> {
         let index_content = index_oid.and_then(|oid| self.index_blob(oid));
-        let attr_checks = sley_worktree::eol_attribute_checks(&self.worktree_root, repo_path)?;
-        let info = sley_worktree::eol_info_for_path(
+        let attr_checks = sley::plumbing::sley_worktree::eol_attribute_checks(&self.worktree_root, repo_path)?;
+        let info = sley::plumbing::sley_worktree::eol_info_for_path(
             &self.worktree_root,
             repo_path,
             index_content.as_deref(),
@@ -1323,7 +1321,7 @@ struct LsFilesWriteOptions<'a> {
     tag: bool,
 }
 
-fn ls_files_tag(entry: &sley_index::IndexEntry) -> char {
+fn ls_files_tag(entry: &sley::plumbing::sley_index::IndexEntry) -> char {
     if entry.is_skip_worktree() { 'S' } else { 'H' }
 }
 
@@ -1446,7 +1444,7 @@ pub(crate) fn cmd_ls_tree(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let oid = resolve_revision(&git_dir, format, treeish)?;
-    let tree_oid = sley_rev::peel_to_tree(&db, format, &oid)?;
+    let tree_oid = sley::plumbing::sley_rev::peel_to_tree(&db, format, &oid)?;
     let object = db.read_object(&tree_oid)?;
     if object.object_type != ObjectType::Tree {
         return Err(GitError::InvalidObject(format!(
@@ -1557,7 +1555,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     // with `paths`. git processes argv left-to-right and applies whatever mode
     // is current to each path as it is seen, so `--add foo --force-remove bar`
     // adds foo and force-removes bar — the flags are positional, not global.
-    let mut path_modes: Vec<sley_worktree::UpdateIndexPathMode> = Vec::new();
+    let mut path_modes: Vec<sley::plumbing::sley_worktree::UpdateIndexPathMode> = Vec::new();
     let mut idx = 0;
     while idx < args.len() {
         if stdin || index_info {
@@ -1571,7 +1569,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                 unresolve_paths.push(PathBuf::from(arg));
             } else if !ignore_paths_after_unresolve {
                 paths.push(PathBuf::from(arg));
-                path_modes.push(sley_worktree::UpdateIndexPathMode {
+                path_modes.push(sley::plumbing::sley_worktree::UpdateIndexPathMode {
                     add,
                     remove,
                     force_remove,
@@ -1804,7 +1802,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                     unresolve_paths.push(PathBuf::from(value));
                 } else if !ignore_paths_after_unresolve {
                     paths.push(PathBuf::from(value));
-                    path_modes.push(sley_worktree::UpdateIndexPathMode {
+                    path_modes.push(sley::plumbing::sley_worktree::UpdateIndexPathMode {
                         add,
                         remove,
                         force_remove,
@@ -1826,7 +1824,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             // current add/remove/force_remove/info_only + set_executable_bit to
             // every stdin path too). Without this the later `paths`/`path_modes`
             // zip would truncate and silently drop the stdin paths.
-            let stdin_mode = sley_worktree::UpdateIndexPathMode {
+            let stdin_mode = sley::plumbing::sley_worktree::UpdateIndexPathMode {
                 add,
                 remove,
                 force_remove,
@@ -1843,7 +1841,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                 .into_iter()
                 .map(|record| record.into_worktree_record(format))
                 .collect::<Result<Vec<_>>>()?;
-            sley_worktree::update_index_index_info(git_dir, format, &records)?;
+            sley::plumbing::sley_worktree::update_index_index_info(git_dir, format, &records)?;
             return Ok(());
         }
     }
@@ -1861,31 +1859,28 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             if unresolve_only {
                 return Ok(());
             }
-            let git_dir = if show_index_version
-                || fsmonitor
-                || split_index.is_some()
-                || clear_resolve_undo
-            {
-                let cwd = env::current_dir()?;
-                Some(discover_git_dir(&cwd)?)
-            } else {
-                None
-            };
+            let git_dir =
+                if show_index_version || fsmonitor || split_index.is_some() || clear_resolve_undo {
+                    let cwd = env::current_dir()?;
+                    Some(discover_git_dir(&cwd)?)
+                } else {
+                    None
+                };
             if clear_resolve_undo && let Some(git_dir) = &git_dir {
                 let format = repository_object_format(git_dir)?;
-                sley_worktree::clear_resolve_undo(git_dir, format)?;
+                sley::plumbing::sley_worktree::clear_resolve_undo(git_dir, format)?;
             }
             if let (Some(split_index), Some(git_dir)) = (split_index, &git_dir) {
                 let format = repository_object_format(git_dir)?;
                 if split_index {
-                    sley_worktree::enable_split_index(git_dir, format)?;
+                    sley::plumbing::sley_worktree::enable_split_index(git_dir, format)?;
                 } else {
-                    sley_worktree::disable_split_index(git_dir, format)?;
+                    sley::plumbing::sley_worktree::disable_split_index(git_dir, format)?;
                 }
             }
             if fsmonitor && let Some(git_dir) = &git_dir {
                 let format = repository_object_format(git_dir)?;
-                sley_worktree::force_write_index(git_dir, format)?;
+                sley::plumbing::sley_worktree::force_write_index(git_dir, format)?;
             }
             if show_index_version
                 && !suppress_after_unresolve
@@ -1950,13 +1945,13 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         .iter()
         .cloned()
         .zip(path_modes.iter().copied())
-        .map(|(path, mode)| sley_worktree::UpdateIndexPath { path, mode })
+        .map(|(path, mode)| sley::plumbing::sley_worktree::UpdateIndexPath { path, mode })
         .collect::<Vec<_>>();
     if clear_resolve_undo {
-        sley_worktree::clear_resolve_undo(&git_dir, format)?;
+        sley::plumbing::sley_worktree::clear_resolve_undo(&git_dir, format)?;
     }
     if unresolve_only {
-        sley_worktree::unresolve_index_paths(
+        sley::plumbing::sley_worktree::unresolve_index_paths(
             &worktree_root,
             &git_dir,
             format,
@@ -1966,13 +1961,13 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     }
     if let Some(enabled) = untracked_cache {
         if enabled {
-            sley_worktree::enable_untracked_cache(&worktree_root, &git_dir, format)?;
+            sley::plumbing::sley_worktree::enable_untracked_cache(&worktree_root, &git_dir, format)?;
         } else {
-            sley_worktree::disable_untracked_cache(&git_dir, format)?;
+            sley::plumbing::sley_worktree::disable_untracked_cache(&git_dir, format)?;
         }
     }
     if refresh {
-        sley_worktree::refresh_index_paths(
+        sley::plumbing::sley_worktree::refresh_index_paths(
             &worktree_root,
             git_dir.clone(),
             format,
@@ -1982,7 +1977,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             really_refresh,
         )?;
         // Unmerged entries make the refresh fail (`<path>: needs merge`).
-        let index_path = sley_worktree::repository_index_path(&git_dir);
+        let index_path = sley::plumbing::sley_worktree::repository_index_path(&git_dir);
         if index_path.exists() {
             let index = Index::parse(&fs::read(&index_path)?, format)?;
             let mut unmerged: Vec<String> = index
@@ -2002,12 +1997,12 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             }
         }
     } else if again {
-        sley_worktree::update_index_again(
+        sley::plumbing::sley_worktree::update_index_again(
             &worktree_root,
             git_dir.clone(),
             format,
             &resolved_paths,
-            sley_worktree::UpdateIndexOptions {
+            sley::plumbing::sley_worktree::UpdateIndexOptions {
                 add,
                 remove,
                 force_remove,
@@ -2018,9 +2013,9 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             },
         )?;
     } else if let Some(index_version) = index_version {
-        sley_worktree::set_index_version(git_dir.clone(), format, index_version, verbose)?;
+        sley::plumbing::sley_worktree::set_index_version(git_dir.clone(), format, index_version, verbose)?;
     } else if let Some(fsmonitor_valid) = fsmonitor_valid {
-        sley_worktree::set_index_fsmonitor_valid_paths(
+        sley::plumbing::sley_worktree::set_index_fsmonitor_valid_paths(
             &worktree_root,
             git_dir.clone(),
             format,
@@ -2028,7 +2023,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             fsmonitor_valid,
         )?;
     } else if let Some(skip_worktree) = skip_worktree {
-        sley_worktree::set_index_skip_worktree_paths(
+        sley::plumbing::sley_worktree::set_index_skip_worktree_paths(
             &worktree_root,
             git_dir.clone(),
             format,
@@ -2036,7 +2031,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             skip_worktree,
         )?;
     } else if let Some(assume_unchanged) = assume_unchanged {
-        sley_worktree::set_index_assume_unchanged_paths(
+        sley::plumbing::sley_worktree::set_index_assume_unchanged_paths(
             &worktree_root,
             git_dir.clone(),
             format,
@@ -2045,7 +2040,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         )?;
     } else if !ordered_paths.is_empty() {
         let config = read_repo_config(&git_dir)?;
-        sley_worktree::update_index_ordered_paths_filtered(
+        sley::plumbing::sley_worktree::update_index_ordered_paths_filtered(
             &worktree_root,
             git_dir.clone(),
             format,
@@ -2054,7 +2049,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             // now carried per-path in `ordered_paths`; only the genuinely
             // whole-invocation `ignore_skip_worktree_entries` is read off the
             // batch options here.
-            sley_worktree::UpdateIndexOptions {
+            sley::plumbing::sley_worktree::UpdateIndexOptions {
                 add: false,
                 remove: false,
                 force_remove: false,
@@ -2072,28 +2067,28 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             .into_iter()
             .map(|entry| entry.into_worktree_entry(format))
             .collect::<Result<Vec<_>>>()?;
-        sley_worktree::update_index_cacheinfo(&git_dir, format, &cacheinfo, add, verbose)?;
+        sley::plumbing::sley_worktree::update_index_cacheinfo(&git_dir, format, &cacheinfo, add, verbose)?;
     }
     if let Some(split_index) = split_index {
         if split_index {
-            sley_worktree::enable_split_index(&git_dir, format)?;
+            sley::plumbing::sley_worktree::enable_split_index(&git_dir, format)?;
         } else {
-            sley_worktree::disable_split_index(&git_dir, format)?;
+            sley::plumbing::sley_worktree::disable_split_index(&git_dir, format)?;
         }
     } else if let Some(config_split_index) =
         read_repo_config(&git_dir)?.get_bool("core", None, "splitIndex")
     {
         if config_split_index {
-            sley_worktree::enable_split_index(&git_dir, format)?;
+            sley::plumbing::sley_worktree::enable_split_index(&git_dir, format)?;
         } else {
-            sley_worktree::disable_split_index(&git_dir, format)?;
+            sley::plumbing::sley_worktree::disable_split_index(&git_dir, format)?;
         }
     }
     if show_index_version && !suppress_after_unresolve {
         print_update_index_version(&git_dir)?;
     }
     if force_write_index {
-        sley_worktree::force_write_index(&git_dir, format)?;
+        sley::plumbing::sley_worktree::force_write_index(&git_dir, format)?;
     }
     if test_untracked_cache && !suppress_after_unresolve {
         print_test_untracked_cache_result(&worktree_root)?;
@@ -2184,7 +2179,7 @@ fn print_update_index_fsmonitor_unset_warning() {
 }
 
 fn print_update_index_version(git_dir: &Path) -> Result<()> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     let version = if index_path.exists() {
         read_index_header_version(&fs::read(index_path)?)?
     } else {
@@ -2218,8 +2213,8 @@ struct CliCacheInfoEntry {
 }
 
 impl CliCacheInfoEntry {
-    fn into_worktree_entry(self, format: ObjectFormat) -> Result<sley_worktree::CacheInfoEntry> {
-        Ok(sley_worktree::CacheInfoEntry {
+    fn into_worktree_entry(self, format: ObjectFormat) -> Result<sley::plumbing::sley_worktree::CacheInfoEntry> {
+        Ok(sley::plumbing::sley_worktree::CacheInfoEntry {
             mode: self.mode,
             oid: ObjectId::from_hex(format, &self.oid)?,
             path: self.path.into_bytes(),
@@ -2242,22 +2237,22 @@ enum CliIndexInfoRecord {
 }
 
 impl CliIndexInfoRecord {
-    fn into_worktree_record(self, format: ObjectFormat) -> Result<sley_worktree::IndexInfoRecord> {
+    fn into_worktree_record(self, format: ObjectFormat) -> Result<sley::plumbing::sley_worktree::IndexInfoRecord> {
         match self {
             Self::Add {
                 mode,
                 oid,
                 stage,
                 path,
-            } => Ok(sley_worktree::IndexInfoRecord::Add(
-                sley_worktree::CacheInfoEntry {
+            } => Ok(sley::plumbing::sley_worktree::IndexInfoRecord::Add(
+                sley::plumbing::sley_worktree::CacheInfoEntry {
                     mode,
                     oid: ObjectId::from_hex(format, &oid)?,
                     path,
                     stage,
                 },
             )),
-            Self::Remove { path } => Ok(sley_worktree::IndexInfoRecord::Remove { path }),
+            Self::Remove { path } => Ok(sley::plumbing::sley_worktree::IndexInfoRecord::Remove { path }),
         }
     }
 }
@@ -2299,7 +2294,7 @@ fn parse_update_index_cacheinfo_split(
 ) -> Result<CliCacheInfoEntry> {
     let mode = u32::from_str_radix(mode, 8)
         .map_err(|_| GitError::Command(format!("invalid update-index --cacheinfo mode {mode}")))?;
-    if mode == sley_index::SPARSE_DIR_MODE && path.ends_with('/') {
+    if mode == sley::plumbing::sley_index::SPARSE_DIR_MODE && path.ends_with('/') {
         eprintln!("error: option 'cacheinfo' cannot add sparse directory '{path}'");
         return Err(GitError::Exit(128));
     }

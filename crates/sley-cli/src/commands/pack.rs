@@ -3,9 +3,9 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley_object::EncodedObject;
-use sley_odb::ObjectReader;
-use sley_pack::{PackInput, PackReverseIndex, PackWriteOptions, pack_order_index_positions};
+use sley::plumbing::sley_object::EncodedObject;
+use sley::plumbing::sley_odb::ObjectReader;
+use sley::plumbing::sley_pack::{PackInput, PackReverseIndex, PackWriteOptions, pack_order_index_positions};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -40,19 +40,17 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
     // the surrounding repository. A `<pack-file>` argument (not `--stdin`) can
     // run outside any repo, so only fall back to repo discovery when needed.
     let repo = match discover_git_dir(env::current_dir()?) {
-        Ok(git_dir) => {
-            match common_git_dir_for_git_dir(&git_dir) {
-                Ok(common_git_dir) => {
-                    let format = match options.object_format {
-                        Some(format) => format,
-                        None => repository_object_format(&common_git_dir)?,
-                    };
-                    Some((common_git_dir, format))
-                }
-                Err(err) if !options.stdin && options.object_format.is_some() => None,
-                Err(err) => return Err(err),
+        Ok(git_dir) => match common_git_dir_for_git_dir(&git_dir) {
+            Ok(common_git_dir) => {
+                let format = match options.object_format {
+                    Some(format) => format,
+                    None => repository_object_format(&common_git_dir)?,
+                };
+                Some((common_git_dir, format))
             }
-        }
+            Err(err) if !options.stdin && options.object_format.is_some() => None,
+            Err(err) => return Err(err),
+        },
         Err(err) => {
             // Outside a repo, a file-mode index-pack is still valid: `git`
             // falls back to the built-in hash (SHA-1) when no repository names
@@ -298,7 +296,7 @@ fn humanise_byte_count(bytes: u64) -> String {
 /// connectivity check that can only run against a repository's object store, so
 /// `index-pack --fsck-objects` fails outside a repo when this returns true.
 fn pack_has_unresolved_link(pack_bytes: &[u8], format: ObjectFormat) -> Result<bool> {
-    let pack = match sley_pack::PackFile::parse(pack_bytes, format) {
+    let pack = match sley::plumbing::sley_pack::PackFile::parse(pack_bytes, format) {
         Ok(pack) => pack,
         Err(_) => return Ok(false),
     };
@@ -349,14 +347,14 @@ pub(crate) fn fsck_pack_objects(
     format: ObjectFormat,
     overrides: &[String],
 ) -> Result<i32> {
-    let pack = match sley_pack::PackFile::parse(pack_bytes, format) {
+    let pack = match sley::plumbing::sley_pack::PackFile::parse(pack_bytes, format) {
         Ok(pack) => pack,
         // A pack that does not even parse is reported by the index step; the
         // fsck pass simply has nothing to inspect.
         Err(_) => return Ok(0),
     };
 
-    let mut severity = sley_fsck::content::SeverityConfig::new(false);
+    let mut severity = sley::plumbing::sley_fsck::content::SeverityConfig::new(false);
     for token in overrides {
         if let Some((id, value)) = token.split_once('=') {
             severity.set(id, value);
@@ -369,12 +367,12 @@ pub(crate) fn fsck_pack_objects(
         .iter()
         .map(|object| object.entry.oid)
         .collect::<Vec<_>>();
-    let report = sley_fsck::fsck_objects_with_options(
+    let report = sley::plumbing::sley_fsck::fsck_objects_with_options(
         &reader,
         format,
         [],
         object_ids,
-        sley_fsck::FsckOptions {
+        sley::plumbing::sley_fsck::FsckOptions {
             severity: severity.clone(),
             ..Default::default()
         },
@@ -382,14 +380,14 @@ pub(crate) fn fsck_pack_objects(
     let mut had_error = false;
     for issue in &report.issues {
         match issue.stream {
-            sley_fsck::IssueStream::Stderr => {
+            sley::plumbing::sley_fsck::IssueStream::Stderr => {
                 if print_index_pack_fsck_issue(&issue.message) {
                     had_error = true;
                 }
             }
-            sley_fsck::IssueStream::Stdout => {
+            sley::plumbing::sley_fsck::IssueStream::Stdout => {
                 eprintln!("error: {}", issue.message);
-                if issue.severity == sley_fsck::IssueSeverity::Error {
+                if issue.severity == sley::plumbing::sley_fsck::IssueSeverity::Error {
                     had_error = true;
                 }
             }
@@ -403,16 +401,16 @@ pub(crate) fn fsck_pack_objects(
     // while the full fsck walker above carries the tree-context checks.
     let mut had_error = false;
     for object in &pack.entries {
-        let findings = sley_fsck::content::check_object_content(
+        let findings = sley::plumbing::sley_fsck::content::check_object_content(
             object.object.object_type,
             &object.object.body,
             &severity,
         );
         for finding in findings {
             let label = match finding.severity {
-                sley_fsck::content::Severity::Error => "error",
-                sley_fsck::content::Severity::Warn => "warning",
-                sley_fsck::content::Severity::Ignore => continue,
+                sley::plumbing::sley_fsck::content::Severity::Error => "error",
+                sley::plumbing::sley_fsck::content::Severity::Warn => "warning",
+                sley::plumbing::sley_fsck::content::Severity::Ignore => continue,
             };
             if let Some(raw) = &finding.raw_stderr {
                 eprintln!("error: {raw}");
@@ -423,7 +421,7 @@ pub(crate) fn fsck_pack_objects(
                 finding.msg_id.camel(),
                 finding.detail
             );
-            if matches!(finding.severity, sley_fsck::content::Severity::Error) {
+            if matches!(finding.severity, sley::plumbing::sley_fsck::content::Severity::Error) {
                 had_error = true;
             }
         }
@@ -437,7 +435,7 @@ struct PackObjectReader {
 }
 
 impl PackObjectReader {
-    fn new(format: ObjectFormat, pack: &sley_pack::PackFile) -> Self {
+    fn new(format: ObjectFormat, pack: &sley::plumbing::sley_pack::PackFile) -> Self {
         let objects = pack
             .entries
             .iter()
@@ -451,14 +449,14 @@ impl ObjectReader for PackObjectReader {
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
         if *oid == ObjectId::empty_tree(self.format) {
             return Ok(Arc::new(EncodedObject::new(
-                sley_object::ObjectType::Tree,
+                sley::plumbing::sley_object::ObjectType::Tree,
                 Vec::new(),
             )));
         }
         self.objects
             .get(oid)
             .cloned()
-            .ok_or_else(|| GitError::NotFound(sley_core::NotFoundKind::Message(oid.to_string())))
+            .ok_or_else(|| GitError::NotFound(sley::plumbing::sley_core::NotFoundKind::Message(oid.to_string())))
     }
 }
 
@@ -615,7 +613,7 @@ fn verify_pack_one(
     };
     // `verify_pack_stats` parses + resolves the pack (validating checksum,
     // inflate, and delta chains) and returns the per-object report git prints.
-    let stats = match sley_pack::PackFile::verify_pack_stats(&pack_bytes, format) {
+    let stats = match sley::plumbing::sley_pack::PackFile::verify_pack_stats(&pack_bytes, format) {
         Ok(stats) => stats,
         Err(err) => {
             eprintln!("error: {err}");
@@ -635,7 +633,7 @@ fn verify_pack_one(
 
     // Every object the index advertises must exist in the pack at the same
     // offset with the same id, and the pack must hold exactly that object set.
-    let mut stat_by_offset: HashMap<u64, &sley_pack::PackVerifyStat> =
+    let mut stat_by_offset: HashMap<u64, &sley::plumbing::sley_pack::PackVerifyStat> =
         HashMap::with_capacity(stats.objects.len());
     for object in &stats.objects {
         stat_by_offset.insert(object.offset, object);
@@ -808,7 +806,7 @@ fn repack_preferred_bitmap_tips(
         let RefTarget::Direct(oid) = reference.target else {
             continue;
         };
-        if let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid) {
+        if let Ok(commit) = sley::plumbing::sley_rev::peel_to_commit(db, format, &oid) {
             tips.insert(commit);
         }
     }
@@ -838,7 +836,7 @@ fn repack_traversal_roots(
     roots.extend(reflog_traversal_roots(git_dir, common_git_dir, format)?);
     // Indexed blobs (upstream --indexed-objects).
     if let Ok(bytes) = fs::read(git_dir.join("index"))
-        && let Ok(index) = sley_index::Index::parse(&bytes, format)
+        && let Ok(index) = sley::plumbing::sley_index::Index::parse(&bytes, format)
     {
         for entry in &index.entries {
             roots.push(entry.oid);
@@ -988,7 +986,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
         && all
         && !write_midx
         && config.get("pack", None, "packSizeLimit").is_none()
-        && sley_worktree::worktree_root_for_git_dir(&common_git_dir)?.is_none()
+        && sley::plumbing::sley_worktree::worktree_root_for_git_dir(&common_git_dir)?.is_none()
         && !pack_dir_has_kept_packs(&common_git_dir)?;
     let mut write_bitmaps = match write_bitmaps {
         Some(explicit) => explicit,
@@ -1052,14 +1050,14 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     let result = if all {
         let roots = repack_traversal_roots(&git_dir, &common_git_dir, format)?;
         let keep_pack_stems: HashSet<String> = keep_packs.iter().cloned().collect();
-        let options = sley_odb::RepackOptions {
+        let options = sley::plumbing::sley_odb::RepackOptions {
             local,
             pack_kept_objects: include_kept_objects,
             keep_pack_stems,
         };
-        sley_odb::repack_reachable_objects_with_options(&common_git_dir, format, &roots, &options)?
+        sley::plumbing::sley_odb::repack_reachable_objects_with_options(&common_git_dir, format, &roots, &options)?
     } else {
-        sley_odb::repack_loose_objects(&common_git_dir, format)?
+        sley::plumbing::sley_odb::repack_loose_objects(&common_git_dir, format)?
     };
     if let Some(result) = result {
         let bitmap_tips = if write_bitmaps {
@@ -1068,7 +1066,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
         } else {
             None
         };
-        sley_odb::install_repack_result_with_bitmap(
+        sley::plumbing::sley_odb::install_repack_result_with_bitmap(
             &common_git_dir,
             format,
             &result,
@@ -1131,7 +1129,7 @@ fn cmd_repack_geometric(
     _pack_kept_objects: bool,
 ) -> Result<()> {
     let kept_stems: HashSet<String> = keep_packs.iter().cloned().collect();
-    let geometric = sley_odb::repack_geometric(common_git_dir, format, split_factor, &kept_stems)?;
+    let geometric = sley::plumbing::sley_odb::repack_geometric(common_git_dir, format, split_factor, &kept_stems)?;
 
     if geometric.result.is_none() {
         if !quiet {
@@ -1158,7 +1156,7 @@ fn cmd_repack_geometric(
     } else {
         None
     };
-    sley_odb::install_geometric_repack_result(
+    sley::plumbing::sley_odb::install_geometric_repack_result(
         common_git_dir,
         format,
         &geometric,
@@ -1264,7 +1262,7 @@ fn cmd_repack_cruft(
 ) -> Result<()> {
     let roots = repack_traversal_roots(git_dir, common_git_dir, format)?;
     let keep_pack_stems: HashSet<String> = keep_packs.iter().cloned().collect();
-    let options = sley_odb::RepackOptions {
+    let options = sley::plumbing::sley_odb::RepackOptions {
         local: false,
         pack_kept_objects,
         keep_pack_stems,
@@ -1276,20 +1274,20 @@ fn cmd_repack_cruft(
     // them all). Compute the pre-expiry unreachable set first so we can diff.
     let pre_expiry = if expire_to.is_some() && prune {
         Some(repack_cruft_or_bad_object(
-            sley_odb::repack_cruft_with_options(common_git_dir, format, &roots, None, &options),
+            sley::plumbing::sley_odb::repack_cruft_with_options(common_git_dir, format, &roots, None, &options),
         )?)
     } else {
         None
     };
 
-    let result = repack_cruft_or_bad_object(sley_odb::repack_cruft_with_options(
+    let result = repack_cruft_or_bad_object(sley::plumbing::sley_odb::repack_cruft_with_options(
         common_git_dir,
         format,
         &roots,
         cruft_expiration,
         &options,
     ))?;
-    sley_odb::install_cruft_repack_result(common_git_dir, format, &result, prune)?;
+    sley::plumbing::sley_odb::install_cruft_repack_result(common_git_dir, format, &result, prune)?;
 
     // Move the expired objects into the --expire-to repository.
     if let (Some(dir), Some(pre)) = (expire_to, pre_expiry.as_ref()) {
@@ -1321,8 +1319,8 @@ fn cmd_repack_cruft(
 }
 
 fn repack_cruft_or_bad_object(
-    result: Result<sley_odb::CruftRepackResult>,
-) -> Result<sley_odb::CruftRepackResult> {
+    result: Result<sley::plumbing::sley_odb::CruftRepackResult>,
+) -> Result<sley::plumbing::sley_odb::CruftRepackResult> {
     match result {
         Ok(result) => Ok(result),
         Err(GitError::NotFound(kind)) => {
@@ -1360,13 +1358,13 @@ fn write_expire_to_cruft_pack(
     let database = FileObjectDatabase::new(objects_dir.clone(), format);
 
     // Stamp each expired object with the best mtime from its on-disk copy.
-    let on_disk = sley_odb::object_mtimes_on_disk_pub(&objects_dir, format)?;
+    let on_disk = sley::plumbing::sley_odb::object_mtimes_on_disk_pub(&objects_dir, format)?;
     let mut survivors: HashMap<ObjectId, u32> = HashMap::new();
     for oid in expired {
         let mtime = on_disk.get(oid).copied().unwrap_or(0);
         survivors.insert(*oid, mtime);
     }
-    let Some(cruft) = sley_odb::build_cruft_pack_pub(&database, format, &survivors)? else {
+    let Some(cruft) = sley::plumbing::sley_odb::build_cruft_pack_pub(&database, format, &survivors)? else {
         return Ok(());
     };
     let pack_name = format!("pack-{}", cruft.checksum.to_hex());
@@ -1585,24 +1583,31 @@ fn gc_run_locked(
     // builtin/gc.c add_repack_all_option: pick the repack flavour.
     if auto_mode == GcAutoMode::Incremental {
         trace_gc_repack(&["repack", "-d", "-l", "--no-write-bitmap-index"]);
-        if let Some(result) = sley_odb::repack_loose_objects(&common_git_dir, format)? {
-            sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+        if let Some(result) =
+            sley::plumbing::sley_odb::repack_loose_objects(&common_git_dir, format)?
+        {
+            sley::plumbing::sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
         }
     } else if prune_expire.as_deref() == Some("now") && !(cruft_packs && options.expire_to.is_some()) {
         // prune_expire=="now" with cruft (no expire-to): immediate drop via -a.
         trace_gc_repack(&["repack", "-d", "-l", "-a"]);
-        let repack_options = sley_odb::RepackOptions {
+        let repack_options = sley::plumbing::sley_odb::RepackOptions {
             local: false,
             pack_kept_objects: false,
             keep_pack_stems,
         };
-        if let Some(result) = sley_odb::repack_reachable_objects_with_options(
+        if let Some(result) = sley::plumbing::sley_odb::repack_reachable_objects_with_options(
             &common_git_dir,
             format,
             &roots,
             &repack_options,
         )? {
-            sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+            sley::plumbing::sley_odb::install_repack_result(
+                &common_git_dir,
+                format,
+                &result,
+                true,
+            )?;
         }
         gc_remove_cruft_packs(&common_git_dir)?;
         if let Some(spec) = prune_expire.as_deref() {
@@ -1642,19 +1647,24 @@ fn gc_run_locked(
             trace_args.push(&filter_to_arg);
         }
         trace_gc_repack(&trace_args);
-        let repack_options = sley_odb::RepackOptions {
+        let repack_options = sley::plumbing::sley_odb::RepackOptions {
             local: false,
             pack_kept_objects: false,
             keep_pack_stems,
         };
-        let result = sley_odb::repack_cruft_with_options(
+        let result = sley::plumbing::sley_odb::repack_cruft_with_options(
             &common_git_dir,
             format,
             &roots,
             cruft_expiration,
             &repack_options,
         )?;
-        sley_odb::install_cruft_repack_result(&common_git_dir, format, &result, true)?;
+        sley::plumbing::sley_odb::install_cruft_repack_result(
+            &common_git_dir,
+            format,
+            &result,
+            true,
+        )?;
         if let Some(expire_to) = options.expire_to.as_deref() {
             if let Some(cruft) = result.cruft.as_ref() {
                 write_expire_to_cruft_pack(
@@ -1696,18 +1706,23 @@ fn gc_run_locked(
                 config.get("gc", None, "repackFilterTo"),
             )?;
         } else {
-            let repack_options = sley_odb::RepackOptions {
+            let repack_options = sley::plumbing::sley_odb::RepackOptions {
                 local: false,
                 pack_kept_objects: false,
                 keep_pack_stems,
             };
-            if let Some(result) = sley_odb::repack_reachable_objects_with_options(
+            if let Some(result) = sley::plumbing::sley_odb::repack_reachable_objects_with_options(
                 &common_git_dir,
                 format,
                 &roots,
                 &repack_options,
             )? {
-                sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+                sley::plumbing::sley_odb::install_repack_result(
+                    &common_git_dir,
+                    format,
+                    &result,
+                    true,
+                )?;
             }
         }
         if filtered_repack {
@@ -1718,7 +1733,9 @@ fn gc_run_locked(
             gc_prune_expired_loose(&common_git_dir, format, &roots, expire)?;
         } else {
             let expire = parse_prune_expire(
-                config.get("gc", None, "pruneExpire").unwrap_or("2.weeks.ago"),
+                config
+                    .get("gc", None, "pruneExpire")
+                    .unwrap_or("2.weeks.ago"),
                 "gc.pruneExpire",
             )?;
             gc_pack_recent_unreachable_loose(&common_git_dir, format, &roots, expire)?;
@@ -1928,7 +1945,7 @@ fn gc_before_repack(
 fn gc_pack_refs(config: &GitConfig, common_git_dir: &Path) -> Result<bool> {
     if let Some(value) = config.get("gc", None, "packRefs") {
         if value.eq_ignore_ascii_case("notbare") {
-            return Ok(sley_worktree::worktree_root_for_git_dir(common_git_dir)?.is_some());
+            return Ok(sley::plumbing::sley_worktree::worktree_root_for_git_dir(common_git_dir)?.is_some());
         }
     }
     Ok(config.get_bool("gc", None, "packRefs").unwrap_or(true))
@@ -1962,14 +1979,14 @@ fn gc_repack_blob_none_filter(
     let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let destination = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let excluded = HashSet::new();
-    let installed = sley_odb::build_and_install_reachable_pack_filtered(
+    let installed = sley::plumbing::sley_odb::build_and_install_reachable_pack_filtered(
         &db,
         &destination,
         format,
         roots.iter().copied(),
         &excluded,
-        sley_odb::RawPackInstallOptions::default(),
-        Some(sley_odb::PackObjectFilter::BlobNone),
+        sley::plumbing::sley_odb::RawPackInstallOptions::default(),
+        Some(sley::plumbing::sley_odb::PackObjectFilter::BlobNone),
         None,
     )?;
 
@@ -3208,7 +3225,7 @@ fn maintenance_global_config_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os("GIT_CONFIG_GLOBAL").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
     }
-    let Some(home) = sley_config::home_dir() else {
+    let Some(home) = sley::plumbing::sley_config::home_dir() else {
         eprintln!("fatal: $HOME not set");
         return Err(GitError::Exit(128));
     };
@@ -3568,7 +3585,7 @@ fn update_systemd(enable: bool) -> Result<()> {
 }
 
 fn update_launchctl(enable: bool) -> Result<()> {
-    let Some(home) = sley_config::home_dir() else {
+    let Some(home) = sley::plumbing::sley_config::home_dir() else {
         return Ok(());
     };
     let base = PathBuf::from(home).join("Library").join("LaunchAgents");
@@ -3655,7 +3672,7 @@ fn xdg_config_home() -> PathBuf {
     env::var_os("XDG_CONFIG_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| sley_config::home_dir().map(|home| PathBuf::from(home).join(".config")))
+        .or_else(|| sley::plumbing::sley_config::home_dir().map(|home| PathBuf::from(home).join(".config")))
         .unwrap_or_else(|| PathBuf::from(".config"))
 }
 
@@ -3686,7 +3703,7 @@ pub(crate) fn cmd_unpack_objects(args: &[String]) -> Result<()> {
     let mut pack_bytes = Vec::new();
     io::Read::read_to_end(&mut io::stdin().lock(), &mut pack_bytes)?;
     if dry_run {
-        sley_pack::PackFile::parse(&pack_bytes, format)?;
+        sley::plumbing::sley_pack::PackFile::parse(&pack_bytes, format)?;
         return Ok(());
     }
     if strict {
@@ -3696,7 +3713,7 @@ pub(crate) fn cmd_unpack_objects(args: &[String]) -> Result<()> {
         }
     }
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    sley_odb::unpack_packfile_objects(&pack_bytes, format, db.loose())?;
+    sley::plumbing::sley_odb::unpack_packfile_objects(&pack_bytes, format, db.loose())?;
     Ok(())
 }
 
@@ -4513,7 +4530,12 @@ pub(crate) fn cmd_prune(args: &[String]) -> Result<()> {
     let format = repository_object_format(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let mut roots = prune_roots(&git_dir, &common_git_dir, format, &options.heads)?;
-    roots.extend(prune_recent_object_roots(&db, &common_git_dir, format, options.expire)?);
+    roots.extend(prune_recent_object_roots(
+        &db,
+        &common_git_dir,
+        format,
+        options.expire,
+    )?);
     roots.extend(prune_recent_hook_roots(&common_git_dir, format)?);
     roots.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     roots.dedup();
@@ -4543,8 +4565,19 @@ pub(crate) fn cmd_prune(args: &[String]) -> Result<()> {
             }
         }
     }
-    prune_shallow_file(&common_git_dir, format, &reachable, options.dry_run, options.verbose)?;
-    prune_temporary_files(&common_git_dir.join("objects"), options.expire, options.dry_run, options.verbose)?;
+    prune_shallow_file(
+        &common_git_dir,
+        format,
+        &reachable,
+        options.dry_run,
+        options.verbose,
+    )?;
+    prune_temporary_files(
+        &common_git_dir.join("objects"),
+        options.expire,
+        options.dry_run,
+        options.verbose,
+    )?;
     prune_temporary_files(
         &common_git_dir.join("objects").join("pack"),
         options.expire,
@@ -4709,11 +4742,11 @@ fn prune_index_roots(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectI
     let Ok(bytes) = fs::read(git_dir.join("index")) else {
         return Ok(Vec::new());
     };
-    let index = sley_index::Index::parse(&bytes, format)?;
+    let index = sley::plumbing::sley_index::Index::parse(&bytes, format)?;
     Ok(index
         .entries
         .into_iter()
-        .filter(|entry| !sley_index::is_gitlink(entry.mode))
+        .filter(|entry| !sley::plumbing::sley_index::is_gitlink(entry.mode))
         .map(|entry| entry.oid)
         .collect())
 }
@@ -4778,7 +4811,7 @@ fn prune_recent_object_roots(
         return Ok(Vec::new());
     }
     let mut roots = Vec::new();
-    for oid in sley_odb::repository_object_ids(common_git_dir, format)? {
+    for oid in sley::plumbing::sley_odb::repository_object_ids(common_git_dir, format)? {
         if prune_object_is_expired(db, &oid, expire)? {
             continue;
         }
@@ -5035,7 +5068,7 @@ fn file_mtime_seconds(metadata: &fs::Metadata) -> i64 {
 
 fn prune_packed_loose_objects(git_dir: &Path, format: ObjectFormat, dry_run: bool) -> Result<()> {
     let objects_dir = repository_objects_dir(git_dir);
-    let packed = sley_odb::packed_object_ids(&objects_dir, format)?;
+    let packed = sley::plumbing::sley_odb::packed_object_ids(&objects_dir, format)?;
     if packed.is_empty() {
         return Ok(());
     }
@@ -5369,7 +5402,7 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
         && bytes.len() > format.raw_len()
     {
         let checksum_offset = bytes.len() - format.raw_len();
-        if let Ok(actual) = sley_core::digest_bytes(format, &bytes[..checksum_offset])
+        if let Ok(actual) = sley::plumbing::sley_core::digest_bytes(format, &bytes[..checksum_offset])
             && actual.as_bytes() != &bytes[checksum_offset..]
         {
             eprintln!("warning: ignoring existing multi-pack-index; checksum mismatch");
@@ -5521,14 +5554,14 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
             for line in fs::read_to_string(snapshot)?.lines() {
                 if let Some(hex) = line.strip_prefix('+')
                     && let Ok(oid) = ObjectId::from_hex(format, hex)
-                    && let Ok(commit) = sley_rev::peel_to_commit(&db, format, &oid)
+                    && let Ok(commit) = sley::plumbing::sley_rev::peel_to_commit(&db, format, &oid)
                 {
                     tips.insert(commit);
                 }
             }
         }
         let preferred_pack = preferred_pack.unwrap_or(0);
-        match sley_odb::build_midx_bitmap(
+        match sley::plumbing::sley_odb::build_midx_bitmap(
             &db,
             format,
             &objects,
@@ -5958,7 +5991,7 @@ fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -> Re
     // Verify-time checksum check: recompute over everything but the trailing
     // hash and compare.
     let checksum_offset = bytes.len() - format.raw_len();
-    let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
+    let actual_checksum = sley::plumbing::sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
     if actual_checksum.as_bytes() != &bytes[checksum_offset..] {
         report("incorrect checksum".to_string());
     }

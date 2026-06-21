@@ -204,7 +204,7 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
     let db = repo.objects();
     let worktree_root = repo.worktree_root()?;
 
-    let mut index = match sley_worktree::read_repository_index(git_dir, format)? {
+    let mut index = match sley::plumbing::sley_worktree::read_repository_index(git_dir, format)? {
         Some(index) => index,
         None => Index {
             version: 2,
@@ -331,7 +331,7 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
             })
         });
         fs::write(
-            sley_worktree::repository_index_path(git_dir),
+            sley::plumbing::sley_worktree::repository_index_path(git_dir),
             index.write(format)?,
         )?;
     }
@@ -432,7 +432,7 @@ fn checkout_temp_write_entry(
     let body = if entry.mode == 0o120000 {
         object.body.clone()
     } else {
-        sley_worktree::apply_smudge_filter(
+        sley::plumbing::sley_worktree::apply_smudge_filter(
             context.worktree_root,
             context.git_dir,
             context.format,
@@ -567,7 +567,7 @@ fn checkout_one_index_entry(
     if entry.mode == 0o120000 {
         write_checkout_symlink(&dest, &object.body, exists)?;
     } else {
-        let body = sley_worktree::apply_smudge_filter(
+        let body = sley::plumbing::sley_worktree::apply_smudge_filter(
             context.worktree_root,
             context.git_dir,
             context.format,

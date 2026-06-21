@@ -1,7 +1,7 @@
 //! Shared diff UI option parsing, mirroring git's `struct diff_options` shape.
 
 use crate::*;
-use sley_options::{
+use sley::plumbing::sley_options::{
     CallbackValue, OptFlags, OptValue, OptionSpec, ParsedOption, ParsedValue, UsageError,
     parse_options,
 };
@@ -78,10 +78,10 @@ pub(crate) struct DiffOptions {
     pub(crate) patch_abbrev: Option<usize>,
     pub(crate) patch_full_index: bool,
     pub(crate) color_always: bool,
-    pub(crate) color_moved: Option<Option<sley_diff_merge::render::ColorMovedMode>>,
-    pub(crate) color_moved_ws: Option<sley_diff_merge::render::ColorMovedWs>,
+    pub(crate) color_moved: Option<Option<sley::plumbing::sley_diff_merge::render::ColorMovedMode>>,
+    pub(crate) color_moved_ws: Option<sley::plumbing::sley_diff_merge::render::ColorMovedWs>,
     pub(crate) diff_algorithm_control: bool,
-    pub(crate) diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    pub(crate) diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm,
     pub(crate) diff_driver_control: bool,
     pub(crate) diff_hunk_control: bool,
     pub(crate) interhunk: Option<usize>,
@@ -91,7 +91,7 @@ pub(crate) struct DiffOptions {
     /// `Some(false)` when given, `None` to fall back to `diff.indentHeuristic`
     /// config (which itself defaults to git's enabled-by-default behavior).
     pub(crate) indent_heuristic: Option<bool>,
-    pub(crate) ws_ignore: sley_diff_merge::WsIgnore,
+    pub(crate) ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore,
     pub(crate) ignore_blank_lines: bool,
     pub(crate) ignore_regexes: Vec<String>,
     pub(crate) diff_output_indicator_control: bool,
@@ -161,14 +161,14 @@ impl Default for DiffOptions {
             color_moved: None,
             color_moved_ws: None,
             diff_algorithm_control: false,
-            diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+            diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
             diff_driver_control: false,
             diff_hunk_control: false,
             interhunk: None,
             diff_whitespace_control: false,
             ws_error_highlight: None,
             indent_heuristic: None,
-            ws_ignore: sley_diff_merge::WsIgnore::default(),
+            ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
             diff_output_indicator_control: false,
@@ -196,8 +196,8 @@ impl Default for DiffOptions {
             rename_empty: true,
             inexact_renames: true,
             renames_explicit: false,
-            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            copy_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             diff_filter: DiffFilter::default(),
             ignore_submodules_cli: None,
             merge_base: false,
@@ -1027,10 +1027,10 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
         (_, Some("find-object")) => options
             .find_object_values
             .push(str_value(option).to_string()),
-        (_, Some("minimal")) => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
-        (_, Some("patience")) => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
+        (_, Some("minimal")) => options.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Minimal,
+        (_, Some("patience")) => options.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Patience,
         (_, Some("histogram")) => {
-            options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram
+            options.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Histogram
         }
         (_, Some("anchored")) => {
             // The anchored algorithm is not implemented; keep bailing.
@@ -1040,11 +1040,11 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
             let value = str_value(option);
             log_validate_diff_algorithm(value)?;
             options.diff_algorithm = match value {
-                "myers" | "default" => sley_diff_merge::DiffAlgorithm::Myers,
-                "minimal" => sley_diff_merge::DiffAlgorithm::Minimal,
-                "patience" => sley_diff_merge::DiffAlgorithm::Patience,
-                "histogram" => sley_diff_merge::DiffAlgorithm::Histogram,
-                _ => sley_diff_merge::DiffAlgorithm::Myers,
+                "myers" | "default" => sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
+                "minimal" => sley::plumbing::sley_diff_merge::DiffAlgorithm::Minimal,
+                "patience" => sley::plumbing::sley_diff_merge::DiffAlgorithm::Patience,
+                "histogram" => sley::plumbing::sley_diff_merge::DiffAlgorithm::Histogram,
+                _ => sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
             };
         }
         (_, Some("inter-hunk-context")) => {
@@ -1151,7 +1151,7 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
         (_, Some("no-color")) => options.color_always = false,
         (_, Some("color-moved")) => {
             options.color_moved = Some(match optional_arg(option) {
-                None => Some(sley_diff_merge::render::ColorMovedMode::Zebra),
+                None => Some(sley::plumbing::sley_diff_merge::render::ColorMovedMode::Zebra),
                 Some(value) => {
                     let mode = parse_color_moved_mode(value)?;
                     mode
@@ -1168,7 +1168,7 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
             options.color_moved_ws = Some(parse_color_moved_ws(value)?);
         }
         (_, Some("no-color-moved-ws")) => {
-            options.color_moved_ws = Some(sley_diff_merge::render::ColorMovedWs::default());
+            options.color_moved_ws = Some(sley::plumbing::sley_diff_merge::render::ColorMovedWs::default());
         }
         (_, Some("ignore-submodules")) => {
             let mode = optional_arg(option).unwrap_or("all");
@@ -1260,16 +1260,16 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
 
 pub(crate) fn parse_color_moved_mode(
     value: &str,
-) -> Result<Option<sley_diff_merge::render::ColorMovedMode>> {
+) -> Result<Option<sley::plumbing::sley_diff_merge::render::ColorMovedMode>> {
     match value {
         "no" | "false" | "0" | "off" => Ok(None),
         "" | "default" | "true" | "1" | "on" | "yes" | "zebra" => {
-            Ok(Some(sley_diff_merge::render::ColorMovedMode::Zebra))
+            Ok(Some(sley::plumbing::sley_diff_merge::render::ColorMovedMode::Zebra))
         }
-        "plain" => Ok(Some(sley_diff_merge::render::ColorMovedMode::Plain)),
-        "blocks" => Ok(Some(sley_diff_merge::render::ColorMovedMode::Blocks)),
+        "plain" => Ok(Some(sley::plumbing::sley_diff_merge::render::ColorMovedMode::Plain)),
+        "blocks" => Ok(Some(sley::plumbing::sley_diff_merge::render::ColorMovedMode::Blocks)),
         "dimmed-zebra" | "dimmed_zebra" => {
-            Ok(Some(sley_diff_merge::render::ColorMovedMode::DimmedZebra))
+            Ok(Some(sley::plumbing::sley_diff_merge::render::ColorMovedMode::DimmedZebra))
         }
         _ => {
             log_validate_color_moved(value)?;
@@ -1278,14 +1278,14 @@ pub(crate) fn parse_color_moved_mode(
     }
 }
 
-pub(crate) fn parse_color_moved_ws(value: &str) -> Result<sley_diff_merge::render::ColorMovedWs> {
-    let mut ws = sley_diff_merge::render::ColorMovedWs::default();
+pub(crate) fn parse_color_moved_ws(value: &str) -> Result<sley::plumbing::sley_diff_merge::render::ColorMovedWs> {
+    let mut ws = sley::plumbing::sley_diff_merge::render::ColorMovedWs::default();
     if value.is_empty() {
         return log_color_moved_ws_invalid_mode(value, value).map(|_| ws);
     }
     for mode in value.split(',') {
         match mode {
-            "no" => ws = sley_diff_merge::render::ColorMovedWs::default(),
+            "no" => ws = sley::plumbing::sley_diff_merge::render::ColorMovedWs::default(),
             "ignore-space-change" => ws.ignore.space_change = true,
             "ignore-space-at-eol" => ws.ignore.space_at_eol = true,
             "ignore-all-space" => ws.ignore.all_space = true,

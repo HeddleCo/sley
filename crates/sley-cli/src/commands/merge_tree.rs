@@ -3,8 +3,8 @@
 //! Two modes are implemented, matching upstream `git`:
 //!
 //! * The modern `git merge-tree [--write-tree] <branch1> <branch2>` mode computes
-//!   a full 3-way merge (reusing [`sley_diff_merge::merge_blobs`] for file content
-//!   and [`sley_rev::merge_bases`] for ancestry), writes the resulting top-level
+//!   a full 3-way merge (reusing [`sley::plumbing::sley_diff_merge::merge_blobs`] for file content
+//!   and [`sley::plumbing::sley_rev::merge_bases`] for ancestry), writes the resulting top-level
 //!   tree to the object database, and prints its object id. On conflict it also
 //!   prints the "Conflicted file info" stage list and informational messages, and
 //!   exits with status 1. See `git merge-tree`'s OUTPUT section for the exact
@@ -382,7 +382,7 @@ fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
         None => {
             let ours_commit = resolve_commit_ish(&git_dir, &db, format, branch1)?;
             let theirs_commit = resolve_commit_ish(&git_dir, &db, format, branch2)?;
-            let bases = sley_rev::merge_bases(&git_dir, format, &db, &ours_commit, &theirs_commit)?;
+            let bases = sley::plumbing::sley_rev::merge_bases(&git_dir, format, &db, &ours_commit, &theirs_commit)?;
             let base_tree = match bases.first() {
                 Some(base) => Some(commit_tree_oid(&db, format, base)?),
                 None => {
@@ -406,21 +406,21 @@ fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
     let detect_renames = merge_tree_detect_renames(&git_dir);
     ensure_merge_tree_inputs_readable(&db, format, base_tree.as_ref(), &ours_tree, &theirs_tree)?;
     let mut write_db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let merge = match sley_diff_merge::merge_trees(
+    let merge = match sley::plumbing::sley_diff_merge::merge_trees(
         &mut write_db,
         format,
         base_tree.as_ref(),
         &ours_tree,
         &theirs_tree,
-        &sley_diff_merge::MergeTreesOptions {
+        &sley::plumbing::sley_diff_merge::MergeTreesOptions {
             ours_label: branch1,
             theirs_label: branch2,
             ancestor_label: "merged common ancestors",
             favor: strategy,
             detect_renames,
-            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            directory_renames: sley_diff_merge::DirectoryRenames::Conflict,
-            style: sley_diff_merge::ConflictStyle::Merge,
+            rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            directory_renames: sley::plumbing::sley_diff_merge::DirectoryRenames::Conflict,
+            style: sley::plumbing::sley_diff_merge::ConflictStyle::Merge,
         },
     ) {
         Ok(merge) => merge,
@@ -444,7 +444,7 @@ fn ensure_merge_tree_inputs_readable(
             if merge_tree_missing_oid(&err).is_some() {
                 let base = match base_tree {
                     Some(base) => *base,
-                    None => sley_core::object_id_for_bytes(format, "tree", b"")?,
+                    None => sley::plumbing::sley_core::object_id_for_bytes(format, "tree", b"")?,
                 };
                 eprintln!("error: Could not read {oid}");
                 eprintln!(
@@ -476,7 +476,7 @@ fn merge_tree_missing_oid(err: &GitError) -> Option<ObjectId> {
 
 fn merge_tree_detect_renames(git_dir: &Path) -> bool {
     let params = effective_config_parameters_env();
-    let Ok(config) = sley_config::read_repo_config(git_dir, params.as_deref()) else {
+    let Ok(config) = sley::plumbing::sley_config::read_repo_config(git_dir, params.as_deref()) else {
         return true;
     };
     config.get_bool("diff", None, "renames") != Some(false)
@@ -570,8 +570,8 @@ fn stdin_record_options(
 /// Interpret recognised `-X` strategy options. Only the conflict-resolution
 /// favouring options affect merge-tree output; everything else is ignored, as
 /// upstream tolerates (and largely ignores) most strategy options here.
-fn parse_strategy_favor(options: &[String]) -> Result<sley_diff_merge::MergeFavor> {
-    use sley_diff_merge::MergeFavor;
+fn parse_strategy_favor(options: &[String]) -> Result<sley::plumbing::sley_diff_merge::MergeFavor> {
+    use sley::plumbing::sley_diff_merge::MergeFavor;
     let mut favor = MergeFavor::None;
     for option in options {
         match option.as_str() {
@@ -616,7 +616,7 @@ fn resolve_commit_ish(
         Ok(oid) => oid,
         Err(_) => return Err(not_something_we_can_merge(rev)),
     };
-    match sley_rev::peel_to_commit(db, format, &oid) {
+    match sley::plumbing::sley_rev::peel_to_commit(db, format, &oid) {
         Ok(commit) => Ok(commit),
         Err(_) => {
             eprintln!(
@@ -639,7 +639,7 @@ fn resolve_tree_ish(
         Ok(oid) => oid,
         Err(_) => return Err(not_something_we_can_merge(rev)),
     };
-    match sley_rev::peel_to_tree(db, format, &oid) {
+    match sley::plumbing::sley_rev::peel_to_tree(db, format, &oid) {
         Ok(tree) => Ok(tree),
         Err(_) => Err(not_something_we_can_merge(rev)),
     }
@@ -661,13 +661,13 @@ fn not_something_we_can_merge(rev: &str) -> GitError {
     GitError::Exit(1)
 }
 
-/// Render a [`sley_diff_merge::MergeTreesResult`] into the `merge-tree
+/// Render a [`sley::plumbing::sley_diff_merge::MergeTreesResult`] into the `merge-tree
 /// --write-tree` [`MergeOutcome`] (tree + sorted conflict stages + ordered
 /// messages). The library computes the merge; this function is purely the
 /// merge-tree-specific *presentation* (message text, message ordering, stage
 /// sorting), kept byte-identical to the historical inline implementation.
 fn render_merge_outcome(
-    merge: &sley_diff_merge::MergeTreesResult,
+    merge: &sley::plumbing::sley_diff_merge::MergeTreesResult,
     ours_label: &str,
     theirs_label: &str,
 ) -> MergeOutcome {
@@ -690,7 +690,7 @@ fn render_merge_outcome(
             continue;
         };
         match kind {
-            sley_diff_merge::MergeConflictKind::Content { add_add } => {
+            sley::plumbing::sley_diff_merge::MergeConflictKind::Content { add_add } => {
                 let conflict_kind = if *add_add { "add/add" } else { "content" };
                 conflict_messages.push(InfoMessage {
                     paths: vec![path.clone()],
@@ -701,7 +701,7 @@ fn render_merge_outcome(
                     ),
                 });
             }
-            sley_diff_merge::MergeConflictKind::RenameContent { .. } => {
+            sley::plumbing::sley_diff_merge::MergeConflictKind::RenameContent { .. } => {
                 conflict_messages.push(InfoMessage {
                     paths: vec![path.clone()],
                     stable_type: "CONFLICT (contents)".to_string(),
@@ -711,7 +711,7 @@ fn render_merge_outcome(
                     ),
                 });
             }
-            sley_diff_merge::MergeConflictKind::RenameRenameTwoToOne {
+            sley::plumbing::sley_diff_merge::MergeConflictKind::RenameRenameTwoToOne {
                 ours_path,
                 theirs_path,
             } => {
@@ -726,7 +726,7 @@ fn render_merge_outcome(
                     ),
                 });
             }
-            sley_diff_merge::MergeConflictKind::RenameRenameOneToTwo {
+            sley::plumbing::sley_diff_merge::MergeConflictKind::RenameRenameOneToTwo {
                 old_path,
                 ours_path,
                 theirs_path,
@@ -744,8 +744,8 @@ fn render_merge_outcome(
                     ),
                 });
             }
-            sley_diff_merge::MergeConflictKind::RenameRenameOneToTwoStage => {}
-            sley_diff_merge::MergeConflictKind::DirRenameSplit { source_dir } => {
+            sley::plumbing::sley_diff_merge::MergeConflictKind::RenameRenameOneToTwoStage => {}
+            sley::plumbing::sley_diff_merge::MergeConflictKind::DirRenameSplit { source_dir } => {
                 conflict_messages.push(InfoMessage {
                     paths: vec![source_dir.clone()],
                     stable_type: "CONFLICT (directory rename split)".to_string(),
@@ -755,7 +755,7 @@ fn render_merge_outcome(
                     ),
                 });
             }
-            sley_diff_merge::MergeConflictKind::ModifyDelete {
+            sley::plumbing::sley_diff_merge::MergeConflictKind::ModifyDelete {
                 deleted_in,
                 modified_in,
             } => {
@@ -768,7 +768,7 @@ fn render_merge_outcome(
                     ),
                 });
             }
-            sley_diff_merge::MergeConflictKind::RenameDelete {
+            sley::plumbing::sley_diff_merge::MergeConflictKind::RenameDelete {
                 old_path,
                 renamed_in,
                 deleted_in,
@@ -783,7 +783,7 @@ fn render_merge_outcome(
                     ),
                 });
             }
-            sley_diff_merge::MergeConflictKind::FileDirectory {
+            sley::plumbing::sley_diff_merge::MergeConflictKind::FileDirectory {
                 original_path,
                 moved_from,
             } => {
@@ -797,7 +797,7 @@ fn render_merge_outcome(
                     ),
                 });
             }
-            sley_diff_merge::MergeConflictKind::DirRenameLocation {
+            sley::plumbing::sley_diff_merge::MergeConflictKind::DirRenameLocation {
                 old_path,
                 renamed_from,
                 added_in,
@@ -821,7 +821,7 @@ fn render_merge_outcome(
                     message,
                 });
             }
-            sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { sources } => {
+            sley::plumbing::sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { sources } => {
                 let source_list = sources
                     .iter()
                     .map(|s| String::from_utf8_lossy(s).into_owned())
@@ -863,7 +863,7 @@ fn render_merge_outcome(
 fn push_conflicted_stages(
     out: &mut Vec<ConflictedStage>,
     path: &[u8],
-    stages: &sley_diff_merge::MergeStages,
+    stages: &sley::plumbing::sley_diff_merge::MergeStages,
 ) {
     for (stage, entry) in [(1u16, &stages.base), (2, &stages.ours), (3, &stages.theirs)] {
         if let Some((mode, oid)) = entry {
@@ -1173,15 +1173,15 @@ fn trivial_content_merge(
 ) -> Result<Vec<u8>> {
     let ours_bytes = blob_bytes(db, ours)?;
     let theirs_bytes = blob_bytes(db, theirs)?;
-    let result = sley_diff_merge::merge_blobs(
+    let result = sley::plumbing::sley_diff_merge::merge_blobs(
         base_bytes,
         &ours_bytes,
         &theirs_bytes,
-        &sley_diff_merge::MergeBlobOptions {
+        &sley::plumbing::sley_diff_merge::MergeBlobOptions {
             ours_label: ".our",
             theirs_label: ".their",
             base_label: ".base",
-            style: sley_diff_merge::ConflictStyle::Merge,
+            style: sley::plumbing::sley_diff_merge::ConflictStyle::Merge,
         },
     );
     Ok(result.content)
@@ -1199,9 +1199,9 @@ fn blob_bytes(db: &FileObjectDatabase, entry: &TrivialEntry) -> Result<Vec<u8>> 
 /// `old` -> `new`, using the shared Myers diff. This drives the diff portion of
 /// the trivial-merge output.
 fn write_unified_hunks(out: &mut impl Write, old: &[u8], new: &[u8]) -> Result<()> {
-    let old_lines = sley_diff_merge::split_lines(old);
-    let new_lines = sley_diff_merge::split_lines(new);
-    let ops = sley_diff_merge::myers_diff_lines(&old_lines, &new_lines);
+    let old_lines = sley::plumbing::sley_diff_merge::split_lines(old);
+    let new_lines = sley::plumbing::sley_diff_merge::split_lines(new);
+    let ops = sley::plumbing::sley_diff_merge::myers_diff_lines(&old_lines, &new_lines);
 
     // Flatten ops into a per-line tag stream: ' ', '-', or '+'.
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1221,7 +1221,7 @@ fn write_unified_hunks(out: &mut impl Write, old: &[u8], new: &[u8]) -> Result<(
     let mut new_cursor = 0usize;
     for op in &ops {
         match op {
-            sley_diff_merge::DiffOp::Equal(count) => {
+            sley::plumbing::sley_diff_merge::DiffOp::Equal(count) => {
                 for _ in 0..*count {
                     rows.push(Row {
                         tag: Tag::Ctx,
@@ -1231,7 +1231,7 @@ fn write_unified_hunks(out: &mut impl Write, old: &[u8], new: &[u8]) -> Result<(
                     new_cursor += 1;
                 }
             }
-            sley_diff_merge::DiffOp::Delete(count) => {
+            sley::plumbing::sley_diff_merge::DiffOp::Delete(count) => {
                 for _ in 0..*count {
                     rows.push(Row {
                         tag: Tag::Del,
@@ -1240,7 +1240,7 @@ fn write_unified_hunks(out: &mut impl Write, old: &[u8], new: &[u8]) -> Result<(
                     old_cursor += 1;
                 }
             }
-            sley_diff_merge::DiffOp::Insert(count) => {
+            sley::plumbing::sley_diff_merge::DiffOp::Insert(count) => {
                 for _ in 0..*count {
                     rows.push(Row {
                         tag: Tag::Add,

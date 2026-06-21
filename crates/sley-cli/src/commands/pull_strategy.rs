@@ -97,8 +97,8 @@ pub(crate) fn cmd_pull_with_strategy(args: &[String]) -> Result<()> {
         )));
     }
 
-    let other_oid = sley_rev::resolve_revision_with_reader(&git_dir, format, &db, &branch)?;
-    let other_oid = sley_rev::peel_to_commit(&db, format, &other_oid)?;
+    let other_oid = sley::plumbing::sley_rev::resolve_revision_with_reader(&git_dir, format, &db, &branch)?;
+    let other_oid = sley::plumbing::sley_rev::peel_to_commit(&db, format, &other_oid)?;
     let Some(head_oid) = head_branch_oid(&store)? else {
         return Err(GitError::Command(
             "pull -s ours requires a born HEAD".into(),
@@ -116,9 +116,9 @@ pub(crate) fn cmd_pull_with_strategy(args: &[String]) -> Result<()> {
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
     let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let merge_oid = sley_sequencer::create_commit(
+    let merge_oid = sley::plumbing::sley_sequencer::create_commit(
         &mut db,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree,
             parents: vec![head_oid, other_oid],
             author,

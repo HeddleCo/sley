@@ -1,0 +1,13 @@
+[package]
+name = "sley-diff-format"
+version.workspace = true
+description = "Public pre-1.0 diff formatting API surface for streaming, borrowed diff rendering in sley."
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

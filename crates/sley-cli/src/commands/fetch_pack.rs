@@ -8,7 +8,7 @@
 
 use crate::commands::remote_cmds::ls_remote_git_dir;
 use crate::*;
-use sley_remote::{apply_shallow_info, compute_local_deepen, read_shallow};
+use sley::plumbing::sley_remote::{apply_shallow_info, compute_local_deepen, read_shallow};
 
 const FETCH_PACK_USAGE: &str = "usage: git fetch-pack [--all] [--stdin] [--quiet | -q] [--keep | -k] [--thin] [--include-tag] [--upload-pack=<git-upload-pack>] [--depth=<n>] [--no-progress] [--diag-url] [-v] [<host>:]<directory> [<refs>...]";
 
@@ -161,7 +161,7 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
             format.name()
         )));
     }
-    let advertisements = sley_remote::local_fetch_advertisements(&remote_git_dir, format)?;
+    let advertisements = sley::plumbing::sley_remote::local_fetch_advertisements(&remote_git_dir, format)?;
 
     // filter_refs: name matches first, then the raw-oid pass over advertised
     // tips (or the uploadpack.allow*sha1inwant escape hatches).
@@ -264,7 +264,7 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
         _ => None,
     };
     if !wants.is_empty() {
-        let shallow_info = sley_remote::install_fetch_pack_via_local_upload_pack(
+        let shallow_info = sley::plumbing::sley_remote::install_fetch_pack_via_local_upload_pack(
             &git_dir,
             &remote_git_dir,
             format,

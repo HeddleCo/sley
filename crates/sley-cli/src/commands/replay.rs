@@ -1,5 +1,5 @@
 //! `git cherry-pick` / `git revert` — porcelains over the sequencer state
-//! machine in [`sley_sequencer::replay`].
+//! machine in [`sley::plumbing::sley_sequencer::replay`].
 //!
 //! The state machine (todo/opts/head/abort-safety files, CHERRY_PICK_HEAD /
 //! REVERT_HEAD lifecycle) lives in the library crate; this module owns the
@@ -12,7 +12,7 @@ use crate::commands::merge_rebase::{
     merge_refuse_if_current_working_directory_becomes_file, three_way_merge_trees_styled,
 };
 use crate::*;
-use sley_sequencer::replay::{self, ReplayAction, ReplayOpts, TodoItem};
+use sley::plumbing::sley_sequencer::replay::{self, ReplayAction, ReplayOpts, TodoItem};
 
 const CHERRY_PICK_USAGE: &str = "\
 usage: git cherry-pick [--edit] [-n] [-m <parent-number>] [-s] [-x] [--ff]
@@ -183,7 +183,7 @@ fn run_git_replay(args: &[String]) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root =
-        sley_worktree::worktree_root_for_git_dir(&git_dir)?.unwrap_or_else(|| cwd.clone());
+        sley::plumbing::sley_worktree::worktree_root_for_git_dir(&git_dir)?.unwrap_or_else(|| cwd.clone());
     let ctx = ReplayCtx {
         action: if parsed.revert.is_some() {
             ReplayAction::Revert
@@ -549,7 +549,7 @@ fn replay_one_commit_to(
         "HEAD",
         &format_log_abbrev_oid(oid),
         "parent",
-        sley_diff_merge::ConflictStyle::Merge,
+        sley::plumbing::sley_diff_merge::ConflictStyle::Merge,
     )
     .map_err(|err| {
         eprintln!("error: {err}");
@@ -580,9 +580,9 @@ fn replay_one_commit_to(
         )?,
     };
     let mut writer = ctx.db();
-    sley_sequencer::create_commit(
+    sley::plumbing::sley_sequencer::create_commit(
         &mut writer,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree: new_tree,
             parents: vec![*head],
             author,
@@ -1082,9 +1082,9 @@ fn select_revisions(
             }
         })
         .collect::<Vec<_>>();
-    let setup = sley_rev::setup_revisions(
+    let setup = sley::plumbing::sley_rev::setup_revisions(
         &setup_args,
-        &sley_rev::RevisionSetupContext {
+        &sley::plumbing::sley_rev::RevisionSetupContext {
             git_dir: &ctx.git_dir,
             worktree_root: Some(&ctx.worktree_root),
             cwd: &cwd,
@@ -1102,7 +1102,7 @@ fn select_revisions(
             eprintln!("fatal: bad revision 'HEAD'");
             GitError::Exit(128)
         })?;
-        options.positives.push(sley_rev::RevisionTip {
+        options.positives.push(sley::plumbing::sley_rev::RevisionTip {
             oid,
             rev: "HEAD".to_string(),
             source_name: Some("HEAD".to_string()),
@@ -1129,7 +1129,7 @@ fn select_revisions(
             .positives
             .iter()
             .map(|tip| {
-                sley_rev::peel_to_commit(&db, ctx.format, &tip.oid).map_err(|_| {
+                sley::plumbing::sley_rev::peel_to_commit(&db, ctx.format, &tip.oid).map_err(|_| {
                     eprintln!("error: {}: can't cherry-pick that object", tip.rev);
                     fatal_failed(action)
                 })
@@ -1142,13 +1142,13 @@ fn select_revisions(
             }
         }
         let order = match options.order {
-            sley_rev::RevisionOrder::Default | sley_rev::RevisionOrder::Date => {
-                sley_rev::RevWalkOrder::CommitDate
+            sley::plumbing::sley_rev::RevisionOrder::Default | sley::plumbing::sley_rev::RevisionOrder::Date => {
+                sley::plumbing::sley_rev::RevWalkOrder::CommitDate
             }
-            sley_rev::RevisionOrder::Topo => sley_rev::RevWalkOrder::Topo,
-            sley_rev::RevisionOrder::AuthorDate => sley_rev::RevWalkOrder::AuthorDate,
+            sley::plumbing::sley_rev::RevisionOrder::Topo => sley::plumbing::sley_rev::RevWalkOrder::Topo,
+            sley::plumbing::sley_rev::RevisionOrder::AuthorDate => sley::plumbing::sley_rev::RevWalkOrder::AuthorDate,
         };
-        let mut walk = sley_rev::RevWalk::new(&ctx.git_dir, ctx.format, &db, starts)
+        let mut walk = sley::plumbing::sley_rev::RevWalk::new(&ctx.git_dir, ctx.format, &db, starts)
             .order(order)
             .first_parent(options.first_parent)
             .date_window(options.date_window);
@@ -1160,7 +1160,7 @@ fn select_revisions(
         }
     } else {
         for tip in &options.positives {
-            let commit_oid = sley_rev::peel_to_commit(&db, ctx.format, &tip.oid).map_err(|_| {
+            let commit_oid = sley::plumbing::sley_rev::peel_to_commit(&db, ctx.format, &tip.oid).map_err(|_| {
                 eprintln!("error: {}: can't cherry-pick that object", tip.rev);
                 fatal_failed(action)
             })?;
@@ -1288,7 +1288,7 @@ fn sequencer_pick_revisions(ctx: &ReplayCtx, opts: &ReplayOpts, rev_args: &[Stri
 /// The unmerged-index guard inside `do_pick_commit`'s dirty-index check
 /// (`error_resolve_conflict`).
 fn check_no_unmerged(ctx: &ReplayCtx) -> std::result::Result<(), ReplayHalt> {
-    let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(&ctx.git_dir);
     let Ok(bytes) = fs::read(&index_path) else {
         return Ok(());
     };
@@ -1500,8 +1500,8 @@ fn do_pick_commit(
     let ours_map = stash_tree_entry_map(&db, ctx.format, &index_tree).map_err(print_fatal_error)?;
 
     let style = match config_value(&ctx.git_dir, "merge", "conflictstyle").as_deref() {
-        Some("diff3") | Some("zdiff3") => sley_diff_merge::ConflictStyle::Diff3,
-        _ => sley_diff_merge::ConflictStyle::Merge,
+        Some("diff3") | Some("zdiff3") => sley::plumbing::sley_diff_merge::ConflictStyle::Diff3,
+        _ => sley::plumbing::sley_diff_merge::ConflictStyle::Merge,
     };
     let (results, conflicts) = three_way_merge_trees_styled(
         &db,
@@ -1582,7 +1582,7 @@ fn do_pick_commit(
     // Clean merge: stage the result.
     apply_merge_results_to_index_and_worktree(ctx, &db, &ours_map, &results)
         .map_err(print_fatal_error)?;
-    let new_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)
+    let new_tree = sley::plumbing::sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)
         .map_err(print_fatal_error)?;
 
     if opts.no_commit {
@@ -1712,11 +1712,11 @@ fn tree_map_of_commit(
 
 /// Tree oid of the current index (the "are there staged changes" probe).
 fn index_tree_oid(ctx: &ReplayCtx) -> Result<ObjectId> {
-    let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(&ctx.git_dir);
     if !index_path.exists() {
         return Ok(ObjectId::empty_tree(ctx.format));
     }
-    sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)
+    sley::plumbing::sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)
 }
 
 fn original_commit_empty(
@@ -2014,7 +2014,7 @@ fn verify_worktree_safe(
                 let Ok(bytes) = fs::read(&full) else {
                     continue;
                 };
-                let on_disk = sley_core::object_id_for_bytes(ctx.format, "blob", &bytes)
+                let on_disk = sley::plumbing::sley_core::object_id_for_bytes(ctx.format, "blob", &bytes)
                     .map_err(print_fatal_error)?;
                 if &on_disk != ours_oid {
                     local_changes.push(path.clone());
@@ -2030,7 +2030,7 @@ fn verify_worktree_safe(
                 // dir holds tracked files being removed by this same apply, and the
                 // gitlink is materialized in their place). Skip the untracked check
                 // for gitlink targets exactly as git skips `check_ok_to_remove`.
-                if matches!(target, Some((mode, _)) if sley_index::is_gitlink(mode)) {
+                if matches!(target, Some((mode, _)) if sley::plumbing::sley_index::is_gitlink(mode)) {
                     continue;
                 }
                 // Untracked file in the way of a new path.
@@ -2075,7 +2075,7 @@ fn apply_merge_results_to_index_and_worktree(
     ours_map: &MergeTreeMap,
     results: &BTreeMap<Vec<u8>, MergePathResult>,
 ) -> Result<()> {
-    let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(&ctx.git_dir);
     let old_index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, ctx.format)?
     } else {
@@ -2157,7 +2157,7 @@ fn apply_merge_results_to_index_and_worktree(
                     // `mkdir`s the submodule dir. `merge_write_worktree_file`
                     // ignores `content` for a gitlink mode (it materializes the
                     // directory), so pass empty content and skip the ODB read.
-                    let content = if sley_index::is_gitlink(*mode) {
+                    let content = if sley::plumbing::sley_index::is_gitlink(*mode) {
                         Vec::new()
                     } else {
                         crate::commands::merge_rebase::merge_read_blob(db, oid)?
@@ -2281,7 +2281,7 @@ fn fast_forward_to(ctx: &ReplayCtx, target: &ObjectId, head: Option<&ObjectId>) 
         }),
     });
     tx.commit()?;
-    sley_worktree::reset_index_and_worktree_to_commit(
+    sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(
         &ctx.worktree_root,
         &ctx.git_dir,
         ctx.format,
@@ -2301,9 +2301,9 @@ fn commit_and_advance_head(
     reflog_message: Vec<u8>,
 ) -> Result<ObjectId> {
     let mut db = ctx.db();
-    let new_oid = sley_sequencer::create_commit(
+    let new_oid = sley::plumbing::sley_sequencer::create_commit(
         &mut db,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree: *tree,
             parents: head.iter().map(|oid| **oid).collect(),
             author,
@@ -2443,7 +2443,7 @@ fn continue_single_pick(ctx: &ReplayCtx, opts: &ReplayOpts) -> Result<()> {
     }
     // Unmerged files leave the commit impossible (the `git commit` child's
     // error block, exit 128).
-    let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(&ctx.git_dir);
     if let Ok(bytes) = fs::read(&index_path) {
         let index = Index::parse(&bytes, ctx.format)?;
         let unmerged: Vec<String> = index
@@ -2627,7 +2627,7 @@ pub(crate) fn reset_merge_in(
         }
         None => MergeTreeMap::new(),
     };
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     let old_index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?
     } else {
@@ -2675,7 +2675,7 @@ pub(crate) fn reset_merge_in(
         if current_entry.as_ref() == target_entry {
             continue;
         }
-        if current.is_some_and(|entry| sley_index::is_gitlink(entry.mode))
+        if current.is_some_and(|entry| sley::plumbing::sley_index::is_gitlink(entry.mode))
             && target_entry.is_none()
             && target_map.keys().any(|candidate| {
                 candidate.starts_with(path) && candidate.get(path.len()) == Some(&b'/')
@@ -2689,13 +2689,13 @@ pub(crate) fn reset_merge_in(
             let rel = entry.path.to_string();
             let full = worktree_root.join(&rel);
             if let Ok(bytes) = fs::read(&full) {
-                let on_disk = sley_core::object_id_for_bytes(format, "blob", &bytes)?;
+                let on_disk = sley::plumbing::sley_core::object_id_for_bytes(format, "blob", &bytes)?;
                 if on_disk != entry.oid {
                     errors.push(path.clone());
                     continue;
                 }
             }
-        } else if matches!(target_entry, Some((mode, _)) if sley_index::is_gitlink(*mode)) {
+        } else if matches!(target_entry, Some((mode, _)) if sley::plumbing::sley_index::is_gitlink(*mode)) {
             let Some(rel) = std::str::from_utf8(path).ok() else {
                 continue;
             };
@@ -2750,7 +2750,7 @@ pub(crate) fn reset_merge_in(
     index.upgrade_version_for_flags();
     fs::write(&index_path, index.write(format)?)?;
     for (path, (mode, oid)) in &updates {
-        let content = if sley_index::is_gitlink(*mode) {
+        let content = if sley::plumbing::sley_index::is_gitlink(*mode) {
             Vec::new()
         } else {
             crate::commands::merge_rebase::merge_read_blob(&db, oid)?
@@ -2765,7 +2765,7 @@ pub(crate) fn reset_merge_in(
     for path in &deletions {
         crate::commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)?;
     }
-    sley_worktree::refresh_index_paths(
+    sley::plumbing::sley_worktree::refresh_index_paths(
         worktree_root,
         git_dir,
         format,
@@ -2802,6 +2802,6 @@ pub(crate) fn reset_merge_in(
         tx.commit()?;
     }
 
-    sley_sequencer::replay::remove_branch_state(git_dir);
+    sley::plumbing::sley_sequencer::replay::remove_branch_state(git_dir);
     Ok(())
 }

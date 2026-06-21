@@ -1,6 +1,13 @@
+//! Core primitives shared by the sley crates.
+//!
+//! This crate keeps the dependency-light building blocks that higher-level
+//! crates reuse: object identifiers, typed errors, repository path helpers, and
+//! small streaming utilities such as [`RecordReader`].
+
 use std::borrow::Borrow;
 use std::error::Error;
 use std::fmt;
+use std::io::BufRead;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -18,6 +25,95 @@ pub fn set_original_cwd(path: Option<PathBuf>) {
 
 pub fn original_cwd() -> Option<PathBuf> {
     ORIGINAL_CWD.lock().ok()?.clone()
+}
+
+/// Streaming reader for records separated by a single terminator byte.
+///
+/// The returned records do not include the terminator. A final unterminated
+/// record at EOF is still returned, which matches how Git treats stdin command
+/// streams and other line-oriented files.
+pub struct RecordReader<R> {
+    reader: R,
+    terminator: u8,
+    record: Vec<u8>,
+}
+
+impl<R> RecordReader<R> {
+    /// Create a reader that splits `reader` on `terminator`.
+    pub fn new(reader: R, terminator: u8) -> Self {
+        Self {
+            reader,
+            terminator,
+            record: Vec::new(),
+        }
+    }
+
+    /// Return the byte used to terminate each record.
+    pub const fn terminator(&self) -> u8 {
+        self.terminator
+    }
+
+    /// Borrow the wrapped reader.
+    pub const fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
+    /// Mutably borrow the wrapped reader.
+    pub const fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
+    /// Borrow the reusable record buffer from the most recent read.
+    pub fn buffer(&self) -> &[u8] {
+        &self.record
+    }
+
+    /// Consume this reader and return the wrapped reader.
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+}
+
+impl<R: BufRead> RecordReader<R> {
+    /// Read the next record and borrow it from this reader's reusable buffer.
+    ///
+    /// The returned slice is invalidated by the next call to [`Self::next_record`]
+    /// or [`Self::read_record_into`]. Use [`Self::read_record`] only when an
+    /// owned buffer is actually needed.
+    pub fn next_record(&mut self) -> Result<Option<&[u8]>> {
+        self.record.clear();
+        let read = self.reader.read_until(self.terminator, &mut self.record)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if self.record.last().copied() == Some(self.terminator) {
+            self.record.pop();
+        }
+        Ok(Some(&self.record))
+    }
+
+    /// Read the next record into a fresh buffer.
+    pub fn read_record(&mut self) -> Result<Option<Vec<u8>>> {
+        Ok(self.next_record()?.map(<[u8]>::to_vec))
+    }
+
+    /// Read the next record into `record`, clearing it first.
+    ///
+    /// Returns `Ok(false)` only when EOF is reached before any bytes are read.
+    /// Empty records before EOF return `Ok(true)` with an empty buffer.
+    pub fn read_record_into(&mut self, record: &mut Vec<u8>) -> Result<bool> {
+        match self.next_record()? {
+            Some(bytes) => {
+                record.clear();
+                record.extend_from_slice(bytes);
+                Ok(true)
+            }
+            None => {
+                record.clear();
+                Ok(false)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1788,6 +1884,95 @@ fn sha256(input: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn record_reader_reads_terminated_and_final_records() {
+        let input = Cursor::new(b"one\ntwo\nthree".as_slice());
+        let mut reader = RecordReader::new(input, b'\n');
+
+        assert_eq!(
+            reader
+                .read_record()
+                .expect("test operation should succeed")
+                .as_deref(),
+            Some(&b"one"[..])
+        );
+        assert_eq!(
+            reader
+                .read_record()
+                .expect("test operation should succeed")
+                .as_deref(),
+            Some(&b"two"[..])
+        );
+        assert_eq!(
+            reader
+                .read_record()
+                .expect("test operation should succeed")
+                .as_deref(),
+            Some(&b"three"[..])
+        );
+        assert_eq!(
+            reader.read_record().expect("test operation should succeed"),
+            None
+        );
+    }
+
+    #[test]
+    fn record_reader_keeps_empty_records() {
+        let input = Cursor::new(b"\0middle\0\0".as_slice());
+        let mut reader = RecordReader::new(input, b'\0');
+
+        assert_eq!(
+            reader
+                .read_record()
+                .expect("test operation should succeed")
+                .as_deref(),
+            Some(&b""[..])
+        );
+        assert_eq!(
+            reader
+                .read_record()
+                .expect("test operation should succeed")
+                .as_deref(),
+            Some(&b"middle"[..])
+        );
+        assert_eq!(
+            reader
+                .read_record()
+                .expect("test operation should succeed")
+                .as_deref(),
+            Some(&b""[..])
+        );
+    }
+
+    #[test]
+    fn record_reader_can_reuse_a_buffer() {
+        let input = Cursor::new(b"a,b".as_slice());
+        let mut reader = RecordReader::new(input, b',');
+        let mut record = b"stale".to_vec();
+
+        assert!(
+            reader
+                .read_record_into(&mut record)
+                .expect("test operation should succeed")
+        );
+        assert_eq!(record, b"a");
+
+        assert!(
+            reader
+                .read_record_into(&mut record)
+                .expect("test operation should succeed")
+        );
+        assert_eq!(record, b"b");
+
+        assert!(
+            !reader
+                .read_record_into(&mut record)
+                .expect("test operation should succeed")
+        );
+        assert!(record.is_empty());
+    }
 
     #[test]
     fn sha1_blob_matches_git_known_value() {

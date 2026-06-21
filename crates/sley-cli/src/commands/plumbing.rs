@@ -167,7 +167,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
     let current_prefix = if remote.is_some() {
         Vec::new()
     } else {
-        match sley_worktree::worktree_root_for_git_dir(&git_dir)? {
+        match sley::plumbing::sley_worktree::worktree_root_for_git_dir(&git_dir)? {
             Some(_) => worktree_prefix(&cwd, &git_dir)?.into_bytes(),
             None => Vec::new(),
         }
@@ -194,7 +194,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
         ObjectType::Commit => {
             let commit = Commit::parse(format, &object.body)?;
             let mtime = commit_graph_commit_time_from_committer(&commit.committer)?;
-            let record = sley_rev::CommitRecord {
+            let record = sley::plumbing::sley_rev::CommitRecord {
                 oid,
                 parents: commit.parents.clone(),
                 commit,
@@ -203,7 +203,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
         }
         ObjectType::Tree => (oid, current_unix_seconds().max(0) as u64, None, None),
         ObjectType::Tag => {
-            let tree_oid = sley_rev::peel_to_tree(&db, format, &oid)?;
+            let tree_oid = sley::plumbing::sley_rev::peel_to_tree(&db, format, &oid)?;
             (tree_oid, current_unix_seconds().max(0) as u64, None, None)
         }
         other => {
@@ -253,9 +253,9 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             )));
         }
     };
-    let attr_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?
+    let attr_root = sley::plumbing::sley_worktree::worktree_root_for_git_dir(&git_dir)?
         .unwrap_or_else(|| git_dir.to_path_buf());
-    let mut convert = sley_archive::ArchiveConvert::from_tree(
+    let mut convert = sley::plumbing::sley_archive::ArchiveConvert::from_tree(
         &attr_root, &git_dir, &config, &db, format, &tree_oid,
     )?;
     // export-subst only runs when archiving a commit (git sets `args->convert`
@@ -269,16 +269,16 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
     // `UserdiffResolver` resolves `diff=<name>` ⇒ `diff.<name>.binary` config and
     // builtin driver flags.
     let diff_attributes =
-        sley_worktree::TreeAttributes::from_tree(&attr_root, &git_dir, &db, format, &tree_oid)?;
+        sley::plumbing::sley_worktree::TreeAttributes::from_tree(&attr_root, &git_dir, &db, format, &tree_oid)?;
     let userdiff =
         commands::userdiff::UserdiffResolver::with_attributes(None, Some(config.clone()));
     convert = convert
         .with_diff_binary(move |path| archive_diff_binary(&diff_attributes, &userdiff, path));
 
-    let extra = sley_archive::ArchiveExtras {
+    let extra = sley::plumbing::sley_archive::ArchiveExtras {
         files: extra_files
             .into_iter()
-            .map(|file| sley_archive::ArchiveExtraEntry {
+            .map(|file| sley::plumbing::sley_archive::ArchiveExtraEntry {
                 path: file.path,
                 content: file.content,
                 mode: file.mode,
@@ -288,7 +288,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
 
     match archive_format {
         ArchiveFormatKind::Tar => {
-            let options = sley_archive::TarArchiveOptions {
+            let options = sley::plumbing::sley_archive::TarArchiveOptions {
                 prefix,
                 strip_prefix: current_prefix,
                 mtime,
@@ -297,13 +297,13 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
                 verbose,
             };
             with_archive_writer(output, |writer| {
-                handle_archive_result(sley_archive::write_tar_archive_full(
+                handle_archive_result(sley::plumbing::sley_archive::write_tar_archive_full(
                     writer, &db, format, &tree_oid, options, &convert, &extra,
                 ))
             })
         }
         ArchiveFormatKind::TarGz => {
-            let options = sley_archive::TarArchiveOptions {
+            let options = sley::plumbing::sley_archive::TarArchiveOptions {
                 prefix,
                 strip_prefix: current_prefix,
                 mtime,
@@ -312,7 +312,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
                 verbose,
             };
             with_archive_writer(output, |writer| {
-                handle_archive_result(sley_archive::write_tar_gz_archive_full(
+                handle_archive_result(sley::plumbing::sley_archive::write_tar_gz_archive_full(
                     writer,
                     &db,
                     format,
@@ -326,7 +326,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             })
         }
         ArchiveFormatKind::TarFilter => {
-            let options = sley_archive::TarArchiveOptions {
+            let options = sley::plumbing::sley_archive::TarArchiveOptions {
                 prefix,
                 strip_prefix: current_prefix,
                 mtime,
@@ -337,7 +337,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             let command = filter_command.expect("tar filter arm has a command");
             with_archive_writer(output, |writer| {
                 let mut tar = Vec::new();
-                handle_archive_result(sley_archive::write_tar_archive_full(
+                handle_archive_result(sley::plumbing::sley_archive::write_tar_archive_full(
                     &mut tar, &db, format, &tree_oid, options, &convert, &extra,
                 ))?;
                 let filtered = run_archive_filter(&command, &tar)?;
@@ -346,7 +346,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             })
         }
         ArchiveFormatKind::Zip => {
-            let options = sley_archive::ZipArchiveOptions {
+            let options = sley::plumbing::sley_archive::ZipArchiveOptions {
                 prefix,
                 strip_prefix: current_prefix,
                 mtime,
@@ -356,7 +356,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
                 compression_level: compression_level.unwrap_or(6),
             };
             with_archive_writer(output, |writer| {
-                handle_archive_result(sley_archive::write_zip_archive_full(
+                handle_archive_result(sley::plumbing::sley_archive::write_zip_archive_full(
                     writer, &db, format, &tree_oid, options, &convert, &extra,
                 ))
             })
@@ -438,7 +438,7 @@ fn archive_remote_git_dir(
         let url = config
             .get("remote", Some(remote), "url")
             .ok_or_else(|| GitError::Command(format!("unknown remote: {remote}")))?;
-        let base = sley_worktree::worktree_root_for_git_dir(git_dir)?
+        let base = sley::plumbing::sley_worktree::worktree_root_for_git_dir(git_dir)?
             .unwrap_or_else(|| git_dir.to_path_buf());
         (PathBuf::from(url), base)
     };
@@ -476,24 +476,24 @@ fn archive_remote_object_allowed(
     if ObjectId::from_hex(format, treeish).is_ok() {
         return Ok(false);
     }
-    let target = match sley_rev::peel_to_commit(db, format, oid) {
+    let target = match sley::plumbing::sley_rev::peel_to_commit(db, format, oid) {
         Ok(target) => target,
         Err(_) => return Ok(false),
     };
-    let store = sley_refs::FileRefStore::new(git_dir, format);
+    let store = sley::plumbing::sley_refs::FileRefStore::new(git_dir, format);
     let mut roots = Vec::new();
-    if let Some(head) = sley_refs::resolve_ref_peeled(&store, "HEAD")? {
+    if let Some(head) = sley::plumbing::sley_refs::resolve_ref_peeled(&store, "HEAD")? {
         roots.push(head);
     }
     for reference in store.list_refs()? {
-        if let sley_refs::RefTarget::Direct(oid) = reference.target {
+        if let sley::plumbing::sley_refs::RefTarget::Direct(oid) = reference.target {
             roots.push(oid);
         }
     }
     if roots.is_empty() {
         return Ok(false);
     }
-    Ok(sley_rev::walk_commits(db, format, roots)?
+    Ok(sley::plumbing::sley_rev::walk_commits(db, format, roots)?
         .iter()
         .any(|record| record.oid == target))
 }
@@ -659,17 +659,17 @@ fn archive_virtual_extra_file(spec: &str) -> Result<ArchiveExtraFile> {
 /// (`Some(true)` = binary, `Some(false)` = text, `None` = auto-detect via
 /// content). Mirrors `userdiff_find_by_path(...)->binary`.
 fn archive_diff_binary(
-    attributes: &sley_worktree::TreeAttributes,
+    attributes: &sley::plumbing::sley_worktree::TreeAttributes,
     userdiff: &commands::userdiff::UserdiffResolver,
     path: &[u8],
 ) -> Option<bool> {
     match attributes.diff_attribute_for_path(path) {
         // `diff` set ⇒ driver_true ⇒ text.
-        Some(sley_worktree::AttributeState::Set) => Some(false),
+        Some(sley::plumbing::sley_worktree::AttributeState::Set) => Some(false),
         // `-diff` ⇒ driver_false ⇒ binary.
-        Some(sley_worktree::AttributeState::Unset) => Some(true),
+        Some(sley::plumbing::sley_worktree::AttributeState::Unset) => Some(true),
         // `diff=<name>` ⇒ resolve the named driver's `binary` flag.
-        Some(sley_worktree::AttributeState::Value(name)) => userdiff
+        Some(sley::plumbing::sley_worktree::AttributeState::Value(name)) => userdiff
             .driver_by_name(&name)
             .ok()
             .flatten()
@@ -1377,7 +1377,7 @@ fn resolve_init_template_dir(
             if let Some(path) =
                 init_config_value("init.templatedir", global_config, config_git_dir)?
             {
-                let expanded = sley_config::expand_user_path(&path);
+                let expanded = sley::plumbing::sley_config::expand_user_path(&path);
                 Ok(Some(if expanded.is_absolute() {
                     expanded
                 } else {
@@ -1703,7 +1703,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let parsed_index = if paths.is_empty() {
         None
     } else {
-        sley_worktree::read_repository_index(&git_dir, format)?
+        sley::plumbing::sley_worktree::read_repository_index(&git_dir, format)?
     };
     die_on_pathspec_inside_submodule(&cwd, &worktree_root, parsed_index.as_ref(), &paths)?;
     // git's `add` re-stats every tracked path it touches, including ones whose
@@ -1728,7 +1728,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let do_refresh = !dry_run && chmod.is_none();
     if update && !all && paths.is_empty() && !dry_run && chmod.is_none() {
         let config = read_repo_config(&git_dir)?;
-        let actions = sley_worktree::add_update_all_tracked_filtered(
+        let actions = sley::plumbing::sley_worktree::add_update_all_tracked_filtered(
             &worktree_root,
             &git_dir,
             format,
@@ -1737,13 +1737,13 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         .into_iter()
         .map(|action| -> Result<AddAction> {
             match action {
-                sley_worktree::AddUpdateTrackedAction::Add(path) => Ok(AddAction::Add(
+                sley::plumbing::sley_worktree::AddUpdateTrackedAction::Add(path) => Ok(AddAction::Add(
                     worktree_root.join(
                         std::str::from_utf8(&path)
                             .map_err(|err| GitError::InvalidPath(err.to_string()))?,
                     ),
                 )),
-                sley_worktree::AddUpdateTrackedAction::Remove(path) => Ok(AddAction::Remove(
+                sley::plumbing::sley_worktree::AddUpdateTrackedAction::Remove(path) => Ok(AddAction::Remove(
                     worktree_root.join(
                         std::str::from_utf8(&path)
                             .map_err(|err| GitError::InvalidPath(err.to_string()))?,
@@ -1779,12 +1779,12 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             .collect::<Vec<_>>();
         if !action_paths.is_empty() {
             let config = read_repo_config(&git_dir)?;
-            sley_worktree::update_index_paths_filtered(
+            sley::plumbing::sley_worktree::update_index_paths_filtered(
                 &worktree_root,
                 &git_dir,
                 format,
                 &action_paths,
-                sley_worktree::UpdateIndexOptions {
+                sley::plumbing::sley_worktree::UpdateIndexOptions {
                     add: true,
                     remove: true,
                     force_remove: false,
@@ -1840,7 +1840,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             let index = reusable_index.take().ok_or_else(|| {
                 GitError::Command("exact tracked add lost its parsed index".into())
             })?;
-            sley_worktree::add_exact_tracked_path_with_index(
+            sley::plumbing::sley_worktree::add_exact_tracked_path_with_index(
                 &worktree_root,
                 &git_dir,
                 format,
@@ -1876,7 +1876,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                     .map(|entry| entry.path.as_bytes().to_vec())
                     .collect()
             } else {
-                sley_worktree::read_repository_index(&git_dir, format)?
+                sley::plumbing::sley_worktree::read_repository_index(&git_dir, format)?
                     .map(|index| {
                         index
                             .entries
@@ -1889,7 +1889,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         } else {
             BTreeSet::new()
         };
-        let update_options = sley_worktree::UpdateIndexOptions {
+        let update_options = sley::plumbing::sley_worktree::UpdateIndexOptions {
             add: true,
             remove: true,
             force_remove: false,
@@ -1899,7 +1899,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             allow_skip_worktree_entries: sparse,
         };
         if let Some(index) = reusable_index.take() {
-            sley_worktree::update_index_paths_filtered_with_index(
+            sley::plumbing::sley_worktree::update_index_paths_filtered_with_index(
                 &worktree_root,
                 &git_dir,
                 format,
@@ -1909,7 +1909,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                 &config,
             )?;
         } else {
-            sley_worktree::update_index_paths_filtered(
+            sley::plumbing::sley_worktree::update_index_paths_filtered(
                 &worktree_root,
                 &git_dir,
                 format,
@@ -1950,7 +1950,7 @@ fn add_intent_to_add(
     paths: &[PathBuf],
 ) -> Result<()> {
     let mut index =
-        sley_worktree::read_repository_index(git_dir, format)?.unwrap_or_else(|| Index {
+        sley::plumbing::sley_worktree::read_repository_index(git_dir, format)?.unwrap_or_else(|| Index {
             version: 2,
             entries: Vec::new(),
             extensions: Vec::new(),
@@ -2002,7 +2002,7 @@ fn add_intent_to_add(
         if index.version < 3 {
             index.version = 3;
         }
-        let index_path = sley_worktree::repository_index_path(git_dir);
+        let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
         std::fs::write(index_path, index.write(format)?)?;
     }
     Ok(())
@@ -2010,13 +2010,13 @@ fn add_intent_to_add(
 
 fn add_update_tracked_action_to_add_action(
     worktree_root: &Path,
-    action: sley_worktree::AddUpdateTrackedAction,
+    action: sley::plumbing::sley_worktree::AddUpdateTrackedAction,
 ) -> Result<AddAction> {
     match action {
-        sley_worktree::AddUpdateTrackedAction::Add(path) => Ok(AddAction::Add(worktree_root.join(
+        sley::plumbing::sley_worktree::AddUpdateTrackedAction::Add(path) => Ok(AddAction::Add(worktree_root.join(
             std::str::from_utf8(&path).map_err(|err| GitError::InvalidPath(err.to_string()))?,
         ))),
-        sley_worktree::AddUpdateTrackedAction::Remove(path) => {
+        sley::plumbing::sley_worktree::AddUpdateTrackedAction::Remove(path) => {
             Ok(AddAction::Remove(worktree_root.join(
                 std::str::from_utf8(&path).map_err(|err| GitError::InvalidPath(err.to_string()))?,
             )))
@@ -2056,7 +2056,7 @@ fn try_add_regular_exact_tracked_raw(
         Ok(path) => path,
         Err(_) => return Ok(None),
     };
-    let result = sley_worktree::add_exact_tracked_path_from_disk(
+    let result = sley::plumbing::sley_worktree::add_exact_tracked_path_from_disk(
         worktree_root,
         git_dir,
         format,
@@ -2065,12 +2065,12 @@ fn try_add_regular_exact_tracked_raw(
         crate::effective_config_parameters_env().as_deref(),
     )?;
     match result {
-        sley_worktree::AddExactTrackedPathResult::Handled(action) => action
+        sley::plumbing::sley_worktree::AddExactTrackedPathResult::Handled(action) => action
             .into_iter()
             .map(|action| add_update_tracked_action_to_add_action(worktree_root, action))
             .collect::<Result<Vec<_>>>()
             .map(Some),
-        sley_worktree::AddExactTrackedPathResult::Unsupported => Ok(None),
+        sley::plumbing::sley_worktree::AddExactTrackedPathResult::Unsupported => Ok(None),
     }
 }
 
@@ -2108,7 +2108,7 @@ fn refresh_index_after_add(
                 .unwrap_or(false)
         });
     let selected: &[PathBuf] = if only_files { refresh_paths } else { &[] };
-    sley_worktree::refresh_index_paths(
+    sley::plumbing::sley_worktree::refresh_index_paths(
         worktree_root,
         git_dir,
         format,
@@ -2208,7 +2208,7 @@ fn index_gitlink_at_path<'a>(entries: &'a [IndexEntry], path: &[u8]) -> Option<&
     let range = add_index_entries_path_range(entries, path);
     entries[range]
         .iter()
-        .find(|entry| entry.stage() == sley_index::Stage::Normal && entry.mode == 0o160000)
+        .find(|entry| entry.stage() == sley::plumbing::sley_index::Stage::Normal && entry.mode == 0o160000)
         .map(|entry| entry.path.as_bytes())
 }
 
@@ -2272,7 +2272,7 @@ fn warn_on_embedded_repos(
         let AddAction::Add(path) = action else {
             continue;
         };
-        if !path.is_dir() || sley_diff_merge::gitlink_git_dir(path).is_none() {
+        if !path.is_dir() || sley::plumbing::sley_diff_merge::gitlink_git_dir(path).is_none() {
             continue;
         }
         let Ok(relative) = path.strip_prefix(worktree_root) else {
@@ -2316,7 +2316,7 @@ fn warn_on_embedded_repos(
 
 fn actions_may_add_embedded_repo(actions: &[AddAction]) -> bool {
     actions.iter().any(|action| match action {
-        AddAction::Add(path) => path.is_dir() && sley_diff_merge::gitlink_git_dir(path).is_some(),
+        AddAction::Add(path) => path.is_dir() && sley::plumbing::sley_diff_merge::gitlink_git_dir(path).is_some(),
         AddAction::Remove(_) => false,
     })
 }
@@ -2439,12 +2439,12 @@ fn resolve_add_regular_actions(
             ignored_paths.insert(ignored_path);
         }
     }
-    sley_worktree::stream_short_status(worktree_root, git_dir, format, |entry| {
+    sley::plumbing::sley_worktree::stream_short_status(worktree_root, git_dir, format, |entry| {
         let actionable = (entry.index == b'?' && entry.worktree == b'?')
             || entry.worktree == b'M'
             || entry.worktree == b'D';
         if !actionable {
-            return Ok(sley_worktree::StreamControl::Continue);
+            return Ok(sley::plumbing::sley_worktree::StreamControl::Continue);
         }
         let path = worktree_root.join(
             std::str::from_utf8(entry.path)
@@ -2458,10 +2458,10 @@ fn resolve_add_regular_actions(
             }
         }
         if !path_matches {
-            return Ok(sley_worktree::StreamControl::Continue);
+            return Ok(sley::plumbing::sley_worktree::StreamControl::Continue);
         }
         if entry.worktree == b'D' && options.ignore_removal {
-            return Ok(sley_worktree::StreamControl::Continue);
+            return Ok(sley::plumbing::sley_worktree::StreamControl::Continue);
         }
         if seen.insert(path.clone()) {
             let action = if entry.worktree == b'D' {
@@ -2471,7 +2471,7 @@ fn resolve_add_regular_actions(
             };
             actions.push(action);
         }
-        Ok(sley_worktree::StreamControl::Continue)
+        Ok(sley::plumbing::sley_worktree::StreamControl::Continue)
     })?;
     if options.chmod.is_some() || options.force {
         // `--force` stages paths the status walk never reports (gitignored
@@ -2533,11 +2533,11 @@ fn collect_add_ignored_pathspec_matches(
 
     let mut candidates = BTreeSet::new();
     for directory in [false, true] {
-        let ignored = sley_worktree::untracked_paths_with_options(
+        let ignored = sley::plumbing::sley_worktree::untracked_paths_with_options(
             worktree_root,
             git_dir,
             format,
-            sley_worktree::UntrackedPathOptions {
+            sley::plumbing::sley_worktree::UntrackedPathOptions {
                 directory,
                 no_empty_directory: false,
                 preserve_ignored_directories: false,
@@ -2585,7 +2585,7 @@ fn add_all_index_paths(
             .map(|entry| entry.path.as_bytes().to_vec())
             .collect());
     }
-    Ok(sley_worktree::read_repository_index(git_dir, format)?
+    Ok(sley::plumbing::sley_worktree::read_repository_index(git_dir, format)?
         .map(|index| {
             index
                 .entries
@@ -2639,7 +2639,7 @@ fn ignored_missing_add_pathspec(
         return Ok(None);
     }
     Ok(
-        sley_worktree::standard_ignore_match(worktree_root, &git_path, false)?
+        sley::plumbing::sley_worktree::standard_ignore_match(worktree_root, &git_path, false)?
             .filter(|ignore_match| ignore_match.ignored)
             .map(|_| git_path),
     )
@@ -2673,7 +2673,7 @@ fn add_ignored_display_path(
         prefix.extend_from_slice(component);
         let prefix_path = worktree_path_from_git_path(worktree_root, &prefix)?;
         let is_dir = prefix_path.is_dir();
-        if sley_worktree::standard_ignore_match(worktree_root, &prefix, is_dir)?
+        if sley::plumbing::sley_worktree::standard_ignore_match(worktree_root, &prefix, is_dir)?
             .is_some_and(|ignore_match| ignore_match.ignored)
         {
             return Ok(prefix);
@@ -2734,11 +2734,11 @@ fn resolve_add_regular_tracked_exact_actions(
     let Some(index) = index else {
         return Ok(None);
     };
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     let index_mtime = fs::metadata(&index_path)
         .ok()
-        .and_then(|metadata| sley_index::file_mtime_parts(&metadata));
-    let stat_cache = sley_index::IndexStatCache::from_index_mtime_only(index_mtime);
+        .and_then(|metadata| sley::plumbing::sley_index::file_mtime_parts(&metadata));
+    let stat_cache = sley::plumbing::sley_index::IndexStatCache::from_index_mtime_only(index_mtime);
     let mut actions = Vec::new();
     let mut exact_tracked = None;
     let single_path = paths.len() == 1;
@@ -2760,7 +2760,7 @@ fn resolve_add_regular_tracked_exact_actions(
         }
         if index.entries[range.clone()]
             .iter()
-            .any(|entry| entry.stage() != sley_index::Stage::Normal || entry.is_skip_worktree())
+            .any(|entry| entry.stage() != sley::plumbing::sley_index::Stage::Normal || entry.is_skip_worktree())
         {
             return Ok(None);
         }
@@ -2854,7 +2854,7 @@ fn reject_add_paths_outside_sparse_checkout(
         {
             git_path.push(b'/');
         }
-        if !sley_worktree::path_in_sparse_checkout(&git_path, &active.sparse, active.mode) {
+        if !sley::plumbing::sley_worktree::path_in_sparse_checkout(&git_path, &active.sparse, active.mode) {
             rejected.push(path.to_string_lossy().replace('\\', "/"));
         }
     }
@@ -2875,8 +2875,8 @@ fn reject_add_paths_outside_sparse_checkout(
 }
 
 struct ActiveSparseCheckoutForAdd {
-    sparse: sley_worktree::SparseCheckout,
-    mode: sley_worktree::SparseCheckoutMode,
+    sparse: sley::plumbing::sley_worktree::SparseCheckout,
+    mode: sley::plumbing::sley_worktree::SparseCheckoutMode,
 }
 
 fn active_sparse_checkout_for_add(git_dir: &Path) -> Result<Option<ActiveSparseCheckoutForAdd>> {
@@ -2904,14 +2904,14 @@ fn active_sparse_checkout_for_add(git_dir: &Path) -> Result<Option<ActiveSparseC
         .get_bool("core", None, "sparseCheckoutCone")
         .or_else(|| repo_config.get_bool("core", None, "sparseCheckoutCone"))
         .unwrap_or(false);
-    let sparse = sley_worktree::SparseCheckout {
+    let sparse = sley::plumbing::sley_worktree::SparseCheckout {
         patterns,
         sparse_index: false,
     };
     let mode = if cone {
-        sley_worktree::SparseCheckoutMode::Cone
+        sley::plumbing::sley_worktree::SparseCheckoutMode::Cone
     } else {
-        sley_worktree::SparseCheckoutMode::Full
+        sley::plumbing::sley_worktree::SparseCheckoutMode::Full
     };
     Ok(Some(ActiveSparseCheckoutForAdd { sparse, mode }))
 }
@@ -3029,9 +3029,9 @@ fn collect_add_files(
         (Ok(left), Ok(right)) => left == right,
         _ => directory == worktree_root,
     };
-    let active_repository = sley_diff_merge::gitlink_git_dir(directory)
+    let active_repository = sley::plumbing::sley_diff_merge::gitlink_git_dir(directory)
         .is_some_and(|embedded| paths_refer_to_same_dir(&embedded, git_dir));
-    if !is_root && !active_repository && sley_diff_merge::gitlink_git_dir(directory).is_some() {
+    if !is_root && !active_repository && sley::plumbing::sley_diff_merge::gitlink_git_dir(directory).is_some() {
         out.insert(directory.to_path_buf());
         return Ok(());
     }
@@ -3252,7 +3252,7 @@ pub(crate) fn cmd_clean(args: &[String]) -> Result<()> {
 }
 
 fn clean_target_is_original_cwd(path: &Path) -> bool {
-    let Some(cwd) = sley_core::original_cwd().or_else(|| env::current_dir().ok()) else {
+    let Some(cwd) = sley::plumbing::sley_core::original_cwd().or_else(|| env::current_dir().ok()) else {
         return false;
     };
     let cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
@@ -3442,7 +3442,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     for (name, input) in &inputs {
         validate_apply_input(input, name)?;
         patches.extend(
-            sley_diff_merge::parse_unified_patch_with_recount(input, recount).map_err(|err| {
+            sley::plumbing::sley_diff_merge::parse_unified_patch_with_recount(input, recount).map_err(|err| {
                 match err {
                     GitError::InvalidFormat(message)
                         if message.starts_with("malformed hunk header") =>
@@ -3491,7 +3491,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             let mut rule = ws_resolver.rule_for_path(target)?;
             // A symlink's incomplete line is not news (apply.c clears it).
             if patch.new_mode == Some(0o120000) {
-                rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
+                rule &= !sley::plumbing::sley_diff_merge::ws::WS_INCOMPLETE_LINE;
             }
             let base = read_patch_base(&worktree_root, patch)?;
             apply_patch_whitespace(
@@ -3539,9 +3539,9 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let mut actions = Vec::new();
     for patch in &patches {
         let base = read_patch_base(&worktree_root, patch)?;
-        let content = match sley_diff_merge::apply_file_patch(&base, patch) {
-            sley_diff_merge::ApplyOutcome::Applied(content) => content,
-            sley_diff_merge::ApplyOutcome::Rejected => {
+        let content = match sley::plumbing::sley_diff_merge::apply_file_patch(&base, patch) {
+            sley::plumbing::sley_diff_merge::ApplyOutcome::Applied(content) => content,
+            sley::plumbing::sley_diff_merge::ApplyOutcome::Rejected => {
                 let name = patch
                     .new_path
                     .as_deref()
@@ -3594,12 +3594,12 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     }
     if update_index && !index_paths.is_empty() {
         let config = read_repo_config(&git_dir)?;
-        sley_worktree::update_index_paths_filtered(
+        sley::plumbing::sley_worktree::update_index_paths_filtered(
             &worktree_root,
             &git_dir,
             format,
             &index_paths,
-            sley_worktree::UpdateIndexOptions {
+            sley::plumbing::sley_worktree::UpdateIndexOptions {
                 add: true,
                 remove: true,
                 force_remove: false,
@@ -3625,7 +3625,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
 fn write_apply_fake_ancestor_index(
     git_dir: &Path,
     format: ObjectFormat,
-    patches: &[sley_diff_merge::FilePatch],
+    patches: &[sley::plumbing::sley_diff_merge::FilePatch],
     inputs: &[(String, Vec<u8>)],
     path: &str,
 ) -> Result<()> {
@@ -3638,11 +3638,11 @@ fn write_apply_fake_ancestor_index(
         let Some(path) = patch.old_path.as_ref().or(patch.new_path.as_ref()) else {
             continue;
         };
-        let oid = sley_rev::resolve_short_object_id(
+        let oid = sley::plumbing::sley_rev::resolve_short_object_id(
             git_dir,
             format,
             &index_record.old_oid,
-            sley_rev::ObjectDisambiguation::Blob,
+            sley::plumbing::sley_rev::ObjectDisambiguation::Blob,
         )?
         .into_result(&index_record.old_oid)?;
         let mode = index_record
@@ -3730,7 +3730,7 @@ fn read_apply_inputs(files: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
 }
 
 fn write_apply_read_only_output(
-    patches: &[sley_diff_merge::FilePatch],
+    patches: &[sley::plumbing::sley_diff_merge::FilePatch],
     stat: bool,
     numstat: bool,
     summary: bool,
@@ -3820,8 +3820,8 @@ fn apply_stat_scale(value: usize, width: usize, max_change: usize) -> usize {
 }
 
 fn apply_patch_name_status_entry(
-    patch: &sley_diff_merge::FilePatch,
-) -> sley_diff_merge::NameStatusEntry {
+    patch: &sley::plumbing::sley_diff_merge::FilePatch,
+) -> sley::plumbing::sley_diff_merge::NameStatusEntry {
     let path = patch
         .new_path
         .as_ref()
@@ -3829,13 +3829,13 @@ fn apply_patch_name_status_entry(
         .cloned()
         .unwrap_or_default();
     let status = if patch.is_new {
-        sley_diff_merge::NameStatus::Added
+        sley::plumbing::sley_diff_merge::NameStatus::Added
     } else if patch.is_delete {
-        sley_diff_merge::NameStatus::Deleted
+        sley::plumbing::sley_diff_merge::NameStatus::Deleted
     } else {
-        sley_diff_merge::NameStatus::Modified
+        sley::plumbing::sley_diff_merge::NameStatus::Modified
     };
-    sley_diff_merge::NameStatusEntry {
+    sley::plumbing::sley_diff_merge::NameStatusEntry {
         status,
         path: BString::from(path),
         old_path: None,
@@ -3846,15 +3846,15 @@ fn apply_patch_name_status_entry(
     }
 }
 
-fn apply_patch_line_stats(patch: &sley_diff_merge::FilePatch) -> DiffLineStats {
+fn apply_patch_line_stats(patch: &sley::plumbing::sley_diff_merge::FilePatch) -> DiffLineStats {
     let mut inserted = 0usize;
     let mut deleted = 0usize;
     for hunk in &patch.hunks {
         for line in &hunk.lines {
             match line {
-                sley_diff_merge::HunkLine::Insert(_) => inserted += 1,
-                sley_diff_merge::HunkLine::Delete(_) => deleted += 1,
-                sley_diff_merge::HunkLine::Context(_) => {}
+                sley::plumbing::sley_diff_merge::HunkLine::Insert(_) => inserted += 1,
+                sley::plumbing::sley_diff_merge::HunkLine::Delete(_) => deleted += 1,
+                sley::plumbing::sley_diff_merge::HunkLine::Context(_) => {}
             }
         }
     }
@@ -3863,7 +3863,7 @@ fn apply_patch_line_stats(patch: &sley_diff_merge::FilePatch) -> DiffLineStats {
 
 fn write_apply_summary_entry(
     stdout: &mut dyn Write,
-    patch: &sley_diff_merge::FilePatch,
+    patch: &sley::plumbing::sley_diff_merge::FilePatch,
 ) -> Result<()> {
     if patch.is_rename {
         if let (Some(old_path), Some(new_path)) = (&patch.old_path, &patch.new_path) {
@@ -3917,11 +3917,11 @@ fn write_apply_summary_entry(
     Ok(())
 }
 
-fn apply_patch_old_mode(patch: &sley_diff_merge::FilePatch) -> Option<u32> {
+fn apply_patch_old_mode(patch: &sley::plumbing::sley_diff_merge::FilePatch) -> Option<u32> {
     if patch.is_new { None } else { patch.old_mode }
 }
 
-fn apply_patch_new_mode(patch: &sley_diff_merge::FilePatch) -> Option<u32> {
+fn apply_patch_new_mode(patch: &sley::plumbing::sley_diff_merge::FilePatch) -> Option<u32> {
     if patch.is_delete {
         None
     } else {
@@ -4109,7 +4109,7 @@ fn apply_trim_ascii_end(bytes: &[u8]) -> &[u8] {
 
 fn apply_write_mode(
     worktree_root: &Path,
-    patch: &sley_diff_merge::FilePatch,
+    patch: &sley::plumbing::sley_diff_merge::FilePatch,
     target: &[u8],
 ) -> Result<u32> {
     if let Some(mode) = patch.new_mode {
@@ -4151,7 +4151,7 @@ impl ApplyAction {
 
 /// Read the worktree base content a patch applies against (empty for a new
 /// file). Shared by the whitespace pass and the apply pass.
-fn read_patch_base(worktree_root: &Path, patch: &sley_diff_merge::FilePatch) -> Result<Vec<u8>> {
+fn read_patch_base(worktree_root: &Path, patch: &sley::plumbing::sley_diff_merge::FilePatch) -> Result<Vec<u8>> {
     if patch.is_new {
         return Ok(Vec::new());
     }
@@ -4182,17 +4182,17 @@ fn parse_ws_action(value: &str) -> Result<WsAction> {
 /// its `check_whitespace`. Mutates the patch's Insert lines in `fix` mode.
 #[allow(clippy::too_many_arguments)]
 fn apply_patch_whitespace(
-    patch: &mut sley_diff_merge::FilePatch,
+    patch: &mut sley::plumbing::sley_diff_merge::FilePatch,
     base: &[u8],
-    rule: sley_diff_merge::ws::WsRule,
+    rule: sley::plumbing::sley_diff_merge::ws::WsRule,
     action: WsAction,
     patch_input_file: &str,
     squelch_limit: usize,
     error_count: &mut usize,
     squelched: &mut usize,
 ) {
-    use sley_diff_merge::HunkLine;
-    use sley_diff_merge::ws;
+    use sley::plumbing::sley_diff_merge::HunkLine;
+    use sley::plumbing::sley_diff_merge::ws;
 
     let fixing = matches!(action, WsAction::Fix);
 
@@ -4247,9 +4247,9 @@ fn apply_patch_whitespace(
 
     // Blank-at-EOF: compare the trailing-blank run of the pre- and post-images.
     if rule & ws::WS_BLANK_AT_EOF != 0 {
-        let postimage = match sley_diff_merge::apply_file_patch(base, patch) {
-            sley_diff_merge::ApplyOutcome::Applied(content) => content,
-            sley_diff_merge::ApplyOutcome::Rejected => return,
+        let postimage = match sley::plumbing::sley_diff_merge::apply_file_patch(base, patch) {
+            sley::plumbing::sley_diff_merge::ApplyOutcome::Applied(content) => content,
+            sley::plumbing::sley_diff_merge::ApplyOutcome::Rejected => return,
         };
         let l1 = ws::count_trailing_blank(base);
         let l2 = ws::count_trailing_blank(&postimage);
@@ -4277,9 +4277,9 @@ fn apply_patch_whitespace(
 
 /// Drop up to `count` trailing blank `Insert` lines from the patch's last hunk
 /// (the `--whitespace=fix` blank-at-EOF correction).
-fn trim_trailing_blank_inserts(patch: &mut sley_diff_merge::FilePatch, mut count: usize) {
-    use sley_diff_merge::HunkLine;
-    use sley_diff_merge::ws;
+fn trim_trailing_blank_inserts(patch: &mut sley::plumbing::sley_diff_merge::FilePatch, mut count: usize) {
+    use sley::plumbing::sley_diff_merge::HunkLine;
+    use sley::plumbing::sley_diff_merge::ws;
     let Some(hunk) = patch.hunks.last_mut() else {
         return;
     };
@@ -4346,7 +4346,7 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
 
     // Resolve `fsck.<msgid>` severity overrides from the repo config (folds in
     // command-line `-c fsck.x=y` via GIT_CONFIG_PARAMETERS).
-    let mut severity = sley_fsck::SeverityConfig::new(strict);
+    let mut severity = sley::plumbing::sley_fsck::SeverityConfig::new(strict);
     if let Ok(config) = read_repo_config(&git_dir) {
         for (key, value) in config.fsck_entries() {
             severity.set(&key, &value);
@@ -4390,9 +4390,9 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
         match db.read_object(oid) {
             Ok(object) => {
                 // A branch ref must point at a commit.
-                if object.object_type != sley_object::ObjectType::Commit && is_branch_ref(name) {
+                if object.object_type != sley::plumbing::sley_object::ObjectType::Commit && is_branch_ref(name) {
                     eprintln!("error: {name}: not a commit");
-                    ref_error_bits |= sley_fsck::ERROR_REFS;
+                    ref_error_bits |= sley::plumbing::sley_fsck::ERROR_REFS;
                 }
                 roots.push(*oid);
                 if name_objects {
@@ -4401,7 +4401,7 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
             }
             Err(_) => {
                 eprintln!("error: {name}: invalid sha1 pointer {oid}");
-                ref_error_bits |= sley_fsck::ERROR_REACHABLE;
+                ref_error_bits |= sley::plumbing::sley_fsck::ERROR_REACHABLE;
             }
         }
     }
@@ -4485,12 +4485,12 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     if roots.is_empty() && progress {
         eprintln!("notice: No default references");
     }
-    let report = sley_fsck::fsck_objects_with_options(
+    let report = sley::plumbing::sley_fsck::fsck_objects_with_options(
         &db,
         format,
         roots,
         object_ids,
-        sley_fsck::FsckOptions {
+        sley::plumbing::sley_fsck::FsckOptions {
             report_dangling,
             report_unreachable,
             connectivity_only,
@@ -4506,8 +4506,8 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     }
     for issue in &report.issues {
         match issue.stream {
-            sley_fsck::IssueStream::Stdout => println!("{}", issue.message),
-            sley_fsck::IssueStream::Stderr => eprintln!("{}", issue.message),
+            sley::plumbing::sley_fsck::IssueStream::Stdout => println!("{}", issue.message),
+            sley::plumbing::sley_fsck::IssueStream::Stderr => eprintln!("{}", issue.message),
         }
     }
     // git's exit status is the OR of its `ERROR_*` bits. The connectivity
@@ -4515,10 +4515,10 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     // bogus explicit head sets ERROR_OBJECT.
     let mut exit_bits = report.exit_code();
     if loose_errors {
-        exit_bits |= sley_fsck::ERROR_OBJECT;
+        exit_bits |= sley::plumbing::sley_fsck::ERROR_OBJECT;
     }
     if alternate_loose_errors || pack_errors {
-        exit_bits |= sley_fsck::ERROR_OBJECT;
+        exit_bits |= sley::plumbing::sley_fsck::ERROR_OBJECT;
     }
     // git's `snapshot_ref` errors (invalid sha1 pointer / not a commit) set
     // ERROR_REACHABLE / ERROR_REFS — not ERROR_OBJECT.
@@ -4615,7 +4615,7 @@ fn fsck_alternate_loose_objects(git_dir: &Path, format: ObjectFormat, cwd: &Path
         } else {
             objects_dir.join(alternate)
         };
-        let store = sley_odb::LooseObjectStore::new(&alternate, format);
+        let store = sley::plumbing::sley_odb::LooseObjectStore::new(&alternate, format);
         for oid in store.object_ids()? {
             let hex = oid.to_hex();
             let display_path = fsck_display_path(&alternate.join(&hex[..2]).join(&hex[2..]), cwd);
@@ -4653,7 +4653,7 @@ fn fsck_pack_files(git_dir: &Path, format: ObjectFormat, cwd: &Path) -> Result<b
         let trailer_len = format.raw_len();
         if bytes.len() >= 12 + trailer_len {
             let trailer_offset = bytes.len() - trailer_len;
-            let actual = sley_core::digest_bytes(format, &bytes[..trailer_offset])?;
+            let actual = sley::plumbing::sley_core::digest_bytes(format, &bytes[..trailer_offset])?;
             let expected = ObjectId::from_raw(format, &bytes[trailer_offset..])?;
             if actual != expected {
                 eprintln!("error: checksum mismatch in {display_path}");
@@ -4669,7 +4669,7 @@ fn fsck_pack_files(git_dir: &Path, format: ObjectFormat, cwd: &Path) -> Result<b
         let Ok(index_bytes) = fs::read(&idx_path) else {
             continue;
         };
-        let Ok(index) = sley_pack::PackIndex::parse(&index_bytes, format) else {
+        let Ok(index) = sley::plumbing::sley_pack::PackIndex::parse(&index_bytes, format) else {
             continue;
         };
         let trailer_offset = bytes.len() - trailer_len;
@@ -4740,7 +4740,7 @@ fn fsck_worktree_head_refs(
         match target {
             RefTarget::Direct(oid) if oid.is_null() => {
                 eprintln!("error: {display}: badRefOid: points to invalid object ID '{oid}'");
-                bits |= sley_fsck::ERROR_REFS;
+                bits |= sley::plumbing::sley_fsck::ERROR_REFS;
             }
             RefTarget::Direct(oid) => {
                 if db.contains(&oid).unwrap_or(false) {
@@ -4750,7 +4750,7 @@ fn fsck_worktree_head_refs(
                     }
                 } else {
                     eprintln!("error: {display}: invalid sha1 pointer {oid}");
-                    bits |= sley_fsck::ERROR_REACHABLE;
+                    bits |= sley::plumbing::sley_fsck::ERROR_REACHABLE;
                 }
             }
             RefTarget::Symbolic(target) => {
@@ -4758,10 +4758,10 @@ fn fsck_worktree_head_refs(
                     eprintln!(
                         "error: {display}: badHeadTarget: HEAD points to non-branch '{target}'"
                     );
-                    bits |= sley_fsck::ERROR_REFS;
+                    bits |= sley::plumbing::sley_fsck::ERROR_REFS;
                     continue;
                 }
-                let reference = sley_refs::Ref {
+                let reference = sley::plumbing::sley_refs::Ref {
                     name: "HEAD".to_string(),
                     target: RefTarget::Symbolic(target),
                 };
@@ -4798,7 +4798,7 @@ fn fsck_index_roots(
     // worktree's index (annotation prefix `<index-path>`), mirroring git's
     // get_worktrees() order with the current worktree's blank filename.
     let mut indexes: Vec<(PathBuf, bool, String)> = Vec::new();
-    let current_index = sley_worktree::repository_index_path(git_dir);
+    let current_index = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     indexes.push((current_index, true, String::new()));
     // Linked worktrees: <common_git_dir>/worktrees/<name>/index. Their reports
     // carry the index path (relative to the cwd-rooted .git when possible).
@@ -4831,7 +4831,7 @@ fn fsck_index_roots(
         if !index_checksum_ok(&index_bytes, format) {
             eprintln!("error: bad index file sha1 signature");
             eprintln!("fatal: index file corrupt");
-            bits |= sley_fsck::ERROR_OBJECT;
+            bits |= sley::plumbing::sley_fsck::ERROR_OBJECT;
             continue;
         }
         let index = match Index::parse(&index_bytes, format) {
@@ -4857,7 +4857,7 @@ fn fsck_index_roots(
             } else {
                 println!("missing blob {oid}");
             }
-            bits |= sley_fsck::ERROR_REACHABLE;
+            bits |= sley::plumbing::sley_fsck::ERROR_REACHABLE;
         }
         // Cache-tree: each recorded (non-invalidated) subtree oid must be a
         // valid tree. git: `<oid>: invalid sha1 pointer in cache-tree of
@@ -4874,7 +4874,7 @@ fn fsck_index_roots(
 /// tree oids to `roots` so they are marked reachable.
 fn fsck_cache_tree(
     db: &FileObjectDatabase,
-    node: &sley_index::CacheTree,
+    node: &sley::plumbing::sley_index::CacheTree,
     index_path: &Path,
     roots: &mut Vec<ObjectId>,
 ) -> i32 {
@@ -4883,20 +4883,20 @@ fn fsck_cache_tree(
         && let Some(oid) = &node.oid
     {
         match db.read_object(oid) {
-            Ok(object) if object.object_type == sley_object::ObjectType::Tree => {
+            Ok(object) if object.object_type == sley::plumbing::sley_object::ObjectType::Tree => {
                 roots.push(oid.clone());
             }
             Ok(_) => {
                 // Present but not a tree: git's `non-tree in cache-tree`.
                 eprintln!("error in cache-tree of {}: non-tree", index_path.display());
-                bits |= sley_fsck::ERROR_OBJECT;
+                bits |= sley::plumbing::sley_fsck::ERROR_OBJECT;
             }
             Err(_) => {
                 eprintln!(
                     "error: {oid}: invalid sha1 pointer in cache-tree of {}",
                     index_path.display()
                 );
-                bits |= sley_fsck::ERROR_REFS;
+                bits |= sley::plumbing::sley_fsck::ERROR_REFS;
             }
         }
     }
@@ -4915,7 +4915,7 @@ fn index_checksum_ok(bytes: &[u8], format: ObjectFormat) -> bool {
         return false;
     }
     let split = bytes.len() - hash_len;
-    match sley_core::digest_bytes(format, &bytes[..split]) {
+    match sley::plumbing::sley_core::digest_bytes(format, &bytes[..split]) {
         Ok(actual) => actual.as_bytes() == &bytes[split..],
         Err(_) => false,
     }
@@ -5828,12 +5828,12 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
         })
         .collect::<Vec<_>>();
     let config_parameters_env = effective_config_parameters_env();
-    let result = sley_worktree::remove_index_and_worktree_paths(
+    let result = sley::plumbing::sley_worktree::remove_index_and_worktree_paths(
         worktree_root,
         git_dir,
         format,
         &resolved_paths,
-        sley_worktree::RemoveOptions {
+        sley::plumbing::sley_worktree::RemoveOptions {
             recursive,
             cached,
             force,
@@ -5932,13 +5932,13 @@ pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
         } else {
             cwd.join(source)
         };
-        let result = sley_worktree::move_index_and_worktree_path(
+        let result = sley::plumbing::sley_worktree::move_index_and_worktree_path(
             &worktree_root,
             &git_dir,
             format,
             &source,
             &destination,
-            sley_worktree::MoveOptions {
+            sley::plumbing::sley_worktree::MoveOptions {
                 force,
                 dry_run,
                 skip_errors,
@@ -6092,15 +6092,15 @@ fn clean_targets(
     let has_pathspec = !pathspec.filters.is_empty();
     // Git treats any pathspec as `-d` for selection purposes.
     let effective_directories = directories || has_pathspec;
-    let index = sley_worktree::read_repository_index(git_dir, format)?;
+    let index = sley::plumbing::sley_worktree::read_repository_index(git_dir, format)?;
     let exclude_patterns = clean_exclude_patterns(git_dir, format, index.as_ref(), excludes)?;
 
     let mut paths = if effective_directories {
-        sley_worktree::untracked_paths_with_options(
+        sley::plumbing::sley_worktree::untracked_paths_with_options(
             worktree_root,
             git_dir,
             format,
-            sley_worktree::UntrackedPathOptions {
+            sley::plumbing::sley_worktree::UntrackedPathOptions {
                 directory: true,
                 no_empty_directory: false,
                 preserve_ignored_directories: directories && ignore_mode == CleanIgnoreMode::Normal,
@@ -6112,11 +6112,11 @@ fn clean_targets(
             },
         )?
     } else {
-        sley_worktree::untracked_paths_with_options(
+        sley::plumbing::sley_worktree::untracked_paths_with_options(
             worktree_root,
             git_dir,
             format,
-            sley_worktree::UntrackedPathOptions {
+            sley::plumbing::sley_worktree::UntrackedPathOptions {
                 directory: false,
                 no_empty_directory: false,
                 preserve_ignored_directories: false,
@@ -6178,7 +6178,7 @@ fn clean_exclude_patterns(
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     for entry in &index.entries {
-        if entry.stage() != sley_index::Stage::Normal
+        if entry.stage() != sley::plumbing::sley_index::Stage::Normal
             || !entry.is_skip_worktree()
             || entry.path.as_bytes() != b".gitignore"
         {
@@ -6534,7 +6534,7 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
     // so `-c commitGraph.generationVersion=1` / `-c commitGraph.changedPaths=…`
     // on the write invocation take effect.
     let repo_config =
-        sley_config::read_repo_config(&git_dir, effective_config_parameters_env().as_deref()).ok();
+        sley::plumbing::sley_config::read_repo_config(&git_dir, effective_config_parameters_env().as_deref()).ok();
     let changed_paths_version = commit_graph_changed_paths_version(repo_config.as_ref())?;
     if !(-1..=2).contains(&changed_paths_version) {
         eprintln!(
@@ -6788,13 +6788,13 @@ fn write_split_commit_graph_file(
     let bloom_settings = full_graph
         .bloom_filters
         .as_ref()
-        .map(|filters| sley_formats::CommitGraphBloomSettings {
+        .map(|filters| sley::plumbing::sley_formats::CommitGraphBloomSettings {
             hash_version: filters.hash_version,
             hash_count: filters.hash_count,
             bits_per_entry: filters.bits_per_entry,
-            max_changed_paths: sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS.max_changed_paths,
+            max_changed_paths: sley::plumbing::sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS.max_changed_paths,
         })
-        .unwrap_or(sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS);
+        .unwrap_or(sley::plumbing::sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS);
     let graph = CommitGraph::write_with_base_options(
         format,
         &new_entries,
@@ -7038,7 +7038,7 @@ fn write_reachable_commit_graph(
     object_dir: &Path,
     format: ObjectFormat,
     changed_paths: bool,
-    bloom_settings: sley_formats::CommitGraphBloomSettings,
+    bloom_settings: sley::plumbing::sley_formats::CommitGraphBloomSettings,
     write_generation_data: bool,
     max_new_filters: Option<usize>,
     existing_filters: &HashMap<ObjectId, Vec<u8>>,
@@ -7076,7 +7076,7 @@ fn commit_graph_packed_commit_starts(
 ) -> Result<Vec<ObjectId>> {
     let mut starts = Vec::new();
     let mut seen = HashSet::new();
-    for oid in sley_odb::packed_object_ids(object_dir, format)? {
+    for oid in sley::plumbing::sley_odb::packed_object_ids(object_dir, format)? {
         let Ok(object) = db.read_object(&oid) else {
             continue;
         };
@@ -7138,7 +7138,7 @@ fn commit_graph_commit_oids_in_pack(
         pack_path.to_path_buf()
     };
     let index_bytes = fs::read(&idx_path)?;
-    let index = sley_pack::PackIndex::parse(&index_bytes, format)?;
+    let index = sley::plumbing::sley_pack::PackIndex::parse(&index_bytes, format)?;
     let mut oids = Vec::new();
     for entry in index.entries {
         if let Ok(object) = db.read_object(&entry.oid)
@@ -7577,7 +7577,7 @@ fn verify_commit_graph_bytes(
     // Checksum validation (git: commit_graph_checksum_valid).
     let hash_len = parsed.hash_len;
     let checksum_offset = bytes.len() - hash_len;
-    let actual = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
+    let actual = sley::plumbing::sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
     let stored = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
     if actual != stored {
         eprintln!("error: the commit-graph file has incorrect checksum and is likely corrupt");
@@ -7856,7 +7856,7 @@ fn commit_graph_for_reachable_refs(
     object_dir: &Path,
     format: ObjectFormat,
     changed_paths: bool,
-    bloom_settings: sley_formats::CommitGraphBloomSettings,
+    bloom_settings: sley::plumbing::sley_formats::CommitGraphBloomSettings,
     write_generation_data: bool,
     max_new_filters: Option<usize>,
     existing_filters: &HashMap<ObjectId, Vec<u8>>,
@@ -7870,14 +7870,14 @@ fn commit_graph_for_reachable_refs(
         let RefTarget::Direct(oid) = reference.target else {
             continue;
         };
-        if let Ok(commit) = sley_rev::peel_to_commit(&db, format, &oid)
+        if let Ok(commit) = sley::plumbing::sley_rev::peel_to_commit(&db, format, &oid)
             && seen_starts.insert(commit)
         {
             starts.push(commit);
         }
     }
     if let Ok(head) = resolve_revision(git_dir, format, "HEAD")
-        && let Ok(commit) = sley_rev::peel_to_commit(&db, format, &head)
+        && let Ok(commit) = sley::plumbing::sley_rev::peel_to_commit(&db, format, &head)
         && seen_starts.insert(commit)
     {
         starts.push(commit);
@@ -7903,7 +7903,7 @@ fn commit_graph_from_starts(
     format: ObjectFormat,
     starts: Vec<ObjectId>,
     changed_paths: bool,
-    bloom_settings: sley_formats::CommitGraphBloomSettings,
+    bloom_settings: sley::plumbing::sley_formats::CommitGraphBloomSettings,
     write_generation_data: bool,
     max_new_filters: Option<usize>,
     existing_filters: &HashMap<ObjectId, Vec<u8>>,
@@ -7914,7 +7914,7 @@ fn commit_graph_from_starts(
     // with `unable to parse commit <oid>` (exit 128). `walk_commits` surfaces a
     // generic read/parse error instead, so map it to git's diagnostic by
     // re-checking which oid in the closure is unparseable.
-    let records = match sley_rev::walk_commits(db, format, starts.clone()) {
+    let records = match sley::plumbing::sley_rev::walk_commits(db, format, starts.clone()) {
         Ok(records) => records,
         Err(err) => {
             if let Some(oid) = commit_graph_first_unparseable_commit(db, format, &starts) {
@@ -7988,27 +7988,27 @@ fn commit_graph_from_starts(
     }
     if changed_paths {
         trace_commit_graph_bloom_settings(bloom_settings);
-        sley_core::trace2::data(
+        sley::plumbing::sley_core::trace2::data(
             "commit-graph",
             "filter-computed",
             bloom_stats.filter_computed,
         );
-        sley_core::trace2::data(
+        sley::plumbing::sley_core::trace2::data(
             "commit-graph",
             "filter-not-computed",
             bloom_stats.filter_not_computed,
         );
-        sley_core::trace2::data(
+        sley::plumbing::sley_core::trace2::data(
             "commit-graph",
             "filter-trunc-empty",
             bloom_stats.filter_trunc_empty,
         );
-        sley_core::trace2::data(
+        sley::plumbing::sley_core::trace2::data(
             "commit-graph",
             "filter-trunc-large",
             bloom_stats.filter_trunc_large,
         );
-        sley_core::trace2::data("commit-graph", "filter-upgraded", 0);
+        sley::plumbing::sley_core::trace2::data("commit-graph", "filter-upgraded", 0);
     }
     CommitGraph::write_with_options(format, &entries, bloom_settings, write_generation_data)
 }
@@ -8059,11 +8059,11 @@ enum CommitGraphBloomDisposition {
 fn commit_graph_bloom_filter_for_record(
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    record: &sley_rev::CommitRecord,
-    records: &HashMap<ObjectId, &sley_rev::CommitRecord>,
-    bloom_settings: sley_formats::CommitGraphBloomSettings,
+    record: &sley::plumbing::sley_rev::CommitRecord,
+    records: &HashMap<ObjectId, &sley::plumbing::sley_rev::CommitRecord>,
+    bloom_settings: sley::plumbing::sley_formats::CommitGraphBloomSettings,
 ) -> Result<(Vec<u8>, CommitGraphBloomDisposition)> {
-    let options = sley_diff_merge::DiffNameStatusOptions {
+    let options = sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
         detect_renames: false,
         detect_copies: false,
         find_copies_harder: false,
@@ -8078,7 +8078,7 @@ fn commit_graph_bloom_filter_for_record(
         if parent_tree == record.commit.tree {
             Vec::new()
         } else {
-            sley_diff_merge::diff_name_status_trees_with_options(
+            sley::plumbing::sley_diff_merge::diff_name_status_trees_with_options(
                 db,
                 format,
                 &parent_tree,
@@ -8087,7 +8087,7 @@ fn commit_graph_bloom_filter_for_record(
             )?
         }
     } else {
-        sley_diff_merge::diff_name_status_empty_tree_with_options(
+        sley::plumbing::sley_diff_merge::diff_name_status_empty_tree_with_options(
             db,
             format,
             &record.commit.tree,
@@ -8096,14 +8096,14 @@ fn commit_graph_bloom_filter_for_record(
     };
     if changes.is_empty() {
         return Ok((
-            sley_formats::commit_graph_bloom_filter_for_paths(
+            sley::plumbing::sley_formats::commit_graph_bloom_filter_for_paths(
                 std::iter::empty::<&[u8]>(),
                 bloom_settings,
             ),
             CommitGraphBloomDisposition::Empty,
         ));
     }
-    let filter = sley_formats::commit_graph_bloom_filter_for_paths(
+    let filter = sley::plumbing::sley_formats::commit_graph_bloom_filter_for_paths(
         changes.iter().map(|entry| entry.path.as_bytes()),
         bloom_settings,
     );
@@ -8118,25 +8118,25 @@ fn commit_graph_bloom_filter_for_record(
 /// `commitGraph.generationVersion` (git's `get_configured_generation_version`):
 /// defaults to 2, which writes the GDA2 corrected-commit-date chunk. A value of
 /// 1 selects the legacy topological-level-only layout (no GDA2/GDO2).
-fn commit_graph_generation_version(config: Option<&sley_config::GitConfig>) -> i64 {
+fn commit_graph_generation_version(config: Option<&sley::plumbing::sley_config::GitConfig>) -> i64 {
     config
         .and_then(
             |config| match config.get_entry("commitGraph", None, "generationVersion") {
-                Some(Some(value)) => sley_config::parse_config_int(value),
+                Some(Some(value)) => sley::plumbing::sley_config::parse_config_int(value),
                 _ => None,
             },
         )
         .unwrap_or(2)
 }
 
-fn commit_graph_changed_paths_version(config: Option<&sley_config::GitConfig>) -> Result<i64> {
+fn commit_graph_changed_paths_version(config: Option<&sley::plumbing::sley_config::GitConfig>) -> Result<i64> {
     let Some(config) = config else {
         return Ok(-1);
     };
     match config.get_entry("commitGraph", None, "changedPathsVersion") {
         Some(None) => return Ok(1),
         Some(Some(value)) => {
-            return sley_config::parse_config_int(value).ok_or_else(|| {
+            return sley::plumbing::sley_config::parse_config_int(value).ok_or_else(|| {
                 GitError::Command(format!(
                     "bad numeric config value '{value}' for 'commitGraph.changedPathsVersion'"
                 ))
@@ -8152,11 +8152,11 @@ fn commit_graph_changed_paths_version(config: Option<&sley_config::GitConfig>) -
 }
 
 fn commit_graph_bloom_settings_for_write(
-    existing: Option<sley_formats::CommitGraphBloomSettings>,
+    existing: Option<sley::plumbing::sley_formats::CommitGraphBloomSettings>,
     changed_paths_version: i64,
     honor_env: bool,
-) -> sley_formats::CommitGraphBloomSettings {
-    let mut settings = sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
+) -> sley::plumbing::sley_formats::CommitGraphBloomSettings {
+    let mut settings = sley::plumbing::sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
     if changed_paths_version == -1
         && let Some(existing) = existing
     {
@@ -8192,7 +8192,7 @@ fn commit_graph_bloom_settings_for_write(
 fn existing_commit_graph_bloom_settings(
     object_dir: &Path,
     format: ObjectFormat,
-) -> Result<Option<sley_formats::CommitGraphBloomSettings>> {
+) -> Result<Option<sley::plumbing::sley_formats::CommitGraphBloomSettings>> {
     let graph_path = object_dir.join("info").join("commit-graph");
     if graph_path.exists()
         && let Some(settings) = commit_graph_bloom_settings_from_file(&graph_path, format)
@@ -8220,11 +8220,11 @@ fn existing_commit_graph_bloom_settings(
 fn commit_graph_bloom_settings_from_file(
     path: &Path,
     format: ObjectFormat,
-) -> Option<sley_formats::CommitGraphBloomSettings> {
+) -> Option<sley::plumbing::sley_formats::CommitGraphBloomSettings> {
     let bytes = fs::read(path).ok()?;
     let graph = CommitGraph::parse(&bytes, format).ok()?;
     graph.bloom_filters.map(|filters| {
-        let mut settings = sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
+        let mut settings = sley::plumbing::sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
         settings.hash_version = filters.hash_version;
         settings.hash_count = filters.hash_count;
         settings.bits_per_entry = filters.bits_per_entry;
@@ -8279,7 +8279,7 @@ fn load_commit_graph_bloom_filters_from_file(
     }
 }
 
-fn trace_commit_graph_bloom_settings(settings: sley_formats::CommitGraphBloomSettings) {
+fn trace_commit_graph_bloom_settings(settings: sley::plumbing::sley_formats::CommitGraphBloomSettings) {
     let Some(target) = env::var_os("GIT_TRACE2_EVENT") else {
         return;
     };
@@ -8320,7 +8320,7 @@ fn read_commit_tree_for_graph(
 
 fn commit_graph_generation(
     oid: &ObjectId,
-    records: &HashMap<ObjectId, &sley_rev::CommitRecord>,
+    records: &HashMap<ObjectId, &sley::plumbing::sley_rev::CommitRecord>,
     cache: &mut HashMap<ObjectId, u32>,
 ) -> Result<u32> {
     if let Some(generation) = cache.get(oid) {
@@ -9249,7 +9249,7 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
         Ok(oid) => oid,
         Err(_) => {
             let tree_rev = resolve_revision_treeish(&git_dir, format, &tree)?;
-            sley_rev::peel_to_tree(&db_resolve, format, &tree_rev)?
+            sley::plumbing::sley_rev::peel_to_tree(&db_resolve, format, &tree_rev)?
         }
     };
     let parents = parents
@@ -9258,7 +9258,7 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
             Ok(oid) => Ok(oid),
             Err(_) => {
                 let resolved = resolve_revision_commitish(&git_dir, format, parent)?;
-                sley_rev::peel_to_commit(&db_resolve, format, &resolved)
+                sley::plumbing::sley_rev::peel_to_commit(&db_resolve, format, &resolved)
             }
         })
         .collect::<Result<Vec<_>>>()?;
@@ -9292,9 +9292,9 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
         None
     };
     let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let oid = sley_sequencer::create_commit(
+    let oid = sley::plumbing::sley_sequencer::create_commit(
         &mut db,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree,
             parents,
             author,

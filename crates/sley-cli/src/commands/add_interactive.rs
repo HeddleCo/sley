@@ -15,8 +15,8 @@ use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use sley_config::GitConfig;
-use sley_core::{GitError, Result};
+use sley::plumbing::sley_config::GitConfig;
+use sley::plumbing::sley_core::{GitError, Result};
 
 use crate::{discover_git_dir, worktree_root_for_git_dir};
 
@@ -85,10 +85,10 @@ impl InteractiveStyle {
         let color_ui = get("color", None, "ui");
         let enabled = match interactive
             .as_deref()
-            .and_then(sley_config::parse_config_bool)
+            .and_then(sley::plumbing::sley_config::parse_config_bool)
         {
             Some(value) => value,
-            None => match color_ui.as_deref().and_then(sley_config::parse_config_bool) {
+            None => match color_ui.as_deref().and_then(sley::plumbing::sley_config::parse_config_bool) {
                 Some(value) => value,
                 None => {
                     env::var("GIT_PAGER_IN_USE").is_ok()
@@ -1006,7 +1006,7 @@ fn patch_color_enabled(config: Option<&GitConfig>, slot: &str) -> bool {
         .or_else(|| config.and_then(|c| c.get("color", None, "ui")));
     match key.as_deref().map(str::trim) {
         Some("always") | Some("auto") => true,
-        Some(value) => sley_config::parse_config_bool(value).unwrap_or(false),
+        Some(value) => sley::plumbing::sley_config::parse_config_bool(value).unwrap_or(false),
         None => {
             env::var("GIT_PAGER_IN_USE").is_ok()
                 && env::var("TERM").is_ok_and(|term| term != "dumb")

@@ -277,21 +277,21 @@ pub(crate) fn signature_has_marker(signature: &[u8]) -> bool {
 fn gpg_program(config: Option<&GitConfig>) -> PathBuf {
     config
         .and_then(|config| config.get("gpg", None, "program"))
-        .map(sley_config::expand_user_path)
+        .map(sley::plumbing::sley_config::expand_user_path)
         .unwrap_or_else(|| PathBuf::from("gpg"))
 }
 
 fn gpg_x509_program(config: Option<&GitConfig>) -> PathBuf {
     config
         .and_then(|config| config.get("gpg", Some("x509"), "program"))
-        .map(sley_config::expand_user_path)
+        .map(sley::plumbing::sley_config::expand_user_path)
         .unwrap_or_else(|| PathBuf::from("gpgsm"))
 }
 
 fn ssh_program(config: Option<&GitConfig>) -> PathBuf {
     config
         .and_then(|config| config.get("gpg", Some("ssh"), "program"))
-        .map(sley_config::expand_user_path)
+        .map(sley::plumbing::sley_config::expand_user_path)
         .unwrap_or_else(|| PathBuf::from("ssh-keygen"))
 }
 
@@ -299,7 +299,7 @@ fn ssh_allowed_signers_file(config: Option<&GitConfig>) -> Option<PathBuf> {
     config
         .and_then(|config| config.get("gpg", Some("ssh"), "allowedSignersFile"))
         .filter(|value| !value.is_empty())
-        .map(sley_config::expand_user_path)
+        .map(sley::plumbing::sley_config::expand_user_path)
 }
 
 fn sign_ssh_payload(

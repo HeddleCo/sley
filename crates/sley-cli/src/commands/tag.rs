@@ -708,9 +708,9 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 key.as_deref(),
             )?;
         }
-        let tag_oid = sley_sequencer::create_annotated_tag(
+        let tag_oid = sley::plumbing::sley_sequencer::create_annotated_tag(
             &mut db,
-            sley_sequencer::TagCreate {
+            sley::plumbing::sley_sequencer::TagCreate {
                 object: target_oid.clone(),
                 object_type: target_object.object_type,
                 name: tag.as_bytes().to_vec(),
@@ -1053,7 +1053,7 @@ fn tag_signature_is_valid(format: ObjectFormat, body: &[u8]) -> Result<bool> {
     else {
         return Ok(true);
     };
-    Ok(line == sley_core::digest_bytes(format, unsigned)?.to_hex())
+    Ok(line == sley::plumbing::sley_core::digest_bytes(format, unsigned)?.to_hex())
 }
 
 fn write_tag_verify_format(format_spec: &str, tag: &Tag) -> Result<()> {
@@ -2275,7 +2275,7 @@ fn write_tag_list_columns(
 
 struct TagListEntry {
     name: String,
-    reference: sley_refs::Ref,
+    reference: sley::plumbing::sley_refs::Ref,
     object_metadata: Option<TagListObjectMetadata>,
 }
 
@@ -2391,7 +2391,7 @@ fn tag_list_annotation_message(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     store: &FileRefStore,
-    reference: &sley_refs::Ref,
+    reference: &sley::plumbing::sley_refs::Ref,
 ) -> Result<Option<Vec<u8>>> {
     let Some((oid, _)) = resolve_for_each_ref_target(store, reference)? else {
         return Ok(None);
@@ -3204,10 +3204,10 @@ fn tag_contains(
     let Some(db) = db else {
         return Ok(false);
     };
-    let Ok(tip) = sley_rev::peel_to_commit(db, format, oid) else {
+    let Ok(tip) = sley::plumbing::sley_rev::peel_to_commit(db, format, oid) else {
         return Ok(false);
     };
-    let reachable = sley_rev::walk_commits(db, format, [tip])?
+    let reachable = sley::plumbing::sley_rev::walk_commits(db, format, [tip])?
         .into_iter()
         .map(|record| record.oid)
         .collect::<HashSet<_>>();
@@ -3236,7 +3236,7 @@ fn tag_merged(
     let RefTarget::Direct(oid) = target else {
         return Ok(false);
     };
-    let Ok(tip) = sley_rev::peel_to_commit(db, format, oid) else {
+    let Ok(tip) = sley::plumbing::sley_rev::peel_to_commit(db, format, oid) else {
         return Ok(false);
     };
     let merged_match =
@@ -3259,8 +3259,8 @@ fn tag_merged_reachable_sets(
     filters
         .iter()
         .map(|oid| {
-            let commit = sley_rev::peel_to_commit(db, format, oid)?;
-            sley_rev::walk_commits(db, format, [commit]).map(|records| {
+            let commit = sley::plumbing::sley_rev::peel_to_commit(db, format, oid)?;
+            sley::plumbing::sley_rev::walk_commits(db, format, [commit]).map(|records| {
                 records
                     .into_iter()
                     .map(|record| record.oid)

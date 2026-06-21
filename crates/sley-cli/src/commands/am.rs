@@ -1999,7 +1999,7 @@ fn am_index_is_dirty(
     format: ObjectFormat,
     head_oid: &ObjectId,
 ) -> Result<bool> {
-    let index_tree = match sley_worktree::write_tree_from_index(git_dir, format) {
+    let index_tree = match sley::plumbing::sley_worktree::write_tree_from_index(git_dir, format) {
         Ok(tree) => tree,
         // An index that cannot be written to a tree is not the "dirty" case this
         // guard targets; let the normal apply path surface any real problem.
@@ -2030,7 +2030,7 @@ fn apply_one_patch(
     ignore_whitespace: bool,
     quiet: bool,
 ) -> Result<ApplyResult> {
-    let file_patches = sley_diff_merge::parse_unified_patch(&patch.diff)?;
+    let file_patches = sley::plumbing::sley_diff_merge::parse_unified_patch(&patch.diff)?;
 
     match try_straight_apply(worktree_root, &file_patches, ignore_whitespace)? {
         Some(actions) => {
@@ -2098,7 +2098,7 @@ enum ApplyFileAction {
 /// `None` if any hunk fails to apply (so the whole patch is atomic, like git).
 fn try_straight_apply(
     worktree_root: &Path,
-    file_patches: &[sley_diff_merge::FilePatch],
+    file_patches: &[sley::plumbing::sley_diff_merge::FilePatch],
     ignore_whitespace: bool,
 ) -> Result<Option<Vec<ApplyFileAction>>> {
     let mut actions = Vec::new();
@@ -2124,9 +2124,9 @@ fn try_straight_apply(
         } else {
             Vec::new()
         };
-        let content = match sley_diff_merge::apply_file_patch(&base, patch) {
-            sley_diff_merge::ApplyOutcome::Applied(content) => content,
-            sley_diff_merge::ApplyOutcome::Rejected => {
+        let content = match sley::plumbing::sley_diff_merge::apply_file_patch(&base, patch) {
+            sley::plumbing::sley_diff_merge::ApplyOutcome::Applied(content) => content,
+            sley::plumbing::sley_diff_merge::ApplyOutcome::Rejected => {
                 // `git am --ignore-whitespace` (apply.c `ignore_ws_change`):
                 // when a hunk fails to match byte-for-byte, retry with a
                 // whitespace-collapsing line matcher, keeping the *target's*
@@ -2170,8 +2170,8 @@ fn try_straight_apply(
 /// line comparison, and on a match the matched base region is replaced by the
 /// hunk's *new* lines while context lines keep the base's existing whitespace.
 /// Returns `None` if any hunk cannot be located even with whitespace ignored.
-fn apply_file_patch_ignore_ws(base: &[u8], patch: &sley_diff_merge::FilePatch) -> Option<Vec<u8>> {
-    use sley_diff_merge::HunkLine;
+fn apply_file_patch_ignore_ws(base: &[u8], patch: &sley::plumbing::sley_diff_merge::FilePatch) -> Option<Vec<u8>> {
+    use sley::plumbing::sley_diff_merge::HunkLine;
 
     if patch.is_delete && patch.hunks.is_empty() {
         return Some(Vec::new());
@@ -2354,7 +2354,7 @@ fn stage_and_commit(
                 mode,
                 content,
             } => {
-                let oid = if sley_index::is_gitlink(*mode) {
+                let oid = if sley::plumbing::sley_index::is_gitlink(*mode) {
                     gitlink_oid_from_subproject_content(format, content)?.ok_or_else(|| {
                         GitError::InvalidFormat(format!(
                             "patch for gitlink {} did not name a subproject commit",
@@ -2381,7 +2381,7 @@ fn stage_and_commit(
     // Invalidate it, matching every entry-mutating writer in sley-worktree.
     index.set_cache_tree(None)?;
     fs::write(
-        sley_worktree::repository_index_path(git_dir),
+        sley::plumbing::sley_worktree::repository_index_path(git_dir),
         index.write(format)?,
     )?;
 
@@ -2421,7 +2421,7 @@ fn create_am_commit(
 ) -> Result<ObjectId> {
     let refs = FileRefStore::new(git_dir, format);
     let head_oid = head_commit_oid(&refs)?;
-    let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
+    let tree = sley::plumbing::sley_worktree::write_tree_from_index(git_dir, format)?;
 
     let (author, committer) = am_commit_identities(patch, commit_opts)?;
     // The message has already been finalised (Message-ID appended + the
@@ -2442,9 +2442,9 @@ fn create_am_commit(
 
     let mut db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let parents: Vec<ObjectId> = head_oid.into_iter().collect();
-    let new_oid = sley_sequencer::create_commit(
+    let new_oid = sley::plumbing::sley_sequencer::create_commit(
         &mut db,
-        sley_sequencer::CommitCreate {
+        sley::plumbing::sley_sequencer::CommitCreate {
             tree,
             parents,
             author,
@@ -2482,7 +2482,7 @@ fn create_am_commit(
         }),
     });
     tx.commit()?;
-    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &new_oid)?;
+    sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &new_oid)?;
     // git runs post-applypatch but ignores its exit status — it is purely
     // informational, run after the commit has already landed (builtin/am.c
     // calls `run_hooks` without checking the result). Swallow any failure.
@@ -2510,7 +2510,7 @@ fn am_commit_identities(patch: &AmPatch, opts: AmCommitOpts) -> Result<(Vec<u8>,
             .clone()
             .unwrap_or_else(|| env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| am_now_date()))
     };
-    let author = sley_sequencer::format_commit_identity(
+    let author = sley::plumbing::sley_sequencer::format_commit_identity(
         &patch.author_name,
         &patch.author_email,
         &author_date,
@@ -2668,7 +2668,7 @@ fn apply_three_way(
     state_dir: &Path,
     number: usize,
     patch: &AmPatch,
-    file_patches: &[sley_diff_merge::FilePatch],
+    file_patches: &[sley::plumbing::sley_diff_merge::FilePatch],
     commit_opts: AmCommitOpts,
     quiet: bool,
 ) -> Result<ApplyResult> {
@@ -2742,8 +2742,8 @@ fn apply_three_way(
             .or_else(|| ours_map.get(&path))
             .map(|(mode, _)| *mode)
             .unwrap_or(0o100644);
-        match sley_diff_merge::apply_file_patch(&base_bytes, file) {
-            sley_diff_merge::ApplyOutcome::Applied(post) => {
+        match sley::plumbing::sley_diff_merge::apply_file_patch(&base_bytes, file) {
+            sley::plumbing::sley_diff_merge::ApplyOutcome::Applied(post) => {
                 let mode = file.new_mode.or(file.old_mode).unwrap_or(inherited_mode);
                 let base_mode = file.old_mode.unwrap_or(inherited_mode);
                 if file.is_new {
@@ -2763,7 +2763,7 @@ fn apply_three_way(
                     }
                 }
             }
-            sley_diff_merge::ApplyOutcome::Rejected => {
+            sley::plumbing::sley_diff_merge::ApplyOutcome::Rejected => {
                 eprintln!("error: Failed to merge in the changes.");
                 return Ok(ApplyResult::Conflict);
             }
@@ -2886,14 +2886,14 @@ fn parse_patch_index_oids(diff: &[u8]) -> BTreeMap<Vec<u8>, String> {
     map
 }
 
-fn file_patch_touches_gitlink(file: &sley_diff_merge::FilePatch) -> bool {
-    file.old_mode.is_some_and(sley_index::is_gitlink)
-        || file.new_mode.is_some_and(sley_index::is_gitlink)
+fn file_patch_touches_gitlink(file: &sley::plumbing::sley_diff_merge::FilePatch) -> bool {
+    file.old_mode.is_some_and(sley::plumbing::sley_index::is_gitlink)
+        || file.new_mode.is_some_and(sley::plumbing::sley_index::is_gitlink)
         || file.hunks.iter().any(|hunk| {
             hunk.lines.iter().any(|line| match line {
-                sley_diff_merge::HunkLine::Context(bytes)
-                | sley_diff_merge::HunkLine::Delete(bytes)
-                | sley_diff_merge::HunkLine::Insert(bytes) => {
+                sley::plumbing::sley_diff_merge::HunkLine::Context(bytes)
+                | sley::plumbing::sley_diff_merge::HunkLine::Delete(bytes)
+                | sley::plumbing::sley_diff_merge::HunkLine::Insert(bytes) => {
                     bytes.starts_with(b"Subproject commit ")
                 }
             })
@@ -2901,7 +2901,7 @@ fn file_patch_touches_gitlink(file: &sley_diff_merge::FilePatch) -> bool {
 }
 
 fn gitlink_oids_from_patch(
-    file: &sley_diff_merge::FilePatch,
+    file: &sley::plumbing::sley_diff_merge::FilePatch,
     format: ObjectFormat,
 ) -> Result<(Option<ObjectId>, Option<ObjectId>)> {
     let mut old_oid = None;
@@ -2909,13 +2909,13 @@ fn gitlink_oids_from_patch(
     for hunk in &file.hunks {
         for line in &hunk.lines {
             match line {
-                sley_diff_merge::HunkLine::Delete(bytes) => {
+                sley::plumbing::sley_diff_merge::HunkLine::Delete(bytes) => {
                     old_oid = gitlink_oid_from_subproject_content(format, bytes)?;
                 }
-                sley_diff_merge::HunkLine::Insert(bytes) => {
+                sley::plumbing::sley_diff_merge::HunkLine::Insert(bytes) => {
                     new_oid = gitlink_oid_from_subproject_content(format, bytes)?;
                 }
-                sley_diff_merge::HunkLine::Context(bytes) => {
+                sley::plumbing::sley_diff_merge::HunkLine::Context(bytes) => {
                     let oid = gitlink_oid_from_subproject_content(format, bytes)?;
                     old_oid = old_oid.or(oid);
                     new_oid = new_oid.or(oid);
@@ -3036,7 +3036,7 @@ fn write_merge_index_and_worktree(
         checksum: None,
     };
     fs::write(
-        sley_worktree::repository_index_path(git_dir),
+        sley::plumbing::sley_worktree::repository_index_path(git_dir),
         index.write(format)?,
     )?;
 
@@ -3044,7 +3044,7 @@ fn write_merge_index_and_worktree(
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = if sley_index::is_gitlink(*mode) {
+                    let content = if sley::plumbing::sley_index::is_gitlink(*mode) {
                         Vec::new()
                     } else {
                         merge_read_blob(db, oid)?
@@ -3367,7 +3367,7 @@ fn am_abort(
             });
         }
         tx.commit()?;
-        sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &oid)?;
+        sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &oid)?;
     }
     // Drop state directly: `finish_am` would re-run the rebase finish (which moves
     // to the rebased tip), but on abort we have already restored orig_head.
@@ -3394,7 +3394,7 @@ fn am_skip(
 ) -> Result<()> {
     am_require_in_progress(state_dir)?;
     let head_oid = resolve_revision(git_dir, format, "HEAD")?;
-    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &head_oid)?;
+    sley::plumbing::sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &head_oid)?;
     let next = read_state_usize(state_dir, "next")?;
     // git's `am_skip` records the skipped commit in `rewritten` too: `<orig> <HEAD>`,
     // where HEAD is the (cleaned) tip at skip time (am.c:2131). The post-rewrite

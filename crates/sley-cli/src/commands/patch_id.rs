@@ -50,7 +50,7 @@
 //! other self-contained command modules (`commands::stash`, `commands::branch`,
 //! `commands::verify_commit`); the wildcard pulls in shared crate-root plumbing
 //! such as `discover_git_dir`, `repository_object_format`, `read_repo_config`,
-//! `global_config_value`, and `sley_config::parse_config_bool`.
+//! `global_config_value`, and `sley::plumbing::sley_config::parse_config_bool`.
 use crate::*;
 
 /// Exact usage text git's `patch-id` prints for `-h` and on option errors. A raw
@@ -330,7 +330,7 @@ fn interpret_patch_id_bool(key: &str, value: Option<&str>) -> Result<bool> {
     let Some(value) = value else {
         return Ok(true);
     };
-    match sley_config::parse_config_bool(value) {
+    match sley::plumbing::sley_config::parse_config_bool(value) {
         Some(flag) => Ok(flag),
         None => {
             eprintln!("fatal: bad boolean config value '{value}' for '{key}'");
@@ -391,7 +391,7 @@ impl PatchHash {
     /// git's `flush_one_hunk`; it runs unconditionally (even on an empty buffer)
     /// so the digest of empty input participates exactly as git's does.
     fn flush(&mut self) -> Result<()> {
-        let digest = sley_core::digest_bytes(self.format, &self.buffer)?;
+        let digest = sley::plumbing::sley_core::digest_bytes(self.format, &self.buffer)?;
         let bytes = digest.as_bytes();
         let mut carry: u16 = 0;
         for (slot, &add) in self.result.iter_mut().zip(bytes.iter()) {
@@ -411,7 +411,7 @@ impl PatchHash {
             self.flush()?;
             Ok(self.result)
         } else {
-            Ok(sley_core::digest_bytes(self.format, &self.buffer)?
+            Ok(sley::plumbing::sley_core::digest_bytes(self.format, &self.buffer)?
                 .as_bytes()
                 .to_vec())
         }

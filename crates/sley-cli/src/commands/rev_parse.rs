@@ -56,16 +56,16 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
     // resolve refs and print their OIDs interleaved with positional args, the
     // same way git's `handle_revision_pseudo_opt` feeds `add_pending_object`.
     // Lazily built (and config loaded) only when the first such option appears.
-    let mut pseudo: Option<sley_rev::PseudoRefResolver> = None;
+    let mut pseudo: Option<sley::plumbing::sley_rev::PseudoRefResolver> = None;
     let mut idx = 0;
     while idx < args.len() {
         let arg = &args[idx];
-        if !verify && sley_rev::PseudoRefResolver::is_pseudo_ref_arg(arg) {
+        if !verify && sley::plumbing::sley_rev::PseudoRefResolver::is_pseudo_ref_arg(arg) {
             let resolver = match pseudo.as_mut() {
                 Some(resolver) => resolver,
                 None => {
                     let config = read_repo_config(&git_dir).ok();
-                    pseudo = Some(sley_rev::PseudoRefResolver::new(
+                    pseudo = Some(sley::plumbing::sley_rev::PseudoRefResolver::new(
                         &git_dir,
                         format,
                         config.as_ref(),
@@ -108,7 +108,10 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                 println!("{}", display_git_common_dir(&cwd, &git_dir, path_format)?);
             }
             "--shared-index-path" => {
-                println!("{}", display_shared_index_path(&cwd, &git_dir, path_format)?);
+                println!(
+                    "{}",
+                    display_shared_index_path(&cwd, &git_dir, path_format)?
+                );
             }
             "--git-path" => {
                 idx += 1;
@@ -182,7 +185,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
             "--short" => short = repository_abbrev(&git_dir, format)?,
             value if value.starts_with("--disambiguate=") && !verify => {
                 let prefix = &value["--disambiguate=".len()..];
-                for oid in sley_rev::object_ids_with_prefix(&git_dir, format, prefix)? {
+                for oid in sley::plumbing::sley_rev::object_ids_with_prefix(&git_dir, format, prefix)? {
                     println!("{}", oid.to_hex());
                 }
             }
@@ -277,7 +280,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                     idx += 1;
                     continue;
                 }
-                if seen_path_arg && sley_rev::split_rev_path_spec(rev).is_some() {
+                if seen_path_arg && sley::plumbing::sley_rev::split_rev_path_spec(rev).is_some() {
                     println!("{rev}");
                     rev_parse_no_such_worktree_path(rev);
                     return Err(GitError::Exit(128));
@@ -384,21 +387,21 @@ fn rev_parse_resolve_revision_arg(
         && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
         && let Some(disambiguation) = rev_parse_core_disambiguate(git_dir)
     {
-        return sley_rev::resolve_short_object_id(git_dir, format, rev, disambiguation)?
+        return sley::plumbing::sley_rev::resolve_short_object_id(git_dir, format, rev, disambiguation)?
             .into_result(rev);
     }
     resolve_revision(git_dir, format, rev)
 }
 
-fn rev_parse_core_disambiguate(git_dir: &Path) -> Option<sley_rev::ObjectDisambiguation> {
+fn rev_parse_core_disambiguate(git_dir: &Path) -> Option<sley::plumbing::sley_rev::ObjectDisambiguation> {
     let config = read_repo_config(git_dir).ok()?;
     match config.get("core", None, "disambiguate")? {
-        "commit" => Some(sley_rev::ObjectDisambiguation::Commit),
-        "committish" => Some(sley_rev::ObjectDisambiguation::Commitish),
-        "tree" => Some(sley_rev::ObjectDisambiguation::Tree),
-        "treeish" => Some(sley_rev::ObjectDisambiguation::Treeish),
-        "blob" => Some(sley_rev::ObjectDisambiguation::Blob),
-        "tag" => Some(sley_rev::ObjectDisambiguation::Tag),
+        "commit" => Some(sley::plumbing::sley_rev::ObjectDisambiguation::Commit),
+        "committish" => Some(sley::plumbing::sley_rev::ObjectDisambiguation::Commitish),
+        "tree" => Some(sley::plumbing::sley_rev::ObjectDisambiguation::Tree),
+        "treeish" => Some(sley::plumbing::sley_rev::ObjectDisambiguation::Treeish),
+        "blob" => Some(sley::plumbing::sley_rev::ObjectDisambiguation::Blob),
+        "tag" => Some(sley::plumbing::sley_rev::ObjectDisambiguation::Tag),
         _ => None,
     }
 }
@@ -422,9 +425,9 @@ fn rev_parse_render_range(
     let mut out = Vec::new();
     if symmetric {
         let db = FileObjectDatabase::from_git_dir(git_dir, format);
-        let left_commit = sley_rev::peel_to_commit(&db, format, &left_oid)?;
-        let right_commit = sley_rev::peel_to_commit(&db, format, &right_oid)?;
-        let bases = sley_rev::merge_bases(git_dir, format, &db, &left_commit, &right_commit)?;
+        let left_commit = sley::plumbing::sley_rev::peel_to_commit(&db, format, &left_oid)?;
+        let right_commit = sley::plumbing::sley_rev::peel_to_commit(&db, format, &right_oid)?;
+        let bases = sley::plumbing::sley_rev::merge_bases(git_dir, format, &db, &left_commit, &right_commit)?;
         if negate {
             out.push(format!("^{}", left_oid.to_hex()));
             out.push(format!("^{}", right_oid.to_hex()));
@@ -453,11 +456,11 @@ fn rev_parse_resolve_commitish(
         && rev.len() < format.hex_len()
         && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        return sley_rev::resolve_short_object_id(
+        return sley::plumbing::sley_rev::resolve_short_object_id(
             git_dir,
             format,
             rev,
-            sley_rev::ObjectDisambiguation::Commitish,
+            sley::plumbing::sley_rev::ObjectDisambiguation::Commitish,
         )?
         .into_result(rev);
     }
@@ -490,7 +493,7 @@ fn rev_parse_normalize_revision_arg(cwd: &Path, git_dir: &Path, rev: &str) -> Re
             None => format!(":{path}"),
         });
     }
-    if let Some((base, path)) = sley_rev::split_rev_path_spec(rev) {
+    if let Some((base, path)) = sley::plumbing::sley_rev::split_rev_path_spec(rev) {
         let path = rev_parse_normalize_relative_path(cwd, git_dir, path)?;
         return Ok(format!("{base}:{path}"));
     }
@@ -564,9 +567,9 @@ fn rev_parse_diagnose_arg_failure(
         println!("{rev}");
         return Ok(());
     }
-    if let Some((base, path)) = sley_rev::split_rev_path_spec(normalized_rev) {
+    if let Some((base, path)) = sley::plumbing::sley_rev::split_rev_path_spec(normalized_rev) {
         println!("{rev}");
-        if let Some((_, original_path)) = sley_rev::split_rev_path_spec(rev) {
+        if let Some((_, original_path)) = sley::plumbing::sley_rev::split_rev_path_spec(rev) {
             return rev_parse_tree_path_error(
                 cwd,
                 git_dir,
@@ -592,7 +595,7 @@ fn rev_parse_diagnose_arg_failure(
     }
     rev_parse_maybe_print_ambiguity(git_dir, format, normalized_rev, &err)?;
     println!("{rev}");
-    Err(sley_rev::ambiguous_argument_error(rev))
+    Err(sley::plumbing::sley_rev::ambiguous_argument_error(rev))
 }
 
 fn rev_parse_maybe_print_ambiguity(
@@ -606,7 +609,7 @@ fn rev_parse_maybe_print_ambiguity(
     };
     eprintln!("error: short object ID {prefix} is ambiguous");
     let hints =
-        match sley_rev::ambiguous_short_object_id_hint(git_dir, format, &prefix, disambiguation) {
+        match sley::plumbing::sley_rev::ambiguous_short_object_id_hint(git_dir, format, &prefix, disambiguation) {
             Ok(hints) => hints,
             Err(GitError::InvalidObject(message)) if message.starts_with("unknown object type") => {
                 eprintln!("fatal: invalid object type");
@@ -627,8 +630,8 @@ fn rev_parse_ambiguity_context(
     format: ObjectFormat,
     rev: &str,
     err: &GitError,
-) -> Option<(String, sley_rev::ObjectDisambiguation)> {
-    if !sley_rev::is_short_object_id_ambiguous_error(err) {
+) -> Option<(String, sley::plumbing::sley_rev::ObjectDisambiguation)> {
+    if !sley::plumbing::sley_rev::is_short_object_id_ambiguous_error(err) {
         return None;
     }
     let GitError::InvalidObjectId(message) = err else {
@@ -641,14 +644,14 @@ fn rev_parse_ambiguity_context(
     Some((prefix.to_string(), disambiguation))
 }
 
-fn rev_parse_disambiguation_for_rev(rev: &str, prefix: &str) -> sley_rev::ObjectDisambiguation {
-    if let Some((base, _)) = sley_rev::split_rev_path_spec(rev)
+fn rev_parse_disambiguation_for_rev(rev: &str, prefix: &str) -> sley::plumbing::sley_rev::ObjectDisambiguation {
+    if let Some((base, _)) = sley::plumbing::sley_rev::split_rev_path_spec(rev)
         && base == prefix
     {
-        return sley_rev::ObjectDisambiguation::Treeish;
+        return sley::plumbing::sley_rev::ObjectDisambiguation::Treeish;
     }
     if rev == prefix {
-        return sley_rev::ObjectDisambiguation::Any;
+        return sley::plumbing::sley_rev::ObjectDisambiguation::Any;
     }
     if rev == format!("{prefix}^0")
         || rev == format!("{prefix}^")
@@ -656,18 +659,18 @@ fn rev_parse_disambiguation_for_rev(rev: &str, prefix: &str) -> sley_rev::Object
         || rev.starts_with(&format!("{prefix}^{{/"))
         || rev.starts_with(&format!("{prefix}^{{commit}}"))
     {
-        return sley_rev::ObjectDisambiguation::Commitish;
+        return sley::plumbing::sley_rev::ObjectDisambiguation::Commitish;
     }
     if rev.starts_with(&format!("{prefix}^{{tree}}")) {
-        return sley_rev::ObjectDisambiguation::Treeish;
+        return sley::plumbing::sley_rev::ObjectDisambiguation::Treeish;
     }
     if rev.starts_with(&format!("{prefix}^{{blob}}")) {
-        return sley_rev::ObjectDisambiguation::Blob;
+        return sley::plumbing::sley_rev::ObjectDisambiguation::Blob;
     }
     if rev.starts_with(&format!("{prefix}^{{tag}}")) {
-        return sley_rev::ObjectDisambiguation::Tag;
+        return sley::plumbing::sley_rev::ObjectDisambiguation::Tag;
     }
-    sley_rev::ObjectDisambiguation::Any
+    sley::plumbing::sley_rev::ObjectDisambiguation::Any
 }
 
 fn rev_parse_tree_path_error(
@@ -774,7 +777,7 @@ fn rev_parse_prefixed_path(cwd: &Path, git_dir: &Path, path: &str) -> Result<Opt
 
 fn rev_parse_tree_contains(git_dir: &Path, format: ObjectFormat, base: &str, path: &str) -> bool {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    sley_rev::resolve_rev_path(git_dir, format, &db, base, path).is_ok()
+    sley::plumbing::sley_rev::resolve_rev_path(git_dir, format, &db, base, path).is_ok()
 }
 
 fn rev_parse_index_contains(git_dir: &Path, format: ObjectFormat, path: &str) -> Result<bool> {
@@ -783,7 +786,7 @@ fn rev_parse_index_contains(git_dir: &Path, format: ObjectFormat, path: &str) ->
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(GitError::Io(err.to_string())),
     };
-    let index = sley_index::Index::parse(&bytes, format)?;
+    let index = sley::plumbing::sley_index::Index::parse(&bytes, format)?;
     Ok(index
         .entries
         .iter()
@@ -1564,7 +1567,7 @@ fn rev_parse_print_positional(rendered: &str, negate: bool) {
 fn rev_parse_bisect(git_dir: &Path, format: ObjectFormat, symbolic_full_name: bool) -> Result<()> {
     let store = FileRefStore::new(git_dir, format);
     let refs = store.list_refs()?;
-    let terms = sley_rev::read_bisect_terms(git_dir)?;
+    let terms = sley::plumbing::sley_rev::read_bisect_terms(git_dir)?;
     let emit = |reference: &Ref, negate: bool| -> Result<()> {
         let rendered = if symbolic_full_name {
             reference.name.clone()
@@ -1610,21 +1613,14 @@ fn validate_bare_rev_parse_setup(setup: &Option<setup::SetupResult>) -> Result<(
     Ok(())
 }
 
-fn rev_parse_worktree_root(
-    git_dir: &Path,
-    setup: Option<&setup::SetupResult>,
-) -> Result<PathBuf> {
+fn rev_parse_worktree_root(git_dir: &Path, setup: Option<&setup::SetupResult>) -> Result<PathBuf> {
     if let Some(worktree) = setup.and_then(|setup| setup.worktree.as_ref()) {
         return Ok(worktree.clone());
     }
     worktree_root_for_git_dir(git_dir)
 }
 
-fn worktree_cdup(
-    cwd: &Path,
-    git_dir: &Path,
-    setup: Option<&setup::SetupResult>,
-) -> Result<String> {
+fn worktree_cdup(cwd: &Path, git_dir: &Path, setup: Option<&setup::SetupResult>) -> Result<String> {
     let prefix = worktree_prefix(cwd, git_dir, setup)?;
     let depth = prefix.split('/').filter(|part| !part.is_empty()).count();
     Ok("../".repeat(depth))
@@ -1729,13 +1725,13 @@ fn display_shared_index_path(
     path_format: RevParsePathFormat,
 ) -> Result<String> {
     let format = repository_object_format(git_dir)?;
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     let bytes = match fs::read(index_path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
         Err(err) => return Err(err.into()),
     };
-    let index = sley_index::Index::parse(&bytes, format)?;
+    let index = sley::plumbing::sley_index::Index::parse(&bytes, format)?;
     let Some(link) = index.split_index_link(format)? else {
         return Ok(String::new());
     };
@@ -1952,7 +1948,7 @@ fn is_bare_repository(git_dir: &Path, setup: Option<&setup::SetupResult>) -> Res
 }
 
 fn is_shallow_repository(git_dir: &Path) -> bool {
-    sley_worktree::is_shallow_repository(git_dir)
+    sley::plumbing::sley_worktree::is_shallow_repository(git_dir)
 }
 
 /// `check_repository_format_gently`.

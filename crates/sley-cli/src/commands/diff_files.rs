@@ -106,7 +106,7 @@ struct DiffFilesOptions {
     interhunk: Option<usize>,
     // `--diff-algorithm=<algo>`: which LCS engine to use. add-patch passes this
     // from `diff.algorithm`; bare diff-files defaults to Myers.
-    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm,
     // `--indent-heuristic` / `--no-indent-heuristic`: `None` falls back to
     // `diff.indentHeuristic` config (default git-enabled).
     indent_heuristic: Option<bool>,
@@ -152,14 +152,14 @@ impl Default for DiffFilesOptions {
             find_copies_harder: false,
             rename_empty: true,
             inexact_renames: true,
-            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            copy_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             src_prefix: "a/".to_string(),
             dst_prefix: "b/".to_string(),
             diff_filter: DiffFilter::default(),
             context: None,
             interhunk: None,
-            diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+            diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
             indent_heuristic: None,
             ignore_submodules: IgnoreSubmodules::Default,
             max_depth: None,
@@ -310,9 +310,9 @@ fn parse_diff_files_args(args: &[String]) -> Result<DiffFilesOptions> {
             value if let Some(rest) = value.strip_prefix("--diff-algorithm=") => {
                 o.diff_algorithm = parse_diff_files_algorithm(rest)?;
             }
-            "--minimal" => o.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
-            "--patience" => o.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
-            "--histogram" => o.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram,
+            "--minimal" => o.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Minimal,
+            "--patience" => o.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Patience,
+            "--histogram" => o.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Histogram,
             // add-patch spawns `diff-files --no-color --ignore-submodules=dirty`.
             // Plumbing diff-files never colorizes; `--ignore-submodules` filters
             // gitlink pairs before rendering below.
@@ -475,12 +475,12 @@ fn diff_files_name_select_conflict() -> GitError {
 /// Map a `--diff-algorithm=<name>` value to a [`DiffAlgorithm`], rejecting an
 /// unknown name with git's `set_diff_algorithm` error. This is the validation
 /// point for `diff.algorithm=bogus` flowing through `add -p` (t3701 #69).
-fn parse_diff_files_algorithm(name: &str) -> Result<sley_diff_merge::DiffAlgorithm> {
+fn parse_diff_files_algorithm(name: &str) -> Result<sley::plumbing::sley_diff_merge::DiffAlgorithm> {
     match name.trim() {
-        "myers" | "default" => Ok(sley_diff_merge::DiffAlgorithm::Myers),
-        "minimal" => Ok(sley_diff_merge::DiffAlgorithm::Minimal),
-        "patience" => Ok(sley_diff_merge::DiffAlgorithm::Patience),
-        "histogram" => Ok(sley_diff_merge::DiffAlgorithm::Histogram),
+        "myers" | "default" => Ok(sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers),
+        "minimal" => Ok(sley::plumbing::sley_diff_merge::DiffAlgorithm::Minimal),
+        "patience" => Ok(sley::plumbing::sley_diff_merge::DiffAlgorithm::Patience),
+        "histogram" => Ok(sley::plumbing::sley_diff_merge::DiffAlgorithm::Histogram),
         _ => {
             eprintln!(
                 "error: option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\""
@@ -540,7 +540,7 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         format.hex_len()
     } else {
         o.patch_abbrev
-            .or(repo.abbrev()?)
+            .or(repository_abbrev(repo.git_dir(), repo.format())?)
             .unwrap_or(7)
             .min(format.hex_len())
     };
@@ -551,13 +551,13 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         DiffPathspec::new(cwd, worktree_root, &o.path_args)?
     };
 
-    let name_status_options = sley_diff_merge::DiffNameStatusOptions {
+    let name_status_options = sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
         detect_renames: o.detect_renames,
         detect_copies: o.detect_copies,
         find_copies_harder: o.find_copies_harder,
         rename_empty: o.rename_empty,
     };
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
+    let rename_options = sley::plumbing::sley_diff_merge::RenameDetectionOptions {
         base: name_status_options,
         detect_inexact: true,
         rename_threshold: o.rename_threshold,
@@ -572,14 +572,14 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
     // content diff; porcelain `git diff` (which refreshes first) keeps the plain
     // content engine.
     let entries = if o.inexact_renames {
-        sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_rename_options(
+        sley::plumbing::sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_rename_options(
             worktree_root,
             git_dir,
             format,
             rename_options,
         )?
     } else {
-        sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_options(
+        sley::plumbing::sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_options(
             worktree_root,
             git_dir,
             format,
@@ -617,8 +617,8 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         entries
             .into_iter()
             .filter(|entry| {
-                entry.old_mode != Some(sley_index::GITLINK_MODE)
-                    && entry.new_mode != Some(sley_index::GITLINK_MODE)
+                entry.old_mode != Some(sley::plumbing::sley_index::GITLINK_MODE)
+                    && entry.new_mode != Some(sley::plumbing::sley_index::GITLINK_MODE)
             })
             .collect()
     } else {
@@ -697,12 +697,12 @@ struct DiffFilesRenderContext<'a> {
     format: ObjectFormat,
     patch_context: usize,
     interhunk: usize,
-    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm,
     indent_heuristic: bool,
 }
 
 fn render_diff_files_entries(
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
     o: &DiffFilesOptions,
     context: DiffFilesRenderContext<'_>,
 ) -> Result<()> {
@@ -806,7 +806,7 @@ fn render_diff_files_entries(
                 ws_error: None,
                 color_moved: None,
                 interhunk: context.interhunk,
-                ws_ignore: sley_diff_merge::WsIgnore::default(),
+                ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
                 diff_algorithm: context.diff_algorithm,
                 ignore_blank_lines: false,
                 ignore_regexes: &[],
@@ -823,28 +823,28 @@ fn render_diff_files_entries(
     Ok(())
 }
 
-fn diff_files_entry_is_dirty_submodule(entry: &sley_diff_merge::NameStatusEntry) -> bool {
-    entry.status == sley_diff_merge::NameStatus::Modified
-        && entry.old_mode == Some(sley_index::GITLINK_MODE)
-        && entry.new_mode == Some(sley_index::GITLINK_MODE)
+fn diff_files_entry_is_dirty_submodule(entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) -> bool {
+    entry.status == sley::plumbing::sley_diff_merge::NameStatus::Modified
+        && entry.old_mode == Some(sley::plumbing::sley_index::GITLINK_MODE)
+        && entry.new_mode == Some(sley::plumbing::sley_index::GITLINK_MODE)
         && entry.old_oid == entry.new_oid
 }
 
 fn add_dirty_submodule_entries(
-    mut entries: Vec<sley_diff_merge::NameStatusEntry>,
+    mut entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+) -> Result<Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>> {
     let index = Index::parse(
-        &fs::read(sley_worktree::repository_index_path(git_dir))?,
+        &fs::read(sley::plumbing::sley_worktree::repository_index_path(git_dir))?,
         format,
     )?;
     for entry in index.entries {
-        if sley_index::Stage::from_flags(entry.flags) != sley_index::Stage::Normal {
+        if sley::plumbing::sley_index::Stage::from_flags(entry.flags) != sley::plumbing::sley_index::Stage::Normal {
             continue;
         }
-        if !sley_index::is_gitlink(entry.mode) {
+        if !sley::plumbing::sley_index::is_gitlink(entry.mode) {
             continue;
         }
         if entries
@@ -855,15 +855,15 @@ fn add_dirty_submodule_entries(
         }
         let path = String::from_utf8_lossy(entry.path.as_bytes()).into_owned();
         let sub_root = worktree_root.join(Path::new(&path));
-        if sley_worktree::submodule_dirt(&sub_root) == 0 {
+        if sley::plumbing::sley_worktree::submodule_dirt(&sub_root) == 0 {
             continue;
         }
-        entries.push(sley_diff_merge::NameStatusEntry {
-            status: sley_diff_merge::NameStatus::Modified,
+        entries.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
+            status: sley::plumbing::sley_diff_merge::NameStatus::Modified,
             path: entry.path,
             old_path: None,
-            old_mode: Some(sley_index::GITLINK_MODE),
-            new_mode: Some(sley_index::GITLINK_MODE),
+            old_mode: Some(sley::plumbing::sley_index::GITLINK_MODE),
+            new_mode: Some(sley::plumbing::sley_index::GITLINK_MODE),
             old_oid: Some(entry.oid),
             new_oid: Some(entry.oid),
         });
@@ -880,7 +880,7 @@ fn add_dirty_submodule_entries(
 /// mode flips) returns `true`. Mirrors the suppression in `write_diff_patch_entry`.
 fn diff_files_stat_entry_has_content_change(data: &DiffStatEntryData<'_>) -> bool {
     let entry = data.entry;
-    if !matches!(entry.status, sley_diff_merge::NameStatus::Modified) {
+    if !matches!(entry.status, sley::plumbing::sley_diff_merge::NameStatus::Modified) {
         return true;
     }
     let mode_unchanged = match (entry.old_mode, entry.new_mode) {
@@ -897,13 +897,13 @@ fn diff_files_stat_entry_has_content_change(data: &DiffStatEntryData<'_>) -> boo
 }
 
 fn filter_racy_clean_equivalent_worktree_entries(
-    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     config: &GitConfig,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+) -> Result<Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>> {
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     let index = match fs::read(&index_path) {
         Ok(bytes) => Index::parse(&bytes, format)?,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(entries),
@@ -927,14 +927,14 @@ fn filter_racy_clean_equivalent_worktree_entries(
 }
 
 fn diff_files_entry_is_racy_clean_equivalent(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     index: &Index,
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     config: &GitConfig,
 ) -> Result<bool> {
-    if entry.status != sley_diff_merge::NameStatus::Modified || entry.old_mode != entry.new_mode {
+    if entry.status != sley::plumbing::sley_diff_merge::NameStatus::Modified || entry.old_mode != entry.new_mode {
         return Ok(false);
     }
     let Some(old_oid) = entry.old_oid else {
@@ -942,7 +942,7 @@ fn diff_files_entry_is_racy_clean_equivalent(
     };
     let path = entry.path.as_bytes();
     let Some(index_entry) = index.entries.iter().find(|candidate| {
-        candidate.stage() == sley_index::Stage::Normal && candidate.path.as_bytes() == path
+        candidate.stage() == sley::plumbing::sley_index::Stage::Normal && candidate.path.as_bytes() == path
     }) else {
         return Ok(false);
     };
@@ -961,7 +961,7 @@ fn diff_files_entry_is_racy_clean_equivalent(
         return Ok(false);
     }
     let body = fs::read(&absolute)?;
-    let clean = sley_worktree::apply_clean_filter(worktree_root, git_dir, config, path, &body)?;
+    let clean = sley::plumbing::sley_worktree::apply_clean_filter(worktree_root, git_dir, config, path, &body)?;
     let clean_oid = EncodedObject::new(ObjectType::Blob, clean).object_id(format)?;
     Ok(clean_oid == old_oid)
 }
@@ -987,7 +987,7 @@ fn diff_files_worktree_path(worktree_root: &Path, path: &[u8]) -> PathBuf {
 /// (NUL-terminated, unquoted) vs the default tab/newline (quoted) layout.
 fn write_diff_files_name_entry(
     stdout: &mut io::Stdout,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     name_only: bool,
     z: bool,
 ) -> Result<()> {

@@ -17,7 +17,7 @@
 //!     single `040000` entry (e.g. `M\tsub`). The recursive (`-r`) modes, and
 //!     every file-content mode (`-p`, `--stat`, `--numstat`, `--shortstat`,
 //!     `--summary`), implicitly descend and are produced via
-//!     `sley_diff_merge::diff_name_status_trees_*`.
+//!     `sley::plumbing::sley_diff_merge::diff_name_status_trees_*`.
 //!   * The commit-id header. When a single commit is given (or commits arrive on
 //!     `--stdin`), git prints the commit's own object id on its own line before
 //!     the diff, unless `--no-commit-id` is set.
@@ -27,7 +27,7 @@
 //! A glob of the crate root brings every shared helper/type into scope via
 //! descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley_object::TreeEntries;
+use sley::plumbing::sley_object::TreeEntries;
 
 /// Which output formats to produce, mirroring git's `output_format` bitmask:
 /// the explicit format options accumulate (`--stat --summary` prints both, and
@@ -133,9 +133,9 @@ struct DiffTreeOptions {
     check: bool,
     /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
     /// `--ignore-cr-at-eol`).
-    ws_ignore: sley_diff_merge::WsIgnore,
+    ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore,
     /// The line-diff algorithm (`--patience` / `--histogram` / Myers default).
-    diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm,
     /// `--ignore-blank-lines`.
     ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
@@ -172,16 +172,16 @@ impl Default for DiffTreeOptions {
             detect_copies: false,
             find_copies_harder: false,
             rename_empty: true,
-            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            copy_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             raw_abbrev: None,
             patch_abbrev: None,
             patch_full_index: false,
             src_prefix: "a/".to_string(),
             dst_prefix: "b/".to_string(),
             check: false,
-            ws_ignore: sley_diff_merge::WsIgnore::default(),
-            diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+            ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
+            diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
             max_depth: None,
@@ -213,9 +213,9 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
                 let config = read_repo_config(&git_dir)?;
                 let db = FileObjectDatabase::from_git_dir(&git_dir, format);
                 let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
-                let setup = sley_rev::setup_revisions(
+                let setup = sley::plumbing::sley_rev::setup_revisions(
                     &setup_args,
-                    &sley_rev::RevisionSetupContext {
+                    &sley::plumbing::sley_rev::RevisionSetupContext {
                         git_dir: &git_dir,
                         worktree_root: worktree_root.as_deref(),
                         cwd: &cwd,
@@ -234,7 +234,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
                     ));
                 }
                 let commit_oid =
-                    sley_rev::peel_to_commit(&db, format, &setup.options.positives[0].oid)?;
+                    sley::plumbing::sley_rev::peel_to_commit(&db, format, &setup.options.positives[0].oid)?;
                 let object = db.read_object(&commit_oid)?;
                 let commit = Commit::parse(format, &object.body)?;
                 println!("{}", commit_subject(&commit.message));
@@ -385,9 +385,9 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             "-m" => options.merges_separate = true,
             // Whitespace-ignore / algorithm / ignore-matching-lines: applied to
             // the patch hunk comparison (see the shared diff renderer).
-            "--minimal" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
-            "--patience" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
-            "--histogram" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram,
+            "--minimal" => options.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Minimal,
+            "--patience" => options.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Patience,
+            "--histogram" => options.diff_algorithm = sley::plumbing::sley_diff_merge::DiffAlgorithm::Histogram,
             "--indent-heuristic" => options.indent_heuristic = Some(true),
             "--no-indent-heuristic" => options.indent_heuristic = Some(false),
             "--diff-algorithm" => {
@@ -489,9 +489,9 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
     let git_dir = repo.git_dir();
     let format = repo.format();
     let db = repo.objects();
-    let setup = sley_rev::setup_revisions(
+    let setup = sley::plumbing::sley_rev::setup_revisions(
         &options.setup_args,
-        &sley_rev::RevisionSetupContext {
+        &sley::plumbing::sley_rev::RevisionSetupContext {
             git_dir,
             worktree_root: repo.worktree_root().ok(),
             cwd: repo.cwd(),
@@ -666,7 +666,7 @@ fn resolve_arg_request(
     git_dir: &Path,
     db: &FileObjectDatabase,
     options: &DiffTreeOptions,
-    revs: &[sley_rev::RevisionTip],
+    revs: &[sley::plumbing::sley_rev::RevisionTip],
 ) -> Result<Vec<DiffRequest>> {
     let format = db.object_format();
     if revs.len() == 1 {
@@ -679,8 +679,8 @@ fn resolve_arg_request(
         // `--`. Here we defensively use the first two.
         let left = revs[0].oid;
         let right = revs[1].oid;
-        let left_tree = sley_rev::peel_to_tree(db, format, &left)?;
-        let right_tree = sley_rev::peel_to_tree(db, format, &right)?;
+        let left_tree = sley::plumbing::sley_rev::peel_to_tree(db, format, &left)?;
+        let right_tree = sley::plumbing::sley_rev::peel_to_tree(db, format, &right)?;
         Ok(vec![DiffRequest {
             left: Some(left_tree),
             right: Some(right_tree),
@@ -692,7 +692,7 @@ fn resolve_arg_request(
 fn resolve_merge_base_arg_request(
     git_dir: &Path,
     db: &FileObjectDatabase,
-    revs: &[sley_rev::RevisionTip],
+    revs: &[sley::plumbing::sley_rev::RevisionTip],
 ) -> Result<Vec<DiffRequest>> {
     if revs.len() != 2 {
         print_diff_tree_usage();
@@ -703,8 +703,8 @@ fn resolve_merge_base_arg_request(
     let right = commands::diff::diff_resolve_commit_arg(git_dir, format, db, &revs[1].rev)?;
     let base = commands::diff::diff_single_merge_base(git_dir, format, db, &left, &right)?;
     Ok(vec![DiffRequest {
-        left: Some(sley_rev::peel_to_tree(db, format, &base)?),
-        right: Some(sley_rev::peel_to_tree(db, format, &right)?),
+        left: Some(sley::plumbing::sley_rev::peel_to_tree(db, format, &base)?),
+        right: Some(sley::plumbing::sley_rev::peel_to_tree(db, format, &right)?),
         ..Default::default()
     }])
 }
@@ -746,7 +746,7 @@ fn single_commit_request(
             let parent_trees = commit
                 .parents
                 .iter()
-                .map(|parent| sley_rev::peel_to_tree(db, format, parent))
+                .map(|parent| sley::plumbing::sley_rev::peel_to_tree(db, format, parent))
                 .collect::<Result<Vec<_>>>()?;
             return Ok(vec![DiffRequest {
                 right: Some(commit.tree.clone()),
@@ -771,7 +771,7 @@ fn single_commit_request(
         let mut requests = Vec::with_capacity(commit.parents.len());
         for parent in &commit.parents {
             requests.push(DiffRequest {
-                left: Some(sley_rev::peel_to_tree(db, format, parent)?),
+                left: Some(sley::plumbing::sley_rev::peel_to_tree(db, format, parent)?),
                 right: Some(commit.tree.clone()),
                 header: Some(DiffHeader {
                     text: header_text.clone(),
@@ -783,7 +783,7 @@ fn single_commit_request(
         return Ok(requests);
     }
     let left = match commit.parents.first() {
-        Some(parent) => Some(sley_rev::peel_to_tree(db, format, parent)?),
+        Some(parent) => Some(sley::plumbing::sley_rev::peel_to_tree(db, format, parent)?),
         None => None,
     };
     // A root commit (no parent) is silently skipped unless --root says to diff it
@@ -860,9 +860,9 @@ fn diff_tree_header_text(
 
 fn diff_tree_pretty_notes(git_dir: &Path, format: ObjectFormat, oid: &ObjectId) -> Result<String> {
     let store = FileRefStore::new(git_dir, format);
-    let handle = sley_notes::NotesRef::expand(sley_notes::DEFAULT_NOTES_REF);
+    let handle = sley::plumbing::sley_notes::NotesRef::expand(sley::plumbing::sley_notes::DEFAULT_NOTES_REF);
     let mut notes =
-        sley_notes::read_note_bytes(git_dir, format, &store, &handle, oid)?.unwrap_or_default();
+        sley::plumbing::sley_notes::read_note_bytes(git_dir, format, &store, &handle, oid)?.unwrap_or_default();
     notes.push(b'\n');
     Ok(String::from_utf8_lossy(&notes).into_owned())
 }
@@ -901,8 +901,8 @@ fn parse_stdin_request(
             return Ok(vec![skip_echo(line)]);
         };
         let (Ok(left_tree), Ok(right_tree)) = (
-            sley_rev::peel_to_tree(db, format, &left),
-            sley_rev::peel_to_tree(db, format, &right),
+            sley::plumbing::sley_rev::peel_to_tree(db, format, &left),
+            sley::plumbing::sley_rev::peel_to_tree(db, format, &right),
         ) else {
             return Ok(vec![skip_echo(line)]);
         };
@@ -1310,7 +1310,7 @@ fn compute_entries(
     left: Option<&ObjectId>,
     right: &ObjectId,
     recursive: bool,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+) -> Result<Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>> {
     if let Some(max_depth) = options.max_depth {
         let specs = DiffTreeDepthPathspecs::new(pathspecs);
         let mut entries =
@@ -1322,8 +1322,8 @@ fn compute_entries(
         return Ok(entries);
     }
     if recursive {
-        let rename_options = sley_diff_merge::RenameDetectionOptions {
-            base: sley_diff_merge::DiffNameStatusOptions {
+        let rename_options = sley::plumbing::sley_diff_merge::RenameDetectionOptions {
+            base: sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
                 detect_renames: options.detect_renames,
                 detect_copies: options.detect_copies,
                 find_copies_harder: options.find_copies_harder,
@@ -1334,14 +1334,14 @@ fn compute_entries(
             copy_threshold: options.copy_threshold,
         };
         let mut entries = match left {
-            Some(left) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+            Some(left) => sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
                 db,
                 format,
                 left,
                 right,
                 rename_options,
             )?,
-            None => sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
+            None => sley::plumbing::sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
                 db,
                 format,
                 right,
@@ -1388,7 +1388,7 @@ fn parse_diff_tree_max_depth(value: &str) -> Result<i64> {
 fn diff_tree_has_wildcard_pathspec(pathspecs: &[String]) -> bool {
     pathspecs
         .iter()
-        .any(|path| sley_worktree::pathspec_is_glob(path.as_bytes()))
+        .any(|path| sley::plumbing::sley_worktree::pathspec_is_glob(path.as_bytes()))
 }
 
 #[derive(Debug)]
@@ -1464,7 +1464,7 @@ fn depth_limited_tree_changes(
     right: Option<&ObjectId>,
     pathspecs: &DiffTreeDepthPathspecs,
     max_depth: i64,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+) -> Result<Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>> {
     let mut out = Vec::new();
     let context = DepthLimitedTreeContext {
         format,
@@ -1488,7 +1488,7 @@ fn collect_depth_limited_tree_changes(
     left_tree: Option<&ObjectId>,
     right_tree: Option<&ObjectId>,
     prefix: Vec<u8>,
-    out: &mut Vec<sley_diff_merge::NameStatusEntry>,
+    out: &mut Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
 ) -> Result<()> {
     let left_map = match left_tree {
         Some(oid) => top_level_entries(context.format, context.db, oid)?,
@@ -1562,7 +1562,7 @@ fn handle_depth_limited_tree_pair(
     left: Option<&TopEntry>,
     right: Option<&TopEntry>,
     path: Vec<u8>,
-    out: &mut Vec<sley_diff_merge::NameStatusEntry>,
+    out: &mut Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
 ) -> Result<()> {
     let left_oid = left.map(|entry| entry.oid);
     let right_oid = right.map(|entry| entry.oid);
@@ -1597,7 +1597,7 @@ fn handle_depth_limited_tree_side(
     left: Option<&TopEntry>,
     right: Option<&TopEntry>,
     path: Vec<u8>,
-    out: &mut Vec<sley_diff_merge::NameStatusEntry>,
+    out: &mut Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
 ) -> Result<()> {
     if context.max_depth < 0 || context.pathspecs.is_ancestor_of_spec(&path) {
         return collect_depth_limited_tree_changes(
@@ -1626,7 +1626,7 @@ fn handle_depth_limited_tree_side(
 }
 
 fn maybe_push_depth_limited_blob_change(
-    out: &mut Vec<sley_diff_merge::NameStatusEntry>,
+    out: &mut Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     path: Vec<u8>,
     left: Option<&TopEntry>,
     right: Option<&TopEntry>,
@@ -1640,12 +1640,12 @@ fn maybe_push_depth_limited_blob_change(
         return;
     }
     let status = match (left, right) {
-        (None, Some(_)) => sley_diff_merge::NameStatus::Added,
-        (Some(_), None) => sley_diff_merge::NameStatus::Deleted,
-        (Some(_), Some(_)) => sley_diff_merge::NameStatus::Modified,
+        (None, Some(_)) => sley::plumbing::sley_diff_merge::NameStatus::Added,
+        (Some(_), None) => sley::plumbing::sley_diff_merge::NameStatus::Deleted,
+        (Some(_), Some(_)) => sley::plumbing::sley_diff_merge::NameStatus::Modified,
         (None, None) => return,
     };
-    out.push(sley_diff_merge::NameStatusEntry {
+    out.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
         status,
         path: BString::from(path),
         old_path: None,
@@ -1657,18 +1657,18 @@ fn maybe_push_depth_limited_blob_change(
 }
 
 fn push_depth_limited_tree_change(
-    out: &mut Vec<sley_diff_merge::NameStatusEntry>,
+    out: &mut Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     path: Vec<u8>,
     left: Option<&TopEntry>,
     right: Option<&TopEntry>,
 ) {
     let status = match (left, right) {
-        (None, Some(_)) => sley_diff_merge::NameStatus::Added,
-        (Some(_), None) => sley_diff_merge::NameStatus::Deleted,
-        (Some(_), Some(_)) => sley_diff_merge::NameStatus::Modified,
+        (None, Some(_)) => sley::plumbing::sley_diff_merge::NameStatus::Added,
+        (Some(_), None) => sley::plumbing::sley_diff_merge::NameStatus::Deleted,
+        (Some(_), Some(_)) => sley::plumbing::sley_diff_merge::NameStatus::Modified,
         (None, None) => return,
     };
-    out.push(sley_diff_merge::NameStatusEntry {
+    out.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
         status,
         path: BString::from(path),
         old_path: None,
@@ -1730,7 +1730,7 @@ fn top_level_entries(
 fn top_level_changes(
     left: &BTreeMap<Vec<u8>, TopEntry>,
     right: &BTreeMap<Vec<u8>, TopEntry>,
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+) -> Vec<sley::plumbing::sley_diff_merge::NameStatusEntry> {
     let mut names: BTreeSet<Vec<u8>> = BTreeSet::new();
     names.extend(left.keys().cloned());
     names.extend(right.keys().cloned());
@@ -1739,12 +1739,12 @@ fn top_level_changes(
         let l = left.get(&name);
         let r = right.get(&name);
         let status = match (l, r) {
-            (None, Some(_)) => sley_diff_merge::NameStatus::Added,
-            (Some(_), None) => sley_diff_merge::NameStatus::Deleted,
-            (Some(l), Some(r)) if l != r => sley_diff_merge::NameStatus::Modified,
+            (None, Some(_)) => sley::plumbing::sley_diff_merge::NameStatus::Added,
+            (Some(_), None) => sley::plumbing::sley_diff_merge::NameStatus::Deleted,
+            (Some(l), Some(r)) if l != r => sley::plumbing::sley_diff_merge::NameStatus::Modified,
             _ => continue,
         };
-        changes.push(sley_diff_merge::NameStatusEntry {
+        changes.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
             status,
             path: BString::from(name),
             old_path: None,
@@ -1765,10 +1765,10 @@ fn top_level_changes(
 /// subtrees collapsed. Only blob (non-`040000`) entries are eligible as rename
 /// or copy candidates; directories never participate.
 fn detect_top_level_renames(
-    mut changes: Vec<sley_diff_merge::NameStatusEntry>,
+    mut changes: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     db: &FileObjectDatabase,
     options: &DiffTreeOptions,
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+) -> Vec<sley::plumbing::sley_diff_merge::NameStatusEntry> {
     if options.detect_renames {
         changes = detect_top_level_rename_pass(
             changes,
@@ -1791,11 +1791,11 @@ fn detect_top_level_renames(
 
 /// Is this change entry a regular-file (blob) side, i.e. eligible for rename/copy
 /// pairing? Directory (`040000`) entries are excluded.
-fn entry_is_blob_old(entry: &sley_diff_merge::NameStatusEntry) -> bool {
+fn entry_is_blob_old(entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) -> bool {
     entry.old_mode.is_some_and(|mode| mode != 0o040000)
 }
 
-fn entry_is_blob_new(entry: &sley_diff_merge::NameStatusEntry) -> bool {
+fn entry_is_blob_new(entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) -> bool {
     entry.new_mode.is_some_and(|mode| mode != 0o040000)
 }
 
@@ -1803,21 +1803,21 @@ fn entry_is_blob_new(entry: &sley_diff_merge::NameStatusEntry) -> bool {
 /// score 100 and take priority; remaining pairs are scored by content
 /// similarity and assigned greedily, best score first.
 fn detect_top_level_rename_pass(
-    changes: Vec<sley_diff_merge::NameStatusEntry>,
+    changes: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     db: &FileObjectDatabase,
     threshold: u8,
     rename_empty: bool,
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+) -> Vec<sley::plumbing::sley_diff_merge::NameStatusEntry> {
     let deleted: Vec<usize> = changes
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.status == sley_diff_merge::NameStatus::Deleted && entry_is_blob_old(e))
+        .filter(|(_, e)| e.status == sley::plumbing::sley_diff_merge::NameStatus::Deleted && entry_is_blob_old(e))
         .map(|(idx, _)| idx)
         .collect();
     let added: Vec<usize> = changes
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.status == sley_diff_merge::NameStatus::Added && entry_is_blob_new(e))
+        .filter(|(_, e)| e.status == sley::plumbing::sley_diff_merge::NameStatus::Added && entry_is_blob_new(e))
         .map(|(idx, _)| idx)
         .collect();
     if deleted.is_empty() || added.is_empty() {
@@ -1879,7 +1879,7 @@ fn detect_top_level_rename_pass(
                 let Some(dst_bytes) = read_blob_for_similarity(db, dst_oid) else {
                     continue;
                 };
-                let score = sley_diff_merge::blob_similarity(&src_bytes, &dst_bytes);
+                let score = sley::plumbing::sley_diff_merge::blob_similarity(&src_bytes, &dst_bytes);
                 if score >= threshold {
                     pairs.push((si, di, score));
                 }
@@ -1907,9 +1907,9 @@ fn detect_top_level_rename_pass(
 /// carries its source's old path/mode/oid, and the consumed source deletes are
 /// dropped.
 fn apply_rename_assignments(
-    changes: Vec<sley_diff_merge::NameStatusEntry>,
+    changes: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     assigned: &BTreeMap<usize, (usize, u8)>,
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+) -> Vec<sley::plumbing::sley_diff_merge::NameStatusEntry> {
     if assigned.is_empty() {
         return changes;
     }
@@ -1935,8 +1935,8 @@ fn apply_rename_assignments(
         }
         if let Some((src_idx, score)) = assigned.get(&idx) {
             let meta = source_meta.get(src_idx).cloned().unwrap_or_default();
-            result.push(sley_diff_merge::NameStatusEntry {
-                status: sley_diff_merge::NameStatus::Renamed(*score),
+            result.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
+                status: sley::plumbing::sley_diff_merge::NameStatus::Renamed(*score),
                 path: entry.path,
                 old_path: Some(meta.path),
                 old_mode: meta.mode,
@@ -1965,19 +1965,19 @@ struct RenameSourceMeta {
 /// only blobs that themselves changed (deleted/modified) on this diff. Copies do
 /// not consume their source.
 fn detect_top_level_copy_pass(
-    mut changes: Vec<sley_diff_merge::NameStatusEntry>,
+    mut changes: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     db: &FileObjectDatabase,
     threshold: u8,
     find_copies_harder: bool,
     rename_empty: bool,
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+) -> Vec<sley::plumbing::sley_diff_merge::NameStatusEntry> {
     if threshold > 100 {
         return changes;
     }
     let sources: Vec<CopySource> = changes
         .iter()
         .filter(|entry| match entry.status {
-            sley_diff_merge::NameStatus::Deleted | sley_diff_merge::NameStatus::Modified => true,
+            sley::plumbing::sley_diff_merge::NameStatus::Deleted | sley::plumbing::sley_diff_merge::NameStatus::Modified => true,
             _ => find_copies_harder,
         })
         .filter_map(|entry| match (entry.old_mode, entry.old_oid.as_ref()) {
@@ -1994,7 +1994,7 @@ fn detect_top_level_copy_pass(
     }
 
     for entry in changes.iter_mut() {
-        if entry.status != sley_diff_merge::NameStatus::Added || !entry_is_blob_new(entry) {
+        if entry.status != sley::plumbing::sley_diff_merge::NameStatus::Added || !entry_is_blob_new(entry) {
             continue;
         }
         let Some(dst_oid) = entry.new_oid else {
@@ -2005,7 +2005,7 @@ fn detect_top_level_copy_pass(
         }
         // Exact-oid copy first (score 100).
         if let Some(source) = sources.iter().find(|source| source.oid == dst_oid) {
-            entry.status = sley_diff_merge::NameStatus::Copied(100);
+            entry.status = sley::plumbing::sley_diff_merge::NameStatus::Copied(100);
             entry.old_path = Some(source.path.clone());
             entry.old_mode = Some(source.mode);
             entry.old_oid = Some(source.oid);
@@ -2022,13 +2022,13 @@ fn detect_top_level_copy_pass(
             let Some(src_bytes) = read_blob_for_similarity(db, &source.oid) else {
                 continue;
             };
-            let score = sley_diff_merge::blob_similarity(&src_bytes, &dst_bytes);
+            let score = sley::plumbing::sley_diff_merge::blob_similarity(&src_bytes, &dst_bytes);
             if score >= threshold && best.as_ref().is_none_or(|(b, _)| score > *b) {
                 best = Some((score, source));
             }
         }
         if let Some((score, source)) = best {
-            entry.status = sley_diff_merge::NameStatus::Copied(score);
+            entry.status = sley::plumbing::sley_diff_merge::NameStatus::Copied(score);
             entry.old_path = Some(source.path.clone());
             entry.old_mode = Some(source.mode);
             entry.old_oid = Some(source.oid);
@@ -2064,7 +2064,7 @@ fn is_empty_blob_oid(oid: &ObjectId) -> bool {
 /// Sort the change list by destination path, matching git's ordering for the
 /// non-rename entries we produce here (raw/name modes and `-t` tree nodes never
 /// involve a rename whose old path would sort differently).
-fn sort_entries_by_path(entries: &mut [sley_diff_merge::NameStatusEntry]) {
+fn sort_entries_by_path(entries: &mut [sley::plumbing::sley_diff_merge::NameStatusEntry]) {
     entries.sort_by(|a, b| a.path.cmp(&b.path));
 }
 
@@ -2075,7 +2075,7 @@ fn changed_tree_nodes(
     db: &FileObjectDatabase,
     left: Option<&ObjectId>,
     right: &ObjectId,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+) -> Result<Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>> {
     let mut out = Vec::new();
     collect_changed_tree_nodes(format, db, left, Some(right), Vec::new(), &mut out)?;
     Ok(out)
@@ -2090,7 +2090,7 @@ fn collect_changed_tree_nodes(
     left_tree: Option<&ObjectId>,
     right_tree: Option<&ObjectId>,
     prefix: Vec<u8>,
-    out: &mut Vec<sley_diff_merge::NameStatusEntry>,
+    out: &mut Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
 ) -> Result<()> {
     let left_children = match left_tree {
         Some(oid) => subtree_children(format, db, oid)?,
@@ -2115,11 +2115,11 @@ fn collect_changed_tree_nodes(
         }
         path.extend_from_slice(&name);
         let status = match (l, r) {
-            (None, Some(_)) => sley_diff_merge::NameStatus::Added,
-            (Some(_), None) => sley_diff_merge::NameStatus::Deleted,
-            _ => sley_diff_merge::NameStatus::Modified,
+            (None, Some(_)) => sley::plumbing::sley_diff_merge::NameStatus::Added,
+            (Some(_), None) => sley::plumbing::sley_diff_merge::NameStatus::Deleted,
+            _ => sley::plumbing::sley_diff_merge::NameStatus::Modified,
         };
-        out.push(sley_diff_merge::NameStatusEntry {
+        out.push(sley::plumbing::sley_diff_merge::NameStatusEntry {
             status,
             path: BString::from(path.clone()),
             old_path: None,

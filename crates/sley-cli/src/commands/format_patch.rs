@@ -23,7 +23,7 @@
 
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
-use sley_notes::{NotesRef, read_note_bytes};
+use sley::plumbing::sley_notes::{NotesRef, read_note_bytes};
 
 /// The `--rfc[=<token>]` / `--no-rfc` state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,7 +263,7 @@ struct FormatPatchOptions {
 }
 
 struct FormatPatchSelection {
-    commits: Vec<sley_rev::CommitRecord>,
+    commits: Vec<sley::plumbing::sley_rev::CommitRecord>,
     pathspecs: Vec<String>,
 }
 
@@ -346,8 +346,8 @@ impl Default for FormatPatchOptions {
             detect_renames: true,
             detect_copies: false,
             find_copies_harder: false,
-            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            copy_threshold: sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             order_file: None,
             cover_letter: None,
             commit_list_format: None,
@@ -772,7 +772,7 @@ fn build_cover_letter(
     options: &FormatPatchOptions,
     resolved: &ResolvedFormat,
     config: &GitConfig,
-    commits: &[sley_rev::CommitRecord],
+    commits: &[sley::plumbing::sley_rev::CommitRecord],
     diff_pathspec: Option<&DiffPathspec>,
     last_number: usize,
     abbrev: usize,
@@ -1396,7 +1396,7 @@ fn resolve_commit_list_format(options: &FormatPatchOptions, config: &GitConfig) 
 fn write_commit_list_cover(
     out: &mut Vec<u8>,
     format: &str,
-    commits: &[sley_rev::CommitRecord],
+    commits: &[sley::plumbing::sley_rev::CommitRecord],
 ) -> Result<()> {
     if let Some(pretty) = format.strip_prefix("log:") {
         write_commit_list_pretty(out, pretty, commits)?;
@@ -1418,7 +1418,7 @@ fn write_commit_list_cover(
 /// commit subjects, wrapped at column 76 with the first line indented 2 and
 /// continuations indented 4. Commits are grouped in first-appearance (oldest
 /// first) order.
-fn write_shortlog_cover(out: &mut Vec<u8>, commits: &[sley_rev::CommitRecord]) {
+fn write_shortlog_cover(out: &mut Vec<u8>, commits: &[sley::plumbing::sley_rev::CommitRecord]) {
     // Preserve first-seen group order while collecting each author's subjects.
     let mut order: Vec<String> = Vec::new();
     let mut groups: HashMap<String, Vec<String>> = HashMap::new();
@@ -1496,7 +1496,7 @@ fn cover_wrap_text(text: &str, width: usize, indent1: usize, indent2: usize) -> 
 fn write_commit_list_pretty(
     out: &mut Vec<u8>,
     format: &str,
-    commits: &[sley_rev::CommitRecord],
+    commits: &[sley::plumbing::sley_rev::CommitRecord],
 ) -> Result<()> {
     let total = commits.len();
     // git iterates `list[n - i]` for i=1..=n; `list` is newest-first (list[0] =
@@ -1518,7 +1518,7 @@ fn write_commit_list_pretty(
 /// matching git's lenient passthrough for the tokens we don't special-case.
 fn expand_commit_list_format(
     format: &str,
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     count: usize,
     total: usize,
 ) -> Result<String> {
@@ -1596,7 +1596,7 @@ fn parse_leading_wrap(format: &str) -> (Option<(usize, usize, usize)>, &str) {
 fn cover_origin_tree(
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    commits: &[sley_rev::CommitRecord],
+    commits: &[sley::plumbing::sley_rev::CommitRecord],
 ) -> Result<Option<ObjectId>> {
     let oldest = &commits[0];
     let Some(parent_oid) = oldest.commit.parents.first() else {
@@ -1616,20 +1616,20 @@ fn cover_diff_entries(
     diff_pathspec: Option<&DiffPathspec>,
     origin_tree: &ObjectId,
     head_tree: &ObjectId,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
-    let base = sley_diff_merge::DiffNameStatusOptions {
+) -> Result<Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>> {
+    let base = sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
         detect_renames: options.detect_renames,
         detect_copies: options.detect_copies,
         find_copies_harder: options.find_copies_harder,
         rename_empty: true,
     };
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
+    let rename_options = sley::plumbing::sley_diff_merge::RenameDetectionOptions {
         base,
         detect_inexact: true,
         rename_threshold: options.rename_threshold,
         copy_threshold: options.copy_threshold,
     };
-    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+    let entries = sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
         db,
         format,
         origin_tree,
@@ -1762,7 +1762,7 @@ fn render_format_patch_notes(
         if body.last() == Some(&b'\n') {
             body.pop();
         }
-        if handle.as_str() == sley_notes::DEFAULT_NOTES_REF {
+        if handle.as_str() == sley::plumbing::sley_notes::DEFAULT_NOTES_REF {
             out.extend_from_slice(b"\nNotes:\n");
         } else {
             let name = handle
@@ -2052,7 +2052,7 @@ fn resolve_signature(options: &FormatPatchOptions, config: &GitConfig) -> Result
     }
     // Default: the git version string.
     Ok(Some(
-        sley_core::UPSTREAM_GIT_COMPAT_VERSION.as_bytes().to_vec(),
+        sley::plumbing::sley_core::UPSTREAM_GIT_COMPAT_VERSION.as_bytes().to_vec(),
     ))
 }
 
@@ -2064,7 +2064,7 @@ struct RenderContext<'a> {
     options: &'a FormatPatchOptions,
     /// Run-wide resolved formatting (prefix, headers, from, signature).
     resolved: &'a ResolvedFormat,
-    record: &'a sley_rev::CommitRecord,
+    record: &'a sley::plumbing::sley_rev::CommitRecord,
     diff_pathspec: Option<&'a DiffPathspec>,
     /// 1-based patch number for the `n` in `[PATCH n/m]` and the file name.
     seq: usize,
@@ -2980,14 +2980,14 @@ fn first_parent_diff_entries(
     options: &FormatPatchOptions,
     diff_pathspec: Option<&DiffPathspec>,
     commit: &Commit,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
-    let base = sley_diff_merge::DiffNameStatusOptions {
+) -> Result<Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>> {
+    let base = sley::plumbing::sley_diff_merge::DiffNameStatusOptions {
         detect_renames: options.detect_renames,
         detect_copies: options.detect_copies,
         find_copies_harder: options.find_copies_harder,
         rename_empty: true,
     };
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
+    let rename_options = sley::plumbing::sley_diff_merge::RenameDetectionOptions {
         base,
         detect_inexact: true,
         rename_threshold: options.rename_threshold,
@@ -2997,7 +2997,7 @@ fn first_parent_diff_entries(
         Some(parent_oid) => {
             let parent_object = db.read_object(parent_oid)?;
             let parent_commit = Commit::parse_ref(format, &parent_object.body)?;
-            sley_diff_merge::diff_name_status_trees_with_rename_options(
+            sley::plumbing::sley_diff_merge::diff_name_status_trees_with_rename_options(
                 db,
                 format,
                 &parent_commit.tree,
@@ -3005,7 +3005,7 @@ fn first_parent_diff_entries(
                 rename_options,
             )
         }
-        None => sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
+        None => sley::plumbing::sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
             db,
             format,
             &commit.tree,
@@ -3033,13 +3033,13 @@ fn select_commits(
     if let Some(rev) = format_patch_bare_exclude(options) {
         let oid = repo
             .resolve_revision(rev)
-            .map_err(|_| sley_rev::ambiguous_argument_error(rev))?;
-        sley_rev::peel_to_commit(db, format, &oid)
-            .map_err(|_| sley_rev::ambiguous_argument_error(rev))?;
+            .map_err(|_| sley::plumbing::sley_rev::ambiguous_argument_error(rev))?;
+        sley::plumbing::sley_rev::peel_to_commit(db, format, &oid)
+            .map_err(|_| sley::plumbing::sley_rev::ambiguous_argument_error(rev))?;
     }
-    let setup = sley_rev::setup_revisions(
+    let setup = sley::plumbing::sley_rev::setup_revisions(
         &setup_args,
-        &sley_rev::RevisionSetupContext {
+        &sley::plumbing::sley_rev::RevisionSetupContext {
             git_dir: repo.git_dir(),
             worktree_root: repo.worktree_root().ok(),
             cwd: repo.cwd(),
@@ -3057,7 +3057,7 @@ fn select_commits(
     let starts = revision_options
         .positives
         .iter()
-        .map(|tip| sley_rev::peel_to_commit(db, format, &tip.oid))
+        .map(|tip| sley::plumbing::sley_rev::peel_to_commit(db, format, &tip.oid))
         .collect::<Result<Vec<_>>>()?;
 
     let mut excluded = HashSet::new();
@@ -3093,7 +3093,7 @@ fn select_commits(
     };
 
     // Keep non-excluded, non-merge commits (newest-first from the walk).
-    let mut selected: Vec<sley_rev::CommitRecord> = walked
+    let mut selected: Vec<sley::plumbing::sley_rev::CommitRecord> = walked
         .into_iter()
         .filter(|record| !excluded.contains(&record.oid) && record.parents.len() <= 1)
         .collect();
@@ -3117,17 +3117,17 @@ fn select_commits(
         });
     }
     if !setup.pathspecs.is_empty() {
-        let pathspec = sley_rev::Pathspec::parse(
+        let pathspec = sley::plumbing::sley_rev::Pathspec::parse(
             setup.pathspecs.iter().map(|spec| spec.as_bytes()),
-            sley_rev::PathspecMatchMagic::default(),
+            sley::plumbing::sley_rev::PathspecMatchMagic::default(),
         )
         .map_err(|err| GitError::Command(format!("bad pathspec: {err:?}")))?;
-        selected = sley_rev::simplify_history(
+        selected = sley::plumbing::sley_rev::simplify_history(
             db,
             format,
             selected,
             &pathspec,
-            sley_rev::SimplifyOptions {
+            sley::plumbing::sley_rev::SimplifyOptions {
                 full_history: false,
                 first_parent: false,
                 ..Default::default()
@@ -3195,7 +3195,7 @@ fn format_patch_bare_exclude(options: &FormatPatchOptions) -> Option<&str> {
 fn format_patch_commit_patch_id(
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
 ) -> Result<Option<Vec<u8>>> {
     if record.parents.len() > 1 {
         return Ok(None);
@@ -3213,7 +3213,7 @@ fn resolve_base_info(
     repo: &RepositoryContext,
     options: &FormatPatchOptions,
     config: &GitConfig,
-    commits: &[sley_rev::CommitRecord],
+    commits: &[sley::plumbing::sley_rev::CommitRecord],
 ) -> Result<Option<BaseInfo>> {
     if commits.is_empty() {
         return Ok(None);
@@ -3248,9 +3248,9 @@ fn resolve_base_info(
 fn resolve_base_commit(repo: &RepositoryContext, rev: &str) -> Result<ObjectId> {
     let oid = repo
         .resolve_revision(rev)
-        .map_err(|_| sley_rev::ambiguous_argument_error(rev))?;
-    sley_rev::peel_to_commit(repo.objects(), repo.format(), &oid)
-        .map_err(|_| sley_rev::ambiguous_argument_error(rev))
+        .map_err(|_| sley::plumbing::sley_rev::ambiguous_argument_error(rev))?;
+    sley::plumbing::sley_rev::peel_to_commit(repo.objects(), repo.format(), &oid)
+        .map_err(|_| sley::plumbing::sley_rev::ambiguous_argument_error(rev))
 }
 
 fn resolve_upstream_base(repo: &RepositoryContext, config: &GitConfig) -> Result<Option<ObjectId>> {
@@ -3281,7 +3281,7 @@ fn validate_base_commit(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     base: &ObjectId,
-    commits: &[sley_rev::CommitRecord],
+    commits: &[sley::plumbing::sley_rev::CommitRecord],
 ) -> Result<()> {
     if commits.iter().any(|record| &record.oid == base) {
         eprintln!("fatal: base commit should be the ancestor of revision list");
@@ -3300,7 +3300,7 @@ fn prerequisite_patch_ids(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     base: &ObjectId,
-    commits: &[sley_rev::CommitRecord],
+    commits: &[sley::plumbing::sley_rev::CommitRecord],
 ) -> Result<Vec<Vec<u8>>> {
     let Some(oldest_parent) = commits[0].parents.first() else {
         return Ok(Vec::new());
@@ -3339,10 +3339,10 @@ fn read_commit_record_for_format_patch(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     oid: ObjectId,
-) -> Result<sley_rev::CommitRecord> {
+) -> Result<sley::plumbing::sley_rev::CommitRecord> {
     let object = db.read_object(&oid)?;
     let commit: Commit = Commit::parse_ref(format, &object.body)?.into();
-    Ok(sley_rev::CommitRecord {
+    Ok(sley::plumbing::sley_rev::CommitRecord {
         oid,
         parents: commit.parents.clone(),
         commit,
@@ -3389,9 +3389,9 @@ fn normalize_relative_prefix(path: &str) -> Option<Vec<u8>> {
 }
 
 fn apply_format_patch_relative(
-    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    entries: Vec<sley::plumbing::sley_diff_merge::NameStatusEntry>,
     options: &FormatPatchOptions,
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+) -> Vec<sley::plumbing::sley_diff_merge::NameStatusEntry> {
     let Some(prefix) = options.relative_prefix.as_deref() else {
         return entries;
     };
@@ -3562,7 +3562,7 @@ fn is_title_char(byte: u8) -> bool {
 /// whole-file hunk. Binary changes get the `Binary files ... differ` line.
 fn write_patch_diff_entry(
     out: &mut Vec<u8>,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     options: &FormatPatchOptions,
@@ -3644,14 +3644,14 @@ fn write_patch_diff_entry(
         ),
     );
     match entry.status {
-        sley_diff_merge::NameStatus::Added => writeln_buf(out, "--- /dev/null"),
+        sley::plumbing::sley_diff_merge::NameStatus::Added => writeln_buf(out, "--- /dev/null"),
         _ => writeln_fmt_buf(
             out,
             format_args!("--- {}", patch_header_path(&options.src_prefix, old_path)),
         ),
     }
     match entry.status {
-        sley_diff_merge::NameStatus::Deleted => writeln_buf(out, "+++ /dev/null"),
+        sley::plumbing::sley_diff_merge::NameStatus::Deleted => writeln_buf(out, "+++ /dev/null"),
         _ => writeln_fmt_buf(
             out,
             format_args!(
@@ -3678,21 +3678,21 @@ fn write_patch_diff_entry(
 
 /// Emit the `new file mode` / `deleted file mode` / `old mode`+`new mode`
 /// headers appropriate for the entry's status.
-fn write_patch_mode_headers(out: &mut Vec<u8>, entry: &sley_diff_merge::NameStatusEntry) {
+fn write_patch_mode_headers(out: &mut Vec<u8>, entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) {
     match entry.status {
-        sley_diff_merge::NameStatus::Added => {
+        sley::plumbing::sley_diff_merge::NameStatus::Added => {
             if let Some(mode) = entry.new_mode {
                 writeln_fmt_buf(out, format_args!("new file mode {mode:06o}"));
             }
         }
-        sley_diff_merge::NameStatus::Deleted => {
+        sley::plumbing::sley_diff_merge::NameStatus::Deleted => {
             if let Some(mode) = entry.old_mode {
                 writeln_fmt_buf(out, format_args!("deleted file mode {mode:06o}"));
             }
         }
-        sley_diff_merge::NameStatus::Modified
-        | sley_diff_merge::NameStatus::Renamed(_)
-        | sley_diff_merge::NameStatus::Copied(_) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Modified
+        | sley::plumbing::sley_diff_merge::NameStatus::Renamed(_)
+        | sley::plumbing::sley_diff_merge::NameStatus::Copied(_) => {
             if let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
                 && old_mode != new_mode
             {
@@ -3700,7 +3700,7 @@ fn write_patch_mode_headers(out: &mut Vec<u8>, entry: &sley_diff_merge::NameStat
                 writeln_fmt_buf(out, format_args!("new mode {new_mode:06o}"));
             }
         }
-        sley_diff_merge::NameStatus::Unmerged => {}
+        sley::plumbing::sley_diff_merge::NameStatus::Unmerged => {}
     }
 }
 
@@ -3708,19 +3708,19 @@ fn write_patch_mode_headers(out: &mut Vec<u8>, entry: &sley_diff_merge::NameStat
 /// rename and copy entries.
 fn write_patch_similarity_headers(
     out: &mut Vec<u8>,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     old_path: &[u8],
     path: &[u8],
 ) {
     let old = status_quote_path(old_path, false);
     let new = status_quote_path(path, false);
     match entry.status {
-        sley_diff_merge::NameStatus::Renamed(score) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Renamed(score) => {
             writeln_fmt_buf(out, format_args!("similarity index {score}%"));
             writeln_fmt_buf(out, format_args!("rename from {old}"));
             writeln_fmt_buf(out, format_args!("rename to {new}"));
         }
-        sley_diff_merge::NameStatus::Copied(score) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Copied(score) => {
             writeln_fmt_buf(out, format_args!("similarity index {score}%"));
             writeln_fmt_buf(out, format_args!("copy from {old}"));
             writeln_fmt_buf(out, format_args!("copy to {new}"));
@@ -3737,7 +3737,7 @@ const HUNK_CONTEXT: usize = 3;
 /// This is the sley-cli-side option bundle; it carries the repository-coupled
 /// concerns (userdiff funcname driver, sley-cli `DiffColors`, word-diff
 /// config) and is translated into the engine's
-/// [`sley_diff_merge::render::HunkRenderOptions`] by [`write_patch_hunks_with`].
+/// [`sley::plumbing::sley_diff_merge::render::HunkRenderOptions`] by [`write_patch_hunks_with`].
 pub(crate) struct PatchHunkOptions<'a> {
     /// Lines of context around each change (`-U<n>`, default 3).
     pub(crate) context: usize,
@@ -3765,11 +3765,11 @@ impl Default for PatchHunkOptions<'_> {
 }
 
 /// Map a sley-cli [`DiffColors`](commands::diff_words::DiffColors) palette into
-/// the engine's [`RenderColors`](sley_diff_merge::render::RenderColors) borrow.
+/// the engine's [`RenderColors`](sley::plumbing::sley_diff_merge::render::RenderColors) borrow.
 pub(crate) fn render_colors(
     colors: &commands::diff_words::DiffColors,
-) -> sley_diff_merge::render::RenderColors<'_> {
-    sley_diff_merge::render::RenderColors {
+) -> sley::plumbing::sley_diff_merge::render::RenderColors<'_> {
+    sley::plumbing::sley_diff_merge::render::RenderColors {
         frag: &colors.frag,
         func: &colors.func,
         old: &colors.old,
@@ -3789,7 +3789,7 @@ pub(crate) fn render_colors(
 }
 
 /// Bridge a sley-cli word-diff config + its line buffers into the engine's
-/// [`HunkWordDiff`](sley_diff_merge::render::HunkWordDiff) hook. The engine
+/// [`HunkWordDiff`](sley::plumbing::sley_diff_merge::render::HunkWordDiff) hook. The engine
 /// owns hunk shaping; this adapter owns the word-level rendering.
 pub(crate) struct WordDiffAdapter<'a> {
     config: &'a commands::diff_words::WordDiffConfig<'a>,
@@ -3805,7 +3805,7 @@ impl<'a> WordDiffAdapter<'a> {
     }
 }
 
-impl sley_diff_merge::render::HunkWordDiff for WordDiffAdapter<'_> {
+impl sley::plumbing::sley_diff_merge::render::HunkWordDiff for WordDiffAdapter<'_> {
     fn push_minus(&mut self, content: &[u8]) {
         self.buffers.push_minus(content);
     }
@@ -3826,7 +3826,7 @@ impl sley_diff_merge::render::HunkWordDiff for WordDiffAdapter<'_> {
 /// A per-line section-heading classifier matching git's funcname resolution:
 /// a userdiff `xfuncname` pattern when a driver is present, else the default
 /// `def_ff` heuristic. Returned as a closure for the engine's
-/// [`HeadingFn`](sley_diff_merge::render::HeadingFn) seam.
+/// [`HeadingFn`](sley::plumbing::sley_diff_merge::render::HeadingFn) seam.
 pub(crate) fn heading_classifier<'a>(
     funcname: Option<&'a commands::userdiff::CompiledFuncname>,
 ) -> impl FnMut(&[u8]) -> Option<Vec<u8>> + 'a {
@@ -3850,7 +3850,7 @@ pub(crate) fn write_patch_hunks(
 /// [`write_patch_hunks`] with explicit hunk shaping options.
 ///
 /// Thin adapter over the shared renderer
-/// [`sley_diff_merge::render::render_hunks`]: it translates the sley-cli
+/// [`sley::plumbing::sley_diff_merge::render::render_hunks`]: it translates the sley-cli
 /// option bundle (userdiff funcname, `DiffColors`, word-diff config) into the
 /// engine's seams and delegates all hunk byte-shaping to the engine.
 pub(crate) fn write_patch_hunks_with(
@@ -3861,19 +3861,19 @@ pub(crate) fn write_patch_hunks_with(
 ) {
     let mut heading = heading_classifier(options.funcname);
     let mut word_diff = options.word_diff.map(WordDiffAdapter::new);
-    let mut render_options = sley_diff_merge::render::HunkRenderOptions {
+    let mut render_options = sley::plumbing::sley_diff_merge::render::HunkRenderOptions {
         context: options.context,
         interhunk: options.interhunk,
         heading: Some(&mut heading),
         colors: options.colors.map(render_colors),
         word_diff: word_diff
             .as_mut()
-            .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
+            .map(|adapter| adapter as &mut dyn sley::plumbing::sley_diff_merge::render::HunkWordDiff),
         ws_error: None,
         color_moved: None,
         ..Default::default()
     };
-    sley_diff_merge::render::render_hunks(out, old_content, new_content, &mut render_options);
+    sley::plumbing::sley_diff_merge::render::render_hunks(out, old_content, new_content, &mut render_options);
 }
 
 /// The diffstat block (`--stat`) written into `out`, via the shared
@@ -3882,7 +3882,7 @@ pub(crate) fn write_patch_hunks_with(
 /// and the diff.stat*Width config is never consulted.
 fn write_patch_diffstat(
     out: &mut Vec<u8>,
-    entries: &[sley_diff_merge::NameStatusEntry],
+    entries: &[sley::plumbing::sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     options: &FormatPatchOptions,
 ) -> Result<()> {
@@ -3911,10 +3911,10 @@ fn write_patch_diffstat(
 /// when stats are on), mirroring the shared renderer.
 fn write_patch_summary_entry(
     out: &mut Vec<u8>,
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
 ) -> Result<()> {
     match entry.status {
-        sley_diff_merge::NameStatus::Added => {
+        sley::plumbing::sley_diff_merge::NameStatus::Added => {
             let mode = entry.new_mode.unwrap_or(0);
             writeln_buf(
                 out,
@@ -3924,7 +3924,7 @@ fn write_patch_summary_entry(
                 ),
             );
         }
-        sley_diff_merge::NameStatus::Deleted => {
+        sley::plumbing::sley_diff_merge::NameStatus::Deleted => {
             let mode = entry.old_mode.unwrap_or(0);
             writeln_buf(
                 out,
@@ -3934,7 +3934,7 @@ fn write_patch_summary_entry(
                 ),
             );
         }
-        sley_diff_merge::NameStatus::Renamed(score) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Renamed(score) => {
             if let Some(old_path) = &entry.old_path {
                 writeln_buf(
                     out,
@@ -3946,7 +3946,7 @@ fn write_patch_summary_entry(
                 );
             }
         }
-        sley_diff_merge::NameStatus::Copied(score) => {
+        sley::plumbing::sley_diff_merge::NameStatus::Copied(score) => {
             if let Some(old_path) = &entry.old_path {
                 writeln_buf(
                     out,
@@ -3958,7 +3958,7 @@ fn write_patch_summary_entry(
                 );
             }
         }
-        sley_diff_merge::NameStatus::Modified => {
+        sley::plumbing::sley_diff_merge::NameStatus::Modified => {
             if entry.old_mode != entry.new_mode
                 && let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
             {
@@ -3971,18 +3971,18 @@ fn write_patch_summary_entry(
                 );
             }
         }
-        sley_diff_merge::NameStatus::Unmerged => {}
+        sley::plumbing::sley_diff_merge::NameStatus::Unmerged => {}
     }
     Ok(())
 }
 
 /// Read the old blob for an entry, if it has one.
 fn entry_old_content(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
     format: ObjectFormat,
 ) -> Result<Option<Vec<u8>>> {
-    if entry.old_mode.is_some_and(sley_index::is_gitlink) {
+    if entry.old_mode.is_some_and(sley::plumbing::sley_index::is_gitlink) {
         return Ok(entry
             .old_oid
             .as_ref()
@@ -3997,14 +3997,14 @@ fn entry_old_content(
 
 /// Read the new blob for an entry (tree-to-tree; never the worktree), if any.
 fn entry_new_content(
-    entry: &sley_diff_merge::NameStatusEntry,
+    entry: &sley::plumbing::sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
     format: ObjectFormat,
 ) -> Result<Option<Vec<u8>>> {
     if entry.new_mode.is_none() {
         return Ok(None);
     }
-    if entry.new_mode.is_some_and(sley_index::is_gitlink) {
+    if entry.new_mode.is_some_and(sley::plumbing::sley_index::is_gitlink) {
         return Ok(entry
             .new_oid
             .as_ref()
@@ -4066,7 +4066,7 @@ fn patch_blob_oid(
     let hex = oid
         .cloned()
         .or_else(|| {
-            content.and_then(|content| sley_core::object_id_for_bytes(format, "blob", content).ok())
+            content.and_then(|content| sley::plumbing::sley_core::object_id_for_bytes(format, "blob", content).ok())
         })
         .map(|oid| oid.to_hex())
         .unwrap_or_else(|| "0".repeat(format.hex_len()));
@@ -4074,7 +4074,7 @@ fn patch_blob_oid(
 }
 
 /// The trailing ` <mode>` on an `index` line when the file mode is unchanged.
-fn patch_mode_suffix(entry: &sley_diff_merge::NameStatusEntry) -> String {
+fn patch_mode_suffix(entry: &sley::plumbing::sley_diff_merge::NameStatusEntry) -> String {
     match (entry.old_mode, entry.new_mode) {
         (Some(old_mode), Some(new_mode)) if old_mode == new_mode => format!(" {old_mode:06o}"),
         _ => String::new(),
@@ -4579,7 +4579,7 @@ fn parse_unified_context_count(value: &str) -> usize {
 /// 0..=100 percentage; accepts a bare integer or a trailing `%`.
 fn parse_similarity(value: &str) -> Result<u8> {
     if value.is_empty() {
-        return Ok(sley_diff_merge::DEFAULT_RENAME_THRESHOLD);
+        return Ok(sley::plumbing::sley_diff_merge::DEFAULT_RENAME_THRESHOLD);
     }
     let digits = value.strip_suffix('%').unwrap_or(value);
     let parsed = digits

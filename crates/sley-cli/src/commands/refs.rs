@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley_options::{OptFlags, OptValue, OptionSpec, ParsedValue, UsageError, parse_options};
+use sley::plumbing::sley_options::{OptFlags, OptValue, OptionSpec, ParsedValue, UsageError, parse_options};
 
 #[derive(Debug)]
 struct ReflogShowOptions {
@@ -882,7 +882,9 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
 }
 
 fn is_reflog_selector(value: &str) -> bool {
-    value.strip_suffix('}').is_some_and(|prefix| prefix.contains("@{"))
+    value
+        .strip_suffix('}')
+        .is_some_and(|prefix| prefix.contains("@{"))
 }
 
 fn expire_reflog_entries(
@@ -990,11 +992,11 @@ fn resolve_reflog_name(store: &FileRefStore, name: &str) -> Result<String> {
 
 fn load_reflog_expire_config(git_dir: &Path) -> Result<GitConfig> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
-    let context = sley_config::ConfigIncludeContext::new(
+    let context = sley::plumbing::sley_config::ConfigIncludeContext::new(
         Some(common_git_dir.clone()),
         repo_current_branch_name(git_dir),
     );
-    sley_config::load_effective_config(&common_git_dir, &context)
+    sley::plumbing::sley_config::load_effective_config(&common_git_dir, &context)
 }
 
 fn apply_reflog_expire_config_from(
@@ -1643,7 +1645,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
         }
         Err(err) => return Err(err),
     };
-    if sley_refs::validate_ref_name_for_update(&name).is_err() {
+    if sley::plumbing::sley_refs::validate_ref_name_for_update(&name).is_err() {
         eprintln!(
             "fatal: update_ref failed for ref '{requested_name}': refusing to update ref with bad name '{name}'"
         );
@@ -2953,7 +2955,7 @@ fn update_ref_stdin_commit_staged(
                     if current.is_some() {
                         tx.delete_with_precondition(
                             write.name,
-                            sley_refs::RefDeletePrecondition::Any,
+                            sley::plumbing::sley_refs::RefDeletePrecondition::Any,
                             None,
                         );
                     }
@@ -3003,7 +3005,7 @@ fn update_ref_stdin_commit_staged(
                 if current.is_some() {
                     tx.delete_with_precondition(
                         delete.name,
-                        sley_refs::RefDeletePrecondition::Any,
+                        sley::plumbing::sley_refs::RefDeletePrecondition::Any,
                         None,
                     );
                 }
@@ -3582,7 +3584,7 @@ fn update_ref_stdin_effective_ref(
         Err(GitError::InvalidPath(_)) => return update_ref_stdin_invalid_ref_format(name),
         Err(err) => return Err(err),
     };
-    if sley_refs::validate_ref_name_for_update(&effective.effective).is_err() {
+    if sley::plumbing::sley_refs::validate_ref_name_for_update(&effective.effective).is_err() {
         return update_ref_stdin_invalid_ref_format(name);
     }
     Ok(effective)
@@ -3772,7 +3774,7 @@ fn update_ref_log_all_ref_updates_matches(name: &str, value: &str) -> bool {
     if value.eq_ignore_ascii_case("always") {
         return true;
     }
-    if !sley_config::parse_config_bool(value).unwrap_or(false) {
+    if !sley::plumbing::sley_config::parse_config_bool(value).unwrap_or(false) {
         return false;
     }
     name == "HEAD"
@@ -3817,7 +3819,7 @@ fn parse_update_ref_oidish(
     // whatever object it resolves to (git does not peel here). `resolve_revision`
     // also covers the plain-ref case (a bare `refs/...` or `HEAD`), so a
     // validation error from `resolve_ref_peeled` above is not fatal on its own.
-    if let Ok(oid) = sley_rev::resolve_revision(git_dir, format, value) {
+    if let Ok(oid) = sley::plumbing::sley_rev::resolve_revision(git_dir, format, value) {
         return Some(oid);
     }
     None
@@ -4081,7 +4083,7 @@ pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
             }
             match store.read_ref(filter)? {
                 Some(target) => {
-                    let reference = sley_refs::Ref {
+                    let reference = sley::plumbing::sley_refs::Ref {
                         name: filter.to_string(),
                         target,
                     };
@@ -4187,7 +4189,7 @@ fn show_ref_exists_requires_reference(count: usize) -> Result<()> {
     Err(GitError::Exit(128))
 }
 
-fn cmd_show_ref_exclude_existing(refs: &[sley_refs::Ref], pattern: Option<&str>) -> Result<()> {
+fn cmd_show_ref_exclude_existing(refs: &[sley::plumbing::sley_refs::Ref], pattern: Option<&str>) -> Result<()> {
     let existing = refs
         .iter()
         .map(|reference| reference.name.as_str())
@@ -4253,7 +4255,7 @@ fn print_show_ref_deref(
     if object.object_type != ObjectType::Tag {
         return Ok(());
     }
-    let peeled = sley_rev::peel_tags(db, format, oid)?;
+    let peeled = sley::plumbing::sley_rev::peel_tags(db, format, oid)?;
     print_show_ref(&peeled, &format!("{name}^{{}}"), false, abbrev);
     Ok(())
 }
@@ -4327,7 +4329,7 @@ fn update_symbolic_ref(
         return Err(GitError::Exit(128));
     }
     let old_oid = resolve_symbolic_ref_oid(store, format, name)?;
-    let new_oid = if sley_refs::validate_ref_name_for_read(target).is_ok() {
+    let new_oid = if sley::plumbing::sley_refs::validate_ref_name_for_read(target).is_ok() {
         resolve_symbolic_ref_oid(store, format, target)?
     } else {
         zero_oid(format)?
@@ -4349,7 +4351,7 @@ fn update_symbolic_ref(
     commit_symbolic_ref_update(tx)
 }
 
-fn commit_symbolic_ref_update(tx: sley_refs::FileRefTransaction<'_>) -> Result<()> {
+fn commit_symbolic_ref_update(tx: sley::plumbing::sley_refs::FileRefTransaction<'_>) -> Result<()> {
     match tx.commit() {
         Ok(()) => Ok(()),
         Err(GitError::Transaction(message)) if message.starts_with("cannot lock ref '") => {
@@ -4429,7 +4431,7 @@ fn symbolic_ref_refusing_outside_refs() -> Result<()> {
 fn symbolic_ref_usage() -> Result<()> {
     eprint!(
         "{}",
-        sley_options::usage_with_options(&symbolic_ref_option_specs(), &symbolic_ref_usage_lines())
+        sley::plumbing::sley_options::usage_with_options(&symbolic_ref_option_specs(), &symbolic_ref_usage_lines())
     );
     Err(GitError::Exit(129))
 }

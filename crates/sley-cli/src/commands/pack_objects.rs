@@ -21,7 +21,7 @@ use std::io::BufRead;
 use std::io::IsTerminal;
 use std::sync::Arc;
 
-use sley_pack::{PackInput, PackReverseIndex, PackWriteOptions, pack_order_index_positions};
+use sley::plumbing::sley_pack::{PackInput, PackReverseIndex, PackWriteOptions, pack_order_index_positions};
 
 use crate::*;
 
@@ -260,8 +260,8 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let database = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    options.object_filter = std::mem::take(&mut options.object_filter)
-        .resolve(&git_dir, &database, format)?;
+    options.object_filter =
+        std::mem::take(&mut options.object_filter).resolve(&git_dir, &database, format)?;
     let progress = options
         .progress
         .unwrap_or_else(|| io::stderr().is_terminal());
@@ -368,7 +368,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             .flat_map(|reuse| reuse.entry_bytes.iter().map(Vec::as_slice))
             .collect();
         let (pack, _) =
-            sley_odb::assemble_pack_with_verbatim_entries(format, &reused_entry_bytes, &inputs)?;
+            sley::plumbing::sley_odb::assemble_pack_with_verbatim_entries(format, &reused_entry_bytes, &inputs)?;
         if options.stdout_mode {
             let mut stdout = io::stdout();
             stdout.write_all(&pack)?;
@@ -444,7 +444,7 @@ fn pack_objects_write_options(git_dir: &Path) -> Result<PackWriteOptions> {
     let config = read_repo_config(git_dir)?;
     let mut options = PackWriteOptions::new();
     if let Some(value) = config.get("pack", None, "window")
-        && let Some(window) = sley_config::parse_config_int(value)
+        && let Some(window) = sley::plumbing::sley_config::parse_config_int(value)
         && window == 0
     {
         options = options.with_window(0).with_depth(0).with_reorder(false);
@@ -453,7 +453,7 @@ fn pack_objects_write_options(git_dir: &Path) -> Result<PackWriteOptions> {
 }
 
 fn parse_pack_size_limit_arg(value: &str) -> Result<u64> {
-    let Some(parsed) = sley_config::parse_config_int(value) else {
+    let Some(parsed) = sley::plumbing::sley_config::parse_config_int(value) else {
         eprintln!("fatal: failed to parse --max-pack-size value '{value}'");
         return Err(GitError::Exit(128));
     };
@@ -474,7 +474,7 @@ fn pack_objects_pack_size_limit(
     if !stdout_mode
         && limit.is_none()
         && let Some(value) = config.get("pack", None, "packSizeLimit")
-        && let Some(parsed) = sley_config::parse_config_int(value)
+        && let Some(parsed) = sley::plumbing::sley_config::parse_config_int(value)
         && parsed > 0
     {
         limit = Some(parsed as u64);
@@ -550,7 +550,7 @@ fn write_pack_file_parts(
     format: ObjectFormat,
     pack: Vec<u8>,
     index: Vec<u8>,
-    entries: Vec<sley_pack::PackIndexEntry>,
+    entries: Vec<sley::plumbing::sley_pack::PackIndexEntry>,
     checksum: ObjectId,
     index_version: Option<u32>,
 ) -> Result<()> {
@@ -633,7 +633,7 @@ struct PackSortKey {
 struct WrittenPackParts {
     pack: Vec<u8>,
     index: Vec<u8>,
-    entries: Vec<sley_pack::PackIndexEntry>,
+    entries: Vec<sley::plumbing::sley_pack::PackIndexEntry>,
     checksum: ObjectId,
     delta_count: u32,
 }
@@ -692,8 +692,8 @@ fn emit_pack_objects_totals(progress: bool, stats_line: &str, pack_reused: u64, 
     if progress {
         eprintln!("{stats_line}");
     }
-    sley_core::trace2::data("pack-objects", "pack-reused", pack_reused);
-    sley_core::trace2::data("pack-objects", "packs-reused", packs_reused);
+    sley::plumbing::sley_core::trace2::data("pack-objects", "pack-reused", pack_reused);
+    sley::plumbing::sley_core::trace2::data("pack-objects", "packs-reused", packs_reused);
 }
 
 /// A bitmapped pack every object of which is wanted, so its bytes are spliced
@@ -915,7 +915,7 @@ impl PackObjectFilter {
         match self {
             Self::SparseOid(value) => {
                 let oid = if let Some((rev, path)) = value.split_once(':') {
-                    sley_rev::resolve_rev_path(git_dir, format, database, rev, path)?
+                    sley::plumbing::sley_rev::resolve_rev_path(git_dir, format, database, rev, path)?
                 } else {
                     resolve_revision(git_dir, format, &value)?
                 };
@@ -1033,7 +1033,11 @@ impl FilteredPackTraversal<'_> {
         provided: bool,
         state: &mut FilteredPackTraversalState,
     ) -> Result<()> {
-        if provided || self.filter.includes_object(ObjectType::Commit, &[], None, 0) {
+        if provided
+            || self
+                .filter
+                .includes_object(ObjectType::Commit, &[], None, 0)
+        {
             self.include_object(oid, Arc::clone(&object), state);
         } else {
             self.omit_object(oid, state);
@@ -1378,7 +1382,7 @@ fn pack_reuse_mode(git_dir: &Path) -> Result<PackReuseMode> {
             None => PackReuseMode::Single,
             Some(value) if value.eq_ignore_ascii_case("single") => PackReuseMode::Single,
             Some(value) if value.eq_ignore_ascii_case("multi") => PackReuseMode::Multi,
-            Some(value) => match sley_config::parse_config_bool(value) {
+            Some(value) => match sley::plumbing::sley_config::parse_config_bool(value) {
                 Some(true) => PackReuseMode::Single,
                 Some(false) => PackReuseMode::None,
                 None => {
@@ -1402,7 +1406,7 @@ fn find_verbatim_reusable_packs(
     if matches!(reuse_mode, PackReuseMode::None) {
         return Ok(None);
     }
-    let pack_dir = sley_odb::repository_objects_dir(common_git_dir).join("pack");
+    let pack_dir = sley::plumbing::sley_odb::repository_objects_dir(common_git_dir).join("pack");
     if let Some(candidates) =
         find_midx_verbatim_reusable_packs(&pack_dir, format, want_set, reuse_mode)?
     {
@@ -1550,7 +1554,7 @@ fn find_midx_verbatim_reusable_packs(
 fn raw_partial_pack_entries_for_wanted_oids(
     format: ObjectFormat,
     pack_bytes: &[u8],
-    index_entries: &[sley_pack::PackIndexEntry],
+    index_entries: &[sley::plumbing::sley_pack::PackIndexEntry],
     want_set: &HashSet<ObjectId>,
 ) -> Result<Option<(HashSet<ObjectId>, Vec<Vec<u8>>)>> {
     let oids: HashSet<ObjectId> = index_entries
@@ -1572,7 +1576,7 @@ fn raw_partial_pack_entries_for_wanted_oids(
 fn raw_pack_entries_for_oids(
     format: ObjectFormat,
     pack_bytes: &[u8],
-    index_entries: &[sley_pack::PackIndexEntry],
+    index_entries: &[sley::plumbing::sley_pack::PackIndexEntry],
     wanted: &HashSet<ObjectId>,
     reject_wanted_deltas: bool,
 ) -> Result<Option<Vec<Vec<u8>>>> {
@@ -1581,7 +1585,7 @@ fn raw_pack_entries_for_oids(
         return Ok(None);
     }
     let trailer_offset = pack_bytes.len() - hash_len;
-    let mut by_offset: Vec<&sley_pack::PackIndexEntry> = index_entries.iter().collect();
+    let mut by_offset: Vec<&sley::plumbing::sley_pack::PackIndexEntry> = index_entries.iter().collect();
     by_offset.sort_by_key(|entry| entry.offset);
 
     let mut out = Vec::new();
@@ -1667,7 +1671,7 @@ struct PackMembership {
 
 impl ObjectLocationScan {
     fn scan(common_git_dir: &Path, format: ObjectFormat) -> Result<Self> {
-        let objects_dir = sley_odb::repository_objects_dir(common_git_dir);
+        let objects_dir = sley::plumbing::sley_odb::repository_objects_dir(common_git_dir);
         let mut object_dirs: Vec<(PathBuf, bool)> = vec![(objects_dir.clone(), true)];
         // info/alternates: one path per line, relative entries resolved
         // against the objects directory (upstream link_alt_odb_entry).
@@ -1911,7 +1915,7 @@ fn write_cruft_pack(
     options: &PackObjectsOptions,
     progress: bool,
 ) -> Result<()> {
-    let objects_dir = sley_odb::repository_objects_dir(common_git_dir);
+    let objects_dir = sley::plumbing::sley_odb::repository_objects_dir(common_git_dir);
     let pack_dir = objects_dir.join("pack");
 
     // Stdin: bare lines name fresh (retained) packs, `-`-prefixed name discard
@@ -1994,7 +1998,7 @@ fn write_cruft_pack(
             let mtimes_path = idx_path.with_extension("mtimes");
             let pack_object_mtimes: Option<Vec<u32>> =
                 fs::read(&mtimes_path).ok().and_then(|bytes| {
-                    sley_pack::PackMtimes::parse(&bytes, format, index.entries.len())
+                    sley::plumbing::sley_pack::PackMtimes::parse(&bytes, format, index.entries.len())
                         .ok()
                         .map(|parsed| parsed.mtimes)
                 });
@@ -2107,7 +2111,7 @@ fn write_cruft_pack(
     // The `.mtimes` table is stored in lexicographic (index) order, which is
     // NOT the pack-emit order `written.entries` carries — sort a copy by oid
     // first so the table lines up with the `.idx` fanout the reader walks.
-    let mut sorted_entries: Vec<&sley_pack::PackIndexEntry> = written.entries.iter().collect();
+    let mut sorted_entries: Vec<&sley::plumbing::sley_pack::PackIndexEntry> = written.entries.iter().collect();
     sorted_entries.sort_by(|a, b| a.oid.as_bytes().cmp(b.oid.as_bytes()));
     let mtimes_table: Vec<u32> = sorted_entries
         .iter()
@@ -2119,7 +2123,7 @@ fn write_cruft_pack(
 
     let positions = pack_order_index_positions(&written.entries);
     let reverse_index = PackReverseIndex::write(format, &positions, &written.checksum)?;
-    let mtimes_bytes = sley_pack::PackMtimes::write(format, &mtimes_table, &written.checksum)?;
+    let mtimes_bytes = sley::plumbing::sley_pack::PackMtimes::write(format, &mtimes_table, &written.checksum)?;
 
     if options.stdout_mode {
         let mut stdout = io::stdout();

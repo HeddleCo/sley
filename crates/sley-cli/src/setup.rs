@@ -21,7 +21,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
-use sley_config::GitConfig;
+use sley::plumbing::sley_config::GitConfig;
 
 use crate::{
     explicit_git_dir, explicit_work_tree, git_env_bool, global_bare, is_git_dir_candidate,

@@ -341,9 +341,9 @@ fn read_shortlog_from_revisions(
     };
     let format = repo.format();
     let db = repo.objects();
-    let setup = sley_rev::setup_revisions(
+    let setup = sley::plumbing::sley_rev::setup_revisions(
         &options.setup_args,
-        &sley_rev::RevisionSetupContext {
+        &sley::plumbing::sley_rev::RevisionSetupContext {
             git_dir: repo.git_dir(),
             worktree_root: repo.worktree_root().ok(),
             cwd: repo.cwd(),
@@ -373,7 +373,7 @@ fn read_shortlog_from_revisions(
 
     let mut starts = Vec::new();
     for tip in &setup.options.positives {
-        starts.push(sley_rev::peel_to_commit(db, format, &tip.oid)?);
+        starts.push(sley::plumbing::sley_rev::peel_to_commit(db, format, &tip.oid)?);
     }
 
     // Everything reachable from a negative tip is removed from the result set.
@@ -648,7 +648,7 @@ fn shortlog_identity_key(raw: &[u8], email: bool, mailmap: &commands::utility::M
 }
 
 fn shortlog_group_keys(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     options: &ShortlogOptions,
     mailmap: &commands::utility::Mailmap,
 ) -> Result<Vec<String>> {
@@ -692,7 +692,7 @@ fn shortlog_group_keys(
 }
 
 fn shortlog_commit_subject(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     options: &ShortlogOptions,
     mailmap: &commands::utility::Mailmap,
 ) -> Result<String> {
@@ -712,7 +712,7 @@ fn shortlog_commit_subject(
 }
 
 fn shortlog_render_format(
-    record: &sley_rev::CommitRecord,
+    record: &sley::plumbing::sley_rev::CommitRecord,
     format: &str,
     date_mode: &DateMode,
     abbrev_len: Option<usize>,

@@ -5,9 +5,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use sley_core::{GitError, Result};
-use sley_object::tree_entry_object_type;
-use sley_pathspec::normalize_ls_files_pathspec;
+use sley::plumbing::sley_core::{GitError, Result};
+use sley::plumbing::sley_object::tree_entry_object_type;
+use sley::plumbing::sley_pathspec::normalize_ls_files_pathspec;
 
 use crate::{
     RepositoryContext, check_ignore_tracked_paths, global_attr_source, require_work_tree,
@@ -125,7 +125,7 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
         let ignore_match = if tracked_paths.contains(&git_path) {
             None
         } else {
-            sley_worktree::standard_ignore_match(worktree_root, &git_path, absolute.is_dir())?
+            sley::plumbing::sley_worktree::standard_ignore_match(worktree_root, &git_path, absolute.is_dir())?
         };
         let path_matched = ignore_match
             .as_ref()
@@ -385,7 +385,7 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
         .worktree_root()
         .ok()
         .map(Path::to_path_buf)
-        .or(sley_worktree::worktree_root_for_git_dir(git_dir)?);
+        .or(sley::plumbing::sley_worktree::worktree_root_for_git_dir(git_dir)?);
     let attr_root = worktree_root.as_deref().unwrap_or(git_dir);
     let prefix = if worktree_root.is_some() {
         worktree_prefix(cwd, git_dir).unwrap_or_default()
@@ -400,10 +400,10 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
         let Some(oid) = resolve_attr_source_or_die(&repo, source, false)? else {
             unreachable!("explicit attr source resolution either returns an oid or exits");
         };
-        Some(sley_rev::peel_to_tree(repo.objects(), format, &oid)?)
+        Some(sley::plumbing::sley_rev::peel_to_tree(repo.objects(), format, &oid)?)
     } else if let Some(source) = attr_tree_config.as_deref() {
         match resolve_attr_source_or_die(&repo, source, true)? {
-            Some(oid) => Some(sley_rev::peel_to_tree(repo.objects(), format, &oid)?),
+            Some(oid) => Some(sley::plumbing::sley_rev::peel_to_tree(repo.objects(), format, &oid)?),
             None => None,
         }
     } else {
@@ -416,11 +416,11 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
             let path_arg = String::from_utf8_lossy(&display_path);
             let git_path = normalize_ls_files_pathspec(prefix.as_bytes(), &path_arg)?;
             let mut checks = if cached {
-                sley_worktree::standard_attributes_for_path_from_index(
+                sley::plumbing::sley_worktree::standard_attributes_for_path_from_index(
                     attr_root, git_dir, format, &git_path, &requested, all,
                 )?
             } else if let Some(tree_oid) = source_tree.as_ref() {
-                sley_worktree::standard_attributes_for_path_from_tree(
+                sley::plumbing::sley_worktree::standard_attributes_for_path_from_tree(
                     attr_root,
                     git_dir,
                     repo.objects(),
@@ -431,7 +431,7 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
                     all,
                 )?
             } else {
-                sley_worktree::standard_attributes_for_path_in_repo(
+                sley::plumbing::sley_worktree::standard_attributes_for_path_in_repo(
                     attr_root,
                     git_dir,
                     &git_path,
@@ -499,7 +499,7 @@ fn resolve_attr_source_or_die(
     repo: &RepositoryContext,
     source: &str,
     ignore_bad: bool,
-) -> Result<Option<sley_core::ObjectId>> {
+) -> Result<Option<sley::plumbing::sley_core::ObjectId>> {
     match repo.resolve_revision(source) {
         Ok(oid) => Ok(Some(oid)),
         Err(_) if ignore_bad => Ok(None),
@@ -511,10 +511,10 @@ fn resolve_attr_source_or_die(
 }
 
 fn fill_builtin_object_mode(
-    checks: &mut [sley_worktree::AttributeCheck],
+    checks: &mut [sley::plumbing::sley_worktree::AttributeCheck],
     worktree_root: Option<&Path>,
     git_dir: &Path,
-    format: sley_core::ObjectFormat,
+    format: sley::plumbing::sley_core::ObjectFormat,
     path: &[u8],
     cached: bool,
 ) -> Result<()> {
@@ -523,7 +523,7 @@ fn fill_builtin_object_mode(
             continue;
         }
         check.state = builtin_object_mode(worktree_root, git_dir, format, path, cached)?
-            .map(sley_worktree::AttributeState::Value);
+            .map(sley::plumbing::sley_worktree::AttributeState::Value);
     }
     Ok(())
 }
@@ -531,7 +531,7 @@ fn fill_builtin_object_mode(
 fn builtin_object_mode(
     worktree_root: Option<&Path>,
     git_dir: &Path,
-    format: sley_core::ObjectFormat,
+    format: sley::plumbing::sley_core::ObjectFormat,
     path: &[u8],
     cached: bool,
 ) -> Result<Option<Vec<u8>>> {
@@ -563,19 +563,19 @@ fn builtin_object_mode(
 
 fn cached_object_mode(
     git_dir: &Path,
-    format: sley_core::ObjectFormat,
+    format: sley::plumbing::sley_core::ObjectFormat,
     path: &[u8],
 ) -> Result<Option<Vec<u8>>> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     if !index_path.exists() {
         return Ok(None);
     }
-    let index = sley_index::Index::parse(&fs::read(index_path)?, format)?;
+    let index = sley::plumbing::sley_index::Index::parse(&fs::read(index_path)?, format)?;
     for entry in index.entries {
         if entry.path.as_bytes() == path && index_entry_stage(&entry) == 0 {
-            if tree_entry_object_type(entry.mode) == sley_object::ObjectType::Blob
-                || tree_entry_object_type(entry.mode) == sley_object::ObjectType::Tree
-                || sley_index::is_gitlink(entry.mode)
+            if tree_entry_object_type(entry.mode) == sley::plumbing::sley_object::ObjectType::Blob
+                || tree_entry_object_type(entry.mode) == sley::plumbing::sley_object::ObjectType::Tree
+                || sley::plumbing::sley_index::is_gitlink(entry.mode)
             {
                 return Ok(Some(format!("{:06o}", entry.mode).into_bytes()));
             }
@@ -584,7 +584,7 @@ fn cached_object_mode(
     Ok(None)
 }
 
-fn index_entry_stage(entry: &sley_index::IndexEntry) -> u16 {
+fn index_entry_stage(entry: &sley::plumbing::sley_index::IndexEntry) -> u16 {
     (entry.flags >> 12) & 0x3
 }
 

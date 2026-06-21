@@ -8,7 +8,7 @@ use crate::remote::{
     rewrite_url_with_config,
 };
 use crate::*;
-use sley_remote::{FetchOptions, LsRemoteRecord};
+use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord};
 use std::process::Command as Proc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,10 +33,10 @@ impl FetchRecurseSubmodules {
     }
 
     pub(crate) fn from_config(value: &str) -> Self {
-        match sley_submodule::parse_fetch_recurse(value) {
-            sley_submodule::RecurseMode::On => Self::On,
-            sley_submodule::RecurseMode::Off => Self::Off,
-            sley_submodule::RecurseMode::OnDemand => Self::OnDemand,
+        match sley::plumbing::sley_submodule::parse_fetch_recurse(value) {
+            sley::plumbing::sley_submodule::RecurseMode::On => Self::On,
+            sley::plumbing::sley_submodule::RecurseMode::Off => Self::Off,
+            sley::plumbing::sley_submodule::RecurseMode::OnDemand => Self::OnDemand,
             _ => Self::Default,
         }
     }
@@ -72,7 +72,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let mut deepen_not = Vec::<String>::new();
     let mut server_options = Vec::<String>::new();
     let mut server_options_from_cli = false;
-    let mut ssh_ip_version = None::<sley_transport::SshIpVersion>;
+    let mut ssh_ip_version = None::<sley::plumbing::sley_transport::SshIpVersion>;
     // `--reject-shallow` / `--no-reject-shallow` are a tri-state (upstream
     // `option_reject_shallow = -1` when unspecified); the CLI flag overrides the
     // `clone.rejectshallow` config when present.
@@ -296,8 +296,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 template = None;
                 template_config = false;
             }
-            "-4" | "--ipv4" => ssh_ip_version = Some(sley_transport::SshIpVersion::V4),
-            "-6" | "--ipv6" => ssh_ip_version = Some(sley_transport::SshIpVersion::V6),
+            "-4" | "--ipv4" => ssh_ip_version = Some(sley::plumbing::sley_transport::SshIpVersion::V4),
+            "-6" | "--ipv6" => ssh_ip_version = Some(sley::plumbing::sley_transport::SshIpVersion::V6),
             "-l" | "--local" => local = Some(true),
             "--no-local" => local = Some(false),
             "--hardlinks" => no_hardlinks = false,
@@ -523,10 +523,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let repository = positional[0].clone();
     let cwd = env::current_dir()?;
     let bundle_source_path = clone_bundle_path(&cwd, &repository);
-    let destination = positional
-        .get(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default_clone_directory(&repository, bare, bundle_source_path.is_some()));
+    let destination = positional.get(1).map(PathBuf::from).unwrap_or_else(|| {
+        default_clone_directory(&repository, bare, bundle_source_path.is_some())
+    });
     // git reports the destination as it was given on the command line (or as
     // derived from the source) — `dir` in upstream `builtin/clone.c` — not its
     // absolutized form.
@@ -571,7 +570,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         eprintln!("fatal: see protocol.version in 'git help config' for more details");
         return Err(GitError::Exit(128));
     }
-    let mut ssh_options = sley_remote::ssh_transport_options_from_config(&transport_config);
+    let mut ssh_options = sley::plumbing::sley_remote::ssh_transport_options_from_config(&transport_config);
     ssh_options.ip_version = ssh_ip_version;
     let resolved_repository = ls_remote_resolved_url(&repository)?;
     check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
@@ -621,7 +620,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    if sley_remote::remote_url_is_http(&repository).unwrap_or(false) {
+    if sley::plumbing::sley_remote::remote_url_is_http(&repository).unwrap_or(false) {
         clone_http_repository(CloneHttpOptions {
             repository: &repository,
             destination: &checkout_destination,
@@ -835,7 +834,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     // builtin/clone.c). A transport clone (`--no-local` / `file://`) honors it
     // when the source advertises filtering (`uploadpack.allowFilter`),
     // otherwise warns exactly like a server without the capability.
-    let mut fetch_filter = None::<sley_odb::PackObjectFilter>;
+    let mut fetch_filter = None::<sley::plumbing::sley_odb::PackObjectFilter>;
     if let Some(filter) = partial_clone_filter.as_deref() {
         if local_mechanism {
             eprintln!("warning: --filter is ignored in local clones; use file:// instead.");
@@ -987,7 +986,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         }
         if checkout {
             let config = read_repo_config(&git_dir)?;
-            sley_worktree::checkout_detached_filtered(
+            sley::plumbing::sley_worktree::checkout_detached_filtered(
                 &checkout_destination,
                 &git_dir,
                 format,
@@ -999,7 +998,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             print_clone_detached_head_advice(revision_oid);
             run_clone_post_checkout_hook(&git_dir, revision_oid)?;
         } else {
-            sley_worktree::checkout_detached(
+            sley::plumbing::sley_worktree::checkout_detached(
                 &checkout_destination,
                 &git_dir,
                 format,
@@ -1019,11 +1018,11 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     }
 
     let remote_common_git_dir_for_head = remote_common_git_dir.clone();
-    let remote_source = sley_remote::CloneSource::Local {
+    let remote_source = sley::plumbing::sley_remote::CloneSource::Local {
         git_dir: remote_git_dir,
         common_git_dir: remote_common_git_dir,
     };
-    let clone_options = sley_remote::CloneOptions {
+    let clone_options = sley::plumbing::sley_remote::CloneOptions {
         origin: &origin,
         checkout_branch: &checkout_branch,
         remote_head_branch: &remote_head_branch,
@@ -1054,10 +1053,10 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         ref_storage,
         ssh_options: None,
     };
-    let mut credentials = sley_remote::NoCredentials;
+    let mut credentials = sley::plumbing::sley_remote::NoCredentials;
     let mut progress = StdoutProgress;
-    let outcome = sley_remote::clone(
-        sley_remote::CloneRequest {
+    let outcome = sley::plumbing::sley_remote::clone(
+        sley::plumbing::sley_remote::CloneRequest {
             destination: &checkout_destination,
             git_dir_override: clone_git_dir_override.as_deref(),
             core_worktree: clone_core_worktree.as_deref(),
@@ -1065,7 +1064,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             source: &remote_source,
             options: &clone_options,
         },
-        sley_remote::CloneServices {
+        sley::plumbing::sley_remote::CloneServices {
             configure: &mut |git_dir| {
                 let fetch_refspec = if single_branch {
                     Some(format!(
@@ -1159,7 +1158,11 @@ fn clone_bundle_path(cwd: &Path, repository: &str) -> Option<PathBuf> {
         return None;
     }
     let raw = PathBuf::from(parsed.path);
-    let base = if raw.is_absolute() { raw } else { cwd.join(raw) };
+    let base = if raw.is_absolute() {
+        raw
+    } else {
+        cwd.join(raw)
+    };
     if local_repository_git_dir_path(&base).is_ok() {
         return None;
     }
@@ -1284,7 +1287,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
             configure_clone_branch(&git_dir, &branch, options.origin)?;
             if options.checkout {
                 let config = read_repo_config(&git_dir)?;
-                sley_worktree::checkout_branch_filtered(
+                sley::plumbing::sley_worktree::checkout_branch_filtered(
                     options.destination,
                     &git_dir,
                     format,
@@ -1349,7 +1352,7 @@ struct CloneHttpOptions<'a> {
     bundle_uri: Option<&'a CloneBundleUri>,
     depth: Option<u32>,
     ref_storage: RefStorageFormat,
-    ssh_options: sley_remote::SshTransportOptions,
+    ssh_options: sley::plumbing::sley_remote::SshTransportOptions,
 }
 
 /// Derive the remote default branch name from the upload-pack advertisement:
@@ -1450,9 +1453,9 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
     }
 
     let remote = parse_remote_url(&ls_remote_resolved_url(options.repository)?)?;
-    let client = sley_remote::new_http_client();
-    let mut credentials = sley_remote::NoCredentials;
-    let (advertisements, features) = sley_remote::http_upload_pack_advertisements(
+    let client = sley::plumbing::sley_remote::new_http_client();
+    let mut credentials = sley::plumbing::sley_remote::NoCredentials;
+    let (advertisements, features) = sley::plumbing::sley_remote::http_upload_pack_advertisements(
         &client,
         &remote,
         ObjectFormat::Sha1,
@@ -1488,8 +1491,8 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
     let tag_opt = options.tag_opt;
     let config_overrides = options.config_overrides;
     let submodule_active = options.submodule_active;
-    let remote_source = sley_remote::CloneSource::Http(remote);
-    let clone_options = sley_remote::CloneOptions {
+    let remote_source = sley::plumbing::sley_remote::CloneSource::Http(remote);
+    let clone_options = sley::plumbing::sley_remote::CloneOptions {
         origin,
         checkout_branch: &checkout_branch,
         remote_head_branch: &remote_head_branch,
@@ -1506,8 +1509,8 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         ssh_options: None,
     };
     let mut progress = StdoutProgress;
-    let outcome = sley_remote::clone(
-        sley_remote::CloneRequest {
+    let outcome = sley::plumbing::sley_remote::clone(
+        sley::plumbing::sley_remote::CloneRequest {
             destination: options.destination,
             git_dir_override: options.git_dir_override,
             core_worktree: options.core_worktree,
@@ -1515,7 +1518,7 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
             source: &remote_source,
             options: &clone_options,
         },
-        sley_remote::CloneServices {
+        sley::plumbing::sley_remote::CloneServices {
             configure: &mut |git_dir| {
                 apply_clone_template(git_dir, template, template_config)?;
                 let fetch_refspec = if single_branch {
@@ -1634,13 +1637,13 @@ fn clone_network_repository(
         trace_configured_local_protocol_version(None);
     }
     let (advertisements, features) = match transport {
-        CloneNetworkTransport::Ssh => sley_remote::ssh_upload_pack_advertisements_with_options(
+        CloneNetworkTransport::Ssh => sley::plumbing::sley_remote::ssh_upload_pack_advertisements_with_options(
             &remote,
             ObjectFormat::Sha1,
             options.ssh_options,
         )?,
         CloneNetworkTransport::Git => {
-            let discovered = sley_remote::git_upload_pack_advertisements_with_protocol(
+            let discovered = sley::plumbing::sley_remote::git_upload_pack_advertisements_with_protocol(
                 &remote,
                 ObjectFormat::Sha1,
                 configured_protocol_version(None) == Some(ProtocolVersion::V2),
@@ -1691,13 +1694,13 @@ fn clone_network_repository(
     let config_overrides = options.config_overrides;
     let submodule_active = options.submodule_active;
     let remote_source = match transport {
-        CloneNetworkTransport::Ssh => sley_remote::CloneSource::Ssh(remote),
-        CloneNetworkTransport::Git => sley_remote::CloneSource::Git {
+        CloneNetworkTransport::Ssh => sley::plumbing::sley_remote::CloneSource::Ssh(remote),
+        CloneNetworkTransport::Git => sley::plumbing::sley_remote::CloneSource::Git {
             remote,
             protocol_v2: configured_protocol_version(None) == Some(ProtocolVersion::V2),
         },
     };
-    let clone_options = sley_remote::CloneOptions {
+    let clone_options = sley::plumbing::sley_remote::CloneOptions {
         origin,
         checkout_branch: &checkout_branch,
         remote_head_branch: &remote_head_branch,
@@ -1713,10 +1716,10 @@ fn clone_network_repository(
         ref_storage: options.ref_storage,
         ssh_options: matches!(transport, CloneNetworkTransport::Ssh).then_some(options.ssh_options),
     };
-    let mut credentials = sley_remote::NoCredentials;
+    let mut credentials = sley::plumbing::sley_remote::NoCredentials;
     let mut progress = StdoutProgress;
-    let outcome = sley_remote::clone(
-        sley_remote::CloneRequest {
+    let outcome = sley::plumbing::sley_remote::clone(
+        sley::plumbing::sley_remote::CloneRequest {
             destination: options.destination,
             git_dir_override: options.git_dir_override,
             core_worktree: options.core_worktree,
@@ -1724,7 +1727,7 @@ fn clone_network_repository(
             source: &remote_source,
             options: &clone_options,
         },
-        sley_remote::CloneServices {
+        sley::plumbing::sley_remote::CloneServices {
             configure: &mut |git_dir| {
                 apply_clone_template(git_dir, template, template_config)?;
                 let fetch_refspec = if single_branch {
@@ -1824,8 +1827,8 @@ fn clone_bare_network_repository(
 
     let config = repo_config_with_transport_policy(&git_dir)?;
     let source = match transport {
-        CloneNetworkTransport::Ssh => sley_remote::FetchSource::Ssh(remote),
-        CloneNetworkTransport::Git => sley_remote::FetchSource::Git {
+        CloneNetworkTransport::Ssh => sley::plumbing::sley_remote::FetchSource::Ssh(remote),
+        CloneNetworkTransport::Git => sley::plumbing::sley_remote::FetchSource::Git {
             remote,
             protocol_v2: configured_protocol_version(None) == Some(ProtocolVersion::V2),
         },
@@ -1878,17 +1881,17 @@ fn clone_bare_network_repository(
     .map(|_| ())
 }
 
-/// Map a [`sley_remote::clone`] result that failed because the requested branch
+/// Map a [`sley::plumbing::sley_remote::clone`] result that failed because the requested branch
 /// was absent from the remote into the CLI's explicit-`--branch` message, leaving
 /// every other result untouched. `git clone -b <missing>` prints a dedicated
 /// "Remote branch … not found" line and exits 128; without an explicit branch the
 /// generic not-found error propagates.
 fn map_clone_missing_branch(
-    outcome: Result<sley_remote::CloneOutcome>,
+    outcome: Result<sley::plumbing::sley_remote::CloneOutcome>,
     branch_explicit: bool,
     checkout_branch: &str,
     origin: &str,
-) -> Result<sley_remote::CloneOutcome> {
+) -> Result<sley::plumbing::sley_remote::CloneOutcome> {
     match outcome {
         Err(GitError::NotFound(kind))
             if branch_explicit
@@ -2119,7 +2122,7 @@ struct CloneLocalOptions<'a> {
     /// The object filter the clone fetch itself applies (only set when the
     /// in-process local server honors the `--filter`, i.e. a `--no-local` /
     /// `file://` clone of an `uploadpack.allowFilter` source).
-    fetch_filter: Option<sley_odb::PackObjectFilter>,
+    fetch_filter: Option<sley::plumbing::sley_odb::PackObjectFilter>,
     head_branch: &'a str,
     branch_explicit: bool,
     /// The source HEAD is detached at this commit (no default branch). The bare
@@ -2280,11 +2283,7 @@ fn clone_bare_or_mirror_local_repository(
     fetch_result?;
     if options.copy_source_alternates {
         let source_git_dir = common_git_dir_for_git_dir(&ls_remote_git_dir(options.repository)?)?;
-        install_local_clone_objects(
-            &source_git_dir,
-            &git_dir,
-            options.local_object_install,
-        )?;
+        install_local_clone_objects(&source_git_dir, &git_dir, options.local_object_install)?;
     }
     if options.dissociate {
         dissociate_clone_alternates(&git_dir, options.format)?;
@@ -2333,13 +2332,13 @@ fn clone_reject_shallow_config(config_overrides: &[GlobalConfigOverride]) -> Res
         let (section, subsection, key) = parameter.split_key();
         if section == "clone" && subsection.is_none() && key == "rejectshallow" {
             let value = parameter.value.as_deref().unwrap_or("true");
-            resolved = sley_config::parse_config_bool(value);
+            resolved = sley::plumbing::sley_config::parse_config_bool(value);
         }
     }
     for override_entry in config_overrides {
         let key = override_entry.key.to_ascii_lowercase();
         if key == "clone.rejectshallow" {
-            resolved = sley_config::parse_config_bool(&override_entry.value);
+            resolved = sley::plumbing::sley_config::parse_config_bool(&override_entry.value);
         }
     }
     Ok(resolved)
@@ -2450,11 +2449,7 @@ fn push_unique_alternate(alternates: &mut Vec<PathBuf>, alternate: PathBuf) {
     }
 }
 
-fn apply_clone_alternates(
-    git_dir: &Path,
-    alternates: &[PathBuf],
-    _dissociate: bool,
-) -> Result<()> {
+fn apply_clone_alternates(git_dir: &Path, alternates: &[PathBuf], _dissociate: bool) -> Result<()> {
     if alternates.is_empty() {
         return Ok(());
     }
@@ -2474,8 +2469,8 @@ fn dissociate_clone_alternates(git_dir: &Path, format: ObjectFormat) -> Result<(
         return Ok(());
     }
     let roots = dissociate_repack_roots(git_dir, format)?;
-    if let Some(result) = sley_odb::repack_reachable_objects(git_dir, format, &roots)? {
-        sley_odb::install_repack_result(git_dir, format, &result, true)?;
+    if let Some(result) = sley::plumbing::sley_odb::repack_reachable_objects(git_dir, format, &roots)? {
+        sley::plumbing::sley_odb::install_repack_result(git_dir, format, &result, true)?;
     }
     match fs::remove_file(&alternates_path) {
         Ok(()) => Ok(()),
@@ -2489,7 +2484,9 @@ fn dissociate_repack_roots(git_dir: &Path, format: ObjectFormat) -> Result<Vec<O
     let mut roots = Vec::new();
     let mut seen = HashSet::new();
     for reference in store.list_refs()? {
-        if let Some(oid) = resolve_clone_ref_oid(&store, reference.target)? && seen.insert(oid) {
+        if let Some(oid) = resolve_clone_ref_oid(&store, reference.target)?
+            && seen.insert(oid)
+        {
             roots.push(oid);
         }
     }
@@ -2616,7 +2613,10 @@ fn install_local_clone_objects(
 
     let source_objects = repository_objects_dir(remote_git_dir);
     let destination_objects = repository_objects_dir(git_dir);
-    if fs::symlink_metadata(&source_objects)?.file_type().is_symlink() {
+    if fs::symlink_metadata(&source_objects)?
+        .file_type()
+        .is_symlink()
+    {
         eprintln!(
             "fatal: '{}' is a symlink, refusing to clone with --local",
             source_objects.display()
@@ -2871,7 +2871,7 @@ fn apply_clone_sparse_checkout(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<()> {
-    let index = sley_worktree::read_repository_index(git_dir, format)?.unwrap_or(Index {
+    let index = sley::plumbing::sley_worktree::read_repository_index(git_dir, format)?.unwrap_or(Index {
         version: 2,
         entries: Vec::new(),
         extensions: Vec::new(),
@@ -2884,7 +2884,7 @@ fn apply_clone_sparse_checkout(
         .map(|entry| PathBuf::from(String::from_utf8_lossy(&entry.path).as_ref()))
         .collect::<Vec<_>>();
     if !sparse_paths.is_empty() {
-        sley_worktree::set_index_skip_worktree_paths(
+        sley::plumbing::sley_worktree::set_index_skip_worktree_paths(
             worktree_root,
             git_dir,
             format,
@@ -2976,7 +2976,7 @@ fn remove_clone_worktree_files(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<()> {
-    let index = sley_worktree::read_repository_index(git_dir, format)?.unwrap_or(Index {
+    let index = sley::plumbing::sley_worktree::read_repository_index(git_dir, format)?.unwrap_or(Index {
         version: 2,
         entries: Vec::new(),
         extensions: Vec::new(),
@@ -2990,7 +2990,7 @@ fn remove_clone_worktree_files(
         }
     }
     fs::write(
-        sley_worktree::repository_index_path(git_dir),
+        sley::plumbing::sley_worktree::repository_index_path(git_dir),
         Index {
             version: 2,
             entries: Vec::new(),
@@ -3199,7 +3199,7 @@ fn clone_source_tag_commit(
     let tag_ref = format!("refs/tags/{name}");
     store.read_ref(&tag_ref).ok()??;
     // Resolve (peeling annotated tags) to the underlying commit.
-    sley_rev::resolve_revision(remote_common_git_dir, format, &tag_ref).ok()
+    sley::plumbing::sley_rev::resolve_revision(remote_common_git_dir, format, &tag_ref).ok()
 }
 
 fn remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<String> {
@@ -3720,7 +3720,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
             eprintln!("fatal: --unshallow on a complete repository does not make sense");
             return Err(GitError::Exit(128));
         }
-        options.depth = Some(sley_remote::INFINITE_DEPTH);
+        options.depth = Some(sley::plumbing::sley_remote::INFINITE_DEPTH);
     }
     if !filter_option_explicit {
         let config = read_repo_config(&git_dir)?;
@@ -3955,7 +3955,7 @@ fn trace_fetch_maintenance() {
     trace_fetch_line("trace: built-in: git maintenance run --auto --no-quiet\n");
 }
 
-fn fetch_pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
+fn fetch_pack_filter_from_spec(spec: &str) -> Option<sley::plumbing::sley_odb::PackObjectFilter> {
     pack_filter_from_spec(spec)
 }
 
@@ -4291,7 +4291,7 @@ fn fetch_changed_submodule_after_superproject(
 }
 
 fn resolve_submodule_git_dir(git_dir: &Path, submodule_root: &Path, path: &str) -> Option<PathBuf> {
-    sley_diff_merge::gitlink_git_dir(submodule_root).or_else(|| {
+    sley::plumbing::sley_diff_merge::gitlink_git_dir(submodule_root).or_else(|| {
         let modules_git_dir = git_dir.join("modules").join(path);
         modules_git_dir.is_dir().then_some(modules_git_dir)
     })
@@ -4307,8 +4307,12 @@ fn resolve_changed_submodule_fetch_target(
     {
         return Ok(Some((sub_git_dir, submodule_root, changed.path.clone())));
     }
-    let Some(name) =
-        submodule_name_for_path_at_commit(req.git_dir, req.format, &changed.super_oid, &changed.path)?
+    let Some(name) = submodule_name_for_path_at_commit(
+        req.git_dir,
+        req.format,
+        &changed.super_oid,
+        &changed.path,
+    )?
     else {
         return Ok(None);
     };
@@ -4331,10 +4335,7 @@ fn ensure_submodule_object_store(git_dir: &Path) -> Result<()> {
     if git_dir.join("objects").is_dir() {
         return Ok(());
     }
-    eprintln!(
-        "fatal: not a git repository: {}",
-        git_dir.display()
-    );
+    eprintln!("fatal: not a git repository: {}", git_dir.display());
     Err(GitError::Exit(128))
 }
 
@@ -4433,12 +4434,16 @@ pub(crate) fn changed_gitlinks_for_fetch(
     git_dir: &Path,
     format: ObjectFormat,
     before: &std::collections::BTreeMap<String, ObjectId>,
-    outcome: &sley_remote::FetchOutcome,
+    outcome: &sley::plumbing::sley_remote::FetchOutcome,
 ) -> Result<Vec<ChangedGitlink>> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut changed = Vec::new();
     for update in &outcome.ref_updates {
-        let old = update.dst.as_deref().and_then(|dst| before.get(dst)).copied();
+        let old = update
+            .dst
+            .as_deref()
+            .and_then(|dst| before.get(dst))
+            .copied();
         if old == Some(update.oid) {
             continue;
         }
@@ -4485,7 +4490,7 @@ fn submodule_name_for_path_at_commit(
         }
         _ => return Ok(None),
     };
-    let Some((_, (_, gitmodules_oid))) = sley_diff_merge::flatten_tree(&db, format, &commit.tree)?
+    let Some((_, (_, gitmodules_oid))) = sley::plumbing::sley_diff_merge::flatten_tree(&db, format, &commit.tree)?
         .into_iter()
         .find(|(entry_path, _)| entry_path.as_slice() == b".gitmodules")
     else {
@@ -4496,7 +4501,7 @@ fn submodule_name_for_path_at_commit(
         return Ok(None);
     }
     let config = GitConfig::parse(&gitmodules.body)?;
-    let set = sley_submodule::SubmoduleConfigSet::parse(&config);
+    let set = sley::plumbing::sley_submodule::SubmoduleConfigSet::parse(&config);
     Ok(set
         .iter()
         .find(|submodule| submodule.path.as_deref() == Some(path))
@@ -4588,9 +4593,9 @@ fn commit_tree_gitlinks(
     if tree.object_type != ObjectType::Tree {
         return Ok(std::collections::BTreeMap::new());
     }
-    Ok(sley_diff_merge::flatten_tree(db, format, tree_oid)?
+    Ok(sley::plumbing::sley_diff_merge::flatten_tree(db, format, tree_oid)?
         .into_iter()
-        .filter(|(_, (mode, _))| sley_index::is_gitlink(*mode))
+        .filter(|(_, (mode, _))| sley::plumbing::sley_index::is_gitlink(*mode))
         .map(|(path, (_, oid))| (path, oid))
         .collect())
 }
@@ -4631,7 +4636,7 @@ fn prefetch_destination(dst: &str) -> String {
     }
 }
 
-fn pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
+fn pack_filter_from_spec(spec: &str) -> Option<sley::plumbing::sley_odb::PackObjectFilter> {
     if let Some(parts) = spec.strip_prefix("combine:") {
         return parts
             .split('+')
@@ -4639,23 +4644,23 @@ fn pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
             .reduce(combine_pack_filters);
     }
     if spec == "blob:none" {
-        return Some(sley_odb::PackObjectFilter::BlobNone);
+        return Some(sley::plumbing::sley_odb::PackObjectFilter::BlobNone);
     }
     if let Some(depth) = spec.strip_prefix("tree:") {
         return parse_rev_list_tree_depth(depth).ok().map(|depth| {
-            sley_odb::PackObjectFilter::TreeDepth(depth.min(u32::MAX as usize) as u32)
+            sley::plumbing::sley_odb::PackObjectFilter::TreeDepth(depth.min(u32::MAX as usize) as u32)
         });
     }
     spec.strip_prefix("blob:limit=")
         .and_then(git_parse_blob_limit)
-        .map(sley_odb::PackObjectFilter::BlobLimit)
+        .map(sley::plumbing::sley_odb::PackObjectFilter::BlobLimit)
 }
 
 fn pack_filter_from_spec_for_clone(
     spec: &str,
     remote_git_dir: &Path,
     format: ObjectFormat,
-) -> Result<Option<sley_odb::PackObjectFilter>> {
+) -> Result<Option<sley::plumbing::sley_odb::PackObjectFilter>> {
     if let Some(body) = spec.strip_prefix("sparse:oid=") {
         return sparse_filter_from_remote(body, remote_git_dir, format).map(Some);
     }
@@ -4666,13 +4671,13 @@ fn sparse_filter_from_remote(
     body: &str,
     remote_git_dir: &Path,
     format: ObjectFormat,
-) -> Result<sley_odb::PackObjectFilter> {
+) -> Result<sley::plumbing::sley_odb::PackObjectFilter> {
     let Some((rev, path)) = body.split_once(':') else {
         eprintln!("fatal: unable to parse sparse filter data in .{body}");
         return Err(GitError::Exit(128));
     };
     let db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
-    let oid = match sley_rev::resolve_rev_path(remote_git_dir, format, &db, rev, path) {
+    let oid = match sley::plumbing::sley_rev::resolve_rev_path(remote_git_dir, format, &db, rev, path) {
         Ok(oid) => oid,
         Err(_) => {
             eprintln!("fatal: unable to access sparse blob in .{body}");
@@ -4697,14 +4702,14 @@ fn sparse_filter_from_remote(
         eprintln!("fatal: unable to parse sparse filter data in .{body}");
         return Err(GitError::Exit(128));
     }
-    Ok(sley_odb::PackObjectFilter::SparsePathSet(paths))
+    Ok(sley::plumbing::sley_odb::PackObjectFilter::SparsePathSet(paths))
 }
 
 fn combine_pack_filters(
-    left: sley_odb::PackObjectFilter,
-    right: sley_odb::PackObjectFilter,
-) -> sley_odb::PackObjectFilter {
-    use sley_odb::PackObjectFilter;
+    left: sley::plumbing::sley_odb::PackObjectFilter,
+    right: sley::plumbing::sley_odb::PackObjectFilter,
+) -> sley::plumbing::sley_odb::PackObjectFilter {
+    use sley::plumbing::sley_odb::PackObjectFilter;
     match (left, right) {
         (PackObjectFilter::TreeDepth(a), PackObjectFilter::TreeDepth(b)) => {
             PackObjectFilter::TreeDepth(a.min(b))
@@ -4761,7 +4766,7 @@ fn fetch_raw_oid_refspecs(
     let promisor = config
         .get_bool("remote", Some(source), "promisor")
         .unwrap_or(false);
-    sley_remote::install_fetch_pack_via_local_upload_pack(
+    sley::plumbing::sley_remote::install_fetch_pack_via_local_upload_pack(
         git_dir,
         &remote_git_dir,
         format,
@@ -4820,9 +4825,8 @@ fn fetch_one_source_with_outcome(
     refspecs: &[String],
     options: FetchOptions,
     server_options: &[String],
-) -> Result<sley_remote::FetchOutcome> {
-    if let Some((bundle_source, bundle)) = fetch_bundle_source(git_dir, format, source)?
-    {
+) -> Result<sley::plumbing::sley_remote::FetchOutcome> {
+    if let Some((bundle_source, bundle)) = fetch_bundle_source(git_dir, format, source)? {
         // Bundle fetches have no shallow support, so a `--depth` is warned-and-
         // ignored here, matching the local-clone behavior.
         if options.depth.is_some() {
@@ -4848,7 +4852,7 @@ fn fetch_one_source_with_outcome(
             &bundle,
             options,
         )?;
-        return Ok(sley_remote::FetchOutcome::default());
+        return Ok(sley::plumbing::sley_remote::FetchOutcome::default());
     }
     let config = transport_policy_config_for_cwd()?;
     let resolved = ls_remote_resolved_url(source)?;
@@ -4906,9 +4910,9 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
     };
     let git_dir = common_git_dir_for_git_dir(&ls_remote_git_dir(repository)?)?;
     let format = repository_object_format(&git_dir)?;
-    let features = sley_remote::receive_pack_features(format);
-    let mut advertisements = sley_remote::local_fetch_advertisements(&git_dir, format)?;
-    sley_remote::attach_receive_pack_capabilities(&mut advertisements, format, &features)?;
+    let features = sley::plumbing::sley_remote::receive_pack_features(format);
+    let mut advertisements = sley::plumbing::sley_remote::local_fetch_advertisements(&git_dir, format)?;
+    sley::plumbing::sley_remote::attach_receive_pack_capabilities(&mut advertisements, format, &features)?;
 
     {
         let stdout = io::stdout();
@@ -4927,7 +4931,7 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
     let commands = read_receive_pack_request(format, &mut stdin)?;
-    let push_options = sley_remote::receive_pack_request_uses_push_options(&commands)
+    let push_options = sley::plumbing::sley_remote::receive_pack_request_uses_push_options(&commands)
         .then(|| read_receive_pack_push_options(&mut stdin))
         .transpose()?;
     let mut packfile = Vec::new();
@@ -4949,7 +4953,7 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
             }
         }
     }
-    let report = sley_remote::receive_pack_into_local_repository(&git_dir, format, &request)?;
+    let report = sley::plumbing::sley_remote::receive_pack_into_local_repository(&git_dir, format, &request)?;
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     write_receive_pack_report_status(&mut stdout, &report)?;
@@ -5013,7 +5017,7 @@ pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
         let mut stdin = stdin.lock();
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
-        return sley_remote::serve_upload_pack_v2_with_config(
+        return sley::plumbing::sley_remote::serve_upload_pack_v2_with_config(
             &git_dir,
             format,
             &config,
@@ -5021,9 +5025,9 @@ pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
             &mut stdout,
         );
     }
-    let features = sley_remote::upload_pack_features(&git_dir, format)?;
-    let mut advertisements = sley_remote::local_fetch_advertisements(&git_dir, format)?;
-    sley_remote::attach_upload_pack_capabilities(&mut advertisements, format, &features)?;
+    let features = sley::plumbing::sley_remote::upload_pack_features(&git_dir, format)?;
+    let mut advertisements = sley::plumbing::sley_remote::local_fetch_advertisements(&git_dir, format)?;
+    sley::plumbing::sley_remote::attach_upload_pack_capabilities(&mut advertisements, format, &features)?;
 
     {
         let stdout = io::stdout();
@@ -5053,14 +5057,14 @@ pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
         }
     }
 
-    let sideband = sley_remote::upload_pack_request_uses_sideband(&request);
-    let response = sley_remote::upload_pack_from_local_repository(
+    let sideband = sley::plumbing::sley_remote::upload_pack_request_uses_sideband(&request);
+    let response = sley::plumbing::sley_remote::upload_pack_from_local_repository(
         &git_dir, format, &features, request, haves,
     )?;
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     if sideband {
-        let response = sley_remote::upload_pack_sideband_response(response);
+        let response = sley::plumbing::sley_remote::upload_pack_sideband_response(response);
         write_upload_pack_packfile_response(&mut stdout, &response)?;
     } else {
         write_upload_pack_raw_packfile_response(&mut stdout, &response)?;
@@ -5203,15 +5207,15 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
                     None => ("", spec.as_str()),
                 };
                 let normalized = if let Some(rest) = body.strip_prefix(':') {
-                    format!(":{}", sley_remote::normalize_push_refname(rest))
+                    format!(":{}", sley::plumbing::sley_remote::normalize_push_refname(rest))
                 } else if let Some((src, dstn)) = body.split_once(':') {
                     format!(
                         "{}:{}",
-                        sley_remote::normalize_push_refname(src),
-                        sley_remote::normalize_push_refname(dstn)
+                        sley::plumbing::sley_remote::normalize_push_refname(src),
+                        sley::plumbing::sley_remote::normalize_push_refname(dstn)
                     )
                 } else {
-                    let name = sley_remote::normalize_push_refname(body);
+                    let name = sley::plumbing::sley_remote::normalize_push_refname(body);
                     format!("{name}:{name}")
                 };
                 format!("{force_marker}{normalized}")
@@ -5223,7 +5227,7 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
     // `--mirror` deletes remote refs the local repo no longer has.
     if mirror {
         let remote_advertisements =
-            sley_remote::local_fetch_advertisements(&remote_git_dir, format)?;
+            sley::plumbing::sley_remote::local_fetch_advertisements(&remote_git_dir, format)?;
         let local_names: std::collections::HashSet<String> = store
             .list_refs()?
             .into_iter()
@@ -5483,22 +5487,22 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let resolved_remote = push_resolved_url(&remote)?;
     check_transport_allowed_url(&resolved_remote, Some(&config))?;
     let parsed_remote = parse_remote_url(&resolved_remote)?;
-    // All transports delegate the git work to `sley_remote::push`, picked purely
+    // All transports delegate the git work to `sley::plumbing::sley_remote::push`, picked purely
     // by the resolved `PushDestination`; this command keeps owning URL/repo
     // resolution, set-upstream config, and the "To <remote>" summary so the
     // user-visible output stays byte-for-byte identical.
     let destination = match parsed_remote.transport {
         RemoteTransport::Ssh | RemoteTransport::Ext => {
-            sley_remote::PushDestination::Ssh(parsed_remote)
+            sley::plumbing::sley_remote::PushDestination::Ssh(parsed_remote)
         }
-        RemoteTransport::Git => sley_remote::PushDestination::Git(parsed_remote),
+        RemoteTransport::Git => sley::plumbing::sley_remote::PushDestination::Git(parsed_remote),
         RemoteTransport::Http | RemoteTransport::Https => {
-            sley_remote::PushDestination::Http(parsed_remote)
+            sley::plumbing::sley_remote::PushDestination::Http(parsed_remote)
         }
         RemoteTransport::Local | RemoteTransport::File => {
             let remote_git_dir = ls_remote_git_dir(&resolved_remote)?;
             let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
-            sley_remote::PushDestination::Local {
+            sley::plumbing::sley_remote::PushDestination::Local {
                 git_dir: remote_git_dir,
                 common_git_dir: remote_common_git_dir,
             }
@@ -5508,14 +5512,14 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     // The file:// (local) transport gets git's full per-ref status report: this
     // is the path the upstream push tests exercise. Other transports keep the
     // existing terse summary.
-    if let sley_remote::PushDestination::Local {
+    if let sley::plumbing::sley_remote::PushDestination::Local {
         git_dir: remote_git_dir,
         common_git_dir: remote_common_git_dir,
     } = &destination
     {
         // `--mirror` also deletes remote refs the local repo no longer has.
         let remote_advertisements = if mirror || prune || follow_tags {
-            Some(sley_remote::local_fetch_advertisements(
+            Some(sley::plumbing::sley_remote::local_fetch_advertisements(
                 remote_git_dir,
                 format,
             )?)
@@ -5625,7 +5629,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
 
 fn append_push_prune_refspecs(
     refspecs: &mut Vec<String>,
-    remote_advertisements: &[sley_protocol::RefAdvertisement],
+    remote_advertisements: &[sley::plumbing::sley_protocol::RefAdvertisement],
     local_names: &std::collections::HashSet<String>,
 ) {
     let mut deletes = std::collections::BTreeSet::new();
@@ -5688,7 +5692,7 @@ fn append_follow_tag_refspecs(
     format: ObjectFormat,
     store: &FileRefStore,
     refspecs: &mut Vec<String>,
-    remote_advertisements: &[sley_protocol::RefAdvertisement],
+    remote_advertisements: &[sley::plumbing::sley_protocol::RefAdvertisement],
 ) -> Result<()> {
     let pushed_tips = pushed_tips_for_follow_tags(git_dir, format, store, refspecs)?;
     if pushed_tips.is_empty() {
@@ -5761,7 +5765,7 @@ fn pushed_tips_for_follow_tags(
             }
             continue;
         }
-        if let Ok(oid) = sley_rev::resolve_revision(git_dir, format, src) {
+        if let Ok(oid) = sley::plumbing::sley_rev::resolve_revision(git_dir, format, src) {
             tips.push(oid);
         }
     }
@@ -5776,12 +5780,12 @@ fn annotated_tag_commit_target(
     oid: &ObjectId,
 ) -> Result<Option<ObjectId>> {
     let object = db.read_object(oid)?;
-    if object.object_type != sley_object::ObjectType::Tag {
+    if object.object_type != sley::plumbing::sley_object::ObjectType::Tag {
         return Ok(None);
     }
-    let tag = sley_object::Tag::parse_ref(format, &object.body)?;
+    let tag = sley::plumbing::sley_object::Tag::parse_ref(format, &object.body)?;
     let target = db.read_object(&tag.object)?;
-    if target.object_type == sley_object::ObjectType::Commit {
+    if target.object_type == sley::plumbing::sley_object::ObjectType::Commit {
         Ok(Some(tag.object))
     } else {
         Ok(None)
@@ -5798,7 +5802,7 @@ fn commit_reaches(
         return Ok(true);
     }
     let object = db.read_object(tip)?;
-    if object.object_type != sley_object::ObjectType::Commit {
+    if object.object_type != sley::plumbing::sley_object::ObjectType::Commit {
         return Ok(false);
     }
     Ok(ancestor_depths(db, format, tip)?.contains_key(target))
@@ -5836,10 +5840,10 @@ fn resolve_force_with_lease(
             Some((refname, expect)) => (refname, Some(expect)),
             None => (spec.as_str(), None),
         };
-        let dst = sley_remote::normalize_push_refname(refname);
+        let dst = sley::plumbing::sley_remote::normalize_push_refname(refname);
         let expected = match expect {
             Some("") => None,
-            Some(value) => Some(sley_rev::resolve_revision(git_dir, format, value)?),
+            Some(value) => Some(sley::plumbing::sley_rev::resolve_revision(git_dir, format, value)?),
             None => {
                 remote_tracking_oid_for_push_lease(git_dir, format, store, config, remote, &dst)?
             }
@@ -5865,8 +5869,8 @@ fn expand_default_force_with_lease(
     receive_config_overrides: &[(String, String)],
     leases: &mut Vec<(String, Option<ObjectId>)>,
 ) -> Result<()> {
-    let preview = sley_remote::push_local_with_report(
-        sley_remote::PushReportRequest {
+    let preview = sley::plumbing::sley_remote::push_local_with_report(
+        sley::plumbing::sley_remote::PushReportRequest {
             git_dir,
             common_git_dir,
             format,
@@ -5957,11 +5961,11 @@ fn remote_tracking_ref_for_push_lease(
     refname: &str,
 ) -> Result<Option<String>> {
     for spec in remote_config_values(config, remote, "fetch") {
-        let parsed = sley_protocol::parse_refspec(&spec)?;
+        let parsed = sley::plumbing::sley_protocol::parse_refspec(&spec)?;
         if parsed.negative {
             continue;
         }
-        if let Some(dst) = sley_protocol::refspec_map_source(&parsed, refname)? {
+        if let Some(dst) = sley::plumbing::sley_protocol::refspec_map_source(&parsed, refname)? {
             return Ok(Some(dst));
         }
     }
@@ -6032,16 +6036,16 @@ fn configured_legacy_protocol(config: Option<&GitConfig>) -> bool {
 
 fn trace_configured_local_protocol_version(config: Option<&GitConfig>) {
     match configured_protocol_version(config) {
-        Some(ProtocolVersion::V1) => sley_protocol::trace_packet_read_payload(b"version 1\n"),
-        Some(ProtocolVersion::V2) => sley_protocol::trace_packet_read_payload(b"version 2\n"),
+        Some(ProtocolVersion::V1) => sley::plumbing::sley_protocol::trace_packet_read_payload(b"version 1\n"),
+        Some(ProtocolVersion::V2) => sley::plumbing::sley_protocol::trace_packet_read_payload(b"version 2\n"),
         _ => {}
     }
 }
 
 fn trace_protocol_v2_upload_pack_capabilities(git_dir: &Path, format: ObjectFormat) {
     let config = read_repo_config(git_dir).unwrap_or_default();
-    sley_protocol::trace_packet_read_payload(b"agent=git/2.54.0\n");
-    sley_protocol::trace_packet_read_payload(b"ls-refs=unborn\n");
+    sley::plumbing::sley_protocol::trace_packet_read_payload(b"agent=git/2.54.0\n");
+    sley::plumbing::sley_protocol::trace_packet_read_payload(b"ls-refs=unborn\n");
     let mut fetch = "fetch=shallow wait-for-done".to_string();
     if config
         .get_bool("uploadpack", None, "allowfilter")
@@ -6050,26 +6054,26 @@ fn trace_protocol_v2_upload_pack_capabilities(git_dir: &Path, format: ObjectForm
         fetch.push_str(" filter");
     }
     fetch.push('\n');
-    sley_protocol::trace_packet_read_payload(fetch.as_bytes());
-    sley_protocol::trace_packet_read_payload(b"server-option\n");
-    sley_protocol::trace_packet_read_payload(
+    sley::plumbing::sley_protocol::trace_packet_read_payload(fetch.as_bytes());
+    sley::plumbing::sley_protocol::trace_packet_read_payload(b"server-option\n");
+    sley::plumbing::sley_protocol::trace_packet_read_payload(
         format!("object-format={}\n", format.name()).as_bytes(),
     );
-    sley_protocol::trace_packet_read_payload(b"0000");
+    sley::plumbing::sley_protocol::trace_packet_read_payload(b"0000");
 }
 
 fn trace_protocol_v2_ls_refs_request(server_options: &[String]) {
-    sley_protocol::trace_packet_write_payload(b"command=ls-refs\n");
+    sley::plumbing::sley_protocol::trace_packet_write_payload(b"command=ls-refs\n");
     for option in server_options {
-        sley_protocol::trace_packet_write_payload(format!("server-option={option}\n").as_bytes());
+        sley::plumbing::sley_protocol::trace_packet_write_payload(format!("server-option={option}\n").as_bytes());
     }
-    sley_protocol::trace_packet_write_payload(b"0001");
-    sley_protocol::trace_packet_write_payload(b"peel\n");
-    sley_protocol::trace_packet_write_payload(b"symrefs\n");
-    sley_protocol::trace_packet_write_payload(b"ref-prefix HEAD\n");
-    sley_protocol::trace_packet_write_payload(b"ref-prefix refs/heads/\n");
-    sley_protocol::trace_packet_write_payload(b"ref-prefix refs/tags/\n");
-    sley_protocol::trace_packet_write_payload(b"0000");
+    sley::plumbing::sley_protocol::trace_packet_write_payload(b"0001");
+    sley::plumbing::sley_protocol::trace_packet_write_payload(b"peel\n");
+    sley::plumbing::sley_protocol::trace_packet_write_payload(b"symrefs\n");
+    sley::plumbing::sley_protocol::trace_packet_write_payload(b"ref-prefix HEAD\n");
+    sley::plumbing::sley_protocol::trace_packet_write_payload(b"ref-prefix refs/heads/\n");
+    sley::plumbing::sley_protocol::trace_packet_write_payload(b"ref-prefix refs/tags/\n");
+    sley::plumbing::sley_protocol::trace_packet_write_payload(b"0000");
 }
 
 fn configured_server_options(config: &GitConfig, remote: &str) -> Result<Vec<String>> {
@@ -6138,8 +6142,8 @@ fn trace2_local_transfer_negotiation(config: &GitConfig, remote_command: Option<
         return;
     }
     let version = protocol_version_for_trace2(config);
-    sley_core::trace2::data("transfer", "server-sid", "sley");
-    sley_core::trace2::data("transfer", "negotiated-version", version);
+    sley::plumbing::sley_core::trace2::data("transfer", "server-sid", "sley");
+    sley::plumbing::sley_core::trace2::data("transfer", "negotiated-version", version);
     if let Some(path) = trace2_event_path_from_remote_command(remote_command) {
         trace2_data_to_path(&path, "client-sid", "sley");
         trace2_data_to_path(&path, "negotiated-version", version);
@@ -6188,7 +6192,7 @@ struct PushOptions {
     progress: bool,
 }
 
-/// Drive [`sley_remote::push`] for an already-resolved `destination` (HTTP or
+/// Drive [`sley::plumbing::sley_remote::push`] for an already-resolved `destination` (HTTP or
 /// local), wiring the credential-helper provider and the stdout progress sink,
 /// then reproduce the CLI's behavior from the structured outcome: nothing on a
 /// no-op push, otherwise the optional set-upstream config write followed by the
@@ -6200,21 +6204,21 @@ fn run_push(
     common_git_dir: &Path,
     format: ObjectFormat,
     remote: &str,
-    destination: &sley_remote::PushDestination,
+    destination: &sley::plumbing::sley_remote::PushDestination,
     refspecs: &[String],
     options: PushOptions,
 ) -> Result<()> {
     let config = repo_config_with_transport_policy(git_dir).unwrap_or_default();
-    let mut credentials = sley_remote::CredentialHelperProvider::new(Some(&config));
+    let mut credentials = sley::plumbing::sley_remote::CredentialHelperProvider::new(Some(&config));
     let mut progress = StdoutProgress;
-    let remote_options = sley_remote::PushOptions {
+    let remote_options = sley::plumbing::sley_remote::PushOptions {
         quiet: options.quiet,
         force: options.force,
     };
-    if matches!(destination, sley_remote::PushDestination::Ssh(_)) {
+    if matches!(destination, sley::plumbing::sley_remote::PushDestination::Ssh(_)) {
         trace_configured_local_protocol_version(Some(&config));
     }
-    let request = sley_remote::PushRequest {
+    let request = sley::plumbing::sley_remote::PushRequest {
         git_dir,
         common_git_dir,
         format,
@@ -6224,11 +6228,11 @@ fn run_push(
         refspecs,
         options: &remote_options,
     };
-    let mut services = sley_remote::PushServices {
+    let mut services = sley::plumbing::sley_remote::PushServices {
         credentials: &mut credentials,
         progress: &mut progress,
     };
-    let plan = sley_remote::plan_push(request, &mut services)?;
+    let plan = sley::plumbing::sley_remote::plan_push(request, &mut services)?;
     if plan.commands.is_empty() {
         return Ok(());
     }
@@ -6247,7 +6251,7 @@ fn run_push(
         return Ok(());
     }
     run_local_receive_pre_hooks(destination, &plan.commands, &[])?;
-    let outcome = sley_remote::execute_push_plan(request, &mut services, plan)?;
+    let outcome = sley::plumbing::sley_remote::execute_push_plan(request, &mut services, plan)?;
     run_local_receive_post_hooks(destination, &outcome.commands, &[])?;
     update_push_remote_tracking_refs(git_dir, format, &config, remote, &outcome.commands)?;
     if options.set_upstream {
@@ -6281,7 +6285,7 @@ struct RunPushLocalReport<'a> {
     receive_config_overrides: &'a [(String, String)],
 }
 
-/// Drive a file:// push through [`sley_remote::push_local_with_report`], render
+/// Drive a file:// push through [`sley::plumbing::sley_remote::push_local_with_report`], render
 /// git's `transport_print_push_status`, update remote-tracking refs, run hooks,
 /// and return the git exit code (1 when any ref was rejected).
 fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
@@ -6312,8 +6316,8 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     // This lets us run the receive-side pre-receive/update hooks before any ref
     // is written, matching git's receive-pack ordering, and reject all refs when
     // a hook declines.
-    let plan = sley_remote::push_local_with_report(
-        sley_remote::PushReportRequest {
+    let plan = sley::plumbing::sley_remote::push_local_with_report(
+        sley::plumbing::sley_remote::PushReportRequest {
             git_dir: req.git_dir,
             common_git_dir: req.common_git_dir,
             format: req.format,
@@ -6356,7 +6360,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     let ok_commands: Vec<ReceivePackCommand> = plan
         .refs
         .iter()
-        .filter(|reference| matches!(reference.status, sley_remote::PushRefStatus::Ok))
+        .filter(|reference| matches!(reference.status, sley::plumbing::sley_remote::PushRefStatus::Ok))
         .map(|reference| ReceivePackCommand {
             old_id: reference.old_id,
             new_id: reference.new_id,
@@ -6364,7 +6368,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         })
         .collect();
 
-    let destination = sley_remote::PushDestination::Local {
+    let destination = sley::plumbing::sley_remote::PushDestination::Local {
         git_dir: req.remote_git_dir.to_path_buf(),
         common_git_dir: req.remote_common_git_dir.to_path_buf(),
     };
@@ -6382,8 +6386,8 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     let mut report = if req.options.dry_run || hook_decline.is_some() {
         plan
     } else {
-        sley_remote::push_local_with_report(
-            sley_remote::PushReportRequest {
+        sley::plumbing::sley_remote::push_local_with_report(
+            sley::plumbing::sley_remote::PushReportRequest {
                 git_dir: req.git_dir,
                 common_git_dir: req.common_git_dir,
                 format: req.format,
@@ -6429,20 +6433,20 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
 
     if let Some(decline) = hook_decline {
         for reference in &mut report.refs {
-            if !matches!(reference.status, sley_remote::PushRefStatus::Ok) {
+            if !matches!(reference.status, sley::plumbing::sley_remote::PushRefStatus::Ok) {
                 continue;
             }
             reference.status = match &decline {
-                ReceiveHookDecline::PreReceive => sley_remote::PushRefStatus::RemoteReject(
+                ReceiveHookDecline::PreReceive => sley::plumbing::sley_remote::PushRefStatus::RemoteReject(
                     "pre-receive hook declined".to_string(),
                 ),
                 ReceiveHookDecline::Update(name) if reference.dst == *name => {
-                    sley_remote::PushRefStatus::RemoteReject("hook declined".to_string())
+                    sley::plumbing::sley_remote::PushRefStatus::RemoteReject("hook declined".to_string())
                 }
                 ReceiveHookDecline::Update(_) if req.atomic => {
-                    sley_remote::PushRefStatus::RemoteReject("atomic push failure".to_string())
+                    sley::plumbing::sley_remote::PushRefStatus::RemoteReject("atomic push failure".to_string())
                 }
-                ReceiveHookDecline::Update(_) => sley_remote::PushRefStatus::Ok,
+                ReceiveHookDecline::Update(_) => sley::plumbing::sley_remote::PushRefStatus::Ok,
             }
         }
     }
@@ -6463,7 +6467,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             .filter(|reference| {
                 matches!(
                     reference.status,
-                    sley_remote::PushRefStatus::Ok | sley_remote::PushRefStatus::UpToDate
+                    sley::plumbing::sley_remote::PushRefStatus::Ok | sley::plumbing::sley_remote::PushRefStatus::UpToDate
                 )
             })
             .map(|reference| ReceivePackCommand {
@@ -6596,7 +6600,7 @@ fn trace_alternate_have_advertisements(
 
 fn resolve_local_ref_target(
     store: &FileRefStore,
-    reference: &sley_refs::Ref,
+    reference: &sley::plumbing::sley_refs::Ref,
 ) -> Result<Option<ObjectId>> {
     let mut target = reference.target.clone();
     for _ in 0..5 {
@@ -6657,7 +6661,7 @@ fn prune_stale_object_tempfiles(remote_git_dir: &Path) {
 }
 
 fn push_warns_current_branch(
-    report: &sley_remote::PushStatusReport,
+    report: &sley::plumbing::sley_remote::PushStatusReport,
     remote_git_dir: &Path,
     format: ObjectFormat,
     remote_config: &GitConfig,
@@ -6668,7 +6672,7 @@ fn push_warns_current_branch(
     if !deny.eq_ignore_ascii_case("warn") {
         return Ok(false);
     }
-    if sley_worktree::worktree_root_for_git_dir(remote_git_dir)?.is_none() {
+    if sley::plumbing::sley_worktree::worktree_root_for_git_dir(remote_git_dir)?.is_none() {
         return Ok(false);
     }
     let store = FileRefStore::new(remote_git_dir, format);
@@ -6681,7 +6685,7 @@ fn push_warns_current_branch(
             && reference.old_id != reference.new_id
             && matches!(
                 reference.status,
-                sley_remote::PushRefStatus::Ok | sley_remote::PushRefStatus::UpToDate
+                sley::plumbing::sley_remote::PushRefStatus::Ok | sley::plumbing::sley_remote::PushRefStatus::UpToDate
             )
     }))
 }
@@ -6718,7 +6722,7 @@ fn trace2_push_pack_objects_path_walk() {
 }
 
 fn trace2_push_wrote(value: usize) {
-    sley_core::trace2::data("write_pack_file", "wrote", value);
+    sley::plumbing::sley_core::trace2::data("write_pack_file", "wrote", value);
     let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
         return;
     };
@@ -6731,7 +6735,7 @@ fn trace2_push_wrote(value: usize) {
 }
 
 fn trace2_push_total_rounds(value: usize) {
-    sley_core::trace2::data("negotiation_v2", "total_rounds", value);
+    sley::plumbing::sley_core::trace2::data("negotiation_v2", "total_rounds", value);
     let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
         return;
     };
@@ -6747,7 +6751,7 @@ fn trace2_push_total_rounds(value: usize) {
 /// the "To <url>" header, one line per ref (OK refs first, then rejects), and a
 /// trailing "Done"/"Everything up-to-date" depending on porcelain and progress.
 fn render_push_status(
-    report: &sley_remote::PushStatusReport,
+    report: &sley::plumbing::sley_remote::PushStatusReport,
     dest: &str,
     porcelain: bool,
     _dry_run: bool,
@@ -6760,7 +6764,7 @@ fn render_push_status(
     // newly-created refs appended in refspec/planning order. A "new" ref is a
     // create (zero old id that is not a deletion). Reproduce that key, then the
     // three status passes below each walk in this canonical order.
-    let mut ordered: Vec<(usize, &sley_remote::PushReportRef)> =
+    let mut ordered: Vec<(usize, &sley::plumbing::sley_remote::PushReportRef)> =
         report.refs.iter().enumerate().collect();
     ordered.sort_by(|(ai, a), (bi, b)| {
         let a_new = a.old_id.is_null() && !a.is_deletion();
@@ -6772,12 +6776,12 @@ fn render_push_status(
             (true, false) => std::cmp::Ordering::Greater,
         }
     });
-    let ordered: Vec<&sley_remote::PushReportRef> = ordered
+    let ordered: Vec<&sley::plumbing::sley_remote::PushReportRef> = ordered
         .into_iter()
         .map(|(_, reference)| reference)
         .collect();
     let mut first = true;
-    let mut emit = |reference: &sley_remote::PushReportRef| {
+    let mut emit = |reference: &sley::plumbing::sley_remote::PushReportRef| {
         if first {
             if porcelain {
                 println!("To {dest}");
@@ -6796,20 +6800,20 @@ fn render_push_status(
     // Each pass preserves planning order.
     if porcelain {
         for reference in &ordered {
-            if matches!(reference.status, sley_remote::PushRefStatus::UpToDate) {
+            if matches!(reference.status, sley::plumbing::sley_remote::PushRefStatus::UpToDate) {
                 emit(reference);
             }
         }
     }
     for reference in &ordered {
-        if matches!(reference.status, sley_remote::PushRefStatus::Ok) {
+        if matches!(reference.status, sley::plumbing::sley_remote::PushRefStatus::Ok) {
             emit(reference);
         }
     }
     for reference in &ordered {
         if !matches!(
             reference.status,
-            sley_remote::PushRefStatus::Ok | sley_remote::PushRefStatus::UpToDate
+            sley::plumbing::sley_remote::PushRefStatus::Ok | sley::plumbing::sley_remote::PushRefStatus::UpToDate
         ) {
             emit(reference);
         }
@@ -6817,7 +6821,7 @@ fn render_push_status(
     for reference in &ordered {
         if matches!(
             &reference.status,
-            sley_remote::PushRefStatus::RemoteReject(message)
+            sley::plumbing::sley_remote::PushRefStatus::RemoteReject(message)
                 if message == "invalid new value provided"
         ) && reference.dst.starts_with("refs/heads/")
             && !reference.new_id.is_null()
@@ -6843,7 +6847,7 @@ fn render_push_status(
 
 /// git's `transport_summary_width`: `2 * maxw + 3` where `maxw` is the widest
 /// unique abbreviation across every ref's old and new oid (min `DEFAULT_ABBREV`).
-fn push_summary_width(report: &sley_remote::PushStatusReport) -> usize {
+fn push_summary_width(report: &sley::plumbing::sley_remote::PushStatusReport) -> usize {
     let mut maxw = 7usize;
     for reference in &report.refs {
         // We approximate `measure_abbrev` with the default abbrev length; the
@@ -6860,13 +6864,13 @@ fn push_summary_width(report: &sley_remote::PushStatusReport) -> usize {
 /// Render one ref's status line. Mirrors git's `print_one_push_report` +
 /// `print_ok_ref_status` + `print_ref_status`.
 fn print_push_ref(
-    reference: &sley_remote::PushReportRef,
+    reference: &sley::plumbing::sley_remote::PushReportRef,
     porcelain: bool,
     summary_width: usize,
     local_db: &FileObjectDatabase,
     remote_db: &FileObjectDatabase,
 ) {
-    use sley_remote::PushRefStatus;
+    use sley::plumbing::sley_remote::PushRefStatus;
     let (flag, summary, msg): (char, String, Option<String>) = match &reference.status {
         PushRefStatus::Ok => push_ok_summary(reference, local_db, remote_db),
         PushRefStatus::UpToDate => ('=', "[up to date]".to_string(), None),
@@ -6945,7 +6949,7 @@ fn print_push_ref(
 /// `[deleted]`/`[new branch]`/`[new tag]`/`[new reference]` summary, or the
 /// `<old>..<new>` / `<old>...<new>` quickref with the forced marker.
 fn push_ok_summary(
-    reference: &sley_remote::PushReportRef,
+    reference: &sley::plumbing::sley_remote::PushReportRef,
     local_db: &FileObjectDatabase,
     remote_db: &FileObjectDatabase,
 ) -> (char, String, Option<String>) {
@@ -6993,7 +6997,7 @@ fn unique_abbrev(oid: &ObjectId, db: &FileObjectDatabase) -> String {
     let mut width = 7.min(hex.len());
     while width < hex.len() {
         match db.resolve_prefix(&hex[..width]) {
-            Ok(sley_odb::ObjectPrefixResolution::Ambiguous(_)) => width += 1,
+            Ok(sley::plumbing::sley_odb::ObjectPrefixResolution::Ambiguous(_)) => width += 1,
             _ => break,
         }
     }
@@ -7042,11 +7046,11 @@ fn update_push_remote_tracking_refs(
 }
 
 fn run_local_receive_pre_hooks(
-    destination: &sley_remote::PushDestination,
+    destination: &sley::plumbing::sley_remote::PushDestination,
     push_commands: &[ReceivePackCommand],
     push_options: &[String],
 ) -> Result<()> {
-    let sley_remote::PushDestination::Local {
+    let sley::plumbing::sley_remote::PushDestination::Local {
         git_dir: remote_git_dir,
         ..
     } = destination
@@ -7090,11 +7094,11 @@ enum ReceiveHookDecline {
 }
 
 fn run_local_receive_pre_hooks_report(
-    destination: &sley_remote::PushDestination,
+    destination: &sley::plumbing::sley_remote::PushDestination,
     push_commands: &[ReceivePackCommand],
     push_options: &[String],
 ) -> Option<ReceiveHookDecline> {
-    let sley_remote::PushDestination::Local {
+    let sley::plumbing::sley_remote::PushDestination::Local {
         git_dir: remote_git_dir,
         ..
     } = destination
@@ -7156,11 +7160,11 @@ fn receive_update_hook_order(push_commands: &[ReceivePackCommand]) -> Vec<&Recei
 }
 
 fn run_local_receive_post_hooks(
-    destination: &sley_remote::PushDestination,
+    destination: &sley::plumbing::sley_remote::PushDestination,
     push_commands: &[ReceivePackCommand],
     push_options: &[String],
 ) -> Result<()> {
-    let sley_remote::PushDestination::Local {
+    let sley::plumbing::sley_remote::PushDestination::Local {
         git_dir: remote_git_dir,
         ..
     } = destination
@@ -7260,7 +7264,7 @@ fn run_pre_push_hook(
 fn run_pre_push_hook_for_report(
     git_dir: &Path,
     remote: &str,
-    refs: &[sley_remote::PushReportRef],
+    refs: &[sley::plumbing::sley_remote::PushReportRef],
 ) -> Result<()> {
     let url = push_resolved_url(remote).unwrap_or_else(|_| remote.to_string());
     let stdin = pre_push_stdin_from_report(refs);
@@ -7277,15 +7281,15 @@ fn run_pre_push_hook_for_report(
     Ok(())
 }
 
-fn pre_push_stdin_from_report(refs: &[sley_remote::PushReportRef]) -> String {
+fn pre_push_stdin_from_report(refs: &[sley::plumbing::sley_remote::PushReportRef]) -> String {
     refs.iter()
         .filter(|reference| {
             !matches!(
                 reference.status,
-                sley_remote::PushRefStatus::RejectNonFastForward
-                    | sley_remote::PushRefStatus::RejectRemoteUpdated
-                    | sley_remote::PushRefStatus::RejectStale
-                    | sley_remote::PushRefStatus::UpToDate
+                sley::plumbing::sley_remote::PushRefStatus::RejectNonFastForward
+                    | sley::plumbing::sley_remote::PushRefStatus::RejectRemoteUpdated
+                    | sley::plumbing::sley_remote::PushRefStatus::RejectStale
+                    | sley::plumbing::sley_remote::PushRefStatus::UpToDate
             )
         })
         .map(|reference| {
@@ -7519,11 +7523,11 @@ fn explicit_push_refspec_with_refmap(
     let source = push_refmap_source_name(store, body);
     for configured in configured_push {
         let configured = configured.strip_prefix('+').unwrap_or(configured);
-        let parsed = sley_protocol::parse_refspec(configured)?;
+        let parsed = sley::plumbing::sley_protocol::parse_refspec(configured)?;
         if parsed.negative {
             continue;
         }
-        if let Some(dst) = sley_protocol::refspec_map_source(&parsed, &source)? {
+        if let Some(dst) = sley::plumbing::sley_protocol::refspec_map_source(&parsed, &source)? {
             return Ok(format!("{force}{source}:{dst}"));
         }
     }
@@ -7795,7 +7799,7 @@ fn configure_push_upstreams(
 fn configure_push_upstreams_from_report(
     git_dir: &Path,
     remote: &str,
-    refs: &[sley_remote::PushReportRef],
+    refs: &[sley::plumbing::sley_remote::PushReportRef],
 ) -> Result<()> {
     let mut config = read_repo_config(git_dir)?;
     let format = repository_object_format(git_dir)?;
@@ -7804,7 +7808,7 @@ fn configure_push_upstreams_from_report(
     for reference in refs {
         if !matches!(
             reference.status,
-            sley_remote::PushRefStatus::Ok | sley_remote::PushRefStatus::UpToDate
+            sley::plumbing::sley_remote::PushRefStatus::Ok | sley::plumbing::sley_remote::PushRefStatus::UpToDate
         ) || reference.is_deletion()
         {
             continue;
@@ -7850,7 +7854,7 @@ pub(crate) fn fetch_bundle(
     bundle: &Bundle,
     options: FetchOptions,
 ) -> Result<()> {
-    sley_remote::fetch_bundle(sley_remote::FetchBundleRequest {
+    sley::plumbing::sley_remote::fetch_bundle(sley::plumbing::sley_remote::FetchBundleRequest {
         git_dir,
         format,
         bundle_path,
@@ -7861,7 +7865,7 @@ pub(crate) fn fetch_bundle(
 }
 
 /// Resolve the repository context and delegate a local (`file://`/path) fetch to
-/// [`sley_remote::fetch`]. Repository/URL resolution and output formatting stay
+/// [`sley::plumbing::sley_remote::fetch`]. Repository/URL resolution and output formatting stay
 /// here; the fetch orchestration (ref-map, pack install, `FETCH_HEAD`, prune)
 /// lives in the library.
 pub(crate) fn fetch_local_repository(
@@ -7881,11 +7885,11 @@ fn fetch_local_repository_with_outcome(
     refspecs: &[String],
     options: FetchOptions,
     server_options: &[String],
-) -> Result<sley_remote::FetchOutcome> {
+) -> Result<sley::plumbing::sley_remote::FetchOutcome> {
     let remote_git_dir = ls_remote_git_dir(source)?;
     let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
     let config = repo_config_with_transport_policy(git_dir)?;
-    let fetch_source = sley_remote::FetchSource::Local {
+    let fetch_source = sley::plumbing::sley_remote::FetchSource::Local {
         git_dir: remote_git_dir,
         common_git_dir: remote_common_git_dir,
     };
@@ -7901,18 +7905,18 @@ fn fetch_local_repository_with_outcome(
     )
 }
 
-/// A [`sley_remote::ProgressSink`] that prints each progress/summary line to
+/// A [`sley::plumbing::sley_remote::ProgressSink`] that prints each progress/summary line to
 /// stdout, reproducing the CLI's fetch prune output. Write errors are ignored,
 /// matching how progress output is otherwise best-effort.
 pub(crate) struct StdoutProgress;
 
-impl sley_remote::ProgressSink for StdoutProgress {
+impl sley::plumbing::sley_remote::ProgressSink for StdoutProgress {
     fn message(&mut self, message: &str) {
         let _ = writeln!(io::stdout(), "{message}");
     }
 }
 
-/// Drive [`sley_remote::fetch`] for an already-resolved `source`, wiring the
+/// Drive [`sley::plumbing::sley_remote::fetch`] for an already-resolved `source`, wiring the
 /// credential-helper provider and the stdout progress sink, then format the
 /// outcome the way the CLI always has (prune notices are emitted through the sink
 /// during the call; nothing else is printed for fetch).
@@ -7921,27 +7925,27 @@ fn run_fetch(
     format: ObjectFormat,
     config: &GitConfig,
     source: &str,
-    fetch_source: &sley_remote::FetchSource,
+    fetch_source: &sley::plumbing::sley_remote::FetchSource,
     refspecs: &[String],
     options: FetchOptions,
     server_options: &[String],
-) -> Result<sley_remote::FetchOutcome> {
+) -> Result<sley::plumbing::sley_remote::FetchOutcome> {
     let before_refs = fetch_ref_snapshot(git_dir, format)?;
-    let mut credentials = sley_remote::CredentialHelperProvider::new(Some(config));
+    let mut credentials = sley::plumbing::sley_remote::CredentialHelperProvider::new(Some(config));
     let mut progress = StdoutProgress;
     if matches!(
         fetch_source,
-        sley_remote::FetchSource::Local { .. } | sley_remote::FetchSource::Ssh(_)
+        sley::plumbing::sley_remote::FetchSource::Local { .. } | sley::plumbing::sley_remote::FetchSource::Ssh(_)
     ) {
         trace_configured_local_protocol_version(Some(config));
     }
-    if matches!(fetch_source, sley_remote::FetchSource::Local { .. })
+    if matches!(fetch_source, sley::plumbing::sley_remote::FetchSource::Local { .. })
         && configured_protocol_version(Some(config)) == Some(ProtocolVersion::V2)
     {
         trace_protocol_v2_ls_refs_request(server_options);
     }
-    let outcome = sley_remote::fetch(
-        sley_remote::FetchRequest {
+    let outcome = sley::plumbing::sley_remote::fetch(
+        sley::plumbing::sley_remote::FetchRequest {
             git_dir,
             format,
             config,
@@ -7950,7 +7954,7 @@ fn run_fetch(
             refspecs,
             options: &options,
         },
-        sley_remote::FetchServices {
+        sley::plumbing::sley_remote::FetchServices {
             credentials: &mut credentials,
             progress: &mut progress,
         },
@@ -7975,7 +7979,7 @@ fn print_fetch_status(
     source: &str,
     quiet: bool,
     before_refs: &std::collections::BTreeMap<String, ObjectId>,
-    outcome: &sley_remote::FetchOutcome,
+    outcome: &sley::plumbing::sley_remote::FetchOutcome,
 ) -> Result<()> {
     if quiet {
         return Ok(());
@@ -8018,7 +8022,7 @@ fn print_fetch_status(
     if rows.is_empty() {
         return Ok(());
     }
-    let source = sley_remote::fetch_head_source_description(config, source);
+    let source = sley::plumbing::sley_remote::fetch_head_source_description(config, source);
     let src_width = rows
         .iter()
         .map(|(_, src, _)| src.len())
@@ -8044,7 +8048,7 @@ fn maybe_set_remote_head_on_fetch(
     config: &GitConfig,
     source: &str,
     refspecs: &[String],
-    outcome: &sley_remote::FetchOutcome,
+    outcome: &sley::plumbing::sley_remote::FetchOutcome,
 ) -> Result<()> {
     // Only for a default fetch (no command-line refspecs) of a configured remote
     // that has fetch refspecs.
@@ -8117,7 +8121,7 @@ pub(crate) fn fetch_source_is_git(source: &str) -> Result<bool> {
 }
 
 /// Resolve the repository context and delegate an SSH fetch to
-/// [`sley_remote::fetch`] via the unified [`sley_remote::FetchSource::Ssh`]
+/// [`sley::plumbing::sley_remote::fetch`] via the unified [`sley::plumbing::sley_remote::FetchSource::Ssh`]
 /// dispatch. URL resolution and output formatting stay here; the fetch
 /// orchestration (ref-map, pack install over `ssh`, `FETCH_HEAD`, prune) lives in
 /// the library, shared with the HTTP and local transports.
@@ -8137,10 +8141,10 @@ fn fetch_ssh_repository_with_outcome(
     source: &str,
     refspecs: &[String],
     options: FetchOptions,
-) -> Result<sley_remote::FetchOutcome> {
+) -> Result<sley::plumbing::sley_remote::FetchOutcome> {
     let config = repo_config_with_transport_policy(git_dir)?;
     let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
-    let fetch_source = sley_remote::FetchSource::Ssh(remote);
+    let fetch_source = sley::plumbing::sley_remote::FetchSource::Ssh(remote);
     run_fetch(
         git_dir,
         format,
@@ -8169,10 +8173,10 @@ fn fetch_git_repository_with_outcome(
     source: &str,
     refspecs: &[String],
     options: FetchOptions,
-) -> Result<sley_remote::FetchOutcome> {
+) -> Result<sley::plumbing::sley_remote::FetchOutcome> {
     let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
     let config = read_repo_config(git_dir)?;
-    let fetch_source = sley_remote::FetchSource::Git {
+    let fetch_source = sley::plumbing::sley_remote::FetchSource::Git {
         remote,
         protocol_v2: configured_protocol_version(Some(&config)) == Some(ProtocolVersion::V2),
     };
@@ -8197,11 +8201,11 @@ fn fetch_git_repository_with_outcome(
 // stay here.
 
 fn fetch_source_is_http(source: &str) -> Result<bool> {
-    sley_remote::remote_url_is_http(&ls_remote_resolved_url(source)?)
+    sley::plumbing::sley_remote::remote_url_is_http(&ls_remote_resolved_url(source)?)
 }
 
 /// Resolve the repository context and delegate a smart-HTTP(S) fetch to
-/// [`sley_remote::fetch`]. URL resolution and output formatting stay here; the
+/// [`sley::plumbing::sley_remote::fetch`]. URL resolution and output formatting stay here; the
 /// fetch orchestration lives in the library.
 fn fetch_http_repository(
     git_dir: &Path,
@@ -8219,10 +8223,10 @@ fn fetch_http_repository_with_outcome(
     source: &str,
     refspecs: &[String],
     options: FetchOptions,
-) -> Result<sley_remote::FetchOutcome> {
+) -> Result<sley::plumbing::sley_remote::FetchOutcome> {
     let config = read_repo_config(git_dir)?;
     let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
-    let fetch_source = sley_remote::FetchSource::Http(remote);
+    let fetch_source = sley::plumbing::sley_remote::FetchSource::Http(remote);
     run_fetch(
         git_dir,
         format,
@@ -8236,7 +8240,7 @@ fn fetch_http_repository_with_outcome(
 }
 
 /// Resolve `repository` to an HTTP(S) remote and list its advertisements via
-/// [`sley_remote::ls_remote`], returning `None` for non-HTTP transports. URL/
+/// [`sley::plumbing::sley_remote::ls_remote`], returning `None` for non-HTTP transports. URL/
 /// config resolution and the ref-name pattern matching stay here; the
 /// advertisement listing and class filtering live in the library.
 fn ls_remote_http_records(
@@ -8255,9 +8259,9 @@ fn ls_remote_http_records(
     let config = discover_git_dir(env::current_dir()?)
         .ok()
         .and_then(|git_dir| read_repo_config(&git_dir).ok());
-    let mut credentials = sley_remote::CredentialHelperProvider::new(config.as_ref());
-    let records = sley_remote::ls_remote(
-        &sley_remote::LsRemoteSource::Http(parsed),
+    let mut credentials = sley::plumbing::sley_remote::CredentialHelperProvider::new(config.as_ref());
+    let records = sley::plumbing::sley_remote::ls_remote(
+        &sley::plumbing::sley_remote::LsRemoteSource::Http(parsed),
         ObjectFormat::Sha1,
         &ls_remote_filter(options),
         &|name| ls_remote_ref_matches(name, &options.patterns),
@@ -8268,8 +8272,8 @@ fn ls_remote_http_records(
 }
 
 /// The library ref-class filter for the parsed ls-remote `options`.
-fn ls_remote_filter(options: &LsRemoteOptions) -> sley_remote::LsRemoteFilter {
-    sley_remote::LsRemoteFilter {
+fn ls_remote_filter(options: &LsRemoteOptions) -> sley::plumbing::sley_remote::LsRemoteFilter {
+    sley::plumbing::sley_remote::LsRemoteFilter {
         heads: options.heads,
         tags: options.tags,
         refs_only: options.refs_only,
@@ -8624,13 +8628,13 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
     };
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let (mut records, format) = sley_remote::ls_remote(
-        &sley_remote::LsRemoteSource::Local { git_dir },
+    let (mut records, format) = sley::plumbing::sley_remote::ls_remote(
+        &sley::plumbing::sley_remote::LsRemoteSource::Local { git_dir },
         format,
         &ls_remote_filter(&options),
         &|name| ls_remote_ref_matches(name, &options.patterns),
         Some(&transport_config),
-        &mut sley_remote::NoCredentials,
+        &mut sley::plumbing::sley_remote::NoCredentials,
     )?;
 
     if options.exit_code && records.is_empty() {
@@ -8677,7 +8681,7 @@ fn ls_remote_upload_pack_command_records(
     let features = set
         .refs
         .first()
-        .map(|advertisement| sley_protocol::parse_upload_pack_features(&advertisement.capabilities))
+        .map(|advertisement| sley::plumbing::sley_protocol::parse_upload_pack_features(&advertisement.capabilities))
         .transpose()?
         .unwrap_or_default();
     let symrefs = features
@@ -8861,7 +8865,7 @@ fn validate_ls_remote_sort_context(sort: Option<LsRemoteSort>) -> Result<Option<
 }
 
 /// Resolve `repository` to an SSH remote and list its advertisements via
-/// [`sley_remote::ls_remote`], returning `None` for non-SSH transports. URL/config
+/// [`sley::plumbing::sley_remote::ls_remote`], returning `None` for non-SSH transports. URL/config
 /// resolution and the ref-name pattern matching stay here; the advertisement
 /// listing and class filtering live in the library, shared with the HTTP path. SSH
 /// does not authenticate at this layer, so no credential provider is supplied.
@@ -8877,13 +8881,13 @@ fn ls_remote_ssh_records(
     ) {
         return Ok(None);
     }
-    let records = sley_remote::ls_remote(
-        &sley_remote::LsRemoteSource::Ssh(parsed),
+    let records = sley::plumbing::sley_remote::ls_remote(
+        &sley::plumbing::sley_remote::LsRemoteSource::Ssh(parsed),
         ObjectFormat::Sha1,
         &ls_remote_filter(options),
         &|name| ls_remote_ref_matches(name, &options.patterns),
         Some(transport_config),
-        &mut sley_remote::NoCredentials,
+        &mut sley::plumbing::sley_remote::NoCredentials,
     )?;
     Ok(Some(records))
 }
@@ -8897,13 +8901,13 @@ fn ls_remote_git_records(
     if parsed.transport != RemoteTransport::Git {
         return Ok(None);
     }
-    let records = sley_remote::ls_remote(
-        &sley_remote::LsRemoteSource::Git(parsed),
+    let records = sley::plumbing::sley_remote::ls_remote(
+        &sley::plumbing::sley_remote::LsRemoteSource::Git(parsed),
         ObjectFormat::Sha1,
         &ls_remote_filter(options),
         &|name| ls_remote_ref_matches(name, &options.patterns),
         Some(transport_config),
-        &mut sley_remote::NoCredentials,
+        &mut sley::plumbing::sley_remote::NoCredentials,
     )?;
     Ok(Some(records))
 }
@@ -8920,8 +8924,8 @@ fn ls_remote_resolved_url(repository: &str) -> Result<String> {
 }
 
 fn check_transport_allowed_url(url: &str, config: Option<&GitConfig>) -> Result<()> {
-    let scheme = sley_remote::transport_scheme_for_url(url);
-    match sley_remote::check_transport_allowed(&scheme, config, None) {
+    let scheme = sley::plumbing::sley_remote::transport_scheme_for_url(url);
+    match sley::plumbing::sley_remote::check_transport_allowed(&scheme, config, None) {
         Ok(()) => Ok(()),
         Err(err) => {
             eprintln!("fatal: {err}");
@@ -8937,16 +8941,16 @@ fn transport_policy_config_for_cwd() -> Result<GitConfig> {
         .as_deref()
         .and_then(|git_dir| common_git_dir_for_git_dir(git_dir).ok());
     let context = match (&common_git_dir, &git_dir) {
-        (Some(common_git_dir), Some(git_dir)) => sley_config::ConfigIncludeContext::new(
+        (Some(common_git_dir), Some(git_dir)) => sley::plumbing::sley_config::ConfigIncludeContext::new(
             Some(common_git_dir.clone()),
             repo_current_branch_name(git_dir),
         ),
-        _ => sley_config::ConfigIncludeContext::new(None, None),
+        _ => sley::plumbing::sley_config::ConfigIncludeContext::new(None, None),
     };
-    let mut config = sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)
+    let mut config = sley::plumbing::sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)
         .map_err(report_config_setup_error)?;
     let parameters = injected_config_parameters()?;
-    sley_config::append_injected_config_sections_with_includes(
+    sley::plumbing::sley_config::append_injected_config_sections_with_includes(
         &mut config,
         &parameters,
         &context,
@@ -8993,7 +8997,8 @@ pub(crate) fn ls_remote_git_dir(repository: &str) -> Result<PathBuf> {
     {
         return Ok(git_dir);
     }
-    let local_git_dir = local_git_dir.ok_or_else(|| GitError::repository_not_found("not a git repository"))?;
+    let local_git_dir =
+        local_git_dir.ok_or_else(|| GitError::repository_not_found("not a git repository"))?;
     let config = read_repo_config(&local_git_dir)?;
     let rewritten = rewrite_url_with_config(&config, repository, false);
     if rewritten != repository
@@ -9569,7 +9574,7 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
             if branches.is_empty() {
                 entries.push(ConfigEntry::new(
                     "fetch",
-                    Some(sley_config::remotes::default_fetch_refspec(name)),
+                    Some(sley::plumbing::sley_config::remotes::default_fetch_refspec(name)),
                 ));
             } else {
                 for branch in &branches {
@@ -9605,9 +9610,9 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(128));
         }
     }
-    match sley_config::remotes::add_remote(&mut config, name, entries) {
+    match sley::plumbing::sley_config::remotes::add_remote(&mut config, name, entries) {
         Ok(()) => {}
-        Err(sley_config::remotes::RemoteEditError::AlreadyExists) => {
+        Err(sley::plumbing::sley_config::remotes::RemoteEditError::AlreadyExists) => {
             // Upstream `builtin/remote.c::add`: `error("remote %s already
             // exists.")` then `exit(3)`. A remote counts as existing when it has
             // any config (e.g. a foreign-vcs `remote.<name>.vcs`), which the
@@ -9615,7 +9620,7 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
             eprintln!("error: remote {name} already exists.");
             return Err(GitError::Exit(3));
         }
-        Err(sley_config::remotes::RemoteEditError::NotFound) => {
+        Err(sley::plumbing::sley_config::remotes::RemoteEditError::NotFound) => {
             return Err(GitError::remote_not_found(name));
         }
     }
@@ -9728,15 +9733,15 @@ pub(crate) fn cmd_remote_remove(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let mut config = read_repo_config_on_disk(&git_dir)?;
     let warn_skipped_local_branches = remote_remove_maps_outside_remote_tracking(&config, name);
-    match sley_config::remotes::remove_remote(&mut config, name) {
+    match sley::plumbing::sley_config::remotes::remove_remote(&mut config, name) {
         Ok(()) => {}
-        Err(sley_config::remotes::RemoteEditError::NotFound) => {
+        Err(sley::plumbing::sley_config::remotes::RemoteEditError::NotFound) => {
             // Upstream `builtin/remote.c::rm`: `error("No such remote: '%s'")`
             // then `exit(2)`.
             eprintln!("error: No such remote: '{name}'");
             return Err(GitError::Exit(2));
         }
-        Err(sley_config::remotes::RemoteEditError::AlreadyExists) => {
+        Err(sley::plumbing::sley_config::remotes::RemoteEditError::AlreadyExists) => {
             return Err(GitError::Command(format!("remote {name} already exists")));
         }
     }
@@ -9890,7 +9895,7 @@ pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
     let new = positional[1];
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let mut config = read_repo_config_on_disk(&git_dir)?;
-    sley_config::remotes::augment_with_legacy_remote_files(&mut config, &git_dir);
+    sley::plumbing::sley_config::remotes::augment_with_legacy_remote_files(&mut config, &git_dir);
     // Upstream `builtin/remote.c::mv` order: the old remote's existence is
     // checked first (`error` + `exit(2)`), then the new name's collision
     // (`exit(3)`), and only then the new name's format (`die`, exit 128). The
@@ -10185,8 +10190,8 @@ fn prune_remote_tracking_refs(
 fn stale_refs_for_remote_fetch(
     config: &GitConfig,
     remote: &str,
-    remote_refs: &[sley_refs::Ref],
-    local_refs: &[sley_refs::Ref],
+    remote_refs: &[sley::plumbing::sley_refs::Ref],
+    local_refs: &[sley::plumbing::sley_refs::Ref],
 ) -> Vec<String> {
     let mut stale = BTreeSet::new();
     for spec in remote_config_values(config, remote, "fetch") {
@@ -10566,9 +10571,9 @@ pub(crate) fn cmd_remote_set_url(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let mut config = read_repo_config_on_disk(&git_dir)?;
     let kind = if push {
-        sley_config::remotes::SetUrlKind::Push
+        sley::plumbing::sley_config::remotes::SetUrlKind::Push
     } else {
-        sley_config::remotes::SetUrlKind::Fetch
+        sley::plumbing::sley_config::remotes::SetUrlKind::Fetch
     };
     let key = kind.key();
     // `--delete`/`<oldurl>` select URLs with git's value-pattern matcher; build
@@ -10576,35 +10581,35 @@ pub(crate) fn cmd_remote_set_url(args: &[String]) -> Result<()> {
     let delete_matcher = delete.then(|| SimpleConfigRegex::parse(url));
     let old_url_matcher = old_url.map(SimpleConfigRegex::parse);
     let op = if add {
-        sley_config::remotes::SetUrlOp::Add { url }
+        sley::plumbing::sley_config::remotes::SetUrlOp::Add { url }
     } else if let Some(matcher) = &delete_matcher {
-        sley_config::remotes::SetUrlOp::Delete {
+        sley::plumbing::sley_config::remotes::SetUrlOp::Delete {
             matches: &|value| matcher.is_match(value),
         }
     } else if let Some(matcher) = &old_url_matcher {
-        sley_config::remotes::SetUrlOp::Replace {
+        sley::plumbing::sley_config::remotes::SetUrlOp::Replace {
             url,
             matches: &|value| matcher.is_match(value),
         }
     } else {
-        sley_config::remotes::SetUrlOp::Set { url }
+        sley::plumbing::sley_config::remotes::SetUrlOp::Set { url }
     };
-    match sley_config::remotes::set_url(&mut config, name, kind, op) {
+    match sley::plumbing::sley_config::remotes::set_url(&mut config, name, kind, op) {
         Ok(()) => write_repo_config(&git_dir, &config),
-        Err(sley_config::remotes::SetUrlError::RemoteNotFound) => {
+        Err(sley::plumbing::sley_config::remotes::SetUrlError::RemoteNotFound) => {
             Err(GitError::remote_not_found(name))
         }
-        Err(sley_config::remotes::SetUrlError::NoMatch) => {
+        Err(sley::plumbing::sley_config::remotes::SetUrlError::NoMatch) => {
             // Only reachable for the `<oldurl>` (replace) form.
             remote_set_url_no_match(old_url.unwrap_or(url))
         }
-        Err(sley_config::remotes::SetUrlError::DeleteNoMatch) => {
+        Err(sley::plumbing::sley_config::remotes::SetUrlError::DeleteNoMatch) => {
             remote_set_url_delete_no_match(name, key)
         }
-        Err(sley_config::remotes::SetUrlError::DeleteAllFetchUrls) => {
+        Err(sley::plumbing::sley_config::remotes::SetUrlError::DeleteAllFetchUrls) => {
             remote_set_url_delete_all_fetch_urls()
         }
-        Err(sley_config::remotes::SetUrlError::MultipleValues) => {
+        Err(sley::plumbing::sley_config::remotes::SetUrlError::MultipleValues) => {
             remote_set_url_multiple_values(name, key, url)
         }
     }
@@ -10674,7 +10679,7 @@ pub(crate) fn cmd_remote_show(args: &[String]) -> Result<()> {
 fn write_remote_show_query(
     stdout: &mut impl Write,
     config: &GitConfig,
-    refs: &[sley_refs::Ref],
+    refs: &[sley::plumbing::sley_refs::Ref],
     name: &str,
     git_dir: &Path,
 ) -> Result<()> {
@@ -10778,7 +10783,7 @@ fn write_remote_show_query(
 fn write_remote_show_no_query(
     stdout: &mut impl Write,
     config: &GitConfig,
-    refs: &[sley_refs::Ref],
+    refs: &[sley::plumbing::sley_refs::Ref],
     name: &str,
 ) -> Result<()> {
     let fetch_urls = remote_config_values_with_empty_clear(config, name, "url");
@@ -10878,8 +10883,8 @@ fn write_remote_show_pull_config(
 fn write_remote_show_push_config(
     stdout: &mut impl Write,
     branches: &[RemotePushConfig],
-    local_refs: &[sley_refs::Ref],
-    remote_refs: &[sley_refs::Ref],
+    local_refs: &[sley::plumbing::sley_refs::Ref],
+    remote_refs: &[sley::plumbing::sley_refs::Ref],
     local_db: &FileObjectDatabase,
     format: ObjectFormat,
     not_queried: bool,
@@ -10952,8 +10957,8 @@ fn write_remote_show_push_config(
 fn remote_show_push_status(
     branch: &str,
     merge: &str,
-    local_refs: &[sley_refs::Ref],
-    remote_refs: &[sley_refs::Ref],
+    local_refs: &[sley::plumbing::sley_refs::Ref],
+    remote_refs: &[sley::plumbing::sley_refs::Ref],
     local_db: &FileObjectDatabase,
     format: ObjectFormat,
 ) -> &'static str {
@@ -10974,7 +10979,7 @@ fn remote_show_push_status(
     }
 }
 
-fn direct_ref_oid<'a>(refs: &'a [sley_refs::Ref], name: &str) -> Option<&'a ObjectId> {
+fn direct_ref_oid<'a>(refs: &'a [sley::plumbing::sley_refs::Ref], name: &str) -> Option<&'a ObjectId> {
     refs.iter()
         .find(|reference| reference.name == name)
         .and_then(|reference| match &reference.target {
@@ -10983,12 +10988,12 @@ fn direct_ref_oid<'a>(refs: &'a [sley_refs::Ref], name: &str) -> Option<&'a Obje
         })
 }
 
-fn remote_tracking_branch_names(refs: &[sley_refs::Ref], name: &str) -> Vec<String> {
+fn remote_tracking_branch_names(refs: &[sley::plumbing::sley_refs::Ref], name: &str) -> Vec<String> {
     let prefix = format!("refs/remotes/{name}/");
     branch_names_with_prefix(refs, &prefix)
 }
 
-fn branch_names_with_prefix(refs: &[sley_refs::Ref], prefix: &str) -> Vec<String> {
+fn branch_names_with_prefix(refs: &[sley::plumbing::sley_refs::Ref], prefix: &str) -> Vec<String> {
     refs.iter()
         .filter_map(|reference| reference.name.strip_prefix(prefix))
         .filter(|branch| *branch != "HEAD")
@@ -11089,8 +11094,8 @@ fn remote_config_values_with_empty_clear(config: &GitConfig, name: &str, key: &s
 fn remote_show_query_push_rows(
     config: &GitConfig,
     remote: &str,
-    local_refs: &[sley_refs::Ref],
-    remote_refs: &[sley_refs::Ref],
+    local_refs: &[sley::plumbing::sley_refs::Ref],
+    remote_refs: &[sley::plumbing::sley_refs::Ref],
 ) -> Vec<RemotePushConfig> {
     let mut rows = Vec::new();
     let specs = remote_config_values(config, remote, "push");
@@ -11182,7 +11187,7 @@ fn remote_show_ref_display(name: &str, full_ref_names: bool) -> &str {
     }
 }
 
-fn local_branch_names(refs: &[sley_refs::Ref]) -> Vec<String> {
+fn local_branch_names(refs: &[sley::plumbing::sley_refs::Ref]) -> Vec<String> {
     branch_names_with_prefix(refs, "refs/heads/")
 }
 
@@ -11194,7 +11199,7 @@ pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
     // i18n.* lookups must see them. The CLI holds command-line `-c` overrides it
     // cannot push into the process env, so it reconstructs the effective
     // `GIT_CONFIG_PARAMETERS` and passes it through.
-    sley_config::read_repo_config(git_dir, crate::effective_config_parameters_env().as_deref())
+    sley::plumbing::sley_config::read_repo_config(git_dir, crate::effective_config_parameters_env().as_deref())
 }
 
 /// The repository's on-disk `config` file alone, with NO command-line `-c` /
@@ -11206,7 +11211,7 @@ pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
 /// This is the bug class behind clone wrongly baking `git -c …` into the cloned
 /// repo's config. Includes (`include.path` / `includeIf`) are still resolved.
 pub(crate) fn read_repo_config_on_disk(git_dir: &Path) -> Result<GitConfig> {
-    sley_config::read_repo_config(git_dir, None)
+    sley::plumbing::sley_config::read_repo_config(git_dir, None)
 }
 
 /// A single `<section>.<key>` value from the *full effective config* (system +
@@ -11216,11 +11221,11 @@ pub(crate) fn read_repo_config_on_disk(git_dir: &Path) -> Result<GitConfig> {
 /// like `branch.autosetuprebase` that are configured outside the cloned repo.
 fn clone_effective_config_value(git_dir: &Path, section: &str, key: &str) -> Option<String> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir).ok()?;
-    let context = sley_config::ConfigIncludeContext::new(
+    let context = sley::plumbing::sley_config::ConfigIncludeContext::new(
         Some(common_git_dir.clone()),
         repo_current_branch_name(git_dir),
     );
-    let config = sley_config::load_effective_config(&common_git_dir, &context).ok()?;
+    let config = sley::plumbing::sley_config::load_effective_config(&common_git_dir, &context).ok()?;
     config.get(section, None, key).map(str::to_owned)
 }
 
@@ -11228,7 +11233,7 @@ fn clone_effective_config_value(git_dir: &Path, section: &str, key: &str) -> Opt
 /// Used for `includeIf "onbranch:<glob>"` resolution; reads HEAD directly so it
 /// needs no object-format or ref-store context.
 pub(crate) fn repo_current_branch_name(git_dir: &Path) -> Option<String> {
-    sley_config::repo_current_branch_name(git_dir)
+    sley::plumbing::sley_config::repo_current_branch_name(git_dir)
 }
 
 pub(crate) fn write_repo_config(git_dir: &Path, config: &GitConfig) -> Result<()> {
@@ -11244,11 +11249,11 @@ pub(crate) fn write_repo_config(git_dir: &Path, config: &GitConfig) -> Result<()
 }
 
 pub(crate) fn remote_names(config: &GitConfig) -> Vec<String> {
-    sley_config::remotes::remote_names(config)
+    sley::plumbing::sley_config::remotes::remote_names(config)
 }
 
 pub(crate) fn remote_exists(config: &GitConfig, name: &str) -> bool {
-    sley_config::remotes::remote_exists(config, name)
+    sley::plumbing::sley_config::remotes::remote_exists(config, name)
 }
 
 fn remote_branch_fetch_refspec(remote: &str, branch: &str) -> String {
@@ -11287,8 +11292,8 @@ pub(crate) fn validate_remote_name(name: &str) -> Result<()> {
     // and `@{` that the delimiter screen lets through.
     let probe = format!("refs/heads/test:refs/remotes/{name}/test");
     let probe_dst = format!("refs/remotes/{name}/test");
-    if sley_protocol::parse_refspec(&probe).is_err()
-        || sley_refs::check_refname_format(&probe_dst, false).is_err()
+    if sley::plumbing::sley_protocol::parse_refspec(&probe).is_err()
+        || sley::plumbing::sley_refs::check_refname_format(&probe_dst, false).is_err()
     {
         // Upstream `builtin/remote.c` (add / rename): `die("'%s' is not a valid
         // remote name")` — a `fatal:` line and exit 128.

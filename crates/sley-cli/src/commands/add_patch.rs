@@ -13,7 +13,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use sley_core::{GitError, Result};
+use sley::plumbing::sley_core::{GitError, Result};
 
 /// Which kind of patch session (add / reset / checkout / stash). Only `Add`
 /// is wired today; the enum keeps the prompt-mode table addressable for the

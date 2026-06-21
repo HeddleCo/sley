@@ -4,8 +4,8 @@
 //! stream + a [`FormatTier`] that describes how much commit data emission needs).
 //! Command fast paths consult the tier instead of hand-maintained string guards.
 
-use sley_core::{GitError, Result};
-use sley_strbuf_expand::{
+use sley::plumbing::sley_core::{GitError, Result};
+use sley::plumbing::sley_strbuf_expand::{
     AtomSyntax, AtomTable, ExpandFormat, ExpandOptions, ExpandSegment, LiteralHex,
 };
 use std::cell::Cell;
@@ -203,7 +203,7 @@ pub(crate) enum MagicPrefix {
 }
 
 /// A parsed `%<`/`%>`/... padding placeholder.
-pub(crate) type PaddingSpec = sley_strbuf_expand::PaddingSpec;
+pub(crate) type PaddingSpec = sley::plumbing::sley_strbuf_expand::PaddingSpec;
 
 /// A parsed `%w(width,indent1,indent2)` wrap directive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,7 +332,7 @@ impl CompiledLogFormat {
                 .all(|token| matches!(token, FormatToken::Literal(_) | FormatToken::OidFull))
     }
 
-    /// True when every token can be rendered from [`sley_rev::CommitMetadata`] alone.
+    /// True when every token can be rendered from [`sley::plumbing::sley_rev::CommitMetadata`] alone.
     pub(crate) fn is_metadata_emitable(&self) -> bool {
         !self.tokens.is_empty() && self.tokens.iter().all(|t| t.is_metadata_emitable())
     }
@@ -815,7 +815,7 @@ fn push_literal_chunk(
 
 fn expand_from_tokens(tokens: &[FormatToken]) -> ExpandFormat<FormatToken> {
     let mut segments = Vec::new();
-    let mut magic = sley_strbuf_expand::MagicPrefix::None;
+    let mut magic = sley::plumbing::sley_strbuf_expand::MagicPrefix::None;
     for token in tokens {
         match token {
             FormatToken::Literal(text) => push_expand_literal(&mut segments, text.as_bytes()),
@@ -824,11 +824,11 @@ fn expand_from_tokens(tokens: &[FormatToken]) -> ExpandFormat<FormatToken> {
             FormatToken::Padding(spec) => segments.push(ExpandSegment::Padding(*spec)),
             FormatToken::Magic(prefix) => magic = expand_magic(*prefix),
             other => {
-                segments.push(ExpandSegment::Atom(sley_strbuf_expand::ExpandAtom {
+                segments.push(ExpandSegment::Atom(sley::plumbing::sley_strbuf_expand::ExpandAtom {
                     magic,
                     atom: other.clone(),
                 }));
-                magic = sley_strbuf_expand::MagicPrefix::None;
+                magic = sley::plumbing::sley_strbuf_expand::MagicPrefix::None;
             }
         }
     }
@@ -846,24 +846,24 @@ fn push_expand_literal(segments: &mut Vec<ExpandSegment<FormatToken>>, literal: 
     }
 }
 
-fn token_magic(prefix: sley_strbuf_expand::MagicPrefix) -> Option<MagicPrefix> {
+fn token_magic(prefix: sley::plumbing::sley_strbuf_expand::MagicPrefix) -> Option<MagicPrefix> {
     match prefix {
-        sley_strbuf_expand::MagicPrefix::None => None,
-        sley_strbuf_expand::MagicPrefix::AddLfBeforeNonEmpty => {
+        sley::plumbing::sley_strbuf_expand::MagicPrefix::None => None,
+        sley::plumbing::sley_strbuf_expand::MagicPrefix::AddLfBeforeNonEmpty => {
             Some(MagicPrefix::AddLfBeforeNonEmpty)
         }
-        sley_strbuf_expand::MagicPrefix::DeleteLfBeforeEmpty => Some(MagicPrefix::DelLfBeforeEmpty),
-        sley_strbuf_expand::MagicPrefix::AddSpaceBeforeNonEmpty => {
+        sley::plumbing::sley_strbuf_expand::MagicPrefix::DeleteLfBeforeEmpty => Some(MagicPrefix::DelLfBeforeEmpty),
+        sley::plumbing::sley_strbuf_expand::MagicPrefix::AddSpaceBeforeNonEmpty => {
             Some(MagicPrefix::AddSpBeforeNonEmpty)
         }
     }
 }
 
-fn expand_magic(prefix: MagicPrefix) -> sley_strbuf_expand::MagicPrefix {
+fn expand_magic(prefix: MagicPrefix) -> sley::plumbing::sley_strbuf_expand::MagicPrefix {
     match prefix {
-        MagicPrefix::DelLfBeforeEmpty => sley_strbuf_expand::MagicPrefix::DeleteLfBeforeEmpty,
-        MagicPrefix::AddLfBeforeNonEmpty => sley_strbuf_expand::MagicPrefix::AddLfBeforeNonEmpty,
-        MagicPrefix::AddSpBeforeNonEmpty => sley_strbuf_expand::MagicPrefix::AddSpaceBeforeNonEmpty,
+        MagicPrefix::DelLfBeforeEmpty => sley::plumbing::sley_strbuf_expand::MagicPrefix::DeleteLfBeforeEmpty,
+        MagicPrefix::AddLfBeforeNonEmpty => sley::plumbing::sley_strbuf_expand::MagicPrefix::AddLfBeforeNonEmpty,
+        MagicPrefix::AddSpBeforeNonEmpty => sley::plumbing::sley_strbuf_expand::MagicPrefix::AddSpaceBeforeNonEmpty,
     }
 }
 
@@ -1032,7 +1032,7 @@ fn expand_decorate_value(arg: &str) -> String {
 
 /// git `term_columns()`: respects COLUMNS env, defaults to 80.
 pub(crate) fn term_columns() -> i64 {
-    sley_strbuf_expand::term_columns() as i64
+    sley::plumbing::sley_strbuf_expand::term_columns() as i64
 }
 
 pub(crate) mod presets {

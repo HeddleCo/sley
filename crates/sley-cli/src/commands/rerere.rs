@@ -325,7 +325,7 @@ struct RerereConflict {
 }
 
 fn find_rerere_conflicts(git_dir: &Path, format: ObjectFormat) -> Result<Vec<RerereConflict>> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     let Ok(bytes) = fs::read(&index_path) else {
         return Ok(Vec::new());
     };
@@ -339,7 +339,7 @@ fn find_rerere_conflicts(git_dir: &Path, format: ObjectFormat) -> Result<Vec<Rer
         while i < index.entries.len() && index.entries[i].path == path {
             let entry = &index.entries[i];
             let stage = entry.stage().as_u16();
-            let regular = entry.mode & sley_index::GIT_MODE_TYPE_MASK == 0o100000;
+            let regular = entry.mode & sley::plumbing::sley_index::GIT_MODE_TYPE_MASK == 0o100000;
             if regular && stage == 2 {
                 has_ours = true;
             } else if regular && stage == 3 {
@@ -459,7 +459,7 @@ fn normalize_conflicted_content(
         return Ok(None);
     }
     let hash = compute_hash
-        .then(|| sley_core::digest_bytes(ObjectFormat::Sha1, &hash_input))
+        .then(|| sley::plumbing::sley_core::digest_bytes(ObjectFormat::Sha1, &hash_input))
         .transpose()?;
     Ok(Some((out, hash)))
 }
@@ -719,15 +719,15 @@ fn try_replay_resolution_variant(
     };
     let base = fs::read(&preimage)?;
     let resolved = fs::read(&postimage)?;
-    let merged = sley_diff_merge::merge_blobs(
+    let merged = sley::plumbing::sley_diff_merge::merge_blobs(
         &base,
         &thisimage,
         &resolved,
-        &sley_diff_merge::MergeBlobOptions {
+        &sley::plumbing::sley_diff_merge::MergeBlobOptions {
             ours_label: "",
             theirs_label: "",
             base_label: "",
-            style: sley_diff_merge::ConflictStyle::Merge,
+            style: sley::plumbing::sley_diff_merge::ConflictStyle::Merge,
         },
     );
     if merged.conflicted {
@@ -749,7 +749,7 @@ fn stage_resolved_path(
     worktree_root: &Path,
     path: &str,
 ) -> Result<()> {
-    let index_path = sley_worktree::repository_index_path(git_dir);
+    let index_path = sley::plumbing::sley_worktree::repository_index_path(git_dir);
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
     let full = worktree_root.join(path);
     let content = fs::read(&full)?;
@@ -857,8 +857,8 @@ fn rerere_diff(git_dir: &Path, format: ObjectFormat) -> Result<()> {
             Ok(bytes) => bytes,
             Err(_) => continue,
         };
-        let diff_entry = sley_diff_merge::NameStatusEntry {
-            status: sley_diff_merge::NameStatus::Modified,
+        let diff_entry = sley::plumbing::sley_diff_merge::NameStatusEntry {
+            status: sley::plumbing::sley_diff_merge::NameStatus::Modified,
             path: BString::from(entry.path.as_bytes()),
             old_path: None,
             old_mode: Some(0o100644),
@@ -888,8 +888,8 @@ fn rerere_diff(git_dir: &Path, format: ObjectFormat) -> Result<()> {
                 ws_error: None,
                 color_moved: None,
                 interhunk: 0,
-                ws_ignore: sley_diff_merge::WsIgnore::default(),
-                diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+                ws_ignore: sley::plumbing::sley_diff_merge::WsIgnore::default(),
+                diff_algorithm: sley::plumbing::sley_diff_merge::DiffAlgorithm::Myers,
                 ignore_blank_lines: false,
                 ignore_regexes: &[],
                 line_ranges: None,

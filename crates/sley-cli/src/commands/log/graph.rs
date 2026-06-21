@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn graph_show_commit(
-    graph: &mut sley_rev::graph::Graph,
+    graph: &mut sley::plumbing::sley_rev::graph::Graph,
     prefix: &str,
     out: &mut dyn Write,
 ) -> Result<()> {
@@ -21,7 +21,7 @@ pub(super) fn graph_show_commit(
 
 /// Emit a single graph row (no trailing newline).
 pub(super) fn graph_show_oneline(
-    graph: &mut sley_rev::graph::Graph,
+    graph: &mut sley::plumbing::sley_rev::graph::Graph,
     prefix: &str,
     out: &mut dyn Write,
 ) -> Result<()> {
@@ -34,7 +34,7 @@ pub(super) fn graph_show_oneline(
 
 /// Emit a padding row (no trailing newline).
 pub(super) fn graph_show_padding(
-    graph: &mut sley_rev::graph::Graph,
+    graph: &mut sley::plumbing::sley_rev::graph::Graph,
     prefix: &str,
     out: &mut dyn Write,
 ) -> Result<()> {
@@ -48,7 +48,7 @@ pub(super) fn graph_show_padding(
 /// Emit the remaining graph rows for the current commit; ends WITHOUT a
 /// trailing newline (upstream `graph_show_remainder`).
 fn graph_show_remainder(
-    graph: &mut sley_rev::graph::Graph,
+    graph: &mut sley::plumbing::sley_rev::graph::Graph,
     prefix: &str,
     out: &mut dyn Write,
 ) -> Result<()> {
@@ -73,7 +73,7 @@ fn graph_show_remainder(
 /// Print `msg` line by line, with a graph row before every line but the first
 /// (upstream `graph_show_strbuf`).
 fn graph_show_strbuf(
-    graph: &mut sley_rev::graph::Graph,
+    graph: &mut sley::plumbing::sley_rev::graph::Graph,
     prefix: &str,
     msg: &[u8],
     out: &mut dyn Write,
@@ -98,7 +98,7 @@ fn graph_show_strbuf(
 /// Print the commit message followed by any remaining graph rows (upstream
 /// `graph_show_commit_msg`).
 pub(super) fn graph_show_commit_msg(
-    graph: &mut sley_rev::graph::Graph,
+    graph: &mut sley::plumbing::sley_rev::graph::Graph,
     prefix: &str,
     msg: &[u8],
     out: &mut dyn Write,

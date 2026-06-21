@@ -3417,10 +3417,9 @@ fn write_repository_index_ref_with_split(
         && !split_index_delta_exceeds_threshold(git_dir, index, &base)
     {
         let (entries, link) = split_index_delta_entries(index, &base, &link)?;
-        let extensions =
-            index_extensions_without_split_index_link(&index_extensions_without_cache_tree(
-                &index.extensions,
-            ));
+        let extensions = index_extensions_without_split_index_link(
+            &index_extensions_without_cache_tree(&index.extensions),
+        );
         let mut primary = Index {
             version: index.version,
             entries,
@@ -3655,8 +3654,10 @@ fn split_index_delta_entries(
                 {
                     delete_positions.push(base_pos as u32);
                     additions.push(index.entries[index_pos].clone());
-                } else if !index_entry_content_eq(&base.entries[base_pos], &index.entries[index_pos])
-                {
+                } else if !index_entry_content_eq(
+                    &base.entries[base_pos],
+                    &index.entries[index_pos],
+                ) {
                     replace_positions.push(base_pos as u32);
                     let mut replacement = index.entries[index_pos].clone();
                     replacement.path = BString::from(Vec::<u8>::new());
@@ -6901,9 +6902,7 @@ fn short_status_tracked_only_with_head_parallel(
         let (worktree_code, worktree_mode, submodule) = match precheck {
             None if entry.is_intent_to_add() => (b' ', None, None),
             None => (b' ', Some(index_entry.mode), None),
-            Some(TrackedOnlyPrecheck::Deleted(_)) if entry.is_intent_to_add() => {
-                (b' ', None, None)
-            }
+            Some(TrackedOnlyPrecheck::Deleted(_)) if entry.is_intent_to_add() => (b' ', None, None),
             Some(TrackedOnlyPrecheck::Deleted(_)) => (b'D', None, None),
             Some(TrackedOnlyPrecheck::Slow(_)) => {
                 let worktree_entry = worktree_entry_for_index_entry_with_attributes(
@@ -16313,8 +16312,7 @@ pub fn remove_index_and_worktree_paths(
                 is_gitlink,
                 is_stage0_gitlink,
                 options.force,
-            )?
-            {
+            )? {
                 true => removed_any = true,
                 false if !removed_any => {
                     eprintln!(
@@ -19660,8 +19658,13 @@ mod tests {
         let git_dir = root.join(".git");
         fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         fs::write(root.join("f.txt"), b"hello\n").expect("test operation should succeed");
-        add_paths_to_index(&root, &git_dir, ObjectFormat::Sha1, &[PathBuf::from("f.txt")])
-            .expect("test operation should succeed");
+        add_paths_to_index(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &[PathBuf::from("f.txt")],
+        )
+        .expect("test operation should succeed");
         let expected = write_tree_from_index(&git_dir, ObjectFormat::Sha1)
             .expect("test operation should succeed");
 

@@ -26,8 +26,48 @@ use std::{env, fs};
 
 static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Object type and uncompressed body size.
+///
+/// This is the streaming counterpart to loading an [`EncodedObject`]. Readers
+/// that can inspect loose or packed object metadata may return it without
+/// allocating the object body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectHeader {
+    pub object_type: ObjectType,
+    pub size: u64,
+}
+
 pub trait ObjectReader {
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>>;
+
+    /// Return an object's header when available.
+    ///
+    /// The default implementation reads the object once. Stores with a
+    /// header-only fast path should override this method.
+    fn read_object_header(&self, oid: &ObjectId) -> Result<Option<ObjectHeader>> {
+        let object = self.read_object(oid)?;
+        Ok(Some(ObjectHeader {
+            object_type: object.object_type,
+            size: object.body.len() as u64,
+        }))
+    }
+
+    /// Copy an object's body to `out`, returning its header.
+    ///
+    /// This gives consumers a stable writer-based `cat-file` primitive today
+    /// and leaves room for stores to override it with true pack/loose streaming.
+    fn copy_object_body_to(
+        &self,
+        oid: &ObjectId,
+        out: &mut dyn Write,
+    ) -> Result<Option<ObjectHeader>> {
+        let object = self.read_object(oid)?;
+        out.write_all(&object.body)?;
+        Ok(Some(ObjectHeader {
+            object_type: object.object_type,
+            size: object.body.len() as u64,
+        }))
+    }
 
     /// Graft-points seam (shallow clones today, replace refs/grafts later):
     /// `true` when history is cut at `oid`, so every walk must treat the
@@ -4412,16 +4452,14 @@ impl FileObjectDatabase {
         if self.contains(&oid)? {
             return Ok(oid);
         }
-        let input = [PackInput {
-            oid: &oid,
-            object,
-        }];
+        let input = [PackInput { oid: &oid, object }];
         let options = PackWriteOptions::new()
             .with_window(0)
             .with_depth(0)
             .with_reorder(false)
             .with_compression_level(compression_level);
-        let pack = PackFile::write_packed_with_known_ids_and_options(&input, self.format, &options)?;
+        let pack =
+            PackFile::write_packed_with_known_ids_and_options(&input, self.format, &options)?;
         self.install_pack(&pack)?;
         Ok(oid)
     }
@@ -4458,7 +4496,8 @@ impl FileObjectDatabase {
             .with_depth(0)
             .with_reorder(false)
             .with_compression_level(compression_level);
-        let pack = PackFile::write_packed_with_known_ids_and_options(&inputs, self.format, &options)?;
+        let pack =
+            PackFile::write_packed_with_known_ids_and_options(&inputs, self.format, &options)?;
         self.install_pack(&pack)?;
         Ok(())
     }
@@ -5341,6 +5380,11 @@ impl ObjectReader for FileObjectDatabase {
                 }
             })
             .contains(oid)
+    }
+
+    fn read_object_header(&self, oid: &ObjectId) -> Result<Option<ObjectHeader>> {
+        FileObjectDatabase::read_object_header(self, oid)
+            .map(|header| header.map(|(object_type, size)| ObjectHeader { object_type, size }))
     }
 
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
