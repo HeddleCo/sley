@@ -187,6 +187,7 @@ jobs:
             t3507-cherry-pick-conflict.sh
             t3510-cherry-pick-sequence.sh
             t3600-rm.sh
+            t3700-add.sh
             t3903-stash.sh
             t3900-i18n-commit.sh
             t3920-crlf-messages.sh

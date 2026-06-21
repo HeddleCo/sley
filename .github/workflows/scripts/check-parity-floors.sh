@@ -482,7 +482,11 @@ declare -A FLOOR=(
     [t4216-log-bloom.sh]=161
     [t5318-commit-graph.sh]=95
     [t3432-rebase-fast-forward.sh]=219
+    # wave-25 (2026-06-21): fetch-push push-caps/status-report 99->111 (banked 110, 1-cell
+    # transport-flake margin); diff-whitespace ignore-modes 119->129; add modes 41->50 (NEW floor).
+    # Guards neutral: t5510=7 t5601=109 t5526=39 t4013=216 t4014=208 t4012=4 t4202=131 t3600=81 t7508=119.
     [t3600-rm.sh]=81
+    [t3700-add.sh]=50
     # codex-wave-2 (2026-06-17): log --graph/--source/--end-of-options/follow-pathspec 80->96 (stable 3x).
     # signed-commit slice (2026-06-20): ssh/x509 signature cells (log --show-signature %G?) 124->131 (stable 3x).
     [t4202-log.sh]=131
@@ -535,7 +539,7 @@ declare -A FLOOR=(
     [t4045-diff-relative.sh]=30
     [t4047-diff-dirstat.sh]=41
     # recov-wave (2026-06-20): diff whitespace --ignore-* modes 114->119 (guard t4013 +1->206).
-    [t4015-diff-whitespace.sh]=119
+    [t4015-diff-whitespace.sh]=129
     [t4018-diff-funcname.sh]=287
     [t4124-apply-ws-rule.sh]=67
     [t4019-diff-wserror.sh]=19
@@ -612,7 +616,7 @@ declare -A FLOOR=(
     # t5520=38 t6040=44 t3200=134.
     [t5528-push-default.sh]=31
     # wave-2 (2026-06-21): push refmaps/forced-tag-status/denyDeleteCurrent/non-commit-reject 92->99 (guards t5510/t5601 held).
-    [t5516-fetch-push.sh]=99
+    [t5516-fetch-push.sh]=110
     [t5520-pull.sh]=75
     [t5601-clone.sh]=107
     # codex-wave-11 (partial clone): --filter=blob:none/blob:limit/tree/sparse:oid,
