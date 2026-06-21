@@ -1235,7 +1235,7 @@ pub fn add_exact_tracked_path_from_disk(
     };
     let object = EncodedObject::new(ObjectType::Blob, body);
     let oid = object.object_id(format)?;
-    if oid != entry.oid {
+    if oid != entry.oid || entry.is_intent_to_add() {
         odb.write_object(object)?;
     }
 
@@ -1626,7 +1626,7 @@ fn add_update_tracked_path(
     };
     let object = EncodedObject::new(ObjectType::Blob, body);
     let oid = object.object_id(format)?;
-    if oid != entry.oid {
+    if oid != entry.oid || entry.is_intent_to_add() {
         odb.write_object(object)?;
     }
     let mut updated_entry =
@@ -4975,6 +4975,10 @@ fn collect_status_entries_head_matches_index(
     entries: &mut Vec<ShortStatusEntry>,
 ) {
     for (path, index_entry) in index {
+        let intent_to_add = stat_cache
+            .index_entry(path)
+            .is_some_and(IndexEntry::is_intent_to_add);
+        let visible_index_entry = (!intent_to_add).then_some(index_entry);
         let worktree_entry = worktree.get(path);
         let worktree_present =
             worktree_entry.is_some() || tracked_presence.contains(path.as_slice());
@@ -4990,9 +4994,11 @@ fn collect_status_entries_head_matches_index(
             untracked_mode,
         );
         let worktree_code = match worktree_entry {
+            None if intent_to_add => b' ',
             None if !worktree_present && skip_worktree => b' ',
             None if !worktree_present => b'D',
-            Some(worktree_entry) if worktree_entry != index_entry => b'M',
+            Some(_) if intent_to_add => b'A',
+            Some(worktree_entry) if Some(worktree_entry) != visible_index_entry => b'M',
             _ if submodule.is_some_and(|sub| sub.any()) => b'M',
             _ => b' ',
         };
@@ -5001,15 +5007,15 @@ fn collect_status_entries_head_matches_index(
                 index: b' ',
                 worktree: worktree_code,
                 path: path.clone(),
-                head_mode: Some(index_entry.mode),
-                index_mode: Some(index_entry.mode),
+                head_mode: visible_index_entry.map(|entry| entry.mode),
+                index_mode: visible_index_entry.map(|entry| entry.mode),
                 worktree_mode: status_worktree_mode(
-                    Some(index_entry),
+                    visible_index_entry,
                     worktree_entry,
                     worktree_present,
                 ),
-                head_oid: Some(index_entry.oid),
-                index_oid: Some(index_entry.oid),
+                head_oid: visible_index_entry.map(|entry| entry.oid),
+                index_oid: visible_index_entry.map(|entry| entry.oid),
                 submodule: submodule.filter(|sub| sub.any()),
             });
         }
@@ -5046,6 +5052,11 @@ fn collect_status_entries_with_head(
     for path in paths {
         let head_entry = inputs.head.get(&path);
         let index_entry = inputs.index.get(&path);
+        let intent_to_add = inputs
+            .stat_cache
+            .index_entry(&path)
+            .is_some_and(IndexEntry::is_intent_to_add);
+        let visible_index_entry = index_entry.filter(|_| !intent_to_add);
         let worktree_entry = inputs.worktree.get(&path);
         let worktree_present =
             worktree_entry.is_some() || inputs.tracked_presence.contains(path.as_slice());
@@ -5056,7 +5067,7 @@ fn collect_status_entries_with_head(
         {
             continue;
         }
-        let submodule = match index_entry {
+        let submodule = match visible_index_entry {
             Some(index_entry) => status_submodule_from_entries(
                 &path,
                 index_entry,
@@ -5067,7 +5078,7 @@ fn collect_status_entries_with_head(
             None => None,
         };
         let skip_worktree = inputs.sparse_checkout_active
-            && index_entry.is_some_and(|_| {
+            && visible_index_entry.is_some_and(|_| {
                 inputs
                     .stat_cache
                     .index_entry(&path)
@@ -5077,14 +5088,16 @@ fn collect_status_entries_with_head(
             if head_entry.is_none() && index_entry.is_none() && worktree_entry.is_some() {
                 (b'?', b'?')
             } else {
-                let index_code = match (head_entry, index_entry) {
+                let index_code = match (head_entry, visible_index_entry) {
                     (None, Some(_)) => b'A',
                     (Some(_), None) => b'D',
                     (Some(left), Some(right)) if left != right => b'M',
                     _ => b' ',
                 };
-                let worktree_code = match (index_entry, worktree_entry) {
+                let worktree_code = match (visible_index_entry, worktree_entry) {
+                    (None, Some(_)) if intent_to_add => b'A',
                     (None, Some(_)) => b'?',
+                    (None, None) if intent_to_add => b' ',
                     (Some(_), None) if !worktree_present && skip_worktree => b' ',
                     (Some(_), None) if !worktree_present => b'D',
                     (Some(left), Some(right)) if left != right => b'M',
@@ -5095,19 +5108,19 @@ fn collect_status_entries_with_head(
             };
         if index_code != b' ' || worktree_code != b' ' {
             let worktree_mode = if skip_worktree && !worktree_present && worktree_entry.is_none() {
-                index_entry.map(|entry| entry.mode)
+                visible_index_entry.map(|entry| entry.mode)
             } else {
-                status_worktree_mode(index_entry, worktree_entry, worktree_present)
+                status_worktree_mode(visible_index_entry, worktree_entry, worktree_present)
             };
             entries.push(ShortStatusEntry {
                 index: index_code,
                 worktree: worktree_code,
                 path,
                 head_mode: head_entry.map(|entry| entry.mode),
-                index_mode: index_entry.map(|entry| entry.mode),
+                index_mode: visible_index_entry.map(|entry| entry.mode),
                 worktree_mode,
                 head_oid: head_entry.map(|entry| entry.oid),
-                index_oid: index_entry.map(|entry| entry.oid),
+                index_oid: visible_index_entry.map(|entry| entry.oid),
                 submodule: submodule.filter(|sub| sub.any()),
             });
         }
@@ -5204,7 +5217,7 @@ fn short_status_tracked_only(
             oid: entry.oid,
         };
         let head_entry = if head_matches_index {
-            Some(&index_entry)
+            (!entry.is_intent_to_add()).then_some(&index_entry)
         } else {
             head.as_ref().and_then(|head| head.get(path))
         };
@@ -5223,15 +5236,19 @@ fn short_status_tracked_only(
             worktree_entry.as_ref(),
             untracked_mode,
         )?;
-        let index_code = match head_entry {
-            None => b'A',
-            Some(head_entry) if *head_entry != index_entry => b'M',
+        let visible_index_entry = (!entry.is_intent_to_add()).then_some(&index_entry);
+        let index_code = match (head_entry, visible_index_entry) {
+            (None, Some(_)) => b'A',
+            (Some(_), None) => b'D',
+            (Some(head_entry), Some(index_entry)) if *head_entry != *index_entry => b'M',
             _ => b' ',
         };
         let worktree_code = match worktree_entry.as_ref() {
+            None if entry.is_intent_to_add() => b' ',
             None if sparse_checkout_active && entry.is_skip_worktree() => b' ',
             None => b'D',
-            Some(worktree_entry) if *worktree_entry != index_entry => b'M',
+            Some(_) if entry.is_intent_to_add() => b'A',
+            Some(worktree_entry) if Some(worktree_entry) != visible_index_entry => b'M',
             _ if submodule.is_some_and(|sub| sub.any()) => b'M',
             _ => b' ',
         };
@@ -5241,10 +5258,10 @@ fn short_status_tracked_only(
                 worktree: worktree_code,
                 path: path.to_vec(),
                 head_mode: head_entry.map(|entry| entry.mode),
-                index_mode: Some(index_entry.mode),
+                index_mode: visible_index_entry.map(|entry| entry.mode),
                 worktree_mode: worktree_entry.as_ref().map(|entry| entry.mode),
                 head_oid: head_entry.map(|entry| entry.oid),
-                index_oid: Some(index_entry.oid),
+                index_oid: visible_index_entry.map(|entry| entry.oid),
                 submodule: submodule.filter(|sub| sub.any()),
             });
         }
@@ -6150,6 +6167,9 @@ fn short_status_tracked_only_head_matches_index_parallel(
         match precheck {
             TrackedOnlyPrecheck::Deleted(idx) => {
                 let entry = &index.entries[idx];
+                if entry.is_intent_to_add() {
+                    continue;
+                }
                 let path = entry.path.as_bytes();
                 entries.push(ShortStatusEntry {
                     index: b' ',
@@ -6186,7 +6206,9 @@ fn short_status_tracked_only_head_matches_index_parallel(
                     untracked_mode,
                 )?;
                 let worktree_code = match worktree_entry.as_ref() {
+                    None if entry.is_intent_to_add() => b' ',
                     None => b'D',
+                    Some(_) if entry.is_intent_to_add() => b'A',
                     Some(worktree_entry) if *worktree_entry != index_entry => b'M',
                     _ if submodule.is_some_and(|sub| sub.any()) => b'M',
                     _ => b' ',
@@ -6196,11 +6218,11 @@ fn short_status_tracked_only_head_matches_index_parallel(
                         index: b' ',
                         worktree: worktree_code,
                         path: path.to_vec(),
-                        head_mode: Some(index_entry.mode),
-                        index_mode: Some(index_entry.mode),
+                        head_mode: (!entry.is_intent_to_add()).then_some(index_entry.mode),
+                        index_mode: (!entry.is_intent_to_add()).then_some(index_entry.mode),
                         worktree_mode: worktree_entry.as_ref().map(|entry| entry.mode),
-                        head_oid: Some(index_entry.oid),
-                        index_oid: Some(index_entry.oid),
+                        head_oid: (!entry.is_intent_to_add()).then_some(index_entry.oid),
+                        index_oid: (!entry.is_intent_to_add()).then_some(index_entry.oid),
                         submodule: submodule.filter(|sub| sub.any()),
                     });
                 }
@@ -6237,6 +6259,9 @@ fn short_status_borrowed_tracked_only_head_matches_index_parallel(
         match precheck {
             TrackedOnlyPrecheck::Deleted(idx) => {
                 let entry = &index.entries[idx];
+                if entry.is_intent_to_add() {
+                    continue;
+                }
                 entries.push(ShortStatusEntry {
                     index: b' ',
                     worktree: b'D',
@@ -6271,7 +6296,9 @@ fn short_status_borrowed_tracked_only_head_matches_index_parallel(
                     untracked_mode,
                 )?;
                 let worktree_code = match worktree_entry.as_ref() {
+                    None if entry.is_intent_to_add() => b' ',
                     None => b'D',
+                    Some(_) if entry.is_intent_to_add() => b'A',
                     Some(worktree_entry) if *worktree_entry != index_entry => b'M',
                     _ if submodule.is_some_and(|sub| sub.any()) => b'M',
                     _ => b' ',
@@ -6281,11 +6308,11 @@ fn short_status_borrowed_tracked_only_head_matches_index_parallel(
                         index: b' ',
                         worktree: worktree_code,
                         path: entry.path.to_vec(),
-                        head_mode: Some(index_entry.mode),
-                        index_mode: Some(index_entry.mode),
+                        head_mode: (!entry.is_intent_to_add()).then_some(index_entry.mode),
+                        index_mode: (!entry.is_intent_to_add()).then_some(index_entry.mode),
                         worktree_mode: worktree_entry.as_ref().map(|entry| entry.mode),
-                        head_oid: Some(index_entry.oid),
-                        index_oid: Some(index_entry.oid),
+                        head_oid: (!entry.is_intent_to_add()).then_some(index_entry.oid),
+                        index_oid: (!entry.is_intent_to_add()).then_some(index_entry.oid),
                         submodule: submodule.filter(|sub| sub.any()),
                     });
                 }
@@ -6325,6 +6352,9 @@ where
         match precheck {
             TrackedOnlyPrecheck::Deleted(idx) => {
                 let entry = &index.entries[idx];
+                if entry.is_intent_to_add() {
+                    continue;
+                }
                 if emit(ShortStatusRow {
                     index: b' ',
                     worktree: b'D',
@@ -6363,7 +6393,9 @@ where
                     untracked_mode,
                 )?;
                 let worktree_code = match worktree_entry.as_ref() {
+                    None if entry.is_intent_to_add() => b' ',
                     None => b'D',
+                    Some(_) if entry.is_intent_to_add() => b'A',
                     Some(worktree_entry) if *worktree_entry != index_entry => b'M',
                     _ if submodule.is_some_and(|sub| sub.any()) => b'M',
                     _ => b' ',
@@ -6373,11 +6405,11 @@ where
                         index: b' ',
                         worktree: worktree_code,
                         path: entry.path,
-                        head_mode: Some(index_entry.mode),
-                        index_mode: Some(index_entry.mode),
+                        head_mode: (!entry.is_intent_to_add()).then_some(index_entry.mode),
+                        index_mode: (!entry.is_intent_to_add()).then_some(index_entry.mode),
                         worktree_mode: worktree_entry.as_ref().map(|entry| entry.mode),
-                        head_oid: Some(index_entry.oid),
-                        index_oid: Some(index_entry.oid),
+                        head_oid: (!entry.is_intent_to_add()).then_some(index_entry.oid),
+                        index_oid: (!entry.is_intent_to_add()).then_some(index_entry.oid),
                         submodule: submodule.filter(|sub| sub.any()),
                     })?
                     .is_stop()
@@ -6478,9 +6510,11 @@ fn short_status_tracked_only_with_head_parallel(
             oid: entry.oid,
         };
         let head_entry = head.get(path);
-        let index_code = match head_entry {
-            None => b'A',
-            Some(head_entry) if *head_entry != index_entry => b'M',
+        let visible_index_entry = (!entry.is_intent_to_add()).then_some(&index_entry);
+        let index_code = match (head_entry, visible_index_entry) {
+            (None, Some(_)) => b'A',
+            (Some(_), None) => b'D',
+            (Some(head_entry), Some(index_entry)) if *head_entry != *index_entry => b'M',
             _ => b' ',
         };
         let precheck = prechecks
@@ -6495,7 +6529,11 @@ fn short_status_tracked_only_with_head_parallel(
                 }
             });
         let (worktree_code, worktree_mode, submodule) = match precheck {
+            None if entry.is_intent_to_add() => (b' ', None, None),
             None => (b' ', Some(index_entry.mode), None),
+            Some(TrackedOnlyPrecheck::Deleted(_)) if entry.is_intent_to_add() => {
+                (b' ', None, None)
+            }
             Some(TrackedOnlyPrecheck::Deleted(_)) => (b'D', None, None),
             Some(TrackedOnlyPrecheck::Slow(_)) => {
                 let worktree_entry = worktree_entry_for_index_entry_with_attributes(
@@ -6514,7 +6552,9 @@ fn short_status_tracked_only_with_head_parallel(
                     untracked_mode,
                 )?;
                 let worktree_code = match worktree_entry.as_ref() {
+                    None if entry.is_intent_to_add() => b' ',
                     None => b'D',
+                    Some(_) if entry.is_intent_to_add() => b'A',
                     Some(worktree_entry) if *worktree_entry != index_entry => b'M',
                     _ if submodule.is_some_and(|sub| sub.any()) => b'M',
                     _ => b' ',
@@ -6532,10 +6572,10 @@ fn short_status_tracked_only_with_head_parallel(
                 worktree: worktree_code,
                 path: path.to_vec(),
                 head_mode: head_entry.map(|entry| entry.mode),
-                index_mode: Some(index_entry.mode),
+                index_mode: visible_index_entry.map(|entry| entry.mode),
                 worktree_mode,
                 head_oid: head_entry.map(|entry| entry.oid),
-                index_oid: Some(index_entry.oid),
+                index_oid: visible_index_entry.map(|entry| entry.oid),
                 submodule,
             });
         }

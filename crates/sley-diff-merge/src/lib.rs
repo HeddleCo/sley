@@ -2223,10 +2223,64 @@ fn apply_name_status_options_to_index_worktree_changes(
     mut changes: Vec<NameStatusEntry>,
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    if options.detect_renames || options.detect_copies {
+    if options.detect_renames {
+        changes = detect_exact_renames_from_changes(changes, options.rename_empty);
+    } else if options.detect_copies {
         changes.sort_by(|left, right| diff_entry_sort_path(left).cmp(diff_entry_sort_path(right)));
     }
     Ok(changes)
+}
+
+fn detect_exact_renames_from_changes(
+    changes: Vec<NameStatusEntry>,
+    rename_empty: bool,
+) -> Vec<NameStatusEntry> {
+    let added = changes
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.status == NameStatus::Added)
+        .collect::<Vec<_>>();
+    let deleted = changes
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.status == NameStatus::Deleted)
+        .collect::<Vec<_>>();
+    let mut consumed_added = BTreeSet::new();
+    let mut consumed_deleted = BTreeSet::new();
+    let mut result = Vec::new();
+
+    for (deleted_index, deleted_entry) in deleted {
+        let Some(old_oid) = deleted_entry.old_oid else {
+            continue;
+        };
+        if !rename_empty && is_empty_blob_oid(&old_oid) {
+            continue;
+        }
+        if let Some((added_index, added_entry)) = added.iter().find(|(added_index, added_entry)| {
+            !consumed_added.contains(added_index) && added_entry.new_oid == Some(old_oid)
+        }) {
+            consumed_deleted.insert(deleted_index);
+            consumed_added.insert(*added_index);
+            result.push(NameStatusEntry {
+                status: NameStatus::Renamed(100),
+                path: added_entry.path.clone(),
+                old_path: Some(deleted_entry.path.clone()),
+                old_mode: deleted_entry.old_mode,
+                new_mode: added_entry.new_mode,
+                old_oid: deleted_entry.old_oid,
+                new_oid: added_entry.new_oid,
+            });
+        }
+    }
+
+    for (index, entry) in changes.into_iter().enumerate() {
+        if consumed_added.contains(&index) || consumed_deleted.contains(&index) {
+            continue;
+        }
+        result.push(entry);
+    }
+    result.sort_by(|left, right| diff_entry_sort_path(left).cmp(diff_entry_sort_path(right)));
+    result
 }
 
 /// Index-vs-worktree name-status for **`git diff-files`** (plumbing), which
@@ -3228,7 +3282,29 @@ fn read_index_entries(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
-    Ok(read_index_snapshot(git_dir, format)?.entries)
+    let index_path = sley_index::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let index = expand_sparse_index_for_worktree_diff(
+        sley_index::read_repository_index(git_dir, format)?,
+        git_dir,
+        format,
+    )?;
+    Ok(index
+        .entries
+        .into_iter()
+        .filter(|entry| entry.stage() == sley_index::Stage::Normal && !entry.is_intent_to_add())
+        .map(|entry| {
+            (
+                entry.path.into_bytes(),
+                TrackedEntry {
+                    mode: entry.mode,
+                    oid: entry.oid,
+                },
+            )
+        })
+        .collect())
 }
 
 /// Collect the set of stage-0 paths flagged intent-to-add (`git add -N`) in the

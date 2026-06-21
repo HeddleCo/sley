@@ -3319,6 +3319,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let mut summary = false;
     let mut recount = false;
     let mut update_index = false;
+    let mut intent_to_add = false;
     let mut build_fake_ancestor: Option<String> = None;
     let mut files = Vec::new();
     // git's default when applying is `warn`; the value is overridden by the
@@ -3346,6 +3347,8 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 ));
             }
             "--index" => update_index = true,
+            "-N" | "--intent-to-add" => intent_to_add = true,
+            "--no-intent-to-add" => intent_to_add = false,
             "--build-fake-ancestor" => {
                 let Some(path) = iter.next() else {
                     return Err(GitError::Command(
@@ -3566,6 +3569,14 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 allow_skip_worktree_entries: false,
             },
             &config,
+        )?;
+    } else if intent_to_add && !index_paths.is_empty() {
+        add_intent_to_add(
+            &worktree_root,
+            &worktree_root,
+            &git_dir,
+            format,
+            &index_paths,
         )?;
     }
     Ok(())

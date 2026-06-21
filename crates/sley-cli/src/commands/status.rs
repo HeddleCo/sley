@@ -680,7 +680,7 @@ fn print_status_short_stream(
             )?,
         );
         entries = status_collapse_pathspec_untracked_entries(entries, options, pathspec);
-        for entry in status_entries_with_exact_renames(entries) {
+        for entry in status_entries_with_exact_renames(worktree_root, git_dir, format, entries)? {
             let mut entry = entry;
             if !display.porcelain_v1 && display.relative_paths {
                 entry.entry.path = pathspec.display(&entry.entry.path);
@@ -819,31 +819,144 @@ struct StatusOutputEntry {
 }
 
 fn status_entries_with_exact_renames(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
     entries: Vec<sley_worktree::ShortStatusEntry>,
-) -> Vec<StatusOutputEntry> {
+) -> Result<Vec<StatusOutputEntry>> {
     let mut used = vec![false; entries.len()];
+    let mut staged_deletes = Vec::<sley_worktree::ShortStatusEntry>::new();
+    let mut staged_used = Vec::<bool>::new();
+    let mut residual_deletes = Vec::<sley_worktree::ShortStatusEntry>::new();
+    let mut residual_used = Vec::<bool>::new();
     let mut output = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         if used[index] {
             continue;
         }
-        if entry.index == b'A'
-            && entry.worktree == b' '
-            && let Some(deleted_index) = entries
+        if entry.index == b' ' && entry.worktree == b'D' {
+            residual_deletes.push(entry.clone());
+            residual_used.push(false);
+            used[index] = true;
+            continue;
+        }
+        if entry.index == b'D' && entry.worktree == b' ' {
+            staged_deletes.push(entry.clone());
+            staged_used.push(false);
+            used[index] = true;
+            continue;
+        }
+        if entry.index == b'A' {
+            let mut staged_match = entries
                 .iter()
                 .enumerate()
                 .find(|(candidate_index, candidate)| {
                     !used[*candidate_index] && status_entries_are_exact_rename(candidate, entry)
                 })
-                .map(|(candidate_index, _)| candidate_index)
-        {
+                .map(|(candidate_index, candidate)| (candidate_index, None, candidate.clone()));
+            if staged_match.is_none() {
+                for (staged_index, candidate) in staged_deletes.iter().enumerate() {
+                    if staged_used[staged_index] {
+                        continue;
+                    }
+                    if status_entries_are_exact_rename(candidate, entry) {
+                        staged_match = Some((index, Some(staged_index), candidate.clone()));
+                        break;
+                    }
+                }
+            }
+            let Some((deleted_index, staged_index, deleted)) = staged_match else {
+                used[index] = true;
+                output.push(StatusOutputEntry {
+                    entry: entry.clone(),
+                    rename_from: None,
+                });
+                continue;
+            };
             let mut renamed = entry.clone();
             renamed.index = b'R';
+            renamed.worktree = b' ';
+            renamed.head_mode = deleted.head_mode;
+            renamed.head_oid = deleted.head_oid;
+            renamed.worktree_mode = entry.index_mode;
             used[index] = true;
-            used[deleted_index] = true;
+            if let Some(staged_index) = staged_index {
+                staged_used[staged_index] = true;
+            } else {
+                used[deleted_index] = true;
+            }
             output.push(StatusOutputEntry {
                 entry: renamed,
-                rename_from: Some(entries[deleted_index].path.clone()),
+                rename_from: Some(deleted.path.clone()),
+            });
+            if entry.worktree != b' ' {
+                let mut residual = entry.clone();
+                residual.index = b' ';
+                residual.head_mode = entry.index_mode;
+                residual.head_oid = entry.index_oid;
+                residual_deletes.push(residual);
+                residual_used.push(false);
+            }
+            continue;
+        }
+        if entry.index == b' ' && entry.worktree == b'A' {
+            let mut worktree_match = None;
+            for (candidate_index, candidate) in entries.iter().enumerate() {
+                if used[candidate_index] {
+                    continue;
+                }
+                if status_entries_are_exact_worktree_rename(
+                    worktree_root,
+                    git_dir,
+                    format,
+                    candidate,
+                    entry,
+                )? {
+                    worktree_match = Some((candidate_index, None, candidate.clone()));
+                    break;
+                }
+            }
+            if worktree_match.is_none() {
+                for (residual_index, candidate) in residual_deletes.iter().enumerate() {
+                    if residual_used[residual_index] {
+                        continue;
+                    }
+                    if status_entries_are_exact_worktree_rename(
+                        worktree_root,
+                        git_dir,
+                        format,
+                        candidate,
+                        entry,
+                    )? {
+                        worktree_match = Some((index, Some(residual_index), candidate.clone()));
+                        break;
+                    }
+                }
+            }
+            let Some((deleted_index, residual_index, deleted)) = worktree_match else {
+                used[index] = true;
+                output.push(StatusOutputEntry {
+                    entry: entry.clone(),
+                    rename_from: None,
+                });
+                continue;
+            };
+            let mut renamed = entry.clone();
+            renamed.worktree = b'R';
+            renamed.head_mode = deleted.head_mode;
+            renamed.index_mode = deleted.index_mode;
+            renamed.head_oid = deleted.head_oid;
+            renamed.index_oid = deleted.index_oid;
+            renamed.worktree_mode = entry.worktree_mode;
+            used[index] = true;
+            if let Some(residual_index) = residual_index {
+                residual_used[residual_index] = true;
+            } else {
+                used[deleted_index] = true;
+            }
+            output.push(StatusOutputEntry {
+                entry: renamed,
+                rename_from: Some(deleted.path.clone()),
             });
             continue;
         }
@@ -853,7 +966,23 @@ fn status_entries_with_exact_renames(
             rename_from: None,
         });
     }
-    output
+    for (entry, used) in staged_deletes.into_iter().zip(staged_used) {
+        if !used {
+            output.push(StatusOutputEntry {
+                entry,
+                rename_from: None,
+            });
+        }
+    }
+    for (entry, used) in residual_deletes.into_iter().zip(residual_used) {
+        if !used {
+            output.push(StatusOutputEntry {
+                entry,
+                rename_from: None,
+            });
+        }
+    }
+    Ok(output)
 }
 
 fn status_entries_are_exact_rename(
@@ -863,9 +992,76 @@ fn status_entries_are_exact_rename(
     deleted.index == b'D'
         && deleted.worktree == b' '
         && added.index == b'A'
-        && added.worktree == b' '
         && deleted.head_mode == added.index_mode
         && deleted.head_oid == added.index_oid
+}
+
+fn status_entries_are_exact_worktree_rename(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    deleted: &sley_worktree::ShortStatusEntry,
+    added: &sley_worktree::ShortStatusEntry,
+) -> Result<bool> {
+    if deleted.index != b' '
+        || deleted.worktree != b'D'
+        || added.index != b' '
+        || added.worktree != b'A'
+        || deleted.index_mode != added.worktree_mode
+    {
+        return Ok(false);
+    }
+    let Some(index_oid) = deleted.index_oid else {
+        return Ok(false);
+    };
+    let Some(worktree_oid) = status_worktree_blob_oid(worktree_root, git_dir, format, &added.path)?
+    else {
+        return Ok(false);
+    };
+    Ok(index_oid == worktree_oid)
+}
+
+fn status_worktree_blob_oid(
+    worktree_root: &Path,
+    _git_dir: &Path,
+    format: ObjectFormat,
+    path: &[u8],
+) -> Result<Option<ObjectId>> {
+    let absolute = worktree_root.join(repo_path_to_path(path));
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.is_dir() {
+        return Ok(None);
+    }
+    let body = if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            fs::read_link(&absolute)?.as_os_str().as_bytes().to_vec()
+        }
+        #[cfg(not(unix))]
+        {
+            fs::read_link(&absolute)?
+                .to_string_lossy()
+                .replace('\\', "/")
+                .into_bytes()
+        }
+    } else {
+        fs::read(&absolute)?
+    };
+    Ok(Some(
+        EncodedObject::new(ObjectType::Blob, body).object_id(format)?,
+    ))
 }
 
 fn status_entry_needs_submodule_ignore(entry: &sley_worktree::ShortStatusEntry) -> bool {
@@ -1046,7 +1242,18 @@ fn print_status_porcelain_v2(
         }
     }
     let zero = zero_oid(format)?;
-    for entry in entries {
+    let entries = match worktree_root_for_git_dir(git_dir) {
+        Ok(worktree_root) => status_entries_with_exact_renames(&worktree_root, git_dir, format, entries)?,
+        Err(_) => entries
+            .into_iter()
+            .map(|entry| StatusOutputEntry {
+                entry,
+                rename_from: None,
+            })
+            .collect(),
+    };
+    for output in entries {
+        let entry = output.entry;
         if entry.index == b'!' && entry.worktree == b'!' {
             stdout.write_all(b"! ")?;
             if z {
@@ -1072,7 +1279,11 @@ fn print_status_porcelain_v2(
         // Porcelain v2 submodule field (wt-status.c wt_porcelain_v2_*):
         // "N..." for an ordinary path; "S<C><M><U>" for a submodule, with C
         // for new commits, M for modified content, U for untracked content.
-        write!(stdout, "1 {index}{worktree} ",)?;
+        if output.rename_from.is_some() {
+            write!(stdout, "2 {index}{worktree} ",)?;
+        } else {
+            write!(stdout, "1 {index}{worktree} ",)?;
+        }
         match entry.submodule {
             Some(submodule) => write!(
                 stdout,
@@ -1092,19 +1303,40 @@ fn print_status_porcelain_v2(
             }
             None => stdout.write_all(b"N... ")?,
         }
-        write!(
-            stdout,
-            "{:06o} {:06o} {:06o} {} {} ",
-            entry.head_mode.unwrap_or(0),
-            entry.index_mode.unwrap_or(0),
-            entry.worktree_mode.unwrap_or(0),
-            entry.head_oid.as_ref().unwrap_or(&zero).to_hex(),
-            entry.index_oid.as_ref().unwrap_or(&zero).to_hex()
-        )?;
-        if z {
-            stdout.write_all(&entry.path)?;
+        if let Some(rename_from) = output.rename_from {
+            write!(
+                stdout,
+                "{:06o} {:06o} {:06o} {} {} R100 ",
+                entry.head_mode.unwrap_or(0),
+                entry.index_mode.unwrap_or(0),
+                entry.worktree_mode.unwrap_or(0),
+                entry.head_oid.as_ref().unwrap_or(&zero).to_hex(),
+                entry.index_oid.as_ref().unwrap_or(&zero).to_hex()
+            )?;
+            if z {
+                stdout.write_all(&entry.path)?;
+                stdout.write_all(&[separator])?;
+                stdout.write_all(&rename_from)?;
+            } else {
+                stdout.write_all(status_quote_path(&entry.path, false).as_bytes())?;
+                stdout.write_all(b"\t")?;
+                stdout.write_all(status_quote_path(&rename_from, false).as_bytes())?;
+            }
         } else {
-            stdout.write_all(status_quote_path(&entry.path, false).as_bytes())?;
+            write!(
+                stdout,
+                "{:06o} {:06o} {:06o} {} {} ",
+                entry.head_mode.unwrap_or(0),
+                entry.index_mode.unwrap_or(0),
+                entry.worktree_mode.unwrap_or(0),
+                entry.head_oid.as_ref().unwrap_or(&zero).to_hex(),
+                entry.index_oid.as_ref().unwrap_or(&zero).to_hex()
+            )?;
+            if z {
+                stdout.write_all(&entry.path)?;
+            } else {
+                stdout.write_all(status_quote_path(&entry.path, false).as_bytes())?;
+            }
         }
         stdout.write_all(&[separator])?;
     }
@@ -2325,14 +2557,25 @@ fn build_status_long_sink_inner(
         }
     }
 
-    let mut staged = Vec::new();
-    let mut unstaged = Vec::new();
+    let mut staged = Vec::<(&str, String)>::new();
+    let mut unstaged = Vec::<(&str, String, String, bool)>::new();
     let mut untracked = Vec::new();
     let mut ignored = Vec::new();
     let unmerged = status_unmerged_paths(git_dir, format)?;
     let unmerged_paths: BTreeSet<Vec<u8>> =
         unmerged.iter().map(|entry| entry.path.clone()).collect();
-    for entry in entries {
+    let entries = match worktree_root_for_git_dir(git_dir) {
+        Ok(worktree_root) => status_entries_with_exact_renames(&worktree_root, git_dir, format, entries)?,
+        Err(_) => entries
+            .into_iter()
+            .map(|entry| StatusOutputEntry {
+                entry,
+                rename_from: None,
+            })
+            .collect(),
+    };
+    for output in entries {
+        let entry = output.entry;
         if unmerged_paths.contains(&entry.path) {
             continue;
         }
@@ -2345,7 +2588,10 @@ fn build_status_long_sink_inner(
             continue;
         }
         if let Some(label) = status_long_change_label(entry.index) {
-            staged.push((label, entry.path.clone()));
+            staged.push((
+                label,
+                status_long_path_display(&entry.path, output.rename_from.as_deref()),
+            ));
         }
         if let Some(label) = status_long_change_label(entry.worktree) {
             // Submodule change detail (wt-status.c): " (new commits, modified
@@ -2372,7 +2618,12 @@ fn build_status_long_sink_inner(
             let dirty_submodule = entry
                 .submodule
                 .is_some_and(|sub| sub.modified_content || sub.untracked_content);
-            unstaged.push((label, entry.path, suffix, dirty_submodule));
+            unstaged.push((
+                label,
+                status_long_path_display(&entry.path, output.rename_from.as_deref()),
+                suffix,
+                dirty_submodule,
+            ));
         }
     }
 
@@ -2406,7 +2657,7 @@ fn build_status_long_sink_inner(
             sink.hint("  (use \"git restore --staged <file>...\" to unstage)");
         }
         for (label, path) in staged {
-            sink.line(format!("\t{label:<12}{}", status_quote_path(&path, false)));
+            sink.line(format!("\t{label:<12}{path}"));
         }
     }
 
@@ -2425,10 +2676,7 @@ fn build_status_long_sink_inner(
             sink.hint("  (commit or discard the untracked or modified content in submodules)");
         }
         for (label, path, suffix, _) in unstaged {
-            sink.line(format!(
-                "\t{label:<12}{}{suffix}",
-                status_quote_path(&path, false)
-            ));
+            sink.line(format!("\t{label:<12}{path}{suffix}"));
         }
     }
 
@@ -3092,11 +3340,23 @@ fn status_commit_word(count: usize) -> &'static str {
     if count == 1 { "commit" } else { "commits" }
 }
 
+fn status_long_path_display(path: &[u8], rename_from: Option<&[u8]>) -> String {
+    match rename_from {
+        Some(rename_from) => format!(
+            "{} -> {}",
+            status_quote_path(rename_from, false),
+            status_quote_path(path, false)
+        ),
+        None => status_quote_path(path, false),
+    }
+}
+
 fn status_long_change_label(code: u8) -> Option<&'static str> {
     match code {
         b'A' => Some("new file:"),
         b'M' => Some("modified:"),
         b'D' => Some("deleted:"),
+        b'R' => Some("renamed:"),
         _ => None,
     }
 }

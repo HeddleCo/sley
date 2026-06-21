@@ -1098,7 +1098,7 @@ fn resolve_add_update_actions(
             if !include_untracked {
                 continue;
             }
-        } else if entry.worktree != b'M' && entry.worktree != b'D' {
+        } else if entry.worktree != b'M' && entry.worktree != b'D' && entry.worktree != b'A' {
             continue;
         }
         let path = worktree_root.join(
