@@ -356,7 +356,7 @@ fn resolve_revision_inner<R: ObjectReader>(
             return search_commit_message_all(git_dir, format, reader, text);
         }
         RevisionSpecKind::IndexPath { stage, path } => {
-            return resolve_index_path(git_dir, format, stage, path);
+            return resolve_index_path(git_dir, format, reader, stage, path);
         }
         RevisionSpecKind::TreePath {
             rev: rev_part,
@@ -4998,9 +4998,10 @@ fn parse_index_stage_path(rest: &str) -> (u8, &str) {
 /// Resolve `path` at `stage` in the on-disk index, returning the recorded blob
 /// id. Reports git-style errors for a missing index, a path absent from the
 /// index, and a path present only at other stages.
-fn resolve_index_path(
+fn resolve_index_path<R: ObjectReader>(
     git_dir: &Path,
     format: sley_core::ObjectFormat,
+    reader: &R,
     stage: u8,
     path: &str,
 ) -> Result<ObjectId> {
@@ -5026,6 +5027,11 @@ fn resolve_index_path(
             return Ok(entry.oid);
         }
     }
+    if stage == 0
+        && let Some(oid) = resolve_index_path_in_sparse_dir(&index, reader, format, &normalized_path)
+    {
+        return Ok(oid);
+    }
     if path_exists {
         Err(GitError::not_found(format!(
             "path '{path}' is in the index, but not at stage {stage}"
@@ -5035,6 +5041,37 @@ fn resolve_index_path(
             "path '{path}' is not in the index"
         )))
     }
+}
+
+fn resolve_index_path_in_sparse_dir<R: ObjectReader>(
+    index: &Index,
+    reader: &R,
+    format: ObjectFormat,
+    normalized_path: &str,
+) -> Option<ObjectId> {
+    for entry in &index.entries {
+        if !entry.is_sparse_dir() {
+            continue;
+        }
+        let Ok(sparse_dir) = std::str::from_utf8(entry.path.as_bytes()) else {
+            continue;
+        };
+        let Some(remainder) = normalized_path.strip_prefix(sparse_dir) else {
+            continue;
+        };
+        if remainder.is_empty() {
+            continue;
+        }
+        let Some(resolved) = resolve_tree_path_entry(reader, format, &entry.oid, remainder) else {
+            continue;
+        };
+        if resolved.object_type == ObjectType::Tree {
+            continue;
+        }
+        sley_core::trace2::region("index", "ensure_full_index");
+        return Some(resolved.oid);
+    }
+    None
 }
 
 /// Extract the merge stage (0-3) from an index entry's flags (bits 12-13).
@@ -6382,6 +6419,51 @@ mod tests {
             matches!(&unknown, GitError::NotFound(kind) if kind.to_string().contains("not in the index")),
             "unexpected error: {unknown:?}"
         );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn resolve_index_path_reads_blobs_beneath_sparse_directory_entries() {
+        let git_dir = temp_git_dir();
+        let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
+        let blob = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"sparse\n".to_vec()))
+            .expect("test operation should succeed");
+        let nested = write_tree(&mut db, &[]);
+        let sparse_tree = write_tree(
+            &mut db,
+            &[(0o100644, b"a", &blob), (0o040000, b"nested", &nested)],
+        );
+        let mut sparse_dir = test_index_entry(b"folder1/", &sparse_tree, 0);
+        sparse_dir.mode = sley_index::SPARSE_DIR_MODE;
+        sparse_dir.set_skip_worktree(true);
+        let index = Index {
+            version: 3,
+            entries: vec![sparse_dir],
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        fs::write(
+            git_dir.join("index"),
+            index
+                .write(ObjectFormat::Sha1)
+                .expect("test operation should succeed"),
+        )
+        .expect("test operation should succeed");
+
+        assert_eq!(
+            resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, ":folder1/a")
+                .expect("test operation should succeed"),
+            blob
+        );
+        for spec in [":folder1/", ":folder1/nested/"] {
+            let err = resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, spec)
+                .expect_err("test operation should fail");
+            assert!(
+                matches!(&err, GitError::NotFound(kind) if kind.to_string().contains("not in the index")),
+                "unexpected error for {spec}: {err:?}"
+            );
+        }
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
