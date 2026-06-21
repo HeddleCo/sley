@@ -19,6 +19,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut conflict_style = None::<sley_worktree::CheckoutConflictStyle>;
     let mut checkout_stage = None::<sley_worktree::CheckoutStage>;
     let mut branch_mode = CheckoutBranchMode::Existing;
+    let mut ignore_other_worktrees = false;
     let mut track = None::<crate::commands::branch::BranchTrackMode>;
     let mut positional = Vec::new();
     let mut dashdash_index = None;
@@ -96,10 +97,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 patch_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
                 inter_hunk_context = true;
             }
-            "--progress"
-            | "--no-progress"
-            | "--ignore-other-worktrees"
-            | "--no-ignore-other-worktrees" => {}
+            "--progress" | "--no-progress" => {}
+            "--ignore-other-worktrees" => ignore_other_worktrees = true,
+            "--no-ignore-other-worktrees" => ignore_other_worktrees = false,
             "--recurse-submodules" => recurse_submodules = Some(true),
             "--no-recurse-submodules" => recurse_submodules = Some(false),
             "--guess" => guess = Some(true),
@@ -783,6 +783,21 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let config = read_repo_config(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let branch_ref = branch_ref_name(branch)?;
+    if !ignore_other_worktrees
+        && !matches!(
+            store.read_ref("HEAD"),
+            Ok(Some(RefTarget::Symbolic(current))) if current == branch_ref
+        )
+        && let Some(worktree) = sley_worktree::find_shared_symref(&git_dir, "HEAD", &branch_ref)?
+    {
+        eprintln!(
+            "fatal: '{}' is already used by worktree at '{}'",
+            branch,
+            worktree.path.display()
+        );
+        checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+        return Err(GitError::Exit(128));
+    }
     let branch_target = if store.read_ref(&branch_ref)?.is_some() {
         sley_refs::resolve_ref_peeled(&store, &branch_ref)?
     } else {

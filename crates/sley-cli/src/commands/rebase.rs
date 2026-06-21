@@ -1393,6 +1393,11 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         items = add_exec_commands(items, &args.exec);
     }
 
+    if config_update_refs {
+        items = add_update_ref_commands(ctx, &items)?;
+        write_rebase_update_refs_state(ctx, &items)?;
+    }
+
     if count_commands(&items) == 0 {
         apply_autostash(ctx);
         seq::remove_merge_state(&ctx.git_dir);
@@ -2572,6 +2577,84 @@ fn add_exec_commands(items: Vec<RebaseTodoItem>, commands: &[String]) -> Vec<Reb
         out.extend(exec_items());
     }
     out
+}
+
+fn add_update_ref_commands(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<Vec<RebaseTodoItem>> {
+    let protected = sley_worktree::worktree_refs_in_use(&ctx.git_dir)?;
+    let wanted_oids = items
+        .iter()
+        .filter_map(|item| item.oid)
+        .collect::<std::collections::HashSet<_>>();
+    if wanted_oids.is_empty() {
+        return Ok(items.to_vec());
+    }
+
+    let store = FileRefStore::new(&ctx.common_git_dir, ctx.format);
+    let mut refs_by_oid = BTreeMap::<ObjectId, Vec<String>>::new();
+    for reference in store.list_refs_with_prefix("refs/heads/")? {
+        if protected.contains(&reference.name) {
+            continue;
+        }
+        let Some(oid) = sley_refs::resolve_ref_peeled(&store, &reference.name)? else {
+            continue;
+        };
+        if wanted_oids.contains(&oid) {
+            refs_by_oid
+                .entry(oid)
+                .or_default()
+                .push(reference.name.clone());
+        }
+    }
+    if refs_by_oid.is_empty() {
+        return Ok(items.to_vec());
+    }
+
+    let mut out = Vec::new();
+    for item in items {
+        out.push(item.clone());
+        let Some(oid) = item.oid else {
+            continue;
+        };
+        let Some(refs) = refs_by_oid.remove(&oid) else {
+            continue;
+        };
+        for refname in refs {
+            out.push(RebaseTodoItem {
+                command: TodoCommand::UpdateRef,
+                flags: 0,
+                oid: None,
+                arg: refname.clone(),
+                raw: format!("update-ref {refname}"),
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn write_rebase_update_refs_state(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<()> {
+    let refs = items
+        .iter()
+        .filter(|item| item.command == TodoCommand::UpdateRef)
+        .map(|item| item.arg.as_str())
+        .collect::<Vec<_>>();
+    if refs.is_empty() {
+        let _ = fs::remove_file(ctx.state_path("update-refs"));
+        return Ok(());
+    }
+    let store = FileRefStore::new(&ctx.common_git_dir, ctx.format);
+    let zero = ObjectId::null(ctx.format);
+    let mut text = String::new();
+    for refname in refs {
+        let old = sley_refs::resolve_ref_peeled(&store, refname)?.unwrap_or(zero);
+        text.push_str(refname);
+        text.push('\n');
+        text.push_str(&old.to_hex());
+        text.push('\n');
+        text.push_str(&zero.to_hex());
+        text.push('\n');
+    }
+    fs::write(ctx.state_path("update-refs"), text)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

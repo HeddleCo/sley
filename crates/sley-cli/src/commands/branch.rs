@@ -7983,12 +7983,11 @@ fn try_delete_symref_branch(
 
 fn branch_checked_out_worktree_path(
     git_dir: &Path,
-    store: &FileRefStore,
+    _store: &FileRefStore,
     refname: &str,
 ) -> Result<Option<String>> {
-    let head_ref = store.current_branch_ref()?;
-    let paths = for_each_ref_worktree_paths(git_dir, head_ref.as_deref())?;
-    Ok(paths.get(refname).cloned())
+    Ok(sley_worktree::find_shared_symref(git_dir, "HEAD", refname)?
+        .map(|worktree| worktree.path.to_string_lossy().into_owned()))
 }
 
 fn force_delete_branches(
@@ -8091,11 +8090,10 @@ fn force_update_branch(
     start: Option<&String>,
 ) -> Result<()> {
     let name = validate_branch_creation_name(branch)?;
-    if store.current_branch_ref()?.as_deref() == Some(name.as_str()) {
-        let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    if let Some(worktree_root) = branch_checked_out_worktree_path(git_dir, store, &name)? {
         eprintln!(
             "fatal: cannot force update the branch '{branch}' used by worktree at '{}'",
-            worktree_root.display()
+            worktree_root
         );
         return Err(GitError::Exit(128));
     }
