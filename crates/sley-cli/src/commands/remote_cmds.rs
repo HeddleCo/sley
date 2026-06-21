@@ -4106,6 +4106,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let mut mirror = false;
     let mut all_refs = false;
     let mut tags = false;
+    let mut follow_tags = false;
     let mut prune = false;
     let mut receive_pack_command: Option<String> = None;
     let mut push_options_cmdline: Option<Vec<String>> = None;
@@ -4138,6 +4139,8 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             "--no-prune" => prune = false,
             "--all" | "--branches" => all_refs = true,
             "--tags" => tags = true,
+            "--follow-tags" => follow_tags = true,
+            "--no-follow-tags" => follow_tags = false,
             "--force-with-lease" => force_with_lease_default = true,
             "--no-force-with-lease" => {
                 force_with_lease_default = false;
@@ -4263,6 +4266,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         }
         (resolved.remote, resolved.refspecs)
     };
+    refspecs = expand_push_tag_shorthand(&refspecs)?;
     default_head_push_destinations(&store, &mut refspecs)?;
     let options = PushOptions {
         quiet,
@@ -4307,16 +4311,23 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     } = &destination
     {
         // `--mirror` also deletes remote refs the local repo no longer has.
+        let remote_advertisements = if mirror || prune || follow_tags {
+            Some(sley_remote::local_fetch_advertisements(
+                remote_git_dir,
+                format,
+            )?)
+        } else {
+            None
+        };
         if mirror || prune {
-            let remote_advertisements =
-                sley_remote::local_fetch_advertisements(remote_git_dir, format)?;
+            let remote_advertisements = remote_advertisements.as_deref().unwrap_or(&[]);
             let local_names: std::collections::HashSet<String> = store
                 .list_refs()?
                 .into_iter()
                 .map(|reference| reference.name)
                 .collect();
             if mirror {
-                for advertisement in &remote_advertisements {
+                for advertisement in remote_advertisements {
                     if advertisement.name.starts_with("refs/")
                         && !local_names.contains(&advertisement.name)
                     {
@@ -4326,6 +4337,16 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             } else {
                 append_push_prune_refspecs(&mut refspecs, &remote_advertisements, &local_names);
             }
+        }
+        if follow_tags {
+            append_follow_tag_refspecs(
+                &git_dir,
+                &common_git_dir,
+                format,
+                &store,
+                &mut refspecs,
+                remote_advertisements.as_deref().unwrap_or(&[]),
+            )?;
         }
         let config = read_repo_config(&git_dir).unwrap_or_default();
         let force_if_includes = force_if_includes
@@ -4440,6 +4461,144 @@ fn append_push_prune_refspecs(
         }
     }
     refspecs.extend(deletes.into_iter().map(|name| format!(":{name}")));
+}
+
+fn expand_push_tag_shorthand(refspecs: &[String]) -> Result<Vec<String>> {
+    let mut expanded = Vec::new();
+    let mut iter = refspecs.iter();
+    while let Some(refspec) = iter.next() {
+        if refspec == "tag" {
+            let name = iter
+                .next()
+                .ok_or_else(|| GitError::Command("you need to specify a tag name".into()))?;
+            expanded.push(format!("refs/tags/{name}:refs/tags/{name}"));
+        } else {
+            expanded.push(refspec.clone());
+        }
+    }
+    Ok(expanded)
+}
+
+fn append_follow_tag_refspecs(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    refspecs: &mut Vec<String>,
+    remote_advertisements: &[sley_protocol::RefAdvertisement],
+) -> Result<()> {
+    let pushed_tips = pushed_tips_for_follow_tags(git_dir, format, store, refspecs)?;
+    if pushed_tips.is_empty() {
+        return Ok(());
+    }
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let mut additions = Vec::new();
+    for reference in store.list_refs()? {
+        let Some(name) = reference.name.strip_prefix("refs/tags/") else {
+            continue;
+        };
+        if remote_advertisements
+            .iter()
+            .any(|advertisement| advertisement.name == reference.name)
+            || refspecs
+                .iter()
+                .any(|refspec| refspec_mentions_destination(refspec, &reference.name))
+        {
+            continue;
+        }
+        let Some((tag_oid, _)) = resolve_for_each_ref_target(store, &reference)? else {
+            continue;
+        };
+        let Some(target) = annotated_tag_commit_target(&db, format, &tag_oid)? else {
+            continue;
+        };
+        if pushed_tips
+            .iter()
+            .any(|tip| commit_reaches(&db, format, tip, &target).unwrap_or(false))
+        {
+            additions.push(format!("refs/tags/{name}:refs/tags/{name}"));
+        }
+    }
+    additions.sort();
+    refspecs.extend(additions);
+    Ok(())
+}
+
+fn refspec_mentions_destination(refspec: &str, destination: &str) -> bool {
+    let refspec = refspec.strip_prefix('+').unwrap_or(refspec);
+    let (_, dst) = refspec.split_once(':').unwrap_or((refspec, refspec));
+    dst == destination
+}
+
+fn pushed_tips_for_follow_tags(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    refspecs: &[String],
+) -> Result<Vec<ObjectId>> {
+    let refs = store.list_refs()?;
+    let mut tips = Vec::new();
+    for refspec in refspecs {
+        let refspec = refspec.strip_prefix('+').unwrap_or(refspec);
+        let src = refspec.split_once(':').map_or(refspec, |(src, _)| src);
+        if src.is_empty() {
+            continue;
+        }
+        if let Some((prefix, suffix)) = src.split_once('*') {
+            for reference in &refs {
+                if reference
+                    .name
+                    .strip_prefix(prefix)
+                    .and_then(|rest| rest.strip_suffix(suffix))
+                    .is_some()
+                    && let Some((oid, _)) = resolve_for_each_ref_target(store, reference)?
+                {
+                    tips.push(oid);
+                }
+            }
+            continue;
+        }
+        if let Ok(oid) = sley_rev::resolve_revision(git_dir, format, src) {
+            tips.push(oid);
+        }
+    }
+    tips.sort();
+    tips.dedup();
+    Ok(tips)
+}
+
+fn annotated_tag_commit_target(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Option<ObjectId>> {
+    let object = db.read_object(oid)?;
+    if object.object_type != sley_object::ObjectType::Tag {
+        return Ok(None);
+    }
+    let tag = sley_object::Tag::parse_ref(format, &object.body)?;
+    let target = db.read_object(&tag.object)?;
+    if target.object_type == sley_object::ObjectType::Commit {
+        Ok(Some(tag.object))
+    } else {
+        Ok(None)
+    }
+}
+
+fn commit_reaches(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tip: &ObjectId,
+    target: &ObjectId,
+) -> Result<bool> {
+    if tip == target {
+        return Ok(true);
+    }
+    let object = db.read_object(tip)?;
+    if object.object_type != sley_object::ObjectType::Commit {
+        return Ok(false);
+    }
+    Ok(ancestor_depths(db, format, tip)?.contains_key(target))
 }
 
 /// Resolve the remote argument for `--mirror`/`--all`/`--tags`: the lone
