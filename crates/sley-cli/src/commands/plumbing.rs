@@ -1751,6 +1751,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         )?;
         if dry_run {
             print_add_actions(&worktree_root, &actions)?;
+            validate_add_chmod_dry_run(&worktree_root, &actions, chmod)?;
             return Ok(());
         }
         let action_paths = actions
@@ -1809,6 +1810,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     )?;
     if dry_run {
         print_add_actions(&worktree_root, &actions)?;
+        validate_add_chmod_dry_run(&worktree_root, &actions, chmod)?;
         if !ignored_paths.is_empty() {
             print_add_ignored_paths(&git_dir, &ignored_paths);
             return Err(GitError::Exit(1));
@@ -2492,6 +2494,19 @@ fn resolve_add_regular_actions(
             }
         }
     }
+    if options.ignore_missing {
+        for (idx, (display, pathspec, _)) in pathspecs.iter().enumerate() {
+            if matched[idx] {
+                continue;
+            }
+            if let Some(ignored_path) =
+                ignored_missing_add_pathspec(worktree_root, display, pathspec)?
+            {
+                matched[idx] = true;
+                ignored_paths.insert(ignored_path);
+            }
+        }
+    }
     for ((display, _, _), matched) in pathspecs.iter().zip(matched) {
         if !matched && !options.ignore_missing {
             eprintln!(
@@ -2610,6 +2625,26 @@ fn add_ignored_path_matches(display: &Path, candidate_path: &Path, pathspec: &Pa
         return add_path_matches(candidate_path, pathspec);
     }
     candidate_path == pathspec || pathspec.starts_with(candidate_path)
+}
+
+fn ignored_missing_add_pathspec(
+    worktree_root: &Path,
+    display: &Path,
+    pathspec: &Path,
+) -> Result<Option<Vec<u8>>> {
+    if add_pathspec_needs_status_walk(display) {
+        return Ok(None);
+    }
+    let Ok(relative) = pathspec.strip_prefix(worktree_root) else {
+        return Ok(None);
+    };
+    let git_path = add_git_path_bytes(relative)?;
+    if git_path.is_empty() {
+        return Ok(None);
+    }
+    Ok(sley_worktree::standard_ignore_match(worktree_root, &git_path, false)?
+        .filter(|ignore_match| ignore_match.ignored)
+        .map(|_| git_path))
 }
 
 fn worktree_path_from_git_path(worktree_root: &Path, git_path: &[u8]) -> Result<PathBuf> {
@@ -3010,6 +3045,37 @@ fn print_add_actions(worktree_root: &Path, actions: &[AddAction]) -> Result<()> 
             "{verb} '{}'",
             display.to_string_lossy().replace('\\', "/")
         )?;
+    }
+    Ok(())
+}
+
+fn validate_add_chmod_dry_run(
+    worktree_root: &Path,
+    actions: &[AddAction],
+    chmod: Option<bool>,
+) -> Result<()> {
+    let Some(executable) = chmod else {
+        return Ok(());
+    };
+    for action in actions {
+        let AddAction::Add(path) = action else {
+            continue;
+        };
+        if fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            let display = path
+                .strip_prefix(worktree_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            eprintln!(
+                "fatal: git update-index: cannot chmod {}x '{display}'",
+                if executable { '+' } else { '-' }
+            );
+            return Err(GitError::Exit(128));
+        }
     }
     Ok(())
 }

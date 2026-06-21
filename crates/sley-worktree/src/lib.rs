@@ -1791,6 +1791,7 @@ fn update_index_paths_impl(
     let mut updated = Vec::new();
     let mut reports: Vec<String> = Vec::new();
     let mut untracked_cache_invalidation_paths = Vec::new();
+    let mut chmod_error = false;
     for update_path in paths {
         let path = &update_path.path;
         // Each path carries the sticky mode that was in effect when it was
@@ -1985,22 +1986,23 @@ fn update_index_paths_impl(
         if let Some(executable) = path_chmod {
             // git's chmod_path() refuses to flip the executable bit on anything
             // that is not a regular file (a symlink/gitlink has no such bit). It
-            // writes the blob first, then errors with this exact message and
-            // leaves the index untouched.
+            // writes the blob first, reports the error, and still writes the
+            // other index updates.
             if is_symlink {
                 eprintln!(
                     "fatal: git update-index: cannot chmod {}x '{}'",
                     if executable { '+' } else { '-' },
                     String::from_utf8_lossy(&git_path)
                 );
-                return Err(GitError::Exit(128));
+                chmod_error = true;
+            } else {
+                entry.mode = if executable { 0o100755 } else { 0o100644 };
+                reports.push(format!(
+                    "chmod {}x '{}'",
+                    if executable { '+' } else { '-' },
+                    String::from_utf8_lossy(&git_path)
+                ));
             }
-            entry.mode = if executable { 0o100755 } else { 0o100644 };
-            reports.push(format!(
-                "chmod {}x '{}'",
-                if executable { '+' } else { '-' },
-                String::from_utf8_lossy(&git_path)
-            ));
         }
         replace_index_entries_with_entry(&mut index.entries, entry);
         untracked_cache_invalidation_paths.push(git_path);
@@ -2020,6 +2022,9 @@ fn update_index_paths_impl(
             writeln!(stdout, "{line}")?;
         }
         stdout.flush()?;
+    }
+    if chmod_error {
+        return Err(GitError::Exit(128));
     }
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
