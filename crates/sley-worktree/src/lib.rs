@@ -26,7 +26,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2997,9 +2997,16 @@ fn repository_index_is_split(git_dir: &Path, format: ObjectFormat) -> Result<boo
     }
 }
 
+fn git_test_split_index_enabled() -> bool {
+    env::var("GIT_TEST_SPLIT_INDEX")
+        .ok()
+        .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "False" | "FALSE"))
+}
+
 pub fn write_repository_index(git_dir: &Path, format: ObjectFormat, index: Index) -> Result<()> {
-    let split =
-        index.split_index_link(format)?.is_some() || repository_index_is_split(git_dir, format)?;
+    let split = index.split_index_link(format)?.is_some()
+        || repository_index_is_split(git_dir, format)?
+        || git_test_split_index_enabled();
     write_repository_index_ref_with_split(git_dir, format, &index, split)
 }
 
@@ -3008,8 +3015,9 @@ pub fn write_repository_index_ref(
     format: ObjectFormat,
     index: &Index,
 ) -> Result<()> {
-    let split =
-        index.split_index_link(format)?.is_some() || repository_index_is_split(git_dir, format)?;
+    let split = index.split_index_link(format)?.is_some()
+        || repository_index_is_split(git_dir, format)?
+        || git_test_split_index_enabled();
     write_repository_index_ref_with_split(git_dir, format, index, split)
 }
 
@@ -3020,7 +3028,7 @@ fn write_repository_index_ref_with_split(
     split: bool,
 ) -> Result<()> {
     let index_path = repository_index_path(git_dir);
-    if !split {
+    if !split || alternate_index_output_path(git_dir, &index_path) {
         let smudged_entries = racily_clean_entry_indexes_before_write(git_dir, format, index)?;
         let extensions = if index.split_index_link(format)?.is_some() {
             Cow::Owned(index_extensions_without_split_index_link(&index.extensions))
@@ -3032,10 +3040,36 @@ fn write_repository_index_ref_with_split(
         } else {
             write_index_with_entry_size_overrides(format, index, &smudged_entries, &extensions)?
         };
-        fs::write(index_path, bytes)?;
+        fs::write(&index_path, bytes)?;
+        apply_index_shared_file_mode(git_dir, &index_path, None)?;
         return Ok(());
     }
 
+    if let Some(link) = index.split_index_link(format)?
+        && !link.base_oid.is_null()
+        && let Some(base) = read_shared_index_for_link(git_dir, &index_path, format, &link)?
+        && !split_index_delta_exceeds_threshold(git_dir, index, &base)
+    {
+        let (entries, link) = split_index_delta_entries(index, &base, &link)?;
+        let extensions =
+            index_extensions_without_split_index_link(&index_extensions_without_cache_tree(
+                &index.extensions,
+            ));
+        let mut primary = Index {
+            version: index.version,
+            entries,
+            extensions,
+            checksum: None,
+        };
+        primary.set_split_index_link(Some(&link))?;
+        fs::write(&index_path, primary.write(format)?)?;
+        apply_index_shared_file_mode(git_dir, &index_path, None)?;
+        return Ok(());
+    }
+
+    let mode_source = fs::metadata(&index_path)
+        .ok()
+        .map(|metadata| metadata.permissions());
     let mut shared = index.clone();
     smudge_racily_clean_entries_before_write(git_dir, format, &mut shared)?;
     shared.clear_split_index_link()?;
@@ -3046,6 +3080,8 @@ fn write_repository_index_ref_with_split(
     if !shared_path.exists() {
         fs::write(&shared_path, &shared_bytes)?;
     }
+    apply_index_shared_file_mode(git_dir, &shared_path, mode_source.as_ref())?;
+    clean_shared_index_files(git_dir, shared_oid)?;
 
     let mut primary = Index {
         version: index.version,
@@ -3054,8 +3090,269 @@ fn write_repository_index_ref_with_split(
         checksum: None,
     };
     primary.set_split_index_link(Some(&SplitIndexLink::new(shared_oid)))?;
-    fs::write(index_path, primary.write(format)?)?;
+    fs::write(&index_path, primary.write(format)?)?;
+    apply_index_shared_file_mode(git_dir, &index_path, mode_source.as_ref())?;
     Ok(())
+}
+
+fn alternate_index_output_path(git_dir: &Path, index_path: &Path) -> bool {
+    env::var_os("GIT_INDEX_FILE").is_some() && index_path != git_dir.join("index")
+}
+
+fn clean_shared_index_files(git_dir: &Path, current_oid: ObjectId) -> Result<()> {
+    let Some(expire_before) = shared_index_expire_before(git_dir) else {
+        return Ok(());
+    };
+    let current_name = format!("sharedindex.{current_oid}");
+    let mut expired = Vec::new();
+    for entry in fs::read_dir(git_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("sharedindex.") || name == current_name {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified <= expire_before {
+            expired.push((modified, entry.path()));
+        }
+    }
+    expired.sort_by_key(|(modified, _)| *modified);
+    let delete_count = expired.len().saturating_sub(1);
+    for (_, path) in expired.into_iter().take(delete_count) {
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
+}
+
+fn shared_index_expire_before(git_dir: &Path) -> Option<SystemTime> {
+    let value = sley_config::read_repo_config(git_dir, None)
+        .ok()
+        .and_then(|config| {
+            config
+                .get("splitIndex", None, "sharedIndexExpire")
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "2.weeks.ago".to_string());
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("never") {
+        return None;
+    }
+    if value.eq_ignore_ascii_case("now") {
+        return Some(SystemTime::now());
+    }
+    if let Some(days) = value
+        .strip_suffix(".days.ago")
+        .or_else(|| value.strip_suffix(".day.ago"))
+        .and_then(|days| days.parse::<u64>().ok())
+    {
+        return SystemTime::now().checked_sub(Duration::from_secs(days * 24 * 60 * 60));
+    }
+    if let Some(weeks) = value
+        .strip_suffix(".weeks.ago")
+        .or_else(|| value.strip_suffix(".week.ago"))
+        .and_then(|weeks| weeks.parse::<u64>().ok())
+    {
+        return SystemTime::now().checked_sub(Duration::from_secs(weeks * 7 * 24 * 60 * 60));
+    }
+    SystemTime::now().checked_sub(Duration::from_secs(14 * 24 * 60 * 60))
+}
+
+fn apply_index_shared_file_mode(
+    git_dir: &Path,
+    path: &Path,
+    mode_source: Option<&fs::Permissions>,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let current = fs::metadata(path)?.permissions();
+        let source_mode = mode_source
+            .map(fs::Permissions::mode)
+            .unwrap_or_else(|| current.mode());
+        let mode = sley_config::read_repo_config(git_dir, None)
+            .ok()
+            .and_then(|config| {
+                config
+                    .get("core", None, "sharedRepository")
+                    .and_then(|value| shared_repository_file_mode(value, source_mode))
+            })
+            .unwrap_or(source_mode & 0o7777);
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = git_dir;
+        let _ = path;
+        let _ = mode_source;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn shared_repository_file_mode(value: &str, source_mode: u32) -> Option<u32> {
+    match value {
+        "umask" | "false" | "no" | "off" | "0" => None,
+        "group" | "true" | "yes" | "on" | "1" => Some((source_mode | 0o660) & 0o7777),
+        "all" | "world" | "everybody" | "2" | "3" => Some((source_mode | 0o664) & 0o7777),
+        value => {
+            let parsed = u32::from_str_radix(value, 8).ok()?;
+            (parsed & 0o600 == 0o600).then_some(parsed & 0o666)
+        }
+    }
+}
+
+fn read_shared_index_for_link(
+    git_dir: &Path,
+    index_path: &Path,
+    format: ObjectFormat,
+    link: &SplitIndexLink,
+) -> Result<Option<Index>> {
+    let name = format!("sharedindex.{}", link.base_oid);
+    let bytes = match fs::read(git_dir.join(&name)) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let alternate = index_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&name);
+            match fs::read(alternate) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let base = Index::parse(&bytes, format)?;
+    if base.checksum != Some(link.base_oid) {
+        return Ok(None);
+    }
+    Ok(Some(base))
+}
+
+fn split_index_delta_exceeds_threshold(git_dir: &Path, index: &Index, base: &Index) -> bool {
+    let max_percent = sley_config::read_repo_config(git_dir, None)
+        .ok()
+        .and_then(|config| {
+            config
+                .get("splitIndex", None, "maxPercentChange")
+                .and_then(|value| value.parse::<i64>().ok())
+        })
+        .unwrap_or(20);
+    match max_percent {
+        0 => return true,
+        100.. => return false,
+        value if value < 0 => {}
+        _ => {}
+    }
+    let not_shared = count_entries_not_shared_with_base(index, base);
+    (index.entries.len() as i64) * max_percent < (not_shared as i64) * 100
+}
+
+fn count_entries_not_shared_with_base(index: &Index, base: &Index) -> usize {
+    index
+        .entries
+        .iter()
+        .filter(|entry| {
+            base.entries
+                .binary_search_by(|base_entry| compare_index_key(base_entry, entry))
+                .is_err()
+        })
+        .count()
+}
+
+fn split_index_delta_entries(
+    index: &Index,
+    base: &Index,
+    previous_link: &SplitIndexLink,
+) -> Result<(Vec<IndexEntry>, SplitIndexLink)> {
+    let mut delete_positions = Vec::new();
+    let mut replace_positions = Vec::new();
+    let mut replacements = Vec::new();
+    let mut additions = Vec::new();
+    let mut base_pos = 0usize;
+    let mut index_pos = 0usize;
+    while base_pos < base.entries.len() && index_pos < index.entries.len() {
+        match compare_index_key(&base.entries[base_pos], &index.entries[index_pos]) {
+            Ordering::Equal => {
+                if previous_link
+                    .delete_positions
+                    .binary_search(&(base_pos as u32))
+                    .is_ok()
+                {
+                    delete_positions.push(base_pos as u32);
+                    additions.push(index.entries[index_pos].clone());
+                } else if !index_entry_content_eq(&base.entries[base_pos], &index.entries[index_pos])
+                {
+                    replace_positions.push(base_pos as u32);
+                    let mut replacement = index.entries[index_pos].clone();
+                    replacement.path = BString::from(Vec::<u8>::new());
+                    replacement.refresh_name_length();
+                    replacements.push(replacement);
+                }
+                base_pos += 1;
+                index_pos += 1;
+            }
+            Ordering::Less => {
+                delete_positions.push(base_pos as u32);
+                base_pos += 1;
+            }
+            Ordering::Greater => {
+                additions.push(index.entries[index_pos].clone());
+                index_pos += 1;
+            }
+        }
+    }
+    while base_pos < base.entries.len() {
+        delete_positions.push(base_pos as u32);
+        base_pos += 1;
+    }
+    while index_pos < index.entries.len() {
+        additions.push(index.entries[index_pos].clone());
+        index_pos += 1;
+    }
+    replacements.extend(additions);
+    Ok((
+        replacements,
+        SplitIndexLink {
+            base_oid: previous_link.base_oid,
+            delete_positions,
+            replace_positions,
+        },
+    ))
+}
+
+fn compare_index_key(left: &IndexEntry, right: &IndexEntry) -> Ordering {
+    left.path
+        .as_bytes()
+        .cmp(right.path.as_bytes())
+        .then_with(|| left.stage().as_u16().cmp(&right.stage().as_u16()))
+}
+
+fn index_entry_content_eq(left: &IndexEntry, right: &IndexEntry) -> bool {
+    const ONDISK_FLAGS: u16 = sley_index::INDEX_FLAG_STAGE_MASK
+        | sley_index::INDEX_FLAG_VALID
+        | sley_index::INDEX_FLAG_EXTENDED;
+    left.ctime_seconds == right.ctime_seconds
+        && left.ctime_nanoseconds == right.ctime_nanoseconds
+        && left.mtime_seconds == right.mtime_seconds
+        && left.mtime_nanoseconds == right.mtime_nanoseconds
+        && left.dev == right.dev
+        && left.ino == right.ino
+        && left.mode == right.mode
+        && left.uid == right.uid
+        && left.gid == right.gid
+        && left.size == right.size
+        && left.oid == right.oid
+        && (left.flags & ONDISK_FLAGS) == (right.flags & ONDISK_FLAGS)
+        && left.flags_extended == right.flags_extended
 }
 
 fn write_index_with_entry_size_overrides(

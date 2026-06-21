@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
-use std::{env, fs};
+use std::{env, fs, io};
 
 pub use sley_core::BString;
 
@@ -1006,9 +1006,6 @@ impl SplitIndexLink {
     pub fn write(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         out.extend_from_slice(self.base_oid.as_bytes());
-        if self.delete_positions.is_empty() && self.replace_positions.is_empty() {
-            return Ok(out);
-        }
         let delete_bits = self
             .delete_positions
             .iter()
@@ -1546,6 +1543,9 @@ fn write_ewah_positions(bit_size: u32, positions: &[u32], out: &mut Vec<u8>) {
         words[rlw_position as usize] = rlw;
         words.extend_from_slice(&raw[literal_start..literal_start + literal_len]);
     }
+    if words.is_empty() {
+        words.push(0);
+    }
     out.extend_from_slice(&bit_size.to_be_bytes());
     out.extend_from_slice(&(words.len() as u32).to_be_bytes());
     for word in words {
@@ -1713,8 +1713,20 @@ fn read_index_file_expanded(
         index.clear_split_index_link()?;
         return Ok(index);
     }
-    let shared_path = git_dir.join(format!("sharedindex.{}", link.base_oid));
-    let shared = Index::parse(&fs::read(&shared_path)?, format)?;
+    let shared_name = format!("sharedindex.{}", link.base_oid);
+    let shared_path = git_dir.join(&shared_name);
+    let shared_bytes = match fs::read(&shared_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let alternate = index_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&shared_name);
+            fs::read(&alternate)?
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let shared = Index::parse(&shared_bytes, format)?;
     let shared_checksum = shared.checksum.ok_or_else(|| {
         GitError::InvalidFormat(format!(
             "shared index {} has no checksum",

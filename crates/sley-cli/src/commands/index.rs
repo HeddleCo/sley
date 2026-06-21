@@ -628,7 +628,20 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         let index_path = sley_worktree::repository_index_path(&git_dir);
         match fs::read(index_path) {
             Ok(index_bytes) => {
-                write_ls_files_index_root_fast(&mut stdout, &index_bytes, format, terminator)?
+                if sley_index::Index::bytes_have_extension(
+                    &index_bytes,
+                    format,
+                    &sley_index::INDEX_EXT_LINK,
+                )? {
+                    if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
+                        for entry in &index.entries {
+                            write_ls_files_path(&mut stdout, &entry.path, terminator)?;
+                            stdout.write_all(&[terminator])?;
+                        }
+                    }
+                } else {
+                    write_ls_files_index_root_fast(&mut stdout, &index_bytes, format, terminator)?
+                }
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
@@ -1901,6 +1914,14 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     }
     if let Some(split_index) = split_index {
         if split_index {
+            sley_worktree::enable_split_index(&git_dir, format)?;
+        } else {
+            sley_worktree::disable_split_index(&git_dir, format)?;
+        }
+    } else if let Some(config_split_index) =
+        read_repo_config(&git_dir)?.get_bool("core", None, "splitIndex")
+    {
+        if config_split_index {
             sley_worktree::enable_split_index(&git_dir, format)?;
         } else {
             sley_worktree::disable_split_index(&git_dir, format)?;

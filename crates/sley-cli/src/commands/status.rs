@@ -386,6 +386,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 untracked_mode,
             )?;
         }
+        apply_status_split_index_config(&git_dir, format, &config)?;
         return Ok(());
     }
     // Resolve the per-submodule ignore setting (command line > `.git/config` >
@@ -517,7 +518,20 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             untracked_mode,
         )?;
     }
+    apply_status_split_index_config(&git_dir, format, &config)?;
     Ok(())
+}
+
+fn apply_status_split_index_config(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+) -> Result<()> {
+    match config.get_bool("core", None, "splitIndex") {
+        Some(true) => sley_worktree::enable_split_index(git_dir, format).map(|_| ()),
+        Some(false) => sley_worktree::disable_split_index(git_dir, format).map(|_| ()),
+        None => Ok(()),
+    }
 }
 
 /// `git status -h`: usage synopsis + exit 129, mirroring commit_usage().

@@ -107,6 +107,9 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
             "--git-common-dir" => {
                 println!("{}", display_git_common_dir(&cwd, &git_dir, path_format)?);
             }
+            "--shared-index-path" => {
+                println!("{}", display_shared_index_path(&cwd, &git_dir, path_format)?);
+            }
             "--git-path" => {
                 idx += 1;
                 let path = args
@@ -1718,6 +1721,33 @@ fn display_git_common_dir_default(cwd: &Path, git_dir: &Path) -> Result<String> 
     let prefix = worktree_prefix(&cwd, &git_dir, None)?;
     let depth = prefix.split('/').filter(|part| !part.is_empty()).count();
     Ok(format!("{}.git", "../".repeat(depth)))
+}
+
+fn display_shared_index_path(
+    cwd: &Path,
+    git_dir: &Path,
+    path_format: RevParsePathFormat,
+) -> Result<String> {
+    let format = repository_object_format(git_dir)?;
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let bytes = match fs::read(index_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let index = sley_index::Index::parse(&bytes, format)?;
+    let Some(link) = index.split_index_link(format)? else {
+        return Ok(String::new());
+    };
+    if link.base_oid.is_null() {
+        return Ok(String::new());
+    }
+    display_git_path(
+        cwd,
+        git_dir,
+        path_format,
+        &format!("sharedindex.{}", link.base_oid),
+    )
 }
 
 fn display_git_path(
