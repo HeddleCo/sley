@@ -3410,13 +3410,8 @@ impl FileRefStore {
                 .map(|reference| reference.name)
                 .collect::<BTreeSet<_>>();
             for change in &changes {
-                match change {
-                    CoalescedRefChange::Update(update) => {
-                        names.insert(update.name.clone());
-                    }
-                    CoalescedRefChange::Delete(delete) => {
-                        names.remove(&delete.name);
-                    }
+                if let CoalescedRefChange::Update(update) = change {
+                    names.insert(update.name.clone());
                 }
             }
             Some(names)
@@ -7419,7 +7414,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
     }
 
     #[test]
-    fn file_ref_transaction_allows_deleted_descendant_to_unlock_parent_create() {
+    fn file_ref_transaction_rejects_deleted_descendant_parent_create() {
         let git_dir = temp_git_dir();
         let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
         let old_conflict = ObjectId::from_hex(
@@ -7453,19 +7448,25 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             new: RefTarget::Direct(new_parent),
             reflog: None,
         });
-        tx.commit().expect("test operation should succeed");
+        let err = tx
+            .commit()
+            .expect_err("D/F-conflicting delete plus create must fail");
+        assert_eq!(
+            err.to_string(),
+            "transaction failed: cannot lock ref 'refs/heads/branch': 'refs/heads/branch/conflict' exists; cannot create 'refs/heads/branch'"
+        );
 
         assert_eq!(
             store
                 .read_ref("refs/heads/branch/conflict")
                 .expect("test operation should succeed"),
-            None
+            Some(RefTarget::Direct(old_conflict))
         );
         assert_eq!(
             store
                 .read_ref("refs/heads/branch")
                 .expect("test operation should succeed"),
-            Some(RefTarget::Direct(new_parent))
+            None
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
