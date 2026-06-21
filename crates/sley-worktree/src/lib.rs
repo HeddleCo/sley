@@ -14223,7 +14223,9 @@ fn restore_index_paths_from_entries(
                 // "resetting an unmodified path is a no-op"). Only when the entry
                 // genuinely changes does git write a fresh, stat-zeroed entry.
                 let unchanged = index_entries.get(&path).is_some_and(|existing| {
-                    existing.oid == entry.oid && existing.mode == entry.mode
+                    existing.oid == entry.oid
+                        && existing.mode == entry.mode
+                        && !existing.is_intent_to_add()
                 });
                 if !unchanged {
                     let mut restored = restored_head_index_entry(worktree_root, db, &path, entry)?;
