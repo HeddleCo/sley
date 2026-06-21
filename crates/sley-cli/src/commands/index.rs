@@ -649,7 +649,8 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     let eol = eol_context.as_ref();
     if let Some(format_spec) = format_spec.as_deref() {
         if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
-            let index = ls_files_display_index(&git_dir, format, index, sparse)?;
+            let index =
+                ls_files_display_index(&git_dir, format, index, sparse && !(deleted || modified))?;
             write_ls_files_formatted(
                 &mut stdout,
                 index.entries.iter(),
@@ -705,7 +706,8 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         if (cached || deleted || modified)
             && let Some(index) = sley_worktree::read_repository_index(&git_dir, format)?
         {
-            let index = ls_files_display_index(&git_dir, format, index, sparse)?;
+            let index =
+                ls_files_display_index(&git_dir, format, index, sparse && !(deleted || modified))?;
             let oid_candidates = ls_files_oid_candidates(&index);
             if ignored && cached {
                 let ignored_entries = sley_worktree::ignored_index_entries(
@@ -761,7 +763,8 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         return Ok(());
     }
     if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
-        let index = ls_files_display_index(&git_dir, format, index, sparse)?;
+        let index =
+            ls_files_display_index(&git_dir, format, index, sparse && !(deleted || modified))?;
         let oid_candidates = ls_files_oid_candidates(&index);
         if unmerged {
             write_ls_files_unmerged(

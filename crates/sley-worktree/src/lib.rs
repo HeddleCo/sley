@@ -1781,6 +1781,9 @@ fn update_index_paths_impl(
     if options.allow_skip_worktree_entries {
         expand_sparse_index(&mut index, &odb, format)?;
     }
+    let sparse_checkout_active = sparse_checkout_config_enabled(git_dir)
+        || index.is_sparse()
+        || index.entries.iter().any(IndexEntry::is_sparse_dir);
     // For small batches, read only each path's `.gitattributes` chain; a
     // whole-worktree matcher can dominate `add -u` when only a few files are
     // dirty in a huge checkout. Large batches still amortize the full matcher.
@@ -1819,6 +1822,9 @@ fn update_index_paths_impl(
             GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
         })?;
         let git_path = git_path_bytes(relative)?;
+        if index_sparse_dir_contains_path(&index, &git_path) {
+            expand_sparse_index(&mut index, &odb, format)?;
+        }
         let existing_range = index_entries_path_range(&index.entries, &git_path);
         if path_mode.force_remove {
             record_resolve_undo_for_range(&mut index, format, &git_path, existing_range)?;
@@ -1826,16 +1832,6 @@ fn update_index_paths_impl(
             untracked_cache_invalidation_paths.push(git_path.clone());
             // git's update_one() reports `remove` for a --force-remove path.
             reports.push(format!("remove '{}'", String::from_utf8_lossy(&git_path)));
-            continue;
-        }
-        if !options.allow_skip_worktree_entries
-            && index.entries[existing_range.clone()]
-                .iter()
-                .any(index_entry_skip_worktree)
-        {
-            if path_mode.remove && !options.ignore_skip_worktree_entries {
-                index.entries.drain(existing_range);
-            }
             continue;
         }
         // lstat (not stat): a symlink must be inspected as the link itself, never
@@ -1863,6 +1859,24 @@ fn update_index_paths_impl(
             }
             Err(err) => return Err(err.into()),
         };
+        if !options.allow_skip_worktree_entries
+            && index.entries[existing_range.clone()]
+                .iter()
+                .any(index_entry_skip_worktree)
+        {
+            if path_mode.remove {
+                if !options.ignore_skip_worktree_entries {
+                    index.entries.drain(existing_range);
+                }
+                continue;
+            }
+            if symlink_metadata.is_none()
+                || options.ignore_skip_worktree_entries
+                || !sparse_checkout_active
+            {
+                continue;
+            }
+        }
         let Some(metadata) = symlink_metadata else {
             if path_mode.remove {
                 record_resolve_undo_for_range(&mut index, format, &git_path, existing_range)?;
@@ -12703,7 +12717,9 @@ pub fn deleted_index_entries(
     let index = Index::parse(&fs::read(index_path)?, format)?;
     let mut deleted = Vec::new();
     for entry in index.entries {
-        if !worktree_path(worktree_root, entry.path.as_bytes())?.exists() {
+        if !worktree_path(worktree_root, entry.path.as_bytes())?.exists()
+            && !index_entry_skip_worktree(&entry)
+        {
             deleted.push(entry);
         }
     }
@@ -12721,24 +12737,31 @@ pub fn modified_index_entries(
     if !index_path.exists() {
         return Ok(Vec::new());
     }
-    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    if index.entries.iter().any(IndexEntry::is_sparse_dir) {
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        expand_sparse_index(&mut index, &db, format)?;
+    }
     // Reuse the same racy-git stat shortcut here: build the cache from the index
     // we just parsed (no second parse) so the worktree walk can skip re-hashing
     // unchanged files. A cached oid is only trusted on a non-racy stat match, so
     // genuinely modified files still fall through to a hash and are reported.
     let stat_cache = IndexStatCache::from_index(&index, &index_path);
-    let worktree = worktree_entries_with_stat_cache(
-        worktree_root,
-        git_dir,
-        format,
-        Some(&stat_cache),
-        None,
-        None,
-    )?;
     let mut modified = Vec::new();
     for entry in index.entries {
-        let Some(worktree_entry) = worktree.get(entry.path.as_bytes()) else {
-            modified.push(entry);
+        let worktree_entry = worktree_entry_for_git_path(
+            worktree_root,
+            git_dir,
+            format,
+            entry.path.as_bytes(),
+            &entry.oid,
+            entry.mode,
+            Some(&stat_cache),
+        )?;
+        let Some(worktree_entry) = worktree_entry else {
+            if !index_entry_skip_worktree(&entry) {
+                modified.push(entry);
+            }
             continue;
         };
         if worktree_entry.mode != entry.mode || worktree_entry.oid != entry.oid {
@@ -14720,6 +14743,14 @@ pub fn expand_sparse_index(
     normalize_index_version_for_extended_flags(index);
     sley_core::trace2::region("index", "ensure_full_index");
     Ok(true)
+}
+
+fn index_sparse_dir_contains_path(index: &Index, git_path: &[u8]) -> bool {
+    index.entries.iter().any(|entry| {
+        entry.is_sparse_dir()
+            && git_path.starts_with(entry.path.as_bytes())
+            && git_path.len() > entry.path.len()
+    })
 }
 
 /// Builds a minimal index entry for an expanded sparse blob: zeroed stat fields

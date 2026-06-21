@@ -384,6 +384,22 @@ pub mod trace2 {
         out
     }
 
+    /// Create the trace2 event target when tracing is enabled, even if this
+    /// command does not emit any data or region events.
+    pub fn touch() {
+        let Some(target) = std::env::var_os("GIT_TRACE2_EVENT") else {
+            return;
+        };
+        let target = target.to_string_lossy().into_owned();
+        if !target.starts_with('/') {
+            return;
+        }
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(target);
+    }
+
     /// Emit a trace2 `data` event (upstream `trace2_data_string` /
     /// `trace2_data_intmax`): a JSON line appended to the `GIT_TRACE2_EVENT`
     /// file when that target is enabled.
