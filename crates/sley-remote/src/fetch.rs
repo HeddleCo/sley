@@ -1247,12 +1247,11 @@ fn fetch_reflog_short_ref(refname: &str) -> String {
 
 fn validate_fetch_ref_updates(
     git_dir: &Path,
-    format: ObjectFormat,
+    _format: ObjectFormat,
     store: &FileRefStore,
     update_head_ok: bool,
     updates: &[FetchRefUpdate],
 ) -> Result<()> {
-    let checked_out = checked_out_branch_refs(git_dir, format)?;
     for update in updates {
         let Some(dst) = update.dst.as_deref() else {
             continue;
@@ -1268,12 +1267,12 @@ fn validate_fetch_ref_updates(
         };
         if old.is_some()
             && !update_head_ok
-            && checked_out.contains(dst)
             && dst.starts_with("refs/heads/")
+            && let Some(worktree) = sley_worktree::find_shared_symref(git_dir, "HEAD", dst)?
         {
-            return Err(GitError::Command(format!(
-                "! [rejected]        {} -> {}  (can't fetch into checked-out branch)",
-                update.src, dst
+            return Err(GitError::InvalidFormat(format!(
+                "fatal: refusing to fetch into branch '{dst}' checked out at '{}'",
+                worktree.path.display()
             )));
         }
         if old.is_some()
@@ -1288,30 +1287,6 @@ fn validate_fetch_ref_updates(
         }
     }
     Ok(())
-}
-
-fn checked_out_branch_refs(git_dir: &Path, format: ObjectFormat) -> Result<HashSet<String>> {
-    let mut refs = HashSet::new();
-    if let Some(RefTarget::Symbolic(target)) =
-        FileRefStore::new(git_dir, format).read_ref("HEAD")?
-    {
-        refs.insert(target);
-    }
-    let worktrees = git_dir.join("worktrees");
-    let Ok(entries) = fs::read_dir(worktrees) else {
-        return Ok(refs);
-    };
-    for entry in entries {
-        let entry = entry?;
-        let head = entry.path().join("HEAD");
-        let Ok(contents) = fs::read_to_string(head) else {
-            continue;
-        };
-        if let Some(target) = contents.trim().strip_prefix("ref: ") {
-            refs.insert(target.to_string());
-        }
-    }
-    Ok(refs)
 }
 
 /// The remote's advertised `HEAD` symref target (`HEAD:<target>` capability).

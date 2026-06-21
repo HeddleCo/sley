@@ -842,6 +842,187 @@ pub fn worktree_root_for_git_dir(git_dir: &Path) -> Result<Option<PathBuf>> {
         .ok_or_else(|| GitError::InvalidPath("git dir has no parent worktree".into()))
 }
 
+pub fn common_git_dir_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
+    if let Some(common_dir) = env::var_os("GIT_COMMON_DIR") {
+        return Ok(PathBuf::from(common_dir));
+    }
+    let commondir = git_dir.join("commondir");
+    if commondir.is_file() {
+        let value = fs::read_to_string(&commondir)?;
+        let path = PathBuf::from(value.trim());
+        let common = if path.is_absolute() {
+            path
+        } else {
+            git_dir.join(path)
+        };
+        return fs::canonicalize(common).map_err(|err| GitError::Io(err.to_string()));
+    }
+    fs::canonicalize(git_dir).map_err(|err| GitError::Io(err.to_string()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedSymrefWorktree {
+    pub refname: String,
+    pub path: PathBuf,
+}
+
+struct WorktreeAdmin {
+    git_dir: PathBuf,
+    path: Option<PathBuf>,
+}
+
+pub fn find_shared_symref(
+    git_dir: &Path,
+    symref: &str,
+    target: &str,
+) -> Result<Option<SharedSymrefWorktree>> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    for admin in worktree_admins(&common_git_dir)? {
+        if worktree_uses_symref(&admin.git_dir, symref, target)? {
+            let path = admin
+                .path
+                .unwrap_or_else(|| admin.git_dir.clone())
+                .to_string_lossy()
+                .into_owned();
+            return Ok(Some(SharedSymrefWorktree {
+                refname: target.to_string(),
+                path: PathBuf::from(path),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+pub fn worktree_refs_in_use(git_dir: &Path) -> Result<HashSet<String>> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let mut refs = HashSet::new();
+    for admin in worktree_admins(&common_git_dir)? {
+        if let Ok(head) = fs::read_to_string(admin.git_dir.join("HEAD")) {
+            let head = head.trim();
+            if let Some(target) = head.strip_prefix("ref: ") {
+                refs.insert(target.to_string());
+            }
+            refs.extend(worktree_detached_operation_refs(&admin.git_dir));
+        }
+    }
+    Ok(refs)
+}
+
+fn worktree_admins(common_git_dir: &Path) -> Result<Vec<WorktreeAdmin>> {
+    let mut admins = Vec::new();
+    admins.push(WorktreeAdmin {
+        git_dir: common_git_dir.to_path_buf(),
+        path: worktree_root_for_git_dir(common_git_dir)?,
+    });
+    let worktrees_dir = common_git_dir.join("worktrees");
+    let Ok(entries) = fs::read_dir(worktrees_dir) else {
+        return Ok(admins);
+    };
+    for entry in entries {
+        let entry = entry?;
+        let git_dir = entry.path();
+        let path = linked_worktree_path(&git_dir);
+        admins.push(WorktreeAdmin { git_dir, path });
+    }
+    Ok(admins)
+}
+
+fn linked_worktree_path(admin_dir: &Path) -> Option<PathBuf> {
+    let gitdir = fs::read_to_string(admin_dir.join("gitdir")).ok()?;
+    let gitdir = gitdir.trim();
+    if gitdir.is_empty() {
+        return None;
+    }
+    let gitdir_path = resolve_worktree_admin_path(admin_dir, gitdir);
+    gitdir_path.parent().map(|path| {
+        fs::canonicalize(path).unwrap_or_else(|_| normalize_lexical_worktree_path(path))
+    })
+}
+
+fn normalize_lexical_worktree_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            _ => out.push(component.as_os_str()),
+        }
+    }
+    out
+}
+
+fn worktree_uses_symref(git_dir: &Path, symref: &str, target: &str) -> Result<bool> {
+    if symref != "HEAD" {
+        return Ok(false);
+    }
+    let Ok(head) = fs::read_to_string(git_dir.join(symref)) else {
+        return Ok(false);
+    };
+    let head = head.trim();
+    if head.strip_prefix("ref: ") == Some(target) {
+        return Ok(true);
+    }
+    if worktree_rebase_update_refs(git_dir)
+        .iter()
+        .any(|name| name == target)
+    {
+        return Ok(true);
+    }
+    if worktree_detached_operation_uses_ref(git_dir, target) {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn worktree_detached_operation_uses_ref(git_dir: &Path, target: &str) -> bool {
+    worktree_detached_operation_refs(git_dir)
+        .iter()
+        .any(|name| name == target)
+}
+
+fn worktree_detached_operation_refs(git_dir: &Path) -> Vec<String> {
+    let mut refs = Vec::new();
+    for dir in ["rebase-merge", "rebase-apply"] {
+        let Some(refname) = operation_head_name_ref(git_dir.join(dir).join("head-name")) else {
+            continue;
+        };
+        refs.push(refname);
+    }
+    refs.extend(worktree_rebase_update_refs(git_dir));
+    if let Some(refname) = operation_head_name_ref(git_dir.join("BISECT_START")) {
+        refs.push(refname);
+    }
+    refs
+}
+
+fn worktree_rebase_update_refs(git_dir: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(git_dir.join("rebase-merge").join("update-refs")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .step_by(3)
+        .filter_map(|line| {
+            let line = line.trim();
+            (!line.is_empty()).then(|| line.to_string())
+        })
+        .collect()
+}
+
+fn operation_head_name_ref(path: PathBuf) -> Option<String> {
+    let value = fs::read_to_string(path).ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.starts_with("refs/heads/") {
+        Some(value.to_string())
+    } else {
+        Some(format!("refs/heads/{value}"))
+    }
+}
+
 /// Resolve a path read from a git-directory administrative file (e.g. the
 /// `gitdir` link of a linked worktree): absolute paths are kept as-is, relative
 /// paths are joined onto the administrative directory.
