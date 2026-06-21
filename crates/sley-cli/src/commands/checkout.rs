@@ -114,6 +114,10 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 track = Some(crate::commands::branch::BranchTrackMode::Never);
             }
             "-b" => {
+                if !matches!(branch_mode, CheckoutBranchMode::Existing) {
+                    eprintln!("fatal: options '--detach' and '-b' cannot be used together");
+                    return Err(GitError::Exit(128));
+                }
                 let branch = iter
                     .next()
                     .ok_or_else(|| GitError::Command("checkout -b requires a branch".into()))?;
@@ -124,6 +128,10 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 };
             }
             "-B" => {
+                if !matches!(branch_mode, CheckoutBranchMode::Existing) {
+                    eprintln!("fatal: options '--detach' and '-B' cannot be used together");
+                    return Err(GitError::Exit(128));
+                }
                 let branch = iter
                     .next()
                     .ok_or_else(|| GitError::Command("checkout -B requires a branch".into()))?;
@@ -133,7 +141,13 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     orphan: false,
                 };
             }
-            "--detach" => branch_mode = CheckoutBranchMode::Detach,
+            "--detach" => {
+                if !matches!(branch_mode, CheckoutBranchMode::Existing) {
+                    eprintln!("fatal: options '-b' and '--detach' cannot be used together");
+                    return Err(GitError::Exit(128));
+                }
+                branch_mode = CheckoutBranchMode::Detach;
+            }
             "--orphan" => {
                 let branch = iter.next().ok_or_else(|| {
                     GitError::Command("checkout --orphan requires a branch".into())
@@ -200,6 +214,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     }
     let checkout_old_head = resolve_ref_peeled(&FileRefStore::new(&git_dir, format), "HEAD")?
         .unwrap_or_else(|| ObjectId::null(format));
+    let checkout_old_direct_head = checkout_direct_head(&FileRefStore::new(&git_dir, format))?;
 
     if matches!(
         track,
@@ -432,6 +447,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             let from = checkout_reflog_from_name(&store);
             let config = read_repo_config(&git_dir)?;
             prefetch_local_promisor_checkout_blobs(&git_dir, format, &config, &target_oid)?;
+            let old_head_direct = checkout_direct_head(&store)?;
             let subject = detached_checkout_subject(&git_dir, format, &target_oid);
             let message = format!("checkout: moving from {from} to {target}").into_bytes();
             if recurse_submodules {
@@ -471,10 +487,17 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             }
             sley_sequencer::replay::remove_branch_state(&git_dir);
             if !quiet {
-                checkout_print_detached_head_advice(&config, target);
+                checkout_print_previous_detached_head(
+                    &git_dir,
+                    format,
+                    &store,
+                    &config,
+                    old_head_direct,
+                    &target_oid,
+                )?;
                 eprintln!(
                     "HEAD is now at {} {}",
-                    format_log_abbrev_oid(&target_oid),
+                    checkout_format_abbrev_oid(&git_dir, format, &config, &target_oid)?,
                     subject
                 );
             }
@@ -505,11 +528,20 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             // branch switch. git detaches HEAD at the resolved commit; treating it
             // as a branch name would mint a bogus `refs/heads/A^0` symref.
             let store = FileRefStore::new(&git_dir, format);
+            let attached_current_branch = if matches!(branch.as_str(), "HEAD" | "@") {
+                store.current_branch()?
+            } else {
+                None
+            };
             let is_branch = branch_ref_name(branch)
                 .ok()
                 .and_then(|name| sley_refs::resolve_ref_peeled(&store, &name).ok().flatten())
                 .is_some();
-            if !is_branch
+            if let Some(current_branch) = attached_current_branch {
+                CheckoutMessage::Existing {
+                    branch: current_branch,
+                }
+            } else if !is_branch
                 && branch.contains("@{")
                 && let Ok(Some(refname)) =
                     sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, branch)
@@ -524,6 +556,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             {
                 let config = read_repo_config(&git_dir)?;
                 prefetch_local_promisor_checkout_blobs(&git_dir, format, &config, &target_oid)?;
+                let old_head_direct = checkout_direct_head(&store)?;
                 let subject = detached_checkout_subject(&git_dir, format, &target_oid);
                 let from = checkout_reflog_from_name(&store);
                 let message = format!("checkout: moving from {from} to {branch}").into_bytes();
@@ -564,10 +597,21 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 }
                 sley_sequencer::replay::remove_branch_state(&git_dir);
                 if !quiet {
-                    checkout_print_detached_head_advice(&config, branch);
+                    if old_head_direct.is_none() {
+                        checkout_print_detached_head_advice(&config, branch);
+                    } else {
+                        checkout_print_previous_detached_head(
+                            &git_dir,
+                            format,
+                            &store,
+                            &config,
+                            old_head_direct,
+                            &target_oid,
+                        )?;
+                    }
                     eprintln!(
                         "HEAD is now at {} {}",
-                        format_log_abbrev_oid(&target_oid),
+                        checkout_format_abbrev_oid(&git_dir, format, &config, &target_oid)?,
                         subject
                     );
                 }
@@ -763,6 +807,14 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     run_post_checkout_hook(&checkout_old_head, &checkout_new_head, true)?;
     commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
     if !quiet {
+        checkout_print_previous_detached_head(
+            &git_dir,
+            format,
+            &store,
+            &config,
+            checkout_old_direct_head,
+            &checkout_new_head,
+        )?;
         checkout_message.print();
     }
     checkout_show_branch_tracking(&git_dir, format, branch, quiet)?;
@@ -851,6 +903,147 @@ fn checkout_print_detached_head_advice(config: &GitConfig, target: &str) {
     eprintln!();
     eprintln!("Turn off this advice by setting config variable advice.detachedHead to false");
     eprintln!();
+}
+
+fn checkout_direct_head(store: &FileRefStore) -> Result<Option<ObjectId>> {
+    Ok(match store.read_ref("HEAD")? {
+        Some(RefTarget::Direct(oid)) => Some(oid),
+        _ => None,
+    })
+}
+
+fn checkout_print_previous_detached_head(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    config: &GitConfig,
+    old_head: Option<ObjectId>,
+    new_head: &ObjectId,
+) -> Result<()> {
+    let Some(old_head) = old_head else {
+        return Ok(());
+    };
+    if checkout_warn_orphaned_detached_commits(git_dir, format, store, config, &old_head, new_head)?
+    {
+        return Ok(());
+    }
+    eprintln!(
+        "Previous HEAD position was {} {}",
+        checkout_format_abbrev_oid(git_dir, format, config, &old_head)?,
+        detached_checkout_subject(git_dir, format, &old_head)
+    );
+    Ok(())
+}
+
+fn checkout_warn_orphaned_detached_commits(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    config: &GitConfig,
+    old_head: &ObjectId,
+    new_head: &ObjectId,
+) -> Result<bool> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let old_commits = match sley_rev::walk_commit_metadata(git_dir, format, &db, [*old_head], false)
+    {
+        Ok(commits) => commits,
+        Err(_) => return Ok(false),
+    };
+    let mut protected_roots = Vec::new();
+    protected_roots.push(*new_head);
+    for reference in store.list_all_refs()? {
+        if reference.name == "HEAD" {
+            continue;
+        }
+        if let Some(oid) = sley_refs::resolve_ref_peeled(store, &reference.name)?
+            && let Ok(commit_oid) = sley_rev::peel_to_commit(&db, format, &oid)
+        {
+            protected_roots.push(commit_oid);
+        }
+    }
+    let protected = sley_rev::walk_commit_metadata(git_dir, format, &db, protected_roots, false)?
+        .into_iter()
+        .map(|commit| commit.oid)
+        .collect::<HashSet<_>>();
+    let orphaned = old_commits
+        .into_iter()
+        .filter(|commit| !protected.contains(&commit.oid))
+        .collect::<Vec<_>>();
+    if orphaned.is_empty() {
+        return Ok(false);
+    }
+
+    let noun = if orphaned.len() == 1 {
+        "1 commit"
+    } else {
+        return checkout_print_multi_orphan_warning(git_dir, format, config, &orphaned);
+    };
+    eprintln!("Warning: you are leaving {noun} behind, not connected to");
+    eprintln!("any of your branches:");
+    eprintln!();
+    for commit in orphaned.iter().take(4) {
+        eprintln!(
+            "  {} {}",
+            checkout_format_abbrev_oid(git_dir, format, config, &commit.oid)?,
+            detached_checkout_subject(git_dir, format, &commit.oid)
+        );
+    }
+    eprintln!();
+    eprintln!("If you want to keep it by creating a new branch, this may be a good time");
+    eprintln!("to do so with:");
+    eprintln!();
+    eprintln!(" git branch <new-branch-name> {}", old_head.to_hex());
+    Ok(true)
+}
+
+fn checkout_print_multi_orphan_warning(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    orphaned: &[sley_rev::CommitMetadata],
+) -> Result<bool> {
+    eprintln!(
+        "Warning: you are leaving {} commits behind, not connected to",
+        orphaned.len()
+    );
+    eprintln!("any of your branches:");
+    eprintln!();
+    for commit in orphaned.iter().take(4) {
+        eprintln!(
+            "  {} {}",
+            checkout_format_abbrev_oid(git_dir, format, config, &commit.oid)?,
+            detached_checkout_subject(git_dir, format, &commit.oid)
+        );
+    }
+    eprintln!();
+    eprintln!("If you want to keep them by creating a new branch, this may be a good time");
+    eprintln!("to do so with:");
+    eprintln!();
+    eprintln!(
+        " git branch <new-branch-name> {}",
+        orphaned
+            .first()
+            .map(|commit| commit.oid.to_hex())
+            .unwrap_or_default()
+    );
+    Ok(true)
+}
+
+fn checkout_format_abbrev_oid(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    oid: &ObjectId,
+) -> Result<String> {
+    let hex = oid.to_hex();
+    let width = repository_abbrev_from_config(git_dir, format, config)?.unwrap_or(hex.len());
+    let mut abbreviated = hex[..width.min(hex.len())].to_string();
+    if abbreviated.len() < hex.len()
+        && env::var("GIT_PRINT_SHA1_ELLIPSIS").is_ok_and(|value| value.eq_ignore_ascii_case("yes"))
+    {
+        abbreviated.push_str("...");
+    }
+    Ok(abbreviated)
 }
 
 fn checkout_track_branch_name(store: &FileRefStore, upstream: &str) -> Result<String> {
