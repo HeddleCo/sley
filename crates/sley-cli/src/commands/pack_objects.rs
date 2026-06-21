@@ -60,6 +60,29 @@ struct PackObjectsOptions {
     write_bitmap_index: bool,
     name_hash_version: Option<i32>,
     max_pack_size: Option<u64>,
+    object_filter: PackObjectFilter,
+    filter_print_omitted: bool,
+    missing_action: PackObjectsMissingAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PackObjectsMissingAction {
+    #[default]
+    Error,
+    AllowAny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum PackObjectFilter {
+    #[default]
+    None,
+    BlobNone,
+    BlobLimit(usize),
+    ObjectType(ObjectType),
+    TreeDepth(usize),
+    SparseOid(String),
+    Sparse(Vec<Vec<u8>>),
+    Combine(Vec<PackObjectFilter>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +120,23 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
                 options.write_bitmap_index = true;
             }
             "--no-write-bitmap-index" if !saw_dashdash => options.write_bitmap_index = false,
+            "--no-filter" if !saw_dashdash => options.object_filter = PackObjectFilter::None,
+            "--filter-print-omitted" if !saw_dashdash => options.filter_print_omitted = true,
+            value if !saw_dashdash && value.starts_with("--filter=") => {
+                let parsed = PackObjectFilter::parse(&value["--filter=".len()..])?;
+                options.object_filter =
+                    std::mem::take(&mut options.object_filter).combine_with(parsed);
+            }
+            "--missing=error" if !saw_dashdash => {
+                options.missing_action = PackObjectsMissingAction::Error;
+            }
+            "--missing=allow-any" | "--missing=allow-promisor" if !saw_dashdash => {
+                options.missing_action = PackObjectsMissingAction::AllowAny;
+            }
+            value if !saw_dashdash && value.starts_with("--missing=") => {
+                eprintln!("fatal: invalid value for --missing");
+                return Err(GitError::Exit(128));
+            }
             "--stdin" if !saw_dashdash => {
                 eprintln!("fatal: disallowed abbreviated or ambiguous option 'stdin'");
                 return Err(GitError::Exit(129));
@@ -220,6 +260,8 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let database = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    options.object_filter = std::mem::take(&mut options.object_filter)
+        .resolve(&git_dir, &database, format)?;
     let progress = options
         .progress
         .unwrap_or_else(|| io::stderr().is_terminal());
@@ -727,38 +769,31 @@ fn collect_traversal_objects(
     // Uninteresting closure first: tolerant of missing objects (upstream
     // never needs to open the have side's missing history).
     let excluded = tolerant_reachable_closure(database, format, &haves)?;
-    let mut want_oids: Vec<ObjectId> = Vec::new();
-    let mut want_objects: Vec<Arc<EncodedObject>> = Vec::new();
-    let mut want_set: HashSet<ObjectId> = HashSet::new();
+    let mut traversal_state = FilteredPackTraversalState::default();
     {
-        let mut pending: Vec<ObjectId> = wants.iter().rev().copied().collect();
-        while let Some(oid) = pending.pop() {
-            if excluded.contains(&oid) || !want_set.insert(oid) {
-                continue;
-            }
-            let object = database.read_object(&oid)?;
-            match object.object_type {
-                ObjectType::Commit => {
-                    let commit = Commit::parse_ref(format, &object.body)?;
-                    pending.extend(commit.parents.iter().rev());
-                    pending.push(commit.tree);
-                }
-                ObjectType::Tree => {
-                    for entry in TreeEntries::new(format, &object.body) {
-                        let entry = entry?;
-                        if !entry.is_gitlink() {
-                            pending.push(entry.oid);
-                        }
-                    }
-                }
-                ObjectType::Tag => {
-                    let tag = Tag::parse_ref(format, &object.body)?;
-                    pending.push(tag.object);
-                }
-                ObjectType::Blob => {}
-            }
-            want_oids.push(oid);
-            want_objects.push(object);
+        let walk = FilteredPackTraversal {
+            database,
+            format,
+            filter: &options.object_filter,
+            missing_action: options.missing_action,
+            excluded: &excluded,
+        };
+        for oid in wants.iter().rev() {
+            walk.visit_oid(*oid, Vec::new(), 0, true, &mut traversal_state)?;
+        }
+    }
+    let FilteredPackTraversalState {
+        mut want_oids,
+        mut want_objects,
+        mut want_set,
+        omitted_oids,
+        ..
+    } = traversal_state;
+    if options.filter_print_omitted {
+        let mut omitted: Vec<_> = omitted_oids.into_iter().collect();
+        omitted.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        for oid in omitted {
+            eprintln!("~{oid}");
         }
     }
 
@@ -784,6 +819,7 @@ fn collect_traversal_objects(
         && !options.honor_pack_keep
         && !options.incremental
         && !options.unpacked
+        && options.object_filter == PackObjectFilter::None
         && options.use_bitmap_index != Some(false)
         && let Some(candidates) = find_verbatim_reusable_packs(
             common_git_dir,
@@ -816,6 +852,510 @@ fn collect_traversal_objects(
     }
 
     Ok((want_oids, want_objects, reused_packs))
+}
+
+impl PackObjectFilter {
+    fn parse(spec: &str) -> Result<Self> {
+        if spec == "blob:none" {
+            return Ok(Self::BlobNone);
+        }
+        if let Some(value) = spec.strip_prefix("blob:limit=") {
+            return Ok(Self::BlobLimit(parse_pack_filter_size(value)?));
+        }
+        if let Some(value) = spec.strip_prefix("tree:") {
+            return Ok(Self::TreeDepth(parse_pack_filter_depth(value)?));
+        }
+        if let Some(value) = spec.strip_prefix("object:type=") {
+            return Ok(Self::ObjectType(parse_pack_filter_object_type(value)?));
+        }
+        if let Some(value) = spec.strip_prefix("sparse:oid=") {
+            return Ok(Self::SparseOid(value.to_string()));
+        }
+        if spec.starts_with("sparse:path=") {
+            eprintln!("fatal: sparse:path filters support has been dropped");
+            return Err(GitError::Exit(128));
+        }
+        if let Some(value) = spec.strip_prefix("combine:") {
+            if value.is_empty() {
+                eprintln!("fatal: expected something after combine:");
+                return Err(GitError::Exit(128));
+            }
+            let mut filters = Vec::new();
+            for raw in value.split('+') {
+                let decoded = pack_filter_decode_sub_filter(raw)?;
+                filters.push(Self::parse(&decoded)?);
+            }
+            return Ok(Self::Combine(filters));
+        }
+        eprintln!("fatal: invalid filter-spec '{spec}'");
+        Err(GitError::Exit(128))
+    }
+
+    fn combine_with(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::None, filter) | (filter, Self::None) => filter,
+            (Self::Combine(mut filters), Self::Combine(mut more)) => {
+                filters.append(&mut more);
+                Self::Combine(filters)
+            }
+            (Self::Combine(mut filters), filter) | (filter, Self::Combine(mut filters)) => {
+                filters.push(filter);
+                Self::Combine(filters)
+            }
+            (left, right) => Self::Combine(vec![left, right]),
+        }
+    }
+
+    fn resolve(
+        self,
+        git_dir: &Path,
+        database: &FileObjectDatabase,
+        format: ObjectFormat,
+    ) -> Result<Self> {
+        match self {
+            Self::SparseOid(value) => {
+                let oid = if let Some((rev, path)) = value.split_once(':') {
+                    sley_rev::resolve_rev_path(git_dir, format, database, rev, path)?
+                } else {
+                    resolve_revision(git_dir, format, &value)?
+                };
+                let object = database.read_object(&oid)?;
+                if object.object_type != ObjectType::Blob {
+                    eprintln!("fatal: expected blob for sparse:oid filter");
+                    return Err(GitError::Exit(128));
+                }
+                Ok(Self::Sparse(
+                    object
+                        .body
+                        .split(|byte| *byte == b'\n')
+                        .filter(|line| !line.is_empty())
+                        .map(|line| line.to_vec())
+                        .collect(),
+                ))
+            }
+            Self::Combine(filters) => filters
+                .into_iter()
+                .map(|filter| filter.resolve(git_dir, database, format))
+                .collect::<Result<Vec<_>>>()
+                .map(Self::Combine),
+            filter => Ok(filter),
+        }
+    }
+
+    fn includes_object(
+        &self,
+        object_type: ObjectType,
+        path: &[u8],
+        size: Option<usize>,
+        depth: usize,
+    ) -> bool {
+        match self {
+            Self::None => true,
+            Self::BlobNone => object_type != ObjectType::Blob,
+            Self::BlobLimit(limit) => object_type != ObjectType::Blob || size.unwrap_or(0) < *limit,
+            Self::ObjectType(wanted) => object_type == *wanted,
+            Self::TreeDepth(limit) => object_type == ObjectType::Commit || depth < *limit,
+            Self::Sparse(patterns) => {
+                object_type != ObjectType::Blob
+                    || pack_sparse_patterns_include(patterns, path, object_type)
+            }
+            Self::Combine(filters) => filters
+                .iter()
+                .all(|filter| filter.includes_object(object_type, path, size, depth)),
+            Self::SparseOid(_) => unreachable!("sparse:oid filter must be resolved before use"),
+        }
+    }
+
+    fn descends_into_tree(&self, next_depth: usize) -> bool {
+        match self {
+            Self::TreeDepth(limit) => next_depth < *limit,
+            Self::ObjectType(ObjectType::Commit | ObjectType::Tag) => false,
+            Self::Combine(filters) => filters
+                .iter()
+                .all(|filter| filter.descends_into_tree(next_depth)),
+            _ => true,
+        }
+    }
+
+    fn needs_blob_size(&self) -> bool {
+        match self {
+            Self::BlobLimit(_) => true,
+            Self::Combine(filters) => filters.iter().any(Self::needs_blob_size),
+            _ => false,
+        }
+    }
+}
+
+struct FilteredPackTraversal<'a> {
+    database: &'a FileObjectDatabase,
+    format: ObjectFormat,
+    filter: &'a PackObjectFilter,
+    missing_action: PackObjectsMissingAction,
+    excluded: &'a HashSet<ObjectId>,
+}
+
+#[derive(Default)]
+struct FilteredPackTraversalState {
+    want_oids: Vec<ObjectId>,
+    want_objects: Vec<Arc<EncodedObject>>,
+    want_set: HashSet<ObjectId>,
+    omitted_oids: HashSet<ObjectId>,
+    expanded_commits: HashSet<ObjectId>,
+    expanded_tags: HashSet<ObjectId>,
+    expanded_trees: HashSet<(ObjectId, Vec<u8>)>,
+}
+
+impl FilteredPackTraversal<'_> {
+    fn visit_oid(
+        &self,
+        oid: ObjectId,
+        path: Vec<u8>,
+        depth: usize,
+        provided: bool,
+        state: &mut FilteredPackTraversalState,
+    ) -> Result<()> {
+        if self.excluded.contains(&oid) {
+            return Ok(());
+        }
+        let object = self.database.read_object(&oid)?;
+        match object.object_type {
+            ObjectType::Commit => self.visit_commit(oid, object, provided, state),
+            ObjectType::Tree => self.visit_tree(oid, object, path, depth, provided, state),
+            ObjectType::Tag => self.visit_tag(oid, object, provided, state),
+            ObjectType::Blob => self.visit_blob(oid, path, depth, provided, Some(object), state),
+        }
+    }
+
+    fn visit_commit(
+        &self,
+        oid: ObjectId,
+        object: Arc<EncodedObject>,
+        provided: bool,
+        state: &mut FilteredPackTraversalState,
+    ) -> Result<()> {
+        if provided || self.filter.includes_object(ObjectType::Commit, &[], None, 0) {
+            self.include_object(oid, Arc::clone(&object), state);
+        } else {
+            self.omit_object(oid, state);
+        }
+        if !state.expanded_commits.insert(oid) {
+            return Ok(());
+        }
+        let commit = Commit::parse_ref(self.format, &object.body)?;
+        self.visit_tree_oid(commit.tree, Vec::new(), 0, false, state)?;
+        for parent in commit.parents {
+            self.visit_oid(parent, Vec::new(), 0, false, state)?;
+        }
+        Ok(())
+    }
+
+    fn visit_tag(
+        &self,
+        oid: ObjectId,
+        object: Arc<EncodedObject>,
+        provided: bool,
+        state: &mut FilteredPackTraversalState,
+    ) -> Result<()> {
+        if provided || self.filter.includes_object(ObjectType::Tag, &[], None, 0) {
+            self.include_object(oid, Arc::clone(&object), state);
+        } else {
+            self.omit_object(oid, state);
+        }
+        if !state.expanded_tags.insert(oid) {
+            return Ok(());
+        }
+        let tag = Tag::parse_ref(self.format, &object.body)?;
+        self.visit_oid(tag.object, Vec::new(), 0, false, state)
+    }
+
+    fn visit_tree_oid(
+        &self,
+        oid: ObjectId,
+        path: Vec<u8>,
+        depth: usize,
+        provided: bool,
+        state: &mut FilteredPackTraversalState,
+    ) -> Result<()> {
+        let object = match self.database.read_object(&oid) {
+            Ok(object) => object,
+            Err(GitError::NotFound(_)) => {
+                eprintln!("fatal: bad tree object {oid}");
+                return Err(GitError::Exit(128));
+            }
+            Err(err) => return Err(err),
+        };
+        self.visit_tree(oid, object, path, depth, provided, state)
+    }
+
+    fn visit_tree(
+        &self,
+        oid: ObjectId,
+        object: Arc<EncodedObject>,
+        path: Vec<u8>,
+        depth: usize,
+        provided: bool,
+        state: &mut FilteredPackTraversalState,
+    ) -> Result<()> {
+        let include = provided
+            || self
+                .filter
+                .includes_object(ObjectType::Tree, &path, None, depth);
+        if include {
+            self.include_object(oid, Arc::clone(&object), state);
+        } else {
+            self.omit_object(oid, state);
+        }
+        if !state.expanded_trees.insert((oid, path.clone())) {
+            return Ok(());
+        }
+        if !self.filter.descends_into_tree(depth + 1) {
+            self.omit_tree_contents(&object, &path, state)?;
+            return Ok(());
+        }
+        for entry in TreeEntries::new(self.format, &object.body) {
+            let entry = entry?;
+            if entry.is_gitlink() {
+                continue;
+            }
+            let entry_path = pack_filter_join_path(&path, entry.name);
+            let entry_type = tree_entry_object_type(entry.mode);
+            if entry_type == ObjectType::Tree {
+                self.visit_tree_oid(entry.oid, entry_path, depth + 1, false, state)?;
+            } else {
+                self.visit_blob(entry.oid, entry_path, depth + 1, false, None, state)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_blob(
+        &self,
+        oid: ObjectId,
+        path: Vec<u8>,
+        depth: usize,
+        provided: bool,
+        object: Option<Arc<EncodedObject>>,
+        state: &mut FilteredPackTraversalState,
+    ) -> Result<()> {
+        if state.want_set.contains(&oid) {
+            return Ok(());
+        }
+        let mut object = object;
+        let size = if self.filter.needs_blob_size() {
+            match object {
+                Some(ref object) => Some(object.body.len()),
+                None => match self.database.read_object(&oid) {
+                    Ok(read) => {
+                        let len = read.body.len();
+                        object = Some(read);
+                        Some(len)
+                    }
+                    Err(GitError::NotFound(_))
+                        if self.missing_action == PackObjectsMissingAction::AllowAny =>
+                    {
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err),
+                },
+            }
+        } else {
+            None
+        };
+        let include = provided
+            || self
+                .filter
+                .includes_object(ObjectType::Blob, &path, size, depth);
+        if include {
+            let object = match object {
+                Some(object) => object,
+                None => match self.database.read_object(&oid) {
+                    Ok(object) => object,
+                    Err(GitError::NotFound(_))
+                        if self.missing_action == PackObjectsMissingAction::AllowAny =>
+                    {
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err),
+                },
+            };
+            self.include_object(oid, object, state);
+        } else if !state.want_set.contains(&oid) {
+            self.omit_object(oid, state);
+        }
+        Ok(())
+    }
+
+    fn omit_tree_contents(
+        &self,
+        object: &EncodedObject,
+        path: &[u8],
+        state: &mut FilteredPackTraversalState,
+    ) -> Result<()> {
+        for entry in TreeEntries::new(self.format, &object.body) {
+            let entry = entry?;
+            if entry.is_gitlink() || state.want_set.contains(&entry.oid) {
+                continue;
+            }
+            state.omitted_oids.insert(entry.oid);
+            if tree_entry_object_type(entry.mode) == ObjectType::Tree
+                && let Ok(child) = self.database.read_object(&entry.oid)
+            {
+                let entry_path = pack_filter_join_path(path, entry.name);
+                self.omit_tree_contents(&child, &entry_path, state)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn include_object(
+        &self,
+        oid: ObjectId,
+        object: Arc<EncodedObject>,
+        state: &mut FilteredPackTraversalState,
+    ) {
+        if state.want_set.insert(oid) {
+            state.want_oids.push(oid);
+            state.want_objects.push(object);
+        }
+        state.omitted_oids.remove(&oid);
+    }
+
+    fn omit_object(&self, oid: ObjectId, state: &mut FilteredPackTraversalState) {
+        if !state.want_set.contains(&oid) {
+            state.omitted_oids.insert(oid);
+        }
+    }
+}
+
+fn parse_pack_filter_size(value: &str) -> Result<usize> {
+    let Some(parsed) = git_parse_unsigned_with_suffix(value) else {
+        eprintln!("fatal: invalid filter-spec 'blob:limit={value}'");
+        return Err(GitError::Exit(128));
+    };
+    usize::try_from(parsed).map_err(|_| {
+        eprintln!("fatal: invalid filter-spec 'blob:limit={value}'");
+        GitError::Exit(128)
+    })
+}
+
+fn parse_pack_filter_depth(value: &str) -> Result<usize> {
+    let Some(parsed) = git_parse_unsigned_with_suffix(value) else {
+        eprintln!("fatal: expected 'tree:<depth>'");
+        return Err(GitError::Exit(128));
+    };
+    usize::try_from(parsed).map_err(|_| {
+        eprintln!("fatal: expected 'tree:<depth>'");
+        GitError::Exit(128)
+    })
+}
+
+fn parse_pack_filter_object_type(value: &str) -> Result<ObjectType> {
+    match value {
+        "commit" => Ok(ObjectType::Commit),
+        "tree" => Ok(ObjectType::Tree),
+        "blob" => Ok(ObjectType::Blob),
+        "tag" => Ok(ObjectType::Tag),
+        _ => {
+            eprintln!("fatal: '{value}' for 'object:type=<type>' is not a valid object type");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn git_parse_unsigned_with_suffix(value: &str) -> Option<u64> {
+    if value.is_empty() || value.contains('-') {
+        return None;
+    }
+    let (digits, factor) = match value.as_bytes()[value.len() - 1] {
+        b'k' | b'K' => (&value[..value.len() - 1], 1024u64),
+        b'm' | b'M' => (&value[..value.len() - 1], 1024 * 1024),
+        b'g' | b'G' => (&value[..value.len() - 1], 1024 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    let base = parse_git_unsigned_base0(digits)?;
+    base.checked_mul(factor)
+}
+
+fn parse_git_unsigned_base0(value: &str) -> Option<u64> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    if value.len() > 1 && value.starts_with('0') {
+        return u64::from_str_radix(&value[1..], 8).ok();
+    }
+    value.parse::<u64>().ok()
+}
+
+fn pack_filter_decode_sub_filter(raw: &str) -> Result<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'@' | b'`' | b'~' => {
+                eprintln!(
+                    "fatal: must escape char in sub-filter-spec: '{}'",
+                    bytes[idx] as char
+                );
+                return Err(GitError::Exit(128));
+            }
+            b'%' => {
+                let Some(high) = bytes
+                    .get(idx + 1)
+                    .and_then(|byte| (*byte as char).to_digit(16))
+                else {
+                    eprintln!("fatal: invalid filter-spec");
+                    return Err(GitError::Exit(128));
+                };
+                let Some(low) = bytes
+                    .get(idx + 2)
+                    .and_then(|byte| (*byte as char).to_digit(16))
+                else {
+                    eprintln!("fatal: invalid filter-spec");
+                    return Err(GitError::Exit(128));
+                };
+                out.push((high * 16 + low) as u8);
+                idx += 3;
+            }
+            byte => {
+                out.push(byte);
+                idx += 1;
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+fn pack_sparse_patterns_include(
+    patterns: &[Vec<u8>],
+    path: &[u8],
+    object_type: ObjectType,
+) -> bool {
+    if path.is_empty() {
+        return object_type == ObjectType::Tree;
+    }
+    patterns.iter().any(|pattern| {
+        if pattern.ends_with(b"/") {
+            let dir = &pattern[..pattern.len() - 1];
+            path == dir || path.starts_with(pattern)
+        } else {
+            path == pattern
+        }
+    })
+}
+
+fn pack_filter_join_path(prefix: &[u8], name: &[u8]) -> Vec<u8> {
+    if prefix.is_empty() {
+        return name.to_vec();
+    }
+    let mut path = Vec::with_capacity(prefix.len() + 1 + name.len());
+    path.extend_from_slice(prefix);
+    path.push(b'/');
+    path.extend_from_slice(name);
+    path
 }
 
 struct ReusablePackCandidate {
