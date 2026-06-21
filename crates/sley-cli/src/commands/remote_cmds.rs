@@ -3353,7 +3353,7 @@ fn parse_fetch_jobs(value: &str) -> Result<Option<usize>> {
 pub(crate) fn resolve_fetch_recurse_submodules(
     config: &GitConfig,
     cli: FetchRecurseSubmodules,
-    default_mode: FetchRecurseSubmodules,
+    _default_mode: FetchRecurseSubmodules,
 ) -> FetchRecurseSubmodules {
     if cli != FetchRecurseSubmodules::Default {
         return cli;
@@ -3370,7 +3370,7 @@ pub(crate) fn resolve_fetch_recurse_submodules(
             return mode;
         }
     }
-    default_mode
+    FetchRecurseSubmodules::Default
 }
 
 pub(crate) struct FetchSubmoduleRequest<'a> {
@@ -3433,7 +3433,13 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
             FetchRecurseSubmodules::On => true,
             FetchRecurseSubmodules::OnDemand => req.changed_gitlinks.contains(&submodule.path),
             FetchRecurseSubmodules::Default => {
-                req.default_recurse_submodules == FetchRecurseSubmodules::On
+                match req.default_recurse_submodules {
+                    FetchRecurseSubmodules::On => true,
+                    FetchRecurseSubmodules::OnDemand => {
+                        req.changed_gitlinks.contains(&submodule.path)
+                    }
+                    FetchRecurseSubmodules::Default | FetchRecurseSubmodules::Off => false,
+                }
             }
             FetchRecurseSubmodules::Off => false,
         };
@@ -3469,13 +3475,29 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
             changed_gitlinks_for_fetch(&sub_git_dir, sub_format, &before_sub_refs, &outcome)?;
         let nested_prefix = format!("{}{}{}", req.submodule_prefix, submodule.path, "/");
         let nested_config = read_repo_config(&sub_git_dir)?;
+        let nested_default_recurse_submodules = match mode {
+            FetchRecurseSubmodules::Default => req.default_recurse_submodules,
+            FetchRecurseSubmodules::OnDemand => FetchRecurseSubmodules::OnDemand,
+            FetchRecurseSubmodules::On => FetchRecurseSubmodules::On,
+            FetchRecurseSubmodules::Off => FetchRecurseSubmodules::Off,
+        };
+        let nested_recurse_submodules = if req.recurse_submodules == FetchRecurseSubmodules::Default
+        {
+            resolve_fetch_recurse_submodules(
+                &nested_config,
+                FetchRecurseSubmodules::Default,
+                nested_default_recurse_submodules,
+            )
+        } else {
+            req.recurse_submodules
+        };
         fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
             git_dir: &sub_git_dir,
             format: sub_format,
             worktree_root: &submodule_root,
             config: &nested_config,
-            recurse_submodules: mode,
-            default_recurse_submodules: req.default_recurse_submodules,
+            recurse_submodules: nested_recurse_submodules,
+            default_recurse_submodules: nested_default_recurse_submodules,
             source: &sub_source,
             changed_gitlinks: nested_changed_gitlinks,
             options: &sub_options,
