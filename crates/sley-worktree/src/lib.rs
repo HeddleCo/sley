@@ -314,6 +314,14 @@ pub fn submodule_dirt(sub_root: &Path) -> u8 {
     dirt
 }
 
+fn embedded_repo_object_format(sub_root: &Path) -> Option<ObjectFormat> {
+    let git_dir = sley_diff_merge::gitlink_git_dir(sub_root)?;
+    sley_config::read_repo_config(&git_dir, None)
+        .ok()?
+        .repository_object_format()
+        .ok()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StatusUntrackedMode {
     #[default]
@@ -1891,6 +1899,12 @@ fn update_index_paths_impl(
             // process_directory).
             let display = String::from_utf8_lossy(&git_path).into_owned();
             let has_dot_git = absolute.join(".git").exists();
+            if let Some(submodule_format) = embedded_repo_object_format(&absolute)
+                && submodule_format != format
+            {
+                eprintln!("fatal: cannot add a submodule of a different hash algorithm");
+                return Err(GitError::Exit(128));
+            }
             let Some(head_oid) = sley_diff_merge::gitlink_head_oid(&absolute, format) else {
                 if has_dot_git {
                     eprintln!("error: '{display}' does not have a commit checked out");
