@@ -3386,13 +3386,16 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     let mut upload_pack_command = None::<String>;
     let mut server_options = Vec::<String>::new();
     let mut server_options_from_cli = false;
-    // `git fetch --all`: fetch from every configured remote in turn.
-    let mut fetch_all_remotes = false;
+    // `git fetch --all`/`--multiple`: fetch from a resolved list of remotes.
+    let mut fetch_all_remotes = None::<bool>;
+    let mut fetch_multiple = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--all" if source.is_none() => fetch_all_remotes = true,
-            "--no-all" if source.is_none() => fetch_all_remotes = false,
+            "--all" if source.is_none() => fetch_all_remotes = Some(true),
+            "--no-all" if source.is_none() => fetch_all_remotes = Some(false),
+            "--multiple" | "-m" if source.is_none() => fetch_multiple = true,
+            "--no-multiple" if source.is_none() => fetch_multiple = false,
             "-q" | "--quiet" => options.quiet = true,
             "--no-quiet" => options.quiet = false,
             "--write-fetch-head" => options.write_fetch_head = true,
@@ -3620,71 +3623,72 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     {
         options.update_head_ok = true;
     }
-    // `git fetch --all`: iterate every configured remote, fetching each with its
-    // own configured refspecs. An explicit `<remote>` is incompatible.
+    let config = read_repo_config(&git_dir)?;
+    let all_from_config = source.is_none()
+        && fetch_all_remotes.is_none()
+        && config.get_bool("fetch", None, "all").unwrap_or(false);
+    let fetch_all_remotes = fetch_all_remotes.unwrap_or(false) || all_from_config;
+    if fetch_multiple && fetch_all_remotes {
+        eprintln!("fatal: --multiple and --all cannot be used together");
+        return Err(GitError::Exit(128));
+    }
     if fetch_all_remotes {
         if source.is_some() {
             eprintln!("fatal: fetch --all does not take a repository argument");
             return Err(GitError::Exit(128));
         }
-        let config = read_repo_config(&git_dir)?;
-        for remote in remote_names(&config) {
-            let mut remote_options = options.clone();
-            if !filter_option_explicit {
-                apply_configured_partial_clone_filter(&config, &remote, &mut remote_options);
-            }
-            if refspecs.is_empty() && !prefetch {
-                remote_options.merge_srcs =
-                    current_branch_merge_for_remote(&git_dir, format, &remote);
-            }
-            let effective_refspecs = if prefetch {
-                prefetch_refspecs(&config, &remote, &refspecs)
-            } else {
-                refspecs.clone()
-            };
-            let before_fetch_refs = fetch_ref_snapshot(&git_dir, format)?;
-            let remote_server_options = if server_options_from_cli {
-                server_options.clone()
-            } else {
-                configured_server_options(&config, &remote)?
-            };
-            if server_options_from_cli && configured_legacy_protocol(Some(&config)) {
-                eprintln!("fatal: server options require protocol version 2 or later");
-                eprintln!("fatal: see protocol.version in 'git help config' for more details");
-                return Err(GitError::Exit(128));
-            }
-            let outcome = fetch_one_source_with_outcome(
-                &git_dir,
-                format,
-                &remote,
-                &effective_refspecs,
-                remote_options.clone(),
-                &remote_server_options,
-            )?;
-            let recurse_submodules = resolve_fetch_recurse_submodules(
-                &config,
-                recurse_submodules_cli,
-                recurse_submodules_default,
-            );
-            fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
-                git_dir: &git_dir,
-                format,
-                worktree_root: &cwd,
-                config: &config,
-                recurse_submodules,
-                default_recurse_submodules: recurse_submodules_default,
-                source: &remote,
-                changed_gitlinks: changed_gitlinks_for_fetch(
-                    &git_dir,
-                    format,
-                    &before_fetch_refs,
-                    &outcome,
-                )?,
-                options: &remote_options,
-                submodule_prefix: &submodule_prefix,
-                jobs,
-            })?;
+        if !refspecs.is_empty() {
+            eprintln!("fatal: fetch --all does not make sense with refspecs");
+            return Err(GitError::Exit(128));
         }
+        let remotes = fetch_all_remote_names(&config);
+        fetch_multiple_remotes(FetchMultipleRequest {
+            git_dir: &git_dir,
+            format,
+            worktree_root: &cwd,
+            config: &config,
+            remotes,
+            refspecs: &refspecs,
+            options: &options,
+            prefetch,
+            filter_option_explicit,
+            recurse_submodules_cli,
+            recurse_submodules_default,
+            submodule_prefix: &submodule_prefix,
+            jobs,
+            server_options: &server_options,
+            server_options_from_cli,
+        })?;
+        if options.refetch {
+            trace2_fetch_refetch_maintenance();
+        }
+        return Ok(());
+    }
+    if fetch_multiple && source.is_none() {
+        fetch_multiple = false;
+    }
+    if fetch_multiple {
+        let mut names = Vec::new();
+        names.push(source.take().unwrap());
+        names.extend(refspecs.drain(..));
+        let remotes = resolve_remote_or_group_names(&config, &names)?;
+        fetch_multiple_remotes(FetchMultipleRequest {
+            git_dir: &git_dir,
+            format,
+            worktree_root: &cwd,
+            config: &config,
+            remotes,
+            refspecs: &refspecs,
+            options: &options,
+            prefetch,
+            filter_option_explicit,
+            recurse_submodules_cli,
+            recurse_submodules_default,
+            submodule_prefix: &submodule_prefix,
+            jobs,
+            server_options: &server_options,
+            server_options_from_cli,
+        })?;
         if options.refetch {
             trace2_fetch_refetch_maintenance();
         }
@@ -3720,7 +3724,6 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         let config = read_repo_config(&git_dir)?;
         apply_configured_partial_clone_filter(&config, &source, &mut options);
     }
-    let config = read_repo_config(&git_dir)?;
     let effective_refspecs = if prefetch {
         prefetch_refspecs(&config, &source, &refspecs)
     } else {
@@ -3779,6 +3782,175 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         jobs,
     })?;
     Ok(())
+}
+
+struct FetchMultipleRequest<'a> {
+    git_dir: &'a Path,
+    format: ObjectFormat,
+    worktree_root: &'a Path,
+    config: &'a GitConfig,
+    remotes: Vec<String>,
+    refspecs: &'a [String],
+    options: &'a FetchOptions,
+    prefetch: bool,
+    filter_option_explicit: bool,
+    recurse_submodules_cli: FetchRecurseSubmodules,
+    recurse_submodules_default: FetchRecurseSubmodules,
+    submodule_prefix: &'a str,
+    jobs: Option<usize>,
+    server_options: &'a [String],
+    server_options_from_cli: bool,
+}
+
+fn fetch_multiple_remotes(req: FetchMultipleRequest<'_>) -> Result<()> {
+    if req.server_options_from_cli && configured_legacy_protocol(Some(req.config)) {
+        eprintln!("fatal: server options require protocol version 2 or later");
+        eprintln!("fatal: see protocol.version in 'git help config' for more details");
+        return Err(GitError::Exit(128));
+    }
+    trace_fetch_parallel_jobs(req.jobs.unwrap_or(1));
+    let parallel_fetch = req.jobs.is_some_and(|jobs| jobs > 1) && req.remotes.len() > 1;
+    let mut failed = false;
+    for remote in req.remotes {
+        if !req.options.quiet {
+            println!("Fetching {remote}");
+        }
+        let mut remote_options = req.options.clone();
+        remote_options.append = true;
+        if !req.filter_option_explicit {
+            apply_configured_partial_clone_filter(req.config, &remote, &mut remote_options);
+        }
+        if req.refspecs.is_empty() && !req.prefetch {
+            remote_options.merge_srcs =
+                current_branch_merge_for_remote(req.git_dir, req.format, &remote);
+        }
+        let effective_refspecs = if req.prefetch {
+            prefetch_refspecs(req.config, &remote, req.refspecs)
+        } else {
+            req.refspecs.to_vec()
+        };
+        let before_fetch_refs = fetch_ref_snapshot(req.git_dir, req.format)?;
+        let remote_server_options = if req.server_options_from_cli {
+            req.server_options.to_vec()
+        } else {
+            match configured_server_options(req.config, &remote) {
+                Ok(options) => options,
+                Err(err) => {
+                    print_fetch_failure(&remote, &err, parallel_fetch);
+                    failed = true;
+                    continue;
+                }
+            }
+        };
+        let result = fetch_one_source_with_outcome(
+            req.git_dir,
+            req.format,
+            &remote,
+            &effective_refspecs,
+            remote_options.clone(),
+            &remote_server_options,
+        );
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                print_fetch_failure(&remote, &err, parallel_fetch);
+                failed = true;
+                continue;
+            }
+        };
+        let recurse_submodules = resolve_fetch_recurse_submodules(
+            req.config,
+            req.recurse_submodules_cli,
+            req.recurse_submodules_default,
+        );
+        fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
+            git_dir: req.git_dir,
+            format: req.format,
+            worktree_root: req.worktree_root,
+            config: req.config,
+            recurse_submodules,
+            default_recurse_submodules: req.recurse_submodules_default,
+            source: &remote,
+            changed_gitlinks: changed_gitlinks_for_fetch(
+                req.git_dir,
+                req.format,
+                &before_fetch_refs,
+                &outcome,
+            )?,
+            options: &remote_options,
+            submodule_prefix: req.submodule_prefix,
+            jobs: req.jobs,
+        })?;
+    }
+    if failed {
+        return Err(GitError::Exit(1));
+    }
+    trace_fetch_maintenance();
+    Ok(())
+}
+
+fn print_fetch_failure(remote: &str, err: &GitError, parallel_fetch: bool) {
+    if parallel_fetch {
+        eprintln!("could not fetch '{remote}' (exit code: 128)");
+        return;
+    }
+    eprintln!("error: could not fetch {remote}");
+    print_fetch_failure_detail(err);
+}
+
+fn print_fetch_failure_detail(err: &GitError) {
+    match err {
+        GitError::Exit(_) => {}
+        GitError::Cli(_, message) | GitError::Command(message) => eprintln!("{message}"),
+        other => eprintln!("{other}"),
+    }
+}
+
+fn fetch_all_remote_names(config: &GitConfig) -> Vec<String> {
+    remote_names(config)
+        .into_iter()
+        .filter(|name| {
+            !config
+                .get_bool("remote", Some(name), "skipfetchall")
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn resolve_remote_or_group_names(config: &GitConfig, names: &[String]) -> Result<Vec<String>> {
+    let mut remotes = Vec::new();
+    for name in names {
+        let before = remotes.len();
+        if let Some(group) = config.get("remotes", None, name) {
+            for remote in group.split_whitespace() {
+                push_unique_remote(&mut remotes, remote.to_string());
+            }
+        }
+        if remotes.len() == before {
+            if !remote_exists(config, name) {
+                eprintln!("fatal: no such remote or remote group: {name}");
+                return Err(GitError::Exit(128));
+            }
+            push_unique_remote(&mut remotes, name.clone());
+        }
+    }
+    Ok(remotes)
+}
+
+fn push_unique_remote(remotes: &mut Vec<String>, name: String) {
+    if !remotes.contains(&name) {
+        remotes.push(name);
+    }
+}
+
+fn trace_fetch_parallel_jobs(jobs: usize) {
+    trace_fetch_line(&format!(
+        "trace: run_processes_parallel: preparing to run up to {jobs} tasks\n"
+    ));
+}
+
+fn trace_fetch_maintenance() {
+    trace_fetch_line("trace: built-in: git maintenance run --auto --no-quiet\n");
 }
 
 fn fetch_pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
@@ -8760,12 +8932,19 @@ fn repo_config_with_transport_policy(git_dir: &Path) -> Result<GitConfig> {
 
 pub(crate) fn ls_remote_git_dir(repository: &str) -> Result<PathBuf> {
     let cwd = env::current_dir()?;
+    let local_git_dir = discover_git_dir(&cwd).ok();
+    if let Some(git_dir) = local_git_dir.as_deref() {
+        let config = read_repo_config(git_dir)?;
+        if remote_exists(&config, repository) {
+            return local_remote_git_dir(&config, repository, git_dir);
+        }
+    }
     if let Ok(path) = ls_remote_repository_path(repository, &cwd)
         && let Ok(git_dir) = local_repository_git_dir_path(&path)
     {
         return Ok(git_dir);
     }
-    let local_git_dir = discover_git_dir(&cwd)?;
+    let local_git_dir = local_git_dir.ok_or_else(|| GitError::repository_not_found("not a git repository"))?;
     let config = read_repo_config(&local_git_dir)?;
     let rewritten = rewrite_url_with_config(&config, repository, false);
     if rewritten != repository
