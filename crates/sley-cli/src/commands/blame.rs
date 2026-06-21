@@ -34,6 +34,7 @@
 // reach its ancestor module's private items, so everything visible at the crate
 // root is in scope here without re-listing it.
 use crate::*;
+use sley_core::Signature;
 use sley_object::TreeEntries;
 
 /// What to print in the metadata column for each line's author.
@@ -92,6 +93,17 @@ struct BlameOptions {
     /// Force progress reporting to stderr (`--progress`); `--no-progress`
     /// clears it.
     progress: bool,
+    /// Number of `-C` options seen. Git treats the second and third `-C` as
+    /// progressively broader copy searches.
+    copy_level: u8,
+    /// Minimum alphanumeric score for `-C` copy matching.
+    copy_score: usize,
+    /// `-f` / `--show-name`: show the origin path before the line number.
+    show_name: bool,
+    /// `-p` / `--porcelain`: emit machine-readable grouped records.
+    porcelain: bool,
+    /// `--line-porcelain`: porcelain with metadata repeated for each line.
+    line_porcelain: bool,
     /// Whether the author column (`-e`/`--show-email`/`--no-show-email`) was set
     /// on the command line; if not, `blame.showEmail` config supplies the
     /// default.
@@ -131,6 +143,10 @@ struct LineBlame {
     commit: ObjectId,
     /// Whether that commit is a rendered boundary (root, absent `--root`).
     boundary: bool,
+    /// Path in the blamed origin.
+    origin_path: String,
+    /// 1-based line number in the blamed origin.
+    origin_lineno: usize,
     /// The raw line bytes, including a trailing newline when present.
     content: Vec<u8>,
 }
@@ -193,6 +209,17 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
             let tip = sley_rev::peel_to_commit(db, format, &oid)?;
             ("HEAD".to_string(), Some(tip))
         }
+        Some(r) if r.contains("..") => {
+            let (left, right) = r.split_once("..").unwrap_or((r, ""));
+            let start = if right.is_empty() { "HEAD" } else { right };
+            let boundary = if left.is_empty() {
+                None
+            } else {
+                let oid = repo.resolve_revision(left)?;
+                Some(sley_rev::peel_to_commit(db, format, &oid)?)
+            };
+            (start.to_string(), boundary)
+        }
         Some(r) => (r.clone(), None),
         None => ("HEAD".to_string(), None),
     };
@@ -216,15 +243,18 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
     // lands, route that worktree-sourced content through
     // `sley_worktree::apply_clean_filter` before it enters `compute_blame`.
     let repo_path = blame_repo_relative_path(cwd, git_dir, &path)?;
-    let final_blob = match read_path_blob(db, format, &start_commit, &repo_path)? {
-        Some(blob) => blob,
-        None => {
+    let (final_blob, virtual_final) = match read_path_blob(db, format, &start_commit, &repo_path)? {
+        Some(blob) => (blob, false),
+        None => match read_index_blob(git_dir, db, format, &repo_path)? {
+            Some(blob) if rev.is_none() || rev_spec == "HEAD" => (blob, true),
+            _ => {
             // git reports the repository-relative path here, not the literal
             // argument (so blaming a missing file from a subdirectory still
             // names `<dir>/<file>`).
             eprintln!("fatal: no such path '{repo_path}' in {rev_spec}");
             return Err(GitError::Exit(128));
         }
+        },
     };
 
     let lines = compute_blame(
@@ -235,6 +265,9 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         &final_blob,
         options.first_parent,
         boundary_tip,
+        options.copy_level,
+        options.copy_score,
+        virtual_final,
     )?;
 
     // Resolve the -L ranges against the real line count, then render. The
@@ -271,6 +304,11 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
     let mut compat = false;
     let mut blank_boundary = false;
     let mut progress = false;
+    let mut copy_level = 0u8;
+    let mut copy_score = 40usize;
+    let mut show_name = false;
+    let mut porcelain = false;
+    let mut line_porcelain = false;
     // Positionals collected before `--`; afterwards everything is a path.
     let mut positionals: Vec<String> = Vec::new();
     let mut paths_after_dd: Vec<String> = Vec::new();
@@ -301,6 +339,12 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
             "--first-parent" => first_parent = true,
             "-c" => compat = true,
             "-b" => blank_boundary = true,
+            "-f" | "--show-name" => show_name = true,
+            "-p" | "--porcelain" => porcelain = true,
+            "--line-porcelain" => {
+                porcelain = true;
+                line_porcelain = true;
+            }
             "--progress" => progress = true,
             "--no-progress" => progress = false,
             "--abbrev" => abbrev_override = Some(0),
@@ -320,6 +364,12 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
             other if other.starts_with("-L") => {
                 // Attached form: `-L1,3`.
                 ranges.push(parse_line_range(&other[2..])?);
+            }
+            other if other == "-C" || is_blame_copy_option(other) => {
+                copy_level = copy_level.saturating_add(1);
+                if other.len() > 2 {
+                    copy_score = other[2..].parse::<usize>().unwrap_or(copy_score);
+                }
             }
             // Options we recognize from git but do not implement. Reject them
             // explicitly rather than misinterpreting them as a path.
@@ -369,6 +419,11 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
         compat,
         blank_boundary,
         progress,
+        copy_level,
+        copy_score,
+        show_name,
+        porcelain,
+        line_porcelain,
         author_field_explicit,
     }))
 }
@@ -416,11 +471,7 @@ fn resolve_positionals(
 fn is_unsupported_blame_option(arg: &str) -> bool {
     if matches!(
         arg,
-        "-p" | "--porcelain"
-            | "--line-porcelain"
-            | "--incremental"
-            | "-f"
-            | "--show-name"
+        "--incremental"
             | "-n"
             | "--show-number"
             | "-w"
@@ -432,14 +483,17 @@ fn is_unsupported_blame_option(arg: &str) -> bool {
     ) {
         return true;
     }
-    arg.starts_with("-C")
-        || arg.starts_with("-M")
+    arg.starts_with("-M")
         || arg.starts_with("-S")
         || arg.starts_with("--contents")
         || arg.starts_with("--ignore-rev")
         || arg.starts_with("--ignore-revs-file")
         || arg.starts_with("--diff-algorithm")
         || arg.starts_with("--reverse=")
+}
+
+fn is_blame_copy_option(arg: &str) -> bool {
+    arg.len() > 2 && arg.starts_with("-C") && arg[2..].bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `-N` where N is all digits is a (rare) negative-number-looking token; treat
@@ -604,6 +658,29 @@ fn read_path_blob(
     Ok(Some(object.body.clone()))
 }
 
+fn read_index_blob(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    repo_path: &str,
+) -> Result<Option<Vec<u8>>> {
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(None);
+    };
+    let Some(entry) = index
+        .entries
+        .iter()
+        .find(|entry| entry.stage() == sley_index::Stage::Normal && entry.path.as_bytes() == repo_path.as_bytes())
+    else {
+        return Ok(None);
+    };
+    let object = read_object_maybe_prefetch_promisor(db, &entry.oid)?;
+    if object.object_type != ObjectType::Blob {
+        return Ok(None);
+    }
+    Ok(Some(object.body.clone()))
+}
+
 /// Walk `repo_path` component-by-component through `tree_oid`, returning the
 /// blob id it names, or `None` if any component is missing or an intermediate
 /// component is not a tree.
@@ -651,12 +728,15 @@ fn lookup_tree_path(
 /// 0-based line in the *suspect's* blob, and the entry covers `num_lines`
 /// consecutive lines in both. The invariant `final[lno + k] == suspect[s_lno +
 /// k]` for `k in 0..num_lines` is what lets us pass whole chunks to a parent.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct OriginKey {
+    commit: ObjectId,
+    path: String,
+    virtual_worktree: bool,
+}
+
 #[derive(Clone)]
 struct BlameEntry {
-    /// Commit currently suspected of introducing these lines.
-    suspect: ObjectId,
-    /// Whether the suspect is a rendered boundary (root, absent `--root`).
-    boundary: bool,
     /// 0-based start line in the final image.
     lno: usize,
     /// 0-based start line in the suspect's blob.
@@ -687,6 +767,9 @@ fn compute_blame(
     final_blob: &[u8],
     first_parent: bool,
     boundary_tip: Option<ObjectId>,
+    copy_level: u8,
+    copy_score: usize,
+    virtual_final: bool,
 ) -> Result<Vec<LineBlame>> {
     let final_lines = sley_diff_merge::split_lines(final_blob);
     let line_count = final_lines.len();
@@ -708,29 +791,26 @@ fn compute_blame(
     // Per-commit suspect chunks ("origin->suspects" in git). A commit is in the
     // queue iff it has at least one suspect chunk. The blob for each commit's
     // path is cached on first use.
-    let mut suspects: HashMap<ObjectId, Vec<BlameEntry>> = HashMap::new();
-    let mut blob_cache: HashMap<ObjectId, Option<Vec<u8>>> = HashMap::new();
+    let mut suspects: HashMap<OriginKey, Vec<BlameEntry>> = HashMap::new();
+    let mut blob_cache: HashMap<(ObjectId, String), Option<Vec<u8>>> = HashMap::new();
     let mut date_cache: HashMap<ObjectId, i64> = HashMap::new();
 
     // The start commit owns the entire final image as one chunk.
-    suspects.insert(
-        *start_commit,
-        vec![BlameEntry {
-            suspect: *start_commit,
-            boundary: false,
-            lno: 0,
-            s_lno: 0,
-            num_lines: line_count,
-        }],
-    );
+    let start_key = OriginKey {
+        commit: *start_commit,
+        path: repo_path.to_string(),
+        virtual_worktree: virtual_final,
+    };
+    blob_cache.insert((start_key.commit, start_key.path.clone()), Some(final_blob.to_vec()));
+    suspects.insert(start_key.clone(), vec![BlameEntry { lno: 0, s_lno: 0, num_lines: line_count }]);
 
     // Commit-date priority queue, newest first (git's
     // compare_commits_by_commit_date). We materialise the comparator lazily via
     // `pop_newest_commit`, caching each commit's date.
-    let mut queue: Vec<ObjectId> = vec![*start_commit];
+    let mut queue: Vec<OriginKey> = vec![start_key];
 
-    while let Some(commit_oid) = pop_newest_commit(&mut queue, db, format, &mut date_cache)? {
-        let Some(mut owned) = suspects.remove(&commit_oid) else {
+    while let Some(origin) = pop_newest_origin(&mut queue, db, format, &mut date_cache)? {
+        let Some(mut owned) = suspects.remove(&origin) else {
             continue;
         };
         if owned.is_empty() {
@@ -739,31 +819,36 @@ fn compute_blame(
 
         // Uninteresting (`^<rev>`) commits are boundaries: charge their lines
         // with the boundary marker and stop — do not pass blame to parents.
-        if uninteresting.contains(&commit_oid) {
-            charge_remaining(&mut result, &final_lines, &commit_oid, true, owned);
+        if uninteresting.contains(&origin.commit) {
+            charge_remaining(&mut result, &final_lines, &origin, true, owned);
             continue;
         }
 
         // Resolve this commit and its blob for the path.
+        let commit_oid = origin.commit;
         let commit_obj = db.read_object(&commit_oid)?;
         let commit = Commit::parse(format, &commit_obj.body)?;
-        let child_blob = cached_blob(db, format, &commit_oid, repo_path, &mut blob_cache)?;
+        let child_blob = cached_blob(db, format, &commit_oid, &origin.path, &mut blob_cache)?;
         let Some(child_blob) = child_blob else {
             // The path is absent at this commit (shouldn't normally happen for a
             // suspect): charge everything here so no line is lost.
-            charge_remaining(&mut result, &final_lines, &commit_oid, false, owned);
+            charge_remaining(&mut result, &final_lines, &origin, false, owned);
             continue;
         };
         let child_lines = sley_diff_merge::split_lines(&child_blob);
 
-        let mut parents = commit.parents.clone();
+        let mut parents = if origin.virtual_worktree {
+            vec![origin.commit]
+        } else {
+            commit.parents.clone()
+        };
         if first_parent {
             parents.truncate(1);
         }
         if parents.is_empty() {
             // Root commit (or `--first-parent` past a root): every remaining
             // line is its own. Render as a boundary unless `--root`.
-            charge_remaining(&mut result, &final_lines, &commit_oid, true, owned);
+            charge_remaining(&mut result, &final_lines, &origin, true, owned);
             continue;
         }
 
@@ -773,7 +858,13 @@ fn compute_blame(
             if owned.is_empty() {
                 break;
             }
-            let parent_blob = cached_blob(db, format, parent, repo_path, &mut blob_cache)?;
+            let Some(parent_origin) =
+                find_parent_origin(db, format, &origin, parent, copy_level > 1)?
+            else {
+                continue;
+            };
+            let parent_blob =
+                cached_blob(db, format, parent, &parent_origin.path, &mut blob_cache)?;
             let Some(parent_blob) = parent_blob else {
                 // Path absent in this parent: it preserves nothing, so all
                 // chunks stay with the current commit for the next parent.
@@ -785,24 +876,49 @@ fn compute_blame(
             // pass_whole_blame / oideq(blob_oid) fast path).
             if parent_blob == child_blob {
                 let passed = std::mem::take(&mut owned);
-                queue_entries(&mut suspects, &mut queue, *parent, passed);
+                queue_entries(&mut suspects, &mut queue, parent_origin, passed);
                 break;
             }
 
             let parent_lines = sley_diff_merge::split_lines(&parent_blob);
             let mut still_ours = Vec::new();
-            let passed = pass_blame_to_parent(&parent_lines, &child_lines, *parent, &mut owned);
+            let passed = pass_blame_to_parent(&parent_lines, &child_lines, &mut owned);
             still_ours.append(&mut owned);
             owned = still_ours;
             if !passed.is_empty() {
-                queue_entries(&mut suspects, &mut queue, *parent, passed);
+                queue_entries(&mut suspects, &mut queue, parent_origin, passed);
+            }
+        }
+
+        if copy_level > 0 && !owned.is_empty() {
+            let copied = find_copies_in_parents(
+                db,
+                format,
+                &origin,
+                &parents,
+                copy_level,
+                copy_score,
+                &mut owned,
+                &final_lines,
+            )?;
+            for (copy_origin, entries) in copied {
+                queue_entries(&mut suspects, &mut queue, copy_origin, entries);
             }
         }
 
         // Anything still suspected of this commit after every parent had a turn
         // is genuinely this commit's: charge it (non-boundary — it has parents).
         if !owned.is_empty() {
-            charge_remaining(&mut result, &final_lines, &commit_oid, false, owned);
+            let guilty = if origin.virtual_worktree {
+                OriginKey {
+                    commit: ObjectId::null(format),
+                    path: origin.path.clone(),
+                    virtual_worktree: true,
+                }
+            } else {
+                origin.clone()
+            };
+            charge_remaining(&mut result, &final_lines, &guilty, false, owned);
         }
     }
 
@@ -815,6 +931,8 @@ fn compute_blame(
             None => out.push(LineBlame {
                 commit: *start_commit,
                 boundary: false,
+                origin_path: repo_path.to_string(),
+                origin_lineno: line_index + 1,
                 content: final_lines[line_index].content.to_vec(),
             }),
         }
@@ -837,7 +955,6 @@ fn compute_blame(
 fn pass_blame_to_parent(
     parent_lines: &[sley_diff_merge::DiffLine<'_>],
     child_lines: &[sley_diff_merge::DiffLine<'_>],
-    _parent: ObjectId,
     owned: &mut Vec<BlameEntry>,
 ) -> Vec<BlameEntry> {
     let hunks = diff_hunks(parent_lines, child_lines);
@@ -1009,8 +1126,6 @@ fn contiguous_parent_hunks(
 fn pass_entry(entry: &mut BlameEntry, offset: isize, passed: &mut Vec<BlameEntry>) {
     let s_lno = (entry.s_lno as isize + offset) as usize;
     passed.push(BlameEntry {
-        suspect: entry.suspect,
-        boundary: false,
         lno: entry.lno,
         s_lno,
         num_lines: entry.num_lines,
@@ -1021,8 +1136,6 @@ fn pass_entry(entry: &mut BlameEntry, offset: isize, passed: &mut Vec<BlameEntry
 /// covering the remainder, mirroring git's `split_blame_at`.
 fn split_entry_at(e: &mut BlameEntry, head_len: usize) -> BlameEntry {
     let tail = BlameEntry {
-        suspect: e.suspect,
-        boundary: e.boundary,
         lno: e.lno + head_len,
         s_lno: e.s_lno + head_len,
         num_lines: e.num_lines - head_len,
@@ -1076,19 +1189,16 @@ fn put_back(deferred: &mut Vec<BlameEntry>, e: BlameEntry) {
 /// Queue a batch of chunks onto `parent`'s suspect list, stamping them with the
 /// parent id and enqueuing the parent commit if it was not already pending.
 fn queue_entries(
-    suspects: &mut HashMap<ObjectId, Vec<BlameEntry>>,
-    queue: &mut Vec<ObjectId>,
-    parent: ObjectId,
-    mut entries: Vec<BlameEntry>,
+    suspects: &mut HashMap<OriginKey, Vec<BlameEntry>>,
+    queue: &mut Vec<OriginKey>,
+    origin: OriginKey,
+    entries: Vec<BlameEntry>,
 ) {
-    for e in &mut entries {
-        e.suspect = parent;
-    }
-    let slot = suspects.entry(parent).or_default();
+    let slot = suspects.entry(origin.clone()).or_default();
     let was_empty = slot.is_empty();
     slot.extend(entries);
     if was_empty {
-        queue.push(parent);
+        queue.push(origin);
     }
 }
 
@@ -1096,7 +1206,7 @@ fn queue_entries(
 fn charge_remaining(
     result: &mut [Option<LineBlame>],
     final_lines: &[sley_diff_merge::DiffLine<'_>],
-    commit_oid: &ObjectId,
+    origin: &OriginKey,
     boundary: bool,
     owned: Vec<BlameEntry>,
 ) {
@@ -1107,13 +1217,259 @@ fn charge_remaining(
                 && slot.is_none()
             {
                 *slot = Some(LineBlame {
-                    commit: *commit_oid,
+                    commit: origin.commit,
                     boundary,
+                    origin_path: origin.path.clone(),
+                    origin_lineno: entry.s_lno + k + 1,
                     content: final_lines[final_line].content.to_vec(),
                 });
             }
         }
     }
+}
+
+fn find_parent_origin(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    origin: &OriginKey,
+    parent: &ObjectId,
+    allow_whole_copy: bool,
+) -> Result<Option<OriginKey>> {
+    if read_path_blob(db, format, parent, &origin.path)?.is_some() {
+        return Ok(Some(OriginKey {
+            commit: *parent,
+            path: origin.path.clone(),
+            virtual_worktree: false,
+        }));
+    }
+
+    let parent_tree = sley_rev::peel_to_tree(db, format, parent)?;
+    let child_tree = sley_rev::peel_to_tree(db, format, &origin.commit)?;
+    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+        db,
+        format,
+        &parent_tree,
+        &child_tree,
+        sley_diff_merge::RenameDetectionOptions {
+            base: sley_diff_merge::DiffNameStatusOptions {
+                detect_renames: true,
+                detect_copies: allow_whole_copy,
+                find_copies_harder: allow_whole_copy,
+                rename_empty: true,
+            },
+            detect_inexact: true,
+            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+        },
+    )?;
+
+    for entry in entries {
+        if entry.path.as_bytes() != origin.path.as_bytes() {
+            continue;
+        }
+        let is_origin = matches!(entry.status, sley_diff_merge::NameStatus::Renamed(_))
+            || (allow_whole_copy && matches!(entry.status, sley_diff_merge::NameStatus::Copied(_)));
+        if is_origin
+            && let Some(old_path) = entry.old_path
+        {
+            return Ok(Some(OriginKey {
+                commit: *parent,
+                path: String::from_utf8_lossy(old_path.as_bytes()).into_owned(),
+                virtual_worktree: false,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn find_copies_in_parents(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    origin: &OriginKey,
+    parents: &[ObjectId],
+    copy_level: u8,
+    copy_score: usize,
+    owned: &mut Vec<BlameEntry>,
+    final_lines: &[sley_diff_merge::DiffLine<'_>],
+) -> Result<Vec<(OriginKey, Vec<BlameEntry>)>> {
+    let mut copied_by_origin: Vec<(OriginKey, Vec<BlameEntry>)> = Vec::new();
+    for parent in parents {
+        if owned.is_empty() {
+            break;
+        }
+        let candidate_paths = copy_candidate_paths(db, format, origin, parent, copy_level)?;
+        for path in candidate_paths {
+            if owned.is_empty() {
+                break;
+            }
+            if path == origin.path {
+                continue;
+            }
+            let Some(blob) = read_path_blob(db, format, parent, &path)? else {
+                continue;
+            };
+            let source_lines = sley_diff_merge::split_lines(&blob);
+            let mut next_owned = Vec::new();
+            let mut copied = Vec::new();
+            for entry in std::mem::take(owned) {
+                split_copy_matches(
+                    entry,
+                    final_lines,
+                    &source_lines,
+                    copy_score,
+                    &mut copied,
+                    &mut next_owned,
+                );
+            }
+            *owned = next_owned;
+            if !copied.is_empty() {
+                copied_by_origin.push((
+                    OriginKey {
+                        commit: *parent,
+                        path,
+                        virtual_worktree: false,
+                    },
+                    copied,
+                ));
+            }
+        }
+    }
+    Ok(copied_by_origin)
+}
+
+fn copy_candidate_paths(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    origin: &OriginKey,
+    parent: &ObjectId,
+    copy_level: u8,
+) -> Result<Vec<String>> {
+    let parent_tree = sley_rev::peel_to_tree(db, format, parent)?;
+    let use_all = copy_level >= 3
+        || (copy_level >= 2 && read_path_blob(db, format, parent, &origin.path)?.is_none());
+    if use_all {
+        let mut out = Vec::new();
+        collect_tree_blob_paths(db, format, &parent_tree, Vec::new(), &mut out)?;
+        return Ok(out);
+    }
+
+    let child_tree = sley_rev::peel_to_tree(db, format, &origin.commit)?;
+    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+        db,
+        format,
+        &parent_tree,
+        &child_tree,
+        sley_diff_merge::RenameDetectionOptions::default(),
+    )?;
+    let mut out = Vec::new();
+    for entry in entries {
+        if let Some(old_path) = entry.old_path {
+            out.push(String::from_utf8_lossy(old_path.as_bytes()).into_owned());
+        } else if matches!(
+            entry.status,
+            sley_diff_merge::NameStatus::Deleted | sley_diff_merge::NameStatus::Modified
+        ) {
+            out.push(String::from_utf8_lossy(entry.path.as_bytes()).into_owned());
+        }
+    }
+    Ok(out)
+}
+
+fn collect_tree_blob_paths(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    prefix: Vec<u8>,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    let object = db.read_object(tree_oid)?;
+    if object.object_type != ObjectType::Tree {
+        return Ok(());
+    }
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
+        let mut path = prefix.clone();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(&entry.name);
+        match sley_object::tree_entry_object_type(entry.mode) {
+            ObjectType::Tree => collect_tree_blob_paths(db, format, &entry.oid, path, out)?,
+            ObjectType::Blob => out.push(String::from_utf8_lossy(&path).into_owned()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn split_copy_matches(
+    entry: BlameEntry,
+    final_lines: &[sley_diff_merge::DiffLine<'_>],
+    source_lines: &[sley_diff_merge::DiffLine<'_>],
+    copy_score: usize,
+    copied: &mut Vec<BlameEntry>,
+    remaining: &mut Vec<BlameEntry>,
+) {
+    let mut cursor = 0usize;
+    while cursor < entry.num_lines {
+        let final_idx = entry.lno + cursor;
+        let source_idx = source_lines.iter().position(|line| {
+            line.content == final_lines[final_idx].content
+                && line.has_newline == final_lines[final_idx].has_newline
+        });
+        let Some(source_start) = source_idx else {
+            push_entry_slice(&entry, cursor, 1, remaining, entry.s_lno + cursor);
+            cursor += 1;
+            continue;
+        };
+
+        let mut len = 1usize;
+        while cursor + len < entry.num_lines
+            && source_start + len < source_lines.len()
+            && source_lines[source_start + len].content == final_lines[entry.lno + cursor + len].content
+            && source_lines[source_start + len].has_newline
+                == final_lines[entry.lno + cursor + len].has_newline
+        {
+            len += 1;
+        }
+
+        if blame_entry_score(final_lines, entry.lno + cursor, len) >= copy_score {
+            push_entry_slice(&entry, cursor, len, copied, source_start);
+        } else {
+            push_entry_slice(&entry, cursor, len, remaining, entry.s_lno + cursor);
+        }
+        cursor += len;
+    }
+}
+
+fn push_entry_slice(
+    entry: &BlameEntry,
+    offset: usize,
+    len: usize,
+    out: &mut Vec<BlameEntry>,
+    source_lno: usize,
+) {
+    out.push(BlameEntry {
+        lno: entry.lno + offset,
+        s_lno: source_lno,
+        num_lines: len,
+    });
+}
+
+fn blame_entry_score(
+    final_lines: &[sley_diff_merge::DiffLine<'_>],
+    start: usize,
+    len: usize,
+) -> usize {
+    let mut score = 1usize;
+    for line in &final_lines[start..start + len] {
+        score += line
+            .content
+            .iter()
+            .filter(|byte| byte.is_ascii_alphanumeric())
+            .count();
+    }
+    score
 }
 
 /// The set of `tip` and all commits reachable from it (its ancestor closure),
@@ -1166,13 +1522,14 @@ fn cached_blob(
     format: ObjectFormat,
     commit: &ObjectId,
     repo_path: &str,
-    cache: &mut HashMap<ObjectId, Option<Vec<u8>>>,
+    cache: &mut HashMap<(ObjectId, String), Option<Vec<u8>>>,
 ) -> Result<Option<Vec<u8>>> {
-    if let Some(hit) = cache.get(commit) {
+    let key = (*commit, repo_path.to_string());
+    if let Some(hit) = cache.get(&key) {
         return Ok(hit.clone());
     }
     let blob = read_path_blob(db, format, commit, repo_path)?;
-    cache.insert(*commit, blob.clone());
+    cache.insert(key, blob.clone());
     Ok(blob)
 }
 
@@ -1185,19 +1542,19 @@ fn cached_blob(
 /// its suspect list first becomes non-empty); a duplicate pops with an empty
 /// suspect list and the caller simply skips it, exactly as git's `assign_blame`
 /// does.
-fn pop_newest_commit(
-    queue: &mut Vec<ObjectId>,
+fn pop_newest_origin(
+    queue: &mut Vec<OriginKey>,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     date_cache: &mut HashMap<ObjectId, i64>,
-) -> Result<Option<ObjectId>> {
+) -> Result<Option<OriginKey>> {
     if queue.is_empty() {
         return Ok(None);
     }
     // Ensure every queued commit has a cached date.
-    for oid in queue.iter() {
-        if !date_cache.contains_key(oid) {
-            let object = db.read_object(oid)?;
+    for oid in queue.iter().map(|origin| origin.commit) {
+        if !date_cache.contains_key(&oid) {
+            let object = db.read_object(&oid)?;
             if object.object_type != ObjectType::Commit {
                 return Err(GitError::InvalidObject(format!(
                     "expected commit {oid}, found {}",
@@ -1206,14 +1563,18 @@ fn pop_newest_commit(
             }
             let commit = Commit::parse(format, &object.body)?;
             let ts = for_each_ref_identity_timestamp(&commit.committer).unwrap_or(0);
-            date_cache.insert(*oid, ts);
+            date_cache.insert(oid, ts);
         }
     }
     let mut best = 0usize;
     for i in 1..queue.len() {
-        let ti = date_cache.get(&queue[i]).copied().unwrap_or(0);
-        let tb = date_cache.get(&queue[best]).copied().unwrap_or(0);
-        if ti > tb || (ti == tb && queue[i].to_hex() < queue[best].to_hex()) {
+        let ti = date_cache.get(&queue[i].commit).copied().unwrap_or(0);
+        let tb = date_cache.get(&queue[best].commit).copied().unwrap_or(0);
+        if ti > tb
+            || (ti == tb
+                && (queue[i].commit.to_hex(), &queue[i].path)
+                    < (queue[best].commit.to_hex(), &queue[best].path))
+        {
             best = i;
         }
     }
@@ -1438,6 +1799,10 @@ fn render_blame(
     selected: &[usize],
     options: &BlameOptions,
 ) -> Result<()> {
+    if options.porcelain {
+        return render_porcelain(git_dir, format, db, lines, selected, options);
+    }
+
     let (abbrev, hex_width) = blame_display_abbrev(git_dir, format, options)?;
 
     // git blame *always* reads the mailmap (`read_mailmap`, no flag) and maps the
@@ -1500,19 +1865,191 @@ fn render_blame(
 
         if options.suppress_author {
             // `<sha> <lineno>) <line>`
-            write!(handle, "{sha} {line_no:>lineno_width$}) ")?;
+            if options.show_name {
+                write!(
+                    handle,
+                    "{sha} {} {line_no:>lineno_width$}) ",
+                    blame.origin_path
+                )?;
+            } else {
+                write!(handle, "{sha} {line_no:>lineno_width$}) ")?;
+            }
         } else {
             let author = &author_strings[display_idx];
             let date = &date_strings[display_idx];
             // `<sha> (<author-padded> <date> <lineno>) <line>`
-            write!(
-                handle,
-                "{sha} ({author:<author_width$} {date} {line_no:>lineno_width$}) "
-            )?;
+            if options.show_name {
+                write!(
+                    handle,
+                    "{sha} {} ({author:<author_width$} {date} {line_no:>lineno_width$}) ",
+                    blame.origin_path
+                )?;
+            } else {
+                write!(
+                    handle,
+                    "{sha} ({author:<author_width$} {date} {line_no:>lineno_width$}) "
+                )?;
+            }
         }
         handle.write_all(content)?;
         handle.write_all(b"\n")?;
     }
+    Ok(())
+}
+
+fn render_porcelain(
+    _git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    lines: &[LineBlame],
+    selected: &[usize],
+    options: &BlameOptions,
+) -> Result<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    let mut idx = 0usize;
+    while idx < selected.len() {
+        let line_no = selected[idx];
+        let blame = &lines[line_no - 1];
+        let mut group_len = 1usize;
+        while idx + group_len < selected.len() {
+            let next_line_no = selected[idx + group_len];
+            if next_line_no != line_no + group_len {
+                break;
+            }
+            let next = &lines[next_line_no - 1];
+            if next.commit != blame.commit
+                || next.origin_path != blame.origin_path
+                || next.origin_lineno != blame.origin_lineno + group_len
+            {
+                break;
+            }
+            group_len += 1;
+        }
+
+        write!(
+            handle,
+            "{} {} {}",
+            blame.commit.to_hex(),
+            blame.origin_lineno,
+            line_no
+        )?;
+        if group_len > 1 {
+            write!(handle, " {group_len}")?;
+        }
+        handle.write_all(b"\n")?;
+        porcelain_details(&mut handle, db, format, blame)?;
+
+        for offset in 0..group_len {
+            if offset > 0 {
+                let current = &lines[selected[idx + offset] - 1];
+                writeln!(
+                    handle,
+                    "{} {} {}",
+                    current.commit.to_hex(),
+                    current.origin_lineno,
+                    selected[idx + offset]
+                )?;
+                if options.line_porcelain {
+                    porcelain_details(&mut handle, db, format, current)?;
+                }
+            }
+            handle.write_all(b"\t")?;
+            handle.write_all(strip_trailing_newline(&lines[selected[idx + offset] - 1].content))?;
+            handle.write_all(b"\n")?;
+        }
+        idx += group_len;
+    }
+    Ok(())
+}
+
+fn porcelain_details(
+    handle: &mut impl Write,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    blame: &LineBlame,
+) -> Result<()> {
+    if blame.commit.is_null() {
+        writeln!(handle, "author Not Committed Yet")?;
+        writeln!(handle, "author-mail <not.committed.yet>")?;
+        writeln!(handle, "author-time 0")?;
+        writeln!(handle, "author-tz +0000")?;
+        writeln!(handle, "committer Not Committed Yet")?;
+        writeln!(handle, "committer-mail <not.committed.yet>")?;
+        writeln!(handle, "committer-time 0")?;
+        writeln!(handle, "committer-tz +0000")?;
+        writeln!(handle, "summary Version of {} from the index", blame.origin_path)?;
+        writeln!(handle, "filename {}", blame.origin_path)?;
+        return Ok(());
+    }
+    let object = db.read_object(&blame.commit)?;
+    let commit = Commit::parse(format, &object.body)?;
+    let author = Signature::from_ident_line(&commit.author);
+    let committer = Signature::from_ident_line(&commit.committer);
+    writeln!(
+        handle,
+        "author {}",
+        author
+            .as_ref()
+            .map(|sig| String::from_utf8_lossy(sig.name.as_bytes()).into_owned())
+            .unwrap_or_default()
+    )?;
+    writeln!(
+        handle,
+        "author-mail <{}>",
+        author
+            .as_ref()
+            .map(|sig| String::from_utf8_lossy(sig.email.as_bytes()).into_owned())
+            .unwrap_or_default()
+    )?;
+    writeln!(
+        handle,
+        "author-time {}",
+        author.as_ref().map(|sig| sig.time.seconds).unwrap_or(0)
+    )?;
+    writeln!(
+        handle,
+        "author-tz {}",
+        author
+            .as_ref()
+            .map(|sig| sig.time.offset_token())
+            .unwrap_or_else(|| "+0000".to_string())
+    )?;
+    writeln!(
+        handle,
+        "committer {}",
+        committer
+            .as_ref()
+            .map(|sig| String::from_utf8_lossy(sig.name.as_bytes()).into_owned())
+            .unwrap_or_default()
+    )?;
+    writeln!(
+        handle,
+        "committer-mail <{}>",
+        committer
+            .as_ref()
+            .map(|sig| String::from_utf8_lossy(sig.email.as_bytes()).into_owned())
+            .unwrap_or_default()
+    )?;
+    writeln!(
+        handle,
+        "committer-time {}",
+        committer.as_ref().map(|sig| sig.time.seconds).unwrap_or(0)
+    )?;
+    writeln!(
+        handle,
+        "committer-tz {}",
+        committer
+            .as_ref()
+            .map(|sig| sig.time.offset_token())
+            .unwrap_or_else(|| "+0000".to_string())
+    )?;
+    writeln!(
+        handle,
+        "summary {}",
+        String::from_utf8_lossy(commit.message.split(|b| *b == b'\n').next().unwrap_or_default())
+    )?;
+    writeln!(handle, "filename {}", blame.origin_path)?;
     Ok(())
 }
 
@@ -1599,6 +2136,18 @@ fn author_and_date(
     options: &BlameOptions,
     mailmap: &commands::utility::Mailmap,
 ) -> Result<(String, String)> {
+    if blame.commit.is_null() {
+        return Ok((
+            match options.author_field {
+                AuthorField::Name => "Not Committed Yet".to_string(),
+                AuthorField::Email => "<not.committed.yet>".to_string(),
+            },
+            match options.date_field {
+                DateField::Iso => "1970-01-01 00:00:00 +0000".to_string(),
+                DateField::Raw => "0 +0000".to_string(),
+            },
+        ));
+    }
     let object = db.read_object(&blame.commit)?;
     let commit = Commit::parse(format, &object.body)?;
     let identity = &commit.author;
@@ -1700,20 +2249,16 @@ mod tests {
     /// its `s_lno` rebased by the offset of any inserted lines above it.
     #[test]
     fn pass_blame_routes_preserved_lines_to_parent() {
-        let child = ObjectId::null(ObjectFormat::Sha1);
         // parent: a b   child: X a b  (one line inserted at the top). Child
         // lines 1 and 2 (a, b) are preserved; they rebase to parent lines 0, 1.
         let p = lines(b"a\nb\n");
         let c = lines(b"X\na\nb\n");
         let mut owned = vec![BlameEntry {
-            suspect: child,
-            boundary: false,
             lno: 0,
             s_lno: 0,
             num_lines: 3,
         }];
-        let parent = ObjectId::null(ObjectFormat::Sha1);
-        let passed = pass_blame_to_parent(&p, &c, parent, &mut owned);
+        let passed = pass_blame_to_parent(&p, &c, &mut owned);
         // The inserted line (child s_lno 0) stays with the child; lines 1..3 go
         // to the parent at parent-s_lno 0..2.
         let ours_lines: usize = owned.iter().map(|e| e.num_lines).sum();
@@ -1728,19 +2273,15 @@ mod tests {
 
     #[test]
     fn pass_blame_charges_changed_lines_to_child() {
-        let child = ObjectId::null(ObjectFormat::Sha1);
         // parent: a b c   child: a Z c — only the middle line changed.
         let p = lines(b"a\nb\nc\n");
         let c = lines(b"a\nZ\nc\n");
         let mut owned = vec![BlameEntry {
-            suspect: child,
-            boundary: false,
             lno: 0,
             s_lno: 0,
             num_lines: 3,
         }];
-        let parent = ObjectId::null(ObjectFormat::Sha1);
-        let passed = pass_blame_to_parent(&p, &c, parent, &mut owned);
+        let passed = pass_blame_to_parent(&p, &c, &mut owned);
         let ours: usize = owned.iter().map(|e| e.num_lines).sum();
         let to_parent: usize = passed.iter().map(|e| e.num_lines).sum();
         assert_eq!(ours, 1, "the changed middle line is charged to the child");
@@ -1749,10 +2290,7 @@ mod tests {
 
     #[test]
     fn split_entry_at_partitions_lines() {
-        let oid = ObjectId::null(ObjectFormat::Sha1);
         let mut e = BlameEntry {
-            suspect: oid,
-            boundary: false,
             lno: 10,
             s_lno: 4,
             num_lines: 5,
