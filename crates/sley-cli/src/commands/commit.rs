@@ -2647,7 +2647,7 @@ fn commit_stage_tracked_changes(git_dir: &Path, format: ObjectFormat) -> Result<
         for path in index
             .entries
             .iter()
-            .filter(|entry| index_entry_stage(entry) > 0)
+            .filter(|entry| index_entry_stage(entry) > 0 || entry.is_intent_to_add())
             .map(|entry| worktree_root.join(repo_path_to_path(entry.path.as_bytes())))
         {
             if seen_paths.insert(path.clone()) {
@@ -2702,7 +2702,7 @@ fn commit_index_tree_if_changed(
         direct => direct,
     };
     let Some(RefTarget::Direct(parent)) = head else {
-        return Ok(Some(tree));
+        return Ok((tree != ObjectId::empty_tree(format)).then_some(tree));
     };
     let object = db.read_object(&parent)?;
     if object.object_type != ObjectType::Commit {
