@@ -288,7 +288,14 @@ pub fn submodule_dirt(sub_root: &Path) -> u8 {
             untracked_mode: StatusUntrackedMode::Normal,
         },
         |entry| {
-            if entry.index == b'?' && entry.worktree == b'?' {
+            if let Some(submodule) = entry.submodule {
+                if submodule.new_commits || submodule.modified_content {
+                    dirt |= DIRTY_SUBMODULE_MODIFIED;
+                }
+                if submodule.untracked_content {
+                    dirt |= DIRTY_SUBMODULE_UNTRACKED;
+                }
+            } else if entry.index == b'?' && entry.worktree == b'?' {
                 dirt |= DIRTY_SUBMODULE_UNTRACKED;
             } else {
                 dirt |= DIRTY_SUBMODULE_MODIFIED;
@@ -3975,6 +3982,11 @@ fn collect_short_status_with_options(
         stat_cache = IndexStatCache::from_index_mtime(&parsed_index, stat_cache.index_mtime);
         head_matches_index = false;
     }
+    let mut unmerged_entries = short_status_unmerged_entries(&parsed_index);
+    let unmerged_paths = unmerged_entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<BTreeSet<_>>();
     if head_matches_index && !options.include_ignored {
         let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
         let entries = short_status_tracked_only(
@@ -3989,6 +4001,7 @@ fn collect_short_status_with_options(
             options.untracked_mode,
         );
         let mut entries = entries?;
+        entries.retain(|entry| !unmerged_paths.contains(&entry.path));
         let untracked_paths = status_untracked_paths_from_index(
             worktree_root,
             git_dir,
@@ -4011,6 +4024,12 @@ fn collect_short_status_with_options(
                 submodule: None,
             });
         }
+        entries.append(&mut unmerged_entries);
+        entries.sort_by(|left, right| {
+            status_sort_category(left)
+                .cmp(&status_sort_category(right))
+                .then_with(|| left.path.cmp(&right.path))
+        });
         return Ok(entries);
     }
     let index = index_entries_from_index(parsed_index);
@@ -4064,6 +4083,8 @@ fn collect_short_status_with_options(
             &mut entries,
         );
     }
+    entries.retain(|entry| !unmerged_paths.contains(&entry.path));
+    entries.append(&mut unmerged_entries);
     if options.include_ignored {
         let ignored_paths =
             ignored_untracked_paths(worktree_root, git_dir, &index, &ignores, true)?;
@@ -4131,6 +4152,53 @@ fn collect_short_status_with_options(
             .then_with(|| left.path.cmp(&right.path))
     });
     Ok(entries)
+}
+
+fn short_status_unmerged_entries(index: &Index) -> Vec<ShortStatusEntry> {
+    let mut by_path: BTreeMap<Vec<u8>, BTreeSet<u16>> = BTreeMap::new();
+    for entry in &index.entries {
+        let stage = entry.stage().as_u16();
+        if stage > 0 {
+            by_path
+                .entry(entry.path.as_bytes().to_vec())
+                .or_default()
+                .insert(stage);
+        }
+    }
+    by_path
+        .into_iter()
+        .map(|(path, stages)| {
+            let (index, worktree) = short_status_unmerged_codes(&stages);
+            ShortStatusEntry {
+                index,
+                worktree,
+                path,
+                head_mode: None,
+                index_mode: None,
+                worktree_mode: None,
+                head_oid: None,
+                index_oid: None,
+                submodule: None,
+            }
+        })
+        .collect()
+}
+
+fn short_status_unmerged_codes(stages: &BTreeSet<u16>) -> (u8, u8) {
+    match (
+        stages.contains(&1),
+        stages.contains(&2),
+        stages.contains(&3),
+    ) {
+        (true, false, false) => (b'D', b'D'),
+        (false, true, false) => (b'A', b'U'),
+        (true, true, false) => (b'U', b'D'),
+        (false, false, true) => (b'U', b'A'),
+        (true, false, true) => (b'D', b'U'),
+        (false, true, true) => (b'A', b'A'),
+        (true, true, true) => (b'U', b'U'),
+        (false, false, false) => (b'U', b'U'),
+    }
 }
 
 fn sparse_checkout_active_for_status(git_dir: &Path, index: &Index) -> bool {
@@ -4508,6 +4576,13 @@ fn short_status_borrowed_head_matches_index_if_possible(
     {
         return Ok(None);
     }
+    if borrowed
+        .entries
+        .iter()
+        .any(|entry| entry.stage() != Stage::Normal)
+    {
+        return Ok(None);
+    }
     let Some(head_tree_oid) = resolve_head_tree_oid(git_dir, format, db)? else {
         return Ok(None);
     };
@@ -4721,6 +4796,13 @@ where
         .entries
         .iter()
         .any(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
+    {
+        return Ok(None);
+    }
+    if borrowed
+        .entries
+        .iter()
+        .any(|entry| entry.stage() != Stage::Normal)
     {
         return Ok(None);
     }
@@ -14541,11 +14623,11 @@ pub fn remove_index_and_worktree_paths(
         && !selected_gitlinks.is_empty()
         && !selected.contains(b".gitmodules".as_slice())
     {
-        remove_submodule_sections_from_gitmodules(
+        ensure_gitmodules_clean_for_submodule_rm(
             worktree_root,
             git_dir,
             format,
-            &mut index_entry_list,
+            &index_entry_list,
             &selected_gitlinks,
             &config_parameters_env,
         )?;
@@ -14573,6 +14655,19 @@ pub fn remove_index_and_worktree_paths(
                 false => {}
             }
         }
+    }
+    if !options.cached
+        && !selected_gitlinks.is_empty()
+        && !selected.contains(b".gitmodules".as_slice())
+    {
+        remove_submodule_sections_from_gitmodules(
+            worktree_root,
+            git_dir,
+            format,
+            &mut index_entry_list,
+            &selected_gitlinks,
+            &config_parameters_env,
+        )?;
     }
     // Keep every entry whose path was not selected, preserving original order
     // and all stages of unmerged paths that were not removed.
@@ -14776,6 +14871,58 @@ fn remove_submodule_sections_from_gitmodules(
         index_entries,
         config_parameters_env,
     )
+}
+
+fn ensure_gitmodules_clean_for_submodule_rm(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    index_entries: &[IndexEntry],
+    selected_gitlinks: &[Vec<u8>],
+    config_parameters_env: &Option<&str>,
+) -> Result<()> {
+    let gitmodules_path = worktree_root.join(".gitmodules");
+    let Ok(original) = fs::read(&gitmodules_path) else {
+        return Ok(());
+    };
+    if !index_entries
+        .iter()
+        .any(|entry| entry.stage() == Stage::Normal && entry.path.as_bytes() == b".gitmodules")
+    {
+        return Ok(());
+    }
+    let config = GitConfig::parse(&original)?;
+    let selected = selected_gitlinks
+        .iter()
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect::<BTreeSet<_>>();
+    let has_matching_section = config.sections.iter().any(|section| {
+        section.name.eq_ignore_ascii_case("submodule")
+            && section
+                .entries
+                .iter()
+                .rev()
+                .find(|entry| entry.key.eq_ignore_ascii_case("path"))
+                .and_then(|entry| entry.value.as_deref())
+                .is_some_and(|path| selected.contains(path))
+    });
+    if !has_matching_section {
+        return Ok(());
+    }
+    if gitmodules_worktree_differs_from_index(
+        worktree_root,
+        git_dir,
+        format,
+        index_entries,
+        &original,
+        config_parameters_env,
+    )? {
+        eprintln!("error: the following file has local modifications:");
+        eprintln!("    .gitmodules");
+        eprintln!("(use --cached to keep the file, or -f to force removal)");
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
 }
 
 fn gitmodules_worktree_differs_from_index(

@@ -3685,10 +3685,34 @@ fn verify_merge_uptodate(
 
     let target_map = merge_results_entry_map(results);
     verify_no_populated_gitlink_directory_overwrite(worktree_root, &target_map, ours_map)?;
+    let conflicted_gitlinks: BTreeSet<Vec<u8>> = results
+        .iter()
+        .filter_map(|(path, result)| match result {
+            MergePathResult::Conflict { base, ours, theirs, .. }
+                if base
+                    .or(*ours)
+                    .or(*theirs)
+                    .is_some_and(|(mode, _)| sley_index::is_gitlink(mode)) =>
+            {
+                Some(path.clone())
+            }
+            _ => None,
+        })
+        .collect();
 
     let status = crate::collect_short_status(worktree_root, git_dir, format)?;
     for entry in &status {
-        if entry.index == b'?' && entry.worktree == b'?' && changed.contains(&entry.path) {
+        let gitlink_worktree_status_is_safe =
+            (conflicted_gitlinks.contains(&entry.path)
+                || ours_map
+                    .get(&entry.path)
+                    .is_some_and(|(mode, _)| sley_index::is_gitlink(*mode)))
+                && changed.contains(&entry.path);
+        if entry.index == b'?'
+            && entry.worktree == b'?'
+            && changed.contains(&entry.path)
+            && !gitlink_worktree_status_is_safe
+        {
             eprintln!(
                 "error: The following untracked working tree files would be overwritten by merge:\n\t{}",
                 String::from_utf8_lossy(&entry.path)
@@ -3700,6 +3724,15 @@ fn verify_merge_uptodate(
         // A staged change anywhere (index column non-blank, not untracked/ignored)
         // makes the index an unclean merge base.
         if entry.index != b' ' && entry.index != b'?' && entry.index != b'!' {
+            let staged_superproject_change =
+                entry.head_mode != entry.index_mode || entry.head_oid != entry.index_oid;
+            let gitlink_index_status_is_worktree_dirt = ours_map
+                .get(&entry.path)
+                .is_some_and(|(mode, _)| sley_index::is_gitlink(*mode))
+                && !staged_superproject_change;
+            if gitlink_index_status_is_worktree_dirt {
+                continue;
+            }
             eprintln!(
                 "error: Your local changes to the following files would be overwritten by merge:\n  {}",
                 String::from_utf8_lossy(&entry.path)
@@ -3713,6 +3746,7 @@ fn verify_merge_uptodate(
             && entry.worktree != b'?'
             && entry.worktree != b'!'
             && changed.contains(&entry.path)
+            && !gitlink_worktree_status_is_safe
         {
             eprintln!(
                 "error: Your local changes to the following files would be overwritten by merge:\n  {}",
