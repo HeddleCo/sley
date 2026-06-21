@@ -6074,13 +6074,103 @@ fn push_remote_and_refspecs(
                 mirror: refspecs.mirror,
             })
         }
-        [remote, refspecs @ ..] => Ok(PushRemoteAndRefspecs {
-            remote: remote.clone(),
-            refspecs: refspecs.to_vec(),
-            set_upstream: false,
-            mirror: false,
-        }),
+        [remote, refspecs @ ..] => {
+            let config = read_repo_config(git_dir).unwrap_or_default();
+            let branch = store.current_branch()?;
+            Ok(PushRemoteAndRefspecs {
+                remote: remote.clone(),
+                refspecs: explicit_push_refspecs_with_refmap(
+                    &config,
+                    store,
+                    branch.as_deref(),
+                    remote,
+                    refspecs,
+                )?,
+                set_upstream: false,
+                mirror: false,
+            })
+        }
     }
+}
+
+fn explicit_push_refspecs_with_refmap(
+    config: &GitConfig,
+    store: &FileRefStore,
+    branch: Option<&str>,
+    remote: &str,
+    refspecs: &[String],
+) -> Result<Vec<String>> {
+    let configured_push = config
+        .get_all("remote", Some(remote), "push")
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let upstream_ref = if configured_push.is_empty()
+        && matches!(push_default_mode(config), PushDefaultMode::Upstream)
+        && branch.is_some()
+        && default_fetch_remote_for_branch(config, branch.unwrap()) == remote
+    {
+        Some(push_upstream_ref(config, branch.unwrap(), remote, false)?)
+    } else {
+        None
+    };
+
+    refspecs
+        .iter()
+        .map(|refspec| {
+            explicit_push_refspec_with_refmap(
+                store,
+                refspec,
+                &configured_push,
+                upstream_ref.as_deref(),
+            )
+        })
+        .collect()
+}
+
+fn explicit_push_refspec_with_refmap(
+    store: &FileRefStore,
+    refspec: &str,
+    configured_push: &[String],
+    upstream_ref: Option<&str>,
+) -> Result<String> {
+    if refspec.contains(':') || refspec == "tag" {
+        return Ok(refspec.to_string());
+    }
+    let (force, body) = refspec
+        .strip_prefix('+')
+        .map_or(("", refspec), |stripped| ("+", stripped));
+    let source = push_refmap_source_name(store, body);
+    for configured in configured_push {
+        let configured = configured.strip_prefix('+').unwrap_or(configured);
+        let parsed = sley_protocol::parse_refspec(configured)?;
+        if parsed.negative {
+            continue;
+        }
+        if let Some(dst) = sley_protocol::refspec_map_source(&parsed, &source)? {
+            return Ok(format!("{force}{source}:{dst}"));
+        }
+    }
+    if let Some(upstream_ref) = upstream_ref {
+        return Ok(format!("{force}{source}:{upstream_ref}"));
+    }
+    Ok(refspec.to_string())
+}
+
+fn push_refmap_source_name(store: &FileRefStore, name: &str) -> String {
+    if name == "HEAD" || name == "@" || name.starts_with("refs/") {
+        return name.to_string();
+    }
+    let branch = format!("refs/heads/{name}");
+    if matches!(store.read_ref(&branch), Ok(Some(_))) {
+        return branch;
+    }
+    let tag = format!("refs/tags/{name}");
+    if matches!(store.read_ref(&tag), Ok(Some(_))) {
+        return tag;
+    }
+    name.to_string()
 }
 
 struct DefaultPushRefspecs {
