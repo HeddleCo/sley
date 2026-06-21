@@ -557,13 +557,18 @@ declare -A FLOOR=(
     # t4041=47 t4027=18 t3105=60 t7508=114.
     [t7400-submodule-basic.sh]=111
     [t7506-status-submodule.sh]=34
+    # wave-26 (2026-06-21): protocol-v2 negotiation/ls-refs/fetch 21->38 (banked 36, 2-cell git:// handshake-flake margin);
+    # wtstatus-ignore 8->25/25 (NEW floor+enroll); rev-parse-disambig 9->35 (NEW floor+enroll). Guards neutral:
+    # t5700=9 t5701=25 t5601=109 t5516=111 t5510=7 t5526=39 t3600=81 t1500=81 t1502=37 t1507=29.
     [t7508-status.sh]=119
+    [t7061-wtstatus-ignore.sh]=25
     # recov-wave (2026-06-20, ENOSPC-recovered 5-slice batch; all guards neutral-or-better, cargo test green):
     # git clean -d/-x/-X/-e/-ff/nested t7300 34->53; git mv -f/-n/dir/multi/submodule t7001 32->53;
     # rev-parse @{upstream}/@{push}/@{N} t1507 9->29 FULL; git archive --format=tar t5000 70->86.
     [t7300-clean.sh]=53
     [t7001-mv.sh]=53
     [t1507-rev-parse-upstream.sh]=29
+    [t1512-rev-parse-disambiguation.sh]=35
     [t5000-tar-tree.sh]=86
     [t4027-diff-submodule.sh]=18
     [t7102-reset.sh]=37
@@ -678,7 +683,7 @@ declare -A FLOOR=(
     [t5543-atomic-push.sh]=11
     [t5548-push-porcelain.sh]=11
     [t6430-merge-recursive.sh]=29
-    [t5702-protocol-v2.sh]=21
+    [t5702-protocol-v2.sh]=36
     [t7103-reset-bare.sh]=12
     [t7110-reset-merge.sh]=21
     [t7201-co.sh]=37
