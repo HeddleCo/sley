@@ -245,9 +245,7 @@ where
                 }
                 value if value.starts_with("--max-count=") => {
                     self.setup.options.max_count = Some(parse_max_count(
-                        value
-                            .strip_prefix("--max-count=")
-                            .expect("prefix matched"),
+                        value.strip_prefix("--max-count=").expect("prefix matched"),
                     )?);
                 }
                 "--skip" => {
@@ -515,11 +513,11 @@ where
             rev,
             self.ctx.config,
         )?;
-        let commit = read_commit(self.ctx.reader, self.ctx.format, &peel_to_commit(
+        let commit = read_commit(
             self.ctx.reader,
             self.ctx.format,
-            &oid,
-        )?)?;
+            &peel_to_commit(self.ctx.reader, self.ctx.format, &oid)?,
+        )?;
         for parent in commit.parents {
             if negated {
                 self.setup.options.negatives.push(parent);
@@ -595,11 +593,14 @@ where
                     });
                     self.setup.options.negatives.extend(bases);
                 }
-                self.setup.options.symmetric_ranges.push(RevisionSymmetricRange {
-                    left: left_oid,
-                    right: right_oid,
-                    negated,
-                });
+                self.setup
+                    .options
+                    .symmetric_ranges
+                    .push(RevisionSymmetricRange {
+                        left: left_oid,
+                        right: right_oid,
+                        negated,
+                    });
             }
         }
         Ok(())
@@ -1101,12 +1102,14 @@ fn ref_selection(
                 !ref_excluded(refname, &selector.excludes, None)
                     && !ref_hidden(refname, selector.hidden, hidden_refs)
             }
-            RefSelectorKind::Glob => selector
-                .pattern
-                .as_deref()
-                .is_some_and(|pattern| glob_ref_selector_matches(pattern, refname))
-                && !ref_excluded(refname, &selector.excludes, None)
-                && !ref_hidden(refname, selector.hidden, hidden_refs),
+            RefSelectorKind::Glob => {
+                selector
+                    .pattern
+                    .as_deref()
+                    .is_some_and(|pattern| glob_ref_selector_matches(pattern, refname))
+                    && !ref_excluded(refname, &selector.excludes, None)
+                    && !ref_hidden(refname, selector.hidden, hidden_refs)
+            }
             RefSelectorKind::Branches => {
                 ref_selector_matches(
                     refname,
@@ -1157,7 +1160,9 @@ fn ref_selector_matches(
     }
     match pattern {
         None => include_all,
-        Some(pattern) => refname_pattern_matches(&namespaced_real_pattern(namespace, pattern), name),
+        Some(pattern) => {
+            refname_pattern_matches(&namespaced_real_pattern(namespace, pattern), name)
+        }
     }
 }
 

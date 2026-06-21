@@ -870,9 +870,9 @@ fn parse_reftable_log_record(
                 *block
                     .get(*offset)
                     .ok_or_else(|| GitError::InvalidFormat("truncated reftable log tz".into()))?,
-                *block.get(*offset + 1).ok_or_else(|| {
-                    GitError::InvalidFormat("truncated reftable log tz".into())
-                })?,
+                *block
+                    .get(*offset + 1)
+                    .ok_or_else(|| GitError::InvalidFormat("truncated reftable log tz".into()))?,
             ]);
             *offset += 2;
             let message = read_reftable_string(block, offset, end)?;
@@ -902,7 +902,7 @@ fn parse_reftable_log_record(
 /// Deflate `data` with a zlib header/trailer at level 9, matching git's
 /// `deflateInit(stream, 9)` for reftable log blocks.
 fn deflate_zlib(data: &[u8]) -> Result<Vec<u8>> {
-    use flate2::{write::ZlibEncoder, Compression};
+    use flate2::{Compression, write::ZlibEncoder};
     use std::io::Write;
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(9));
     encoder
@@ -1231,7 +1231,8 @@ impl CommitGraph {
         validate_commit_graph_write_entries(format, &entries)?;
         let object_ids = entries.iter().map(|entry| entry.oid).collect::<Vec<_>>();
         let parent_positions = commit_graph_parent_positions(&entries, base_oids)?;
-        let (cdat, edge) = write_commit_graph_commit_data_with_positions(&entries, &parent_positions)?;
+        let (cdat, edge) =
+            write_commit_graph_commit_data_with_positions(&entries, &parent_positions)?;
         let mut chunks = vec![
             (*b"OIDF", write_commit_graph_fanout(&object_ids)?),
             (*b"OIDL", write_commit_graph_oid_lookup(&object_ids)),
@@ -2660,11 +2661,7 @@ fn reference_backend_env() -> Result<Option<ReferenceBackendEnv>> {
         }
     };
     let path = PathBuf::from(path);
-    Ok(Some(ReferenceBackendEnv {
-        raw,
-        format,
-        path,
-    }))
+    Ok(Some(ReferenceBackendEnv { raw, format, path }))
 }
 
 impl RepositoryBootstrap {
@@ -2813,7 +2810,10 @@ impl RepositoryBootstrap {
         let head_path = git_dir.join("HEAD");
         if let Some(backend) = alt_ref_storage.as_ref() {
             fs::create_dir_all(git_dir.join("refs"))?;
-            fs::write(git_dir.join("refs").join("heads"), b"repository uses alternate refs storage\n")?;
+            fs::write(
+                git_dir.join("refs").join("heads"),
+                b"repository uses alternate refs storage\n",
+            )?;
             if !head_path.exists() {
                 fs::write(&head_path, b"ref: refs/heads/.invalid\n")?;
             }
@@ -2951,10 +2951,9 @@ fn build_init_config(
     ref_storage_value: Option<&str>,
     core_worktree: Option<&str>,
 ) -> GitConfig {
-    let uses_extensions =
-        object_format == ObjectFormat::Sha256
-            || ref_storage == RefStorageFormat::Reftable
-            || ref_storage_value.is_some();
+    let uses_extensions = object_format == ObjectFormat::Sha256
+        || ref_storage == RefStorageFormat::Reftable
+        || ref_storage_value.is_some();
     let mut core_entries = vec![
         ConfigEntry::new(
             "repositoryformatversion",

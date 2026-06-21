@@ -166,9 +166,10 @@ fn parse_last_modified_args(args: &[String]) -> Result<LastModifiedOptions> {
                 options.max_depth = parse_last_modified_depth(&value["--max-depth=".len()..])?;
                 i += 1;
             }
-            value if value.starts_with('-')
-                && value.len() > 1
-                && value[1..].bytes().all(|byte| byte.is_ascii_digit()) =>
+            value
+                if value.starts_with('-')
+                    && value.len() > 1
+                    && value[1..].bytes().all(|byte| byte.is_ascii_digit()) =>
             {
                 options.max_count = Some(value[1..].parse::<usize>().map_err(|_| {
                     GitError::Command(format!("invalid max-count {}", &value[1..]))
@@ -270,9 +271,7 @@ fn last_modified_two_commits() -> GitError {
 }
 
 fn print_last_modified_usage() {
-    eprintln!(
-        "usage: git last-modified [--recursive] [--show-trees] [--max-depth=<depth>] [-z]"
-    );
+    eprintln!("usage: git last-modified [--recursive] [--show-trees] [--max-depth=<depth>] [-z]");
     eprintln!("                         [<revision-range>] [[--] <pathspec>...]");
 }
 
@@ -466,7 +465,8 @@ fn collect_last_modified_paths(
     max_depth: i64,
     show_trees: bool,
 ) -> Result<Vec<PathEntry>> {
-    let mut paths = collect_visible_tree_entries(db, format, tree_oid, pathspec, max_depth, show_trees)?;
+    let mut paths =
+        collect_visible_tree_entries(db, format, tree_oid, pathspec, max_depth, show_trees)?;
     paths.retain(|entry| pathspec.matches(&entry.path));
     Ok(paths)
 }
@@ -521,9 +521,8 @@ fn collect_visible_tree_entries_inner(
                     oid: entry.oid,
                 });
             }
-            let may_descend = max_depth < 0
-                || depth < max_depth
-                || pathspec_needs_descent(pathspec, &path);
+            let may_descend =
+                max_depth < 0 || depth < max_depth || pathspec_needs_descent(pathspec, &path);
             if may_descend {
                 collect_visible_tree_entries_inner(
                     db,
@@ -564,7 +563,9 @@ fn pathspec_needs_descent(pathspec: &sley_pathspec::Pathspec, path: &[u8]) -> bo
     }
     pathspec.elements().iter().any(|element| {
         let pattern = element.pattern();
-        pattern.len() > path.len() && pattern.starts_with(path) && pattern.get(path.len()) == Some(&b'/')
+        pattern.len() > path.len()
+            && pattern.starts_with(path)
+            && pattern.get(path.len()) == Some(&b'/')
     })
 }
 
@@ -593,10 +594,7 @@ fn changed_paths_between_trees(
     Ok(out)
 }
 
-fn insert_changed_path_and_parents(
-    out: &mut HashSet<Vec<u8>>,
-    path: &[u8],
-) {
+fn insert_changed_path_and_parents(out: &mut HashSet<Vec<u8>>, path: &[u8]) {
     out.insert(path.to_vec());
     for idx in 0..path.len() {
         if path[idx] == b'/' {
@@ -627,7 +625,14 @@ fn collect_all_tree_entries_inner(
     for (name, entry) in read_tree_map(db, format, tree_oid)? {
         let path = join_tree_path(&prefix, &name);
         if entry.mode == 0o040000 {
-            collect_all_tree_entries_inner(db, format, &entry.oid, include_trees, path.clone(), out)?;
+            collect_all_tree_entries_inner(
+                db,
+                format,
+                &entry.oid,
+                include_trees,
+                path.clone(),
+                out,
+            )?;
             if include_trees {
                 out.push(PathEntry {
                     path,

@@ -259,16 +259,17 @@ impl<'a> ArgCursor<'a> {
     /// non-SP separator in the `\n` path (git's `expected SP but got`).
     fn skip_delimiter(&mut self) -> Result<bool> {
         match self.term {
-            Terminator::Newline => {
-                match self.cur() {
-                    None | Some(0) => Ok(false),
-                    Some(b' ') => {
-                        self.pos += 1;
-                        Ok(true)
-                    }
-                    Some(_) => Err(die(format!("expected SP but got: {}", self.remainder_str()))),
+            Terminator::Newline => match self.cur() {
+                None | Some(0) => Ok(false),
+                Some(b' ') => {
+                    self.pos += 1;
+                    Ok(true)
                 }
-            }
+                Some(_) => Err(die(format!(
+                    "expected SP but got: {}",
+                    self.remainder_str()
+                ))),
+            },
             Terminator::Nul => {
                 // git: `if (**next) return NULL;` — a non-NUL here means the
                 // previous record had not ended, i.e. no further argument.
@@ -424,10 +425,7 @@ mod tests {
 
     #[test]
     fn unquote_escapes() {
-        assert_eq!(
-            unquote(br#""a\tb\n""#).as_deref(),
-            Some(&b"a\tb\n"[..])
-        );
+        assert_eq!(unquote(br#""a\tb\n""#).as_deref(), Some(&b"a\tb\n"[..]));
         assert_eq!(unquote(br#""\\""#).as_deref(), Some(&b"\\"[..]));
         assert_eq!(unquote(br#""\"""#).as_deref(), Some(&b"\""[..]));
     }

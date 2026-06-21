@@ -1050,9 +1050,7 @@ fn append_promisor_ref_lines(
         return Ok(());
     }
     lines.sort();
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(promisor_path)?;
+    let mut file = fs::OpenOptions::new().append(true).open(promisor_path)?;
     use std::io::Write as _;
     for line in lines {
         file.write_all(line.as_bytes())?;
@@ -1214,7 +1212,11 @@ fn local_ls_refs_v2_records(
         } else if request.unborn && lsrefs_unborn_config(config) != LsRefsUnbornConfig::Ignore {
             // An unborn HEAD (points at a not-yet-created branch) is reported as
             // an `unborn` record carrying its symref-target.
-            entries.push(("HEAD".to_string(), ObjectId::null(format), head_symref.clone()));
+            entries.push((
+                "HEAD".to_string(),
+                ObjectId::null(format),
+                head_symref.clone(),
+            ));
         }
     }
     for reference in store.list_refs()? {

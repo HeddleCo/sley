@@ -177,9 +177,7 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
                 });
             }
             "--show-current-patch" => set_show_patch_mode(&mut show_patch, ShowPatchMode::Raw)?,
-            "--show-current-patch=raw" => {
-                set_show_patch_mode(&mut show_patch, ShowPatchMode::Raw)?
-            }
+            "--show-current-patch=raw" => set_show_patch_mode(&mut show_patch, ShowPatchMode::Raw)?,
             "--show-current-patch=diff" => {
                 set_show_patch_mode(&mut show_patch, ShowPatchMode::Diff)?
             }
@@ -428,19 +426,26 @@ pub(crate) fn start_rebase_apply(
         .unwrap_or_else(|| "detached HEAD".to_string());
     fs::write(state_dir.join("head-name"), format!("{head_name}\n"))?;
     fs::write(state_dir.join("onto"), format!("{}\n", params.onto))?;
-    fs::write(state_dir.join("orig-head"), format!("{}\n", params.orig_head))?;
+    fs::write(
+        state_dir.join("orig-head"),
+        format!("{}\n", params.orig_head),
+    )?;
     // The apply backend's `--abort`/finish restores `orig_head`, not the
     // post-detach HEAD, so overwrite abort-safety with orig_head.
     fs::write(
         state_dir.join("abort-safety"),
         format!("{}\n", params.orig_head),
     )?;
-    fs::write(
-        state_dir.join("quiet"),
-        bool_flag(params.quiet),
-    )?;
+    fs::write(state_dir.join("quiet"), bool_flag(params.quiet))?;
 
-    run_am_series(git_dir, common_git_dir, worktree_root, format, &state_dir, 1)
+    run_am_series(
+        git_dir,
+        common_git_dir,
+        worktree_root,
+        format,
+        &state_dir,
+        1,
+    )
 }
 
 /// Whether a `.git/rebase-apply/` state dir belongs to a `git rebase --apply`
@@ -531,12 +536,8 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             }
             "-m" | "--message-id" => options.message_id = true,
             "--no-message-id" => options.message_id = false,
-            "--committer-date-is-author-date" => {
-                options.committer_date_is_author_date = true
-            }
-            "--no-committer-date-is-author-date" => {
-                options.committer_date_is_author_date = false
-            }
+            "--committer-date-is-author-date" => options.committer_date_is_author_date = true,
+            "--no-committer-date-is-author-date" => options.committer_date_is_author_date = false,
             "--ignore-date" => options.ignore_date = true,
             "--no-ignore-date" => options.ignore_date = false,
             "-n" | "--no-verify" => options.no_verify = true,
@@ -755,10 +756,7 @@ fn detect_am_patch_format(
     if mboxes.is_empty() || mboxes.first().is_some_and(|path| path == "-") {
         return Ok(AmPatchFormat::Mbox);
     }
-    if mboxes
-        .first()
-        .is_some_and(|path| Path::new(path).is_dir())
-    {
+    if mboxes.first().is_some_and(|path| Path::new(path).is_dir()) {
         return Ok(AmPatchFormat::Mbox);
     }
 
@@ -1047,7 +1045,10 @@ fn parse_mboxrd(input: &[u8], cleanup: SubjectCleanup) -> Result<Vec<AmPatch>> {
     }
     if starts.is_empty() {
         let unescaped = unescape_mboxrd(input);
-        return Ok(vec![parse_message(&split_keep_newline(&unescaped), cleanup)?]);
+        return Ok(vec![parse_message(
+            &split_keep_newline(&unescaped),
+            cleanup,
+        )?]);
     }
     let mut patches = Vec::new();
     for (position, &start) in starts.iter().enumerate() {
@@ -1654,7 +1655,10 @@ fn write_am_state_dir(
     fs::write(state_dir.join("sign"), bool_flag(options.signoff))?;
     fs::write(state_dir.join("threeway"), bool_flag(options.three_way))?;
     fs::write(state_dir.join("keep"), bool_flag(options.keep_non_patch))?;
-    fs::write(state_dir.join("empty"), empty_action_name(options.empty_action))?;
+    fs::write(
+        state_dir.join("empty"),
+        empty_action_name(options.empty_action),
+    )?;
     fs::write(state_dir.join("messageid"), bool_flag(options.message_id))?;
     fs::write(
         state_dir.join("committer-date-is-author-date"),
@@ -1837,10 +1841,7 @@ fn read_am_commit_opts(state_dir: &Path) -> AmCommitOpts {
     AmCommitOpts {
         signoff: read_state_bool(state_dir, "sign"),
         message_id: read_state_bool(state_dir, "messageid"),
-        committer_date_is_author_date: read_state_bool(
-            state_dir,
-            "committer-date-is-author-date",
-        ),
+        committer_date_is_author_date: read_state_bool(state_dir, "committer-date-is-author-date"),
         ignore_date: read_state_bool(state_dir, "ignore-date"),
         no_verify: read_state_bool(state_dir, "no-verify"),
         // The `head-name` marker is written only by the rebase apply backend
@@ -2169,10 +2170,7 @@ fn try_straight_apply(
 /// line comparison, and on a match the matched base region is replaced by the
 /// hunk's *new* lines while context lines keep the base's existing whitespace.
 /// Returns `None` if any hunk cannot be located even with whitespace ignored.
-fn apply_file_patch_ignore_ws(
-    base: &[u8],
-    patch: &sley_diff_merge::FilePatch,
-) -> Option<Vec<u8>> {
+fn apply_file_patch_ignore_ws(base: &[u8], patch: &sley_diff_merge::FilePatch) -> Option<Vec<u8>> {
     use sley_diff_merge::HunkLine;
 
     if patch.is_delete && patch.hunks.is_empty() {
@@ -2437,8 +2435,7 @@ fn create_am_commit(
     // pre-applypatch runs after staging, before the commit; a failure aborts the
     // run (git exits 1). `--no-verify` skips it.
     if !commit_opts.no_verify
-        && commands::hooks::run_hook("pre-applypatch", commands::hooks::HookRun::default())
-            .is_err()
+        && commands::hooks::run_hook("pre-applypatch", commands::hooks::HookRun::default()).is_err()
     {
         return Err(GitError::Exit(1));
     }
@@ -2513,8 +2510,11 @@ fn am_commit_identities(patch: &AmPatch, opts: AmCommitOpts) -> Result<(Vec<u8>,
             .clone()
             .unwrap_or_else(|| env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| am_now_date()))
     };
-    let author =
-        sley_sequencer::format_commit_identity(&patch.author_name, &patch.author_email, &author_date)?;
+    let author = sley_sequencer::format_commit_identity(
+        &patch.author_name,
+        &patch.author_email,
+        &author_date,
+    )?;
 
     let committer = if opts.committer_date_is_author_date {
         commit_identity_from_env_with_date("COMMITTER", &author_date)?
@@ -2702,9 +2702,12 @@ fn apply_three_way(
             let mode = file.new_mode.or(file.old_mode).unwrap_or(0o160000);
             if file.is_new {
                 base_map.remove(&path);
-            } else if let Some(old_oid) = old_oid
-                .or_else(|| ours_map.get(&old_path).or_else(|| ours_map.get(&path)).map(|(_, oid)| *oid))
-            {
+            } else if let Some(old_oid) = old_oid.or_else(|| {
+                ours_map
+                    .get(&old_path)
+                    .or_else(|| ours_map.get(&path))
+                    .map(|(_, oid)| *oid)
+            }) {
                 base_map.insert(old_path.clone(), (base_mode, old_oid));
             }
             if file.is_delete {
@@ -2931,11 +2934,7 @@ fn gitlink_oid_from_subproject_content(
         return Ok(None);
     };
     let text = String::from_utf8_lossy(rest);
-    let hex = text
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .trim();
+    let hex = text.split_whitespace().next().unwrap_or_default().trim();
     if hex.is_empty() {
         return Ok(None);
     }
@@ -3252,8 +3251,7 @@ fn apply_rebase_autostash(common_git_dir: &Path, state_dir: &Path) -> Result<()>
         let _ = fs::remove_file(&autostash_path);
         let format = repository_object_format(common_git_dir)?;
         if let Ok(oid) = ObjectId::from_hex(format, text.trim()) {
-            let applied =
-                commands::stash::apply_stash_commit_quietly(&oid).unwrap_or(false);
+            let applied = commands::stash::apply_stash_commit_quietly(&oid).unwrap_or(false);
             if applied {
                 eprintln!("Applied autostash.");
             } else if commands::stash::store_stash_commit(&oid, "autostash").is_ok() {
@@ -3449,9 +3447,7 @@ fn am_continue(
     // index as *changed*, so it reaches the same unmerged branch.)
     if has_unmerged {
         println!("You still have unmerged paths in your index.");
-        println!(
-            "You should 'git add' each file with resolved conflicts to mark them as such."
-        );
+        println!("You should 'git add' each file with resolved conflicts to mark them as such.");
         println!("You might run `git rm` on a file to accept \"deleted by them\" for it.");
         am_print_resolve_hints();
         return Err(GitError::Exit(128));
@@ -3464,12 +3460,8 @@ fn am_continue(
         && !am_index_is_dirty(git_dir, common_git_dir, format, &head_oid)?
     {
         println!("No changes - did you forget to use 'git add'?");
-        println!(
-            "If there is nothing left to stage, chances are that something else"
-        );
-        println!(
-            "already introduced the same changes; you might want to skip this patch."
-        );
+        println!("If there is nothing left to stage, chances are that something else");
+        println!("already introduced the same changes; you might want to skip this patch.");
         am_print_resolve_hints();
         return Err(GitError::Exit(128));
     }

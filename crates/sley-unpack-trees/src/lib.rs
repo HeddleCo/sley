@@ -283,8 +283,12 @@ pub trait WorktreeProbe {
     ///
     /// `merge` is the entry about to be written. `reset` carries the option so
     /// `--reset` can authorize overwriting untracked files.
-    fn verify_absent_overwrite(&self, path: &[u8], merge: &CacheEntry, reset: ResetType)
-    -> Result<()>;
+    fn verify_absent_overwrite(
+        &self,
+        path: &[u8],
+        merge: &CacheEntry,
+        reset: ResetType,
+    ) -> Result<()>;
 
     /// git's `verify_absent(… ERROR_WOULD_LOSE_UNTRACKED_REMOVED …)`: would
     /// removing `path` discard an untracked working-tree file at that name?
@@ -371,8 +375,7 @@ pub trait WorktreeWriter {
     /// Returning `Ok(None)` means "no stat available" (e.g. the platform could
     /// not `lstat` the written path); the entry then keeps an all-zero stat,
     /// which git treats as "needs a refresh / racily clean".
-    fn write_blob(&mut self, path: &[u8], mode: u32, oid: &ObjectId)
-    -> Result<Option<StatInfo>>;
+    fn write_blob(&mut self, path: &[u8], mode: u32, oid: &ObjectId) -> Result<Option<StatInfo>>;
     /// Remove `path` from the working tree (idempotent on an absent target).
     /// This is git's `unlink_entry`.
     fn remove_path(&mut self, path: &[u8]) -> Result<()>;
@@ -1060,7 +1063,11 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
         removals,
         ..
     } = state;
-    result.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.entry.stage.cmp(&b.entry.stage)));
+    result.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.entry.stage.cmp(&b.entry.stage))
+    });
 
     let removed_paths = removals.into_iter().map(|r| r.path).collect();
     Ok(UnpackTreesResult {
@@ -1212,8 +1219,15 @@ mod tests {
         let res = unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &NullWorktree)
             .expect("oneway identical");
         assert_eq!(res.entries.len(), 1);
-        assert_eq!(res.entries[0].entry.stat, Some(stat), "cached stat preserved");
-        assert!(!res.entries[0].wt_update, "identical entry is not rewritten");
+        assert_eq!(
+            res.entries[0].entry.stat,
+            Some(stat),
+            "cached stat preserved"
+        );
+        assert!(
+            !res.entries[0].wt_update,
+            "identical entry is not rewritten"
+        );
     }
 
     #[test]
@@ -1510,12 +1524,9 @@ mod tests {
             new_oid: &ObjectId,
             reset: ResetType,
         ) -> Result<()> {
-            self.calls.borrow_mut().push((
-                path.to_vec(),
-                old_oid.copied(),
-                *new_oid,
-                reset,
-            ));
+            self.calls
+                .borrow_mut()
+                .push((path.to_vec(), old_oid.copied(), *new_oid, reset));
             if self.reject_path.as_deref() == Some(path) {
                 return Err(GitError::Exit(128));
             }
@@ -1568,7 +1579,11 @@ mod tests {
         let calls = probe.calls.borrow();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, b"sub".to_vec());
-        assert_eq!(calls[0].1, Some(oid(1)), "old_oid is the prior gitlink commit");
+        assert_eq!(
+            calls[0].1,
+            Some(oid(1)),
+            "old_oid is the prior gitlink commit"
+        );
         assert_eq!(calls[0].2, oid(2), "new_oid is the new gitlink commit");
     }
 
@@ -1593,7 +1608,8 @@ mod tests {
         let index = gitlink_idx(&[(b"sub", 5)]);
         let tree = gitlink(&[(b"sub", 5)]);
         let probe = RecordingProbe::default();
-        unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &probe).expect("oneway same gitlink");
+        unpack_trees(&index, &[tree], MergeFn::OneWay, &opts(), &probe)
+            .expect("oneway same gitlink");
         assert!(
             probe.calls.borrow().is_empty(),
             "an unchanged gitlink never reaches merged_entry"
@@ -1623,7 +1639,8 @@ mod tests {
         let probe = RecordingProbe::default();
         let mut opts = opts();
         opts.reset = ResetType::OverwriteUntracked;
-        unpack_trees(&index, &[tree], MergeFn::OneWay, &opts, &probe).expect("oneway reset gitlink");
+        unpack_trees(&index, &[tree], MergeFn::OneWay, &opts, &probe)
+            .expect("oneway reset gitlink");
         assert_eq!(
             probe.calls.borrow()[0].3,
             ResetType::OverwriteUntracked,

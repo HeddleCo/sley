@@ -535,7 +535,9 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             .min(format.hex_len())
     };
     let ws_resolver = if options.check {
-        Some(commands::diff::WhitespaceRuleResolver::from_git_dir(git_dir)?)
+        Some(commands::diff::WhitespaceRuleResolver::from_git_dir(
+            git_dir,
+        )?)
     } else {
         None
     };
@@ -549,7 +551,11 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
     let diff_pathspec = if setup.pathspecs.is_empty() || options.max_depth.is_some() {
         None
     } else if let Ok(worktree_root) = repo.worktree_root() {
-        Some(DiffPathspec::new(repo.cwd(), worktree_root, &setup.pathspecs)?)
+        Some(DiffPathspec::new(
+            repo.cwd(),
+            worktree_root,
+            &setup.pathspecs,
+        )?)
     } else {
         None
     };
@@ -855,8 +861,8 @@ fn diff_tree_header_text(
 fn diff_tree_pretty_notes(git_dir: &Path, format: ObjectFormat, oid: &ObjectId) -> Result<String> {
     let store = FileRefStore::new(git_dir, format);
     let handle = sley_notes::NotesRef::expand(sley_notes::DEFAULT_NOTES_REF);
-    let mut notes = sley_notes::read_note_bytes(git_dir, format, &store, &handle, oid)?
-        .unwrap_or_default();
+    let mut notes =
+        sley_notes::read_note_bytes(git_dir, format, &store, &handle, oid)?.unwrap_or_default();
     notes.push(b'\n');
     Ok(String::from_utf8_lossy(&notes).into_owned())
 }
@@ -1289,7 +1295,6 @@ fn run_combined_request(
     Ok(has_differences)
 }
 
-
 /// Build the change list for a request, honouring the recursion mode.
 ///
 ///   * Recursive: delegate to `sley_diff_merge`, which flattens subtrees into
@@ -1308,7 +1313,8 @@ fn compute_entries(
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
     if let Some(max_depth) = options.max_depth {
         let specs = DiffTreeDepthPathspecs::new(pathspecs);
-        let mut entries = depth_limited_tree_changes(format, db, left, Some(right), &specs, max_depth)?;
+        let mut entries =
+            depth_limited_tree_changes(format, db, left, Some(right), &specs, max_depth)?;
         sort_entries_by_path(&mut entries);
         if options.reverse {
             entries = reverse_diff_entries(entries);
@@ -1433,10 +1439,7 @@ fn relative_depth_from_spec(spec: &[u8], path: &[u8]) -> Option<i64> {
     if path == spec {
         return Some(0);
     }
-    if path.len() > spec.len()
-        && path.starts_with(spec)
-        && path.get(spec.len()) == Some(&b'/')
-    {
+    if path.len() > spec.len() && path.starts_with(spec) && path.get(spec.len()) == Some(&b'/') {
         return Some(path_component_count(&path[spec.len() + 1..]));
     }
     None
@@ -1469,13 +1472,7 @@ fn depth_limited_tree_changes(
         pathspecs,
         max_depth,
     };
-    collect_depth_limited_tree_changes(
-        &context,
-        left,
-        right,
-        Vec::new(),
-        &mut out,
-    )?;
+    collect_depth_limited_tree_changes(&context, left, right, Vec::new(), &mut out)?;
     Ok(out)
 }
 
@@ -1517,22 +1514,10 @@ fn collect_depth_limited_tree_changes(
 
         match (left_is_tree, right_is_tree) {
             (true, true) => {
-                handle_depth_limited_tree_pair(
-                    context,
-                    left,
-                    right,
-                    path,
-                    out,
-                )?;
+                handle_depth_limited_tree_pair(context, left, right, path, out)?;
             }
             (true, false) => {
-                handle_depth_limited_tree_side(
-                    context,
-                    left,
-                    None,
-                    path.clone(),
-                    out,
-                )?;
+                handle_depth_limited_tree_side(context, left, None, path.clone(), out)?;
                 if let Some(right) = right {
                     maybe_push_depth_limited_blob_change(
                         out,
@@ -1555,13 +1540,7 @@ fn collect_depth_limited_tree_changes(
                         context.max_depth,
                     );
                 }
-                handle_depth_limited_tree_side(
-                    context,
-                    None,
-                    right,
-                    path,
-                    out,
-                )?;
+                handle_depth_limited_tree_side(context, None, right, path, out)?;
             }
             (false, false) => {
                 maybe_push_depth_limited_blob_change(

@@ -2432,8 +2432,7 @@ mod tests {
             ]
         );
 
-        let remote =
-            parse_remote_url("[myhost:123]:src").expect("test operation should succeed");
+        let remote = parse_remote_url("[myhost:123]:src").expect("test operation should succeed");
         assert_eq!(
             remote,
             RemoteUrl {
@@ -2461,8 +2460,7 @@ mod tests {
         assert_eq!(remote.port, None);
         assert_eq!(remote.path, "rep");
 
-        let remote =
-            parse_remote_url("[user@::1]:repo").expect("test operation should succeed");
+        let remote = parse_remote_url("[user@::1]:repo").expect("test operation should succeed");
         assert_eq!(remote.user.as_deref(), Some("user"));
         assert_eq!(remote.host.as_deref(), Some("::1"));
 

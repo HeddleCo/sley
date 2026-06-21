@@ -1019,7 +1019,11 @@ fn alternate_packed_object_ids(
     for alternate in alternate_object_dirs(objects_dir) {
         let mut alternate_oids = HashSet::new();
         collect_packed_object_ids(&alternate.join("pack"), format, &mut alternate_oids)?;
-        oids.extend(alternate_oids.into_iter().map(|oid| (alternate.clone(), oid)));
+        oids.extend(
+            alternate_oids
+                .into_iter()
+                .map(|oid| (alternate.clone(), oid)),
+        );
     }
     oids.sort_by(|left, right| {
         left.0
@@ -6171,7 +6175,9 @@ mod tests {
         let store = LooseObjectStore::new(root.join("objects"), ObjectFormat::Sha1);
         // Incompressible body so the deflate stream is long and a deep byte is well
         // past the 32 inflated header-window bytes.
-        let body: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2654435761)) as u8).collect();
+        let body: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(2654435761)) as u8)
+            .collect();
         let object = EncodedObject::new(ObjectType::Blob, body.clone());
         let oid = store
             .write_object(object)

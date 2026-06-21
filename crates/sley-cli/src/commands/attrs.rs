@@ -10,8 +10,8 @@ use sley_object::tree_entry_object_type;
 use sley_pathspec::normalize_ls_files_pathspec;
 
 use crate::{
-    RepositoryContext, check_ignore_tracked_paths, global_attr_source, resolve_cli_path,
-    require_work_tree, status_quote_path, worktree_prefix, write_check_attr_state,
+    RepositoryContext, check_ignore_tracked_paths, global_attr_source, require_work_tree,
+    resolve_cli_path, status_quote_path, worktree_prefix, write_check_attr_state,
 };
 
 pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
@@ -111,65 +111,61 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
     let mut stdout = io::stdout().lock();
     let terminator = if z { b'\0' } else { b'\n' };
     let mut matched_any = false;
-    let process_path =
-        |display_path: Vec<u8>, stdout: &mut std::io::StdoutLock<'_>| -> Result<bool> {
-            let path_arg = String::from_utf8_lossy(&display_path);
-            let git_path = normalize_ls_files_pathspec(prefix.as_bytes(), &path_arg)?;
-            validate_check_ignore_pathspec(
-                worktree_root,
-                &git_path,
-                &display_path,
-                &gitlink_paths,
-            )?;
-            let absolute = resolve_cli_path(cwd, &path_arg);
-            // Tracked paths are never ignored (upstream check-ignore consults the
-            // index via find_pathspecs_matching_against_index and skips matching
-            // entries): report them as non-matching rather than skipping output,
-            // so `-v -n` still prints the `::` line for them.
-            let ignore_match = if tracked_paths.contains(&git_path) {
-                None
-            } else {
-                sley_worktree::standard_ignore_match(worktree_root, &git_path, absolute.is_dir())?
-            };
-            let path_matched = ignore_match
-                .as_ref()
-                .is_some_and(|ignore_match| verbose || ignore_match.ignored);
-            if let Some(ignore_match) = ignore_match {
-                if !quiet && verbose {
-                    if z {
-                        stdout.write_all(&ignore_match.source)?;
-                        stdout.write_all(&[0])?;
-                        write!(stdout, "{}", ignore_match.line_number)?;
-                        stdout.write_all(&[0])?;
-                        stdout.write_all(&ignore_match.pattern)?;
-                        stdout.write_all(&[0])?;
-                        stdout.write_all(&display_path)?;
-                        stdout.write_all(&[0])?;
-                    } else {
-                        stdout.write_all(&ignore_match.source)?;
-                        write!(stdout, ":{}:", ignore_match.line_number)?;
-                        stdout.write_all(&ignore_match.pattern)?;
-                        stdout.write_all(b"\t")?;
-                        write_check_ignore_quoted(stdout, &display_path)?;
-                        stdout.write_all(&[terminator])?;
-                    }
-                } else if !quiet && ignore_match.ignored {
-                    stdout.write_all(&display_path)?;
-                    stdout.write_all(&[terminator])?;
-                }
-            } else if verbose && non_matching && !quiet {
+    let process_path = |display_path: Vec<u8>,
+                        stdout: &mut std::io::StdoutLock<'_>|
+     -> Result<bool> {
+        let path_arg = String::from_utf8_lossy(&display_path);
+        let git_path = normalize_ls_files_pathspec(prefix.as_bytes(), &path_arg)?;
+        validate_check_ignore_pathspec(worktree_root, &git_path, &display_path, &gitlink_paths)?;
+        let absolute = resolve_cli_path(cwd, &path_arg);
+        // Tracked paths are never ignored (upstream check-ignore consults the
+        // index via find_pathspecs_matching_against_index and skips matching
+        // entries): report them as non-matching rather than skipping output,
+        // so `-v -n` still prints the `::` line for them.
+        let ignore_match = if tracked_paths.contains(&git_path) {
+            None
+        } else {
+            sley_worktree::standard_ignore_match(worktree_root, &git_path, absolute.is_dir())?
+        };
+        let path_matched = ignore_match
+            .as_ref()
+            .is_some_and(|ignore_match| verbose || ignore_match.ignored);
+        if let Some(ignore_match) = ignore_match {
+            if !quiet && verbose {
                 if z {
-                    stdout.write_all(&[0, 0, 0])?;
+                    stdout.write_all(&ignore_match.source)?;
+                    stdout.write_all(&[0])?;
+                    write!(stdout, "{}", ignore_match.line_number)?;
+                    stdout.write_all(&[0])?;
+                    stdout.write_all(&ignore_match.pattern)?;
+                    stdout.write_all(&[0])?;
                     stdout.write_all(&display_path)?;
                     stdout.write_all(&[0])?;
                 } else {
-                    stdout.write_all(b"::\t")?;
+                    stdout.write_all(&ignore_match.source)?;
+                    write!(stdout, ":{}:", ignore_match.line_number)?;
+                    stdout.write_all(&ignore_match.pattern)?;
+                    stdout.write_all(b"\t")?;
                     write_check_ignore_quoted(stdout, &display_path)?;
                     stdout.write_all(&[terminator])?;
                 }
+            } else if !quiet && ignore_match.ignored {
+                stdout.write_all(&display_path)?;
+                stdout.write_all(&[terminator])?;
             }
-            Ok(path_matched)
-        };
+        } else if verbose && non_matching && !quiet {
+            if z {
+                stdout.write_all(&[0, 0, 0])?;
+                stdout.write_all(&display_path)?;
+                stdout.write_all(&[0])?;
+            } else {
+                stdout.write_all(b"::\t")?;
+                write_check_ignore_quoted(stdout, &display_path)?;
+                stdout.write_all(&[terminator])?;
+            }
+        }
+        Ok(path_matched)
+    };
     if read_stdin {
         crate::commands::stdin_stream::stream_stdin_records(
             terminator,
@@ -415,73 +411,67 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
     };
     let mut stdout = io::stdout().lock();
     let terminator = if z { b'\0' } else { b'\n' };
-    let process_path = |display_path: Vec<u8>,
-                        mut stdout: &mut std::io::StdoutLock<'_>|
-     -> Result<()> {
-        let path_arg = String::from_utf8_lossy(&display_path);
-        let git_path = normalize_ls_files_pathspec(prefix.as_bytes(), &path_arg)?;
-        let mut checks = if cached {
-            sley_worktree::standard_attributes_for_path_from_index(
-                attr_root,
-                git_dir,
-                format,
-                &git_path,
-                &requested,
-                all,
-            )?
-        } else if let Some(tree_oid) = source_tree.as_ref() {
-            sley_worktree::standard_attributes_for_path_from_tree(
-                attr_root,
-                git_dir,
-                repo.objects(),
-                format,
-                tree_oid,
-                &git_path,
-                &requested,
-                all,
-            )?
-        } else {
-            sley_worktree::standard_attributes_for_path_in_repo(
-                attr_root,
-                git_dir,
-                &git_path,
-                &requested,
-                all,
-                worktree_root.is_some(),
-                repo.config()
-                    .get_bool("core", None, "ignorecase")
-                    .unwrap_or(false),
-            )?
-        };
-        if !all {
-            fill_builtin_object_mode(
-                &mut checks,
-                worktree_root.as_deref(),
-                git_dir,
-                format,
-                &git_path,
-                cached,
-            )?;
-        }
-        for check in checks {
-            if z {
-                stdout.write_all(&display_path)?;
-                stdout.write_all(&[0])?;
-                stdout.write_all(&check.attribute)?;
-                stdout.write_all(&[0])?;
-                write_check_attr_state(&mut stdout, check.state.as_ref())?;
-                stdout.write_all(&[0])?;
+    let process_path =
+        |display_path: Vec<u8>, mut stdout: &mut std::io::StdoutLock<'_>| -> Result<()> {
+            let path_arg = String::from_utf8_lossy(&display_path);
+            let git_path = normalize_ls_files_pathspec(prefix.as_bytes(), &path_arg)?;
+            let mut checks = if cached {
+                sley_worktree::standard_attributes_for_path_from_index(
+                    attr_root, git_dir, format, &git_path, &requested, all,
+                )?
+            } else if let Some(tree_oid) = source_tree.as_ref() {
+                sley_worktree::standard_attributes_for_path_from_tree(
+                    attr_root,
+                    git_dir,
+                    repo.objects(),
+                    format,
+                    tree_oid,
+                    &git_path,
+                    &requested,
+                    all,
+                )?
             } else {
-                stdout.write_all(status_quote_path(&display_path, false).as_bytes())?;
-                stdout.write_all(b": ")?;
-                stdout.write_all(&check.attribute)?;
-                stdout.write_all(b": ")?;
-                write_check_attr_state(&mut stdout, check.state.as_ref())?;
-                stdout.write_all(b"\n")?;
+                sley_worktree::standard_attributes_for_path_in_repo(
+                    attr_root,
+                    git_dir,
+                    &git_path,
+                    &requested,
+                    all,
+                    worktree_root.is_some(),
+                    repo.config()
+                        .get_bool("core", None, "ignorecase")
+                        .unwrap_or(false),
+                )?
+            };
+            if !all {
+                fill_builtin_object_mode(
+                    &mut checks,
+                    worktree_root.as_deref(),
+                    git_dir,
+                    format,
+                    &git_path,
+                    cached,
+                )?;
             }
-        }
-        Ok(())
-    };
+            for check in checks {
+                if z {
+                    stdout.write_all(&display_path)?;
+                    stdout.write_all(&[0])?;
+                    stdout.write_all(&check.attribute)?;
+                    stdout.write_all(&[0])?;
+                    write_check_attr_state(&mut stdout, check.state.as_ref())?;
+                    stdout.write_all(&[0])?;
+                } else {
+                    stdout.write_all(status_quote_path(&display_path, false).as_bytes())?;
+                    stdout.write_all(b": ")?;
+                    stdout.write_all(&check.attribute)?;
+                    stdout.write_all(b": ")?;
+                    write_check_attr_state(&mut stdout, check.state.as_ref())?;
+                    stdout.write_all(b"\n")?;
+                }
+            }
+            Ok(())
+        };
     if read_stdin {
         crate::commands::stdin_stream::stream_stdin_records(
             terminator,

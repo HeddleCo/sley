@@ -241,10 +241,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
     // repo-relative path is used for any -L error message, matching git.
     let selected = select_lines(&lines, &options, &repo_path)?;
     if options.progress {
-        eprintln!(
-            "Blaming lines: 100% ({0}/{0}), done.",
-            selected.len()
-        );
+        eprintln!("Blaming lines: 100% ({0}/{0}), done.", selected.len());
     }
     if selected.is_empty() {
         return Ok(());
@@ -978,14 +975,12 @@ fn contiguous_parent_hunks(
     if parent_lines.is_empty() || child_lines.len() < parent_lines.len() {
         return None;
     }
-    let offset = child_lines
-        .windows(parent_lines.len())
-        .position(|window| {
-            parent_lines
-                .iter()
-                .zip(window)
-                .all(|(parent, child)| parent.content == child.content)
-        })?;
+    let offset = child_lines.windows(parent_lines.len()).position(|window| {
+        parent_lines
+            .iter()
+            .zip(window)
+            .all(|(parent, child)| parent.content == child.content)
+    })?;
 
     let mut hunks = Vec::new();
     if offset > 0 {
@@ -1005,11 +1000,7 @@ fn contiguous_parent_hunks(
             count_b: child_lines.len() - child_after,
         });
     }
-    if hunks.is_empty() {
-        None
-    } else {
-        Some(hunks)
-    }
+    if hunks.is_empty() { None } else { Some(hunks) }
 }
 
 /// Pass `entry` to a parent: rebase its `s_lno` by `offset` (the parent leads
@@ -1823,15 +1814,9 @@ mod tests {
     fn resolve_regex_bound_finds_first_match_from_anchor() {
         let contents: Vec<&[u8]> = vec![b"apple", b"robot green", b"banana", b"green tea"];
         // From line 1, /green/ matches line 2.
-        assert_eq!(
-            resolve_regex_bound("green", &contents, 1, 4).unwrap(),
-            2
-        );
+        assert_eq!(resolve_regex_bound("green", &contents, 1, 4).unwrap(), 2);
         // From line 3, /green/ matches line 4 (the search anchor advances).
-        assert_eq!(
-            resolve_regex_bound("green", &contents, 3, 4).unwrap(),
-            4
-        );
+        assert_eq!(resolve_regex_bound("green", &contents, 3, 4).unwrap(), 4);
         // No match is the fatal error.
         assert!(matches!(
             resolve_regex_bound("zzz", &contents, 1, 4),

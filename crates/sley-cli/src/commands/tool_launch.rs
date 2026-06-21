@@ -52,7 +52,9 @@ pub(crate) fn resolve_tool_command(
         None => {
             let path = config
                 .get(mode_section, Some(name), "path")
-                .or_else(|| fallback_section.and_then(|section| config.get(section, Some(name), "path")))
+                .or_else(|| {
+                    fallback_section.and_then(|section| config.get(section, Some(name), "path"))
+                })
                 .map(str::to_owned)
                 .or_else(|| builtin_tool_program(name));
             let Some(path) = path else {
@@ -78,9 +80,10 @@ pub(crate) fn resolve_tool_command(
     let trust_exit_code = trust_override.unwrap_or_else(|| {
         config
             .get_bool(mode_section, Some(name), "trustexitcode")
-            .or_else(|| fallback_section.and_then(|section| {
-                config.get_bool(section, Some(name), "trustexitcode")
-            }))
+            .or_else(|| {
+                fallback_section
+                    .and_then(|section| config.get_bool(section, Some(name), "trustexitcode"))
+            })
             .or_else(|| config.get_bool(mode_section, None, "trustexitcode"))
             .unwrap_or(false)
     });
@@ -96,10 +99,10 @@ pub(crate) fn resolve_tool_command(
 pub(crate) fn builtin_tool_program(name: &str) -> Option<String> {
     match name {
         "araxis" | "bc" | "bc3" | "bc4" | "codecompare" | "deltawalker" | "diffmerge"
-        | "diffuse" | "ecmerge" | "emerge" | "gvimdiff" | "gvimdiff2" | "gvimdiff3"
-        | "kdiff3" | "kompare" | "meld" | "nvimdiff" | "nvimdiff2" | "nvimdiff3"
-        | "opendiff" | "p4merge" | "smerge" | "tkdiff" | "tortoisemerge" | "vimdiff"
-        | "vimdiff2" | "vimdiff3" | "winmerge" | "xxdiff" => Some(name.to_string()),
+        | "diffuse" | "ecmerge" | "emerge" | "gvimdiff" | "gvimdiff2" | "gvimdiff3" | "kdiff3"
+        | "kompare" | "meld" | "nvimdiff" | "nvimdiff2" | "nvimdiff3" | "opendiff" | "p4merge"
+        | "smerge" | "tkdiff" | "tortoisemerge" | "vimdiff" | "vimdiff2" | "vimdiff3"
+        | "winmerge" | "xxdiff" => Some(name.to_string()),
         _ => None,
     }
 }

@@ -3,9 +3,7 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley_pathspec::{
-    LsFilesPathFilter, parse_normalized_pathspec_element, pathspec_filters_match,
-};
+use sley_pathspec::{LsFilesPathFilter, parse_normalized_pathspec_element, pathspec_filters_match};
 
 pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     // `-h`/`--help` short-circuits before any repository state is read, so it
@@ -123,8 +121,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 explicit_untracked = true;
             }
             value if value.starts_with("--untracked-files=") => {
-                untracked_mode =
-                    parse_status_untracked_mode(&value["--untracked-files=".len()..])?;
+                untracked_mode = parse_status_untracked_mode(&value["--untracked-files=".len()..])?;
                 explicit_untracked = true;
             }
             value if value.starts_with("--porcelain=") => {
@@ -997,10 +994,7 @@ fn print_status_porcelain_v2(
         // Porcelain v2 submodule field (wt-status.c wt_porcelain_v2_*):
         // "N..." for an ordinary path; "S<C><M><U>" for a submodule, with C
         // for new commits, M for modified content, U for untracked content.
-        write!(
-            stdout,
-            "1 {index}{worktree} ",
-        )?;
+        write!(stdout, "1 {index}{worktree} ",)?;
         match entry.submodule {
             Some(submodule) => write!(
                 stdout,
@@ -1013,7 +1007,9 @@ fn print_status_porcelain_v2(
                     '.'
                 },
             )?,
-            None if entry.index_mode.is_some_and(sley_index::is_gitlink) || entry.worktree_mode.is_some_and(sley_index::is_gitlink) => {
+            None if entry.index_mode.is_some_and(sley_index::is_gitlink)
+                || entry.worktree_mode.is_some_and(sley_index::is_gitlink) =>
+            {
                 stdout.write_all(b"S... ")?;
             }
             None => stdout.write_all(b"N... ")?,
@@ -1336,7 +1332,9 @@ fn index_gitlinks(git_dir: &Path, format: ObjectFormat) -> Result<BTreeMap<Vec<u
     Ok(index
         .entries
         .iter()
-        .filter(|entry| entry.stage() == sley_index::Stage::Normal && sley_index::is_gitlink(entry.mode))
+        .filter(|entry| {
+            entry.stage() == sley_index::Stage::Normal && sley_index::is_gitlink(entry.mode)
+        })
         .map(|entry| (entry.path.to_vec(), entry.oid))
         .collect())
 }
@@ -1409,7 +1407,8 @@ fn render_summary_section(
         if !is_addition && resolver.for_path(path) == IgnoreSubmodules::All {
             continue;
         }
-        let Some(body) = render_one_submodule(worktree_root, format, limit, path, *old_oid, *new_oid)?
+        let Some(body) =
+            render_one_submodule(worktree_root, format, limit, path, *old_oid, *new_oid)?
         else {
             continue;
         };
@@ -1481,7 +1480,10 @@ fn render_one_submodule(
             )
         } else {
             let missing = if !src_present { &old } else { &new };
-            format!("  Warn: {path_str} doesn't contain commit {}\n", missing.to_hex())
+            format!(
+                "  Warn: {path_str} doesn't contain commit {}\n",
+                missing.to_hex()
+            )
         };
         return Ok(Some(format!(
             "* {path_str} {src_abbrev}...{dst_abbrev}:\n{warn}"
@@ -2032,21 +2034,30 @@ fn status_rebase_information(
         return Ok(());
     }
     let done = status_rebase_todo_lines(git_dir, format, &format!("{}/done", rebase.dir_name))?;
-    let todo =
-        status_rebase_todo_lines(git_dir, format, &format!("{}/git-rebase-todo", rebase.dir_name))?;
+    let todo = status_rebase_todo_lines(
+        git_dir,
+        format,
+        &format!("{}/git-rebase-todo", rebase.dir_name),
+    )?;
     if done.is_empty() {
         sink.line("No commands done.");
     } else if done.len() == 1 {
         sink.line("Last command done (1 command done):");
         sink.line(format!("   {}", done[0]));
     } else {
-        sink.line(format!("Last commands done ({} commands done):", done.len()));
+        sink.line(format!(
+            "Last commands done ({} commands done):",
+            done.len()
+        ));
         let start = done.len().saturating_sub(2);
         for line in &done[start..] {
             sink.line(format!("   {line}"));
         }
         if done.len() > 2 {
-            sink.hint(format!("  (see more in file .git/{}/done)", rebase.dir_name));
+            sink.hint(format!(
+                "  (see more in file .git/{}/done)",
+                rebase.dir_name
+            ));
         }
     }
 
@@ -2241,7 +2252,8 @@ fn build_status_long_sink_inner(
     let mut untracked = Vec::new();
     let mut ignored = Vec::new();
     let unmerged = status_unmerged_paths(git_dir, format)?;
-    let unmerged_paths: BTreeSet<Vec<u8>> = unmerged.iter().map(|entry| entry.path.clone()).collect();
+    let unmerged_paths: BTreeSet<Vec<u8>> =
+        unmerged.iter().map(|entry| entry.path.clone()).collect();
     for entry in entries {
         if unmerged_paths.contains(&entry.path) {
             continue;
@@ -2380,7 +2392,8 @@ fn build_status_long_sink_inner(
         }
         printed_anything = true;
     }
-    let has_summary = !submodule_summary.staged.is_empty() || !submodule_summary.unstaged.is_empty();
+    let has_summary =
+        !submodule_summary.staged.is_empty() || !submodule_summary.unstaged.is_empty();
 
     if has_untracked {
         if head_initial || has_staged || has_unstaged || has_unmerged || has_summary {
@@ -2400,7 +2413,13 @@ fn build_status_long_sink_inner(
     }
 
     if has_ignored {
-        if head_initial || has_staged || has_unstaged || has_unmerged || has_summary || has_untracked {
+        if head_initial
+            || has_staged
+            || has_unstaged
+            || has_unmerged
+            || has_summary
+            || has_untracked
+        {
             sink.blank();
         }
         sink.line("Ignored files:");
@@ -2483,7 +2502,10 @@ fn build_status_long_sink_inner(
     Ok(sink)
 }
 
-fn status_sparse_footer(git_dir: &Path, format: ObjectFormat) -> Result<Option<StatusSparseFooter>> {
+fn status_sparse_footer(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Option<StatusSparseFooter>> {
     let sparse_enabled = GitConfig::read(git_dir.join("config.worktree"))
         .ok()
         .and_then(|config| config.get_bool("core", None, "sparseCheckout"))
@@ -2735,11 +2757,14 @@ fn status_detached_from_tag(
         let Some((_, message)) = line.split_once('\t') else {
             continue;
         };
-        let Some(tag) = message.strip_prefix("checkout: moving from ").and_then(|text| {
-            text.rsplit_once(" to ")
-                .map(|(_, target)| target.trim())
-                .filter(|target| !target.is_empty())
-        }) else {
+        let Some(tag) = message
+            .strip_prefix("checkout: moving from ")
+            .and_then(|text| {
+                text.rsplit_once(" to ")
+                    .map(|(_, target)| target.trim())
+                    .filter(|target| !target.is_empty())
+            })
+        else {
             continue;
         };
         for (name, target) in status_loose_tag_oids(git_dir, format)? {
@@ -2810,8 +2835,14 @@ pub(crate) fn status_long_tracking_lines(
             if !seen.insert(refname.clone()) {
                 continue;
             }
-            let tracking =
-                status_branch_tracking_for_ref(store, git_dir, format, oid, &refname, ahead_behind)?;
+            let tracking = status_branch_tracking_for_ref(
+                store,
+                git_dir,
+                format,
+                oid,
+                &refname,
+                ahead_behind,
+            )?;
             status_long_tracking_state_lines(
                 &tracking,
                 suppress_divergence_advice,
@@ -2870,7 +2901,7 @@ fn status_branch_tracking_for_ref(
     let state = if ahead_behind {
         match store.read_ref(refname)? {
             None => StatusBranchTrackingState::Gone,
-            Some(_) => for_each_ref_upstream_track(store, &db, format, oid, refname)?
+            Some(_) => for_each_ref_upstream_track(store, git_dir, &db, format, oid, refname)?
                 .map(StatusBranchTrackingState::Counts)
                 .unwrap_or(StatusBranchTrackingState::Different),
         }
@@ -2937,7 +2968,10 @@ fn status_long_tracking_state_lines(
             }
         }
         StatusBranchTrackingState::Counts(ForEachRefTrack { ahead, behind, .. }) => {
-            sink.line(format!("Your branch and '{}' have diverged,", tracking.upstream));
+            sink.line(format!(
+                "Your branch and '{}' have diverged,",
+                tracking.upstream
+            ));
             sink.line(format!(
                 "and have {ahead} and {behind} different commits each, respectively."
             ));
@@ -2983,7 +3017,9 @@ fn status_long_change_label(code: u8) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn status_entries_have_index_changes(entries: &[sley_worktree::ShortStatusEntry]) -> bool {
+pub(crate) fn status_entries_have_index_changes(
+    entries: &[sley_worktree::ShortStatusEntry],
+) -> bool {
     entries
         .iter()
         .any(|entry| status_long_change_label(entry.index).is_some())
@@ -3119,9 +3155,11 @@ fn status_branch_tracking(
     let track = if ahead_behind {
         match store.read_ref(&upstream.refname)? {
             None => StatusBranchTrackingState::Gone,
-            Some(_) => for_each_ref_upstream_track(store, &db, format, oid, &upstream.refname)?
-                .map(StatusBranchTrackingState::Counts)
-                .unwrap_or(StatusBranchTrackingState::Different),
+            Some(_) => {
+                for_each_ref_upstream_track(store, git_dir, &db, format, oid, &upstream.refname)?
+            }
+            .map(StatusBranchTrackingState::Counts)
+            .unwrap_or(StatusBranchTrackingState::Different),
         }
     } else {
         status_branch_tracking_without_ahead_behind(store, oid, &upstream.refname)?

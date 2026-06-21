@@ -10,11 +10,11 @@
 //! `FileObjectDatabase`, ...);
 //! see `commands::stash` for the rationale.
 
-use crate::*;
 use crate::grep_source::{
     Expr, ExprToken, GrepCompileConfig, GrepMatcher, PatternKind, PatternTypeOption,
     RegexDiagnosticVerbosity,
 };
+use crate::*;
 use sley_pathspec::{parse_normalized_pathspec_element, pathspec_attrs_match_with};
 use std::borrow::Cow;
 
@@ -945,7 +945,14 @@ fn grep_no_index(
         let Ok(content) = fs::read(&file.absolute) else {
             continue;
         };
-        let matched = grep_buffer(&content, &file.display, None, &plan, &mut out, &mut printed_file)?;
+        let matched = grep_buffer(
+            &content,
+            &file.display,
+            None,
+            &plan,
+            &mut out,
+            &mut printed_file,
+        )?;
         any_match = any_match || matched;
     }
     if any_match {
@@ -1634,14 +1641,7 @@ fn emit_lines(
             b"-"
         };
         if !heading {
-            write_match_prefix_sep_colored(
-                out,
-                rev,
-                display_path,
-                show_filename,
-                sep,
-                colors,
-            )?;
+            write_match_prefix_sep_colored(out, rev, display_path, show_filename, sep, colors)?;
         }
         if opts.line_number {
             out.write_all((i + 1).to_string().as_bytes())?;
@@ -1775,12 +1775,7 @@ fn write_highlighted_line(
     Ok(())
 }
 
-fn write_colored_bytes(
-    out: &mut impl Write,
-    bytes: &[u8],
-    color: &str,
-    reset: &str,
-) -> Result<()> {
+fn write_colored_bytes(out: &mut impl Write, bytes: &[u8], color: &str, reset: &str) -> Result<()> {
     if color.is_empty() {
         out.write_all(bytes)?;
     } else {

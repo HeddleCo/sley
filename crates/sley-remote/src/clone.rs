@@ -370,10 +370,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         tx.update(RefUpdate {
             name: "HEAD".to_string(),
             expected: None,
-            new: RefTarget::Symbolic(format!(
-                "refs/heads/{}",
-                request.options.checkout_branch
-            )),
+            new: RefTarget::Symbolic(format!("refs/heads/{}", request.options.checkout_branch)),
             reflog: None,
         });
         tx.commit()?;

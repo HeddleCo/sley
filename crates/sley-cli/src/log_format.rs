@@ -366,7 +366,10 @@ impl CompiledLogFormat {
         self.token_segments = token_segments_from_expand(&self.expand);
     }
 
-    pub(crate) fn segment_range_for_tokens(&self, token_range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    pub(crate) fn segment_range_for_tokens(
+        &self,
+        token_range: std::ops::Range<usize>,
+    ) -> std::ops::Range<usize> {
         let start = self
             .token_segments
             .get(token_range.start)
@@ -461,10 +464,8 @@ impl AtomTable for LogFormatAtomTable {
         if first == 'x' {
             let bytes = value.as_bytes();
             if let (Some(high), Some(low)) = (bytes.get(1), bytes.get(2))
-                && let (Some(high), Some(low)) = (
-                    (*high as char).to_digit(16),
-                    (*low as char).to_digit(16),
-                )
+                && let (Some(high), Some(low)) =
+                    ((*high as char).to_digit(16), (*low as char).to_digit(16))
             {
                 return Ok(Some((FormatToken::HexByte(((high << 4) | low) as u8), 3)));
             }
@@ -533,7 +534,11 @@ impl AtomTable for LogFormatAtomTable {
                 FormatToken::DecorationsBare
             }
             'G' => return parse_g_atom(value).map(Some),
-            'g' if matches!(self.dialect, LogFormatDialect::Stash | LogFormatDialect::Log) => {
+            'g' if matches!(
+                self.dialect,
+                LogFormatDialect::Stash | LogFormatDialect::Log
+            ) =>
+            {
                 return parse_reflog_g_atom(value).map(Some);
             }
             'g' => return parse_g_date_atom(value).map(Some),
@@ -737,9 +742,7 @@ fn parse_identity_atom(
     Ok((token, 2))
 }
 
-fn tokens_from_expand(
-    expand: &ExpandFormat<FormatToken>,
-) -> (Vec<FormatToken>, Vec<usize>) {
+fn tokens_from_expand(expand: &ExpandFormat<FormatToken>) -> (Vec<FormatToken>, Vec<usize>) {
     let mut tokens = Vec::new();
     let mut token_segments = Vec::new();
     for (segment_index, segment) in expand.segments().iter().enumerate() {
@@ -1079,11 +1082,9 @@ mod tests {
 
     #[test]
     fn known_g_signature_atoms_are_not_literals() {
-        let compiled = CompiledLogFormat::compile(
-            "%GG|%G?|%GS|%GK|%GF|%GP|%GT|%GX|%G",
-            LogFormatDialect::Log,
-        )
-        .unwrap();
+        let compiled =
+            CompiledLogFormat::compile("%GG|%G?|%GS|%GK|%GF|%GP|%GT|%GX|%G", LogFormatDialect::Log)
+                .unwrap();
         assert_eq!(
             compiled.tokens,
             vec![

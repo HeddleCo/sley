@@ -113,9 +113,10 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             value if !saw_dashdash && value.starts_with("--cruft-expiration=") => {
                 options.cruft = true;
                 let spec = &value["--cruft-expiration=".len()..];
-                let ts = crate::commands::approxidate::parse_expiry_date(spec).ok_or_else(|| {
-                    GitError::Command(format!("malformed expiration date '{spec}'"))
-                })?;
+                let ts =
+                    crate::commands::approxidate::parse_expiry_date(spec).ok_or_else(|| {
+                        GitError::Command(format!("malformed expiration date '{spec}'"))
+                    })?;
                 // git's cruft_expiration is a `timestamp_t` (unsigned); zero
                 // means "never expire". A saturating cast keeps the "now"/"all"
                 // sentinel (i64 from u64::MAX) at u32::MAX so nothing survives.
@@ -171,8 +172,14 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             // recomputes its own deltas (so reuse toggles are moot), only ever
             // writes non-empty packs unless there is nothing to write, and the
             // reflog/index inclusion knobs only matter alongside `--revs`.
-            "--no-reuse-delta" | "--no-reuse-object" | "--non-empty" | "--keep-true-parents"
-            | "--reflog" | "--indexed-objects" | "--delta-islands" | "--sparse"
+            "--no-reuse-delta"
+            | "--no-reuse-object"
+            | "--non-empty"
+            | "--keep-true-parents"
+            | "--reflog"
+            | "--indexed-objects"
+            | "--delta-islands"
+            | "--sparse"
             | "--no-sparse"
                 if !saw_dashdash => {}
             "--progress" | "--all-progress" | "--all-progress-implied" if !saw_dashdash => {
@@ -220,7 +227,14 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
         pack_objects_pack_size_limit(&git_dir, options.max_pack_size, options.stdout_mode)?;
 
     if options.cruft {
-        return write_cruft_pack(&git_dir, &common_git_dir, &database, format, &options, progress);
+        return write_cruft_pack(
+            &git_dir,
+            &common_git_dir,
+            &database,
+            format,
+            &options,
+            progress,
+        );
     }
     if options.stdin_packs {
         return read_stdin_packs(format);
@@ -1317,7 +1331,9 @@ fn parse_index_version_spec(spec: &str) -> Result<u32> {
         // strtoul base 0: consume an optional 0x/0X prefix then alphanumeric
         // digits. The offset value itself is derived from the offsets by sley's
         // writer, so we only need to consume the token and reject trailing junk.
-        let offset_token = after_comma.strip_prefix("0x").or_else(|| after_comma.strip_prefix("0X"));
+        let offset_token = after_comma
+            .strip_prefix("0x")
+            .or_else(|| after_comma.strip_prefix("0X"));
         let body = offset_token.unwrap_or(after_comma);
         let off_end = body
             .bytes()
@@ -1436,11 +1452,12 @@ fn write_cruft_pack(
             }
             // Candidate source: contribute object mtimes.
             let mtimes_path = idx_path.with_extension("mtimes");
-            let pack_object_mtimes: Option<Vec<u32>> = fs::read(&mtimes_path).ok().and_then(|bytes| {
-                sley_pack::PackMtimes::parse(&bytes, format, index.entries.len())
-                    .ok()
-                    .map(|parsed| parsed.mtimes)
-            });
+            let pack_object_mtimes: Option<Vec<u32>> =
+                fs::read(&mtimes_path).ok().and_then(|bytes| {
+                    sley_pack::PackMtimes::parse(&bytes, format, index.entries.len())
+                        .ok()
+                        .map(|parsed| parsed.mtimes)
+                });
             let pack_mtime = fs::metadata(&pack_path)
                 .and_then(|metadata| metadata.modified())
                 .ok()

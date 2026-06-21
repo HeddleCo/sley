@@ -35,8 +35,8 @@ use sley_protocol::{
 };
 use sley_protocol::{
     PushSourceRef, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackPushRequest,
-    ReceivePackReportStatus, ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement, RefSpec,
-    parse_refspec, plan_push_commands,
+    ReceivePackReportStatus, ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement,
+    RefSpec, parse_refspec, plan_push_commands,
 };
 
 use crate::pack::push_pack_roots;
@@ -290,8 +290,7 @@ impl PushStatusReport {
     /// `transport_refs_pushed`): used to print "Everything up-to-date".
     pub fn refs_pushed(&self) -> bool {
         self.refs.iter().any(|reference| {
-            reference.old_id != reference.new_id
-                && matches!(reference.status, PushRefStatus::Ok)
+            reference.old_id != reference.new_id && matches!(reference.status, PushRefStatus::Ok)
         })
     }
 }
@@ -1065,8 +1064,7 @@ pub fn push_local_with_report(
             remote_refs.iter().map(|reference| reference.oid).collect();
         let pack_objects: Vec<ObjectId> = Vec::new();
         let starts = push_pack_roots(&send, &pack_objects);
-        let remote_db =
-            FileObjectDatabase::from_git_dir(request.remote_common_git_dir, format);
+        let remote_db = FileObjectDatabase::from_git_dir(request.remote_common_git_dir, format);
         let remote_excluded =
             collect_reachable_object_ids(&remote_db, format, remote_excluded_tips)?;
         let packfile = if starts.is_empty() {
@@ -1095,7 +1093,8 @@ pub fn push_local_with_report(
         if let ReceivePackUnpackStatus::Error(message) = &report.unpack {
             for reference in &mut refs {
                 if matches!(reference.status, PushRefStatus::Ok) {
-                    reference.status = PushRefStatus::RemoteReject(format!("unpacker error: {message}"));
+                    reference.status =
+                        PushRefStatus::RemoteReject(format!("unpacker error: {message}"));
                 }
             }
         }
@@ -1530,8 +1529,7 @@ pub(crate) fn plan_push_command_forces(
     let parsed_refspecs = refspecs
         .iter()
         .map(|refspec| {
-            let normalized =
-                normalize_push_refspec_for_sources(refspec, local_refs, remote_refs)?;
+            let normalized = normalize_push_refspec_for_sources(refspec, local_refs, remote_refs)?;
             parse_refspec(&normalized)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1573,8 +1571,12 @@ fn plan_push_command_sources(
     for refspec in refspecs {
         let normalized = normalize_push_refspec_for_sources(refspec, local_refs, remote_refs)?;
         let parsed = parse_refspec(&normalized)?;
-        let commands =
-            plan_push_commands(format, local_refs, remote_refs, std::slice::from_ref(&parsed))?;
+        let commands = plan_push_commands(
+            format,
+            local_refs,
+            remote_refs,
+            std::slice::from_ref(&parsed),
+        )?;
         for command in commands {
             let source = push_command_source_name(&parsed, &command);
             planned.push(PlannedPushCommand {

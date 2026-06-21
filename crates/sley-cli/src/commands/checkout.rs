@@ -2,8 +2,8 @@
 
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
-use crate::*;
 use super::status::{StatusLineSink, status_long_tracking_lines};
+use crate::*;
 
 pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut quiet = false;
@@ -36,7 +36,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             }
             "--conflict" => {
                 let Some(value) = iter.next() else {
-                    return Err(GitError::Command("checkout --conflict requires a value".into()));
+                    return Err(GitError::Command(
+                        "checkout --conflict requires a value".into(),
+                    ));
                 };
                 conflict_style = Some(checkout_conflict_style(value)?);
                 conflict_implies_merge = true;
@@ -94,7 +96,10 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 patch_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
                 inter_hunk_context = true;
             }
-            "--progress" | "--no-progress" | "--ignore-other-worktrees" | "--no-ignore-other-worktrees" => {}
+            "--progress"
+            | "--no-progress"
+            | "--ignore-other-worktrees"
+            | "--no-ignore-other-worktrees" => {}
             "--recurse-submodules" => recurse_submodules = Some(true),
             "--no-recurse-submodules" => recurse_submodules = Some(false),
             "--guess" => guess = Some(true),
@@ -290,7 +295,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             match source {
                 Some(rev) => {
                     if path_merge || conflict_implies_merge {
-                        eprintln!("fatal: '--merge' cannot be used when checking out paths from a tree");
+                        eprintln!(
+                            "fatal: '--merge' cannot be used when checking out paths from a tree"
+                        );
                         return Err(GitError::Exit(128));
                     }
                     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
@@ -645,10 +652,14 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             }
             let start = positional.first().map(String::as_str).unwrap_or("HEAD");
             let store = FileRefStore::new(&git_dir, format);
-            if matches!(track, Some(crate::commands::branch::BranchTrackMode::Direct))
-                && !checkout_start_is_trackable_branch(&store, &checkout_config, start)?
+            if matches!(
+                track,
+                Some(crate::commands::branch::BranchTrackMode::Direct)
+            ) && !checkout_start_is_trackable_branch(&store, &checkout_config, start)?
             {
-                eprintln!("fatal: cannot set up tracking information; starting point '{start}' is not a branch");
+                eprintln!(
+                    "fatal: cannot set up tracking information; starting point '{start}' is not a branch"
+                );
                 return Err(GitError::Exit(128));
             }
             let was_reset = checkout_create_or_reset_branch(
@@ -694,12 +705,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let store = FileRefStore::new(&git_dir, format);
     let branch_target = sley_refs::resolve_ref_peeled(&store, &branch_ref_name(branch)?)?;
     if let Some(target) = branch_target {
-        let local_promisor = prefetch_local_promisor_checkout_blobs(
-            &git_dir,
-            format,
-            &config,
-            &target,
-        )?;
+        let local_promisor =
+            prefetch_local_promisor_checkout_blobs(&git_dir, format, &config, &target)?;
         if local_promisor
             && resolve_ref_peeled(&store, "HEAD")? == Some(target)
             && checkout_index_empty(&git_dir, format)?
@@ -887,13 +894,8 @@ fn checkout_tracking_start_ref(store: &FileRefStore, start: &str) -> Option<Stri
         ]
     };
     candidates.into_iter().find_map(|candidate| {
-        checkout_tracking_direct_ref(store, &candidate).or_else(|| {
-            store
-                .read_ref(&candidate)
-                .ok()
-                .flatten()
-                .map(|_| candidate)
-        })
+        checkout_tracking_direct_ref(store, &candidate)
+            .or_else(|| store.read_ref(&candidate).ok().flatten().map(|_| candidate))
     })
 }
 
@@ -919,9 +921,7 @@ fn checkout_start_is_trackable_branch(
     if start == "HEAD" {
         return Ok(store.current_branch()?.is_some());
     }
-    if !start.contains('/')
-        && store.read_ref(&format!("refs/tags/{start}"))?.is_some()
-    {
+    if !start.contains('/') && store.read_ref(&format!("refs/tags/{start}"))?.is_some() {
         return Ok(false);
     }
     if let Ok(local_ref) = branch_ref_name(start)
@@ -1502,10 +1502,7 @@ fn checkout_show_local_changes(
     // Reuse the shared `diff-index` renderer (byte-identical with git's
     // name-status output). It diffs the tree-ish against the working tree by
     // default — exactly git's `run_diff_index(&rev, 0)`.
-    commands::diff_index::cmd_diff_index(&[
-        "--name-status".to_string(),
-        new_commit.to_hex(),
-    ])
+    commands::diff_index::cmd_diff_index(&["--name-status".to_string(), new_commit.to_hex()])
 }
 
 fn checkout_sparse_checkout_enabled(git_dir: &Path) -> bool {
@@ -1529,11 +1526,9 @@ fn prefetch_local_promisor_checkout_blobs(
         .get("extensions", None, "partialclone")
         .map(str::to_string)
         .or_else(|| {
-            remote_names(config).into_iter().find(|name| {
-                config
-                    .get_bool("remote", Some(name), "promisor")
-                    == Some(true)
-            })
+            remote_names(config)
+                .into_iter()
+                .find(|name| config.get_bool("remote", Some(name), "promisor") == Some(true))
         })
     else {
         return Ok(false);
@@ -1628,7 +1623,16 @@ fn checkout_show_branch_tracking(
         return Ok(());
     };
     let mut sink = StatusLineSink::new(true, None);
-    status_long_tracking_lines(git_dir, format, &store, &branch_ref, &oid, true, false, &mut sink)?;
+    status_long_tracking_lines(
+        git_dir,
+        format,
+        &store,
+        &branch_ref,
+        &oid,
+        true,
+        false,
+        &mut sink,
+    )?;
     let mut buf = Vec::new();
     sink.write_to(&mut buf);
     if buf.ends_with(b"\n\n") {

@@ -168,17 +168,15 @@ impl GrepMatcher {
                         PatternKind::Extended => RegexMode::Ere,
                         _ => RegexMode::Pcre,
                     };
-                    let regex =
-                        Regex::compile(raw, mode, config.ignore_case, config.word).map_err(
-                            |err| {
-                                report_regex_error(
-                                    error_context,
-                                    raw,
-                                    config.diagnostic_verbosity,
-                                    &err,
-                                )
-                            },
-                        )?;
+                    let regex = Regex::compile(raw, mode, config.ignore_case, config.word)
+                        .map_err(|err| {
+                            report_regex_error(
+                                error_context,
+                                raw,
+                                config.diagnostic_verbosity,
+                                &err,
+                            )
+                        })?;
                     CompiledPattern::Regex(regex)
                 }
             };

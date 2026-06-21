@@ -1064,9 +1064,8 @@ fn resolve_reflog_date(
     rev: &str,
     config: Option<&GitConfig>,
 ) -> Result<ObjectId> {
-    let cutoff = parse_reflog_selector_date(date).ok_or_else(|| {
-        GitError::Unsupported(format!("revision selector @{{{date}}}"))
-    })?;
+    let cutoff = parse_reflog_selector_date(date)
+        .ok_or_else(|| GitError::Unsupported(format!("revision selector @{{{date}}}")))?;
     let refs = FileRefStore::new(git_dir.to_path_buf(), format);
     let ref_name = reflog_ref_name_for_base(git_dir, format, &refs, base, config)?;
     let entries = refs.read_reflog(&ref_name)?;
@@ -1122,9 +1121,7 @@ fn parse_reflog_selector_date(value: &str) -> Option<i64> {
         return None;
     }
     let offset = parse_reflog_timezone(tz)?;
-    Some(
-        days_from_civil(year, month, day)? * 86_400 + hour * 3_600 + minute * 60 + second - offset,
-    )
+    Some(days_from_civil(year, month, day)? * 86_400 + hour * 3_600 + minute * 60 + second - offset)
 }
 
 fn parse_reflog_month(value: &str) -> Option<u32> {
@@ -2283,7 +2280,9 @@ impl<'a> CommitGraphContext<'a> {
             return Ok(None);
         };
         let state = state.get_or_insert_with(|| RawCommitGraphCountState::new(graph.commit_count));
-        graph.count_reachable_indices(&[idx], first_parent, state).map(Some)
+        graph
+            .count_reachable_indices(&[idx], first_parent, state)
+            .map(Some)
     }
 
     /// Resolve `oid`'s graph metadata, loading and parsing the graph on first
@@ -2697,11 +2696,11 @@ fn warn_invalid_commit_graph_bloom_chunks(
             emit_commit_graph_bloom_warning_once(
                 path,
                 format!(
-                "warning: ignoring out-of-range offset ({}) for changed-path filter at pos {} of {} (chunk size: {})",
-                cumulative,
-                idx,
-                display_path,
-                bdat.len()
+                    "warning: ignoring out-of-range offset ({}) for changed-path filter at pos {} of {} (chunk size: {})",
+                    cumulative,
+                    idx,
+                    display_path,
+                    bdat.len()
                 ),
             );
             return;
@@ -2710,12 +2709,12 @@ fn warn_invalid_commit_graph_bloom_chunks(
             emit_commit_graph_bloom_warning_once(
                 path,
                 format!(
-                "warning: ignoring decreasing changed-path index offsets ({} > {}) for positions {} and {} of {}",
-                previous,
-                cumulative,
-                idx.saturating_sub(1),
-                idx,
-                display_path
+                    "warning: ignoring decreasing changed-path index offsets ({} > {}) for positions {} and {} of {}",
+                    previous,
+                    cumulative,
+                    idx.saturating_sub(1),
+                    idx,
+                    display_path
                 ),
             );
             return;
@@ -3789,9 +3788,9 @@ fn commit_graph_bloom_consult(
     let Some(filter) = bloom.filter.as_ref() else {
         return GraphBloomConsult::NotPresent;
     };
-    let maybe_changed = paths.iter().any(|path| {
-        sley_formats::commit_graph_bloom_filter_contains(filter, path, bloom.settings)
-    });
+    let maybe_changed = paths
+        .iter()
+        .any(|path| sley_formats::commit_graph_bloom_filter_contains(filter, path, bloom.settings));
     if maybe_changed {
         GraphBloomConsult::Maybe
     } else {
@@ -3829,8 +3828,8 @@ fn compute_treesame(
         }
     };
     let requested_bloom_version = commit_graph_bloom_read_changed_paths_version(db.objects_dir());
-    let bloom_paths = commit_graph_bloom_paths_for_pathspec(pathspec)
-        .filter(|_| requested_bloom_version != 0);
+    let bloom_paths =
+        commit_graph_bloom_paths_for_pathspec(pathspec).filter(|_| requested_bloom_version != 0);
     if bloom_paths.is_some() {
         warn_invalid_commit_graph_bloom_for_objects_dir(db.objects_dir(), format);
     }
@@ -4332,10 +4331,8 @@ fn simplify_merges_pass(
     relevant_set: &HashSet<ObjectId>,
     options: SimplifyOptions,
 ) -> Vec<CommitRecord> {
-    let real_parents: HashMap<ObjectId, Vec<ObjectId>> = records
-        .iter()
-        .map(|r| (r.oid, r.parents.clone()))
-        .collect();
+    let real_parents: HashMap<ObjectId, Vec<ObjectId>> =
+        records.iter().map(|r| (r.oid, r.parents.clone())).collect();
     let treesame = |oid: &ObjectId| simplify.get(oid).map(|s| s.treesame).unwrap_or(false);
     let relevant = |oid: &ObjectId| relevant_set.contains(oid);
 
@@ -4445,7 +4442,11 @@ fn simplify_merges_pass(
             // Surviving parents as (real_index, simplified_oid). Rewrite each
             // real parent to its simplification, then dedup by simplified oid
             // (remove_duplicate_parents keeps the first occurrence).
-            let take = if options.first_parent { 1 } else { parents.len() };
+            let take = if options.first_parent {
+                1
+            } else {
+                parents.len()
+            };
             let mut surviving: Vec<(usize, ObjectId)> = Vec::with_capacity(take);
             let mut seen: HashSet<ObjectId> = HashSet::new();
             for (n, p) in parents.iter().enumerate().take(take) {
@@ -4496,9 +4497,7 @@ fn simplify_merges_pass(
                             }
                         }
                     }
-                    if !unmarked_treesame
-                        && let Some(m) = first_marked_treesame
-                    {
+                    if !unmarked_treesame && let Some(m) = first_marked_treesame {
                         marked.remove(&m);
                         marked_count -= 1;
                     }
@@ -5539,6 +5538,69 @@ fn ancestor_set_with_graph<R: ObjectReader>(
     Ok(seen)
 }
 
+/// Count commits reachable from `local` but not `target` (`ahead`) and from
+/// `target` but not `local` (`behind`).
+///
+/// This is the tracking-count primitive used by porcelain such as
+/// `status --branch`. It avoids materializing parsed commits: equality and
+/// simple linear fast-forward/behind cases return after a tiny parent walk, and
+/// the general case falls back to OID-only ancestry sets backed by one shared
+/// commit-graph context.
+pub fn ahead_behind_counts<R: ObjectReader>(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    reader: &R,
+    local: &ObjectId,
+    target: &ObjectId,
+) -> Result<(usize, usize)> {
+    if local == target {
+        return Ok((0, 0));
+    }
+
+    let mut graph = CommitGraphContext::load(git_dir, format);
+    if let Some(ahead) = linear_unique_count(&mut graph, reader, local, target)? {
+        return Ok((ahead, 0));
+    }
+    if let Some(behind) = linear_unique_count(&mut graph, reader, target, local)? {
+        return Ok((0, behind));
+    }
+
+    let local_reachable = ancestor_set_with_graph(&mut graph, reader, local)?;
+    let target_reachable = ancestor_set_with_graph(&mut graph, reader, target)?;
+    let ahead = local_reachable.difference(&target_reachable).count();
+    let behind = target_reachable.difference(&local_reachable).count();
+    Ok((ahead, behind))
+}
+
+fn linear_unique_count<R: ObjectReader>(
+    graph: &mut CommitGraphContext<'_>,
+    reader: &R,
+    descendant: &ObjectId,
+    ancestor: &ObjectId,
+) -> Result<Option<usize>> {
+    let mut current = *descendant;
+    let mut count = 0usize;
+    let mut seen = HashSet::new();
+    loop {
+        if &current == ancestor {
+            return Ok(Some(count));
+        }
+        if !seen.insert(current) {
+            return Ok(None);
+        }
+
+        let mut parents = graph.commit_parent_ids(reader, &current)?;
+        let Some(parent) = parents.next() else {
+            return Ok(None);
+        };
+        if parents.next().is_some() {
+            return Ok(None);
+        }
+        count += 1;
+        current = parent;
+    }
+}
+
 /// Determine whether `ancestor` is reachable from `descendant` via parent
 /// edges (an ancestor check). A commit is considered its own ancestor.
 pub fn is_ancestor<R: ObjectReader>(
@@ -5680,11 +5742,8 @@ mod tests {
     #[test]
     fn setup_revisions_parses_ranges_carets_and_not() {
         let fixture = setup_revisions_fixture();
-        let setup = run_setup(
-            &fixture,
-            ["base..main", "^side", "--not", "base", "^main"],
-        )
-        .expect("setup should parse");
+        let setup = run_setup(&fixture, ["base..main", "^side", "--not", "base", "^main"])
+            .expect("setup should parse");
         assert_eq!(
             setup
                 .options
@@ -5725,24 +5784,32 @@ mod tests {
         // `--exclude` matches like git's `wildmatch(pattern, name, 0)`: a bare
         // `skip` is an exact match (it would NOT drop `skip/topic`), so excluding
         // the nested branch needs the `skip/*` glob — matching git's behavior.
-        let setup = run_setup(&fixture, ["--exclude=skip/*", "--branches"])
-            .expect("setup should parse");
+        let setup =
+            run_setup(&fixture, ["--exclude=skip/*", "--branches"]).expect("setup should parse");
         assert_oid_set(
             setup.options.positives.iter().map(|tip| tip.oid),
-            [fixture.tip, fixture.left, fixture.right, fixture.base, fixture.side],
+            [
+                fixture.tip,
+                fixture.left,
+                fixture.right,
+                fixture.base,
+                fixture.side,
+            ],
         );
-        assert!(!setup
-            .options
-            .positives
-            .iter()
-            .any(|tip| tip.oid == fixture.skipped));
+        assert!(
+            !setup
+                .options
+                .positives
+                .iter()
+                .any(|tip| tip.oid == fixture.skipped)
+        );
     }
 
     #[test]
     fn setup_revisions_collects_pathspecs_after_boundary() {
         let fixture = setup_revisions_fixture();
-        let setup = run_setup(&fixture, ["HEAD", "--", "missing-path"])
-            .expect("setup should parse");
+        let setup =
+            run_setup(&fixture, ["HEAD", "--", "missing-path"]).expect("setup should parse");
         assert_eq!(setup.options.positives[0].oid, fixture.tip);
         assert_eq!(setup.pathspecs, vec!["missing-path".to_string()]);
     }

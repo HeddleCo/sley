@@ -522,7 +522,10 @@ fn run_stdin_merges(options: &MergeTreeOptions) -> Result<()> {
     Ok(())
 }
 
-fn stdin_record_options(options: &MergeTreeOptions, record: &[u8]) -> Result<Option<MergeTreeOptions>> {
+fn stdin_record_options(
+    options: &MergeTreeOptions,
+    record: &[u8],
+) -> Result<Option<MergeTreeOptions>> {
     let text = std::str::from_utf8(record)
         .map_err(|_| GitError::Command("merge-tree --stdin input is not UTF-8".into()))?;
     let tokens: Vec<&str> = text.split_whitespace().collect();
@@ -554,7 +557,10 @@ fn stdin_record_options(options: &MergeTreeOptions, record: &[u8]) -> Result<Opt
             batch.positionals.push((*right).to_string());
         }
         _ => {
-            eprintln!("fatal: malformed input line: {}", String::from_utf8_lossy(record));
+            eprintln!(
+                "fatal: malformed input line: {}",
+                String::from_utf8_lossy(record)
+            );
             return Err(GitError::Exit(128));
         }
     }

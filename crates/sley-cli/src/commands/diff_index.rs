@@ -263,8 +263,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let tree_tip = &setup.options.positives[0];
     let tree_oid = if merge_base {
         let head = commands::diff::diff_resolve_commit_arg(git_dir, format, db, "HEAD")?;
-        let other =
-            commands::diff::diff_resolve_commit_arg(git_dir, format, db, &tree_tip.rev)?;
+        let other = commands::diff::diff_resolve_commit_arg(git_dir, format, db, &tree_tip.rev)?;
         let base = commands::diff::diff_single_merge_base(git_dir, format, db, &head, &other)?;
         sley_rev::peel_to_tree(db, format, &base)?
     } else {
@@ -364,14 +363,9 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     }
     let mut entries = apply_submodule_ignore_filter(entries, &submodule_config);
     let submodule_dirt = match (!cached, worktree_root) {
-        (true, Some(root)) => collect_dirty_submodules(
-            &mut entries,
-            git_dir,
-            format,
-            root,
-            &submodule_config,
-            None,
-        )?,
+        (true, Some(root)) => {
+            collect_dirty_submodules(&mut entries, git_dir, format, root, &submodule_config, None)?
+        }
         _ => HashMap::new(),
     };
 
@@ -408,14 +402,8 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     // whitespace error, OR-ing in 1 when `--exit-code`/`--quiet` + changes).
     if check {
         let resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(git_dir)?;
-        let check_failed = commands::diff::run_diff_check(
-            &entries,
-            db,
-            worktree_root,
-            false,
-            !cached,
-            &resolver,
-        )?;
+        let check_failed =
+            commands::diff::run_diff_check(&entries, db, worktree_root, false, !cached, &resolver)?;
         let mut code = 0;
         if check_failed {
             code |= 0o2;
@@ -431,8 +419,11 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     if !quiet {
         // `--indent-heuristic` / `--no-indent-heuristic` win over
         // `diff.indentHeuristic`, which defaults to git's enabled behavior.
-        let indent_heuristic = indent_heuristic
-            .unwrap_or_else(|| repo.config().get_bool("diff", None, "indentheuristic").unwrap_or(true));
+        let indent_heuristic = indent_heuristic.unwrap_or_else(|| {
+            repo.config()
+                .get_bool("diff", None, "indentheuristic")
+                .unwrap_or(true)
+        });
         render(
             &entries,
             &output,

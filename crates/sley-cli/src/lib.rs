@@ -5970,6 +5970,7 @@ fn map_remote_fetch_refspec(refspec: &str, merge: &str) -> Option<String> {
 
 fn for_each_ref_upstream_track(
     store: &FileRefStore,
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     oid: &ObjectId,
@@ -5992,10 +5993,11 @@ fn for_each_ref_upstream_track(
     let Some((upstream_oid, _)) = resolve_for_each_ref_target(store, &upstream_ref)? else {
         return Ok(Some(gone_track));
     };
-    for_each_ref_ahead_behind(db, format, oid, &upstream_oid)
+    for_each_ref_ahead_behind(git_dir, db, format, oid, &upstream_oid)
 }
 
 fn for_each_ref_ahead_behind(
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     oid: &ObjectId,
@@ -6007,16 +6009,8 @@ fn for_each_ref_ahead_behind(
     let Ok(target_commit) = sley_rev::peel_to_commit(db, format, target) else {
         return Ok(None);
     };
-    let local_reachable = sley_rev::walk_commits(db, format, [local_commit])?
-        .into_iter()
-        .map(|record| record.oid)
-        .collect::<HashSet<_>>();
-    let target_reachable = sley_rev::walk_commits(db, format, [target_commit])?
-        .into_iter()
-        .map(|record| record.oid)
-        .collect::<HashSet<_>>();
-    let ahead = local_reachable.difference(&target_reachable).count();
-    let behind = target_reachable.difference(&local_reachable).count();
+    let (ahead, behind) =
+        sley_rev::ahead_behind_counts(git_dir, format, db, &local_commit, &target_commit)?;
     Ok(Some(ForEachRefTrack {
         ahead,
         behind,
@@ -6754,6 +6748,7 @@ fn print_for_each_ref_format(
                     } else if let Some(rev) = other.strip_prefix("ahead-behind:") {
                         let target = resolve_revision(context.git_dir, context.format, rev)?;
                         if let Some(track) = for_each_ref_ahead_behind(
+                            context.git_dir,
                             context.db,
                             context.format,
                             context.oid,

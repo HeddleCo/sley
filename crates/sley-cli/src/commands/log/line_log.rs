@@ -94,8 +94,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
     let reachable = rev_list_walk_commits(db, format, [tip], first_parent)?;
     let refs: Vec<&sley_rev::CommitRecord> = reachable.iter().collect();
     let ordered_refs = rev_list_topo_order(refs)?;
-    let ordered: Vec<sley_rev::CommitRecord> =
-        ordered_refs.into_iter().cloned().collect();
+    let ordered: Vec<sley_rev::CommitRecord> = ordered_refs.into_iter().cloned().collect();
 
     let result = crate::commands::line_log::run_line_log(
         db,
@@ -180,8 +179,15 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
     let decorations: HashMap<ObjectId, Vec<String>> = if decoration == LogDecorationMode::Off {
         HashMap::new()
     } else {
-        let include = ["HEAD", "refs/heads/", "refs/tags/", "refs/remotes/", "refs/stash", "refs/replace/"]
-            .map(str::to_string);
+        let include = [
+            "HEAD",
+            "refs/heads/",
+            "refs/tags/",
+            "refs/remotes/",
+            "refs/stash",
+            "refs/replace/",
+        ]
+        .map(str::to_string);
         let filter = DecorationFilter::new(&include, &[], &[]);
         log_decoration_map(git_dir, db, format, decoration, &filter)?
     };
@@ -280,7 +286,10 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                 writeln!(
                     stdout,
                     "Author: {}",
-                    commit_identity_mailmapped(&record.commit.author, use_mailmap.then_some(&mailmap))
+                    commit_identity_mailmapped(
+                        &record.commit.author,
+                        use_mailmap.then_some(&mailmap)
+                    )
                 )?;
                 if *kind == LogDefaultKind::Medium {
                     writeln!(
@@ -333,7 +342,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                     date_mode,
                     source_oid: None,
                     describe: Some(&describe_ctx),
-                signature: None,
+                    signature: None,
                     color: false,
                     output_encoding,
                     mailmap: &mailmap,

@@ -179,7 +179,10 @@ fn branch_merge_values(config: &GitConfig, branch: &str) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn fetch_head_merge_record(git_dir: &Path, format: ObjectFormat) -> Result<FetchHeadRecord> {
+pub(crate) fn fetch_head_merge_record(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<FetchHeadRecord> {
     fetch_head_merge_records(git_dir, format)?
         .into_iter()
         .next()
@@ -197,7 +200,10 @@ fn fetch_head_merge_records(git_dir: &Path, format: ObjectFormat) -> Result<Vec<
         .collect())
 }
 
-pub(crate) fn resolve_fetch_head_revision(git_dir: &Path, format: ObjectFormat) -> Result<ObjectId> {
+pub(crate) fn resolve_fetch_head_revision(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<ObjectId> {
     Ok(fetch_head_merge_record(git_dir, format)?.oid)
 }
 
@@ -238,8 +244,7 @@ fn update_worktree_after_fetch_moved_head(
     );
     let orig_tree = commit_tree_oid(db, format, &orig_head)?;
     let curr_tree = commit_tree_oid(db, format, &curr_head)?;
-    if fetch_moved_head_would_clobber_worktree(worktree_root, db, format, &orig_tree, &curr_tree)?
-    {
+    if fetch_moved_head_would_clobber_worktree(worktree_root, db, format, &orig_tree, &curr_tree)? {
         eprintln!(
             "fatal: Cannot fast-forward your working tree.\nAfter making sure that you saved anything precious from\n$ git diff {orig_head}\noutput, run\n$ git reset --hard\nto recover."
         );
@@ -341,7 +346,9 @@ fn ensure_pull_can_merge() -> Result<()> {
     print_hint("hint:   git config pull.rebase true   # rebase");
     print_hint("hint:   git config pull.ff only       # fast-forward only");
     print_hint("hint:");
-    print_hint("hint: You can replace \"git config\" with \"git config --global\" to set a default");
+    print_hint(
+        "hint: You can replace \"git config\" with \"git config --global\" to set a default",
+    );
     print_hint("hint: preference for all repositories. You can also pass --rebase, --no-rebase,");
     print_hint("hint: or --ff-only on the command line to override the configured default per");
     print_hint("hint: invocation.");
@@ -530,7 +537,11 @@ fn pull_rebase_fork_point(
 }
 
 fn pull_remote_tracking_ref(config: &GitConfig, remote: &str, remote_ref: &str) -> Option<String> {
-    for fetch in config.get_all("remote", Some(remote), "fetch").into_iter().flatten() {
+    for fetch in config
+        .get_all("remote", Some(remote), "fetch")
+        .into_iter()
+        .flatten()
+    {
         let refspec = parse_refspec(fetch).ok()?;
         if refspec.negative || refspec.dst.is_none() {
             continue;
@@ -798,9 +809,9 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             "--recurse-submodules" => recurse_submodules_cli = FetchRecurseSubmodules::On,
             "--no-recurse-submodules" => recurse_submodules_cli = FetchRecurseSubmodules::Off,
             value if value.starts_with("--recurse-submodules=") => {
-                let value = value
-                    .strip_prefix("--recurse-submodules=")
-                    .ok_or_else(|| GitError::Command("pull --recurse-submodules requires a value".into()))?;
+                let value = value.strip_prefix("--recurse-submodules=").ok_or_else(|| {
+                    GitError::Command("pull --recurse-submodules requires a value".into())
+                })?;
                 recurse_submodules_cli = FetchRecurseSubmodules::from_arg(Some(value))?;
             }
             "--depth" => expect_depth_value = true,
@@ -845,9 +856,11 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     // a bare `--no-rebase` must clear it (was previously keyed off `pull.rebase`
     // alone, which wrongly fired on `git pull --no-rebase`).
     let current_branch_name = match store.read_ref("HEAD")? {
-        Some(RefTarget::Symbolic(name)) => {
-            Some(name.strip_prefix("refs/heads/").unwrap_or(&name).to_string())
-        }
+        Some(RefTarget::Symbolic(name)) => Some(
+            name.strip_prefix("refs/heads/")
+                .unwrap_or(&name)
+                .to_string(),
+        ),
         _ => None,
     };
     let branch_rebase = current_branch_name
@@ -925,16 +938,17 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     // pull-into-void decision keys off the *pre-fetch* state, so capture it now.
     let orig_head_unborn = orig_head.is_none();
     let before_fetch_refs = fetch_ref_snapshot(&git_dir, format)?;
-    let fetch_outcome = match pull_fetch(&git_dir, format, &remote, &refspecs, fetch_options.clone()) {
-        Ok(outcome) => outcome,
-        Err(err) => {
-        if !merge_srcs.is_empty() && format!("{err}").contains("remote ref") {
-            print_pull_no_such_ref_fetched(&merge_srcs);
-            return Err(GitError::Exit(1));
-        }
-        return Err(err);
-        }
-    };
+    let fetch_outcome =
+        match pull_fetch(&git_dir, format, &remote, &refspecs, fetch_options.clone()) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                if !merge_srcs.is_empty() && format!("{err}").contains("remote ref") {
+                    print_pull_no_such_ref_fetched(&merge_srcs);
+                    return Err(GitError::Exit(1));
+                }
+                return Err(err);
+            }
+        };
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;

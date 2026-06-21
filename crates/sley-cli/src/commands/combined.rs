@@ -129,7 +129,11 @@ pub(crate) fn write_combined_raw(
     for parent in &path.parents {
         write!(stdout, " {}", combined_raw_oid(parent.oid.as_ref(), ctx))?;
     }
-    write!(stdout, " {} ", combined_raw_oid(path.result_oid.as_ref(), ctx))?;
+    write!(
+        stdout,
+        " {} ",
+        combined_raw_oid(path.result_oid.as_ref(), ctx)
+    )?;
     for parent in &path.parents {
         write!(stdout, "{}", parent.status)?;
     }
@@ -233,7 +237,11 @@ pub(crate) fn write_combined_patch(
         return Ok(false);
     }
 
-    let head = if ctx.dense { "diff --cc " } else { "diff --combined " };
+    let head = if ctx.dense {
+        "diff --cc "
+    } else {
+        "diff --combined "
+    };
     writeln!(stdout, "{head}{}", status_quote_path(&path.path, false))?;
 
     write!(stdout, "index ")?;
@@ -281,18 +289,33 @@ pub(crate) fn write_combined_patch(
             if parent.status == 'A' {
                 writeln!(stdout, "--- /dev/null")?;
             } else {
-                writeln!(stdout, "--- {}{}", ctx.src_prefix, status_quote_path(&path.path, false))?;
+                writeln!(
+                    stdout,
+                    "--- {}{}",
+                    ctx.src_prefix,
+                    status_quote_path(&path.path, false)
+                )?;
             }
         }
     } else if added {
         writeln!(stdout, "--- /dev/null")?;
     } else {
-        writeln!(stdout, "--- {}{}", ctx.src_prefix, status_quote_path(&path.path, false))?;
+        writeln!(
+            stdout,
+            "--- {}{}",
+            ctx.src_prefix,
+            status_quote_path(&path.path, false)
+        )?;
     }
     if deleted {
         writeln!(stdout, "+++ /dev/null")?;
     } else {
-        writeln!(stdout, "+++ {}{}", ctx.dst_prefix, status_quote_path(&path.path, false))?;
+        writeln!(
+            stdout,
+            "+++ {}{}",
+            ctx.dst_prefix,
+            status_quote_path(&path.path, false)
+        )?;
     }
 
     stdout.write_all(&body)?;

@@ -381,7 +381,9 @@ pub fn merge_notes(
             )));
         }
         (None, Some(remote)) => {
-            update_notes_ref_to_commit(git_dir, format, store, local_ref, None, remote, message, identity)?;
+            update_notes_ref_to_commit(
+                git_dir, format, store, local_ref, None, remote, message, identity,
+            )?;
             return Ok(NotesMergeOutcome::FastForward { result: remote });
         }
         (Some(local), None) => {
@@ -394,7 +396,9 @@ pub fn merge_notes(
     }
 
     let (Some(local_oid), Some(remote_oid)) = (local_oid, remote_oid) else {
-        return Err(GitError::InvalidFormat("missing notes merge endpoint".into()));
+        return Err(GitError::InvalidFormat(
+            "missing notes merge endpoint".into(),
+        ));
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let bases = merge_base_oids(&db, format, &local_oid, &remote_oid)?;
@@ -471,16 +475,14 @@ pub fn merge_notes(
                 }
             }
             NotesMergeStrategy::CatSortUniq => {
-                if let Some(blob) =
-                    combine_note_blobs(
-                        git_dir,
-                        &db,
-                        format,
-                        local,
-                        remote,
-                        NoteBlobCombine::CatSortUniq,
-                    )?
-                {
+                if let Some(blob) = combine_note_blobs(
+                    git_dir,
+                    &db,
+                    format,
+                    local,
+                    remote,
+                    NoteBlobCombine::CatSortUniq,
+                )? {
                     merged.insert(annotated, blob);
                 }
             }
@@ -532,11 +534,7 @@ pub fn finalize_notes_merge(
         let blob = writable.write_object(EncodedObject::new(ObjectType::Blob, body.clone()))?;
         notes.insert(*annotated, blob);
     }
-    let expected = partial
-        .parents
-        .first()
-        .copied()
-        .map(RefTarget::Direct);
+    let expected = partial.parents.first().copied().map(RefTarget::Direct);
     commit_notes_update_with_parents(
         git_dir,
         format,
@@ -791,11 +789,7 @@ fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
     sley_config::read_repo_config(git_dir, None)
 }
 
-fn read_commit(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    oid: &ObjectId,
-) -> Result<Commit> {
+fn read_commit(db: &FileObjectDatabase, format: ObjectFormat, oid: &ObjectId) -> Result<Commit> {
     let object = db.read_object(oid)?;
     if object.object_type != ObjectType::Commit {
         return Err(GitError::InvalidFormat(format!(
@@ -806,7 +800,11 @@ fn read_commit(
     Commit::parse(format, &object.body)
 }
 
-fn commit_tree_oid(db: &FileObjectDatabase, format: ObjectFormat, oid: &ObjectId) -> Result<ObjectId> {
+fn commit_tree_oid(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<ObjectId> {
     Ok(read_commit(db, format, oid)?.tree)
 }
 
@@ -1132,10 +1130,7 @@ fn reflog_message_from_commit_message(message: &[u8]) -> Vec<u8> {
     out
 }
 
-fn write_notes_tree(
-    db: &mut FileObjectDatabase,
-    notes: &[Note],
-) -> Result<ObjectId> {
+fn write_notes_tree(db: &mut FileObjectDatabase, notes: &[Note]) -> Result<ObjectId> {
     if notes.len() >= 256 {
         write_fanout_notes_tree(db, notes)
     } else {
@@ -1458,7 +1453,7 @@ mod tests {
                 committer: identity.committer.clone(),
                 message: b"fanout notes\n".to_vec(),
                 encoding: None,
-            signature: None,
+                signature: None,
             },
         )
         .expect("commit");
@@ -1521,7 +1516,7 @@ mod tests {
                 committer: identity.committer.clone(),
                 message: b"fanout notes\n".to_vec(),
                 encoding: None,
-            signature: None,
+                signature: None,
             },
         )
         .expect("test operation should succeed");
@@ -1646,7 +1641,7 @@ mod tests {
                 committer: identity.committer.clone(),
                 message: b"fanout notes\n".to_vec(),
                 encoding: None,
-            signature: None,
+                signature: None,
             },
         )
         .expect("commit");

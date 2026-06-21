@@ -2667,11 +2667,9 @@ pub(crate) fn reset_merge_in(
         }
         if current.is_some_and(|entry| sley_index::is_gitlink(entry.mode))
             && target_entry.is_none()
-            && target_map
-                .keys()
-                .any(|candidate| {
-                    candidate.starts_with(path) && candidate.get(path.len()) == Some(&b'/')
-                })
+            && target_map.keys().any(|candidate| {
+                candidate.starts_with(path) && candidate.get(path.len()) == Some(&b'/')
+            })
         {
             errors.push(path.clone());
             continue;

@@ -30,17 +30,17 @@ use sley_config::GitConfig;
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
 use sley_odb::FileObjectDatabase;
+use sley_protocol::write_pkt_line_payload;
 use sley_protocol::{
     GitService, ProtocolV2FetchShallowInfo, ReceivePackCommand, ReceivePackFeatures,
     ReceivePackPushRequestOptions, RefAdvertisement, UploadPackFeatures,
     UploadPackNegotiationRequest, UploadPackRawPackfileResponse, UploadPackRequest,
     build_receive_pack_push_request, parse_receive_pack_features, parse_upload_pack_features,
-    read_receive_pack_report_status,
-    read_ref_advertisement_set, read_upload_pack_raw_packfile_response,
+    read_receive_pack_report_status, read_ref_advertisement_set,
+    read_upload_pack_raw_packfile_response,
     read_upload_pack_shallow_info_and_raw_packfile_response, write_receive_pack_push_request,
     write_upload_pack_negotiation_request, write_upload_pack_request,
 };
-use sley_protocol::write_pkt_line_payload;
 use sley_refs::FileRefStore;
 use sley_transport::{
     RemoteTransport, RemoteUrl, SshCommandVariant, SshIpVersion, ssh_process_args_with_ip,
@@ -125,7 +125,9 @@ fn ext_process_command_for_remote(
 ) -> Result<ServiceProcessCommand> {
     let parsed = parse_remote_ext_command(&remote.path, service)?;
     let Some((program, args)) = parsed.argv.split_first() else {
-        return Err(GitError::InvalidFormat("ext remote command is empty".into()));
+        return Err(GitError::InvalidFormat(
+            "ext remote command is empty".into(),
+        ));
     };
     Ok(ServiceProcessCommand {
         program: program.clone(),
@@ -134,7 +136,11 @@ fn ext_process_command_for_remote(
             ("GIT_EXT_SERVICE".into(), service.as_str().into()),
             (
                 "GIT_EXT_SERVICE_NOPREFIX".into(),
-                service.as_str().strip_prefix("git-").unwrap_or(service.as_str()).into(),
+                service
+                    .as_str()
+                    .strip_prefix("git-")
+                    .unwrap_or(service.as_str())
+                    .into(),
             ),
         ],
         git_request: parsed.git_request.map(|repo| ExtGitRequest {
@@ -470,7 +476,10 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
         refspecs,
         force,
     } = request;
-    if !matches!(remote.transport, RemoteTransport::Ssh | RemoteTransport::Ext) {
+    if !matches!(
+        remote.transport,
+        RemoteTransport::Ssh | RemoteTransport::Ext
+    ) {
         return Err(GitError::InvalidFormat(
             "SSH receive-pack requires an SSH remote".into(),
         ));
@@ -557,7 +566,10 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
         command_forces,
         pack_objects,
     } = request;
-    if !matches!(remote.transport, RemoteTransport::Ssh | RemoteTransport::Ext) {
+    if !matches!(
+        remote.transport,
+        RemoteTransport::Ssh | RemoteTransport::Ext
+    ) {
         return Err(GitError::InvalidFormat(
             "SSH receive-pack requires an SSH remote".into(),
         ));
@@ -702,7 +714,10 @@ pub(crate) fn ls_remote_ssh(
     filter: &crate::ls_remote::LsRemoteFilter,
     matches: &dyn Fn(&str) -> bool,
 ) -> Result<(Vec<crate::ls_remote::LsRemoteRecord>, ObjectFormat)> {
-    if !matches!(remote.transport, RemoteTransport::Ssh | RemoteTransport::Ext) {
+    if !matches!(
+        remote.transport,
+        RemoteTransport::Ssh | RemoteTransport::Ext
+    ) {
         return Err(GitError::InvalidFormat(
             "SSH upload-pack requires an SSH remote".into(),
         ));
@@ -973,7 +988,10 @@ fn ssh_upload_pack_fetch_response_inner(
     Vec<ProtocolV2FetchShallowInfo>,
     UploadPackRawPackfileResponse,
 )> {
-    if !matches!(remote.transport, RemoteTransport::Ssh | RemoteTransport::Ext) {
+    if !matches!(
+        remote.transport,
+        RemoteTransport::Ssh | RemoteTransport::Ext
+    ) {
         return Err(GitError::InvalidFormat(
             "SSH upload-pack requires an SSH remote".into(),
         ));
@@ -1047,10 +1065,7 @@ mod tests {
         let parsed = parse_remote_ext_command("sh -c %S% ..", GitService::UploadPack)
             .expect("remote-ext command parses");
 
-        assert_eq!(
-            parsed.argv,
-            vec!["sh", "-c", "git-upload-pack .."],
-        );
+        assert_eq!(parsed.argv, vec!["sh", "-c", "git-upload-pack .."],);
         assert_eq!(parsed.git_request, None);
         assert_eq!(parsed.git_request_vhost, None);
     }
@@ -1065,11 +1080,9 @@ mod tests {
 
     #[test]
     fn remote_ext_parser_extracts_git_daemon_request_arguments() {
-        let parsed = parse_remote_ext_command(
-            "fake-daemon %G/two.git %Vhost",
-            GitService::UploadPack,
-        )
-        .expect("remote-ext command parses");
+        let parsed =
+            parse_remote_ext_command("fake-daemon %G/two.git %Vhost", GitService::UploadPack)
+                .expect("remote-ext command parses");
 
         assert_eq!(parsed.argv, vec!["fake-daemon"]);
         assert_eq!(parsed.git_request.as_deref(), Some("/two.git"));

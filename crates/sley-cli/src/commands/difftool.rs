@@ -1,8 +1,8 @@
-use crate::*;
 use crate::commands::tool_launch::{
     ToolCommand, ToolEnvironment, ToolMode, config_bool, gui_default, print_tool_help,
     resolve_tool_command, run_tool_shell, select_tool_name,
 };
+use crate::*;
 
 #[derive(Default)]
 struct DifftoolOptions {
@@ -43,7 +43,11 @@ pub(crate) fn cmd_difftool(args: &[String]) -> Result<()> {
         .gui
         .unwrap_or_else(|| gui_default(config, ToolMode::Diff));
     let diffs = collect_difftool_entries(&repo, &options)?;
-    let diffs = order_difftool_entries(diffs, options.rotate_to.as_deref(), options.skip_to.as_deref())?;
+    let diffs = order_difftool_entries(
+        diffs,
+        options.rotate_to.as_deref(),
+        options.skip_to.as_deref(),
+    )?;
     if diffs.is_empty() {
         return Ok(());
     }
@@ -56,7 +60,8 @@ pub(crate) fn cmd_difftool(args: &[String]) -> Result<()> {
     let temp = TempDir::new("sley-difftool")?;
     let total = diffs.len();
     for (idx, entry) in diffs.iter().enumerate() {
-        let materialized = materialize_difftool_entry(repo.objects(), worktree_root, entry, &temp.path)?;
+        let materialized =
+            materialize_difftool_entry(repo.objects(), worktree_root, entry, &temp.path)?;
         if prompt {
             let path = String::from_utf8_lossy(&entry.path);
             println!();
@@ -162,7 +167,8 @@ fn resolve_difftool_tool(
             is_builtin: false,
         });
     }
-    let Some(tool) = select_tool_name(config, ToolMode::Diff, options.cli_tool.as_deref(), gui) else {
+    let Some(tool) = select_tool_name(config, ToolMode::Diff, options.cli_tool.as_deref(), gui)
+    else {
         eprintln!("No diff tool configured");
         return Err(GitError::Exit(1));
     };
@@ -203,24 +209,29 @@ fn collect_difftool_entries(
     let base_options = sley_diff_merge::DiffNameStatusOptions::default();
     let mut entries = match (options.cached, revs.as_slice()) {
         (true, []) => sley_diff_merge::diff_name_status_head_index(git_dir, format)?,
-        (true, [tree]) => {
-            sley_diff_merge::diff_name_status_tree_index_with_options(git_dir, format, tree, base_options)?
-        }
+        (true, [tree]) => sley_diff_merge::diff_name_status_tree_index_with_options(
+            git_dir,
+            format,
+            tree,
+            base_options,
+        )?,
         (false, []) => {
             sley_diff_merge::diff_name_status_index_worktree(worktree_root, git_dir, format)?
         }
-        (false, [tree]) => {
-            sley_diff_merge::diff_name_status_tree_worktree_with_options(
-                worktree_root,
-                git_dir,
-                format,
-                tree,
-                base_options,
-            )?
-        }
-        (_, [left, right]) => {
-            sley_diff_merge::diff_name_status_trees_with_options(db, format, left, right, base_options)?
-        }
+        (false, [tree]) => sley_diff_merge::diff_name_status_tree_worktree_with_options(
+            worktree_root,
+            git_dir,
+            format,
+            tree,
+            base_options,
+        )?,
+        (_, [left, right]) => sley_diff_merge::diff_name_status_trees_with_options(
+            db,
+            format,
+            left,
+            right,
+            base_options,
+        )?,
         _ => Vec::new(),
     };
     if options.cached {
@@ -295,7 +306,11 @@ fn materialize_difftool_entry(
     let rel = repo_path_to_path(&entry.path);
     let local = temp.join("left").join(&rel);
     let remote = temp.join("right").join(&rel);
-    write_materialized(&local, diff_entry_old_content(entry, db)?.as_deref(), entry.old_mode)?;
+    write_materialized(
+        &local,
+        diff_entry_old_content(entry, db)?.as_deref(),
+        entry.old_mode,
+    )?;
     write_materialized(
         &remote,
         diff_entry_new_content(entry, db, Some(worktree_root), entry.new_oid.is_none())?.as_deref(),
@@ -387,7 +402,9 @@ fn run_dir_difftool(
         let worktree_path = repo.worktree_root()?.join(&rel);
         snapshots.push(DirDiffSnapshot {
             rel,
-            right: (!right_was_symlink).then(|| fs::read(&right_path).ok()).flatten(),
+            right: (!right_was_symlink)
+                .then(|| fs::read(&right_path).ok())
+                .flatten(),
             worktree: fs::read(worktree_path).ok(),
             right_was_symlink,
         });
@@ -442,7 +459,10 @@ fn run_dir_difftool(
         }
     }
     if conflict {
-        eprintln!("warning: temporary files exist in '{}'.", temp.path.display());
+        eprintln!(
+            "warning: temporary files exist in '{}'.",
+            temp.path.display()
+        );
         eprintln!("warning: you may want to cleanup or recover these.");
         temp.keep();
         return Err(GitError::Exit(1));
@@ -471,10 +491,7 @@ fn dir_diff_new_content(
     if entry.new_mode == Some(0o120000) && entry.new_oid.is_none() {
         let path = repo.worktree_root()?.join(repo_path_to_path(&entry.path));
         return Ok(Some(
-            fs::read_link(path)?
-                .to_string_lossy()
-                .as_bytes()
-                .to_vec(),
+            fs::read_link(path)?.to_string_lossy().as_bytes().to_vec(),
         ));
     }
     diff_entry_new_content(

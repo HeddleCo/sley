@@ -1877,7 +1877,11 @@ fn expand_sparse_index_for_worktree_diff(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<Index> {
-    if !index.entries.iter().any(sley_index::IndexEntry::is_sparse_dir) {
+    if !index
+        .entries
+        .iter()
+        .any(sley_index::IndexEntry::is_sparse_dir)
+    {
         return Ok(index);
     }
 
@@ -2333,7 +2337,8 @@ fn augment_with_stat_dirty_entries(
             // actually differ from the cached oid — so a `touch`ed-then-re-`add`ed
             // file (same-second mtime as the index) stays clean.
             sley_index::StatVerdict::RacyNeedsContentCheck => {
-                if worktree_oid_matches_index(worktree_root, git_path, &metadata, tracked, format)? {
+                if worktree_oid_matches_index(worktree_root, git_path, &metadata, tracked, format)?
+                {
                     continue;
                 }
             }
@@ -3766,8 +3771,7 @@ fn index_worktree_change_for_entry(
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err)
-            if err.kind() == std::io::ErrorKind::NotFound
-                && index_entry.is_skip_worktree() =>
+            if err.kind() == std::io::ErrorKind::NotFound && index_entry.is_skip_worktree() =>
         {
             return Ok(None);
         }
@@ -4235,10 +4239,14 @@ fn apply_one_hunk(image: &mut Vec<Line>, hunk: &Hunk, running_offset: isize) -> 
     // Mark the no-final-newline state on the last preimage/postimage line so the
     // exact-match check and the spliced result reproduce a missing terminal
     // newline byte-for-byte.
-    if hunk.old_no_newline && let Some(last) = preimage.last_mut() {
+    if hunk.old_no_newline
+        && let Some(last) = preimage.last_mut()
+    {
         last.no_newline = true;
     }
-    if hunk.new_no_newline && let Some(last) = postimage.last_mut() {
+    if hunk.new_no_newline
+        && let Some(last) = postimage.last_mut()
+    {
         last.no_newline = true;
     }
 
@@ -4877,7 +4885,9 @@ fn parse_octal(bytes: &[u8]) -> Option<u32> {
 }
 
 fn parse_percent(bytes: &[u8]) -> Option<u8> {
-    let trimmed = trim_ascii_end(bytes).strip_suffix(b"%").unwrap_or(trim_ascii_end(bytes));
+    let trimmed = trim_ascii_end(bytes)
+        .strip_suffix(b"%")
+        .unwrap_or(trim_ascii_end(bytes));
     let value = parse_usize(trimmed)?;
     u8::try_from(value).ok().filter(|value| *value <= 100)
 }
@@ -5375,9 +5385,15 @@ pub fn merge_entry_maps(
         for (dest, sides) in &rehomed_paths {
             for info in [&sides.ours, &sides.theirs].into_iter().flatten() {
                 let (added_in, dir_renamed_in) = if info.added_on_ours {
-                    (options.ours_label.to_string(), options.theirs_label.to_string())
+                    (
+                        options.ours_label.to_string(),
+                        options.theirs_label.to_string(),
+                    )
                 } else {
-                    (options.theirs_label.to_string(), options.ours_label.to_string())
+                    (
+                        options.theirs_label.to_string(),
+                        options.ours_label.to_string(),
+                    )
                 };
                 info_messages.push(MergeInfoMessage::DirRenameApplied {
                     old_path: info.old_path.clone(),
@@ -5747,9 +5763,15 @@ pub fn merge_entry_maps(
             for info in [&infos.ours, &infos.theirs].into_iter().flatten() {
                 let (added_in, dir_renamed_in) = if info.added_on_ours {
                     // The path was added/renamed by ours, into a dir theirs renamed.
-                    (options.ours_label.to_string(), options.theirs_label.to_string())
+                    (
+                        options.ours_label.to_string(),
+                        options.theirs_label.to_string(),
+                    )
                 } else {
-                    (options.theirs_label.to_string(), options.ours_label.to_string())
+                    (
+                        options.theirs_label.to_string(),
+                        options.ours_label.to_string(),
+                    )
                 };
                 if let Some(slot) = paths.iter_mut().find(|p| &p.path == dest)
                     && slot.conflict.is_none()
@@ -6875,11 +6897,14 @@ fn plan_rehome(
             continue;
         }
         let renamed_from = side_rename_src.get(path.as_slice()).map(|s| s.to_vec());
-        planned.entry(dest.clone()).or_default().push(DirRenameMove {
-            from: path,
-            to: dest,
-            renamed_from,
-        });
+        planned
+            .entry(dest.clone())
+            .or_default()
+            .push(DirRenameMove {
+                from: path,
+                to: dest,
+                renamed_from,
+            });
     }
 
     let mut moves = Vec::new();
@@ -7177,10 +7202,7 @@ fn apply_dir_rename_two_to_one_conflicts(
                 &theirs_bytes,
                 &MergeBlobOptions {
                     ours_label: &qualify_label(options.ours_label, &conflict.ours_label_path),
-                    theirs_label: &qualify_label(
-                        options.theirs_label,
-                        &conflict.theirs_label_path,
-                    ),
+                    theirs_label: &qualify_label(options.theirs_label, &conflict.theirs_label_path),
                     base_label: options.ancestor_label,
                     style: options.style,
                 },
@@ -7974,10 +7996,9 @@ index ccccccc..ddddddd 100644
         // Hunk: context `anchor`, then append `added1`/`added2`. No trailing
         // context => match_end. At line 3 (`anchor`) the preimage is just one
         // line and does not reach EOF, so it must be rejected.
-        let patch = parse_unified_patch(
-            b"--- a/x\n+++ b/x\n@@ -3,1 +3,3 @@\n anchor\n+added1\n+added2\n",
-        )
-        .expect("test operation should succeed");
+        let patch =
+            parse_unified_patch(b"--- a/x\n+++ b/x\n@@ -3,1 +3,3 @@\n anchor\n+added1\n+added2\n")
+                .expect("test operation should succeed");
         assert_eq!(apply_file_patch(base, &patch[0]), ApplyOutcome::Rejected);
     }
 
@@ -7987,10 +8008,9 @@ index ccccccc..ddddddd 100644
         // the matching context IS the last line of the file (preimage reaches
         // EOF), so `match_end` is satisfied.
         let base = b"one\ntwo\nanchor\n";
-        let patch = parse_unified_patch(
-            b"--- a/x\n+++ b/x\n@@ -3,1 +3,3 @@\n anchor\n+added1\n+added2\n",
-        )
-        .expect("test operation should succeed");
+        let patch =
+            parse_unified_patch(b"--- a/x\n+++ b/x\n@@ -3,1 +3,3 @@\n anchor\n+added1\n+added2\n")
+                .expect("test operation should succeed");
         let out = applied(apply_file_patch(base, &patch[0]));
         assert_eq!(out, b"one\ntwo\nanchor\nadded1\nadded2\n");
     }
@@ -8001,10 +8021,9 @@ index ccccccc..ddddddd 100644
         // the file (`match_beginning`). If the matching context only appears
         // later, git rejects rather than wandering to it.
         let base = b"junk\nalpha\nbeta\ngamma\n";
-        let patch = parse_unified_patch(
-            b"--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n alpha\n+INSERT\n beta\n",
-        )
-        .expect("test operation should succeed");
+        let patch =
+            parse_unified_patch(b"--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n alpha\n+INSERT\n beta\n")
+                .expect("test operation should succeed");
         assert_eq!(apply_file_patch(base, &patch[0]), ApplyOutcome::Rejected);
     }
 

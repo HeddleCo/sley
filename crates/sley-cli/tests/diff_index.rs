@@ -482,39 +482,71 @@ fn diff_index_cached_max_depth_limits_index_paths() {
     fs::write(repo.join("one/two/three/file"), "base\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
-    for path in [
-        "file",
-        "one/file",
-        "one/two/file",
-        "one/two/three/file",
-    ] {
+    for path in ["file", "one/file", "one/two/file", "one/two/three/file"] {
         fs::write(repo.join(path), "index\n").expect("test operation should succeed");
     }
     git_ok(&repo, &["add", "."]);
 
     assert_sley_stdout(
         &repo,
-        &["diff-index", "--max-depth=0", "--name-only", "--cached", "HEAD", "--"],
+        &[
+            "diff-index",
+            "--max-depth=0",
+            "--name-only",
+            "--cached",
+            "HEAD",
+            "--",
+        ],
         "file\n",
     );
     assert_sley_stdout(
         &repo,
-        &["diff-index", "--max-depth=1", "--name-only", "--cached", "HEAD", "--"],
+        &[
+            "diff-index",
+            "--max-depth=1",
+            "--name-only",
+            "--cached",
+            "HEAD",
+            "--",
+        ],
         "file\none/file\n",
     );
     assert_sley_stdout(
         &repo,
-        &["diff-index", "--max-depth=0", "--name-only", "--cached", "HEAD", "--", "one"],
+        &[
+            "diff-index",
+            "--max-depth=0",
+            "--name-only",
+            "--cached",
+            "HEAD",
+            "--",
+            "one",
+        ],
         "",
     );
     assert_sley_stdout(
         &repo,
-        &["diff-index", "--max-depth=2", "--name-only", "--cached", "HEAD", "--", "one"],
+        &[
+            "diff-index",
+            "--max-depth=2",
+            "--name-only",
+            "--cached",
+            "HEAD",
+            "--",
+            "one",
+        ],
         "one/file\none/two/file\n",
     );
     assert_sley_stdout(
         &repo,
-        &["diff-index", "--max-depth=-1", "--name-only", "--cached", "HEAD", "--"],
+        &[
+            "diff-index",
+            "--max-depth=-1",
+            "--name-only",
+            "--cached",
+            "HEAD",
+            "--",
+        ],
         "file\none/file\none/two/file\none/two/three/file\n",
     );
 

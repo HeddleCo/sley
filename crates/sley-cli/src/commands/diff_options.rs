@@ -291,7 +291,12 @@ fn diff_option_specs() -> &'static [OptionSpec<'static>] {
         ),
         opt_bool(Some('r'), None, OptFlags::NONE, "recurse into subtrees"),
         opt_bool(Some('c'), None, OptFlags::NONE, "generate combined diff"),
-        opt_bool(None, Some("cc"), OptFlags::NONE, "generate dense combined diff"),
+        opt_bool(
+            None,
+            Some("cc"),
+            OptFlags::NONE,
+            "generate dense combined diff",
+        ),
         opt_bool(None, Some("cached"), OptFlags::NONE, "show cached changes"),
         opt_bool(
             None,

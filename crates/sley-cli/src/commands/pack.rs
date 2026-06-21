@@ -61,7 +61,9 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
         .or_else(|| repo.as_ref().map(|(_, format)| *format))
         .unwrap_or(ObjectFormat::Sha1);
     if options.stdin {
-        let (common_git_dir, _) = repo.as_ref().expect("stdin index-pack requires a repository");
+        let (common_git_dir, _) = repo
+            .as_ref()
+            .expect("stdin index-pack requires a repository");
         let common_git_dir = common_git_dir.clone();
         let mut pack = Vec::new();
         io::stdin().read_to_end(&mut pack)?;
@@ -232,9 +234,10 @@ fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
             }
             value if value.starts_with("--max-input-size=") => {
                 let spec = &value["--max-input-size=".len()..];
-                options.max_input_size = Some(spec.parse().map_err(|_| {
-                    GitError::Command(format!("bad max-input-size '{spec}'"))
-                })?);
+                options.max_input_size = Some(
+                    spec.parse()
+                        .map_err(|_| GitError::Command(format!("bad max-input-size '{spec}'")))?,
+                );
             }
             value if value.starts_with("--threads=") || value.starts_with("--pack_header=") => {}
             value if value.starts_with('-') => return index_pack_usage(),
@@ -743,23 +746,12 @@ fn expand_repack_short_clusters(args: &[String]) -> Vec<String> {
         let bytes = arg.as_bytes();
         if bytes.len() > 2
             && bytes[0] == b'-'
-            && bytes[1..]
-                .iter()
-                .all(|&ch| {
-                    matches!(
-                        ch,
-                        b'a' | b'A'
-                            | b'b'
-                            | b'd'
-                            | b'f'
-                            | b'F'
-                            | b'k'
-                            | b'l'
-                            | b'm'
-                            | b'n'
-                            | b'q'
-                    )
-                })
+            && bytes[1..].iter().all(|&ch| {
+                matches!(
+                    ch,
+                    b'a' | b'A' | b'b' | b'd' | b'f' | b'F' | b'k' | b'l' | b'm' | b'n' | b'q'
+                )
+            })
         {
             expanded.extend(bytes[1..].iter().map(|&ch| format!("-{}", ch as char)));
         } else {
@@ -917,8 +909,9 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--cruft-expiration=") => {
                 cruft = true;
-                cruft_expiration =
-                    Some(parse_cruft_expiration(&value["--cruft-expiration=".len()..])?);
+                cruft_expiration = Some(parse_cruft_expiration(
+                    &value["--cruft-expiration=".len()..],
+                )?);
             }
             "--expire-to" => {
                 let value = iter.next().ok_or_else(|| {
@@ -993,10 +986,8 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
         Some(explicit) => explicit,
         None => config_write_bitmaps.unwrap_or(auto_bare_bitmaps),
     };
-    let include_kept_objects = pack_kept_objects
-        || (write_bitmaps
-            && !write_midx
-            && !auto_bare_bitmaps);
+    let include_kept_objects =
+        pack_kept_objects || (write_bitmaps && !write_midx && !auto_bare_bitmaps);
 
     if write_bitmaps && local && object_dir_has_alternates(&common_git_dir) {
         eprintln!("warning: disabling bitmap writing, as some objects are not being packed");
@@ -1132,8 +1123,7 @@ fn cmd_repack_geometric(
     _pack_kept_objects: bool,
 ) -> Result<()> {
     let kept_stems: HashSet<String> = keep_packs.iter().cloned().collect();
-    let geometric =
-        sley_odb::repack_geometric(common_git_dir, format, split_factor, &kept_stems)?;
+    let geometric = sley_odb::repack_geometric(common_git_dir, format, split_factor, &kept_stems)?;
 
     if geometric.result.is_none() {
         if !quiet {
@@ -1234,13 +1224,9 @@ fn cmd_repack_cruft(
     // expire-to repo as a second cruft pack (with no expiration, so it keeps
     // them all). Compute the pre-expiry unreachable set first so we can diff.
     let pre_expiry = if expire_to.is_some() && prune {
-        Some(repack_cruft_or_bad_object(sley_odb::repack_cruft_with_options(
-            common_git_dir,
-            format,
-            &roots,
-            None,
-            &options,
-        ))?)
+        Some(repack_cruft_or_bad_object(
+            sley_odb::repack_cruft_with_options(common_git_dir, format, &roots, None, &options),
+        )?)
     } else {
         None
     };
@@ -1728,11 +1714,18 @@ fn maintenance_select_tasks(
     schedule: Option<&str>,
 ) -> Result<Vec<String>> {
     if !requested.is_empty() {
-        return Ok(requested.iter().map(|task| task.to_ascii_lowercase()).collect());
+        return Ok(requested
+            .iter()
+            .map(|task| task.to_ascii_lowercase())
+            .collect());
     }
     let strategy = config
         .get("maintenance", None, "strategy")
-        .unwrap_or(if schedule.is_some() { "none" } else { "geometric" });
+        .unwrap_or(if schedule.is_some() {
+            "none"
+        } else {
+            "geometric"
+        });
     let strategy_name = strategy.to_ascii_lowercase();
     let mut selected = match strategy_name.as_str() {
         "none" => Vec::new(),
@@ -1809,7 +1802,10 @@ fn maintenance_run_order(task: &str) -> usize {
 }
 
 fn maintenance_schedule_rank(value: &str) -> Result<u8> {
-    match validate_maintenance_schedule(value)?.to_ascii_lowercase().as_str() {
+    match validate_maintenance_schedule(value)?
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "weekly" => Ok(1),
         "daily" => Ok(2),
         "hourly" => Ok(3),
@@ -1833,7 +1829,10 @@ fn maintenance_run_selected(
         .is_err()
     {
         if !auto && !quiet {
-            eprintln!("warning: lock file '{}' exists, skipping maintenance", lock.display());
+            eprintln!(
+                "warning: lock file '{}' exists, skipping maintenance",
+                lock.display()
+            );
         }
         return Ok(());
     }
@@ -1912,8 +1911,14 @@ fn maintenance_run_one(
             let progress = if quiet { "--no-progress" } else { "--progress" };
             run_sley_child(&["multi-pack-index", "write", progress], None)?;
             run_sley_child(&["multi-pack-index", "expire", progress], None)?;
-            let batch = format!("--batch-size={}", maintenance_auto_pack_size(common_git_dir)?);
-            run_sley_child(&["multi-pack-index", "repack", progress, batch.as_str()], None)
+            let batch = format!(
+                "--batch-size={}",
+                maintenance_auto_pack_size(common_git_dir)?
+            );
+            run_sley_child(
+                &["multi-pack-index", "repack", progress, batch.as_str()],
+                None,
+            )
         }
         "geometric-repack" => {
             let factor = config
@@ -2058,8 +2063,9 @@ pub(crate) fn trace2_child_start(args: &[&str]) {
         .map(|arg| format!("\"{}\"", json_escape(arg)))
         .collect::<Vec<_>>()
         .join(",");
-    let line =
-        format!("{{\"event\":\"child_start\",\"sid\":\"sley\",\"child_id\":0,\"argv\":[{argv}]}}\n");
+    let line = format!(
+        "{{\"event\":\"child_start\",\"sid\":\"sley\",\"child_id\":0,\"argv\":[{argv}]}}\n"
+    );
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = file.write_all(line.as_bytes());
     }
@@ -2219,7 +2225,12 @@ fn maintenance_auto_pack_size(common_git_dir: &Path) -> Result<u64> {
         }
     }
     sizes.sort_unstable_by(|a, b| b.cmp(a));
-    Ok(sizes.get(1).copied().unwrap_or(0).saturating_add(1).min(i32::MAX as u64))
+    Ok(sizes
+        .get(1)
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .min(i32::MAX as u64))
 }
 
 fn count_reachable_commits(common_git_dir: &Path) -> Result<usize> {
@@ -2409,7 +2420,9 @@ fn count_dir_entries(path: &Path) -> Result<usize> {
     if !path.exists() {
         return Ok(0);
     }
-    Ok(fs::read_dir(path)?.filter_map(std::result::Result::ok).count())
+    Ok(fs::read_dir(path)?
+        .filter_map(std::result::Result::ok)
+        .count())
 }
 
 fn count_reflog_entries(path: &Path) -> Result<usize> {
@@ -2596,7 +2609,8 @@ fn config_remove_value(path: &Path, section: &str, key: &str, value: &str) -> Re
             continue;
         }
         candidate.entries.retain(|entry| {
-            let matched = entry.key.eq_ignore_ascii_case(key) && entry.value.as_deref() == Some(value);
+            let matched =
+                entry.key.eq_ignore_ascii_case(key) && entry.value.as_deref() == Some(value);
             removed |= matched;
             !matched
         });
@@ -2711,7 +2725,10 @@ fn validate_scheduler_available(scheduler: MaintenanceScheduler) -> Result<()> {
     if scheduler_available(scheduler) {
         Ok(())
     } else {
-        eprintln!("fatal: {} scheduler is not available", scheduler_name(scheduler));
+        eprintln!(
+            "fatal: {} scheduler is not available",
+            scheduler_name(scheduler)
+        );
         Err(GitError::Exit(128))
     }
 }
@@ -2762,7 +2779,10 @@ fn run_scheduler_command(scheduler: MaintenanceScheduler, args: &[&str]) -> Resu
     }
 }
 
-fn update_background_schedule(common_git_dir: &Path, enable: Option<MaintenanceScheduler>) -> Result<()> {
+fn update_background_schedule(
+    common_git_dir: &Path,
+    enable: Option<MaintenanceScheduler>,
+) -> Result<()> {
     let lock = repository_objects_dir(common_git_dir).join("schedule.lock");
     if fs::OpenOptions::new()
         .write(true)
@@ -2770,9 +2790,7 @@ fn update_background_schedule(common_git_dir: &Path, enable: Option<MaintenanceS
         .open(&lock)
         .is_err()
     {
-        eprintln!(
-            "error: Another scheduled git-maintenance(1) process seems to be running"
-        );
+        eprintln!("error: Another scheduled git-maintenance(1) process seems to be running");
         return Err(GitError::Exit(128));
     }
     if let Some(scheduler) = enable
@@ -2801,7 +2819,11 @@ fn update_background_schedule(common_git_dir: &Path, enable: Option<MaintenanceS
     Ok(())
 }
 
-fn update_scheduler(common_git_dir: &Path, scheduler: MaintenanceScheduler, enable: bool) -> Result<()> {
+fn update_scheduler(
+    common_git_dir: &Path,
+    scheduler: MaintenanceScheduler,
+    enable: bool,
+) -> Result<()> {
     match scheduler {
         MaintenanceScheduler::Cron => update_cron(enable),
         MaintenanceScheduler::Systemd => update_systemd(enable),
@@ -2854,17 +2876,30 @@ fn update_systemd(enable: bool) -> Result<()> {
             "[Service]\nExecStart=git -c core.askPass=true -c credential.interactive=false for-each-repo --keep-going --config=maintenance.repo maintenance run --schedule=%i\n",
         )?;
         for frequency in ["hourly", "daily", "weekly"] {
-            fs::write(base.join(format!("git-maintenance@{frequency}.timer")), "[Timer]\n")?;
+            fs::write(
+                base.join(format!("git-maintenance@{frequency}.timer")),
+                "[Timer]\n",
+            )?;
             run_scheduler_command(
                 MaintenanceScheduler::Systemd,
-                &["--user", "enable", "--now", &format!("git-maintenance@{frequency}.timer")],
+                &[
+                    "--user",
+                    "enable",
+                    "--now",
+                    &format!("git-maintenance@{frequency}.timer"),
+                ],
             )?;
         }
     } else {
         for frequency in ["hourly", "daily", "weekly"] {
             let _ = run_scheduler_command(
                 MaintenanceScheduler::Systemd,
-                &["--user", "disable", "--now", &format!("git-maintenance@{frequency}.timer")],
+                &[
+                    "--user",
+                    "disable",
+                    "--now",
+                    &format!("git-maintenance@{frequency}.timer"),
+                ],
             );
             let _ = fs::remove_file(base.join(format!("git-maintenance@{frequency}.timer")));
         }
@@ -2881,7 +2916,8 @@ fn update_launchctl(enable: bool) -> Result<()> {
     if enable {
         fs::create_dir_all(&base)?;
         let all_exist = ["hourly", "daily", "weekly"].iter().all(|frequency| {
-            base.join(format!("org.git-scm.git.{frequency}.plist")).exists()
+            base.join(format!("org.git-scm.git.{frequency}.plist"))
+                .exists()
         });
         if all_exist {
             for frequency in ["hourly", "daily", "weekly"] {
@@ -2894,16 +2930,28 @@ fn update_launchctl(enable: bool) -> Result<()> {
         }
         for frequency in ["hourly", "daily", "weekly"] {
             let plist = base.join(format!("org.git-scm.git.{frequency}.plist"));
-            fs::write(&plist, format!("<plist><string>schedule={frequency}</string></plist>\n"))?;
+            fs::write(
+                &plist,
+                format!("<plist><string>schedule={frequency}</string></plist>\n"),
+            )?;
             let plist = plist.display().to_string();
-            let _ = run_scheduler_command(MaintenanceScheduler::Launchctl, &["bootout", "gui/0", &plist]);
-            run_scheduler_command(MaintenanceScheduler::Launchctl, &["bootstrap", "gui/0", &plist])?;
+            let _ = run_scheduler_command(
+                MaintenanceScheduler::Launchctl,
+                &["bootout", "gui/0", &plist],
+            );
+            run_scheduler_command(
+                MaintenanceScheduler::Launchctl,
+                &["bootstrap", "gui/0", &plist],
+            )?;
         }
     } else {
         for frequency in ["hourly", "daily", "weekly"] {
             let plist = base.join(format!("org.git-scm.git.{frequency}.plist"));
             let plist_arg = plist.display().to_string();
-            let _ = run_scheduler_command(MaintenanceScheduler::Launchctl, &["bootout", "gui/0", &plist_arg]);
+            let _ = run_scheduler_command(
+                MaintenanceScheduler::Launchctl,
+                &["bootout", "gui/0", &plist_arg],
+            );
             let _ = fs::remove_file(plist);
         }
     }
@@ -2918,14 +2966,26 @@ fn update_schtasks(common_git_dir: &Path, enable: bool) -> Result<()> {
             let xml = xml.display().to_string();
             run_scheduler_command(
                 MaintenanceScheduler::Schtasks,
-                &["/create", "/tn", &format!("Git Maintenance ({frequency})"), "/f", "/xml", &xml],
+                &[
+                    "/create",
+                    "/tn",
+                    &format!("Git Maintenance ({frequency})"),
+                    "/f",
+                    "/xml",
+                    &xml,
+                ],
             )?;
         }
     } else {
         for frequency in ["hourly", "daily", "weekly"] {
             let _ = run_scheduler_command(
                 MaintenanceScheduler::Schtasks,
-                &["/delete", "/tn", &format!("Git Maintenance ({frequency})"), "/f"],
+                &[
+                    "/delete",
+                    "/tn",
+                    &format!("Git Maintenance ({frequency})"),
+                    "/f",
+                ],
             );
         }
     }
@@ -3943,7 +4003,10 @@ pub(crate) fn cmd_multi_pack_index(args: &[String]) -> Result<()> {
             }
             value
                 if value.starts_with("--object-dir=")
-                    || matches!(value, "--progress" | "--no-progress" | "--bitmap" | "--no-bitmap") =>
+                    || matches!(
+                        value,
+                        "--progress" | "--no-progress" | "--bitmap" | "--no-bitmap"
+                    ) =>
             {
                 global.push(value.to_string());
             }
@@ -4647,7 +4710,10 @@ fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -> Re
     // not fatal to the rest of the pass.
     let mut pack_indexes: Vec<Option<PackIndex>> = Vec::with_capacity(parsed.pack_names.len());
     for (position, name) in parsed.pack_names.iter().enumerate() {
-        match fs::read(pack_dir.join(name)).ok().and_then(|raw| PackIndex::parse(&raw, format).ok()) {
+        match fs::read(pack_dir.join(name))
+            .ok()
+            .and_then(|raw| PackIndex::parse(&raw, format).ok())
+        {
             Some(index) => pack_indexes.push(Some(index)),
             None => {
                 report(format!("failed to load pack in position {position}"));
@@ -4658,7 +4724,11 @@ fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -> Re
 
     if parsed.object_count == 0 {
         report("the midx contains no oid".to_string());
-        return if reported { Err(GitError::Exit(1)) } else { Ok(()) };
+        return if reported {
+            Err(GitError::Exit(1))
+        } else {
+            Ok(())
+        };
     }
 
     if progress {
@@ -4720,7 +4790,10 @@ struct VerifyMidx {
     entries: Vec<MultiPackIndexEntry>,
 }
 
-fn parse_midx_for_verify(bytes: &[u8], format: ObjectFormat) -> std::result::Result<VerifyMidx, String> {
+fn parse_midx_for_verify(
+    bytes: &[u8],
+    format: ObjectFormat,
+) -> std::result::Result<VerifyMidx, String> {
     let hash_len = format.raw_len();
     const MIDX_HEADER_SIZE: usize = 12;
     if bytes.len() < MIDX_HEADER_SIZE + 12 + hash_len {

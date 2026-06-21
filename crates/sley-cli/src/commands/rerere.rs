@@ -161,7 +161,9 @@ pub(crate) fn repo_rerere(
             continue;
         };
         let Some((normalized, hash)) = normalize_conflicted_content(&content, true)? else {
-            if let Some(pos) = rr.iter().position(|entry| entry.path.as_bytes() == conflict.path)
+            if let Some(pos) = rr
+                .iter()
+                .position(|entry| entry.path.as_bytes() == conflict.path)
                 && handle_resolved_path(git_dir, &mut rr[pos], &full)?
             {
                 changed = true;
@@ -608,7 +610,10 @@ fn lcs_line_matches(left: &[&[u8]], right: &[&[u8]]) -> Vec<(usize, usize)> {
     out
 }
 
-fn significant_common_runs(matches: &[(usize, usize)], min_len: usize) -> Vec<(usize, usize, usize)> {
+fn significant_common_runs(
+    matches: &[(usize, usize)],
+    min_len: usize,
+) -> Vec<(usize, usize, usize)> {
     let mut runs = Vec::new();
     let mut idx = 0;
     while idx < matches.len() {
@@ -650,7 +655,10 @@ fn is_cmarker(line: &[u8], marker: u8) -> bool {
     if line.len() < RERERE_MARKER_SIZE + 1 {
         return false;
     }
-    if !line[..RERERE_MARKER_SIZE].iter().all(|byte| *byte == marker) {
+    if !line[..RERERE_MARKER_SIZE]
+        .iter()
+        .all(|byte| *byte == marker)
+    {
         return false;
     }
     let next = line[RERERE_MARKER_SIZE];
@@ -726,7 +734,10 @@ fn try_replay_resolution_variant(
         return Ok(false);
     }
     fs::write(&full, &merged.content)?;
-    let _ = fs::write(rerere_cache_file_path(&cache_dir, entry.variant, "thisimage"), &thisimage);
+    let _ = fs::write(
+        rerere_cache_file_path(&cache_dir, entry.variant, "thisimage"),
+        &thisimage,
+    );
     let _ = fs::write(&postimage, &resolved);
     let _ = format;
     Ok(true)
@@ -770,7 +781,11 @@ fn stage_resolved_path(
 fn resolved_worktree_mode(path: &Path) -> Result<u32> {
     use std::os::unix::fs::PermissionsExt;
     let mode = fs::metadata(path)?.permissions().mode();
-    Ok(if mode & 0o111 != 0 { 0o100755 } else { 0o100644 })
+    Ok(if mode & 0o111 != 0 {
+        0o100755
+    } else {
+        0o100644
+    })
 }
 
 #[cfg(not(unix))]
@@ -993,7 +1008,9 @@ fn rr_dir_is_expired(path: &Path, expiry: Duration) -> Result<bool> {
         if !path.is_file() || !is_pre_or_postimage_file(&path) {
             continue;
         }
-        let modified = fs::metadata(&path)?.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let modified = fs::metadata(&path)?
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
         newest = Some(newest.map_or(modified, |current: SystemTime| current.max(modified)));
     }
     let Some(newest) = newest else {
@@ -1053,9 +1070,11 @@ fn rerere_forget(git_dir: &Path, paths: &[String]) -> Result<()> {
             }
             fs::remove_file(&postimage)?;
             forgotten.push(entry.clone());
-            if let Ok(thisimage) =
-                fs::read(rerere_cache_file_path(&cache_dir, entry.variant, "thisimage"))
-            {
+            if let Ok(thisimage) = fs::read(rerere_cache_file_path(
+                &cache_dir,
+                entry.variant,
+                "thisimage",
+            )) {
                 fs::write(
                     rerere_cache_file_path(&cache_dir, entry.variant, "preimage"),
                     thisimage,

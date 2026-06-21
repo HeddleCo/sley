@@ -345,7 +345,13 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
     let decorations: HashMap<ObjectId, Vec<String>> = if decoration_mode == LogDecorationMode::Off {
         HashMap::new()
     } else {
-        log_decoration_map(git_dir, db, format, decoration_mode, &crate::DecorationFilter::default())?
+        log_decoration_map(
+            git_dir,
+            db,
+            format,
+            decoration_mode,
+            &crate::DecorationFilter::default(),
+        )?
     };
 
     let mut setup_args = vec!["--default".to_string(), "HEAD".to_string()];
@@ -370,7 +376,11 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         None
     } else {
         let worktree_root = repo.worktree_root()?;
-        Some(DiffPathspec::new(repo.cwd(), worktree_root, &setup.pathspecs)?)
+        Some(DiffPathspec::new(
+            repo.cwd(),
+            worktree_root,
+            &setup.pathspecs,
+        )?)
     };
 
     let mut shown_one = false;
@@ -403,8 +413,11 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         options.grep_pattern_kind,
         options.grep_pattern_kind_explicit,
     );
-    let grep_matcher =
-        compile_log_message_grep_matcher(&options.grep_patterns, grep_kind, options.grep_ignore_case)?;
+    let grep_matcher = compile_log_message_grep_matcher(
+        &options.grep_patterns,
+        grep_kind,
+        options.grep_ignore_case,
+    )?;
     for tip in &setup.options.positives {
         if !show_tip_matches_grep(
             db,
@@ -702,9 +715,12 @@ fn show_commit(
     // `git show`, which defaults to a diff). The first-parent diff (empty-tree for
     // a root) is computed for merges too, because git's default renders the stat
     // family for them even though the patch/raw/name listings are suppressed.
-    let show_root = options
-        .show_root
-        .unwrap_or_else(|| context.config.get_bool("log", None, "showroot").unwrap_or(true));
+    let show_root = options.show_root.unwrap_or_else(|| {
+        context
+            .config
+            .get_bool("log", None, "showroot")
+            .unwrap_or(true)
+    });
     let entries = if commit.parents.is_empty() && !show_root {
         Vec::new()
     } else {
@@ -790,8 +806,12 @@ fn write_show_signature(
     else {
         return Ok(());
     };
-    let verification =
-        commands::signing::verify_payload(context.git_dir, Some(context.config), &payload, &signature)?;
+    let verification = commands::signing::verify_payload(
+        context.git_dir,
+        Some(context.config),
+        &payload,
+        &signature,
+    )?;
     stdout.write_all(&verification.human_output)?;
     Ok(())
 }
@@ -876,12 +896,11 @@ fn write_commit_trailer(
     // A merge in combined mode renders the combined patch (plus the stat family,
     // which is always first-parent). In any other merge mode (off / first-parent
     // default) only the stat family renders.
-    let combined_merge = layout.is_merge
-        && matches!(layout.merge_mode, ShowMergeMode::Combined { .. });
+    let combined_merge =
+        layout.is_merge && matches!(layout.merge_mode, ShowMergeMode::Combined { .. });
     // `--first-parent` (and `--diff-merges=first-parent`) renders the full
     // first-parent diff for a merge — the same body an ordinary commit gets.
-    let first_parent_merge =
-        layout.is_merge && layout.merge_mode == ShowMergeMode::FirstParent;
+    let first_parent_merge = layout.is_merge && layout.merge_mode == ShowMergeMode::FirstParent;
     // For an off-mode merge only the stat family renders; for a combined merge,
     // a first-parent merge, and an ordinary commit the body renders fully.
     let body_renders = if combined_merge {
@@ -1196,9 +1215,9 @@ fn write_commit_diff(
             }
             Ok(())
         }
-        ShowDiffMode::Patch => {
-            write_commit_diff_patch(stdout, git_dir, db, format, config, userdiff, options, entries)
-        }
+        ShowDiffMode::Patch => write_commit_diff_patch(
+            stdout, git_dir, db, format, config, userdiff, options, entries,
+        ),
     }
 }
 
@@ -1768,9 +1787,9 @@ fn parse_pretty_value(value: &str) -> Result<ShowCommitFormat> {
         }),
         // Built-in named layouts sley does not yet render. Reject explicitly
         // rather than mis-formatting them as literal text.
-        "full" | "fuller" | "email" | "mboxrd" | "raw" => Err(GitError::Unsupported(
-            format!("show does not support --pretty={value}"),
-        )),
+        "full" | "fuller" | "email" | "mboxrd" | "raw" => Err(GitError::Unsupported(format!(
+            "show does not support --pretty={value}"
+        ))),
         other if other.contains('%') => Ok(ShowCommitFormat::Custom {
             compiled: CompiledLogFormat::compile(other, LogFormatDialect::Log)?,
             final_newline: true,

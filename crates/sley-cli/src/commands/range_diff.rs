@@ -110,7 +110,10 @@ pub(crate) fn render_format_patch_range_diff(
                 &previous_oid,
                 &new_tip,
             )?;
-            let mut range = bases.iter().map(|base| format!("^{base}")).collect::<Vec<_>>();
+            let mut range = bases
+                .iter()
+                .map(|base| format!("^{base}"))
+                .collect::<Vec<_>>();
             range.push(previous.to_string());
             range
         }
@@ -202,9 +205,9 @@ fn parse_range_diff_args(
             "--abbrev" => options.abbrev = 7.min(repo.format().hex_len()),
             "-U" | "--unified" => {
                 idx += 1;
-                let value = args.get(idx).ok_or_else(|| {
-                    GitError::Command("option `unified' requires a value".into())
-                })?;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| GitError::Command("option `unified' requires a value".into()))?;
                 options.diff.context = parse_usize_option(value, "unified")?;
                 options.diff.patch = true;
             }
@@ -229,12 +232,10 @@ fn parse_range_diff_args(
             value if let Some(value) = value.strip_prefix("--abbrev=") => {
                 options.abbrev = parse_usize_option(value, "abbrev")?.min(repo.format().hex_len());
             }
-            value if let Some(value) = value.strip_prefix("--notes=") => {
-                match &mut options.notes {
-                    NotesMode::Refs(refs) => refs.push(value.to_string()),
-                    _ => options.notes = NotesMode::Refs(vec![value.to_string()]),
-                }
-            }
+            value if let Some(value) = value.strip_prefix("--notes=") => match &mut options.notes {
+                NotesMode::Refs(refs) => refs.push(value.to_string()),
+                _ => options.notes = NotesMode::Refs(vec![value.to_string()]),
+            },
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!(
                     "unsupported range-diff option {value}"
@@ -255,14 +256,26 @@ fn parse_range_diff_args(
             let right = if right.is_empty() { "HEAD" } else { right };
             let left_oid = repo.resolve_revision(left)?;
             let right_oid = repo.resolve_revision(right)?;
-            let bases = merge_bases(repo.git_dir(), repo.objects(), repo.format(), &left_oid, &right_oid)?;
+            let bases = merge_bases(
+                repo.git_dir(),
+                repo.objects(),
+                repo.format(),
+                &left_oid,
+                &right_oid,
+            )?;
             if bases.is_empty() {
                 eprintln!("fatal: no merge base between '{left}' and '{right}'");
                 return Err(GitError::Exit(128));
             }
-            let mut range1 = bases.iter().map(|base| format!("^{base}")).collect::<Vec<_>>();
+            let mut range1 = bases
+                .iter()
+                .map(|base| format!("^{base}"))
+                .collect::<Vec<_>>();
             range1.push(left.to_string());
-            let mut range2 = bases.iter().map(|base| format!("^{base}")).collect::<Vec<_>>();
+            let mut range2 = bases
+                .iter()
+                .map(|base| format!("^{base}"))
+                .collect::<Vec<_>>();
             range2.push(right.to_string());
             Ok(ParsedRangeDiff {
                 range1,
@@ -406,11 +419,12 @@ fn read_patches(
             excluded.insert(record.oid);
         }
     }
-    let mut selected: Vec<sley_rev::CommitRecord> = rev_list_walk_commits(db, format, starts, false)?
-        .into_iter()
-        .filter(|record| !excluded.contains(&record.oid))
-        .filter(|record| options.include_merges || record.parents.len() <= 1)
-        .collect();
+    let mut selected: Vec<sley_rev::CommitRecord> =
+        rev_list_walk_commits(db, format, starts, false)?
+            .into_iter()
+            .filter(|record| !excluded.contains(&record.oid))
+            .filter(|record| options.include_merges || record.parents.len() <= 1)
+            .collect();
     if !setup.pathspecs.is_empty() {
         let pathspec = sley_rev::Pathspec::parse(
             setup.pathspecs.iter().map(|spec| spec.as_bytes()),
@@ -462,7 +476,11 @@ fn build_patch_text(
     out.extend_from_slice(b" ## Metadata ##\nAuthor: ");
     out.extend_from_slice(commit_author_identity(&record.commit.author).as_bytes());
     out.extend_from_slice(b"\n\n ## Commit message ##\n");
-    let message = record.commit.message.strip_suffix(b"\n").unwrap_or(&record.commit.message);
+    let message = record
+        .commit
+        .message
+        .strip_suffix(b"\n")
+        .unwrap_or(&record.commit.message);
     for line in message.split(|b| *b == b'\n') {
         if line.is_empty() {
             out.push(b'\n');
@@ -498,7 +516,12 @@ fn build_patch_text(
         rename_empty: true,
     };
     let entries = if record.parents.is_empty() {
-        sley_diff_merge::diff_name_status_empty_tree_with_options(db, format, &record.commit.tree, base)?
+        sley_diff_merge::diff_name_status_empty_tree_with_options(
+            db,
+            format,
+            &record.commit.tree,
+            base,
+        )?
     } else {
         sley_diff_merge::diff_name_status_trees_with_rename_options(
             db,
@@ -632,7 +655,9 @@ fn append_normalized_hunks(out: &mut Vec<u8>, raw_patch: &[u8], path: &[u8]) {
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 struct NoteBlock {
@@ -800,12 +825,7 @@ fn write_pair_header(
     Ok(())
 }
 
-fn write_unique_abbrev(
-    out: &mut Vec<u8>,
-    db: &FileObjectDatabase,
-    oid: &ObjectId,
-    width: usize,
-) {
+fn write_unique_abbrev(out: &mut Vec<u8>, db: &FileObjectDatabase, oid: &ObjectId, width: usize) {
     let hex = oid.to_hex();
     let mut len = width.min(hex.len());
     while len < hex.len() {
@@ -821,12 +841,7 @@ fn decimal_width(value: usize) -> usize {
     value.checked_ilog10().unwrap_or(0) as usize + 1
 }
 
-fn write_interdiff(
-    out: &mut dyn Write,
-    left: &[u8],
-    right: &[u8],
-    context: usize,
-) -> Result<()> {
+fn write_interdiff(out: &mut dyn Write, left: &[u8], right: &[u8], context: usize) -> Result<()> {
     let mut rendered = Vec::new();
     let mut heading = section_heading_classifier();
     let mut opts = sley_diff_merge::render::HunkRenderOptions {

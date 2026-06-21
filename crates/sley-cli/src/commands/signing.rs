@@ -135,9 +135,23 @@ pub(crate) fn verify_payload(
     signature: &[u8],
 ) -> Result<GpgVerification> {
     match verification_format(config, signature)? {
-        SigningFormat::OpenPgp => verify_gpg_payload(gpg_program(config), git_dir, config, payload, signature, true),
+        SigningFormat::OpenPgp => verify_gpg_payload(
+            gpg_program(config),
+            git_dir,
+            config,
+            payload,
+            signature,
+            true,
+        ),
         SigningFormat::Ssh => verify_ssh_payload(git_dir, config, payload, signature),
-        SigningFormat::X509 => verify_gpg_payload(gpg_x509_program(config), git_dir, config, payload, signature, false),
+        SigningFormat::X509 => verify_gpg_payload(
+            gpg_x509_program(config),
+            git_dir,
+            config,
+            payload,
+            signature,
+            false,
+        ),
     }
 }
 
@@ -189,7 +203,10 @@ pub(crate) fn commit_signature_payload(body: &[u8]) -> Option<(Vec<u8>, Vec<u8>)
 }
 
 pub(crate) fn commit_payload_without_signature(body: &[u8]) -> Vec<u8> {
-    let Some(header_end) = body.windows(2).position(|window| window == b"\n\n").map(|idx| idx + 1)
+    let Some(header_end) = body
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|idx| idx + 1)
     else {
         return body.to_vec();
     };
@@ -356,7 +373,12 @@ fn verify_ssh_payload(
     fs::write(&temp.signature, signature)?;
     let verify_time = ssh_verify_time_arg(payload);
     let program = ssh_program(config);
-    let find = ssh_find_principals(&program, &allowed_signers, &temp.signature, verify_time.as_deref())?;
+    let find = ssh_find_principals(
+        &program,
+        &allowed_signers,
+        &temp.signature,
+        verify_time.as_deref(),
+    )?;
     let mut human_output = Vec::new();
     let mut ret_success = false;
     if find.status.success() && !find.stdout.is_empty() {
@@ -383,7 +405,8 @@ fn verify_ssh_payload(
             }
         }
     } else {
-        let output = ssh_check_novalidate(&program, &temp.signature, verify_time.as_deref(), payload)?;
+        let output =
+            ssh_check_novalidate(&program, &temp.signature, verify_time.as_deref(), payload)?;
         let good_output = output.stdout;
         human_output = good_output.clone();
         human_output.extend_from_slice(&find.stderr);
@@ -707,8 +730,8 @@ fn extract_commit_signature(body: &[u8]) -> Option<Vec<u8>> {
         if collecting {
             break;
         }
-        if let Some(value) = header_value(content, b"gpgsig")
-            .or_else(|| header_value(content, b"gpgsig-sha256"))
+        if let Some(value) =
+            header_value(content, b"gpgsig").or_else(|| header_value(content, b"gpgsig-sha256"))
         {
             collecting = true;
             signature.extend_from_slice(value);

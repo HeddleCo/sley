@@ -398,8 +398,10 @@ fn cmd_sparse_check_rules(args: &[String]) -> Result<()> {
                 })
                 .collect();
             if cone_mode {
-                let dirs: Vec<Vec<u8>> =
-                    decoded.iter().map(|line| normalize_cone_dir(line)).collect();
+                let dirs: Vec<Vec<u8>> = decoded
+                    .iter()
+                    .map(|line| normalize_cone_dir(line))
+                    .collect();
                 build_cone_file(&dirs)
                     .split(|byte| *byte == b'\n')
                     .filter(|line| !line.is_empty())
@@ -505,9 +507,7 @@ fn cmd_sparse_clean(args: &[String]) -> Result<()> {
     let msg_prefix = if dry_run { "Would remove" } else { "Removing" };
     let mut out = io::stdout();
     for dir in &sparse_dirs {
-        let abs = ctx
-            .worktree_root
-            .join(std::ffi::OsStr::from_bytes(dir));
+        let abs = ctx.worktree_root.join(std::ffi::OsStr::from_bytes(dir));
         if !abs.is_dir() {
             continue;
         }
@@ -569,7 +569,10 @@ fn sparse_directories(ctx: &SparseContext, patterns: &[Vec<u8>]) -> Result<Vec<V
         // Record, for each ancestor directory of this path, whether any in-cone
         // file lives beneath it.
         let mut start = 0usize;
-        while let Some(rel) = path.get(start..).and_then(|s| s.iter().position(|b| *b == b'/')) {
+        while let Some(rel) = path
+            .get(start..)
+            .and_then(|s| s.iter().position(|b| *b == b'/'))
+        {
             let end = start + rel;
             let dir = path[..end].to_vec();
             let entry = dir_state.entry(dir).or_insert(false);
@@ -827,7 +830,11 @@ fn validate_cone_dir(arg: &[u8], skip_checks: bool) -> Result<Vec<u8>> {
         );
         return Err(GitError::Exit(128));
     }
-    if !skip_checks && arg.iter().any(|byte| matches!(*byte, b'*' | b'?' | b'[' | b']')) {
+    if !skip_checks
+        && arg
+            .iter()
+            .any(|byte| matches!(*byte, b'*' | b'?' | b'[' | b']'))
+    {
         eprintln!(
             "fatal: specify directories rather than patterns.  If your directory really has any of '*?[]\\' in it, pass --skip-checks"
         );

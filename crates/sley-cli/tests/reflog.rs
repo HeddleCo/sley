@@ -98,11 +98,23 @@ fn prepare_reflog_repo(root: &Path) {
     // backwards; upstream git only collapses entries in that pathological case,
     // so testing against it asserted a degenerate behavior rather than the real
     // "show all entries" contract.
-    run_success_with_identity_at(root, &["commit", "--allow-empty", "-qm", "one"], "@1700000000 +0000");
-    run_success_with_identity_at(root, &["commit", "--allow-empty", "-qm", "two"], "@1700000010 +0000");
+    run_success_with_identity_at(
+        root,
+        &["commit", "--allow-empty", "-qm", "one"],
+        "@1700000000 +0000",
+    );
+    run_success_with_identity_at(
+        root,
+        &["commit", "--allow-empty", "-qm", "two"],
+        "@1700000010 +0000",
+    );
     run_success_with_identity_at(root, &["branch", "topic", "HEAD~1"], "@1700000020 +0000");
     run_success_with_identity_at(root, &["checkout", "-q", "topic"], "@1700000030 +0000");
-    run_success_with_identity_at(root, &["commit", "--allow-empty", "-qm", "topic"], "@1700000040 +0000");
+    run_success_with_identity_at(
+        root,
+        &["commit", "--allow-empty", "-qm", "topic"],
+        "@1700000040 +0000",
+    );
     run_success_with_identity_at(root, &["checkout", "-q", "main"], "@1700000050 +0000");
 }
 

@@ -314,11 +314,7 @@ impl LogDiffContext<'_> {
         }
         if opts.name_only {
             for entry in &entries {
-                writeln!(
-                    out,
-                    "{}",
-                    String::from_utf8_lossy(entry.path.as_bytes())
-                )?;
+                writeln!(out, "{}", String::from_utf8_lossy(entry.path.as_bytes()))?;
             }
         }
         if opts.numstat {
@@ -422,15 +418,14 @@ impl LogDiffContext<'_> {
             .collect::<Result<Vec<_>>>()?;
 
         // Stat family is computed against the first parent (STAT_FORMAT_MASK).
-        let stat_active =
-            opts.raw
-                || opts.name_status
-                || opts.name_only
-                || opts.numstat
-                || opts.stat
-                || opts.compact_summary
-                || opts.shortstat
-                || opts.summary;
+        let stat_active = opts.raw
+            || opts.name_status
+            || opts.name_only
+            || opts.numstat
+            || opts.stat
+            || opts.compact_summary
+            || opts.shortstat
+            || opts.summary;
         let first_parent_entries = if stat_active {
             let base = sley_diff_merge::DiffNameStatusOptions {
                 detect_renames: self.detect_renames,
@@ -469,11 +464,7 @@ impl LogDiffContext<'_> {
         }
         if opts.name_only {
             for path in &paths {
-                writeln!(
-                    out,
-                    "{}",
-                    String::from_utf8_lossy(&path.path)
-                )?;
+                writeln!(out, "{}", String::from_utf8_lossy(&path.path))?;
             }
         }
         if opts.numstat {

@@ -196,8 +196,12 @@ fn verify_one_commit(
         io::stdout().write_all(&payload)?;
         io::stdout().flush()?;
     }
-    let verification =
-        commands::signing::verify_payload(repo.git_dir(), Some(repo.config()), &payload, &signature)?;
+    let verification = commands::signing::verify_payload(
+        repo.git_dir(),
+        Some(repo.config()),
+        &payload,
+        &signature,
+    )?;
     if options.raw {
         io::stderr().write_all(&verification.status_output)?;
     } else {

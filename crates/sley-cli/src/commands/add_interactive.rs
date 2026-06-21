@@ -83,12 +83,17 @@ impl InteractiveStyle {
         };
         let interactive = get("color", None, "interactive");
         let color_ui = get("color", None, "ui");
-        let enabled = match interactive.as_deref().and_then(sley_config::parse_config_bool) {
+        let enabled = match interactive
+            .as_deref()
+            .and_then(sley_config::parse_config_bool)
+        {
             Some(value) => value,
             None => match color_ui.as_deref().and_then(sley_config::parse_config_bool) {
                 Some(value) => value,
-                None => env::var("GIT_PAGER_IN_USE").is_ok()
-                    && env::var("TERM").map(|term| term != "dumb").unwrap_or(false),
+                None => {
+                    env::var("GIT_PAGER_IN_USE").is_ok()
+                        && env::var("TERM").map(|term| term != "dumb").unwrap_or(false)
+                }
             },
         };
         let color_slot = |slot: &str, default: &str| -> String {
@@ -1002,8 +1007,10 @@ fn patch_color_enabled(config: Option<&GitConfig>, slot: &str) -> bool {
     match key.as_deref().map(str::trim) {
         Some("always") | Some("auto") => true,
         Some(value) => sley_config::parse_config_bool(value).unwrap_or(false),
-        None => env::var("GIT_PAGER_IN_USE").is_ok()
-            && env::var("TERM").is_ok_and(|term| term != "dumb"),
+        None => {
+            env::var("GIT_PAGER_IN_USE").is_ok()
+                && env::var("TERM").is_ok_and(|term| term != "dumb")
+        }
     }
 }
 

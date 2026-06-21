@@ -2,12 +2,12 @@
 
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
-use crate::*;
 use super::status::{
-    SubmoduleIgnoreResolver, StatusLongDisplay, apply_submodule_ignore, build_status_long_sink,
+    StatusLongDisplay, SubmoduleIgnoreResolver, apply_submodule_ignore, build_status_long_sink,
     commit_comment_string, print_status_long, status_comment_prefix,
     status_entries_have_index_changes, status_submodule_summary,
 };
+use crate::*;
 
 enum CommitShortFlag {
     /// A boolean flag that takes no value (e.g. `-q`, `-s`, `-a`).
@@ -942,9 +942,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         .as_ref()
         .map(|fixup| read_fixup_commit_message(&git_dir, format, fixup, &commit_encoding))
         .transpose()?;
-    let fixup_reword_tree = if fixup_commit.as_ref().is_some_and(|fixup| {
-        fixup.is_reword() || (fixup.is_amend_style() && only_without_paths)
-    }) {
+    let fixup_reword_tree = if fixup_commit
+        .as_ref()
+        .is_some_and(|fixup| fixup.is_reword() || (fixup.is_amend_style() && only_without_paths))
+    {
         let Some(commit) = read_head_commit(&git_dir, format)? else {
             eprintln!("fatal: You have nothing to amend.");
             return Err(GitError::Exit(128));
@@ -1116,7 +1117,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         && !in_merge
         && (edit_flag == Some(true)
             || (edit_flag != Some(false)
-                && (!had_message_source || reedit_message || fixup_uses_editor || squash_uses_editor)));
+                && (!had_message_source
+                    || reedit_message
+                    || fixup_uses_editor
+                    || squash_uses_editor)));
     let partial_head_tree = if !pathspec_args.is_empty() {
         let refs = FileRefStore::new(&git_dir, format);
         let head = commands::merge_rebase::head_commit_oid(&refs)?;
@@ -1182,8 +1186,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         // `author_date_is_interesting()` = `--date` given or author reused from
         // another commit (`-C`/`-c`/amend); env GIT_AUTHOR_DATE alone does not
         // trigger the template Date line.
-        let author_date_interesting =
-            author_date.is_some() || reuse_message.is_some() || amend;
+        let author_date_interesting = author_date.is_some() || reuse_message.is_some() || amend;
         let block = build_commit_editor_template_block(&CommitTemplateBlock {
             git_dir: &git_dir,
             format,
@@ -1199,7 +1202,14 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         template.extend_from_slice(&block);
     }
     if use_editor && verbose > 0 {
-        append_commit_verbose_diff(&git_dir, format, amend, verbose as u8, &comment_char, &mut template)?;
+        append_commit_verbose_diff(
+            &git_dir,
+            format,
+            amend,
+            verbose as u8,
+            &comment_char,
+            &mut template,
+        )?;
     }
     fs::write(&editmsg, &template)?;
     let editmsg_arg = editmsg.to_string_lossy().into_owned();
@@ -1314,7 +1324,12 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         && template_message_source
         && cleanup_mode_strips_comments(cleanup_mode)
         && let Some(template_bytes) = read_commit_template_file(path)?
-        && commit_template_lacks_edit_content(&message, &template_bytes, cleanup_mode, &comment_char)
+        && commit_template_lacks_edit_content(
+            &message,
+            &template_bytes,
+            cleanup_mode,
+            &comment_char,
+        )
     {
         let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit; you did not edit the message.");
@@ -1334,10 +1349,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             quiet,
         );
     }
-    let precomputed_index_tree = if !allow_empty
-        && !amend
-        && fixup_reword_tree.is_none()
-    {
+    let precomputed_index_tree = if !allow_empty && !amend && fixup_reword_tree.is_none() {
         match commit_index_tree_if_changed(&git_dir, format, &commit_odb)? {
             Some(tree) => Some(tree),
             None => {
@@ -1491,7 +1503,11 @@ fn print_commit_summary(
         None => "detached HEAD".to_string(),
     };
     let abbrev = commit_summary_abbrev(git_dir, format, new_oid)?;
-    let root = if parent.is_none() { " (root-commit)" } else { "" };
+    let root = if parent.is_none() {
+        " (root-commit)"
+    } else {
+        ""
+    };
     let subject = commit_subject(message);
 
     let mut out = io::stdout();
@@ -1532,11 +1548,7 @@ fn print_commit_summary(
 /// The post-commit summary uses the repository's effective abbreviation width.
 /// Avoid per-commit uniqueness scans here: on large packed repositories that
 /// turns a one-file commit into an all-object walk before the first line prints.
-fn commit_summary_abbrev(
-    git_dir: &Path,
-    format: ObjectFormat,
-    oid: &ObjectId,
-) -> Result<String> {
+fn commit_summary_abbrev(git_dir: &Path, format: ObjectFormat, oid: &ObjectId) -> Result<String> {
     let hex = oid.to_hex();
     let width = repository_abbrev(git_dir, format)?
         .map(|width| width.min(hex.len()))
@@ -1595,7 +1607,11 @@ fn write_commit_summary_entry(
             if let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
                 && old_mode != new_mode
             {
-                writeln!(out, " mode change {old_mode:06o} => {new_mode:06o} {}", entry.path)?;
+                writeln!(
+                    out,
+                    " mode change {old_mode:06o} => {new_mode:06o} {}",
+                    entry.path
+                )?;
             }
         }
         _ => {}
@@ -2214,7 +2230,9 @@ impl CommitFixup {
 /// exit code 129 and a "[Uu]sage" match in the output.
 fn commit_usage() -> Result<()> {
     eprintln!("usage: git commit [-a | --interactive | --patch] [-s] [-v] [-u<mode>] [--amend]");
-    eprintln!("                  [--dry-run] [(-c | -C | --squash) <commit> | --fixup [(amend|reword):]<commit>]");
+    eprintln!(
+        "                  [--dry-run] [(-c | -C | --squash) <commit> | --fixup [(amend|reword):]<commit>]"
+    );
     eprintln!("                  [-F <file> | -m <msg>] [--reset-author] [--allow-empty]");
     eprintln!("                  [--no-verify] [-e] [--author=<author>] [--date=<date>]");
     eprintln!("                  [--cleanup=<mode>] [--[no-]status] [-i | -o] [pathspec...]");
@@ -2344,9 +2362,7 @@ fn is_commit_trailer_line(line: &str) -> bool {
     };
     !key.is_empty()
         && !value.trim().is_empty()
-        && key
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// Validate a `--cleanup`/`commit.cleanup` mode string. git's `get_cleanup_mode`
@@ -2429,9 +2445,12 @@ fn read_squash_merge_message_from_file(git_dir: &Path) -> Result<Vec<u8>> {
 
 fn merge_msg_conflicts_block(message: &[u8]) -> Option<&[u8]> {
     let conflicts = message_line_start(message, b"# Conflicts:\n")?;
-    let cut = message_line_start(message, b"# ------------------------ >8 ------------------------\n")
-        .filter(|cut| *cut < conflicts)
-        .unwrap_or(conflicts);
+    let cut = message_line_start(
+        message,
+        b"# ------------------------ >8 ------------------------\n",
+    )
+    .filter(|cut| *cut < conflicts)
+    .unwrap_or(conflicts);
     let start = if cut > 0 && message[cut - 1] == b'\n' {
         cut - 1
     } else {
@@ -2451,7 +2470,11 @@ fn message_line_start(message: &[u8], marker: &[u8]) -> Option<usize> {
 }
 
 fn merge_msg_block_has_scissors(message: &[u8]) -> bool {
-    message_line_start(message, b"# ------------------------ >8 ------------------------\n").is_some()
+    message_line_start(
+        message,
+        b"# ------------------------ >8 ------------------------\n",
+    )
+    .is_some()
 }
 
 fn commit_cleanup_config_is_scissors(git_dir: &Path) -> bool {
@@ -2772,11 +2795,7 @@ fn append_commit_diff_index_patch(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let base_tree = commit_verbose_base_tree(git_dir, format, amend)?;
     let entries = if worktree {
-        sley_diff_merge::diff_name_status_index_worktree(
-            &worktree_root,
-            git_dir,
-            format,
-        )?
+        sley_diff_merge::diff_name_status_index_worktree(&worktree_root, git_dir, format)?
     } else {
         sley_diff_merge::diff_name_status_tree_index_with_options(
             git_dir,
@@ -2823,11 +2842,7 @@ fn append_commit_diff_index_patch(
     Ok(())
 }
 
-fn commit_verbose_base_tree(
-    git_dir: &Path,
-    format: ObjectFormat,
-    amend: bool,
-) -> Result<ObjectId> {
+fn commit_verbose_base_tree(git_dir: &Path, format: ObjectFormat, amend: bool) -> Result<ObjectId> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let store = FileRefStore::new(git_dir, format);
     let head = match store.read_ref("HEAD")? {
@@ -2954,13 +2969,8 @@ fn build_commit_editor_template_block(input: &CommitTemplateBlock) -> Result<Vec
     out.push(b'\n');
 
     // The long working-tree status, every line commented.
-    let status = render_commit_template_status(
-        git_dir,
-        format,
-        comment_char,
-        amend,
-        untracked_override,
-    )?;
+    let status =
+        render_commit_template_status(git_dir, format, comment_char, amend, untracked_override)?;
     out.extend_from_slice(&status);
     Ok(out)
 }

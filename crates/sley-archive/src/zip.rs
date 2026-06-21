@@ -107,7 +107,15 @@ pub fn write_zip_archive_full<W>(
 where
     W: Write + ?Sized,
 {
-    write_zip_archive_inner(writer, reader, format, tree_oid, options, Some(convert), extra)
+    write_zip_archive_inner(
+        writer,
+        reader,
+        format,
+        tree_oid,
+        options,
+        Some(convert),
+        extra,
+    )
 }
 
 fn write_zip_archive_inner<R, W>(
@@ -356,9 +364,8 @@ fn deflate_raw(data: &[u8], level: u32) -> Option<Vec<u8>> {
 /// broken-down time is UTC. Returns `(date, time)`.
 fn dos_time(timestamp: u64) -> (u16, u16) {
     let tm = gmtime(timestamp as i64);
-    let date = (tm.mday as u16)
-        + ((tm.mon as u16 + 1) * 32)
-        + (((tm.year + 1900 - 1980) as u16) * 512);
+    let date =
+        (tm.mday as u16) + ((tm.mon as u16 + 1) * 32) + (((tm.year + 1900 - 1980) as u16) * 512);
     let time = (tm.sec as u16 / 2) + (tm.min as u16 * 32) + (tm.hour as u16 * 2048);
     (date, time)
 }

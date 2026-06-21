@@ -900,7 +900,9 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
     Ok(updates)
 }
 
-fn advertisements_without_peeled_refs(advertisements: &[RefAdvertisement]) -> Vec<RefAdvertisement> {
+fn advertisements_without_peeled_refs(
+    advertisements: &[RefAdvertisement],
+) -> Vec<RefAdvertisement> {
     advertisements
         .iter()
         .filter(|advertisement| !advertisement.name.ends_with("^{}"))
@@ -1007,7 +1009,13 @@ fn finalize_fetch(
         }
         outcome.wrote_fetch_head = true;
     }
-    apply_fetch_ref_updates(store, format, fetch_head_source, log_all_ref_updates, updates)?;
+    apply_fetch_ref_updates(
+        store,
+        format,
+        fetch_head_source,
+        log_all_ref_updates,
+        updates,
+    )?;
     outcome.ref_updates = std::mem::take(updates);
     Ok(())
 }
@@ -1147,7 +1155,10 @@ fn validate_fetch_ref_updates(
                 update.src, dst
             )));
         }
-        if old.is_some() && old != Some(update.oid) && dst.starts_with("refs/tags/") && !update.force
+        if old.is_some()
+            && old != Some(update.oid)
+            && dst.starts_with("refs/tags/")
+            && !update.force
         {
             return Err(GitError::Command(format!(
                 "! [rejected]        {} -> {}  (would clobber existing tag)",
@@ -1160,7 +1171,8 @@ fn validate_fetch_ref_updates(
 
 fn checked_out_branch_refs(git_dir: &Path, format: ObjectFormat) -> Result<HashSet<String>> {
     let mut refs = HashSet::new();
-    if let Some(RefTarget::Symbolic(target)) = FileRefStore::new(git_dir, format).read_ref("HEAD")?
+    if let Some(RefTarget::Symbolic(target)) =
+        FileRefStore::new(git_dir, format).read_ref("HEAD")?
     {
         refs.insert(target);
     }

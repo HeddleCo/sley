@@ -820,7 +820,10 @@ impl Index {
 
     /// Replace (or remove) the split-index `link` extension.
     pub fn set_split_index_link(&mut self, link: Option<&SplitIndexLink>) -> Result<()> {
-        self.replace_extension(&INDEX_EXT_LINK, link.map(SplitIndexLink::write).transpose()?)
+        self.replace_extension(
+            &INDEX_EXT_LINK,
+            link.map(SplitIndexLink::write).transpose()?,
+        )
     }
 
     /// Remove the split-index `link` extension.
@@ -842,9 +845,7 @@ impl Index {
                 encode_index_extension(&mut rebuilt, &id, chunk_body)?;
             }
         }
-        if !replaced
-            && let Some(body) = body.as_ref()
-        {
+        if !replaced && let Some(body) = body.as_ref() {
             encode_index_extension(&mut rebuilt, signature, body)?;
         }
         self.extensions = rebuilt;
@@ -1057,7 +1058,10 @@ impl UntrackedCache {
                     "truncated untracked-cache directory oid".into(),
                 ));
             }
-            dir.exclude_oid = Some(ObjectId::from_raw(format, &body[offset..offset + hash_len])?);
+            dir.exclude_oid = Some(ObjectId::from_raw(
+                format,
+                &body[offset..offset + hash_len],
+            )?);
             offset += hash_len;
         }
         if offset != end {
@@ -1581,7 +1585,11 @@ pub fn read_repository_index(git_dir: impl AsRef<Path>, format: ObjectFormat) ->
     read_index_file_expanded(&index_path, git_dir, format)
 }
 
-fn read_index_file_expanded(index_path: &Path, git_dir: &Path, format: ObjectFormat) -> Result<Index> {
+fn read_index_file_expanded(
+    index_path: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Index> {
     let mut index = Index::parse(&fs::read(index_path)?, format)?;
     let Some(link) = index.split_index_link(format)? else {
         return Ok(index);
@@ -1622,7 +1630,9 @@ fn merge_split_index_entries(
             ));
         }
         let Some(replacement) = replacement_iter.next() else {
-            return Err(GitError::InvalidFormat("too few replacement entries".into()));
+            return Err(GitError::InvalidFormat(
+                "too few replacement entries".into(),
+            ));
         };
         let mut replacement = replacement;
         if replacement.path.is_empty() {
@@ -2530,14 +2540,18 @@ mod tests {
         let sub = dir.join("sub");
         fs::create_dir_all(&sub).expect("test operation should succeed");
         assert_eq!(
-            gitlink_stat_verdict(&fs::symlink_metadata(&sub).expect("test operation should succeed")),
+            gitlink_stat_verdict(
+                &fs::symlink_metadata(&sub).expect("test operation should succeed")
+            ),
             GitlinkStatVerdict::Populated
         );
         // A regular file where the submodule should be → TypeChanged (dirty).
         let file = dir.join("file");
         fs::write(&file, b"x").expect("test operation should succeed");
         assert_eq!(
-            gitlink_stat_verdict(&fs::symlink_metadata(&file).expect("test operation should succeed")),
+            gitlink_stat_verdict(
+                &fs::symlink_metadata(&file).expect("test operation should succeed")
+            ),
             GitlinkStatVerdict::TypeChanged
         );
     }

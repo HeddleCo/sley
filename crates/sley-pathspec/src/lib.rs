@@ -188,7 +188,7 @@ impl PathspecElement {
     /// Whether `name` (a repo-relative path, no leading slash) is selected by
     /// this single element, ignoring its exclude polarity. Use
     /// [`Pathspec::matches`] for the combined include/exclude semantics.
-pub fn matches_path(&self, name: &[u8]) -> bool {
+    pub fn matches_path(&self, name: &[u8]) -> bool {
         pathspec_item_matches(&self.pattern, name, self.magic())
     }
 
@@ -285,8 +285,7 @@ impl LsFilesPathFilter {
         // exact / directory-prefix / wildcard matching under the active magic.
         let path_no_slash = path.strip_suffix(b"/").unwrap_or(path);
         self.element.matches_path(path)
-            || (path_no_slash.len() != path.len()
-                && self.element.matches_path(path_no_slash))
+            || (path_no_slash.len() != path.len() && self.element.matches_path(path_no_slash))
     }
 }
 
@@ -357,9 +356,7 @@ pub fn pathspec_attrs_match_with(
         let (name, expected) = match requirement {
             PathspecAttrRequirement::Set(name) => (name, AttrRequirementKind::Set),
             PathspecAttrRequirement::Unset(name) => (name, AttrRequirementKind::Unset),
-            PathspecAttrRequirement::Unspecified(name) => {
-                (name, AttrRequirementKind::Unspecified)
-            }
+            PathspecAttrRequirement::Unspecified(name) => (name, AttrRequirementKind::Unspecified),
             PathspecAttrRequirement::Value { name, value } => {
                 (name, AttrRequirementKind::Value(value))
             }
@@ -393,7 +390,11 @@ pub fn parse_normalized_pathspec_element(
 ) -> sley_core::Result<PathspecElement> {
     let element = PathspecElement::parse(arg.as_bytes(), magic)
         .map_err(|err| GitError::Command(format!("bad pathspec: {err}")))?;
-    let base = if element.is_top() { b"".as_slice() } else { prefix };
+    let base = if element.is_top() {
+        b"".as_slice()
+    } else {
+        prefix
+    };
     let pattern = normalize_ls_files_pathspec(base, &String::from_utf8_lossy(element.pattern()))?;
     Ok(element.with_pattern(pattern))
 }
@@ -469,7 +470,9 @@ fn split_magic(body: &[u8]) -> Vec<Vec<u8>> {
     words
 }
 
-fn parse_attr_requirements(body: &[u8]) -> Result<Vec<PathspecAttrRequirement>, PathspecParseError> {
+fn parse_attr_requirements(
+    body: &[u8],
+) -> Result<Vec<PathspecAttrRequirement>, PathspecParseError> {
     if body.is_empty() {
         return Err(PathspecParseError::EmptyAttrMagic);
     }
@@ -588,7 +591,10 @@ impl core::fmt::Display for PathspecParseError {
                 String::from_utf8_lossy(spec)
             ),
             PathspecParseError::AttrValueTrailingBackslash => {
-                write!(f, "Escape character '\\' not allowed as last character in attr value")
+                write!(
+                    f,
+                    "Escape character '\\' not allowed as last character in attr value"
+                )
             }
             PathspecParseError::AttrValueUnsupportedBackslash => {
                 write!(f, "Only '\\,' is supported for value matching")

@@ -311,9 +311,11 @@ pub fn write_for_each_ref_format(
         .iter()
         .any(for_each_ref_segment_has_control)
     {
-        format.inner.write_to(stdout, &mut write_atom, |stdout, value| {
-            write_for_each_ref_quoted_atom(stdout, value, quote)
-        })?;
+        format
+            .inner
+            .write_to(stdout, &mut write_atom, |stdout, value| {
+                write_for_each_ref_quoted_atom(stdout, value, quote)
+            })?;
         if reset_color_at_eol {
             stdout.write_all(b"\x1b[m")?;
         }
@@ -370,12 +372,8 @@ fn write_for_each_ref_format_range(
                     }
                     match control {
                         ForEachRefControlAtom::Align(options) => {
-                            let (value, next) = render_for_each_ref_align(
-                                segments,
-                                idx + 1,
-                                &options,
-                                write_atom,
-                            )?;
+                            let (value, next) =
+                                render_for_each_ref_align(segments, idx + 1, &options, write_atom)?;
                             let mut value = value;
                             apply_for_each_ref_padding(&mut value, pending_padding.take());
                             apply_for_each_ref_magic(out, atom.magic, &value);
@@ -436,9 +434,7 @@ fn render_for_each_ref_align(
         write_atom,
     )?;
     if stop != Some(ForEachRefControlStop::End) {
-        return Err(GitError::Command(
-            "missing %(end) atom for %(align)".into(),
-        ));
+        return Err(GitError::Command("missing %(end) atom for %(align)".into()));
     }
     apply_for_each_ref_align(&mut value, options);
     Ok((value, idx + 1))
@@ -565,9 +561,9 @@ fn for_each_ref_control_atom(atom: &ForEachRefAtom) -> Option<ForEachRefControlA
         )));
     }
     if let Some(expected) = value.strip_prefix("if:notequals=") {
-        return Some(ForEachRefControlAtom::If(
-            ForEachRefIfCondition::NotEquals(expected.to_string()),
-        ));
+        return Some(ForEachRefControlAtom::If(ForEachRefIfCondition::NotEquals(
+            expected.to_string(),
+        )));
     }
     match value.as_str() {
         "then" => Some(ForEachRefControlAtom::Then),
@@ -1144,7 +1140,8 @@ pub fn shorten_unambiguous_ref(
             matched
         };
         let ambiguous = (0..rules_to_fail).any(|rule_idx| {
-            rule_idx != matched && ref_exists(&expand_ref_rule(REF_REV_PARSE_RULES[rule_idx], short))
+            rule_idx != matched
+                && ref_exists(&expand_ref_rule(REF_REV_PARSE_RULES[rule_idx], short))
         });
         if !ambiguous {
             return short.to_string();

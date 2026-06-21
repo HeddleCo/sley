@@ -318,7 +318,11 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                     } else {
                         oid
                     };
-                    verified_output = Some(if negate { format!("^{rendered}") } else { rendered });
+                    verified_output = Some(if negate {
+                        format!("^{rendered}")
+                    } else {
+                        rendered
+                    });
                     idx += 1;
                     continue;
                 }
@@ -336,7 +340,8 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
         }
         idx += 1;
     }
-    if verify && verified_revs == 0
+    if verify
+        && verified_revs == 0
         && let Some(default_rev) = default_rev
     {
         let oid = match resolve_revision(&git_dir, format, &default_rev) {
@@ -350,9 +355,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
     if verify && verified_revs != 1 {
         return rev_parse_needed_single_revision(quiet);
     }
-    if verify
-        && let Some(output) = verified_output
-    {
+    if verify && let Some(output) = verified_output {
         println!("{output}");
     }
     Ok(())
@@ -509,7 +512,10 @@ fn rev_parse_normalize_relative_path(cwd: &Path, git_dir: &Path, path: &str) -> 
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
                 if normalized == root {
-                    eprintln!("fatal: '{path}' is outside repository at '{}'", root.display());
+                    eprintln!(
+                        "fatal: '{path}' is outside repository at '{}'",
+                        root.display()
+                    );
                     return Err(GitError::Exit(128));
                 }
                 normalized.pop();
@@ -519,7 +525,10 @@ fn rev_parse_normalize_relative_path(cwd: &Path, git_dir: &Path, path: &str) -> 
         }
     }
     if !normalized.starts_with(&root) {
-        eprintln!("fatal: '{path}' is outside repository at '{}'", root.display());
+        eprintln!(
+            "fatal: '{path}' is outside repository at '{}'",
+            root.display()
+        );
         return Err(GitError::Exit(128));
     }
     let relative = normalized
@@ -766,7 +775,10 @@ fn rev_parse_index_contains(git_dir: &Path, format: ObjectFormat, path: &str) ->
         Err(err) => return Err(GitError::Io(err.to_string())),
     };
     let index = sley_index::Index::parse(&bytes, format)?;
-    Ok(index.entries.iter().any(|entry| entry.path == path.as_bytes()))
+    Ok(index
+        .entries
+        .iter()
+        .any(|entry| entry.path == path.as_bytes()))
 }
 
 fn rev_parse_repository_index_path(git_dir: &Path) -> PathBuf {
@@ -919,12 +931,18 @@ fn rev_parse_parseopt(args: &[String]) -> Result<()> {
             Ok(())
         }
         Err(RevParseParseOptError::Help { full }) => {
-            print!("{}", render_rev_parse_parseopt_usage(&usage, &specs, full, true));
+            print!(
+                "{}",
+                render_rev_parse_parseopt_usage(&usage, &specs, full, true)
+            );
             Err(GitError::Exit(129))
         }
         Err(RevParseParseOptError::Usage { message }) => {
             eprintln!("error: {message}");
-            eprint!("{}", render_rev_parse_parseopt_usage(&usage, &specs, false, false));
+            eprint!(
+                "{}",
+                render_rev_parse_parseopt_usage(&usage, &specs, false, false)
+            );
             Err(GitError::Exit(129))
         }
     }

@@ -542,9 +542,8 @@ mod tests {
 
     #[test]
     fn parses_basic_submodule() {
-        let cfg = config_from(
-            "[submodule \"lib\"]\n\tpath = lib\n\turl = https://example.com/lib.git\n",
-        );
+        let cfg =
+            config_from("[submodule \"lib\"]\n\tpath = lib\n\turl = https://example.com/lib.git\n");
         let set = SubmoduleConfigSet::parse(&cfg);
         assert_eq!(set.len(), 1);
         let sub = set.from_name("lib").expect("lib present");
@@ -557,7 +556,10 @@ mod tests {
     fn first_value_wins_and_warns_on_duplicate() {
         let cfg = config_from("[submodule \"x\"]\n\tpath = a\n\tpath = b\n");
         let set = SubmoduleConfigSet::parse(&cfg);
-        assert_eq!(set.from_name("x").and_then(|s| s.path.as_deref()), Some("a"));
+        assert_eq!(
+            set.from_name("x").and_then(|s| s.path.as_deref()),
+            Some("a")
+        );
         assert!(set.warnings.iter().any(|w| matches!(
             w,
             ParseWarning::MultipleConfig { option, .. } if option == "path"
@@ -626,9 +628,7 @@ mod tests {
 
     #[test]
     fn shallow_and_branch_parse() {
-        let cfg = config_from(
-            "[submodule \"s\"]\n\tbranch = main\n\tshallow = true\n",
-        );
+        let cfg = config_from("[submodule \"s\"]\n\tbranch = main\n\tshallow = true\n");
         let set = SubmoduleConfigSet::parse(&cfg);
         let sub = set.from_name("s").expect("s");
         assert_eq!(sub.branch.as_deref(), Some("main"));

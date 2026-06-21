@@ -4024,6 +4024,8 @@ struct StatusProfileCounters {
     overlap_enabled: bool,
 }
 
+const STATUS_BORROWED_OVERLAP_MIN_STAGE0: usize = 1024;
+
 impl StatusProfileCounters {
     fn enabled() -> bool {
         std::env::var_os("SLEY_STATUS_PROFILE").is_some_and(|value| value != "0")
@@ -4884,7 +4886,7 @@ fn short_status_borrowed_head_matches_index_if_possible(
         return Ok(Some(entries));
     }
 
-    if stage0_entry_count < 8192 {
+    if stage0_entry_count < STATUS_BORROWED_OVERLAP_MIN_STAGE0 {
         let tracked_start = Instant::now();
         let mut entries = short_status_borrowed_tracked_only_head_matches_index_parallel(
             worktree_root,
@@ -5114,7 +5116,7 @@ where
         return Ok(Some(()));
     }
 
-    if stage0_entry_count < 8192 {
+    if stage0_entry_count < STATUS_BORROWED_OVERLAP_MIN_STAGE0 {
         let tracked_start = Instant::now();
         let tracked_control =
             stream_short_status_borrowed_tracked_only_head_matches_index_parallel(
@@ -5304,7 +5306,7 @@ fn short_status_borrowed_head_matches_index_count_if_possible(
         return Ok(Some(count));
     }
 
-    if stage0_entry_count < 8192 {
+    if stage0_entry_count < STATUS_BORROWED_OVERLAP_MIN_STAGE0 {
         let tracked_start = Instant::now();
         let tracked_count = short_status_borrowed_tracked_only_head_matches_index_count_parallel(
             worktree_root,

@@ -436,13 +436,7 @@ fn skip_loc(bytes: &[u8], mut i: usize) -> usize {
 /// Parse one loc (the part before/after a `,`). `begin` is the anchor context:
 /// for the start loc it is `-anchor`, for the end loc it is `start_begin + 1`.
 /// Returns the resolved 1-based line number (git's `*ret`).
-fn parse_loc(
-    spec: &str,
-    data: &[u8],
-    ends: &[usize],
-    lines: i64,
-    begin: i64,
-) -> Result<i64> {
+fn parse_loc(spec: &str, data: &[u8], ends: &[usize], lines: i64, begin: i64) -> Result<i64> {
     let bytes = spec.as_bytes();
     // "+N" / "-N" relative form (only when begin >= 1).
     if begin >= 1 && (bytes.first() == Some(&b'+') || bytes.first() == Some(&b'-')) {
@@ -491,7 +485,9 @@ fn parse_loc(
         }
     }
     if !spec.starts_with('/') {
-        return Err(line_log_fatal(format!("-L invalid line specification: {spec}")));
+        return Err(line_log_fatal(format!(
+            "-L invalid line specification: {spec}"
+        )));
     }
     // Extract the regex between the first '/' and the next unescaped '/'.
     let sbytes = spec.as_bytes();
@@ -503,7 +499,9 @@ fn parse_loc(
         j += 1;
     }
     if j >= sbytes.len() || sbytes[j] != b'/' {
-        return Err(line_log_fatal(format!("-L invalid line specification: {spec}")));
+        return Err(line_log_fatal(format!(
+            "-L invalid line specification: {spec}"
+        )));
     }
     let pattern = &spec[1..j];
     // begin-- (human terms → 0-based), search from that line.
@@ -670,8 +668,7 @@ fn parse_range_arg(
         anchor = lines + 1;
     }
     let bytes = range_part.as_bytes();
-    if bytes.first() == Some(&b':')
-        || (bytes.first() == Some(&b'^') && bytes.get(1) == Some(&b':'))
+    if bytes.first() == Some(&b':') || (bytes.first() == Some(&b'^') && bytes.get(1) == Some(&b':'))
     {
         return parse_range_funcname(range_part, data, ends, lines, anchor);
     }
@@ -726,9 +723,8 @@ fn parse_lines(
     let mut list: RangeList = Vec::new();
     for arg in args {
         let (range_part, file_part) = split_range_and_file(&arg.raw)?;
-        let entry = resolve_tree_path_entry(db, format, tip_tree, &file_part).ok_or_else(|| {
-            line_log_fatal(format!("There is no path {file_part} in the commit"))
-        })?;
+        let entry = resolve_tree_path_entry(db, format, tip_tree, &file_part)
+            .ok_or_else(|| line_log_fatal(format!("There is no path {file_part} in the commit")))?;
         if entry.object_type != ObjectType::Blob {
             return Err(line_log_fatal(format!(
                 "There is no path {file_part} in the commit"
@@ -743,8 +739,7 @@ fn parse_lines(
             .and_then(|f| f.ranges.ranges.last())
             .map(|r| r.end + 1)
             .unwrap_or(1);
-        let ParsedRange { begin, end } =
-            parse_range_arg(&range_part, &data, &ends, lines, anchor)?;
+        let ParsedRange { begin, end } = parse_range_arg(&range_part, &data, &ends, lines, anchor)?;
         if (lines == 0 && (begin != 0 || end != 0)) || lines < begin {
             return Err(line_log_fatal(format!(
                 "file {file_part} has only {lines} lines"
@@ -811,7 +806,11 @@ fn collect_diff(parent: &[u8], target: &[u8]) -> DiffRanges {
 /// back across the diff. Returns the touched-hunk DiffRanges if any hunk
 /// touched a tracked range. Destructively updates `fr.ranges` to the parent
 /// side. Mirrors `process_diff_filepair`.
-fn process_file_diff(parent_blob: &[u8], target_blob: &[u8], fr: &mut FileRange) -> Option<DiffRanges> {
+fn process_file_diff(
+    parent_blob: &[u8],
+    target_blob: &[u8],
+    fr: &mut FileRange,
+) -> Option<DiffRanges> {
     if fr.ranges.is_empty() {
         return None;
     }
@@ -830,7 +829,9 @@ fn find_entry<'a>(
     entries: &'a [sley_diff_merge::NameStatusEntry],
     path: &str,
 ) -> Option<&'a sley_diff_merge::NameStatusEntry> {
-    entries.iter().find(|e| e.path.as_bytes() == path.as_bytes())
+    entries
+        .iter()
+        .find(|e| e.path.as_bytes() == path.as_bytes())
 }
 
 /// Produce the per-commit name-status entries against a parent tree.
@@ -863,16 +864,15 @@ fn commit_name_status(
         (Some(parent), false) => {
             sley_diff_merge::diff_name_status_trees_with_options(db, format, parent, tree, base)?
         }
-        (None, _) => sley_diff_merge::diff_name_status_empty_tree_with_options(db, format, tree, base)?,
+        (None, _) => {
+            sley_diff_merge::diff_name_status_empty_tree_with_options(db, format, tree, base)?
+        }
     };
     Ok(entries)
 }
 
 /// Blob bytes for a name-status side; `None` for an absent (added/deleted) side.
-fn entry_side_blob(
-    db: &FileObjectDatabase,
-    oid: Option<&ObjectId>,
-) -> Result<Option<Vec<u8>>> {
+fn entry_side_blob(db: &FileObjectDatabase, oid: Option<&ObjectId>) -> Result<Option<Vec<u8>>> {
     match oid {
         Some(oid) => Ok(Some(read_blob(db, oid)?)),
         None => Ok(None),
@@ -969,7 +969,11 @@ fn process_ranges_ordinary(
 }
 
 /// Tree oid of a commit oid.
-fn parent_tree_oid(db: &FileObjectDatabase, format: ObjectFormat, oid: &ObjectId) -> Result<ObjectId> {
+fn parent_tree_oid(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<ObjectId> {
     let object = db.read_object(oid)?;
     Ok(Commit::parse_ref(format, &object.body)?.tree)
 }
@@ -1028,8 +1032,7 @@ pub(crate) fn run_line_log(
     let mut interesting: Vec<ObjectId> = Vec::new();
     let mut printed: HashMap<ObjectId, Vec<PrintedFile>> = HashMap::new();
     // Index records by oid for parent lookups.
-    let by_oid: HashMap<ObjectId, &CommitRecord> =
-        ordered.iter().map(|r| (r.oid, r)).collect();
+    let by_oid: HashMap<ObjectId, &CommitRecord> = ordered.iter().map(|r| (r.oid, r)).collect();
 
     for record in ordered {
         let range = match ranges_by_commit.remove(&record.oid) {
@@ -1042,8 +1045,7 @@ pub(crate) fn run_line_log(
             process_ranges_merge(db, format, record, &range, detect_renames)?
         } else {
             let parent = record.parents.first().copied();
-            process_ranges_ordinary(db, format, record, &range, detect_renames)?
-                .into_merge(parent)
+            process_ranges_ordinary(db, format, record, &range, detect_renames)?.into_merge(parent)
         };
 
         if result.changed {
@@ -1085,11 +1087,7 @@ pub(crate) fn run_line_log(
 
 /// Merge `add` into the range list stored for `commit` (git's `add_line_range`
 /// → `line_log_data_merge`: union per-path).
-fn merge_into_commit(
-    map: &mut HashMap<ObjectId, RangeList>,
-    commit: ObjectId,
-    add: RangeList,
-) {
+fn merge_into_commit(map: &mut HashMap<ObjectId, RangeList>, commit: ObjectId, add: RangeList) {
     let entry = map.entry(commit).or_default();
     for fr in add {
         if fr.ranges.is_empty() {

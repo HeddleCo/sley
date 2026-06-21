@@ -181,7 +181,9 @@ pub fn parse_packed_refs(format: ObjectFormat, bytes: &[u8]) -> Result<Vec<Packe
 }
 
 fn packed_refs_unexpected_line(line: &str) -> GitError {
-    GitError::InvalidFormat(format!("fatal: unexpected line in .git/packed-refs: {line}"))
+    GitError::InvalidFormat(format!(
+        "fatal: unexpected line in .git/packed-refs: {line}"
+    ))
 }
 
 fn packed_refs_have_prefix(format: ObjectFormat, bytes: &[u8], prefix: &str) -> Result<bool> {
@@ -981,9 +983,7 @@ impl FileRefStore {
             false,
             0,
             |_| true,
-            |name, oid| {
-                peel(name, oid).map(|peeled| PackRefDecision::Pack { peeled })
-            },
+            |name, oid| peel(name, oid).map(|peeled| PackRefDecision::Pack { peeled }),
         )
     }
 
@@ -2011,7 +2011,6 @@ impl FileRefStore {
         Ok(entries)
     }
 
-
     fn collect_loose_refs(
         &self,
         dir: &Path,
@@ -2382,7 +2381,6 @@ impl FileRefStore {
             &self.common_dir
         }
     }
-
 }
 
 fn reftable_ref_target(value: ReftableRefValue) -> Result<Option<RefTarget>> {
@@ -2518,7 +2516,10 @@ fn reftable_table_name(min_update_index: u64, max_update_index: u64) -> String {
     // Mix the process id in so concurrent writers in the same nanosecond still
     // pick distinct names; truncate to 32 bits to match git's `%08x`.
     let salt = (nanos as u64) ^ (u64::from(std::process::id()) << 16);
-    format!("0x{min_update_index:012x}-0x{max_update_index:012x}-{:08x}.ref", salt as u32)
+    format!(
+        "0x{min_update_index:012x}-0x{max_update_index:012x}-{:08x}.ref",
+        salt as u32
+    )
 }
 
 fn reftable_autocompaction_disabled() -> bool {
@@ -2534,8 +2535,13 @@ fn reftable_autocompaction_disabled() -> bool {
 fn reftable_table_name_is_valid(name: &str) -> bool {
     fn hex_prefix(s: &str) -> Option<&str> {
         // strtoull(base 16) skips an optional leading 0x and consumes hex digits.
-        let body = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
-        let consumed = body.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(body.len());
+        let body = s
+            .strip_prefix("0x")
+            .or_else(|| s.strip_prefix("0X"))
+            .unwrap_or(s);
+        let consumed = body
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(body.len());
         if consumed == 0 {
             return None;
         }
@@ -2629,11 +2635,8 @@ pub struct RefTransactionHookUpdate {
 /// the prepare phases into the git-shaped `in '<phase>' phase, update aborted by
 /// the reference-transaction hook` failure.
 pub trait ReferenceTransactionHook {
-    fn run(
-        &self,
-        phase: RefTransactionPhase,
-        updates: &[RefTransactionHookUpdate],
-    ) -> Result<bool>;
+    fn run(&self, phase: RefTransactionPhase, updates: &[RefTransactionHookUpdate])
+    -> Result<bool>;
 }
 
 pub struct FileRefTransaction<'a> {
@@ -2835,8 +2838,9 @@ fn hook_old_value(zero: &str, precondition: &RefPrecondition) -> String {
     match precondition {
         RefPrecondition::Any | RefPrecondition::MustExist => zero.to_string(),
         RefPrecondition::MustNotExist => zero.to_string(),
-        RefPrecondition::MustExistAndMatch(target)
-        | RefPrecondition::ExistingMustMatch(target) => hook_target_value(zero, Some(target)),
+        RefPrecondition::MustExistAndMatch(target) | RefPrecondition::ExistingMustMatch(target) => {
+            hook_target_value(zero, Some(target))
+        }
     }
 }
 
@@ -3101,8 +3105,7 @@ impl FileRefStore {
             match &changes[index] {
                 CoalescedRefChange::Update(update) => {
                     let current = if use_packed_snapshot {
-                        match self
-                            .read_ref_from_packed_snapshot(&update.name, &packed_ref_targets)
+                        match self.read_ref_from_packed_snapshot(&update.name, &packed_ref_targets)
                         {
                             Ok(current) => current,
                             Err(err) => {
@@ -3134,9 +3137,7 @@ impl FileRefStore {
                             return Err(err);
                         }
                     };
-                    if pending[index].original.is_none()
-                        && current.as_ref() == Some(&update.new)
-                    {
+                    if pending[index].original.is_none() && current.as_ref() == Some(&update.new) {
                         pending[index].action = PendingPathAction::ReleaseLock;
                     }
                     for entry in &update.reflog {
@@ -3144,7 +3145,8 @@ impl FileRefStore {
                     }
                 }
                 CoalescedRefChange::Delete(delete) => {
-                    let state = match self.read_locked_ref_state(&delete.name, &packed_ref_targets) {
+                    let state = match self.read_locked_ref_state(&delete.name, &packed_ref_targets)
+                    {
                         Ok(state) => state,
                         Err(err) => {
                             release_pending_locks(&pending);
@@ -3548,7 +3550,8 @@ impl ReftableListLock {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&self.lock_path, &self.list_path).map_err(|err| GitError::Io(err.to_string()))?;
+        fs::rename(&self.lock_path, &self.list_path)
+            .map_err(|err| GitError::Io(err.to_string()))?;
         self.active = false;
         Ok(())
     }
@@ -4361,7 +4364,9 @@ pub fn branch_ref_name_for_read(branch: &str) -> Result<String> {
 
 pub fn branch_ref_name_for_source(branch: &str) -> Result<String> {
     if branch.starts_with("--") {
-        return Err(GitError::InvalidPath(format!("invalid branch name {branch}")));
+        return Err(GitError::InvalidPath(format!(
+            "invalid branch name {branch}"
+        )));
     }
     let name = format!("{}{}", BranchRefName::PREFIX, branch);
     check_refname_format(&name, false)?;
@@ -4390,9 +4395,7 @@ fn write_locked_with_timeout(path: &Path, bytes: &[u8], timeout_millis: u64) -> 
                 file.sync_all()?;
                 break;
             }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::AlreadyExists && timeout_millis > 0 =>
-            {
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && timeout_millis > 0 => {
                 let elapsed = start
                     .elapsed()
                     .unwrap_or_else(|_| Duration::from_millis(timeout_millis + 1));
