@@ -56,7 +56,13 @@ struct LinkedWorktreeAdmin {
 struct WorktreePruneOptions {
     dry_run: bool,
     verbose: bool,
-    expire: bool,
+    expire: i64,
+}
+
+#[derive(Debug)]
+struct PruneKeptWorktree {
+    path: PathBuf,
+    admin_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -346,64 +352,176 @@ fn worktree_list_usage<T>() -> Result<T> {
 
 pub(crate) fn cmd_worktree_prune(args: &[String]) -> Result<()> {
     let options = parse_worktree_prune_options(args)?;
-    if !options.expire {
-        return Ok(());
-    }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    prune_invalid_worktree_admin_entries(&common_git_dir, &options)?;
-    for admin in collect_linked_worktree_admins(&common_git_dir)? {
-        if admin.locked_reason.is_some() {
-            continue;
-        }
-        let Some(reason) = admin.prunable_reason else {
-            continue;
-        };
-        if options.dry_run || options.verbose {
-            eprintln!("Removing worktrees/{}: {}", admin.admin_name, reason);
-        }
-        if !options.dry_run {
-            fs::remove_dir_all(&admin.admin_dir)?;
-        }
+    let mut kept = prune_worktree_admins(&common_git_dir, &options)?;
+    let main_path = fs::canonicalize(&common_git_dir).unwrap_or_else(|_| common_git_dir.clone());
+    kept.push(PruneKeptWorktree {
+        path: normalize_lexical_path(&main_path),
+        admin_name: None,
+    });
+    prune_duplicate_worktree_admins(&common_git_dir, &options, kept);
+    if !options.dry_run {
+        remove_empty_worktrees_dir(&common_git_dir);
     }
-    remove_empty_worktrees_dir(&common_git_dir);
     Ok(())
 }
 
-fn prune_invalid_worktree_admin_entries(
+fn prune_worktree_admins(
     common_git_dir: &Path,
     options: &WorktreePruneOptions,
-) -> Result<()> {
+) -> Result<Vec<PruneKeptWorktree>> {
     let worktrees_dir = common_git_dir.join("worktrees");
     let Ok(entries) = fs::read_dir(&worktrees_dir) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
+    let mut kept = Vec::new();
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() && path.join("gitdir").is_file() {
-            continue;
-        }
-        if path.is_dir() && path.join("locked").exists() {
-            continue;
-        }
-        if options.dry_run || options.verbose {
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy())
-                .unwrap_or_default();
-            eprintln!("Removing worktrees/{name}: invalid worktree administrative entry");
-        }
-        if !options.dry_run {
-            if path.is_dir() {
-                fs::remove_dir_all(path)?;
-            } else {
-                fs::remove_file(path)?;
-            }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match should_prune_worktree_admin(&path, &name, options.expire)? {
+            PruneAdminDecision::Prune(reason) => prune_worktree_admin(&path, &name, &reason, options),
+            PruneAdminDecision::Keep { gitdir } => kept.push(PruneKeptWorktree {
+                path: gitdir,
+                admin_name: Some(name),
+            }),
+            PruneAdminDecision::Skip => {}
         }
     }
-    Ok(())
+    Ok(kept)
+}
+
+enum PruneAdminDecision {
+    Prune(String),
+    Keep { gitdir: PathBuf },
+    Skip,
+}
+
+fn should_prune_worktree_admin(
+    admin_dir: &Path,
+    _admin_name: &str,
+    expire: i64,
+) -> Result<PruneAdminDecision> {
+    if !admin_dir.is_dir() {
+        return Ok(PruneAdminDecision::Prune(
+            "not a valid directory".to_string(),
+        ));
+    }
+    if admin_dir.join("locked").exists() {
+        return Ok(PruneAdminDecision::Skip);
+    }
+    let gitdir_file = admin_dir.join("gitdir");
+    let metadata = match fs::metadata(&gitdir_file) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return Ok(PruneAdminDecision::Prune(
+                "gitdir file does not exist".to_string(),
+            ));
+        }
+    };
+    let mut path = match fs::read_to_string(&gitdir_file) {
+        Ok(path) => path,
+        Err(err) => {
+            return Ok(PruneAdminDecision::Prune(format!(
+                "unable to read gitdir file ({err})"
+            )));
+        }
+    };
+    let expected = metadata.len() as usize;
+    if path.len() != expected {
+        return Ok(PruneAdminDecision::Prune(format!(
+            "short read (expected {expected} bytes, read {})",
+            path.len()
+        )));
+    }
+    while path.ends_with(['\n', '\r']) {
+        path.pop();
+    }
+    if path.is_empty() {
+        return Ok(PruneAdminDecision::Prune(
+            "invalid gitdir file".to_string(),
+        ));
+    }
+    let gitdir = resolve_admin_path_forgiving(admin_dir, &path);
+    if !gitdir.exists() {
+        let index = admin_dir.join("index");
+        let expired = fs::metadata(index)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64 <= expire)
+            .unwrap_or(true);
+        if expired {
+            return Ok(PruneAdminDecision::Prune(
+                "gitdir file points to non-existent location".to_string(),
+            ));
+        }
+    }
+    Ok(PruneAdminDecision::Keep { gitdir })
+}
+
+fn resolve_admin_path_forgiving(admin_dir: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        admin_dir.join(path)
+    };
+    fs::canonicalize(&resolved).unwrap_or_else(|_| normalize_lexical_path(&resolved))
+}
+
+fn prune_duplicate_worktree_admins(
+    common_git_dir: &Path,
+    options: &WorktreePruneOptions,
+    mut kept: Vec<PruneKeptWorktree>,
+) {
+    kept.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| match (&left.admin_name, &right.admin_name) {
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(left), Some(right)) => left.cmp(right),
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+    });
+    for index in 1..kept.len() {
+        if kept[index].path == kept[index - 1].path
+            && let Some(admin_name) = kept[index].admin_name.as_ref()
+        {
+            let admin_dir = common_git_dir.join("worktrees").join(admin_name);
+            prune_worktree_admin(&admin_dir, admin_name, "duplicate entry", options);
+        }
+    }
+}
+
+fn prune_worktree_admin(
+    admin_dir: &Path,
+    admin_name: &str,
+    reason: &str,
+    options: &WorktreePruneOptions,
+) {
+    if options.dry_run || options.verbose {
+        eprintln!("Removing worktrees/{admin_name}: {reason}");
+    }
+    if options.dry_run {
+        return;
+    }
+    let result = if admin_dir.is_dir() {
+        fs::remove_dir_all(admin_dir)
+    } else {
+        fs::remove_file(admin_dir)
+    };
+    if let Err(err) = result
+        && err.kind() != io::ErrorKind::NotFound
+    {
+        eprintln!("error: failed to delete '{}': {err}", admin_dir.display());
+    }
 }
 
 fn remove_empty_worktrees_dir(common_git_dir: &Path) {
@@ -549,7 +667,7 @@ pub(crate) fn cmd_worktree_repair(args: &[String]) -> Result<()> {
 fn parse_worktree_prune_options(args: &[String]) -> Result<WorktreePruneOptions> {
     let mut dry_run = false;
     let mut verbose = false;
-    let mut expire = true;
+    let mut expire = i64::MAX;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -560,14 +678,16 @@ fn parse_worktree_prune_options(args: &[String]) -> Result<WorktreePruneOptions>
             "--no-verbose" => verbose = false,
             "--expire" => {
                 index += 1;
-                if args.get(index).is_none() {
+                let Some(value) = args.get(index) else {
                     eprintln!("error: option `expire' requires a value");
                     return Err(GitError::Exit(129));
-                }
-                expire = true;
+                };
+                expire = parse_worktree_prune_expire(value)?;
             }
-            value if value.starts_with("--expire=") => expire = true,
-            "--no-expire" => expire = false,
+            value if value.starts_with("--expire=") => {
+                expire = parse_worktree_prune_expire(&value["--expire=".len()..])?;
+            }
+            "--no-expire" => expire = 0,
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
                 return worktree_prune_usage();
@@ -580,6 +700,19 @@ fn parse_worktree_prune_options(args: &[String]) -> Result<WorktreePruneOptions>
         dry_run,
         verbose,
         expire,
+    })
+}
+
+fn parse_worktree_prune_expire(value: &str) -> Result<i64> {
+    let Some(timestamp) = crate::commands::approxidate::parse_expiry_date(value) else {
+        eprintln!("fatal: invalid approxidate value: '{value}'");
+        return Err(GitError::Exit(128));
+    };
+    let timestamp = timestamp as u64;
+    Ok(if timestamp >= i64::MAX as u64 {
+        i64::MAX
+    } else {
+        timestamp as i64
     })
 }
 
