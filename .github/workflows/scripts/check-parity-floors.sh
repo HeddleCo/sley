@@ -471,13 +471,17 @@ declare -A FLOOR=(
     [t5326-multi-pack-bitmaps.sh]=344
     # codex-wave-4-recovery: rev_list filters t6006 enroll@56 / t6112 enroll@48.
     # wave-2 (2026-06-21): rev-list --format %-placeholders/%w()/%C()/trailers 56->77 (guard t4202-log held=131).
+    # wave-28 (2026-06-21, core, post-#108): prune reachability/expiry 13->32/32 (NEW full pass);
+    # checkout-detach advice/prev-HEAD 16->26/26 (full pass); rev-list cherry-pick patch-id 7->23/23 (NEW full).
+    # All guards neutral incl t1450-fsck=96 t1400=275 t7700=29.
     [t6006-rev-list-format.sh]=77
+    [t6007-rev-list-cherry-pick-file.sh]=23
     [t6112-rev-list-filters-objects.sh]=48
     [t6113-rev-list-bitmap-filters.sh]=13
     [t1800-hook.sh]=55
     # wave-27 (2026-06-21, core): pack-object option/split 46->55 (+bonus t5303 21->31); restore modes
     # 5->15/15 (NEW full pass); describe misplaced-tags/blob/abbrev0 84->98. Guards neutral.
-    [t2020-checkout-detach.sh]=16
+    [t2020-checkout-detach.sh]=26
     [t2070-restore.sh]=15
     [t6003-rev-list-topo-order.sh]=36
     [t6012-rev-list-simplify.sh]=36
@@ -595,7 +599,7 @@ declare -A FLOOR=(
     [t5300-pack-object.sh]=55
     [t5302-pack-index.sh]=31
     [t5303-pack-corruption-resilience.sh]=31
-    [t5304-prune.sh]=13
+    [t5304-prune.sh]=32
     [t5319-multi-pack-index.sh]=77
     [t5324-split-commit-graph.sh]=25
     [t5329-pack-objects-cruft.sh]=19

@@ -229,6 +229,7 @@ jobs:
             t6012-rev-list-simplify.sh
             t6030-bisect-porcelain.sh
             t6006-rev-list-format.sh
+            t6007-rev-list-cherry-pick-file.sh
             t6112-rev-list-filters-objects.sh
             t6113-rev-list-bitmap-filters.sh
             t6120-describe.sh
