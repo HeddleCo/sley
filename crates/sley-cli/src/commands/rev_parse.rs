@@ -61,18 +61,17 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
     while idx < args.len() {
         let arg = &args[idx];
         if !verify && sley::plumbing::sley_rev::PseudoRefResolver::is_pseudo_ref_arg(arg) {
-            let resolver = match pseudo.as_mut() {
-                Some(resolver) => resolver,
-                None => {
-                    let config = read_repo_config(&git_dir).ok();
-                    pseudo = Some(sley::plumbing::sley_rev::PseudoRefResolver::new(
-                        &git_dir,
-                        format,
-                        config.as_ref(),
-                    )?);
-                    pseudo.as_mut().expect("just inserted")
-                }
-            };
+            if pseudo.is_none() {
+                let config = read_repo_config(&git_dir).ok();
+                pseudo = Some(sley::plumbing::sley_rev::PseudoRefResolver::new(
+                    &git_dir,
+                    format,
+                    config.as_ref(),
+                )?);
+            }
+            let resolver = pseudo.as_mut().ok_or_else(|| {
+                GitError::Command("internal error: pseudo-ref resolver was not initialized".into())
+            })?;
             if let Some(matched) = resolver.feed(arg)? {
                 for matched_ref in matched {
                     let oid = matched_ref.oid.to_hex();
@@ -1134,9 +1133,11 @@ fn parse_rev_parse_parseopt_short_bundle<'a>(
     specs: &[RevParseParseOptSpec],
     flags: RevParseParseOptFlags,
 ) -> std::result::Result<(), RevParseParseOptError> {
-    let mut rest = args[*idx]
-        .strip_prefix('-')
-        .expect("caller checked leading dash");
+    let Some(mut rest) = args[*idx].strip_prefix('-') else {
+        return Err(RevParseParseOptError::Usage {
+            message: "expected option".into(),
+        });
+    };
     while let Some(short) = rest.chars().next() {
         rest = &rest[short.len_utf8()..];
         let Some(spec_index) = specs

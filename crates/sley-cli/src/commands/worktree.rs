@@ -1400,7 +1400,15 @@ fn repair_registered_worktree_gitfile(
     let repair = match read {
         GitfileRepairRead::NotARepo | GitfileRepairRead::Broken => Some(".git file broken"),
         GitfileRepairRead::GitDir(_) => {
-            let current = backlink.as_ref().expect("gitdir target is present");
+            let Some(current) = backlink.as_ref() else {
+                report_worktree_repair(
+                    true,
+                    &admin.path.display().to_string(),
+                    "missing gitdir target",
+                    failed,
+                );
+                return Ok(());
+            };
             if !repair_paths_equal(current, &admin_real) {
                 Some(".git file incorrect")
             } else {

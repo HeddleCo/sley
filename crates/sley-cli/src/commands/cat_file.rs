@@ -498,9 +498,9 @@ impl ObjectQuery<'_> {
             )),
             // Never reaches execution: `--batch-all-objects` is folded into a batch
             // request or rejected during option validation.
-            CatFileCmdMode::BatchAllObjects => unreachable!(
-                "--batch-all-objects is handled during option validation, not execution"
-            ),
+            CatFileCmdMode::BatchAllObjects => Err(GitError::Command(
+                "--batch-all-objects reached single-object execution".into(),
+            )),
         }
     }
 
@@ -913,7 +913,7 @@ impl CatFileBatchRequest {
             let mut object_name = String::with_capacity(view.format().hex_len());
             for oid in view.all_object_ids()? {
                 object_name.clear();
-                write!(&mut object_name, "{oid}").expect("writing an object id cannot fail");
+                object_name.push_str(&oid.to_hex());
                 emit(&mut stdout, &object_name)?;
             }
         } else {

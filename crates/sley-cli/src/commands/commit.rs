@@ -1336,7 +1336,11 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     if !pathspec_args.is_empty() {
-        let (head, tree_map) = partial_head_tree.expect("partial commit precomputed HEAD tree");
+        let Some((head, tree_map)) = partial_head_tree else {
+            return Err(GitError::Command(
+                "partial commit requires a precomputed HEAD tree".into(),
+            ));
+        };
         return commit_partial_paths(
             &git_dir,
             format,

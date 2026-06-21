@@ -314,7 +314,11 @@ pub fn parse_service_discovery_response(
             format,
             payload_frames,
         )?),
-        None => unreachable!("payload_frames is non-empty"),
+        None => {
+            return Err(GitError::InvalidFormat(
+                "service discovery response missing payload".into(),
+            ));
+        }
     };
     Ok(ServiceDiscoveryResponse {
         announcement,
@@ -936,7 +940,11 @@ fn parse_remote_url_with_scheme(scheme: &str, rest: &str) -> Result<RemoteUrl> {
                     "git" => RemoteTransport::Git,
                     "http" => RemoteTransport::Http,
                     "https" => RemoteTransport::Https,
-                    _ => unreachable!("matched remote URL scheme"),
+                    _ => {
+                        return Err(GitError::InvalidFormat(format!(
+                            "unsupported remote URL scheme {scheme}"
+                        )));
+                    }
                 },
                 user,
                 password,

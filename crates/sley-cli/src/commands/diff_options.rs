@@ -936,7 +936,7 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
             options
                 .output_format
                 .bitop(DiffOutputFormat::DIFFSTAT, DiffOutputFormat::NO_OUTPUT);
-            let long = option.long.expect("matched stat option has long name");
+            let long = long_option_name(option)?;
             let value = format!("--{long}={}", str_value(option));
             diff_stat_parse_width_option(&value, &mut options.stat_widths)?;
             if let Some(count) = diff_stat_count_option(&value)? {
@@ -1104,9 +1104,7 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
             }
         }
         (_, Some("output-indicator-new" | "output-indicator-old" | "output-indicator-context")) => {
-            let long = option
-                .long
-                .expect("matched output-indicator option has long name");
+            let long = long_option_name(option)?;
             log_validate_output_indicator(long, str_value(option))?;
             options.diff_output_indicator_control = true;
         }
@@ -1317,6 +1315,12 @@ fn str_value<'a>(option: &'a ParsedOption<'a>) -> &'a str {
         ParsedValue::Str(value) => value,
         _ => "",
     }
+}
+
+fn long_option_name<'a>(option: &'a ParsedOption<'a>) -> Result<&'a str> {
+    option
+        .long
+        .ok_or_else(|| GitError::Command("matched diff option is missing its long name".into()))
 }
 
 fn optional_arg<'a>(option: &'a ParsedOption<'a>) -> Option<&'a str> {

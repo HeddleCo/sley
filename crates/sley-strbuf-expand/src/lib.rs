@@ -505,7 +505,7 @@ fn apply_padding(out: &mut Vec<u8>, value: &mut Vec<u8>, padding: Option<Padding
         PaddingAlign::Left => (0, extra),
         PaddingAlign::Right => (extra, 0),
         PaddingAlign::Center => (extra / 2, extra - (extra / 2)),
-        PaddingAlign::LeftAndSteal => unreachable!("normalised above"),
+        PaddingAlign::LeftAndSteal => (0, extra),
     };
     let mut padded = Vec::with_capacity(value.len() + extra);
     padded.extend(std::iter::repeat_n(b' ', left));

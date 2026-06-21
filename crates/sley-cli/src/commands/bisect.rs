@@ -902,7 +902,10 @@ fn bisect_start(
                 }
             },
             Some(RefTarget::Direct(oid)) => oid.to_hex(),
-            None => unreachable!("checked above"),
+            None => {
+                eprintln!("error: bad HEAD");
+                return Ok(BISECT_FAILED);
+            }
         }
     };
 
@@ -1659,7 +1662,9 @@ fn bisect_next_all(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Write) 
     if res != BISECT_OK {
         return Ok(res);
     }
-    let bad = bad.expect("checked by check_good_are_ancestors_of_bad");
+    let Some(bad) = bad else {
+        return Ok(BISECT_FAILED);
+    };
 
     // Candidate list: `bad ^goods` (newest-first), restricted by BISECT_NAMES.
     let candidates = bisect_candidate_records(repo, &bad, &goods, first_parent)?;

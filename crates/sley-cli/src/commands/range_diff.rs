@@ -766,7 +766,16 @@ fn output_range_diff(
             j += 1;
         }
         if j < right.len() {
-            let li = right[j].matching.expect("matched RHS has LHS");
+            let Some(li) = right[j].matching else {
+                return Err(GitError::InvalidFormat(
+                    "range-diff correspondence is missing its left patch".into(),
+                ));
+            };
+            if li >= left.len() {
+                return Err(GitError::InvalidFormat(
+                    "range-diff correspondence points outside the left series".into(),
+                ));
+            }
             write_pair_header(
                 out,
                 repo,
@@ -804,7 +813,11 @@ fn write_pair_header(
         (Some(_), Some(_)) => '!',
         (Some(_), None) => '<',
         (None, Some(_)) => '>',
-        (None, None) => unreachable!(),
+        (None, None) => {
+            return Err(GitError::InvalidFormat(
+                "range-diff entry has neither left nor right patch".into(),
+            ));
+        }
     };
     let subject = left.or(right).map(|p| p.subject.as_str()).unwrap_or("");
     match left {

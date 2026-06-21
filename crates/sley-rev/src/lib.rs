@@ -2317,12 +2317,10 @@ impl<'a> CommitGraphContext<'a> {
     }
 
     fn direct_graph(&mut self) -> &DirectCommitGraph {
-        if self.direct_graph.is_none() {
-            self.direct_graph = Some(load_direct_commit_graph(self.git_dir, self.format));
-        }
+        let git_dir = self.git_dir;
+        let format = self.format;
         self.direct_graph
-            .as_ref()
-            .expect("direct commit graph load state initialized")
+            .get_or_insert_with(|| load_direct_commit_graph(git_dir, format))
     }
 
     fn count_reachable_direct(

@@ -8,18 +8,18 @@ use std::path::PathBuf;
 // them, so we just compute and emit the expected path here. Benchmarks that
 // exec it are responsible for ensuring the `sley` binary exists first, for
 // example with `cargo build -p sley-cli --bin sley`.
-fn main() {
-    let manifest_dir =
-        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let workspace_root = manifest_dir.join("../..");
     let target_dir = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root.join("target"));
-    let profile = std::env::var("PROFILE").expect("PROFILE");
+    let profile = std::env::var("PROFILE")?;
     let bin = target_dir.join(&profile).join("sley");
 
     println!("cargo:rerun-if-env-changed=PROFILE");
     println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
 
     println!("cargo:rustc-env=SLEY_BENCH_BIN={}", bin.display());
+    Ok(())
 }

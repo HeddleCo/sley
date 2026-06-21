@@ -5347,10 +5347,9 @@ fn reverse_diff_entry(entry: sley::plumbing::sley_diff_merge::NameStatusEntry) -
             ..entry
         },
         sley::plumbing::sley_diff_merge::NameStatus::Renamed(score) => {
-            let new_path = entry
-                .old_path
-                .clone()
-                .expect("rename entries include old_path");
+            let Some(new_path) = entry.old_path.clone() else {
+                return entry;
+            };
             sley::plumbing::sley_diff_merge::NameStatusEntry {
                 status: sley::plumbing::sley_diff_merge::NameStatus::Renamed(score),
                 path: new_path,
@@ -6592,12 +6591,16 @@ fn print_for_each_ref_format(
                         .and_then(|peeled| peeled.author.as_deref()),
                 )?,
                 "authorname" | "*authorname" => {
-                    for_each_ref_try_name_atom(stdout, placeholder, context)
-                        .expect("name atom recognized")?
+                    require_for_each_ref_atom(
+                        for_each_ref_try_name_atom(stdout, placeholder, context),
+                        "name",
+                    )?
                 }
                 "authoremail" | "*authoremail" => {
-                    for_each_ref_try_email_atom(stdout, placeholder, context)
-                        .expect("email atom recognized")?
+                    require_for_each_ref_atom(
+                        for_each_ref_try_email_atom(stdout, placeholder, context),
+                        "email",
+                    )?
                 }
                 "committer" => write_for_each_ref_identity(
                     stdout,
@@ -6614,12 +6617,16 @@ fn print_for_each_ref_format(
                         .and_then(|peeled| peeled.committer.as_deref()),
                 )?,
                 "committername" | "*committername" => {
-                    for_each_ref_try_name_atom(stdout, placeholder, context)
-                        .expect("name atom recognized")?
+                    require_for_each_ref_atom(
+                        for_each_ref_try_name_atom(stdout, placeholder, context),
+                        "name",
+                    )?
                 }
                 "committeremail" | "*committeremail" => {
-                    for_each_ref_try_email_atom(stdout, placeholder, context)
-                        .expect("email atom recognized")?
+                    require_for_each_ref_atom(
+                        for_each_ref_try_email_atom(stdout, placeholder, context),
+                        "email",
+                    )?
                 }
                 "tagger" => write_for_each_ref_identity(
                     stdout,
@@ -6630,12 +6637,16 @@ fn print_for_each_ref_format(
                 )?,
                 "*tagger" => write_for_each_ref_identity(stdout, None)?,
                 "taggername" | "*taggername" => {
-                    for_each_ref_try_name_atom(stdout, placeholder, context)
-                        .expect("name atom recognized")?
+                    require_for_each_ref_atom(
+                        for_each_ref_try_name_atom(stdout, placeholder, context),
+                        "name",
+                    )?
                 }
                 "taggeremail" | "*taggeremail" => {
-                    for_each_ref_try_email_atom(stdout, placeholder, context)
-                        .expect("email atom recognized")?
+                    require_for_each_ref_atom(
+                        for_each_ref_try_email_atom(stdout, placeholder, context),
+                        "email",
+                    )?
                 }
                 "creator" => write_for_each_ref_identity(
                     stdout,
@@ -6653,8 +6664,10 @@ fn print_for_each_ref_format(
                 )?,
                 "authordate" | "*authordate" | "committerdate" | "*committerdate"
                 | "taggerdate" | "*taggerdate" | "creatordate" | "*creatordate" => {
-                    for_each_ref_try_date_atom(stdout, placeholder, context)
-                        .expect("date atom recognized")?
+                    require_for_each_ref_atom(
+                        for_each_ref_try_date_atom(stdout, placeholder, context),
+                        "date",
+                    )?
                 }
                 "tree" => {
                     if let Some(tree) = context
@@ -6988,7 +7001,11 @@ fn write_for_each_ref_typed_atom(
     context: &ForEachRefFormatContext<'_>,
 ) -> Result<()> {
     match atom {
-        ForEachRefAtom::Raw(_) => unreachable!("raw atoms are handled by the compatibility path"),
+        ForEachRefAtom::Raw(_) => {
+            return Err(GitError::Command(
+                "raw for-each-ref atom reached typed formatter".into(),
+            ));
+        }
         ForEachRefAtom::Color(value) => {
             let color = for_each_ref_color_escape(value)?;
             if context.color {
@@ -7203,6 +7220,15 @@ fn parse_for_each_ref_email_options(
         }
     }
     Ok(options)
+}
+
+fn require_for_each_ref_atom(result: Option<Result<()>>, kind: &str) -> Result<()> {
+    match result {
+        Some(result) => result,
+        None => Err(GitError::Command(format!(
+            "internal for-each-ref formatter error: {kind} atom was not recognized"
+        ))),
+    }
 }
 
 /// If `placeholder` is an email atom (`(\*?)(author|committer|tagger)email`
@@ -8089,7 +8115,7 @@ fn log_date_mode(value: &str) -> Result<DateMode> {
         Some(mode) => Ok(mode),
         None => {
             log_unknown_date_format(value)?;
-            unreachable!("log_unknown_date_format always returns an error")
+            Err(GitError::Exit(128))
         }
     }
 }
@@ -8556,7 +8582,11 @@ impl SimpleLogRegex {
                 })
                 .collect::<Result<Vec<_>>>()?,
             SimpleLogRegexMode::Fixed => vec![SimpleLogRegexAlternative::parse_fixed(pattern)],
-            SimpleLogRegexMode::Perl => unreachable!("handled above"),
+            SimpleLogRegexMode::Perl => {
+                return Err(GitError::Command(
+                    "Perl log regex mode was not compiled before simple parsing".into(),
+                ));
+            }
         };
         Ok(Self {
             alternatives,
@@ -9976,7 +10006,10 @@ fn append_metadata_parent_oids(out: &mut Vec<u8>, parents: &[ObjectId], abbrev_l
 fn format_metadata_parent_oids(parents: &[ObjectId], abbrev_len: Option<usize>) -> String {
     let mut out = Vec::with_capacity(parents.len().saturating_mul(41));
     append_metadata_parent_oids(&mut out, parents, abbrev_len);
-    String::from_utf8(out).expect("object ids are always ASCII hex")
+    match String::from_utf8(out) {
+        Ok(text) => text,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    }
 }
 
 fn emit_compiled_log_format_metadata(
@@ -11161,7 +11194,7 @@ fn repository_auto_abbrev_width(git_dir: &Path, format: ObjectFormat) -> Result<
         return Ok(7.min(format.hex_len()));
     }
     let bits = u64::BITS as usize - object_count.saturating_sub(1).leading_zeros() as usize;
-    Ok(((bits + 1) / 2).max(7).min(format.hex_len()))
+    Ok(bits.div_ceil(2).max(7).min(format.hex_len()))
 }
 
 fn repository_approx_object_count(git_dir: &Path, format: ObjectFormat) -> Result<u64> {

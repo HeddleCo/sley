@@ -1643,7 +1643,12 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
                     match option {
                         b'S' => staged = true,
                         b'W' => worktree = true,
-                        _ => unreachable!("restore short-option group was filtered"),
+                        _ => {
+                            return Err(GitError::Command(format!(
+                                "unsupported restore option -{}",
+                                char::from(option)
+                            )));
+                        }
                     }
                 }
             }

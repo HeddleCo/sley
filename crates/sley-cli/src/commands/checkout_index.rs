@@ -142,7 +142,7 @@ fn parse_checkout_index_options(args: &[String]) -> Result<CheckoutIndexOptions>
                         b'n' => options.create = false,
                         b'u' => options.update_stat = true,
                         b'z' => options.nul = true,
-                        _ => unreachable!("short-option group was pre-filtered"),
+                        _ => return Err(checkout_index_unknown_option(value)),
                     }
                 }
             }
@@ -461,7 +461,10 @@ fn checkout_temp_create_path(worktree_root: &Path) -> Result<(String, PathBuf)> 
             *slot = alphabet[(value % alphabet.len() as u64) as usize];
             value /= alphabet.len() as u64;
         }
-        let suffix = std::str::from_utf8(&suffix).expect("temporary suffix is ASCII");
+        let suffix = suffix
+            .iter()
+            .map(|&byte| char::from(byte))
+            .collect::<String>();
         let name = format!(".merge_file_{suffix}");
         let path = worktree_root.join(&name);
         match fs::OpenOptions::new()

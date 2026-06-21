@@ -1394,9 +1394,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         )?
                     }
                 } else {
-                    let worktree_root = worktree_root
-                        .as_ref()
-                        .expect("worktree root set for diff <rev>");
+                    let Some(worktree_root) = worktree_root.as_ref() else {
+                        return Err(GitError::Command("diff requires a worktree".into()));
+                    };
                     if inexact_renames {
                         sley::plumbing::sley_diff_merge::diff_name_status_tree_worktree_with_rename_options(
                             worktree_root,
@@ -1457,9 +1457,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             )?
         }
     } else if head {
-        let worktree_root = worktree_root
-            .as_ref()
-            .expect("worktree root set for diff HEAD");
+        let Some(worktree_root) = worktree_root.as_ref() else {
+            return Err(GitError::Command("diff requires a worktree".into()));
+        };
         if inexact_renames {
             sley::plumbing::sley_diff_merge::diff_name_status_head_worktree_with_rename_options(
                 worktree_root,
@@ -1476,7 +1476,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             )?
         }
     } else {
-        let worktree_root = worktree_root.as_ref().expect("worktree root set for diff");
+        let Some(worktree_root) = worktree_root.as_ref() else {
+            return Err(GitError::Command("diff requires a worktree".into()));
+        };
         let diff = if inexact_renames {
             sley::plumbing::sley_diff_merge::diff_name_status_index_worktree_with_rename_options_and_gitlinks(
                 worktree_root,
@@ -1731,10 +1733,10 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             }
         }
         if show_numstat {
-            for entry in stat_entries
-                .as_ref()
-                .expect("stat entries collected for numstat")
-            {
+            let Some(stat_entries) = stat_entries.as_ref() else {
+                return Err(GitError::Command("diff numstat entries were not collected".into()));
+            };
+            for entry in stat_entries {
                 write_diff_numstat_materialized_entry(&mut stdout, entry.entry, entry.stats, z)?;
             }
         }
@@ -1745,11 +1747,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             } else {
                 stat_widths.resolve_config_defaults();
             }
+            let Some(stat_entries) = stat_entries.as_ref() else {
+                return Err(GitError::Command("diff stat entries were not collected".into()));
+            };
             write_diff_stat_materialized_with_widths(
                 &mut stdout,
-                stat_entries
-                    .as_ref()
-                    .expect("stat entries collected for diffstat"),
+                stat_entries,
                 DiffStatOptions {
                     compact_summary,
                     stat_count,
@@ -1759,12 +1762,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             )?;
         }
         if show_shortstat {
-            write_diff_shortstat_materialized(
-                &mut stdout,
-                stat_entries
-                    .as_ref()
-                    .expect("stat entries collected for shortstat"),
-            )?;
+            let Some(stat_entries) = stat_entries.as_ref() else {
+                return Err(GitError::Command(
+                    "diff shortstat entries were not collected".into(),
+                ));
+            };
+            write_diff_shortstat_materialized(&mut stdout, stat_entries)?;
         }
         if let Some(dirstat_options) = dirstat
             && !name_only

@@ -185,11 +185,8 @@ impl ShowContext<'_> {
                 self.format,
             )?);
         }
-        Ok(Ref::map(self.mailmap.borrow(), |mailmap| {
-            mailmap
-                .as_ref()
-                .expect("mailmap cache was just initialized")
-        }))
+        Ref::filter_map(self.mailmap.borrow(), |mailmap| mailmap.as_ref())
+            .map_err(|_| GitError::Command("mailmap cache was not initialized".into()))
     }
 }
 
@@ -1019,7 +1016,11 @@ fn write_show_commit_header(
                 stdout.write_all(&notes)?;
             }
         }
-        _ => unreachable!("separate merge header is only used for medium format"),
+        _ => {
+            return Err(GitError::Command(
+                "separate merge header is only used for medium format".into(),
+            ));
+        }
     }
     Ok(())
 }

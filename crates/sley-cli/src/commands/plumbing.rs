@@ -326,6 +326,11 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             })
         }
         ArchiveFormatKind::TarFilter => {
+            let Some(command) = filter_command else {
+                return Err(GitError::Command(
+                    "archive filter format selected without a filter command".into(),
+                ));
+            };
             let options = sley::plumbing::sley_archive::TarArchiveOptions {
                 prefix,
                 strip_prefix: current_prefix,
@@ -334,7 +339,6 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
                 pathspecs,
                 verbose,
             };
-            let command = filter_command.expect("tar filter arm has a command");
             with_archive_writer(output, |writer| {
                 let mut tar = Vec::new();
                 handle_archive_result(sley::plumbing::sley_archive::write_tar_archive_full(
@@ -1581,9 +1585,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             }
             "--no-chmod" => chmod = None,
             value if value.starts_with("--chmod=") => {
-                let value = value
-                    .strip_prefix("--chmod=")
-                    .expect("prefix checked by match guard");
+                let value = &value["--chmod=".len()..];
                 chmod = Some(parse_add_chmod(value)?);
             }
             "--ignore-errors" => ignore_errors = true,
@@ -1631,7 +1633,12 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                         b'u' => update = true,
                         b'v' => verbose = true,
                         b'f' => force = true,
-                        _ => unreachable!("add short-option group was filtered"),
+                        _ => {
+                            return Err(GitError::Command(format!(
+                                "unknown add option -{}",
+                                char::from(option)
+                            )));
+                        }
                     }
                 }
             }
@@ -5774,7 +5781,12 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
                         b'f' => force = true,
                         b'n' => dry_run = true,
                         b'q' => quiet = true,
-                        _ => unreachable!("rm short-option group was filtered"),
+                        _ => {
+                            return Err(GitError::Command(format!(
+                                "unknown rm option -{}",
+                                char::from(option)
+                            )));
+                        }
                     }
                 }
             }
@@ -6763,7 +6775,9 @@ fn write_split_commit_graph_file(
             if !(force_by_max || merge_by_size) {
                 break;
             }
-            let top = layers.pop().expect("checked last layer");
+            let Some(top) = layers.pop() else {
+                break;
+            };
             new_count = new_count.saturating_add(top.graph.commits.len());
             let base_oids = layers
                 .iter()

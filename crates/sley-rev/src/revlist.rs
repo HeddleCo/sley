@@ -230,12 +230,14 @@ pub fn rev_list_ready_order<K: Ord>(
     let mut emitted = vec![false; records.len()];
     let mut out = Vec::with_capacity(records.len());
     while !ready.is_empty() {
-        let ready_pos = ready
+        let Some(ready_pos) = ready
             .iter()
             .enumerate()
             .max_by_key(|(_, idx)| ready_key(**idx))
             .map(|(pos, _)| pos)
-            .expect("ready is not empty");
+        else {
+            break;
+        };
         let idx = ready.swap_remove(ready_pos);
         if emitted[idx] {
             continue;
@@ -287,12 +289,14 @@ pub fn rev_list_metadata_date_order(records: Vec<CommitMetadata>) -> Vec<CommitM
     let mut emitted = vec![false; records.len()];
     let mut order = Vec::with_capacity(records.len());
     while !ready.is_empty() {
-        let ready_pos = ready
+        let Some(ready_pos) = ready
             .iter()
             .enumerate()
             .max_by_key(|(_, idx)| (records[**idx].commit_time, Reverse(**idx)))
             .map(|(pos, _)| pos)
-            .expect("ready is not empty");
+        else {
+            break;
+        };
         let idx = ready.swap_remove(ready_pos);
         if emitted[idx] {
             continue;

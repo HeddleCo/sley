@@ -703,8 +703,7 @@ impl ObjectId {
 
     pub fn to_hex(&self) -> String {
         let mut out = String::with_capacity(self.format.hex_len());
-        self.write_hex(&mut out)
-            .expect("writing object id hex to a String cannot fail");
+        push_hex_bytes(self.as_bytes(), &mut out);
         out
     }
 
@@ -1583,7 +1582,7 @@ pub fn digest_bytes(format: ObjectFormat, bytes: &[u8]) -> Result<ObjectId> {
 
 pub fn to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
-    write_hex_bytes(bytes, &mut out).expect("writing hex to a String cannot fail");
+    push_hex_bytes(bytes, &mut out);
     out
 }
 
@@ -1594,6 +1593,14 @@ fn write_hex_bytes(bytes: &[u8], out: &mut impl fmt::Write) -> fmt::Result {
         out.write_char(HEX[(byte & 0x0f) as usize] as char)?;
     }
     Ok(())
+}
+
+fn push_hex_bytes(bytes: &[u8], out: &mut String) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
 }
 
 fn hex_nibble_value(byte: u8) -> Option<u8> {

@@ -7013,7 +7013,9 @@ fn stage0_index_chunk_ranges<E>(
         end = idx + 1;
         normals_in_chunk += 1;
         if normals_in_chunk == chunk_size {
-            ranges.push(start.expect("chunk start must exist")..end);
+            if let Some(chunk_start) = start {
+                ranges.push(chunk_start..end);
+            }
             start = None;
             normals_in_chunk = 0;
         }
@@ -9367,7 +9369,10 @@ impl IgnorePatternBuckets {
             }
             IgnoreBucketKind::SuffixBasename => self
                 .suffix_basename
-                .entry(*pattern.pattern.last().expect("suffix literal is non-empty"))
+                .entry(match pattern.pattern.last().copied() {
+                    Some(byte) => byte,
+                    None => return,
+                })
                 .or_default()
                 .push(index),
             IgnoreBucketKind::PrefixBasename => self
@@ -12195,10 +12200,12 @@ fn run_process_filter(
         let filter = ProcessFilter::start(command)?;
         filters.insert(command.to_string(), filter);
     }
-    let result = filters
-        .get_mut(command)
-        .expect("process filter was inserted")
-        .apply(direction, path, content, blob);
+    let Some(filter) = filters.get_mut(command) else {
+        return Err(ProcessFilterFailure::protocol(
+            "process filter cache missing inserted filter",
+        ));
+    };
+    let result = filter.apply(direction, path, content, blob);
     if result.as_ref().is_err_and(|err| err.protocol) {
         filters.remove(command);
     }
@@ -13232,7 +13239,7 @@ fn check_safe_crlf(
                     "warning: in the working copy of '{display}', CRLF will be replaced by LF the next time Git touches it"
                 );
             }
-            ConvFlags::Off => unreachable!("handled above"),
+            ConvFlags::Off => {}
         }
     } else if old_stats.lonelf > 0 && new_stats.lonelf == 0 {
         // CRLFs would be added by checkout.
@@ -13246,7 +13253,7 @@ fn check_safe_crlf(
                     "warning: in the working copy of '{display}', LF will be replaced by CRLF the next time Git touches it"
                 );
             }
-            ConvFlags::Off => unreachable!("handled above"),
+            ConvFlags::Off => {}
         }
     }
     Ok(())
@@ -13820,8 +13827,14 @@ fn materialize_tree_entry_with_optional_smudge(
     if smudge_config.is_none() || sley_index::is_gitlink(entry.mode) {
         return materialize_tree_entry(db, worktree_root, path, entry);
     }
-    let config = smudge_config.expect("checked above");
-    let matcher = attributes.expect("attributes are built when smudge_config is set");
+    let Some(config) = smudge_config else {
+        return materialize_tree_entry(db, worktree_root, path, entry);
+    };
+    let Some(matcher) = attributes else {
+        return Err(GitError::Command(
+            "smudge attributes were not initialized".into(),
+        ));
+    };
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
     let body = apply_smudge_filter_with_attributes_cow_format(
@@ -17245,7 +17258,33 @@ pub fn move_index_and_worktree_path(
         });
     }
 
-    let position = source_position.expect("tracked non-directory source must have an index entry");
+    let Some(position) = source_position else {
+        if options.skip_errors {
+            return Ok(MoveResult {
+                source: source_path,
+                destination: destination_path,
+                skipped: true,
+                fatal: None,
+                details: Vec::new(),
+            });
+        }
+        let fatal = format!(
+            "fatal: bad source, source={}, destination={}",
+            String::from_utf8_lossy(&source_path),
+            String::from_utf8_lossy(&destination_path)
+        );
+        if options.dry_run {
+            return Ok(MoveResult {
+                source: source_path,
+                destination: destination_path,
+                skipped: false,
+                fatal: Some(fatal),
+                details: Vec::new(),
+            });
+        }
+        eprintln!("{fatal}");
+        return Err(GitError::Exit(128));
+    };
     if options.dry_run {
         return Ok(MoveResult {
             source: source_path,
@@ -18536,17 +18575,12 @@ fn tracked_only_clean_filter<'a>(
     worktree_root: &Path,
     git_dir: &Path,
 ) -> &'a mut TrackedOnlyCleanFilter {
-    if clean_filter.is_none() {
-        *clean_filter = Some(TrackedOnlyCleanFilter {
-            config: sley_config::read_repo_config(git_dir, None).unwrap_or_default(),
-            matcher: AttributeMatcher::from_worktree_base(worktree_root),
-            requested: filter_attribute_names(),
-            attribute_dirs: BTreeSet::new(),
-        });
-    }
-    clean_filter
-        .as_mut()
-        .expect("tracked-only clean filter initialized")
+    clean_filter.get_or_insert_with(|| TrackedOnlyCleanFilter {
+        config: sley_config::read_repo_config(git_dir, None).unwrap_or_default(),
+        matcher: AttributeMatcher::from_worktree_base(worktree_root),
+        requested: filter_attribute_names(),
+        attribute_dirs: BTreeSet::new(),
+    })
 }
 
 fn tracked_only_clean_filter_with_config<'a>(
@@ -18554,17 +18588,12 @@ fn tracked_only_clean_filter_with_config<'a>(
     worktree_root: &Path,
     config: &GitConfig,
 ) -> &'a mut TrackedOnlyCleanFilter {
-    if clean_filter.is_none() {
-        *clean_filter = Some(TrackedOnlyCleanFilter {
-            config: config.clone(),
-            matcher: AttributeMatcher::from_worktree_base(worktree_root),
-            requested: filter_attribute_names(),
-            attribute_dirs: BTreeSet::new(),
-        });
-    }
-    clean_filter
-        .as_mut()
-        .expect("tracked-only clean filter initialized")
+    clean_filter.get_or_insert_with(|| TrackedOnlyCleanFilter {
+        config: config.clone(),
+        matcher: AttributeMatcher::from_worktree_base(worktree_root),
+        requested: filter_attribute_names(),
+        attribute_dirs: BTreeSet::new(),
+    })
 }
 
 struct WorktreeEntriesWalk<'a> {

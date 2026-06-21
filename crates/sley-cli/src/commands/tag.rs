@@ -2140,7 +2140,9 @@ fn print_tag_list(
     );
     if let Some(format_spec) = options.format_spec {
         let format_spec = ForEachRefFormat::parse(format_spec)?;
-        let db = db.as_ref().expect("format listing creates object database");
+        let db = db.as_ref().ok_or_else(|| {
+            GitError::Command("tag --format requires an object database".into())
+        })?;
         let objectname_abbrev = repository_abbrev(git_dir, format)?;
         let objectname_candidates = cat_file_all_object_ids(git_dir, format)?;
         let deltabase = zero_oid(format)?;
@@ -2199,7 +2201,9 @@ fn print_tag_list(
         }
         stdout.flush()?;
     } else if let Some(lines) = options.annotation_lines {
-        let db = db.as_ref().expect("tag -n listing creates object database");
+        let db = db.as_ref().ok_or_else(|| {
+            GitError::Command("tag -n requires an object database".into())
+        })?;
         for entry in entries {
             let message = tag_list_annotation_message(db, format, store, &entry.reference)?;
             write_tag_list_annotation(&mut io::stdout(), &entry.name, message.as_deref(), lines)?;

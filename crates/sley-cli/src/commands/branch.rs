@@ -123,7 +123,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_color_always_flag(color)
                 && no_color == "--no-color" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, no_color, color]
@@ -131,21 +131,21 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_color == "--no-color"
                 && branch_color_always_flag(color) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_colored(git_dir, store, mode)
         }
         [flag, display_flag]
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_list_noop_display_flag(display_flag) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [display_flag, flag]
             if branch_list_noop_display_flag(display_flag)
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, first, second]
@@ -153,7 +153,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_column_noop_flag(first)
                 && branch_column_noop_flag(second) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [first, second, flag]
@@ -161,7 +161,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_column_noop_flag(second)
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, first, second]
@@ -169,7 +169,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_abbrev_noop_flag(first)
                 && branch_abbrev_noop_flag(second) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [first, second, flag]
@@ -177,7 +177,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_abbrev_noop_flag(second)
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, first, second]
@@ -185,7 +185,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_omit_empty_value(first).is_some()
                 && branch_omit_empty_value(second).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [first, second, flag]
@@ -193,7 +193,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_omit_empty_value(second).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, sort, key]
@@ -201,16 +201,16 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && key == "refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, sort]
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_version_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(sort).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(sort)?;
             print_branch_list_version_sorted(store, mode, descending)
         }
         [flag, sort, key]
@@ -218,18 +218,18 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_version_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(key).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(key)?;
             print_branch_list_version_sorted(store, mode, descending)
         }
         [sort, flag]
             if branch_version_sort_value(sort).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(sort).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(sort)?;
             print_branch_list_version_sorted(store, mode, descending)
         }
         [sort, key, flag]
@@ -237,18 +237,18 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_version_sort_value(key).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(key).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(key)?;
             print_branch_list_version_sorted(store, mode, descending)
         }
         [flag, sort]
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_objectname_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(sort)?;
             print_branch_list_objectname_sorted(store, mode, descending)
         }
         [flag, sort, key]
@@ -256,18 +256,18 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_objectname_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_objectname_sorted(store, mode, descending)
         }
         [sort, flag]
             if branch_objectname_sort_value(sort).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(sort)?;
             print_branch_list_objectname_sorted(store, mode, descending)
         }
         [sort, key, flag]
@@ -275,18 +275,18 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectname_sort_value(key).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_objectname_sorted(store, mode, descending)
         }
         [flag, sort]
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_objecttype_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(sort)?;
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
         }
         [flag, sort, key]
@@ -294,18 +294,18 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_objecttype_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
         }
         [sort, flag]
             if branch_objecttype_sort_value(sort).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(sort)?;
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
         }
         [sort, key, flag]
@@ -313,43 +313,43 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objecttype_sort_value(key).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
         }
         [flag, sort]
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_objectsize_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(sort)?;
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
         }
         [flag, sort]
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_date_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let (field, descending) =
-                branch_date_sort_value(sort).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(sort)?;
             print_branch_list_date_sorted(git_dir, format, store, mode, field, descending)
         }
         [flag, sort]
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_upstream_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(sort).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(sort)?;
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
         }
         [flag, sort]
             if branch_remote_or_all_mode(flag).is_some() && branch_push_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(sort)?;
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
         [flag, sort, key]
@@ -357,9 +357,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_objectsize_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
         }
         [flag, sort, key]
@@ -367,9 +367,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_date_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let (field, descending) =
-                branch_date_sort_value(key).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(key)?;
             print_branch_list_date_sorted(git_dir, format, store, mode, field, descending)
         }
         [flag, sort, key]
@@ -377,9 +377,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_upstream_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
         }
         [flag, sort, key]
@@ -387,43 +387,43 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_push_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
         [sort, flag]
             if branch_objectsize_sort_value(sort).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(sort)?;
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
         }
         [sort, flag]
             if branch_date_sort_value(sort).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let (field, descending) =
-                branch_date_sort_value(sort).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(sort)?;
             print_branch_list_date_sorted(git_dir, format, store, mode, field, descending)
         }
         [sort, flag]
             if branch_upstream_sort_value(sort).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(sort).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(sort)?;
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
         }
         [sort, flag]
             if branch_push_sort_value(sort).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(sort)?;
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
         [sort, key, flag]
@@ -431,9 +431,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectsize_sort_value(key).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
         }
         [sort, key, flag]
@@ -441,9 +441,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_date_sort_value(key).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let (field, descending) =
-                branch_date_sort_value(key).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(key)?;
             print_branch_list_date_sorted(git_dir, format, store, mode, field, descending)
         }
         [sort, key, flag]
@@ -451,9 +451,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_upstream_sort_value(key).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
         }
         [sort, key, flag]
@@ -461,14 +461,14 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_push_sort_value(key).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
         [flag, sort]
             if branch_remote_or_all_mode(flag).is_some() && sort == "--sort=-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_sorted(store, mode, true)
         }
         [flag, sort, key]
@@ -476,13 +476,13 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && key == "-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_sorted(store, mode, true)
         }
         [sort, flag]
             if sort == "--sort=-refname" && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_sorted(store, mode, true)
         }
         [sort, key, flag]
@@ -490,7 +490,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && key == "-refname"
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_sorted(store, mode, true)
         }
         [flag, sort, no_sort]
@@ -498,7 +498,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort=refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, sort, no_sort]
@@ -506,7 +506,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && (branch_non_refname_sort_value(sort))
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, sort, no_sort]
@@ -514,7 +514,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort=-refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, no_sort, sort]
@@ -522,7 +522,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && sort == "--sort=refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, no_sort, sort]
@@ -530,9 +530,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && branch_version_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(sort).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(sort)?;
             print_branch_list_version_sorted(store, mode, descending)
         }
         [flag, no_sort, sort]
@@ -540,9 +540,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && branch_objectname_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(sort)?;
             print_branch_list_objectname_sorted(store, mode, descending)
         }
         [flag, no_sort, sort]
@@ -550,9 +550,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && branch_objecttype_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(sort)?;
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
         }
         [flag, no_sort, sort]
@@ -560,9 +560,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && branch_objectsize_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(sort)?;
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
         }
         [flag, no_sort, sort]
@@ -570,9 +570,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && branch_date_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let (field, descending) =
-                branch_date_sort_value(sort).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(sort)?;
             print_branch_list_date_sorted(git_dir, format, store, mode, field, descending)
         }
         [flag, no_sort, sort]
@@ -580,9 +580,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && branch_upstream_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(sort).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(sort)?;
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
         }
         [flag, no_sort, sort]
@@ -590,8 +590,8 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && branch_push_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(sort)?;
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
         [flag, no_sort, sort]
@@ -599,7 +599,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && sort == "--sort=-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_sorted(store, mode, true)
         }
         [flag, sort, key, no_sort]
@@ -608,7 +608,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && key == "refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, sort, key, no_sort]
@@ -617,7 +617,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && (branch_non_refname_sort_value(key))
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, sort, key, no_sort]
@@ -626,7 +626,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && key == "-refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, no_sort, sort, key]
@@ -635,7 +635,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && key == "refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, no_sort, sort, key]
@@ -644,9 +644,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_version_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(key).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(key)?;
             print_branch_list_version_sorted(store, mode, descending)
         }
         [flag, no_sort, sort, key]
@@ -655,9 +655,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_objectname_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_objectname_sorted(store, mode, descending)
         }
         [flag, no_sort, sort, key]
@@ -666,9 +666,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_objecttype_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
         }
         [flag, no_sort, sort, key]
@@ -677,9 +677,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_objectsize_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
         }
         [flag, no_sort, sort, key]
@@ -688,9 +688,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_date_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let (field, descending) =
-                branch_date_sort_value(key).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(key)?;
             print_branch_list_date_sorted(git_dir, format, store, mode, field, descending)
         }
         [flag, no_sort, sort, key]
@@ -699,9 +699,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_upstream_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
         }
         [flag, no_sort, sort, key]
@@ -710,8 +710,8 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_push_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
         [flag, no_sort, sort, key]
@@ -720,7 +720,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && key == "-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_sorted(store, mode, true)
         }
         [sort, key, flag]
@@ -728,7 +728,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && key == "refname"
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag] if branch_ignore_case_flag(flag) => print_branch_list(store, BranchListMode::Local),
@@ -741,13 +741,13 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         [flag, ignore]
             if branch_remote_or_all_mode(flag).is_some() && branch_ignore_case_flag(ignore) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [ignore, flag]
             if branch_ignore_case_flag(ignore) && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag] if flag == "--no-points-at" => print_branch_list(store, BranchListMode::Local),
@@ -897,7 +897,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             print_branch_list(store, BranchListMode::Local)
         }
         [list, sort] if list == "--list" && branch_version_sort_value(sort).is_some() => {
-            let descending = branch_version_sort_value(sort).expect("guard checked branch sort value");
+            let descending = branch_version_sort_value_checked(sort)?;
             print_branch_list_version_sorted(store, BranchListMode::Local, descending)
         }
         [list, sort, key]
@@ -905,12 +905,12 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_version_sort_value(key).is_some() =>
         {
-            let descending = branch_version_sort_value(key).expect("guard checked branch sort value");
+            let descending = branch_version_sort_value_checked(key)?;
             print_branch_list_version_sorted(store, BranchListMode::Local, descending)
         }
         [list, sort] if list == "--list" && branch_objectname_sort_value(sort).is_some() => {
             let descending =
-                branch_objectname_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(sort)?;
             print_branch_list_objectname_sorted(store, BranchListMode::Local, descending)
         }
         [list, sort, key]
@@ -919,12 +919,12 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectname_sort_value(key).is_some() =>
         {
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_objectname_sorted(store, BranchListMode::Local, descending)
         }
         [list, sort] if list == "--list" && branch_objecttype_sort_value(sort).is_some() => {
             let descending =
-                branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(sort)?;
             print_branch_list_objecttype_sorted(
                 git_dir,
                 format,
@@ -939,7 +939,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objecttype_sort_value(key).is_some() =>
         {
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_objecttype_sorted(
                 git_dir,
                 format,
@@ -950,7 +950,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [list, sort] if list == "--list" && branch_objectsize_sort_value(sort).is_some() => {
             let descending =
-                branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(sort)?;
             print_branch_list_objectsize_sorted(
                 git_dir,
                 format,
@@ -965,7 +965,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectsize_sort_value(key).is_some() =>
         {
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_objectsize_sorted(
                 git_dir,
                 format,
@@ -976,7 +976,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [list, sort] if list == "--list" && branch_date_sort_value(sort).is_some() => {
             let (field, descending) =
-                branch_date_sort_value(sort).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(sort)?;
             print_branch_list_date_sorted(
                 git_dir,
                 format,
@@ -992,7 +992,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_date_sort_value(key).is_some() =>
         {
             let (field, descending) =
-                branch_date_sort_value(key).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(key)?;
             print_branch_list_date_sorted(
                 git_dir,
                 format,
@@ -1004,11 +1004,11 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [list, sort] if list == "--list" && branch_upstream_sort_value(sort).is_some() => {
             let descending =
-                branch_upstream_sort_value(sort).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(sort)?;
             print_branch_list_upstream_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [list, sort] if list == "--list" && branch_push_sort_value(sort).is_some() => {
-            let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
+            let descending = branch_push_sort_value_checked(sort)?;
             print_branch_list_push_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [list, sort, key]
@@ -1017,13 +1017,13 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_upstream_sort_value(key).is_some() =>
         {
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_upstream_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [list, sort, key]
             if list == "--list" && sort == "--sort" && branch_push_sort_value(key).is_some() =>
         {
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_push_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [list, sort, patterns @ ..]
@@ -1032,7 +1032,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_objectname_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(sort)?;
             print_branch_list_matching_objectname_sorted(
                 store,
                 BranchListMode::Local,
@@ -1048,7 +1048,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_matching_objectname_sorted(
                 store,
                 BranchListMode::Local,
@@ -1063,7 +1063,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(sort)?;
             print_branch_list_matching_objecttype_sorted(
                 git_dir,
                 format,
@@ -1081,7 +1081,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_matching_objecttype_sorted(
                 git_dir,
                 format,
@@ -1098,7 +1098,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(sort)?;
             print_branch_list_matching_objectsize_sorted(
                 git_dir,
                 format,
@@ -1116,7 +1116,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_matching_objectsize_sorted(
                 git_dir,
                 format,
@@ -1133,7 +1133,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let (field, descending) =
-                branch_date_sort_value(sort).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(sort)?;
             print_branch_list_matching_date_sorted(
                 git_dir,
                 format,
@@ -1151,7 +1151,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let (field, descending) =
-                branch_date_sort_value(key).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(key)?;
             print_branch_list_matching_date_sorted(
                 git_dir,
                 format,
@@ -1168,7 +1168,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_upstream_sort_value(sort).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(sort)?;
             print_branch_list_matching_upstream_sorted(
                 git_dir,
                 store,
@@ -1183,7 +1183,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_push_sort_value(sort).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
+            let descending = branch_push_sort_value_checked(sort)?;
             print_branch_list_matching_push_sorted(
                 git_dir,
                 store,
@@ -1200,7 +1200,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_matching_upstream_sorted(
                 git_dir,
                 store,
@@ -1216,7 +1216,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_push_sort_value(key).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_matching_push_sorted(
                 git_dir,
                 store,
@@ -1246,7 +1246,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_version_sort_value(sort).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let descending = branch_version_sort_value(sort).expect("guard checked branch sort value");
+            let descending = branch_version_sort_value_checked(sort)?;
             print_branch_list_matching_version_sorted(
                 store,
                 BranchListMode::Local,
@@ -1261,7 +1261,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_version_sort_value(key).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let descending = branch_version_sort_value(key).expect("guard checked branch sort value");
+            let descending = branch_version_sort_value_checked(key)?;
             print_branch_list_matching_version_sorted(
                 store,
                 BranchListMode::Local,
@@ -1318,7 +1318,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             print_branch_list(store, BranchListMode::Local)
         }
         [sort, list] if branch_version_sort_value(sort).is_some() && list == "--list" => {
-            let descending = branch_version_sort_value(sort).expect("guard checked branch sort value");
+            let descending = branch_version_sort_value_checked(sort)?;
             print_branch_list_version_sorted(store, BranchListMode::Local, descending)
         }
         [sort, key, list]
@@ -1326,12 +1326,12 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_version_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let descending = branch_version_sort_value(key).expect("guard checked branch sort value");
+            let descending = branch_version_sort_value_checked(key)?;
             print_branch_list_version_sorted(store, BranchListMode::Local, descending)
         }
         [sort, list] if branch_objectname_sort_value(sort).is_some() && list == "--list" => {
             let descending =
-                branch_objectname_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(sort)?;
             print_branch_list_objectname_sorted(store, BranchListMode::Local, descending)
         }
         [sort, key, list]
@@ -1340,12 +1340,12 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_objectname_sorted(store, BranchListMode::Local, descending)
         }
         [sort, list] if branch_objecttype_sort_value(sort).is_some() && list == "--list" => {
             let descending =
-                branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(sort)?;
             print_branch_list_objecttype_sorted(
                 git_dir,
                 format,
@@ -1360,7 +1360,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_objecttype_sorted(
                 git_dir,
                 format,
@@ -1371,7 +1371,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [sort, list] if branch_objectsize_sort_value(sort).is_some() && list == "--list" => {
             let descending =
-                branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(sort)?;
             print_branch_list_objectsize_sorted(
                 git_dir,
                 format,
@@ -1386,7 +1386,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_objectsize_sorted(
                 git_dir,
                 format,
@@ -1397,7 +1397,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [sort, list] if branch_date_sort_value(sort).is_some() && list == "--list" => {
             let (field, descending) =
-                branch_date_sort_value(sort).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(sort)?;
             print_branch_list_date_sorted(
                 git_dir,
                 format,
@@ -1413,7 +1413,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let (field, descending) =
-                branch_date_sort_value(key).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(key)?;
             print_branch_list_date_sorted(
                 git_dir,
                 format,
@@ -1425,11 +1425,11 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [sort, list] if branch_upstream_sort_value(sort).is_some() && list == "--list" => {
             let descending =
-                branch_upstream_sort_value(sort).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(sort)?;
             print_branch_list_upstream_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [sort, list] if branch_push_sort_value(sort).is_some() && list == "--list" => {
-            let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
+            let descending = branch_push_sort_value_checked(sort)?;
             print_branch_list_push_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [sort, key, list]
@@ -1438,13 +1438,13 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_upstream_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [sort, key, list]
             if sort == "--sort" && branch_push_sort_value(key).is_some() && list == "--list" =>
         {
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_push_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [sort, list, patterns @ ..]
@@ -1453,7 +1453,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_objectname_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(sort)?;
             print_branch_list_matching_objectname_sorted(
                 store,
                 BranchListMode::Local,
@@ -1469,7 +1469,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_matching_objectname_sorted(
                 store,
                 BranchListMode::Local,
@@ -1484,7 +1484,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(sort)?;
             print_branch_list_matching_objecttype_sorted(
                 git_dir,
                 format,
@@ -1502,7 +1502,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_matching_objecttype_sorted(
                 git_dir,
                 format,
@@ -1519,7 +1519,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(sort)?;
             print_branch_list_matching_objectsize_sorted(
                 git_dir,
                 format,
@@ -1537,7 +1537,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_matching_objectsize_sorted(
                 git_dir,
                 format,
@@ -1554,7 +1554,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let (field, descending) =
-                branch_date_sort_value(sort).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(sort)?;
             print_branch_list_matching_date_sorted(
                 git_dir,
                 format,
@@ -1572,7 +1572,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let (field, descending) =
-                branch_date_sort_value(key).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(key)?;
             print_branch_list_matching_date_sorted(
                 git_dir,
                 format,
@@ -1589,7 +1589,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_upstream_sort_value(sort).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(sort)?;
             print_branch_list_matching_upstream_sorted(
                 git_dir,
                 store,
@@ -1604,7 +1604,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
+            let descending = branch_push_sort_value_checked(sort)?;
             print_branch_list_matching_push_sorted(
                 git_dir,
                 store,
@@ -1621,7 +1621,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_matching_upstream_sorted(
                 git_dir,
                 store,
@@ -1637,7 +1637,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_matching_push_sorted(
                 git_dir,
                 store,
@@ -1652,7 +1652,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_version_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let descending = branch_version_sort_value(sort).expect("guard checked branch sort value");
+            let descending = branch_version_sort_value_checked(sort)?;
             print_branch_list_matching_version_sorted(
                 store,
                 BranchListMode::Local,
@@ -1667,7 +1667,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let descending =
-                branch_objectname_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(sort)?;
             print_branch_list_matching_objectname_sorted(
                 store,
                 BranchListMode::Local,
@@ -1682,7 +1682,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let descending =
-                branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(sort)?;
             print_branch_list_matching_objecttype_sorted(
                 git_dir,
                 format,
@@ -1699,7 +1699,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let descending =
-                branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(sort)?;
             print_branch_list_matching_objectsize_sorted(
                 git_dir,
                 format,
@@ -1716,7 +1716,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let (field, descending) =
-                branch_date_sort_value(sort).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(sort)?;
             print_branch_list_matching_date_sorted(
                 git_dir,
                 format,
@@ -1733,7 +1733,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let descending =
-                branch_upstream_sort_value(sort).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(sort)?;
             print_branch_list_matching_upstream_sorted(
                 git_dir,
                 store,
@@ -1748,7 +1748,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_push_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
+            let descending = branch_push_sort_value_checked(sort)?;
             print_branch_list_matching_push_sorted(
                 git_dir,
                 store,
@@ -1764,7 +1764,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_version_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let descending = branch_version_sort_value(key).expect("guard checked branch sort value");
+            let descending = branch_version_sort_value_checked(key)?;
             print_branch_list_matching_version_sorted(
                 store,
                 BranchListMode::Local,
@@ -1780,7 +1780,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_matching_objectname_sorted(
                 store,
                 BranchListMode::Local,
@@ -1796,7 +1796,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_matching_objecttype_sorted(
                 git_dir,
                 format,
@@ -1814,7 +1814,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_matching_objectsize_sorted(
                 git_dir,
                 format,
@@ -1832,7 +1832,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let (field, descending) =
-                branch_date_sort_value(key).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(key)?;
             print_branch_list_matching_date_sorted(
                 git_dir,
                 format,
@@ -1850,7 +1850,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_matching_upstream_sorted(
                 git_dir,
                 store,
@@ -1866,7 +1866,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_push_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_matching_push_sorted(
                 git_dir,
                 store,
@@ -1881,7 +1881,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let descending = branch_version_sort_value(sort).expect("guard checked branch sort value");
+            let descending = branch_version_sort_value_checked(sort)?;
             print_branch_list_matching_version_sorted(
                 store,
                 BranchListMode::Local,
@@ -1896,7 +1896,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let descending = branch_version_sort_value(key).expect("guard checked branch sort value");
+            let descending = branch_version_sort_value_checked(key)?;
             print_branch_list_matching_version_sorted(
                 store,
                 BranchListMode::Local,
@@ -2022,7 +2022,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_color_always_flag(color)
                 && no_color == "--no-color" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, color, patterns @ ..]
@@ -2059,7 +2059,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_color == "--no-color"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, no_color, color, patterns @ ..]
@@ -2068,7 +2068,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_color == "--no-color"
                 && branch_color_always_flag(color) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching_colored(store, mode, patterns)
         }
         [flag, no_color, color, list, patterns @ ..]
@@ -2077,7 +2077,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_color_always_flag(color)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching_colored(store, mode, patterns)
         }
         [flag, rev] if flag == "--points-at" => {
@@ -2378,7 +2378,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && contains == "--contains"
                 && no_contains == "--no-contains" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let contains_oid = resolve_revision(git_dir, format, contains_rev)?;
             let no_contains_oid = resolve_revision(git_dir, format, no_contains_rev)?;
             print_branch_list_contains_filters(
@@ -2395,7 +2395,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_contains == "--no-contains"
                 && contains == "--contains" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let contains_oid = resolve_revision(git_dir, format, contains_rev)?;
             let no_contains_oid = resolve_revision(git_dir, format, no_contains_rev)?;
             print_branch_list_contains_filters(
@@ -2461,7 +2461,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && merged == "--merged"
                 && no_merged == "--no-merged" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let merged_oid = resolve_revision(git_dir, format, merged_rev)?;
             let no_merged_oid = resolve_revision(git_dir, format, no_merged_rev)?;
             print_branch_list_merged_filters(
@@ -2478,7 +2478,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_merged == "--no-merged"
                 && merged == "--merged" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let merged_oid = resolve_revision(git_dir, format, merged_rev)?;
             let no_merged_oid = resolve_revision(git_dir, format, no_merged_rev)?;
             print_branch_list_merged_filters(
@@ -2578,12 +2578,12 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             let contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_contains_eq_value(contains).expect("guard checked branch option"),
+                branch_contains_eq_value_checked(contains)?,
             )?;
             let no_contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_contains_eq_value(no_contains).expect("guard checked branch option"),
+                branch_no_contains_eq_value_checked(no_contains)?,
             )?;
             print_branch_list_contains_filters(
                 git_dir,
@@ -2601,12 +2601,12 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             let contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_contains_eq_value(contains).expect("guard checked branch option"),
+                branch_contains_eq_value_checked(contains)?,
             )?;
             let no_contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_contains_eq_value(no_contains).expect("guard checked branch option"),
+                branch_no_contains_eq_value_checked(no_contains)?,
             )?;
             print_branch_list_contains_filters(
                 git_dir,
@@ -2624,12 +2624,12 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             let merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_merged_eq_value(merged).expect("guard checked branch option"),
+                branch_merged_eq_value_checked(merged)?,
             )?;
             let no_merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_merged_eq_value(no_merged).expect("guard checked branch option"),
+                branch_no_merged_eq_value_checked(no_merged)?,
             )?;
             print_branch_list_merged_filters(
                 git_dir,
@@ -2647,12 +2647,12 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             let merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_merged_eq_value(merged).expect("guard checked branch option"),
+                branch_merged_eq_value_checked(merged)?,
             )?;
             let no_merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_merged_eq_value(no_merged).expect("guard checked branch option"),
+                branch_no_merged_eq_value_checked(no_merged)?,
             )?;
             print_branch_list_merged_filters(
                 git_dir,
@@ -2720,12 +2720,12 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             let contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_contains_eq_value(contains).expect("guard checked branch option"),
+                branch_contains_eq_value_checked(contains)?,
             )?;
             let no_contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_contains_eq_value(no_contains).expect("guard checked branch option"),
+                branch_no_contains_eq_value_checked(no_contains)?,
             )?;
             print_branch_list_contains_filters_matching(
                 git_dir,
@@ -2745,12 +2745,12 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             let contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_contains_eq_value(contains).expect("guard checked branch option"),
+                branch_contains_eq_value_checked(contains)?,
             )?;
             let no_contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_contains_eq_value(no_contains).expect("guard checked branch option"),
+                branch_no_contains_eq_value_checked(no_contains)?,
             )?;
             print_branch_list_contains_filters_matching(
                 git_dir,
@@ -2770,12 +2770,12 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             let merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_merged_eq_value(merged).expect("guard checked branch option"),
+                branch_merged_eq_value_checked(merged)?,
             )?;
             let no_merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_merged_eq_value(no_merged).expect("guard checked branch option"),
+                branch_no_merged_eq_value_checked(no_merged)?,
             )?;
             print_branch_list_merged_filters_matching(
                 git_dir,
@@ -2795,12 +2795,12 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             let merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_merged_eq_value(merged).expect("guard checked branch option"),
+                branch_merged_eq_value_checked(merged)?,
             )?;
             let no_merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_merged_eq_value(no_merged).expect("guard checked branch option"),
+                branch_no_merged_eq_value_checked(no_merged)?,
             )?;
             print_branch_list_merged_filters_matching(
                 git_dir,
@@ -2816,7 +2816,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             let oid = resolve_revision(
                 git_dir,
                 format,
-                branch_contains_eq_value(contains).expect("guard checked branch option"),
+                branch_contains_eq_value_checked(contains)?,
             )?;
             print_branch_list_contains_filters_matching(
                 git_dir,
@@ -2832,7 +2832,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             let oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_contains_eq_value(contains).expect("guard checked branch option"),
+                branch_no_contains_eq_value_checked(contains)?,
             )?;
             print_branch_list_contains_filters_matching(
                 git_dir,
@@ -2848,7 +2848,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             let oid = resolve_revision(
                 git_dir,
                 format,
-                branch_merged_eq_value(merged).expect("guard checked branch option"),
+                branch_merged_eq_value_checked(merged)?,
             )?;
             print_branch_list_merged_filters_matching(
                 git_dir,
@@ -2864,7 +2864,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             let oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_merged_eq_value(merged).expect("guard checked branch option"),
+                branch_no_merged_eq_value_checked(merged)?,
             )?;
             print_branch_list_merged_filters_matching(
                 git_dir,
@@ -3146,7 +3146,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                     patterns,
                     ignore_case: false,
                     format_spec,
-                    omit_empty: branch_omit_empty_value(omit_empty).expect("guard checked flag"),
+                    omit_empty: branch_omit_empty_value_checked(omit_empty)?,
                 },
             )
         }
@@ -3167,7 +3167,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                     patterns,
                     ignore_case: false,
                     format_spec,
-                    omit_empty: branch_omit_empty_value(omit_empty).expect("guard checked flag"),
+                    omit_empty: branch_omit_empty_value_checked(omit_empty)?,
                 },
             )
         }
@@ -3185,7 +3185,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                     patterns,
                     ignore_case: false,
                     format_spec,
-                    omit_empty: branch_omit_empty_value(omit_empty).expect("guard checked flag"),
+                    omit_empty: branch_omit_empty_value_checked(omit_empty)?,
                 },
             )
         }
@@ -3203,7 +3203,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                     patterns,
                     ignore_case: false,
                     format_spec,
-                    omit_empty: branch_omit_empty_value(omit_empty).expect("guard checked flag"),
+                    omit_empty: branch_omit_empty_value_checked(omit_empty)?,
                 },
             )
         }
@@ -3278,16 +3278,16 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_contains_eq_value(contains).is_some()
                 && branch_no_contains_eq_value(no_contains).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_contains_eq_value(contains).expect("guard checked branch option"),
+                branch_contains_eq_value_checked(contains)?,
             )?;
             let no_contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_contains_eq_value(no_contains).expect("guard checked branch option"),
+                branch_no_contains_eq_value_checked(no_contains)?,
             )?;
             print_branch_list_contains_filters(
                 git_dir,
@@ -3303,16 +3303,16 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_no_contains_eq_value(no_contains).is_some()
                 && branch_contains_eq_value(contains).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_contains_eq_value(contains).expect("guard checked branch option"),
+                branch_contains_eq_value_checked(contains)?,
             )?;
             let no_contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_contains_eq_value(no_contains).expect("guard checked branch option"),
+                branch_no_contains_eq_value_checked(no_contains)?,
             )?;
             print_branch_list_contains_filters(
                 git_dir,
@@ -3328,16 +3328,16 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_merged_eq_value(merged).is_some()
                 && branch_no_merged_eq_value(no_merged).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_merged_eq_value(merged).expect("guard checked branch option"),
+                branch_merged_eq_value_checked(merged)?,
             )?;
             let no_merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_merged_eq_value(no_merged).expect("guard checked branch option"),
+                branch_no_merged_eq_value_checked(no_merged)?,
             )?;
             print_branch_list_merged_filters(
                 git_dir,
@@ -3353,16 +3353,16 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_no_merged_eq_value(no_merged).is_some()
                 && branch_merged_eq_value(merged).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_merged_eq_value(merged).expect("guard checked branch option"),
+                branch_merged_eq_value_checked(merged)?,
             )?;
             let no_merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_merged_eq_value(no_merged).expect("guard checked branch option"),
+                branch_no_merged_eq_value_checked(no_merged)?,
             )?;
             print_branch_list_merged_filters(
                 git_dir,
@@ -3498,7 +3498,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && format_flag.starts_with("--format=")
                 && no_format == "--no-format" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, format_flag, format_spec, no_format]
@@ -3507,7 +3507,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_format == "--no-format" =>
         {
             let _ = format_spec;
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, no_format, format_flag]
@@ -3515,7 +3515,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_format == "--no-format"
                 && format_flag.starts_with("--format=") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -3526,7 +3526,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_format == "--no-format"
                 && format_flag == "--format" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_format(git_dir, format, store, mode, &[], false, format_spec)
         }
         [flag, format_flag, no_format, list, patterns @ ..]
@@ -3535,7 +3535,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_format == "--no-format"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, format_flag, format_spec, no_format, list, patterns @ ..]
@@ -3545,7 +3545,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list" =>
         {
             let _ = format_spec;
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, no_format, format_flag, list, patterns @ ..]
@@ -3554,7 +3554,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && format_flag.starts_with("--format=")
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -3566,7 +3566,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && format_flag == "--format"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_format(git_dir, format, store, mode, patterns, false, format_spec)
         }
         [flag, list, format_flag, no_format, patterns @ ..]
@@ -3575,7 +3575,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && format_flag.starts_with("--format=")
                 && no_format == "--no-format" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, format_flag, format_spec, no_format, patterns @ ..]
@@ -3585,7 +3585,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_format == "--no-format" =>
         {
             let _ = format_spec;
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, format_flag, omit_empty]
@@ -3593,7 +3593,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && format_flag.starts_with("--format=")
                 && branch_omit_empty_value(omit_empty).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -3606,7 +3606,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                     patterns: &[],
                     ignore_case: false,
                     format_spec,
-                    omit_empty: branch_omit_empty_value(omit_empty).expect("guard checked flag"),
+                    omit_empty: branch_omit_empty_value_checked(omit_empty)?,
                 },
             )
         }
@@ -3616,7 +3616,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_omit_empty_value(omit_empty).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -3629,7 +3629,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                     patterns,
                     ignore_case: false,
                     format_spec,
-                    omit_empty: branch_omit_empty_value(omit_empty).expect("guard checked flag"),
+                    omit_empty: branch_omit_empty_value_checked(omit_empty)?,
                 },
             )
         }
@@ -3639,7 +3639,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && format_flag.starts_with("--format=")
                 && branch_omit_empty_value(omit_empty).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -3652,7 +3652,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                     patterns,
                     ignore_case: false,
                     format_spec,
-                    omit_empty: branch_omit_empty_value(omit_empty).expect("guard checked flag"),
+                    omit_empty: branch_omit_empty_value_checked(omit_empty)?,
                 },
             )
         }
@@ -3661,7 +3661,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && format_flag == "--format"
                 && branch_omit_empty_value(omit_empty).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_format_omit_empty(
                 git_dir,
                 format,
@@ -3671,7 +3671,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                     patterns: &[],
                     ignore_case: false,
                     format_spec,
-                    omit_empty: branch_omit_empty_value(omit_empty).expect("guard checked flag"),
+                    omit_empty: branch_omit_empty_value_checked(omit_empty)?,
                 },
             )
         }
@@ -3681,7 +3681,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_omit_empty_value(omit_empty).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_format_omit_empty(
                 git_dir,
                 format,
@@ -3691,7 +3691,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                     patterns,
                     ignore_case: false,
                     format_spec,
-                    omit_empty: branch_omit_empty_value(omit_empty).expect("guard checked flag"),
+                    omit_empty: branch_omit_empty_value_checked(omit_empty)?,
                 },
             )
         }
@@ -3701,7 +3701,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && format_flag == "--format"
                 && branch_omit_empty_value(omit_empty).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_format_omit_empty(
                 git_dir,
                 format,
@@ -3711,7 +3711,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                     patterns,
                     ignore_case: false,
                     format_spec,
-                    omit_empty: branch_omit_empty_value(omit_empty).expect("guard checked flag"),
+                    omit_empty: branch_omit_empty_value_checked(omit_empty)?,
                 },
             )
         }
@@ -3910,7 +3910,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && branch_list_noop_display_flag(display_flag) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, list, display_flag, patterns @ ..]
@@ -3918,7 +3918,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && branch_list_noop_display_flag(display_flag) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, first, second, list, patterns @ ..]
@@ -3927,7 +3927,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_column_noop_flag(second)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, first, second, patterns @ ..]
@@ -3936,7 +3936,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_column_noop_flag(first)
                 && branch_column_noop_flag(second) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, first, second, list, patterns @ ..]
@@ -3945,7 +3945,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_abbrev_noop_flag(second)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, first, second, patterns @ ..]
@@ -3954,7 +3954,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_abbrev_noop_flag(first)
                 && branch_abbrev_noop_flag(second) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, display_flag, list]
@@ -3962,7 +3962,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_list_noop_display_flag(display_flag)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, display_flag, list, patterns @ ..]
@@ -3970,7 +3970,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_list_noop_display_flag(display_flag)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, first, second, list, patterns @ ..]
@@ -3979,7 +3979,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_omit_empty_value(second).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, first, second, patterns @ ..]
@@ -3988,7 +3988,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_omit_empty_value(first).is_some()
                 && branch_omit_empty_value(second).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, sort, key]
@@ -3997,7 +3997,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && key == "refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, list, sort]
@@ -4005,9 +4005,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && branch_version_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(sort).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(sort)?;
             print_branch_list_version_sorted(store, mode, descending)
         }
         [flag, list, sort, key]
@@ -4016,9 +4016,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_version_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(key).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(key)?;
             print_branch_list_version_sorted(store, mode, descending)
         }
         [flag, list, sort]
@@ -4026,9 +4026,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && branch_objectname_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(sort)?;
             print_branch_list_objectname_sorted(store, mode, descending)
         }
         [flag, list, sort, key]
@@ -4037,9 +4037,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_objectname_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_objectname_sorted(store, mode, descending)
         }
         [flag, list, sort]
@@ -4047,9 +4047,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && branch_objecttype_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(sort)?;
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
         }
         [flag, list, sort, key]
@@ -4058,9 +4058,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_objecttype_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
         }
         [flag, list, sort]
@@ -4068,9 +4068,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && branch_objectsize_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(sort)?;
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
         }
         [flag, list, sort, key]
@@ -4079,9 +4079,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_objectsize_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
         }
         [flag, list, sort]
@@ -4089,9 +4089,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && branch_upstream_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(sort).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(sort)?;
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
         }
         [flag, list, sort]
@@ -4099,8 +4099,8 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && branch_push_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(sort)?;
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
         [flag, list, sort, key]
@@ -4109,9 +4109,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_upstream_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
         }
         [flag, list, sort, key]
@@ -4120,8 +4120,8 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_push_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
         [flag, list, sort, patterns @ ..]
@@ -4130,9 +4130,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectname_sort_value(sort).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(sort)?;
             print_branch_list_matching_objectname_sorted(store, mode, patterns, false, descending)
         }
         [flag, list, sort, key, patterns @ ..]
@@ -4142,9 +4142,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectname_sort_value(key).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_matching_objectname_sorted(store, mode, patterns, false, descending)
         }
         [flag, list, sort, patterns @ ..]
@@ -4153,9 +4153,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objecttype_sort_value(sort).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(sort)?;
             print_branch_list_matching_objecttype_sorted(
                 git_dir, format, store, mode, patterns, false, descending,
             )
@@ -4167,9 +4167,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objecttype_sort_value(key).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_matching_objecttype_sorted(
                 git_dir, format, store, mode, patterns, false, descending,
             )
@@ -4180,9 +4180,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectsize_sort_value(sort).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(sort)?;
             print_branch_list_matching_objectsize_sorted(
                 git_dir, format, store, mode, patterns, false, descending,
             )
@@ -4194,9 +4194,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectsize_sort_value(key).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_matching_objectsize_sorted(
                 git_dir, format, store, mode, patterns, false, descending,
             )
@@ -4207,9 +4207,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_upstream_sort_value(sort).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(sort).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(sort)?;
             print_branch_list_matching_upstream_sorted(
                 git_dir, store, mode, patterns, false, descending,
             )
@@ -4220,8 +4220,8 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_push_sort_value(sort).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(sort)?;
             print_branch_list_matching_push_sorted(
                 git_dir, store, mode, patterns, false, descending,
             )
@@ -4233,9 +4233,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_upstream_sort_value(key).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_matching_upstream_sorted(
                 git_dir, store, mode, patterns, false, descending,
             )
@@ -4247,8 +4247,8 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_push_sort_value(key).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_matching_push_sorted(
                 git_dir, store, mode, patterns, false, descending,
             )
@@ -4259,7 +4259,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && (branch_non_refname_sort_value(sort))
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, sort, key, no_sort, patterns @ ..]
@@ -4269,7 +4269,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && (branch_non_refname_sort_value(key))
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, sort, patterns @ ..]
@@ -4278,9 +4278,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_version_sort_value(sort).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(sort).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(sort)?;
             print_branch_list_matching_version_sorted(store, mode, patterns, false, descending)
         }
         [flag, list, sort, key, patterns @ ..]
@@ -4290,9 +4290,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_version_sort_value(key).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(key).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(key)?;
             print_branch_list_matching_version_sorted(store, mode, patterns, false, descending)
         }
         [flag, list, sort]
@@ -4300,7 +4300,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && sort == "--sort=-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_sorted(store, mode, true)
         }
         [flag, list, sort, key]
@@ -4309,7 +4309,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && key == "-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_sorted(store, mode, true)
         }
         [flag, list, sort, no_sort, patterns @ ..]
@@ -4318,7 +4318,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort=-refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, sort, key, no_sort, patterns @ ..]
@@ -4328,7 +4328,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && key == "-refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, sort, patterns @ ..]
@@ -4336,7 +4336,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && sort == "--sort=-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching_sorted(store, mode, patterns, false, true)
         }
         [flag, list, sort, key, patterns @ ..]
@@ -4345,7 +4345,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && key == "-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching_sorted(store, mode, patterns, false, true)
         }
         [flag, list, sort, key, patterns @ ..]
@@ -4354,7 +4354,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && key == "refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, sort, key, list]
@@ -4363,7 +4363,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && key == "refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list(store, mode)
         }
         [flag, sort, list]
@@ -4371,9 +4371,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_version_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(sort).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(sort)?;
             print_branch_list_version_sorted(store, mode, descending)
         }
         [flag, sort, key, list]
@@ -4382,9 +4382,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_version_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(key).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(key)?;
             print_branch_list_version_sorted(store, mode, descending)
         }
         [flag, sort, list]
@@ -4392,9 +4392,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectname_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(sort)?;
             print_branch_list_objectname_sorted(store, mode, descending)
         }
         [flag, sort, key, list]
@@ -4403,9 +4403,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectname_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_objectname_sorted(store, mode, descending)
         }
         [flag, sort, list]
@@ -4413,9 +4413,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objecttype_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(sort)?;
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
         }
         [flag, sort, key, list]
@@ -4424,9 +4424,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objecttype_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
         }
         [flag, sort, list]
@@ -4434,9 +4434,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectsize_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(sort)?;
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
         }
         [flag, sort, key, list]
@@ -4445,9 +4445,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectsize_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
         }
         [flag, sort, list]
@@ -4455,9 +4455,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_upstream_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(sort).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(sort)?;
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
         }
         [flag, sort, list]
@@ -4465,8 +4465,8 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_push_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(sort)?;
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
         [flag, sort, key, list]
@@ -4475,9 +4475,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_upstream_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
         }
         [flag, sort, key, list]
@@ -4486,8 +4486,8 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_push_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
         [flag, sort, list, patterns @ ..]
@@ -4496,9 +4496,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(sort)?;
             print_branch_list_matching_objectname_sorted(store, mode, patterns, false, descending)
         }
         [flag, sort, key, list, patterns @ ..]
@@ -4508,9 +4508,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_matching_objectname_sorted(store, mode, patterns, false, descending)
         }
         [flag, sort, list, patterns @ ..]
@@ -4519,9 +4519,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(sort)?;
             print_branch_list_matching_objecttype_sorted(
                 git_dir, format, store, mode, patterns, false, descending,
             )
@@ -4533,9 +4533,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_matching_objecttype_sorted(
                 git_dir, format, store, mode, patterns, false, descending,
             )
@@ -4546,9 +4546,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(sort)?;
             print_branch_list_matching_objectsize_sorted(
                 git_dir, format, store, mode, patterns, false, descending,
             )
@@ -4560,9 +4560,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_matching_objectsize_sorted(
                 git_dir, format, store, mode, patterns, false, descending,
             )
@@ -4573,9 +4573,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(sort).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(sort)?;
             print_branch_list_matching_upstream_sorted(
                 git_dir, store, mode, patterns, false, descending,
             )
@@ -4586,8 +4586,8 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(sort)?;
             print_branch_list_matching_push_sorted(
                 git_dir, store, mode, patterns, false, descending,
             )
@@ -4599,9 +4599,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_matching_upstream_sorted(
                 git_dir, store, mode, patterns, false, descending,
             )
@@ -4613,8 +4613,8 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_matching_push_sorted(
                 git_dir, store, mode, patterns, false, descending,
             )
@@ -4625,9 +4625,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_version_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(sort).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(sort)?;
             print_branch_list_matching_version_sorted(store, mode, patterns, false, descending)
         }
         [flag, no_sort, sort, list, patterns @ ..]
@@ -4636,9 +4636,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectname_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(sort)?;
             print_branch_list_matching_objectname_sorted(store, mode, patterns, false, descending)
         }
         [flag, no_sort, sort, list, patterns @ ..]
@@ -4647,9 +4647,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objecttype_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(sort)?;
             print_branch_list_matching_objecttype_sorted(
                 git_dir, format, store, mode, patterns, false, descending,
             )
@@ -4660,9 +4660,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectsize_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(sort)?;
             print_branch_list_matching_objectsize_sorted(
                 git_dir, format, store, mode, patterns, false, descending,
             )
@@ -4673,9 +4673,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_date_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let (field, descending) =
-                branch_date_sort_value(sort).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(sort)?;
             print_branch_list_matching_date_sorted(
                 git_dir,
                 format,
@@ -4692,9 +4692,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_upstream_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(sort).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(sort)?;
             print_branch_list_matching_upstream_sorted(
                 git_dir, store, mode, patterns, false, descending,
             )
@@ -4705,8 +4705,8 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_push_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(sort)?;
             print_branch_list_matching_push_sorted(
                 git_dir, store, mode, patterns, false, descending,
             )
@@ -4718,9 +4718,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_version_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(key).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(key)?;
             print_branch_list_matching_version_sorted(store, mode, patterns, false, descending)
         }
         [flag, no_sort, sort, key, list, patterns @ ..]
@@ -4730,9 +4730,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectname_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_matching_objectname_sorted(store, mode, patterns, false, descending)
         }
         [flag, no_sort, sort, key, list, patterns @ ..]
@@ -4742,9 +4742,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objecttype_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_matching_objecttype_sorted(
                 git_dir, format, store, mode, patterns, false, descending,
             )
@@ -4756,9 +4756,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectsize_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_matching_objectsize_sorted(
                 git_dir, format, store, mode, patterns, false, descending,
             )
@@ -4770,9 +4770,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_date_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let (field, descending) =
-                branch_date_sort_value(key).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(key)?;
             print_branch_list_matching_date_sorted(
                 git_dir,
                 format,
@@ -4790,9 +4790,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_upstream_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_matching_upstream_sorted(
                 git_dir, store, mode, patterns, false, descending,
             )
@@ -4804,8 +4804,8 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_push_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_matching_push_sorted(
                 git_dir, store, mode, patterns, false, descending,
             )
@@ -4816,9 +4816,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(sort).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(sort)?;
             print_branch_list_matching_version_sorted(store, mode, patterns, false, descending)
         }
         [flag, sort, key, list, patterns @ ..]
@@ -4828,9 +4828,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let descending =
-                branch_version_sort_value(key).expect("guard checked branch sort value");
+                branch_version_sort_value_checked(key)?;
             print_branch_list_matching_version_sorted(store, mode, patterns, false, descending)
         }
         [flag, sort, list]
@@ -4838,7 +4838,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort=-refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_sorted(store, mode, true)
         }
         [flag, sort, key, list]
@@ -4847,7 +4847,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && key == "-refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_sorted(store, mode, true)
         }
         [flag, sort, list, patterns @ ..]
@@ -4855,7 +4855,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort=-refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching_sorted(store, mode, patterns, false, true)
         }
         [flag, sort, key, list, patterns @ ..]
@@ -4864,7 +4864,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && key == "-refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching_sorted(store, mode, patterns, false, true)
         }
         [flag, no_sort, sort, list, patterns @ ..]
@@ -4873,7 +4873,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort=-refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching_sorted(store, mode, patterns, false, true)
         }
         [flag, no_sort, sort, key, list, patterns @ ..]
@@ -4883,7 +4883,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && key == "-refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching_sorted(store, mode, patterns, false, true)
         }
         [flag, sort, key, list, patterns @ ..]
@@ -4892,7 +4892,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && key == "refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, sort, no_sort, list, patterns @ ..]
@@ -4901,7 +4901,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, sort, no_sort, list, patterns @ ..]
@@ -4910,7 +4910,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, sort, no_sort, list, patterns @ ..]
@@ -4919,7 +4919,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, no_sort, sort, list, patterns @ ..]
@@ -4928,7 +4928,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort=refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, sort, no_sort, patterns @ ..]
@@ -4937,7 +4937,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort=refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, sort, key, no_sort, list, patterns @ ..]
@@ -4947,7 +4947,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, sort, key, no_sort, list, patterns @ ..]
@@ -4957,7 +4957,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, sort, key, no_sort, list, patterns @ ..]
@@ -4967,7 +4967,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_sort == "--no-sort"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, no_sort, sort, key, list, patterns @ ..]
@@ -4977,7 +4977,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && key == "refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, sort, key, no_sort, patterns @ ..]
@@ -4987,7 +4987,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && key == "refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, format_flag, ignore, list, patterns @ ..]
@@ -4996,7 +4996,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_ignore_case_enabled_flag(ignore)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -5008,7 +5008,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_ignore_case_enabled_flag(ignore)
                 && format_flag.starts_with("--format=") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -5021,7 +5021,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && reset == "--no-ignore-case"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -5033,7 +5033,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_ignore_case_enabled_flag(ignore)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_format(git_dir, format, store, mode, patterns, true, format_spec)
         }
         [flag, list, ignore, format_flag, format_spec, patterns @ ..]
@@ -5042,7 +5042,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_ignore_case_enabled_flag(ignore)
                 && format_flag == "--format" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_format(git_dir, format, store, mode, patterns, true, format_spec)
         }
         [flag, format_flag, format_spec, ignore, reset, list, patterns @ ..]
@@ -5052,7 +5052,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && reset == "--no-ignore-case"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_format(git_dir, format, store, mode, patterns, false, format_spec)
         }
         [flag, list, ignore, reset, patterns @ ..]
@@ -5061,7 +5061,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_ignore_case_enabled_flag(ignore)
                 && reset == "--no-ignore-case" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, ignore, list, reset, patterns @ ..]
@@ -5070,7 +5070,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && reset == "--no-ignore-case" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, ignore, reset, list, patterns @ ..]
@@ -5079,7 +5079,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && reset == "--no-ignore-case"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, points_at, rev, patterns @ ..]
@@ -5087,7 +5087,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && points_at == "--points-at" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let oid = resolve_revision(git_dir, format, rev)?;
             print_branch_list_points_at_matching(store, mode, &oid, patterns)
         }
@@ -5096,7 +5096,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && points_at.starts_with("--points-at=") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let rev = points_at
                 .strip_prefix("--points-at=")
                 .ok_or_else(|| GitError::Command("branch --points-at requires a value".into()))?;
@@ -5109,7 +5109,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && contains == "--contains"
                 && no_contains == "--no-contains" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let contains_oid = resolve_revision(git_dir, format, contains_rev)?;
             let no_contains_oid = resolve_revision(git_dir, format, no_contains_rev)?;
             print_branch_list_contains_filters_matching(
@@ -5128,7 +5128,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_contains == "--no-contains"
                 && contains == "--contains" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let contains_oid = resolve_revision(git_dir, format, contains_rev)?;
             let no_contains_oid = resolve_revision(git_dir, format, no_contains_rev)?;
             print_branch_list_contains_filters_matching(
@@ -5147,7 +5147,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && merged == "--merged"
                 && no_merged == "--no-merged" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let merged_oid = resolve_revision(git_dir, format, merged_rev)?;
             let no_merged_oid = resolve_revision(git_dir, format, no_merged_rev)?;
             print_branch_list_merged_filters_matching(
@@ -5166,7 +5166,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && no_merged == "--no-merged"
                 && merged == "--merged" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let merged_oid = resolve_revision(git_dir, format, merged_rev)?;
             let no_merged_oid = resolve_revision(git_dir, format, no_merged_rev)?;
             print_branch_list_merged_filters_matching(
@@ -5185,16 +5185,16 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_contains_eq_value(contains).is_some()
                 && branch_no_contains_eq_value(no_contains).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_contains_eq_value(contains).expect("guard checked branch option"),
+                branch_contains_eq_value_checked(contains)?,
             )?;
             let no_contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_contains_eq_value(no_contains).expect("guard checked branch option"),
+                branch_no_contains_eq_value_checked(no_contains)?,
             )?;
             print_branch_list_contains_filters_matching(
                 git_dir,
@@ -5212,16 +5212,16 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_no_contains_eq_value(no_contains).is_some()
                 && branch_contains_eq_value(contains).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_contains_eq_value(contains).expect("guard checked branch option"),
+                branch_contains_eq_value_checked(contains)?,
             )?;
             let no_contains_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_contains_eq_value(no_contains).expect("guard checked branch option"),
+                branch_no_contains_eq_value_checked(no_contains)?,
             )?;
             print_branch_list_contains_filters_matching(
                 git_dir,
@@ -5239,16 +5239,16 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_merged_eq_value(merged).is_some()
                 && branch_no_merged_eq_value(no_merged).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_merged_eq_value(merged).expect("guard checked branch option"),
+                branch_merged_eq_value_checked(merged)?,
             )?;
             let no_merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_merged_eq_value(no_merged).expect("guard checked branch option"),
+                branch_no_merged_eq_value_checked(no_merged)?,
             )?;
             print_branch_list_merged_filters_matching(
                 git_dir,
@@ -5266,16 +5266,16 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_no_merged_eq_value(no_merged).is_some()
                 && branch_merged_eq_value(merged).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_merged_eq_value(merged).expect("guard checked branch option"),
+                branch_merged_eq_value_checked(merged)?,
             )?;
             let no_merged_oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_merged_eq_value(no_merged).expect("guard checked branch option"),
+                branch_no_merged_eq_value_checked(no_merged)?,
             )?;
             print_branch_list_merged_filters_matching(
                 git_dir,
@@ -5292,7 +5292,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && contains == "--contains" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let oid = resolve_revision(git_dir, format, rev)?;
             print_branch_list_contains_filters_matching(
                 git_dir,
@@ -5309,7 +5309,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && contains == "--no-contains" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let oid = resolve_revision(git_dir, format, rev)?;
             print_branch_list_contains_filters_matching(
                 git_dir,
@@ -5326,7 +5326,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && merged == "--merged" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let oid = resolve_revision(git_dir, format, rev)?;
             print_branch_list_merged_filters_matching(
                 git_dir,
@@ -5343,7 +5343,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && merged == "--no-merged" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let oid = resolve_revision(git_dir, format, rev)?;
             print_branch_list_merged_filters_matching(
                 git_dir,
@@ -5360,11 +5360,11 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && branch_contains_eq_value(contains).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let oid = resolve_revision(
                 git_dir,
                 format,
-                branch_contains_eq_value(contains).expect("guard checked branch option"),
+                branch_contains_eq_value_checked(contains)?,
             )?;
             print_branch_list_contains_filters_matching(
                 git_dir,
@@ -5381,11 +5381,11 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && branch_no_contains_eq_value(contains).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_contains_eq_value(contains).expect("guard checked branch option"),
+                branch_no_contains_eq_value_checked(contains)?,
             )?;
             print_branch_list_contains_filters_matching(
                 git_dir,
@@ -5402,11 +5402,11 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && branch_merged_eq_value(merged).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let oid = resolve_revision(
                 git_dir,
                 format,
-                branch_merged_eq_value(merged).expect("guard checked branch option"),
+                branch_merged_eq_value_checked(merged)?,
             )?;
             print_branch_list_merged_filters_matching(
                 git_dir,
@@ -5423,11 +5423,11 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && list == "--list"
                 && branch_no_merged_eq_value(merged).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_checked(flag)?;
             let oid = resolve_revision(
                 git_dir,
                 format,
-                branch_no_merged_eq_value(merged).expect("guard checked branch option"),
+                branch_no_merged_eq_value_checked(merged)?,
             )?;
             print_branch_list_merged_filters_matching(
                 git_dir,
@@ -5479,26 +5479,26 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             print_branch_list(store, BranchListMode::Local)
         }
         [flag] if branch_version_sort_value(flag).is_some() => {
-            let descending = branch_version_sort_value(flag).expect("guard checked branch sort value");
+            let descending = branch_version_sort_value_checked(flag)?;
             print_branch_list_version_sorted(store, BranchListMode::Local, descending)
         }
         [flag, key] if flag == "--sort" && branch_version_sort_value(key).is_some() => {
-            let descending = branch_version_sort_value(key).expect("guard checked branch sort value");
+            let descending = branch_version_sort_value_checked(key)?;
             print_branch_list_version_sorted(store, BranchListMode::Local, descending)
         }
         [flag] if branch_objectname_sort_value(flag).is_some() => {
             let descending =
-                branch_objectname_sort_value(flag).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(flag)?;
             print_branch_list_objectname_sorted(store, BranchListMode::Local, descending)
         }
         [flag, key] if flag == "--sort" && branch_objectname_sort_value(key).is_some() => {
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_objectname_sorted(store, BranchListMode::Local, descending)
         }
         [flag] if branch_objecttype_sort_value(flag).is_some() => {
             let descending =
-                branch_objecttype_sort_value(flag).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(flag)?;
             print_branch_list_objecttype_sorted(
                 git_dir,
                 format,
@@ -5509,7 +5509,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [flag, key] if flag == "--sort" && branch_objecttype_sort_value(key).is_some() => {
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_objecttype_sorted(
                 git_dir,
                 format,
@@ -5520,7 +5520,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [flag] if branch_objectsize_sort_value(flag).is_some() => {
             let descending =
-                branch_objectsize_sort_value(flag).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(flag)?;
             print_branch_list_objectsize_sorted(
                 git_dir,
                 format,
@@ -5531,7 +5531,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [flag, key] if flag == "--sort" && branch_objectsize_sort_value(key).is_some() => {
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_objectsize_sorted(
                 git_dir,
                 format,
@@ -5542,7 +5542,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [flag] if branch_date_sort_value(flag).is_some() => {
             let (field, descending) =
-                branch_date_sort_value(flag).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(flag)?;
             print_branch_list_date_sorted(
                 git_dir,
                 format,
@@ -5554,7 +5554,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [flag, key] if flag == "--sort" && branch_date_sort_value(key).is_some() => {
             let (field, descending) =
-                branch_date_sort_value(key).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(key)?;
             print_branch_list_date_sorted(
                 git_dir,
                 format,
@@ -5566,20 +5566,20 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [flag] if branch_upstream_sort_value(flag).is_some() => {
             let descending =
-                branch_upstream_sort_value(flag).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(flag)?;
             print_branch_list_upstream_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [flag] if branch_push_sort_value(flag).is_some() => {
-            let descending = branch_push_sort_value(flag).expect("guard checked branch sort value");
+            let descending = branch_push_sort_value_checked(flag)?;
             print_branch_list_push_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [flag, key] if flag == "--sort" && branch_upstream_sort_value(key).is_some() => {
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_upstream_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [flag, key] if flag == "--sort" && branch_push_sort_value(key).is_some() => {
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_push_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [flag] if flag == "--sort=-refname" => {
@@ -5604,17 +5604,17 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             print_branch_list(store, BranchListMode::Local)
         }
         [no_sort, sort] if no_sort == "--no-sort" && branch_version_sort_value(sort).is_some() => {
-            let descending = branch_version_sort_value(sort).expect("guard checked branch sort value");
+            let descending = branch_version_sort_value_checked(sort)?;
             print_branch_list_version_sorted(store, BranchListMode::Local, descending)
         }
         [no_sort, sort] if no_sort == "--no-sort" && branch_objectname_sort_value(sort).is_some() => {
             let descending =
-                branch_objectname_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(sort)?;
             print_branch_list_objectname_sorted(store, BranchListMode::Local, descending)
         }
         [no_sort, sort] if no_sort == "--no-sort" && branch_objecttype_sort_value(sort).is_some() => {
             let descending =
-                branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(sort)?;
             print_branch_list_objecttype_sorted(
                 git_dir,
                 format,
@@ -5625,7 +5625,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [no_sort, sort] if no_sort == "--no-sort" && branch_objectsize_sort_value(sort).is_some() => {
             let descending =
-                branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(sort)?;
             print_branch_list_objectsize_sorted(
                 git_dir,
                 format,
@@ -5636,7 +5636,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [no_sort, sort] if no_sort == "--no-sort" && branch_date_sort_value(sort).is_some() => {
             let (field, descending) =
-                branch_date_sort_value(sort).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(sort)?;
             print_branch_list_date_sorted(
                 git_dir,
                 format,
@@ -5648,11 +5648,11 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         [no_sort, sort] if no_sort == "--no-sort" && branch_upstream_sort_value(sort).is_some() => {
             let descending =
-                branch_upstream_sort_value(sort).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(sort)?;
             print_branch_list_upstream_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [no_sort, sort] if no_sort == "--no-sort" && branch_push_sort_value(sort).is_some() => {
-            let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
+            let descending = branch_push_sort_value_checked(sort)?;
             print_branch_list_push_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [no_sort, sort] if no_sort == "--no-sort" && sort == "--sort=-refname" => {
@@ -5677,7 +5677,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         [no_sort, sort, key]
             if no_sort == "--no-sort" && sort == "--sort" && branch_version_sort_value(key).is_some() =>
         {
-            let descending = branch_version_sort_value(key).expect("guard checked branch sort value");
+            let descending = branch_version_sort_value_checked(key)?;
             print_branch_list_version_sorted(store, BranchListMode::Local, descending)
         }
         [no_sort, sort, key]
@@ -5686,7 +5686,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectname_sort_value(key).is_some() =>
         {
             let descending =
-                branch_objectname_sort_value(key).expect("guard checked branch sort value");
+                branch_objectname_sort_value_checked(key)?;
             print_branch_list_objectname_sorted(store, BranchListMode::Local, descending)
         }
         [no_sort, sort, key]
@@ -5695,7 +5695,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objecttype_sort_value(key).is_some() =>
         {
             let descending =
-                branch_objecttype_sort_value(key).expect("guard checked branch sort value");
+                branch_objecttype_sort_value_checked(key)?;
             print_branch_list_objecttype_sorted(
                 git_dir,
                 format,
@@ -5710,7 +5710,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_objectsize_sort_value(key).is_some() =>
         {
             let descending =
-                branch_objectsize_sort_value(key).expect("guard checked branch sort value");
+                branch_objectsize_sort_value_checked(key)?;
             print_branch_list_objectsize_sorted(
                 git_dir,
                 format,
@@ -5725,7 +5725,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_date_sort_value(key).is_some() =>
         {
             let (field, descending) =
-                branch_date_sort_value(key).expect("guard checked branch sort value");
+                branch_date_sort_value_checked(key)?;
             print_branch_list_date_sorted(
                 git_dir,
                 format,
@@ -5741,7 +5741,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && branch_upstream_sort_value(key).is_some() =>
         {
             let descending =
-                branch_upstream_sort_value(key).expect("guard checked branch sort value");
+                branch_upstream_sort_value_checked(key)?;
             print_branch_list_upstream_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [no_sort, sort, key]
@@ -5749,7 +5749,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 && sort == "--sort"
                 && branch_push_sort_value(key).is_some() =>
         {
-            let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
+            let descending = branch_push_sort_value_checked(key)?;
             print_branch_list_push_sorted(git_dir, store, BranchListMode::Local, descending)
         }
         [no_sort, sort, key] if no_sort == "--no-sort" && sort == "--sort" && key == "-refname" => {
@@ -6268,9 +6268,7 @@ fn parse_branch_general_list_options(
                 saw_list_control = true;
             }
             value if value.starts_with("--sort=") => {
-                let value = value
-                    .strip_prefix("--sort=")
-                    .expect("prefix checked by match guard");
+                let value = branch_strip_prefix(value, "--sort=")?;
                 sort = Some(branch_sort_from_key(
                     git_dir,
                     repository_object_format(git_dir)?,
@@ -6369,12 +6367,7 @@ fn parse_branch_format_list_options(
                 format_spec = Some(value.to_string());
             }
             value if value.starts_with("--format=") => {
-                format_spec = Some(
-                    value
-                        .strip_prefix("--format=")
-                        .expect("prefix checked by match guard")
-                        .to_string(),
-                );
+                format_spec = Some(branch_strip_prefix(value, "--format=")?.to_string());
             }
             "--sort" => {
                 idx += 1;
@@ -6384,9 +6377,7 @@ fn parse_branch_format_list_options(
                 sort = Some(branch_sort_from_key(git_dir, format, value)?);
             }
             value if value.starts_with("--sort=") => {
-                let value = value
-                    .strip_prefix("--sort=")
-                    .expect("prefix checked by match guard");
+                let value = branch_strip_prefix(value, "--sort=")?;
                 sort = Some(branch_sort_from_key(git_dir, format, value)?);
             }
             "--no-sort" => sort = None,
@@ -6413,31 +6404,29 @@ fn branch_sort_from_key(git_dir: &Path, format: ObjectFormat, key: &str) -> Resu
         "refname" => Ok(BranchSort::Refname(false)),
         "-refname" => Ok(BranchSort::Refname(true)),
         value if branch_version_sort_value(value).is_some() => Ok(BranchSort::Version(
-            branch_version_sort_value(value).expect("checked branch version sort"),
+            branch_version_sort_value_checked(value)?,
         )),
         value if branch_objectname_sort_value(value).is_some() => Ok(BranchSort::ObjectName(
-            branch_objectname_sort_value(value).expect("checked branch objectname sort"),
+            branch_objectname_sort_value_checked(value)?,
         )),
         value if branch_objecttype_sort_value(value).is_some() => Ok(BranchSort::ObjectType(
-            branch_objecttype_sort_value(value).expect("checked branch objecttype sort"),
+            branch_objecttype_sort_value_checked(value)?,
         )),
         value if branch_objectsize_sort_value(value).is_some() => Ok(BranchSort::ObjectSize(
-            branch_objectsize_sort_value(value).expect("checked branch objectsize sort"),
+            branch_objectsize_sort_value_checked(value)?,
         )),
         value if branch_date_sort_value(value).is_some() => {
-            let (field, descending) =
-                branch_date_sort_value(value).expect("checked branch date sort");
+            let (field, descending) = branch_date_sort_value_checked(value)?;
             Ok(BranchSort::Date(field, descending))
         }
         value if branch_upstream_sort_value(value).is_some() => Ok(BranchSort::Upstream(
-            branch_upstream_sort_value(value).expect("checked branch upstream sort"),
+            branch_upstream_sort_value_checked(value)?,
         )),
-        value if branch_push_sort_value(value).is_some() => Ok(BranchSort::Push(
-            branch_push_sort_value(value).expect("checked branch push sort"),
-        )),
+        value if branch_push_sort_value(value).is_some() => {
+            Ok(BranchSort::Push(branch_push_sort_value_checked(value)?))
+        }
         value if branch_ahead_behind_sort_value(value).is_some() => {
-            let (rev, descending) =
-                branch_ahead_behind_sort_value(value).expect("checked ahead-behind sort");
+            let (rev, descending) = branch_ahead_behind_sort_value_checked(value)?;
             let oid = resolve_revision(git_dir, format, rev)?;
             Ok(BranchSort::AheadBehind(oid, descending))
         }
@@ -6522,9 +6511,7 @@ fn parse_branch_verbose_list_options(args: &[String]) -> Result<Option<BranchVer
             "--abbrev" => abbrev = None,
             "--no-abbrev" => abbrev = Some(None),
             value if value.starts_with("--abbrev=") => {
-                let value = value
-                    .strip_prefix("--abbrev=")
-                    .expect("prefix checked by match guard");
+                let value = branch_strip_prefix(value, "--abbrev=")?;
                 let width = value
                     .parse::<usize>()
                     .map_err(|_| GitError::Command(format!("invalid abbrev length {value}")))?;
@@ -7865,9 +7852,9 @@ fn validate_branch_creation_name(branch: &str) -> Result<String> {
         print_branch_ref_syntax_hint();
         return Err(GitError::Exit(128));
     }
-    match branch_ref_name(branch)
-        .and_then(|refname| sley::plumbing::sley_refs::check_refname_format(&refname, false).map(|()| refname))
-    {
+    match branch_ref_name(branch).and_then(|refname| {
+        sley::plumbing::sley_refs::check_refname_format(&refname, false).map(|()| refname)
+    }) {
         Ok(refname) => Ok(refname),
         Err(GitError::InvalidPath(_)) => {
             eprintln!("fatal: '{branch}' is not a valid branch name");
@@ -7987,8 +7974,10 @@ fn branch_checked_out_worktree_path(
     _store: &FileRefStore,
     refname: &str,
 ) -> Result<Option<String>> {
-    Ok(sley::plumbing::sley_worktree::find_shared_symref(git_dir, "HEAD", refname)?
-        .map(|worktree| worktree.path.to_string_lossy().into_owned()))
+    Ok(
+        sley::plumbing::sley_worktree::find_shared_symref(git_dir, "HEAD", refname)?
+            .map(|worktree| worktree.path.to_string_lossy().into_owned()),
+    )
 }
 
 fn force_delete_branches(
@@ -8270,7 +8259,10 @@ enum BranchListMode {
     All,
 }
 
-fn branch_refs_for_mode(store: &FileRefStore, mode: BranchListMode) -> Result<Vec<sley::plumbing::sley_refs::Ref>> {
+fn branch_refs_for_mode(
+    store: &FileRefStore,
+    mode: BranchListMode,
+) -> Result<Vec<sley::plumbing::sley_refs::Ref>> {
     match mode {
         BranchListMode::Local => store.list_refs_with_prefix("refs/heads/"),
         BranchListMode::Remote => store.list_refs_with_prefix("refs/remotes/"),
@@ -9034,6 +9026,10 @@ fn branch_omit_empty_value(value: &str) -> Option<bool> {
     }
 }
 
+fn branch_omit_empty_value_checked(value: &str) -> Result<bool> {
+    branch_checked_option(value, "omit-empty flag", branch_omit_empty_value(value))
+}
+
 fn branch_list_noop_display_flag(value: &str) -> bool {
     branch_color_noop_flag(value)
         || branch_column_noop_flag(value)
@@ -9062,6 +9058,26 @@ fn branch_remote_or_all_mode(value: &str) -> Option<BranchListMode> {
     }
 }
 
+fn branch_checked_option<T>(value: &str, kind: &str, option: Option<T>) -> Result<T> {
+    option.ok_or_else(|| {
+        GitError::Command(format!(
+            "internal branch parser mismatch for {kind}: {value}"
+        ))
+    })
+}
+
+fn branch_strip_prefix<'a>(value: &'a str, prefix: &str) -> Result<&'a str> {
+    value.strip_prefix(prefix).ok_or_else(|| {
+        GitError::Command(format!(
+            "internal branch parser mismatch for prefix {prefix}: {value}"
+        ))
+    })
+}
+
+fn branch_remote_or_all_mode_checked(value: &str) -> Result<BranchListMode> {
+    branch_checked_option(value, "branch mode", branch_remote_or_all_mode(value))
+}
+
 fn branch_column_noop_flag(value: &str) -> bool {
     matches!(
         value,
@@ -9085,12 +9101,24 @@ fn branch_version_sort_value(value: &str) -> Option<bool> {
     }
 }
 
+fn branch_version_sort_value_checked(value: &str) -> Result<bool> {
+    branch_checked_option(value, "version sort", branch_version_sort_value(value))
+}
+
 fn branch_objectname_sort_value(value: &str) -> Option<bool> {
     match value {
         "--sort=objectname" | "objectname" => Some(false),
         "--sort=-objectname" | "-objectname" => Some(true),
         _ => None,
     }
+}
+
+fn branch_objectname_sort_value_checked(value: &str) -> Result<bool> {
+    branch_checked_option(
+        value,
+        "objectname sort",
+        branch_objectname_sort_value(value),
+    )
 }
 
 fn branch_objecttype_sort_value(value: &str) -> Option<bool> {
@@ -9101,12 +9129,28 @@ fn branch_objecttype_sort_value(value: &str) -> Option<bool> {
     }
 }
 
+fn branch_objecttype_sort_value_checked(value: &str) -> Result<bool> {
+    branch_checked_option(
+        value,
+        "objecttype sort",
+        branch_objecttype_sort_value(value),
+    )
+}
+
 fn branch_objectsize_sort_value(value: &str) -> Option<bool> {
     match value {
         "--sort=objectsize" | "objectsize" => Some(false),
         "--sort=-objectsize" | "-objectsize" => Some(true),
         _ => None,
     }
+}
+
+fn branch_objectsize_sort_value_checked(value: &str) -> Result<bool> {
+    branch_checked_option(
+        value,
+        "objectsize sort",
+        branch_objectsize_sort_value(value),
+    )
 }
 
 fn branch_date_sort_value(value: &str) -> Option<(ForEachRefDateSortField, bool)> {
@@ -9125,12 +9169,20 @@ fn branch_date_sort_value(value: &str) -> Option<(ForEachRefDateSortField, bool)
     }
 }
 
+fn branch_date_sort_value_checked(value: &str) -> Result<(ForEachRefDateSortField, bool)> {
+    branch_checked_option(value, "date sort", branch_date_sort_value(value))
+}
+
 fn branch_upstream_sort_value(value: &str) -> Option<bool> {
     match value {
         "--sort=upstream" | "upstream" => Some(false),
         "--sort=-upstream" | "-upstream" => Some(true),
         _ => None,
     }
+}
+
+fn branch_upstream_sort_value_checked(value: &str) -> Result<bool> {
+    branch_checked_option(value, "upstream sort", branch_upstream_sort_value(value))
 }
 
 fn branch_push_sort_value(value: &str) -> Option<bool> {
@@ -9141,11 +9193,23 @@ fn branch_push_sort_value(value: &str) -> Option<bool> {
     }
 }
 
+fn branch_push_sort_value_checked(value: &str) -> Result<bool> {
+    branch_checked_option(value, "push sort", branch_push_sort_value(value))
+}
+
 fn branch_ahead_behind_sort_value(value: &str) -> Option<(&str, bool)> {
     value
         .strip_prefix("ahead-behind:")
         .map(|rev| (rev, false))
         .or_else(|| value.strip_prefix("-ahead-behind:").map(|rev| (rev, true)))
+}
+
+fn branch_ahead_behind_sort_value_checked(value: &str) -> Result<(&str, bool)> {
+    branch_checked_option(
+        value,
+        "ahead-behind sort",
+        branch_ahead_behind_sort_value(value),
+    )
 }
 
 fn branch_non_refname_sort_value(value: &str) -> bool {
@@ -9162,16 +9226,36 @@ fn branch_contains_eq_value(value: &str) -> Option<&str> {
     value.strip_prefix("--contains=")
 }
 
+fn branch_contains_eq_value_checked(value: &str) -> Result<&str> {
+    branch_checked_option(value, "--contains value", branch_contains_eq_value(value))
+}
+
 fn branch_no_contains_eq_value(value: &str) -> Option<&str> {
     value.strip_prefix("--no-contains=")
+}
+
+fn branch_no_contains_eq_value_checked(value: &str) -> Result<&str> {
+    branch_checked_option(
+        value,
+        "--no-contains value",
+        branch_no_contains_eq_value(value),
+    )
 }
 
 fn branch_merged_eq_value(value: &str) -> Option<&str> {
     value.strip_prefix("--merged=")
 }
 
+fn branch_merged_eq_value_checked(value: &str) -> Result<&str> {
+    branch_checked_option(value, "--merged value", branch_merged_eq_value(value))
+}
+
 fn branch_no_merged_eq_value(value: &str) -> Option<&str> {
     value.strip_prefix("--no-merged=")
+}
+
+fn branch_no_merged_eq_value_checked(value: &str) -> Result<&str> {
+    branch_checked_option(value, "--no-merged value", branch_no_merged_eq_value(value))
 }
 
 fn print_branch_list_format(
@@ -9710,7 +9794,10 @@ fn print_branch_list_filtered_upstream_sorted_with_color(
     print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
 }
 
-fn branch_ref_upstream_sort_key(config: &GitConfig, reference: &sley::plumbing::sley_refs::Ref) -> String {
+fn branch_ref_upstream_sort_key(
+    config: &GitConfig,
+    reference: &sley::plumbing::sley_refs::Ref,
+) -> String {
     for_each_ref_upstream(config, &reference.name)
         .map(|upstream| upstream.refname)
         .unwrap_or_default()
@@ -9740,7 +9827,10 @@ fn print_branch_list_filtered_push_sorted_with_color(
     print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
 }
 
-fn branch_ref_push_sort_key(config: &GitConfig, reference: &sley::plumbing::sley_refs::Ref) -> String {
+fn branch_ref_push_sort_key(
+    config: &GitConfig,
+    reference: &sley::plumbing::sley_refs::Ref,
+) -> String {
     for_each_ref_push(config, &reference.name)
         .and_then(|push| push.refname)
         .unwrap_or_default()
@@ -10004,7 +10094,11 @@ fn remote_symbolic_ref_is_dangling(
     }
 }
 
-fn remote_branch_display(reference: &sley::plumbing::sley_refs::Ref, name: &str, mode: BranchListMode) -> String {
+fn remote_branch_display(
+    reference: &sley::plumbing::sley_refs::Ref,
+    name: &str,
+    mode: BranchListMode,
+) -> String {
     let display = if matches!(mode, BranchListMode::All) {
         format!("remotes/{name}")
     } else {
@@ -10151,7 +10245,7 @@ fn print_branch_list_verbose(
             ' '
         };
         let mut tracking =
-            branch_verbose_tracking(row.upstream.as_ref(), row.upstream_track, options.verbosity);
+            branch_verbose_tracking(row.upstream.as_ref(), row.upstream_track, options.verbosity)?;
         if options.verbosity >= 2
             && !row.is_head
             && let Some(worktree_path) = &row.worktree_path
@@ -10216,25 +10310,25 @@ fn branch_verbose_tracking(
     upstream: Option<&ForEachRefUpstream>,
     track: Option<ForEachRefTrack>,
     verbosity: usize,
-) -> String {
+) -> Result<String> {
     match (verbosity, upstream, track) {
-        (0, _, _) => String::new(),
+        (0, _, _) => Ok(String::new()),
         (1, _, Some(track)) if track.gone || track.ahead > 0 || track.behind > 0 => {
             let mut out = Vec::new();
-            write_for_each_ref_track(&mut out, track, true).expect("write to vec");
-            format!(" {}", String::from_utf8_lossy(&out))
+            write_for_each_ref_track(&mut out, track, true)?;
+            Ok(format!(" {}", String::from_utf8_lossy(&out)))
         }
-        (1, _, _) => String::new(),
+        (1, _, _) => Ok(String::new()),
         (_, Some(upstream), Some(track)) if track.gone || track.ahead > 0 || track.behind > 0 => {
             let mut out = Vec::new();
-            write_for_each_ref_track(&mut out, track, false).expect("write to vec");
-            format!(
+            write_for_each_ref_track(&mut out, track, false)?;
+            Ok(format!(
                 " [{}: {}]",
                 for_each_ref_short_name(&upstream.refname),
                 String::from_utf8_lossy(&out)
-            )
+            ))
         }
-        (_, Some(upstream), _) => format!(" [{}]", for_each_ref_short_name(&upstream.refname)),
-        (_, None, _) => String::new(),
+        (_, Some(upstream), _) => Ok(format!(" [{}]", for_each_ref_short_name(&upstream.refname))),
+        (_, None, _) => Ok(String::new()),
     }
 }

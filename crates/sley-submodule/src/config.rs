@@ -259,11 +259,9 @@ impl SubmoduleConfigSet {
 /// caller); we index it back out so each arm can mutate in place and push
 /// warnings onto `set.warnings`.
 fn parse_config(set: &mut SubmoduleConfigSet, name: &str, item: &str, value: Option<&str>) {
-    let index = set
-        .submodules
-        .iter()
-        .position(|sub| sub.name == name)
-        .expect("submodule created before parse_config dispatch");
+    let Some(index) = set.submodules.iter().position(|sub| sub.name == name) else {
+        return;
+    };
 
     match item {
         "path" => {

@@ -1278,7 +1278,7 @@ fn build_changes(tagged: &[TaggedLine<'_>]) -> Vec<Change> {
             match tagged[idx].kind {
                 LineKind::Delete => chg1 += 1,
                 LineKind::Insert => chg2 += 1,
-                LineKind::Context => unreachable!(),
+                LineKind::Context => {}
             }
             idx += 1;
         }
@@ -1650,13 +1650,12 @@ fn mark_color_as_moved(tagged: &[TaggedLine<'_>], color_moved: ColorMoved) -> Ve
             continue;
         }
 
-        pmb_advance_or_null(
-            &mut pmb,
-            &entries,
-            tagged,
-            line_entry.expect("plus/minus line has move-detection entry"),
-            color_moved.ws,
-        );
+        let Some(line_entry) = line_entry else {
+            moved_symbol = None;
+            n += 1;
+            continue;
+        };
+        pmb_advance_or_null(&mut pmb, &entries, tagged, line_entry, color_moved.ws);
 
         if pmb.is_empty() {
             let contiguous =

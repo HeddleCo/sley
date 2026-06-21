@@ -209,10 +209,9 @@ fn decode_tree_entry<'a>(
     }
     // The terminating NUL is guaranteed to exist within bounds by the size check
     // above (the byte before the hash is a NUL), so this find always succeeds.
-    let nul_rel = buf[name_start..]
-        .iter()
-        .position(|&b| b == 0)
-        .expect("tree entry name is NUL-terminated by the size precondition");
+    let Some(nul_rel) = buf[name_start..].iter().position(|&b| b == 0) else {
+        return Err("too-short tree object");
+    };
     let name = &buf[name_start..name_start + nul_rel];
     let oid_start = name_start + nul_rel + 1;
     let oid_end = oid_start + hashsz;
@@ -782,10 +781,14 @@ fn verify_headers(body: &[u8], reporter: &mut FsckReporter) -> i32 {
 /// below are bounded by it just as git relies on. Every ident message id is
 /// ERROR severity, so a reported problem returns 1.
 fn fsck_ident<'a>(ident: &'a [u8], reporter: &mut FsckReporter) -> (i32, &'a [u8]) {
-    let nl = ident
-        .iter()
-        .position(|&b| b == b'\n')
-        .expect("verify_headers guarantees a terminating newline");
+    let Some(nl) = ident.iter().position(|&b| b == b'\n') else {
+        let r = reporter.report(
+            Severity::Error,
+            "unterminatedHeader",
+            "unterminated header",
+        );
+        return (r, &ident[ident.len()..]);
+    };
     // git advances `*ident = nl + 1` regardless of outcome.
     let after = &ident[nl + 1..];
     let end = ident.len();

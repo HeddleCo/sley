@@ -1150,9 +1150,10 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         None => upstream_name.clone(),
     };
     let onto = if args.root && args.onto_name.is_none() {
-        squash_onto.expect("created squash-onto for --root")
-    } else if onto_name.contains("...") {
-        let (left, right) = onto_name.split_once("...").expect("contains ...");
+        squash_onto.ok_or_else(|| {
+            GitError::Command("internal error: missing squash-onto for --root rebase".into())
+        })?
+    } else if let Some((left, right)) = onto_name.split_once("...") {
         let left_oid = resolve_revision(
             &ctx.git_dir,
             ctx.format,
@@ -1965,7 +1966,11 @@ fn make_script_commits(
         sorted.push(oid);
         if let Some(kids) = children.get(&oid) {
             for kid in kids.clone() {
-                let deg = indegree.get_mut(&kid).expect("child has indegree");
+                let Some(deg) = indegree.get_mut(&kid) else {
+                    return Err(GitError::Command(format!(
+                        "internal error: missing indegree for child commit {kid}"
+                    )));
+                };
                 *deg -= 1;
                 if *deg == 0 {
                     ready.push(kid);
@@ -1975,7 +1980,11 @@ fn make_script_commits(
     }
     let mut out = Vec::new();
     for oid in sorted {
-        let record = records.remove(&oid).expect("record collected");
+        let Some(record) = records.remove(&oid) else {
+            return Err(GitError::Command(format!(
+                "internal error: sorted commit {oid} was not collected"
+            )));
+        };
         if record.parents.len() > 1 {
             continue; // skip merge commits
         }
@@ -2091,7 +2100,11 @@ fn make_script_with_merges(
         sorted.push(oid);
         if let Some(kids) = children.get(&oid) {
             for kid in kids.clone() {
-                let deg = indegree.get_mut(&kid).expect("child has indegree");
+                let Some(deg) = indegree.get_mut(&kid) else {
+                    return Err(GitError::Command(format!(
+                        "internal error: missing indegree for child commit {kid}"
+                    )));
+                };
                 *deg -= 1;
                 if *deg == 0 {
                     ready.push(kid);
@@ -2108,7 +2121,11 @@ fn make_script_with_merges(
     let mut tips = Vec::new();
 
     for oid in &sorted {
-        let record = records.get(oid).expect("sorted record exists");
+        let Some(record) = records.get(oid) else {
+            return Err(GitError::Command(format!(
+                "internal error: sorted commit {oid} was not collected"
+            )));
+        };
         let parent_tree = match record.parents.first() {
             Some(parent) => commit_tree_oid(db, ctx.format, parent)?,
             None => ObjectId::empty_tree(ctx.format),
@@ -2176,7 +2193,11 @@ fn make_script_with_merges(
 
     let mut child_seen = std::collections::HashSet::new();
     for oid in &sorted {
-        let record = records.get(oid).expect("sorted record exists");
+        let Some(record) = records.get(oid) else {
+            return Err(GitError::Command(format!(
+                "internal error: sorted commit {oid} was not collected"
+            )));
+        };
         for parent in &record.parents {
             if !records.contains_key(parent) {
                 continue;
@@ -2224,7 +2245,11 @@ fn make_script_with_merges(
                 break Some(current);
             }
             list.push(current);
-            let record = records.get(&current).expect("record exists");
+            let Some(record) = records.get(&current) else {
+                return Err(GitError::Command(format!(
+                    "internal error: commit {current} disappeared from rebase script records"
+                )));
+            };
             let Some(parent) = record.parents.first().copied() else {
                 break None;
             };
@@ -2460,9 +2485,12 @@ fn rearrange_squash(
         if item.oid.is_none() || item.command == TodoCommand::Drop {
             continue;
         }
+        let Some(oid) = item.oid else {
+            continue;
+        };
         // The subject is read off the commit, not the (potentially custom)
         // instruction-format arg.
-        let record = read_rev_list_commit_record(db, ctx.format, item.oid.expect("checked"))?;
+        let record = read_rev_list_commit_record(db, ctx.format, oid)?;
         let subject = format_commit_subject(&record.commit);
         subjects[i] = Some(subject.clone());
 
@@ -2522,7 +2550,7 @@ fn rearrange_squash(
         } else {
             subject2item.entry(subject).or_insert(i);
         }
-        commit2item.insert(item.oid.expect("checked"), i);
+        commit2item.insert(oid, i);
     }
 
     if !rearranged {
@@ -3802,7 +3830,9 @@ fn pick_one_commit(
     todo: &mut TodoList,
     item: &RebaseTodoItem,
 ) -> Result<PickOutcome> {
-    let oid = item.oid.expect("pick-like commands carry a commit");
+    let oid = item.oid.ok_or_else(|| {
+        GitError::Command("internal error: pick-like todo command did not carry a commit".into())
+    })?;
     let record = read_rev_list_commit_record(db, ctx.format, oid)?;
     let refs = ctx.refs();
     let head =
@@ -4133,13 +4163,13 @@ fn pick_one_commit(
     }
 
     if item.command == TodoCommand::Edit {
-        let new_head = head_commit_oid(&ctx.refs())?.expect("just committed");
+        let _new_head = head_commit_oid(&ctx.refs())?
+            .ok_or_else(|| GitError::Command("cannot read HEAD after commit".into()))?;
         eprintln!(
             "Stopped at {}...  {}",
             find_unique_abbrev_hex(ctx, db, &oid),
             item.arg
         );
-        let _ = new_head;
         return stop_with_patch(ctx, db, opts, &record, item, 0, true);
     }
 

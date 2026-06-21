@@ -386,7 +386,7 @@ impl RepositoryContext {
             return Ok(7.min(format.hex_len()));
         }
         let bits = usize::BITS as usize - count.saturating_sub(1).leading_zeros() as usize;
-        Ok(((bits + 1) / 2).max(7).min(format.hex_len()))
+        Ok(bits.div_ceil(2).max(7).min(format.hex_len()))
     }
 
     pub fn replace_objects(&self) -> bool {

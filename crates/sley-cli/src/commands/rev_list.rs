@@ -795,13 +795,12 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         // `commit <oid>` header). The plain-oid fast path below still gates on
         // `abbrev_commit`.
         let effective_abbrev_len = abbrev_len;
-        let mut line =
-            metadata_format.map(|compiled| Vec::with_capacity(compiled.estimated_line_capacity()));
+        let mut line = match metadata_format {
+            Some(compiled) => Vec::with_capacity(compiled.estimated_line_capacity()),
+            None => Vec::new(),
+        };
         for record in &selected {
             if let Some(compiled) = metadata_format {
-                let line = line
-                    .as_mut()
-                    .expect("metadata line buffer initialized with metadata format");
                 line.clear();
                 emit_compiled_log_format_metadata(
                     record,
@@ -821,9 +820,9 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         mailmap: &mailmap,
                         use_mailmap,
                     },
-                    line,
+                    &mut line,
                 )?;
-                stdout.write_all(line)?;
+                stdout.write_all(&line)?;
                 if parents && !compiled.uses_parents() {
                     for parent in &record.parents {
                         write!(stdout, " {parent}")?;
@@ -1218,7 +1217,9 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                     }
                     if oneline {
                         let RevListPretty::Compiled { compiled, .. } = &pretty else {
-                            unreachable!("oneline requires compiled preset");
+                            return Err(GitError::Command(
+                                "rev-list --oneline requires compiled pretty output".into(),
+                            ));
                         };
                         let format_context = LogFormatContext {
                             abbrev_len: abbrev_commit.then_some(abbrev_len).flatten(),
@@ -1871,7 +1872,9 @@ fn write_rev_list_boundary_record(
             }
             if oneline {
                 let RevListPretty::Compiled { compiled, .. } = pretty else {
-                    unreachable!("oneline requires compiled preset");
+                    return Err(GitError::Command(
+                        "rev-list --oneline requires compiled pretty output".into(),
+                    ));
                 };
                 print!("-");
                 print_log_format(
@@ -2248,7 +2251,9 @@ impl RevListObjectFilter {
                 }
                 Ok(true)
             }
-            Self::SparseOid(_) => unreachable!("sparse:oid filter must be resolved before use"),
+            Self::SparseOid(_) => Err(GitError::Command(
+                "sparse:oid filter must be resolved before use".into(),
+            )),
         }
     }
 }
@@ -3104,7 +3109,11 @@ fn rev_list_bitmap_apply_filter(
         // Excluded by the eligibility allowlist.
         RevListObjectFilter::TreeDepth(_)
         | RevListObjectFilter::SparseOid(_)
-        | RevListObjectFilter::Sparse(_) => unreachable!("unsupported filters fall back"),
+        | RevListObjectFilter::Sparse(_) => {
+            return Err(GitError::Command(
+                "unsupported rev-list bitmap filter reached bitmap path".into(),
+            ));
+        }
     }
     Ok(())
 }

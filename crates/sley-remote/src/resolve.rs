@@ -44,13 +44,13 @@ pub fn transport_kind_for_url(url: &str) -> Result<Option<RemoteTransportKind>> 
 /// the repository working tree, or the parent of `.git` for a bare repo).
 pub fn fetch_source_for_url(url: &str, relative_base: &Path) -> Result<FetchSource> {
     let parsed = parse_remote_url(url)?;
-    source_from_parsed(&parsed, relative_base).map(FetchSource::from_concrete)
+    FetchSource::from_concrete(source_from_parsed(&parsed, relative_base)?)
 }
 
 /// Build a [`PushDestination`] from a resolved URL.
 pub fn push_destination_for_url(url: &str, relative_base: &Path) -> Result<PushDestination> {
     let parsed = parse_remote_url(url)?;
-    source_from_parsed(&parsed, relative_base).map(PushDestination::from_concrete)
+    PushDestination::from_concrete(source_from_parsed(&parsed, relative_base)?)
 }
 
 /// Resolve fetch URL rewriting and transport source in one step.
@@ -84,48 +84,48 @@ enum ConcreteRemote {
 }
 
 impl FetchSource {
-    fn from_concrete(source: ConcreteRemote) -> Self {
+    fn from_concrete(source: ConcreteRemote) -> Result<Self> {
         match source {
             ConcreteRemote::Network(remote) => match remote.transport {
-                RemoteTransport::Http | RemoteTransport::Https => Self::Http(remote),
-                RemoteTransport::Ssh | RemoteTransport::Ext => Self::Ssh(remote),
-                RemoteTransport::Git => Self::Git {
+                RemoteTransport::Http | RemoteTransport::Https => Ok(Self::Http(remote)),
+                RemoteTransport::Ssh | RemoteTransport::Ext => Ok(Self::Ssh(remote)),
+                RemoteTransport::Git => Ok(Self::Git {
                     remote,
                     protocol_v2: false,
-                },
-                RemoteTransport::Local | RemoteTransport::File => {
-                    unreachable!("local remotes use FetchSource::Local")
-                }
+                }),
+                RemoteTransport::Local | RemoteTransport::File => Err(GitError::Command(
+                    "local transport reached network fetch source".into(),
+                )),
             },
             ConcreteRemote::Local {
                 git_dir,
                 common_git_dir,
-            } => Self::Local {
+            } => Ok(Self::Local {
                 git_dir,
                 common_git_dir,
-            },
+            }),
         }
     }
 }
 
 impl PushDestination {
-    fn from_concrete(source: ConcreteRemote) -> Self {
+    fn from_concrete(source: ConcreteRemote) -> Result<Self> {
         match source {
             ConcreteRemote::Network(remote) => match remote.transport {
-                RemoteTransport::Http | RemoteTransport::Https => Self::Http(remote),
-                RemoteTransport::Ssh | RemoteTransport::Ext => Self::Ssh(remote),
-                RemoteTransport::Git => Self::Git(remote),
-                RemoteTransport::Local | RemoteTransport::File => {
-                    unreachable!("local remotes use PushDestination::Local")
-                }
+                RemoteTransport::Http | RemoteTransport::Https => Ok(Self::Http(remote)),
+                RemoteTransport::Ssh | RemoteTransport::Ext => Ok(Self::Ssh(remote)),
+                RemoteTransport::Git => Ok(Self::Git(remote)),
+                RemoteTransport::Local | RemoteTransport::File => Err(GitError::Command(
+                    "local transport reached network push destination".into(),
+                )),
             },
             ConcreteRemote::Local {
                 git_dir,
                 common_git_dir,
-            } => Self::Local {
+            } => Ok(Self::Local {
                 git_dir,
                 common_git_dir,
-            },
+            }),
         }
     }
 }

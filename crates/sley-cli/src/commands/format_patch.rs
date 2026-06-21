@@ -786,9 +786,11 @@ fn build_cover_letter(
 
     // The tip (newest) commit anchors the mbox `From <oid>` separator; the
     // boundary (parent of the oldest) anchors the cumulative diffstat.
-    let head = commits
-        .last()
-        .expect("cover letter requires at least one commit");
+    let Some(head) = commits.last() else {
+        return Err(GitError::Command(
+            "cover letter requires at least one commit".into(),
+        ));
+    };
     out.extend_from_slice(b"From ");
     if resolved.zero_commit {
         out.extend_from_slice("0".repeat(format.hex_len()).as_bytes());
@@ -4088,7 +4090,7 @@ fn writeln_buf(out: &mut Vec<u8>, text: &str) {
 }
 
 fn write_fmt_buf(out: &mut Vec<u8>, args: std::fmt::Arguments<'_>) {
-    std::io::Write::write_fmt(out, args).expect("writing to Vec cannot fail");
+    let _ = std::io::Write::write_fmt(out, args);
 }
 
 fn writeln_fmt_buf(out: &mut Vec<u8>, args: std::fmt::Arguments<'_>) {

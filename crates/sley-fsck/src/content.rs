@@ -616,12 +616,17 @@ fn is_digit(b: u8) -> bool {
 /// finding or `None` if the ident is well-formed. On success advances nothing
 /// (the caller re-derives the next line).
 fn fsck_ident(body: &[u8], start: usize) -> Result<usize, ContentFinding> {
-    // verify_headers guarantees a newline exists from here.
-    let nl = body[start..]
+    let Some(nl) = body[start..]
         .iter()
         .position(|&b| b == b'\n')
         .map(|off| start + off)
-        .expect("verify_headers guarantees a newline");
+    else {
+        return Err(finding(
+            MsgId::UnterminatedHeader,
+            "unterminated header",
+            true,
+        ));
+    };
     let next = nl + 1;
     let line_end = nl; // exclusive end of the ident value (the '\n')
 

@@ -273,7 +273,7 @@ impl CompiledFuncname {
             .get(1)
             .copied()
             .flatten()
-            .unwrap_or_else(|| captures[0].expect("whole-match span present"));
+            .or_else(|| captures.first().copied().flatten())?;
         let heading = &line[start..end];
         let mut result = heading.len().min(FUNCNAME_BUFFER);
         while result > 0 && heading[result - 1].is_ascii_whitespace() {

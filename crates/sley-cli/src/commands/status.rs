@@ -1105,9 +1105,9 @@ fn lazy_submodule_ignore_resolver<'a>(
             ignore_submodules_arg,
         )?);
     }
-    Ok(resolver
-        .as_ref()
-        .expect("submodule ignore resolver initialized"))
+    resolver.as_ref().ok_or_else(|| {
+        GitError::Command("submodule ignore resolver was not initialized".into())
+    })
 }
 
 fn status_option_takes_no_value_error(option: &str) -> Result<()> {
@@ -1130,7 +1130,7 @@ fn parse_status_untracked_mode(value: &str) -> Result<sley::plumbing::sley_workt
         "no" | "false" | "off" | "0" | "" => Ok(sley::plumbing::sley_worktree::StatusUntrackedMode::None),
         other => {
             status_invalid_untracked_files_mode_error(other)?;
-            unreachable!()
+            Err(GitError::Exit(128))
         }
     }
 }
@@ -1774,8 +1774,6 @@ fn render_one_submodule(
     old_oid: Option<ObjectId>,
     new_oid: Option<ObjectId>,
 ) -> Result<Option<String>> {
-    use std::fmt::Write as _;
-
     let Ok(path_str) = std::str::from_utf8(path) else {
         return Ok(None);
     };
@@ -1851,7 +1849,11 @@ fn render_one_submodule(
         marked.len()
     };
     for (marker, subject) in marked.iter().take(shown) {
-        writeln!(body, "  {marker} {subject}").expect("writing to String cannot fail");
+        body.push_str("  ");
+        body.push(*marker);
+        body.push(' ');
+        body.push_str(subject);
+        body.push('\n');
     }
     Ok(Some(body))
 }

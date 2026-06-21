@@ -911,9 +911,11 @@ impl ConfigStack {
     /// Append the command-line/environment injection layer (`-c`,
     /// `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`): scope `command`, origin
     /// `command line:`, one event per parameter in order.
-    pub fn push_parameters(&mut self, parameters: &[ConfigParameter]) {
+    pub fn push_parameters(&mut self, parameters: &[ConfigParameter]) -> Result<()> {
         for param in parameters {
-            let (section, subsection, key) = param.split_key();
+            let (section, subsection, key) = param
+                .split_key()
+                .map_err(|err| GitError::InvalidFormat(err.message()))?;
             self.entries.push(ConfigStackEntry {
                 section: section.to_string(),
                 subsection: subsection.map(str::to_string),
@@ -924,6 +926,7 @@ impl ConfigStack {
                 included_from: None,
             });
         }
+        Ok(())
     }
 
     /// The last (highest-precedence) entry for the key, including value-less
@@ -1553,7 +1556,9 @@ impl<'a> ConfigParser<'a> {
                     }
                 }
                 Some('#') | Some(';') => {
-                    let sigil = self.bump().expect("peeked comment sigil");
+                    let Some(sigil) = self.bump() else {
+                        break;
+                    };
                     pending_preamble.push(ConfigPreambleLine::Comment {
                         sigil,
                         text: self.parse_comment_text(),
@@ -1700,7 +1705,10 @@ impl<'a> ConfigParser<'a> {
     fn parse_entry(&mut self) -> Result<ConfigEntry> {
         let mut indent = String::new();
         while matches!(self.peek(), Some(' ') | Some('\t')) {
-            indent.push(self.bump().expect("peeked whitespace"));
+            let Some(ch) = self.bump() else {
+                break;
+            };
+            indent.push(ch);
         }
         if indent.is_empty() {
             indent.push('\t');
@@ -2085,15 +2093,22 @@ impl ConfigParameter {
     /// [`GitConfig`] indexes entries. The split is on the first and last `.`:
     /// section before the first dot, key after the last dot, subsection (if any)
     /// in between. The key is guaranteed valid because it was canonicalised.
-    pub fn split_key(&self) -> (&str, Option<&str>, &str) {
+    pub fn split_key(
+        &self,
+    ) -> std::result::Result<(&str, Option<&str>, &str), ConfigParameterError> {
         let first = self
             .canonical_key
             .find('.')
-            .expect("canonical key has a section");
+            .ok_or_else(|| ConfigParameterError::NoSection(self.canonical_key.clone()))?;
         let last = self
             .canonical_key
             .rfind('.')
-            .expect("canonical key has a key");
+            .ok_or_else(|| ConfigParameterError::NoVariableName(self.canonical_key.clone()))?;
+        if last + 1 == self.canonical_key.len() {
+            return Err(ConfigParameterError::NoVariableName(
+                self.canonical_key.clone(),
+            ));
+        }
         let section = &self.canonical_key[..first];
         let key = &self.canonical_key[last + 1..];
         let subsection = if first == last {
@@ -2101,7 +2116,7 @@ impl ConfigParameter {
         } else {
             Some(&self.canonical_key[first + 1..last])
         };
-        (section, subsection, key)
+        Ok((section, subsection, key))
     }
 }
 
@@ -2201,7 +2216,7 @@ pub fn canonicalize_config_key(key: &str) -> std::result::Result<String, ConfigP
         }
         out.push(c);
     }
-    Ok(String::from_utf8(out).expect("ascii-lowercased valid utf-8 stays valid utf-8"))
+    String::from_utf8(out).map_err(|_| ConfigParameterError::InvalidKey(key.to_string()))
 }
 
 /// Parse a single `key[=value]` parameter (git's `git_config_parse_parameter`,
@@ -2283,8 +2298,10 @@ fn sq_dequote_step(bytes: &[u8], pos: usize) -> Option<(String, usize)> {
                 // which case the escaped char is emitted and quoting resumes.
                 let escaped = bytes.get(src + 1).copied();
                 let resumes = bytes.get(src + 2).copied() == Some(b'\'');
-                if matches!(escaped, Some(b'\'') | Some(b'!')) && resumes {
-                    out.push(escaped.expect("escaped byte present"));
+                if let Some(escaped @ (b'\'' | b'!')) = escaped
+                    && resumes
+                {
+                    out.push(escaped);
                     src += 2; // src now indexes the resuming quote; loop pre-incs past it
                     continue;
                 }
@@ -2467,16 +2484,18 @@ pub fn injected_config_parameters(
 /// appending to a [`GitConfig`] at the end (highest precedence). Each parameter
 /// becomes its own one-entry section so duplicate keys and `--get-all`/`--list`
 /// ordering match git's "each `-c` is a distinct config event" semantics.
-pub fn injected_config_sections(parameters: &[ConfigParameter]) -> Vec<ConfigSection> {
+pub fn injected_config_sections(
+    parameters: &[ConfigParameter],
+) -> std::result::Result<Vec<ConfigSection>, ConfigParameterError> {
     parameters
         .iter()
         .map(|param| {
-            let (section, subsection, key) = param.split_key();
-            ConfigSection::new(
+            let (section, subsection, key) = param.split_key()?;
+            Ok(ConfigSection::new(
                 section.to_string(),
                 subsection.map(str::to_string),
                 vec![ConfigEntry::new(key.to_string(), param.value.clone())],
-            )
+            ))
         })
         .collect()
 }
@@ -2495,10 +2514,12 @@ pub fn append_injected_config_sections_with_includes(
     context: &ConfigIncludeContext,
     base_dir: &Path,
 ) -> Result<()> {
+    let sections = injected_config_sections(parameters)
+        .map_err(|err| GitError::InvalidFormat(err.message()))?;
     let injected = GitConfig {
         preamble: Vec::new(),
         suffix: Vec::new(),
-        sections: injected_config_sections(parameters),
+        sections,
     };
     splice_includes(&injected, base_dir, context, 0, false, &mut config.sections)
 }
@@ -2756,19 +2777,19 @@ mod tests {
             canonical_key: "a.b c.d".to_string(),
             value: Some("v".to_string()),
         };
-        assert_eq!(p.split_key(), ("a", Some("b c"), "d"));
+        assert_eq!(p.split_key(), Ok(("a", Some("b c"), "d")));
         let p = ConfigParameter {
             canonical_key: "foo.bar".to_string(),
             value: None,
         };
-        assert_eq!(p.split_key(), ("foo", None, "bar"));
+        assert_eq!(p.split_key(), Ok(("foo", None, "bar")));
         let p = ConfigParameter {
             canonical_key: "key.ambiguous=section.whatever".to_string(),
             value: Some("value".to_string()),
         };
         assert_eq!(
             p.split_key(),
-            ("key", Some("ambiguous=section"), "whatever")
+            Ok(("key", Some("ambiguous=section"), "whatever"))
         );
     }
 
@@ -2877,7 +2898,9 @@ mod tests {
             },
         ];
         let mut config = GitConfig::default();
-        config.sections.extend(injected_config_sections(&params));
+        config
+            .sections
+            .extend(injected_config_sections(&params).unwrap());
         // Last one wins, case-insensitive on section + variable.
         assert_eq!(config.get("sec", None, "VAR"), Some("VAL"));
         // Both values are preserved for --get-all in order.

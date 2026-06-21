@@ -2329,7 +2329,9 @@ fn parse_clone_config_override(value: &str) -> Result<GlobalConfigOverride> {
 fn clone_reject_shallow_config(config_overrides: &[GlobalConfigOverride]) -> Result<Option<bool>> {
     let mut resolved = None;
     for parameter in crate::injected_config_parameters()? {
-        let (section, subsection, key) = parameter.split_key();
+        let (section, subsection, key) = parameter
+            .split_key()
+            .map_err(crate::report_config_parameter_error)?;
         if section == "clone" && subsection.is_none() && key == "rejectshallow" {
             let value = parameter.value.as_deref().unwrap_or("true");
             resolved = sley::plumbing::sley_config::parse_config_bool(value);
@@ -3671,7 +3673,12 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     }
     if fetch_multiple {
         let mut names = Vec::new();
-        names.push(source.take().unwrap());
+        let Some(source) = source.take() else {
+            return Err(GitError::Command(
+                "fetch --multiple requires a remote or group name".into(),
+            ));
+        };
+        names.push(source);
         names.extend(refspecs.drain(..));
         let remotes = resolve_remote_or_group_names(&config, &names)?;
         fetch_multiple_remotes(FetchMultipleRequest {
@@ -7478,11 +7485,11 @@ fn explicit_push_refspecs_with_refmap(
         .map(|refspec| {
             let upstream_ref = if configured_push.is_empty()
                 && matches!(push_default_mode(config), PushDefaultMode::Upstream)
-                && branch.is_some()
-                && explicit_refspec_uses_upstream_refmap(store, branch.unwrap(), refspec)
-                && default_fetch_remote_for_branch(config, branch.unwrap()) == remote
+                && let Some(branch) = branch
+                && explicit_refspec_uses_upstream_refmap(store, branch, refspec)
+                && default_fetch_remote_for_branch(config, branch) == remote
             {
-                Some(push_upstream_ref(config, branch.unwrap(), remote, false)?)
+                Some(push_upstream_ref(config, branch, remote, false)?)
             } else {
                 None
             };
@@ -7644,7 +7651,11 @@ to update which remote branch."
             dst = push_upstream_ref(config, branch, remote, auto_setup)?;
         }
         PushDefaultMode::Current => {}
-        PushDefaultMode::Matching | PushDefaultMode::Nothing => unreachable!(),
+        PushDefaultMode::Matching | PushDefaultMode::Nothing => {
+            return Err(GitError::Command(
+                "push.default mode does not produce a single default refspec".into(),
+            ));
+        }
     }
 
     if auto_setup && config.get_all("branch", Some(branch), "merge").is_empty() {
@@ -8853,7 +8864,11 @@ fn validate_ls_remote_sort_context(sort: Option<LsRemoteSort>) -> Result<Option<
         }
         Some(LsRemoteSort::TaggerDate | LsRemoteSort::TaggerDateDescending) => "taggerdate",
         Some(LsRemoteSort::CreatorDate | LsRemoteSort::CreatorDateDescending) => "creatordate",
-        _ => unreachable!("guard checked object-data sort"),
+        _ => {
+            return Err(GitError::Command(
+                "ls-remote sort does not require local object data".into(),
+            ));
+        }
     };
     if let Ok(git_dir) = discover_git_dir(env::current_dir()?) {
         return Ok(Some(git_dir));
@@ -9170,8 +9185,12 @@ fn sort_ls_remote_records(
             | LsRemoteSort::CreatorDate
             | LsRemoteSort::CreatorDateDescending
     ) {
+        let Some(local_git_dir) = local_git_dir else {
+            eprintln!("fatal: sort field requires access to local object data");
+            return Err(GitError::Exit(128));
+        };
         Some(FileObjectDatabase::from_git_dir(
-            local_git_dir.expect("object-data sort validated local git dir"),
+            local_git_dir,
             format,
         ))
     } else {
@@ -9270,7 +9289,10 @@ fn ls_remote_sort_key(
             Ok(LsRemoteSortKey::Text(record.oid.to_hex()))
         }
         LsRemoteSort::ObjectType | LsRemoteSort::ObjectTypeDescending => {
-            let db = local_db.expect("objecttype sort requires local db");
+            let Some(db) = local_db else {
+                eprintln!("fatal: sort field requires access to local object data");
+                return Err(GitError::Exit(128));
+            };
             let object = db.read_object(&record.oid).map_err(|_| {
                 eprintln!("fatal: missing object {} for {}", record.oid, record.name);
                 GitError::Exit(128)
@@ -9280,7 +9302,10 @@ fn ls_remote_sort_key(
             ))
         }
         LsRemoteSort::ObjectSize | LsRemoteSort::ObjectSizeDescending => {
-            let db = local_db.expect("objectsize sort requires local db");
+            let Some(db) = local_db else {
+                eprintln!("fatal: sort field requires access to local object data");
+                return Err(GitError::Exit(128));
+            };
             let object = db.read_object(&record.oid).map_err(|_| {
                 eprintln!("fatal: missing object {} for {}", record.oid, record.name);
                 GitError::Exit(128)
@@ -9288,7 +9313,10 @@ fn ls_remote_sort_key(
             Ok(LsRemoteSortKey::Number(object.body.len() as i128))
         }
         LsRemoteSort::ObjectSizeDisk | LsRemoteSort::ObjectSizeDiskDescending => {
-            let git_dir = local_git_dir.expect("objectsize:disk sort requires local git dir");
+            let Some(git_dir) = local_git_dir else {
+                eprintln!("fatal: sort field requires access to local object data");
+                return Err(GitError::Exit(128));
+            };
             let storage = cat_file_object_storage(git_dir, record.oid.format(), &record.oid)
                 .map_err(|_| {
                     eprintln!("fatal: missing object {} for {}", record.oid, record.name);
@@ -9316,7 +9344,10 @@ fn ls_remote_date_sort_key(
     local_db: Option<&FileObjectDatabase>,
     field: ForEachRefDateSortField,
 ) -> Result<LsRemoteSortKey> {
-    let db = local_db.expect("date sort requires local db");
+    let Some(db) = local_db else {
+        eprintln!("fatal: sort field requires access to local object data");
+        return Err(GitError::Exit(128));
+    };
     let object = db.read_object(&record.oid).map_err(|_| {
         eprintln!("fatal: missing object {} for {}", record.oid, record.name);
         GitError::Exit(128)
@@ -10423,7 +10454,11 @@ pub(crate) fn cmd_remote_set_head(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
-    let branch = branch.expect("branch action requires branch");
+    let Some(branch) = branch else {
+        return Err(GitError::Command(
+            "remote set-head branch action requires a branch".into(),
+        ));
+    };
     validate_remote_branch_name(branch)?;
     let target = format!("refs/remotes/{name}/{branch}");
     if store.read_ref(&target)?.is_none() {

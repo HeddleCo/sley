@@ -244,9 +244,8 @@ where
                     self.setup.options.max_count = Some(parse_max_count(value)?);
                 }
                 value if value.starts_with("--max-count=") => {
-                    self.setup.options.max_count = Some(parse_max_count(
-                        value.strip_prefix("--max-count=").expect("prefix matched"),
-                    )?);
+                    self.setup.options.max_count =
+                        Some(parse_max_count(&value["--max-count=".len()..])?);
                 }
                 "--skip" => {
                     let value = iter
@@ -255,26 +254,23 @@ where
                     self.setup.options.skip = parse_skip(value)?;
                 }
                 value if value.starts_with("--skip=") => {
-                    self.setup.options.skip =
-                        parse_skip(value.strip_prefix("--skip=").expect("prefix matched"))?;
+                    self.setup.options.skip = parse_skip(&value["--skip=".len()..])?;
                 }
                 "--max-age" => {
                     let value = iter.next().ok_or_else(max_age_requires_value_error)?;
                     self.setup.options.date_window.min_time = Some(parse_timestamp(value)?);
                 }
                 value if value.starts_with("--max-age=") => {
-                    self.setup.options.date_window.min_time = Some(parse_timestamp(
-                        value.strip_prefix("--max-age=").expect("prefix matched"),
-                    )?);
+                    self.setup.options.date_window.min_time =
+                        Some(parse_timestamp(&value["--max-age=".len()..])?);
                 }
                 "--min-age" => {
                     let value = iter.next().ok_or_else(min_age_requires_value_error)?;
                     self.setup.options.date_window.max_time = Some(parse_timestamp(value)?);
                 }
                 value if value.starts_with("--min-age=") => {
-                    self.setup.options.date_window.max_time = Some(parse_timestamp(
-                        value.strip_prefix("--min-age=").expect("prefix matched"),
-                    )?);
+                    self.setup.options.date_window.max_time =
+                        Some(parse_timestamp(&value["--min-age=".len()..])?);
                 }
                 "--since" | "--after" => {
                     let value = iter
@@ -283,14 +279,12 @@ where
                     self.setup.options.date_window.min_time = Some(parse_date_cutoff(value)?);
                 }
                 value if value.starts_with("--since=") => {
-                    self.setup.options.date_window.min_time = Some(parse_date_cutoff(
-                        value.strip_prefix("--since=").expect("prefix matched"),
-                    )?);
+                    self.setup.options.date_window.min_time =
+                        Some(parse_date_cutoff(&value["--since=".len()..])?);
                 }
                 value if value.starts_with("--after=") => {
-                    self.setup.options.date_window.min_time = Some(parse_date_cutoff(
-                        value.strip_prefix("--after=").expect("prefix matched"),
-                    )?);
+                    self.setup.options.date_window.min_time =
+                        Some(parse_date_cutoff(&value["--after=".len()..])?);
                 }
                 "--until" | "--before" => {
                     let value = iter
@@ -299,14 +293,12 @@ where
                     self.setup.options.date_window.max_time = Some(parse_date_cutoff(value)?);
                 }
                 value if value.starts_with("--until=") => {
-                    self.setup.options.date_window.max_time = Some(parse_date_cutoff(
-                        value.strip_prefix("--until=").expect("prefix matched"),
-                    )?);
+                    self.setup.options.date_window.max_time =
+                        Some(parse_date_cutoff(&value["--until=".len()..])?);
                 }
                 value if value.starts_with("--before=") => {
-                    self.setup.options.date_window.max_time = Some(parse_date_cutoff(
-                        value.strip_prefix("--before=").expect("prefix matched"),
-                    )?);
+                    self.setup.options.date_window.max_time =
+                        Some(parse_date_cutoff(&value["--before=".len()..])?);
                 }
                 "--author" => {
                     let value = iter
@@ -380,9 +372,7 @@ where
                 }
                 value if value.starts_with("--exclude-hidden=") => {
                     self.set_pending_hidden(parse_exclude_hidden(
-                        value
-                            .strip_prefix("--exclude-hidden=")
-                            .expect("prefix matched"),
+                        &value["--exclude-hidden=".len()..],
                     )?)?;
                 }
                 value if value.starts_with('-') => self.setup.leftovers.push(value.to_string()),

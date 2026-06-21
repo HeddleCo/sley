@@ -330,7 +330,11 @@ fn build_git_replay_plan(ctx: &ReplayCtx, parsed: GitReplayArgs) -> Result<GitRe
     };
     let (action, base, default_target, old_oid, reflog_message) = match mode {
         ReplayModeKind::Onto => {
-            let onto = parsed.onto.as_ref().expect("--onto mode has value");
+            let Some(onto) = parsed.onto.as_ref() else {
+                return Err(GitError::Command(
+                    "replay --onto mode is missing its value".into(),
+                ));
+            };
             let base = resolve_revision(&ctx.git_dir, ctx.format, onto).map_err(|_| {
                 eprintln!("fatal: '{onto}' is not a valid commit-ish for --onto");
                 GitError::Exit(128)
@@ -346,7 +350,11 @@ fn build_git_replay_plan(ctx: &ReplayCtx, parsed: GitReplayArgs) -> Result<GitRe
             )
         }
         ReplayModeKind::Advance => {
-            let advance = parsed.advance.as_ref().expect("--advance mode has value");
+            let Some(advance) = parsed.advance.as_ref() else {
+                return Err(GitError::Command(
+                    "replay --advance mode is missing its value".into(),
+                ));
+            };
             let target = replay_existing_ref(&refs, advance, "--advance")?;
             let old_oid = read_direct_ref(&refs, ctx.format, &target)?;
             let Some(base) = old_oid else {
@@ -362,7 +370,11 @@ fn build_git_replay_plan(ctx: &ReplayCtx, parsed: GitReplayArgs) -> Result<GitRe
             )
         }
         ReplayModeKind::Revert => {
-            let revert = parsed.revert.as_ref().expect("--revert mode has value");
+            let Some(revert) = parsed.revert.as_ref() else {
+                return Err(GitError::Command(
+                    "replay --revert mode is missing its value".into(),
+                ));
+            };
             let target = replay_existing_ref(&refs, revert, "--revert")?;
             let old_oid = read_direct_ref(&refs, ctx.format, &target)?;
             let Some(base) = old_oid else {

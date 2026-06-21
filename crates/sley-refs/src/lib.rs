@@ -3782,9 +3782,9 @@ fn coalesce_ref_changes(changes: Vec<QueuedRefChange>) -> Result<Vec<CoalescedRe
     if !has_delete {
         let updates = changes
             .into_iter()
-            .map(|change| match change {
-                QueuedRefChange::Update(update) => update,
-                QueuedRefChange::Delete(_) => unreachable!("has_delete was false"),
+            .filter_map(|change| match change {
+                QueuedRefChange::Update(update) => Some(update),
+                QueuedRefChange::Delete(_) => None,
             })
             .collect::<Vec<_>>();
         return coalesce_ref_updates(updates).map(|updates| {

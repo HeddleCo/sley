@@ -561,15 +561,18 @@ fn log_cached_mailmap<'a>(
     if cache.is_none() {
         *cache = Some(commands::utility::Mailmap::load_default(git_dir, format)?);
     }
-    Ok(cache.as_ref().expect("mailmap cache was just initialized"))
+    let Some(mailmap) = cache.as_ref() else {
+        return Err(GitError::Command("mailmap cache was not initialized".into()));
+    };
+    Ok(mailmap)
 }
 
 fn render_log_raw_pretty(record: &sley::plumbing::sley_rev::CommitRecord) -> Vec<u8> {
     let mut out = Vec::new();
-    writeln!(out, "commit {}", record.oid).expect("write to Vec cannot fail");
-    writeln!(out, "tree {}", record.commit.tree).expect("write to Vec cannot fail");
+    let _ = writeln!(out, "commit {}", record.oid);
+    let _ = writeln!(out, "tree {}", record.commit.tree);
     for parent in &record.parents {
-        writeln!(out, "parent {parent}").expect("write to Vec cannot fail");
+        let _ = writeln!(out, "parent {parent}");
     }
     out.extend_from_slice(b"author ");
     out.extend_from_slice(&record.commit.author);
@@ -2078,7 +2081,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     needle.clone().into_bytes()
                 },
             }),
-            PickaxeSpec::FindObject(_) => unreachable!("find-object handled above"),
+            PickaxeSpec::FindObject(_) => {
+                return Err(GitError::Command(
+                    "find-object pickaxe was not compiled before log traversal".into(),
+                ));
+            }
         }
     } else {
         None
@@ -2518,7 +2525,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 suppress_extra_final_newline,
                 ..
             } => (compiled, *final_newline, *suppress_extra_final_newline),
-            _ => unreachable!("metadata fast path requires compiled output"),
+            _ => {
+                return Err(GitError::Command(
+                    "metadata fast path requires compiled log output".into(),
+                ));
+            }
         };
         let stdout = io::stdout();
         let mut stdout = io::BufWriter::new(stdout.lock());
@@ -2596,7 +2607,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 suppress_extra_final_newline,
                 ..
             } => (compiled, *final_newline, *suppress_extra_final_newline),
-            _ => unreachable!("limited commit fast path requires compiled output"),
+            _ => {
+                return Err(GitError::Command(
+                    "limited commit fast path requires compiled log output".into(),
+                ));
+            }
         };
         let mut stdout = io::stdout();
         let term: &[u8] = if null_terminate { b"\0" } else { b"\n" };
@@ -2627,7 +2642,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         if skip > 0 {
             selected = selected.into_iter().skip(skip).collect();
         }
-        selected.truncate(max_count.expect("limited log path requires max-count"));
+        let Some(max_count) = max_count else {
+            return Err(GitError::Command(
+                "limited log path requires max-count".into(),
+            ));
+        };
+        selected.truncate(max_count);
         if reverse {
             selected.reverse();
         }
@@ -3226,7 +3246,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     for (index, record) in selected.iter().enumerate() {
         match output {
             LogOutput::Default(kind) => {
-                let out = default_out.as_mut().expect("default output buffer");
+                let Some(out) = default_out.as_mut() else {
+                    return Err(GitError::Command("default log output was not initialized".into()));
+                };
                 let separate_parent_count = log_diff
                     .as_ref()
                     .and_then(|log_diff| log_diff.separate_parent_count(record));

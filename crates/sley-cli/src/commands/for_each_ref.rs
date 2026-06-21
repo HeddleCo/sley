@@ -88,10 +88,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
     while idx < args.len() {
         match args[idx].as_str() {
             value if value.starts_with("--format=") => {
-                format_spec = value
-                    .strip_prefix("--format=")
-                    .expect("prefix checked by match guard")
-                    .to_string();
+                format_spec = value["--format=".len()..].to_string();
             }
             "--format" => {
                 idx += 1;
@@ -137,9 +134,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             }
             "--no-count" => count = None,
             value if value.starts_with("--count=") => {
-                let value = value
-                    .strip_prefix("--count=")
-                    .expect("prefix checked by match guard");
+                let value = &value["--count=".len()..];
                 count = Some(parse_for_each_ref_count(value)?);
             }
             "--sort" => {
@@ -155,9 +150,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
                 sort_explicit = false;
             }
             value if value.starts_with("--sort=") => {
-                let value = value
-                    .strip_prefix("--sort=")
-                    .expect("prefix checked by match guard");
+                let value = &value["--sort=".len()..];
                 sorts.push(parse_for_each_ref_sort(value)?);
                 sort_explicit = true;
             }
@@ -170,9 +163,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             }
             "--no-start-after" => start_after = None,
             value if value.starts_with("--start-after=") => {
-                let value = value
-                    .strip_prefix("--start-after=")
-                    .expect("prefix checked by match guard");
+                let value = &value["--start-after=".len()..];
                 start_after = Some(value.to_string());
             }
             "--exclude" => {
@@ -184,9 +175,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             }
             "--no-exclude" => excludes.clear(),
             value if value.starts_with("--exclude=") => {
-                let value = value
-                    .strip_prefix("--exclude=")
-                    .expect("prefix checked by match guard");
+                let value = &value["--exclude=".len()..];
                 excludes.push(value.to_string());
             }
             "--points-at" => {
@@ -197,9 +186,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
                 points_at_revs.push(value.to_string());
             }
             value if value.starts_with("--points-at=") => {
-                let value = value
-                    .strip_prefix("--points-at=")
-                    .expect("prefix checked by match guard");
+                let value = &value["--points-at=".len()..];
                 points_at_revs.push(value.to_string());
             }
             "--contains" => {
@@ -211,9 +198,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
                 }
             }
             value if value.starts_with("--contains=") => {
-                let value = value
-                    .strip_prefix("--contains=")
-                    .expect("prefix checked by match guard");
+                let value = &value["--contains=".len()..];
                 contains_revs.push(value.to_string());
             }
             "--no-contains" => {
@@ -225,9 +210,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
                 }
             }
             value if value.starts_with("--no-contains=") => {
-                let value = value
-                    .strip_prefix("--no-contains=")
-                    .expect("prefix checked by match guard");
+                let value = &value["--no-contains=".len()..];
                 no_contains_revs.push(value.to_string());
             }
             "--merged" => {
@@ -239,9 +222,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
                 }
             }
             value if value.starts_with("--merged=") => {
-                let value = value
-                    .strip_prefix("--merged=")
-                    .expect("prefix checked by match guard");
+                let value = &value["--merged=".len()..];
                 merged_filter = Some((value.to_string(), true));
             }
             "--no-merged" => {
@@ -253,9 +234,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
                 }
             }
             value if value.starts_with("--no-merged=") => {
-                let value = value
-                    .strip_prefix("--no-merged=")
-                    .expect("prefix checked by match guard");
+                let value = &value["--no-merged=".len()..];
                 merged_filter = Some((value.to_string(), false));
             }
             value if value.starts_with('-') => {

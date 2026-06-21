@@ -2398,7 +2398,12 @@ impl Bundle {
         match self.version {
             2 => out.extend_from_slice(b"# v2 git bundle\n"),
             3 => out.extend_from_slice(b"# v3 git bundle\n"),
-            _ => unreachable!(),
+            _ => {
+                return Err(GitError::InvalidFormat(format!(
+                    "unsupported bundle version {}",
+                    self.version
+                )));
+            }
         }
         if self.version == 3 {
             let mut wrote_object_format = false;

@@ -170,7 +170,11 @@ pub(crate) fn repo_rerere(
             }
             continue;
         };
-        let hash = hash.expect("hash requested");
+        let Some(hash) = hash else {
+            return Err(GitError::InvalidFormat(
+                "rerere conflict hash was not computed".into(),
+            ));
+        };
         let hash_hex = hash.to_hex();
         let entry_pos = if let Some(pos) = rr
             .iter()

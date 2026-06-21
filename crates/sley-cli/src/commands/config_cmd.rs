@@ -789,7 +789,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         // the structured document path.
         match action {
             ConfigAction::Set => {
-                let key = key.expect("validated config key");
+                let key = require_config_key(key)?;
                 // git's ACTION_SET: with no value-pattern, refuse if the key is
                 // already multi-valued (CONFIG_NOTHING_SET → "cannot overwrite
                 // multiple values with a single value").
@@ -802,7 +802,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             ConfigAction::SetAll => {
                 // git's ACTION_SET_ALL: legacy `<key> <value> <value-pattern>` —
                 // single replace with a value-pattern (no multi-replace flag).
-                let key = key.expect("validated config key");
+                let key = require_config_key(key)?;
                 let value = normalize_set_value(&key, positional[1], value_type)?;
                 let pred = value_pattern_filter.map(filter_predicate);
                 if !config_raw_edit(
@@ -818,7 +818,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 }
             }
             ConfigAction::ReplaceAll => {
-                let key = key.expect("validated config key");
+                let key = require_config_key(key)?;
                 let value = normalize_set_value(&key, positional[1], value_type)?;
                 let pred = value_pattern_filter.map(filter_predicate);
                 // --replace-all: multi-replace; never errors on multiple matches.
@@ -832,7 +832,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 )?;
             }
             ConfigAction::Add => {
-                let key = key.expect("validated config key");
+                let key = require_config_key(key)?;
                 let value = normalize_set_value(&key, positional[1], value_type)?;
                 // git's ACTION_ADD: set_multivar with CONFIG_REGEX_NONE — a
                 // pattern that matches nothing, so it always appends a new line.
@@ -847,14 +847,14 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 )?;
             }
             ConfigAction::Unset => {
-                let key = key.expect("validated config key");
+                let key = require_config_key(key)?;
                 let pred = value_pattern_filter.map(filter_predicate);
                 if !config_raw_edit(&source, &key, None, None, pred.as_deref(), false)? {
                     return Err(GitError::Exit(5));
                 }
             }
             ConfigAction::UnsetAll => {
-                let key = key.expect("validated config key");
+                let key = require_config_key(key)?;
                 let pred = value_pattern_filter.map(filter_predicate);
                 if !config_raw_edit(&source, &key, None, None, pred.as_deref(), true)? {
                     return Err(GitError::Exit(5));
@@ -866,7 +866,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             ConfigAction::RemoveSection => {
                 config_rename_or_remove_section(&source, positional[0], None)?;
             }
-            _ => unreachable!("write actions handled above"),
+            _ => return Err(GitError::Command("config write action dispatch failed".into())),
         }
         return Ok(());
     }
@@ -884,7 +884,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     if matches!(source, ConfigSource::Repository(_)) {
         let parameters = crate::injected_config_parameters()?;
         let mut stack = sley::plumbing::sley_config::ConfigStack { entries };
-        stack.push_parameters(&parameters);
+        stack.push_parameters(&parameters)?;
         entries = stack.entries;
     }
     let entries = entries;
@@ -922,7 +922,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         let get_key = if subcommand_get_regexp {
             SubcommandGetKey::Regexp(SimpleConfigRegex::parse(positional[0]))
         } else {
-            SubcommandGetKey::Exact(key.expect("validated config key"))
+            SubcommandGetKey::Exact(require_config_key(key)?)
         };
         let value_filter = subcommand_value_pattern
             .as_deref()
@@ -961,7 +961,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             }
         }
         ConfigAction::Get => {
-            let key = key.expect("validated config key");
+            let key = require_config_key(key)?;
             // Classic `--get <name> <value-pattern>` filters the (possibly
             // multi-valued) key by value and returns the last surviving match,
             // exactly as git's shared `get_value` collector does. Without a
@@ -1134,7 +1134,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             }
         }
         ConfigAction::GetAll => {
-            let key = key.expect("validated config key");
+            let key = require_config_key(key)?;
             // Classic `--get-all <name> <value-pattern>` filters every value of
             // the key by the pattern (git's shared `get_value` with the "all"
             // flag set). Without a pattern, list every value directly.
@@ -1206,7 +1206,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 return Err(GitError::Exit(1));
             }
         }
-        _ => unreachable!("write actions handled above"),
+        _ => return Err(GitError::Command("config read action dispatch failed".into())),
     }
     Ok(())
 }
@@ -2337,6 +2337,10 @@ pub(crate) fn parse_config_key(value: &str) -> Result<ConfigKey> {
         subsection,
         key,
     })
+}
+
+fn require_config_key(key: Option<ConfigKey>) -> Result<ConfigKey> {
+    key.ok_or_else(|| GitError::Command("config action requires a key".into()))
 }
 
 fn parse_config_urlmatch_target(value: &str) -> Result<ConfigUrlMatchTarget> {

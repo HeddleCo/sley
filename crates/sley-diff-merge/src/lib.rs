@@ -6995,7 +6995,9 @@ fn plan_rehome(
             });
             continue;
         }
-        moves.push(group.into_iter().next().expect("non-empty"));
+        if let Some(planned_move) = group.into_iter().next() {
+            moves.push(planned_move);
+        }
     }
     moves
 }

@@ -2339,9 +2339,9 @@ fn current_branch_short_name(refs: &FileRefStore) -> Result<Option<String>> {
 pub(crate) fn effective_config_with_overrides() -> Option<GitConfig> {
     let mut config = identity_effective_config()?;
     if let Ok(parameters) = crate::injected_config_parameters() {
-        config
-            .sections
-            .extend(sley::plumbing::sley_config::injected_config_sections(&parameters));
+        if let Ok(sections) = sley::plumbing::sley_config::injected_config_sections(&parameters) {
+            config.sections.extend(sections);
+        }
     }
     Some(config)
 }

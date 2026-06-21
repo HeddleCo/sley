@@ -583,7 +583,12 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                         b'i' => ignored = true,
                         b't' => tag = true,
                         b'z' => nul = true,
-                        _ => unreachable!("ls-files short-option group was filtered"),
+                        _ => {
+                            return Err(GitError::Command(format!(
+                                "unknown ls-files option -{}",
+                                char::from(option)
+                            )));
+                        }
                     }
                 }
             }
@@ -1648,9 +1653,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                 allow_no_input = true;
             }
             value if value.starts_with("--index-version=") => {
-                let value = value
-                    .strip_prefix("--index-version=")
-                    .expect("prefix checked by match guard");
+                let value = &value["--index-version=".len()..];
                 index_version = Some(parse_update_index_version(value)?);
                 allow_no_input = true;
             }
@@ -1751,9 +1754,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                 chmod = Some(parse_update_index_chmod(value)?);
             }
             value if value.starts_with("--chmod=") => {
-                let value = value
-                    .strip_prefix("--chmod=")
-                    .expect("prefix checked by match guard");
+                let value = &value["--chmod=".len()..];
                 chmod = Some(parse_update_index_chmod(value)?);
             }
             "--cacheinfo" => {
@@ -1779,9 +1780,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                 }
             }
             value if value.starts_with("--cacheinfo=") => {
-                let value = value
-                    .strip_prefix("--cacheinfo=")
-                    .expect("prefix checked by match guard");
+                let value = &value["--cacheinfo=".len()..];
                 cacheinfo.push(parse_update_index_cacheinfo_tuple(value)?);
             }
             "-h" | "--help" => return update_index_usage_help(),

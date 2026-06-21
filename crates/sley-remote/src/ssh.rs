@@ -233,7 +233,11 @@ fn parse_remote_ext_arg<'a>(
     let arg = match special {
         Some(b'G') => RemoteExtArg::GitRequest(expanded),
         Some(b'V') => RemoteExtArg::GitRequestVhost(expanded),
-        Some(_) => unreachable!("validated remote-ext special"),
+        Some(_) => {
+            return Err(GitError::InvalidFormat(
+                "invalid remote-ext special argument".into(),
+            ));
+        }
         None => RemoteExtArg::Arg(expanded),
     };
     Ok((arg, next))

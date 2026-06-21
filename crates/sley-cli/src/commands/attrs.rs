@@ -398,7 +398,9 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
     let attr_tree_config = repo.config().get("attr", None, "tree").map(str::to_string);
     let source_tree = if let Some(source) = attr_source.as_deref() {
         let Some(oid) = resolve_attr_source_or_die(&repo, source, false)? else {
-            unreachable!("explicit attr source resolution either returns an oid or exits");
+            return Err(GitError::Command(
+                "explicit attr source did not resolve to a tree".into(),
+            ));
         };
         Some(sley::plumbing::sley_rev::peel_to_tree(repo.objects(), format, &oid)?)
     } else if let Some(source) = attr_tree_config.as_deref() {

@@ -344,9 +344,13 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
         && reused_packs.is_empty()
         && let Some(limit) = max_pack_size
     {
-        let base_name = options.base_name.expect("checked above");
+        let Some(base_name) = options.base_name.as_ref() else {
+            return Err(GitError::Command(
+                "pack-objects requires a base name without --stdout".into(),
+            ));
+        };
         let delta_count = write_split_pack_files(
-            &base_name,
+            base_name,
             format,
             &oids,
             &objects,
@@ -415,7 +419,11 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
         }
     };
 
-    let base_name = options.base_name.expect("checked above");
+    let Some(base_name) = options.base_name.as_ref() else {
+        return Err(GitError::Command(
+            "pack-objects requires a base name without --stdout".into(),
+        ));
+    };
     let positions = pack_order_index_positions(&result.entries);
     let reverse_index = PackReverseIndex::write(format, &positions, &result.checksum)?;
 
@@ -962,7 +970,7 @@ impl PackObjectFilter {
             Self::Combine(filters) => filters
                 .iter()
                 .all(|filter| filter.includes_object(object_type, path, size, depth)),
-            Self::SparseOid(_) => unreachable!("sparse:oid filter must be resolved before use"),
+            Self::SparseOid(_) => false,
         }
     }
 
@@ -2132,7 +2140,11 @@ fn write_cruft_pack(
         return Ok(());
     }
 
-    let base_name = base_name.expect("base name required without --stdout");
+    let Some(base_name) = base_name else {
+        return Err(GitError::Command(
+            "pack-objects requires a base name without --stdout".into(),
+        ));
+    };
     fs::write(format!("{base_name}-{checksum_hex}.pack"), &written.pack)?;
     fs::write(format!("{base_name}-{checksum_hex}.rev"), &reverse_index)?;
     fs::write(format!("{base_name}-{checksum_hex}.mtimes"), &mtimes_bytes)?;

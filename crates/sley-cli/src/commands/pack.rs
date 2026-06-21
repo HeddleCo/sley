@@ -67,9 +67,11 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
         .or_else(|| repo.as_ref().map(|(_, format)| *format))
         .unwrap_or(ObjectFormat::Sha1);
     if options.stdin {
-        let (common_git_dir, _) = repo
-            .as_ref()
-            .expect("stdin index-pack requires a repository");
+        let Some((common_git_dir, _)) = repo.as_ref() else {
+            return Err(GitError::Command(
+                "index-pack --stdin requires a repository".into(),
+            ));
+        };
         let common_git_dir = common_git_dir.clone();
         let mut pack = Vec::new();
         io::stdin().read_to_end(&mut pack)?;
@@ -4199,10 +4201,10 @@ impl CountPackedObjectLookup {
                 self.summaries.as_slice(),
             )?);
         }
-        Ok(self
-            .indexes
-            .as_ref()
-            .expect("count pack indexes are loaded")
+        let Some(indexes) = self.indexes.as_ref() else {
+            return Err(GitError::Command("count pack indexes are not loaded".into()));
+        };
+        Ok(indexes
             .iter()
             .any(|index| index.contains(oid)))
     }

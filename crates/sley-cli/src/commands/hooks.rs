@@ -354,14 +354,12 @@ fn hook_config() -> Vec<ScopedSection> {
         }));
     }
     if let Ok(parameters) = crate::injected_config_parameters() {
-        out.extend(
-            sley::plumbing::sley_config::injected_config_sections(&parameters)
-                .into_iter()
-                .map(|section| ScopedSection {
-                    scope: "command",
-                    section,
-                }),
-        );
+        if let Ok(sections) = sley::plumbing::sley_config::injected_config_sections(&parameters) {
+            out.extend(sections.into_iter().map(|section| ScopedSection {
+                scope: "command",
+                section,
+            }));
+        }
     }
     out
 }

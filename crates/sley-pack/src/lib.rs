@@ -557,7 +557,11 @@ impl PackFile {
                     PackObjectKind::Tree => ObjectType::Tree,
                     PackObjectKind::Blob => ObjectType::Blob,
                     PackObjectKind::Tag => ObjectType::Tag,
-                    PackObjectKind::OfsDelta | PackObjectKind::RefDelta => unreachable!(),
+                    PackObjectKind::OfsDelta | PackObjectKind::RefDelta => {
+                        return Err(GitError::InvalidFormat(
+                            "delta pack object was not resolved".into(),
+                        ));
+                    }
                 };
                 let object = EncodedObject::new(object_type, body);
                 let oid = object.object_id(format)?;
@@ -1207,7 +1211,9 @@ impl<'a> PackIndexView<'a> {
             ..
         } = &self.tables
         else {
-            unreachable!("v2 validation only runs for v2 views");
+            return Err(GitError::InvalidFormat(
+                "v2 validation received a non-v2 pack index".into(),
+            ));
         };
         let oid_table = self.slice(oid_table.clone());
         let small_offset_table = self.slice(small_offset_table.clone());
@@ -1232,7 +1238,9 @@ impl<'a> PackIndexView<'a> {
 
     fn validate_v1_entries(&self) -> Result<()> {
         let PackIndexViewTables::V1 { entry_table } = &self.tables else {
-            unreachable!("v1 validation only runs for v1 views");
+            return Err(GitError::InvalidFormat(
+                "v1 validation received a non-v1 pack index".into(),
+            ));
         };
         let entry_table = self.slice(entry_table.clone());
         let hash_len = self.format.raw_len();
@@ -1505,7 +1513,11 @@ impl PackIndex {
                     PackObjectKind::Tree => ObjectType::Tree,
                     PackObjectKind::Blob => ObjectType::Blob,
                     PackObjectKind::Tag => ObjectType::Tag,
-                    PackObjectKind::OfsDelta | PackObjectKind::RefDelta => unreachable!(),
+                    PackObjectKind::OfsDelta | PackObjectKind::RefDelta => {
+                        return Err(GitError::InvalidFormat(
+                            "delta pack object was not resolved".into(),
+                        ));
+                    }
                 };
                 let object = EncodedObject::new(object_type, body);
                 let oid = object.object_id(format)?;

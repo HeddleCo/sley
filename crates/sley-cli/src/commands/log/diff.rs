@@ -244,7 +244,11 @@ impl LogDiffContext<'_> {
                         Some(self.parent_tree(&parents[0])?)
                     }
                     // Handled above.
-                    LogDiffMerges::Combined { .. } => unreachable!(),
+                    LogDiffMerges::Combined { .. } => {
+                        return Err(GitError::Command(
+                            "combined merge diff reached separate diff renderer".into(),
+                        ));
+                    }
                 },
             }
         };

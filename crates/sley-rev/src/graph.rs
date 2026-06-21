@@ -235,7 +235,9 @@ impl Graph {
         self.prev_edges_added = self.edges_added;
         self.edges_added = 0;
 
-        let commit = self.commit.expect("update() must set a commit");
+        let Some(commit) = self.commit else {
+            return;
+        };
         let num_columns = self.columns.len();
         let mut seen_this = false;
         let mut is_commit_in_columns = true;
@@ -355,7 +357,9 @@ impl Graph {
 
     fn output_pre_commit_line(&mut self, line: &mut Line) {
         debug_assert!(self.num_parents >= 3);
-        let commit = self.commit.expect("commit set");
+        let Some(commit) = self.commit else {
+            return;
+        };
 
         let mut seen_this = false;
         for i in 0..self.columns.len() {
@@ -401,7 +405,9 @@ impl Graph {
     }
 
     fn output_commit_line(&mut self, line: &mut Line) {
-        let commit = self.commit.expect("commit set");
+        let Some(commit) = self.commit else {
+            return;
+        };
         let num_columns = self.columns.len();
         let mut seen_this = false;
         for i in 0..=num_columns {
@@ -455,7 +461,9 @@ impl Graph {
     }
 
     fn output_post_merge_line(&mut self, line: &mut Line) {
-        let commit = self.commit.expect("commit set");
+        let Some(commit) = self.commit else {
+            return;
+        };
         let first_parent = self.parents.first().copied();
         let mut parent_col: Option<Column> = None;
         let num_columns = self.columns.len();
@@ -477,9 +485,9 @@ impl Graph {
                 seen_this = true;
                 let mut idx = self.merge_layout;
                 for (j, parent) in self.parents.clone().iter().enumerate() {
-                    let par_column = self
-                        .find_new_column_by_commit(parent)
-                        .expect("parent must be in new_columns");
+                    let Some(par_column) = self.find_new_column_by_commit(parent) else {
+                        continue;
+                    };
                     let par_col = self.new_columns[par_column].clone();
                     let ch = MERGE_CHARS[idx as usize];
                     self.write_column(line, &par_col, ch);
@@ -659,7 +667,9 @@ impl Graph {
             self.next_line(out);
             return;
         }
-        let commit = self.commit.expect("commit set");
+        let Some(commit) = self.commit else {
+            return;
+        };
         let mut line = Line {
             buf: String::new(),
             width: 0,

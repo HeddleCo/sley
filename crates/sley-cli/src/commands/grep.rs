@@ -476,7 +476,9 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         return grep_no_index(&opts, color_config, &positionals, DASHDASH);
     }
 
-    let repo = repo.expect("repository discovery succeeded above");
+    let Some(repo) = repo else {
+        return Err(GitError::Command("grep requires a repository".into()));
+    };
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();

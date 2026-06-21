@@ -1113,7 +1113,7 @@ fn expand_ref_rule(rule: &str, short: &str) -> String {
 /// Strip the prefix/suffix of a rev-parse rule from `refname`, returning the
 /// `%.*s` portion if the rule matches (git's `match_parse_rule`).
 fn match_ref_parse_rule<'a>(refname: &'a str, rule: &str) -> Option<&'a str> {
-    let (prefix, suffix) = rule.split_once("{}").expect("rule contains {}");
+    let (prefix, suffix) = rule.split_once("{}")?;
     refname
         .strip_prefix(prefix)
         .and_then(|rest| rest.strip_suffix(suffix))
