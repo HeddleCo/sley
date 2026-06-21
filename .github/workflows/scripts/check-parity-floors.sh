@@ -911,6 +911,20 @@ declare -A FLOOR=(
     # cargo test --workspace green (0 failed).
     [t1700-split-index.sh]=29
     [t2402-worktree-list.sh]=27
+    # wave-31 (2026-06-21, core probe-picked off main eefcc6ff): ls-remote, mktag, checkout-branch.
+    # t5512-ls-remote 28->40 FULL (implicit-remote selection, From-<url> header, -q/-h, local hideRefs
+    # + override ordering, protocol v0/v2 symref, --symref/--branches, no-such-remote text).
+    # t3800-mktag 131->151 FULL (strict fsck tag-object parse: header order/presence, ident
+    # diagnostics, extra-header severity, object-existence/type checks w/ replace refs, strict/info).
+    # t2018-checkout-branch 16->25 FULL (-b/-B/--track/--orphan, merge-base start, @{-N} expansion,
+    # dirty-checkout rollback, mergeable preservation, no-checkout, exact fatal messages).
+    # No file-level collisions (distinct sley-cli command files + new sley-remote/ls_remote.rs); all 3
+    # re-verified on the MERGED binary. mktag's sley-fsck changes did NOT regress fsck/tag (t1450=96
+    # t7004=229 held). Guards held/gained: t2400=215 t5526=56 t7508=119 t2020=26 t5510=7 t5500=354
+    # t5601=109(floor107) t5516=111(floor110) t1400=275. cargo test --workspace green.
+    [t5512-ls-remote.sh]=40
+    [t3800-mktag.sh]=151
+    [t2018-checkout-branch.sh]=25
 )
 
 fail=0
