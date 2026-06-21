@@ -5790,6 +5790,16 @@ fn update_push_remote_tracking_refs(
         let name = format!("refs/remotes/{remote}/{branch}");
         if command.new_id.is_null() {
             let _ = refs.delete_ref(&name);
+        } else if refs.read_ref(&name)? == Some(RefTarget::Direct(command.new_id)) {
+            let packed_name = name.clone();
+            refs.pack_refs_selected_with_timeout(
+                true,
+                false,
+                0,
+                |candidate| candidate == packed_name,
+                |_, _| Ok(PackRefDecision::Pack { peeled: None }),
+            )?;
+            continue;
         } else {
             tx.update(RefUpdate {
                 name,
@@ -5826,7 +5836,7 @@ fn run_local_receive_pre_hooks(
             ..commands::hooks::HookRun::default()
         },
     )?;
-    for command in push_commands {
+    for command in receive_update_hook_order(push_commands) {
         let _ = commands::hooks::run_traditional_hook_at(
             remote_git_dir,
             "update",
@@ -5878,7 +5888,7 @@ fn run_local_receive_pre_hooks_report(
     {
         return Some(ReceiveHookDecline::PreReceive);
     }
-    for command in push_commands {
+    for command in receive_update_hook_order(push_commands) {
         if commands::hooks::run_traditional_hook_at(
             remote_git_dir,
             "update",
@@ -5899,6 +5909,13 @@ fn run_local_receive_pre_hooks_report(
         }
     }
     None
+}
+
+fn receive_update_hook_order(push_commands: &[ReceivePackCommand]) -> Vec<&ReceivePackCommand> {
+    let mut ordered = Vec::with_capacity(push_commands.len());
+    ordered.extend(push_commands.iter().filter(|command| command.new_id.is_null()));
+    ordered.extend(push_commands.iter().filter(|command| !command.new_id.is_null()));
+    ordered
 }
 
 fn run_local_receive_post_hooks(
@@ -5929,8 +5946,8 @@ fn run_local_receive_post_hooks(
         remote_git_dir,
         "post-update",
         commands::hooks::HookRun {
-            args: push_commands
-                .iter()
+            args: receive_stream_hook_order(push_commands)
+                .into_iter()
                 .map(|command| command.name.clone())
                 .collect(),
             env: push_option_env.clone(),
@@ -5962,11 +5979,21 @@ fn push_option_hook_env(push_options: &[String]) -> Vec<(String, String)> {
 }
 
 fn receive_hook_stdin(push_commands: &[ReceivePackCommand]) -> Vec<u8> {
-    push_commands
+    receive_stream_hook_order(push_commands)
         .iter()
         .map(|command| format!("{} {} {}\n", command.old_id, command.new_id, command.name))
         .collect::<String>()
         .into_bytes()
+}
+
+fn receive_stream_hook_order(push_commands: &[ReceivePackCommand]) -> Vec<&ReceivePackCommand> {
+    let mut existing = push_commands
+        .iter()
+        .filter(|command| !command.old_id.is_null())
+        .collect::<Vec<_>>();
+    existing.sort_by(|left, right| left.name.cmp(&right.name));
+    existing.extend(push_commands.iter().filter(|command| command.old_id.is_null()));
+    existing
 }
 
 fn run_pre_push_hook(
@@ -6085,6 +6112,7 @@ fn push_remote_and_refspecs(
     match positional {
         [] => {
             let config = read_repo_config(git_dir).unwrap_or_default();
+            reject_empty_branch_config(&config)?;
             let branch = store.current_branch()?;
             let remote = default_push_remote(&config, branch.as_deref())?;
             let refspecs = default_push_refspecs(&config, branch.as_deref(), &remote)?;
@@ -6097,6 +6125,7 @@ fn push_remote_and_refspecs(
         }
         [remote] => {
             let config = read_repo_config(git_dir).unwrap_or_default();
+            reject_empty_branch_config(&config)?;
             let branch = store.current_branch()?;
             let refspecs = default_push_refspecs(&config, branch.as_deref(), remote)?;
             Ok(PushRemoteAndRefspecs {
@@ -6108,6 +6137,7 @@ fn push_remote_and_refspecs(
         }
         [remote, refspecs @ ..] => {
             let config = read_repo_config(git_dir).unwrap_or_default();
+            reject_empty_branch_config(&config)?;
             let branch = store.current_branch()?;
             Ok(PushRemoteAndRefspecs {
                 remote: remote.clone(),
@@ -6123,6 +6153,22 @@ fn push_remote_and_refspecs(
             })
         }
     }
+}
+
+fn reject_empty_branch_config(config: &GitConfig) -> Result<()> {
+    for section in &config.sections {
+        if section.name.eq_ignore_ascii_case("branch") && section.subsection.as_deref() == Some("")
+        {
+            let key = section
+                .entries
+                .first()
+                .map(|entry| entry.key.as_str())
+                .unwrap_or("");
+            eprintln!("fatal: bad config variable 'branch..{key}' in file '.git/config'");
+            return Err(GitError::Exit(128));
+        }
+    }
+    Ok(())
 }
 
 fn explicit_push_refspecs_with_refmap(

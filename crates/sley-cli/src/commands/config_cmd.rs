@@ -2321,10 +2321,9 @@ pub(crate) fn parse_config_key(value: &str) -> Result<ConfigKey> {
     }
     let subsection = if parts.len() > 2 {
         let subsection = parts[1..parts.len() - 1].join(".");
-        if subsection.is_empty()
-            || subsection
-                .bytes()
-                .any(|byte| matches!(byte, b'\n' | b'\r' | 0))
+        if subsection
+            .bytes()
+            .any(|byte| matches!(byte, b'\n' | b'\r' | 0))
         {
             eprintln!("error: invalid key: {value}");
             return Err(GitError::Exit(1));

@@ -2960,8 +2960,13 @@ impl FileRefStore {
                 .map(|reference| reference.name)
                 .collect::<BTreeSet<_>>();
             for change in &changes {
-                if let CoalescedRefChange::Update(update) = change {
-                    names.insert(update.name.clone());
+                match change {
+                    CoalescedRefChange::Update(update) => {
+                        names.insert(update.name.clone());
+                    }
+                    CoalescedRefChange::Delete(delete) => {
+                        names.remove(&delete.name);
+                    }
                 }
             }
             Some(names)
@@ -3223,13 +3228,11 @@ impl FileRefStore {
                 rollback_after_apply(&pending, index + 1);
                 return Err(err);
             }
-        }
-
-        for change in &pending {
-            if matches!(change.action, PendingPathAction::Delete) && change.original.is_some() {
-                self.prune_empty_ref_dirs(&change.name);
+            if matches!(pending[index].action, PendingPathAction::Delete) {
+                self.prune_empty_ref_dirs(&pending[index].name);
             }
         }
+
         // Git unlinks logs/refs/<name> (and prunes now-empty log dirs) on delete;
         // do this before appending update reflogs so a delete+recreate in the
         // same direction does not race the new ref's reflog file.
@@ -3658,6 +3661,7 @@ fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::IsADirectory => Ok(None),
         Err(err) => Err(GitError::Io(err.to_string())),
     }
 }
@@ -3682,6 +3686,9 @@ fn stage_pending_change(change: &PendingPathChange) -> Result<()> {
 fn apply_pending_change(change: &PendingPathChange) -> Result<()> {
     match &change.action {
         PendingPathAction::Write { .. } => {
+            if change.path.is_dir() {
+                fs::remove_dir(&change.path).map_err(|err| GitError::Io(err.to_string()))?;
+            }
             fs::rename(&change.lock_path, &change.path).map_err(|err| GitError::Io(err.to_string()))
         }
         PendingPathAction::Delete => {
@@ -3759,6 +3766,9 @@ fn maybe_fail_loose_commit_action(_index: usize) -> Result<()> {
 /// Best-effort atomic restore of `path` to `bytes` during rollback, reusing the
 /// write-to-temp-then-rename dance so a crash mid-rollback cannot truncate a ref.
 fn restore_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     write_locked(path, bytes)
 }
 
@@ -6878,6 +6888,58 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 .read_ref("refs/heads/topic")
                 .expect("test operation should succeed"),
             Some(RefTarget::Direct(new_topic))
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_transaction_allows_deleted_descendant_to_unlock_parent_create() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let old_conflict = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let new_parent = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .expect("test operation should succeed");
+        let mut seed = store.transaction();
+        seed.update(RefUpdate {
+            name: "refs/heads/branch/conflict".into(),
+            expected: None,
+            new: RefTarget::Direct(old_conflict),
+            reflog: None,
+        });
+        seed.commit().expect("test operation should succeed");
+
+        let mut tx = store.transaction();
+        tx.delete_with_precondition(
+            "refs/heads/branch/conflict",
+            RefDeletePrecondition::Direct(Some(old_conflict)),
+            None,
+        );
+        tx.update(RefUpdate {
+            name: "refs/heads/branch".into(),
+            expected: None,
+            new: RefTarget::Direct(new_parent),
+            reflog: None,
+        });
+        tx.commit().expect("test operation should succeed");
+
+        assert_eq!(
+            store
+                .read_ref("refs/heads/branch/conflict")
+                .expect("test operation should succeed"),
+            None
+        );
+        assert_eq!(
+            store
+                .read_ref("refs/heads/branch")
+                .expect("test operation should succeed"),
+            Some(RefTarget::Direct(new_parent))
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }

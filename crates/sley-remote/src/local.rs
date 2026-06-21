@@ -26,9 +26,10 @@ use sley_protocol::{
     PKT_LINE_MAX_PAYLOAD_LEN, ProtocolV2FetchAcknowledgment,
     ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
     ProtocolV2LsRefsRecord, ProtocolV2LsRefsRef, ProtocolV2LsRefsRequest, ProtocolVersion,
-    ReceivePackFeatures, ReceivePackPushRequest, ReceivePackReportStatus, ReceivePackRequest,
-    RefAdvertisement, SideBandChannel, SideBandPacket, TransportHandshake, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackPackfileResponse, UploadPackRawPackfileResponse,
+    ReceivePackCommand, ReceivePackFeatures, ReceivePackPushRequest, ReceivePackReportStatus,
+    ReceivePackRequest, RefAdvertisement, SideBandChannel, SideBandPacket, TransportHandshake,
+    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackPackfileResponse,
+    UploadPackRawPackfileResponse,
     UploadPackRequest, apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
     encode_receive_pack_features, encode_upload_pack_features,
     read_protocol_v2_command_request, read_upload_pack_negotiation_request, read_upload_pack_request,
@@ -36,7 +37,9 @@ use sley_protocol::{
     write_protocol_v2_ls_refs_response, write_upload_pack_negotiation_request,
     write_upload_pack_request,
 };
-use sley_refs::{DeleteRef, FileRefStore, Ref, RefPrecondition, RefTarget, ReflogEntry};
+use sley_refs::{
+    DeleteRef, FileRefStore, Ref, RefDeletePrecondition, RefPrecondition, RefTarget, ReflogEntry,
+};
 
 /// The all-zero object id for `format`, used for the synthetic
 /// `capabilities^{}` advertisement when a repository has no refs.
@@ -207,6 +210,7 @@ pub fn receive_pack_into_local_repository(
 ) -> Result<ReceivePackReportStatus> {
     let remote_store = FileRefStore::new(remote_git_dir, format);
     let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
+    let deletes_applied_with_updates = std::cell::RefCell::new(HashSet::<String>::new());
     apply_receive_pack_push_request(
         &receive_pack_features(format),
         request,
@@ -217,29 +221,23 @@ pub fn receive_pack_into_local_repository(
         |packfile| remote_db.install_raw_pack(packfile).map(|_| ()),
         |oid| remote_db.contains(oid),
         |commands| {
-            let mut tx = remote_store.transaction();
-            let log_updates = receive_pack_log_all_ref_updates(remote_git_dir);
-            for command in commands {
-                let precondition = if command.old_id.is_null() {
-                    RefPrecondition::MustNotExist
-                } else {
-                    RefPrecondition::MustExistAndMatch(RefTarget::Direct(command.old_id))
-                };
-                let reflog = if log_updates && receive_pack_should_write_reflog(&command.name) {
-                    Some(receive_pack_reflog_entry(format, command.old_id, command.new_id))
-                } else {
-                    None
-                };
-                tx.update_to(
-                    command.name.clone(),
-                    RefTarget::Direct(command.new_id),
-                    precondition,
-                    reflog,
-                );
-            }
-            tx.commit()
+            let applied = apply_receive_pack_ref_transaction(
+                remote_git_dir,
+                format,
+                &remote_store,
+                commands,
+                &request.commands.commands,
+            )?;
+            deletes_applied_with_updates.borrow_mut().extend(applied);
+            Ok(())
         },
         |command| {
+            if deletes_applied_with_updates
+                .borrow()
+                .contains(command.name.as_str())
+            {
+                return Ok(());
+            }
             remote_store
                 .delete_ref_checked(DeleteRef {
                     name: command.name.clone(),
@@ -329,6 +327,7 @@ pub fn receive_pack_reachable_pack_into_local_repository(
     let remote_store = FileRefStore::new(remote_git_dir, format);
     let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
     let mut starts = Some(starts);
+    let deletes_applied_with_updates = std::cell::RefCell::new(HashSet::<String>::new());
     apply_receive_pack_push_request(
         &receive_pack_features(format),
         request,
@@ -352,29 +351,23 @@ pub fn receive_pack_reachable_pack_into_local_repository(
         },
         |oid| remote_db.contains(oid),
         |commands| {
-            let mut tx = remote_store.transaction();
-            let log_updates = receive_pack_log_all_ref_updates(remote_git_dir);
-            for command in commands {
-                let precondition = if command.old_id.is_null() {
-                    RefPrecondition::MustNotExist
-                } else {
-                    RefPrecondition::MustExistAndMatch(RefTarget::Direct(command.old_id))
-                };
-                let reflog = if log_updates && receive_pack_should_write_reflog(&command.name) {
-                    Some(receive_pack_reflog_entry(format, command.old_id, command.new_id))
-                } else {
-                    None
-                };
-                tx.update_to(
-                    command.name.clone(),
-                    RefTarget::Direct(command.new_id),
-                    precondition,
-                    reflog,
-                );
-            }
-            tx.commit()
+            let applied = apply_receive_pack_ref_transaction(
+                remote_git_dir,
+                format,
+                &remote_store,
+                commands,
+                &request.commands.commands,
+            )?;
+            deletes_applied_with_updates.borrow_mut().extend(applied);
+            Ok(())
         },
         |command| {
+            if deletes_applied_with_updates
+                .borrow()
+                .contains(command.name.as_str())
+            {
+                return Ok(());
+            }
             remote_store
                 .delete_ref_checked(DeleteRef {
                     name: command.name.clone(),
@@ -385,6 +378,79 @@ pub fn receive_pack_reachable_pack_into_local_repository(
                 .map_err(|err| GitError::Transaction(err.to_string()))
         },
     )
+}
+
+fn apply_receive_pack_ref_transaction(
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    updates: &[ReceivePackCommand],
+    all_commands: &[ReceivePackCommand],
+) -> Result<HashSet<String>> {
+    let updates = canonical_receive_pack_update_commands(store, updates)?;
+    let deletes = all_commands
+        .iter()
+        .filter(|command| command.new_id.is_null())
+        .collect::<Vec<_>>();
+    let mut tx = store.transaction();
+    for command in &deletes {
+        tx.delete_with_precondition(
+            command.name.clone(),
+            RefDeletePrecondition::Direct((!command.old_id.is_null()).then_some(command.old_id)),
+            None,
+        );
+    }
+    let log_updates = receive_pack_log_all_ref_updates(remote_git_dir);
+    for command in &updates {
+        let precondition = if command.old_id.is_null() {
+            RefPrecondition::MustNotExist
+        } else {
+            RefPrecondition::MustExistAndMatch(RefTarget::Direct(command.old_id))
+        };
+        let reflog = if log_updates && receive_pack_should_write_reflog(&command.name) {
+            Some(receive_pack_reflog_entry(format, command.old_id, command.new_id))
+        } else {
+            None
+        };
+        tx.update_to(
+            command.name.clone(),
+            RefTarget::Direct(command.new_id),
+            precondition,
+            reflog,
+        );
+    }
+    tx.commit()?;
+    Ok(deletes
+        .into_iter()
+        .map(|command| command.name.clone())
+        .collect())
+}
+
+fn canonical_receive_pack_update_commands(
+    store: &FileRefStore,
+    commands: &[ReceivePackCommand],
+) -> Result<Vec<ReceivePackCommand>> {
+    let mut by_actual = HashMap::<String, ObjectId>::new();
+    let mut canonical = Vec::with_capacity(commands.len());
+    for command in commands {
+        let name = match store.read_ref(&command.name)? {
+            Some(RefTarget::Symbolic(target)) => target,
+            Some(RefTarget::Direct(_)) | None => command.name.clone(),
+        };
+        if let Some(existing) = by_actual.get(&name) {
+            if existing != &command.new_id {
+                return Err(GitError::Command("refusing inconsistent update".into()));
+            }
+        } else {
+            by_actual.insert(name.clone(), command.new_id);
+        }
+        canonical.push(ReceivePackCommand {
+            old_id: command.old_id,
+            new_id: command.new_id,
+            name,
+        });
+    }
+    Ok(canonical)
 }
 
 /// The ref advertisements a local repository would send to a fetching client:

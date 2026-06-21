@@ -1050,7 +1050,9 @@ pub fn push_local_with_report(
     // Send only the commands that survived client-side checks.
     let send: Vec<ReceivePackCommand> = refs
         .iter()
-        .filter(|reference| matches!(reference.status, PushRefStatus::Ok))
+        .filter(|reference| {
+            matches!(reference.status, PushRefStatus::Ok) && reference.old_id != reference.new_id
+        })
         .map(|reference| ReceivePackCommand {
             old_id: reference.old_id,
             new_id: reference.new_id,
@@ -1124,9 +1126,18 @@ fn classify_push_command(
 ) -> Result<PushRefStatus> {
     let command = &plan.command;
 
+    if receive_ref_is_hidden(config, request.receive_config_overrides, &command.name) {
+        let reason = if command.new_id.is_null() {
+            "deny deleting a hidden ref"
+        } else {
+            "deny updating a hidden ref"
+        };
+        return Ok(PushRefStatus::RemoteReject(reason.to_string()));
+    }
+
     // No change: the remote already has exactly this value (and it is not a
     // create-from-nothing of a non-existent ref). git reports UPTODATE.
-    if command.old_id == command.new_id {
+    if command.old_id == command.new_id && !command.new_id.is_null() {
         return Ok(PushRefStatus::UpToDate);
     }
 
@@ -1237,6 +1248,63 @@ fn classify_push_command(
     }
 
     Ok(PushRefStatus::Ok)
+}
+
+fn receive_ref_is_hidden(
+    config: &GitConfig,
+    overrides: &[(String, String)],
+    refname: &str,
+) -> bool {
+    let mut hide_refs = Vec::new();
+    hide_refs.extend(hidden_ref_values(config, "transfer", None));
+    hide_refs.extend(hidden_ref_values(config, "receive", None));
+    hide_refs.extend(
+        overrides
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("hiderefs"))
+            .map(|(_, value)| trim_hidden_ref_pattern(value)),
+    );
+    ref_is_hidden_by_patterns(refname, &hide_refs)
+}
+
+fn hidden_ref_values(
+    config: &GitConfig,
+    section: &str,
+    subsection: Option<&str>,
+) -> Vec<String> {
+    config
+        .get_all(section, subsection, "hiderefs")
+        .into_iter()
+        .flatten()
+        .map(trim_hidden_ref_pattern)
+        .collect()
+}
+
+fn trim_hidden_ref_pattern(value: &str) -> String {
+    value.trim_end_matches('/').to_string()
+}
+
+fn ref_is_hidden_by_patterns(refname: &str, patterns: &[String]) -> bool {
+    for pattern in patterns.iter().rev() {
+        let mut pattern = pattern.as_str();
+        let negated = pattern.strip_prefix('!').is_some();
+        if negated {
+            pattern = &pattern[1..];
+        }
+        if let Some(rest) = pattern.strip_prefix('^') {
+            pattern = rest;
+        }
+        if hidden_ref_pattern_matches(refname, pattern) {
+            return !negated;
+        }
+    }
+    false
+}
+
+fn hidden_ref_pattern_matches(refname: &str, pattern: &str) -> bool {
+    refname
+        .strip_prefix(pattern)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 fn lease_expectation_mismatch(
@@ -1581,7 +1649,11 @@ fn normalize_push_refspec_for_sources(
         .map_or((false, refspec), |refspec| (true, refspec));
     let normalized = if let Some((src, dst)) = refspec.split_once(':') {
         let (src, src_kind) = normalize_push_source_refname(src, local_refs);
-        let dst = normalize_push_destination_refname(dst, src_kind, remote_refs)?;
+        let dst = if src.is_empty() {
+            normalize_push_delete_destination_refname(dst, remote_refs)?
+        } else {
+            normalize_push_destination_refname(dst, src_kind, remote_refs)?
+        };
         if !src.is_empty() && !dst.contains('*') && push_destination_is_onelevel_under_refs(&dst) {
             return Err(GitError::Command(format!(
                 "destination refspec {dst} is not a valid ref"
@@ -1721,6 +1793,22 @@ fn normalize_push_source_refname(
         (name.to_string(), PushSourceKind::Unqualifiable)
     } else {
         (branch, PushSourceKind::Branch)
+    }
+}
+
+fn normalize_push_delete_destination_refname(
+    name: &str,
+    remote_refs: &[RefAdvertisement],
+) -> Result<String> {
+    if name.is_empty() || name == "HEAD" || name.starts_with("refs/") {
+        return Ok(name.to_string());
+    }
+    match count_refspec_match_dst(name, remote_refs) {
+        DstMatch::Unique(matched) => Ok(matched.to_string()),
+        DstMatch::Ambiguous => Err(GitError::Command(format!(
+            "dst refspec {name} matches more than one"
+        ))),
+        DstMatch::None => Err(GitError::reference_not_found(format!("remote ref {name}"))),
     }
 }
 
