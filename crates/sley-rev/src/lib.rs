@@ -1398,11 +1398,7 @@ fn resolve_upstream_ref(
         nth_prior_checkout_branch_name(git_dir, format, prior)?.ok_or_else(|| {
             GitError::not_found(format!("not enough previous checkouts to resolve {base}"))
         })?
-    } else if base.starts_with("refs/") {
-        return Err(GitError::InvalidFormat(format!(
-            "{base} is not a branch, cannot resolve {rev}"
-        )));
-    } else if base.contains("@{") {
+    } else if base.starts_with("refs/") || base.contains("@{") {
         return Err(GitError::InvalidFormat(format!(
             "{base} is not a branch, cannot resolve {rev}"
         )));
