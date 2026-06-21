@@ -1121,12 +1121,15 @@ name = "sley-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "sley-cli",
  "sley-core",
  "sley-formats",
  "sley-object",
  "sley-odb",
  "sley-pack",
  "sley-refs",
+ "sley-rev",
+ "sley-worktree",
 ]
 
 [[package]]
@@ -1421,6 +1424,7 @@ dependencies = [
  "sley-diff-merge",
  "sley-formats",
  "sley-index",
+ "sley-mmap",
  "sley-object",
  "sley-odb",
  "sley-pathspec",

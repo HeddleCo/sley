@@ -177,7 +177,10 @@ fn cmd_repo_info(args: &[String]) -> Result<()> {
     }
 
     let fields = if parsed.all {
-        REPO_INFO_KEYS.iter().map(|key| (*key).to_string()).collect()
+        REPO_INFO_KEYS
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect()
     } else {
         parsed.fields
     };

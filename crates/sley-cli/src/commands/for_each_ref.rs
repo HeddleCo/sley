@@ -381,7 +381,9 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
     // shorten_unambiguous_ref, which probes the ref store for ambiguity; collect
     // the ref-name universe once, plus `core.warnambiguousrefs` (default true).
     let ref_names: std::collections::HashSet<String> = if needs.short_ref {
-        refs.iter().map(|reference| reference.name.clone()).collect()
+        refs.iter()
+            .map(|reference| reference.name.clone())
+            .collect()
     } else {
         std::collections::HashSet::new()
     };
@@ -488,7 +490,14 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             upstream
                 .as_ref()
                 .map(|upstream| {
-                    for_each_ref_upstream_track(&store, &db, format, &oid, &upstream.refname)
+                    for_each_ref_upstream_track(
+                        &store,
+                        &git_dir,
+                        &db,
+                        format,
+                        &oid,
+                        &upstream.refname,
+                    )
                 })
                 .transpose()?
                 .flatten()
@@ -498,7 +507,9 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         let push_track = if needs.push_track {
             push.as_ref()
                 .and_then(|push| push.refname.as_deref())
-                .map(|push_ref| for_each_ref_upstream_track(&store, &db, format, &oid, push_ref))
+                .map(|push_ref| {
+                    for_each_ref_upstream_track(&store, &git_dir, &db, format, &oid, push_ref)
+                })
                 .transpose()?
                 .flatten()
         } else {

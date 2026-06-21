@@ -39,9 +39,9 @@ pub use config::{
     check_submodule_name, check_submodule_url, looks_like_command_line_option, parse_fetch_recurse,
     parse_update_strategy, parse_update_type, update_type_to_string,
 };
-pub use relative_url::{relative_url, resolve_relative_url};
-pub use update_strategy::determine_update_strategy;
 pub use move_head::{
     MoveHeadContext, MoveHeadFlags, MoveHeadVerdict, check_move_head, check_submodule_move_head,
     verify_clean_submodule,
 };
+pub use relative_url::{relative_url, resolve_relative_url};
+pub use update_strategy::determine_update_strategy;

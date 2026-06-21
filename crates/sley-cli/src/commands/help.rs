@@ -138,11 +138,17 @@ const GUIDE_PAGES: &[(&str, &str)] = &[
     ("credentials", "Providing usernames and passwords to Git"),
     ("cvs-migration", "Git for CVS users"),
     ("diffcore", "Tweaking diff output"),
-    ("everyday", "A useful minimum set of commands for Everyday Git"),
+    (
+        "everyday",
+        "A useful minimum set of commands for Everyday Git",
+    ),
     ("faq", "Frequently asked questions about using Git"),
     ("glossary", "A Git Glossary"),
     ("namespaces", "Git namespaces"),
-    ("remote-helpers", "Helper programs to interact with remote repositories"),
+    (
+        "remote-helpers",
+        "Helper programs to interact with remote repositories",
+    ),
     ("submodules", "Mounting one repository inside another"),
     ("tutorial", "A tutorial introduction to Git"),
     ("tutorial-2", "A tutorial introduction to Git: part two"),
@@ -153,8 +159,14 @@ const USER_INTERFACES: &[(&str, &str)] = &[
     ("attributes", "Defining attributes per path"),
     ("cli", "Git command-line interface and conventions"),
     ("hooks", "Hooks used by Git"),
-    ("ignore", "Specifies intentionally untracked files to ignore"),
-    ("mailmap", "Map author/committer names and/or E-Mail addresses"),
+    (
+        "ignore",
+        "Specifies intentionally untracked files to ignore",
+    ),
+    (
+        "mailmap",
+        "Map author/committer names and/or E-Mail addresses",
+    ),
     ("modules", "Defining submodule properties"),
     ("repository-layout", "Git Repository Layout"),
     ("revisions", "Specifying revisions and ranges for Git"),
@@ -227,6 +239,7 @@ pub(crate) fn has_command_specific_help(command: &str) -> bool {
         "diff-files"
             | "diff-index"
             | "interpret-trailers"
+            | "maintenance"
             | "mktag"
             | "patch-id"
             | "shortlog"
@@ -272,8 +285,13 @@ pub(crate) fn cmd_help(args: &[String]) -> Result<()> {
                 mode = set_mode(mode, HelpMode::DeveloperInterfaces)?;
             }
             "--exclude-guides" => exclude_guides = true,
-            "--no-verbose" | "--verbose" | "-v" | "--external-commands" | "--aliases"
-            | "--no-external-commands" | "--no-aliases" => list_modifiers += 1,
+            "--no-verbose"
+            | "--verbose"
+            | "-v"
+            | "--external-commands"
+            | "--aliases"
+            | "--no-external-commands"
+            | "--no-aliases" => list_modifiers += 1,
             "-m" | "--man" => {
                 format = HelpFormat::Man;
                 doc_format_flags += 1;
@@ -313,7 +331,11 @@ pub(crate) fn cmd_help(args: &[String]) -> Result<()> {
     if list_modifiers > 0 && !matches!(mode, HelpMode::All | HelpMode::Default) {
         return help_usage_error();
     }
-    if exclude_guides && command.as_deref().is_none_or(|name| !is_builtin_command(name)) {
+    if exclude_guides
+        && command
+            .as_deref()
+            .is_none_or(|name| !is_builtin_command(name))
+    {
         return unknown_command(command.as_deref().unwrap_or(""), 1);
     }
 
@@ -344,7 +366,10 @@ pub(crate) fn cmd_help(args: &[String]) -> Result<()> {
             Ok(())
         }
         (HelpMode::UserInterfaces, None) => {
-            print_interface_list("User-facing repository, command and file interfaces", USER_INTERFACES);
+            print_interface_list(
+                "User-facing repository, command and file interfaces",
+                USER_INTERFACES,
+            );
             Ok(())
         }
         (HelpMode::DeveloperInterfaces, None) => {
@@ -361,7 +386,9 @@ pub(crate) fn cmd_help(args: &[String]) -> Result<()> {
 pub(crate) fn print_common_help() {
     println!("usage: git [-v | --version] [-h | --help] [-C <path>] [-c <name>=<value>]");
     println!("           [--exec-path[=<path>]] [--html-path] [--man-path] [--info-path]");
-    println!("           [-p | --paginate | -P | --no-pager] [--no-replace-objects] [--no-lazy-fetch]");
+    println!(
+        "           [-p | --paginate | -P | --no-pager] [--no-replace-objects] [--no-lazy-fetch]"
+    );
     println!("           [--no-optional-locks] [--no-advice] [--bare] [--git-dir=<path>]");
     println!("           [--work-tree=<path>] [--namespace=<name>] [--config-env=<name>=<envvar>]");
     println!("           <command> [<args>]");
@@ -544,37 +571,70 @@ fn print_all_commands() {
             ("add", "Add file contents to the index"),
             ("am", "Apply a series of patches from a mailbox"),
             ("archive", "Create an archive of files from a named tree"),
-            ("bisect", "Use binary search to find the commit that introduced a bug"),
+            (
+                "bisect",
+                "Use binary search to find the commit that introduced a bug",
+            ),
             ("branch", "List, create, or delete branches"),
             ("bundle", "Move objects and refs by archive"),
             ("checkout", "Switch branches or restore working tree files"),
-            ("cherry-pick", "Apply the changes introduced by some existing commits"),
+            (
+                "cherry-pick",
+                "Apply the changes introduced by some existing commits",
+            ),
             ("clean", "Remove untracked files from the working tree"),
             ("clone", "Clone a repository into a new directory"),
             ("commit", "Record changes to the repository"),
-            ("describe", "Give an object a human readable name based on an available ref"),
-            ("diff", "Show changes between commits, commit and working tree, etc"),
+            (
+                "describe",
+                "Give an object a human readable name based on an available ref",
+            ),
+            (
+                "diff",
+                "Show changes between commits, commit and working tree, etc",
+            ),
             ("fetch", "Download objects and refs from another repository"),
             ("format-patch", "Prepare patches for e-mail submission"),
-            ("gc", "Cleanup unnecessary files and optimize the local repository"),
+            (
+                "gc",
+                "Cleanup unnecessary files and optimize the local repository",
+            ),
             ("grep", "Print lines matching a pattern"),
-            ("init", "Create an empty Git repository or reinitialize an existing one"),
+            (
+                "init",
+                "Create an empty Git repository or reinitialize an existing one",
+            ),
             ("log", "Show commit logs"),
             ("merge", "Join two or more development histories together"),
             ("mv", "Move or rename a file, a directory, or a symlink"),
             ("notes", "Add or inspect object notes"),
-            ("pull", "Fetch from and integrate with another repository or a local branch"),
+            (
+                "pull",
+                "Fetch from and integrate with another repository or a local branch",
+            ),
             ("push", "Update remote refs along with associated objects"),
-            ("range-diff", "Compare two commit ranges (e.g. two versions of a branch)"),
+            (
+                "range-diff",
+                "Compare two commit ranges (e.g. two versions of a branch)",
+            ),
             ("rebase", "Reapply commits on top of another base tip"),
             ("reset", "Set `HEAD` or the index to a known state"),
             ("restore", "Restore working tree files"),
             ("revert", "Revert some existing commits"),
-            ("rm", "Remove files from the working tree and from the index"),
+            (
+                "rm",
+                "Remove files from the working tree and from the index",
+            ),
             ("shortlog", "Summarize 'git log' output"),
             ("show", "Show various types of objects"),
-            ("sparse-checkout", "Reduce your working tree to a subset of tracked files"),
-            ("stash", "Stash the changes in a dirty working directory away"),
+            (
+                "sparse-checkout",
+                "Reduce your working tree to a subset of tracked files",
+            ),
+            (
+                "stash",
+                "Stash the changes in a dirty working directory away",
+            ),
             ("status", "Show the working tree status"),
             ("submodule", "Initialize, update or inspect submodules"),
             ("switch", "Switch branches"),
@@ -588,9 +648,18 @@ fn print_all_commands() {
             ("config", "Get and set repository or global options"),
             ("fast-import", "Backend for fast Git data importers"),
             ("filter-branch", "Rewrite branches"),
-            ("mergetool", "Run merge conflict resolution tools to resolve merge conflicts"),
-            ("pack-refs", "Pack heads and tags for efficient repository access"),
-            ("prune", "Prune all unreachable objects from the object database"),
+            (
+                "mergetool",
+                "Run merge conflict resolution tools to resolve merge conflicts",
+            ),
+            (
+                "pack-refs",
+                "Pack heads and tags for efficient repository access",
+            ),
+            (
+                "prune",
+                "Prune all unreachable objects from the object database",
+            ),
             ("reflog", "Manage reflog information"),
             ("refs", "Low-level access to refs"),
             ("remote", "Manage set of tracked repositories"),
@@ -602,19 +671,37 @@ fn print_all_commands() {
         "Ancillary Commands / Interrogators",
         &[
             ("annotate", "Annotate file lines with commit information"),
-            ("blame", "Show what revision and author last modified each line of a file"),
-            ("bugreport", "Collect information for user to file a bug report"),
-            ("count-objects", "Count unpacked number of objects and their disk consumption"),
+            (
+                "blame",
+                "Show what revision and author last modified each line of a file",
+            ),
+            (
+                "bugreport",
+                "Collect information for user to file a bug report",
+            ),
+            (
+                "count-objects",
+                "Count unpacked number of objects and their disk consumption",
+            ),
             ("difftool", "Show changes using common diff tools"),
-            ("fsck", "Verifies the connectivity and validity of the objects in the database"),
+            (
+                "fsck",
+                "Verifies the connectivity and validity of the objects in the database",
+            ),
             ("help", "Display help information about Git"),
-            ("merge-tree", "Perform merge without touching index or working tree"),
+            (
+                "merge-tree",
+                "Perform merge without touching index or working tree",
+            ),
             ("rerere", "Reuse recorded resolution of conflicted merges"),
             ("show-branch", "Show branches and their commits"),
             ("verify-commit", "Check the GPG signature of commits"),
             ("verify-tag", "Check the GPG signature of tags"),
             ("version", "Display version information about Git"),
-            ("whatchanged", "Show logs with differences each commit introduces"),
+            (
+                "whatchanged",
+                "Show logs with differences each commit introduces",
+            ),
         ],
     );
     print_heading("Interacting with Others");
@@ -622,47 +709,95 @@ fn print_all_commands() {
         "Low-level Commands / Manipulators",
         &[
             ("apply", "Apply a patch to files and/or to the index"),
-            ("checkout-index", "Copy files from the index to the working tree"),
+            (
+                "checkout-index",
+                "Copy files from the index to the working tree",
+            ),
             ("commit-graph", "Write and verify Git commit-graph files"),
             ("commit-tree", "Create a new commit object"),
-            ("hash-object", "Compute object ID and optionally create an object from a file"),
-            ("index-pack", "Build pack index file for an existing packed archive"),
+            (
+                "hash-object",
+                "Compute object ID and optionally create an object from a file",
+            ),
+            (
+                "index-pack",
+                "Build pack index file for an existing packed archive",
+            ),
             ("merge-file", "Run a three-way file merge"),
             ("mktag", "Creates a tag object with extra validation"),
             ("mktree", "Build a tree-object from ls-tree formatted text"),
             ("multi-pack-index", "Write and verify multi-pack-indexes"),
             ("pack-objects", "Create a packed archive of objects"),
-            ("prune-packed", "Remove extra objects that are already in pack files"),
+            (
+                "prune-packed",
+                "Remove extra objects that are already in pack files",
+            ),
             ("read-tree", "Reads tree information into the index"),
-            ("replay", "EXPERIMENTAL: Replay commits on a new base, works with bare repos too"),
+            (
+                "replay",
+                "EXPERIMENTAL: Replay commits on a new base, works with bare repos too",
+            ),
             ("symbolic-ref", "Read, modify and delete symbolic refs"),
             ("unpack-objects", "Unpack objects from a packed archive"),
-            ("update-index", "Register file contents in the working tree to the index"),
-            ("update-ref", "Update the object name stored in a ref safely"),
+            (
+                "update-index",
+                "Register file contents in the working tree to the index",
+            ),
+            (
+                "update-ref",
+                "Update the object name stored in a ref safely",
+            ),
             ("write-tree", "Create a tree object from the current index"),
         ],
     );
     print_command_section(
         "Low-level Commands / Interrogators",
         &[
-            ("cat-file", "Provide contents or details of repository objects"),
-            ("diff-files", "Compares files in the working tree and the index"),
+            (
+                "cat-file",
+                "Provide contents or details of repository objects",
+            ),
+            (
+                "diff-files",
+                "Compares files in the working tree and the index",
+            ),
             ("diff-index", "Compare a tree to the working tree or index"),
-            ("diff-tree", "Compares the content and mode of blobs found via two tree objects"),
+            (
+                "diff-tree",
+                "Compares the content and mode of blobs found via two tree objects",
+            ),
             ("for-each-ref", "Output information on each ref"),
-            ("get-tar-commit-id", "Extract commit ID from an archive created using git-archive"),
-            ("last-modified", "EXPERIMENTAL: Show when files were last modified"),
-            ("ls-files", "Show information about files in the index and the working tree"),
+            (
+                "get-tar-commit-id",
+                "Extract commit ID from an archive created using git-archive",
+            ),
+            (
+                "last-modified",
+                "EXPERIMENTAL: Show when files were last modified",
+            ),
+            (
+                "ls-files",
+                "Show information about files in the index and the working tree",
+            ),
             ("ls-remote", "List references in a remote repository"),
             ("ls-tree", "List the contents of a tree object"),
-            ("merge-base", "Find as good common ancestors as possible for a merge"),
+            (
+                "merge-base",
+                "Find as good common ancestors as possible for a merge",
+            ),
             ("name-rev", "Find symbolic names for given revs"),
             ("repo", "Retrieve information about the repository"),
-            ("rev-list", "Lists commit objects in reverse chronological order"),
+            (
+                "rev-list",
+                "Lists commit objects in reverse chronological order",
+            ),
             ("rev-parse", "Pick out and massage parameters"),
             ("show-index", "Show packed archive index"),
             ("show-ref", "List references in a local repository"),
-            ("unpack-file", "Creates a temporary file with a blob's contents"),
+            (
+                "unpack-file",
+                "Creates a temporary file with a blob's contents",
+            ),
             ("var", "Show a Git logical variable"),
             ("verify-pack", "Validate packed Git archive files"),
         ],
@@ -671,9 +806,18 @@ fn print_all_commands() {
         "Low-level Commands / Syncing Repositories",
         &[
             ("daemon", "A really simple server for Git repositories"),
-            ("fetch-pack", "Receive missing objects from another repository"),
-            ("send-pack", "Push objects over Git protocol to another repository"),
-            ("update-server-info", "Update auxiliary info file to help dumb servers"),
+            (
+                "fetch-pack",
+                "Receive missing objects from another repository",
+            ),
+            (
+                "send-pack",
+                "Push objects over Git protocol to another repository",
+            ),
+            (
+                "update-server-info",
+                "Update auxiliary info file to help dumb servers",
+            ),
         ],
     );
     print_command_section(
@@ -681,16 +825,28 @@ fn print_all_commands() {
         &[
             ("check-attr", "Display gitattributes information"),
             ("check-ignore", "Debug gitignore / exclude files"),
-            ("check-mailmap", "Show canonical names and email addresses of contacts"),
-            ("check-ref-format", "Ensures that a reference name is well formed"),
+            (
+                "check-mailmap",
+                "Show canonical names and email addresses of contacts",
+            ),
+            (
+                "check-ref-format",
+                "Ensures that a reference name is well formed",
+            ),
             ("fmt-merge-msg", "Produce a merge commit message"),
             ("hook", "Run git hooks"),
-            ("interpret-trailers", "Add or parse structured information in commit messages"),
+            (
+                "interpret-trailers",
+                "Add or parse structured information in commit messages",
+            ),
             ("patch-id", "Compute unique IDs for patches"),
             ("stripspace", "Remove unnecessary whitespace"),
         ],
     );
-    print_interface_section("User-facing repository, command and file interfaces", USER_INTERFACES);
+    print_interface_section(
+        "User-facing repository, command and file interfaces",
+        USER_INTERFACES,
+    );
     print_interface_section(
         "Developer-facing file formats, protocols and other interfaces",
         DEVELOPER_INTERFACES,

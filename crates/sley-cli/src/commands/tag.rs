@@ -684,7 +684,8 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
             message = launch_tag_editor(&git_dir, tag, &message)?;
             editmsg_written = true;
         } else {
-            message = tag_message_with_trailers(tag_cleanup_message(message, cleanup_mode), &trailers);
+            message =
+                tag_message_with_trailers(tag_cleanup_message(message, cleanup_mode), &trailers);
         }
         if use_editor {
             message = tag_cleanup_message(message, cleanup_mode);
@@ -733,8 +734,12 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 .or_else(|| config.get_bool("advice", None, "nestedTag"))
                 .unwrap_or(true)
         {
-            eprintln!("hint: You have created a nested tag. The object referred to by your new tag is");
-            eprintln!("hint: already a tag. If you meant to tag the object that it points to, use:");
+            eprintln!(
+                "hint: You have created a nested tag. The object referred to by your new tag is"
+            );
+            eprintln!(
+                "hint: already a tag. If you meant to tag the object that it points to, use:"
+            );
             eprintln!("hint:");
             eprintln!("hint: \tgit tag -f {tag} {target}^{{}}");
             eprintln!("hint: Disable this message with \"git config set advice.nestedTag false\"");
@@ -1033,7 +1038,10 @@ fn tag_signature_is_valid(format: ObjectFormat, body: &[u8]) -> Result<bool> {
     if signature_count > 1 {
         return Ok(true);
     }
-    let Some(start) = body.windows(marker.len()).position(|window| window == marker) else {
+    let Some(start) = body
+        .windows(marker.len())
+        .position(|window| window == marker)
+    else {
         return Ok(false);
     };
     let unsigned = &body[..start];
@@ -1055,13 +1063,19 @@ fn write_tag_verify_format(format_spec: &str, tag: &Tag) -> Result<()> {
     }
     let format = ForEachRefFormat::parse(format_spec)?;
     let mut stdout = io::stdout();
-    write_for_each_ref_format(&mut stdout, &format, ForEachRefQuoteMode::None, false, |out, atom| {
-        match atom {
-            ForEachRefAtom::Raw(value) if value == "tag" => out.extend_from_slice(&tag.name),
-            _ => {}
-        }
-        Ok(())
-    })?;
+    write_for_each_ref_format(
+        &mut stdout,
+        &format,
+        ForEachRefQuoteMode::None,
+        false,
+        |out, atom| {
+            match atom {
+                ForEachRefAtom::Raw(value) if value == "tag" => out.extend_from_slice(&tag.name),
+                _ => {}
+            }
+            Ok(())
+        },
+    )?;
     stdout.write_all(b"\n")?;
     stdout.flush()?;
     Ok(())
@@ -2081,7 +2095,7 @@ fn print_tag_list(
     let merged_reachable = tag_merged_reachable_sets(db.as_ref(), format, options.merged)?;
     let no_merged_reachable = tag_merged_reachable_sets(db.as_ref(), format, options.no_merged)?;
     let mut entries = Vec::new();
-    for reference in store.list_refs()? {
+    for reference in store.list_refs_with_prefix("refs/tags/")? {
         if let Some(name) = reference.name.strip_prefix("refs/tags/")
             && (options.patterns.is_empty()
                 || options.patterns.iter().any(|pattern| {

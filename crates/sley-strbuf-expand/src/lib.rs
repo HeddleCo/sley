@@ -313,8 +313,7 @@ where
         if matches!(
             self.options.atom_syntax,
             AtomSyntax::Parenthesized | AtomSyntax::ParenthesizedAndPrefixed
-        )
-            && self.input.as_bytes().get(placeholder_start).copied() == Some(b'(')
+        ) && self.input.as_bytes().get(placeholder_start).copied() == Some(b'(')
         {
             let value_start = placeholder_start + 1;
             let Some(relative_end) = self.input[value_start..].find(')') else {
@@ -332,8 +331,9 @@ where
         if matches!(
             self.options.atom_syntax,
             AtomSyntax::Prefixed | AtomSyntax::ParenthesizedAndPrefixed
-        ) && let Some((atom, consumed)) =
-            self.table.parse_prefix_atom(&self.input[placeholder_start..])?
+        ) && let Some((atom, consumed)) = self
+            .table
+            .parse_prefix_atom(&self.input[placeholder_start..])?
         {
             self.push_segment(ExpandSegment::Atom(ExpandAtom { magic, atom }));
             self.cursor = placeholder_start + consumed;
@@ -348,8 +348,9 @@ where
     fn parse_hex_escape(&self, start: usize) -> Option<(u8, usize)> {
         match self.options.literal_hex {
             LiteralHex::None => None,
-            LiteralHex::Bare => parse_hex_pair(self.input.as_bytes().get(start..start + 2)?)
-                .map(|byte| (byte, 2)),
+            LiteralHex::Bare => {
+                parse_hex_pair(self.input.as_bytes().get(start..start + 2)?).map(|byte| (byte, 2))
+            }
             LiteralHex::XPrefixed => parse_x_hex(self.input.as_bytes(), start),
             LiteralHex::Both => parse_x_hex(self.input.as_bytes(), start).or_else(|| {
                 parse_hex_pair(self.input.as_bytes().get(start..start + 2)?).map(|byte| (byte, 2))

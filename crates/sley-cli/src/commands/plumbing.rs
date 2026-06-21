@@ -60,14 +60,18 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             "--mtime" => {
                 mtime_option = Some(
                     iter.next()
-                        .ok_or_else(|| GitError::Command("archive --mtime requires a value".into()))?
+                        .ok_or_else(|| {
+                            GitError::Command("archive --mtime requires a value".into())
+                        })?
                         .clone(),
                 );
             }
             "--remote" => {
                 remote = Some(
                     iter.next()
-                        .ok_or_else(|| GitError::Command("archive --remote requires a value".into()))?
+                        .ok_or_else(|| {
+                            GitError::Command("archive --remote requires a value".into())
+                        })?
                         .clone(),
                 );
             }
@@ -230,7 +234,9 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
         Some(name) => name,
         None => output
             .as_deref()
-            .and_then(|name| archive_format_from_filename_with_config(name, &config, remote.is_some()))
+            .and_then(|name| {
+                archive_format_from_filename_with_config(name, &config, remote.is_some())
+            })
             .unwrap_or_else(|| "tar".to_string()),
     };
     let filter_command = archive_filter_command(&config, &format_name, remote.is_some())?;
@@ -264,10 +270,10 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
     // builtin driver flags.
     let diff_attributes =
         sley_worktree::TreeAttributes::from_tree(&attr_root, &git_dir, &db, format, &tree_oid)?;
-    let userdiff = commands::userdiff::UserdiffResolver::with_attributes(None, Some(config.clone()));
-    convert = convert.with_diff_binary(move |path| {
-        archive_diff_binary(&diff_attributes, &userdiff, path)
-    });
+    let userdiff =
+        commands::userdiff::UserdiffResolver::with_attributes(None, Some(config.clone()));
+    convert = convert
+        .with_diff_binary(move |path| archive_diff_binary(&diff_attributes, &userdiff, path));
 
     let extra = sley_archive::ArchiveExtras {
         files: extra_files
@@ -418,12 +424,16 @@ fn archive_config_for_list(remote: Option<&str>, cwd: &Path) -> Result<GitConfig
     read_repo_config(&git_dir)
 }
 
-fn archive_remote_git_dir(remote: &str, cwd: &Path, local_git_dir: Option<&Path>) -> Result<PathBuf> {
+fn archive_remote_git_dir(
+    remote: &str,
+    cwd: &Path,
+    local_git_dir: Option<&Path>,
+) -> Result<PathBuf> {
     let (path, base) = if archive_remote_looks_like_path(remote) {
         (PathBuf::from(remote), cwd.to_path_buf())
     } else {
-        let git_dir = local_git_dir
-            .ok_or_else(|| GitError::Command(format!("unknown remote: {remote}")))?;
+        let git_dir =
+            local_git_dir.ok_or_else(|| GitError::Command(format!("unknown remote: {remote}")))?;
         let config = read_repo_config(git_dir)?;
         let url = config
             .get("remote", Some(remote), "url")
@@ -432,7 +442,11 @@ fn archive_remote_git_dir(remote: &str, cwd: &Path, local_git_dir: Option<&Path>
             .unwrap_or_else(|| git_dir.to_path_buf());
         (PathBuf::from(url), base)
     };
-    let repo = if path.is_absolute() { path } else { base.join(path) };
+    let repo = if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    };
     discover_git_dir(&repo)
 }
 
@@ -505,7 +519,11 @@ fn archive_list_formats(config: &GitConfig, is_remote: bool) -> Vec<String> {
         if !has_command {
             continue;
         }
-        if is_remote && !config.get_bool("tar", Some(name), "remote").unwrap_or(false) {
+        if is_remote
+            && !config
+                .get_bool("tar", Some(name), "remote")
+                .unwrap_or(false)
+        {
             continue;
         }
         if !formats.iter().any(|format| format == name) {
@@ -668,7 +686,9 @@ fn handle_archive_result(result: Result<()>) -> Result<()> {
             eprintln!("fatal: {message}");
             Err(GitError::Exit(128))
         }
-        Err(GitError::InvalidPath(message)) if message.contains("outside the current directory") => {
+        Err(GitError::InvalidPath(message))
+            if message.contains("outside the current directory") =>
+        {
             eprintln!("fatal: {message}");
             Err(GitError::Exit(128))
         }
@@ -1479,9 +1499,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                 return Err(GitError::Exit(128));
             }
             if auto_advance == Some(false) {
-                eprintln!(
-                    "fatal: the option '--no-auto-advance' requires '--interactive/--patch'"
-                );
+                eprintln!("fatal: the option '--no-auto-advance' requires '--interactive/--patch'");
                 return Err(GitError::Exit(128));
             }
         }
@@ -1931,12 +1949,13 @@ fn add_intent_to_add(
     format: ObjectFormat,
     paths: &[PathBuf],
 ) -> Result<()> {
-    let mut index = sley_worktree::read_repository_index(git_dir, format)?.unwrap_or_else(|| Index {
-        version: 2,
-        entries: Vec::new(),
-        extensions: Vec::new(),
-        checksum: None,
-    });
+    let mut index =
+        sley_worktree::read_repository_index(git_dir, format)?.unwrap_or_else(|| Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        });
 
     let mut changed = false;
     for path in paths {
@@ -1960,10 +1979,9 @@ fn add_intent_to_add(
             continue;
         }
         // Skip paths already in the index at stage 0 (tracked or already ITA).
-        let already = index
-            .entries
-            .iter()
-            .any(|entry| index_entry_stage(entry) == 0 && entry.path.as_bytes() == git_path.as_slice());
+        let already = index.entries.iter().any(|entry| {
+            index_entry_stage(entry) == 0 && entry.path.as_bytes() == git_path.as_slice()
+        });
         if already {
             continue;
         }
@@ -2430,15 +2448,13 @@ fn resolve_add_regular_actions(
     let _ignore_errors = options.ignore_errors;
     if !options.force {
         let indexed_paths = add_all_index_paths(git_dir, format, reusable_index.as_ref())?;
-        for (idx, ignored_path) in
-            collect_add_ignored_pathspec_matches(
-                worktree_root,
-                git_dir,
-                format,
-                &pathspecs,
-                &indexed_paths,
-            )?
-        {
+        for (idx, ignored_path) in collect_add_ignored_pathspec_matches(
+            worktree_root,
+            git_dir,
+            format,
+            &pathspecs,
+            &indexed_paths,
+        )? {
             matched[idx] = true;
             ignored_paths.insert(ignored_path);
         }
@@ -2642,14 +2658,16 @@ fn ignored_missing_add_pathspec(
     if git_path.is_empty() {
         return Ok(None);
     }
-    Ok(sley_worktree::standard_ignore_match(worktree_root, &git_path, false)?
-        .filter(|ignore_match| ignore_match.ignored)
-        .map(|_| git_path))
+    Ok(
+        sley_worktree::standard_ignore_match(worktree_root, &git_path, false)?
+            .filter(|ignore_match| ignore_match.ignored)
+            .map(|_| git_path),
+    )
 }
 
 fn worktree_path_from_git_path(worktree_root: &Path, git_path: &[u8]) -> Result<PathBuf> {
-    let text = std::str::from_utf8(git_path)
-        .map_err(|err| GitError::InvalidPath(err.to_string()))?;
+    let text =
+        std::str::from_utf8(git_path).map_err(|err| GitError::InvalidPath(err.to_string()))?;
     let mut path = worktree_root.to_path_buf();
     for component in text.split('/') {
         if !component.is_empty() {
@@ -2698,9 +2716,7 @@ fn print_add_ignored_paths(git_dir: &Path, ignored_paths: &[Vec<u8>]) {
     }
     if add_ignored_file_advice_enabled(git_dir) {
         eprintln!("hint: Use -f if you really want to add them.");
-        eprintln!(
-            "hint: Disable this message with \"git config set advice.addIgnoredFile false\""
-        );
+        eprintln!("hint: Disable this message with \"git config set advice.addIgnoredFile false\"");
     }
 }
 
@@ -3129,9 +3145,9 @@ pub(crate) fn cmd_clean(args: &[String]) -> Result<()> {
                 if value.starts_with('-')
                     && !value.starts_with("--")
                     && value.len() > 2
-                    && value[1..]
-                        .bytes()
-                        .all(|byte| matches!(byte, b'f' | b'd' | b'n' | b'q' | b'x' | b'X' | b'i')) =>
+                    && value[1..].bytes().all(|byte| {
+                        matches!(byte, b'f' | b'd' | b'n' | b'q' | b'x' | b'X' | b'i')
+                    }) =>
             {
                 for byte in value[1..].bytes() {
                     match byte {
@@ -3237,8 +3253,14 @@ enum CleanIgnoreMode {
 fn print_clean_interactive_stub() -> Result<()> {
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "*** Commands ***")?;
-    writeln!(stdout, "    1: clean                2: filter by pattern    3: select by numbers")?;
-    writeln!(stdout, "    4: ask each             5: quit                 6: help")?;
+    writeln!(
+        stdout,
+        "    1: clean                2: filter by pattern    3: select by numbers"
+    )?;
+    writeln!(
+        stdout,
+        "    4: ask each             5: quit                 6: help"
+    )?;
     stdout.flush()?;
     Ok(())
 }
@@ -3254,7 +3276,11 @@ fn clean_trace2_directories_visited(value: usize) {
     let line = format!(
         "19:00:00.000000 file.c:1 | d0 | main | data | r1 | ? | ? | read_directory | ..directories-visited:{value}\n"
     );
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&target) {
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&target)
+    {
         let _ = file.write_all(line.as_bytes());
     }
 }
@@ -3307,8 +3333,13 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             "--numstat" => numstat = true,
             "--summary" => summary = true,
             "--recount" => recount = true,
-            "-q" | "--quiet" | "--allow-empty" | "--unsafe-paths" | "-l"
-            | "--ignore-whitespace" | "--ignore-space-change" => {}
+            "-q"
+            | "--quiet"
+            | "--allow-empty"
+            | "--unsafe-paths"
+            | "-l"
+            | "--ignore-whitespace"
+            | "--ignore-space-change" => {}
             "-R" | "--reverse" => {
                 return Err(GitError::Unsupported(
                     "apply --reverse is not supported yet".into(),
@@ -3367,14 +3398,18 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let mut patches = Vec::new();
     for (name, input) in &inputs {
         validate_apply_input(input, name)?;
-        patches.extend(sley_diff_merge::parse_unified_patch_with_recount(input, recount).map_err(
-            |err| match err {
-                GitError::InvalidFormat(message) if message.starts_with("malformed hunk header") => {
-                    apply_corrupt_patch_error(input, name)
+        patches.extend(
+            sley_diff_merge::parse_unified_patch_with_recount(input, recount).map_err(|err| {
+                match err {
+                    GitError::InvalidFormat(message)
+                        if message.starts_with("malformed hunk header") =>
+                    {
+                        apply_corrupt_patch_error(input, name)
+                    }
+                    other => other,
                 }
-                other => other,
-            },
-        )?);
+            })?,
+        );
     }
     if let Some(path) = build_fake_ancestor {
         write_apply_fake_ancestor_index(&git_dir, format, &patches, &inputs, &path)?;
@@ -3625,7 +3660,9 @@ fn parse_apply_octal(bytes: &[u8]) -> Option<u32> {
 }
 
 fn split_once_bytes<'a>(bytes: &'a [u8], needle: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
-    let pos = bytes.windows(needle.len()).position(|window| window == needle)?;
+    let pos = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)?;
     Some((&bytes[..pos], &bytes[pos + needle.len()..]))
 }
 
@@ -3710,8 +3747,8 @@ fn write_apply_stat(stdout: &mut dyn Write, entries: &[DiffStatEntryData<'_>]) -
                     } else if deleted == 0 {
                         write!(stdout, "{}", "+".repeat(scaled_total))?;
                     } else {
-                        let add = apply_stat_scale(inserted, graph_width, max_change)
-                            .min(scaled_total);
+                        let add =
+                            apply_stat_scale(inserted, graph_width, max_change).min(scaled_total);
                         let del = scaled_total.saturating_sub(add);
                         write!(stdout, "{}{}", "+".repeat(add), "-".repeat(del))?;
                     }
@@ -3731,7 +3768,9 @@ fn apply_stat_scale(value: usize, width: usize, max_change: usize) -> usize {
     (value * width + max_change / 2) / max_change
 }
 
-fn apply_patch_name_status_entry(patch: &sley_diff_merge::FilePatch) -> sley_diff_merge::NameStatusEntry {
+fn apply_patch_name_status_entry(
+    patch: &sley_diff_merge::FilePatch,
+) -> sley_diff_merge::NameStatusEntry {
     let path = patch
         .new_path
         .as_ref()
@@ -3771,7 +3810,10 @@ fn apply_patch_line_stats(patch: &sley_diff_merge::FilePatch) -> DiffLineStats {
     DiffLineStats::Text { inserted, deleted }
 }
 
-fn write_apply_summary_entry(stdout: &mut dyn Write, patch: &sley_diff_merge::FilePatch) -> Result<()> {
+fn write_apply_summary_entry(
+    stdout: &mut dyn Write,
+    patch: &sley_diff_merge::FilePatch,
+) -> Result<()> {
     if patch.is_rename {
         if let (Some(old_path), Some(new_path)) = (&patch.old_path, &patch.new_path) {
             let path = diff_stat_pprint_rename(old_path, new_path);
@@ -3815,7 +3857,10 @@ fn write_apply_summary_entry(stdout: &mut dyn Write, patch: &sley_diff_merge::Fi
     {
         if let Some(path) = patch.new_path.as_ref().or(patch.old_path.as_ref()) {
             let path = status_quote_path(path, false);
-            writeln!(stdout, " mode change {old_mode:06o} => {new_mode:06o} {path}")?;
+            writeln!(
+                stdout,
+                " mode change {old_mode:06o} => {new_mode:06o} {path}"
+            )?;
         }
     }
     Ok(())
@@ -3826,7 +3871,11 @@ fn apply_patch_old_mode(patch: &sley_diff_merge::FilePatch) -> Option<u32> {
 }
 
 fn apply_patch_new_mode(patch: &sley_diff_merge::FilePatch) -> Option<u32> {
-    if patch.is_delete { None } else { patch.new_mode }
+    if patch.is_delete {
+        None
+    } else {
+        patch.new_mode
+    }
 }
 
 fn validate_apply_input(input: &[u8], name: &str) -> Result<()> {
@@ -3947,9 +3996,7 @@ fn apply_parse_usize(bytes: &[u8]) -> Option<usize> {
         if !byte.is_ascii_digit() {
             return None;
         }
-        value = value
-            .checked_mul(10)?
-            .checked_add((byte - b'0') as usize)?;
+        value = value.checked_mul(10)?.checked_add((byte - b'0') as usize)?;
     }
     Some(value)
 }
@@ -4053,10 +4100,7 @@ impl ApplyAction {
 
 /// Read the worktree base content a patch applies against (empty for a new
 /// file). Shared by the whitespace pass and the apply pass.
-fn read_patch_base(
-    worktree_root: &Path,
-    patch: &sley_diff_merge::FilePatch,
-) -> Result<Vec<u8>> {
+fn read_patch_base(worktree_root: &Path, patch: &sley_diff_merge::FilePatch) -> Result<Vec<u8>> {
     if patch.is_new {
         return Ok(Vec::new());
     }
@@ -4383,14 +4427,8 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     // sets ERROR_REFS.
     let mut index_error_bits = 0i32;
     if explicit_oids.is_empty() {
-        index_error_bits |= fsck_index_roots(
-            &db,
-            format,
-            &git_dir,
-            name_objects,
-            &mut roots,
-            &bad_loose,
-        )?;
+        index_error_bits |=
+            fsck_index_roots(&db, format, &git_dir, name_objects, &mut roots, &bad_loose)?;
     }
 
     if roots.is_empty() && progress {
@@ -4508,11 +4546,7 @@ fn fsck_display_path(path: &Path, cwd: &Path) -> String {
     }
 }
 
-fn fsck_alternate_loose_objects(
-    git_dir: &Path,
-    format: ObjectFormat,
-    cwd: &Path,
-) -> Result<bool> {
+fn fsck_alternate_loose_objects(git_dir: &Path, format: ObjectFormat, cwd: &Path) -> Result<bool> {
     let objects_dir = repository_objects_dir(git_dir);
     let alternates = objects_dir.join("info").join("alternates");
     let Ok(contents) = fs::read_to_string(&alternates) else {
@@ -4597,9 +4631,7 @@ fn fsck_pack_files(git_dir: &Path, format: ObjectFormat, cwd: &Path) -> Result<b
             }
             let object_type = (bytes[offset] >> 4) & 0x07;
             if object_type == 0 {
-                eprintln!(
-                    "error: unknown object type 0 at offset {offset} in {display_path}"
-                );
+                eprintln!("error: unknown object type 0 at offset {offset} in {display_path}");
                 failed = true;
             }
         }
@@ -4656,9 +4688,7 @@ fn fsck_worktree_head_refs(
         };
         match target {
             RefTarget::Direct(oid) if oid.is_null() => {
-                eprintln!(
-                    "error: {display}: badRefOid: points to invalid object ID '{oid}'"
-                );
+                eprintln!("error: {display}: badRefOid: points to invalid object ID '{oid}'");
                 bits |= sley_fsck::ERROR_REFS;
             }
             RefTarget::Direct(oid) => {
@@ -6264,7 +6294,8 @@ pub(crate) fn cmd_bundle(args: &[String]) -> Result<()> {
 const BUNDLE_CREATE_USAGE: &str = "usage: git bundle create [-q | --quiet | --progress]\n                  [--version=<version>] <file> <git-rev-list-args>\n";
 const BUNDLE_VERIFY_USAGE: &str = "usage: git bundle verify [-q | --quiet] <file>\n";
 const BUNDLE_LIST_HEADS_USAGE: &str = "usage: git bundle list-heads <file> [<refname>...]\n";
-const BUNDLE_UNBUNDLE_USAGE: &str = "usage: git bundle unbundle [--progress] <file> [<refname>...]\n";
+const BUNDLE_UNBUNDLE_USAGE: &str =
+    "usage: git bundle unbundle [--progress] <file> [<refname>...]\n";
 
 fn print_bundle_usage() {
     eprint!("{BUNDLE_CREATE_USAGE}");
@@ -6370,14 +6401,14 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command("--max-commits requires a value".into()))?;
-                split.max_commits = Some(commit_graph_parse_positive_usize(value, "--max-commits")?);
+                split.max_commits =
+                    Some(commit_graph_parse_positive_usize(value, "--max-commits")?);
             }
             "--size-multiple" => {
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command("--size-multiple requires a value".into()))?;
-                split.size_multiple =
-                    commit_graph_parse_positive_usize(value, "--size-multiple")?;
+                split.size_multiple = commit_graph_parse_positive_usize(value, "--size-multiple")?;
             }
             "--expire-time" => {
                 let value = iter
@@ -6461,11 +6492,8 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let existing_bloom_settings = existing_commit_graph_bloom_settings(&object_dir, format)?;
-    let bloom_settings = commit_graph_bloom_settings_for_write(
-        existing_bloom_settings,
-        changed_paths_version,
-        true,
-    );
+    let bloom_settings =
+        commit_graph_bloom_settings_for_write(existing_bloom_settings, changed_paths_version, true);
     // git: write_generation_data = (get_configured_generation_version(r) == 2).
     // Default is 2; `commitGraph.generationVersion=1` omits the GDA2/GDO2 chunks.
     let write_generation_data = commit_graph_generation_version(repo_config.as_ref()) == 2;
@@ -6505,9 +6533,7 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
             );
         }
         CommitGraphSource::AllPacks => commit_graph_packed_commit_starts(&db, &object_dir, format)?,
-        CommitGraphSource::StdinPacks => {
-            commit_graph_stdin_packs_starts(&db, &object_dir, format)?
-        }
+        CommitGraphSource::StdinPacks => commit_graph_stdin_packs_starts(&db, &object_dir, format)?,
         CommitGraphSource::StdinCommits => {
             let starts = commit_graph_stdin_commits_starts(&db, format)?;
             // git's `read_one_commit` loop drives a "Collecting commits from
@@ -6667,7 +6693,9 @@ fn write_split_commit_graph_file(
         .collect::<HashSet<_>>();
     let mut new_entries = commit_graph_write_entries_from_graph(&full_graph)?
         .into_iter()
-        .filter(|entry| options.mode == CommitGraphSplitMode::Replace || !existing_oids.contains(&entry.oid))
+        .filter(|entry| {
+            options.mode == CommitGraphSplitMode::Replace || !existing_oids.contains(&entry.oid)
+        })
         .collect::<Vec<_>>();
     if new_entries.is_empty() && options.mode != CommitGraphSplitMode::Replace {
         return Ok(());
@@ -6679,7 +6707,8 @@ fn write_split_commit_graph_file(
             let force_by_max = options
                 .max_commits
                 .is_some_and(|max_commits| new_count > max_commits);
-            let merge_by_size = top.graph.commits.len() <= options.size_multiple.saturating_mul(new_count);
+            let merge_by_size =
+                top.graph.commits.len() <= options.size_multiple.saturating_mul(new_count);
             if !(force_by_max || merge_by_size) {
                 break;
             }
@@ -6690,8 +6719,7 @@ fn write_split_commit_graph_file(
                 .flat_map(|layer| layer.graph.commits.iter().map(|entry| entry.oid))
                 .collect::<Vec<_>>();
             new_entries.extend(commit_graph_write_entries_from_graph_with_base(
-                &top.graph,
-                &base_oids,
+                &top.graph, &base_oids,
             )?);
         }
     }
@@ -6748,7 +6776,10 @@ fn write_split_commit_graph_file(
     Ok(())
 }
 
-fn load_commit_graph_layers(object_dir: &Path, format: ObjectFormat) -> Result<Vec<CommitGraphLayer>> {
+fn load_commit_graph_layers(
+    object_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<CommitGraphLayer>> {
     let local_chain = object_dir
         .join("info")
         .join("commit-graphs")
@@ -6820,7 +6851,9 @@ fn commit_graph_alternate_object_dirs(object_dir: &Path) -> Result<Vec<PathBuf>>
         .collect())
 }
 
-fn commit_graph_write_entries_from_graph(graph: &CommitGraph) -> Result<Vec<CommitGraphWriteEntry>> {
+fn commit_graph_write_entries_from_graph(
+    graph: &CommitGraph,
+) -> Result<Vec<CommitGraphWriteEntry>> {
     commit_graph_write_entries_from_graph_with_base(graph, &[])
 }
 
@@ -6940,7 +6973,9 @@ fn read_commit_graph_chain_hashes(path: &Path, format: ObjectFormat) -> Result<V
 fn graph_file_checksum(bytes: &[u8], format: ObjectFormat) -> Result<ObjectId> {
     let raw_len = format.raw_len();
     if bytes.len() < raw_len {
-        return Err(GitError::InvalidFormat("commit-graph file too short".into()));
+        return Err(GitError::InvalidFormat(
+            "commit-graph file too short".into(),
+        ));
     }
     ObjectId::from_raw(format, &bytes[bytes.len() - raw_len..])
 }
@@ -7142,7 +7177,10 @@ fn cmd_commit_graph_verify(args: &[String]) -> Result<()> {
         }
         OpenResult::OpenError => {
             // git: die_errno("Could not open commit-graph '%s'") ⇒ exit 128.
-            eprintln!("fatal: Could not open commit-graph '{}'", graph_path.display());
+            eprintln!(
+                "fatal: Could not open commit-graph '{}'",
+                graph_path.display()
+            );
             return Err(GitError::Exit(128));
         }
         OpenResult::NotFound => {}
@@ -7358,12 +7396,7 @@ fn parse_commit_graph_for_verify<'a>(
     let mfile_size = bytes.len();
     let mut toc = GRAPH_HEADER_SIZE;
     for _ in 0..num_chunks {
-        let chunk_id = [
-            bytes[toc],
-            bytes[toc + 1],
-            bytes[toc + 2],
-            bytes[toc + 3],
-        ];
+        let chunk_id = [bytes[toc], bytes[toc + 1], bytes[toc + 2], bytes[toc + 3]];
         let chunk_offset = read_be64(bytes, toc + 4) as usize;
         if chunk_id == [0, 0, 0, 0] {
             eprintln!("error: terminating chunk id appears earlier than expected");
@@ -7372,9 +7405,7 @@ fn parse_commit_graph_for_verify<'a>(
         let next_toc = toc + GRAPH_CHUNK_TOC_ENTRY_SIZE;
         let next_chunk_offset = read_be64(bytes, next_toc + 4) as usize;
         if next_chunk_offset < chunk_offset || next_chunk_offset > mfile_size - hash_len {
-            eprintln!(
-                "error: improper chunk offset(s) {chunk_offset:X} and {next_chunk_offset:X}"
-            );
+            eprintln!("error: improper chunk offset(s) {chunk_offset:X} and {next_chunk_offset:X}");
             return Err(GitError::Exit(1));
         }
         if chunks.iter().any(|chunk| chunk.id == chunk_id) {
@@ -7512,9 +7543,7 @@ fn verify_commit_graph_bytes(
         if let Some(prev) = prev_oid
             && prev.as_bytes() >= cur_oid.as_bytes()
         {
-            eprintln!(
-                "error: commit-graph has incorrect OID order: {prev} then {cur_oid}"
-            );
+            eprintln!("error: commit-graph has incorrect OID order: {prev} then {cur_oid}");
             had_error = true;
             non_checksum_error = true;
         }
@@ -7559,9 +7588,7 @@ fn verify_commit_graph_bytes(
     // git drives a progress meter titled "Verifying commits in commit graph"
     // here; emit the final, complete line when progress is requested.
     if progress {
-        eprintln!(
-            "Verifying commits in commit graph: 100% ({num_commits}/{num_commits}), done."
-        );
+        eprintln!("Verifying commits in commit graph: 100% ({num_commits}/{num_commits}), done.");
     }
     let mut seen_gen_zero: Option<ObjectId> = None;
     let mut seen_gen_non_zero: Option<ObjectId> = None;
@@ -7614,14 +7641,10 @@ fn verify_commit_graph_bytes(
             }
         }
         if graph_parents.len() > odb_parents.len() {
-            eprintln!(
-                "error: commit-graph parent list for commit {cur_oid} is too long"
-            );
+            eprintln!("error: commit-graph parent list for commit {cur_oid} is too long");
             had_error = true;
         } else if odb_parents.len() > graph_parents.len() {
-            eprintln!(
-                "error: commit-graph parent list for commit {cur_oid} terminates early"
-            );
+            eprintln!("error: commit-graph parent list for commit {cur_oid} terminates early");
             had_error = true;
         }
 
@@ -7903,10 +7926,12 @@ fn commit_graph_from_starts(
                 "Computing commit changed paths Bloom filters: 100% ({count}/{count}), done."
             );
         }
+        eprintln!("Computing commit graph generation numbers: 100% ({count}/{count}), done.");
         eprintln!(
-            "Computing commit graph generation numbers: 100% ({count}/{count}), done."
+            "Writing out commit graph in 3 passes: 100% ({}/{}), done.",
+            count * 3,
+            count * 3
         );
-        eprintln!("Writing out commit graph in 3 passes: 100% ({}/{}), done.", count * 3, count * 3);
     }
     if changed_paths {
         trace_commit_graph_bloom_settings(bloom_settings);
@@ -8042,10 +8067,12 @@ fn commit_graph_bloom_filter_for_record(
 /// 1 selects the legacy topological-level-only layout (no GDA2/GDO2).
 fn commit_graph_generation_version(config: Option<&sley_config::GitConfig>) -> i64 {
     config
-        .and_then(|config| match config.get_entry("commitGraph", None, "generationVersion") {
-            Some(Some(value)) => sley_config::parse_config_int(value),
-            _ => None,
-        })
+        .and_then(
+            |config| match config.get_entry("commitGraph", None, "generationVersion") {
+                Some(Some(value)) => sley_config::parse_config_int(value),
+                _ => None,
+            },
+        )
         .unwrap_or(2)
 }
 
@@ -8214,7 +8241,11 @@ fn trace_commit_graph_bloom_settings(settings: sley_formats::CommitGraphBloomSet
         settings.bits_per_entry,
         settings.max_changed_paths
     );
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&target) {
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&target)
+    {
         let _ = file.write_all(line.as_bytes());
     }
 }
@@ -8339,11 +8370,13 @@ fn cmd_bundle_create(args: &[String]) -> Result<()> {
         eprintln!("fatal: Refusing to create empty bundle.");
         return Err(GitError::Exit(128));
     };
-    let version = version.unwrap_or(if format == ObjectFormat::Sha1 && options.filter.is_none() {
-        2
-    } else {
-        3
-    });
+    let version = version.unwrap_or(
+        if format == ObjectFormat::Sha1 && options.filter.is_none() {
+            2
+        } else {
+            3
+        },
+    );
     if !(2..=3).contains(&version) {
         return Err(GitError::InvalidFormat(format!(
             "unsupported bundle version {version}"
@@ -8707,10 +8740,19 @@ fn bundle_create_selection(
     }
 
     let user_excluded_objects = collect_reachable_object_ids(db, format, excludes.iter().copied())?;
-    let mut references =
-        filter_bundle_references(git_dir, format, db, includes, options, &user_excluded_objects)?;
+    let mut references = filter_bundle_references(
+        git_dir,
+        format,
+        db,
+        includes,
+        options,
+        &user_excluded_objects,
+    )?;
     dedupe_bundle_references(&mut references);
-    let starts = references.iter().map(|reference| reference.oid).collect::<Vec<_>>();
+    let starts = references
+        .iter()
+        .map(|reference| reference.oid)
+        .collect::<Vec<_>>();
     excludes.extend(bundle_limit_excludes(db, format, &starts, options)?);
     let excluded_objects = collect_reachable_object_ids(db, format, excludes.iter().copied())?;
     let mut prerequisites = bundle_boundary_prerequisites(db, format, &starts, &excluded_objects)?;
@@ -8823,7 +8865,10 @@ fn filter_bundle_references(
             .filter_map(|(idx, reference)| {
                 let object = db.read_object(&reference.oid).ok()?;
                 if object.object_type == ObjectType::Commit {
-                    Some((idx, bundle_object_timestamp(db, format, &reference.oid).unwrap_or(0)))
+                    Some((
+                        idx,
+                        bundle_object_timestamp(db, format, &reference.oid).unwrap_or(0),
+                    ))
                 } else {
                     None
                 }
@@ -8986,8 +9031,7 @@ fn bundle_limit_excludes(
             let object = db.read_object(&oid)?;
             match object.object_type {
                 ObjectType::Commit => {
-                    if bundle_object_timestamp(db, format, &oid).is_some_and(|time| time <= since)
-                    {
+                    if bundle_object_timestamp(db, format, &oid).is_some_and(|time| time <= since) {
                         if seen.insert(oid) {
                             excludes.push(oid);
                         }
@@ -9184,11 +9228,8 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
             encoding: None,
             message: message.clone(),
         };
-        let key = commands::signing::signing_key(
-            config.as_ref(),
-            gpg_sign_key.as_deref(),
-            &committer,
-        );
+        let key =
+            commands::signing::signing_key(config.as_ref(), gpg_sign_key.as_deref(), &committer);
         Some(commands::signing::sign_payload(
             config.as_ref(),
             &unsigned.write(),

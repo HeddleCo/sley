@@ -354,6 +354,25 @@ fn emit_encoded_compiled_log_format_with_notes(
     Ok(())
 }
 
+fn emit_encoded_compiled_log_format_no_notes(
+    record: &sley_rev::CommitRecord,
+    compiled: &CompiledLogFormat,
+    context: &LogFormatContext<'_>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+    emit_compiled_log_format(
+        record,
+        compiled,
+        context,
+        &mut line,
+        0..compiled.tokens.len(),
+    )?;
+    let encoded = log_reencode_message(&line, "UTF-8", context.output_encoding);
+    out.extend_from_slice(&encoded);
+    Ok(())
+}
+
 struct LogFormatNoteResolver<'a, 'b> {
     git_dir: &'a Path,
     format: ObjectFormat,
@@ -505,6 +524,44 @@ fn compiled_format_uses_notes(compiled: &CompiledLogFormat) -> bool {
         .tokens
         .iter()
         .any(|token| matches!(token, FormatToken::NoteName))
+}
+
+fn compiled_format_uses_mailmap(compiled: &CompiledLogFormat) -> bool {
+    compiled.tokens.iter().any(|token| {
+        matches!(
+            token,
+            FormatToken::AuthorNameMapped
+                | FormatToken::AuthorEmailMapped
+                | FormatToken::AuthorEmailLocalMapped
+                | FormatToken::CommitterNameMapped
+                | FormatToken::CommitterEmailMapped
+                | FormatToken::CommitterEmailLocalMapped
+        )
+    })
+}
+
+fn log_output_needs_mailmap(output: &LogOutput, use_mailmap: bool) -> bool {
+    match output {
+        LogOutput::Default(kind) => {
+            use_mailmap
+                && matches!(
+                    kind,
+                    LogDefaultKind::Medium | LogDefaultKind::Short | LogDefaultKind::Fuller
+                )
+        }
+        LogOutput::Compiled { compiled, .. } => compiled_format_uses_mailmap(compiled),
+    }
+}
+
+fn log_cached_mailmap<'a>(
+    cache: &'a mut Option<commands::utility::Mailmap>,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<&'a commands::utility::Mailmap> {
+    if cache.is_none() {
+        *cache = Some(commands::utility::Mailmap::load_default(git_dir, format)?);
+    }
+    Ok(cache.as_ref().expect("mailmap cache was just initialized"))
 }
 
 fn render_log_raw_pretty(record: &sley_rev::CommitRecord) -> Vec<u8> {
@@ -1886,7 +1943,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             .or_else(|| config.get_bool("log", None, "showSignature"))
             .unwrap_or(false)
     });
-    let mailmap = commands::utility::Mailmap::load_default(&git_dir, format)?;
+    let empty_mailmap = commands::utility::Mailmap::default();
+    let mut mailmap_cache = None;
     let setup = match sley_rev::setup_revisions(
         &setup_args,
         &sley_rev::RevisionSetupContext {
@@ -2477,7 +2535,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     signature: None,
                     color: color_always,
                     output_encoding: &output_encoding,
-                    mailmap: &mailmap,
+                    mailmap: &empty_mailmap,
                     use_mailmap,
                 },
                 &mut line,
@@ -2543,7 +2601,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             signature: None,
             color: color_always,
             output_encoding: &output_encoding,
-            mailmap: &mailmap,
+            mailmap: &empty_mailmap,
             use_mailmap,
         };
         let metadata = sley_rev::walk_commit_metadata_date_ordered_limited(
@@ -2600,21 +2658,19 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         }
     }
     let mut selected = Vec::new();
+    let filter_mailmap = if use_mailmap && (author_filters.is_some() || committer_filters.is_some())
+    {
+        Some(log_cached_mailmap(&mut mailmap_cache, &git_dir, format)?)
+    } else {
+        None
+    };
     for record in &commits {
         if excluded.contains(&record.oid)
             || min_parents.is_some_and(|min| record.parents.len() < min)
             || max_parents.is_some_and(|max| record.parents.len() > max)
             || !log_age_filters_match(record, max_age, min_age)?
-            || !log_author_matcher_matches(
-                record,
-                author_filters.as_ref(),
-                use_mailmap.then_some(&mailmap),
-            )
-            || !log_committer_matcher_matches(
-                record,
-                committer_filters.as_ref(),
-                use_mailmap.then_some(&mailmap),
-            )
+            || !log_author_matcher_matches(record, author_filters.as_ref(), filter_mailmap)
+            || !log_committer_matcher_matches(record, committer_filters.as_ref(), filter_mailmap)
             || !log_grep_matcher_matches(record, grep_filters.as_ref(), grep_all_match, invert_grep)
         {
             continue;
@@ -2893,17 +2949,22 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         } else {
             None
         };
-    // Resolve the notes-display refs once. Notes show by default only for the
-    // medium (no-`--pretty`) format; an explicit `--notes`/`--no-notes` flag
-    // overrides. The empty list short-circuits all per-commit note lookups.
-    let notes_store = FileRefStore::new(&git_dir, format);
+    // Resolve the notes-display refs once, but only for output modes that can
+    // display notes. The empty list short-circuits all per-commit note lookups.
     let pretty_format_uses_notes = matches!(&output, LogOutput::Compiled { compiled, .. } if compiled_format_uses_notes(compiled));
     let notes_default_format =
         matches!(output, LogOutput::Default(LogDefaultKind::Medium)) || pretty_format_uses_notes;
-    let display_notes_refs = if notes_display.is_active(notes_default_format) {
-        notes_display.resolve_refs(&git_dir, &notes_store)?
+    let display_notes = if notes_display.is_active(notes_default_format) {
+        let notes_store = FileRefStore::new(&git_dir, format);
+        let refs = notes_display.resolve_refs(&git_dir, &notes_store)?;
+        Some((notes_store, refs))
     } else {
-        Vec::new()
+        None
+    };
+    let output_mailmap = if log_output_needs_mailmap(&output, use_mailmap) {
+        log_cached_mailmap(&mut mailmap_cache, &git_dir, format)?
+    } else {
+        &empty_mailmap
     };
 
     if let Some(shown) = &graph_shown {
@@ -2953,20 +3014,29 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         signature: Some(&signature_ctx),
                         color: color_always,
                         output_encoding: &output_encoding,
-                        mailmap: &mailmap,
+                        mailmap: output_mailmap,
                         use_mailmap,
                     };
                     let mut msg = Vec::with_capacity(compiled.estimated_line_capacity());
-                    emit_encoded_compiled_log_format_with_notes(
-                        &git_dir,
-                        format,
-                        &notes_store,
-                        &display_notes_refs,
-                        record,
-                        compiled,
-                        &format_context,
-                        &mut msg,
-                    )?;
+                    if let Some((notes_store, display_notes_refs)) = display_notes.as_ref() {
+                        emit_encoded_compiled_log_format_with_notes(
+                            &git_dir,
+                            format,
+                            notes_store,
+                            display_notes_refs,
+                            record,
+                            compiled,
+                            &format_context,
+                            &mut msg,
+                        )?;
+                    } else {
+                        emit_encoded_compiled_log_format_no_notes(
+                            record,
+                            compiled,
+                            &format_context,
+                            &mut msg,
+                        )?;
+                    }
                     if let Some(log_diff) = &log_diff {
                         let mut padding = String::new();
                         graph_state.padding_line(&mut padding);
@@ -3061,7 +3131,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             "Author:     {}",
                             commit_identity_mailmapped(
                                 &record.commit.author,
-                                use_mailmap.then_some(&mailmap)
+                                use_mailmap.then_some(output_mailmap)
                             )
                         )?;
                         writeln!(
@@ -3074,7 +3144,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             "Commit:     {}",
                             commit_identity_mailmapped(
                                 &record.commit.committer,
-                                use_mailmap.then_some(&mailmap)
+                                use_mailmap.then_some(output_mailmap)
                             )
                         )?;
                         writeln!(
@@ -3088,7 +3158,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             "Author: {}",
                             commit_identity_mailmapped(
                                 &record.commit.author,
-                                use_mailmap.then_some(&mailmap)
+                                use_mailmap.then_some(output_mailmap)
                             )
                         )?;
                         if *kind == LogDefaultKind::Medium {
@@ -3160,7 +3230,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         let prefix_width =
                             log_prefix_display_width(line_prefix.as_deref().unwrap_or(""));
                         if let Some(parent_index) = separate_parent_index {
-                            log_diff.render_parent(record, parent_index, prefix_width, &mut diff_block)?;
+                            log_diff.render_parent(
+                                record,
+                                parent_index,
+                                prefix_width,
+                                &mut diff_block,
+                            )?;
                         } else {
                             log_diff.render(record, prefix_width, &mut diff_block)?;
                         }
@@ -3232,7 +3307,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     if kind == LogDefaultKind::Fuller {
                         let author = commit_identity_mailmapped(
                             &record.commit.author,
-                            use_mailmap.then_some(&mailmap),
+                            use_mailmap.then_some(output_mailmap),
                         );
                         write!(out, "Author:     ")?;
                         out.write_all(&log_highlight_matches(
@@ -3248,7 +3323,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         )?;
                         let committer = commit_identity_mailmapped(
                             &record.commit.committer,
-                            use_mailmap.then_some(&mailmap),
+                            use_mailmap.then_some(output_mailmap),
                         );
                         write!(out, "Commit:     ")?;
                         out.write_all(&log_highlight_matches(
@@ -3265,7 +3340,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     } else {
                         let author = commit_identity_mailmapped(
                             &record.commit.author,
-                            use_mailmap.then_some(&mailmap),
+                            use_mailmap.then_some(output_mailmap),
                         );
                         write!(out, "Author: ")?;
                         out.write_all(&log_highlight_matches(
@@ -3294,12 +3369,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         ))?;
                         writeln!(out)?;
                     }
-                    if !display_notes_refs.is_empty() {
+                    if let Some((notes_store, display_notes_refs)) = display_notes.as_ref()
+                        && !display_notes_refs.is_empty()
+                    {
                         let notes = render_notes_block(
                             &git_dir,
                             format,
-                            &notes_store,
-                            &display_notes_refs,
+                            notes_store,
+                            display_notes_refs,
                             &record.oid,
                         )?;
                         out.write_all(&notes)?;
@@ -3334,7 +3411,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     signature: Some(&signature_ctx),
                     color: color_always,
                     output_encoding: &output_encoding,
-                    mailmap: &mailmap,
+                    mailmap: output_mailmap,
                     use_mailmap,
                 };
                 let mut ended_with_newline = false;
@@ -3349,16 +3426,25 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 } else if let Some(prefix) = &line_prefix {
                     // `--line-prefix=<p>` prefixes every output line.
                     let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
-                    emit_encoded_compiled_log_format_with_notes(
-                        &git_dir,
-                        format,
-                        &notes_store,
-                        &display_notes_refs,
-                        record,
-                        compiled,
-                        &format_context,
-                        &mut line,
-                    )?;
+                    if let Some((notes_store, display_notes_refs)) = display_notes.as_ref() {
+                        emit_encoded_compiled_log_format_with_notes(
+                            &git_dir,
+                            format,
+                            notes_store,
+                            display_notes_refs,
+                            record,
+                            compiled,
+                            &format_context,
+                            &mut line,
+                        )?;
+                    } else {
+                        emit_encoded_compiled_log_format_no_notes(
+                            record,
+                            compiled,
+                            &format_context,
+                            &mut line,
+                        )?;
+                    }
                     let mut stdout = io::stdout();
                     let mut start = 0usize;
                     while start < line.len() {
@@ -3377,16 +3463,25 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     ended_with_newline = line.last() == Some(&b'\n');
                 } else {
                     let mut out = Vec::with_capacity(compiled.estimated_line_capacity());
-                    emit_encoded_compiled_log_format_with_notes(
-                        &git_dir,
-                        format,
-                        &notes_store,
-                        &display_notes_refs,
-                        record,
-                        compiled,
-                        &format_context,
-                        &mut out,
-                    )?;
+                    if let Some((notes_store, display_notes_refs)) = display_notes.as_ref() {
+                        emit_encoded_compiled_log_format_with_notes(
+                            &git_dir,
+                            format,
+                            notes_store,
+                            display_notes_refs,
+                            record,
+                            compiled,
+                            &format_context,
+                            &mut out,
+                        )?;
+                    } else {
+                        emit_encoded_compiled_log_format_no_notes(
+                            record,
+                            compiled,
+                            &format_context,
+                            &mut out,
+                        )?;
+                    }
                     ended_with_newline = out.last() == Some(&b'\n');
                     io::stdout().write_all(&out)?;
                 }

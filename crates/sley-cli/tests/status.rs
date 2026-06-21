@@ -428,8 +428,11 @@ fn status_ignored_directory_rollup_and_negation_match_upstream_git() {
     fs::create_dir_all(&root).expect("create temp repo");
     {
         git(&root, &["init", "-q", "-b", "main"]);
-        fs::write(root.join(".gitignore"), b"ignored/*\n!ignored/keep.txt\nrollup/\n")
-            .expect("write ignore file");
+        fs::write(
+            root.join(".gitignore"),
+            b"ignored/*\n!ignored/keep.txt\nrollup/\n",
+        )
+        .expect("write ignore file");
         git(&root, &["add", ".gitignore"]);
         git(
             &root,
@@ -513,8 +516,7 @@ fn status_skip_worktree_untracked_modes_match_upstream_git() {
     {
         git(&root, &["init", "-q", "-b", "main"]);
         fs::create_dir_all(root.join("sparse")).expect("create sparse directory");
-        fs::write(root.join("sparse").join("file.txt"), b"tracked\n")
-            .expect("write tracked file");
+        fs::write(root.join("sparse").join("file.txt"), b"tracked\n").expect("write tracked file");
         git(&root, &["add", "sparse/file.txt"]);
         git(
             &root,
@@ -529,9 +531,11 @@ fn status_skip_worktree_untracked_modes_match_upstream_git() {
                 "-q",
             ],
         );
-        git(&root, &["update-index", "--skip-worktree", "sparse/file.txt"]);
-        fs::write(root.join("sparse").join("extra.txt"), b"extra\n")
-            .expect("write untracked file");
+        git(
+            &root,
+            &["update-index", "--skip-worktree", "sparse/file.txt"],
+        );
+        fs::write(root.join("sparse").join("extra.txt"), b"extra\n").expect("write untracked file");
 
         for args in [
             vec!["status", "--short"],
@@ -864,8 +868,11 @@ fn status_hides_root_gitignore_matches_like_upstream_git() {
             .expect("write anchored glob ignored file");
         fs::create_dir_all(root.join("tmp-nested-repo/.git"))
             .expect("create ignored nested repo fixture");
-        fs::write(root.join("tmp-nested-repo/.git/HEAD"), b"ref: refs/heads/main\n")
-            .expect("write ignored nested repo head");
+        fs::write(
+            root.join("tmp-nested-repo/.git/HEAD"),
+            b"ref: refs/heads/main\n",
+        )
+        .expect("write ignored nested repo head");
         fs::write(root.join("tmp-nested-repo/file.txt"), b"ignored\n")
             .expect("write ignored nested repo file");
         fs::create_dir_all(root.join("nested/tmp-info-only"))

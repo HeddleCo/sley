@@ -151,9 +151,10 @@ fn parse_shortlog_args(args: &[String]) -> Result<ShortlogOptions> {
                 let value = iter
                     .next()
                     .ok_or_else(|| shortlog_option_requires_value("abbrev"))?;
-                options.abbrev_len = Some(value.parse::<usize>().map_err(|_| {
-                    GitError::Command(format!("invalid abbrev length {value}"))
-                })?);
+                options.abbrev_len =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        GitError::Command(format!("invalid abbrev length {value}"))
+                    })?);
             }
             "--output" => {
                 let value = iter
@@ -218,9 +219,10 @@ fn parse_shortlog_args(args: &[String]) -> Result<ShortlogOptions> {
                 } else if let Some(rest) = value.strip_prefix("--date=") {
                     options.date_mode = log_date_mode(rest)?;
                 } else if let Some(rest) = value.strip_prefix("--abbrev=") {
-                    options.abbrev_len = Some(rest.parse::<usize>().map_err(|_| {
-                        GitError::Command(format!("invalid abbrev length {rest}"))
-                    })?);
+                    options.abbrev_len =
+                        Some(rest.parse::<usize>().map_err(|_| {
+                            GitError::Command(format!("invalid abbrev length {rest}"))
+                        })?);
                 } else if let Some(rest) = value.strip_prefix("--output=") {
                     options.output = Some(rest.to_string());
                 } else if let Some(rest) = value.strip_prefix("--max-count=") {
@@ -654,7 +656,11 @@ fn shortlog_group_keys(
     for group in &options.groups {
         match group {
             ShortlogGroup::Author => {
-                keys.push(shortlog_identity_key(&record.commit.author, options.email, mailmap));
+                keys.push(shortlog_identity_key(
+                    &record.commit.author,
+                    options.email,
+                    mailmap,
+                ));
             }
             ShortlogGroup::Committer => {
                 keys.push(shortlog_identity_key(
@@ -723,14 +729,20 @@ fn shortlog_render_format(
         date_mode,
         source_oid: None,
         describe: None,
-                signature: None,
+        signature: None,
         color: false,
         output_encoding: "UTF-8",
         mailmap,
         use_mailmap: false,
     };
     let mut out = Vec::with_capacity(compiled.estimated_line_capacity());
-    emit_compiled_log_format(record, &compiled, &context, &mut out, 0..compiled.tokens.len())?;
+    emit_compiled_log_format(
+        record,
+        &compiled,
+        &context,
+        &mut out,
+        0..compiled.tokens.len(),
+    )?;
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
@@ -834,9 +846,9 @@ fn parse_shortlog_group(value: &str) -> Result<ShortlogGroup> {
     match value {
         "author" => Ok(ShortlogGroup::Author),
         "committer" => Ok(ShortlogGroup::Committer),
-        value if value.starts_with("trailer:") => {
-            Ok(ShortlogGroup::Trailer(value["trailer:".len()..].to_string()))
-        }
+        value if value.starts_with("trailer:") => Ok(ShortlogGroup::Trailer(
+            value["trailer:".len()..].to_string(),
+        )),
         value if value.starts_with("format:") => {
             Ok(ShortlogGroup::Format(value["format:".len()..].to_string()))
         }

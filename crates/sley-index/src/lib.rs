@@ -423,6 +423,121 @@ impl<'a> BorrowedIndex<'a> {
 }
 
 impl Index {
+    /// Return whether the raw index bytes carry an extension chunk with
+    /// `signature`, without materializing the owned [`IndexEntry`] list.
+    pub fn bytes_have_extension(
+        bytes: &[u8],
+        format: ObjectFormat,
+        signature: &[u8; 4],
+    ) -> Result<bool> {
+        let extensions = Self::raw_extension_bytes(bytes, format)?;
+        let mut offset = 0;
+        while offset < extensions.len() {
+            if extensions.len() - offset < 8 {
+                return Err(GitError::InvalidFormat(
+                    "truncated index extension header".into(),
+                ));
+            }
+            let id = &extensions[offset..offset + 4];
+            let len = u32_be(&extensions[offset + 4..offset + 8]) as usize;
+            let body_start = offset + 8;
+            let body_end = body_start
+                .checked_add(len)
+                .ok_or_else(|| GitError::InvalidFormat("index extension length overflow".into()))?;
+            if body_end > extensions.len() {
+                return Err(GitError::InvalidFormat(
+                    "index extension body extends past end".into(),
+                ));
+            }
+            if id == signature {
+                return Ok(true);
+            }
+            offset = body_end;
+        }
+        Ok(false)
+    }
+
+    fn raw_extension_bytes(bytes: &[u8], format: ObjectFormat) -> Result<&[u8]> {
+        let hash_len = format.raw_len();
+        if bytes.len() < 12 + hash_len {
+            return Err(GitError::InvalidFormat("index header too short".into()));
+        }
+        let checksum_offset = bytes.len() - hash_len;
+        let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
+        let checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
+        if actual_checksum != checksum {
+            return Err(GitError::InvalidFormat(format!(
+                "index checksum mismatch: expected {checksum}, got {actual_checksum}"
+            )));
+        }
+        if &bytes[..4] != b"DIRC" {
+            return Err(GitError::InvalidFormat("missing DIRC signature".into()));
+        }
+        let version = u32_be(&bytes[4..8]);
+        if !(2..=4).contains(&version) {
+            return Err(GitError::Unsupported(format!("index version {version}")));
+        }
+        let count = u32_be(&bytes[8..12]) as usize;
+        let mut offset = 12;
+        let mut previous_path = Vec::new();
+        for _ in 0..count {
+            let entry_header_len = 40 + hash_len + 2;
+            if checksum_offset.saturating_sub(offset) < entry_header_len {
+                return Err(GitError::InvalidFormat("truncated index entry".into()));
+            }
+            let start = offset;
+            let flags_start = offset + 40 + hash_len;
+            let flags = u16_be(&bytes[flags_start..flags_start + 2]);
+            offset = flags_start + 2;
+            if flags & INDEX_FLAG_EXTENDED != 0 {
+                if checksum_offset.saturating_sub(offset) < 2 {
+                    return Err(GitError::InvalidFormat(
+                        "truncated index extended flags".into(),
+                    ));
+                }
+                offset += 2;
+            }
+            if version == 4 {
+                let strip_len =
+                    decode_index_v4_path_strip_len(bytes, &mut offset, checksum_offset)?;
+                if strip_len > previous_path.len() {
+                    return Err(GitError::InvalidFormat(
+                        "index v4 path compression removes too much prefix".into(),
+                    ));
+                }
+                let path_start = offset;
+                while bytes.get(offset).copied() != Some(0) {
+                    offset += 1;
+                    if offset >= checksum_offset {
+                        return Err(GitError::InvalidFormat("unterminated index path".into()));
+                    }
+                }
+                let prefix_len = previous_path.len() - strip_len;
+                let suffix = &bytes[path_start..offset];
+                let mut path = Vec::with_capacity(prefix_len + suffix.len());
+                path.extend_from_slice(&previous_path[..prefix_len]);
+                path.extend_from_slice(suffix);
+                offset += 1;
+                previous_path = path;
+            } else {
+                while bytes.get(offset).copied() != Some(0) {
+                    offset += 1;
+                    if offset >= checksum_offset {
+                        return Err(GitError::InvalidFormat("unterminated index path".into()));
+                    }
+                }
+                offset += 1;
+                while (offset - start) % 8 != 0 {
+                    offset += 1;
+                    if offset > checksum_offset {
+                        return Err(GitError::InvalidFormat("truncated index padding".into()));
+                    }
+                }
+            }
+        }
+        Ok(&bytes[offset..checksum_offset])
+    }
+
     pub fn for_each_path<F>(bytes: &[u8], format: ObjectFormat, mut visit: F) -> Result<()>
     where
         F: FnMut(&[u8]) -> Result<()>,
@@ -820,7 +935,10 @@ impl Index {
 
     /// Replace (or remove) the split-index `link` extension.
     pub fn set_split_index_link(&mut self, link: Option<&SplitIndexLink>) -> Result<()> {
-        self.replace_extension(&INDEX_EXT_LINK, link.map(SplitIndexLink::write).transpose()?)
+        self.replace_extension(
+            &INDEX_EXT_LINK,
+            link.map(SplitIndexLink::write).transpose()?,
+        )
     }
 
     /// Remove the split-index `link` extension.
@@ -842,9 +960,7 @@ impl Index {
                 encode_index_extension(&mut rebuilt, &id, chunk_body)?;
             }
         }
-        if !replaced
-            && let Some(body) = body.as_ref()
-        {
+        if !replaced && let Some(body) = body.as_ref() {
             encode_index_extension(&mut rebuilt, signature, body)?;
         }
         self.extensions = rebuilt;
@@ -1057,7 +1173,10 @@ impl UntrackedCache {
                     "truncated untracked-cache directory oid".into(),
                 ));
             }
-            dir.exclude_oid = Some(ObjectId::from_raw(format, &body[offset..offset + hash_len])?);
+            dir.exclude_oid = Some(ObjectId::from_raw(
+                format,
+                &body[offset..offset + hash_len],
+            )?);
             offset += hash_len;
         }
         if offset != end {
@@ -1581,7 +1700,11 @@ pub fn read_repository_index(git_dir: impl AsRef<Path>, format: ObjectFormat) ->
     read_index_file_expanded(&index_path, git_dir, format)
 }
 
-fn read_index_file_expanded(index_path: &Path, git_dir: &Path, format: ObjectFormat) -> Result<Index> {
+fn read_index_file_expanded(
+    index_path: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Index> {
     let mut index = Index::parse(&fs::read(index_path)?, format)?;
     let Some(link) = index.split_index_link(format)? else {
         return Ok(index);
@@ -1622,7 +1745,9 @@ fn merge_split_index_entries(
             ));
         }
         let Some(replacement) = replacement_iter.next() else {
-            return Err(GitError::InvalidFormat("too few replacement entries".into()));
+            return Err(GitError::InvalidFormat(
+                "too few replacement entries".into(),
+            ));
         };
         let mut replacement = replacement;
         if replacement.path.is_empty() {
@@ -2530,14 +2655,18 @@ mod tests {
         let sub = dir.join("sub");
         fs::create_dir_all(&sub).expect("test operation should succeed");
         assert_eq!(
-            gitlink_stat_verdict(&fs::symlink_metadata(&sub).expect("test operation should succeed")),
+            gitlink_stat_verdict(
+                &fs::symlink_metadata(&sub).expect("test operation should succeed")
+            ),
             GitlinkStatVerdict::Populated
         );
         // A regular file where the submodule should be → TypeChanged (dirty).
         let file = dir.join("file");
         fs::write(&file, b"x").expect("test operation should succeed");
         assert_eq!(
-            gitlink_stat_verdict(&fs::symlink_metadata(&file).expect("test operation should succeed")),
+            gitlink_stat_verdict(
+                &fs::symlink_metadata(&file).expect("test operation should succeed")
+            ),
             GitlinkStatVerdict::TypeChanged
         );
     }
@@ -3143,6 +3272,29 @@ mod tests {
                 .extension(b"link")
                 .expect("test operation should succeed"),
             Some(&b"\x00\x01\x02opaque"[..])
+        );
+    }
+
+    #[test]
+    fn index_bytes_have_extension_scans_without_owned_parse() {
+        let mut extensions = Vec::new();
+        encode_index_extension(&mut extensions, b"UNTR", b"opaque")
+            .expect("test operation should succeed");
+        let mut index = sample_index(2);
+        for entry in &mut index.entries {
+            entry.flags &= !INDEX_FLAG_EXTENDED;
+            entry.flags_extended = 0;
+        }
+        index.extensions = extensions;
+        let bytes = index.write_sha1().expect("test operation should succeed");
+
+        assert!(
+            Index::bytes_have_extension(&bytes, ObjectFormat::Sha1, b"UNTR")
+                .expect("test operation should succeed")
+        );
+        assert!(
+            !Index::bytes_have_extension(&bytes, ObjectFormat::Sha1, b"TREE")
+                .expect("test operation should succeed")
         );
     }
 

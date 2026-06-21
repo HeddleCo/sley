@@ -154,8 +154,14 @@ fn grep_word_and_fixed_string_match_git() {
     // Multiple patterns via -e are OR-combined.
     assert_same(&repo, &["grep", "-e", "hello", "-e", "baz"]);
     assert_same(&repo, &["grep", "-n", "-e", "hello", "-e", "baz"]);
-    assert_same(&repo, &["grep", "--all-match", "-e", "hello", "-e", "world"]);
-    assert_same(&repo, &["grep", "-L", "--all-match", "-e", "hello", "-e", "baz"]);
+    assert_same(
+        &repo,
+        &["grep", "--all-match", "-e", "hello", "-e", "world"],
+    );
+    assert_same(
+        &repo,
+        &["grep", "-L", "--all-match", "-e", "hello", "-e", "baz"],
+    );
 
     fs::remove_dir_all(&root).ok();
 }

@@ -671,10 +671,13 @@ pub fn ssh_process_args_with_ip(
             SshCommandVariant::OpenSsh
             | SshCommandVariant::Plink
             | SshCommandVariant::TortoisePlink => {
-                args.push(match ip_version {
-                    SshIpVersion::V4 => "-4",
-                    SshIpVersion::V6 => "-6",
-                }.into());
+                args.push(
+                    match ip_version {
+                        SshIpVersion::V4 => "-4",
+                        SshIpVersion::V6 => "-6",
+                    }
+                    .into(),
+                );
             }
             SshCommandVariant::Simple => {
                 return Err(GitError::InvalidFormat(
@@ -2432,8 +2435,7 @@ mod tests {
             ]
         );
 
-        let remote =
-            parse_remote_url("[myhost:123]:src").expect("test operation should succeed");
+        let remote = parse_remote_url("[myhost:123]:src").expect("test operation should succeed");
         assert_eq!(
             remote,
             RemoteUrl {
@@ -2461,8 +2463,7 @@ mod tests {
         assert_eq!(remote.port, None);
         assert_eq!(remote.path, "rep");
 
-        let remote =
-            parse_remote_url("[user@::1]:repo").expect("test operation should succeed");
+        let remote = parse_remote_url("[user@::1]:repo").expect("test operation should succeed");
         assert_eq!(remote.user.as_deref(), Some("user"));
         assert_eq!(remote.host.as_deref(), Some("::1"));
 
@@ -2506,8 +2507,7 @@ mod tests {
 
     #[test]
     fn ssh_process_args_include_ip_family_by_variant() {
-        let remote =
-            parse_remote_url("[myhost:123]:src").expect("test operation should succeed");
+        let remote = parse_remote_url("[myhost:123]:src").expect("test operation should succeed");
         assert_eq!(
             ssh_process_args_with_ip(
                 &remote,
@@ -2554,14 +2554,14 @@ mod tests {
     #[test]
     fn ssh_scheme_accepts_git_ipv6_authority_forms() {
         for (url, user, host, port, path) in [
-            ("ssh://::1/home/user/repo", None, "::1", None, "/home/user/repo"),
             (
-                "ssh://user@::1/~repo",
-                Some("user"),
+                "ssh://::1/home/user/repo",
+                None,
                 "::1",
                 None,
-                "/~repo",
+                "/home/user/repo",
             ),
+            ("ssh://user@::1/~repo", Some("user"), "::1", None, "/~repo"),
             (
                 "ssh://[user@::1]:22/home/user/repo",
                 Some("user"),

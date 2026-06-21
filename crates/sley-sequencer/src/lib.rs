@@ -385,7 +385,7 @@ mod tests {
                 committer: identity,
                 message: b"initial subject\n".to_vec(),
                 encoding: None,
-            signature: None,
+                signature: None,
             },
         )
         .expect("test operation should succeed");

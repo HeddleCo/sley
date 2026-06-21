@@ -302,9 +302,9 @@ fn parse_diff_files_args(args: &[String]) -> Result<DiffFilesOptions> {
             }
             "--diff-algorithm" => {
                 idx += 1;
-                let value = args.get(idx).ok_or_else(|| {
-                    GitError::Command("--diff-algorithm requires a value".into())
-                })?;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| GitError::Command("--diff-algorithm requires a value".into()))?;
                 o.diff_algorithm = parse_diff_files_algorithm(value)?;
             }
             value if let Some(rest) = value.strip_prefix("--diff-algorithm=") => {
@@ -836,7 +836,10 @@ fn add_dirty_submodule_entries(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
-    let index = Index::parse(&fs::read(sley_worktree::repository_index_path(git_dir))?, format)?;
+    let index = Index::parse(
+        &fs::read(sley_worktree::repository_index_path(git_dir))?,
+        format,
+    )?;
     for entry in index.entries {
         if sley_index::Stage::from_flags(entry.flags) != sley_index::Stage::Normal {
             continue;
@@ -844,7 +847,10 @@ fn add_dirty_submodule_entries(
         if !sley_index::is_gitlink(entry.mode) {
             continue;
         }
-        if entries.iter().any(|diff| diff.path.as_bytes() == entry.path.as_bytes()) {
+        if entries
+            .iter()
+            .any(|diff| diff.path.as_bytes() == entry.path.as_bytes())
+        {
             continue;
         }
         let path = String::from_utf8_lossy(entry.path.as_bytes()).into_owned();
@@ -897,7 +903,10 @@ fn filter_racy_clean_equivalent_worktree_entries(
     format: ObjectFormat,
     config: &GitConfig,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
-    let index = Index::parse(&fs::read(sley_worktree::repository_index_path(git_dir))?, format)?;
+    let index = Index::parse(
+        &fs::read(sley_worktree::repository_index_path(git_dir))?,
+        format,
+    )?;
     let mut filtered = Vec::with_capacity(entries.len());
     for entry in entries {
         if diff_files_entry_is_racy_clean_equivalent(
@@ -923,22 +932,16 @@ fn diff_files_entry_is_racy_clean_equivalent(
     format: ObjectFormat,
     config: &GitConfig,
 ) -> Result<bool> {
-    if entry.status != sley_diff_merge::NameStatus::Modified
-        || entry.old_mode != entry.new_mode
-    {
+    if entry.status != sley_diff_merge::NameStatus::Modified || entry.old_mode != entry.new_mode {
         return Ok(false);
     }
     let Some(old_oid) = entry.old_oid else {
         return Ok(false);
     };
     let path = entry.path.as_bytes();
-    let Some(index_entry) = index
-        .entries
-        .iter()
-        .find(|candidate| {
-            candidate.stage() == sley_index::Stage::Normal && candidate.path.as_bytes() == path
-        })
-    else {
+    let Some(index_entry) = index.entries.iter().find(|candidate| {
+        candidate.stage() == sley_index::Stage::Normal && candidate.path.as_bytes() == path
+    }) else {
         return Ok(false);
     };
     if index_entry.oid != old_oid || Some(index_entry.mode) != entry.old_mode {

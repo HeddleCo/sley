@@ -69,7 +69,11 @@ fn diff_filter_letter_bit(letter: char) -> u32 {
 
 /// Parse a `--diff-filter` argument: each uppercase letter adds a positive bit,
 /// each lowercase letter adds a negated bit (git `diff_opt_diff_filter`).
-pub(super) fn parse_diff_filter_arg(arg: &str, filter: &mut u32, filter_not: &mut u32) -> Result<()> {
+pub(super) fn parse_diff_filter_arg(
+    arg: &str,
+    filter: &mut u32,
+    filter_not: &mut u32,
+) -> Result<()> {
     for ch in arg.chars() {
         let (negate, upper) = if ch.is_ascii_lowercase() {
             (true, ch.to_ascii_uppercase())
@@ -490,12 +494,7 @@ impl CompiledPickaxe {
     }
 
     /// Whether this filepair (old/new blob bytes) matches the pickaxe.
-    fn filepair_matches(
-        &self,
-        old: Option<&[u8]>,
-        new: Option<&[u8]>,
-        ignore_case: bool,
-    ) -> bool {
+    fn filepair_matches(&self, old: Option<&[u8]>, new: Option<&[u8]>, ignore_case: bool) -> bool {
         match self {
             CompiledPickaxe::StringLiteral { needle } => {
                 let c1 = old.map_or(0, |d| Self::count_literal(needle, d, ignore_case, 0));

@@ -9,11 +9,7 @@ pub(crate) trait GrepArgOptions {
     fn grep_invert_mut(&mut self) -> &mut bool;
 }
 
-pub(crate) fn parse_grep_args<'a, I, O>(
-    arg: &str,
-    iter: &mut I,
-    options: &mut O,
-) -> Result<bool>
+pub(crate) fn parse_grep_args<'a, I, O>(arg: &str, iter: &mut I, options: &mut O) -> Result<bool>
 where
     I: Iterator<Item = &'a String>,
     O: GrepArgOptions,

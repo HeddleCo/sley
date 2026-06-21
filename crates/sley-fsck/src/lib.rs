@@ -1,5 +1,5 @@
-use sley_core::{ObjectFormat, ObjectId};
 use sley_config::GitConfig;
+use sley_core::{ObjectFormat, ObjectId};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
 use sley_odb::ObjectReader;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -309,7 +309,8 @@ where
             // git emits some raw `error: <msg>` stderr lines (e.g. tree-walk's
             // "empty filename in tree entry") *before* the formatted finding.
             if let Some(raw) = &f.raw_stderr {
-                self.issues.push(FsckIssue::content_error(format!("error: {raw}")));
+                self.issues
+                    .push(FsckIssue::content_error(format!("error: {raw}")));
             }
             let msg = format!(
                 "{prefix} {} {oid}: {}: {}",
@@ -344,8 +345,9 @@ where
         let Ok(commit) = Commit::parse_ref(self.format, body) else {
             if self.connectivity_only {
                 self.error_bits |= ERROR_OBJECT;
-                self.issues
-                    .push(FsckIssue::error(format!("{oid}: object corrupt or missing")));
+                self.issues.push(FsckIssue::error(format!(
+                    "{oid}: object corrupt or missing"
+                )));
             }
             return;
         };
@@ -397,8 +399,9 @@ where
             // The content checker already reported `badTree`/`nullSha1`/etc.
             if self.connectivity_only {
                 self.error_bits |= ERROR_OBJECT;
-                self.issues
-                    .push(FsckIssue::error(format!("{oid}: object corrupt or missing")));
+                self.issues.push(FsckIssue::error(format!(
+                    "{oid}: object corrupt or missing"
+                )));
             }
             return;
         };
@@ -476,8 +479,9 @@ where
         let Ok(tag) = Tag::parse_ref(self.format, body) else {
             if self.connectivity_only {
                 self.error_bits |= ERROR_OBJECT;
-                self.issues
-                    .push(FsckIssue::error(format!("{oid}: object corrupt or missing")));
+                self.issues.push(FsckIssue::error(format!(
+                    "{oid}: object corrupt or missing"
+                )));
             }
             return;
         };

@@ -39,9 +39,7 @@ struct DaemonOptions {
 
 impl DaemonOptions {
     fn document_root(&self) -> Option<&Path> {
-        self.base_path
-            .as_deref()
-            .or(self.root.as_deref())
+        self.base_path.as_deref().or(self.root.as_deref())
     }
 }
 
@@ -164,11 +162,9 @@ fn handle_connection(opts: &DaemonOptions, mut stream: TcpStream) -> Result<()> 
         return Ok(());
     };
     let request = parse_daemon_request(&payload)?;
-    if let Some((repo, receive)) = prepare_daemon_request(
-        opts,
-        &request,
-        |msg| write_error(&mut stream, msg),
-    )? {
+    if let Some((repo, receive)) =
+        prepare_daemon_request(opts, &request, |msg| write_error(&mut stream, msg))?
+    {
         run_service(&repo, receive, request.git_protocol.as_deref(), stream)?;
     }
     Ok(())
@@ -180,11 +176,9 @@ fn handle_inetd_connection(opts: &DaemonOptions) -> Result<()> {
         return Ok(());
     };
     let request = parse_daemon_request(&payload)?;
-    if let Some((repo, receive)) = prepare_daemon_request(
-        opts,
-        &request,
-        |msg| write_error_stdio(msg),
-    )? {
+    if let Some((repo, receive)) =
+        prepare_daemon_request(opts, &request, |msg| write_error_stdio(msg))?
+    {
         run_service_stdio(&repo, receive, request.git_protocol.as_deref())?;
     }
     Ok(())
@@ -201,7 +195,10 @@ fn parse_daemon_request(payload: &[u8]) -> Result<DaemonRequest> {
     // `git-upload-pack <path>\0host=<h>\0\0version=2\0`
     // The service line ends at the first NUL (or the trailing LF); everything
     // after it is extra args, each NUL-terminated.
-    let line_end = payload.iter().position(|&b| b == 0).unwrap_or(payload.len());
+    let line_end = payload
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(payload.len());
     let mut line = &payload[..line_end];
     if line.last() == Some(&b'\n') {
         line = &line[..line.len() - 1];

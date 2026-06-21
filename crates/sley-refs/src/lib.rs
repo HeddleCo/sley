@@ -132,6 +132,14 @@ pub enum PackRefDecision {
 }
 
 pub fn parse_packed_refs(format: ObjectFormat, bytes: &[u8]) -> Result<Vec<PackedRef>> {
+    parse_packed_refs_filtered(format, bytes, |_| true)
+}
+
+fn parse_packed_refs_with_prefix(
+    format: ObjectFormat,
+    bytes: &[u8],
+    prefix: &str,
+) -> Result<Vec<PackedRef>> {
     if !bytes.is_empty() && !bytes.ends_with(b"\n") {
         let line_start = bytes
             .iter()
@@ -145,6 +153,73 @@ pub fn parse_packed_refs(format: ObjectFormat, bytes: &[u8]) -> Result<Vec<Packe
     let text =
         std::str::from_utf8(bytes).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
     let mut refs: Vec<PackedRef> = Vec::new();
+    let mut saw_ref = false;
+    let mut included_last_ref = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(peeled) = line.strip_prefix('^') {
+            if !saw_ref {
+                return Err(GitError::InvalidFormat(
+                    "peeled packed ref without preceding ref".into(),
+                ));
+            }
+            if included_last_ref {
+                let oid = ObjectId::from_hex(format, peeled)?;
+                if let Some(last) = refs.last_mut() {
+                    last.peeled = Some(oid);
+                }
+            }
+            continue;
+        }
+        let (oid, name) = line
+            .split_once(' ')
+            .ok_or_else(|| packed_refs_unexpected_line(line))?;
+        saw_ref = true;
+        included_last_ref = name.starts_with(prefix);
+        if !included_last_ref {
+            continue;
+        }
+        if oid.len() != format.hex_len()
+            || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || validate_ref_name_for_read(name).is_err()
+        {
+            return Err(packed_refs_unexpected_line(line));
+        }
+        let oid = ObjectId::from_hex(format, oid)?;
+        refs.push(PackedRef {
+            reference: Ref {
+                name: name.into(),
+                target: RefTarget::Direct(oid),
+            },
+            peeled: None,
+        });
+    }
+    Ok(refs)
+}
+
+fn parse_packed_refs_filtered(
+    format: ObjectFormat,
+    bytes: &[u8],
+    mut include: impl FnMut(&str) -> bool,
+) -> Result<Vec<PackedRef>> {
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        let line_start = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let line = String::from_utf8_lossy(&bytes[line_start..]);
+        return Err(GitError::InvalidFormat(format!(
+            "fatal: unterminated line in .git/packed-refs: {line}"
+        )));
+    }
+    let text =
+        std::str::from_utf8(bytes).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    let mut refs: Vec<PackedRef> = Vec::new();
+    let mut saw_ref = false;
+    let mut included_last_ref = false;
     for raw_line in text.lines() {
         let line = raw_line.trim_end();
         if line.is_empty() || line.starts_with('#') {
@@ -152,12 +227,14 @@ pub fn parse_packed_refs(format: ObjectFormat, bytes: &[u8]) -> Result<Vec<Packe
         }
         if let Some(peeled) = line.strip_prefix('^') {
             let oid = ObjectId::from_hex(format, peeled)?;
-            let Some(last) = refs.last_mut() else {
+            if !saw_ref {
                 return Err(GitError::InvalidFormat(
                     "peeled packed ref without preceding ref".into(),
                 ));
-            };
-            last.peeled = Some(oid);
+            }
+            if included_last_ref && let Some(last) = refs.last_mut() {
+                last.peeled = Some(oid);
+            }
             continue;
         }
         let (oid, name) = line
@@ -169,19 +246,82 @@ pub fn parse_packed_refs(format: ObjectFormat, bytes: &[u8]) -> Result<Vec<Packe
         {
             return Err(packed_refs_unexpected_line(line));
         }
-        refs.push(PackedRef {
-            reference: Ref {
-                name: name.into(),
-                target: RefTarget::Direct(ObjectId::from_hex(format, oid)?),
-            },
-            peeled: None,
-        });
+        let oid = ObjectId::from_hex(format, oid)?;
+        saw_ref = true;
+        included_last_ref = include(name);
+        if included_last_ref {
+            refs.push(PackedRef {
+                reference: Ref {
+                    name: name.into(),
+                    target: RefTarget::Direct(oid),
+                },
+                peeled: None,
+            });
+        }
     }
     Ok(refs)
 }
 
+fn packed_ref_names_with_prefix(
+    format: ObjectFormat,
+    bytes: &[u8],
+    prefix: &str,
+    strip_prefix: bool,
+    names: &mut Vec<String>,
+) -> Result<()> {
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        let line_start = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let line = String::from_utf8_lossy(&bytes[line_start..]);
+        return Err(GitError::InvalidFormat(format!(
+            "fatal: unterminated line in .git/packed-refs: {line}"
+        )));
+    }
+    let text =
+        std::str::from_utf8(bytes).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    let mut saw_ref = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('^') {
+            if !saw_ref {
+                return Err(GitError::InvalidFormat(
+                    "peeled packed ref without preceding ref".into(),
+                ));
+            }
+            continue;
+        }
+        let (oid, name) = line
+            .split_once(' ')
+            .ok_or_else(|| packed_refs_unexpected_line(line))?;
+        saw_ref = true;
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        if oid.len() != format.hex_len()
+            || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || validate_ref_name_for_read(name).is_err()
+        {
+            return Err(packed_refs_unexpected_line(line));
+        }
+        let name = if strip_prefix {
+            &name[prefix.len()..]
+        } else {
+            name
+        };
+        names.push(name.to_owned());
+    }
+    Ok(())
+}
+
 fn packed_refs_unexpected_line(line: &str) -> GitError {
-    GitError::InvalidFormat(format!("fatal: unexpected line in .git/packed-refs: {line}"))
+    GitError::InvalidFormat(format!(
+        "fatal: unexpected line in .git/packed-refs: {line}"
+    ))
 }
 
 fn packed_refs_have_prefix(format: ObjectFormat, bytes: &[u8], prefix: &str) -> Result<bool> {
@@ -869,25 +1009,29 @@ impl FileRefStore {
     }
 
     pub fn list_refs(&self) -> Result<Vec<Ref>> {
+        self.list_refs_with_prefix("refs/")
+    }
+
+    pub fn list_refs_with_prefix(&self, prefix: &str) -> Result<Vec<Ref>> {
         if self.uses_reftable()? {
-            return self.list_reftable_refs();
+            return self.list_reftable_refs_with_prefix(prefix);
         }
         let mut refs = Vec::new();
         let packed_path = self.storage_dir.join("packed-refs");
         if packed_path.exists() {
-            for packed in parse_packed_refs(self.format, &fs::read(packed_path)?)? {
+            for packed in
+                parse_packed_refs_with_prefix(self.format, &fs::read(packed_path)?, prefix)?
+            {
                 refs.push(packed.reference);
             }
         }
-        let refs_dir = self.storage_dir.join("refs");
         let mut loose_refs = BTreeMap::new();
-        if refs_dir.exists() {
-            self.collect_loose_refs(&refs_dir, "refs", &mut loose_refs)?;
-        }
+        self.collect_loose_refs_with_prefix(prefix, &mut loose_refs)?;
         if !loose_refs.is_empty() {
             refs.retain(|reference| !loose_refs.contains_key(&reference.name));
             refs.extend(loose_refs.into_values());
         }
+        refs.retain(|reference| reference.name.starts_with(prefix));
         refs.retain(|reference| {
             if validate_ref_name(&reference.name).is_ok() {
                 true
@@ -898,6 +1042,88 @@ impl FileRefStore {
         });
         refs.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(refs)
+    }
+
+    pub fn list_ref_names_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        if self.uses_reftable()? {
+            return Ok(self
+                .list_reftable_refs_with_prefix(prefix)?
+                .into_iter()
+                .map(|reference| reference.name)
+                .collect());
+        }
+        let mut names = Vec::new();
+        let packed_path = self.storage_dir.join("packed-refs");
+        if packed_path.exists() {
+            packed_ref_names_with_prefix(
+                self.format,
+                &fs::read(packed_path)?,
+                prefix,
+                false,
+                &mut names,
+            )?;
+        }
+        let mut loose_names = BTreeSet::new();
+        self.collect_loose_ref_names_with_prefix(prefix, &mut loose_names)?;
+        if !loose_names.is_empty() {
+            names.retain(|name| !loose_names.contains(name));
+            names.extend(loose_names);
+        }
+        names.retain(|name| name.starts_with(prefix));
+        names.retain(|name| {
+            if validate_ref_name(name).is_ok() {
+                true
+            } else {
+                warn_broken_ref_name(name);
+                false
+            }
+        });
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    pub fn list_short_ref_names_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        if self.uses_reftable()? {
+            let mut names = self
+                .list_reftable_refs_with_prefix(prefix)?
+                .into_iter()
+                .filter_map(|reference| reference.name.strip_prefix(prefix).map(str::to_owned))
+                .collect::<Vec<_>>();
+            names.sort();
+            return Ok(names);
+        }
+        let mut names = Vec::new();
+        let packed_path = self.storage_dir.join("packed-refs");
+        if packed_path.exists() {
+            packed_ref_names_with_prefix(
+                self.format,
+                &fs::read(packed_path)?,
+                prefix,
+                true,
+                &mut names,
+            )?;
+        }
+        let mut loose_full_names = BTreeSet::new();
+        self.collect_loose_ref_names_with_prefix(prefix, &mut loose_full_names)?;
+        let loose_names = loose_full_names
+            .into_iter()
+            .filter_map(|name| {
+                if validate_ref_name(&name).is_ok() {
+                    name.strip_prefix(prefix).map(str::to_owned)
+                } else {
+                    warn_broken_ref_name(&name);
+                    None
+                }
+            })
+            .collect::<BTreeSet<_>>();
+        if !loose_names.is_empty() {
+            names.retain(|name| !loose_names.contains(name));
+            names.extend(loose_names);
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
     }
 
     pub fn list_all_refs(&self) -> Result<Vec<Ref>> {
@@ -981,9 +1207,7 @@ impl FileRefStore {
             false,
             0,
             |_| true,
-            |name, oid| {
-                peel(name, oid).map(|peeled| PackRefDecision::Pack { peeled })
-            },
+            |name, oid| peel(name, oid).map(|peeled| PackRefDecision::Pack { peeled }),
         )
     }
 
@@ -1596,10 +1820,14 @@ impl FileRefStore {
     }
 
     fn list_reftable_refs(&self) -> Result<Vec<Ref>> {
+        self.list_reftable_refs_with_prefix("refs/")
+    }
+
+    fn list_reftable_refs_with_prefix(&self, prefix: &str) -> Result<Vec<Ref>> {
         let mut refs = BTreeMap::<String, Ref>::new();
         for table in self.reftables()? {
             for record in table.refs {
-                if !record.name.starts_with("refs/") {
+                if !record.name.starts_with("refs/") || !record.name.starts_with(prefix) {
                     continue;
                 }
                 match reftable_ref_target(record.value)? {
@@ -2011,7 +2239,6 @@ impl FileRefStore {
         Ok(entries)
     }
 
-
     fn collect_loose_refs(
         &self,
         dir: &Path,
@@ -2028,6 +2255,113 @@ impl FileRefStore {
                 let reference = parse_loose_ref(self.format, name.clone(), &fs::read(path)?)?;
                 refs.insert(name, reference);
             }
+        }
+        Ok(())
+    }
+
+    fn collect_loose_refs_with_prefix(
+        &self,
+        prefix: &str,
+        refs: &mut BTreeMap<String, Ref>,
+    ) -> Result<()> {
+        if !safe_ref_prefix_for_directory_scan(prefix) {
+            return self.collect_all_loose_refs(refs);
+        }
+
+        let trimmed = prefix.trim_end_matches('/');
+        if prefix.ends_with('/') {
+            let candidate = self.storage_dir.join(trimmed);
+            match fs::metadata(&candidate) {
+                Ok(meta) if meta.is_dir() => {
+                    self.collect_loose_refs(&candidate, trimmed, refs)?;
+                    return Ok(());
+                }
+                Ok(_) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        let Some((parent_prefix, _)) = trimmed.rsplit_once('/') else {
+            return self.collect_all_loose_refs(refs);
+        };
+        let parent = self.storage_dir.join(parent_prefix);
+        match fs::metadata(&parent) {
+            Ok(meta) if meta.is_dir() => self.collect_loose_refs(&parent, parent_prefix, refs),
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn collect_loose_ref_names(
+        &self,
+        dir: &Path,
+        prefix: &str,
+        names: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = format!("{prefix}/{}", entry.file_name().to_string_lossy());
+            if path.is_dir() {
+                self.collect_loose_ref_names(&path, &name, names)?;
+            } else if !name.ends_with(".lock") {
+                names.insert(name);
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_loose_ref_names_with_prefix(
+        &self,
+        prefix: &str,
+        names: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if !safe_ref_prefix_for_directory_scan(prefix) {
+            return self.collect_all_loose_ref_names(names);
+        }
+
+        let trimmed = prefix.trim_end_matches('/');
+        if prefix.ends_with('/') {
+            let candidate = self.storage_dir.join(trimmed);
+            match fs::metadata(&candidate) {
+                Ok(meta) if meta.is_dir() => {
+                    self.collect_loose_ref_names(&candidate, trimmed, names)?;
+                    return Ok(());
+                }
+                Ok(_) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        let Some((parent_prefix, _)) = trimmed.rsplit_once('/') else {
+            return self.collect_all_loose_ref_names(names);
+        };
+        let parent = self.storage_dir.join(parent_prefix);
+        match fs::metadata(&parent) {
+            Ok(meta) if meta.is_dir() => {
+                self.collect_loose_ref_names(&parent, parent_prefix, names)
+            }
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn collect_all_loose_ref_names(&self, names: &mut BTreeSet<String>) -> Result<()> {
+        let refs_dir = self.storage_dir.join("refs");
+        if refs_dir.exists() {
+            self.collect_loose_ref_names(&refs_dir, "refs", names)?;
+        }
+        Ok(())
+    }
+
+    fn collect_all_loose_refs(&self, refs: &mut BTreeMap<String, Ref>) -> Result<()> {
+        let refs_dir = self.storage_dir.join("refs");
+        if refs_dir.exists() {
+            self.collect_loose_refs(&refs_dir, "refs", refs)?;
         }
         Ok(())
     }
@@ -2383,6 +2717,102 @@ impl FileRefStore {
         }
     }
 
+    fn check_ref_directory_conflict_targeted(&self, name: &str) -> Result<()> {
+        let components = name.split('/').collect::<Vec<_>>();
+        let mut ancestors = Vec::new();
+        for index in 1..components.len() {
+            let ancestor = components[..index].join("/");
+            if self.loose_ref_file_exists_for_conflict(&ancestor)? {
+                return Err(ref_directory_conflict_error(name, &ancestor));
+            }
+            ancestors.push(ancestor);
+        }
+        let child_prefix = format!("{name}/");
+        if let Some(existing) = self.first_loose_ref_name_with_prefix(&child_prefix)? {
+            return Err(ref_directory_conflict_error(name, &existing));
+        }
+        if let Some(existing) =
+            self.first_packed_ref_directory_conflict(&ancestors, &child_prefix)?
+        {
+            return Err(ref_directory_conflict_error(name, &existing));
+        }
+        Ok(())
+    }
+
+    fn loose_ref_file_exists_for_conflict(&self, name: &str) -> Result<bool> {
+        let path = self.ref_path(name);
+        match fs::symlink_metadata(path) {
+            Ok(meta) => Ok(!meta.is_dir()),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    || err.kind() == std::io::ErrorKind::NotADirectory =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn first_packed_ref_directory_conflict(
+        &self,
+        ancestors: &[String],
+        child_prefix: &str,
+    ) -> Result<Option<String>> {
+        let packed_path = self.storage_dir.join("packed-refs");
+        let text = match fs::read_to_string(packed_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        for raw_line in text.lines() {
+            let line = raw_line.trim_end();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            let (_, name) = line
+                .split_once(' ')
+                .ok_or_else(|| packed_refs_unexpected_line(line))?;
+            if ancestors.iter().any(|ancestor| ancestor == name) || name.starts_with(child_prefix) {
+                return Ok(Some(name.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn first_loose_ref_name_with_prefix(&self, prefix: &str) -> Result<Option<String>> {
+        if !prefix.starts_with("refs/") || !prefix.ends_with('/') {
+            return Ok(None);
+        }
+        let trimmed = prefix.trim_end_matches('/');
+        let dir = self.ref_base_dir(trimmed).join(trimmed);
+        self.first_loose_ref_name_in_dir(&dir, trimmed)
+    }
+
+    fn first_loose_ref_name_in_dir(&self, dir: &Path, prefix: &str) -> Result<Option<String>> {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    || err.kind() == std::io::ErrorKind::NotADirectory =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let name = format!("{prefix}/{}", entry.file_name().to_string_lossy());
+            if path.is_dir() {
+                if let Some(found) = self.first_loose_ref_name_in_dir(&path, &name)? {
+                    return Ok(Some(found));
+                }
+            } else if !name.ends_with(".lock") {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn reftable_ref_target(value: ReftableRefValue) -> Result<Option<RefTarget>> {
@@ -2518,7 +2948,10 @@ fn reftable_table_name(min_update_index: u64, max_update_index: u64) -> String {
     // Mix the process id in so concurrent writers in the same nanosecond still
     // pick distinct names; truncate to 32 bits to match git's `%08x`.
     let salt = (nanos as u64) ^ (u64::from(std::process::id()) << 16);
-    format!("0x{min_update_index:012x}-0x{max_update_index:012x}-{:08x}.ref", salt as u32)
+    format!(
+        "0x{min_update_index:012x}-0x{max_update_index:012x}-{:08x}.ref",
+        salt as u32
+    )
 }
 
 fn reftable_autocompaction_disabled() -> bool {
@@ -2534,8 +2967,13 @@ fn reftable_autocompaction_disabled() -> bool {
 fn reftable_table_name_is_valid(name: &str) -> bool {
     fn hex_prefix(s: &str) -> Option<&str> {
         // strtoull(base 16) skips an optional leading 0x and consumes hex digits.
-        let body = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
-        let consumed = body.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(body.len());
+        let body = s
+            .strip_prefix("0x")
+            .or_else(|| s.strip_prefix("0X"))
+            .unwrap_or(s);
+        let consumed = body
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(body.len());
         if consumed == 0 {
             return None;
         }
@@ -2629,11 +3067,8 @@ pub struct RefTransactionHookUpdate {
 /// the prepare phases into the git-shaped `in '<phase>' phase, update aborted by
 /// the reference-transaction hook` failure.
 pub trait ReferenceTransactionHook {
-    fn run(
-        &self,
-        phase: RefTransactionPhase,
-        updates: &[RefTransactionHookUpdate],
-    ) -> Result<bool>;
+    fn run(&self, phase: RefTransactionPhase, updates: &[RefTransactionHookUpdate])
+    -> Result<bool>;
 }
 
 pub struct FileRefTransaction<'a> {
@@ -2835,8 +3270,9 @@ fn hook_old_value(zero: &str, precondition: &RefPrecondition) -> String {
     match precondition {
         RefPrecondition::Any | RefPrecondition::MustExist => zero.to_string(),
         RefPrecondition::MustNotExist => zero.to_string(),
-        RefPrecondition::MustExistAndMatch(target)
-        | RefPrecondition::ExistingMustMatch(target) => hook_target_value(zero, Some(target)),
+        RefPrecondition::MustExistAndMatch(target) | RefPrecondition::ExistingMustMatch(target) => {
+            hook_target_value(zero, Some(target))
+        }
     }
 }
 
@@ -2865,9 +3301,15 @@ fn hook_target_value(zero: &str, target: Option<&RefTarget>) -> String {
 
 impl FileRefStore {
     fn commit_reftable(&self, changes: Vec<CoalescedRefChange>) -> Result<()> {
-        // Capture HEAD's symref target before any ref is mutated so the
-        // HEAD-reflog mirror reflects the pre-transaction checked-out branch.
-        let head_branch = self.head_symref_target();
+        // Capture HEAD's symref target only when there is a reflog to mirror.
+        let has_reflogs = changes.iter().any(|change| {
+            matches!(change, CoalescedRefChange::Update(update) if !update.reflog.is_empty())
+        });
+        let head_branch = if has_reflogs {
+            self.head_symref_target()
+        } else {
+            None
+        };
         let mut records = Vec::with_capacity(changes.len());
         let mut reflogs = Vec::new();
         let mut delete_names = Vec::new();
@@ -2944,16 +3386,24 @@ impl FileRefStore {
         hook: Option<&dyn ReferenceTransactionHook>,
         hook_updates: Option<&[RefTransactionHookUpdate]>,
     ) -> Result<()> {
-        // Capture HEAD's symref target before any ref is mutated so the
-        // HEAD-reflog mirror reflects the pre-transaction checked-out branch.
-        let head_branch = self.head_symref_target();
+        // Capture HEAD's symref target only when there is a reflog to mirror.
+        let has_reflogs = changes.iter().any(|change| {
+            matches!(change, CoalescedRefChange::Update(update) if !update.reflog.is_empty())
+        });
+        let head_branch = if has_reflogs {
+            self.head_symref_target()
+        } else {
+            None
+        };
         let has_delete = changes
             .iter()
             .any(|change| matches!(change, CoalescedRefChange::Delete(_)));
-        let conflict_names = if changes
+        let update_count = changes
             .iter()
-            .any(|change| matches!(change, CoalescedRefChange::Update(_)))
-        {
+            .filter(|change| matches!(change, CoalescedRefChange::Update(_)))
+            .count();
+        let targeted_conflict_check = update_count == 1 && !has_delete;
+        let conflict_names = if update_count > 0 && !targeted_conflict_check {
             let mut names = self
                 .list_refs()?
                 .into_iter()
@@ -2977,12 +3427,18 @@ impl FileRefStore {
         // Acquire every lock first; bail (releasing what we hold) on any failure.
         for change in &changes {
             let name = change.name();
-            if matches!(change, CoalescedRefChange::Update(_))
-                && let Some(conflict_names) = conflict_names.as_ref()
-                && let Err(err) = check_ref_directory_conflict_in_names(name, conflict_names)
-            {
-                release_pending_locks(&pending);
-                return Err(err);
+            if matches!(change, CoalescedRefChange::Update(_)) {
+                let conflict_result = if targeted_conflict_check {
+                    self.check_ref_directory_conflict_targeted(name)
+                } else if let Some(conflict_names) = conflict_names.as_ref() {
+                    check_ref_directory_conflict_in_names(name, conflict_names)
+                } else {
+                    Ok(())
+                };
+                if let Err(err) = conflict_result {
+                    release_pending_locks(&pending);
+                    return Err(err);
+                }
             }
             let path = self.ref_path(name);
             let parent = path
@@ -3101,8 +3557,7 @@ impl FileRefStore {
             match &changes[index] {
                 CoalescedRefChange::Update(update) => {
                     let current = if use_packed_snapshot {
-                        match self
-                            .read_ref_from_packed_snapshot(&update.name, &packed_ref_targets)
+                        match self.read_ref_from_packed_snapshot(&update.name, &packed_ref_targets)
                         {
                             Ok(current) => current,
                             Err(err) => {
@@ -3134,9 +3589,7 @@ impl FileRefStore {
                             return Err(err);
                         }
                     };
-                    if pending[index].original.is_none()
-                        && current.as_ref() == Some(&update.new)
-                    {
+                    if pending[index].original.is_none() && current.as_ref() == Some(&update.new) {
                         pending[index].action = PendingPathAction::ReleaseLock;
                     }
                     for entry in &update.reflog {
@@ -3144,7 +3597,8 @@ impl FileRefStore {
                     }
                 }
                 CoalescedRefChange::Delete(delete) => {
-                    let state = match self.read_locked_ref_state(&delete.name, &packed_ref_targets) {
+                    let state = match self.read_locked_ref_state(&delete.name, &packed_ref_targets)
+                    {
                         Ok(state) => state,
                         Err(err) => {
                             release_pending_locks(&pending);
@@ -3548,7 +4002,8 @@ impl ReftableListLock {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&self.lock_path, &self.list_path).map_err(|err| GitError::Io(err.to_string()))?;
+        fs::rename(&self.lock_path, &self.list_path)
+            .map_err(|err| GitError::Io(err.to_string()))?;
         self.active = false;
         Ok(())
     }
@@ -4361,7 +4816,9 @@ pub fn branch_ref_name_for_read(branch: &str) -> Result<String> {
 
 pub fn branch_ref_name_for_source(branch: &str) -> Result<String> {
     if branch.starts_with("--") {
-        return Err(GitError::InvalidPath(format!("invalid branch name {branch}")));
+        return Err(GitError::InvalidPath(format!(
+            "invalid branch name {branch}"
+        )));
     }
     let name = format!("{}{}", BranchRefName::PREFIX, branch);
     check_refname_format(&name, false)?;
@@ -4390,9 +4847,7 @@ fn write_locked_with_timeout(path: &Path, bytes: &[u8], timeout_millis: u64) -> 
                 file.sync_all()?;
                 break;
             }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::AlreadyExists && timeout_millis > 0 =>
-            {
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && timeout_millis > 0 => {
                 let elapsed = start
                     .elapsed()
                     .unwrap_or_else(|_| Duration::from_millis(timeout_millis + 1));
@@ -4588,6 +5043,20 @@ fn validate_ref_path_safe_for_read(name: &str) -> Result<()> {
         return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
     }
     Ok(())
+}
+
+fn safe_ref_prefix_for_directory_scan(prefix: &str) -> bool {
+    let path = Path::new(prefix);
+    prefix.starts_with("refs/")
+        && !prefix.starts_with('/')
+        && !prefix.contains('\\')
+        && !path.is_absolute()
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
 }
 
 fn warn_broken_ref_name(name: &str) {
@@ -5833,6 +6302,54 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
     }
 
     #[test]
+    fn file_ref_store_lists_refs_with_prefix_and_preserves_loose_shadowing() {
+        let git_dir = temp_git_dir();
+        fs::write(
+            git_dir.join("packed-refs"),
+            b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 refs/heads/main\n\
+              18f002b4484b838b205a48b1e9e6763ba5e3a607 refs/heads/topic\n\
+              ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1.0\n",
+        )
+        .expect("test operation should succeed");
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let loose_main = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let packed_topic = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "18f002b4484b838b205a48b1e9e6763ba5e3a607",
+        )
+        .expect("test operation should succeed");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(loose_main),
+            reflog: None,
+        });
+        tx.commit().expect("test operation should succeed");
+
+        assert_eq!(
+            store
+                .list_refs_with_prefix("refs/heads/")
+                .expect("test operation should succeed"),
+            vec![
+                Ref {
+                    name: "refs/heads/main".into(),
+                    target: RefTarget::Direct(loose_main),
+                },
+                Ref {
+                    name: "refs/heads/topic".into(),
+                    target: RefTarget::Direct(packed_topic),
+                },
+            ]
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
     fn file_ref_store_writes_packed_refs() {
         let git_dir = temp_git_dir();
         let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
@@ -5997,6 +6514,15 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                     target: RefTarget::Direct(tag_oid),
                 },
             ]
+        );
+        assert_eq!(
+            store
+                .list_refs_with_prefix("refs/tags/")
+                .expect("test operation should succeed"),
+            vec![Ref {
+                name: "refs/tags/v1.0".into(),
+                target: RefTarget::Direct(tag_oid),
+            }]
         );
 
         fs::remove_dir_all(git_dir).expect("test operation should succeed");

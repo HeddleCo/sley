@@ -89,8 +89,7 @@ impl CatFileOptions {
                         if option.has_value() {
                             return option_takes_no_value(option.name());
                         }
-                        options.use_mailmap =
-                            matches!(option.name(), "use-mailmap" | "mailmap");
+                        options.use_mailmap = matches!(option.name(), "use-mailmap" | "mailmap");
                     }
                     "batch" => options.set_batch_mode(
                         CatFileBatchMode::Batch,
@@ -438,7 +437,8 @@ impl RepositoryObjectView {
 
     fn resolve_path(&self, rev: &str, path: &str) -> Result<sley_rev::ResolvedTreePath> {
         warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, rev);
-        sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db).resolve_path(rev, path)
+        sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db)
+            .resolve_path(rev, path)
     }
 
     fn resolve_path_follow_symlinks(&self, rev: &str, path: &str) -> sley_rev::SymlinkedTreePath {
@@ -771,9 +771,7 @@ fn cat_file_apply_mailmap_body(
     object_type: ObjectType,
     mailmap: &commands::utility::Mailmap,
 ) -> Vec<u8> {
-    if mailmap.is_empty()
-        || !matches!(object_type, ObjectType::Commit | ObjectType::Tag)
-    {
+    if mailmap.is_empty() || !matches!(object_type, ObjectType::Commit | ObjectType::Tag) {
         return body.to_vec();
     }
     let mut out = Vec::with_capacity(body.len());
@@ -789,8 +787,10 @@ fn cat_file_apply_mailmap_body(
         let line = &rest[..line_end];
         match ["author ", "committer ", "tagger "]
             .iter()
-            .find_map(|prefix| line.strip_prefix(prefix.as_bytes()).map(|ident| (*prefix, ident)))
-        {
+            .find_map(|prefix| {
+                line.strip_prefix(prefix.as_bytes())
+                    .map(|ident| (*prefix, ident))
+            }) {
             Some((prefix, ident)) => {
                 out.extend_from_slice(prefix.as_bytes());
                 out.extend_from_slice(&cat_file_rewrite_ident(ident, mailmap));
@@ -1274,9 +1274,8 @@ fn print_cat_file_batch_record(
             let mailmap = batch_record_mailmap(record.use_mailmap)?;
             if !mailmap.is_empty() {
                 let object = record.view.db().read_object(&read_oid)?;
-                size =
-                    cat_file_apply_mailmap_body(&object.body, object.object_type, &mailmap).len()
-                        as u64;
+                size = cat_file_apply_mailmap_body(&object.body, object.object_type, &mailmap).len()
+                    as u64;
             }
         }
         if record.filter.excludes(object_type, size) {

@@ -7,10 +7,10 @@
 //! `--skip` / `--quit` / `--edit-todo`, and autostash handling.
 
 use crate::commands::merge_rebase::{
-    MergePathResult, commit_tree_oid, head_commit_oid, merge_bases, merge_index_entry,
-    merge_read_blob, merge_remove_worktree_file, merge_write_worktree_file,
-    merge_favor_from_strategy_opts, print_branch_commit_summary,
-    print_commit_shortstat_between_trees, three_way_merge_trees, three_way_merge_trees_with_favor,
+    MergePathResult, commit_tree_oid, head_commit_oid, merge_bases, merge_favor_from_strategy_opts,
+    merge_index_entry, merge_read_blob, merge_remove_worktree_file, merge_write_worktree_file,
+    print_branch_commit_summary, print_commit_shortstat_between_trees, three_way_merge_trees,
+    three_way_merge_trees_with_favor,
 };
 use crate::commands::replay::{comment_char, launch_editor, strip_comment_lines};
 use crate::*;
@@ -327,9 +327,9 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             "--no-rebase-merges" => out.rebase_merges = Some(RebaseMergesArg::Disabled),
             _ if arg.starts_with("--rebase-merges=") => {
                 out.rebase_merges = match &arg["--rebase-merges=".len()..] {
-                    "no-rebase-cousins" => Some(RebaseMergesArg::Enabled(
-                        RebaseMergesMode::NoRebaseCousins,
-                    )),
+                    "no-rebase-cousins" => {
+                        Some(RebaseMergesArg::Enabled(RebaseMergesMode::NoRebaseCousins))
+                    }
                     "rebase-cousins" => {
                         Some(RebaseMergesArg::Enabled(RebaseMergesMode::RebaseCousins))
                     }
@@ -531,7 +531,10 @@ fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
         fs::write(dir.join("strategy"), format!("{strategy}\n"))?;
     }
     if !opts.strategy_opts.is_empty() {
-        fs::write(dir.join("strategy_opts"), opts.strategy_opts.join("\n") + "\n")?;
+        fs::write(
+            dir.join("strategy_opts"),
+            opts.strategy_opts.join("\n") + "\n",
+        )?;
     }
     Ok(())
 }
@@ -1851,11 +1854,7 @@ fn rebase_commit_signature(
         encoding,
         message: message.to_vec(),
     };
-    let key = commands::signing::signing_key(
-        config.as_ref(),
-        opts.gpg_sign.as_deref(),
-        committer,
-    );
+    let key = commands::signing::signing_key(config.as_ref(), opts.gpg_sign.as_deref(), committer);
     commands::signing::sign_payload(config.as_ref(), &unsigned.write(), key.as_deref()).map(Some)
 }
 
@@ -2238,7 +2237,10 @@ fn make_script_with_merges(
             }
             Some(oid) => {
                 if let Some(label) = labels.get(&oid) {
-                    format!("{label} # {}", commit_subject(&records[&oid].commit.message))
+                    format!(
+                        "{label} # {}",
+                        commit_subject(&records[&oid].commit.message)
+                    )
                 } else {
                     "onto".to_string()
                 }
@@ -2317,7 +2319,14 @@ fn label_for_oid(
     used: &mut std::collections::HashSet<String>,
     db: &FileObjectDatabase,
 ) -> String {
-    ensure_label(ctx, oid, &find_unique_abbrev_hex(ctx, db, oid), labels, used, db)
+    ensure_label(
+        ctx,
+        oid,
+        &find_unique_abbrev_hex(ctx, db, oid),
+        labels,
+        used,
+        db,
+    )
 }
 
 fn sanitize_label(input: &str) -> String {
@@ -3199,7 +3208,10 @@ fn do_reset(ctx: &Ctx, db: &FileObjectDatabase, opts: &MachineOpts, name: &str) 
             let refs = ctx.refs();
             match refs.read_ref(&refname)? {
                 Some(RefTarget::Direct(oid)) => oid,
-                _ if name.starts_with("refs/") || looks_like_object_name(name) || name.contains('^') => {
+                _ if name.starts_with("refs/")
+                    || looks_like_object_name(name)
+                    || name.contains('^') =>
+                {
                     resolve_reset_target(ctx, db, name)?
                 }
                 _ => {
@@ -3252,8 +3264,8 @@ fn do_merge(
     }
 
     let refs = ctx.refs();
-    let head =
-        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot merge without HEAD".into()))?;
+    let head = head_commit_oid(&refs)?
+        .ok_or_else(|| GitError::Command("cannot merge without HEAD".into()))?;
     let original = match item.oid {
         Some(oid) => Some(read_rev_list_commit_record(db, ctx.format, oid)?),
         None => None,
@@ -3522,7 +3534,9 @@ fn resolve_reset_target(ctx: &Ctx, db: &FileObjectDatabase, name: &str) -> Resul
                 eprintln!("error: object {oid} is a {}", object.object_type.as_str());
                 return Err(GitError::Exit(1));
             }
-            Err(GitError::InvalidObject(format!("{name} does not point to a commit")))
+            Err(GitError::InvalidObject(format!(
+                "{name} does not point to a commit"
+            )))
         }
     }
 }
@@ -3538,7 +3552,11 @@ fn parse_merge_todo_arg(arg: &str) -> (Vec<String>, Option<String>) {
     )
 }
 
-fn resolve_merge_label(ctx: &Ctx, db: &FileObjectDatabase, label: &str) -> Result<Option<ObjectId>> {
+fn resolve_merge_label(
+    ctx: &Ctx,
+    db: &FileObjectDatabase,
+    label: &str,
+) -> Result<Option<ObjectId>> {
     let refs = ctx.refs();
     let rewritten = format!("refs/rewritten/{label}");
     if let Some(RefTarget::Direct(oid)) = refs.read_ref(&rewritten)? {
@@ -3611,7 +3629,13 @@ fn create_merge_commit_from_index(
         },
     )?;
     let subject = commit_subject(message);
-    detach_head_with_reflog(ctx, head, new_oid, ctx.reflog("merge", Some(&subject)), committer)?;
+    detach_head_with_reflog(
+        ctx,
+        head,
+        new_oid,
+        ctx.reflog("merge", Some(&subject)),
+        committer,
+    )?;
     let _ = fs::remove_file(ctx.git_dir.join("MERGE_HEAD"));
     let _ = fs::remove_file(ctx.git_dir.join("MERGE_MODE"));
     let _ = fs::remove_file(ctx.git_dir.join("MERGE_MSG"));
@@ -3630,8 +3654,8 @@ fn do_octopus_merge_commit(
     oneline: Option<String>,
 ) -> Result<PickOutcome> {
     let refs = ctx.refs();
-    let head =
-        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot merge without HEAD".into()))?;
+    let head = head_commit_oid(&refs)?
+        .ok_or_else(|| GitError::Command("cannot merge without HEAD".into()))?;
     let mut merged_tree = commit_tree_oid(db, ctx.format, &head)?;
     let mut parents = vec![head];
     for (label, oid) in merge_heads {
@@ -3813,7 +3837,8 @@ fn pick_one_commit(
 
     // Compose the message (fixup/squash machinery).
     let target_encoding = commit_encoding_config(&ctx.git_dir);
-    let mut message = commit_message_for_commit_encoding(&record.commit, &target_encoding).into_owned();
+    let mut message =
+        commit_message_for_commit_encoding(&record.commit, &target_encoding).into_owned();
     if opts.signoff && !is_fixup {
         message =
             commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env()?);
@@ -4936,9 +4961,9 @@ fn rebase_continue(ctx: &Ctx) -> Result<()> {
     let unmerged = status.iter().any(|entry| {
         matches!(entry.index, b'U' | b'A' | b'D') && matches!(entry.worktree, b'U' | b'A' | b'D')
     });
-    let has_unstaged = status
-        .iter()
-        .any(|entry| entry.worktree != b' ' && entry.worktree != b'?' && !is_submodule_only_status(entry));
+    let has_unstaged = status.iter().any(|entry| {
+        entry.worktree != b' ' && entry.worktree != b'?' && !is_submodule_only_status(entry)
+    });
     if unmerged || has_unstaged {
         println!("You must edit all merge conflicts and then");
         println!("mark them as resolved using git add");
@@ -5289,7 +5314,10 @@ fn create_autostash(ctx: &Ctx, use_apply_backend: bool) -> Result<()> {
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("autostash"), oid.to_hex())?;
     let db = ctx.db();
-    println!("Created autostash: {}", find_unique_abbrev_hex(ctx, &db, &oid));
+    println!(
+        "Created autostash: {}",
+        find_unique_abbrev_hex(ctx, &db, &oid)
+    );
     let refs = ctx.refs();
     let head =
         head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;

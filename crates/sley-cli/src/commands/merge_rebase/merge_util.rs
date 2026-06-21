@@ -90,8 +90,7 @@ pub(crate) fn merge_write_worktree_file(
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
-            let target =
-                std::path::PathBuf::from(std::ffi::OsString::from_vec(content.to_vec()));
+            let target = std::path::PathBuf::from(std::ffi::OsString::from_vec(content.to_vec()));
             std::os::unix::fs::symlink(&target, &full)?;
         }
         #[cfg(not(unix))]

@@ -967,9 +967,7 @@ fn resolve_cover_text(
             // Subject stays the placeholder; the WHOLE description is the body.
             Ok((placeholder_subject, pp_remainder(&description)))
         }
-        CoverFromDescription::Subject => {
-            Ok((subject_para, pp_remainder(remainder)))
-        }
+        CoverFromDescription::Subject => Ok((subject_para, pp_remainder(remainder))),
         CoverFromDescription::Auto => {
             if subject_para.chars().count() > COVER_FROM_AUTO_MAX_SUBJECT_LEN {
                 // Too-long would-be subject: fall back to MESSAGE behaviour.
@@ -988,7 +986,11 @@ fn read_cover_description(
     options: &FormatPatchOptions,
     config: &GitConfig,
 ) -> Result<Option<String>> {
-    if let Some(path) = options.description_file.as_deref().filter(|p| !p.is_empty()) {
+    if let Some(path) = options
+        .description_file
+        .as_deref()
+        .filter(|p| !p.is_empty())
+    {
         let resolved = resolve_cli_path(repo.cwd(), path);
         let bytes = fs::read(&resolved).map_err(|err| {
             GitError::Command(format!(
@@ -1051,9 +1053,7 @@ fn cover_branch_name(
     }
     // Fall back to the current branch (the symbolic HEAD short name).
     match repo.refs().read_ref("HEAD")? {
-        Some(RefTarget::Symbolic(name)) => {
-            Ok(name.strip_prefix("refs/heads/").map(str::to_string))
-        }
+        Some(RefTarget::Symbolic(name)) => Ok(name.strip_prefix("refs/heads/").map(str::to_string)),
         _ => Ok(None),
     }
 }
@@ -1240,18 +1240,7 @@ fn add_rfc2047(out: &mut Vec<u8>, line: &[u8], kind: Rfc2047Type) {
 fn is_rfc822_special(byte: u8) -> bool {
     matches!(
         byte,
-        b'(' | b')'
-            | b'<'
-            | b'>'
-            | b'['
-            | b']'
-            | b':'
-            | b';'
-            | b'@'
-            | b','
-            | b'.'
-            | b'"'
-            | b'\\'
+        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b':' | b';' | b'@' | b',' | b'.' | b'"' | b'\\'
     )
 }
 
@@ -1588,7 +1577,9 @@ fn parse_leading_wrap(format: &str) -> (Option<(usize, usize, usize)>, &str) {
         return (None, format);
     };
     let args = &rest[..close];
-    let mut nums = args.split(',').map(|n| n.trim().parse::<usize>().unwrap_or(0));
+    let mut nums = args
+        .split(',')
+        .map(|n| n.trim().parse::<usize>().unwrap_or(0));
     let width = nums.next().unwrap_or(0);
     let indent1 = nums.next().unwrap_or(0);
     let indent2 = nums.next().unwrap_or(0);
@@ -1867,7 +1858,11 @@ fn resolve_header_block(
     if !options.no_add_header {
         // format.headers entries route through add_header (To:/Cc: prefixes go
         // to the recipient lists; everything else is a raw header line).
-        for value in config.get_all("format", None, "headers").into_iter().flatten() {
+        for value in config
+            .get_all("format", None, "headers")
+            .into_iter()
+            .flatten()
+        {
             route_config_header(value, &mut headers, &mut to, &mut cc);
         }
     }
@@ -1919,12 +1914,7 @@ fn route_config_header(
 /// Emit a folded `To: `/`Cc: ` recipient block: the first recipient on the
 /// header line, each subsequent one on a continuation line indented by four
 /// spaces, with a trailing comma after every recipient except the last.
-fn write_recipient_block(
-    out: &mut Vec<u8>,
-    label: &str,
-    recipients: &[String],
-    encode: bool,
-) {
+fn write_recipient_block(out: &mut Vec<u8>, label: &str, recipients: &[String], encode: bool) {
     if recipients.is_empty() {
         return;
     }
@@ -2019,10 +2009,7 @@ fn git_config_bool_str(value: &str) -> Option<bool> {
 /// text suppresses); `--signature-file=<path>` / `format.signaturefile` reads a
 /// file; `format.signature` config sets text (empty suppresses); otherwise the
 /// default is the git version string. Returns `None` to drop the block.
-fn resolve_signature(
-    options: &FormatPatchOptions,
-    config: &GitConfig,
-) -> Result<Option<Vec<u8>>> {
+fn resolve_signature(options: &FormatPatchOptions, config: &GitConfig) -> Result<Option<Vec<u8>>> {
     // Command-line --signature / --no-signature win over everything.
     match &options.signature {
         SignatureMode::Suppress => return Ok(None),
@@ -2034,14 +2021,11 @@ fn resolve_signature(
     // --signature-file overrides format.signaturefile; both read a file whose
     // bytes become the signature (git appends a trailing newline, so an extra
     // blank line follows the file content).
-    let file = options
-        .signature_file
-        .clone()
-        .or_else(|| {
-            config
-                .get("format", None, "signaturefile")
-                .map(str::to_string)
-        });
+    let file = options.signature_file.clone().or_else(|| {
+        config
+            .get("format", None, "signaturefile")
+            .map(str::to_string)
+    });
     if let Some(path) = file {
         let mut bytes = fs::read(&path).map_err(|err| {
             GitError::Command(format!("could not read signature file {path}: {err}"))
@@ -3114,9 +3098,11 @@ fn select_commits(
         options.grep_pattern_kind,
         options.grep_pattern_kind_explicit,
     );
-    if let Some(matcher) =
-        compile_log_message_grep_matcher(&options.grep_patterns, grep_kind, options.grep_ignore_case)?
-    {
+    if let Some(matcher) = compile_log_message_grep_matcher(
+        &options.grep_patterns,
+        grep_kind,
+        options.grep_ignore_case,
+    )? {
         selected.retain(|record| {
             let matched = if options.grep_all_match {
                 matcher.matches_all(&record.commit.message)
@@ -3235,8 +3221,12 @@ fn resolve_base_info(
         BaseMode::Commit(rev) => Some(resolve_base_commit(repo, rev)?),
         BaseMode::Auto => resolve_upstream_base(repo, config)?,
         BaseMode::Config => match config.get("format", None, "useAutoBase") {
-            Some(value) if value.eq_ignore_ascii_case("true") => resolve_upstream_base(repo, config)?,
-            Some(value) if value.eq_ignore_ascii_case("whenAble") => resolve_upstream_base(repo, config)?,
+            Some(value) if value.eq_ignore_ascii_case("true") => {
+                resolve_upstream_base(repo, config)?
+            }
+            Some(value) if value.eq_ignore_ascii_case("whenAble") => {
+                resolve_upstream_base(repo, config)?
+            }
             _ => None,
         },
     };
@@ -3266,9 +3256,7 @@ fn resolve_upstream_base(repo: &RepositoryContext, config: &GitConfig) -> Result
     let Some(merge) = config.get("branch", Some(&branch), "merge") else {
         return Ok(None);
     };
-    let remote = config
-        .get("branch", Some(&branch), "remote")
-        .unwrap_or(".");
+    let remote = config.get("branch", Some(&branch), "remote").unwrap_or(".");
     let rev = if remote == "." {
         merge.to_string()
     } else {
@@ -3280,9 +3268,7 @@ fn resolve_upstream_base(repo: &RepositoryContext, config: &GitConfig) -> Result
 
 fn current_branch_name(repo: &RepositoryContext) -> Result<Option<String>> {
     match repo.refs().read_ref("HEAD")? {
-        Some(RefTarget::Symbolic(name)) => {
-            Ok(name.strip_prefix("refs/heads/").map(str::to_string))
-        }
+        Some(RefTarget::Symbolic(name)) => Ok(name.strip_prefix("refs/heads/").map(str::to_string)),
         _ => Ok(None),
     }
 }
@@ -3369,10 +3355,7 @@ fn resolve_format_patch_relative_prefix(
         RelativeMode::On(Some(path)) => Ok(normalize_relative_prefix(path)),
         RelativeMode::On(None) => cwd_relative_prefix(repo),
         RelativeMode::Config => {
-            if config
-                .get_bool("diff", None, "relative")
-                .unwrap_or(false)
-            {
+            if config.get_bool("diff", None, "relative").unwrap_or(false) {
                 cwd_relative_prefix(repo)
             } else {
                 Ok(None)
@@ -3454,12 +3437,8 @@ fn parse_format_noprefix_bool(value: &str) -> Result<bool> {
         "false" | "no" | "off" | "0" => Ok(false),
         _ => {
             eprintln!("fatal: bad boolean config value '{value}' for 'format.noprefix'");
-            eprintln!(
-                "hint: 'format.noprefix' used to accept any value and treat that as 'true'."
-            );
-            eprintln!(
-                "hint: Now it only accepts boolean values, like what 'diff.noprefix' does."
-            );
+            eprintln!("hint: 'format.noprefix' used to accept any value and treat that as 'true'.");
+            eprintln!("hint: Now it only accepts boolean values, like what 'diff.noprefix' does.");
             Err(GitError::Exit(128))
         }
     }

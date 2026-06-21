@@ -298,7 +298,9 @@ fn attach_display_diff(files: &mut [FileDiff], text: &str) -> Result<()> {
         fd.display_header = lines[index..index + fd.header.len()].to_vec();
         index += fd.header.len();
         for hunk in &mut fd.hunks {
-            if hunk.is_mode_change || (hunk.old_offset == 0 && hunk.new_offset == 0 && hunk.body.is_empty()) {
+            if hunk.is_mode_change
+                || (hunk.old_offset == 0 && hunk.new_offset == 0 && hunk.body.is_empty())
+            {
                 hunk.display_header = None;
             } else {
                 if index >= lines.len() {
@@ -331,8 +333,8 @@ fn render_display_diff_text(files: &[FileDiff], cfg: &PatchConfig) -> String {
             out.push('\n');
         }
         for hunk in &fd.hunks {
-            let special =
-                hunk.is_mode_change || (hunk.old_offset == 0 && hunk.new_offset == 0 && hunk.body.is_empty());
+            let special = hunk.is_mode_change
+                || (hunk.old_offset == 0 && hunk.new_offset == 0 && hunk.body.is_empty());
             if !special {
                 out.push_str(&display_line(&format_hunk_header(hunk, 0), cfg));
                 out.push('\n');
@@ -1044,8 +1046,7 @@ fn patch_update_file(
                             rendered = None;
                         }
                         None => {
-                            pending_err =
-                                Some("No hunk matches the given pattern\n".to_string());
+                            pending_err = Some("No hunk matches the given pattern\n".to_string());
                         }
                     },
                     'e' => {
@@ -1053,9 +1054,8 @@ fn patch_update_file(
                         // deletions (matches build_suffix's `,e` gating).
                         let mode_change_count = if fd.mode_change.is_some() { 1 } else { 0 };
                         if fd.deleted || hunk_index + 1 <= mode_change_count {
-                            pending_err = Some(format!(
-                                "Unknown command '{answer}' (use '?' for help)\n"
-                            ));
+                            pending_err =
+                                Some(format!("Unknown command '{answer}' (use '?' for help)\n"));
                         } else {
                             match edit_hunk_loop(fd, hunk_index, stdin) {
                                 EditResult::Applied => {
@@ -1109,9 +1109,8 @@ fn patch_update_file(
                         }
                     }
                     _ => {
-                        pending_err = Some(format!(
-                            "Unknown command '{answer}' (use '?' for help)\n"
-                        ));
+                        pending_err =
+                            Some(format!("Unknown command '{answer}' (use '?' for help)\n"));
                     }
                 }
             }
@@ -1368,9 +1367,10 @@ enum EditResult {
 /// and validate it applies (re-prompting on failure). Mirrors add-patch.c's
 /// `edit_hunk_loop` + `edit_hunk_manually` + `run_apply_check`.
 fn edit_hunk_loop(fd: &mut FileDiff, hunk_index: usize, stdin: &mut impl BufRead) -> EditResult {
-    let git_dir = match env::current_dir().ok().and_then(|cwd| {
-        crate::discover_git_dir(cwd).ok()
-    }) {
+    let git_dir = match env::current_dir()
+        .ok()
+        .and_then(|cwd| crate::discover_git_dir(cwd).ok())
+    {
         Some(dir) => dir,
         None => return EditResult::Abandoned,
     };
@@ -1815,8 +1815,11 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
     let base_text = String::from_utf8_lossy(&base).into_owned();
     let new_content = apply_hunks(&base_text, fd);
     // Write the result as a blob.
-    let oid = run_capture(&["hash-object", "-w", "--stdin"], Some(new_content.as_bytes()))
-        .map_err(|e| GitError::Io(e.to_string()))?;
+    let oid = run_capture(
+        &["hash-object", "-w", "--stdin"],
+        Some(new_content.as_bytes()),
+    )
+    .map_err(|e| GitError::Io(e.to_string()))?;
     let oid = String::from_utf8_lossy(&oid).trim().to_string();
     // Stage mode. For a mode-change file the diff's `index` line carries no mode,
     // so `fd.mode` is the default 100644: use the explicit `mode_change` new mode
@@ -1849,8 +1852,11 @@ fn apply_file_to_index_reverse(fd: &FileDiff) -> Result<()> {
     let base = run_capture(&["cat-file", "blob", &spec], None).unwrap_or_default();
     let base_text = String::from_utf8_lossy(&base).into_owned();
     let new_content = apply_hunks_reverse(&base_text, fd);
-    let oid = run_capture(&["hash-object", "-w", "--stdin"], Some(new_content.as_bytes()))
-        .map_err(|e| GitError::Io(e.to_string()))?;
+    let oid = run_capture(
+        &["hash-object", "-w", "--stdin"],
+        Some(new_content.as_bytes()),
+    )
+    .map_err(|e| GitError::Io(e.to_string()))?;
     let oid = String::from_utf8_lossy(&oid).trim().to_string();
     let mode = format!("{:o}", fd.mode);
     let args = ["update-index", "--cacheinfo", &mode, &oid, &fd.path];

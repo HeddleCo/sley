@@ -14,10 +14,10 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sley_config::GitConfig;
 use sley_core::{
     Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
 };
-use sley_config::GitConfig;
 use sley_object::{Commit, ObjectType, Tag};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
@@ -26,12 +26,12 @@ use sley_odb::{
 use sley_protocol::{
     PKT_LINE_MAX_PAYLOAD_LEN, ProtocolV2FetchAcknowledgment, ProtocolV2FetchFeatures,
     ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
-    ProtocolV2LsRefsFeatures, ProtocolV2LsRefsRecord, ProtocolV2LsRefsRef,
-    ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand, ReceivePackFeatures,
-    ReceivePackPushRequest, ReceivePackReportStatus, ReceivePackRequest, RefAdvertisement,
-    SideBandChannel, SideBandPacket, TransportHandshake, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackPackfileResponse, UploadPackRawPackfileResponse,
-    UploadPackRequest, apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
+    ProtocolV2LsRefsFeatures, ProtocolV2LsRefsRecord, ProtocolV2LsRefsRef, ProtocolV2LsRefsRequest,
+    ProtocolVersion, ReceivePackCommand, ReceivePackFeatures, ReceivePackPushRequest,
+    ReceivePackReportStatus, ReceivePackRequest, RefAdvertisement, SideBandChannel, SideBandPacket,
+    TransportHandshake, UploadPackFeatures, UploadPackNegotiationRequest,
+    UploadPackPackfileResponse, UploadPackRawPackfileResponse, UploadPackRequest,
+    apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
     classify_protocol_v2_command_request, encode_protocol_v2_fetch_capability,
     encode_protocol_v2_ls_refs_capability, encode_receive_pack_features,
     encode_upload_pack_features, read_protocol_v2_command_request,
@@ -411,7 +411,11 @@ fn apply_receive_pack_ref_transaction(
             RefPrecondition::MustExistAndMatch(RefTarget::Direct(command.old_id))
         };
         let reflog = if log_updates && receive_pack_should_write_reflog(&command.name) {
-            Some(receive_pack_reflog_entry(format, command.old_id, command.new_id))
+            Some(receive_pack_reflog_entry(
+                format,
+                command.old_id,
+                command.new_id,
+            ))
         } else {
             None
         };
@@ -1050,9 +1054,7 @@ fn append_promisor_ref_lines(
         return Ok(());
     }
     lines.sort();
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(promisor_path)?;
+    let mut file = fs::OpenOptions::new().append(true).open(promisor_path)?;
     use std::io::Write as _;
     for line in lines {
         file.write_all(line.as_bytes())?;
@@ -1138,7 +1140,10 @@ fn upload_pack_blob_packfile_uri_configured(config: &GitConfig) -> bool {
 /// The v2 capabilities advertised by the upload-pack server, in the order git
 /// emits them: `agent`, `ls-refs[=unborn]`, `fetch=<features>`,
 /// `server-option`, `object-format=<hash>`.
-fn upload_pack_v2_capabilities(format: ObjectFormat, config: &GitConfig) -> Result<Vec<Capability>> {
+fn upload_pack_v2_capabilities(
+    format: ObjectFormat,
+    config: &GitConfig,
+) -> Result<Vec<Capability>> {
     let mut capabilities = vec![
         Capability {
             name: "agent".into(),
@@ -1214,7 +1219,11 @@ fn local_ls_refs_v2_records(
         } else if request.unborn && lsrefs_unborn_config(config) != LsRefsUnbornConfig::Ignore {
             // An unborn HEAD (points at a not-yet-created branch) is reported as
             // an `unborn` record carrying its symref-target.
-            entries.push(("HEAD".to_string(), ObjectId::null(format), head_symref.clone()));
+            entries.push((
+                "HEAD".to_string(),
+                ObjectId::null(format),
+                head_symref.clone(),
+            ));
         }
     }
     for reference in store.list_refs()? {

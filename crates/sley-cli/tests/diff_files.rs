@@ -229,12 +229,7 @@ fn diff_files_max_depth_limits_worktree_paths() {
     fs::write(repo.join("one/two/three/file"), "index\n").expect("write deep file");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
-    for path in [
-        "file",
-        "one/file",
-        "one/two/file",
-        "one/two/three/file",
-    ] {
+    for path in ["file", "one/file", "one/two/file", "one/two/three/file"] {
         fs::write(repo.join(path), "worktree\n").expect("modify tracked file");
     }
 
@@ -250,12 +245,24 @@ fn diff_files_max_depth_limits_worktree_paths() {
     );
     assert_sley_stdout(
         &repo,
-        &["diff-files", "--max-depth=0", "--name-only", "--", "one/two"],
+        &[
+            "diff-files",
+            "--max-depth=0",
+            "--name-only",
+            "--",
+            "one/two",
+        ],
         "",
     );
     assert_sley_stdout(
         &repo,
-        &["diff-files", "--max-depth=2", "--name-only", "--", "one/two"],
+        &[
+            "diff-files",
+            "--max-depth=2",
+            "--name-only",
+            "--",
+            "one/two",
+        ],
         "one/two/file\none/two/three/file\n",
     );
     assert_sley_stdout(

@@ -284,17 +284,8 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
                 set_mode(ReadTreeMode::Prefix(normalize_prefix(value)), &mut mode)?;
             }
             // Accepted no-op switches that don't change our deterministic output.
-            "-v"
-            | "--verbose"
-            | "--no-verbose"
-            | "-q"
-            | "--quiet"
-            | "--no-quiet"
-            | "--trivial"
-            | "--no-trivial"
-            | "--aggressive"
-            | "--no-aggressive"
-            | "--debug-unpack"
+            "-v" | "--verbose" | "--no-verbose" | "-q" | "--quiet" | "--no-quiet" | "--trivial"
+            | "--no-trivial" | "--aggressive" | "--no-aggressive" | "--debug-unpack"
             | "--no-debug-unpack" => {}
             "--no-sparse-checkout" => sparse_checkout = false,
             "--sparse-checkout" => sparse_checkout = true,
@@ -523,7 +514,9 @@ impl ReadTreePathRules {
     fn from_config(config: &GitConfig) -> Self {
         Self {
             protect_hfs: config.get_bool("core", None, "protectHFS").unwrap_or(false),
-            protect_ntfs: config.get_bool("core", None, "protectNTFS").unwrap_or(false),
+            protect_ntfs: config
+                .get_bool("core", None, "protectNTFS")
+                .unwrap_or(false),
         }
     }
 }
@@ -705,7 +698,11 @@ fn current_index_flat(
             if entry_stage(entry) == 0 {
                 out.insert(
                     entry.path.as_bytes().to_vec(),
-                    (entry.mode, entry.oid, Some(stat_info_from_index_entry(entry))),
+                    (
+                        entry.mode,
+                        entry.oid,
+                        Some(stat_info_from_index_entry(entry)),
+                    ),
                 );
             }
         }
@@ -966,9 +963,7 @@ impl ReadTreeWorktree<'_> {
                 // owned by the merge; an untracked one would be lost → reject.
                 if !self.original_paths.contains(&child_git) {
                     let display = String::from_utf8_lossy(dir_git_path);
-                    eprintln!(
-                        "error: Updating '{display}' would lose untracked files in it"
-                    );
+                    eprintln!("error: Updating '{display}' would lose untracked files in it");
                     return Err(GitError::Exit(128));
                 }
             }
@@ -1425,9 +1420,7 @@ fn verify_uptodate_path(
                     "error: Your local changes to the following files would be overwritten by checkout:"
                 );
                 eprintln!("\t{}", String::from_utf8_lossy(path));
-                eprintln!(
-                    "Please commit your changes or stash them before you switch branches."
-                );
+                eprintln!("Please commit your changes or stash them before you switch branches.");
                 eprintln!("Aborting");
             }
         }
@@ -1643,9 +1636,7 @@ fn reset_worktree_to_entries(
 /// only see the staged fallback. Ordering by `.gitattributes`-first makes the
 /// worktree copy authoritative for siblings in the same batch, matching git's
 /// sorted unpack-trees materialization.
-fn worktree_write_order(
-    entries: &[(Vec<u8>, StagedEntry)],
-) -> Vec<(&Vec<u8>, &StagedEntry)> {
+fn worktree_write_order(entries: &[(Vec<u8>, StagedEntry)]) -> Vec<(&Vec<u8>, &StagedEntry)> {
     let mut ordered: Vec<(&Vec<u8>, &StagedEntry)> =
         entries.iter().map(|(path, entry)| (path, entry)).collect();
     // Stable sort with a key that ranks a directory's `.gitattributes` ahead of
@@ -1818,21 +1809,14 @@ fn checkout_submodule_to_commit(
         return Ok(());
     };
     let path_str = String::from_utf8_lossy(path);
-    let (submodule_name, submodule_url) =
-        submodule_name_and_url_for_path(worktree_root, &path_str)
-            .unwrap_or_else(|| (path_str.to_string(), None));
+    let (submodule_name, submodule_url) = submodule_name_and_url_for_path(worktree_root, &path_str)
+        .unwrap_or_else(|| (path_str.to_string(), None));
     let sub_git_dir = submodule_admin_git_dir(git_dir, &submodule_name);
     if !sub_git_dir.is_dir() {
         if sub_root.join(".git").is_dir() {
             copy_dir_recursive(&sub_root.join(".git"), &sub_git_dir)?;
         } else if let Some(url) = submodule_url {
-            clone_submodule_for_checkout(
-                worktree_root,
-                git_dir,
-                &sub_root,
-                &sub_git_dir,
-                &url,
-            )?;
+            clone_submodule_for_checkout(worktree_root, git_dir, &sub_root, &sub_git_dir, &url)?;
         } else {
             eprintln!("fatal: could not get a repository handle for submodule '{path_str}'");
             return Err(GitError::Exit(128));
@@ -1860,7 +1844,9 @@ fn checkout_submodule_to_commit(
         for entry in index
             .into_iter()
             .flat_map(|index| index.entries)
-            .filter(|entry| entry.stage() == sley_index::Stage::Normal && sley_index::is_gitlink(entry.mode))
+            .filter(|entry| {
+                entry.stage() == sley_index::Stage::Normal && sley_index::is_gitlink(entry.mode)
+            })
         {
             let nested_path = entry.path.as_bytes();
             let Ok(nested_path_str) = std::str::from_utf8(nested_path) else {
@@ -1941,7 +1927,10 @@ fn submodule_admin_git_dir(super_git_dir: &Path, name: &str) -> PathBuf {
 
 fn connect_submodule_worktree(sub_root: &Path, sub_git_dir: &Path) -> Result<()> {
     fs::create_dir_all(sub_git_dir)?;
-    fs::write(sub_root.join(".git"), format!("gitdir: {}\n", sub_git_dir.display()))?;
+    fs::write(
+        sub_root.join(".git"),
+        format!("gitdir: {}\n", sub_git_dir.display()),
+    )?;
     crate::commands::submodule::set_submodule_core_worktree(sub_root, sub_git_dir)?;
     Ok(())
 }
@@ -2235,11 +2224,8 @@ mod submodule_hook_tests {
 
     #[test]
     fn populated_detects_git_dir_and_gitfile() {
-        let base = std::env::temp_dir().join(format!(
-            "sley-rt-pop-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("sley-rt-pop-{}-{}", std::process::id(), line!()));
         let _ = fs::remove_dir_all(&base);
         // (a) embedded `.git` directory → populated.
         let with_dir = base.join("dir_form");
@@ -2269,16 +2255,13 @@ mod submodule_hook_tests {
     fn dirty_active_populated_nonforced_would_lose_and_errors() {
         // This is the cell-47/48 shape: a submodule whose HEAD is moving (old
         // set) and whose index is dirty, not forced → ERROR_WOULD_LOSE_SUBMODULE.
-        let _set = gitmodules_set(
-            "[submodule \"sub1\"]\n\tpath = sub1\n\turl = ./sub1\n",
-        );
+        let _set = gitmodules_set("[submodule \"sub1\"]\n\tpath = sub1\n\turl = ./sub1\n");
         let ctx = MoveHeadContext {
             active: true,
             populated: true,
             has_dirty_index: true,
         };
-        let verdict =
-            check_submodule_move_head(true, &ctx, Some("oldhex"), Some("newhex"), false);
+        let verdict = check_submodule_move_head(true, &ctx, Some("oldhex"), Some("newhex"), false);
         assert_eq!(verdict, MoveHeadVerdict::WouldLose);
         assert!(matches!(
             move_head_verdict_to_result(verdict, "sub1"),
@@ -2294,8 +2277,7 @@ mod submodule_hook_tests {
             populated: true,
             has_dirty_index: true,
         };
-        let verdict =
-            check_submodule_move_head(true, &ctx, Some("oldhex"), Some("newhex"), true);
+        let verdict = check_submodule_move_head(true, &ctx, Some("oldhex"), Some("newhex"), true);
         assert_eq!(verdict, MoveHeadVerdict::Ok);
         assert!(move_head_verdict_to_result(verdict, "sub1").is_ok());
     }

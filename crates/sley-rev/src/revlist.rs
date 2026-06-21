@@ -326,7 +326,13 @@ pub fn rev_list_walk_commits(
     starts: impl IntoIterator<Item = ObjectId>,
     first_parent: bool,
 ) -> Result<Vec<CommitRecord>> {
-    rev_list_walk_commits_with_missing(db, format, starts, first_parent, RevListMissingAction::Error)
+    rev_list_walk_commits_with_missing(
+        db,
+        format,
+        starts,
+        first_parent,
+        RevListMissingAction::Error,
+    )
 }
 
 pub fn rev_list_walk_commits_with_missing(

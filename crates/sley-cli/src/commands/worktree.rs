@@ -1225,8 +1225,7 @@ fn repair_registered_worktree_gitfile(
         return Ok(());
     }
 
-    let admin_real =
-        fs::canonicalize(&admin.admin_dir).unwrap_or_else(|_| admin.admin_dir.clone());
+    let admin_real = fs::canonicalize(&admin.admin_dir).unwrap_or_else(|_| admin.admin_dir.clone());
     let dot_git = admin.path.join(".git");
     let mut backlink = None;
     let read = read_gitfile_for_repair(&dot_git)?;
@@ -1270,7 +1269,12 @@ fn repair_registered_worktree_gitfile(
 
     if let Some(repair) = repair {
         report_worktree_repair(false, &admin.path.display().to_string(), repair, failed);
-        write_worktree_linking_files(common_git_dir, &admin.admin_dir, &admin.path, relative_paths)?;
+        write_worktree_linking_files(
+            common_git_dir,
+            &admin.admin_dir,
+            &admin.path,
+            relative_paths,
+        )?;
     }
     Ok(())
 }
@@ -1465,7 +1469,9 @@ fn worktree_unique_tracking_name(
     name: &str,
 ) -> Result<Option<String>> {
     let config = read_repo_config(common_git_dir).unwrap_or_default();
-    let default_remote = config.get("checkout", None, "defaultRemote").map(str::to_string);
+    let default_remote = config
+        .get("checkout", None, "defaultRemote")
+        .map(str::to_string);
     let src_ref = format!("refs/heads/{name}");
     let mut unique: Option<String> = None;
     let mut num_matches = 0usize;
@@ -1667,7 +1673,14 @@ fn worktree_add_resolve_head(
         // builtin/worktree.c `add`: the `ac < 2 && new_branch` arm).
         if options.start.is_none()
             && !options.force_branch
-            && dwim_orphan(common_git_dir, worktree_git_dir, format, store, options, false)?
+            && dwim_orphan(
+                common_git_dir,
+                worktree_git_dir,
+                format,
+                store,
+                options,
+                false,
+            )?
         {
             return worktree_add_inferred_orphan_head(branch.clone(), format);
         }
@@ -1849,7 +1862,14 @@ fn worktree_add_resolve_head(
             orphan: false,
         });
     }
-    if dwim_orphan(common_git_dir, worktree_git_dir, format, store, options, true)? {
+    if dwim_orphan(
+        common_git_dir,
+        worktree_git_dir,
+        format,
+        store,
+        options,
+        true,
+    )? {
         return worktree_add_inferred_orphan_head(branch, format);
     }
     // The new branch is created from HEAD. git's `!opts.orphan &&

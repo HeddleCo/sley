@@ -17,6 +17,7 @@
 
 use crate::*;
 use sley_object::TreeEntries;
+use std::cell::{Ref, RefCell};
 
 /// How the per-object diff (for commits) is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,10 +170,27 @@ struct ShowContext<'a> {
     db: &'a FileObjectDatabase,
     format: ObjectFormat,
     config: &'a GitConfig,
-    userdiff: Option<&'a commands::userdiff::UserdiffResolver>,
     options: &'a ShowOptions,
     decorations: &'a HashMap<ObjectId, Vec<String>>,
     diff_pathspec: Option<&'a DiffPathspec>,
+    mailmap: RefCell<Option<commands::utility::Mailmap>>,
+}
+
+impl ShowContext<'_> {
+    fn mailmap(&self) -> Result<Ref<'_, commands::utility::Mailmap>> {
+        let needs_load = self.mailmap.borrow().is_none();
+        if needs_load {
+            *self.mailmap.borrow_mut() = Some(commands::utility::Mailmap::load_default(
+                self.git_dir,
+                self.format,
+            )?);
+        }
+        Ok(Ref::map(self.mailmap.borrow(), |mailmap| {
+            mailmap
+                .as_ref()
+                .expect("mailmap cache was just initialized")
+        }))
+    }
 }
 
 struct CommitTrailerLayout {
@@ -194,6 +212,28 @@ fn resolve_show_merge_mode(options: &ShowOptions) -> ShowMergeMode {
         Some(mode) => mode,
         None if options.first_parent => ShowMergeMode::FirstParent,
         None => ShowMergeMode::Combined { dense: true },
+    }
+}
+
+fn show_compiled_format_uses_mailmap(compiled: &CompiledLogFormat) -> bool {
+    compiled.tokens.iter().any(|token| {
+        matches!(
+            token,
+            FormatToken::AuthorNameMapped
+                | FormatToken::AuthorEmailMapped
+                | FormatToken::AuthorEmailLocalMapped
+                | FormatToken::CommitterNameMapped
+                | FormatToken::CommitterEmailMapped
+                | FormatToken::CommitterEmailLocalMapped
+        )
+    })
+}
+
+fn show_commit_format_needs_mailmap(format: &ShowCommitFormat, use_mailmap: bool) -> bool {
+    match format {
+        ShowCommitFormat::Medium | ShowCommitFormat::Short => use_mailmap,
+        ShowCommitFormat::Custom { compiled, .. } => show_compiled_format_uses_mailmap(compiled),
+        ShowCommitFormat::Oneline | ShowCommitFormat::FullOneline => false,
     }
 }
 
@@ -314,13 +354,28 @@ impl super::grep_args::GrepArgOptions for ShowOptions {
 }
 
 pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
+    let profile_enabled = show_profile_enabled();
+    let profile_start = std::time::Instant::now();
+    let mut profile_last = profile_start;
     let mut options = parse_show_args(args)?;
+    show_profile_mark(
+        profile_enabled,
+        "parse_args",
+        profile_start,
+        &mut profile_last,
+    );
 
     let repo = RepositoryContext::discover_current()?;
     let git_dir = repo.git_dir();
     let format = repo.format();
     let config = repo.config();
     let db = repo.objects();
+    show_profile_mark(
+        profile_enabled,
+        "discover",
+        profile_start,
+        &mut profile_last,
+    );
     if options.show_signature.is_none() {
         options.show_signature = Some(
             config
@@ -342,11 +397,29 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         }
         _ => options.decorate,
     };
+    show_profile_mark(
+        profile_enabled,
+        "signature_decor_mode",
+        profile_start,
+        &mut profile_last,
+    );
     let decorations: HashMap<ObjectId, Vec<String>> = if decoration_mode == LogDecorationMode::Off {
         HashMap::new()
     } else {
-        log_decoration_map(git_dir, db, format, decoration_mode, &crate::DecorationFilter::default())?
+        log_decoration_map(
+            git_dir,
+            db,
+            format,
+            decoration_mode,
+            &crate::DecorationFilter::default(),
+        )?
     };
+    show_profile_mark(
+        profile_enabled,
+        "decorations",
+        profile_start,
+        &mut profile_last,
+    );
 
     let mut setup_args = vec!["--default".to_string(), "HEAD".to_string()];
     setup_args.extend(options.setup_args.iter().cloned());
@@ -361,6 +434,12 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
             config: Some(config),
         },
     )?;
+    show_profile_mark(
+        profile_enabled,
+        "setup_revisions",
+        profile_start,
+        &mut profile_last,
+    );
     if let Some(leftover) = setup.leftovers.first() {
         return Err(GitError::Command(format!(
             "unsupported show option {leftover}"
@@ -370,41 +449,47 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         None
     } else {
         let worktree_root = repo.worktree_root()?;
-        Some(DiffPathspec::new(repo.cwd(), worktree_root, &setup.pathspecs)?)
+        Some(DiffPathspec::new(
+            repo.cwd(),
+            worktree_root,
+            &setup.pathspecs,
+        )?)
     };
 
     let mut shown_one = false;
     let mut stdout = io::stdout();
-    let userdiff = if options.diff_mode == ShowDiffMode::Patch && options.shows_patch_body() {
-        let attributes = repo
-            .worktree_root()
-            .ok()
-            .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
-            .transpose()?;
-        Some(commands::userdiff::UserdiffResolver::with_attributes(
-            attributes,
-            Some(config.clone()),
-        ))
-    } else {
-        None
-    };
+    show_profile_mark(
+        profile_enabled,
+        "userdiff",
+        profile_start,
+        &mut profile_last,
+    );
     let context = ShowContext {
         git_dir,
         db,
         format,
         config,
-        userdiff: userdiff.as_ref(),
         options: &options,
         decorations: &decorations,
         diff_pathspec: diff_pathspec.as_ref(),
+        mailmap: RefCell::new(None),
     };
     let grep_kind = log_grep_pattern_kind_from_config(
         config,
         options.grep_pattern_kind,
         options.grep_pattern_kind_explicit,
     );
-    let grep_matcher =
-        compile_log_message_grep_matcher(&options.grep_patterns, grep_kind, options.grep_ignore_case)?;
+    let grep_matcher = compile_log_message_grep_matcher(
+        &options.grep_patterns,
+        grep_kind,
+        options.grep_ignore_case,
+    )?;
+    show_profile_mark(
+        profile_enabled,
+        "grep_compile",
+        profile_start,
+        &mut profile_last,
+    );
     for tip in &setup.options.positives {
         if !show_tip_matches_grep(
             db,
@@ -425,8 +510,37 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
             false,
         )?;
     }
+    show_profile_mark(
+        profile_enabled,
+        "show_objects",
+        profile_start,
+        &mut profile_last,
+    );
     stdout.flush()?;
+    show_profile_mark(profile_enabled, "flush", profile_start, &mut profile_last);
     Ok(())
+}
+
+fn show_profile_enabled() -> bool {
+    std::env::var_os("SLEY_SHOW_PROFILE").is_some_and(|value| value != "0")
+}
+
+fn show_profile_mark(
+    enabled: bool,
+    label: &str,
+    start: std::time::Instant,
+    last: &mut std::time::Instant,
+) {
+    if !enabled {
+        return;
+    }
+    let now = std::time::Instant::now();
+    eprintln!(
+        "{{\"schema\":\"sley.show.profile.v1\",\"stage\":\"{label}\",\"delta_us\":{},\"total_us\":{}}}",
+        now.duration_since(*last).as_micros(),
+        now.duration_since(start).as_micros()
+    );
+    *last = now;
 }
 
 fn show_tip_matches_grep(
@@ -522,6 +636,9 @@ fn show_commit(
     shown_one: &mut bool,
     suppress_separator: bool,
 ) -> Result<()> {
+    let profile_enabled = show_profile_enabled();
+    let profile_start = std::time::Instant::now();
+    let mut profile_last = profile_start;
     let options = context.options;
     let decorations = context.decorations;
     let output_encoding = options
@@ -535,7 +652,14 @@ fn show_commit(
         .config
         .get_bool("log", None, "mailmap")
         .unwrap_or(true);
-    let mailmap = commands::utility::Mailmap::load_default(context.git_dir, context.format)?;
+    let needs_mailmap = show_commit_format_needs_mailmap(&options.commit_format, use_mailmap);
+    let mailmap_guard = if needs_mailmap {
+        Some(context.mailmap()?)
+    } else {
+        None
+    };
+    let mailmap = mailmap_guard.as_deref();
+    let empty_mailmap = commands::utility::Mailmap::default();
     let record = sley_rev::CommitRecord {
         oid: *oid,
         parents: commit.parents.clone(),
@@ -585,7 +709,7 @@ fn show_commit(
             commit,
             shown_one,
             suppress_separator,
-            use_mailmap.then_some(&mailmap),
+            mailmap,
             text_self_terminated,
             blank_before_diff,
             separator_mode,
@@ -624,7 +748,7 @@ fn show_commit(
             writeln!(
                 stdout,
                 "Author: {}",
-                commit_identity_mailmapped(&commit.author, use_mailmap.then_some(&mailmap))
+                commit_identity_mailmapped(&commit.author, mailmap)
             )?;
             if matches!(options.commit_format, ShowCommitFormat::Medium) {
                 writeln!(
@@ -688,7 +812,7 @@ fn show_commit(
                     source_oid: None,
                     describe: None,
                     signature: Some(&signature_ctx),
-                    mailmap: &mailmap,
+                    mailmap: mailmap.unwrap_or(&empty_mailmap),
                     use_mailmap,
                     color: false,
                     output_encoding: &output_encoding,
@@ -697,15 +821,26 @@ fn show_commit(
         }
     }
     *shown_one = true;
+    show_profile_mark(
+        profile_enabled,
+        "commit_header",
+        profile_start,
+        &mut profile_last,
+    );
 
     // Every format — including `--oneline` — still shows the patch (this is
     // `git show`, which defaults to a diff). The first-parent diff (empty-tree for
     // a root) is computed for merges too, because git's default renders the stat
     // family for them even though the patch/raw/name listings are suppressed.
-    let show_root = options
-        .show_root
-        .unwrap_or_else(|| context.config.get_bool("log", None, "showroot").unwrap_or(true));
-    let entries = if commit.parents.is_empty() && !show_root {
+    let show_root = options.show_root.unwrap_or_else(|| {
+        context
+            .config
+            .get_bool("log", None, "showroot")
+            .unwrap_or(true)
+    });
+    let needs_first_parent_entries =
+        show_commit_needs_first_parent_entries(options, is_merge, merge_mode);
+    let entries = if !needs_first_parent_entries || (commit.parents.is_empty() && !show_root) {
         Vec::new()
     } else {
         commit_diff_entries(
@@ -717,8 +852,14 @@ fn show_commit(
             commit,
         )?
     };
+    show_profile_mark(
+        profile_enabled,
+        "commit_diff_entries",
+        profile_start,
+        &mut profile_last,
+    );
 
-    write_commit_trailer(
+    let result = write_commit_trailer(
         stdout,
         context,
         CommitTrailerLayout {
@@ -730,7 +871,29 @@ fn show_commit(
         },
         commit,
         &entries,
-    )
+    );
+    show_profile_mark(
+        profile_enabled,
+        "commit_trailer",
+        profile_start,
+        &mut profile_last,
+    );
+    result
+}
+
+fn show_commit_needs_first_parent_entries(
+    options: &ShowOptions,
+    is_merge: bool,
+    merge_mode: ShowMergeMode,
+) -> bool {
+    if !is_merge {
+        return true;
+    }
+    // Combined merge patch/name output is derived from all parents in
+    // `write_show_combined`. The first-parent entry list only feeds the stat
+    // family, so avoid flattening and diffing two full trees for plain
+    // `git show --oneline <merge>`.
+    !matches!(merge_mode, ShowMergeMode::Combined { .. }) || merge_renders_stat(options)
 }
 
 fn show_commit_separate_merge(
@@ -790,8 +953,12 @@ fn write_show_signature(
     else {
         return Ok(());
     };
-    let verification =
-        commands::signing::verify_payload(context.git_dir, Some(context.config), &payload, &signature)?;
+    let verification = commands::signing::verify_payload(
+        context.git_dir,
+        Some(context.config),
+        &payload,
+        &signature,
+    )?;
     stdout.write_all(&verification.human_output)?;
     Ok(())
 }
@@ -876,19 +1043,18 @@ fn write_commit_trailer(
     // A merge in combined mode renders the combined patch (plus the stat family,
     // which is always first-parent). In any other merge mode (off / first-parent
     // default) only the stat family renders.
-    let combined_merge = layout.is_merge
-        && matches!(layout.merge_mode, ShowMergeMode::Combined { .. });
+    let combined_merge =
+        layout.is_merge && matches!(layout.merge_mode, ShowMergeMode::Combined { .. });
     // `--first-parent` (and `--diff-merges=first-parent`) renders the full
     // first-parent diff for a merge — the same body an ordinary commit gets.
-    let first_parent_merge =
-        layout.is_merge && layout.merge_mode == ShowMergeMode::FirstParent;
+    let first_parent_merge = layout.is_merge && layout.merge_mode == ShowMergeMode::FirstParent;
     // For an off-mode merge only the stat family renders; for a combined merge,
     // a first-parent merge, and an ordinary commit the body renders fully.
     let body_renders = if combined_merge {
         // A combined merge renders a body for every active diff mode (the
         // combined patch, the first-parent stat family, or the combined
         // name/name-status listing).
-        diff_active && !entries.is_empty()
+        diff_active && (!merge_renders_stat(options) || !entries.is_empty())
     } else if layout.is_merge && !first_parent_merge {
         diff_active && merge_renders_stat(options) && !entries.is_empty()
     } else {
@@ -929,7 +1095,6 @@ fn write_commit_trailer(
                 context.db,
                 context.format,
                 context.config,
-                context.userdiff,
                 options,
                 entries,
             )
@@ -1172,7 +1337,6 @@ fn write_commit_diff(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     config: &GitConfig,
-    userdiff: Option<&commands::userdiff::UserdiffResolver>,
     options: &ShowOptions,
     entries: &[sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
@@ -1197,7 +1361,7 @@ fn write_commit_diff(
             Ok(())
         }
         ShowDiffMode::Patch => {
-            write_commit_diff_patch(stdout, git_dir, db, format, config, userdiff, options, entries)
+            write_commit_diff_patch(stdout, git_dir, db, format, config, options, entries)
         }
     }
 }
@@ -1211,7 +1375,6 @@ fn write_commit_diff_patch(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     config: &GitConfig,
-    userdiff: Option<&commands::userdiff::UserdiffResolver>,
     options: &ShowOptions,
     entries: &[sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
@@ -1280,6 +1443,14 @@ fn write_commit_diff_patch(
         if wrote_prefix {
             writeln!(stdout)?;
         }
+        let userdiff_attributes = worktree_root_for_git_dir(git_dir)
+            .ok()
+            .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+            .transpose()?;
+        let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
+            userdiff_attributes,
+            Some(config.clone()),
+        );
         let colors = options
             .color_always
             .then(|| commands::diff_words::DiffColors::enabled(Some(config)));
@@ -1297,7 +1468,7 @@ fn write_commit_diff_patch(
                 src_prefix: "a/",
                 dst_prefix: "b/",
                 context: 3,
-                userdiff,
+                userdiff: Some(&userdiff),
                 colors: colors.as_ref(),
                 word_diff: word_request.as_ref(),
                 no_index_contents: None,
@@ -1642,9 +1813,9 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
                 };
             }
             "--word-diff-regex" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("--word-diff-regex requires a value".into()))?;
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--word-diff-regex requires a value".into())
+                })?;
                 options.word_diff_regex = Some(value.clone());
                 if options.word_diff_mode.is_none() {
                     options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
@@ -1697,10 +1868,11 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             "--root" => options.show_root = Some(true),
             "--no-root" => options.show_root = Some(false),
             value if value.starts_with("--color=") => {}
-            value if value.starts_with("--color-moved=")
-                || value.starts_with("--color-moved-ws=")
-                || value.starts_with("--no-color-moved=")
-                || value.starts_with("--no-color-moved-ws=") => {}
+            value
+                if value.starts_with("--color-moved=")
+                    || value.starts_with("--color-moved-ws=")
+                    || value.starts_with("--no-color-moved=")
+                    || value.starts_with("--no-color-moved-ws=") => {}
             value if value.starts_with('-') && value != "-" => {
                 return Err(GitError::Command(format!(
                     "unsupported show option {value}"
@@ -1768,9 +1940,9 @@ fn parse_pretty_value(value: &str) -> Result<ShowCommitFormat> {
         }),
         // Built-in named layouts sley does not yet render. Reject explicitly
         // rather than mis-formatting them as literal text.
-        "full" | "fuller" | "email" | "mboxrd" | "raw" => Err(GitError::Unsupported(
-            format!("show does not support --pretty={value}"),
-        )),
+        "full" | "fuller" | "email" | "mboxrd" | "raw" => Err(GitError::Unsupported(format!(
+            "show does not support --pretty={value}"
+        ))),
         other if other.contains('%') => Ok(ShowCommitFormat::Custom {
             compiled: CompiledLogFormat::compile(other, LogFormatDialect::Log)?,
             final_newline: true,

@@ -11,7 +11,9 @@ use sley_core::{GitError, Result};
 
 pub(crate) fn cmd_filter_branch(args: &[String]) -> Result<()> {
     let exe = env::current_exe().map_err(|err| {
-        GitError::Command(format!("cannot locate current executable for filter-branch: {err}"))
+        GitError::Command(format!(
+            "cannot locate current executable for filter-branch: {err}"
+        ))
     })?;
     let helper = FilterBranchHelper::create(&exe)?;
     let mut command = Proc::new("sh");
@@ -72,32 +74,24 @@ fn unique_helper_dir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    env::temp_dir().join(format!(
-        "sley-filter-branch-{}-{nanos}",
-        std::process::id()
-    ))
+    env::temp_dir().join(format!("sley-filter-branch-{}-{nanos}", std::process::id()))
 }
 
 fn write_executable(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = fs::File::create(path).map_err(|err| {
-        GitError::Command(format!("cannot write {}: {err}", path.display()))
-    })?;
-    file.write_all(bytes).map_err(|err| {
-        GitError::Command(format!("cannot write {}: {err}", path.display()))
-    })?;
+    let mut file = fs::File::create(path)
+        .map_err(|err| GitError::Command(format!("cannot write {}: {err}", path.display())))?;
+    file.write_all(bytes)
+        .map_err(|err| GitError::Command(format!("cannot write {}: {err}", path.display())))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mut permissions = file
             .metadata()
-            .map_err(|err| {
-                GitError::Command(format!("cannot stat {}: {err}", path.display()))
-            })?
+            .map_err(|err| GitError::Command(format!("cannot stat {}: {err}", path.display())))?
             .permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).map_err(|err| {
-            GitError::Command(format!("cannot chmod {}: {err}", path.display()))
-        })?;
+        fs::set_permissions(path, permissions)
+            .map_err(|err| GitError::Command(format!("cannot chmod {}: {err}", path.display())))?;
     }
     Ok(())
 }

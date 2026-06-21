@@ -99,12 +99,7 @@ pub fn relative_url(remote_url: &str, url: &str, up_path: Option<&str>) -> Strin
     };
 
     // Strip a single trailing separator (git: remoteurl[len-1] = '\0').
-    if remoteurl
-        .as_bytes()
-        .last()
-        .copied()
-        .is_some_and(is_dir_sep)
-    {
+    if remoteurl.as_bytes().last().copied().is_some_and(is_dir_sep) {
         remoteurl.pop();
     }
 
@@ -178,7 +173,11 @@ mod tests {
     #[test]
     fn t7400_relative_url_matrix() {
         let cases = [
-            ("ssh://hostname/repo", "../subrepo", "ssh://hostname/subrepo"),
+            (
+                "ssh://hostname/repo",
+                "../subrepo",
+                "ssh://hostname/subrepo",
+            ),
             (
                 "ssh://hostname:22/repo",
                 "../subrepo",
@@ -225,10 +224,7 @@ mod tests {
     #[test]
     fn absolute_and_ssh_urls_passthrough() {
         assert_eq!(relative_url("/base", "/abs/path", None), "/abs/path");
-        assert_eq!(
-            relative_url("/base", "ssh://h/repo", None),
-            "ssh://h/repo"
-        );
+        assert_eq!(relative_url("/base", "ssh://h/repo", None), "ssh://h/repo");
         assert_eq!(
             relative_url("/base", "https://h/repo", None),
             "https://h/repo"

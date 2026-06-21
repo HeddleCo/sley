@@ -437,7 +437,11 @@ fn add_touched_tracked_path_restats_without_verbose_action_like_upstream_git() {
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
-            run(env!("CARGO_BIN_EXE_sley"), &rust, &["diff-files", "--name-only"]),
+            run(
+                env!("CARGO_BIN_EXE_sley"),
+                &rust,
+                &["diff-files", "--name-only"]
+            ),
             git(&upstream, &["diff-files", "--name-only"]),
             "diff-files differed after restatting touched tracked path"
         );

@@ -116,7 +116,9 @@ impl<'a> ArchiveConvert<'a> {
     /// `export-subst` attribute. Returns the original bytes (borrowed) when
     /// nothing converts.
     fn smudge<'b>(&self, path: &[u8], body: &'b [u8]) -> Result<Cow<'b, [u8]>> {
-        let converted = self.attributes.apply_smudge_filter(self.config, path, body)?;
+        let converted = self
+            .attributes
+            .apply_smudge_filter(self.config, path, body)?;
         // `apply_smudge_filter` returns an owned Vec; the borrow-first variant is
         // private to sley-worktree, so compare here to keep the no-op common case
         // (binary blobs, no eol/filter attribute) zero-copy through tar output.
@@ -352,7 +354,15 @@ pub fn write_tar_archive_full<W>(
 where
     W: Write + ?Sized,
 {
-    write_tar_archive_inner(writer, reader, format, tree_oid, options, Some(convert), extra)
+    write_tar_archive_inner(
+        writer,
+        reader,
+        format,
+        tree_oid,
+        options,
+        Some(convert),
+        extra,
+    )
 }
 
 /// Like [`write_tar_archive_full`] but gzip-wrapped (`git archive --format=tgz`
@@ -373,11 +383,19 @@ where
     W: Write + ?Sized,
 {
     let mut tar = Vec::new();
-    write_tar_archive_inner(&mut tar, reader, format, tree_oid, options, Some(convert), extra)?;
-    let mut encoder = flate2::GzBuilder::new()
-        .mtime(0)
-        .operating_system(3)
-        .write(Vec::new(), flate2::Compression::new(compression_level.min(9)));
+    write_tar_archive_inner(
+        &mut tar,
+        reader,
+        format,
+        tree_oid,
+        options,
+        Some(convert),
+        extra,
+    )?;
+    let mut encoder = flate2::GzBuilder::new().mtime(0).operating_system(3).write(
+        Vec::new(),
+        flate2::Compression::new(compression_level.min(9)),
+    );
     encoder
         .write_all(&tar)
         .map_err(|err| GitError::Io(err.to_string()))?;
@@ -725,8 +743,7 @@ where
                     force_include,
                     context.convert,
                     matched,
-                )
-                {
+                ) {
                     continue;
                 }
                 // export-ignore on a file omits it (git checks the attribute on
@@ -773,11 +790,10 @@ where
                     };
                     // git classifies the *converted* content against the
                     // tree-relative path's `diff` driver.
-                    let is_binary = context
-                        .convert
-                        .map_or_else(|| buffer_is_binary(&body), |convert| {
-                            convert.is_binary(&relative_path, &body)
-                        });
+                    let is_binary = context.convert.map_or_else(
+                        || buffer_is_binary(&body),
+                        |convert| convert.is_binary(&relative_path, &body),
+                    );
                     sink.emit(ArchiveEntry::File {
                         path,
                         mode: entry.mode,
@@ -901,7 +917,10 @@ struct ArchiveTreeSelection {
     full_subtree: bool,
 }
 
-fn archive_tree_selection(relative_path: &[u8], pathspecs: &[ArchivePathspec]) -> ArchiveTreeSelection {
+fn archive_tree_selection(
+    relative_path: &[u8],
+    pathspecs: &[ArchivePathspec],
+) -> ArchiveTreeSelection {
     if pathspecs.is_empty() {
         return ArchiveTreeSelection {
             descend: true,
@@ -980,7 +999,11 @@ fn write_global_extended_header(
 ) -> Result<u64> {
     let mut ext_header = Vec::new();
     if let Some(commit_id) = commit_id {
-        append_pax_record(&mut ext_header, b"comment", commit_id.to_string().as_bytes());
+        append_pax_record(
+            &mut ext_header,
+            b"comment",
+            commit_id.to_string().as_bytes(),
+        );
     }
     let entry_mtime = if mtime > USTAR_MAX_MTIME {
         append_pax_record(&mut ext_header, b"mtime", mtime.to_string().as_bytes());
@@ -1112,7 +1135,16 @@ fn write_extended_header(
     mtime: u64,
 ) -> Result<()> {
     let name = format!("{oid}.paxheader").into_bytes();
-    write_ustar_header(writer, &name, 0o666, body.len() as u64, mtime, b'x', b"", b"")?;
+    write_ustar_header(
+        writer,
+        &name,
+        0o666,
+        body.len() as u64,
+        mtime,
+        b'x',
+        b"",
+        b"",
+    )?;
     writer.write_all(body)?;
     write_padding(writer, body.len())
 }

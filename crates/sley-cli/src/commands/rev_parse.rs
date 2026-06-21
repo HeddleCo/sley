@@ -32,11 +32,10 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
     // git's repository setup validates the repository format (version vs
     // extensions) before rev-parse processes any argument; a bare `rev-parse`
     // in a malformed repository must still die (t0001 #60/#62/#64).
-    verify_repository_format(&git_dir)?;
+    let format = verify_repository_format(&git_dir)?;
     if args.is_empty() {
         return Err(GitError::Command("rev-parse requires <rev>...".into()));
     }
-    let format = repository_object_format(&git_dir)?;
     let mut short: Option<usize> = None;
     let mut short_revs = 0usize;
     let mut verify = false;
@@ -318,7 +317,11 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                     } else {
                         oid
                     };
-                    verified_output = Some(if negate { format!("^{rendered}") } else { rendered });
+                    verified_output = Some(if negate {
+                        format!("^{rendered}")
+                    } else {
+                        rendered
+                    });
                     idx += 1;
                     continue;
                 }
@@ -336,7 +339,8 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
         }
         idx += 1;
     }
-    if verify && verified_revs == 0
+    if verify
+        && verified_revs == 0
         && let Some(default_rev) = default_rev
     {
         let oid = match resolve_revision(&git_dir, format, &default_rev) {
@@ -350,9 +354,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
     if verify && verified_revs != 1 {
         return rev_parse_needed_single_revision(quiet);
     }
-    if verify
-        && let Some(output) = verified_output
-    {
+    if verify && let Some(output) = verified_output {
         println!("{output}");
     }
     Ok(())
@@ -509,7 +511,10 @@ fn rev_parse_normalize_relative_path(cwd: &Path, git_dir: &Path, path: &str) -> 
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
                 if normalized == root {
-                    eprintln!("fatal: '{path}' is outside repository at '{}'", root.display());
+                    eprintln!(
+                        "fatal: '{path}' is outside repository at '{}'",
+                        root.display()
+                    );
                     return Err(GitError::Exit(128));
                 }
                 normalized.pop();
@@ -519,7 +524,10 @@ fn rev_parse_normalize_relative_path(cwd: &Path, git_dir: &Path, path: &str) -> 
         }
     }
     if !normalized.starts_with(&root) {
-        eprintln!("fatal: '{path}' is outside repository at '{}'", root.display());
+        eprintln!(
+            "fatal: '{path}' is outside repository at '{}'",
+            root.display()
+        );
         return Err(GitError::Exit(128));
     }
     let relative = normalized
@@ -766,7 +774,10 @@ fn rev_parse_index_contains(git_dir: &Path, format: ObjectFormat, path: &str) ->
         Err(err) => return Err(GitError::Io(err.to_string())),
     };
     let index = sley_index::Index::parse(&bytes, format)?;
-    Ok(index.entries.iter().any(|entry| entry.path == path.as_bytes()))
+    Ok(index
+        .entries
+        .iter()
+        .any(|entry| entry.path == path.as_bytes()))
 }
 
 fn rev_parse_repository_index_path(git_dir: &Path) -> PathBuf {
@@ -919,12 +930,18 @@ fn rev_parse_parseopt(args: &[String]) -> Result<()> {
             Ok(())
         }
         Err(RevParseParseOptError::Help { full }) => {
-            print!("{}", render_rev_parse_parseopt_usage(&usage, &specs, full, true));
+            print!(
+                "{}",
+                render_rev_parse_parseopt_usage(&usage, &specs, full, true)
+            );
             Err(GitError::Exit(129))
         }
         Err(RevParseParseOptError::Usage { message }) => {
             eprintln!("error: {message}");
-            eprint!("{}", render_rev_parse_parseopt_usage(&usage, &specs, false, false));
+            eprint!(
+                "{}",
+                render_rev_parse_parseopt_usage(&usage, &specs, false, false)
+            );
             Err(GitError::Exit(129))
         }
     }
@@ -1833,15 +1850,15 @@ fn is_shallow_repository(git_dir: &Path) -> bool {
 }
 
 /// `check_repository_format_gently`.
-fn verify_repository_format(git_dir: &Path) -> Result<()> {
+fn verify_repository_format(git_dir: &Path) -> Result<ObjectFormat> {
     repository_ref_storage_format(git_dir)?;
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let config_path = common_git_dir.join("config");
     let Ok(config) = GitConfig::read(&config_path) else {
-        return Ok(());
+        return Ok(ObjectFormat::Sha1);
     };
     let Some(version_value) = config.get("core", None, "repositoryformatversion") else {
-        return Ok(());
+        return Ok(config.repository_object_format()?);
     };
     let version: i64 = version_value.trim().parse().unwrap_or(0);
     if version > 1 {
@@ -1894,7 +1911,7 @@ fn verify_repository_format(git_dir: &Path) -> Result<()> {
         );
         return Err(GitError::Exit(128));
     }
-    Ok(())
+    config.repository_object_format()
 }
 
 fn repository_ref_storage_format(git_dir: &Path) -> Result<&'static str> {

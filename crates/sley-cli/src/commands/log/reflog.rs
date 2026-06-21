@@ -202,7 +202,7 @@ pub(super) fn compile_log_filter_matcher(
             ignore_case,
             word: false,
             line_regexp: false,
-            diagnostic_verbosity: crate::grep_source::RegexDiagnosticVerbosity::from_env(),
+            diagnostic_verbosity: crate::grep_source::RegexDiagnosticVerbosity::Default,
         },
         error_context,
     )

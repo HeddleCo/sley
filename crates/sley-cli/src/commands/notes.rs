@@ -1491,7 +1491,11 @@ fn conflict_note_body(
         }
         (Some(local), Some(remote)) => {
             if verbosity >= -1 {
-                let reason = if conflict.base.is_some() { "content" } else { "add/add" };
+                let reason = if conflict.base.is_some() {
+                    "content"
+                } else {
+                    "add/add"
+                };
                 println!(
                     "CONFLICT ({reason}): Merge conflict in notes for object {}",
                     conflict.annotated.to_hex()

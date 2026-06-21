@@ -176,7 +176,11 @@ pub fn parse_whitespace_rule(string: &str) -> Option<WsRule> {
         // `tabwidth=N`. git tests the token after the negation strip
         // (`string` points past any leading `-`), so match from `name_start`.
         if let Some(arg) = token_starts_with_tabwidth(&bytes[name_start..token_end]) {
-            let digits: String = arg.iter().take_while(|b| b.is_ascii_digit()).map(|&b| b as char).collect();
+            let digits: String = arg
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .map(|&b| b as char)
+                .collect();
             let tabwidth: u32 = digits.parse().unwrap_or(0);
             if tabwidth > 0 && tabwidth < 0o100 {
                 rule &= !WS_TAB_WIDTH_MASK;
@@ -318,7 +322,12 @@ pub fn ws_check(line: &[u8], ws_rule: WsRule) -> WsRule {
 
 /// Like [`ws_check`] but also appends the line to `out` with whitespace-error
 /// spans painted using `colors`. Port of `ws_check_emit`.
-pub fn ws_check_emit(line: &[u8], ws_rule: WsRule, out: &mut Vec<u8>, colors: &WsEmitColors<'_>) -> WsRule {
+pub fn ws_check_emit(
+    line: &[u8],
+    ws_rule: WsRule,
+    out: &mut Vec<u8>,
+    colors: &WsEmitColors<'_>,
+) -> WsRule {
     ws_check_emit_inner(line, ws_rule, Some((out, colors)))
 }
 
@@ -650,14 +659,16 @@ mod tests {
     #[test]
     fn parse_basic() {
         // -trailing,-space-before,-indent disables those.
-        let r = parse_whitespace_rule("-trailing,-space-before,-indent").expect("valid whitespace rule");
+        let r = parse_whitespace_rule("-trailing,-space-before,-indent")
+            .expect("valid whitespace rule");
         assert_eq!(r & WS_BLANK_AT_EOL, 0);
         assert_eq!(r & WS_SPACE_BEFORE_TAB, 0);
     }
 
     #[test]
     fn parse_tab_in_indent_and_tabwidth() {
-        let r = parse_whitespace_rule("-trailing,-space,-indent,tab").expect("valid whitespace rule");
+        let r =
+            parse_whitespace_rule("-trailing,-space,-indent,tab").expect("valid whitespace rule");
         assert_ne!(r & WS_TAB_IN_INDENT, 0);
         let r2 = parse_whitespace_rule("tab-in-indent,tabwidth=16").expect("valid whitespace rule");
         assert_eq!(ws_tab_width(r2), 16);
@@ -693,8 +704,14 @@ mod tests {
 
     #[test]
     fn error_string_order() {
-        assert_eq!(whitespace_error_string(WS_TRAILING_SPACE), "trailing whitespace");
-        assert_eq!(whitespace_error_string(WS_BLANK_AT_EOF), "new blank line at EOF");
+        assert_eq!(
+            whitespace_error_string(WS_TRAILING_SPACE),
+            "trailing whitespace"
+        );
+        assert_eq!(
+            whitespace_error_string(WS_BLANK_AT_EOF),
+            "new blank line at EOF"
+        );
         assert_eq!(
             whitespace_error_string(WS_SPACE_BEFORE_TAB | WS_TAB_IN_INDENT),
             "space before tab in indent, tab in indent"
@@ -712,7 +729,8 @@ mod tests {
     #[test]
     fn fix_tab_in_indent_expands() {
         let mut out = Vec::new();
-        let r = parse_whitespace_rule("-trailing,-space,-indent,tab").expect("valid whitespace rule");
+        let r =
+            parse_whitespace_rule("-trailing,-space,-indent,tab").expect("valid whitespace rule");
         // A leading tab expands to 8 spaces.
         ws_fix_copy(&mut out, b"\tfoo();\n", r);
         assert_eq!(out, b"        foo();\n");

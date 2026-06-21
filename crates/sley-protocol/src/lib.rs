@@ -93,11 +93,11 @@ fn packet_trace(data: &[u8], is_write: bool) {
         data.to_vec()
     };
 
-    let mut out = format!("packet: {:>12}{} ", packet_trace_prefix(), if is_write {
-        '>'
-    } else {
-        '<'
-    });
+    let mut out = format!(
+        "packet: {:>12}{} ",
+        packet_trace_prefix(),
+        if is_write { '>' } else { '<' }
+    );
     for &byte in &rendered {
         if byte == b'\n' {
             continue;

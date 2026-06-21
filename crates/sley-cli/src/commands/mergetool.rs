@@ -1,8 +1,8 @@
-use crate::*;
 use crate::commands::tool_launch::{
     ToolCommand, ToolEnvironment, ToolMode, gui_default, print_tool_help, resolve_tool_command,
     run_tool_shell, select_tool_name,
 };
+use crate::*;
 
 #[derive(Default)]
 struct MergetoolOptions {
@@ -28,7 +28,9 @@ pub(crate) fn cmd_mergetool(args: &[String]) -> Result<()> {
     let gui = options
         .gui
         .unwrap_or_else(|| gui_default(config, ToolMode::Merge));
-    let Some(tool_name) = select_tool_name(config, ToolMode::Merge, options.cli_tool.as_deref(), gui) else {
+    let Some(tool_name) =
+        select_tool_name(config, ToolMode::Merge, options.cli_tool.as_deref(), gui)
+    else {
         eprintln!("No merge tool configured");
         return Err(GitError::Exit(1));
     };
@@ -221,7 +223,11 @@ fn run_one_mergetool_path(
 
     let materialized = materialize_mergetool_files(repo, config, conflict, &merged)?;
     if should_prompt(config, options) {
-        print!("Hit return to start merge resolution tool ({}) for '{}': ", tool.name, String::from_utf8_lossy(&conflict.path));
+        print!(
+            "Hit return to start merge resolution tool ({}) for '{}': ",
+            tool.name,
+            String::from_utf8_lossy(&conflict.path)
+        );
         io::stdout().flush()?;
         let mut ignored = String::new();
         if io::stdin().read_line(&mut ignored)? == 0 {
@@ -312,7 +318,11 @@ fn cleanup_mergetool_files(
     if success && keep_backup && merged.exists() {
         let backup = merged.with_extension(format!(
             "{}orig",
-            merged.extension().and_then(|ext| ext.to_str()).map(|_| "").unwrap_or("")
+            merged
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|_| "")
+                .unwrap_or("")
         ));
         let _ = fs::copy(merged, backup);
     }
@@ -427,14 +437,17 @@ fn stage_cacheinfo(repo: &RepositoryContext, path: &[u8], mode: u32, oid: Object
     sley_worktree::update_index_index_info(
         repo.git_dir(),
         repo.format(),
-        &[sley_worktree::IndexInfoRecord::Remove {
-            path: path.to_vec(),
-        }, sley_worktree::IndexInfoRecord::Add(sley_worktree::CacheInfoEntry {
-            mode,
-            oid,
-            path: path.to_vec(),
-            stage: 0,
-        })],
+        &[
+            sley_worktree::IndexInfoRecord::Remove {
+                path: path.to_vec(),
+            },
+            sley_worktree::IndexInfoRecord::Add(sley_worktree::CacheInfoEntry {
+                mode,
+                oid,
+                path: path.to_vec(),
+                stage: 0,
+            }),
+        ],
     )?;
     Ok(())
 }
@@ -466,11 +479,9 @@ fn is_gitlink_conflict(conflict: &UnmergedPath) -> bool {
 }
 
 fn should_prompt(config: &GitConfig, options: &MergetoolOptions) -> bool {
-    options.prompt.unwrap_or_else(|| {
-        config
-            .get_bool("mergetool", None, "prompt")
-            .unwrap_or(true)
-    })
+    options
+        .prompt
+        .unwrap_or_else(|| config.get_bool("mergetool", None, "prompt").unwrap_or(true))
 }
 
 fn normalize_user_path(cwd: &Path, worktree_root: &Path, value: &str) -> Result<Vec<u8>> {

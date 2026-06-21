@@ -340,7 +340,13 @@ pub fn render_hunks(
     // possible, snap add/delete pairs back into alignment, and (under the
     // indent heuristic) shift to the most readable split. Runs on the raw edit
     // script before it is flattened into tagged lines.
-    change_compact(&mut ops, &old, &new, options.ws_ignore, options.indent_heuristic);
+    change_compact(
+        &mut ops,
+        &old,
+        &new,
+        options.ws_ignore,
+        options.indent_heuristic,
+    );
 
     // Flatten the edit script into a tagged line stream carrying old/new
     // positions.
@@ -621,7 +627,11 @@ fn score_add_split(m: &SplitMeasurement, s: &mut SplitScore) {
     s.penalty += TOTAL_BLANK_WEIGHT * total_blank;
     s.penalty += POST_BLANK_WEIGHT * post_blank;
 
-    let indent = if m.indent != -1 { m.indent } else { m.post_indent };
+    let indent = if m.indent != -1 {
+        m.indent
+    } else {
+        m.post_indent
+    };
     let any_blanks = total_blank != 0;
 
     s.effective_indent += indent;
@@ -949,11 +959,7 @@ fn change_compact(
         } else {
             // Both sides are unchanged here: an equal run.
             let mut run = 0usize;
-            while i < n_old
-                && j < n_new
-                && !xdf1.changed[i]
-                && !xdf2.changed[j]
-            {
+            while i < n_old && j < n_new && !xdf1.changed[i] && !xdf2.changed[j] {
                 run += 1;
                 i += 1;
                 j += 1;
@@ -1424,7 +1430,10 @@ fn expand_hunks_to_function_context(
             .iter()
             .any(|line| line.kind == LineKind::Delete);
         let (side, range) = if old_changed {
-            (FunctionSide::Old, function_context_range(old, first.old_index, false, classifier))
+            (
+                FunctionSide::Old,
+                function_context_range(old, first.old_index, false, classifier),
+            )
         } else {
             (
                 FunctionSide::New,
@@ -1650,7 +1659,8 @@ fn mark_color_as_moved(tagged: &[TaggedLine<'_>], color_moved: ColorMoved) -> Ve
         );
 
         if pmb.is_empty() {
-            let contiguous = adjust_last_block(&mut styles, tagged, color_moved.mode, n, block_length);
+            let contiguous =
+                adjust_last_block(&mut styles, tagged, color_moved.mode, n, block_length);
             if !contiguous && block_length > 1 {
                 n -= block_length;
             } else {
@@ -2427,7 +2437,12 @@ fn combine_one_parent(
     let cnt = result_lines.len();
     let nmask = 1u64 << n;
     let parent_lines = split_lines(parent);
-    let ops = myers_diff_lines_ws(&parent_lines, result_lines, options.ws_ignore, options.algorithm);
+    let ops = myers_diff_lines_ws(
+        &parent_lines,
+        result_lines,
+        options.ws_ignore,
+        options.algorithm,
+    );
 
     // Walk the edit script, tracking the 1-based result line number (`lno`,
     // git's `state->lno`) and the parent line number (`p_lno`/`ob`). For each
@@ -2519,14 +2534,22 @@ fn combine_one_parent(
 /// lost list (git's `coalesce_lines` LCS merge). A deletion that matches an
 /// already-present lost line (under the active whitespace flags) gets its
 /// parent bit OR'd into that line's `parent_map` instead of being added again.
-fn coalesce_lost(base: &mut Vec<CdLost>, newlines: Vec<Vec<u8>>, n: usize, options: &CombinedRenderOptions) {
+fn coalesce_lost(
+    base: &mut Vec<CdLost>,
+    newlines: Vec<Vec<u8>>,
+    n: usize,
+    options: &CombinedRenderOptions,
+) {
     let pmask = 1u64 << n;
     if newlines.is_empty() {
         return;
     }
     if base.is_empty() {
         for line in newlines {
-            base.push(CdLost { line, parent_map: pmask });
+            base.push(CdLost {
+                line,
+                parent_map: pmask,
+            });
         }
         return;
     }
@@ -2554,22 +2577,34 @@ fn coalesce_lost(base: &mut Vec<CdLost>, newlines: Vec<Vec<u8>>, n: usize, optio
     let mut i = m;
     let mut j = k;
     while i > 0 || j > 0 {
-        if i > 0 && j > 0 && combined_lines_match(&base[i - 1].line, &newlines[j - 1], options.ws_ignore) {
+        if i > 0
+            && j > 0
+            && combined_lines_match(&base[i - 1].line, &newlines[j - 1], options.ws_ignore)
+        {
             let mut entry = std::mem::replace(
                 &mut base[i - 1],
-                CdLost { line: Vec::new(), parent_map: 0 },
+                CdLost {
+                    line: Vec::new(),
+                    parent_map: 0,
+                },
             );
             entry.parent_map |= pmask;
             merged.push(entry);
             i -= 1;
             j -= 1;
         } else if j > 0 && (i == 0 || lcs[i][j - 1] >= lcs[i - 1][j]) {
-            merged.push(CdLost { line: newlines[j - 1].clone(), parent_map: pmask });
+            merged.push(CdLost {
+                line: newlines[j - 1].clone(),
+                parent_map: pmask,
+            });
             j -= 1;
         } else {
             let entry = std::mem::replace(
                 &mut base[i - 1],
-                CdLost { line: Vec::new(), parent_map: 0 },
+                CdLost {
+                    line: Vec::new(),
+                    parent_map: 0,
+                },
             );
             merged.push(entry);
             i -= 1;
@@ -2754,7 +2789,11 @@ fn give_context(sline: &mut [CdLine], cnt: usize, num_parent: usize, context: us
 
             // No overlap within context: paint the trailing edge a bit.
             i = k;
-            let kk = if j2 + context < cnt + 1 { j2 + context } else { cnt + 1 };
+            let kk = if j2 + context < cnt + 1 {
+                j2 + context
+            } else {
+                cnt + 1
+            };
             let mut jj = j2;
             while jj < kk {
                 sline[jj].flag |= mark;
@@ -2806,7 +2845,11 @@ fn make_hunks(
             if (sline[j].flag & mark) == 0 {
                 // Look beyond the end for an interesting line within context.
                 let mut la = adjust_hunk_tail(sline, all_mask, hunk_begin, j);
-                la = if la + context < cnt + 1 { la + context } else { cnt + 1 };
+                la = if la + context < cnt + 1 {
+                    la + context
+                } else {
+                    cnt + 1
+                };
                 let mut contin = false;
                 while la > 0 && j < la {
                     la -= 1;
@@ -2866,7 +2909,14 @@ fn make_hunks(
 }
 
 /// git's `show_parent_lno`: emit one `-l0,len` column for parent `n`.
-fn show_parent_lno(out: &mut Vec<u8>, sline: &[CdLine], l0: usize, l1: usize, n: usize, null_context: u64) {
+fn show_parent_lno(
+    out: &mut Vec<u8>,
+    sline: &[CdLine],
+    l0: usize,
+    l1: usize,
+    n: usize,
+    null_context: u64,
+) {
     let a = sline[l0].p_lno[n];
     let b = sline[l1].p_lno[n];
     out.extend_from_slice(format!(" -{},{}", a, b - a - null_context).as_bytes());
@@ -3078,10 +3128,8 @@ mod tests {
         // The change is far enough below `fn foo()` that the funcname line
         // precedes the hunk (the heading scan looks *above* the hunk's first
         // line, so a change touching line 1 would correctly find no heading).
-        let old: &[u8] =
-            b"fn foo() {\n    a\n    b\n    c\n    d\n    e\n    f\n    g\n}\n";
-        let new: &[u8] =
-            b"fn foo() {\n    a\n    b\n    c\n    d\n    CHANGED\n    f\n    g\n}\n";
+        let old: &[u8] = b"fn foo() {\n    a\n    b\n    c\n    d\n    e\n    f\n    g\n}\n";
+        let new: &[u8] = b"fn foo() {\n    a\n    b\n    c\n    d\n    CHANGED\n    f\n    g\n}\n";
         let mut out = Vec::new();
         // Classifier accepts any line whose first byte is an ASCII letter
         // (a crude def_ff stand-in for the test).
@@ -3125,8 +3173,7 @@ mod tests {
         let result = b"A\nB\nC\nD\nE\nF\n1\n2\n";
         let text = render_cc(result, &[p0, p1], true);
         assert_eq!(
-            text,
-            "@@@ -1,6 -1,4 +1,8 @@@\n  A\n  B\n +C\n +D\n +E\n +F\n+ 1\n+ 2\n",
+            text, "@@@ -1,6 -1,4 +1,8 @@@\n  A\n  B\n +C\n +D\n +E\n +F\n+ 1\n+ 2\n",
             "combined dense output:\n{text}",
         );
     }
@@ -3154,8 +3201,7 @@ mod tests {
         let result = b"a\nb\nc\n";
         let text = render_cc(result, &[parent, parent], true);
         assert_eq!(
-            text,
-            "@@@ -1,2 -1,2 +1,3 @@@\n  a\n  b\n++c\n",
+            text, "@@@ -1,2 -1,2 +1,3 @@@\n  a\n  b\n++c\n",
             "reuse output:\n{text}",
         );
     }

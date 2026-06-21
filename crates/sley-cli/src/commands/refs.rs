@@ -1,7 +1,7 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
-use std::fs;
 use std::cell::RefCell;
+use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,7 +35,10 @@ enum ReflogFormat {
 }
 
 pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
-    if args.first().is_some_and(|arg| arg == "-h" || arg == "--help") {
+    if args
+        .first()
+        .is_some_and(|arg| arg == "-h" || arg == "--help")
+    {
         print_reflog_usage_stdout();
         return Err(GitError::Exit(129));
     }
@@ -98,8 +101,11 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
         options.grep_pattern_kind,
         options.grep_pattern_kind_explicit,
     );
-    let grep_matcher =
-        compile_log_message_grep_matcher(&options.grep_patterns, grep_kind, options.grep_ignore_case)?;
+    let grep_matcher = compile_log_message_grep_matcher(
+        &options.grep_patterns,
+        grep_kind,
+        options.grep_ignore_case,
+    )?;
     // `git reflog show` (== `git log -g`) walks the reflog newest-to-oldest and
     // prints EVERY entry verbatim: HEAD@{N} is just the entry's position. There
     // is no reachability filter and no dedup by OID — a no-op `rebase --no-ff`
@@ -203,7 +209,9 @@ fn print_reflog_usage_stdout() {
     println!("   or: git reflog drop [--all [--single-worktree] | <refs>...]");
     println!("   or: git reflog expire [--expire=<time>] [--expire-unreachable=<time>]");
     println!("                         [--rewrite] [--updateref] [--stale-fix]");
-    println!("                         [--dry-run | -n] [--verbose] [--all [--single-worktree] | <refs>...]");
+    println!(
+        "                         [--dry-run | -n] [--verbose] [--all [--single-worktree] | <refs>...]"
+    );
 }
 
 fn print_reflog_show_usage_stdout() {
@@ -234,7 +242,9 @@ fn print_reflog_drop_usage_stdout() {
 fn print_reflog_expire_usage_stdout() {
     println!("usage: git reflog expire [--expire=<time>] [--expire-unreachable=<time>]");
     println!("                         [--rewrite] [--updateref] [--stale-fix]");
-    println!("                         [--dry-run | -n] [--verbose] [--all [--single-worktree] | <refs>...]");
+    println!(
+        "                         [--dry-run | -n] [--verbose] [--all [--single-worktree] | <refs>...]"
+    );
 }
 
 fn cmd_reflog_exists(args: &[String]) -> Result<()> {
@@ -559,10 +569,11 @@ fn parse_reflog_delete_spec(store: &FileRefStore, spec: &str) -> Option<(String,
     let spec = spec.strip_suffix('}')?;
     let (reference, selector) = spec.rsplit_once("@{")?;
     let reference = resolve_reflog_name(store, reference).ok()?;
-    let selector = selector
-        .parse::<usize>()
-        .ok()
-        .or_else(|| reflog_selector_by_date(store, &reference, selector).ok().flatten())?;
+    let selector = selector.parse::<usize>().ok().or_else(|| {
+        reflog_selector_by_date(store, &reference, selector)
+            .ok()
+            .flatten()
+    })?;
     Some((reference, selector))
 }
 
@@ -847,17 +858,15 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
         }
         let mut target_options = options;
         apply_reflog_expire_pattern_config_from(&context.config, &reference, &mut target_options)?;
-        if let Err(GitError::Exit(code)) =
-            expire_reflog_entries(
-                &target_store,
-                &db,
-                &target_git_dir,
-                format,
-                &reference,
-                target_options,
-                &mut context,
-            )
-        {
+        if let Err(GitError::Exit(code)) = expire_reflog_entries(
+            &target_store,
+            &db,
+            &target_git_dir,
+            format,
+            &reference,
+            target_options,
+            &mut context,
+        ) {
             exit_code = code;
         }
     }
@@ -909,12 +918,7 @@ fn expire_reflog_entries(
                 .and_then(|value| value.as_ref())
                 .is_none_or(|commits| {
                     reflog_oid_is_reachable_or_non_commit(db, &entry.old_oid, &zero, commits)
-                        && reflog_oid_is_reachable_or_non_commit(
-                            db,
-                            &entry.new_oid,
-                            &zero,
-                            commits,
-                        )
+                        && reflog_oid_is_reachable_or_non_commit(db, &entry.new_oid, &zero, commits)
                 });
             prune = !reachable_from_tip;
         }
@@ -997,8 +1001,7 @@ fn apply_reflog_expire_config_from(
     if !options.explicit_expire_unreachable
         && let Some(value) = config.get("gc", None, "reflogExpireUnreachable")
     {
-        options.expire_unreachable =
-            parse_reflog_expire_time(value, "gc.reflogExpireUnreachable")?;
+        options.expire_unreachable = parse_reflog_expire_time(value, "gc.reflogExpireUnreachable")?;
     }
     Ok(())
 }
@@ -1824,19 +1827,58 @@ struct RefStdinCommand {
 }
 
 const REF_STDIN_COMMANDS: &[RefStdinCommand] = &[
-    RefStdinCommand { prefix: "update", args: 3 },
-    RefStdinCommand { prefix: "create", args: 2 },
-    RefStdinCommand { prefix: "delete", args: 2 },
-    RefStdinCommand { prefix: "verify", args: 2 },
-    RefStdinCommand { prefix: "symref-update", args: 4 },
-    RefStdinCommand { prefix: "symref-create", args: 2 },
-    RefStdinCommand { prefix: "symref-delete", args: 2 },
-    RefStdinCommand { prefix: "symref-verify", args: 2 },
-    RefStdinCommand { prefix: "option", args: 1 },
-    RefStdinCommand { prefix: "start", args: 0 },
-    RefStdinCommand { prefix: "prepare", args: 0 },
-    RefStdinCommand { prefix: "abort", args: 0 },
-    RefStdinCommand { prefix: "commit", args: 0 },
+    RefStdinCommand {
+        prefix: "update",
+        args: 3,
+    },
+    RefStdinCommand {
+        prefix: "create",
+        args: 2,
+    },
+    RefStdinCommand {
+        prefix: "delete",
+        args: 2,
+    },
+    RefStdinCommand {
+        prefix: "verify",
+        args: 2,
+    },
+    RefStdinCommand {
+        prefix: "symref-update",
+        args: 4,
+    },
+    RefStdinCommand {
+        prefix: "symref-create",
+        args: 2,
+    },
+    RefStdinCommand {
+        prefix: "symref-delete",
+        args: 2,
+    },
+    RefStdinCommand {
+        prefix: "symref-verify",
+        args: 2,
+    },
+    RefStdinCommand {
+        prefix: "option",
+        args: 1,
+    },
+    RefStdinCommand {
+        prefix: "start",
+        args: 0,
+    },
+    RefStdinCommand {
+        prefix: "prepare",
+        args: 0,
+    },
+    RefStdinCommand {
+        prefix: "abort",
+        args: 0,
+    },
+    RefStdinCommand {
+        prefix: "commit",
+        args: 0,
+    },
 ];
 
 /// Match a command verb against the dispatch table the way git does: the input
@@ -1876,12 +1918,12 @@ fn update_ref_stdin(context: UpdateRefStdinContext<'_>, deref: bool, nul: bool) 
     let mut deref = deref;
     let mut transaction = UpdateRefStdinTransaction::default();
     let stdin = io::stdin();
-    let mut reader =
-        crate::commands::stdin_stream::StdinRecordReader::new(stdin.lock(), b'\n');
+    let mut reader = crate::commands::stdin_stream::StdinRecordReader::new(stdin.lock(), b'\n');
     let mut stdout = io::stdout().lock();
     while let Some(mut line) = reader.read_record()? {
         crate::commands::stdin_stream::strip_trailing_cr(&mut line);
-        let result = update_ref_stdin_line(&context, &mut deref, &mut transaction, &mut stdout, &line);
+        let result =
+            update_ref_stdin_line(&context, &mut deref, &mut transaction, &mut stdout, &line);
         if let Err(err) = result {
             let _ = transaction.restore(context.store);
             return Err(err);
@@ -1898,7 +1940,7 @@ fn update_ref_stdin_line(
     stdout: &mut dyn Write,
     line: &[u8],
 ) -> Result<()> {
-    use crate::commands::ref_command_stream::{classify_line, ArgCursor, Terminator};
+    use crate::commands::ref_command_stream::{ArgCursor, Terminator, classify_line};
 
     // git's first two guards: a bare terminator is `empty command in input`,
     // leading whitespace is `whitespace before command: <line>`.
@@ -1927,9 +1969,7 @@ fn update_ref_stdin_z(context: &UpdateRefStdinContext<'_>, deref: bool) -> Resul
         // truly empty record which trips the empty-command guard.)
         crate::commands::ref_command_stream::classify_line(&first)?;
 
-        let Some((cmd, arg_start)) =
-            match_ref_stdin_command(&first, b'\0')
-        else {
+        let Some((cmd, arg_start)) = match_ref_stdin_command(&first, b'\0') else {
             transaction.restore(context.store)?;
             return update_ref_stdin_bad_command(&String::from_utf8_lossy(&first));
         };
@@ -1955,8 +1995,14 @@ fn update_ref_stdin_z(context: &UpdateRefStdinContext<'_>, deref: bool) -> Resul
         }
 
         let cursor = ArgCursor::new(&stitched, Terminator::Nul);
-        let result =
-            dispatch_ref_stdin_command(context, &mut deref, &mut transaction, &mut stdout, cmd, cursor);
+        let result = dispatch_ref_stdin_command(
+            context,
+            &mut deref,
+            &mut transaction,
+            &mut stdout,
+            cmd,
+            cursor,
+        );
         if let Err(err) = result {
             transaction.restore(context.store)?;
             return Err(err);
@@ -2036,13 +2082,7 @@ fn dispatch_ref_stdin_command(
             cursor.finish("update", &raw_name)?;
 
             let new_oid = match new {
-                Some(v) => resolve_stdin_oid(
-                    context,
-                    "update",
-                    &raw_name,
-                    "<new-oid>",
-                    &v,
-                )?,
+                Some(v) => resolve_stdin_oid(context, "update", &raw_name, "<new-oid>", &v)?,
                 None => zero_oid(context.format)?,
             };
             let expected = match old {
@@ -2118,13 +2158,7 @@ fn dispatch_ref_stdin_command(
             cursor.finish("create", &raw_name)?;
 
             let new_oid = match new {
-                Some(v) => resolve_stdin_oid(
-                    context,
-                    "create",
-                    &raw_name,
-                    "<new-oid>",
-                    &v,
-                )?,
+                Some(v) => resolve_stdin_oid(context, "create", &raw_name, "<new-oid>", &v)?,
                 None => zero_oid(context.format)?,
             };
             if new_oid == zero_oid(context.format)? {
@@ -2193,13 +2227,7 @@ fn dispatch_ref_stdin_command(
                 // error.
                 OldOid::Zero => return update_ref_stdin_delete_zero(&raw_name),
                 OldOid::Value(v) => {
-                    let oid = resolve_stdin_oid(
-                        context,
-                        "delete",
-                        &raw_name,
-                        "<old-oid>",
-                        &v,
-                    )?;
+                    let oid = resolve_stdin_oid(context, "delete", &raw_name, "<old-oid>", &v)?;
                     // git: a resolved zero <old-oid> is also rejected.
                     if oid == zero_oid(context.format)? {
                         return update_ref_stdin_delete_zero(&raw_name);
@@ -2254,13 +2282,7 @@ fn dispatch_ref_stdin_command(
             cursor.finish("verify", &raw_name)?;
 
             let expected = match old {
-                Some(v) => resolve_stdin_oid(
-                    context,
-                    "verify",
-                    &raw_name,
-                    "<old-oid>",
-                    &v,
-                )?,
+                Some(v) => resolve_stdin_oid(context, "verify", &raw_name, "<old-oid>", &v)?,
                 None => zero_oid(context.format)?,
             };
             let effective = update_ref_stdin_effective_ref(context.store, &raw_name, *deref)?;
@@ -2297,7 +2319,10 @@ fn dispatch_ref_stdin_command(
                 return update_ref_stdin_missing_ref(verb);
             };
             let Some(target) = cursor.parse_next_refname()? else {
-                return update_ref_stdin_symref_update_missing_new_target_for("symref-create", &raw_name);
+                return update_ref_stdin_symref_update_missing_new_target_for(
+                    "symref-create",
+                    &raw_name,
+                );
             };
             cursor.finish("symref-create", &raw_name)?;
 
@@ -2365,13 +2390,7 @@ fn dispatch_ref_stdin_command(
                 return Ok(());
             }
             transaction.mark_applied();
-            update_ref_stdin_symref_update(
-                context,
-                &effective.requested,
-                &name,
-                &target,
-                expected,
-            )
+            update_ref_stdin_symref_update(context, &effective.requested, &name, &target, expected)
         }
         "symref-verify" => {
             if *deref {
@@ -2706,10 +2725,11 @@ impl UpdateRefStdinTransaction {
             return self.restore(context.store);
         }
         if let Some(name) = self.duplicate.clone() {
-            let message = self
-                .duplicate_message
-                .clone()
-                .or_else(|| self.infer_duplicate_message(context.store, &name).ok().flatten());
+            let message = self.duplicate_message.clone().or_else(|| {
+                self.infer_duplicate_message(context.store, &name)
+                    .ok()
+                    .flatten()
+            });
             self.restore(context.store)?;
             update_ref_stdin_duplicate_failure("", &name, message.as_deref());
             return Err(GitError::Exit(128));
@@ -2931,23 +2951,27 @@ fn update_ref_stdin_commit_staged(
                     }
                     continue;
                 }
-                check_update_ref_new_value_cached(context, &write.name, &write.new_oid)
-                .map_err(|reason| {
-                    eprintln!("fatal: cannot update ref '{}': {reason}", write.name);
-                    GitError::Exit(128)
-                })?;
+                check_update_ref_new_value_cached(context, &write.name, &write.new_oid).map_err(
+                    |reason| {
+                        eprintln!("fatal: cannot update ref '{}': {reason}", write.name);
+                        GitError::Exit(128)
+                    },
+                )?;
                 let old_oid = match current {
                     Some(RefTarget::Direct(oid)) => oid,
                     _ => zero,
                 };
-                let reflog =
-                    update_ref_should_write_reflog(context.git_dir, &write.name, context.create_reflog)?
-                        .then(|| ReflogEntry {
-                            old_oid,
-                            new_oid: write.new_oid,
-                            committer: ref_reflog_committer(),
-                            message: context.message.clone(),
-                        });
+                let reflog = update_ref_should_write_reflog(
+                    context.git_dir,
+                    &write.name,
+                    context.create_reflog,
+                )?
+                .then(|| ReflogEntry {
+                    old_oid,
+                    new_oid: write.new_oid,
+                    committer: ref_reflog_committer(),
+                    message: context.message.clone(),
+                });
                 tx.update(RefUpdate {
                     name: write.name,
                     expected: None,
@@ -3418,8 +3442,7 @@ fn update_ref_stdin_write_batch(
     if request.new_oid == zero_oid(context.format)? {
         return update_ref_delete_stdin(context.store, context.format, &request.name, None);
     }
-    if let Err(reason) =
-        check_update_ref_new_value_cached(context, &request.name, &request.new_oid)
+    if let Err(reason) = check_update_ref_new_value_cached(context, &request.name, &request.new_oid)
     {
         writeln!(
             stdout,
@@ -3505,11 +3528,12 @@ fn update_ref_stdin_write(
             None,
         );
     }
-    check_update_ref_new_value_cached(context, &request.name, &request.new_oid)
-    .map_err(|reason| {
-        eprintln!("fatal: cannot update ref '{}': {reason}", request.name);
-        GitError::Exit(128)
-    })?;
+    check_update_ref_new_value_cached(context, &request.name, &request.new_oid).map_err(
+        |reason| {
+            eprintln!("fatal: cannot update ref '{}': {reason}", request.name);
+            GitError::Exit(128)
+        },
+    )?;
     let old_oid = match current {
         Some(RefTarget::Direct(oid)) => oid,
         _ => zero_oid(context.format)?,
@@ -4501,9 +4525,9 @@ fn cmd_refs_migrate(args: &[String]) -> Result<()> {
                 target_format = Some(parse_refs_migrate_ref_format(value)?);
             }
             value if value.starts_with("--ref-format=") => {
-                let value = value.strip_prefix("--ref-format=").ok_or_else(|| {
-                    GitError::Command("--ref-format requires a value".into())
-                })?;
+                let value = value
+                    .strip_prefix("--ref-format=")
+                    .ok_or_else(|| GitError::Command("--ref-format requires a value".into()))?;
                 target_format = Some(parse_refs_migrate_ref_format(value)?);
             }
             "--" => {
@@ -4775,9 +4799,11 @@ fn refs_migrate_set_config_value(
         .iter()
         .rposition(|section| section.name.eq_ignore_ascii_case(section_name))
         .unwrap_or_else(|| {
-            config
-                .sections
-                .push(ConfigSection::new(section_name.to_string(), None, Vec::new()));
+            config.sections.push(ConfigSection::new(
+                section_name.to_string(),
+                None,
+                Vec::new(),
+            ));
             config.sections.len() - 1
         });
     let section = &mut config.sections[section_idx];
@@ -4790,9 +4816,10 @@ fn refs_migrate_set_config_value(
         entry.value = Some(value.to_string());
         return;
     }
-    section
-        .entries
-        .push(ConfigEntry::new(key_name.to_string(), Some(value.to_string())));
+    section.entries.push(ConfigEntry::new(
+        key_name.to_string(),
+        Some(value.to_string()),
+    ));
 }
 
 fn refs_migrate_display_path(git_dir: &Path, common_git_dir: &Path, path: &Path) -> String {

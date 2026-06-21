@@ -180,13 +180,9 @@ mod tests {
 
     #[test]
     fn invalid_config_value_errors() {
-        let err = determine_update_strategy(
-            UpdateType::Unspecified,
-            Some("bogus"),
-            &unspec(),
-            false,
-        )
-        .unwrap_err();
+        let err =
+            determine_update_strategy(UpdateType::Unspecified, Some("bogus"), &unspec(), false)
+                .unwrap_err();
         assert_eq!(err, "bogus");
     }
 }

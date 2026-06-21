@@ -207,7 +207,9 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
     if (options.repository.starts_with("../") || options.repository.starts_with("./"))
         && normalize_lexical_path(&cwd) != normalize_lexical_path(&worktree_root)
     {
-        eprintln!("fatal: relative repository paths can only be used from the toplevel of the working tree");
+        eprintln!(
+            "fatal: relative repository paths can only be used from the toplevel of the working tree"
+        );
         return Err(GitError::Exit(128));
     }
 
@@ -230,7 +232,12 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
     let normalized_path = normalize_submodule_add_path(&cwd, &worktree_root, &path)?;
     let destination = worktree_root.join(&normalized_path);
     let add_name = submodule_add_name(&worktree_root, &normalized_path, options.name.as_deref())?;
-    validate_submodule_add_name_available(&worktree_root, &add_name, &normalized_path, options.force)?;
+    validate_submodule_add_name_available(
+        &worktree_root,
+        &add_name,
+        &normalized_path,
+        options.force,
+    )?;
 
     if git_dir.join("index.lock").exists() {
         eprintln!(
@@ -263,7 +270,11 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     if !options.force
-        && sley_worktree::path_matches_standard_ignore(&worktree_root, normalized_path.as_bytes(), true)?
+        && sley_worktree::path_matches_standard_ignore(
+            &worktree_root,
+            normalized_path.as_bytes(),
+            true,
+        )?
     {
         eprintln!("The following paths are ignored by one of your .gitignore files:");
         eprintln!("{normalized_path}");
@@ -527,7 +538,8 @@ fn update_one_submodule(
     target_oid: &ObjectId,
     options: &SubmoduleUpdateOptions<'_>,
 ) -> Result<UpdateOutcome> {
-    let display = submodule_displaypath(cwd, worktree_root, &submodule.path, &options.super_prefix)?;
+    let display =
+        submodule_displaypath(cwd, worktree_root, &submodule.path, &options.super_prefix)?;
     let path = worktree_root.join(&submodule.path);
 
     // git's `prepare_to_clone_next_submodule`: an update=none submodule (from
@@ -741,7 +753,10 @@ fn remote_target_oid(
     if let Some(oid) = resolve_ref_to_oid(&store, &remote_ref)? {
         return Ok(oid);
     }
-    eprintln!("fatal: Unable to find {remote_ref} revision in submodule path '{}'", display);
+    eprintln!(
+        "fatal: Unable to find {remote_ref} revision in submodule path '{}'",
+        display
+    );
     Err(GitError::Exit(128))
 }
 
@@ -760,10 +775,7 @@ fn self_sley_fetch(path: &Path, remote: &str) -> Result<std::process::ExitStatus
 /// git's `remote_submodule_branch`: `submodule.<name>.branch` from
 /// `.git/config`, falling back to the `.gitmodules` branch, then `HEAD`. A `.`
 /// value means "inherit the superproject's current branch".
-fn resolve_remote_branch(
-    config: &GitConfig,
-    submodule: &SubmoduleConfigEntry,
-) -> Result<String> {
+fn resolve_remote_branch(config: &GitConfig, submodule: &SubmoduleConfigEntry) -> Result<String> {
     let branch = config
         .get("submodule", Some(&submodule.name), "branch")
         .map(str::to_string)
@@ -881,7 +893,11 @@ fn run_submodule_update_command(
         UpdateType::Command => {
             let cmd = strategy.command.clone().unwrap_or_default();
             command = ProcessCommand::new("sh");
-            command.arg("-c").arg(format!("{cmd} \"$@\"")).arg(&cmd).arg(&oid);
+            command
+                .arg("-c")
+                .arg(format!("{cmd} \"$@\""))
+                .arg(&cmd)
+                .arg(&oid);
         }
         UpdateType::None | UpdateType::Unspecified => {
             // Resolved strategy never carries these (none is skipped earlier,
@@ -913,9 +929,7 @@ fn run_submodule_update_command(
             }
             UpdateType::Command => {
                 let cmd = strategy.command.clone().unwrap_or_default();
-                eprintln!(
-                    "fatal: Execution of '{cmd} {oid}' failed in submodule path '{display}'"
-                );
+                eprintln!("fatal: Execution of '{cmd} {oid}' failed in submodule path '{display}'");
             }
             UpdateType::None | UpdateType::Unspecified => {}
         }
@@ -2372,10 +2386,7 @@ fn index_has_gitlink_matching(index: &Option<Index>, pathspec: &str) -> bool {
         index.entries.iter().any(|entry| {
             sley_index::is_gitlink(entry.mode)
                 && entry.stage() == sley_index::Stage::Normal
-                && submodule_path_matches_pathspec(
-                    &String::from_utf8_lossy(&entry.path),
-                    pathspec,
-                )
+                && submodule_path_matches_pathspec(&String::from_utf8_lossy(&entry.path), pathspec)
         })
     })
 }
@@ -2628,7 +2639,8 @@ fn run_submodule_foreach_command(
     //    quotes inside later args stay literal.
     let mut command = ProcessCommand::new("sh");
     if options.args.len() == 1 {
-        let toplevel = fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
+        let toplevel =
+            fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
         command
             .arg("-c")
             .arg(format!(
@@ -2740,8 +2752,12 @@ fn generate_submodule_summary(
     // a missing commit falls back to the 7-char prefix of the full oid. We use
     // the 7-char prefix uniformly (the test submodules are small, so the unique
     // abbrev is 7), and track "missing" to suppress the commit count.
-    let (src_abbrev, missing_src) =
-        summary_abbrev(sub_repo.as_deref(), &oid_src, src_is_gitlink, entry.status == 'D');
+    let (src_abbrev, missing_src) = summary_abbrev(
+        sub_repo.as_deref(),
+        &oid_src,
+        src_is_gitlink,
+        entry.status == 'D',
+    );
     let (dst_abbrev, missing_dst) =
         summary_abbrev(sub_repo.as_deref(), &oid_dst, dst_is_gitlink, false);
 
@@ -3069,9 +3085,7 @@ pub(crate) fn read_submodule_configs(worktree_root: &Path) -> Result<Vec<Submodu
 /// init path copies into `.git/config`. `Unspecified` (never set, or an
 /// invalid value the typed parser rejected) maps to `None`, matching the old
 /// behavior where only a present, recognized `update =` line was copied.
-fn submodule_update_to_raw(
-    strategy: &sley_submodule::UpdateStrategy,
-) -> Option<String> {
+fn submodule_update_to_raw(strategy: &sley_submodule::UpdateStrategy) -> Option<String> {
     use sley_submodule::UpdateType;
     match strategy.kind {
         UpdateType::Unspecified => None,

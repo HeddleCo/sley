@@ -221,7 +221,10 @@ mod tests {
         assert_eq!(transport_scheme_for_url("ssh://host/repo.git"), "ssh");
         assert_eq!(transport_scheme_for_url("git+ssh://host/repo.git"), "ssh");
         assert_eq!(transport_scheme_for_url("user@host:repo.git"), "ssh");
-        assert_eq!(transport_scheme_for_url("ext::fake-remote %S repo.git"), "ext");
+        assert_eq!(
+            transport_scheme_for_url("ext::fake-remote %S repo.git"),
+            "ext"
+        );
         assert_eq!(transport_scheme_for_url("foo://host/repo.git"), "foo");
     }
 

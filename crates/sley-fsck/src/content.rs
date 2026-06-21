@@ -417,10 +417,7 @@ fn is_hfs_dot_name(name: &[u8], needle: &str) -> bool {
     let Ok(text) = std::str::from_utf8(name) else {
         return false;
     };
-    let folded: String = text
-        .chars()
-        .filter(|ch| !is_hfs_ignorable(*ch))
-        .collect();
+    let folded: String = text.chars().filter(|ch| !is_hfs_ignorable(*ch)).collect();
     folded.eq_ignore_ascii_case(&format!(".{needle}"))
 }
 
@@ -1131,7 +1128,11 @@ fn check_tree(body: &[u8], large_pathname_len: usize) -> Vec<ContentFinding> {
         ));
     }
     if has_full_path {
-        out.push(finding(MsgId::FullPathname, "contains full pathnames", false));
+        out.push(finding(
+            MsgId::FullPathname,
+            "contains full pathnames",
+            false,
+        ));
     }
     if has_empty_name {
         out.push(finding(MsgId::EmptyName, "contains empty pathname", false));
@@ -1153,7 +1154,11 @@ fn check_tree(body: &[u8], large_pathname_len: usize) -> Vec<ContentFinding> {
         ));
     }
     if has_bad_modes {
-        out.push(finding(MsgId::BadFilemode, "contains bad file modes", false));
+        out.push(finding(
+            MsgId::BadFilemode,
+            "contains bad file modes",
+            false,
+        ));
     }
     if has_dup_entries {
         out.push(finding(
@@ -1221,9 +1226,7 @@ fn valid_oid_line(body: &[u8], from: usize) -> bool {
         None => return false,
     };
     let end = from + oid_hex_len;
-    body.len() > end
-        && body[from..end].iter().all(u8::is_ascii_hexdigit)
-        && body[end] == b'\n'
+    body.len() > end && body[from..end].iter().all(u8::is_ascii_hexdigit) && body[end] == b'\n'
 }
 
 /// Determine sha1 (40) vs sha256 (64) hex length from the object content. We
@@ -1290,10 +1293,7 @@ fn valid_tag_name(name: &[u8]) -> bool {
 
 /// Standard git tree-entry modes.
 fn is_valid_mode(mode: u32) -> bool {
-    matches!(
-        mode,
-        0o100755 | 0o100644 | 0o120000 | 0o040000 | 0o160000
-    )
+    matches!(mode, 0o100755 | 0o100644 | 0o120000 | 0o040000 | 0o160000)
 }
 
 fn parse_octal_mode(bytes: &[u8]) -> Option<u32> {
@@ -1465,7 +1465,7 @@ message\n"
 author A U Thor <author@>example.com> 1234567890 +0000\n\
 committer C O Mitter <committer@example.com> 1234567890 +0000\n\n\
 m\n"
-            .to_vec();
+        .to_vec();
         let f = check_object_content(ObjectType::Commit, &body, &cfg());
         // The embedded '>' is inside the email; git reports missingSpaceBeforeDate
         // because the email closes early. Either way it must be a non-empty error.
@@ -1479,7 +1479,7 @@ m\n"
 author A U Thor author@example.com> 1234567890 +0000\n\
 committer C O Mitter <committer@example.com> 1234567890 +0000\n\n\
 m\n"
-            .to_vec();
+        .to_vec();
         let f = check_object_content(ObjectType::Commit, &body, &cfg());
         assert_eq!(ids(&f), vec!["badName"]);
     }
@@ -1487,12 +1487,16 @@ m\n"
     #[test]
     fn commit_nul_in_header() {
         let mut body = b"tree 0000000000000000000000000000000000000000\n\
-author".to_vec();
+author"
+            .to_vec();
         body.push(0);
         body.extend_from_slice(b" A <a@b.com> 1 +0000\n");
         let f = check_object_content(ObjectType::Commit, &body, &cfg());
         assert_eq!(ids(&f), vec!["nulInHeader"]);
-        assert!(f[0].detail.starts_with("unterminated header: NUL at offset"));
+        assert!(
+            f[0].detail
+                .starts_with("unterminated header: NUL at offset")
+        );
     }
 
     #[test]
@@ -1576,10 +1580,7 @@ This is an invalid tag.\n"
         let f = check_object_content(ObjectType::Tag, &body, &cfg());
         assert_eq!(ids(&f), vec!["badTagName", "missingTaggerEntry"]);
         assert_eq!(f[0].detail, "invalid 'tag' name: wrong name format");
-        assert_eq!(
-            f[1].detail,
-            "invalid format - expected 'tagger' line"
-        );
+        assert_eq!(f[1].detail, "invalid format - expected 'tagger' line");
     }
 
     #[test]
@@ -1609,7 +1610,10 @@ msg\n"
             body.extend_from_slice(&[0x44u8; 20]);
         }
         let f = check_object_content(ObjectType::Tree, &body, &cfg());
-        assert!(f.iter().any(|x| x.msg_id == MsgId::DuplicateEntries), "{f:?}");
+        assert!(
+            f.iter().any(|x| x.msg_id == MsgId::DuplicateEntries),
+            "{f:?}"
+        );
     }
 
     #[test]

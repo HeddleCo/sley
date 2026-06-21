@@ -372,10 +372,7 @@ impl LsTreePathContext {
     }
 }
 
-fn normalize_ls_tree_pathspec_into(
-    components: &mut Vec<String>,
-    pathspec: &str,
-) -> Result<String> {
+fn normalize_ls_tree_pathspec_into(components: &mut Vec<String>, pathspec: &str) -> Result<String> {
     for component in pathspec.split('/') {
         match component {
             "" | "." => {}
@@ -1195,11 +1192,7 @@ struct LsFilesWriteOptions<'a> {
 }
 
 fn ls_files_tag(entry: &sley_index::IndexEntry) -> char {
-    if entry.is_skip_worktree() {
-        'S'
-    } else {
-        'H'
-    }
+    if entry.is_skip_worktree() { 'S' } else { 'H' }
 }
 
 pub(crate) fn cmd_ls_tree(args: &[String]) -> Result<()> {

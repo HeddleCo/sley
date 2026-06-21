@@ -146,11 +146,7 @@ pub fn remote_exists(config: &GitConfig, name: &str) -> bool {
 /// separators. Only such names trigger the legacy `remotes/`/`branches/` file
 /// lookup.
 fn valid_remote_nick(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\')
 }
 
 /// The repository default branch name used to fill the missing `#frag` of a
@@ -197,11 +193,7 @@ pub fn augment_with_legacy_remote_files(config: &mut GitConfig, git_dir: &Path) 
     config.sections.extend(new_sections);
 }
 
-fn augment_from_remotes_dir(
-    config: &GitConfig,
-    git_dir: &Path,
-    out: &mut Vec<ConfigSection>,
-) {
+fn augment_from_remotes_dir(config: &GitConfig, git_dir: &Path, out: &mut Vec<ConfigSection>) {
     let dir = git_dir.join("remotes");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
@@ -222,10 +214,15 @@ fn augment_from_remotes_dir(
             if let Some(url) = line.strip_prefix("URL:") {
                 section_entries.push(ConfigEntry::new("url", Some(url.trim_start().to_string())));
             } else if let Some(spec) = line.strip_prefix("Pull:") {
-                section_entries
-                    .push(ConfigEntry::new("fetch", Some(spec.trim_start().to_string())));
+                section_entries.push(ConfigEntry::new(
+                    "fetch",
+                    Some(spec.trim_start().to_string()),
+                ));
             } else if let Some(spec) = line.strip_prefix("Push:") {
-                section_entries.push(ConfigEntry::new("push", Some(spec.trim_start().to_string())));
+                section_entries.push(ConfigEntry::new(
+                    "push",
+                    Some(spec.trim_start().to_string()),
+                ));
             }
         }
         if section_entries.iter().any(|e| e.key == "url") {
@@ -234,11 +231,7 @@ fn augment_from_remotes_dir(
     }
 }
 
-fn augment_from_branches_dir(
-    config: &GitConfig,
-    git_dir: &Path,
-    out: &mut Vec<ConfigSection>,
-) {
+fn augment_from_branches_dir(config: &GitConfig, git_dir: &Path, out: &mut Vec<ConfigSection>) {
     let dir = git_dir.join("branches");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;

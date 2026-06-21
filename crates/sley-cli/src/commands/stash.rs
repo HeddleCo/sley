@@ -80,8 +80,7 @@ pub(crate) fn cmd_stash(args: &[String]) -> Result<()> {
 fn stash_can_start_assumed_push(value: &str) -> bool {
     matches!(
         value,
-        "--"
-            | "-q"
+        "--" | "-q"
             | "--quiet"
             | "--no-quiet"
             | "-u"
@@ -128,13 +127,19 @@ fn stash_can_start_assumed_push(value: &str) -> bool {
 
 fn stash_usage_stdout() {
     println!("usage: git stash list [<log-options>]");
-    println!("   or: git stash show [-u | --include-untracked | --only-untracked] [<diff-options>] [<stash>]");
+    println!(
+        "   or: git stash show [-u | --include-untracked | --only-untracked] [<diff-options>] [<stash>]"
+    );
     println!("   or: git stash drop [-q | --quiet] [<stash>]");
     println!("   or: git stash pop [--index] [-q | --quiet] [<stash>]");
     println!("   or: git stash apply [--index] [-q | --quiet] [<stash>]");
     println!("   or: git stash branch <branchname> [<stash>]");
-    println!("   or: git stash [push] [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]");
-    println!("   or: git stash save [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]");
+    println!(
+        "   or: git stash [push] [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]"
+    );
+    println!(
+        "   or: git stash save [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]"
+    );
     println!("   or: git stash clear");
     println!("   or: git stash create [<message>]");
     println!("   or: git stash store [(-m | --message) <message>] [-q | --quiet] <commit>");
@@ -144,13 +149,19 @@ fn stash_usage_stdout() {
 
 fn stash_usage_stderr() {
     eprintln!("usage: git stash list [<log-options>]");
-    eprintln!("   or: git stash show [-u | --include-untracked | --only-untracked] [<diff-options>] [<stash>]");
+    eprintln!(
+        "   or: git stash show [-u | --include-untracked | --only-untracked] [<diff-options>] [<stash>]"
+    );
     eprintln!("   or: git stash drop [-q | --quiet] [<stash>]");
     eprintln!("   or: git stash pop [--index] [-q | --quiet] [<stash>]");
     eprintln!("   or: git stash apply [--index] [-q | --quiet] [<stash>]");
     eprintln!("   or: git stash branch <branchname> [<stash>]");
-    eprintln!("   or: git stash [push] [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]");
-    eprintln!("   or: git stash save [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]");
+    eprintln!(
+        "   or: git stash [push] [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]"
+    );
+    eprintln!(
+        "   or: git stash save [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]"
+    );
     eprintln!("   or: git stash clear");
     eprintln!("   or: git stash create [<message>]");
     eprintln!("   or: git stash store [(-m | --message) <message>] [-q | --quiet] <commit>");
@@ -159,7 +170,9 @@ fn stash_usage_stderr() {
 }
 
 fn stash_push_usage_stdout() {
-    println!("usage: git stash [push] [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]");
+    println!(
+        "usage: git stash [push] [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]"
+    );
 }
 
 /// git's assumed-`push` guard: with no explicit subcommand, options are parsed up
@@ -267,10 +280,7 @@ fn cmd_stash_branch(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     if args.len() > 2 {
-        eprintln!(
-            "Too many revisions specified: '{}' '{}'",
-            args[1], args[2]
-        );
+        eprintln!("Too many revisions specified: '{}' '{}'", args[1], args[2]);
         return Err(GitError::Exit(1));
     }
     if args[0].starts_with('-') {
@@ -314,7 +324,10 @@ fn cmd_stash_branch(args: &[String]) -> Result<()> {
         display,
         direct_oid: Some(stash_oid),
     })?;
-    if args.get(1).is_none_or(|spec| stash_argument_names_stash_ref(spec)) {
+    if args
+        .get(1)
+        .is_none_or(|spec| stash_argument_names_stash_ref(spec))
+    {
         drop_stash_entry(
             &applied.common_git_dir,
             applied.format,
@@ -438,7 +451,11 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
     let mut selector = options.selector;
     let stash_oid = if let Some(oid) = options.direct_oid {
         oid
-    } else if let Some(spec) = options.spec.as_deref().filter(|_| options.explicit_selector) {
+    } else if let Some(spec) = options
+        .spec
+        .as_deref()
+        .filter(|_| options.explicit_selector)
+    {
         let oid = resolve_stash_argument(&common_git_dir, format, &store, &db, Some(spec))?;
         if let Some((index, _entry)) = entries
             .iter()
@@ -648,7 +665,14 @@ fn apply_stash_via_merge(
     // in the way of a path the merge would write (unpack_trees' verify steps).
     verify_stash_apply_safe(state.worktree_root, format, &ours_map, &results)?;
 
-    apply_stash_merge_results(state.worktree_root, state.git_dir, db, format, &ours_map, &results)?;
+    apply_stash_merge_results(
+        state.worktree_root,
+        state.git_dir,
+        db,
+        format,
+        &ours_map,
+        &results,
+    )?;
 
     if !conflicts.is_empty() {
         // Conflicts stay in the worktree/index for the user to resolve; git does
@@ -1199,9 +1223,9 @@ fn stash_numeric_selector(spec: &str) -> Option<Result<usize>> {
     selector
         .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
         .map(|selector| {
-        selector
-            .parse::<usize>()
-            .map_err(|_| stash_invalid_reference_error(spec))
+            selector
+                .parse::<usize>()
+                .map_err(|_| stash_invalid_reference_error(spec))
         })
 }
 
@@ -1635,7 +1659,12 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
             eprintln!("Can't use --patch and --include-untracked or --all at the same time");
             return Err(GitError::Exit(1));
         }
-        return commands::add_interactive::cmd_add_patch(&[], unified_context, inter_hunk_context, true);
+        return commands::add_interactive::cmd_add_patch(
+            &[],
+            unified_context,
+            inter_hunk_context,
+            true,
+        );
     }
     let Some(created) = create_stash_commit(
         &message_args,
@@ -1900,7 +1929,7 @@ fn create_stash_commit(
                 message: format!("untracked files on {branch}: {head_name} {head_subject}\n")
                     .into_bytes(),
                 encoding: None,
-            signature: None,
+                signature: None,
             },
         )?)
     } else {
@@ -2896,8 +2925,13 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
     // git's `stash show` accepts any stash-like argument (a `stash@{n}` ref, a
     // bare index, or a raw commit-ish such as `git stash create`'s output), not
     // just a reflog selector.
-    let stash_oid =
-        resolve_stash_argument(&common_git_dir, format, &store, &db, specs.first().map(String::as_str))?;
+    let stash_oid = resolve_stash_argument(
+        &common_git_dir,
+        format,
+        &store,
+        &db,
+        specs.first().map(String::as_str),
+    )?;
     let object = db.read_object(&stash_oid)?;
     if object.object_type != ObjectType::Commit {
         return Err(GitError::InvalidObject(format!(
@@ -4011,7 +4045,12 @@ fn parse_stash_list_filter_patterns(
     patterns: &[LogFilterPattern],
     mode: SimpleLogRegexMode,
 ) -> Result<Vec<SimpleLogRegex>> {
-    parse_log_filter_patterns(patterns, mode).map_err(|err| match err {
+    parse_log_filter_patterns_with_diagnostic_verbosity(
+        patterns,
+        mode,
+        grep_source::RegexDiagnosticVerbosity::Default,
+    )
+    .map_err(|err| match err {
         GitError::Exit(128) => GitError::Exit(1),
         err => err,
     })
@@ -4132,9 +4171,10 @@ fn write_stash_list_patch(
         &commit.tree,
         sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
-    let abbrev = repository_abbrev(&common_git_dir_for_git_dir(&discover_git_dir(
-        &env::current_dir()?,
-    )?)?, format)?
+    let abbrev = repository_abbrev(
+        &common_git_dir_for_git_dir(&discover_git_dir(&env::current_dir()?)?)?,
+        format,
+    )?
     .unwrap_or(7)
     .min(format.hex_len());
     for entry in &entries {
@@ -4418,7 +4458,9 @@ fn read_stash_export_chain(
             return Err(GitError::Exit(1));
         }
         if commit.parents.is_empty() {
-            if commit.author != stash_export_identity() || commit.committer != stash_export_identity() {
+            if commit.author != stash_export_identity()
+                || commit.committer != stash_export_identity()
+            {
                 eprintln!("error: found root commit {current} with invalid data");
                 return Err(GitError::Exit(1));
             }

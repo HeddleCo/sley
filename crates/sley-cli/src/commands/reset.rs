@@ -181,17 +181,15 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             interhunk: inter_hunk_context.map(|value| value as usize),
             ..commands::add_patch::PatchConfig::default()
         };
-        cfg.reset_interactive = sley_config::read_repo_config(
-            &discover_git_dir(&env::current_dir()?)?,
-            None,
-        )
-        .ok()
-        .and_then(|config| {
-            config
-                .get("interactive", None, "reset")
-                .map(ToString::to_string)
-        })
-        .unwrap_or_default();
+        cfg.reset_interactive =
+            sley_config::read_repo_config(&discover_git_dir(&env::current_dir()?)?, None)
+                .ok()
+                .and_then(|config| {
+                    config
+                        .get("interactive", None, "reset")
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_default();
         return commands::add_patch::run_add_patch(
             commands::add_patch::PatchMode::Reset,
             &positionals,
@@ -205,10 +203,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     // working tree — `--hard`, `--merge`, `--keep` — must run in a work tree, so
     // a bare repository refuses with "this operation must be run in a work
     // tree". `--soft` (HEAD-only) and `--mixed` (index-only) are exempt.
-    if matches!(
-        mode,
-        ResetMode::Hard | ResetMode::Merge | ResetMode::Keep
-    ) {
+    if matches!(mode, ResetMode::Hard | ResetMode::Merge | ResetMode::Keep) {
         require_work_tree(&git_dir)?;
     }
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -275,11 +270,10 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(128));
         }
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let head_oid = resolve_revision(&git_dir, format, "HEAD")
-            .map_err(|_| {
-                eprintln!("fatal: You do not have a valid HEAD.");
-                GitError::Exit(128)
-            })?;
+        let head_oid = resolve_revision(&git_dir, format, "HEAD").map_err(|_| {
+            eprintln!("fatal: You do not have a valid HEAD.");
+            GitError::Exit(128)
+        })?;
         let old_head = head_oid;
         let head_tree = commands::merge_rebase::commit_tree_oid(&db, format, &head_oid)?;
         let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
@@ -346,9 +340,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         // half-merged index behind would silently strand the conflict state.
         // builtin/reset.c: `reset_type == SOFT && (merge in progress || unmerged)`
         // → "Cannot do a soft reset in the middle of a merge." (exit 128).
-        if mode == ResetMode::Soft
-            && reset_soft_blocked_by_merge(&git_dir, format)?
-        {
+        if mode == ResetMode::Soft && reset_soft_blocked_by_merge(&git_dir, format)? {
             eprintln!("fatal: Cannot do a soft reset in the middle of a merge.");
             return Err(GitError::Exit(128));
         }
@@ -526,7 +518,9 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
                 cwd.join(path)
             };
             if !absolute.exists() {
-                return Err(sley_rev::ambiguous_argument_error(&path.display().to_string()));
+                return Err(sley_rev::ambiguous_argument_error(
+                    &path.display().to_string(),
+                ));
             }
         }
     }
@@ -657,7 +651,9 @@ fn apply_reset_intent_to_add(
         .map(|path| IndexEntry::intent_to_add(format, path.clone()))
         .collect::<Vec<_>>();
     index.entries.extend(additions);
-    index.entries.sort_by(|left, right| left.path.cmp(&right.path));
+    index
+        .entries
+        .sort_by(|left, right| left.path.cmp(&right.path));
     // intent-to-add entries carry extended flags, which the v2 index writer cannot
     // encode; bump to v3 when needed (mirrors `git add -N`'s index upgrade).
     index.upgrade_version_for_flags();
@@ -748,13 +744,7 @@ fn apply_reset_sparse_checkout(
         patterns,
         sparse_index,
     };
-    sley_worktree::apply_sparse_checkout_with_mode(
-        worktree_root,
-        git_dir,
-        format,
-        &sparse,
-        mode,
-    )?;
+    sley_worktree::apply_sparse_checkout_with_mode(worktree_root, git_dir, format, &sparse, mode)?;
     Ok(())
 }
 

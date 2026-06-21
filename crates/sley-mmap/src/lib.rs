@@ -14,11 +14,12 @@
 //!
 //! sley only maps git files that are written by atomic rename of a
 //! fully-written temporary and are never truncated or rewritten in place:
-//! pack/index files, multi-pack-index files, and commit-graph files. A repack/gc
-//! or commit-graph write replaces the file by writing a new one and renaming it
-//! into place, and unlinking a still-mapped file keeps the inode (and the
-//! mapping) valid on Unix. So the backing bytes never shrink under a live map,
-//! which is the condition `Mmap::map` requires.
+//! pack/index files, the repository index, multi-pack-index files, and
+//! commit-graph files. A repack/gc, index write, or commit-graph write replaces
+//! the file by writing a new one and renaming it into place, and unlinking a
+//! still-mapped file keeps the inode (and the mapping) valid on Unix. So the
+//! backing bytes never shrink under a live map, which is the condition
+//! `Mmap::map` requires.
 
 use std::fs::File;
 use std::io;
@@ -88,6 +89,32 @@ impl MappedFile {
         }
         // SAFETY: `path` is a git pack file, which sley writes atomically and never
         // mutates in place (see the doc comment), so the mapped bytes stay valid.
+        unsafe { Self::open(path) }
+    }
+
+    /// Memory-map a repository **index** file read-only.
+    ///
+    /// Git-compatible writers update `.git/index` by writing `.git/index.lock`
+    /// and atomically renaming it into place; they do not truncate the live
+    /// index while readers hold it open. That gives the same stable-inode
+    /// property as pack files. This accepts only regular files named `index`;
+    /// callers with an unusual `GIT_INDEX_FILE` can fall back to `std::fs::read`.
+    pub fn open_index(path: &Path) -> io::Result<Self> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "index path is not a regular file",
+            ));
+        }
+        if path.file_name().and_then(|name| name.to_str()) != Some("index") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "index path must be named index",
+            ));
+        }
+        // SAFETY: git replaces the repository index via lockfile rename instead
+        // of truncating/reusing the mapped file in place.
         unsafe { Self::open(path) }
     }
 

@@ -502,7 +502,14 @@ fn merge_octopus(
             )?;
             writeln!(stdout, "Fast-forward")?;
             let new_tree = commit_tree_oid(&db, format, &new_oid)?;
-            write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &new_tree, merge_diffstat_mode(options))?;
+            write_merge_result_diffstat(
+                &mut stdout,
+                &db,
+                format,
+                &head_tree,
+                &new_tree,
+                merge_diffstat_mode(options),
+            )?;
             stdout.flush()?;
         }
         return Ok(());
@@ -582,7 +589,14 @@ fn merge_octopus(
     if !options.quiet {
         let mut stdout = io::stdout();
         writeln!(stdout, "Merge made by the 'octopus' strategy.")?;
-        write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &merged_tree, merge_diffstat_mode(options))?;
+        write_merge_result_diffstat(
+            &mut stdout,
+            &db,
+            format,
+            &head_tree,
+            &merged_tree,
+            merge_diffstat_mode(options),
+        )?;
         stdout.flush()?;
     }
 
@@ -594,9 +608,10 @@ fn merge_octopus(
     // (i.e. it is not an ancestor of any merged head) OR `--no-ff` forces it in.
     // `reduced` already excludes any head reachable from HEAD, so HEAD is
     // "subsumed" exactly when it is an ancestor of some reduced head.
-    let head_subsumed = reduced
-        .iter()
-        .any(|(_, oid)| oid == &head_oid || is_ancestor_commit(&db, git_dir, format, &head_oid, oid).unwrap_or(false));
+    let head_subsumed = reduced.iter().any(|(_, oid)| {
+        oid == &head_oid
+            || is_ancestor_commit(&db, git_dir, format, &head_oid, oid).unwrap_or(false)
+    });
     let mut parents: Vec<ObjectId> = Vec::with_capacity(reduced.len() + 1);
     if !head_subsumed || options.no_ff() {
         parents.push(head_oid);
@@ -841,9 +856,7 @@ fn glob_match_simple(pattern: &str, text: &str) -> bool {
             return text.is_empty();
         }
         match pat[0] {
-            b'*' => {
-                inner(&pat[1..], text) || (!text.is_empty() && inner(pat, &text[1..]))
-            }
+            b'*' => inner(&pat[1..], text) || (!text.is_empty() && inner(pat, &text[1..])),
             b'?' => !text.is_empty() && inner(&pat[1..], &text[1..]),
             b'[' => {
                 let Some(end) = pat.iter().position(|byte| *byte == b']') else {
@@ -909,7 +922,11 @@ fn merge_message_title(
     }
     for (singular, plural, list) in [
         ("branch ", "branches ", &branches),
-        ("remote-tracking branch ", "remote-tracking branches ", &remotes),
+        (
+            "remote-tracking branch ",
+            "remote-tracking branches ",
+            &remotes,
+        ),
         ("tag ", "tags ", &tags),
         ("commit ", "commits ", &commits),
     ] {
@@ -999,7 +1016,8 @@ fn merge_log_shortlog(
                 .committer_signature()
                 .map(|s| s.time.seconds)
                 .unwrap_or(0);
-            tb.cmp(&ta).then_with(|| b.oid.to_hex().cmp(&a.oid.to_hex()))
+            tb.cmp(&ta)
+                .then_with(|| b.oid.to_hex().cmp(&a.oid.to_hex()))
         });
         let count = walked.len();
         let mut subjects = Vec::new();
@@ -1051,16 +1069,14 @@ fn build_merge_message(
     } else {
         match &options.message {
             Some(m) => m.clone(),
-            None => {
-                merge_message_title(
-                    refs,
-                    git_dir,
-                    db,
-                    format,
-                    &names,
-                    options.into_name.as_deref(),
-                )?
-            }
+            None => merge_message_title(
+                refs,
+                git_dir,
+                db,
+                format,
+                &names,
+                options.into_name.as_deref(),
+            )?,
         }
     };
     append_merge_target_tag_messages(&mut message, db, git_dir, format, &names)?;
@@ -1359,9 +1375,9 @@ pub(crate) fn cmd_fmt_merge_msg(args: &[String]) -> Result<()> {
             io::stdin().read_to_end(&mut input)?;
             input
         }
-        Some(path) => fs::read(path).map_err(|err| {
-            GitError::Io(format!("cannot open '{}': {err}", path))
-        })?,
+        Some(path) => {
+            fs::read(path).map_err(|err| GitError::Io(format!("cannot open '{}': {err}", path)))?
+        }
     };
 
     let mut shortlog_len = options.shortlog_len;
@@ -1371,9 +1387,10 @@ pub(crate) fn cmd_fmt_merge_msg(args: &[String]) -> Result<()> {
     let shortlog_len = shortlog_len.unwrap_or(0);
     let head_oid = match refs.read_ref("HEAD")? {
         Some(RefTarget::Direct(oid)) => oid,
-        Some(RefTarget::Symbolic(name)) => refs.read_ref(&name)?.and_then(|target| target.oid()).ok_or_else(|| {
-            GitError::InvalidFormat("No current branch".into())
-        })?,
+        Some(RefTarget::Symbolic(name)) => refs
+            .read_ref(&name)?
+            .and_then(|target| target.oid())
+            .ok_or_else(|| GitError::InvalidFormat("No current branch".into()))?,
         None => return Err(GitError::InvalidFormat("No current branch".into())),
     };
     let current_branch = options
@@ -1438,7 +1455,9 @@ fn parse_fmt_merge_msg_args(args: &[String]) -> Result<FmtMergeMsgOptions> {
             "-m" | "--message" => {
                 options.message = Some(
                     iter.next()
-                        .ok_or_else(|| GitError::Command("fmt-merge-msg -m requires a value".into()))?
+                        .ok_or_else(|| {
+                            GitError::Command("fmt-merge-msg -m requires a value".into())
+                        })?
                         .clone(),
                 );
             }
@@ -1448,7 +1467,9 @@ fn parse_fmt_merge_msg_args(args: &[String]) -> Result<FmtMergeMsgOptions> {
             "-F" | "--file" => {
                 options.file = Some(
                     iter.next()
-                        .ok_or_else(|| GitError::Command("fmt-merge-msg -F requires a value".into()))?
+                        .ok_or_else(|| {
+                            GitError::Command("fmt-merge-msg -F requires a value".into())
+                        })?
                         .clone(),
                 );
             }
@@ -1458,7 +1479,9 @@ fn parse_fmt_merge_msg_args(args: &[String]) -> Result<FmtMergeMsgOptions> {
             "--into-name" => {
                 options.into_name = Some(
                     iter.next()
-                        .ok_or_else(|| GitError::Command("fmt-merge-msg --into-name requires a value".into()))?
+                        .ok_or_else(|| {
+                            GitError::Command("fmt-merge-msg --into-name requires a value".into())
+                        })?
                         .clone(),
                 );
             }
@@ -1559,12 +1582,7 @@ fn fmt_merge_origin_from_desc(
         (desc, desc, true)
     };
     let (kind, name, title_name, is_local_branch) = if pulling_head {
-        (
-            FmtMergeKind::Head,
-            src.to_string(),
-            src.to_string(),
-            false,
-        )
+        (FmtMergeKind::Head, src.to_string(), src.to_string(), false)
     } else if let Some(name) = what.strip_prefix("branch ") {
         (
             FmtMergeKind::Branch,
@@ -1782,9 +1800,18 @@ fn fmt_tag_message_without_signature(message: &[u8]) -> &[u8] {
 
 fn tag_signature_kind_local(body: &[u8]) -> Option<(usize, SyntheticSignatureKind)> {
     const MARKERS: [(&[u8], SyntheticSignatureKind); 3] = [
-        (b"-----BEGIN PGP SIGNATURE-----", SyntheticSignatureKind::Pgp),
-        (b"-----BEGIN SSH SIGNATURE-----", SyntheticSignatureKind::Ssh),
-        (b"-----BEGIN SIGNED MESSAGE-----", SyntheticSignatureKind::Pgp),
+        (
+            b"-----BEGIN PGP SIGNATURE-----",
+            SyntheticSignatureKind::Pgp,
+        ),
+        (
+            b"-----BEGIN SSH SIGNATURE-----",
+            SyntheticSignatureKind::Ssh,
+        ),
+        (
+            b"-----BEGIN SIGNED MESSAGE-----",
+            SyntheticSignatureKind::Pgp,
+        ),
     ];
     let mut offset = 0usize;
     for line in body.split_inclusive(|byte| *byte == b'\n') {
@@ -1816,7 +1843,9 @@ fn append_synthetic_signature_note(out: &mut String, kind: SyntheticSignatureKin
     out.push('\n');
     if kind == SyntheticSignatureKind::Ssh {
         if out.contains("untrusted") {
-            out.push_str(&format!("{comment} Good \"git\" signature with synthetic signer\n"));
+            out.push_str(&format!(
+                "{comment} Good \"git\" signature with synthetic signer\n"
+            ));
             out.push_str(&format!("{comment} No principal matched\n"));
         } else if out.contains("expired")
             || out.contains("notyetvalid")
@@ -1824,7 +1853,9 @@ fn append_synthetic_signature_note(out: &mut String, kind: SyntheticSignatureKin
         {
             out.push_str(&format!("{comment} No principal matched\n"));
         } else {
-            out.push_str(&format!("{comment} Good \"git\" signature for synthetic signer\n"));
+            out.push_str(&format!(
+                "{comment} Good \"git\" signature for synthetic signer\n"
+            ));
         }
     } else if env::var_os("GNUPGHOME").as_deref() == Some(std::ffi::OsStr::new(".")) {
         out.push_str(&format!("{comment} gpg: Signature made\n"));
@@ -1874,7 +1905,9 @@ fn fmt_merge_log_shortlog(
         .into_iter()
         .map(|record| record.oid)
         .collect();
-    let me_author = commit_identity_from_env("AUTHOR").ok().and_then(identity_name);
+    let me_author = commit_identity_from_env("AUTHOR")
+        .ok()
+        .and_then(identity_name);
     let me_committer = commit_identity_from_env("COMMITTER")
         .ok()
         .and_then(identity_name);
@@ -1895,7 +1928,8 @@ fn fmt_merge_log_shortlog(
                 .committer_signature()
                 .map(|s| s.time.seconds)
                 .unwrap_or(0);
-            tb.cmp(&ta).then_with(|| b.oid.to_hex().cmp(&a.oid.to_hex()))
+            tb.cmp(&ta)
+                .then_with(|| b.oid.to_hex().cmp(&a.oid.to_hex()))
         });
         let mut subjects = Vec::new();
         let mut authors: BTreeMap<String, usize> = BTreeMap::new();
@@ -2441,7 +2475,9 @@ fn parse_merge_args(args: &[String], options: &mut MergeOptions) -> Result<Parse
             "--into-name" => {
                 options.into_name = Some(
                     iter.next()
-                        .ok_or_else(|| GitError::Command("merge --into-name requires a value".into()))?
+                        .ok_or_else(|| {
+                            GitError::Command("merge --into-name requires a value".into())
+                        })?
                         .clone(),
                 );
             }
@@ -2608,7 +2644,10 @@ pub(crate) fn reflog_action_override() -> Option<String> {
     if let Ok(value) = env::var("GIT_REFLOG_ACTION") {
         return Some(value);
     }
-    REFLOG_ACTION_OVERRIDE.lock().ok().and_then(|slot| slot.clone())
+    REFLOG_ACTION_OVERRIDE
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
 }
 
 /// The reflog message git's merge writes: `<GIT_REFLOG_ACTION>: <suffix>`, with
@@ -2719,7 +2758,8 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             return Err(GitError::Command("merge requires a commit argument".into()));
         }
         _ => {
-            let reduced = reduce_merge_targets(&git_dir, &common_git_dir, format, &refs, &positional)?;
+            let reduced =
+                reduce_merge_targets(&git_dir, &common_git_dir, format, &refs, &positional)?;
             match reduced.as_slice() {
                 [] => {
                     if !options.quiet {
@@ -3011,7 +3051,14 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 format_log_abbrev_oid(&other_oid)
             )?;
             writeln!(stdout, "Fast-forward")?;
-            write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &other_tree, merge_diffstat_mode(&options))?;
+            write_merge_result_diffstat(
+                &mut stdout,
+                &db,
+                format,
+                &head_tree,
+                &other_tree,
+                merge_diffstat_mode(&options),
+            )?;
             stdout.flush()?;
         }
         if merge_autostash {
@@ -3173,13 +3220,24 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
 
         if !options.quiet {
             let mut stdout = io::stdout();
-            let strategy = if options.resolve_strategy { "resolve" } else { "ort" };
+            let strategy = if options.resolve_strategy {
+                "resolve"
+            } else {
+                "ort"
+            };
             print_merge_info_messages(&info_messages);
             if options.resolve_strategy {
                 writeln!(stdout, "Wonderful.")?;
             }
             writeln!(stdout, "Merge made by the '{strategy}' strategy.")?;
-            write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &merged_tree, merge_diffstat_mode(&options))?;
+            write_merge_result_diffstat(
+                &mut stdout,
+                &db,
+                format,
+                &head_tree,
+                &merged_tree,
+                merge_diffstat_mode(&options),
+            )?;
             stdout.flush()?;
         }
         if options.edit == Some(true) {
@@ -3484,7 +3542,10 @@ fn print_merge_info_messages(messages: &[sley_diff_merge::MergeInfoMessage]) {
 /// message ordering.
 fn print_merge_conflict_messages(results: &MergePathResults) {
     for (path, result) in results {
-        let MergePathResult::Conflict { kind, auto_merged, .. } = result else {
+        let MergePathResult::Conflict {
+            kind, auto_merged, ..
+        } = result
+        else {
             continue;
         };
         let path_str = String::from_utf8_lossy(path);
@@ -3688,11 +3749,12 @@ fn verify_merge_uptodate(
     let conflicted_gitlinks: BTreeSet<Vec<u8>> = results
         .iter()
         .filter_map(|(path, result)| match result {
-            MergePathResult::Conflict { base, ours, theirs, .. }
-                if base
-                    .or(*ours)
-                    .or(*theirs)
-                    .is_some_and(|(mode, _)| sley_index::is_gitlink(mode)) =>
+            MergePathResult::Conflict {
+                base, ours, theirs, ..
+            } if base
+                .or(*ours)
+                .or(*theirs)
+                .is_some_and(|(mode, _)| sley_index::is_gitlink(mode)) =>
             {
                 Some(path.clone())
             }
@@ -3702,12 +3764,11 @@ fn verify_merge_uptodate(
 
     let status = crate::collect_short_status(worktree_root, git_dir, format)?;
     for entry in &status {
-        let gitlink_worktree_status_is_safe =
-            (conflicted_gitlinks.contains(&entry.path)
-                || ours_map
-                    .get(&entry.path)
-                    .is_some_and(|(mode, _)| sley_index::is_gitlink(*mode)))
-                && changed.contains(&entry.path);
+        let gitlink_worktree_status_is_safe = (conflicted_gitlinks.contains(&entry.path)
+            || ours_map
+                .get(&entry.path)
+                .is_some_and(|(mode, _)| sley_index::is_gitlink(*mode)))
+            && changed.contains(&entry.path);
         if entry.index == b'?'
             && entry.worktree == b'?'
             && changed.contains(&entry.path)
@@ -3822,7 +3883,9 @@ fn gitlink_target_dir_is_safe(
         return Ok(true);
     }
     let prefix = path_with_trailing_slash(path);
-    let tracked_dir = head_map.keys().any(|candidate| candidate.starts_with(&prefix));
+    let tracked_dir = head_map
+        .keys()
+        .any(|candidate| candidate.starts_with(&prefix));
     if !tracked_dir {
         return Ok(false);
     }
@@ -3855,7 +3918,9 @@ fn verify_no_populated_gitlink_directory_overwrite(
         if overwritten.is_empty() {
             continue;
         }
-        eprintln!("error: The following untracked working tree files would be overwritten by merge:");
+        eprintln!(
+            "error: The following untracked working tree files would be overwritten by merge:"
+        );
         for candidate in overwritten {
             eprintln!("\t{}", String::from_utf8_lossy(candidate));
         }
@@ -3943,11 +4008,7 @@ pub(crate) fn cmd_merge_abort() -> Result<()> {
 /// in-progress merge changed (a conflicted stage>0 entry, a stage-0 entry that
 /// differs from HEAD, or a HEAD path the merge dropped), and leave all other
 /// worktree paths — including purely-local modifications — untouched.
-fn reset_merge_to_head(
-    git_dir: &Path,
-    worktree_root: &Path,
-    format: ObjectFormat,
-) -> Result<()> {
+fn reset_merge_to_head(git_dir: &Path, worktree_root: &Path, format: ObjectFormat) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let head_oid = resolve_revision(git_dir, format, "HEAD")?;
@@ -3973,8 +4034,7 @@ fn reset_merge_to_head(
         }
     }
     // HEAD paths the merge dropped from the index also need restoring.
-    let index_paths: BTreeSet<Vec<u8>> =
-        index.entries.iter().map(|e| e.path.to_vec()).collect();
+    let index_paths: BTreeSet<Vec<u8>> = index.entries.iter().map(|e| e.path.to_vec()).collect();
     for path in head_map.keys() {
         if !index_paths.contains(path) {
             touched.insert(path.clone());

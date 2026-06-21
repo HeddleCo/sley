@@ -609,23 +609,24 @@ impl PackFile {
             let entry_offset = offset as u64;
             let header = parse_entry_header(bytes, &mut offset)?;
             let stream_size = header.size;
-            let base = match header.kind {
-                PackObjectKind::OfsDelta => Some(DeltaBase::Offset(
-                    parse_ofs_delta_base_offset(bytes, &mut offset, entry_offset)?,
-                )),
-                PackObjectKind::RefDelta => {
-                    let hash_len = format.raw_len();
-                    if offset + hash_len > trailer_offset {
-                        return Err(GitError::InvalidFormat(
-                            "truncated ref-delta base object id".into(),
-                        ));
+            let base =
+                match header.kind {
+                    PackObjectKind::OfsDelta => Some(DeltaBase::Offset(
+                        parse_ofs_delta_base_offset(bytes, &mut offset, entry_offset)?,
+                    )),
+                    PackObjectKind::RefDelta => {
+                        let hash_len = format.raw_len();
+                        if offset + hash_len > trailer_offset {
+                            return Err(GitError::InvalidFormat(
+                                "truncated ref-delta base object id".into(),
+                            ));
+                        }
+                        let oid = ObjectId::from_raw(format, &bytes[offset..offset + hash_len])?;
+                        offset += hash_len;
+                        Some(DeltaBase::Ref(oid))
                     }
-                    let oid = ObjectId::from_raw(format, &bytes[offset..offset + hash_len])?;
-                    offset += hash_len;
-                    Some(DeltaBase::Ref(oid))
-                }
-                _ => None,
-            };
+                    _ => None,
+                };
             // Skip the compressed body to reach the next entry header.
             let mut body = Vec::new();
             let consumed = inflate_into(
@@ -716,13 +717,7 @@ impl PackFile {
             offset_of_oid.insert(*oid, *off);
         }
         for idx in 0..on_disk.len() {
-            resolve_depth(
-                idx,
-                &on_disk,
-                &index_by_offset,
-                &offset_of_oid,
-                &mut depth,
-            );
+            resolve_depth(idx, &on_disk, &index_by_offset, &offset_of_oid, &mut depth);
         }
 
         let mut stats = Vec::with_capacity(on_disk.len());
