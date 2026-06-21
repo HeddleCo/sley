@@ -4590,6 +4590,15 @@ impl FileObjectDatabase {
     }
 
     pub fn resolve_prefix(&self, prefix: &str) -> Result<ObjectPrefixResolution> {
+        let mut matches = self.object_ids_with_prefix(prefix)?;
+        Ok(match matches.len() {
+            0 => ObjectPrefixResolution::Missing,
+            1 => ObjectPrefixResolution::Unique(matches.remove(0)),
+            _ => ObjectPrefixResolution::Ambiguous(matches),
+        })
+    }
+
+    pub fn object_ids_with_prefix(&self, prefix: &str) -> Result<Vec<ObjectId>> {
         validate_object_id_prefix(self.format, prefix)?;
         let mut matches = Vec::new();
         for oid in self.object_ids()? {
@@ -4597,11 +4606,7 @@ impl FileObjectDatabase {
                 matches.push(oid);
             }
         }
-        Ok(match matches.len() {
-            0 => ObjectPrefixResolution::Missing,
-            1 => ObjectPrefixResolution::Unique(matches.remove(0)),
-            _ => ObjectPrefixResolution::Ambiguous(matches),
-        })
+        Ok(matches)
     }
 
     /// The object type and content size of `oid` without decoding its full body —

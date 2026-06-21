@@ -483,7 +483,7 @@ where
     }
 
     fn add_revision_token(&mut self, rev: &str, negated: bool) -> Result<()> {
-        let oid = resolve_revision_with_config_optional(
+        let oid = resolve_revision_commitish_with_config_optional(
             self.ctx.git_dir,
             self.ctx.format,
             self.ctx.reader,
@@ -606,7 +606,7 @@ where
     }
 
     fn resolve_commit(&self, rev: &str) -> Result<ObjectId> {
-        let oid = resolve_revision_with_config_optional(
+        let oid = resolve_revision_commitish_with_config_optional(
             self.ctx.git_dir,
             self.ctx.format,
             self.ctx.reader,
@@ -661,6 +661,26 @@ fn resolve_revision_with_config_optional<R: ObjectReader>(
         Some(config) => resolve_revision_with_config(git_dir, format, reader, rev, config),
         None => resolve_revision_with_reader(git_dir, format, reader, rev),
     }
+}
+
+fn resolve_revision_commitish_with_config_optional<R: ObjectReader>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &R,
+    rev: &str,
+    config: Option<&GitConfig>,
+) -> Result<ObjectId> {
+    if super::is_short_hex_prefix(format, rev) {
+        return resolve_short_object_id_with_reader(
+            git_dir,
+            format,
+            reader,
+            rev,
+            ObjectDisambiguation::Commitish,
+        )?
+        .into_result(rev);
+    }
+    resolve_revision_with_config_optional(git_dir, format, reader, rev, config)
 }
 
 fn read_commit<R: ObjectReader>(reader: &R, format: ObjectFormat, oid: &ObjectId) -> Result<Commit> {

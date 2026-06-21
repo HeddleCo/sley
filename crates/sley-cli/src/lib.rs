@@ -11349,9 +11349,43 @@ fn resolve_revision(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<O
     sley_rev::resolve_revision(git_dir, format, rev)
 }
 
+fn resolve_revision_commitish(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<ObjectId> {
+    warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
+    if is_short_hex_object_prefix(format, rev) {
+        return sley_rev::resolve_short_object_id(
+            git_dir,
+            format,
+            rev,
+            sley_rev::ObjectDisambiguation::Commitish,
+        )?
+        .into_result(rev);
+    }
+    sley_rev::resolve_revision(git_dir, format, rev)
+}
+
+fn resolve_revision_treeish(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<ObjectId> {
+    warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
+    if is_short_hex_object_prefix(format, rev) {
+        return sley_rev::resolve_short_object_id(
+            git_dir,
+            format,
+            rev,
+            sley_rev::ObjectDisambiguation::Treeish,
+        )?
+        .into_result(rev);
+    }
+    sley_rev::resolve_revision(git_dir, format, rev)
+}
+
+fn is_short_hex_object_prefix(format: ObjectFormat, rev: &str) -> bool {
+    rev.len() >= 4
+        && rev.len() < format.hex_len()
+        && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn warn_ambiguous_refname_for_object_prefix(git_dir: &Path, format: ObjectFormat, rev: &str) {
     if rev.len() < 4
-        || rev.len() >= format.hex_len()
+        || rev.len() > format.hex_len()
         || !rev.bytes().all(|byte| byte.is_ascii_hexdigit())
         || !revision_ref_name_exists(git_dir, format, rev)
     {

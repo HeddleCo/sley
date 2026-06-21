@@ -129,6 +129,34 @@ pub struct CommitRecord {
     pub commit: Commit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectDisambiguation {
+    Any,
+    Commit,
+    Commitish,
+    Tree,
+    Treeish,
+    Tag,
+    Blob,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShortObjectIdResolution {
+    Missing,
+    Unique(ObjectId),
+    Ambiguous(Vec<ObjectId>),
+}
+
+impl ShortObjectIdResolution {
+    pub fn into_result(self, prefix: &str) -> Result<ObjectId> {
+        match self {
+            Self::Unique(oid) => Ok(oid),
+            Self::Missing => Err(GitError::not_found(format!("revision {prefix}"))),
+            Self::Ambiguous(_) => Err(short_object_id_ambiguous_error(prefix)),
+        }
+    }
+}
+
 /// Lightweight commit-walk record: id, parents, and committer time only.
 ///
 /// Unlike [`CommitRecord`] (which carries the whole parsed [`Commit`] and so
@@ -351,10 +379,36 @@ fn resolve_revision_inner<R: ObjectReader>(
                 "revision {rev} has empty base"
             )));
         }
-        let base_oid = resolve_revision_inner(git_dir, format, reader, base, config)?;
+        let base_oid = match disambiguation_for_suffix(suffix) {
+            Some(disambiguation) if is_short_hex_prefix(format, base) => {
+                resolve_short_object_id_with_reader(git_dir, format, reader, base, disambiguation)?
+                    .into_result(base)?
+            }
+            _ => resolve_revision_inner(git_dir, format, reader, base, config)?,
+        };
         return apply_revision_suffix(git_dir, reader, format, &base_oid, suffix, rev);
     }
     resolve_revision_name(git_dir, format, rev)
+}
+
+fn is_short_hex_prefix(format: ObjectFormat, value: &str) -> bool {
+    value.len() >= 4
+        && value.len() < format.hex_len()
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn disambiguation_for_suffix(suffix: RevisionSuffix<'_>) -> Option<ObjectDisambiguation> {
+    match suffix {
+        RevisionSuffix::Parent(_) | RevisionSuffix::FirstParent(_) | RevisionSuffix::Search(_) => {
+            Some(ObjectDisambiguation::Commitish)
+        }
+        RevisionSuffix::Peel(PeelKind::Object) => Some(ObjectDisambiguation::Any),
+        RevisionSuffix::Peel(PeelKind::AnyNonTag) => Some(ObjectDisambiguation::Any),
+        RevisionSuffix::Peel(PeelKind::Commit) => Some(ObjectDisambiguation::Commitish),
+        RevisionSuffix::Peel(PeelKind::Tree) => Some(ObjectDisambiguation::Treeish),
+        RevisionSuffix::Peel(PeelKind::Tag) => Some(ObjectDisambiguation::Tag),
+        RevisionSuffix::Peel(PeelKind::Blob) => Some(ObjectDisambiguation::Blob),
+    }
 }
 
 pub struct RevisionResolver<'a, R> {
@@ -429,22 +483,8 @@ fn resolve_revision_name(
         && rev.len() < format.hex_len()
         && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        let db = FileObjectDatabase::from_git_dir(git_dir, format);
-        match db.resolve_prefix(rev)? {
-            ObjectPrefixResolution::Unique(oid) => return Ok(oid),
-            ObjectPrefixResolution::Ambiguous(matches) => {
-                let mut names = matches
-                    .into_iter()
-                    .map(|oid| oid.to_string())
-                    .collect::<Vec<_>>();
-                names.sort();
-                return Err(GitError::InvalidObjectId(format!(
-                    "short object ID {rev} is ambiguous: {}",
-                    names.join(", ")
-                )));
-            }
-            ObjectPrefixResolution::Missing => {}
-        }
+        return resolve_short_object_id(git_dir, format, rev, ObjectDisambiguation::Any)?
+            .into_result(rev);
     }
     // git's get_describe_name: `<tag>-<count>-g<hex>` (describe output) resolves
     // to the abbreviated commit named by the trailing `-g<hex>`.
@@ -452,6 +492,244 @@ fn resolve_revision_name(
         return Ok(oid);
     }
     Err(GitError::not_found(format!("revision {rev}")))
+}
+
+pub fn short_object_id_ambiguous_error(prefix: &str) -> GitError {
+    GitError::InvalidObjectId(format!("short object ID {prefix} is ambiguous"))
+}
+
+pub fn is_short_object_id_ambiguous_error(err: &GitError) -> bool {
+    matches!(err, GitError::InvalidObjectId(msg) if msg.starts_with("short object ID ") && msg.ends_with(" is ambiguous"))
+}
+
+pub fn resolve_short_object_id(
+    git_dir: &Path,
+    format: ObjectFormat,
+    prefix: &str,
+    disambiguation: ObjectDisambiguation,
+) -> Result<ShortObjectIdResolution> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    resolve_short_object_id_with_reader(git_dir, format, &db, prefix, disambiguation)
+}
+
+pub fn object_ids_with_prefix(
+    git_dir: &Path,
+    format: ObjectFormat,
+    prefix: &str,
+) -> Result<Vec<ObjectId>> {
+    FileObjectDatabase::from_git_dir(git_dir, format).object_ids_with_prefix(prefix)
+}
+
+pub fn resolve_short_object_id_with_reader<R: ObjectReader>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &R,
+    prefix: &str,
+    disambiguation: ObjectDisambiguation,
+) -> Result<ShortObjectIdResolution> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let candidates = db.object_ids_with_prefix(prefix)?;
+    if candidates.is_empty() {
+        return Ok(ShortObjectIdResolution::Missing);
+    }
+    if disambiguation == ObjectDisambiguation::Any {
+        return Ok(match candidates.len() {
+            1 => ShortObjectIdResolution::Unique(candidates[0]),
+            _ => ShortObjectIdResolution::Ambiguous(candidates),
+        });
+    }
+    let mut accepted = Vec::new();
+    for oid in &candidates {
+        if short_object_id_matches_type(reader, format, oid, disambiguation) {
+            accepted.push(*oid);
+        }
+    }
+    Ok(match accepted.len() {
+        1 => ShortObjectIdResolution::Unique(accepted[0]),
+        0 => ShortObjectIdResolution::Ambiguous(candidates),
+        _ => ShortObjectIdResolution::Ambiguous(accepted),
+    })
+}
+
+fn short_object_id_matches_type<R: ObjectReader>(
+    reader: &R,
+    format: ObjectFormat,
+    oid: &ObjectId,
+    disambiguation: ObjectDisambiguation,
+) -> bool {
+    match disambiguation {
+        ObjectDisambiguation::Any => true,
+        ObjectDisambiguation::Commit => reader
+            .read_object(oid)
+            .is_ok_and(|object| object.object_type == ObjectType::Commit),
+        ObjectDisambiguation::Commitish => peel_to_commit(reader, format, oid).is_ok(),
+        ObjectDisambiguation::Tree => reader
+            .read_object(oid)
+            .is_ok_and(|object| object.object_type == ObjectType::Tree),
+        ObjectDisambiguation::Treeish => peel_to_tree(reader, format, oid).is_ok(),
+        ObjectDisambiguation::Tag => reader
+            .read_object(oid)
+            .is_ok_and(|object| object.object_type == ObjectType::Tag),
+        ObjectDisambiguation::Blob => peel_to_blob(reader, format, oid).is_ok(),
+    }
+}
+
+pub fn ambiguous_short_object_id_hint(
+    git_dir: &Path,
+    format: ObjectFormat,
+    prefix: &str,
+    disambiguation: ObjectDisambiguation,
+) -> Result<Vec<String>> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut candidates = db.object_ids_with_prefix(prefix)?;
+    candidates.sort_by(|left, right| {
+        let left_type = ambiguous_candidate_type_for_sort(&db, left);
+        let right_type = ambiguous_candidate_type_for_sort(&db, right);
+        ambiguous_type_sort_key(left_type)
+            .cmp(&ambiguous_type_sort_key(right_type))
+            .then_with(|| left.to_hex().cmp(&right.to_hex()))
+    });
+    let mut out = Vec::new();
+    for oid in candidates {
+        if disambiguation != ObjectDisambiguation::Any
+            && !short_object_id_matches_type(&db, format, &oid, disambiguation)
+        {
+            continue;
+        }
+        out.push(ambiguous_short_object_id_line(&db, format, &oid)?);
+    }
+    if out.is_empty() && disambiguation != ObjectDisambiguation::Any {
+        for oid in db.object_ids_with_prefix(prefix)? {
+            out.push(ambiguous_short_object_id_line(&db, format, &oid)?);
+        }
+    }
+    Ok(out)
+}
+
+fn ambiguous_candidate_type_for_sort(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+) -> Option<ObjectType> {
+    match db.read_object_header(oid) {
+        Ok(Some((object_type, _))) => Some(object_type),
+        Err(GitError::InvalidObject(message)) if message.starts_with("unable to unpack ") => {
+            eprintln!("error: {message}");
+            None
+        }
+        Ok(None) | Err(_) => None,
+    }
+}
+
+fn ambiguous_type_sort_key(object_type: Option<ObjectType>) -> u8 {
+    match object_type {
+        None => 0,
+        Some(ObjectType::Tag) => 1,
+        Some(ObjectType::Commit) => 2,
+        Some(ObjectType::Tree) => 3,
+        Some(ObjectType::Blob) => 4,
+    }
+}
+
+fn ambiguous_short_object_id_line(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<String> {
+    let abbrev = unique_object_abbrev(db, oid)?;
+    let object_type = match db.read_object_header(oid) {
+        Ok(Some((object_type, _))) => object_type,
+        Err(GitError::InvalidObject(message)) if message.starts_with("unknown object type") => {
+            return Err(GitError::InvalidObject(message));
+        }
+        Err(GitError::InvalidObject(message)) if message.starts_with("unable to unpack ") => {
+            eprintln!("error: {message}");
+            return Ok(format!("{abbrev} [bad object]"));
+        }
+        Ok(None) | Err(_) => return Ok(format!("{abbrev} [bad object]")),
+    };
+    if matches!(object_type, ObjectType::Tree | ObjectType::Blob) {
+        return Ok(format!("{abbrev} {}", object_type.as_str()));
+    }
+    let object = match db.read_object(oid) {
+        Ok(object) => object,
+        Err(GitError::InvalidObject(message)) if message.starts_with("unknown object type") => {
+            return Err(GitError::InvalidObject(message));
+        }
+        Err(GitError::InvalidObject(message)) if message.starts_with("unable to unpack ") => {
+            eprintln!("error: {message}");
+            return Ok(format!("{abbrev} [bad object]"));
+        }
+        Err(_) => return Ok(format!("{abbrev} [bad object]")),
+    };
+    Ok(match object_type {
+        ObjectType::Commit => {
+            let commit = Commit::parse_ref(format, &object.body)?;
+            let subject = first_message_line(commit.message);
+            match short_date_from_ident(commit.committer) {
+                Some(date) if !subject.is_empty() => format!("{abbrev} commit {date} - {subject}"),
+                Some(date) => format!("{abbrev} commit {date} - "),
+                None if !subject.is_empty() => format!("{abbrev} commit  - {subject}"),
+                None => format!("{abbrev} commit  - "),
+            }
+        }
+        ObjectType::Tag => match Tag::parse_ref(format, &object.body) {
+            Ok(tag) => {
+                let name = String::from_utf8_lossy(tag.name);
+                match tag.tagger.and_then(short_date_from_ident) {
+                    Some(date) => format!("{abbrev} tag {date} - {name}"),
+                    None => format!("{abbrev} tag  - {name}"),
+                }
+            }
+            Err(_) => format!("{abbrev} [bad tag, could not parse it]"),
+        },
+        ObjectType::Tree => format!("{abbrev} tree"),
+        ObjectType::Blob => format!("{abbrev} blob"),
+    })
+}
+
+fn unique_object_abbrev(db: &FileObjectDatabase, oid: &ObjectId) -> Result<String> {
+    let hex = oid.to_hex();
+    let mut width = 7.min(hex.len());
+    while width < hex.len() {
+        match db.resolve_prefix(&hex[..width])? {
+            ObjectPrefixResolution::Ambiguous(_) => width += 1,
+            _ => break,
+        }
+    }
+    Ok(hex[..width].to_string())
+}
+
+fn first_message_line(message: &[u8]) -> String {
+    let line = message
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    String::from_utf8_lossy(line).into_owned()
+}
+
+fn short_date_from_ident(ident: &[u8]) -> Option<String> {
+    let signature = sley_core::Signature::from_ident_line(ident)?;
+    short_date_from_timestamp(signature.time.seconds)
+}
+
+fn short_date_from_timestamp(timestamp: i64) -> Option<String> {
+    let days = timestamp.div_euclid(86_400);
+    let (year, month, day) = civil_from_days_for_short_date(days)?;
+    Some(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn civil_from_days_for_short_date(days: i64) -> Option<(i64, u32, u32)> {
+    let z = days.checked_add(719_468)?;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096).div_euclid(365);
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2).div_euclid(153);
+    let day = doy - (153 * mp + 2).div_euclid(5) + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(month <= 2);
+    Some((year, u32::try_from(month).ok()?, u32::try_from(day).ok()?))
 }
 
 /// Resolve a `git describe` name (`<ref>-<count>-g<hex>`) back to the commit it
@@ -478,11 +756,10 @@ fn resolve_describe_name(
             if hex.len() >= 4
                 && hex.len() < format.hex_len()
                 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && let ShortObjectIdResolution::Unique(oid) =
+                    resolve_short_object_id(git_dir, format, hex, ObjectDisambiguation::Commit)?
             {
-                let db = FileObjectDatabase::from_git_dir(git_dir, format);
-                if let ObjectPrefixResolution::Unique(oid) = db.resolve_prefix(hex)? {
-                    return Ok(Some(oid));
-                }
+                return Ok(Some(oid));
             }
         }
         break;
@@ -4388,7 +4665,18 @@ pub fn resolve_rev_path_entry<R: ObjectReader>(
     rev: &str,
     path: &str,
 ) -> Result<ResolvedTreePath> {
-    let rev_oid = resolve_revision_with_reader(git_dir, format, reader, rev)?;
+    let rev_oid = if is_short_hex_prefix(format, rev) {
+        resolve_short_object_id_with_reader(
+            git_dir,
+            format,
+            reader,
+            rev,
+            ObjectDisambiguation::Treeish,
+        )?
+        .into_result(rev)?
+    } else {
+        resolve_revision_with_reader(git_dir, format, reader, rev)?
+    };
     let tree_oid = peel_to_tree(reader, format, &rev_oid)?;
     resolve_tree_path_entry(reader, format, &tree_oid, path)
         .ok_or_else(|| GitError::not_found(format!("path '{path}' does not exist in '{rev}'")))
