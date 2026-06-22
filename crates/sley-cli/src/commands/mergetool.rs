@@ -487,11 +487,11 @@ fn should_prompt(config: &GitConfig, options: &MergetoolOptions) -> bool {
 
 fn normalize_user_path(cwd: &Path, worktree_root: &Path, value: &str) -> Result<Vec<u8>> {
     let path = Path::new(value);
-    let absolute = if path.is_absolute() {
+    let absolute = lexical_normalize_path(&if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
-    };
+    });
     let relative = absolute
         .strip_prefix(worktree_root)
         .unwrap_or(path)
@@ -499,6 +499,20 @@ fn normalize_user_path(cwd: &Path, worktree_root: &Path, value: &str) -> Result<
         .trim_start_matches("./")
         .replace('\\', "/");
     Ok(relative.into_bytes())
+}
+
+fn lexical_normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            _ => out.push(component.as_os_str()),
+        }
+    }
+    out
 }
 
 fn with_trailing_slash(path: &[u8]) -> Vec<u8> {
