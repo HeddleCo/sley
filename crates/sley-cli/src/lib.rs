@@ -2510,6 +2510,188 @@ pub(crate) struct DiffPatchOptions<'a> {
     pub(crate) indent_heuristic: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DiffEntryRenderModes {
+    pub(crate) raw: bool,
+    pub(crate) numstat: bool,
+    pub(crate) stat: bool,
+    pub(crate) shortstat: bool,
+    pub(crate) summary: bool,
+    pub(crate) patch: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DiffEntryRawRenderOptions {
+    pub(crate) z: bool,
+    pub(crate) abbrev: Option<usize>,
+    pub(crate) format: ObjectFormat,
+}
+
+pub(crate) enum DiffEntryStatSource<'a> {
+    Entries {
+        db: &'a FileObjectDatabase,
+        worktree_root: Option<&'a Path>,
+        use_worktree_new: bool,
+    },
+    Materialized(&'a [DiffStatEntryData<'a>]),
+}
+
+pub(crate) struct DiffEntryStatRenderOptions<'a> {
+    pub(crate) source: Option<DiffEntryStatSource<'a>>,
+    pub(crate) z: bool,
+    pub(crate) options: DiffStatOptions,
+    pub(crate) widths: Option<DiffStatWidths>,
+}
+
+pub(crate) struct DiffEntryRenderContext<'a> {
+    pub(crate) raw: DiffEntryRawRenderOptions,
+    pub(crate) stat: DiffEntryStatRenderOptions<'a>,
+    pub(crate) after_stat: Option<&'a mut dyn FnMut(&mut dyn Write) -> Result<()>>,
+    pub(crate) prefix_already_written: bool,
+}
+
+pub(crate) fn render_diff_entries<RawZero, PatchEntry>(
+    stdout: &mut dyn Write,
+    entries: &[sley_diff_merge::NameStatusEntry],
+    modes: DiffEntryRenderModes,
+    mut context: DiffEntryRenderContext<'_>,
+    mut raw_zero_worktree_oids: RawZero,
+    mut write_patch_entry: PatchEntry,
+) -> Result<()>
+where
+    RawZero: FnMut(&sley_diff_merge::NameStatusEntry) -> bool,
+    PatchEntry: FnMut(&mut dyn Write, &sley_diff_merge::NameStatusEntry) -> Result<()>,
+{
+    let mut wrote_prefix = context.prefix_already_written;
+    if modes.raw {
+        for entry in entries {
+            write_diff_raw_entry(
+                stdout,
+                entry,
+                context.raw.z,
+                raw_zero_worktree_oids(entry),
+                context.raw.abbrev,
+                context.raw.format,
+            )?;
+        }
+        wrote_prefix = true;
+    }
+    if modes.numstat {
+        match context
+            .stat
+            .source
+            .as_ref()
+            .expect("stat source provided for numstat")
+        {
+            DiffEntryStatSource::Entries {
+                db,
+                worktree_root,
+                use_worktree_new,
+            } => {
+                for entry in entries {
+                    write_diff_numstat_entry(
+                        stdout,
+                        entry,
+                        context.stat.z,
+                        db,
+                        *worktree_root,
+                        *use_worktree_new,
+                    )?;
+                }
+            }
+            DiffEntryStatSource::Materialized(stat_entries) => {
+                for entry in *stat_entries {
+                    write_diff_numstat_materialized_entry(
+                        stdout,
+                        entry.entry,
+                        entry.stats,
+                        context.stat.z,
+                    )?;
+                }
+            }
+        }
+        wrote_prefix = true;
+    }
+    if modes.stat {
+        match context
+            .stat
+            .source
+            .as_ref()
+            .expect("stat source provided for diffstat")
+        {
+            DiffEntryStatSource::Entries {
+                db,
+                worktree_root,
+                use_worktree_new,
+            } => match context.stat.widths {
+                Some(widths) => write_diff_stat_with_widths(
+                    stdout,
+                    entries,
+                    db,
+                    *worktree_root,
+                    *use_worktree_new,
+                    context.stat.options,
+                    widths,
+                )?,
+                None => write_diff_stat(
+                    stdout,
+                    entries,
+                    db,
+                    *worktree_root,
+                    *use_worktree_new,
+                    context.stat.options,
+                )?,
+            },
+            DiffEntryStatSource::Materialized(stat_entries) => match context.stat.widths {
+                Some(widths) => write_diff_stat_materialized_with_widths(
+                    stdout,
+                    stat_entries,
+                    context.stat.options,
+                    widths,
+                )?,
+                None => write_diff_stat_materialized(stdout, stat_entries, context.stat.options)?,
+            },
+        }
+        wrote_prefix = true;
+    }
+    if modes.shortstat {
+        match context
+            .stat
+            .source
+            .as_ref()
+            .expect("stat source provided for shortstat")
+        {
+            DiffEntryStatSource::Entries {
+                db,
+                worktree_root,
+                use_worktree_new,
+            } => write_diff_shortstat(stdout, entries, db, *worktree_root, *use_worktree_new)?,
+            DiffEntryStatSource::Materialized(stat_entries) => {
+                write_diff_shortstat_materialized(stdout, stat_entries)?;
+            }
+        }
+        wrote_prefix = true;
+    }
+    if let Some(after_stat) = context.after_stat.as_mut() {
+        after_stat(stdout)?;
+    }
+    if modes.summary {
+        for entry in entries {
+            write_diff_summary_entry(stdout, entry)?;
+        }
+        wrote_prefix = true;
+    }
+    if modes.patch {
+        if wrote_prefix {
+            writeln!(stdout)?;
+        }
+        for entry in entries {
+            write_patch_entry(stdout, entry)?;
+        }
+    }
+    Ok(())
+}
+
 /// A `--word-diff` request before per-file word-regex resolution.
 struct WordDiffRequest<'a> {
     mode: commands::diff_words::WordDiffMode,

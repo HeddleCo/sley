@@ -1095,57 +1095,43 @@ fn run_diff_request(
     {
         writeln!(stdout, "---")?;
     }
-    if output.raw {
-        for entry in &entries {
-            write_diff_raw_entry(
-                stdout,
-                entry,
-                context.options.z,
-                false,
-                context.raw_abbrev,
-                context.format,
-            )?;
-        }
-        wrote_block = true;
-    }
-    if output.numstat {
-        for entry in &entries {
-            write_diff_numstat_entry(stdout, entry, context.options.z, context.db, None, false)?;
-        }
-        wrote_block = true;
-    }
-    if output.stat {
-        write_diff_stat_with_widths(
-            stdout,
-            &entries,
-            context.db,
-            None,
-            false,
-            DiffStatOptions {
-                compact_summary: output.compact_summary,
-                stat_count: None,
-                color: false,
+    render_diff_entries(
+        stdout,
+        &entries,
+        DiffEntryRenderModes {
+            raw: output.raw,
+            numstat: output.numstat,
+            stat: output.stat,
+            shortstat: output.shortstat,
+            summary: output.summary,
+            patch: output.patch && !entries.is_empty(),
+        },
+        DiffEntryRenderContext {
+            raw: DiffEntryRawRenderOptions {
+                z: context.options.z,
+                abbrev: context.raw_abbrev,
+                format: context.format,
             },
-            // diff-tree is plumbing: fixed 80 columns, no config caps.
-            DiffStatWidths::plumbing(),
-        )?;
-        wrote_block = true;
-    }
-    if output.shortstat {
-        write_diff_shortstat(stdout, &entries, context.db, None, false)?;
-        wrote_block = true;
-    }
-    if output.summary {
-        for entry in &entries {
-            write_diff_summary_entry(stdout, entry)?;
-        }
-        wrote_block = true;
-    }
-    if output.patch && !entries.is_empty() {
-        if wrote_block {
-            writeln!(stdout)?;
-        }
-        for entry in &entries {
+            stat: DiffEntryStatRenderOptions {
+                source: Some(DiffEntryStatSource::Entries {
+                    db: context.db,
+                    worktree_root: None,
+                    use_worktree_new: false,
+                }),
+                z: context.options.z,
+                options: DiffStatOptions {
+                    compact_summary: output.compact_summary,
+                    stat_count: None,
+                    color: false,
+                },
+                // diff-tree is plumbing: fixed 80 columns, no config caps.
+                widths: Some(DiffStatWidths::plumbing()),
+            },
+            after_stat: None,
+            prefix_already_written: wrote_block,
+        },
+        |_| false,
+        |stdout, entry| {
             let patch_options = DiffPatchOptions {
                 db: context.db,
                 worktree_root: None,
@@ -1171,9 +1157,9 @@ fn run_diff_request(
                 line_ranges: None,
                 indent_heuristic: context.indent_heuristic,
             };
-            write_diff_patch_entry(stdout, entry, patch_options)?;
-        }
-    }
+            write_diff_patch_entry(stdout, entry, patch_options)
+        },
+    )?;
 
     Ok(has_differences)
 }
