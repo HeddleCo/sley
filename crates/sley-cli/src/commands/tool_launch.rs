@@ -167,9 +167,18 @@ pub(crate) fn gui_default(config: &GitConfig, mode: ToolMode) -> bool {
 }
 
 pub(crate) fn run_tool_shell(command: &str, envs: &ToolEnvironment) -> Result<i32> {
+    run_tool_shell_in_dir(command, envs, Path::new("."))
+}
+
+pub(crate) fn run_tool_shell_in_dir(
+    command: &str,
+    envs: &ToolEnvironment,
+    cwd: &Path,
+) -> Result<i32> {
     let status = ProcessCommand::new("sh")
         .arg("-c")
         .arg(command)
+        .current_dir(cwd)
         .env("LOCAL", &envs.local)
         .env("REMOTE", &envs.remote)
         .env("MERGED", &envs.merged)

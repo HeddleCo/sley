@@ -1,6 +1,6 @@
 use crate::commands::tool_launch::{
     ToolCommand, ToolEnvironment, ToolMode, gui_default, print_tool_help, resolve_tool_command,
-    run_tool_shell, select_tool_name,
+    run_tool_shell_in_dir, select_tool_name,
 };
 use crate::*;
 
@@ -234,13 +234,13 @@ fn run_one_mergetool_path(
             return Ok(false);
         }
     }
-    let status = run_tool_shell(&tool.command, &materialized)?;
+    let status = run_tool_shell_in_dir(&tool.command, &materialized, worktree_root)?;
     if status != 0 && tool.trust_exit_code {
-        cleanup_mergetool_files(config, &materialized, &merged, false)?;
+        cleanup_mergetool_files(config, worktree_root, &materialized, &merged, false)?;
         return Ok(false);
     }
     stage_worktree_path(repo, &conflict.path)?;
-    cleanup_mergetool_files(config, &materialized, &merged, true)?;
+    cleanup_mergetool_files(config, worktree_root, &materialized, &merged, true)?;
     Ok(true)
 }
 
@@ -275,9 +275,9 @@ fn materialize_mergetool_files(
     write_stage_file(repo.objects(), conflict.local.as_ref(), &local)?;
     write_stage_file(repo.objects(), conflict.remote.as_ref(), &remote)?;
     write_stage_file(repo.objects(), conflict.base.as_ref(), &base)?;
-    let local = display_mergetool_temp_path(&local, write_to_temp);
-    let remote = display_mergetool_temp_path(&remote, write_to_temp);
-    let base = display_mergetool_temp_path(&base, write_to_temp);
+    let local = display_mergetool_temp_path(&local, repo.worktree_root()?, write_to_temp);
+    let remote = display_mergetool_temp_path(&remote, repo.worktree_root()?, write_to_temp);
+    let base = display_mergetool_temp_path(&base, repo.worktree_root()?, write_to_temp);
     Ok(ToolEnvironment {
         local,
         remote,
@@ -305,6 +305,7 @@ fn write_stage_file(
 
 fn cleanup_mergetool_files(
     config: &GitConfig,
+    worktree_root: &Path,
     envs: &ToolEnvironment,
     merged: &Path,
     success: bool,
@@ -327,9 +328,9 @@ fn cleanup_mergetool_files(
         let _ = fs::copy(merged, backup);
     }
     if !keep_temporaries {
-        let _ = fs::remove_file(&envs.local);
-        let _ = fs::remove_file(&envs.remote);
-        let _ = fs::remove_file(&envs.base);
+        let _ = fs::remove_file(resolve_mergetool_env_path(worktree_root, &envs.local));
+        let _ = fs::remove_file(resolve_mergetool_env_path(worktree_root, &envs.remote));
+        let _ = fs::remove_file(resolve_mergetool_env_path(worktree_root, &envs.base));
     }
     Ok(())
 }
@@ -522,12 +523,22 @@ fn make_temp_dir(prefix: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn display_mergetool_temp_path(path: &Path, write_to_temp: bool) -> PathBuf {
+fn display_mergetool_temp_path(path: &Path, worktree_root: &Path, write_to_temp: bool) -> PathBuf {
     if write_to_temp {
         return path.to_path_buf();
     }
-    match path.file_name() {
-        Some(name) => PathBuf::from(".").join(name),
-        None => path.to_path_buf(),
+    match path.strip_prefix(worktree_root) {
+        Ok(relative) => PathBuf::from(".").join(relative),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+fn resolve_mergetool_env_path(worktree_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match path.strip_prefix(".") {
+        Ok(relative) => worktree_root.join(relative),
+        Err(_) => worktree_root.join(path),
     }
 }
