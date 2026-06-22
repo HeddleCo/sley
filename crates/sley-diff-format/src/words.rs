@@ -334,6 +334,12 @@ pub struct WordDiffBuffers {
     plus: Vec<u8>,
 }
 
+impl Default for WordDiffBuffers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WordDiffBuffers {
     pub fn new() -> Self {
         Self {
