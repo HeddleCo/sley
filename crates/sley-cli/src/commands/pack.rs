@@ -5519,6 +5519,11 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     )?;
     let midx_checksum = ObjectId::from_raw(format, &midx[midx.len() - format.raw_len()..])?;
     let bitmap_name = format!("multi-pack-index-{}.bitmap", midx_checksum.to_hex());
+    if fs::read(pack_dir.join("multi-pack-index")).is_ok_and(|existing| existing == midx)
+        && (!write_bitmap || pack_dir.join(&bitmap_name).exists())
+    {
+        return Ok(());
+    }
 
     // Build the bitmap BEFORE the midx lands on disk: a closure failure must
     // abort the whole write (upstream dies and leaves no midx behind),

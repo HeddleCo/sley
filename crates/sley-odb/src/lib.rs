@@ -4966,7 +4966,26 @@ impl FileObjectDatabase {
             return Ok(Some(Arc::clone(midx)));
         }
         let bytes = load_multi_pack_index_lookup_data(midx_path)?;
-        let midx = Arc::new(MultiPackIndexOidLookup::parse(bytes, self.format)?);
+        let midx = match MultiPackIndexOidLookup::parse(bytes, self.format) {
+            Ok(midx) => Arc::new(midx),
+            Err(GitError::InvalidFormat(message))
+                if message.starts_with("multi-pack-index hash id ") =>
+            {
+                let actual = message
+                    .strip_prefix("multi-pack-index hash id ")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .unwrap_or("0");
+                let expected = match self.format {
+                    ObjectFormat::Sha1 => 1,
+                    ObjectFormat::Sha256 => 2,
+                };
+                eprintln!(
+                    "error: multi-pack-index hash version {actual} does not match version {expected}"
+                );
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
         if let Ok(mut cache) = self.multi_pack_oid_lookups.lock() {
             cache.insert(midx_path.to_path_buf(), Arc::clone(&midx));
         }
