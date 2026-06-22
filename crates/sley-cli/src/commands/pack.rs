@@ -5436,10 +5436,12 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     }
 
     let mut objects = Vec::new();
+    let mut pack_object_counts = vec![0usize; pack_names.len()];
     for (pack_int_id, pack_name) in pack_names.iter().enumerate() {
         let index_bytes = fs::read(pack_dir.join(pack_name))?;
         let force_large_offset = pack_index_has_large_offset_area(&index_bytes, format);
         let index = PackIndex::parse_without_checksum(&index_bytes, format)?;
+        pack_object_counts[pack_int_id] = index.entries.len();
         for entry in index.entries {
             objects.push(MultiPackIndexEntry {
                 oid: entry.oid,
@@ -5466,7 +5468,17 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
             match pack_names.iter().position(|pack_name| {
                 pack_name == name || Some(pack_name.as_str()) == normalized.as_deref()
             }) {
-                Some(position) => Some(position as u32),
+                Some(position) => {
+                    if pack_object_counts.get(position).copied().unwrap_or(0) == 0 {
+                        let pack_path = pack_dir.join(&pack_names[position]).with_extension("pack");
+                        eprintln!(
+                            "error: cannot select preferred pack {} with no objects",
+                            pack_path.display()
+                        );
+                        return Err(GitError::Exit(255));
+                    }
+                    Some(position as u32)
+                }
                 None => {
                     eprintln!("warning: unknown preferred pack: '{name}'");
                     write_bitmap.then_some(0)

@@ -923,15 +923,6 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
         }
     }
 
-    if !bare
-        && path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".git"))
-    {
-        bare = true;
-    }
-
     let cwd = env::current_dir()?;
     let init_config_git_dir =
         init_config_git_dir_for_lookup(&cwd, &path, bare, separate_git_dir.as_deref())?;
