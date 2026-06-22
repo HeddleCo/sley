@@ -1,6 +1,6 @@
 use crate::commands::tool_launch::{
     ToolCommand, ToolEnvironment, ToolMode, gui_default, print_tool_help, resolve_tool_command,
-    run_tool_shell, select_tool_name,
+    run_tool_shell_in_dir, select_tool_name,
 };
 use crate::*;
 
@@ -234,13 +234,13 @@ fn run_one_mergetool_path(
             return Ok(false);
         }
     }
-    let status = run_tool_shell(&tool.command, &materialized)?;
+    let status = run_tool_shell_in_dir(&tool.command, &materialized, worktree_root)?;
     if status != 0 && tool.trust_exit_code {
-        cleanup_mergetool_files(config, &materialized, &merged, false)?;
+        cleanup_mergetool_files(config, worktree_root, &materialized, &merged, false)?;
         return Ok(false);
     }
     stage_worktree_path(repo, &conflict.path)?;
-    cleanup_mergetool_files(config, &materialized, &merged, true)?;
+    cleanup_mergetool_files(config, worktree_root, &materialized, &merged, true)?;
     Ok(true)
 }
 
@@ -272,12 +272,12 @@ fn materialize_mergetool_files(
     let local = parent.join(format!("{stem}_LOCAL_{}", std::process::id()));
     let remote = parent.join(format!("{stem}_REMOTE_{}", std::process::id()));
     let base = parent.join(format!("{stem}_BASE_{}", std::process::id()));
-    write_stage_file(repo.objects(), conflict.local.as_ref(), &local)?;
-    write_stage_file(repo.objects(), conflict.remote.as_ref(), &remote)?;
-    write_stage_file(repo.objects(), conflict.base.as_ref(), &base)?;
-    let local = display_mergetool_temp_path(&local, write_to_temp);
-    let remote = display_mergetool_temp_path(&remote, write_to_temp);
-    let base = display_mergetool_temp_path(&base, write_to_temp);
+    write_stage_file(config, repo.objects(), conflict.local.as_ref(), &local)?;
+    write_stage_file(config, repo.objects(), conflict.remote.as_ref(), &remote)?;
+    write_stage_file(config, repo.objects(), conflict.base.as_ref(), &base)?;
+    let local = display_mergetool_temp_path(&local, repo.worktree_root()?, write_to_temp);
+    let remote = display_mergetool_temp_path(&remote, repo.worktree_root()?, write_to_temp);
+    let base = display_mergetool_temp_path(&base, repo.worktree_root()?, write_to_temp);
     Ok(ToolEnvironment {
         local,
         remote,
@@ -287,15 +287,22 @@ fn materialize_mergetool_files(
 }
 
 fn write_stage_file(
+    config: &GitConfig,
     db: &FileObjectDatabase,
     entry: Option<&IndexEntry>,
     path: &Path,
 ) -> Result<()> {
-    let content = match entry {
+    let mut content = match entry {
         Some(entry) if entry.mode == 0o160000 => entry.oid.to_string().into_bytes(),
         Some(entry) => read_blob(db, &entry.oid)?,
         None => Vec::new(),
     };
+    if entry.is_some_and(|entry| entry.mode & sley_index::GIT_MODE_TYPE_MASK == 0o100000)
+        && checkout_crlf(config)
+        && !content.contains(&0)
+    {
+        content = lf_to_crlf(&content);
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -303,8 +310,26 @@ fn write_stage_file(
     Ok(())
 }
 
+fn checkout_crlf(config: &GitConfig) -> bool {
+    config.get_bool("core", None, "autocrlf").unwrap_or(false)
+}
+
+fn lf_to_crlf(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut previous = None;
+    for &byte in input {
+        if byte == b'\n' && previous != Some(b'\r') {
+            out.push(b'\r');
+        }
+        out.push(byte);
+        previous = Some(byte);
+    }
+    out
+}
+
 fn cleanup_mergetool_files(
     config: &GitConfig,
+    worktree_root: &Path,
     envs: &ToolEnvironment,
     merged: &Path,
     success: bool,
@@ -327,9 +352,9 @@ fn cleanup_mergetool_files(
         let _ = fs::copy(merged, backup);
     }
     if !keep_temporaries {
-        let _ = fs::remove_file(&envs.local);
-        let _ = fs::remove_file(&envs.remote);
-        let _ = fs::remove_file(&envs.base);
+        let _ = fs::remove_file(resolve_mergetool_env_path(worktree_root, &envs.local));
+        let _ = fs::remove_file(resolve_mergetool_env_path(worktree_root, &envs.remote));
+        let _ = fs::remove_file(resolve_mergetool_env_path(worktree_root, &envs.base));
     }
     Ok(())
 }
@@ -486,11 +511,11 @@ fn should_prompt(config: &GitConfig, options: &MergetoolOptions) -> bool {
 
 fn normalize_user_path(cwd: &Path, worktree_root: &Path, value: &str) -> Result<Vec<u8>> {
     let path = Path::new(value);
-    let absolute = if path.is_absolute() {
+    let absolute = lexical_normalize_path(&if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
-    };
+    });
     let relative = absolute
         .strip_prefix(worktree_root)
         .unwrap_or(path)
@@ -498,6 +523,20 @@ fn normalize_user_path(cwd: &Path, worktree_root: &Path, value: &str) -> Result<
         .trim_start_matches("./")
         .replace('\\', "/");
     Ok(relative.into_bytes())
+}
+
+fn lexical_normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            _ => out.push(component.as_os_str()),
+        }
+    }
+    out
 }
 
 fn with_trailing_slash(path: &[u8]) -> Vec<u8> {
@@ -522,12 +561,22 @@ fn make_temp_dir(prefix: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn display_mergetool_temp_path(path: &Path, write_to_temp: bool) -> PathBuf {
+fn display_mergetool_temp_path(path: &Path, worktree_root: &Path, write_to_temp: bool) -> PathBuf {
     if write_to_temp {
         return path.to_path_buf();
     }
-    match path.file_name() {
-        Some(name) => PathBuf::from(".").join(name),
-        None => path.to_path_buf(),
+    match path.strip_prefix(worktree_root) {
+        Ok(relative) => PathBuf::from(".").join(relative),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+fn resolve_mergetool_env_path(worktree_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match path.strip_prefix(".") {
+        Ok(relative) => worktree_root.join(relative),
+        Err(_) => worktree_root.join(path),
     }
 }
