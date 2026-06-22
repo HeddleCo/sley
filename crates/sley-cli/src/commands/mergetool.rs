@@ -272,9 +272,9 @@ fn materialize_mergetool_files(
     let local = parent.join(format!("{stem}_LOCAL_{}", std::process::id()));
     let remote = parent.join(format!("{stem}_REMOTE_{}", std::process::id()));
     let base = parent.join(format!("{stem}_BASE_{}", std::process::id()));
-    write_stage_file(repo.objects(), conflict.local.as_ref(), &local)?;
-    write_stage_file(repo.objects(), conflict.remote.as_ref(), &remote)?;
-    write_stage_file(repo.objects(), conflict.base.as_ref(), &base)?;
+    write_stage_file(config, repo.objects(), conflict.local.as_ref(), &local)?;
+    write_stage_file(config, repo.objects(), conflict.remote.as_ref(), &remote)?;
+    write_stage_file(config, repo.objects(), conflict.base.as_ref(), &base)?;
     let local = display_mergetool_temp_path(&local, repo.worktree_root()?, write_to_temp);
     let remote = display_mergetool_temp_path(&remote, repo.worktree_root()?, write_to_temp);
     let base = display_mergetool_temp_path(&base, repo.worktree_root()?, write_to_temp);
@@ -287,20 +287,44 @@ fn materialize_mergetool_files(
 }
 
 fn write_stage_file(
+    config: &GitConfig,
     db: &FileObjectDatabase,
     entry: Option<&IndexEntry>,
     path: &Path,
 ) -> Result<()> {
-    let content = match entry {
+    let mut content = match entry {
         Some(entry) if entry.mode == 0o160000 => entry.oid.to_string().into_bytes(),
         Some(entry) => read_blob(db, &entry.oid)?,
         None => Vec::new(),
     };
+    if entry.is_some_and(|entry| entry.mode & sley_index::GIT_MODE_TYPE_MASK == 0o100000)
+        && checkout_crlf(config)
+        && !content.contains(&0)
+    {
+        content = lf_to_crlf(&content);
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, content)?;
     Ok(())
+}
+
+fn checkout_crlf(config: &GitConfig) -> bool {
+    config.get_bool("core", None, "autocrlf").unwrap_or(false)
+}
+
+fn lf_to_crlf(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut previous = None;
+    for &byte in input {
+        if byte == b'\n' && previous != Some(b'\r') {
+            out.push(b'\r');
+        }
+        out.push(byte);
+        previous = Some(byte);
+    }
+    out
 }
 
 fn cleanup_mergetool_files(
