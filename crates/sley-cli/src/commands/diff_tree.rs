@@ -139,7 +139,7 @@ struct DiffTreeOptions {
     /// `--ignore-blank-lines`.
     ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
-    ignore_regexes: Vec<crate::grep_source::Regex>,
+    ignore_regexes: Vec<sley_grep::Regex>,
     /// `--max-depth=<n>`: recurse tree diffs only to this many directory
     /// levels below the matching pathspec and show changed subtrees at the
     /// boundary. `-1` means unlimited recursion.
@@ -1088,6 +1088,12 @@ fn run_diff_request(
         }
         wrote_block = true;
     }
+    let stat_entries_for_render = if output.numstat || output.stat || output.shortstat {
+        collect_diff_stat_entries(&entries, context.db, None, false)?
+    } else {
+        Vec::new()
+    };
+
     if output.patch
         && output.stat
         && context.options.pretty == Some(DiffTreePretty::Medium)
@@ -1095,58 +1101,42 @@ fn run_diff_request(
     {
         writeln!(stdout, "---")?;
     }
-    if output.raw {
-        for entry in &entries {
-            write_diff_raw_entry(
-                stdout,
-                entry,
-                context.options.z,
-                false,
-                context.raw_abbrev,
-                context.format,
-            )?;
-        }
-        wrote_block = true;
-    }
-    if output.numstat {
-        for entry in &entries {
-            write_diff_numstat_entry(stdout, entry, context.options.z, context.db, None, false)?;
-        }
-        wrote_block = true;
-    }
-    if output.stat {
-        write_diff_stat_with_widths(
-            stdout,
-            &entries,
-            context.db,
-            None,
-            false,
-            DiffStatOptions {
-                compact_summary: output.compact_summary,
-                stat_count: None,
-                color: false,
+    render_diff_entries(
+        stdout,
+        &entries,
+        DiffEntryRenderModes {
+            raw: output.raw,
+            numstat: output.numstat,
+            stat: output.stat,
+            shortstat: output.shortstat,
+            summary: output.summary,
+            patch: output.patch && !entries.is_empty(),
+        },
+        DiffEntryRenderContext {
+            raw: DiffEntryRawRenderOptions {
+                z: context.options.z,
+                abbrev: context.raw_abbrev,
+                format: context.format,
             },
-            // diff-tree is plumbing: fixed 80 columns, no config caps.
-            DiffStatWidths::plumbing(),
-        )?;
-        wrote_block = true;
-    }
-    if output.shortstat {
-        write_diff_shortstat(stdout, &entries, context.db, None, false)?;
-        wrote_block = true;
-    }
-    if output.summary {
-        for entry in &entries {
-            write_diff_summary_entry(stdout, entry)?;
-        }
-        wrote_block = true;
-    }
-    if output.patch && !entries.is_empty() {
-        if wrote_block {
-            writeln!(stdout)?;
-        }
-        for entry in &entries {
-            let patch_options = DiffPatchOptions {
+            stat: DiffEntryStatRenderOptions {
+                source: Some(DiffEntryStatSource::Materialized(
+                    &stat_entries_for_render,
+                )),
+                z: context.options.z,
+                options: DiffStatOptions {
+                    compact_summary: output.compact_summary,
+                    stat_count: None,
+                    color: false,
+                },
+                // diff-tree is plumbing: fixed 80 columns, no config caps.
+                widths: Some(DiffStatWidths::plumbing()),
+            },
+            after_stat: None,
+            prefix_already_written: wrote_block,
+        },
+        |_| false,
+        |stdout, entry| {
+            let patch_options = DiffRenderOptions {
                 db: context.db,
                 worktree_root: None,
                 use_worktree_new: false,
@@ -1156,6 +1146,7 @@ fn run_diff_request(
                 dst_prefix: &context.options.dst_prefix,
                 context: 3,
                 userdiff: None,
+                funcname: None,
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,
@@ -1171,9 +1162,9 @@ fn run_diff_request(
                 line_ranges: None,
                 indent_heuristic: context.indent_heuristic,
             };
-            write_diff_patch_entry(stdout, entry, patch_options)?;
-        }
-    }
+            write_diff_patch_entry(stdout, entry, patch_options)
+        },
+    )?;
 
     Ok(has_differences)
 }
@@ -1252,18 +1243,25 @@ fn run_combined_request(
             true,
         )?;
         has_differences |= !first_parent_entries.is_empty();
+        let stat_entries = if output.numstat || output.stat || output.shortstat {
+            collect_diff_stat_entries(&first_parent_entries, db, None, false)?
+        } else {
+            Vec::new()
+        };
         if output.numstat {
-            for entry in &first_parent_entries {
-                write_diff_numstat_entry(stdout, entry, context.options.z, db, None, false)?;
+            for entry in &stat_entries {
+                write_diff_numstat_materialized_entry(
+                    stdout,
+                    entry.entry,
+                    entry.stats,
+                    context.options.z,
+                )?;
             }
         }
         if output.stat {
-            write_diff_stat_with_widths(
+            write_diff_stat_materialized_with_widths(
                 stdout,
-                &first_parent_entries,
-                db,
-                None,
-                false,
+                &stat_entries,
                 DiffStatOptions {
                     compact_summary: output.compact_summary,
                     stat_count: None,
@@ -1273,7 +1271,7 @@ fn run_combined_request(
             )?;
         }
         if output.shortstat {
-            write_diff_shortstat(stdout, &first_parent_entries, db, None, false)?;
+            write_diff_shortstat_materialized(stdout, &stat_entries)?;
         }
         if output.summary {
             for entry in &first_parent_entries {

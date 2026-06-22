@@ -20,7 +20,7 @@ struct ReflogShowOptions {
     abbrev_commit: Option<bool>,
     pathspecs: Vec<String>,
     grep_patterns: Vec<String>,
-    grep_pattern_kind: crate::grep_source::PatternKind,
+    grep_pattern_kind: sley_grep::PatternKind,
     grep_pattern_kind_explicit: bool,
     grep_ignore_case: bool,
     grep_all_match: bool,
@@ -1251,7 +1251,7 @@ fn parse_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
     let mut refs = Vec::new();
     let mut pathspecs = Vec::new();
     let mut grep_patterns = Vec::new();
-    let mut grep_pattern_kind = crate::grep_source::PatternKind::Basic;
+    let mut grep_pattern_kind = sley_grep::PatternKind::Basic;
     let mut grep_pattern_kind_explicit = false;
     let mut grep_ignore_case = false;
     let mut grep_all_match = false;
@@ -1348,19 +1348,19 @@ fn parse_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
             "--invert-grep" => grep_invert = true,
             "-i" | "--regexp-ignore-case" => grep_ignore_case = true,
             "-F" | "--fixed-strings" => {
-                grep_pattern_kind = crate::grep_source::PatternKind::Fixed;
+                grep_pattern_kind = sley_grep::PatternKind::Fixed;
                 grep_pattern_kind_explicit = true;
             }
             "--basic-regexp" => {
-                grep_pattern_kind = crate::grep_source::PatternKind::Basic;
+                grep_pattern_kind = sley_grep::PatternKind::Basic;
                 grep_pattern_kind_explicit = true;
             }
             "-E" | "--extended-regexp" => {
-                grep_pattern_kind = crate::grep_source::PatternKind::Extended;
+                grep_pattern_kind = sley_grep::PatternKind::Extended;
                 grep_pattern_kind_explicit = true;
             }
             "-P" | "--perl-regexp" => {
-                grep_pattern_kind = crate::grep_source::PatternKind::Perl;
+                grep_pattern_kind = sley_grep::PatternKind::Perl;
                 grep_pattern_kind_explicit = true;
             }
             value

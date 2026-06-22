@@ -870,7 +870,7 @@ fn rerere_diff(git_dir: &Path, format: ObjectFormat) -> Result<()> {
         write_diff_patch_entry(
             &mut rendered,
             &diff_entry,
-            DiffPatchOptions {
+            DiffRenderOptions {
                 db: &db,
                 worktree_root: None,
                 use_worktree_new: false,
@@ -880,6 +880,7 @@ fn rerere_diff(git_dir: &Path, format: ObjectFormat) -> Result<()> {
                 dst_prefix: "b/",
                 context: 3,
                 userdiff: None,
+                funcname: None,
                 colors: None,
                 word_diff: None,
                 no_index_contents: Some((Some(&old), Some(&new))),

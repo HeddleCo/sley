@@ -1,0 +1,15 @@
+[package]
+name = "sley-pretty"
+version.workspace = true
+description = "Shared pretty/log-format compiler for sley."
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sley-core = { path = "../sley-core", version = "0.1.0" }
+sley-strbuf-expand = { path = "../sley-strbuf-expand", version = "0.1.0" }
+
+[lints]
+workspace = true

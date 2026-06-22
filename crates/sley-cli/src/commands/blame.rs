@@ -1618,7 +1618,7 @@ fn resolve_regex_bound(
     from: usize,
     _total: usize,
 ) -> Result<usize> {
-    use crate::grep_source::{Regex, RegexMode};
+    use sley_grep::{Regex, RegexMode};
     let re = Regex::compile(pattern, RegexMode::Bre, false, false).map_err(|_| {
         eprintln!("fatal: -L parameter '{pattern}': invalid regex");
         GitError::Exit(128)
@@ -1643,7 +1643,7 @@ fn resolve_function_bound(
     contents: &[&[u8]],
     from: usize,
 ) -> Result<(usize, usize)> {
-    use crate::grep_source::{Regex, RegexMode};
+    use sley_grep::{Regex, RegexMode};
     let re = Regex::compile(pattern, RegexMode::Bre, false, false).map_err(|_| {
         eprintln!("fatal: -L parameter '{pattern}': invalid regex");
         GitError::Exit(128)

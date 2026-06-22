@@ -78,7 +78,7 @@ pub(super) struct LogDiffOptions {
     /// `--ignore-blank-lines`.
     pub(super) ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
-    pub(super) ignore_regexes: Vec<crate::grep_source::Regex>,
+    pub(super) ignore_regexes: Vec<sley_grep::Regex>,
     /// `-a`/`--text`: treat all files as text (affects `-G` binary skipping).
     pub(super) text: bool,
     /// `-O<file>`: reorder diff entries according to an orderfile.
@@ -305,6 +305,11 @@ impl LogDiffContext<'_> {
         }
 
         let opts = self.opts;
+        let stat_entries = if opts.numstat || opts.stat || opts.compact_summary || opts.shortstat {
+            collect_diff_stat_entries(&entries, self.db, None, false)?
+        } else {
+            Vec::new()
+        };
         let patch = opts.patch || merges_only;
         if opts.raw {
             for entry in &entries {
@@ -322,20 +327,17 @@ impl LogDiffContext<'_> {
             }
         }
         if opts.numstat {
-            for entry in &entries {
-                write_diff_numstat_entry(out, entry, false, self.db, None, false)?;
+            for entry in &stat_entries {
+                write_diff_numstat_materialized_entry(out, entry.entry, entry.stats, false)?;
             }
         }
         if opts.stat || opts.compact_summary {
             let mut widths = opts.stat_widths;
             widths.resolve_config(self.config);
             widths.line_prefix_width = line_prefix_width;
-            write_diff_stat_with_widths(
+            write_diff_stat_materialized_with_widths(
                 out,
-                &entries,
-                self.db,
-                None,
-                false,
+                &stat_entries,
                 DiffStatOptions {
                     compact_summary: opts.compact_summary,
                     stat_count: opts.stat_count,
@@ -345,7 +347,7 @@ impl LogDiffContext<'_> {
             )?;
         }
         if opts.shortstat {
-            write_diff_shortstat(out, &entries, self.db, None, false)?;
+            write_diff_shortstat_materialized(out, &stat_entries)?;
         }
         if opts.summary {
             for entry in &entries {
@@ -368,7 +370,7 @@ impl LogDiffContext<'_> {
                 write_diff_patch_entry(
                     out,
                     entry,
-                    DiffPatchOptions {
+                    DiffRenderOptions {
                         db: self.db,
                         worktree_root: None,
                         use_worktree_new: false,
@@ -378,6 +380,7 @@ impl LogDiffContext<'_> {
                         dst_prefix: "b/",
                         context: 3,
                         userdiff: None,
+                        funcname: None,
                         colors: None,
                         word_diff: None,
                         no_index_contents: None,
@@ -471,21 +474,23 @@ impl LogDiffContext<'_> {
                 writeln!(out, "{}", String::from_utf8_lossy(&path.path))?;
             }
         }
+        let stat_entries = if opts.numstat || opts.stat || opts.compact_summary || opts.shortstat {
+            collect_diff_stat_entries(&first_parent_entries, self.db, None, false)?
+        } else {
+            Vec::new()
+        };
         if opts.numstat {
-            for entry in &first_parent_entries {
-                write_diff_numstat_entry(out, entry, false, self.db, None, false)?;
+            for entry in &stat_entries {
+                write_diff_numstat_materialized_entry(out, entry.entry, entry.stats, false)?;
             }
         }
         if opts.stat || opts.compact_summary {
             let mut widths = opts.stat_widths;
             widths.resolve_config(self.config);
             widths.line_prefix_width = line_prefix_width;
-            write_diff_stat_with_widths(
+            write_diff_stat_materialized_with_widths(
                 out,
-                &first_parent_entries,
-                self.db,
-                None,
-                false,
+                &stat_entries,
                 DiffStatOptions {
                     compact_summary: opts.compact_summary,
                     stat_count: opts.stat_count,
@@ -495,7 +500,7 @@ impl LogDiffContext<'_> {
             )?;
         }
         if opts.shortstat {
-            write_diff_shortstat(out, &first_parent_entries, self.db, None, false)?;
+            write_diff_shortstat_materialized(out, &stat_entries)?;
         }
         if opts.summary {
             for entry in &first_parent_entries {

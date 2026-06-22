@@ -123,14 +123,12 @@ pub(crate) fn collect_short_status_with_options(
 }
 
 mod commands;
-mod grep_source;
-mod log_format;
 mod remote;
 mod repo_path;
 mod repository;
 mod setup;
 
-pub(crate) use log_format::{CompiledLogFormat, FormatToken, LogFormatDialect, presets};
+pub(crate) use sley_pretty::{CompiledLogFormat, FormatToken, LogFormatDialect, presets};
 
 pub(crate) use commands::args::{GitArgCursor, long_option_value};
 pub(crate) use commands::cat_file::{cat_file_all_object_ids, cat_file_object_storage};
@@ -2486,7 +2484,7 @@ fn diff_raw_oid(
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct DiffPatchOptions<'a> {
+pub(crate) struct DiffRenderOptions<'a> {
     pub(crate) db: &'a FileObjectDatabase,
     pub(crate) worktree_root: Option<&'a Path>,
     pub(crate) use_worktree_new: bool,
@@ -2499,6 +2497,10 @@ pub(crate) struct DiffPatchOptions<'a> {
     /// Userdiff driver resolution (`diff=<driver>` attributes + config);
     /// `None` keeps the default funcname heuristic.
     pub(crate) userdiff: Option<&'a commands::userdiff::UserdiffResolver>,
+    /// Explicit function-name heading pattern for `@@ @@` section headers.
+    /// `None` falls back to `userdiff` resolution or the built-in default
+    /// funcname resolver.
+    pub(crate) funcname: Option<&'a commands::userdiff::CompiledFuncname>,
     /// ANSI palette when color output is enabled.
     pub(crate) colors: Option<&'a commands::diff_words::DiffColors>,
     /// Word-diff rendering request (mode + the command-line regex override).
@@ -2530,13 +2532,146 @@ pub(crate) struct DiffPatchOptions<'a> {
     pub(crate) ignore_blank_lines: bool,
     /// `-I<regex>` / `--ignore-matching-lines`: drop change groups all of whose
     /// lines match one of these (compiled ERE) regexes.
-    pub(crate) ignore_regexes: &'a [grep_source::Regex],
+    pub(crate) ignore_regexes: &'a [sley_grep::Regex],
     /// `log -L`: restrict the emitted hunks to these post-image line ranges.
     /// `None` (every non-line-log caller) renders the full patch.
     pub(crate) line_ranges: Option<&'a [sley_diff_merge::render::LineRange]>,
     /// `--indent-heuristic` / `diff.indentHeuristic`: shift slidable change
     /// groups to the most readable boundary. Enabled by default, matching git.
     pub(crate) indent_heuristic: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DiffEntryRenderModes {
+    pub(crate) raw: bool,
+    pub(crate) numstat: bool,
+    pub(crate) stat: bool,
+    pub(crate) shortstat: bool,
+    pub(crate) summary: bool,
+    pub(crate) patch: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DiffEntryRawRenderOptions {
+    pub(crate) z: bool,
+    pub(crate) abbrev: Option<usize>,
+    pub(crate) format: ObjectFormat,
+}
+
+pub(crate) enum DiffEntryStatSource<'a> {
+    Materialized(&'a [DiffStatEntryData<'a>]),
+}
+
+pub(crate) struct DiffEntryStatRenderOptions<'a> {
+    pub(crate) source: Option<DiffEntryStatSource<'a>>,
+    pub(crate) z: bool,
+    pub(crate) options: DiffStatOptions,
+    pub(crate) widths: Option<DiffStatWidths>,
+}
+
+pub(crate) struct DiffEntryRenderContext<'a> {
+    pub(crate) raw: DiffEntryRawRenderOptions,
+    pub(crate) stat: DiffEntryStatRenderOptions<'a>,
+    pub(crate) after_stat: Option<&'a mut dyn FnMut(&mut dyn Write) -> Result<()>>,
+    pub(crate) prefix_already_written: bool,
+}
+
+pub(crate) fn render_diff_entries<RawZero, PatchEntry>(
+    stdout: &mut dyn Write,
+    entries: &[sley_diff_merge::NameStatusEntry],
+    modes: DiffEntryRenderModes,
+    mut context: DiffEntryRenderContext<'_>,
+    mut raw_zero_worktree_oids: RawZero,
+    mut write_patch_entry: PatchEntry,
+) -> Result<()>
+where
+    RawZero: FnMut(&sley_diff_merge::NameStatusEntry) -> bool,
+    PatchEntry: FnMut(&mut dyn Write, &sley_diff_merge::NameStatusEntry) -> Result<()>,
+{
+    let mut wrote_prefix = context.prefix_already_written;
+    if modes.raw {
+        for entry in entries {
+            write_diff_raw_entry(
+                stdout,
+                entry,
+                context.raw.z,
+                raw_zero_worktree_oids(entry),
+                context.raw.abbrev,
+                context.raw.format,
+            )?;
+        }
+        wrote_prefix = true;
+    }
+    if modes.numstat {
+        match context
+            .stat
+            .source
+            .as_ref()
+            .expect("stat source provided for numstat")
+        {
+            DiffEntryStatSource::Materialized(stat_entries) => {
+                for entry in *stat_entries {
+                    write_diff_numstat_materialized_entry(
+                        stdout,
+                        entry.entry,
+                        entry.stats,
+                        context.stat.z,
+                    )?;
+                }
+            }
+        }
+        wrote_prefix = true;
+    }
+    if modes.stat {
+        match context
+            .stat
+            .source
+            .as_ref()
+            .expect("stat source provided for diffstat")
+        {
+            DiffEntryStatSource::Materialized(stat_entries) => match context.stat.widths {
+                Some(widths) => write_diff_stat_materialized_with_widths(
+                    stdout,
+                    stat_entries,
+                    context.stat.options,
+                    widths,
+                )?,
+                None => write_diff_stat_materialized(stdout, stat_entries, context.stat.options)?,
+            },
+        }
+        wrote_prefix = true;
+    }
+    if modes.shortstat {
+        match context
+            .stat
+            .source
+            .as_ref()
+            .expect("stat source provided for shortstat")
+        {
+            DiffEntryStatSource::Materialized(stat_entries) => {
+                write_diff_shortstat_materialized(stdout, stat_entries)?;
+            }
+        }
+        wrote_prefix = true;
+    }
+    if let Some(after_stat) = context.after_stat.as_mut() {
+        after_stat(stdout)?;
+    }
+    if modes.summary {
+        for entry in entries {
+            write_diff_summary_entry(stdout, entry)?;
+        }
+        wrote_prefix = true;
+    }
+    if modes.patch {
+        if wrote_prefix {
+            writeln!(stdout)?;
+        }
+        for entry in entries {
+            write_patch_entry(stdout, entry)?;
+        }
+    }
+    Ok(())
 }
 
 /// A `--word-diff` request before per-file word-regex resolution.
@@ -2780,7 +2915,7 @@ pub(crate) fn render_tree_to_tree_patch(
         write_diff_patch_entry(
             &mut out,
             entry,
-            DiffPatchOptions {
+            DiffRenderOptions {
                 db,
                 worktree_root: None,
                 use_worktree_new: false,
@@ -2790,6 +2925,7 @@ pub(crate) fn render_tree_to_tree_patch(
                 dst_prefix: "b/",
                 context: 3,
                 userdiff: None,
+                funcname: None,
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,
@@ -2889,10 +3025,10 @@ fn diff_order_glob_matches(pattern: &[u8], text: &[u8]) -> bool {
 /// `error: invalid regex given to -I: '<pat>'` and exit code 129.
 pub(crate) fn compile_ignore_matching_regexes(
     patterns: &[String],
-) -> Result<Vec<grep_source::Regex>> {
+) -> Result<Vec<sley_grep::Regex>> {
     let mut compiled = Vec::with_capacity(patterns.len());
     for pattern in patterns {
-        match grep_source::Regex::compile(pattern, grep_source::RegexMode::Ere, false, false) {
+        match sley_grep::Regex::compile(pattern, sley_grep::RegexMode::Ere, false, false) {
             Ok(regex) => compiled.push(regex),
             Err(_) => {
                 eprintln!("error: invalid regex given to -I: '{pattern}'");
@@ -2906,7 +3042,7 @@ pub(crate) fn compile_ignore_matching_regexes(
 pub(crate) fn write_diff_patch_entry(
     stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
-    options: DiffPatchOptions<'_>,
+    options: DiffRenderOptions<'_>,
 ) -> Result<()> {
     if is_gitlink_pair(entry)
         && options.submodule_format != commands::diff_options::SubmoduleDiffFormat::Short
@@ -3108,9 +3244,13 @@ pub(crate) fn write_diff_patch_entry(
     // ignore suppresses all content hunks for a rename/copy/mode change, git
     // still emits the metadata through the index line, but does not print the
     // `---`/`+++` file headers.
-    let funcname = old_driver
-        .as_ref()
-        .and_then(|driver| driver.funcname.as_ref())
+    let funcname = options
+        .funcname
+        .or_else(|| {
+            old_driver
+                .as_ref()
+                .and_then(|driver| driver.funcname.as_ref())
+        })
         .or_else(|| {
             new_driver
                 .as_ref()
@@ -3140,9 +3280,9 @@ pub(crate) fn write_diff_patch_entry(
                 });
             word_regex = spec
                 .map(|spec| {
-                    grep_source::Regex::compile_bytes(
+                    sley_grep::Regex::compile_bytes(
                         &spec,
-                        grep_source::RegexMode::Ere,
+                        sley_grep::RegexMode::Ere,
                         false,
                         false,
                     )
@@ -3235,7 +3375,7 @@ fn write_diff_binary_patch_entry(
     entry: &sley_diff_merge::NameStatusEntry,
     old_content: Option<Vec<u8>>,
     new_content: Option<Vec<u8>>,
-    options: DiffPatchOptions<'_>,
+    options: DiffRenderOptions<'_>,
 ) -> Result<()> {
     let old_path = entry.old_path.as_deref().unwrap_or(&entry.path);
     let diff_old_path = diff_patch_prefixed_path(options.src_prefix, old_path);
@@ -3365,20 +3505,6 @@ fn diff_patch_mode_suffix(entry: &sley_diff_merge::NameStatusEntry) -> String {
     }
 }
 
-fn write_diff_numstat_entry(
-    stdout: &mut dyn Write,
-    entry: &sley_diff_merge::NameStatusEntry,
-    z: bool,
-    db: &FileObjectDatabase,
-    worktree_root: Option<&Path>,
-    use_worktree_new: bool,
-) -> Result<()> {
-    let old_content = diff_entry_old_content(entry, db)?;
-    let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
-    let stats = diff_line_stats(old_content.as_deref(), new_content.as_deref());
-    write_diff_numstat_materialized_entry(stdout, entry, stats, z)
-}
-
 fn write_diff_numstat_materialized_entry(
     stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
@@ -3418,17 +3544,6 @@ fn write_diff_numstat_counts(stdout: &mut dyn Write, stats: DiffLineStats) -> Re
     Ok(())
 }
 
-fn write_diff_shortstat(
-    stdout: &mut dyn Write,
-    entries: &[sley_diff_merge::NameStatusEntry],
-    db: &FileObjectDatabase,
-    worktree_root: Option<&Path>,
-    use_worktree_new: bool,
-) -> Result<()> {
-    let stat_entries = collect_diff_stat_entries(entries, db, worktree_root, use_worktree_new)?;
-    write_diff_shortstat_materialized(stdout, &stat_entries)
-}
-
 fn write_diff_shortstat_materialized(
     stdout: &mut dyn Write,
     entries: &[DiffStatEntryData<'_>],
@@ -3438,38 +3553,6 @@ fn write_diff_shortstat_materialized(
     }
     let (inserted, deleted) = diff_stat_totals(entries);
     write_diff_stat_summary_line(stdout, entries.len(), inserted, deleted)
-}
-
-fn write_diff_stat(
-    stdout: &mut dyn Write,
-    entries: &[sley_diff_merge::NameStatusEntry],
-    db: &FileObjectDatabase,
-    worktree_root: Option<&Path>,
-    use_worktree_new: bool,
-    options: DiffStatOptions,
-) -> Result<()> {
-    // Legacy entry point used by porcelain renderers (merge, stash, bisect, ...)
-    // that have not been migrated to pass widths explicitly. git's porcelain
-    // commands scale the stat to the terminal and respect the diff.stat*Width
-    // config, so resolve both here.
-    let mut widths = DiffStatWidths::terminal();
-    if let Ok(cwd) = env::current_dir()
-        && let Ok(git_dir) = discover_git_dir(&cwd)
-        && let Ok(config) = commands::remote_cmds::read_repo_config(&git_dir)
-    {
-        widths.resolve_config(&config);
-    } else {
-        widths.resolve_config_defaults();
-    }
-    write_diff_stat_with_widths(
-        stdout,
-        entries,
-        db,
-        worktree_root,
-        use_worktree_new,
-        options,
-        widths,
-    )
 }
 
 /// The `--stat=<width>[,<name-width>[,<count>]]` / `--stat-*-width` knobs plus
@@ -3569,20 +3652,6 @@ fn diff_stat_display_width(name: &str) -> i64 {
     name.chars().count() as i64
 }
 
-/// Faithful port of git diff.c `show_stats()`.
-fn write_diff_stat_with_widths(
-    stdout: &mut dyn Write,
-    entries: &[sley_diff_merge::NameStatusEntry],
-    db: &FileObjectDatabase,
-    worktree_root: Option<&Path>,
-    use_worktree_new: bool,
-    options: DiffStatOptions,
-    widths: DiffStatWidths,
-) -> Result<()> {
-    let stat_entries = collect_diff_stat_entries(entries, db, worktree_root, use_worktree_new)?;
-    write_diff_stat_materialized_with_widths(stdout, &stat_entries, options, widths)
-}
-
 fn write_diff_stat_materialized_with_widths(
     stdout: &mut dyn Write,
     entries: &[DiffStatEntryData<'_>],
@@ -3634,7 +3703,7 @@ fn write_diff_stat_materialized_with_widths(
     count = count.min(rows.len());
 
     let mut width = if widths.stat_width == -1 {
-        log_format::term_columns() - widths.line_prefix_width
+        sley_pretty::term_columns() - widths.line_prefix_width
     } else if widths.stat_width != 0 {
         widths.stat_width
     } else {
@@ -4333,7 +4402,7 @@ fn is_gitlink_pair(entry: &sley_diff_merge::NameStatusEntry) -> bool {
 
 fn visible_submodule_dirt(
     entry: &sley_diff_merge::NameStatusEntry,
-    options: &DiffPatchOptions<'_>,
+    options: &DiffRenderOptions<'_>,
 ) -> u8 {
     options
         .submodule_dirt
@@ -4361,7 +4430,7 @@ fn submodule_git_dir_for_path(
 fn write_submodule_patch_entry(
     stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
-    options: DiffPatchOptions<'_>,
+    options: DiffRenderOptions<'_>,
 ) -> Result<()> {
     let old_is_gitlink = entry.old_mode == Some(0o160000);
     let new_is_gitlink = entry.new_mode == Some(0o160000);
@@ -4388,7 +4457,7 @@ fn write_submodule_patch_entry(
         return write_diff_patch_entry(
             stdout,
             &blob_entry,
-            DiffPatchOptions {
+            DiffRenderOptions {
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 ..options
             },
@@ -4407,7 +4476,7 @@ fn write_submodule_patch_entry(
         write_diff_patch_entry(
             stdout,
             &blob_entry,
-            DiffPatchOptions {
+            DiffRenderOptions {
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 ..options
             },
@@ -4656,7 +4725,7 @@ fn submodule_commit_subject(commit: &Commit) -> String {
 fn write_submodule_inline_diff(
     stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
-    options: DiffPatchOptions<'_>,
+    options: DiffRenderOptions<'_>,
     sub_db: &FileObjectDatabase,
     sub_format: ObjectFormat,
     old_oid: &ObjectId,
@@ -4706,7 +4775,7 @@ fn write_submodule_inline_diff(
             write_diff_patch_entry(
                 stdout,
                 dirty_entry,
-                DiffPatchOptions {
+                DiffRenderOptions {
                     db: sub_db,
                     worktree_root: Some(sub_root),
                     use_worktree_new: true,
@@ -4716,6 +4785,7 @@ fn write_submodule_inline_diff(
                     dst_prefix: &dst_prefix,
                     context: options.context,
                     userdiff: None,
+                    funcname: None,
                     colors: options.colors,
                     word_diff: None,
                     no_index_contents: None,
@@ -4749,7 +4819,7 @@ fn write_submodule_inline_diff(
         write_diff_patch_entry(
             stdout,
             sub_entry,
-            DiffPatchOptions {
+            DiffRenderOptions {
                 db: sub_db,
                 worktree_root: nested_worktree_root.as_deref(),
                 use_worktree_new: false,
@@ -4759,6 +4829,7 @@ fn write_submodule_inline_diff(
                 dst_prefix: &dst_prefix,
                 context: options.context,
                 userdiff: None,
+                funcname: None,
                 colors: options.colors,
                 word_diff: None,
                 no_index_contents: None,
@@ -4815,7 +4886,7 @@ pub(crate) fn diff_entry_produces_output(
     context: usize,
     ws_ignore: sley_diff_merge::WsIgnore,
     ignore_blank_lines: bool,
-    ignore_regexes: &[grep_source::Regex],
+    ignore_regexes: &[sley_grep::Regex],
 ) -> Result<bool> {
     // Non-modification statuses, mode changes, and renames/copies always show.
     let mode_unchanged = match (entry.old_mode, entry.new_mode) {
@@ -7330,8 +7401,8 @@ fn for_each_ref_try_trailers_atom(
     };
 
     let options = match arg {
-        None => commands::for_each_ref::ForEachRefTrailerOptions::default(),
-        Some(arg) => match commands::for_each_ref::parse_for_each_ref_trailer_options(arg) {
+        None => sley_pretty::ForEachRefTrailerOptions::default(),
+        Some(arg) => match sley_pretty::parse_for_each_ref_trailer_options(arg) {
             Ok(options) => options,
             Err(None) => {
                 eprintln!("fatal: expected %(trailers:key=<value>)");
@@ -7435,8 +7506,8 @@ fn for_each_ref_describe_atom(placeholder: &str) -> Option<(bool, &str)> {
 /// comma-separated options, and on the first unrecognized token report
 /// `unrecognized %(describe) argument: <bad-token-through-end>` (git keeps the
 /// rest of the string, not just the offending token).
-fn for_each_ref_parse_describe_opts(opts: &str) -> Result<log_format::DescribeSpec> {
-    let mut spec = log_format::DescribeSpec::default();
+fn for_each_ref_parse_describe_opts(opts: &str) -> Result<sley_pretty::DescribeSpec> {
+    let mut spec = sley_pretty::DescribeSpec::default();
     let mut rest = opts;
     while !rest.is_empty() {
         let (part, next) = match rest.split_once(',') {
@@ -8518,7 +8589,7 @@ struct SimpleLogRegex {
     alternatives: Vec<SimpleLogRegexAlternative>,
     /// `--perl-regexp` patterns compile through the full grep regex engine in
     /// PCRE mode instead of the simple BRE subset above.
-    perl: Option<grep_source::Regex>,
+    perl: Option<sley_grep::Regex>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -8576,7 +8647,7 @@ impl SimpleLogRegex {
             pattern,
             error_context,
             mode,
-            grep_source::RegexDiagnosticVerbosity::from_env(),
+            sley_grep::RegexDiagnosticVerbosity::from_env(),
         )
     }
 
@@ -8584,11 +8655,11 @@ impl SimpleLogRegex {
         pattern: &str,
         error_context: &'static str,
         mode: SimpleLogRegexMode,
-        diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
+        diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity,
     ) -> Result<Self> {
         if let SimpleLogRegexMode::Perl = mode {
             let regex =
-                grep_source::Regex::compile(pattern, grep_source::RegexMode::Pcre, false, false)?;
+                sley_grep::Regex::compile(pattern, sley_grep::RegexMode::Pcre, false, false)?;
             return Ok(Self {
                 alternatives: Vec::new(),
                 perl: Some(regex),
@@ -8628,7 +8699,7 @@ impl SimpleLogRegexAlternative {
     fn parse(
         pattern: &str,
         error_context: &'static str,
-        diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
+        diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity,
     ) -> Result<Self> {
         let mut bytes = pattern.as_bytes();
         let anchor_start = bytes.first().copied() == Some(b'^');
@@ -8768,14 +8839,14 @@ fn parse_log_filter_patterns(
     parse_log_filter_patterns_with_diagnostic_verbosity(
         patterns,
         mode,
-        grep_source::RegexDiagnosticVerbosity::from_env(),
+        sley_grep::RegexDiagnosticVerbosity::from_env(),
     )
 }
 
 fn parse_log_filter_patterns_with_diagnostic_verbosity(
     patterns: &[LogFilterPattern],
     mode: SimpleLogRegexMode,
-    diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
+    diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity,
 ) -> Result<Vec<SimpleLogRegex>> {
     patterns
         .iter()
@@ -8792,9 +8863,9 @@ fn parse_log_filter_patterns_with_diagnostic_verbosity(
 
 fn log_grep_pattern_kind_from_config(
     config: &GitConfig,
-    current: grep_source::PatternKind,
+    current: sley_grep::PatternKind,
     explicit: bool,
-) -> grep_source::PatternKind {
+) -> sley_grep::PatternKind {
     if explicit {
         return current;
     }
@@ -8803,30 +8874,30 @@ fn log_grep_pattern_kind_from_config(
         .map(|value| value.trim().to_ascii_lowercase())
         .as_deref()
     {
-        Some("fixed") => grep_source::PatternKind::Fixed,
-        Some("basic") => grep_source::PatternKind::Basic,
-        Some("extended") => grep_source::PatternKind::Extended,
-        Some("perl") => grep_source::PatternKind::Perl,
+        Some("fixed") => sley_grep::PatternKind::Fixed,
+        Some("basic") => sley_grep::PatternKind::Basic,
+        Some("extended") => sley_grep::PatternKind::Extended,
+        Some("perl") => sley_grep::PatternKind::Perl,
         _ => current,
     }
 }
 
 fn compile_log_message_grep_matcher(
     patterns: &[String],
-    kind: grep_source::PatternKind,
+    kind: sley_grep::PatternKind,
     ignore_case: bool,
-) -> Result<Option<grep_source::GrepMatcher>> {
+) -> Result<Option<sley_grep::GrepMatcher>> {
     if patterns.is_empty() {
         return Ok(None);
     }
-    grep_source::GrepMatcher::compile_with_error_context(
-        grep_source::GrepCompileConfig {
+    sley_grep::GrepMatcher::compile_with_error_context(
+        sley_grep::GrepCompileConfig {
             patterns,
             kind,
             ignore_case,
             word: false,
             line_regexp: false,
-            diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity::from_env(),
+            diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity::from_env(),
         },
         "command line",
     )
@@ -8855,7 +8926,7 @@ fn parse_simple_log_regex_class(
     bytes: &[u8],
     pattern: &str,
     error_context: &'static str,
-    diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
+    diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity,
 ) -> Result<(SimpleLogRegexClass, usize)> {
     let mut end = None;
     for (idx, byte) in bytes.iter().enumerate() {
@@ -8895,13 +8966,13 @@ fn log_regex_unterminated_class_error(
     _class_bytes: &[u8],
     pattern: &str,
     error_context: &str,
-    diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
+    diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity,
 ) -> Result<(SimpleLogRegexClass, usize)> {
-    Err(grep_source::report_regex_compile_error(
+    Err(sley_grep::report_regex_compile_error(
         error_context,
         pattern,
         diagnostic_verbosity,
-        grep_source::RegexDiagnosticDetail::UnbalancedBrackets,
+        sley_grep::RegexDiagnosticDetail::UnbalancedBrackets,
     ))
 }
 
@@ -9660,7 +9731,7 @@ fn emit_log_one_token(
             FormatToken::HexByte(byte) => out.push(*byte),
             FormatToken::Trailers(opts) => {
                 let parsed =
-                    crate::commands::for_each_ref::parse_for_each_ref_trailer_options(opts)
+                    sley_pretty::parse_for_each_ref_trailer_options(opts)
                         .map_err(|_| GitError::Command("invalid %(trailers) options".into()))?;
                 let rendered =
                     crate::commands::for_each_ref::for_each_ref_format_trailers(message, &parsed);
@@ -9959,7 +10030,7 @@ fn emit_log_decorate(
     out: &mut Vec<u8>,
     oid: &ObjectId,
     decorations: &HashMap<ObjectId, Vec<String>>,
-    spec: &log_format::DecorateSpec,
+    spec: &sley_pretty::DecorateSpec,
 ) {
     let Some(refs) = decorations.get(oid) else {
         return;
@@ -9984,7 +10055,7 @@ fn emit_log_decorate(
 
 /// Re-render a single decoration entry under the decorate spec's tag/pointer
 /// overrides. The stored entry uses the default " -> " pointer and "tag: " tag.
-fn log_decorate_entry(entry: &str, spec: &log_format::DecorateSpec) -> String {
+fn log_decorate_entry(entry: &str, spec: &sley_pretty::DecorateSpec) -> String {
     if let Some(rest) = entry.strip_prefix("HEAD -> ") {
         format!("HEAD{}{}", spec.pointer, log_decorate_entry(rest, spec))
     } else if let Some(rest) = entry.strip_prefix("tag: ") {
@@ -9999,7 +10070,7 @@ fn log_decorate_entry(entry: &str, spec: &log_format::DecorateSpec) -> String {
 fn log_describe_placeholder(
     ctx: &LogDescribeContext<'_>,
     oid: &ObjectId,
-    spec: &log_format::DescribeSpec,
+    spec: &sley_pretty::DescribeSpec,
 ) -> Result<String> {
     let result = crate::commands::describe::describe_for_format(
         ctx.git_dir,

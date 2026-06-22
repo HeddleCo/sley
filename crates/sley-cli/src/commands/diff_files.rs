@@ -732,18 +732,6 @@ fn render_diff_files_entries(
     let show_default_raw = no_output_mode && !o.patch;
     let show_summary = o.summary && !o.name_only && !o.name_status;
 
-    if show_raw || show_default_raw {
-        for entry in entries {
-            write_diff_raw_entry(
-                &mut stdout,
-                entry,
-                o.z,
-                zero_worktree_oids,
-                context.raw_abbrev,
-                context.format,
-            )?;
-        }
-    }
     // Stat-family output (numstat/stat/shortstat) reflects *content*, so — like
     // git's diffcore, which drops unmodified pairs before the stat walk — the
     // stat-dirty-but-content-identical entries (a `touch`ed / `reset
@@ -757,38 +745,40 @@ fn render_diff_files_entries(
     } else {
         Vec::new()
     };
-    if show_numstat {
-        for entry in &content_entries {
-            write_diff_numstat_materialized_entry(&mut stdout, entry.entry, entry.stats, o.z)?;
-        }
-    }
-    if show_stat {
-        write_diff_stat_materialized(
-            &mut stdout,
-            &content_entries,
-            DiffStatOptions {
-                compact_summary: o.compact_summary,
-                stat_count: o.stat_count,
-                color: false,
+
+    render_diff_entries(
+        &mut stdout,
+        entries,
+        DiffEntryRenderModes {
+            raw: show_raw || show_default_raw,
+            numstat: show_numstat,
+            stat: show_stat,
+            shortstat: show_shortstat,
+            summary: show_summary,
+            patch: show_patch,
+        },
+        DiffEntryRenderContext {
+            raw: DiffEntryRawRenderOptions {
+                z: o.z,
+                abbrev: context.raw_abbrev,
+                format: context.format,
             },
-        )?;
-    }
-    if show_shortstat {
-        write_diff_shortstat_materialized(&mut stdout, &content_entries)?;
-    }
-    if show_summary {
-        for entry in entries {
-            write_diff_summary_entry(&mut stdout, entry)?;
-        }
-    }
-    if show_patch {
-        // When a patch is combined with raw/stat/summary output, git separates
-        // the two blocks with a blank line.
-        if show_raw || show_numstat || show_stat || show_shortstat || show_summary {
-            writeln!(stdout)?;
-        }
-        for entry in entries {
-            let patch_options = DiffPatchOptions {
+            stat: DiffEntryStatRenderOptions {
+                source: Some(DiffEntryStatSource::Materialized(&content_entries)),
+                z: o.z,
+                options: DiffStatOptions {
+                    compact_summary: o.compact_summary,
+                    stat_count: o.stat_count,
+                    color: false,
+                },
+                widths: None,
+            },
+            after_stat: None,
+            prefix_already_written: false,
+        },
+        |_| zero_worktree_oids,
+        |stdout, entry| {
+            let patch_options = DiffRenderOptions {
                 db: context.db,
                 worktree_root,
                 use_worktree_new,
@@ -798,6 +788,7 @@ fn render_diff_files_entries(
                 dst_prefix: &o.dst_prefix,
                 context: context.patch_context,
                 userdiff: None,
+                funcname: None,
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,
@@ -813,9 +804,11 @@ fn render_diff_files_entries(
                 line_ranges: None,
                 indent_heuristic: context.indent_heuristic,
             };
-            write_diff_patch_entry(&mut stdout, entry, patch_options)?;
-        }
-    } else if o.name_only || o.name_status {
+            write_diff_patch_entry(stdout, entry, patch_options)
+        },
+    )?;
+
+    if !show_patch && (o.name_only || o.name_status) {
         for entry in entries {
             write_diff_files_name_entry(&mut stdout, entry, o.name_only, o.z)?;
         }

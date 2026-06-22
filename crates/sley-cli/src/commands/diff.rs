@@ -1698,7 +1698,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         } else {
             None
         };
-        if show_raw {
+        let (zero_all_worktree_oids, index_oids): (bool, HashMap<Vec<u8>, ObjectId>) = if show_raw {
             // git zeroes the worktree-side oid only when it cannot be trusted:
             // a stat-clean file keeps its index oid in raw output. The
             // worktree entries carry the freshly-hashed content oid, so
@@ -1707,7 +1707,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             let needs_index_oids = zero_worktree_oids
                 && !zero_all_worktree_oids
                 && entries.iter().any(|entry| entry.new_oid.is_some());
-            let index_oids: HashMap<Vec<u8>, ObjectId> = if needs_index_oids {
+            let index_oids = if needs_index_oids {
                 let index_path = sley_worktree::repository_index_path(&git_dir);
                 match fs::read(&index_path) {
                     Ok(bytes) => Index::parse(&bytes, format)?
@@ -1720,74 +1720,35 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             } else {
                 HashMap::new()
             };
-            for entry in &entries {
-                let zero_entry = zero_all_worktree_oids
-                    || (zero_worktree_oids
-                        && entry
-                            .new_oid
-                            .as_ref()
-                            .is_none_or(|oid| index_oids.get(&entry.path[..]) != Some(oid)));
-                write_diff_raw_entry(&mut stdout, entry, z, zero_entry, raw_abbrev, format)?;
-            }
-        }
-        if show_numstat {
-            for entry in stat_entries
-                .as_ref()
-                .expect("stat entries collected for numstat")
-            {
-                write_diff_numstat_materialized_entry(&mut stdout, entry.entry, entry.stats, z)?;
-            }
-        }
+            (zero_all_worktree_oids, index_oids)
+        } else {
+            (false, HashMap::new())
+        };
+        let mut resolved_stat_widths = stat_widths;
         if show_stat {
-            let mut stat_widths = stat_widths;
             if let Some(config) = repo_config.as_ref() {
-                stat_widths.resolve_config(config);
+                resolved_stat_widths.resolve_config(config);
             } else {
-                stat_widths.resolve_config_defaults();
-            }
-            write_diff_stat_materialized_with_widths(
-                &mut stdout,
-                stat_entries
-                    .as_ref()
-                    .expect("stat entries collected for diffstat"),
-                DiffStatOptions {
-                    compact_summary,
-                    stat_count,
-                    color: color_always,
-                },
-                stat_widths,
-            )?;
-        }
-        if show_shortstat {
-            write_diff_shortstat_materialized(
-                &mut stdout,
-                stat_entries
-                    .as_ref()
-                    .expect("stat entries collected for shortstat"),
-            )?;
-        }
-        if let Some(dirstat_options) = dirstat
-            && !name_only
-            && !name_status
-        {
-            write_diff_dirstat(
-                &mut stdout,
-                &entries,
-                &db,
-                worktree_root.as_deref(),
-                use_worktree_new,
-                dirstat_options,
-            )?;
-        }
-        if show_summary {
-            for entry in &entries {
-                write_diff_summary_entry(&mut stdout, entry)?;
+                resolved_stat_widths.resolve_config_defaults();
             }
         }
+        let mut render_dirstat = |stdout: &mut dyn Write| {
+            if let Some(dirstat_options) = dirstat
+                && !name_only
+                && !name_status
+            {
+                write_diff_dirstat(
+                    stdout,
+                    &entries,
+                    &db,
+                    worktree_root.as_deref(),
+                    use_worktree_new,
+                    dirstat_options,
+                )?;
+            }
+            Ok(())
+        };
         if show_patch {
-            if show_raw || show_numstat || show_stat || show_shortstat || show_summary {
-                writeln!(stdout)?;
-            }
             let combined_unmerged = if plain_index_worktree_diff {
                 diff_unmerged_worktree_combined_paths(&git_dir, worktree_root.as_deref(), format)?
             } else {
@@ -1820,85 +1781,172 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     WhitespaceRuleResolver::from_git_dir_with_config(&git_dir, repo_config.as_ref())
                 })
                 .transpose()?;
-            for entry in &entries {
-                if let Some(combined) = combined_unmerged.get(entry.path.as_bytes()) {
-                    if wrote_combined_unmerged.insert(entry.path.as_bytes().to_vec()) {
-                        write_diff_unmerged_worktree_combined(
-                            &mut stdout,
-                            &db,
-                            combined,
-                            patch_abbrev,
-                            &src_prefix,
-                            &dst_prefix,
-                        )?;
+            render_diff_entries(
+                &mut stdout,
+                &entries,
+                DiffEntryRenderModes {
+                    raw: show_raw,
+                    numstat: show_numstat,
+                    stat: show_stat,
+                    shortstat: show_shortstat,
+                    summary: show_summary,
+                    patch: true,
+                },
+                DiffEntryRenderContext {
+                    raw: DiffEntryRawRenderOptions {
+                        z,
+                        abbrev: raw_abbrev,
+                        format,
+                    },
+                    stat: DiffEntryStatRenderOptions {
+                        source: stat_entries
+                            .as_deref()
+                            .map(DiffEntryStatSource::Materialized),
+                        z,
+                        options: DiffStatOptions {
+                            compact_summary,
+                            stat_count,
+                            color: color_always,
+                        },
+                        widths: Some(resolved_stat_widths),
+                    },
+                    after_stat: Some(&mut render_dirstat),
+                    prefix_already_written: false,
+                },
+                |entry| {
+                    zero_all_worktree_oids
+                        || (zero_worktree_oids
+                            && entry
+                                .new_oid
+                                .as_ref()
+                                .is_none_or(|oid| index_oids.get(&entry.path[..]) != Some(oid)))
+                },
+                |stdout, entry| {
+                    if let Some(combined) = combined_unmerged.get(entry.path.as_bytes()) {
+                        if wrote_combined_unmerged.insert(entry.path.as_bytes().to_vec()) {
+                            write_diff_unmerged_worktree_combined(
+                                stdout,
+                                &db,
+                                combined,
+                                patch_abbrev,
+                                &src_prefix,
+                                &dst_prefix,
+                            )?;
+                        }
+                        return Ok(());
                     }
-                    continue;
-                }
-                let ws_error = match (ws_resolver.as_ref(), ws_error_kinds) {
-                    (Some(resolver), Some(kinds)) => {
-                        let rule = if kinds.plain {
-                            0
-                        } else {
-                            resolver.rule_for_path(&entry.path)?
-                        };
-                        Some(sley_diff_merge::render::WsErrorHighlight {
-                            rule,
-                            old: kinds.old,
-                            new: kinds.new,
-                            context: kinds.context,
-                        })
-                    }
-                    _ => None,
-                };
-                let materialized_contents = if use_worktree_old {
-                    Some((
-                        diff_entry_old_content_for_diff(
-                            entry,
-                            &db,
-                            worktree_root.as_deref(),
-                            true,
-                        )?,
-                        diff_entry_new_content(
-                            entry,
-                            &db,
-                            worktree_root.as_deref(),
-                            use_worktree_new,
-                        )?,
-                    ))
-                } else {
-                    None
-                };
-                let no_index_contents = materialized_contents
-                    .as_ref()
-                    .map(|(old, new)| (old.as_deref(), new.as_deref()));
-                let options = DiffPatchOptions {
-                    db: &db,
-                    worktree_root: worktree_root.as_deref(),
-                    use_worktree_new,
-                    format,
-                    abbrev: patch_abbrev,
-                    src_prefix: &src_prefix,
-                    dst_prefix: &dst_prefix,
-                    context: patch_context,
-                    userdiff: Some(&userdiff),
-                    colors: colors.as_ref(),
-                    word_diff: word_request.as_ref(),
-                    no_index_contents,
-                    submodule_format,
-                    submodule_dirt: Some(&dirty_submodules),
-                    ws_error,
-                    color_moved,
-                    interhunk: interhunk.unwrap_or(0),
-                    ws_ignore,
-                    diff_algorithm,
-                    ignore_blank_lines,
-                    ignore_regexes: &ignore_regexes,
-                    line_ranges: None,
-                    indent_heuristic,
-                };
-                write_diff_patch_entry(&mut stdout, entry, options)?;
-            }
-        } else if !show_summary
+                    let ws_error = match (ws_resolver.as_ref(), ws_error_kinds) {
+                        (Some(resolver), Some(kinds)) => {
+                            let rule = if kinds.plain {
+                                0
+                            } else {
+                                resolver.rule_for_path(&entry.path)?
+                            };
+                            Some(sley_diff_merge::render::WsErrorHighlight {
+                                rule,
+                                old: kinds.old,
+                                new: kinds.new,
+                                context: kinds.context,
+                            })
+                        }
+                        _ => None,
+                    };
+                    let materialized_contents = if use_worktree_old {
+                        Some((
+                            diff_entry_old_content_for_diff(
+                                entry,
+                                &db,
+                                worktree_root.as_deref(),
+                                true,
+                            )?,
+                            diff_entry_new_content(
+                                entry,
+                                &db,
+                                worktree_root.as_deref(),
+                                use_worktree_new,
+                            )?,
+                        ))
+                    } else {
+                        None
+                    };
+                    let no_index_contents = materialized_contents
+                        .as_ref()
+                        .map(|(old, new)| (old.as_deref(), new.as_deref()));
+                    let options = DiffRenderOptions {
+                        db: &db,
+                        worktree_root: worktree_root.as_deref(),
+                        use_worktree_new,
+                        format,
+                        abbrev: patch_abbrev,
+                        src_prefix: &src_prefix,
+                        dst_prefix: &dst_prefix,
+                        context: patch_context,
+                        userdiff: Some(&userdiff),
+                        funcname: None,
+                        colors: colors.as_ref(),
+                        word_diff: word_request.as_ref(),
+                        no_index_contents,
+                        submodule_format,
+                        submodule_dirt: Some(&dirty_submodules),
+                        ws_error,
+                        color_moved,
+                        interhunk: interhunk.unwrap_or(0),
+                        ws_ignore,
+                        diff_algorithm,
+                        ignore_blank_lines,
+                        ignore_regexes: &ignore_regexes,
+                        line_ranges: None,
+                        indent_heuristic,
+                    };
+                    write_diff_patch_entry(stdout, entry, options)
+                },
+            )?;
+        } else {
+            render_diff_entries(
+                &mut stdout,
+                &entries,
+                DiffEntryRenderModes {
+                    raw: show_raw,
+                    numstat: show_numstat,
+                    stat: show_stat,
+                    shortstat: show_shortstat,
+                    summary: show_summary,
+                    patch: false,
+                },
+                DiffEntryRenderContext {
+                    raw: DiffEntryRawRenderOptions {
+                        z,
+                        abbrev: raw_abbrev,
+                        format,
+                    },
+                    stat: DiffEntryStatRenderOptions {
+                        source: stat_entries
+                            .as_deref()
+                            .map(DiffEntryStatSource::Materialized),
+                        z,
+                        options: DiffStatOptions {
+                            compact_summary,
+                            stat_count,
+                            color: color_always,
+                        },
+                        widths: Some(resolved_stat_widths),
+                    },
+                    after_stat: Some(&mut render_dirstat),
+                    prefix_already_written: false,
+                },
+                |entry| {
+                    zero_all_worktree_oids
+                        || (zero_worktree_oids
+                            && entry
+                                .new_oid
+                                .as_ref()
+                                .is_none_or(|oid| index_oids.get(&entry.path[..]) != Some(oid)))
+                },
+                |_, _| Ok(()),
+            )?;
+        }
+        if !show_patch
+            && !show_summary
             && (summary || (!show_stat && !show_shortstat))
             && !show_numstat
             && !show_raw
@@ -2100,7 +2148,7 @@ fn diff_unmerged_worktree_combined_paths(
 }
 
 fn write_diff_unmerged_worktree_combined(
-    stdout: &mut impl Write,
+    stdout: &mut dyn Write,
     db: &FileObjectDatabase,
     path: &UnmergedWorktreeCombinedPath,
     abbrev: usize,
@@ -2458,7 +2506,7 @@ fn apply_diff_relative(
 struct DiffStatIgnoreOptions<'a> {
     ws_ignore: sley_diff_merge::WsIgnore,
     ignore_blank_lines: bool,
-    ignore_regexes: &'a [grep_source::Regex],
+    ignore_regexes: &'a [sley_grep::Regex],
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
     indent_heuristic: bool,
 }
@@ -2513,7 +2561,7 @@ fn diff_line_stats_from_ignored_hunks(
     new_content: Option<&[u8]>,
     ws_ignore: sley_diff_merge::WsIgnore,
     ignore_blank_lines: bool,
-    ignore_regexes: &[grep_source::Regex],
+    ignore_regexes: &[sley_grep::Regex],
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
     indent_heuristic: bool,
 ) -> DiffLineStats {
@@ -2574,7 +2622,7 @@ struct DiffNoIndexParams<'a> {
     ws_ignore: sley_diff_merge::WsIgnore,
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
     ignore_blank_lines: bool,
-    ignore_regexes: &'a [crate::grep_source::Regex],
+    ignore_regexes: &'a [sley_grep::Regex],
     indent_heuristic: bool,
 }
 
@@ -2722,7 +2770,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             config.clone(),
         );
         for entry in &entries {
-            let options = DiffPatchOptions {
+            let options = DiffRenderOptions {
                 db: &db,
                 worktree_root: None,
                 use_worktree_new: false,
@@ -2732,6 +2780,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                 dst_prefix: params.dst_prefix,
                 context: params.context,
                 userdiff: Some(&userdiff),
+                funcname: None,
                 colors: colors.as_ref(),
                 word_diff: word_request.as_ref(),
                 no_index_contents: Some((

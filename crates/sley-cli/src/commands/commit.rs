@@ -1536,7 +1536,8 @@ fn print_commit_summary(
         sley_diff_merge::RenameDetectionOptions::default(),
     )?;
     if !entries.is_empty() {
-        write_diff_shortstat(&mut out, &entries, db, None, false)?;
+        let stat_entries = collect_diff_stat_entries(&entries, db, None, false)?;
+        write_diff_shortstat_materialized(&mut out, &stat_entries)?;
         for entry in &entries {
             write_commit_summary_entry(&mut out, entry)?;
         }
@@ -2812,7 +2813,7 @@ fn append_commit_diff_index_patch(
         write_diff_patch_entry(
             out,
             &entry,
-            DiffPatchOptions {
+            DiffRenderOptions {
                 db: &db,
                 worktree_root: worktree.then_some(worktree_root.as_path()),
                 use_worktree_new: worktree,
@@ -2822,6 +2823,7 @@ fn append_commit_diff_index_patch(
                 dst_prefix,
                 context: 3,
                 userdiff: None,
+                funcname: None,
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,

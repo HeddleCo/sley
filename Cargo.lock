@@ -1100,10 +1100,12 @@ dependencies = [
  "sley-core",
  "sley-diff-merge",
  "sley-formats",
+ "sley-grep",
  "sley-index",
  "sley-notes",
  "sley-object",
  "sley-odb",
+ "sley-pretty",
  "sley-refs",
  "sley-remote",
  "sley-rev",
@@ -1155,6 +1157,7 @@ dependencies = [
  "sley-fetch",
  "sley-formats",
  "sley-fsck",
+ "sley-grep",
  "sley-index",
  "sley-notes",
  "sley-object",
@@ -1162,6 +1165,7 @@ dependencies = [
  "sley-options",
  "sley-pack",
  "sley-pathspec",
+ "sley-pretty",
  "sley-protocol",
  "sley-ref-filter",
  "sley-refs",
@@ -1239,6 +1243,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sley-grep"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+]
+
+[[package]]
 name = "sley-index"
 version = "0.1.0"
 dependencies = [
@@ -1303,6 +1314,14 @@ name = "sley-pathspec"
 version = "0.1.0"
 dependencies = [
  "sley-core",
+]
+
+[[package]]
+name = "sley-pretty"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+ "sley-strbuf-expand",
 ]
 
 [[package]]

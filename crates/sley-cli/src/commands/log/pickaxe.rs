@@ -18,9 +18,9 @@ pub(super) enum CompiledPickaxe {
     /// Literal-substring `-S`: count occurrences of `needle`.
     StringLiteral { needle: Vec<u8> },
     /// Regex `-S --pickaxe-regex`: count regex matches.
-    StringRegex { regex: crate::grep_source::Regex },
+    StringRegex { regex: sley_grep::Regex },
     /// `-G<regex>`: regex matches an added/removed diff line.
-    Grep { regex: crate::grep_source::Regex },
+    Grep { regex: sley_grep::Regex },
     /// `--find-object`: blob oid set.
     FindObject { oids: HashSet<ObjectId> },
 }
@@ -390,7 +390,7 @@ fn pickaxe_is_binary(bytes: &[u8]) -> bool {
 /// `-G<regex>`: run a textual diff between `old` and `new` and report whether
 /// the regex matches any added or removed line (the leading `+`/`-` is trimmed
 /// before matching, like git's `diffgrep_consume`).
-fn pickaxe_diff_grep(old: &[u8], new: &[u8], regex: &crate::grep_source::Regex) -> bool {
+fn pickaxe_diff_grep(old: &[u8], new: &[u8], regex: &sley_grep::Regex) -> bool {
     let old_lines = sley_diff_merge::split_lines(old);
     let new_lines = sley_diff_merge::split_lines(new);
     let mut old_idx = 0;
@@ -427,10 +427,10 @@ fn pickaxe_diff_grep(old: &[u8], new: &[u8], regex: &crate::grep_source::Regex) 
 pub(super) fn compile_pickaxe_regex(
     pattern: &str,
     ignore_case: bool,
-) -> Result<crate::grep_source::Regex> {
-    crate::grep_source::Regex::compile(
+) -> Result<sley_grep::Regex> {
+    sley_grep::Regex::compile(
         pattern,
-        crate::grep_source::RegexMode::Ere,
+        sley_grep::RegexMode::Ere,
         ignore_case,
         false,
     )
@@ -475,7 +475,7 @@ impl CompiledPickaxe {
     }
 
     /// Count non-overlapping regex matches in `data`, capped at `limit`.
-    fn count_regex(regex: &crate::grep_source::Regex, data: &[u8], limit: usize) -> usize {
+    fn count_regex(regex: &sley_grep::Regex, data: &[u8], limit: usize) -> usize {
         let mut cnt = 0;
         let mut from = 0;
         while from <= data.len() {

@@ -986,167 +986,6 @@ impl ForEachRefNeeds {
     }
 }
 
-// ---------------------------------------------------------------------------
-// %(trailers) / %(contents:trailers) — a focused port of git's
-// format_trailers_from_commit (trailer.c) restricted to the for-each-ref atom
-// option set: only, unfold, keyonly, valueonly, key, separator,
-// key_value_separator.
-// ---------------------------------------------------------------------------
-
-#[derive(Default)]
-pub(crate) struct ForEachRefTrailerOptions {
-    only: bool,
-    unfold: bool,
-    key_only: bool,
-    value_only: bool,
-    /// `Some` when any `key=` filter was given; lookups are case-insensitive.
-    filter: Option<Vec<String>>,
-    separator: Option<String>,
-    key_value_separator: Option<String>,
-}
-
-/// Parse the `%(trailers:...)` option string (the part after the colon, with a
-/// synthetic trailing `)` removed). `Err(None)` => `expected %(trailers:key=...)`;
-/// `Err(Some(arg))` => `unknown %(trailers) argument: arg`.
-pub(crate) fn parse_for_each_ref_trailer_options(
-    arg: &str,
-) -> std::result::Result<ForEachRefTrailerOptions, Option<String>> {
-    let mut options = ForEachRefTrailerOptions::default();
-    let mut rest = arg;
-    loop {
-        if rest.is_empty() {
-            break;
-        }
-        if let Some((value, tail)) = for_each_ref_match_arg_value(rest, "key") {
-            // git: a `key` with no `=value` is an error (-1 -> expected ...).
-            let Some(value) = value else {
-                return Err(None);
-            };
-            let value = value.strip_suffix(':').unwrap_or(value);
-            options
-                .filter
-                .get_or_insert_with(Vec::new)
-                .push(value.to_string());
-            options.only = true;
-            rest = tail;
-        } else if let Some((value, tail)) = for_each_ref_match_arg_value(rest, "separator") {
-            options.separator = Some(for_each_ref_expand_string_arg(value.unwrap_or("")));
-            rest = tail;
-        } else if let Some((value, tail)) =
-            for_each_ref_match_arg_value(rest, "key_value_separator")
-        {
-            options.key_value_separator = Some(for_each_ref_expand_string_arg(value.unwrap_or("")));
-            rest = tail;
-        } else if let Some(tail) = for_each_ref_match_bool_arg(rest, "only", &mut options.only) {
-            rest = tail;
-        } else if let Some(tail) = for_each_ref_match_bool_arg(rest, "unfold", &mut options.unfold)
-        {
-            rest = tail;
-        } else if let Some(tail) =
-            for_each_ref_match_bool_arg(rest, "keyonly", &mut options.key_only)
-        {
-            rest = tail;
-        } else if let Some(tail) =
-            for_each_ref_match_bool_arg(rest, "valueonly", &mut options.value_only)
-        {
-            rest = tail;
-        } else {
-            // git: invalid_arg = up to the next ',' or ')'.
-            let len = rest.find([',', ')']).unwrap_or(rest.len());
-            return Err(Some(rest[..len].to_string()));
-        }
-    }
-    Ok(options)
-}
-
-/// git `match_placeholder_arg_value`: match `candidate` at the start of `to_parse`
-/// followed by `=value` (until `,`/`)`), or bare (followed by `,`/end). Returns
-/// `(value, remainder)` on a match. The input has no trailing `)` (we operate on
-/// the comma-joined option list directly), so end-of-string acts like `)`.
-fn for_each_ref_match_arg_value<'a>(
-    to_parse: &'a str,
-    candidate: &str,
-) -> Option<(Option<&'a str>, &'a str)> {
-    let p = to_parse.strip_prefix(candidate)?;
-    if let Some(after_eq) = p.strip_prefix('=') {
-        let len = after_eq.find([',', ')']).unwrap_or(after_eq.len());
-        let value = &after_eq[..len];
-        let p = &after_eq[len..];
-        let tail = p.strip_prefix(',').unwrap_or(p);
-        Some((Some(value), tail))
-    } else if let Some(tail) = p.strip_prefix(',') {
-        Some((None, tail))
-    } else if p.is_empty() || p.starts_with(')') {
-        Some((None, p.strip_prefix(')').unwrap_or(p)))
-    } else {
-        None
-    }
-}
-
-/// git `match_placeholder_bool_arg` for the value-less boolean options used by
-/// for-each-ref (`only`/`unfold`/`keyonly`/`valueonly`), incl. `=yes/no/...`.
-fn for_each_ref_match_bool_arg<'a>(
-    to_parse: &'a str,
-    candidate: &str,
-    out: &mut bool,
-) -> Option<&'a str> {
-    let (value, tail) = for_each_ref_match_arg_value(to_parse, candidate)?;
-    match value {
-        None => {
-            *out = true;
-            Some(tail)
-        }
-        Some(value) => match for_each_ref_parse_maybe_bool(value) {
-            Some(v) => {
-                *out = v;
-                Some(tail)
-            }
-            // git returns 0 here (no match) so the option falls through to the
-            // unknown-argument path.
-            None => None,
-        },
-    }
-}
-
-fn for_each_ref_parse_maybe_bool(value: &str) -> Option<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "1" | "yes" | "true" => Some(true),
-        "0" | "no" | "false" => Some(false),
-        _ => None,
-    }
-}
-
-/// git `expand_string_arg`: only `%%` and `%x##` literal escapes are expanded;
-/// any other `%` is emitted verbatim.
-fn for_each_ref_expand_string_arg(arg: &str) -> String {
-    let bytes = arg.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut idx = 0;
-    while idx < bytes.len() {
-        if bytes[idx] != b'%' {
-            out.push(bytes[idx]);
-            idx += 1;
-            continue;
-        }
-        if bytes.get(idx + 1) == Some(&b'%') {
-            out.push(b'%');
-            idx += 2;
-        } else if bytes.get(idx + 1) == Some(&b'x')
-            && let (Some(h), Some(l)) = (
-                bytes.get(idx + 2).and_then(|b| (*b as char).to_digit(16)),
-                bytes.get(idx + 3).and_then(|b| (*b as char).to_digit(16)),
-            )
-        {
-            out.push((h * 16 + l) as u8);
-            idx += 4;
-        } else {
-            out.push(b'%');
-            idx += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 struct ForEachRefTrailerItem {
     /// `Some(token)` for a real trailer; `None` for a preserved non-trailer line.
     token: Option<String>,
@@ -1157,7 +996,7 @@ struct ForEachRefTrailerItem {
 /// `format_trailers_from_commit` + `format_trailers`.
 pub(crate) fn for_each_ref_format_trailers(
     message: &[u8],
-    options: &ForEachRefTrailerOptions,
+    options: &sley_pretty::ForEachRefTrailerOptions,
 ) -> Vec<u8> {
     let text = String::from_utf8_lossy(message);
     let block = for_each_ref_trailer_block(&text);
@@ -1317,7 +1156,7 @@ fn for_each_ref_find_trailer_block_start(buf: &str, len: usize) -> usize {
 /// `trailer_block_get` split + `parse_trailers`).
 fn for_each_ref_parse_trailer_items(
     block: &str,
-    options: &ForEachRefTrailerOptions,
+    options: &sley_pretty::ForEachRefTrailerOptions,
 ) -> Vec<ForEachRefTrailerItem> {
     // Split on '\n' keeping each line; fold continuation lines (leading
     // whitespace) into the previous line *only if it had a separator*.

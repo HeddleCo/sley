@@ -15,11 +15,9 @@
 //! every shared plumbing helper — `RepositoryContext`, `FileObjectDatabase`,
 //! `FileRefStore`, the `sley_rev`/`sley_diff_merge` re-exports, the
 //! identity/date helpers, and so on — is in scope without re-listing it. The
-//! diff/stat rendering in the shared
-//! crate writes only to `io::Stdout`; format-patch needs to direct output at a
-//! file too, so the unified-patch, diffstat, and summary rendering is reproduced
-//! here against an in-memory byte buffer using the same `sley_diff_merge` engine
-//! (name-status diff + blob reads) the rest of the CLI uses.
+//! diff/stat rendering in the shared crate writes to generic `Write` sinks, so
+//! format-patch keeps only the mbox framing here and delegates patch/summary
+//! rendering to the unified diff path.
 
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
@@ -253,7 +251,7 @@ struct FormatPatchOptions {
     relative_prefix: Option<Vec<u8>>,
     /// `--grep=<pattern>` commit-message filters.
     grep_patterns: Vec<String>,
-    grep_pattern_kind: crate::grep_source::PatternKind,
+    grep_pattern_kind: sley_grep::PatternKind,
     grep_pattern_kind_explicit: bool,
     grep_ignore_case: bool,
     grep_all_match: bool,
@@ -364,7 +362,7 @@ impl Default for FormatPatchOptions {
             relative_mode: RelativeMode::Config,
             relative_prefix: None,
             grep_patterns: Vec::new(),
-            grep_pattern_kind: crate::grep_source::PatternKind::Basic,
+            grep_pattern_kind: sley_grep::PatternKind::Basic,
             grep_pattern_kind_explicit: false,
             grep_ignore_case: false,
             grep_all_match: false,
@@ -379,7 +377,7 @@ impl super::grep_args::GrepArgOptions for FormatPatchOptions {
         &mut self.grep_patterns
     }
 
-    fn grep_pattern_kind_mut(&mut self) -> &mut crate::grep_source::PatternKind {
+    fn grep_pattern_kind_mut(&mut self) -> &mut sley_grep::PatternKind {
         &mut self.grep_pattern_kind
     }
 
@@ -858,7 +856,7 @@ fn build_cover_letter(
         if options.stat {
             write_patch_diffstat(&mut out, &entries, db, options)?;
             for entry in &entries {
-                write_patch_summary_entry(&mut out, entry)?;
+                write_diff_summary_entry(&mut out, entry)?;
             }
             // git's diff flush ends the diffstat block with a blank line; the
             // cover has no per-file diff after it, so that blank sits directly
@@ -2231,7 +2229,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
             out.extend_from_slice(&notes);
             write_patch_diffstat(&mut out, &entries, db, options)?;
             for entry in &entries {
-                write_patch_summary_entry(&mut out, entry)?;
+                write_diff_summary_entry(&mut out, entry)?;
             }
             out.push(b'\n');
         } else {
@@ -2239,7 +2237,11 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         }
 
         for entry in &entries {
-            write_patch_diff_entry(&mut out, entry, db, format, options, abbrev)?;
+            write_diff_patch_entry(
+                &mut out,
+                entry,
+                format_patch_diff_options(db, format, options, abbrev),
+            )?;
         }
     }
 
@@ -3550,219 +3552,47 @@ fn is_title_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_'
 }
 
-// --- diff rendering into a byte buffer ----------------------------------------
+// --- format-patch diff adapter -------------------------------------------------
 //
-// The shared crate's `write_diff_*` helpers target `io::Stdout` exclusively;
-// format-patch must also write into files, so the rendering below mirrors that
-// logic against a `Vec<u8>`, using the same `sley_diff_merge` data
-// (NameStatusEntry) and blob reads. Output is kept byte-for-byte compatible.
+// The mail framing stays in this module; per-file patch and summary rendering
+// routes through the unified diff helpers with format-patch's byte constraints.
 
-/// Render one file's unified-diff section (the `diff --git ...` block) into
-/// `out`, including the mode/index/`---`/`+++` headers and the single
-/// whole-file hunk. Binary changes get the `Binary files ... differ` line.
-fn write_patch_diff_entry(
-    out: &mut Vec<u8>,
-    entry: &sley_diff_merge::NameStatusEntry,
-    db: &FileObjectDatabase,
+fn format_patch_diff_options<'a>(
+    db: &'a FileObjectDatabase,
     format: ObjectFormat,
-    options: &FormatPatchOptions,
+    options: &'a FormatPatchOptions,
     abbrev: usize,
-) -> Result<()> {
-    let old_content = entry_old_content(entry, db, format)?;
-    let new_content = entry_new_content(entry, db, format)?;
-    let content_changed = old_content.as_deref() != new_content.as_deref();
-
-    let old_path = entry.old_path.as_deref().unwrap_or(&entry.path);
-    let diff_old_path = patch_prefixed_path(&options.src_prefix, old_path);
-    let diff_new_path = patch_prefixed_path(&options.dst_prefix, &entry.path);
-    writeln_fmt_buf(
-        out,
-        format_args!("diff --git {diff_old_path} {diff_new_path}"),
-    );
-    write_patch_mode_headers(out, entry);
-    write_patch_similarity_headers(out, entry, old_path, &entry.path);
-
-    let is_binary = old_content.as_deref().is_some_and(|c| c.contains(&0))
-        || new_content.as_deref().is_some_and(|c| c.contains(&0));
-    if is_binary {
-        if !content_changed {
-            return Ok(());
-        }
-        writeln_fmt_buf(
-            out,
-            format_args!(
-                "index {}..{}{}",
-                patch_blob_oid(
-                    entry.old_oid.as_ref(),
-                    old_content.as_deref(),
-                    format,
-                    abbrev
-                ),
-                patch_blob_oid(
-                    entry.new_oid.as_ref(),
-                    new_content.as_deref(),
-                    format,
-                    abbrev
-                ),
-                patch_mode_suffix(entry)
-            ),
-        );
-        let old = if old_content.is_some() {
-            patch_prefixed_path(&options.src_prefix, old_path)
-        } else {
-            "/dev/null".to_string()
-        };
-        let new = if new_content.is_some() {
-            patch_prefixed_path(&options.dst_prefix, &entry.path)
-        } else {
-            "/dev/null".to_string()
-        };
-        writeln_fmt_buf(out, format_args!("Binary files {old} and {new} differ"));
-        return Ok(());
-    }
-
-    if !content_changed {
-        return Ok(());
-    }
-    writeln_fmt_buf(
-        out,
-        format_args!(
-            "index {}..{}{}",
-            patch_blob_oid(
-                entry.old_oid.as_ref(),
-                old_content.as_deref(),
-                format,
-                abbrev
-            ),
-            patch_blob_oid(
-                entry.new_oid.as_ref(),
-                new_content.as_deref(),
-                format,
-                abbrev
-            ),
-            patch_mode_suffix(entry)
-        ),
-    );
-    match entry.status {
-        sley_diff_merge::NameStatus::Added => writeln_buf(out, "--- /dev/null"),
-        _ => writeln_fmt_buf(
-            out,
-            format_args!("--- {}", patch_header_path(&options.src_prefix, old_path)),
-        ),
-    }
-    match entry.status {
-        sley_diff_merge::NameStatus::Deleted => writeln_buf(out, "+++ /dev/null"),
-        _ => writeln_fmt_buf(
-            out,
-            format_args!(
-                "+++ {}",
-                patch_header_path(&options.dst_prefix, &entry.path)
-            ),
-        ),
-    }
-    if options.context_lines == HUNK_CONTEXT {
-        write_patch_hunks(out, old_content.as_deref(), new_content.as_deref());
-    } else {
-        write_patch_hunks_with(
-            out,
-            old_content.as_deref(),
-            new_content.as_deref(),
-            &PatchHunkOptions {
-                context: options.context_lines,
-                ..Default::default()
-            },
-        );
-    }
-    Ok(())
-}
-
-/// Emit the `new file mode` / `deleted file mode` / `old mode`+`new mode`
-/// headers appropriate for the entry's status.
-fn write_patch_mode_headers(out: &mut Vec<u8>, entry: &sley_diff_merge::NameStatusEntry) {
-    match entry.status {
-        sley_diff_merge::NameStatus::Added => {
-            if let Some(mode) = entry.new_mode {
-                writeln_fmt_buf(out, format_args!("new file mode {mode:06o}"));
-            }
-        }
-        sley_diff_merge::NameStatus::Deleted => {
-            if let Some(mode) = entry.old_mode {
-                writeln_fmt_buf(out, format_args!("deleted file mode {mode:06o}"));
-            }
-        }
-        sley_diff_merge::NameStatus::Modified
-        | sley_diff_merge::NameStatus::Renamed(_)
-        | sley_diff_merge::NameStatus::Copied(_) => {
-            if let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
-                && old_mode != new_mode
-            {
-                writeln_fmt_buf(out, format_args!("old mode {old_mode:06o}"));
-                writeln_fmt_buf(out, format_args!("new mode {new_mode:06o}"));
-            }
-        }
-        sley_diff_merge::NameStatus::Unmerged => {}
-    }
-}
-
-/// Emit the `similarity index`/`rename from|to`/`copy from|to` headers for
-/// rename and copy entries.
-fn write_patch_similarity_headers(
-    out: &mut Vec<u8>,
-    entry: &sley_diff_merge::NameStatusEntry,
-    old_path: &[u8],
-    path: &[u8],
-) {
-    let old = status_quote_path(old_path, false);
-    let new = status_quote_path(path, false);
-    match entry.status {
-        sley_diff_merge::NameStatus::Renamed(score) => {
-            writeln_fmt_buf(out, format_args!("similarity index {score}%"));
-            writeln_fmt_buf(out, format_args!("rename from {old}"));
-            writeln_fmt_buf(out, format_args!("rename to {new}"));
-        }
-        sley_diff_merge::NameStatus::Copied(score) => {
-            writeln_fmt_buf(out, format_args!("similarity index {score}%"));
-            writeln_fmt_buf(out, format_args!("copy from {old}"));
-            writeln_fmt_buf(out, format_args!("copy to {new}"));
-        }
-        _ => {}
+) -> crate::DiffRenderOptions<'a> {
+    crate::DiffRenderOptions {
+        db,
+        worktree_root: None,
+        use_worktree_new: false,
+        format,
+        abbrev,
+        src_prefix: &options.src_prefix,
+        dst_prefix: &options.dst_prefix,
+        context: options.context_lines,
+        userdiff: None,
+        funcname: None,
+        colors: None,
+        word_diff: None,
+        no_index_contents: None,
+        submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+        submodule_dirt: None,
+        ws_error: None,
+        color_moved: None,
+        interhunk: 0,
+        ws_ignore: sley_diff_merge::WsIgnore::default(),
+        diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+        ignore_blank_lines: false,
+        ignore_regexes: &[],
+        line_ranges: None,
+        indent_heuristic: true,
     }
 }
 
 /// Number of unchanged lines of context git keeps around each change in a hunk.
 const HUNK_CONTEXT: usize = 3;
-
-/// Options for [`write_patch_hunks_with`]: hunk shaping and heading lookup.
-///
-/// This is the sley-cli-side option bundle; it carries the repository-coupled
-/// concerns (userdiff funcname driver, sley-cli `DiffColors`, word-diff
-/// config) and is translated into the engine's
-/// [`sley_diff_merge::render::HunkRenderOptions`] by [`write_patch_hunks_with`].
-pub(crate) struct PatchHunkOptions<'a> {
-    /// Lines of context around each change (`-U<n>`, default 3).
-    pub(crate) context: usize,
-    /// Extra inter-hunk merging distance (`--inter-hunk-context`).
-    pub(crate) interhunk: usize,
-    /// Compiled userdiff funcname patterns for the path; `None` selects the
-    /// default `def_ff` heuristic.
-    pub(crate) funcname: Option<&'a commands::userdiff::CompiledFuncname>,
-    /// ANSI palette when color output is enabled.
-    pub(crate) colors: Option<&'a commands::diff_words::DiffColors>,
-    /// Word-diff rendering (replaces the +/- line bodies of each hunk).
-    pub(crate) word_diff: Option<&'a commands::diff_words::WordDiffConfig<'a>>,
-}
-
-impl Default for PatchHunkOptions<'_> {
-    fn default() -> Self {
-        Self {
-            context: HUNK_CONTEXT,
-            interhunk: 0,
-            funcname: None,
-            colors: None,
-            word_diff: None,
-        }
-    }
-}
 
 /// Map a sley-cli [`DiffColors`](commands::diff_words::DiffColors) palette into
 /// the engine's [`RenderColors`](sley_diff_merge::render::RenderColors) borrow.
@@ -3843,8 +3673,9 @@ pub(crate) fn write_patch_hunks(
     out: &mut Vec<u8>,
     old_content: Option<&[u8]>,
     new_content: Option<&[u8]>,
+    options: &crate::DiffRenderOptions<'_>,
 ) {
-    write_patch_hunks_with(out, old_content, new_content, &PatchHunkOptions::default());
+    write_patch_hunks_with(out, old_content, new_content, options);
 }
 
 /// [`write_patch_hunks`] with explicit hunk shaping options.
@@ -3857,10 +3688,20 @@ pub(crate) fn write_patch_hunks_with(
     out: &mut Vec<u8>,
     old_content: Option<&[u8]>,
     new_content: Option<&[u8]>,
-    options: &PatchHunkOptions<'_>,
+    options: &crate::DiffRenderOptions<'_>,
 ) {
     let mut heading = heading_classifier(options.funcname);
-    let mut word_diff = options.word_diff.map(WordDiffAdapter::new);
+    let mut word_diff: Option<WordDiffAdapter> = None;
+    let default_colors = commands::diff_words::DiffColors::default();
+    let mut word_diff_config: Option<commands::diff_words::WordDiffConfig> = None;
+    if let Some(word_request) = options.word_diff {
+        word_diff_config = Some(commands::diff_words::WordDiffConfig {
+            mode: word_request.mode,
+            regex: None,
+            colors: options.colors.unwrap_or(&default_colors),
+        });
+    }
+    word_diff = word_diff_config.as_ref().map(WordDiffAdapter::new);
     let mut render_options = sley_diff_merge::render::HunkRenderOptions {
         context: options.context,
         interhunk: options.interhunk,
@@ -3886,17 +3727,15 @@ fn write_patch_diffstat(
     db: &FileObjectDatabase,
     options: &FormatPatchOptions,
 ) -> Result<()> {
+    let stat_entries = collect_diff_stat_entries(entries, db, None, false)?;
     let mut widths = options.stat_widths;
     if widths.stat_width == 0 {
         // MAIL_DEFAULT_WRAP
         widths.stat_width = 72;
     }
-    write_diff_stat_with_widths(
+    write_diff_stat_materialized_with_widths(
         out,
-        entries,
-        db,
-        None,
-        false,
+        &stat_entries,
         DiffStatOptions {
             compact_summary: false,
             stat_count: options.stat_count,
@@ -3904,181 +3743,6 @@ fn write_patch_diffstat(
         },
         widths,
     )
-}
-
-/// The ` create mode`/` delete mode`/` rename`/` copy`/` mode change` summary
-/// line for a single entry (the `--summary` lines format-patch always includes
-/// when stats are on), mirroring the shared renderer.
-fn write_patch_summary_entry(
-    out: &mut Vec<u8>,
-    entry: &sley_diff_merge::NameStatusEntry,
-) -> Result<()> {
-    match entry.status {
-        sley_diff_merge::NameStatus::Added => {
-            let mode = entry.new_mode.unwrap_or(0);
-            writeln_buf(
-                out,
-                &format!(
-                    " create mode {mode:06o} {}",
-                    status_quote_path(&entry.path, false)
-                ),
-            );
-        }
-        sley_diff_merge::NameStatus::Deleted => {
-            let mode = entry.old_mode.unwrap_or(0);
-            writeln_buf(
-                out,
-                &format!(
-                    " delete mode {mode:06o} {}",
-                    status_quote_path(&entry.path, false)
-                ),
-            );
-        }
-        sley_diff_merge::NameStatus::Renamed(score) => {
-            if let Some(old_path) = &entry.old_path {
-                writeln_buf(
-                    out,
-                    &format!(
-                        " rename {} => {} ({score}%)",
-                        status_quote_path(old_path, false),
-                        status_quote_path(&entry.path, false)
-                    ),
-                );
-            }
-        }
-        sley_diff_merge::NameStatus::Copied(score) => {
-            if let Some(old_path) = &entry.old_path {
-                writeln_buf(
-                    out,
-                    &format!(
-                        " copy {} => {} ({score}%)",
-                        status_quote_path(old_path, false),
-                        status_quote_path(&entry.path, false)
-                    ),
-                );
-            }
-        }
-        sley_diff_merge::NameStatus::Modified => {
-            if entry.old_mode != entry.new_mode
-                && let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
-            {
-                writeln_buf(
-                    out,
-                    &format!(
-                        " mode change {old_mode:06o} => {new_mode:06o} {}",
-                        status_quote_path(&entry.path, false)
-                    ),
-                );
-            }
-        }
-        sley_diff_merge::NameStatus::Unmerged => {}
-    }
-    Ok(())
-}
-
-/// Read the old blob for an entry, if it has one.
-fn entry_old_content(
-    entry: &sley_diff_merge::NameStatusEntry,
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-) -> Result<Option<Vec<u8>>> {
-    if entry.old_mode.is_some_and(sley_index::is_gitlink) {
-        return Ok(entry
-            .old_oid
-            .as_ref()
-            .map(|oid| gitlink_patch_content(format, oid)));
-    }
-    entry
-        .old_oid
-        .as_ref()
-        .map(|oid| read_patch_blob(db, oid))
-        .transpose()
-}
-
-/// Read the new blob for an entry (tree-to-tree; never the worktree), if any.
-fn entry_new_content(
-    entry: &sley_diff_merge::NameStatusEntry,
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-) -> Result<Option<Vec<u8>>> {
-    if entry.new_mode.is_none() {
-        return Ok(None);
-    }
-    if entry.new_mode.is_some_and(sley_index::is_gitlink) {
-        return Ok(entry
-            .new_oid
-            .as_ref()
-            .map(|oid| gitlink_patch_content(format, oid)));
-    }
-    entry
-        .new_oid
-        .as_ref()
-        .map(|oid| read_patch_blob(db, oid))
-        .transpose()
-}
-
-fn gitlink_patch_content(_format: ObjectFormat, oid: &ObjectId) -> Vec<u8> {
-    format!("Subproject commit {oid}\n").into_bytes()
-}
-
-/// Read a blob object's bytes, erroring if the id is not a blob.
-fn read_patch_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
-    let object = db.read_object(oid)?;
-    if object.object_type != ObjectType::Blob {
-        return Err(GitError::InvalidObject(format!(
-            "format-patch expected blob object {oid}"
-        )));
-    }
-    Ok(object.body.clone())
-}
-
-/// Render the `<prefix><path>` token for a `diff --git` line / `Binary files`
-/// line, C-quoting if needed.
-fn patch_prefixed_path(prefix: &str, path: &[u8]) -> String {
-    let mut bytes = Vec::with_capacity(prefix.len() + path.len());
-    bytes.extend_from_slice(prefix.as_bytes());
-    bytes.extend_from_slice(path);
-    status_quote_path(&bytes, false)
-}
-
-/// Render the `<prefix><path>` token for a `---`/`+++` header line. git appends
-/// a literal tab when the (unquoted) name contains a space, so downstream
-/// parsers can find the path boundary.
-fn patch_header_path(prefix: &str, path: &[u8]) -> String {
-    let mut bytes = Vec::with_capacity(prefix.len() + path.len());
-    bytes.extend_from_slice(prefix.as_bytes());
-    bytes.extend_from_slice(path);
-    let mut quoted = status_quote_path(&bytes, false);
-    if !quoted.starts_with('"') && bytes.contains(&b' ') {
-        quoted.push('\t');
-    }
-    quoted
-}
-
-/// Abbreviated (or zero-filled, for /dev/null sides) blob id for an `index`
-/// line, computing it from content when the entry lacks a stored oid.
-fn patch_blob_oid(
-    oid: Option<&ObjectId>,
-    content: Option<&[u8]>,
-    format: ObjectFormat,
-    abbrev: usize,
-) -> String {
-    let hex = oid
-        .cloned()
-        .or_else(|| {
-            content.and_then(|content| sley_core::object_id_for_bytes(format, "blob", content).ok())
-        })
-        .map(|oid| oid.to_hex())
-        .unwrap_or_else(|| "0".repeat(format.hex_len()));
-    hex[..abbrev.min(hex.len())].to_string()
-}
-
-/// The trailing ` <mode>` on an `index` line when the file mode is unchanged.
-fn patch_mode_suffix(entry: &sley_diff_merge::NameStatusEntry) -> String {
-    match (entry.old_mode, entry.new_mode) {
-        (Some(old_mode), Some(new_mode)) if old_mode == new_mode => format!(" {old_mode:06o}"),
-        _ => String::new(),
-    }
 }
 
 /// Append `text` plus a newline to the buffer.

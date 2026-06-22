@@ -1781,17 +1781,15 @@ fn print_rebase_diffstat(
         return Ok(());
     }
     let mut stdout = io::stdout();
+    let stat_entries = collect_diff_stat_entries(entries.as_slice(), db, None, false)?;
     // The diffstat rows + the "N file changed …" trailer (already emitted by
     // `write_diff_stat`). It is NOT followed by a separate shortstat — emitting
     // one double-printed the "N file changed" line (t3404 "verbose flag is
     // heeded"). Tree-to-tree diff: the "new" side is the target tree's blobs,
     // never the worktree (so `use_worktree_new = false`).
-    write_diff_stat(
+    write_diff_stat_materialized(
         &mut stdout,
-        &entries,
-        db,
-        None,
-        false,
+        &stat_entries,
         DiffStatOptions {
             compact_summary: false,
             stat_count: None,

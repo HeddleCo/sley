@@ -1769,7 +1769,7 @@ fn rev_list_render_tree_to_tree_patch(
         write_diff_patch_entry(
             &mut out,
             entry,
-            DiffPatchOptions {
+            DiffRenderOptions {
                 db,
                 worktree_root: None,
                 use_worktree_new: false,
@@ -1779,6 +1779,7 @@ fn rev_list_render_tree_to_tree_patch(
                 dst_prefix: "b/",
                 context: 3,
                 userdiff: None,
+                funcname: None,
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,

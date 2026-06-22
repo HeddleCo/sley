@@ -143,7 +143,7 @@ struct ShowOptions {
     /// `--ignore-blank-lines`.
     ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
-    ignore_regexes: Vec<crate::grep_source::Regex>,
+    ignore_regexes: Vec<sley_grep::Regex>,
     /// `--word-diff` rendering mode.
     word_diff_mode: Option<commands::diff_words::WordDiffMode>,
     /// `--word-diff-regex` / `--color-words=<regex>` override.
@@ -152,7 +152,7 @@ struct ShowOptions {
     color_always: bool,
     /// `--grep=<pattern>` commit-message filters.
     grep_patterns: Vec<String>,
-    grep_pattern_kind: crate::grep_source::PatternKind,
+    grep_pattern_kind: sley_grep::PatternKind,
     grep_pattern_kind_explicit: bool,
     grep_ignore_case: bool,
     grep_all_match: bool,
@@ -278,7 +278,7 @@ impl Default for ShowOptions {
             word_diff_regex: None,
             color_always: false,
             grep_patterns: Vec::new(),
-            grep_pattern_kind: crate::grep_source::PatternKind::Basic,
+            grep_pattern_kind: sley_grep::PatternKind::Basic,
             grep_pattern_kind_explicit: false,
             grep_ignore_case: false,
             grep_all_match: false,
@@ -332,7 +332,7 @@ impl super::grep_args::GrepArgOptions for ShowOptions {
         &mut self.grep_patterns
     }
 
-    fn grep_pattern_kind_mut(&mut self) -> &mut crate::grep_source::PatternKind {
+    fn grep_pattern_kind_mut(&mut self) -> &mut sley_grep::PatternKind {
         &mut self.grep_pattern_kind
     }
 
@@ -547,7 +547,7 @@ fn show_tip_matches_grep(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     oid: &ObjectId,
-    matcher: Option<&crate::grep_source::GrepMatcher>,
+    matcher: Option<&sley_grep::GrepMatcher>,
     all_match: bool,
     invert: bool,
 ) -> Result<bool> {
@@ -1145,20 +1145,18 @@ fn write_merge_stat(
     entries: &[sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
     let color = diff_color_enabled(config);
+    let stat_entries = collect_diff_stat_entries(entries, db, None, false)?;
     if options.numstat {
-        for entry in entries {
-            write_diff_numstat_entry(stdout, entry, false, db, None, false)?;
+        for entry in &stat_entries {
+            write_diff_numstat_materialized_entry(stdout, entry.entry, entry.stats, false)?;
         }
     }
     if options.stat || options.compact_summary {
         let mut stat_widths = options.stat_widths;
         stat_widths.resolve_config(config);
-        write_diff_stat_with_widths(
+        write_diff_stat_materialized_with_widths(
             stdout,
-            entries,
-            db,
-            None,
-            false,
+            &stat_entries,
             DiffStatOptions {
                 compact_summary: options.compact_summary,
                 stat_count: options.stat_count,
@@ -1168,7 +1166,7 @@ fn write_merge_stat(
         )?;
     }
     if options.shortstat {
-        write_diff_shortstat(stdout, entries, db, None, false)?;
+        write_diff_shortstat_materialized(stdout, &stat_entries)?;
     }
     if options.summary {
         for entry in entries {
@@ -1191,6 +1189,12 @@ fn write_show_combined(
 ) -> Result<()> {
     let options = context.options;
     let db = context.db;
+    let stat_entries = if options.numstat || options.stat || options.compact_summary || options.shortstat
+    {
+        collect_diff_stat_entries(entries, db, None, false)?
+    } else {
+        Vec::new()
+    };
     let format = context.format;
     let dense = matches!(layout.merge_mode, ShowMergeMode::Combined { dense: true });
 
@@ -1391,58 +1395,20 @@ fn write_commit_diff_patch(
     };
     let color = diff_color_enabled(config);
 
-    let show_stat = options.stat || options.compact_summary;
     let show_patch = options.shows_patch_body();
-    let mut wrote_prefix = false;
+    let stat_entries = if options.numstat || options.stat || options.compact_summary || options.shortstat {
+        collect_diff_stat_entries(entries, db, None, false)?
+    } else {
+        Vec::new()
+    };
 
     if entries.is_empty() {
         return Ok(());
     }
 
-    if options.raw {
-        for entry in entries {
-            write_diff_raw_entry(stdout, entry, false, false, raw_abbrev, format)?;
-        }
-        wrote_prefix = true;
-    }
-    if options.numstat {
-        for entry in entries {
-            write_diff_numstat_entry(stdout, entry, false, db, None, false)?;
-        }
-        wrote_prefix = true;
-    }
-    if show_stat {
-        let mut stat_widths = options.stat_widths;
-        stat_widths.resolve_config(config);
-        write_diff_stat_with_widths(
-            stdout,
-            entries,
-            db,
-            None,
-            false,
-            DiffStatOptions {
-                compact_summary: options.compact_summary,
-                stat_count: options.stat_count,
-                color,
-            },
-            stat_widths,
-        )?;
-        wrote_prefix = true;
-    }
-    if options.shortstat {
-        write_diff_shortstat(stdout, entries, db, None, false)?;
-        wrote_prefix = true;
-    }
-    if options.summary {
-        for entry in entries {
-            write_diff_summary_entry(stdout, entry)?;
-        }
-        wrote_prefix = true;
-    }
+    let mut stat_widths = options.stat_widths;
+    stat_widths.resolve_config(config);
     if show_patch {
-        if wrote_prefix {
-            writeln!(stdout)?;
-        }
         let userdiff_attributes = worktree_root_for_git_dir(git_dir)
             .ok()
             .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
@@ -1458,38 +1424,105 @@ fn write_commit_diff_patch(
             mode,
             cli_regex: options.word_diff_regex.as_deref(),
         });
-        for entry in entries {
-            let patch_options = DiffPatchOptions {
-                db,
-                worktree_root: None,
-                use_worktree_new: false,
-                format,
-                abbrev: patch_abbrev,
-                src_prefix: "a/",
-                dst_prefix: "b/",
-                context: 3,
-                userdiff: Some(&userdiff),
-                colors: colors.as_ref(),
-                word_diff: word_request.as_ref(),
-                no_index_contents: None,
-                submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
-                submodule_dirt: None,
-                ws_error: None,
-                color_moved: None,
-                interhunk: 0,
-                ws_ignore: options.ws_ignore,
-                diff_algorithm: options.diff_algorithm,
-                ignore_blank_lines: options.ignore_blank_lines,
-                ignore_regexes: &options.ignore_regexes,
-                line_ranges: None,
-                indent_heuristic: options.indent_heuristic.unwrap_or_else(|| {
-                    config
-                        .get_bool("diff", None, "indentheuristic")
-                        .unwrap_or(true)
-                }),
-            };
-            write_diff_patch_entry(stdout, entry, patch_options)?;
-        }
+        render_diff_entries(
+            stdout,
+            entries,
+            DiffEntryRenderModes {
+                raw: options.raw,
+                numstat: options.numstat,
+                stat: options.stat || options.compact_summary,
+                shortstat: options.shortstat,
+                summary: options.summary,
+                patch: true,
+            },
+            DiffEntryRenderContext {
+                raw: DiffEntryRawRenderOptions {
+                    z: false,
+                    abbrev: raw_abbrev,
+                    format,
+                },
+                stat: DiffEntryStatRenderOptions {
+                    source: Some(DiffEntryStatSource::Materialized(&stat_entries)),
+                    z: false,
+                    options: DiffStatOptions {
+                        compact_summary: options.compact_summary,
+                        stat_count: options.stat_count,
+                        color,
+                    },
+                    widths: Some(stat_widths),
+                },
+                prefix_already_written: false,
+                after_stat: None,
+            },
+            |_| false,
+            |stdout, entry| {
+                let patch_options = DiffRenderOptions {
+                    db,
+                    worktree_root: None,
+                    use_worktree_new: false,
+                    format,
+                    abbrev: patch_abbrev,
+                    src_prefix: "a/",
+                    dst_prefix: "b/",
+                    context: 3,
+                    userdiff: Some(&userdiff),
+                    funcname: None,
+                    colors: colors.as_ref(),
+                    word_diff: word_request.as_ref(),
+                    no_index_contents: None,
+                    submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                    submodule_dirt: None,
+                    ws_error: None,
+                    color_moved: None,
+                    interhunk: 0,
+                    ws_ignore: options.ws_ignore,
+                    diff_algorithm: options.diff_algorithm,
+                    ignore_blank_lines: options.ignore_blank_lines,
+                    ignore_regexes: &options.ignore_regexes,
+                    line_ranges: None,
+                    indent_heuristic: options.indent_heuristic.unwrap_or_else(|| {
+                        config
+                            .get_bool("diff", None, "indentheuristic")
+                            .unwrap_or(true)
+                    }),
+                };
+                write_diff_patch_entry(stdout, entry, patch_options)
+            },
+        )?;
+    } else {
+        render_diff_entries(
+            stdout,
+            entries,
+            DiffEntryRenderModes {
+                raw: options.raw,
+                numstat: options.numstat,
+                stat: options.stat || options.compact_summary,
+                shortstat: options.shortstat,
+                summary: options.summary,
+                patch: false,
+            },
+            DiffEntryRenderContext {
+                raw: DiffEntryRawRenderOptions {
+                    z: false,
+                    abbrev: raw_abbrev,
+                    format,
+                },
+                stat: DiffEntryStatRenderOptions {
+                    source: Some(DiffEntryStatSource::Materialized(&stat_entries)),
+                    z: false,
+                    options: DiffStatOptions {
+                        compact_summary: options.compact_summary,
+                        stat_count: options.stat_count,
+                        color,
+                    },
+                    widths: Some(stat_widths),
+                },
+                prefix_already_written: false,
+                after_stat: None,
+            },
+            |_| false,
+            |_, _| Ok(()),
+        )?;
     }
     Ok(())
 }

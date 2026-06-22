@@ -3,7 +3,7 @@
 //! (`diff_words_styles`, `fn_out_diff_words_aux`, `find_word_boundaries`,
 //! `diff_words_fill`, `emit_hunk_header`).
 
-use crate::grep_source::Regex;
+use sley_grep::Regex;
 use crate::*;
 
 /// ANSI palette for colored diff output. Each slot holds the escape sequence

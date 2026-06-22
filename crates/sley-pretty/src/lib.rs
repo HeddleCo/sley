@@ -4,14 +4,181 @@
 //! stream + a [`FormatTier`] that describes how much commit data emission needs).
 //! Command fast paths consult the tier instead of hand-maintained string guards.
 
+#![allow(
+    clippy::if_same_then_else,
+    clippy::manual_contains,
+    clippy::needless_question_mark
+)]
+
 use sley_core::{GitError, Result};
 use sley_strbuf_expand::{
     AtomSyntax, AtomTable, ExpandFormat, ExpandOptions, ExpandSegment, LiteralHex,
 };
 use std::cell::Cell;
 
+// ---------------------------------------------------------------------------
+// %(trailers) / %(contents:trailers) — a focused port of git's
+// format_trailers_from_commit (trailer.c) restricted to the for-each-ref atom
+// option set: only, unfold, keyonly, valueonly, key, separator,
+// key_value_separator.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+pub struct ForEachRefTrailerOptions {
+    pub only: bool,
+    pub unfold: bool,
+    pub key_only: bool,
+    pub value_only: bool,
+    /// `Some` when any `key=` filter was given; lookups are case-insensitive.
+    pub filter: Option<Vec<String>>,
+    pub separator: Option<String>,
+    pub key_value_separator: Option<String>,
+}
+
+/// Parse the `%(trailers:...)` option string (the part after the colon, with a
+/// synthetic trailing `)` removed). `Err(None)` => `expected %(trailers:key=...)`;
+/// `Err(Some(arg))` => `unknown %(trailers) argument: arg`.
+pub fn parse_for_each_ref_trailer_options(
+    arg: &str,
+) -> std::result::Result<ForEachRefTrailerOptions, Option<String>> {
+    let mut options = ForEachRefTrailerOptions::default();
+    let mut rest = arg;
+    loop {
+        if rest.is_empty() {
+            break;
+        }
+        if let Some((value, tail)) = for_each_ref_match_arg_value(rest, "key") {
+            // git: a `key` with no `=value` is an error (-1 -> expected ...).
+            let Some(value) = value else {
+                return Err(None);
+            };
+            let value = value.strip_suffix(':').unwrap_or(value);
+            options
+                .filter
+                .get_or_insert_with(Vec::new)
+                .push(value.to_string());
+            options.only = true;
+            rest = tail;
+        } else if let Some((value, tail)) = for_each_ref_match_arg_value(rest, "separator") {
+            options.separator = Some(for_each_ref_expand_string_arg(value.unwrap_or("")));
+            rest = tail;
+        } else if let Some((value, tail)) =
+            for_each_ref_match_arg_value(rest, "key_value_separator")
+        {
+            options.key_value_separator = Some(for_each_ref_expand_string_arg(value.unwrap_or("")));
+            rest = tail;
+        } else if let Some(tail) = for_each_ref_match_bool_arg(rest, "only", &mut options.only) {
+            rest = tail;
+        } else if let Some(tail) = for_each_ref_match_bool_arg(rest, "unfold", &mut options.unfold)
+        {
+            rest = tail;
+        } else if let Some(tail) =
+            for_each_ref_match_bool_arg(rest, "keyonly", &mut options.key_only)
+        {
+            rest = tail;
+        } else if let Some(tail) =
+            for_each_ref_match_bool_arg(rest, "valueonly", &mut options.value_only)
+        {
+            rest = tail;
+        } else {
+            // git: invalid_arg = up to the next ',' or ')'.
+            let len = rest.find([',', ')']).unwrap_or(rest.len());
+            return Err(Some(rest[..len].to_string()));
+        }
+    }
+    Ok(options)
+}
+
+/// git `match_placeholder_arg_value`: match `candidate` at the start of `to_parse`
+/// followed by `=value` (until `,`/`)`), or bare (followed by `,`/end). Returns
+/// `(value, remainder)` on a match. The input has no trailing `)` (we operate on
+/// the comma-joined option list directly), so end-of-string acts like `)`.
+fn for_each_ref_match_arg_value<'a>(
+    to_parse: &'a str,
+    candidate: &str,
+) -> Option<(Option<&'a str>, &'a str)> {
+    let p = to_parse.strip_prefix(candidate)?;
+    if let Some(after_eq) = p.strip_prefix('=') {
+        let len = after_eq.find([',', ')']).unwrap_or(after_eq.len());
+        let value = &after_eq[..len];
+        let p = &after_eq[len..];
+        let tail = p.strip_prefix(',').unwrap_or(p);
+        Some((Some(value), tail))
+    } else if let Some(tail) = p.strip_prefix(',') {
+        Some((None, tail))
+    } else if p.is_empty() || p.starts_with(')') {
+        Some((None, p.strip_prefix(')').unwrap_or(p)))
+    } else {
+        None
+    }
+}
+
+/// git `match_placeholder_bool_arg` for the value-less boolean options used by
+/// for-each-ref (`only`/`unfold`/`keyonly`/`valueonly`), incl. `=yes/no/...`.
+fn for_each_ref_match_bool_arg<'a>(
+    to_parse: &'a str,
+    candidate: &str,
+    out: &mut bool,
+) -> Option<&'a str> {
+    let (value, tail) = for_each_ref_match_arg_value(to_parse, candidate)?;
+    match value {
+        None => {
+            *out = true;
+            Some(tail)
+        }
+        Some(value) => match for_each_ref_parse_maybe_bool(value) {
+            Some(v) => {
+                *out = v;
+                Some(tail)
+            }
+            // git returns 0 here (no match) so the option falls through to the
+            // unknown-argument path.
+            None => None,
+        },
+    }
+}
+
+fn for_each_ref_parse_maybe_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "yes" | "true" => Some(true),
+        "0" | "no" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// git `expand_string_arg`: only `%%` and `%x##` literal escapes are expanded;
+/// any other `%` is emitted verbatim.
+fn for_each_ref_expand_string_arg(arg: &str) -> String {
+    let bytes = arg.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] != b'%' {
+            out.push(bytes[idx]);
+            idx += 1;
+            continue;
+        }
+        if bytes.get(idx + 1) == Some(&b'%') {
+            out.push(b'%');
+            idx += 2;
+        } else if bytes.get(idx + 1) == Some(&b'x')
+            && let (Some(h), Some(l)) = (
+                bytes.get(idx + 2).and_then(|b| (*b as char).to_digit(16)),
+                bytes.get(idx + 3).and_then(|b| (*b as char).to_digit(16)),
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            idx += 4;
+        } else {
+            out.push(b'%');
+            idx += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LogFormatDialect {
+pub enum LogFormatDialect {
     Log,
     RevList,
     Stash,
@@ -20,7 +187,7 @@ pub(crate) enum LogFormatDialect {
 /// How much commit data a format needs to render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[allow(dead_code)]
-pub(crate) enum FormatTier {
+pub enum FormatTier {
     /// `%H` (and literals / no-op color codes only).
     OidOnly,
     /// Oids + parents + left/right marker — satisfied by [`CommitMetadata`].
@@ -32,34 +199,34 @@ pub(crate) enum FormatTier {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct FormatFields(u16);
+pub struct FormatFields(u16);
 
 #[allow(dead_code)]
 impl FormatFields {
-    pub(crate) const OID: Self = Self(1 << 0);
-    pub(crate) const TREE: Self = Self(1 << 1);
-    pub(crate) const PARENTS: Self = Self(1 << 2);
-    pub(crate) const SUBJECT: Self = Self(1 << 3);
-    pub(crate) const BODY: Self = Self(1 << 4);
-    pub(crate) const AUTHOR: Self = Self(1 << 5);
-    pub(crate) const COMMITTER: Self = Self(1 << 6);
-    pub(crate) const ENCODING: Self = Self(1 << 7);
-    pub(crate) const DECORATIONS: Self = Self(1 << 8);
-    pub(crate) const REV_SOURCE: Self = Self(1 << 9);
+    pub const OID: Self = Self(1 << 0);
+    pub const TREE: Self = Self(1 << 1);
+    pub const PARENTS: Self = Self(1 << 2);
+    pub const SUBJECT: Self = Self(1 << 3);
+    pub const BODY: Self = Self(1 << 4);
+    pub const AUTHOR: Self = Self(1 << 5);
+    pub const COMMITTER: Self = Self(1 << 6);
+    pub const ENCODING: Self = Self(1 << 7);
+    pub const DECORATIONS: Self = Self(1 << 8);
+    pub const REV_SOURCE: Self = Self(1 << 9);
 
-    pub(crate) const fn contains(self, other: Self) -> bool {
+    pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
-    pub(crate) const fn intersects(self, other: Self) -> bool {
+    pub const fn intersects(self, other: Self) -> bool {
         self.0 & other.0 != 0
     }
 
-    pub(crate) const fn is_empty(self) -> bool {
+    pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
-    pub(crate) fn tier(self) -> FormatTier {
+    pub fn tier(self) -> FormatTier {
         if self.intersects(
             Self::BODY | Self::AUTHOR | Self::COMMITTER | Self::ENCODING | Self::DECORATIONS,
         ) {
@@ -95,7 +262,7 @@ impl std::ops::BitOr for FormatFields {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FormatToken {
+pub enum FormatToken {
     Literal(String),
     Percent,
     OidFull,
@@ -193,7 +360,7 @@ pub(crate) enum FormatToken {
 
 /// git's per-placeholder magic prefix (`%-`/`%+`/`% `).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MagicPrefix {
+pub enum MagicPrefix {
     /// `%-`: delete preceding newline(s) when the placeholder is empty.
     DelLfBeforeEmpty,
     /// `%+`: insert a newline before a non-empty placeholder.
@@ -203,11 +370,11 @@ pub(crate) enum MagicPrefix {
 }
 
 /// A parsed `%<`/`%>`/... padding placeholder.
-pub(crate) type PaddingSpec = sley_strbuf_expand::PaddingSpec;
+pub type PaddingSpec = sley_strbuf_expand::PaddingSpec;
 
 /// A parsed `%w(width,indent1,indent2)` wrap directive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct WrapSpec {
+pub struct WrapSpec {
     pub width: usize,
     pub indent1: usize,
     pub indent2: usize,
@@ -215,7 +382,7 @@ pub(crate) struct WrapSpec {
 
 /// A parsed `%(decorate[:opts])` placeholder.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DecorateSpec {
+pub struct DecorateSpec {
     pub prefix: String,
     pub suffix: String,
     pub separator: String,
@@ -237,7 +404,7 @@ impl Default for DecorateSpec {
 
 /// A parsed `%(describe[:opts])` placeholder.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct DescribeSpec {
+pub struct DescribeSpec {
     pub tags: bool,
     pub abbrev: Option<usize>,
     pub matches: Vec<String>,
@@ -245,7 +412,7 @@ pub(crate) struct DescribeSpec {
 }
 
 impl FormatToken {
-    pub(crate) fn is_metadata_emitable(&self) -> bool {
+    pub fn is_metadata_emitable(&self) -> bool {
         matches!(
             self,
             FormatToken::Literal(_)
@@ -266,16 +433,16 @@ impl FormatToken {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CompiledLogFormat {
+pub struct CompiledLogFormat {
     pub tokens: Vec<FormatToken>,
     pub fields: FormatFields,
     pub dialect: LogFormatDialect,
-    pub(crate) expand: ExpandFormat<FormatToken>,
+    pub expand: ExpandFormat<FormatToken>,
     token_segments: Vec<usize>,
 }
 
 impl CompiledLogFormat {
-    pub(crate) fn compile(format: &str, dialect: LogFormatDialect) -> Result<Self> {
+    pub fn compile(format: &str, dialect: LogFormatDialect) -> Result<Self> {
         let table = LogFormatAtomTable {
             dialect,
             fields: Cell::new(FormatFields::default()),
@@ -300,29 +467,29 @@ impl CompiledLogFormat {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn tier(&self) -> FormatTier {
+    pub fn tier(&self) -> FormatTier {
         self.fields.tier()
     }
 
-    pub(crate) fn uses_decorations(&self) -> bool {
+    pub fn uses_decorations(&self) -> bool {
         self.fields.contains(FormatFields::DECORATIONS)
     }
 
-    pub(crate) fn uses_parents(&self) -> bool {
+    pub fn uses_parents(&self) -> bool {
         self.fields.contains(FormatFields::PARENTS)
     }
 
-    pub(crate) fn uses_oid(&self) -> bool {
+    pub fn uses_oid(&self) -> bool {
         self.fields.contains(FormatFields::OID)
     }
 
-    pub(crate) fn uses_source(&self) -> bool {
+    pub fn uses_source(&self) -> bool {
         self.fields.contains(FormatFields::REV_SOURCE)
     }
 
     /// True when the format emits only full oids (`%H`) plus inert literals/newlines.
     #[allow(dead_code)]
-    pub(crate) fn is_oid_only(&self) -> bool {
+    pub fn is_oid_only(&self) -> bool {
         self.tokens
             .iter()
             .any(|token| *token == FormatToken::OidFull)
@@ -333,11 +500,11 @@ impl CompiledLogFormat {
     }
 
     /// True when every token can be rendered from [`sley_rev::CommitMetadata`] alone.
-    pub(crate) fn is_metadata_emitable(&self) -> bool {
+    pub fn is_metadata_emitable(&self) -> bool {
         !self.tokens.is_empty() && self.tokens.iter().all(|t| t.is_metadata_emitable())
     }
 
-    pub(crate) fn insert_parents_after_oid(&mut self) {
+    pub fn insert_parents_after_oid(&mut self) {
         for index in 0..self.tokens.len() {
             match self.tokens[index] {
                 FormatToken::OidFull => {
@@ -366,7 +533,7 @@ impl CompiledLogFormat {
         self.token_segments = token_segments_from_expand(&self.expand);
     }
 
-    pub(crate) fn segment_range_for_tokens(
+    pub fn segment_range_for_tokens(
         &self,
         token_range: std::ops::Range<usize>,
     ) -> std::ops::Range<usize> {
@@ -384,7 +551,7 @@ impl CompiledLogFormat {
     }
 
     /// Pre-size a line buffer for one emission pass.
-    pub(crate) fn estimated_line_capacity(&self) -> usize {
+    pub fn estimated_line_capacity(&self) -> usize {
         self.tokens.iter().fold(64usize, |acc, token| {
             acc + match token {
                 FormatToken::Literal(text) => text.len(),
@@ -569,7 +736,7 @@ fn parse_parenthesized_atom(
         let opts = opts.strip_prefix(':').unwrap_or("");
         if !(inner == "trailers" || inner.starts_with("trailers:"))
             || (!opts.is_empty()
-                && crate::commands::for_each_ref::parse_for_each_ref_trailer_options(opts).is_err())
+                && parse_for_each_ref_trailer_options(opts).is_err())
         {
             return Ok(literal());
         }
@@ -1031,15 +1198,15 @@ fn expand_decorate_value(arg: &str) -> String {
 }
 
 /// git `term_columns()`: respects COLUMNS env, defaults to 80.
-pub(crate) fn term_columns() -> i64 {
+pub fn term_columns() -> i64 {
     sley_strbuf_expand::term_columns() as i64
 }
 
-pub(crate) mod presets {
+pub mod presets {
     use super::{CompiledLogFormat, LogFormatDialect, Result};
 
     /// `git log --oneline` / `--pretty=oneline` (%h/%H + optional %d + subject).
-    pub(crate) fn log_oneline(
+    pub fn log_oneline(
         decorate: bool,
         full_oid: bool,
         parents: bool,
@@ -1058,7 +1225,7 @@ pub(crate) mod presets {
     }
 
     /// `rev-list --oneline`.
-    pub(crate) fn rev_list_oneline() -> Result<CompiledLogFormat> {
+    pub fn rev_list_oneline() -> Result<CompiledLogFormat> {
         CompiledLogFormat::compile("%h %s", LogFormatDialect::RevList)
     }
 }

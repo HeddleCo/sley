@@ -551,7 +551,7 @@ fn build_patch_text(
         write_diff_patch_entry(
             &mut raw,
             entry,
-            DiffPatchOptions {
+            DiffRenderOptions {
                 db,
                 worktree_root: None,
                 use_worktree_new: false,
@@ -561,6 +561,7 @@ fn build_patch_text(
                 dst_prefix: "",
                 context: 3,
                 userdiff: None,
+                funcname: None,
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,
