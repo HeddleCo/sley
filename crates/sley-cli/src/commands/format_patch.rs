@@ -3884,17 +3884,15 @@ fn write_patch_diffstat(
     db: &FileObjectDatabase,
     options: &FormatPatchOptions,
 ) -> Result<()> {
+    let stat_entries = collect_diff_stat_entries(entries, db, None, false)?;
     let mut widths = options.stat_widths;
     if widths.stat_width == 0 {
         // MAIL_DEFAULT_WRAP
         widths.stat_width = 72;
     }
-    write_diff_stat_with_widths(
+    write_diff_stat_materialized_with_widths(
         out,
-        entries,
-        db,
-        None,
-        false,
+        &stat_entries,
         DiffStatOptions {
             compact_summary: false,
             stat_count: options.stat_count,

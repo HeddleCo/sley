@@ -1145,20 +1145,18 @@ fn write_merge_stat(
     entries: &[sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
     let color = diff_color_enabled(config);
+    let stat_entries = collect_diff_stat_entries(entries, db, None, false)?;
     if options.numstat {
-        for entry in entries {
-            write_diff_numstat_entry(stdout, entry, false, db, None, false)?;
+        for entry in &stat_entries {
+            write_diff_numstat_materialized_entry(stdout, entry.entry, entry.stats, false)?;
         }
     }
     if options.stat || options.compact_summary {
         let mut stat_widths = options.stat_widths;
         stat_widths.resolve_config(config);
-        write_diff_stat_with_widths(
+        write_diff_stat_materialized_with_widths(
             stdout,
-            entries,
-            db,
-            None,
-            false,
+            &stat_entries,
             DiffStatOptions {
                 compact_summary: options.compact_summary,
                 stat_count: options.stat_count,
@@ -1168,7 +1166,7 @@ fn write_merge_stat(
         )?;
     }
     if options.shortstat {
-        write_diff_shortstat(stdout, entries, db, None, false)?;
+        write_diff_shortstat_materialized(stdout, &stat_entries)?;
     }
     if options.summary {
         for entry in entries {
@@ -1191,6 +1189,12 @@ fn write_show_combined(
 ) -> Result<()> {
     let options = context.options;
     let db = context.db;
+    let stat_entries = if options.numstat || options.stat || options.compact_summary || options.shortstat
+    {
+        collect_diff_stat_entries(entries, db, None, false)?
+    } else {
+        Vec::new()
+    };
     let format = context.format;
     let dense = matches!(layout.merge_mode, ShowMergeMode::Combined { dense: true });
 
@@ -1392,6 +1396,11 @@ fn write_commit_diff_patch(
     let color = diff_color_enabled(config);
 
     let show_patch = options.shows_patch_body();
+    let stat_entries = if options.numstat || options.stat || options.compact_summary || options.shortstat {
+        collect_diff_stat_entries(entries, db, None, false)?
+    } else {
+        Vec::new()
+    };
 
     if entries.is_empty() {
         return Ok(());
@@ -1433,11 +1442,7 @@ fn write_commit_diff_patch(
                     format,
                 },
                 stat: DiffEntryStatRenderOptions {
-                    source: Some(DiffEntryStatSource::Entries {
-                        db,
-                        worktree_root: None,
-                        use_worktree_new: false,
-                    }),
+                    source: Some(DiffEntryStatSource::Materialized(&stat_entries)),
                     z: false,
                     options: DiffStatOptions {
                         compact_summary: options.compact_summary,
@@ -1503,11 +1508,7 @@ fn write_commit_diff_patch(
                     format,
                 },
                 stat: DiffEntryStatRenderOptions {
-                    source: Some(DiffEntryStatSource::Entries {
-                        db,
-                        worktree_root: None,
-                        use_worktree_new: false,
-                    }),
+                    source: Some(DiffEntryStatSource::Materialized(&stat_entries)),
                     z: false,
                     options: DiffStatOptions {
                         compact_summary: options.compact_summary,
