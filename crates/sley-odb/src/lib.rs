@@ -2195,7 +2195,7 @@ fn prune_pack_paths_matching<'a>(
         if !should_prune(pack_path)? {
             continue;
         }
-        remove_file_if_exists(&pack_path)?;
+        remove_file_if_exists(pack_path)?;
         remove_file_if_exists(&pack_path.with_extension("idx"))?;
         for ext in ["rev", "mtimes", "bitmap"] {
             remove_file_if_exists(&pack_path.with_extension(ext))?;
