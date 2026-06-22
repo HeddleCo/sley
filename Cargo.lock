@@ -1239,6 +1239,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sley-grep"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+]
+
+[[package]]
 name = "sley-index"
 version = "0.1.0"
 dependencies = [
