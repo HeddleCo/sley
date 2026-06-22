@@ -4386,9 +4386,9 @@ fn commit_symbolic_ref_update(tx: sley_refs::FileRefTransaction<'_>) -> Result<(
     match tx.commit() {
         Ok(()) => Ok(()),
         Err(GitError::Transaction(message)) if message.starts_with("cannot lock ref '") => {
-            let detail = message
-                .split_once(": ")
-                .map(|(_, detail)| detail)
+            let detail = parse_df_conflict_message(&message)
+                .filter(|(new_ref, existing_ref)| existing_ref.starts_with(&format!("{new_ref}/")))
+                .and_then(|_| message.split_once(": ").map(|(_, detail)| detail))
                 .unwrap_or(&message);
             eprintln!("error: {detail}");
             Err(GitError::Exit(1))
