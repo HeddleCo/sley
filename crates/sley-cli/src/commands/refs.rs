@@ -3627,9 +3627,15 @@ fn update_ref_effective_ref(
     }
     let mut current = requested.clone();
     for _ in 0..16 {
-        match store.read_ref(&current)? {
-            Some(RefTarget::Symbolic(target)) => current = target,
-            _ => break,
+        match store.read_ref(&current) {
+            Ok(Some(RefTarget::Symbolic(target))) => current = target,
+            Ok(_) => break,
+            Err(GitError::InvalidPath(_))
+                if sley_refs::validate_ref_name_for_update(&current).is_ok() =>
+            {
+                break;
+            }
+            Err(err) => return Err(err),
         }
     }
     Ok(EffectiveRefName {

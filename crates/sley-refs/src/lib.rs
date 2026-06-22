@@ -5012,6 +5012,9 @@ pub fn validate_ref_name_for_read(name: &str) -> Result<()> {
     if is_root_ref_syntax(name) {
         return Ok(());
     }
+    if check_refname_format(name, true).is_ok() {
+        return Ok(());
+    }
     validate_ref_path_safe_for_read(name)
 }
 
@@ -5022,7 +5025,7 @@ pub fn validate_ref_name_for_update(name: &str) -> Result<()> {
     if is_root_ref_syntax(name) {
         return Ok(());
     }
-    Err(GitError::InvalidPath(format!("invalid ref name {name}")))
+    check_refname_format(name, true)
 }
 
 /// git's is_root_ref_syntax (refs.c): a ref name made only of uppercase ASCII,
