@@ -3594,78 +3594,6 @@ fn format_patch_diff_options<'a>(
 /// Number of unchanged lines of context git keeps around each change in a hunk.
 const HUNK_CONTEXT: usize = 3;
 
-/// Map a sley-cli [`DiffColors`](commands::diff_words::DiffColors) palette into
-/// the engine's [`RenderColors`](sley_diff_merge::render::RenderColors) borrow.
-pub(crate) fn render_colors(
-    colors: &commands::diff_words::DiffColors,
-) -> sley_diff_merge::render::RenderColors<'_> {
-    sley_diff_merge::render::RenderColors {
-        frag: &colors.frag,
-        func: &colors.func,
-        old: &colors.old,
-        new: &colors.new,
-        context: &colors.context,
-        reset: &colors.reset,
-        whitespace: &colors.whitespace,
-        old_moved: &colors.old_moved,
-        old_moved_alt: &colors.old_moved_alt,
-        old_moved_dim: &colors.old_moved_dim,
-        old_moved_alt_dim: &colors.old_moved_alt_dim,
-        new_moved: &colors.new_moved,
-        new_moved_alt: &colors.new_moved_alt,
-        new_moved_dim: &colors.new_moved_dim,
-        new_moved_alt_dim: &colors.new_moved_alt_dim,
-    }
-}
-
-/// Bridge a sley-cli word-diff config + its line buffers into the engine's
-/// [`HunkWordDiff`](sley_diff_merge::render::HunkWordDiff) hook. The engine
-/// owns hunk shaping; this adapter owns the word-level rendering.
-pub(crate) struct WordDiffAdapter<'a> {
-    config: &'a commands::diff_words::WordDiffConfig<'a>,
-    buffers: commands::diff_words::WordDiffBuffers,
-}
-
-impl<'a> WordDiffAdapter<'a> {
-    pub(crate) fn new(config: &'a commands::diff_words::WordDiffConfig<'a>) -> Self {
-        Self {
-            config,
-            buffers: commands::diff_words::WordDiffBuffers::new(),
-        }
-    }
-}
-
-impl sley_diff_merge::render::HunkWordDiff for WordDiffAdapter<'_> {
-    fn push_minus(&mut self, content: &[u8]) {
-        self.buffers.push_minus(content);
-    }
-
-    fn push_plus(&mut self, content: &[u8]) {
-        self.buffers.push_plus(content);
-    }
-
-    fn flush(&mut self, out: &mut Vec<u8>) {
-        self.buffers.flush(out, self.config);
-    }
-
-    fn emit_context_line(&mut self, out: &mut Vec<u8>, content: &[u8]) {
-        commands::diff_words::WordDiffBuffers::emit_context_line(out, self.config, content);
-    }
-}
-
-/// A per-line section-heading classifier matching git's funcname resolution:
-/// a userdiff `xfuncname` pattern when a driver is present, else the default
-/// `def_ff` heuristic. Returned as a closure for the engine's
-/// [`HeadingFn`](sley_diff_merge::render::HeadingFn) seam.
-pub(crate) fn heading_classifier<'a>(
-    funcname: Option<&'a commands::userdiff::CompiledFuncname>,
-) -> impl FnMut(&[u8]) -> Option<Vec<u8>> + 'a {
-    move |line: &[u8]| match funcname {
-        Some(funcname) => funcname.match_line(line),
-        None => commands::userdiff::default_funcname_heading(line),
-    }
-}
-
 /// Emit the unified-diff hunks for a single file change into `out`, grouping
 /// changes with [`HUNK_CONTEXT`] lines of surrounding context (merging nearby
 /// groups), and prefixing each `@@` header with git's default section heading.
@@ -3690,8 +3618,8 @@ pub(crate) fn write_patch_hunks_with(
     new_content: Option<&[u8]>,
     options: &crate::DiffRenderOptions<'_>,
 ) {
-    let mut heading = heading_classifier(options.funcname);
-    let mut word_diff: Option<WordDiffAdapter> = None;
+    let mut heading = sley_diff_format::heading_classifier(options.funcname);
+    let mut word_diff: Option<sley_diff_format::WordDiffAdapter> = None;
     let default_colors = commands::diff_words::DiffColors::default();
     let mut word_diff_config: Option<commands::diff_words::WordDiffConfig> = None;
     if let Some(word_request) = options.word_diff {
@@ -3701,12 +3629,14 @@ pub(crate) fn write_patch_hunks_with(
             colors: options.colors.unwrap_or(&default_colors),
         });
     }
-    word_diff = word_diff_config.as_ref().map(WordDiffAdapter::new);
+    word_diff = word_diff_config
+        .as_ref()
+        .map(sley_diff_format::WordDiffAdapter::new);
     let mut render_options = sley_diff_merge::render::HunkRenderOptions {
         context: options.context,
         interhunk: options.interhunk,
         heading: Some(&mut heading),
-        colors: options.colors.map(render_colors),
+        colors: options.colors.map(sley_diff_format::render_colors),
         word_diff: word_diff
             .as_mut()
             .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
