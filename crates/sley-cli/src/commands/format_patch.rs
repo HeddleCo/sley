@@ -3594,10 +3594,10 @@ fn format_patch_diff_options<'a>(
 /// Number of unchanged lines of context git keeps around each change in a hunk.
 const HUNK_CONTEXT: usize = 3;
 
-/// Map a sley-cli [`DiffColors`](commands::diff_words::DiffColors) palette into
+/// Map a sley-cli [`DiffColors`](sley_diff_format::DiffColors) palette into
 /// the engine's [`RenderColors`](sley_diff_merge::render::RenderColors) borrow.
 pub(crate) fn render_colors(
-    colors: &commands::diff_words::DiffColors,
+    colors: &sley_diff_format::DiffColors,
 ) -> sley_diff_merge::render::RenderColors<'_> {
     sley_diff_merge::render::RenderColors {
         frag: &colors.frag,
@@ -3622,15 +3622,15 @@ pub(crate) fn render_colors(
 /// [`HunkWordDiff`](sley_diff_merge::render::HunkWordDiff) hook. The engine
 /// owns hunk shaping; this adapter owns the word-level rendering.
 pub(crate) struct WordDiffAdapter<'a> {
-    config: &'a commands::diff_words::WordDiffConfig<'a>,
-    buffers: commands::diff_words::WordDiffBuffers,
+    config: &'a sley_diff_format::WordDiffConfig<'a>,
+    buffers: sley_diff_format::WordDiffBuffers,
 }
 
 impl<'a> WordDiffAdapter<'a> {
-    pub(crate) fn new(config: &'a commands::diff_words::WordDiffConfig<'a>) -> Self {
+    pub(crate) fn new(config: &'a sley_diff_format::WordDiffConfig<'a>) -> Self {
         Self {
             config,
-            buffers: commands::diff_words::WordDiffBuffers::new(),
+            buffers: sley_diff_format::WordDiffBuffers::new(),
         }
     }
 }
@@ -3649,7 +3649,7 @@ impl sley_diff_merge::render::HunkWordDiff for WordDiffAdapter<'_> {
     }
 
     fn emit_context_line(&mut self, out: &mut Vec<u8>, content: &[u8]) {
-        commands::diff_words::WordDiffBuffers::emit_context_line(out, self.config, content);
+        sley_diff_format::WordDiffBuffers::emit_context_line(out, self.config, content);
     }
 }
 
@@ -3658,7 +3658,7 @@ impl sley_diff_merge::render::HunkWordDiff for WordDiffAdapter<'_> {
 /// `def_ff` heuristic. Returned as a closure for the engine's
 /// [`HeadingFn`](sley_diff_merge::render::HeadingFn) seam.
 pub(crate) fn heading_classifier<'a>(
-    funcname: Option<&'a commands::userdiff::CompiledFuncname>,
+    funcname: Option<&'a sley_diff_format::CompiledFuncname>,
 ) -> impl FnMut(&[u8]) -> Option<Vec<u8>> + 'a {
     move |line: &[u8]| match funcname {
         Some(funcname) => funcname.match_line(line),
@@ -3692,10 +3692,10 @@ pub(crate) fn write_patch_hunks_with(
 ) {
     let mut heading = heading_classifier(options.funcname);
     let mut word_diff: Option<WordDiffAdapter> = None;
-    let default_colors = commands::diff_words::DiffColors::default();
-    let mut word_diff_config: Option<commands::diff_words::WordDiffConfig> = None;
+    let default_colors = sley_diff_format::DiffColors::default();
+    let mut word_diff_config: Option<sley_diff_format::WordDiffConfig> = None;
     if let Some(word_request) = options.word_diff {
-        word_diff_config = Some(commands::diff_words::WordDiffConfig {
+        word_diff_config = Some(sley_diff_format::WordDiffConfig {
             mode: word_request.mode,
             regex: None,
             colors: options.colors.unwrap_or(&default_colors),

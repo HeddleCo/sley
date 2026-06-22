@@ -1098,6 +1098,7 @@ version = "0.1.0"
 dependencies = [
  "sley-config",
  "sley-core",
+ "sley-diff-format",
  "sley-diff-merge",
  "sley-formats",
  "sley-grep",
@@ -1153,6 +1154,7 @@ dependencies = [
  "sley-archive",
  "sley-config",
  "sley-core",
+ "sley-diff-format",
  "sley-diff-merge",
  "sley-fetch",
  "sley-formats",
@@ -1192,6 +1194,16 @@ name = "sley-core"
 version = "0.1.0"
 dependencies = [
  "sha1",
+]
+
+[[package]]
+name = "sley-diff-format"
+version = "0.1.0"
+dependencies = [
+ "sley-config",
+ "sley-core",
+ "sley-diff-merge",
+ "sley-grep",
 ]
 
 [[package]]

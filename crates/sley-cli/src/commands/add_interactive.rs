@@ -960,7 +960,7 @@ fn resolve_patch_config(
         .and_then(|c| c.get("diff", None, "algorithm"))
         .map(|v| v.trim().to_string());
     let colors = patch_color_enabled(config.as_ref(), "diff")
-        .then(|| super::diff_words::DiffColors::enabled(config.as_ref()));
+        .then(|| sley_diff_format::DiffColors::enabled(config.as_ref()));
     let interactive_enabled = patch_color_enabled(config.as_ref(), "interactive");
     let prompt_color = patch_color_slot(
         config.as_ref(),
@@ -1026,7 +1026,7 @@ fn patch_color_slot(
     }
     config
         .and_then(|c| c.get("color", Some(section), slot))
-        .and_then(|value| super::diff_words::parse_color_value(&value))
+        .and_then(|value| sley_diff_format::parse_color_value(&value))
         .unwrap_or_else(|| default.to_string())
 }
 

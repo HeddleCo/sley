@@ -2473,9 +2473,9 @@ pub(crate) struct DiffRenderOptions<'a> {
     /// Explicit function-name heading pattern for `@@ @@` section headers.
     /// `None` falls back to `userdiff` resolution or the built-in default
     /// funcname resolver.
-    pub(crate) funcname: Option<&'a commands::userdiff::CompiledFuncname>,
+    pub(crate) funcname: Option<&'a sley_diff_format::CompiledFuncname>,
     /// ANSI palette when color output is enabled.
-    pub(crate) colors: Option<&'a commands::diff_words::DiffColors>,
+    pub(crate) colors: Option<&'a sley_diff_format::DiffColors>,
     /// Word-diff rendering request (mode + the command-line regex override).
     pub(crate) word_diff: Option<&'a WordDiffRequest<'a>>,
     /// Preloaded file contents for `diff --no-index` (old, new), bypassing
@@ -2649,7 +2649,7 @@ where
 
 /// A `--word-diff` request before per-file word-regex resolution.
 struct WordDiffRequest<'a> {
-    mode: commands::diff_words::WordDiffMode,
+    mode: sley_diff_format::WordDiffMode,
     /// `--word-diff-regex` / `--color-words=<re>` override.
     cli_regex: Option<&'a str>,
 }
@@ -2657,7 +2657,7 @@ struct WordDiffRequest<'a> {
 /// Write one metainfo header line, wrapped in the meta color when enabled.
 fn write_diff_meta_line(
     stdout: &mut dyn Write,
-    colors: Option<&commands::diff_words::DiffColors>,
+    colors: Option<&sley_diff_format::DiffColors>,
     line: &str,
 ) -> Result<()> {
     match colors {
@@ -3268,8 +3268,8 @@ pub(crate) fn write_diff_patch_entry(
                     })
                 })
                 .transpose()?;
-            default_colors = commands::diff_words::DiffColors::default();
-            Some(commands::diff_words::WordDiffConfig {
+            default_colors = sley_diff_format::DiffColors::default();
+            Some(sley_diff_format::WordDiffConfig {
                 mode: request.mode,
                 regex: word_regex.as_ref(),
                 colors: colors.unwrap_or(&default_colors),

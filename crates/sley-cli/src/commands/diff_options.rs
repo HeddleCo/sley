@@ -99,7 +99,7 @@ pub(crate) struct DiffOptions {
     pub(crate) diff_patch_output_control: bool,
     pub(crate) diff_rewrite_control: bool,
     pub(crate) diff_submodule_format: Option<SubmoduleDiffFormat>,
-    pub(crate) word_diff_mode: Option<commands::diff_words::WordDiffMode>,
+    pub(crate) word_diff_mode: Option<sley_diff_format::WordDiffMode>,
     pub(crate) word_diff_regex: Option<String>,
     pub(crate) no_index: bool,
     pub(crate) combined: Option<bool>,
@@ -1078,27 +1078,27 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
             if let Some(value) = optional_arg(option) {
                 diff_validate_word_diff(value)?;
                 options.word_diff_mode = match value {
-                    "plain" => Some(commands::diff_words::WordDiffMode::Plain),
-                    "porcelain" => Some(commands::diff_words::WordDiffMode::Porcelain),
+                    "plain" => Some(sley_diff_format::WordDiffMode::Plain),
+                    "porcelain" => Some(sley_diff_format::WordDiffMode::Porcelain),
                     "color" => {
                         options.color_always = true;
-                        Some(commands::diff_words::WordDiffMode::Color)
+                        Some(sley_diff_format::WordDiffMode::Color)
                     }
                     _ => None,
                 };
             } else if options.word_diff_mode.is_none() {
-                options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
+                options.word_diff_mode = Some(sley_diff_format::WordDiffMode::Plain);
             }
         }
         (_, Some("word-diff-regex")) => {
             options.word_diff_regex = Some(str_value(option).to_string());
             if options.word_diff_mode.is_none() {
-                options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
+                options.word_diff_mode = Some(sley_diff_format::WordDiffMode::Plain);
             }
         }
         (_, Some("color-words")) => {
             options.color_always = true;
-            options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Color);
+            options.word_diff_mode = Some(sley_diff_format::WordDiffMode::Color);
             if let Some(value) = optional_arg(option) {
                 options.word_diff_regex = Some(value.to_string());
             }

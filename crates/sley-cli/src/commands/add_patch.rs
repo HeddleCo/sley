@@ -34,7 +34,7 @@ pub(crate) struct PatchConfig {
     pub interhunk: Option<usize>,
     /// `diff.algorithm` value to forward to the spawned `diff-files`, if set.
     pub diff_algorithm: Option<String>,
-    pub colors: Option<crate::commands::diff_words::DiffColors>,
+    pub colors: Option<sley_diff_format::DiffColors>,
     pub prompt_color: String,
     pub header_color: String,
     pub reset_interactive: String,

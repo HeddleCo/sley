@@ -1755,8 +1755,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 BTreeMap::new()
             };
             let mut wrote_combined_unmerged = BTreeSet::new();
-            let colors = color_always
-                .then(|| commands::diff_words::DiffColors::enabled(repo_config.as_ref()));
+            let colors =
+                color_always.then(|| sley_diff_format::DiffColors::enabled(repo_config.as_ref()));
             let word_request = word_diff_mode.map(|mode| WordDiffRequest {
                 mode,
                 cli_regex: word_diff_regex.as_deref(),
@@ -2613,7 +2613,7 @@ struct DiffNoIndexParams<'a> {
     output_format: commands::diff_options::DiffOutputFormat,
     raw_abbrev: Option<Option<usize>>,
     z: bool,
-    word_diff_mode: Option<commands::diff_words::WordDiffMode>,
+    word_diff_mode: Option<sley_diff_format::WordDiffMode>,
     word_diff_regex: Option<&'a str>,
     src_prefix: &'a str,
     dst_prefix: &'a str,
@@ -2661,7 +2661,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
         .and_then(|dir| worktree_root_for_git_dir(dir).ok());
     let colors = params
         .color
-        .then(|| commands::diff_words::DiffColors::enabled(config.as_ref()));
+        .then(|| sley_diff_format::DiffColors::enabled(config.as_ref()));
     let word_request = params.word_diff_mode.map(|mode| WordDiffRequest {
         mode,
         cli_regex: params.word_diff_regex,

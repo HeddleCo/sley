@@ -145,7 +145,7 @@ struct ShowOptions {
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
     ignore_regexes: Vec<sley_grep::Regex>,
     /// `--word-diff` rendering mode.
-    word_diff_mode: Option<commands::diff_words::WordDiffMode>,
+    word_diff_mode: Option<sley_diff_format::WordDiffMode>,
     /// `--word-diff-regex` / `--color-words=<regex>` override.
     word_diff_regex: Option<String>,
     /// Force colored patch output for `--word-diff=color` / `--color-words`.
@@ -1419,7 +1419,7 @@ fn write_commit_diff_patch(
         );
         let colors = options
             .color_always
-            .then(|| commands::diff_words::DiffColors::enabled(Some(config)));
+            .then(|| sley_diff_format::DiffColors::enabled(Some(config)));
         let word_request = options.word_diff_mode.map(|mode| WordDiffRequest {
             mode,
             cli_regex: options.word_diff_regex.as_deref(),
@@ -1827,16 +1827,16 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             "--ignore-blank-lines" => options.ignore_blank_lines = true,
             "--word-diff" => {
                 if options.word_diff_mode.is_none() {
-                    options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
+                    options.word_diff_mode = Some(sley_diff_format::WordDiffMode::Plain);
                 }
             }
             value if let Some(mode) = value.strip_prefix("--word-diff=") => {
                 options.word_diff_mode = match mode {
-                    "plain" => Some(commands::diff_words::WordDiffMode::Plain),
-                    "porcelain" => Some(commands::diff_words::WordDiffMode::Porcelain),
+                    "plain" => Some(sley_diff_format::WordDiffMode::Plain),
+                    "porcelain" => Some(sley_diff_format::WordDiffMode::Porcelain),
                     "color" => {
                         options.color_always = true;
-                        Some(commands::diff_words::WordDiffMode::Color)
+                        Some(sley_diff_format::WordDiffMode::Color)
                     }
                     "none" => None,
                     _ => {
@@ -1851,22 +1851,22 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
                 })?;
                 options.word_diff_regex = Some(value.clone());
                 if options.word_diff_mode.is_none() {
-                    options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
+                    options.word_diff_mode = Some(sley_diff_format::WordDiffMode::Plain);
                 }
             }
             value if let Some(regex) = value.strip_prefix("--word-diff-regex=") => {
                 options.word_diff_regex = Some(regex.to_string());
                 if options.word_diff_mode.is_none() {
-                    options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
+                    options.word_diff_mode = Some(sley_diff_format::WordDiffMode::Plain);
                 }
             }
             "--color-words" => {
                 options.color_always = true;
-                options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Color);
+                options.word_diff_mode = Some(sley_diff_format::WordDiffMode::Color);
             }
             value if let Some(regex) = value.strip_prefix("--color-words=") => {
                 options.color_always = true;
-                options.word_diff_mode = Some(commands::diff_words::WordDiffMode::Color);
+                options.word_diff_mode = Some(sley_diff_format::WordDiffMode::Color);
                 options.word_diff_regex = Some(regex.to_string());
             }
             "-I" | "--ignore-matching-lines" => {

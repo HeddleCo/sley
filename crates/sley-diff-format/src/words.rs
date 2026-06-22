@@ -3,38 +3,38 @@
 //! (`diff_words_styles`, `fn_out_diff_words_aux`, `find_word_boundaries`,
 //! `diff_words_fill`, `emit_hunk_header`).
 
+use sley_config::GitConfig;
 use sley_grep::Regex;
-use crate::*;
 
 /// ANSI palette for colored diff output. Each slot holds the escape sequence
 /// (empty when color is disabled), mirroring `diff_get_color`.
 #[derive(Clone, Default)]
-pub(crate) struct DiffColors {
-    pub(crate) meta: String,
-    pub(crate) frag: String,
-    pub(crate) func: String,
-    pub(crate) old: String,
-    pub(crate) new: String,
-    pub(crate) context: String,
-    pub(crate) reset: String,
+pub struct DiffColors {
+    pub meta: String,
+    pub frag: String,
+    pub func: String,
+    pub old: String,
+    pub new: String,
+    pub context: String,
+    pub reset: String,
     /// `color.diff.whitespace` — the highlight for whitespace errors
     /// (`--ws-error-highlight`). Default `[7m` (reverse), matching git.
-    pub(crate) whitespace: String,
-    pub(crate) old_moved: String,
-    pub(crate) old_moved_alt: String,
-    pub(crate) old_moved_dim: String,
-    pub(crate) old_moved_alt_dim: String,
-    pub(crate) new_moved: String,
-    pub(crate) new_moved_alt: String,
-    pub(crate) new_moved_dim: String,
-    pub(crate) new_moved_alt_dim: String,
+    pub whitespace: String,
+    pub old_moved: String,
+    pub old_moved_alt: String,
+    pub old_moved_dim: String,
+    pub old_moved_alt_dim: String,
+    pub new_moved: String,
+    pub new_moved_alt: String,
+    pub new_moved_dim: String,
+    pub new_moved_alt_dim: String,
 }
 
 impl DiffColors {
     /// The default enabled palette: meta=bold, frag=cyan, old=red, new=green,
     /// func/context unset, overridden by `color.diff.<slot>` with the legacy
     /// `diff.color.<slot>` spelling as a fallback.
-    pub(crate) fn enabled(config: Option<&GitConfig>) -> Self {
+    pub fn enabled(config: Option<&GitConfig>) -> Self {
         let lookup = |slot: &str, default: &str| -> String {
             let value = config.and_then(|config| {
                 config
@@ -72,7 +72,7 @@ impl DiffColors {
 /// Parse a git color word ("red", "bold", "green dim", ...) into an ANSI
 /// sequence. Only the simple forms the diff palette uses are supported;
 /// unknown words yield `None` (caller keeps the default).
-pub(crate) fn parse_color_value(value: &str) -> Option<String> {
+pub fn parse_color_value(value: &str) -> Option<String> {
     let mut fg: Option<u8> = None;
     let mut fg_seen = false;
     let mut bg: Option<u8> = None;
@@ -130,7 +130,7 @@ pub(crate) fn parse_color_value(value: &str) -> Option<String> {
 /// Wrap one already-newline-terminated line in a color, mirroring
 /// `emit_line_0`: the reset lands before the trailing newline, and a line
 /// that is empty (ignoring its newline) is passed through uncolored.
-pub(crate) fn push_colored_line(out: &mut Vec<u8>, color: &str, reset: &str, line: &[u8]) {
+pub fn push_colored_line(out: &mut Vec<u8>, color: &str, reset: &str, line: &[u8]) {
     let (body, newline): (&[u8], &[u8]) = match line.split_last() {
         Some((b'\n', body)) => (body, b"\n"),
         _ => (line, b""),
@@ -151,7 +151,7 @@ pub(crate) fn push_colored_line(out: &mut Vec<u8>, color: &str, reset: &str, lin
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WordDiffMode {
+pub enum WordDiffMode {
     Plain,
     Porcelain,
     Color,
@@ -159,10 +159,10 @@ pub(crate) enum WordDiffMode {
 
 /// Word-diff configuration for one file pair: the rendering mode, the
 /// compiled word regex (None = whitespace tokenization), and the palette.
-pub(crate) struct WordDiffConfig<'a> {
-    pub(crate) mode: WordDiffMode,
-    pub(crate) regex: Option<&'a Regex>,
-    pub(crate) colors: &'a DiffColors,
+pub struct WordDiffConfig<'a> {
+    pub mode: WordDiffMode,
+    pub regex: Option<&'a Regex>,
+    pub colors: &'a DiffColors,
 }
 
 struct StyleElem<'a> {
@@ -329,13 +329,13 @@ fn is_xdl_space(byte: u8) -> bool {
 }
 
 /// The per-hunk word-diff renderer state: accumulated minus/plus text.
-pub(crate) struct WordDiffBuffers {
+pub struct WordDiffBuffers {
     minus: Vec<u8>,
     plus: Vec<u8>,
 }
 
 impl WordDiffBuffers {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             minus: Vec::new(),
             plus: Vec::new(),
@@ -343,18 +343,18 @@ impl WordDiffBuffers {
     }
 
     /// Append one removed line's content (prefix already stripped).
-    pub(crate) fn push_minus(&mut self, content: &[u8]) {
+    pub fn push_minus(&mut self, content: &[u8]) {
         self.minus.extend_from_slice(content);
     }
 
     /// Append one added line's content (prefix already stripped).
-    pub(crate) fn push_plus(&mut self, content: &[u8]) {
+    pub fn push_plus(&mut self, content: &[u8]) {
         self.plus.extend_from_slice(content);
     }
 
     /// Port of `diff_words_show`: word-diff the accumulated buffers into
     /// `out` and reset them.
-    pub(crate) fn flush(&mut self, out: &mut Vec<u8>, config: &WordDiffConfig<'_>) {
+    pub fn flush(&mut self, out: &mut Vec<u8>, config: &WordDiffConfig<'_>) {
         if self.minus.is_empty() && self.plus.is_empty() {
             return;
         }
@@ -492,11 +492,7 @@ impl WordDiffBuffers {
 
     /// Emit a context line in word-diff mode (after flushing): porcelain
     /// keeps the ` ` prefix and appends `~`; plain/color drop the prefix.
-    pub(crate) fn emit_context_line(
-        out: &mut Vec<u8>,
-        config: &WordDiffConfig<'_>,
-        content: &[u8],
-    ) {
+    pub fn emit_context_line(out: &mut Vec<u8>, config: &WordDiffConfig<'_>, content: &[u8]) {
         let colors = config.colors;
         match config.mode {
             WordDiffMode::Porcelain => {

@@ -28,7 +28,6 @@ pub(crate) mod diff_files;
 pub(crate) mod diff_index;
 pub(crate) mod diff_options;
 pub(crate) mod diff_tree;
-pub(crate) mod diff_words;
 pub(crate) mod difftool;
 pub(crate) mod fast_import;
 pub(crate) mod fetch_pack;
