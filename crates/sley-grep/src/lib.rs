@@ -2,12 +2,12 @@
 
 use sley_core::{GitError, Result};
 
-pub(crate) const INVALID_REGEX_MESSAGE: &str = "Invalid regular expression";
-pub(crate) const UNBALANCED_BRACKETS_MESSAGE: &str = "brackets ([ ]) not balanced";
+pub const INVALID_REGEX_MESSAGE: &str = "Invalid regular expression";
+pub const UNBALANCED_BRACKETS_MESSAGE: &str = "brackets ([ ]) not balanced";
 
 /// How the regular expression text is interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PatternKind {
+pub enum PatternKind {
     /// POSIX basic regular expressions (Git's default).
     Basic,
     /// POSIX extended regular expressions (`-E` / `--extended-regexp`).
@@ -21,7 +21,7 @@ pub(crate) enum PatternKind {
 /// Mirror of git's `GREP_PATTERN_TYPE_*`. `Unspecified` means "fall back to
 /// `extended_regexp_option`".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PatternTypeOption {
+pub enum PatternTypeOption {
     Unspecified,
     Bre,
     Ere,
@@ -31,7 +31,7 @@ pub(crate) enum PatternTypeOption {
 
 /// A token in the boolean grep expression (parsed from the argv stream).
 #[derive(Clone)]
-pub(crate) enum ExprToken {
+pub enum ExprToken {
     Pattern(usize), // index into the compiled pattern list
     And,
     Or,
@@ -42,7 +42,7 @@ pub(crate) enum ExprToken {
 
 /// The parsed boolean expression tree (`-e A --and ( -e B --or --not -e C )`).
 #[derive(Clone)]
-pub(crate) enum Expr {
+pub enum Expr {
     /// Leaf: index into the compiled pattern list.
     Atom(usize),
     Not(Box<Expr>),
@@ -51,13 +51,13 @@ pub(crate) enum Expr {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RegexDiagnosticVerbosity {
+pub enum RegexDiagnosticVerbosity {
     Default,
     Verbose,
 }
 
 impl RegexDiagnosticVerbosity {
-    pub(crate) fn from_env() -> Self {
+    pub fn from_env() -> Self {
         match std::env::var_os("SLEY_REGEX_VERBOSE").and_then(|value| value.into_string().ok()) {
             Some(value) if !value.is_empty() && value != "0" && value != "false" => Self::Verbose,
             _ => Self::Default,
@@ -66,7 +66,7 @@ impl RegexDiagnosticVerbosity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RegexDiagnosticDetail {
+pub enum RegexDiagnosticDetail {
     Generic,
     UnbalancedBrackets,
 }
@@ -86,7 +86,7 @@ impl RegexDiagnosticDetail {
     }
 }
 
-pub(crate) fn regex_diagnostic_message(
+pub fn regex_diagnostic_message(
     detail: RegexDiagnosticDetail,
     verbosity: RegexDiagnosticVerbosity,
 ) -> &'static str {
@@ -98,7 +98,7 @@ pub(crate) fn regex_diagnostic_message(
     }
 }
 
-pub(crate) fn report_regex_compile_error(
+pub fn report_regex_compile_error(
     error_context: &str,
     pattern: &str,
     verbosity: RegexDiagnosticVerbosity,
@@ -109,7 +109,7 @@ pub(crate) fn report_regex_compile_error(
     GitError::Exit(128)
 }
 
-pub(crate) fn report_regex_error(
+pub fn report_regex_error(
     error_context: &str,
     pattern: &str,
     verbosity: RegexDiagnosticVerbosity,
@@ -123,35 +123,35 @@ pub(crate) fn report_regex_error(
     )
 }
 
-pub(crate) struct GrepCompileConfig<'a> {
-    pub(crate) patterns: &'a [String],
-    pub(crate) kind: PatternKind,
-    pub(crate) ignore_case: bool,
-    pub(crate) word: bool,
-    pub(crate) line_regexp: bool,
-    pub(crate) diagnostic_verbosity: RegexDiagnosticVerbosity,
+pub struct GrepCompileConfig<'a> {
+    pub patterns: &'a [String],
+    pub kind: PatternKind,
+    pub ignore_case: bool,
+    pub word: bool,
+    pub line_regexp: bool,
+    pub diagnostic_verbosity: RegexDiagnosticVerbosity,
 }
 
 // ---------------------------------------------------------------------------
 // Regular-expression engine (POSIX BRE/ERE subset) + fixed strings
 // ---------------------------------------------------------------------------
 
-pub(crate) struct GrepMatcher {
+pub struct GrepMatcher {
     patterns: Vec<CompiledPattern>,
     line_regexp: bool,
 }
 
-enum CompiledPattern {
+pub enum CompiledPattern {
     Fixed { needle: Vec<u8>, ignore_case: bool },
     Regex(Regex),
 }
 
 impl GrepMatcher {
-    pub(crate) fn compile(config: GrepCompileConfig<'_>) -> Result<Self> {
+    pub fn compile(config: GrepCompileConfig<'_>) -> Result<Self> {
         Self::compile_with_error_context(config, "command line")
     }
 
-    pub(crate) fn compile_with_error_context(
+    pub fn compile_with_error_context(
         config: GrepCompileConfig<'_>,
         error_context: &str,
     ) -> Result<Self> {
@@ -188,20 +188,20 @@ impl GrepMatcher {
         })
     }
 
-    pub(crate) fn pattern_count(&self) -> usize {
+    pub fn pattern_count(&self) -> usize {
         self.patterns.len()
     }
 
-    pub(crate) fn matches_any(&self, haystack: &[u8]) -> bool {
+    pub fn matches_any(&self, haystack: &[u8]) -> bool {
         (0..self.pattern_count()).any(|idx| self.find_idx(idx, haystack, 0).is_some())
     }
 
-    pub(crate) fn matches_all(&self, haystack: &[u8]) -> bool {
+    pub fn matches_all(&self, haystack: &[u8]) -> bool {
         (0..self.pattern_count()).all(|idx| self.find_idx(idx, haystack, 0).is_some())
     }
 
     /// Find the leftmost match of pattern `idx` starting at `from`.
-    pub(crate) fn find_idx(&self, idx: usize, line: &[u8], from: usize) -> Option<(usize, usize)> {
+    pub fn find_idx(&self, idx: usize, line: &[u8], from: usize) -> Option<(usize, usize)> {
         let pattern = &self.patterns[idx];
         if self.line_regexp {
             if pattern.matches_line(line, true) && from == 0 {
@@ -214,7 +214,7 @@ impl GrepMatcher {
 
     /// Byte spans of (non-overlapping, left-most) matches on `line`, for `-o`.
     /// In expression mode, scans only the positive (atom) patterns.
-    pub(crate) fn match_spans_expr(&self, expr: Option<&Expr>, line: &[u8]) -> Vec<(usize, usize)> {
+    pub fn match_spans_expr(&self, expr: Option<&Expr>, line: &[u8]) -> Vec<(usize, usize)> {
         let indices = self.positive_pattern_indices(expr);
         let mut spans = Vec::new();
         let mut start = 0;
@@ -239,7 +239,7 @@ impl GrepMatcher {
         spans
     }
 
-    pub(crate) fn matches_all_positive_patterns<'a>(
+    pub fn matches_all_positive_patterns<'a>(
         &self,
         expr: Option<&Expr>,
         lines: impl IntoIterator<Item = &'a [u8]>,
@@ -332,7 +332,7 @@ fn bytes_eq(a: &[u8], b: &[u8], ignore_case: bool) -> bool {
     }
 }
 
-pub(crate) fn contains(haystack: &[u8], needle: &[u8], ignore_case: bool) -> bool {
+pub fn contains(haystack: &[u8], needle: &[u8], ignore_case: bool) -> bool {
     find_substring(haystack, needle, ignore_case, 0).is_some()
 }
 
@@ -369,7 +369,7 @@ fn find_substring(haystack: &[u8], needle: &[u8], ignore_case: bool, from: usize
 /// escapes inside classes, inline `(?i)`, named groups and backreferences,
 /// and leading `(*VERB)` control verbs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RegexMode {
+pub enum RegexMode {
     Bre,
     Ere,
     Pcre,
@@ -456,7 +456,7 @@ enum PosixClass {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Regex {
+pub struct Regex {
     root: Node,
     ignore_case: bool,
     /// Number of capturing groups (PCRE mode); sizes the backreference slots.
@@ -464,7 +464,7 @@ pub(crate) struct Regex {
 }
 
 impl Regex {
-    pub(crate) fn compile(
+    pub fn compile(
         pattern: &str,
         mode: RegexMode,
         ignore_case: bool,
@@ -476,7 +476,7 @@ impl Regex {
     /// Compile a pattern given as raw bytes. Userdiff word regexes embed
     /// non-UTF-8 byte ranges (`[\xc0-\xff][\x80-\xbf]+`), so the byte form is
     /// the primitive; [`Regex::compile`] delegates here.
-    pub(crate) fn compile_bytes(
+    pub fn compile_bytes(
         pattern: &[u8],
         mode: RegexMode,
         ignore_case: bool,
@@ -522,7 +522,7 @@ impl Regex {
         })
     }
 
-    pub(crate) fn find_from(&self, text: &[u8], from: usize) -> Option<(usize, usize)> {
+    pub fn find_from(&self, text: &[u8], from: usize) -> Option<(usize, usize)> {
         self.find_from_with(text, from, self.ignore_case)
     }
 
@@ -549,7 +549,7 @@ impl Regex {
     /// Substring match with the caller's case sensitivity (used by the
     /// `log --grep` family, which resolves `-i` per invocation rather than at
     /// compile time).
-    pub(crate) fn is_match_with_case(&self, text: &[u8], ignore_case: bool) -> bool {
+    pub fn is_match_with_case(&self, text: &[u8], ignore_case: bool) -> bool {
         self.find_from_with(text, 0, ignore_case || self.ignore_case)
             .is_some()
     }
@@ -557,7 +557,7 @@ impl Regex {
     /// Leftmost match with capture-group spans, like POSIX `regexec` filling
     /// `pmatch`. Index 0 is the whole match; index `n` is group `n`'s span or
     /// `None` when the group did not participate in the match.
-    pub(crate) fn find_captures(&self, text: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
+    pub fn find_captures(&self, text: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
         for start in 0..=text.len() {
             let ctx = MatchCtx::new(text, self.num_groups);
             if let Some(end) = match_node(&self.root, &ctx, start, self.ignore_case) {
@@ -575,7 +575,7 @@ impl Regex {
     /// word regexes are flat alternations of token shapes where `regexec`'s
     /// longest-match rule is observable (`0xdead` must tokenize via the hex
     /// alternative, not as `0` by the earlier decimal one).
-    pub(crate) fn find_longest_alternative(&self, text: &[u8]) -> Option<(usize, usize)> {
+    pub fn find_longest_alternative(&self, text: &[u8]) -> Option<(usize, usize)> {
         let branches: Vec<&Node> = match &self.root {
             Node::Alt(branches) => branches.iter().collect(),
             other => vec![other],

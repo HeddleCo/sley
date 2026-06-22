@@ -139,7 +139,7 @@ struct DiffTreeOptions {
     /// `--ignore-blank-lines`.
     ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
-    ignore_regexes: Vec<crate::grep_source::Regex>,
+    ignore_regexes: Vec<sley_grep::Regex>,
     /// `--max-depth=<n>`: recurse tree diffs only to this many directory
     /// levels below the matching pathspec and show changed subtrees at the
     /// boundary. `-1` means unlimited recursion.

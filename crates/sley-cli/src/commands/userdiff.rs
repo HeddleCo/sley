@@ -10,7 +10,7 @@
 //! `|[^[:space:]]|[\xc0-\xff][\x80-\xbf]+` tail) dumped verbatim, so the byte
 //! content matches upstream exactly.
 
-use crate::grep_source::{Regex, RegexMode};
+use sley_grep::{Regex, RegexMode};
 use crate::*;
 use std::cell::RefCell;
 use std::collections::HashMap;

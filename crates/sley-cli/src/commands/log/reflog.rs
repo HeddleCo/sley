@@ -188,21 +188,21 @@ fn emit_default_reflog_walk_format(
 
 pub(super) fn compile_log_filter_matcher(
     patterns: &[String],
-    kind: crate::grep_source::PatternKind,
+    kind: sley_grep::PatternKind,
     ignore_case: bool,
     error_context: &str,
-) -> Result<Option<crate::grep_source::GrepMatcher>> {
+) -> Result<Option<sley_grep::GrepMatcher>> {
     if patterns.is_empty() {
         return Ok(None);
     }
-    crate::grep_source::GrepMatcher::compile_with_error_context(
-        crate::grep_source::GrepCompileConfig {
+    sley_grep::GrepMatcher::compile_with_error_context(
+        sley_grep::GrepCompileConfig {
             patterns,
             kind,
             ignore_case,
             word: false,
             line_regexp: false,
-            diagnostic_verbosity: crate::grep_source::RegexDiagnosticVerbosity::Default,
+            diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity::Default,
         },
         error_context,
     )
@@ -237,7 +237,7 @@ impl LogGrepColors {
 
 pub(super) fn log_highlight_matches(
     text: &[u8],
-    matcher: Option<&crate::grep_source::GrepMatcher>,
+    matcher: Option<&sley_grep::GrepMatcher>,
     colors: &LogGrepColors,
 ) -> Vec<u8> {
     let Some(matcher) = matcher.filter(|_| colors.enabled && !colors.matched.is_empty()) else {
@@ -278,7 +278,7 @@ pub(super) fn log_highlight_matches(
 
 pub(super) fn log_author_matcher_matches(
     record: &sley_rev::CommitRecord,
-    filter: Option<&crate::grep_source::GrepMatcher>,
+    filter: Option<&sley_grep::GrepMatcher>,
     mailmap: Option<&commands::utility::Mailmap>,
 ) -> bool {
     filter.is_none_or(|filter| {
@@ -291,7 +291,7 @@ pub(super) fn log_author_matcher_matches(
 
 pub(super) fn log_committer_matcher_matches(
     record: &sley_rev::CommitRecord,
-    filter: Option<&crate::grep_source::GrepMatcher>,
+    filter: Option<&sley_grep::GrepMatcher>,
     mailmap: Option<&commands::utility::Mailmap>,
 ) -> bool {
     filter.is_none_or(|filter| {
@@ -331,7 +331,7 @@ fn log_mailmapped_identity_header(
 
 pub(super) fn log_grep_matcher_matches(
     record: &sley_rev::CommitRecord,
-    filter: Option<&crate::grep_source::GrepMatcher>,
+    filter: Option<&sley_grep::GrepMatcher>,
     all_match: bool,
     invert: bool,
 ) -> bool {

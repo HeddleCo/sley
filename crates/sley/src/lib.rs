@@ -76,6 +76,7 @@ pub mod plumbing {
     pub use sley_core;
     pub use sley_diff_merge;
     pub use sley_formats;
+    pub use sley_grep;
     pub use sley_index;
     pub use sley_notes;
     pub use sley_object;
@@ -96,6 +97,7 @@ pub use sley_core::{
     ObjectFormat, ObjectId, Result, Signature,
 };
 pub use sley_diff_merge::{DiffNameStatusOptions, NameStatusEntry};
+pub use sley_grep as grep;
 pub use sley_index::{Index, IndexEntry, Stage as IndexStage};
 pub use sley_object::{
     Commit as CommitObject, ObjectType as GitObjectType, Tag as TagObject, Tree as TreeObject,

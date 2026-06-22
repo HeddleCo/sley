@@ -10,7 +10,7 @@
 //! `FileObjectDatabase`, ...);
 //! see `commands::stash` for the rationale.
 
-use crate::grep_source::{
+use sley_grep::{
     Expr, ExprToken, GrepCompileConfig, GrepMatcher, PatternKind, PatternTypeOption,
     RegexDiagnosticVerbosity,
 };
@@ -2150,7 +2150,7 @@ fn grep_pathspec_match(spec: &sley_pathspec::PathspecElement, path: &[u8]) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grep_source::{Regex, RegexMode, contains};
+    use sley_grep::{Regex, RegexMode, contains};
 
     fn regex_match(pattern: &str, extended: bool, text: &str) -> bool {
         let mode = if extended {

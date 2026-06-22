@@ -2458,7 +2458,7 @@ fn apply_diff_relative(
 struct DiffStatIgnoreOptions<'a> {
     ws_ignore: sley_diff_merge::WsIgnore,
     ignore_blank_lines: bool,
-    ignore_regexes: &'a [grep_source::Regex],
+    ignore_regexes: &'a [sley_grep::Regex],
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
     indent_heuristic: bool,
 }
@@ -2513,7 +2513,7 @@ fn diff_line_stats_from_ignored_hunks(
     new_content: Option<&[u8]>,
     ws_ignore: sley_diff_merge::WsIgnore,
     ignore_blank_lines: bool,
-    ignore_regexes: &[grep_source::Regex],
+    ignore_regexes: &[sley_grep::Regex],
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
     indent_heuristic: bool,
 ) -> DiffLineStats {
@@ -2574,7 +2574,7 @@ struct DiffNoIndexParams<'a> {
     ws_ignore: sley_diff_merge::WsIgnore,
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
     ignore_blank_lines: bool,
-    ignore_regexes: &'a [crate::grep_source::Regex],
+    ignore_regexes: &'a [sley_grep::Regex],
     indent_heuristic: bool,
 }
 

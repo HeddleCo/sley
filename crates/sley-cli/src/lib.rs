@@ -123,7 +123,6 @@ pub(crate) fn collect_short_status_with_options(
 }
 
 mod commands;
-mod grep_source;
 mod log_format;
 mod remote;
 mod repo_path;
@@ -2503,7 +2502,7 @@ pub(crate) struct DiffPatchOptions<'a> {
     pub(crate) ignore_blank_lines: bool,
     /// `-I<regex>` / `--ignore-matching-lines`: drop change groups all of whose
     /// lines match one of these (compiled ERE) regexes.
-    pub(crate) ignore_regexes: &'a [grep_source::Regex],
+    pub(crate) ignore_regexes: &'a [sley_grep::Regex],
     /// `log -L`: restrict the emitted hunks to these post-image line ranges.
     /// `None` (every non-line-log caller) renders the full patch.
     pub(crate) line_ranges: Option<&'a [sley_diff_merge::render::LineRange]>,
@@ -2862,10 +2861,10 @@ fn diff_order_glob_matches(pattern: &[u8], text: &[u8]) -> bool {
 /// `error: invalid regex given to -I: '<pat>'` and exit code 129.
 pub(crate) fn compile_ignore_matching_regexes(
     patterns: &[String],
-) -> Result<Vec<grep_source::Regex>> {
+) -> Result<Vec<sley_grep::Regex>> {
     let mut compiled = Vec::with_capacity(patterns.len());
     for pattern in patterns {
-        match grep_source::Regex::compile(pattern, grep_source::RegexMode::Ere, false, false) {
+        match sley_grep::Regex::compile(pattern, sley_grep::RegexMode::Ere, false, false) {
             Ok(regex) => compiled.push(regex),
             Err(_) => {
                 eprintln!("error: invalid regex given to -I: '{pattern}'");
@@ -3113,9 +3112,9 @@ pub(crate) fn write_diff_patch_entry(
                 });
             word_regex = spec
                 .map(|spec| {
-                    grep_source::Regex::compile_bytes(
+                    sley_grep::Regex::compile_bytes(
                         &spec,
-                        grep_source::RegexMode::Ere,
+                        sley_grep::RegexMode::Ere,
                         false,
                         false,
                     )
@@ -4788,7 +4787,7 @@ pub(crate) fn diff_entry_produces_output(
     context: usize,
     ws_ignore: sley_diff_merge::WsIgnore,
     ignore_blank_lines: bool,
-    ignore_regexes: &[grep_source::Regex],
+    ignore_regexes: &[sley_grep::Regex],
 ) -> Result<bool> {
     // Non-modification statuses, mode changes, and renames/copies always show.
     let mode_unchanged = match (entry.old_mode, entry.new_mode) {
@@ -8475,7 +8474,7 @@ struct SimpleLogRegex {
     alternatives: Vec<SimpleLogRegexAlternative>,
     /// `--perl-regexp` patterns compile through the full grep regex engine in
     /// PCRE mode instead of the simple BRE subset above.
-    perl: Option<grep_source::Regex>,
+    perl: Option<sley_grep::Regex>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -8533,7 +8532,7 @@ impl SimpleLogRegex {
             pattern,
             error_context,
             mode,
-            grep_source::RegexDiagnosticVerbosity::from_env(),
+            sley_grep::RegexDiagnosticVerbosity::from_env(),
         )
     }
 
@@ -8541,11 +8540,11 @@ impl SimpleLogRegex {
         pattern: &str,
         error_context: &'static str,
         mode: SimpleLogRegexMode,
-        diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
+        diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity,
     ) -> Result<Self> {
         if let SimpleLogRegexMode::Perl = mode {
             let regex =
-                grep_source::Regex::compile(pattern, grep_source::RegexMode::Pcre, false, false)?;
+                sley_grep::Regex::compile(pattern, sley_grep::RegexMode::Pcre, false, false)?;
             return Ok(Self {
                 alternatives: Vec::new(),
                 perl: Some(regex),
@@ -8585,7 +8584,7 @@ impl SimpleLogRegexAlternative {
     fn parse(
         pattern: &str,
         error_context: &'static str,
-        diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
+        diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity,
     ) -> Result<Self> {
         let mut bytes = pattern.as_bytes();
         let anchor_start = bytes.first().copied() == Some(b'^');
@@ -8725,14 +8724,14 @@ fn parse_log_filter_patterns(
     parse_log_filter_patterns_with_diagnostic_verbosity(
         patterns,
         mode,
-        grep_source::RegexDiagnosticVerbosity::from_env(),
+        sley_grep::RegexDiagnosticVerbosity::from_env(),
     )
 }
 
 fn parse_log_filter_patterns_with_diagnostic_verbosity(
     patterns: &[LogFilterPattern],
     mode: SimpleLogRegexMode,
-    diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
+    diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity,
 ) -> Result<Vec<SimpleLogRegex>> {
     patterns
         .iter()
@@ -8749,9 +8748,9 @@ fn parse_log_filter_patterns_with_diagnostic_verbosity(
 
 fn log_grep_pattern_kind_from_config(
     config: &GitConfig,
-    current: grep_source::PatternKind,
+    current: sley_grep::PatternKind,
     explicit: bool,
-) -> grep_source::PatternKind {
+) -> sley_grep::PatternKind {
     if explicit {
         return current;
     }
@@ -8760,30 +8759,30 @@ fn log_grep_pattern_kind_from_config(
         .map(|value| value.trim().to_ascii_lowercase())
         .as_deref()
     {
-        Some("fixed") => grep_source::PatternKind::Fixed,
-        Some("basic") => grep_source::PatternKind::Basic,
-        Some("extended") => grep_source::PatternKind::Extended,
-        Some("perl") => grep_source::PatternKind::Perl,
+        Some("fixed") => sley_grep::PatternKind::Fixed,
+        Some("basic") => sley_grep::PatternKind::Basic,
+        Some("extended") => sley_grep::PatternKind::Extended,
+        Some("perl") => sley_grep::PatternKind::Perl,
         _ => current,
     }
 }
 
 fn compile_log_message_grep_matcher(
     patterns: &[String],
-    kind: grep_source::PatternKind,
+    kind: sley_grep::PatternKind,
     ignore_case: bool,
-) -> Result<Option<grep_source::GrepMatcher>> {
+) -> Result<Option<sley_grep::GrepMatcher>> {
     if patterns.is_empty() {
         return Ok(None);
     }
-    grep_source::GrepMatcher::compile_with_error_context(
-        grep_source::GrepCompileConfig {
+    sley_grep::GrepMatcher::compile_with_error_context(
+        sley_grep::GrepCompileConfig {
             patterns,
             kind,
             ignore_case,
             word: false,
             line_regexp: false,
-            diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity::from_env(),
+            diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity::from_env(),
         },
         "command line",
     )
@@ -8812,7 +8811,7 @@ fn parse_simple_log_regex_class(
     bytes: &[u8],
     pattern: &str,
     error_context: &'static str,
-    diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
+    diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity,
 ) -> Result<(SimpleLogRegexClass, usize)> {
     let mut end = None;
     for (idx, byte) in bytes.iter().enumerate() {
@@ -8852,13 +8851,13 @@ fn log_regex_unterminated_class_error(
     _class_bytes: &[u8],
     pattern: &str,
     error_context: &str,
-    diagnostic_verbosity: grep_source::RegexDiagnosticVerbosity,
+    diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity,
 ) -> Result<(SimpleLogRegexClass, usize)> {
-    Err(grep_source::report_regex_compile_error(
+    Err(sley_grep::report_regex_compile_error(
         error_context,
         pattern,
         diagnostic_verbosity,
-        grep_source::RegexDiagnosticDetail::UnbalancedBrackets,
+        sley_grep::RegexDiagnosticDetail::UnbalancedBrackets,
     ))
 }
 

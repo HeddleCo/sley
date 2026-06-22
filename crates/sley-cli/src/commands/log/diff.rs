@@ -78,7 +78,7 @@ pub(super) struct LogDiffOptions {
     /// `--ignore-blank-lines`.
     pub(super) ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
-    pub(super) ignore_regexes: Vec<crate::grep_source::Regex>,
+    pub(super) ignore_regexes: Vec<sley_grep::Regex>,
     /// `-a`/`--text`: treat all files as text (affects `-G` binary skipping).
     pub(super) text: bool,
     /// `-O<file>`: reorder diff entries according to an orderfile.
