@@ -4,6 +4,12 @@
 //! stream + a [`FormatTier`] that describes how much commit data emission needs).
 //! Command fast paths consult the tier instead of hand-maintained string guards.
 
+#![allow(
+    clippy::if_same_then_else,
+    clippy::manual_contains,
+    clippy::needless_question_mark
+)]
+
 use sley_core::{GitError, Result};
 use sley_strbuf_expand::{
     AtomSyntax, AtomTable, ExpandFormat, ExpandOptions, ExpandSegment, LiteralHex,
