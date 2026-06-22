@@ -2332,6 +2332,17 @@ impl MultiPackIndex {
         objects: &[MultiPackIndexEntry],
         preferred_pack: Option<u32>,
     ) -> Result<Vec<u8>> {
+        Self::write_with_bitmap_packs(format, version, pack_names, objects, preferred_pack, None)
+    }
+
+    pub fn write_with_bitmap_packs(
+        format: ObjectFormat,
+        version: u8,
+        pack_names: &[String],
+        objects: &[MultiPackIndexEntry],
+        preferred_pack: Option<u32>,
+        bitmapped_packs: Option<&[MultiPackBitmapPack]>,
+    ) -> Result<Vec<u8>> {
         if let Some(preferred) = preferred_pack
             && preferred as usize >= pack_names.len()
         {
@@ -2354,6 +2365,25 @@ impl MultiPackIndex {
             return Err(GitError::InvalidFormat(
                 "too many multi-pack-index objects".into(),
             ));
+        }
+        if let Some(bitmapped_packs) = bitmapped_packs {
+            if bitmapped_packs.len() != pack_names.len() {
+                return Err(GitError::InvalidFormat(
+                    "multi-pack-index BTMP pack count mismatch".into(),
+                ));
+            }
+            for pack in bitmapped_packs {
+                let bitmap_end = u64::from(pack.bitmap_pos)
+                    .checked_add(u64::from(pack.bitmap_nr))
+                    .ok_or_else(|| {
+                        GitError::InvalidFormat("multi-pack-index BTMP range overflow".into())
+                    })?;
+                if bitmap_end > objects.len() as u64 {
+                    return Err(GitError::InvalidFormat(
+                        "multi-pack-index BTMP range points past object table".into(),
+                    ));
+                }
+            }
         }
         validate_midx_pack_names(pack_names)?;
         if version == 1 && pack_names.windows(2).any(|pair| pair[0] > pair[1]) {
@@ -2416,6 +2446,14 @@ impl MultiPackIndex {
                 ridx.extend_from_slice(&midx_pos.to_be_bytes());
             }
             chunks.push((*b"RIDX", ridx));
+        }
+        if let Some(bitmapped_packs) = bitmapped_packs {
+            let mut btmp = Vec::with_capacity(bitmapped_packs.len() * 8);
+            for pack in bitmapped_packs {
+                btmp.extend_from_slice(&pack.bitmap_pos.to_be_bytes());
+                btmp.extend_from_slice(&pack.bitmap_nr.to_be_bytes());
+            }
+            chunks.push((*b"BTMP", btmp));
         }
         write_multi_pack_index_chunks(format, version, pack_names.len() as u32, &chunks)
     }

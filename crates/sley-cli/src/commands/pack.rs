@@ -5498,12 +5498,17 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     });
     objects.dedup_by(|next, kept| next.oid == kept.oid);
 
-    let midx = MultiPackIndex::write_with_reverse_index(
+    let bitmapped_packs = write_bitmap.then(|| {
+        midx_bitmapped_pack_ranges(pack_names.len(), &objects, preferred_pack.unwrap_or(0))
+    });
+
+    let midx = MultiPackIndex::write_with_bitmap_packs(
         format,
         1,
         &pack_names,
         &objects,
         write_bitmap.then(|| preferred_pack.unwrap_or(0)),
+        bitmapped_packs.as_deref(),
     )?;
     let midx_checksum = ObjectId::from_raw(format, &midx[midx.len() - format.raw_len()..])?;
     let bitmap_name = format!("multi-pack-index-{}.bitmap", midx_checksum.to_hex());
@@ -5593,6 +5598,37 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
         fs::rename(&temp_path, &bitmap_path)?;
     }
     Ok(())
+}
+
+fn midx_bitmapped_pack_ranges(
+    pack_count: usize,
+    objects: &[MultiPackIndexEntry],
+    preferred_pack: u32,
+) -> Vec<sley_pack::MultiPackBitmapPack> {
+    let mut ranges = vec![
+        sley_pack::MultiPackBitmapPack {
+            bitmap_pos: 0,
+            bitmap_nr: 0,
+        };
+        pack_count
+    ];
+    let mut pseudo: Vec<usize> = (0..objects.len()).collect();
+    pseudo.sort_by_key(|&midx_pos| {
+        let object = &objects[midx_pos];
+        (
+            object.pack_int_id != preferred_pack,
+            object.pack_int_id,
+            object.offset,
+        )
+    });
+    for (bitmap_pos, midx_pos) in pseudo.into_iter().enumerate() {
+        let pack = &mut ranges[objects[midx_pos].pack_int_id as usize];
+        if pack.bitmap_nr == 0 {
+            pack.bitmap_pos = bitmap_pos as u32;
+        }
+        pack.bitmap_nr += 1;
+    }
+    ranges
 }
 
 /// Scan `<object_dir>/pack` for `.idx` files and write a fresh, non-bitmap
