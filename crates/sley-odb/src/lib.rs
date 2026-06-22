@@ -3016,8 +3016,21 @@ fn load_midx_bitmap(pack_dir: &Path, format: ObjectFormat) -> Result<Option<Load
     let Ok(midx_bytes) = fs::read(&midx_path) else {
         return Ok(None);
     };
-    let Ok(midx) = MultiPackIndex::parse(&midx_bytes, format) else {
+    if midx_has_bad_ridx_chunk(&midx_bytes, format) {
+        eprintln!("error: multi-pack-index reverse-index chunk is the wrong size");
+        eprintln!("warning: multi-pack bitmap is missing required reverse index");
         return Ok(None);
+    }
+    let midx = match MultiPackIndex::parse(&midx_bytes, format) {
+        Ok(midx) => midx,
+        Err(GitError::InvalidFormat(message))
+            if message == "multi-pack-index reverse-index chunk is the wrong size" =>
+        {
+            eprintln!("error: {message}");
+            eprintln!("warning: multi-pack bitmap is missing required reverse index");
+            return Ok(None);
+        }
+        Err(_) => return Ok(None),
     };
     let bitmap_path = pack_dir.join(format!(
         "multi-pack-index-{}.bitmap",
@@ -3085,6 +3098,67 @@ fn load_midx_bitmap(pack_dir: &Path, format: ObjectFormat) -> Result<Option<Load
         Ok(loaded) => Ok(Some(loaded)),
         Err(_) => Ok(None),
     }
+}
+
+fn midx_has_bad_ridx_chunk(bytes: &[u8], format: ObjectFormat) -> bool {
+    let hash_len = format.raw_len();
+    if bytes.len() < 12 + 12 + hash_len || &bytes[..4] != b"MIDX" {
+        return false;
+    }
+    let chunk_count = bytes[6] as usize;
+    let table_len = match (chunk_count + 1).checked_mul(12) {
+        Some(table_len) => table_len,
+        None => return false,
+    };
+    let table_end = match 12usize.checked_add(table_len) {
+        Some(table_end) if table_end <= bytes.len().saturating_sub(hash_len) => table_end,
+        _ => return false,
+    };
+    let mut entries = Vec::with_capacity(chunk_count + 1);
+    let mut cursor = 12usize;
+    while cursor < table_end {
+        let id = [
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ];
+        let mut raw_offset = [0u8; 8];
+        raw_offset.copy_from_slice(&bytes[cursor + 4..cursor + 12]);
+        entries.push((id, u64::from_be_bytes(raw_offset) as usize));
+        cursor += 12;
+    }
+    let mut oidf = None;
+    let mut ridx = None;
+    for pair in entries.windows(2) {
+        let start = pair[0].1;
+        let end = pair[1].1;
+        if end < start || end > bytes.len().saturating_sub(hash_len) {
+            return false;
+        }
+        match &pair[0].0 {
+            b"OIDF" => oidf = Some((start, end)),
+            b"RIDX" => ridx = Some((start, end)),
+            _ => {}
+        }
+    }
+    let Some((oidf_start, oidf_end)) = oidf else {
+        return false;
+    };
+    let Some((ridx_start, ridx_end)) = ridx else {
+        return false;
+    };
+    if oidf_end.saturating_sub(oidf_start) != 256 * 4 {
+        return false;
+    }
+    let object_count_start = oidf_end - 4;
+    let object_count = u32::from_be_bytes([
+        bytes[object_count_start],
+        bytes[object_count_start + 1],
+        bytes[object_count_start + 2],
+        bytes[object_count_start + 3],
+    ]) as usize;
+    ridx_end.saturating_sub(ridx_start) != object_count.saturating_mul(4)
 }
 
 fn load_pack_bitmap_file(
@@ -4275,7 +4349,7 @@ fn collect_packed_object_ids(
     }
     let midx_path = pack_dir.join("multi-pack-index");
     if midx_path.exists() {
-        let midx = MultiPackIndex::parse(&fs::read(&midx_path)?, format)?;
+        let midx = MultiPackIndex::parse_without_checksum(&fs::read(&midx_path)?, format)?;
         oids.extend(midx.objects.into_iter().map(|entry| entry.oid));
     }
     for entry in fs::read_dir(pack_dir)? {
@@ -7146,11 +7220,13 @@ mod tests {
                     oid: first_oid,
                     pack_int_id: 0,
                     offset: first_pack.entries[0].offset,
+                    force_large_offset: false,
                 },
                 sley_pack::MultiPackIndexEntry {
                     oid: second_oid,
                     pack_int_id: 1,
                     offset: second_pack.entries[0].offset,
+                    force_large_offset: false,
                 },
             ],
         )

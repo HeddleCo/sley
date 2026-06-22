@@ -1080,7 +1080,11 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
         remove_pack_bitmap_sidecars(&common_git_dir)?;
     }
     if write_midx {
-        cmd_multi_pack_index_write(&[])?;
+        let mut midx_args = Vec::new();
+        if write_bitmaps {
+            midx_args.push("--bitmap".to_string());
+        }
+        cmd_multi_pack_index_write(&midx_args)?;
     }
     if update_server_info {
         crate::commands::refs::cmd_update_server_info(&[])?;
@@ -5433,12 +5437,15 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
 
     let mut objects = Vec::new();
     for (pack_int_id, pack_name) in pack_names.iter().enumerate() {
-        let index = PackIndex::parse(&fs::read(pack_dir.join(pack_name))?, format)?;
+        let index_bytes = fs::read(pack_dir.join(pack_name))?;
+        let force_large_offset = pack_index_has_large_offset_area(&index_bytes, format);
+        let index = PackIndex::parse_without_checksum(&index_bytes, format)?;
         for entry in index.entries {
             objects.push(MultiPackIndexEntry {
                 oid: entry.oid,
                 pack_int_id: pack_int_id as u32,
                 offset: entry.offset,
+                force_large_offset,
             });
         }
     }
@@ -5631,6 +5638,34 @@ fn midx_bitmapped_pack_ranges(
     ranges
 }
 
+fn pack_index_has_large_offset_area(bytes: &[u8], format: ObjectFormat) -> bool {
+    let hash_len = format.raw_len();
+    if bytes.len() < 8 + 256 * 4 + 2 * hash_len || bytes.get(..4) != Some(&[0xff, b't', b'O', b'c'])
+    {
+        return false;
+    }
+    let count = {
+        let start = 8 + 255 * 4;
+        u32::from_be_bytes([
+            bytes[start],
+            bytes[start + 1],
+            bytes[start + 2],
+            bytes[start + 3],
+        ]) as usize
+    };
+    let Some(after_oids) = (8usize + 256 * 4).checked_add(count.saturating_mul(hash_len)) else {
+        return false;
+    };
+    let Some(after_crc) = after_oids.checked_add(count.saturating_mul(4)) else {
+        return false;
+    };
+    let Some(after_small_offsets) = after_crc.checked_add(count.saturating_mul(4)) else {
+        return false;
+    };
+    let trailer_start = bytes.len().saturating_sub(2 * hash_len);
+    after_small_offsets < trailer_start
+}
+
 /// Scan `<object_dir>/pack` for `.idx` files and write a fresh, non-bitmap
 /// multi-pack-index over them, applying upstream's cross-pack duplicate
 /// resolution (keep the copy from the newest pack, ties broken by lowest pack
@@ -5673,12 +5708,13 @@ fn write_default_midx(object_dir: &Path, format: ObjectFormat) -> Result<()> {
 
     let mut objects = Vec::new();
     for (pack_int_id, pack_name) in pack_names.iter().enumerate() {
-        let index = PackIndex::parse(&fs::read(pack_dir.join(pack_name))?, format)?;
+        let index = PackIndex::parse_without_checksum(&fs::read(pack_dir.join(pack_name))?, format)?;
         for entry in index.entries {
             objects.push(MultiPackIndexEntry {
                 oid: entry.oid,
                 pack_int_id: pack_int_id as u32,
                 offset: entry.offset,
+                force_large_offset: false,
             });
         }
     }
@@ -5800,7 +5836,8 @@ fn cmd_multi_pack_index_repack(args: &[String]) -> Result<()> {
     let mut pack_size = vec![0u64; num_packs];
     let mut pack_mtime = vec![std::time::UNIX_EPOCH; num_packs];
     for (i, name) in midx.pack_names.iter().enumerate() {
-        if let Ok(index) = PackIndex::parse(&fs::read(pack_dir.join(name))?, format) {
+        if let Ok(index) = PackIndex::parse_without_checksum(&fs::read(pack_dir.join(name))?, format)
+        {
             pack_objects_total[i] = index.entries.len() as u64;
         }
         let pack_path = pack_dir.join(name).with_extension("pack");
@@ -5980,7 +6017,11 @@ fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -> Re
     let parsed = match parse_midx_for_verify(&bytes, format) {
         Ok(parsed) => parsed,
         Err(message) => {
-            eprintln!("error: {message}");
+            if message == "multi-pack-index large offset out of bounds" {
+                eprintln!("error: incorrect object offset");
+            } else {
+                eprintln!("error: {message}");
+            }
             return Err(GitError::Exit(1));
         }
     };
@@ -6009,7 +6050,7 @@ fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -> Re
     for (position, name) in parsed.pack_names.iter().enumerate() {
         match fs::read(pack_dir.join(name))
             .ok()
-            .and_then(|raw| PackIndex::parse(&raw, format).ok())
+            .and_then(|raw| PackIndex::parse_without_checksum(&raw, format).ok())
         {
             Some(index) => pack_indexes.push(Some(index)),
             None => {
@@ -6265,6 +6306,7 @@ fn parse_midx_for_verify(
             oid,
             pack_int_id,
             offset,
+            force_large_offset: raw_offset & 0x8000_0000 != 0,
         });
     }
 
