@@ -1685,13 +1685,18 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
         Some(RefTarget::Direct(oid)) => oid,
         _ => zero_oid(format)?,
     };
-    let reflog =
-        update_ref_should_write_reflog(&git_dir, &name, create_reflog)?.then(|| ReflogEntry {
-            old_oid,
-            new_oid,
-            committer: ref_reflog_committer(),
-            message,
-        });
+    let writes_reflog = update_ref_should_write_reflog(&git_dir, &name, create_reflog)?;
+    let reftable_fsync_count = if store.uses_reftable()? {
+        2 + if writes_reflog { 2 } else { 0 }
+    } else {
+        0
+    };
+    let reflog = writes_reflog.then(|| ReflogEntry {
+        old_oid,
+        new_oid,
+        committer: ref_reflog_committer(),
+        message,
+    });
     let tx_name = name.clone();
     let hook = ReferenceTransactionHookRunner::new(&git_dir);
     let mut tx = store.transaction().with_hook(&hook);
@@ -1706,7 +1711,10 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
         reflog,
     });
     match tx.commit() {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            trace_reference_fsync_counter(reftable_fsync_count);
+            Ok(())
+        }
         Err(GitError::Io(message))
             if message.starts_with(&format!("could not lock ref {tx_name}: ")) =>
         {

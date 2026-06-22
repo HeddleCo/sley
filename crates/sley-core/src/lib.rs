@@ -441,6 +441,31 @@ pub mod trace2 {
         }
     }
 
+    /// Emit a trace2 `counter` event. Git writes these for accumulated counters
+    /// such as fsync hardware flushes when the event target is enabled.
+    pub fn counter(category: &str, name: &str, count: impl Display) {
+        let Some(target) = std::env::var_os("GIT_TRACE2_EVENT") else {
+            return;
+        };
+        let target = target.to_string_lossy().into_owned();
+        if !target.starts_with('/') {
+            return;
+        }
+        let line = format!(
+            "{{\"event\":\"counter\",\"sid\":\"sley\",\"thread\":\"main\",\"category\":\"{}\",\"name\":\"{}\",\"count\":{}}}\n",
+            escape_json(category),
+            escape_json(name),
+            count,
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&target)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+
     /// Emit a trace2 region enter/leave pair. This is the minimal event shape
     /// Git's `test_region` helper greps for when asserting sparse-index
     /// expansion and conversion behaviour.

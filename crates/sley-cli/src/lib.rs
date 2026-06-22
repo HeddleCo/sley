@@ -701,6 +701,33 @@ fn global_config_value(key: &str) -> Result<Option<String>> {
         }))
 }
 
+fn trace_reference_fsync_counter(count: usize) {
+    if count == 0 || env::var_os("GIT_TRACE2_EVENT").is_none() {
+        return;
+    }
+    if !env::var("GIT_TEST_FSYNC").is_ok_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }) {
+        return;
+    }
+    let Ok(Some(components)) = global_config_value("core.fsync") else {
+        return;
+    };
+    let references_are_synced = components
+        .split([',', ' ', '\t'])
+        .filter(|component| !component.is_empty())
+        .any(|component| {
+            component.eq_ignore_ascii_case("reference") || component.eq_ignore_ascii_case("all")
+        });
+    if !references_are_synced {
+        return;
+    }
+    sley_core::trace2::counter("fsync", "hardware-flush", count);
+}
+
 /// Parse the full config-injection stream (env-count pairs plus the effective
 /// `GIT_CONFIG_PARAMETERS` = inherited env + command-line `-c`/`--config-env`),
 /// converting any parse failure into git's `error: <msg>\nfatal: unable to parse

@@ -3790,14 +3790,16 @@ pub(crate) fn cmd_pack_refs(args: &[String]) -> Result<()> {
         if options.auto && store.reftable_table_count()? <= 2 {
             return Ok(());
         }
-        return store.compact_reftable_stack().map_err(|err| {
+        store.compact_reftable_stack().map_err(|err| {
             if matches!(err, GitError::Io(ref message) if message.contains("File exists")) {
                 eprintln!("error: unable to compact stack: data is locked");
                 GitError::Exit(1)
             } else {
                 err
             }
-        });
+        })?;
+        trace_reference_fsync_counter(2);
+        return Ok(());
     }
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let timeout_millis = pack_refs_timeout_millis(&common_git_dir)?;
