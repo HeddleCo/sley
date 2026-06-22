@@ -1872,7 +1872,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     let no_index_contents = materialized_contents
                         .as_ref()
                         .map(|(old, new)| (old.as_deref(), new.as_deref()));
-                    let options = DiffPatchOptions {
+                    let options = DiffRenderOptions {
                         db: &db,
                         worktree_root: worktree_root.as_deref(),
                         use_worktree_new,
@@ -1882,6 +1882,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         dst_prefix: &dst_prefix,
                         context: patch_context,
                         userdiff: Some(&userdiff),
+                        funcname: None,
                         colors: colors.as_ref(),
                         word_diff: word_request.as_ref(),
                         no_index_contents,
@@ -2769,7 +2770,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             config.clone(),
         );
         for entry in &entries {
-            let options = DiffPatchOptions {
+            let options = DiffRenderOptions {
                 db: &db,
                 worktree_root: None,
                 use_worktree_new: false,
@@ -2779,6 +2780,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                 dst_prefix: params.dst_prefix,
                 context: params.context,
                 userdiff: Some(&userdiff),
+                funcname: None,
                 colors: colors.as_ref(),
                 word_diff: word_request.as_ref(),
                 no_index_contents: Some((

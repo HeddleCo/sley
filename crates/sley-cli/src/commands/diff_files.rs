@@ -778,7 +778,7 @@ fn render_diff_files_entries(
         },
         |_| zero_worktree_oids,
         |stdout, entry| {
-            let patch_options = DiffPatchOptions {
+            let patch_options = DiffRenderOptions {
                 db: context.db,
                 worktree_root,
                 use_worktree_new,
@@ -788,6 +788,7 @@ fn render_diff_files_entries(
                 dst_prefix: &o.dst_prefix,
                 context: context.patch_context,
                 userdiff: None,
+                funcname: None,
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,
