@@ -6017,7 +6017,7 @@ fn cmd_multi_pack_index_verify(args: &[String]) -> Result<()> {
 /// `die()`/`error()` strings; verify-time corruptions (incorrect checksum,
 /// failed pack load, no oid, oid lookup order, incorrect object offset) are
 /// reported the way upstream's verify pass reports them.
-fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -> Result<()> {
+pub(crate) fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -> Result<()> {
     let pack_dir = object_dir.join("pack");
     let midx_path = pack_dir.join("multi-pack-index");
     let bytes = match fs::read(&midx_path) {

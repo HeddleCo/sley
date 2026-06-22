@@ -4538,6 +4538,13 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
         }
     }
 
+    if fsck_core_multi_pack_index_enabled(&git_dir) {
+        let object_dir = repository_objects_dir(&git_dir);
+        if crate::commands::pack::verify_midx_at(&object_dir, format, progress).is_err() {
+            exit_bits |= sley_fsck::ERROR_OBJECT;
+        }
+    }
+
     if exit_bits != 0 {
         Err(GitError::Exit(exit_bits))
     } else {
@@ -4553,6 +4560,15 @@ fn fsck_core_commit_graph_enabled(git_dir: &Path) -> bool {
     read_repo_config(git_dir)
         .ok()
         .and_then(|config| config.get_bool("core", None, "commitGraph"))
+        .unwrap_or(true)
+}
+
+/// `core.multiPackIndex` resolved with git's default of true (an unset value
+/// enables the fsck multi-pack-index check).
+fn fsck_core_multi_pack_index_enabled(git_dir: &Path) -> bool {
+    read_repo_config(git_dir)
+        .ok()
+        .and_then(|config| config.get_bool("core", None, "multiPackIndex"))
         .unwrap_or(true)
 }
 
