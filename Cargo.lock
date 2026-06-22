@@ -1105,6 +1105,7 @@ dependencies = [
  "sley-notes",
  "sley-object",
  "sley-odb",
+ "sley-pretty",
  "sley-refs",
  "sley-remote",
  "sley-rev",
@@ -1164,6 +1165,7 @@ dependencies = [
  "sley-options",
  "sley-pack",
  "sley-pathspec",
+ "sley-pretty",
  "sley-protocol",
  "sley-ref-filter",
  "sley-refs",
@@ -1312,6 +1314,14 @@ name = "sley-pathspec"
 version = "0.1.0"
 dependencies = [
  "sley-core",
+]
+
+[[package]]
+name = "sley-pretty"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+ "sley-strbuf-expand",
 ]
 
 [[package]]

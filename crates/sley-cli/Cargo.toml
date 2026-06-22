@@ -32,6 +32,7 @@ sley-odb = { path = "../sley-odb" }
 sley-options = { path = "../sley-options" }
 sley-pack = { path = "../sley-pack" }
 sley-pathspec = { path = "../sley-pathspec" }
+sley-pretty = { path = "../sley-pretty" }
 sley-protocol = { path = "../sley-protocol" }
 sley-ref-filter = { path = "../sley-ref-filter" }
 sley-refs = { path = "../sley-refs" }
