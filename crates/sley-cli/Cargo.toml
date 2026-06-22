@@ -20,6 +20,7 @@ filetime = "0.2"
 sley-archive = { path = "../sley-archive" }
 sley-config = { path = "../sley-config" }
 sley-core = { path = "../sley-core" }
+sley-diff-format = { path = "../sley-diff-format" }
 sley-diff-merge = { path = "../sley-diff-merge" }
 sley-fetch = { path = "../sley-fetch" }
 sley-formats = { path = "../sley-formats" }

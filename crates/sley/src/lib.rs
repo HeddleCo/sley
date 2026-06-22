@@ -74,6 +74,7 @@ pub mod notes {
 pub mod plumbing {
     pub use sley_config;
     pub use sley_core;
+    pub use sley_diff_format;
     pub use sley_diff_merge;
     pub use sley_formats;
     pub use sley_grep;
@@ -97,6 +98,7 @@ pub use sley_core::{
     BString, FullName, GitError, GitTime, MissingObjectContext, MissingObjectKind, NotFoundKind,
     ObjectFormat, ObjectId, Result, Signature,
 };
+pub use sley_diff_format as diff_format;
 pub use sley_diff_merge::{DiffNameStatusOptions, NameStatusEntry};
 pub use sley_grep as grep;
 pub use sley_index::{Index, IndexEntry, Stage as IndexStage};
