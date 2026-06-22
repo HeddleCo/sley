@@ -5,8 +5,8 @@ use crate::*;
 use sley_diff_merge::{ConflictStyle, MergeBlobOptions, merge_blobs};
 use sley_notes::{
     NotesCommitIdentity, NotesMergeConflict, NotesMergeOutcome, NotesMergeStrategy, NotesRef,
-    finalize_notes_merge, list_notes, merge_notes, notes_ref_expected, read_note, remove_note,
-    resolve_notes_ref_with_config, upsert_note, write_notes,
+    finalize_notes_merge, list_notes, merge_notes, notes_ref_expected, read_note,
+    read_note_from_tree, remove_note, resolve_notes_ref_with_config, upsert_note, write_notes,
 };
 
 pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
@@ -592,14 +592,21 @@ fn notes_show(
         parse_optional_single_object(args, NotesUsage::Show)?.unwrap_or_else(|| "HEAD".to_string());
     let target = resolve_note_object(git_dir, format, &spec)?;
     let store = FileRefStore::new(git_dir, format);
-    let Some(blob) = read_note(
-        git_dir,
-        format,
-        &store,
-        &notes_ref_handle(notes_ref),
-        &target,
-    )?
-    else {
+    let blob = if notes_ref_contains_revision_syntax(notes_ref) {
+        match notes_tree_from_revision(git_dir, format, notes_ref)? {
+            Some(tree_oid) => read_note_from_tree(git_dir, format, &tree_oid, &target)?,
+            None => None,
+        }
+    } else {
+        read_note(
+            git_dir,
+            format,
+            &store,
+            &notes_ref_handle(notes_ref),
+            &target,
+        )?
+    };
+    let Some(blob) = blob else {
         eprintln!("error: no note found for object {}.", target.to_hex());
         return Err(GitError::Exit(1));
     };
@@ -608,6 +615,25 @@ fn notes_show(
     io::stdout().write_all(&object.body)?;
     io::stdout().flush()?;
     Ok(())
+}
+
+fn notes_ref_contains_revision_syntax(notes_ref: &str) -> bool {
+    notes_ref.contains("@{") || notes_ref.contains("^{")
+}
+
+fn notes_tree_from_revision(
+    git_dir: &Path,
+    format: ObjectFormat,
+    notes_ref: &str,
+) -> Result<Option<ObjectId>> {
+    let oid = resolve_revision(git_dir, format, notes_ref)?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let object = db.read_object(&oid)?;
+    match object.object_type {
+        ObjectType::Commit => Ok(Some(Commit::parse_ref(format, &object.body)?.tree)),
+        ObjectType::Tree => Ok(Some(oid)),
+        _ => Ok(None),
+    }
 }
 
 fn notes_add(git_dir: &Path, format: ObjectFormat, notes_ref: &str, args: &[String]) -> Result<()> {

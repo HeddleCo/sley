@@ -282,6 +282,17 @@ pub fn read_note_for(
     lookup_note_for(&db, format, &tree_oid, "", &annotated.to_hex())
 }
 
+/// Return the note blob oid for `annotated` from an already-resolved notes tree.
+pub fn read_note_from_tree(
+    git_dir: &Path,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    annotated: &ObjectId,
+) -> Result<Option<ObjectId>> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    lookup_note_for(&db, format, tree_oid, "", &annotated.to_hex())
+}
+
 /// Return the note blob oid for `annotated`, if any.
 pub fn read_note(
     git_dir: &Path,
