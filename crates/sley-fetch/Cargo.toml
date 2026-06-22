@@ -8,16 +8,16 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core", version = "0.1.0" }
-sley-odb = { path = "../sley-odb", version = "0.1.0" }
-sley-protocol = { path = "../sley-protocol", version = "0.1.0" }
-sley-transport = { path = "../sley-transport", version = "0.1.0" }
+sley-core = { path = "../sley-core", version = "0.2.0" }
+sley-odb = { path = "../sley-odb", version = "0.2.0" }
+sley-protocol = { path = "../sley-protocol", version = "0.2.0" }
+sley-transport = { path = "../sley-transport", version = "0.2.0" }
 
 [dev-dependencies]
-sley-formats = { path = "../sley-formats", version = "0.1.0" }
-sley-object = { path = "../sley-object", version = "0.1.0" }
-sley-pack = { path = "../sley-pack", version = "0.1.0" }
-sley-protocol = { path = "../sley-protocol", version = "0.1.0" }
+sley-formats = { path = "../sley-formats", version = "0.2.0" }
+sley-object = { path = "../sley-object", version = "0.2.0" }
+sley-pack = { path = "../sley-pack", version = "0.2.0" }
+sley-protocol = { path = "../sley-protocol", version = "0.2.0" }
 
 [lints]
 workspace = true

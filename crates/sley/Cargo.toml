@@ -8,22 +8,22 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core", version = "0.1.0" }
-sley-object = { path = "../sley-object", version = "0.1.0" }
-sley-config = { path = "../sley-config", version = "0.1.0" }
-sley-diff-format = { path = "../sley-diff-format", version = "0.1.0" }
-sley-diff-merge = { path = "../sley-diff-merge", version = "0.1.0" }
-sley-formats = { path = "../sley-formats", version = "0.1.0" }
-sley-grep = { path = "../sley-grep", version = "0.1.0" }
-sley-index = { path = "../sley-index", version = "0.1.0" }
-sley-notes = { path = "../sley-notes", version = "0.1.0" }
-sley-odb = { path = "../sley-odb", version = "0.1.0" }
-sley-pretty = { path = "../sley-pretty", version = "0.1.0" }
-sley-refs = { path = "../sley-refs", version = "0.1.0" }
-sley-rev = { path = "../sley-rev", version = "0.1.0" }
-sley-sequencer = { path = "../sley-sequencer", version = "0.1.0" }
-sley-worktree = { path = "../sley-worktree", version = "0.1.0" }
-sley-remote = { path = "../sley-remote", version = "0.1.0", optional = true }
+sley-core = { path = "../sley-core", version = "0.2.0" }
+sley-object = { path = "../sley-object", version = "0.2.0" }
+sley-config = { path = "../sley-config", version = "0.2.0" }
+sley-diff-format = { path = "../sley-diff-format", version = "0.2.0" }
+sley-diff-merge = { path = "../sley-diff-merge", version = "0.2.0" }
+sley-formats = { path = "../sley-formats", version = "0.2.0" }
+sley-grep = { path = "../sley-grep", version = "0.2.0" }
+sley-index = { path = "../sley-index", version = "0.2.0" }
+sley-notes = { path = "../sley-notes", version = "0.2.0" }
+sley-odb = { path = "../sley-odb", version = "0.2.0" }
+sley-pretty = { path = "../sley-pretty", version = "0.2.0" }
+sley-refs = { path = "../sley-refs", version = "0.2.0" }
+sley-rev = { path = "../sley-rev", version = "0.2.0" }
+sley-sequencer = { path = "../sley-sequencer", version = "0.2.0" }
+sley-worktree = { path = "../sley-worktree", version = "0.2.0" }
+sley-remote = { path = "../sley-remote", version = "0.2.0", optional = true }
 
 [features]
 default = ["remote", "mmap", "fast-sha1"]
