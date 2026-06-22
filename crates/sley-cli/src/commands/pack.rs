@@ -3784,7 +3784,7 @@ pub(crate) fn cmd_pack_refs(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let store = FileRefStore::new(&common_git_dir, format)
+    let store = FileRefStore::new(&git_dir, format)
         .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?);
     if store.uses_reftable()? {
         if options.auto && store.reftable_table_count()? <= 2 {

@@ -653,6 +653,7 @@ pub struct FileRefStore {
     storage_dir: PathBuf,
     format: ObjectFormat,
     reftable_lock_timeout_millis: Option<u64>,
+    combine_reftable_logs: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -698,18 +699,25 @@ pub struct AppliedBundleRefUpdate {
     pub new_oid: ObjectId,
 }
 
-fn configured_ref_storage_dir(common_dir: &Path) -> Option<PathBuf> {
+fn configured_ref_storage_backend(common_dir: &Path) -> Option<(RefBackendKind, Option<PathBuf>)> {
     if let Ok(value) = env::var("GIT_REFERENCE_BACKEND")
-        && let Ok((_, Some(path))) = parse_ref_storage_backend_value(&value)
+        && let Ok((kind, path)) = parse_ref_storage_backend_value(&value)
     {
-        return Some(ref_storage_path_from_config(common_dir, path));
+        return Some((
+            kind,
+            path.map(|path| ref_storage_path_from_config(common_dir, path)),
+        ));
     }
     let config = GitConfig::read(common_dir.join("config")).ok()?;
     let value = config.get("extensions", None, "refStorage")?;
     parse_ref_storage_backend_value(value)
         .ok()
-        .and_then(|(_, path)| path)
-        .map(|path| ref_storage_path_from_config(common_dir, path))
+        .map(|(kind, path)| {
+            (
+                kind,
+                path.map(|path| ref_storage_path_from_config(common_dir, path)),
+            )
+        })
 }
 
 fn ref_storage_path_from_config(common_dir: &Path, path: PathBuf) -> PathBuf {
@@ -753,19 +761,29 @@ impl FileRefStore {
     pub fn new(git_dir: impl Into<PathBuf>, format: ObjectFormat) -> Self {
         let git_dir = git_dir.into();
         let common_dir = repository_common_dir(&git_dir);
-        let storage_dir =
-            configured_ref_storage_dir(&common_dir).unwrap_or_else(|| common_dir.clone());
+        let configured = configured_ref_storage_backend(&common_dir);
+        let storage_dir = match configured {
+            Some((_, Some(path))) => path,
+            Some((RefBackendKind::Reftable, None)) if git_dir != common_dir => git_dir.clone(),
+            _ => common_dir.clone(),
+        };
         Self {
             git_dir,
             common_dir,
             storage_dir,
             format,
             reftable_lock_timeout_millis: None,
+            combine_reftable_logs: false,
         }
     }
 
     pub fn with_reftable_lock_timeout_millis(mut self, timeout_millis: Option<u64>) -> Self {
         self.reftable_lock_timeout_millis = timeout_millis;
+        self
+    }
+
+    pub fn with_reftable_combined_logs(mut self, combine: bool) -> Self {
+        self.combine_reftable_logs = combine;
         self
     }
 
@@ -776,11 +794,12 @@ impl FileRefStore {
 
     fn read_ref_unchecked(&self, name: &str) -> Result<Option<RefTarget>> {
         if self.uses_reftable()? {
-            if let Some(target) = self.read_reftable_ref(name)? {
+            let (store, name) = self.reftable_store_for_ref(name)?;
+            if let Some(target) = store.read_reftable_ref(&name)? {
                 return Ok(Some(target));
             }
-            if name != "HEAD" && is_root_ref_syntax(name) {
-                return Ok(self.read_loose_ref(name)?.map(|reference| reference.target));
+            if name != "HEAD" && is_root_ref_syntax(&name) {
+                return Ok(self.read_loose_ref(&name)?.map(|reference| reference.target));
             }
             return Ok(None);
         }
@@ -804,11 +823,12 @@ impl FileRefStore {
     ///     live and no packed entry); git maps both to exit code 2.
     pub fn raw_ref_exists(&self, name: &str) -> Result<bool> {
         if self.uses_reftable()? {
-            if self.read_reftable_ref(name)?.is_some() {
+            let (store, name) = self.reftable_store_for_ref(name)?;
+            if store.read_reftable_ref(&name)?.is_some() {
                 return Ok(true);
             }
-            if name != "HEAD" && is_root_ref_syntax(name) {
-                return Ok(self.read_loose_ref(name)?.is_some());
+            if name != "HEAD" && is_root_ref_syntax(&name) {
+                return Ok(self.read_loose_ref(&name)?.is_some());
             }
             return Ok(false);
         }
@@ -1018,7 +1038,21 @@ impl FileRefStore {
 
     pub fn list_refs_with_prefix(&self, prefix: &str) -> Result<Vec<Ref>> {
         if self.uses_reftable()? {
-            return self.list_reftable_refs_with_prefix(prefix);
+            let mut refs = BTreeMap::<String, Ref>::new();
+            for reference in self
+                .reftable_store_with_storage(self.common_dir.clone())
+                .list_reftable_refs_with_prefix(prefix)?
+            {
+                refs.insert(reference.name.clone(), reference);
+            }
+            if self.git_dir != self.common_dir {
+                for reference in self.list_reftable_refs_with_prefix(prefix)? {
+                    if reftable_current_worktree_ref(&reference.name) {
+                        refs.insert(reference.name.clone(), reference);
+                    }
+                }
+            }
+            return Ok(refs.into_values().collect());
         }
         let mut refs = Vec::new();
         let packed_path = self.storage_dir.join("packed-refs");
@@ -1051,7 +1085,7 @@ impl FileRefStore {
     pub fn list_ref_names_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         if self.uses_reftable()? {
             return Ok(self
-                .list_reftable_refs_with_prefix(prefix)?
+                .list_refs_with_prefix(prefix)?
                 .into_iter()
                 .map(|reference| reference.name)
                 .collect());
@@ -1908,35 +1942,89 @@ impl FileRefStore {
     fn reftables(&self) -> Result<Vec<Reftable>> {
         let reftable_dir = self.storage_dir.join("reftable");
         let tables_list = reftable_dir.join("tables.list");
-        if !tables_list.exists() {
-            return Ok(Vec::new());
-        }
-        let text = fs::read_to_string(&tables_list)?;
-        let mut tables = Vec::new();
-        for raw_line in text.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() {
+        for _ in 0..10 {
+            let text = match fs::read_to_string(&tables_list) {
+                Ok(text) => text,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if !tables_list.exists() {
+                        return Ok(Vec::new());
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let mut tables = Vec::new();
+            let mut reload = false;
+            for raw_line in text.lines() {
+                let line = raw_line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if line.contains('/')
+                    || line.contains('\\')
+                    || Path::new(line).components().count() != 1
+                {
+                    return Err(GitError::InvalidPath(format!(
+                        "invalid reftable table name {line}"
+                    )));
+                }
+                let bytes = match fs::read(reftable_dir.join(line)) {
+                    Ok(bytes) => bytes,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        reload = true;
+                        break;
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+                let table = Reftable::parse(&bytes)?;
+                if table.header.object_format != self.format {
+                    return Err(GitError::InvalidFormat(format!(
+                        "reftable {line} has {} object ids in {} repository",
+                        table.header.object_format.name(),
+                        self.format.name()
+                    )));
+                }
+                tables.push(table);
+            }
+            if reload {
+                thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            if line.contains('/')
-                || line.contains('\\')
-                || Path::new(line).components().count() != 1
-            {
-                return Err(GitError::InvalidPath(format!(
-                    "invalid reftable table name {line}"
-                )));
-            }
-            let table = Reftable::parse(&fs::read(reftable_dir.join(line))?)?;
-            if table.header.object_format != self.format {
-                return Err(GitError::InvalidFormat(format!(
-                    "reftable {line} has {} object ids in {} repository",
-                    table.header.object_format.name(),
-                    self.format.name()
-                )));
-            }
-            tables.push(table);
+            return Ok(tables);
         }
-        Ok(tables)
+        Err(GitError::Io(format!(
+            "cannot read stable reftable stack {}",
+            tables_list.display()
+        )))
+    }
+
+    fn reftable_store_with_storage(&self, storage_dir: PathBuf) -> FileRefStore {
+        FileRefStore {
+            git_dir: self.git_dir.clone(),
+            common_dir: self.common_dir.clone(),
+            storage_dir,
+            format: self.format,
+            reftable_lock_timeout_millis: self.reftable_lock_timeout_millis,
+            combine_reftable_logs: self.combine_reftable_logs,
+        }
+    }
+
+    fn reftable_store_for_ref(&self, name: &str) -> Result<(FileRefStore, String)> {
+        if let Some((worktree, rewritten)) = reftable_other_worktree_ref(name) {
+            let storage_dir = self.common_dir.join("worktrees").join(worktree);
+            return Ok((
+                self.reftable_store_with_storage(storage_dir),
+                rewritten.to_string(),
+            ));
+        }
+        if reftable_current_worktree_ref(name) {
+            return Ok((self.reftable_store_with_storage(self.git_dir.clone()), name.to_string()));
+        }
+        Ok((
+            self.reftable_store_with_storage(self.common_dir.clone()),
+            name.to_string(),
+        ))
     }
 
     pub fn uses_reftable(&self) -> Result<bool> {
@@ -2418,8 +2506,9 @@ impl FileRefStore {
 
     fn write_loose_ref(&self, reference: &Ref) -> Result<()> {
         if self.uses_reftable()? {
-            self.append_reftable_records(vec![ReftableRefRecord {
-                name: reference.name.clone(),
+            let (store, name) = self.reftable_store_for_ref(&reference.name)?;
+            store.append_reftable_records(vec![ReftableRefRecord {
+                name,
                 update_index: 0,
                 value: reftable_value_from_ref_target(&reference.target),
             }])?;
@@ -3308,6 +3397,22 @@ fn hook_target_value(zero: &str, target: Option<&RefTarget>) -> String {
 
 impl FileRefStore {
     fn commit_reftable(&self, changes: Vec<CoalescedRefChange>) -> Result<()> {
+        let routed = self.route_reftable_changes(changes)?;
+        if routed.len() != 1 || routed[0].0.storage_dir != self.storage_dir {
+            for (store, changes) in routed {
+                store.commit_reftable_local(changes)?;
+            }
+            return Ok(());
+        }
+        let mut routed = routed;
+        if let Some((_, changes)) = routed.pop() {
+            self.commit_reftable_local(changes)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn commit_reftable_local(&self, changes: Vec<CoalescedRefChange>) -> Result<()> {
         // Capture HEAD's symref target only when there is a reflog to mirror.
         let has_reflogs = changes.iter().any(|change| {
             matches!(change, CoalescedRefChange::Update(update) if !update.reflog.is_empty())
@@ -3380,6 +3485,25 @@ impl FileRefStore {
                 }
             }
         }
+        if self.combine_reftable_logs || self.git_dir != self.common_dir {
+            let head_mirror = Self::head_reflog_mirror(head_branch.as_deref(), &reflogs);
+            reflogs.extend(head_mirror);
+            let log_records = reflogs
+                .into_iter()
+                .map(|(name, entry)| {
+                    Ok(ReftableLogRecord {
+                        refname: name,
+                        update_index: 0,
+                        value: ReftableLogValue::Update(reftable_update_from_reflog(&entry)?),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.append_reftable_table(records, log_records)?;
+            for name in &delete_names {
+                self.remove_reflog_file(name);
+            }
+            return Ok(());
+        }
         self.append_reftable_records(records)?;
         // Git unlinks logs/refs/<name> (pruning now-empty dirs) on delete; do
         // this before appending update reflogs so a delete+recreate does not race
@@ -3393,6 +3517,36 @@ impl FileRefStore {
             self.append_reflog(&name, &entry)?;
         }
         Ok(())
+    }
+
+    fn route_reftable_changes(
+        &self,
+        changes: Vec<CoalescedRefChange>,
+    ) -> Result<Vec<(FileRefStore, Vec<CoalescedRefChange>)>> {
+        let mut grouped = BTreeMap::<PathBuf, (FileRefStore, Vec<CoalescedRefChange>)>::new();
+        for change in changes {
+            let name = match &change {
+                CoalescedRefChange::Update(update) => update.name.as_str(),
+                CoalescedRefChange::Delete(delete) => delete.name.as_str(),
+            };
+            let (store, rewritten) = self.reftable_store_for_ref(name)?;
+            let rewritten_change = match change {
+                CoalescedRefChange::Update(mut update) => {
+                    update.name = rewritten;
+                    CoalescedRefChange::Update(update)
+                }
+                CoalescedRefChange::Delete(mut delete) => {
+                    delete.name = rewritten;
+                    CoalescedRefChange::Delete(delete)
+                }
+            };
+            grouped
+                .entry(store.storage_dir.clone())
+                .or_insert_with(|| (store, Vec::new()))
+                .1
+                .push(rewritten_change);
+        }
+        Ok(grouped.into_values().collect())
     }
 
     /// Atomic, all-or-nothing commit for the loose-ref backend. See
@@ -5040,6 +5194,22 @@ fn is_root_ref_syntax(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_uppercase() || b == b'-' || b == b'_')
+}
+
+fn reftable_current_worktree_ref(name: &str) -> bool {
+    is_root_ref_syntax(name)
+        || name.starts_with("refs/bisect/")
+        || name.starts_with("refs/worktree/")
+        || name.starts_with("refs/rewritten/")
+}
+
+fn reftable_other_worktree_ref(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("worktrees/")?;
+    let (worktree, rewritten) = rest.split_once('/')?;
+    if worktree.is_empty() || rewritten.is_empty() {
+        return None;
+    }
+    Some((worktree, rewritten))
 }
 
 pub fn validate_ref_name(name: &str) -> Result<()> {

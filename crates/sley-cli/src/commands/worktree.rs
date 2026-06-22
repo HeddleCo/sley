@@ -138,7 +138,7 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     let format = repository_object_format(&common_git_dir)?;
     let path = resolve_cli_path(&cwd, &options.path);
     validate_worktree_add_destination(&path, &options.path)?;
-    let store = FileRefStore::new(&common_git_dir, format);
+    let store = FileRefStore::new(&common_git_dir, format).with_reftable_combined_logs(true);
     let committer = commit_identity_from_env("COMMITTER")?;
 
     // `--orphan` with no explicit `-b`/`-B` names the new unborn branch after
@@ -220,18 +220,19 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     fs::create_dir_all(&path)?;
     write_worktree_linking_files(&common_git_dir, &admin_dir, &path, relative_paths)?;
     fs::write(admin_dir.join("commondir"), "../..\n")?;
+    let reftable_refs = FileRefStore::new(&common_git_dir, format).uses_reftable()?;
     // An inferred-orphan worktree has no source commit, so — matching git — it
     // writes no ORIG_HEAD and points HEAD at the unborn branch.
-    if !add_head.orphan {
+    if !add_head.orphan && !reftable_refs {
         fs::write(admin_dir.join("ORIG_HEAD"), format!("{}\n", add_head.oid))?;
     }
-    match add_head.branch_name.as_ref() {
-        Some(branch) => fs::write(
-            admin_dir.join("HEAD"),
-            format!("ref: {}\n", branch_ref_name(branch)?),
-        )?,
-        None => fs::write(admin_dir.join("HEAD"), format!("{}\n", add_head.oid))?,
-    }
+    write_linked_worktree_head(
+        &admin_dir,
+        format,
+        &add_head,
+        reftable_refs,
+        committer.clone(),
+    )?;
     if options.lock {
         fs::write(
             admin_dir.join("locked"),
@@ -264,6 +265,64 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     // the post-checkout "HEAD is now at ..." reset line remains.
     if !options.quiet && options.checkout {
         print_reset_hard_head(&common_git_dir, format, &add_head.oid)?;
+    }
+    Ok(())
+}
+
+fn write_linked_worktree_head(
+    admin_dir: &Path,
+    format: ObjectFormat,
+    add_head: &WorktreeAddHead,
+    reftable_refs: bool,
+    committer: Vec<u8>,
+) -> Result<()> {
+    if reftable_refs {
+        let target = match add_head.branch_name.as_ref() {
+            Some(branch) => RefTarget::Symbolic(branch_ref_name(branch)?),
+            None => RefTarget::Direct(add_head.oid),
+        };
+        let worktree_store = FileRefStore::new(admin_dir, format);
+        let mut transaction = worktree_store.transaction();
+        transaction.update(RefUpdate {
+            name: "HEAD".to_string(),
+            expected: None,
+            new: target,
+            reflog: None,
+        });
+        transaction.commit()?;
+        worktree_store.write_reflog(
+            "HEAD",
+            &[ReflogEntry {
+                old_oid: ObjectId::null(format),
+                new_oid: add_head.oid,
+                committer: committer.clone(),
+                message: b"worktree add".to_vec(),
+            }],
+        )?;
+        if !add_head.orphan {
+            let mut transaction = worktree_store.transaction();
+            transaction.update(RefUpdate {
+                name: "ORIG_HEAD".to_string(),
+                expected: None,
+                new: RefTarget::Direct(add_head.oid),
+                reflog: None,
+            });
+            transaction.commit()?;
+        }
+        fs::write(admin_dir.join("HEAD"), b"ref: refs/heads/.invalid\n")?;
+        fs::create_dir_all(admin_dir.join("refs"))?;
+        fs::write(
+            admin_dir.join("refs").join("heads"),
+            b"this repository uses the reftable format\n",
+        )?;
+        return Ok(());
+    }
+    match add_head.branch_name.as_ref() {
+        Some(branch) => fs::write(
+            admin_dir.join("HEAD"),
+            format!("ref: {}\n", branch_ref_name(branch)?),
+        )?,
+        None => fs::write(admin_dir.join("HEAD"), format!("{}\n", add_head.oid))?,
     }
     Ok(())
 }
