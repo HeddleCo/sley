@@ -1315,6 +1315,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sley-pretty"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+ "sley-strbuf-expand",
+]
+
+[[package]]
 name = "sley-protocol"
 version = "0.1.0"
 dependencies = [

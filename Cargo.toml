@@ -11,6 +11,7 @@ members = [
     "crates/sley-refs",
     "crates/sley-pathspec",
     "crates/sley-grep",
+    "crates/sley-pretty",
     "crates/sley-rev",
     "crates/sley-worktree",
     "crates/sley-diff-merge",
