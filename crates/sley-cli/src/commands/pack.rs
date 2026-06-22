@@ -5879,6 +5879,16 @@ fn cmd_multi_pack_index_repack(args: &[String]) -> Result<()> {
             }
         }
         Some(batch_size) => {
+            if pack_size
+                .iter()
+                .enumerate()
+                .filter_map(|(i, size)| want(i).then_some(*size))
+                .min()
+                .is_some_and(|min_size| batch_size <= min_size)
+            {
+                return Ok(());
+            }
+
             // Visit packs smallest-mtime first; include the smaller packs whose
             // expected (reference-proportional) size keeps the running total
             // under the batch, skipping any single pack already >= batch.
