@@ -4347,9 +4347,11 @@ fn collect_packed_object_ids(
     if !pack_dir.exists() {
         return Ok(());
     }
+    let mut midx_pack_names = HashSet::new();
     let midx_path = pack_dir.join("multi-pack-index");
     if midx_path.exists() {
         let midx = MultiPackIndex::parse_without_checksum(&fs::read(&midx_path)?, format)?;
+        midx_pack_names.extend(midx.pack_names.iter().cloned());
         oids.extend(midx.objects.into_iter().map(|entry| entry.oid));
     }
     for entry in fs::read_dir(pack_dir)? {
@@ -4360,7 +4362,22 @@ fn collect_packed_object_ids(
         if !path.with_extension("pack").exists() {
             continue;
         }
-        let index = PackIndex::parse(&fs::read(path)?, format)?;
+        let index = match PackIndex::parse(&fs::read(&path)?, format) {
+            Ok(index) => index,
+            Err(_err)
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| midx_pack_names.contains(name)) =>
+            {
+                eprintln!(
+                    "error: packfile {} index unavailable",
+                    path.with_extension("pack").display()
+                );
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         oids.extend(index.entries.into_iter().map(|entry| entry.oid));
     }
     Ok(())
@@ -5029,19 +5046,31 @@ impl FileObjectDatabase {
         let hinted_pack_index = registry.cached_hint();
         if let Some(pack_index) = hinted_pack_index {
             let pack = &registry.packs[pack_index];
-            let index = pack.index(self.format)?;
-            if let Some(entry) = index.find(oid) {
-                return Ok(Some(PackLookup::from_registered(
-                    Arc::clone(pack),
-                    entry.offset,
-                )));
+            match pack.index(self.format) {
+                Ok(index) => {
+                    if let Some(entry) = index.find(oid) {
+                        return Ok(Some(PackLookup::from_registered(
+                            Arc::clone(pack),
+                            entry.offset,
+                        )));
+                    }
+                }
+                Err(_) => {
+                    eprintln!("error: packfile {} index unavailable", pack.pack.display());
+                }
             }
         }
         for (pack_index, pack) in registry.packs.iter().enumerate() {
             if Some(pack_index) == hinted_pack_index {
                 continue;
             }
-            let index = pack.index(self.format)?;
+            let index = match pack.index(self.format) {
+                Ok(index) => index,
+                Err(_) => {
+                    eprintln!("error: packfile {} index unavailable", pack.pack.display());
+                    continue;
+                }
+            };
             if let Some(entry) = index.find(oid) {
                 registry.remember_hint(pack_index);
                 return Ok(Some(PackLookup::from_registered(
