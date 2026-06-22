@@ -1100,6 +1100,7 @@ dependencies = [
  "sley-core",
  "sley-diff-merge",
  "sley-formats",
+ "sley-grep",
  "sley-index",
  "sley-notes",
  "sley-object",
