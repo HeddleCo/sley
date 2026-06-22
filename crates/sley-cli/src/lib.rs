@@ -2457,7 +2457,7 @@ fn diff_raw_oid(
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct DiffPatchOptions<'a> {
+pub(crate) struct DiffRenderOptions<'a> {
     pub(crate) db: &'a FileObjectDatabase,
     pub(crate) worktree_root: Option<&'a Path>,
     pub(crate) use_worktree_new: bool,
@@ -2470,6 +2470,10 @@ pub(crate) struct DiffPatchOptions<'a> {
     /// Userdiff driver resolution (`diff=<driver>` attributes + config);
     /// `None` keeps the default funcname heuristic.
     pub(crate) userdiff: Option<&'a commands::userdiff::UserdiffResolver>,
+    /// Explicit function-name heading pattern for `@@ @@` section headers.
+    /// `None` falls back to `userdiff` resolution or the built-in default
+    /// funcname resolver.
+    pub(crate) funcname: Option<&'a commands::userdiff::CompiledFuncname>,
     /// ANSI palette when color output is enabled.
     pub(crate) colors: Option<&'a commands::diff_words::DiffColors>,
     /// Word-diff rendering request (mode + the command-line regex override).
@@ -2933,7 +2937,7 @@ pub(crate) fn render_tree_to_tree_patch(
         write_diff_patch_entry(
             &mut out,
             entry,
-            DiffPatchOptions {
+            DiffRenderOptions {
                 db,
                 worktree_root: None,
                 use_worktree_new: false,
@@ -2943,6 +2947,7 @@ pub(crate) fn render_tree_to_tree_patch(
                 dst_prefix: "b/",
                 context: 3,
                 userdiff: None,
+                funcname: None,
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,
@@ -3059,7 +3064,7 @@ pub(crate) fn compile_ignore_matching_regexes(
 pub(crate) fn write_diff_patch_entry(
     stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
-    options: DiffPatchOptions<'_>,
+    options: DiffRenderOptions<'_>,
 ) -> Result<()> {
     if is_gitlink_pair(entry)
         && options.submodule_format != commands::diff_options::SubmoduleDiffFormat::Short
@@ -3261,9 +3266,13 @@ pub(crate) fn write_diff_patch_entry(
     // ignore suppresses all content hunks for a rename/copy/mode change, git
     // still emits the metadata through the index line, but does not print the
     // `---`/`+++` file headers.
-    let funcname = old_driver
-        .as_ref()
-        .and_then(|driver| driver.funcname.as_ref())
+    let funcname = options
+        .funcname
+        .or_else(|| {
+            old_driver
+                .as_ref()
+                .and_then(|driver| driver.funcname.as_ref())
+        })
         .or_else(|| {
             new_driver
                 .as_ref()
@@ -3388,7 +3397,7 @@ fn write_diff_binary_patch_entry(
     entry: &sley_diff_merge::NameStatusEntry,
     old_content: Option<Vec<u8>>,
     new_content: Option<Vec<u8>>,
-    options: DiffPatchOptions<'_>,
+    options: DiffRenderOptions<'_>,
 ) -> Result<()> {
     let old_path = entry.old_path.as_deref().unwrap_or(&entry.path);
     let diff_old_path = diff_patch_prefixed_path(options.src_prefix, old_path);
@@ -4486,7 +4495,7 @@ fn is_gitlink_pair(entry: &sley_diff_merge::NameStatusEntry) -> bool {
 
 fn visible_submodule_dirt(
     entry: &sley_diff_merge::NameStatusEntry,
-    options: &DiffPatchOptions<'_>,
+    options: &DiffRenderOptions<'_>,
 ) -> u8 {
     options
         .submodule_dirt
@@ -4514,7 +4523,7 @@ fn submodule_git_dir_for_path(
 fn write_submodule_patch_entry(
     stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
-    options: DiffPatchOptions<'_>,
+    options: DiffRenderOptions<'_>,
 ) -> Result<()> {
     let old_is_gitlink = entry.old_mode == Some(0o160000);
     let new_is_gitlink = entry.new_mode == Some(0o160000);
@@ -4541,7 +4550,7 @@ fn write_submodule_patch_entry(
         return write_diff_patch_entry(
             stdout,
             &blob_entry,
-            DiffPatchOptions {
+            DiffRenderOptions {
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 ..options
             },
@@ -4560,7 +4569,7 @@ fn write_submodule_patch_entry(
         write_diff_patch_entry(
             stdout,
             &blob_entry,
-            DiffPatchOptions {
+            DiffRenderOptions {
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 ..options
             },
@@ -4809,7 +4818,7 @@ fn submodule_commit_subject(commit: &Commit) -> String {
 fn write_submodule_inline_diff(
     stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
-    options: DiffPatchOptions<'_>,
+    options: DiffRenderOptions<'_>,
     sub_db: &FileObjectDatabase,
     sub_format: ObjectFormat,
     old_oid: &ObjectId,
@@ -4859,7 +4868,7 @@ fn write_submodule_inline_diff(
             write_diff_patch_entry(
                 stdout,
                 dirty_entry,
-                DiffPatchOptions {
+                DiffRenderOptions {
                     db: sub_db,
                     worktree_root: Some(sub_root),
                     use_worktree_new: true,
@@ -4869,6 +4878,7 @@ fn write_submodule_inline_diff(
                     dst_prefix: &dst_prefix,
                     context: options.context,
                     userdiff: None,
+                    funcname: None,
                     colors: options.colors,
                     word_diff: None,
                     no_index_contents: None,
@@ -4902,7 +4912,7 @@ fn write_submodule_inline_diff(
         write_diff_patch_entry(
             stdout,
             sub_entry,
-            DiffPatchOptions {
+            DiffRenderOptions {
                 db: sub_db,
                 worktree_root: nested_worktree_root.as_deref(),
                 use_worktree_new: false,
@@ -4912,6 +4922,7 @@ fn write_submodule_inline_diff(
                 dst_prefix: &dst_prefix,
                 context: options.context,
                 userdiff: None,
+                funcname: None,
                 colors: options.colors,
                 word_diff: None,
                 no_index_contents: None,

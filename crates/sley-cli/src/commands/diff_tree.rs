@@ -1132,7 +1132,7 @@ fn run_diff_request(
         },
         |_| false,
         |stdout, entry| {
-            let patch_options = DiffPatchOptions {
+            let patch_options = DiffRenderOptions {
                 db: context.db,
                 worktree_root: None,
                 use_worktree_new: false,
@@ -1142,6 +1142,7 @@ fn run_diff_request(
                 dst_prefix: &context.options.dst_prefix,
                 context: 3,
                 userdiff: None,
+                funcname: None,
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,

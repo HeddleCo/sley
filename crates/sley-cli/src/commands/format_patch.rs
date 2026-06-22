@@ -3660,19 +3660,38 @@ fn write_patch_diff_entry(
             ),
         ),
     }
-    if options.context_lines == HUNK_CONTEXT {
-        write_patch_hunks(out, old_content.as_deref(), new_content.as_deref());
-    } else {
-        write_patch_hunks_with(
-            out,
-            old_content.as_deref(),
-            new_content.as_deref(),
-            &PatchHunkOptions {
-                context: options.context_lines,
-                ..Default::default()
-            },
-        );
-    }
+    let diff_options = crate::DiffRenderOptions {
+        db,
+        worktree_root: None,
+        use_worktree_new: false,
+        format,
+        abbrev,
+        src_prefix: &options.src_prefix,
+        dst_prefix: &options.dst_prefix,
+        context: options.context_lines,
+        userdiff: None,
+        funcname: None,
+        colors: None,
+        word_diff: None,
+        no_index_contents: None,
+        submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+        submodule_dirt: None,
+        ws_error: None,
+        color_moved: None,
+        interhunk: 0,
+        ws_ignore: sley_diff_merge::WsIgnore::default(),
+        diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+        ignore_blank_lines: false,
+        ignore_regexes: &[],
+        line_ranges: None,
+        indent_heuristic: true,
+    };
+    write_patch_hunks_with(
+        out,
+        old_content.as_deref(),
+        new_content.as_deref(),
+        &diff_options,
+    );
     Ok(())
 }
 
@@ -3731,38 +3750,6 @@ fn write_patch_similarity_headers(
 
 /// Number of unchanged lines of context git keeps around each change in a hunk.
 const HUNK_CONTEXT: usize = 3;
-
-/// Options for [`write_patch_hunks_with`]: hunk shaping and heading lookup.
-///
-/// This is the sley-cli-side option bundle; it carries the repository-coupled
-/// concerns (userdiff funcname driver, sley-cli `DiffColors`, word-diff
-/// config) and is translated into the engine's
-/// [`sley_diff_merge::render::HunkRenderOptions`] by [`write_patch_hunks_with`].
-pub(crate) struct PatchHunkOptions<'a> {
-    /// Lines of context around each change (`-U<n>`, default 3).
-    pub(crate) context: usize,
-    /// Extra inter-hunk merging distance (`--inter-hunk-context`).
-    pub(crate) interhunk: usize,
-    /// Compiled userdiff funcname patterns for the path; `None` selects the
-    /// default `def_ff` heuristic.
-    pub(crate) funcname: Option<&'a commands::userdiff::CompiledFuncname>,
-    /// ANSI palette when color output is enabled.
-    pub(crate) colors: Option<&'a commands::diff_words::DiffColors>,
-    /// Word-diff rendering (replaces the +/- line bodies of each hunk).
-    pub(crate) word_diff: Option<&'a commands::diff_words::WordDiffConfig<'a>>,
-}
-
-impl Default for PatchHunkOptions<'_> {
-    fn default() -> Self {
-        Self {
-            context: HUNK_CONTEXT,
-            interhunk: 0,
-            funcname: None,
-            colors: None,
-            word_diff: None,
-        }
-    }
-}
 
 /// Map a sley-cli [`DiffColors`](commands::diff_words::DiffColors) palette into
 /// the engine's [`RenderColors`](sley_diff_merge::render::RenderColors) borrow.
@@ -3843,8 +3830,9 @@ pub(crate) fn write_patch_hunks(
     out: &mut Vec<u8>,
     old_content: Option<&[u8]>,
     new_content: Option<&[u8]>,
+    options: &crate::DiffRenderOptions<'_>,
 ) {
-    write_patch_hunks_with(out, old_content, new_content, &PatchHunkOptions::default());
+    write_patch_hunks_with(out, old_content, new_content, options);
 }
 
 /// [`write_patch_hunks`] with explicit hunk shaping options.
@@ -3857,10 +3845,20 @@ pub(crate) fn write_patch_hunks_with(
     out: &mut Vec<u8>,
     old_content: Option<&[u8]>,
     new_content: Option<&[u8]>,
-    options: &PatchHunkOptions<'_>,
+    options: &crate::DiffRenderOptions<'_>,
 ) {
     let mut heading = heading_classifier(options.funcname);
-    let mut word_diff = options.word_diff.map(WordDiffAdapter::new);
+    let mut word_diff: Option<WordDiffAdapter> = None;
+    let default_colors = commands::diff_words::DiffColors::default();
+    let mut word_diff_config: Option<commands::diff_words::WordDiffConfig> = None;
+    if let Some(word_request) = options.word_diff {
+        word_diff_config = Some(commands::diff_words::WordDiffConfig {
+            mode: word_request.mode,
+            regex: None,
+            colors: options.colors.unwrap_or(&default_colors),
+        });
+    }
+    word_diff = word_diff_config.as_ref().map(WordDiffAdapter::new);
     let mut render_options = sley_diff_merge::render::HunkRenderOptions {
         context: options.context,
         interhunk: options.interhunk,

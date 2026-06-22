@@ -422,7 +422,7 @@ fn render_line_log_patch(
         crate::write_diff_patch_entry(
             out,
             &entry,
-            crate::DiffPatchOptions {
+            crate::DiffRenderOptions {
                 db,
                 worktree_root: None,
                 use_worktree_new: false,
@@ -439,6 +439,7 @@ fn render_line_log_patch(
                 submodule_dirt: None,
                 ws_error: None,
                 color_moved: None,
+                funcname: None,
                 interhunk: 0,
                 ws_ignore: diff_opts.ws_ignore,
                 diff_algorithm: diff_opts.diff_algorithm,

@@ -22,7 +22,7 @@ use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 
 // Pull in the crate-root helpers this command shares with `cmd_diff`
 // (RepositoryContext, FileObjectDatabase, the
-// DiffPathspec/DiffFilter/DiffStatOptions/DiffPatchOptions types, and every
+// DiffPathspec/DiffFilter/DiffStatOptions/DiffRenderOptions types, and every
 // write_diff_* renderer), matching the established `commands::*` pattern.
 use crate::*;
 
@@ -583,7 +583,7 @@ fn render(
             writeln!(stdout)?;
         }
         for entry in entries {
-            let options = DiffPatchOptions {
+            let options = DiffRenderOptions {
                 db: ctx.db,
                 worktree_root: ctx.worktree_root,
                 use_worktree_new: ctx.use_worktree_new,
@@ -593,6 +593,7 @@ fn render(
                 dst_prefix: ctx.dst_prefix,
                 context: 3,
                 userdiff: None,
+                funcname: None,
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,

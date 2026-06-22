@@ -1451,7 +1451,7 @@ fn write_commit_diff_patch(
             },
             |_| false,
             |stdout, entry| {
-                let patch_options = DiffPatchOptions {
+                let patch_options = DiffRenderOptions {
                     db,
                     worktree_root: None,
                     use_worktree_new: false,
@@ -1461,6 +1461,7 @@ fn write_commit_diff_patch(
                     dst_prefix: "b/",
                     context: 3,
                     userdiff: Some(&userdiff),
+                    funcname: None,
                     colors: colors.as_ref(),
                     word_diff: word_request.as_ref(),
                     no_index_contents: None,

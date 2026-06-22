@@ -368,7 +368,7 @@ impl LogDiffContext<'_> {
                 write_diff_patch_entry(
                     out,
                     entry,
-                    DiffPatchOptions {
+                    DiffRenderOptions {
                         db: self.db,
                         worktree_root: None,
                         use_worktree_new: false,
@@ -378,6 +378,7 @@ impl LogDiffContext<'_> {
                         dst_prefix: "b/",
                         context: 3,
                         userdiff: None,
+                        funcname: None,
                         colors: None,
                         word_diff: None,
                         no_index_contents: None,

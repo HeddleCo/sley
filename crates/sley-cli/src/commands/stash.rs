@@ -3116,7 +3116,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                     writeln!(stdout)?;
                 }
                 for entry in &entries {
-                    let options = DiffPatchOptions {
+                    let options = DiffRenderOptions {
                         db: &db,
                         worktree_root: None,
                         use_worktree_new: false,
@@ -3126,6 +3126,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                         dst_prefix: "b/",
                         context: 3,
                         userdiff: None,
+                        funcname: None,
                         colors: None,
                         word_diff: None,
                         no_index_contents: None,
@@ -4224,7 +4225,7 @@ fn write_stash_list_patch(
     .unwrap_or(7)
     .min(format.hex_len());
     for entry in &entries {
-        let options = DiffPatchOptions {
+        let options = DiffRenderOptions {
             db,
             worktree_root: None,
             use_worktree_new: false,
@@ -4234,6 +4235,7 @@ fn write_stash_list_patch(
             dst_prefix: "b/",
             context: 3,
             userdiff: None,
+            funcname: None,
             colors: None,
             word_diff: None,
             no_index_contents: None,
