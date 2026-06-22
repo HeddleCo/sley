@@ -1614,8 +1614,8 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
         } else {
             None
         };
-        let name = match update_ref_effective_name(&store, &positional[0], deref) {
-            Ok(name) => name,
+        let effective = match update_ref_effective_ref(&store, &positional[0], deref) {
+            Ok(effective) => effective,
             Err(GitError::InvalidPath(_)) => {
                 eprintln!(
                     "error: refusing to update ref with bad name '{}'",
@@ -1625,7 +1625,20 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             }
             Err(err) => return Err(err),
         };
-        return update_ref_delete(&store, format, &name, expected_oid.as_ref());
+        if deref
+            && effective.requested == effective.effective
+            && matches!(
+                store.read_ref(&effective.requested)?,
+                Some(RefTarget::Symbolic(target)) if target == effective.requested
+            )
+        {
+            eprintln!(
+                "error: multiple updates for '{}' (including one via symref '{}') are not allowed",
+                effective.requested, effective.requested
+            );
+            return Err(GitError::Exit(1));
+        }
+        return update_ref_delete(&store, format, &effective.effective, expected_oid.as_ref());
     }
     if positional.len() != 2 && positional.len() != 3 {
         return Err(GitError::Command(
@@ -4353,7 +4366,11 @@ fn commit_symbolic_ref_update(tx: sley_refs::FileRefTransaction<'_>) -> Result<(
     match tx.commit() {
         Ok(()) => Ok(()),
         Err(GitError::Transaction(message)) if message.starts_with("cannot lock ref '") => {
-            eprintln!("error: {message}");
+            let detail = message
+                .split_once(": ")
+                .map(|(_, detail)| detail)
+                .unwrap_or(&message);
+            eprintln!("error: {detail}");
             Err(GitError::Exit(1))
         }
         Err(err) => Err(err),

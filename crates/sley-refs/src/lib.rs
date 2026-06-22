@@ -3314,6 +3314,26 @@ impl FileRefStore {
         } else {
             None
         };
+        if changes
+            .iter()
+            .any(|change| matches!(change, CoalescedRefChange::Update(_)))
+        {
+            let mut names = self
+                .list_refs()?
+                .into_iter()
+                .map(|reference| reference.name)
+                .collect::<BTreeSet<_>>();
+            for change in &changes {
+                if let CoalescedRefChange::Update(update) = change {
+                    names.insert(update.name.clone());
+                }
+            }
+            for change in &changes {
+                if let CoalescedRefChange::Update(update) = change {
+                    check_ref_directory_conflict_in_names(&update.name, &names)?;
+                }
+            }
+        }
         let mut records = Vec::with_capacity(changes.len());
         let mut reflogs = Vec::new();
         let mut delete_names = Vec::new();
