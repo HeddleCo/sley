@@ -604,7 +604,7 @@ declare -A FLOOR=(
     [t5302-pack-index.sh]=31
     [t5303-pack-corruption-resilience.sh]=31
     [t5304-prune.sh]=32
-    [t5319-multi-pack-index.sh]=77
+    [t5319-multi-pack-index.sh]=93  # wave-39: 70->95 (midx bitmap/verify/expire/repack; banked 93 margin, 3 hard cells)
     [t5324-split-commit-graph.sh]=25
     [t5329-pack-objects-cruft.sh]=19
     [t5504-fetch-receive-strict.sh]=7
@@ -673,7 +673,7 @@ declare -A FLOOR=(
     # interaction regression): t4015=102, t4013=172, t7600=50, t5304=13, t6500-gc=14,
     # t7700-repack=17, t5319=77, t5324=11, t7508=114, t2107=10, t7008=5.
     [t7800-difftool.sh]=91
-    [t7610-mergetool.sh]=12
+    [t7610-mergetool.sh]=20  # wave-39: 12->21 (per-file tool cwd/temp/autocrlf; banked 20 margin, 10 interactive cells remain)
     # codex-wave-10 (untracked-cache UNTR extension): native read/write, update-index
     # toggles, status create/remove/keep, -uall/-unormal bypass, exclude-OID hashing,
     # mutation invalidation, trace2 perf, ident-mismatch, UNTR-preserve across rewrites.
@@ -742,7 +742,7 @@ declare -A FLOOR=(
     [t7703-repack-geometric.sh]=11
     [t7704-repack-cruft.sh]=15
     [t6500-gc.sh]=34  # wave-38: 15->35 (repack/prune/auto-heuristic/commit-graph), banked 34 margin
-    [t0610-reftable-basics.sh]=72
+    [t0610-reftable-basics.sh]=89  # wave-39: 71->91 FULL (D/F+symref conflicts, linked-wt stack routing, compaction races; banked 89 margin)
     [t4061-diff-indent.sh]=21
     # wave-12 (2026-06-19, integ/wave12A onto bd53260f): 4-slice disjoint batch.
     # diff-external driver + max-depth (t4020 24->72 full, t4072 2->50); pull
