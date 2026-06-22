@@ -321,6 +321,12 @@ fn collect_reflog_names(path: &Path, base: &Path, names: &mut BTreeSet<String>) 
 
 fn collect_repository_reflog_names(git_dir: &Path, names: &mut BTreeSet<String>) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(git_dir, format);
+    if store.uses_reftable()? {
+        names.extend(store.list_reflog_names()?);
+        return Ok(());
+    }
     let common_logs = common_git_dir.join("logs");
     let worktree_logs = git_dir.join("logs");
     if worktree_logs != common_logs {
