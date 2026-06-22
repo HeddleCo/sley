@@ -625,6 +625,10 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             filter_provided_objects,
             unpacked,
         };
+        if !bitmap_eligible || want_roots.is_empty() {
+            let objects_dir = sley_odb::repository_objects_dir(&git_dir);
+            let _ = sley_odb::load_pack_bitmap(&objects_dir, format)?;
+        }
         if bitmap_eligible
             && !want_roots.is_empty()
             && rev_list_try_bitmap(&git_dir, &db, format, &query)?

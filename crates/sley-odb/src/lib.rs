@@ -1456,10 +1456,10 @@ pub fn install_repack_result_with_bitmap(
     // pack is never removed for an object the new index cannot serve.
     let present: HashSet<ObjectId> = parsed_index.entries.iter().map(|entry| entry.oid).collect();
 
-    prune_packs_contained_in(
+    prune_obsolete_pack_paths(
         &objects_dir,
         format,
-        &present,
+        &result.obsolete_packs,
         &new_pack_path,
         &result.retained_pack_stems,
     )?;
@@ -2148,12 +2148,23 @@ fn existing_pack_files(pack_dir: &Path) -> Result<Vec<PathBuf>> {
 /// Remove pre-existing packs whose every object is contained in `present`,
 /// skipping `keep` (the pack just written), `.keep` packs, and `.promisor` packs.
 /// A stale multi-pack-index that references any removed pack is removed too.
-fn prune_packs_contained_in(
+fn prune_obsolete_pack_paths(
     objects_dir: &Path,
     format: ObjectFormat,
-    present: &HashSet<ObjectId>,
+    packs: &[PathBuf],
     keep: &Path,
     retained_pack_stems: &[String],
+) -> Result<()> {
+    prune_pack_paths_matching(objects_dir, format, packs.iter(), keep, retained_pack_stems, |_| Ok(true))
+}
+
+fn prune_pack_paths_matching<'a>(
+    objects_dir: &Path,
+    format: ObjectFormat,
+    packs: impl IntoIterator<Item = &'a PathBuf>,
+    keep: &Path,
+    retained_pack_stems: &[String],
+    mut should_prune: impl FnMut(&Path) -> Result<bool>,
 ) -> Result<()> {
     let pack_dir = objects_dir.join("pack");
     let keep_stem = keep.file_stem().map(|stem| stem.to_owned());
@@ -2161,7 +2172,7 @@ fn prune_packs_contained_in(
         retained_pack_stems.iter().map(String::as_str).collect();
     let mut removed_stems: HashSet<String> = HashSet::new();
 
-    for pack_path in existing_pack_files(&pack_dir)? {
+    for pack_path in packs {
         if pack_path == keep {
             continue;
         }
@@ -2181,24 +2192,11 @@ fn prune_packs_contained_in(
         {
             continue;
         }
-        let index_path = pack_path.with_extension("idx");
-        if !index_path.exists() {
-            // Without an index we cannot prove containment; leave it alone.
+        if !should_prune(pack_path)? {
             continue;
         }
-        let index = PackIndex::parse(&fs::read(&index_path)?, format)?;
-        if !index
-            .entries
-            .iter()
-            .all(|entry| present.contains(&entry.oid))
-        {
-            continue;
-        }
-        // Every object in this pack is safely in the new pack and it has no Git
-        // policy sidecar that says to keep it: remove the pack, its index, and
-        // cache sidecars derived from them.
-        remove_file_if_exists(&pack_path)?;
-        remove_file_if_exists(&index_path)?;
+        remove_file_if_exists(pack_path)?;
+        remove_file_if_exists(&pack_path.with_extension("idx"))?;
         for ext in ["rev", "mtimes", "bitmap"] {
             remove_file_if_exists(&pack_path.with_extension(ext))?;
         }
@@ -3016,8 +3014,21 @@ fn load_midx_bitmap(pack_dir: &Path, format: ObjectFormat) -> Result<Option<Load
     let Ok(midx_bytes) = fs::read(&midx_path) else {
         return Ok(None);
     };
-    let Ok(midx) = MultiPackIndex::parse(&midx_bytes, format) else {
+    if midx_has_bad_ridx_chunk(&midx_bytes, format) {
+        eprintln!("error: multi-pack-index reverse-index chunk is the wrong size");
+        eprintln!("warning: multi-pack bitmap is missing required reverse index");
         return Ok(None);
+    }
+    let midx = match MultiPackIndex::parse(&midx_bytes, format) {
+        Ok(midx) => midx,
+        Err(GitError::InvalidFormat(message))
+            if message == "multi-pack-index reverse-index chunk is the wrong size" =>
+        {
+            eprintln!("error: {message}");
+            eprintln!("warning: multi-pack bitmap is missing required reverse index");
+            return Ok(None);
+        }
+        Err(_) => return Ok(None),
     };
     let bitmap_path = pack_dir.join(format!(
         "multi-pack-index-{}.bitmap",
@@ -3085,6 +3096,67 @@ fn load_midx_bitmap(pack_dir: &Path, format: ObjectFormat) -> Result<Option<Load
         Ok(loaded) => Ok(Some(loaded)),
         Err(_) => Ok(None),
     }
+}
+
+fn midx_has_bad_ridx_chunk(bytes: &[u8], format: ObjectFormat) -> bool {
+    let hash_len = format.raw_len();
+    if bytes.len() < 12 + 12 + hash_len || &bytes[..4] != b"MIDX" {
+        return false;
+    }
+    let chunk_count = bytes[6] as usize;
+    let table_len = match (chunk_count + 1).checked_mul(12) {
+        Some(table_len) => table_len,
+        None => return false,
+    };
+    let table_end = match 12usize.checked_add(table_len) {
+        Some(table_end) if table_end <= bytes.len().saturating_sub(hash_len) => table_end,
+        _ => return false,
+    };
+    let mut entries = Vec::with_capacity(chunk_count + 1);
+    let mut cursor = 12usize;
+    while cursor < table_end {
+        let id = [
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ];
+        let mut raw_offset = [0u8; 8];
+        raw_offset.copy_from_slice(&bytes[cursor + 4..cursor + 12]);
+        entries.push((id, u64::from_be_bytes(raw_offset) as usize));
+        cursor += 12;
+    }
+    let mut oidf = None;
+    let mut ridx = None;
+    for pair in entries.windows(2) {
+        let start = pair[0].1;
+        let end = pair[1].1;
+        if end < start || end > bytes.len().saturating_sub(hash_len) {
+            return false;
+        }
+        match &pair[0].0 {
+            b"OIDF" => oidf = Some((start, end)),
+            b"RIDX" => ridx = Some((start, end)),
+            _ => {}
+        }
+    }
+    let Some((oidf_start, oidf_end)) = oidf else {
+        return false;
+    };
+    let Some((ridx_start, ridx_end)) = ridx else {
+        return false;
+    };
+    if oidf_end.saturating_sub(oidf_start) != 256 * 4 {
+        return false;
+    }
+    let object_count_start = oidf_end - 4;
+    let object_count = u32::from_be_bytes([
+        bytes[object_count_start],
+        bytes[object_count_start + 1],
+        bytes[object_count_start + 2],
+        bytes[object_count_start + 3],
+    ]) as usize;
+    ridx_end.saturating_sub(ridx_start) != object_count.saturating_mul(4)
 }
 
 fn load_pack_bitmap_file(
@@ -4273,9 +4345,11 @@ fn collect_packed_object_ids(
     if !pack_dir.exists() {
         return Ok(());
     }
+    let mut midx_pack_names = HashSet::new();
     let midx_path = pack_dir.join("multi-pack-index");
     if midx_path.exists() {
-        let midx = MultiPackIndex::parse(&fs::read(&midx_path)?, format)?;
+        let midx = MultiPackIndex::parse_without_checksum(&fs::read(&midx_path)?, format)?;
+        midx_pack_names.extend(midx.pack_names.iter().cloned());
         oids.extend(midx.objects.into_iter().map(|entry| entry.oid));
     }
     for entry in fs::read_dir(pack_dir)? {
@@ -4286,7 +4360,22 @@ fn collect_packed_object_ids(
         if !path.with_extension("pack").exists() {
             continue;
         }
-        let index = PackIndex::parse(&fs::read(path)?, format)?;
+        let index = match PackIndex::parse(&fs::read(&path)?, format) {
+            Ok(index) => index,
+            Err(_err)
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| midx_pack_names.contains(name)) =>
+            {
+                eprintln!(
+                    "error: packfile {} index unavailable",
+                    path.with_extension("pack").display()
+                );
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         oids.extend(index.entries.into_iter().map(|entry| entry.oid));
     }
     Ok(())
@@ -4892,7 +4981,26 @@ impl FileObjectDatabase {
             return Ok(Some(Arc::clone(midx)));
         }
         let bytes = load_multi_pack_index_lookup_data(midx_path)?;
-        let midx = Arc::new(MultiPackIndexOidLookup::parse(bytes, self.format)?);
+        let midx = match MultiPackIndexOidLookup::parse(bytes, self.format) {
+            Ok(midx) => Arc::new(midx),
+            Err(GitError::InvalidFormat(message))
+                if message.starts_with("multi-pack-index hash id ") =>
+            {
+                let actual = message
+                    .strip_prefix("multi-pack-index hash id ")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .unwrap_or("0");
+                let expected = match self.format {
+                    ObjectFormat::Sha1 => 1,
+                    ObjectFormat::Sha256 => 2,
+                };
+                eprintln!(
+                    "error: multi-pack-index hash version {actual} does not match version {expected}"
+                );
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
         if let Ok(mut cache) = self.multi_pack_oid_lookups.lock() {
             cache.insert(midx_path.to_path_buf(), Arc::clone(&midx));
         }
@@ -4936,19 +5044,31 @@ impl FileObjectDatabase {
         let hinted_pack_index = registry.cached_hint();
         if let Some(pack_index) = hinted_pack_index {
             let pack = &registry.packs[pack_index];
-            let index = pack.index(self.format)?;
-            if let Some(entry) = index.find(oid) {
-                return Ok(Some(PackLookup::from_registered(
-                    Arc::clone(pack),
-                    entry.offset,
-                )));
+            match pack.index(self.format) {
+                Ok(index) => {
+                    if let Some(entry) = index.find(oid) {
+                        return Ok(Some(PackLookup::from_registered(
+                            Arc::clone(pack),
+                            entry.offset,
+                        )));
+                    }
+                }
+                Err(_) => {
+                    eprintln!("error: packfile {} index unavailable", pack.pack.display());
+                }
             }
         }
         for (pack_index, pack) in registry.packs.iter().enumerate() {
             if Some(pack_index) == hinted_pack_index {
                 continue;
             }
-            let index = pack.index(self.format)?;
+            let index = match pack.index(self.format) {
+                Ok(index) => index,
+                Err(_) => {
+                    eprintln!("error: packfile {} index unavailable", pack.pack.display());
+                    continue;
+                }
+            };
             if let Some(entry) = index.find(oid) {
                 registry.remember_hint(pack_index);
                 return Ok(Some(PackLookup::from_registered(
@@ -7146,11 +7266,13 @@ mod tests {
                     oid: first_oid,
                     pack_int_id: 0,
                     offset: first_pack.entries[0].offset,
+                    force_large_offset: false,
                 },
                 sley_pack::MultiPackIndexEntry {
                     oid: second_oid,
                     pack_int_id: 1,
                     offset: second_pack.entries[0].offset,
+                    force_large_offset: false,
                 },
             ],
         )

@@ -382,6 +382,7 @@ pub struct MultiPackIndexEntry {
     pub oid: ObjectId,
     pub pack_int_id: u32,
     pub offset: u64,
+    pub force_large_offset: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1111,15 +1112,20 @@ impl<'a> PackIndexView<'a> {
                 u32_be(&bytes[start..start + 4]) & 0x8000_0000 != 0
             })
             .count();
-        let large_offset_table = checked_range(offset, large_offset_count, 8, bytes.len())?;
+        let mut large_offset_table = checked_range(offset, large_offset_count, 8, bytes.len())?;
         offset = large_offset_table.end;
 
         let expected_trailer_offset = bytes.len() - hash_len * 2;
         if offset != expected_trailer_offset {
-            return Err(GitError::InvalidFormat(format!(
-                "pack index has {} unexpected bytes before trailer",
-                expected_trailer_offset.saturating_sub(offset)
-            )));
+            if !verify_checksum && offset < expected_trailer_offset {
+                large_offset_table = large_offset_table.start..expected_trailer_offset;
+                offset = expected_trailer_offset;
+            } else {
+                return Err(GitError::InvalidFormat(format!(
+                    "pack index has {} unexpected bytes before trailer",
+                    expected_trailer_offset.saturating_sub(offset)
+                )));
+            }
         }
         let pack_checksum = ObjectId::from_raw(format, &bytes[offset..offset + hash_len])?;
 
@@ -1550,12 +1556,20 @@ impl PackIndex {
     }
 
     pub fn parse(bytes: &[u8], format: ObjectFormat) -> Result<Self> {
+        Self::parse_impl(bytes, format, true)
+    }
+
+    pub fn parse_without_checksum(bytes: &[u8], format: ObjectFormat) -> Result<Self> {
+        Self::parse_impl(bytes, format, false)
+    }
+
+    fn parse_impl(bytes: &[u8], format: ObjectFormat, verify_checksum: bool) -> Result<Self> {
         let hash_len = format.raw_len();
         if bytes.len() < 4 {
             return Err(GitError::InvalidFormat("pack index too short".into()));
         }
         if bytes[..4] != [0xff, b't', b'O', b'c'] {
-            return Self::parse_v1(bytes, format);
+            return Self::parse_v1_impl(bytes, format, verify_checksum);
         }
         if bytes.len() < 8 + 256 * 4 + 2 * hash_len {
             return Err(GitError::InvalidFormat("pack index too short".into()));
@@ -1567,13 +1581,15 @@ impl PackIndex {
             )));
         }
         let index_checksum_offset = bytes.len() - hash_len;
-        let actual_index_checksum =
-            sley_core::digest_bytes(format, &bytes[..index_checksum_offset])?;
         let index_checksum = ObjectId::from_raw(format, &bytes[index_checksum_offset..])?;
-        if actual_index_checksum != index_checksum {
-            return Err(GitError::InvalidFormat(format!(
-                "pack index checksum mismatch: expected {index_checksum}, got {actual_index_checksum}"
-            )));
+        if verify_checksum {
+            let actual_index_checksum =
+                sley_core::digest_bytes(format, &bytes[..index_checksum_offset])?;
+            if actual_index_checksum != index_checksum {
+                return Err(GitError::InvalidFormat(format!(
+                    "pack index checksum mismatch: expected {index_checksum}, got {actual_index_checksum}"
+                )));
+            }
         }
 
         let mut offset = 8usize;
@@ -1603,15 +1619,20 @@ impl PackIndex {
                 u32_be(&bytes[start..start + 4]) & 0x8000_0000 != 0
             })
             .count();
-        let large_offset_table = checked_range(offset, large_offset_count, 8, bytes.len())?;
+        let mut large_offset_table = checked_range(offset, large_offset_count, 8, bytes.len())?;
         offset = large_offset_table.end;
 
         let expected_trailer_offset = bytes.len() - hash_len * 2;
         if offset != expected_trailer_offset {
-            return Err(GitError::InvalidFormat(format!(
-                "pack index has {} unexpected bytes before trailer",
-                expected_trailer_offset.saturating_sub(offset)
-            )));
+            if !verify_checksum && offset < expected_trailer_offset {
+                large_offset_table = large_offset_table.start..expected_trailer_offset;
+                offset = expected_trailer_offset;
+            } else {
+                return Err(GitError::InvalidFormat(format!(
+                    "pack index has {} unexpected bytes before trailer",
+                    expected_trailer_offset.saturating_sub(offset)
+                )));
+            }
         }
         let pack_checksum = ObjectId::from_raw(format, &bytes[offset..offset + hash_len])?;
 
@@ -1645,7 +1666,7 @@ impl PackIndex {
             } else {
                 let large_idx = (raw_offset & 0x7fff_ffff) as usize;
                 let large_start = large_offset_table.start + large_idx * 8;
-                if large_idx >= large_offset_count {
+                if large_idx >= large_offset_table.len() / 8 {
                     return Err(GitError::InvalidFormat(
                         "pack index large offset points past table".into(),
                     ));
@@ -1667,19 +1688,21 @@ impl PackIndex {
         })
     }
 
-    fn parse_v1(bytes: &[u8], format: ObjectFormat) -> Result<Self> {
+    fn parse_v1_impl(bytes: &[u8], format: ObjectFormat, verify_checksum: bool) -> Result<Self> {
         let hash_len = format.raw_len();
         if bytes.len() < 256 * 4 + 2 * hash_len {
             return Err(GitError::InvalidFormat("pack index too short".into()));
         }
         let index_checksum_offset = bytes.len() - hash_len;
-        let actual_index_checksum =
-            sley_core::digest_bytes(format, &bytes[..index_checksum_offset])?;
         let index_checksum = ObjectId::from_raw(format, &bytes[index_checksum_offset..])?;
-        if actual_index_checksum != index_checksum {
-            return Err(GitError::InvalidFormat(format!(
-                "pack index checksum mismatch: expected {index_checksum}, got {actual_index_checksum}"
-            )));
+        if verify_checksum {
+            let actual_index_checksum =
+                sley_core::digest_bytes(format, &bytes[..index_checksum_offset])?;
+            if actual_index_checksum != index_checksum {
+                return Err(GitError::InvalidFormat(format!(
+                    "pack index checksum mismatch: expected {index_checksum}, got {actual_index_checksum}"
+                )));
+            }
         }
 
         let mut offset = 0usize;
@@ -2332,6 +2355,17 @@ impl MultiPackIndex {
         objects: &[MultiPackIndexEntry],
         preferred_pack: Option<u32>,
     ) -> Result<Vec<u8>> {
+        Self::write_with_bitmap_packs(format, version, pack_names, objects, preferred_pack, None)
+    }
+
+    pub fn write_with_bitmap_packs(
+        format: ObjectFormat,
+        version: u8,
+        pack_names: &[String],
+        objects: &[MultiPackIndexEntry],
+        preferred_pack: Option<u32>,
+        bitmapped_packs: Option<&[MultiPackBitmapPack]>,
+    ) -> Result<Vec<u8>> {
         if let Some(preferred) = preferred_pack
             && preferred as usize >= pack_names.len()
         {
@@ -2354,6 +2388,25 @@ impl MultiPackIndex {
             return Err(GitError::InvalidFormat(
                 "too many multi-pack-index objects".into(),
             ));
+        }
+        if let Some(bitmapped_packs) = bitmapped_packs {
+            if bitmapped_packs.len() != pack_names.len() {
+                return Err(GitError::InvalidFormat(
+                    "multi-pack-index BTMP pack count mismatch".into(),
+                ));
+            }
+            for pack in bitmapped_packs {
+                let bitmap_end = u64::from(pack.bitmap_pos)
+                    .checked_add(u64::from(pack.bitmap_nr))
+                    .ok_or_else(|| {
+                        GitError::InvalidFormat("multi-pack-index BTMP range overflow".into())
+                    })?;
+                if bitmap_end > objects.len() as u64 {
+                    return Err(GitError::InvalidFormat(
+                        "multi-pack-index BTMP range points past object table".into(),
+                    ));
+                }
+            }
         }
         validate_midx_pack_names(pack_names)?;
         if version == 1 && pack_names.windows(2).any(|pair| pair[0] > pair[1]) {
@@ -2417,10 +2470,26 @@ impl MultiPackIndex {
             }
             chunks.push((*b"RIDX", ridx));
         }
+        if let Some(bitmapped_packs) = bitmapped_packs {
+            let mut btmp = Vec::with_capacity(bitmapped_packs.len() * 8);
+            for pack in bitmapped_packs {
+                btmp.extend_from_slice(&pack.bitmap_pos.to_be_bytes());
+                btmp.extend_from_slice(&pack.bitmap_nr.to_be_bytes());
+            }
+            chunks.push((*b"BTMP", btmp));
+        }
         write_multi_pack_index_chunks(format, version, pack_names.len() as u32, &chunks)
     }
 
     pub fn parse(bytes: &[u8], format: ObjectFormat) -> Result<Self> {
+        Self::parse_impl(bytes, format, true)
+    }
+
+    pub fn parse_without_checksum(bytes: &[u8], format: ObjectFormat) -> Result<Self> {
+        Self::parse_impl(bytes, format, false)
+    }
+
+    fn parse_impl(bytes: &[u8], format: ObjectFormat, verify_checksum: bool) -> Result<Self> {
         let hash_len = format.raw_len();
         if bytes.len() < 12 + 12 + hash_len {
             return Err(GitError::InvalidFormat(
@@ -2466,12 +2535,14 @@ impl MultiPackIndex {
             ));
         }
 
-        let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
         let checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
-        if actual_checksum != checksum {
-            return Err(GitError::InvalidFormat(format!(
-                "multi-pack-index checksum mismatch: expected {checksum}, got {actual_checksum}"
-            )));
+        if verify_checksum {
+            let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
+            if actual_checksum != checksum {
+                return Err(GitError::InvalidFormat(format!(
+                    "multi-pack-index checksum mismatch: expected {checksum}, got {actual_checksum}"
+                )));
+            }
         }
 
         let mut entries = Vec::with_capacity(chunk_count + 1);
@@ -2505,6 +2576,7 @@ impl MultiPackIndex {
 
         let mut chunks = Vec::with_capacity(chunk_count);
         let mut previous_offset = data_start as u64;
+        let mut reported_unaligned = false;
         for pair in entries.windows(2) {
             let (id, chunk_offset) = pair[0];
             let (_next_id, next_offset) = pair[1];
@@ -2517,6 +2589,13 @@ impl MultiPackIndex {
                 return Err(GitError::InvalidFormat(
                     "multi-pack-index chunk offsets are not monotonic".into(),
                 ));
+            }
+            if chunk_offset % 4 != 0 && !reported_unaligned {
+                eprintln!(
+                    "error: chunk id {:08x} not 4-byte aligned",
+                    u32::from_be_bytes(id)
+                );
+                reported_unaligned = true;
             }
             if next_offset < chunk_offset || next_offset > checksum_offset as u64 {
                 return Err(GitError::InvalidFormat(
@@ -2641,6 +2720,7 @@ impl MultiPackIndexOidLookup {
 
         let mut chunks = Vec::with_capacity(chunk_count);
         let mut previous_offset = data_start as u64;
+        let mut reported_unaligned = false;
         for pair in entries.windows(2) {
             let (id, chunk_offset) = pair[0];
             let (_next_id, next_offset) = pair[1];
@@ -2653,6 +2733,13 @@ impl MultiPackIndexOidLookup {
                 return Err(GitError::InvalidFormat(
                     "multi-pack-index chunk offsets are not monotonic".into(),
                 ));
+            }
+            if chunk_offset % 4 != 0 && !reported_unaligned {
+                eprintln!(
+                    "error: chunk id {:08x} not 4-byte aligned",
+                    u32::from_be_bytes(id)
+                );
+                reported_unaligned = true;
             }
             if next_offset < chunk_offset || next_offset > checksum_offset as u64 {
                 return Err(GitError::InvalidFormat(
@@ -2676,7 +2763,7 @@ impl MultiPackIndexOidLookup {
         })?;
         if oid_lookup.len() != expected_len {
             return Err(GitError::InvalidFormat(
-                "multi-pack-index OIDL chunk has invalid length".into(),
+                "error: multi-pack-index OID lookup chunk is the wrong size\nfatal: multi-pack-index required OID lookup chunk missing or corrupted".into(),
             ));
         }
         let object_offsets = midx_chunk_data(raw, &chunks, *b"OOFF", true)?
@@ -2686,7 +2773,7 @@ impl MultiPackIndexOidLookup {
         })?;
         if object_offsets.len() != expected_offsets_len {
             return Err(GitError::InvalidFormat(
-                "multi-pack-index OOFF chunk has invalid length".into(),
+                "error: multi-pack-index object offset chunk is the wrong size\nfatal: multi-pack-index required object offsets chunk missing or corrupted".into(),
             ));
         }
         let large_offsets = midx_chunk_data(raw, &chunks, *b"LOFF", false)?;
@@ -2768,7 +2855,7 @@ impl MultiPackIndexOidLookup {
             })?;
             if large_end > self.large_offsets_len {
                 return Err(GitError::InvalidFormat(
-                    "multi-pack-index large offset points past LOFF chunk".into(),
+                    "fatal: multi-pack-index large offset out of bounds".into(),
                 ));
             }
             let start = large_offsets_offset + large_start;
@@ -2778,6 +2865,7 @@ impl MultiPackIndexOidLookup {
             oid,
             pack_int_id,
             offset,
+            force_large_offset: raw_offset & 0x8000_0000 != 0,
         }))
     }
 
@@ -2887,7 +2975,7 @@ fn write_midx_object_offsets(
     let mut out = Vec::new();
     for object in objects {
         out.extend_from_slice(&object.pack_int_id.to_be_bytes());
-        if object.offset < 0x8000_0000 {
+        if object.offset < 0x8000_0000 && !object.force_large_offset {
             out.extend_from_slice(&(object.offset as u32).to_be_bytes());
         } else {
             let large_idx = large_offsets.len() / 8;
@@ -4456,7 +4544,7 @@ fn parse_midx_pack_names(
     while names.len() < pack_count {
         let Some(relative_end) = data[offset..].iter().position(|byte| *byte == 0) else {
             return Err(GitError::InvalidFormat(
-                "multi-pack-index PNAM entry is unterminated".into(),
+                "fatal: multi-pack-index pack-name chunk is too short".into(),
             ));
         };
         let name_bytes = &data[offset..offset + relative_end];
@@ -4497,7 +4585,7 @@ fn parse_midx_oid_fanout(
         .ok_or_else(|| GitError::InvalidFormat("multi-pack-index missing OIDF chunk".into()))?;
     if data.len() != 256 * 4 {
         return Err(GitError::InvalidFormat(
-            "multi-pack-index OIDF chunk has invalid length".into(),
+            "error: multi-pack-index OID fanout is of the wrong size\nfatal: multi-pack-index required OID fanout chunk missing or corrupted".into(),
         ));
     }
     let mut fanout = [0u32; 256];
@@ -4507,7 +4595,12 @@ fn parse_midx_oid_fanout(
         *slot = u32_be(&data[start..start + 4]);
         if *slot < previous {
             return Err(GitError::InvalidFormat(
-                "multi-pack-index OIDF fanout is not monotonic".into(),
+                format!(
+                    "error: oid fanout out of order: fanout[{}] = {:x} > {:x} = fanout[{idx}]\nfatal: multi-pack-index required OID fanout chunk missing or corrupted",
+                    idx - 1,
+                    previous,
+                    *slot
+                ),
             ));
         }
         previous = *slot;
@@ -4529,7 +4622,7 @@ fn parse_midx_object_ids(
         .ok_or_else(|| GitError::InvalidFormat("multi-pack-index OIDL chunk overflow".into()))?;
     if data.len() != expected_len {
         return Err(GitError::InvalidFormat(
-            "multi-pack-index OIDL chunk has invalid length".into(),
+            "error: multi-pack-index OID lookup chunk is the wrong size\nfatal: multi-pack-index required OID lookup chunk missing or corrupted".into(),
         ));
     }
 
@@ -4581,7 +4674,7 @@ fn parse_midx_object_offsets(
         .ok_or_else(|| GitError::InvalidFormat("multi-pack-index OOFF chunk overflow".into()))?;
     if data.len() != expected_len {
         return Err(GitError::InvalidFormat(
-            "multi-pack-index OOFF chunk has invalid length".into(),
+            "error: multi-pack-index object offset chunk is the wrong size\nfatal: multi-pack-index required object offsets chunk missing or corrupted".into(),
         ));
     }
     let large_offsets = midx_chunk_data(bytes, chunks, *b"LOFF", false)?;
@@ -4620,7 +4713,7 @@ fn parse_midx_object_offsets(
             })?;
             if large_end > large_offsets.len() {
                 return Err(GitError::InvalidFormat(
-                    "multi-pack-index large offset points past LOFF chunk".into(),
+                    "fatal: multi-pack-index large offset out of bounds".into(),
                 ));
             }
             u64_be(&large_offsets[large_start..large_end])
@@ -4629,6 +4722,7 @@ fn parse_midx_object_offsets(
             oid,
             pack_int_id,
             offset,
+            force_large_offset: raw_offset & 0x8000_0000 != 0,
         });
     }
     Ok(entries)
@@ -4647,7 +4741,7 @@ fn parse_midx_reverse_index(
         .ok_or_else(|| GitError::InvalidFormat("multi-pack-index RIDX chunk overflow".into()))?;
     if data.len() != expected_len {
         return Err(GitError::InvalidFormat(
-            "multi-pack-index RIDX chunk has invalid length".into(),
+            "multi-pack-index reverse-index chunk is the wrong size".into(),
         ));
     }
     let mut positions = Vec::with_capacity(object_count);
@@ -6722,11 +6816,13 @@ mod tests {
                     oid: second.clone(),
                     pack_int_id: 0,
                     offset: 0x1_0000_0000,
+                    force_large_offset: false,
                 },
                 MultiPackIndexEntry {
                     oid: first.clone(),
                     pack_int_id: 1,
                     offset: 12,
+                    force_large_offset: false,
                 },
             ],
         )
@@ -6792,6 +6888,7 @@ mod tests {
                     oid,
                     pack_int_id: 1,
                     offset: 12,
+                    force_large_offset: false,
                 }],
             )
             .is_err()
@@ -6806,11 +6903,13 @@ mod tests {
                         oid,
                         pack_int_id: 0,
                         offset: 12,
+                        force_large_offset: false,
                     },
                     MultiPackIndexEntry {
                         oid,
                         pack_int_id: 0,
                         offset: 24,
+                        force_large_offset: false,
                     },
                 ],
             )
