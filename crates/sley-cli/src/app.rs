@@ -60,6 +60,7 @@ static GLOBAL_WORK_TREE: Mutex<Option<PathBuf>> = Mutex::new(None);
 static GLOBAL_ATTR_SOURCE: Mutex<Option<String>> = Mutex::new(None);
 static GLOBAL_BARE: Mutex<bool> = Mutex::new(false);
 static GLOBAL_REPLACE_OBJECTS: Mutex<bool> = Mutex::new(true);
+static GLOBAL_OPTIONAL_LOCKS: Mutex<bool> = Mutex::new(true);
 /// Default pathspec magic set by the global `--{glob,noglob,icase,literal}-pathspecs`
 /// options (and the corresponding `GIT_*_PATHSPECS` env vars). Mirrors git's
 /// `get_default_pathspec_flags()`: `--literal-pathspecs` wins and forces every
@@ -154,6 +155,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     set_global_attr_source(global.attr_source);
     set_global_bare(global.bare);
     set_global_replace_objects(global.replace_objects);
+    set_global_optional_locks(global.optional_locks);
     set_global_pathspec_flags(global.pathspec_flags);
     // Emit git's GIT_TRACE_SETUP output (the env/config/gitfile discovery trace)
     // before dispatching. This is the CLI-side repository setup that
@@ -416,6 +418,7 @@ struct GlobalOptions<'a> {
     attr_source: Option<String>,
     bare: bool,
     replace_objects: bool,
+    optional_locks: bool,
     pathspec_flags: PathspecFlags,
 }
 
@@ -433,6 +436,7 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
     let mut attr_source = None;
     let mut bare = false;
     let mut replace_objects = env::var_os("GIT_NO_REPLACE_OBJECTS").is_none();
+    let mut optional_locks = git_optional_locks_env_enabled();
     let mut pathspec_flags = PathspecFlags::default();
     while let Some(arg) = args.get(index) {
         match arg.as_str() {
@@ -475,8 +479,11 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
             | "-P"
             | "--no-pager"
             | "--no-lazy-fetch"
-            | "--no-optional-locks"
             | "--no-advice" => {
+                index += 1;
+            }
+            "--no-optional-locks" => {
+                optional_locks = false;
                 index += 1;
             }
             "--no-replace-objects" => {
@@ -560,6 +567,7 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
         attr_source,
         bare,
         replace_objects,
+        optional_locks,
         pathspec_flags,
     })
 }
@@ -784,6 +792,12 @@ fn set_global_replace_objects(replace_objects: bool) {
     }
 }
 
+fn set_global_optional_locks(optional_locks: bool) {
+    if let Ok(mut value) = GLOBAL_OPTIONAL_LOCKS.lock() {
+        *value = optional_locks;
+    }
+}
+
 fn set_global_pathspec_flags(flags: PathspecFlags) {
     if let Ok(mut value) = GLOBAL_PATHSPEC_FLAGS.lock() {
         *value = flags;
@@ -841,6 +855,13 @@ fn git_env_bool(name: &str) -> bool {
     }
 }
 
+fn git_optional_locks_env_enabled() -> bool {
+    match env::var("GIT_OPTIONAL_LOCKS") {
+        Ok(value) => !matches!(value.as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
+}
+
 fn global_git_dir() -> Option<PathBuf> {
     GLOBAL_GIT_DIR.lock().ok()?.clone()
 }
@@ -876,6 +897,10 @@ fn global_bare() -> bool {
 fn global_replace_objects() -> bool {
     GLOBAL_REPLACE_OBJECTS.lock().map_or(true, |value| *value)
         && env::var_os("GIT_NO_REPLACE_OBJECTS").is_none()
+}
+
+pub(crate) fn optional_locks_enabled() -> bool {
+    GLOBAL_OPTIONAL_LOCKS.lock().map_or(true, |value| *value) && git_optional_locks_env_enabled()
 }
 
 pub(crate) fn replace_objects_active(refs: &FileRefStore) -> Result<bool> {

@@ -1707,6 +1707,30 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
+    if !update
+        && !all
+        && let Some(actions) = try_add_regular_exact_untracked_raw(
+            &cwd,
+            &worktree_root,
+            &git_dir,
+            format,
+            &paths,
+            AddRegularOptions {
+                chmod,
+                force,
+                ignore_errors,
+                ignore_removal,
+                ignore_missing,
+                dry_run,
+                sparse,
+            },
+        )?
+    {
+        if verbose {
+            print_add_actions(&worktree_root, &actions)?;
+        }
+        return Ok(());
+    }
     let parsed_index = if paths.is_empty() {
         None
     } else {
@@ -1815,6 +1839,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         actions,
         mut reusable_index,
         exact_tracked,
+        exact_untracked,
         ignored_paths,
     } = resolve_add_regular_actions(
         &cwd,
@@ -1864,6 +1889,26 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             print_add_actions(&worktree_root, &actions)?;
         }
         return Ok(());
+    }
+    if let Some(git_path) = exact_untracked
+        && let Some(index) = reusable_index.take()
+    {
+        let config = read_repo_config(&git_dir)?;
+        if sley::plumbing::sley_worktree::add_exact_untracked_path_with_index(
+            &worktree_root,
+            &git_dir,
+            format,
+            index,
+            &git_path,
+            &config,
+        )?
+        .is_some()
+        {
+            if verbose {
+                print_add_actions(&worktree_root, &actions)?;
+            }
+            return Ok(());
+        }
     }
     let action_paths = actions
         .iter()
@@ -2070,6 +2115,82 @@ fn try_add_regular_exact_tracked_raw(
         &git_path,
         options.ignore_removal,
         crate::effective_config_parameters_env().as_deref(),
+    )?;
+    match result {
+        sley::plumbing::sley_worktree::AddExactTrackedPathResult::Handled(action) => action
+            .into_iter()
+            .map(|action| add_update_tracked_action_to_add_action(worktree_root, action))
+            .collect::<Result<Vec<_>>>()
+            .map(Some),
+        sley::plumbing::sley_worktree::AddExactTrackedPathResult::Unsupported => Ok(None),
+    }
+}
+
+fn try_add_regular_exact_untracked_raw(
+    cwd: &Path,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    options: AddRegularOptions,
+) -> Result<Option<Vec<AddAction>>> {
+    if paths.len() != 1
+        || options.dry_run
+        || options.chmod.is_some()
+        || options.ignore_missing
+        || options.sparse
+    {
+        return Ok(None);
+    }
+    reject_add_paths_outside_sparse_checkout(cwd, worktree_root, git_dir, paths, options)?;
+    let path = &paths[0];
+    if add_pathspec_needs_status_walk(path) || add_pathspec_has_trailing_separator(path) {
+        return Ok(None);
+    }
+    let absolute = normalize_add_absolute_path(cwd, path);
+    let Ok(relative) = absolute.strip_prefix(worktree_root) else {
+        return Ok(None);
+    };
+    if relative.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let git_path = match add_git_path_bytes(relative) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let file_type = metadata.file_type();
+    if metadata.is_dir() || !(file_type.is_file() || file_type.is_symlink()) {
+        return Ok(None);
+    }
+    if !options.force
+        && sley::plumbing::sley_worktree::standard_ignore_match(
+            worktree_root,
+            &git_path,
+            false,
+        )?
+        .is_some_and(|ignore_match| ignore_match.ignored)
+    {
+        return Ok(None);
+    }
+    let config = read_repo_config(git_dir)?;
+    let result = sley::plumbing::sley_worktree::add_exact_untracked_path_from_disk(
+        worktree_root,
+        git_dir,
+        format,
+        &git_path,
+        &config,
     )?;
     match result {
         sley::plumbing::sley_worktree::AddExactTrackedPathResult::Handled(action) => action
@@ -2379,12 +2500,19 @@ struct AddRegularResolution {
     actions: Vec<AddAction>,
     reusable_index: Option<Index>,
     exact_tracked: Option<ExactTrackedAdd>,
+    exact_untracked: Option<Vec<u8>>,
     ignored_paths: Vec<Vec<u8>>,
 }
 
 struct ExactTrackedAdd {
     git_path: Vec<u8>,
     needs_index_update: bool,
+}
+
+struct LiteralFileResolution {
+    actions: Vec<AddAction>,
+    ignored_paths: Vec<Vec<u8>>,
+    exact_untracked: Option<Vec<u8>>,
 }
 
 struct TrackedExactResolution {
@@ -2414,7 +2542,23 @@ fn resolve_add_regular_actions(
             actions: exact.actions,
             reusable_index,
             exact_tracked: exact.exact_tracked,
+            exact_untracked: None,
             ignored_paths: Vec::new(),
+        });
+    }
+    if let Some(literal) = resolve_add_regular_literal_file_actions(
+        cwd,
+        worktree_root,
+        &paths,
+        options,
+        reusable_index.as_ref(),
+    )? {
+        return Ok(AddRegularResolution {
+            actions: literal.actions,
+            reusable_index,
+            exact_tracked: None,
+            exact_untracked: literal.exact_untracked,
+            ignored_paths: literal.ignored_paths,
         });
     }
     let pathspecs = paths
@@ -2523,6 +2667,7 @@ fn resolve_add_regular_actions(
         actions,
         reusable_index: None,
         exact_tracked: None,
+        exact_untracked: None,
         ignored_paths: ignored_paths.into_iter().collect(),
     })
 }
@@ -2536,6 +2681,11 @@ fn collect_add_ignored_pathspec_matches(
 ) -> Result<Vec<(usize, Vec<u8>)>> {
     if pathspecs.is_empty() {
         return Ok(Vec::new());
+    }
+    if let Some(matches) =
+        collect_add_ignored_literal_file_matches(worktree_root, pathspecs, indexed_paths)?
+    {
+        return Ok(matches);
     }
 
     let mut candidates = BTreeSet::new();
@@ -2578,6 +2728,60 @@ fn collect_add_ignored_pathspec_matches(
         }
     }
     Ok(matches)
+}
+
+fn collect_add_ignored_literal_file_matches(
+    worktree_root: &Path,
+    pathspecs: &[(PathBuf, PathBuf, bool)],
+    indexed_paths: &BTreeSet<Vec<u8>>,
+) -> Result<Option<Vec<(usize, Vec<u8>)>>> {
+    let mut matches = Vec::new();
+    for (idx, (display, pathspec, matched)) in pathspecs.iter().enumerate() {
+        if add_pathspec_needs_status_walk(display) || add_pathspec_needs_status_walk(pathspec) {
+            return Ok(None);
+        }
+        if !matched {
+            continue;
+        }
+        let Ok(relative) = pathspec.strip_prefix(worktree_root) else {
+            return Ok(None);
+        };
+        let git_path = add_git_path_bytes(relative)?;
+        if git_path.is_empty() {
+            return Ok(None);
+        }
+        let metadata = match fs::symlink_metadata(pathspec) {
+            Ok(metadata) => metadata,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if metadata.is_dir() {
+            return Ok(None);
+        }
+        if add_ignored_candidate_is_indexed(&git_path, indexed_paths) {
+            continue;
+        }
+        if sley::plumbing::sley_worktree::standard_ignore_match(
+            worktree_root,
+            &git_path,
+            metadata.file_type().is_dir(),
+        )?
+        .is_some_and(|ignore_match| ignore_match.ignored)
+        {
+            matches.push((
+                idx,
+                add_ignored_display_path(worktree_root, pathspec, &git_path)?,
+            ));
+        }
+    }
+    Ok(Some(matches))
 }
 
 fn add_all_index_paths(
@@ -2816,6 +3020,76 @@ fn resolve_add_regular_tracked_exact_actions(
     Ok(Some(TrackedExactResolution {
         actions,
         exact_tracked,
+    }))
+}
+
+fn resolve_add_regular_literal_file_actions(
+    cwd: &Path,
+    worktree_root: &Path,
+    paths: &[PathBuf],
+    options: AddRegularOptions,
+    index: Option<&Index>,
+) -> Result<Option<LiteralFileResolution>> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let Some(index) = index else {
+        return Ok(None);
+    };
+    let mut actions = Vec::new();
+    let mut ignored_paths = BTreeSet::new();
+    let mut exact_untracked = None;
+    for path in paths {
+        if add_pathspec_needs_status_walk(path) {
+            return Ok(None);
+        }
+        let absolute = normalize_add_absolute_path(cwd, path);
+        let Ok(relative) = absolute.strip_prefix(worktree_root) else {
+            return Ok(None);
+        };
+        let git_path = add_git_path_bytes(relative)?;
+        if git_path.is_empty() {
+            return Ok(None);
+        }
+        if !add_index_entries_path_range(&index.entries, &git_path).is_empty() {
+            return Ok(None);
+        }
+        let metadata = match fs::symlink_metadata(&absolute) {
+            Ok(metadata) => metadata,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let file_type = metadata.file_type();
+        if metadata.is_dir() || !(file_type.is_file() || file_type.is_symlink()) {
+            return Ok(None);
+        }
+        if !options.force
+            && sley::plumbing::sley_worktree::standard_ignore_match(
+                worktree_root,
+                &git_path,
+                false,
+            )?
+            .is_some_and(|ignore_match| ignore_match.ignored)
+        {
+            ignored_paths.insert(add_ignored_display_path(worktree_root, &absolute, &git_path)?);
+            continue;
+        }
+        if paths.len() == 1 && options.chmod.is_none() {
+            exact_untracked = Some(git_path);
+        }
+        actions.push(AddAction::Add(absolute));
+    }
+    Ok(Some(LiteralFileResolution {
+        actions,
+        exact_untracked: ignored_paths.is_empty().then_some(exact_untracked).flatten(),
+        ignored_paths: ignored_paths.into_iter().collect(),
     }))
 }
 

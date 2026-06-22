@@ -10,7 +10,7 @@ license.workspace = true
 sley-core = { path = "../sley-core" }
 sley-formats = { path = "../sley-formats" }
 sley-object = { path = "../sley-object" }
-sley-odb = { path = "../sley-odb" }
+sley-odb = { path = "../sley-odb", features = ["mmap"] }
 sley-pack = { path = "../sley-pack" }
 sley-refs = { path = "../sley-refs" }
 sley-rev = { path = "../sley-rev" }

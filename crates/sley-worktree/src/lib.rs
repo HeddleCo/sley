@@ -1562,10 +1562,193 @@ pub fn add_exact_tracked_path_with_index(
     Ok(action)
 }
 
+/// Add one literal, currently-untracked file using a caller-provided index.
+///
+/// This is the structured fallback for callers that already paid to parse the
+/// index. It returns `Ok(None)` when the path is not a simple file/symlink add,
+/// or when the existing index shape requires a broader add/status path.
+pub fn add_exact_untracked_path_with_index(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    mut index: Index,
+    git_path: &[u8],
+    clean_config: &GitConfig,
+) -> Result<Option<AddUpdateTrackedAction>> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    if git_path.is_empty()
+        || !index_entries_path_range(&index.entries, git_path).is_empty()
+        || index_sparse_dir_contains_path(&index, git_path)
+    {
+        return Ok(None);
+    }
+    let absolute = worktree_root.join(repo_path_to_os_path(git_path)?);
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let file_type = metadata.file_type();
+    if metadata.is_dir() || !(file_type.is_file() || file_type.is_symlink()) {
+        return Ok(None);
+    }
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    let is_symlink = file_type.is_symlink();
+    let body = if is_symlink {
+        symlink_target_bytes(&absolute)?
+    } else {
+        let body = fs::read(&absolute)?;
+        let checks = filter_attribute_checks(worktree_root, git_path)?;
+        apply_clean_filter_with_attributes_cow_safecrlf(
+            clean_config,
+            &checks,
+            git_path,
+            &body,
+            ConvFlags::from_config(clean_config),
+            SafeCrlfIndexBlob::None,
+        )?
+        .into_owned()
+    };
+    let object = EncodedObject::new(ObjectType::Blob, body);
+    let oid = odb.write_object(object)?;
+    let trust_filemode = trust_executable_bit(clean_config);
+    let mut entry =
+        index_entry_from_metadata_with_filemode(git_path.to_vec(), oid, &metadata, trust_filemode);
+    if is_symlink {
+        entry.mode = 0o120000;
+    }
+    replace_index_entries_with_entry(&mut index.entries, entry);
+    normalize_index_version_for_extended_flags(&mut index);
+    index.extensions = index_extensions_without_cache_tree(&index.extensions);
+    invalidate_untracked_cache_for_git_paths(&mut index, format, &[git_path.to_vec()])?;
+    write_repository_index_ref(git_dir, format, &index)?;
+    Ok(Some(AddUpdateTrackedAction::Add(git_path.to_vec())))
+}
+
+/// Add one literal, currently-untracked file by rewriting the index bytes.
+///
+/// The fast path validates the on-disk index checksum, inserts a single encoded
+/// entry into a v2/v3 index, drops stale cache-tree/untracked-cache extensions,
+/// and avoids constructing owned index entries for the rest of the file. It
+/// returns [`AddExactTrackedPathResult::Unsupported`] when the index or path
+/// requires the general add engine.
+pub fn add_exact_untracked_path_from_disk(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    git_path: &[u8],
+    clean_config: &GitConfig,
+) -> Result<AddExactTrackedPathResult> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    if git_path.is_empty() {
+        return Ok(AddExactTrackedPathResult::Unsupported);
+    }
+    let index_path = repository_index_path(git_dir);
+    let index_bytes = match fs::read(&index_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AddExactTrackedPathResult::Unsupported);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let Some(raw) = raw_untracked_index_insertion(&index_bytes, format, git_path)? else {
+        return Ok(AddExactTrackedPathResult::Unsupported);
+    };
+    let Some(extensions) = raw_index_extensions_without_stale_add_caches(
+        &index_bytes,
+        raw.entries_end,
+        raw.checksum_offset,
+    )?
+    else {
+        return Ok(AddExactTrackedPathResult::Unsupported);
+    };
+
+    let absolute = worktree_root.join(repo_path_to_os_path(git_path)?);
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(AddExactTrackedPathResult::Unsupported);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let file_type = metadata.file_type();
+    if metadata.is_dir() || !(file_type.is_file() || file_type.is_symlink()) {
+        return Ok(AddExactTrackedPathResult::Unsupported);
+    }
+
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    let is_symlink = file_type.is_symlink();
+    let body = if is_symlink {
+        symlink_target_bytes(&absolute)?
+    } else {
+        let body = fs::read(&absolute)?;
+        let checks = filter_attribute_checks(worktree_root, git_path)?;
+        apply_clean_filter_with_attributes_cow_safecrlf(
+            clean_config,
+            &checks,
+            git_path,
+            &body,
+            ConvFlags::from_config(clean_config),
+            SafeCrlfIndexBlob::None,
+        )?
+        .into_owned()
+    };
+    let object = EncodedObject::new(ObjectType::Blob, body);
+    let oid = odb.write_object(object)?;
+    let trust_filemode = trust_executable_bit(clean_config);
+    let mut entry =
+        index_entry_from_metadata_with_filemode(git_path.to_vec(), oid, &metadata, trust_filemode);
+    if is_symlink {
+        entry.mode = 0o120000;
+    }
+    if !raw_index_entry_can_insert(&entry, raw.version, format) {
+        return Ok(AddExactTrackedPathResult::Unsupported);
+    }
+
+    let mut rewritten = Vec::with_capacity(index_bytes.len() + raw_index_entry_len(&entry));
+    rewritten.extend_from_slice(&index_bytes[..8]);
+    let Some(new_count) = raw.count.checked_add(1) else {
+        return Ok(AddExactTrackedPathResult::Unsupported);
+    };
+    rewritten.extend_from_slice(&new_count.to_be_bytes());
+    rewritten.extend_from_slice(&index_bytes[12..raw.insert_offset]);
+    encode_raw_index_entry(&entry, raw.version, format, &mut rewritten)?;
+    rewritten.extend_from_slice(&index_bytes[raw.insert_offset..raw.entries_end]);
+    rewritten.extend_from_slice(&extensions);
+    let checksum = sley_core::digest_bytes(format, &rewritten)?;
+    rewritten.extend_from_slice(checksum.as_bytes());
+    fs::write(index_path, rewritten)?;
+    Ok(AddExactTrackedPathResult::Handled(Some(
+        AddUpdateTrackedAction::Add(git_path.to_vec()),
+    )))
+}
+
 struct RawExactIndexEntry {
     version: u32,
     entry: IndexEntry,
     entry_start: usize,
+    entries_end: usize,
+    checksum_offset: usize,
+}
+
+struct RawIndexInsertion {
+    version: u32,
+    count: u32,
+    insert_offset: usize,
     entries_end: usize,
     checksum_offset: usize,
 }
@@ -1673,6 +1856,97 @@ fn raw_exact_index_entry(
     }
 }
 
+fn raw_untracked_index_insertion(
+    bytes: &[u8],
+    format: ObjectFormat,
+    git_path: &[u8],
+) -> Result<Option<RawIndexInsertion>> {
+    let hash_len = format.raw_len();
+    if bytes.len() < 12 + hash_len {
+        return Err(GitError::InvalidFormat("index header too short".into()));
+    }
+    let checksum_offset = bytes.len() - hash_len;
+    let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
+    let expected_checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
+    if actual_checksum != expected_checksum {
+        return Err(GitError::InvalidFormat(format!(
+            "index checksum mismatch: expected {expected_checksum}, got {actual_checksum}"
+        )));
+    }
+    if &bytes[..4] != b"DIRC" {
+        return Err(GitError::InvalidFormat("missing DIRC signature".into()));
+    }
+    let version = u32_from_be(&bytes[4..8]);
+    if !(2..=3).contains(&version) {
+        return Ok(None);
+    }
+    let count = u32_from_be(&bytes[8..12]);
+    let mut offset = 12;
+    let mut insert_offset = None;
+    for _ in 0..count {
+        let entry_header_len = 40 + hash_len + 2;
+        if checksum_offset.saturating_sub(offset) < entry_header_len {
+            return Err(GitError::InvalidFormat("truncated index entry".into()));
+        }
+        let start = offset;
+        let oid_start = offset + 40;
+        let oid_end = oid_start + hash_len;
+        let flags = u16_from_be(&bytes[oid_end..oid_end + 2]);
+        offset = oid_end + 2;
+        if flags & INDEX_FLAG_EXTENDED != 0 {
+            if checksum_offset.saturating_sub(offset) < 2 {
+                return Err(GitError::InvalidFormat(
+                    "truncated index extended flags".into(),
+                ));
+            }
+            offset += 2;
+        }
+        let path_start = offset;
+        while bytes.get(offset).copied() != Some(0) {
+            offset += 1;
+            if offset >= checksum_offset {
+                return Err(GitError::InvalidFormat("unterminated index path".into()));
+            }
+        }
+        let path = &bytes[path_start..offset];
+        offset += 1;
+        while (offset - start) % 8 != 0 {
+            offset += 1;
+            if offset > checksum_offset {
+                return Err(GitError::InvalidFormat("truncated index padding".into()));
+            }
+        }
+        if raw_index_paths_conflict(path, git_path) {
+            return Ok(None);
+        }
+        if insert_offset.is_none() && path > git_path {
+            insert_offset = Some(start);
+        }
+    }
+    Ok(Some(RawIndexInsertion {
+        version,
+        count,
+        insert_offset: insert_offset.unwrap_or(offset),
+        entries_end: offset,
+        checksum_offset,
+    }))
+}
+
+fn raw_index_paths_conflict(existing: &[u8], git_path: &[u8]) -> bool {
+    if existing == git_path {
+        return true;
+    }
+    if existing.ends_with(b"/") && git_path.starts_with(existing) {
+        return true;
+    }
+    existing
+        .strip_prefix(git_path)
+        .is_some_and(|rest| rest.starts_with(b"/"))
+        || git_path
+            .strip_prefix(existing)
+            .is_some_and(|rest| rest.starts_with(b"/"))
+}
+
 fn raw_exact_entry_can_patch(raw: &RawExactIndexEntry, git_path: &[u8]) -> bool {
     raw.version == 2
         && raw.entry.flags_extended == 0
@@ -1715,6 +1989,103 @@ fn raw_index_extensions_are_filterable(
         offset = end;
     }
     true
+}
+
+fn raw_index_extensions_without_stale_add_caches(
+    bytes: &[u8],
+    entries_end: usize,
+    checksum_offset: usize,
+) -> Result<Option<Vec<u8>>> {
+    let mut offset = entries_end;
+    let mut rewritten = Vec::with_capacity(checksum_offset.saturating_sub(entries_end));
+    while offset < checksum_offset {
+        if checksum_offset.saturating_sub(offset) < 8 {
+            return Ok(None);
+        }
+        let signature = &bytes[offset..offset + 4];
+        let size = u32_from_be(&bytes[offset + 4..offset + 8]) as usize;
+        let Some(end) = offset
+            .checked_add(8)
+            .and_then(|offset| offset.checked_add(size))
+        else {
+            return Ok(None);
+        };
+        if end > checksum_offset {
+            return Ok(None);
+        }
+        if signature == b"link" {
+            return Ok(None);
+        }
+        if signature != b"TREE" && signature != b"UNTR" {
+            rewritten.extend_from_slice(&bytes[offset..end]);
+        }
+        offset = end;
+    }
+    Ok(Some(rewritten))
+}
+
+fn raw_index_entry_can_insert(entry: &IndexEntry, version: u32, format: ObjectFormat) -> bool {
+    if entry.oid.format() != format {
+        return false;
+    }
+    let has_extended_flags = entry.flags & INDEX_FLAG_EXTENDED != 0 || entry.flags_extended != 0;
+    if has_extended_flags && version < 3 {
+        return false;
+    }
+    !entry.path.is_empty()
+}
+
+fn raw_index_entry_len(entry: &IndexEntry) -> usize {
+    let path_len = entry.path.len();
+    let fixed = 40 + entry.oid.as_bytes().len() + 2;
+    let extended = if entry.flags & INDEX_FLAG_EXTENDED != 0 || entry.flags_extended != 0 {
+        2
+    } else {
+        0
+    };
+    let unpadded = fixed + extended + path_len + 1;
+    unpadded + ((8 - (unpadded % 8)) % 8)
+}
+
+fn encode_raw_index_entry(
+    entry: &IndexEntry,
+    version: u32,
+    format: ObjectFormat,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if !raw_index_entry_can_insert(entry, version, format) {
+        return Err(GitError::Unsupported(
+            "index entry cannot be encoded in raw insert path".into(),
+        ));
+    }
+    let start = out.len();
+    out.extend_from_slice(&entry.ctime_seconds.to_be_bytes());
+    out.extend_from_slice(&entry.ctime_nanoseconds.to_be_bytes());
+    out.extend_from_slice(&entry.mtime_seconds.to_be_bytes());
+    out.extend_from_slice(&entry.mtime_nanoseconds.to_be_bytes());
+    out.extend_from_slice(&entry.dev.to_be_bytes());
+    out.extend_from_slice(&entry.ino.to_be_bytes());
+    out.extend_from_slice(&entry.mode.to_be_bytes());
+    out.extend_from_slice(&entry.uid.to_be_bytes());
+    out.extend_from_slice(&entry.gid.to_be_bytes());
+    out.extend_from_slice(&entry.size.to_be_bytes());
+    out.extend_from_slice(entry.oid.as_bytes());
+    let has_extended_flags = entry.flags & INDEX_FLAG_EXTENDED != 0 || entry.flags_extended != 0;
+    let flags = if has_extended_flags {
+        entry.flags | INDEX_FLAG_EXTENDED
+    } else {
+        entry.flags & !INDEX_FLAG_EXTENDED
+    };
+    out.extend_from_slice(&flags.to_be_bytes());
+    if has_extended_flags {
+        out.extend_from_slice(&entry.flags_extended.to_be_bytes());
+    }
+    out.extend_from_slice(entry.path.as_bytes());
+    out.push(0);
+    while (out.len() - start) % 8 != 0 {
+        out.push(0);
+    }
+    Ok(())
 }
 
 fn patch_raw_index_entry(
@@ -4743,8 +5114,7 @@ struct StatusProfileCounters {
 }
 
 const STATUS_BORROWED_OVERLAP_MIN_STAGE0: usize = 1024;
-const STATUS_WORKER_STACK_SIZE: usize = 32 * 1024;
-
+const STATUS_WORKER_STACK_SIZE: usize = 128 * 1024;
 fn spawn_status_worker<'scope, 'env, F, T>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     name: &str,
@@ -6771,8 +7141,8 @@ where
                     _ if submodule.is_some_and(|sub| sub.any()) => b'M',
                     _ => b' ',
                 };
-                if worktree_code != b' ' {
-                    if emit(ShortStatusRow {
+                if worktree_code != b' '
+                    && emit(ShortStatusRow {
                         index: b' ',
                         worktree: worktree_code,
                         path: entry.path,
@@ -6784,9 +7154,8 @@ where
                         submodule: submodule.filter(|sub| sub.any()),
                     })?
                     .is_stop()
-                    {
-                        return Ok(StreamControl::Stop);
-                    }
+                {
+                    return Ok(StreamControl::Stop);
                 }
             }
         }
@@ -7623,7 +7992,9 @@ pub fn standard_ignore_match(
     path: &[u8],
     is_dir: bool,
 ) -> Result<Option<IgnoreMatch>> {
-    let ignores = IgnoreMatcher::from_worktree_root(worktree_root.as_ref())?;
+    let worktree_root = worktree_root.as_ref();
+    let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+    read_path_ignore_patterns_into_matcher(worktree_root, path, is_dir, &mut ignores)?;
     Ok(ignores.match_for(path, is_dir).map(IgnorePattern::to_match))
 }
 
@@ -8006,6 +8377,30 @@ fn status_untracked_paths_from_borrowed_index(
     Ok(paths)
 }
 
+fn status_untracked_count_from_borrowed_index(
+    root: &Path,
+    git_dir: &Path,
+    index: &BorrowedIndex<'_>,
+    ignores: &mut IgnoreMatcher,
+    untracked_mode: StatusUntrackedMode,
+    profile: Option<&mut StatusProfileCounters>,
+) -> Result<usize> {
+    if matches!(untracked_mode, StatusUntrackedMode::None) {
+        return Ok(0);
+    }
+    let tracked = BorrowedIndexLookup::new(&index.entries);
+    let mut context = StatusUntrackedWalk {
+        git_dir,
+        tracked: &tracked,
+        ignores,
+        untracked_mode,
+        profile,
+    };
+    let mut count = 0usize;
+    count_status_untracked_paths(&mut context, root, &[], &mut count)?;
+    Ok(count)
+}
+
 fn stream_status_untracked_paths_from_borrowed_index<F>(
     root: &Path,
     git_dir: &Path,
@@ -8030,30 +8425,6 @@ where
         profile,
     };
     stream_status_untracked_paths(&mut context, root, &[], &mut emit).map(|_| ())
-}
-
-fn status_untracked_count_from_borrowed_index(
-    root: &Path,
-    git_dir: &Path,
-    index: &BorrowedIndex<'_>,
-    ignores: &mut IgnoreMatcher,
-    untracked_mode: StatusUntrackedMode,
-    profile: Option<&mut StatusProfileCounters>,
-) -> Result<usize> {
-    if matches!(untracked_mode, StatusUntrackedMode::None) {
-        return Ok(0);
-    }
-    let tracked = BorrowedIndexLookup::new(&index.entries);
-    let mut context = StatusUntrackedWalk {
-        git_dir,
-        tracked: &tracked,
-        ignores,
-        untracked_mode,
-        profile,
-    };
-    let mut count = 0usize;
-    count_status_untracked_paths(&mut context, root, &[], &mut count)?;
-    Ok(count)
 }
 
 trait StatusTrackedLookup {
@@ -8189,12 +8560,12 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
         context.ignores,
         context.profile.as_deref_mut(),
     )?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     let result = (|| -> Result<()> {
         let mut git_path = dir_git_path.to_vec();
         for entry in entries {
-            let file_name = entry.file_name();
-            if file_name == std::ffi::OsStr::new(".git") {
+            let file_name = entry.file_name;
+            if file_name == ".git" {
                 continue;
             }
             let path_len = git_path_push_component(&mut git_path, &file_name);
@@ -8211,9 +8582,9 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                     if let Some(profile) = context.profile.as_deref_mut() {
                         profile.file_type_calls += 1;
                     }
-                    let file_type = entry.file_type()?;
+                    let path = dir.join(&file_name);
+                    let file_type = entry.file_type;
                     if file_type.is_dir() {
-                        let path = entry.path();
                         if !is_same_path(&path, context.git_dir) {
                             collect_status_untracked_paths(context, &path, &git_path, paths)?;
                         }
@@ -8223,7 +8594,8 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                 if let Some(profile) = context.profile.as_deref_mut() {
                     profile.file_type_calls += 1;
                 }
-                let file_type = entry.file_type()?;
+                let path = dir.join(&file_name);
+                let file_type = entry.file_type;
                 let is_dir = file_type.is_dir();
                 if file_type.is_file() || file_type.is_symlink() {
                     if !context.ignores.is_ignored_profiled(
@@ -8235,7 +8607,6 @@ fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                     }
                     return Ok(());
                 } else if is_dir {
-                    let path = entry.path();
                     if context.ignores.is_ignored_profiled(
                         &git_path,
                         true,
@@ -8310,12 +8681,12 @@ where
         context.ignores,
         context.profile.as_deref_mut(),
     )?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     let result = (|| -> Result<StreamControl> {
         let mut git_path = dir_git_path.to_vec();
         for entry in entries {
-            let file_name = entry.file_name();
-            if file_name == std::ffi::OsStr::new(".git") {
+            let file_name = entry.file_name;
+            if file_name == ".git" {
                 continue;
             }
             let path_len = git_path_push_component(&mut git_path, &file_name);
@@ -8332,9 +8703,9 @@ where
                     if let Some(profile) = context.profile.as_deref_mut() {
                         profile.file_type_calls += 1;
                     }
-                    let file_type = entry.file_type()?;
+                    let path = dir.join(&file_name);
+                    let file_type = entry.file_type;
                     if file_type.is_dir() {
-                        let path = entry.path();
                         if !is_same_path(&path, context.git_dir) {
                             if stream_status_untracked_paths(context, &path, &git_path, emit)?
                                 .is_stop()
@@ -8348,7 +8719,8 @@ where
                 if let Some(profile) = context.profile.as_deref_mut() {
                     profile.file_type_calls += 1;
                 }
-                let file_type = entry.file_type()?;
+                let path = dir.join(&file_name);
+                let file_type = entry.file_type;
                 let is_dir = file_type.is_dir();
                 if file_type.is_file() || file_type.is_symlink() {
                     if !context.ignores.is_ignored_profiled(
@@ -8369,7 +8741,6 @@ where
                     ) {
                         return Ok(StreamControl::Continue);
                     }
-                    let path = entry.path();
                     if is_same_path(&path, context.git_dir) {
                         return Ok(StreamControl::Continue);
                     }
@@ -8457,12 +8828,12 @@ fn count_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
         context.ignores,
         context.profile.as_deref_mut(),
     )?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     let result = (|| -> Result<()> {
         let mut git_path = dir_git_path.to_vec();
         for entry in entries {
-            let file_name = entry.file_name();
-            if file_name == std::ffi::OsStr::new(".git") {
+            let file_name = entry.file_name;
+            if file_name == ".git" {
                 continue;
             }
             let path_len = git_path_push_component(&mut git_path, &file_name);
@@ -8479,9 +8850,9 @@ fn count_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                     if let Some(profile) = context.profile.as_deref_mut() {
                         profile.file_type_calls += 1;
                     }
-                    let file_type = entry.file_type()?;
+                    let path = dir.join(&file_name);
+                    let file_type = entry.file_type;
                     if file_type.is_dir() {
-                        let path = entry.path();
                         if !is_same_path(&path, context.git_dir) {
                             count_status_untracked_paths(context, &path, &git_path, count)?;
                         }
@@ -8491,7 +8862,8 @@ fn count_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                 if let Some(profile) = context.profile.as_deref_mut() {
                     profile.file_type_calls += 1;
                 }
-                let file_type = entry.file_type()?;
+                let path = dir.join(&file_name);
+                let file_type = entry.file_type;
                 let is_dir = file_type.is_dir();
                 if file_type.is_file() || file_type.is_symlink() {
                     if !context.ignores.is_ignored_profiled(
@@ -8503,7 +8875,6 @@ fn count_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
                     }
                     return Ok(());
                 } else if is_dir {
-                    let path = entry.path();
                     if context.ignores.is_ignored_profiled(
                         &git_path,
                         true,
@@ -8603,12 +8974,12 @@ fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Sized>(
         context.ignores,
         context.profile.as_deref_mut(),
     )?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     let result = (|| -> Result<bool> {
         let mut git_path = dir_git_path.to_vec();
         for entry in entries {
-            let file_name = entry.file_name();
-            if file_name == std::ffi::OsStr::new(".git") {
+            let file_name = entry.file_name;
+            if file_name == ".git" {
                 continue;
             }
             let path_len = git_path_push_component(&mut git_path, &file_name);
@@ -8616,7 +8987,8 @@ fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Sized>(
                 if let Some(profile) = context.profile.as_deref_mut() {
                     profile.file_type_calls += 1;
                 }
-                let file_type = entry.file_type()?;
+                let path = dir.join(&file_name);
+                let file_type = entry.file_type;
                 let is_dir = file_type.is_dir();
                 if context.ignores.is_ignored_profiled(
                     &git_path,
@@ -8629,7 +9001,6 @@ fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Sized>(
                     return Ok(Some(true));
                 }
                 if is_dir {
-                    let path = entry.path();
                     if is_same_path(&path, context.git_dir) {
                         return Ok(None);
                     }
@@ -8653,12 +9024,17 @@ fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Sized>(
     result
 }
 
+struct StatusDirEntry {
+    file_name: std::ffi::OsString,
+    file_type: fs::FileType,
+}
+
 fn read_dir_entries_with_ignore_patterns(
     dir: &Path,
     base: &[u8],
     matcher: &mut IgnoreMatcher,
     mut profile: Option<&mut StatusProfileCounters>,
-) -> Result<Vec<fs::DirEntry>> {
+) -> Result<Vec<StatusDirEntry>> {
     let mut entries = Vec::new();
     let mut ignore_path = None;
     if let Some(profile) = profile.as_deref_mut() {
@@ -8669,18 +9045,22 @@ fn read_dir_entries_with_ignore_patterns(
         if let Some(profile) = profile.as_deref_mut() {
             profile.dir_entries_seen += 1;
         }
-        if entry.file_name() == std::ffi::OsStr::new(".gitignore") {
+        let file_name = entry.file_name();
+        if file_name == std::ffi::OsStr::new(".gitignore") {
             ignore_path = Some(entry.path());
         }
-        entries.push(entry);
+        entries.push(StatusDirEntry {
+            file_name,
+            file_type: entry.file_type()?,
+        });
     }
     if let Some(profile) = profile {
-        profile.read_dir_entry_vec_cap_bytes +=
-            (entries.capacity() * std::mem::size_of::<fs::DirEntry>()) as u64;
-        profile.read_dir_entry_vec_max_len =
-            profile.read_dir_entry_vec_max_len.max(entries.len() as u64);
-        profile.read_dir_entry_vec_max_cap = profile
-            .read_dir_entry_vec_max_cap
+        profile.read_dir_name_vec_cap_bytes +=
+            (entries.capacity() * std::mem::size_of::<StatusDirEntry>()) as u64;
+        profile.read_dir_name_vec_max_len =
+            profile.read_dir_name_vec_max_len.max(entries.len() as u64);
+        profile.read_dir_name_vec_max_cap = profile
+            .read_dir_name_vec_max_cap
             .max(entries.capacity() as u64);
     }
     if let Some(path) = ignore_path {
@@ -8837,7 +9217,7 @@ fn build_untracked_cache_dir<T: StatusTrackedLookup + ?Sized>(
 ) -> Result<UntrackedCacheDir> {
     let ignore_len = ignores.patterns.len();
     let mut entries = read_dir_entries_with_ignore_patterns(dir, dir_git_path, ignores, None)?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     let exclude_path = if dir_git_path.is_empty() {
         b".gitignore".to_vec()
     } else {
@@ -8865,8 +9245,8 @@ fn build_untracked_cache_dir<T: StatusTrackedLookup + ?Sized>(
     let result = (|| -> Result<()> {
         let mut git_path = dir_git_path.to_vec();
         for entry in entries {
-            let file_name = entry.file_name();
-            if file_name == std::ffi::OsStr::new(".git") {
+            let file_name = entry.file_name;
+            if file_name == ".git" {
                 continue;
             }
             let path_len = git_path_push_component(&mut git_path, &file_name);
@@ -8874,7 +9254,8 @@ fn build_untracked_cache_dir<T: StatusTrackedLookup + ?Sized>(
                 if tracked.tracked_kind(&git_path).is_some() {
                     return Ok(());
                 }
-                let file_type = entry.file_type()?;
+                let path = dir.join(&file_name);
+                let file_type = entry.file_type;
                 let is_dir = file_type.is_dir();
                 if ignores.is_ignored(&git_path, is_dir) {
                     return Ok(());
@@ -8886,7 +9267,6 @@ fn build_untracked_cache_dir<T: StatusTrackedLookup + ?Sized>(
                 if !is_dir {
                     return Ok(());
                 }
-                let path = entry.path();
                 if is_same_path(&path, git_dir) {
                     return Ok(());
                 }
@@ -11015,6 +11395,33 @@ fn read_dir_ignore_patterns_for_base(
     }
     source.extend_from_slice(b".gitignore");
     read_per_directory_ignore_patterns_into_matcher(dir.join(".gitignore"), matcher, base, &source)
+}
+
+fn read_path_ignore_patterns_into_matcher(
+    root: &Path,
+    path: &[u8],
+    _is_dir: bool,
+    matcher: &mut IgnoreMatcher,
+) -> Result<()> {
+    read_dir_ignore_patterns_for_base(root, &[], matcher)?;
+
+    let mut base = Vec::new();
+    let mut components = path.split(|byte| *byte == b'/').peekable();
+    while let Some(component) = components.next() {
+        if component.is_empty() || components.peek().is_none() {
+            break;
+        }
+        if !base.is_empty() {
+            base.push(b'/');
+        }
+        base.extend_from_slice(component);
+        if matcher.is_ignored(&base, true) {
+            break;
+        }
+        let dir = root.join(repo_path_to_os_path(&base)?);
+        read_dir_ignore_patterns_for_base(&dir, &base, matcher)?;
+    }
+    Ok(())
 }
 
 /// Fold `dir`'s `.gitattributes` (if any) into `matcher`, scoped to `dir`'s path

@@ -378,7 +378,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
         )?;
         if !pathspec.has_filters() && !show_ignored && explicit_untracked {
             sley::plumbing::sley_worktree::emit_untracked_cache_bypass_trace();
-        } else if !pathspec.has_filters() && !show_ignored {
+        } else if crate::optional_locks_enabled() && !pathspec.has_filters() && !show_ignored {
             sley::plumbing::sley_worktree::refresh_untracked_cache_after_status(
                 &worktree_root,
                 &git_dir,
@@ -387,7 +387,9 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 untracked_mode,
             )?;
         }
-        apply_status_split_index_config(&git_dir, format, &config)?;
+        if crate::optional_locks_enabled() {
+            apply_status_split_index_config(&git_dir, format, &config)?;
+        }
         return Ok(());
     }
     // Resolve the per-submodule ignore setting (command line > `.git/config` >
@@ -510,7 +512,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     }
     if !pathspec.has_filters() && !show_ignored && explicit_untracked {
         sley::plumbing::sley_worktree::emit_untracked_cache_bypass_trace();
-    } else if !pathspec.has_filters() && !show_ignored {
+    } else if crate::optional_locks_enabled() && !pathspec.has_filters() && !show_ignored {
         sley::plumbing::sley_worktree::refresh_untracked_cache_after_status(
             &worktree_root,
             &git_dir,
@@ -519,7 +521,9 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             untracked_mode,
         )?;
     }
-    apply_status_split_index_config(&git_dir, format, &config)?;
+    if crate::optional_locks_enabled() {
+        apply_status_split_index_config(&git_dir, format, &config)?;
+    }
     Ok(())
 }
 
