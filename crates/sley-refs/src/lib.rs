@@ -1458,9 +1458,12 @@ impl FileRefStore {
         // Detect a directory/file conflict against some *other* ref before
         // mutating anything (git's rename_ref fails up front, leaving the old
         // branch intact): e.g. renaming `q` -> `r/q` while `r` exists, or `q` ->
-        // `r` while `r/x` exists. The old ref itself is excluded because a
-        // self-nesting rename (`m` -> `m/m`) is handled by removing it first.
-        if let Some(conflict) = self.conflicting_ref_for_path(&new_name, &old_name)? {
+        // `r` while `r/x` exists. For renames, the old ref itself is excluded
+        // because a self-nesting rename (`m` -> `m/m`) is handled by removing it
+        // first. Copies leave the source ref in place, so the source can
+        // conflict with the destination.
+        let conflict_exclude = if copy { "" } else { &old_name };
+        if let Some(conflict) = self.conflicting_ref_for_path(&new_name, conflict_exclude)? {
             return Err(GitError::Transaction(format!(
                 "'{conflict}' exists; cannot create '{new_name}'"
             )));

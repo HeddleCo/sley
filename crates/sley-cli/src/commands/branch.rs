@@ -6714,7 +6714,10 @@ fn run_branch_move_options(
                 committer: committer.clone(),
                 message: format!("Branch: renamed {old_ref} to {new_ref}").into_bytes(),
             };
-            store.move_branch(&old_branch, &new_branch, options.force, committer)?;
+            if let Err(err) = store.move_branch(&old_branch, &new_branch, options.force, committer)
+            {
+                return branch_move_failed(err, "rename");
+            }
             let linked_update = update_linked_worktree_heads(git_dir, &old_ref, &new_ref);
             if head_was_old {
                 store.append_reflog("HEAD", &head_reflog)?;
@@ -6724,11 +6727,25 @@ fn run_branch_move_options(
         }
         BranchMoveKind::Copy => {
             let committer = branch_reflog_committer_identity(store, &old_branch)?;
-            store.copy_branch(&old_branch, &new_branch, options.force, committer)?;
+            if let Err(err) = store.copy_branch(&old_branch, &new_branch, options.force, committer)
+            {
+                return branch_move_failed(err, "copy");
+            }
             copy_branch_config(git_dir, &old_branch, &new_branch)?;
         }
     }
     Ok(())
+}
+
+fn branch_move_failed(err: GitError, operation: &str) -> Result<()> {
+    match err {
+        GitError::Transaction(message) => {
+            eprintln!("error: {message}");
+            eprintln!("fatal: branch {operation} failed");
+            Err(GitError::Exit(128))
+        }
+        err => Err(err),
+    }
 }
 
 fn update_linked_worktree_heads(git_dir: &Path, old_ref: &str, new_ref: &str) -> Result<()> {
