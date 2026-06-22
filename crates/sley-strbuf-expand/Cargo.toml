@@ -1,13 +1,12 @@
 [package]
 name = "sley-strbuf-expand"
-publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core" }
+sley-core = { path = "../sley-core", version = "0.2.0" }
 
 [lints]
 workspace = true
