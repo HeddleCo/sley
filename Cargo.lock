@@ -1164,6 +1164,7 @@ dependencies = [
  "sley-options",
  "sley-pack",
  "sley-pathspec",
+ "sley-pretty",
  "sley-protocol",
  "sley-ref-filter",
  "sley-refs",

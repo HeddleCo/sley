@@ -123,13 +123,12 @@ pub(crate) fn collect_short_status_with_options(
 }
 
 mod commands;
-mod log_format;
 mod remote;
 mod repo_path;
 mod repository;
 mod setup;
 
-pub(crate) use log_format::{CompiledLogFormat, FormatToken, LogFormatDialect, presets};
+pub(crate) use sley_pretty::{CompiledLogFormat, FormatToken, LogFormatDialect, presets};
 
 pub(crate) use commands::args::{GitArgCursor, long_option_value};
 pub(crate) use commands::cat_file::{cat_file_all_object_ids, cat_file_object_storage};
@@ -3606,7 +3605,7 @@ fn write_diff_stat_materialized_with_widths(
     count = count.min(rows.len());
 
     let mut width = if widths.stat_width == -1 {
-        log_format::term_columns() - widths.line_prefix_width
+        sley_pretty::term_columns() - widths.line_prefix_width
     } else if widths.stat_width != 0 {
         widths.stat_width
     } else {
@@ -7286,8 +7285,8 @@ fn for_each_ref_try_trailers_atom(
     };
 
     let options = match arg {
-        None => commands::for_each_ref::ForEachRefTrailerOptions::default(),
-        Some(arg) => match commands::for_each_ref::parse_for_each_ref_trailer_options(arg) {
+        None => sley_pretty::ForEachRefTrailerOptions::default(),
+        Some(arg) => match sley_pretty::parse_for_each_ref_trailer_options(arg) {
             Ok(options) => options,
             Err(None) => {
                 eprintln!("fatal: expected %(trailers:key=<value>)");
@@ -7391,8 +7390,8 @@ fn for_each_ref_describe_atom(placeholder: &str) -> Option<(bool, &str)> {
 /// comma-separated options, and on the first unrecognized token report
 /// `unrecognized %(describe) argument: <bad-token-through-end>` (git keeps the
 /// rest of the string, not just the offending token).
-fn for_each_ref_parse_describe_opts(opts: &str) -> Result<log_format::DescribeSpec> {
-    let mut spec = log_format::DescribeSpec::default();
+fn for_each_ref_parse_describe_opts(opts: &str) -> Result<sley_pretty::DescribeSpec> {
+    let mut spec = sley_pretty::DescribeSpec::default();
     let mut rest = opts;
     while !rest.is_empty() {
         let (part, next) = match rest.split_once(',') {
@@ -9616,7 +9615,7 @@ fn emit_log_one_token(
             FormatToken::HexByte(byte) => out.push(*byte),
             FormatToken::Trailers(opts) => {
                 let parsed =
-                    crate::commands::for_each_ref::parse_for_each_ref_trailer_options(opts)
+                    sley_pretty::parse_for_each_ref_trailer_options(opts)
                         .map_err(|_| GitError::Command("invalid %(trailers) options".into()))?;
                 let rendered =
                     crate::commands::for_each_ref::for_each_ref_format_trailers(message, &parsed);
@@ -9915,7 +9914,7 @@ fn emit_log_decorate(
     out: &mut Vec<u8>,
     oid: &ObjectId,
     decorations: &HashMap<ObjectId, Vec<String>>,
-    spec: &log_format::DecorateSpec,
+    spec: &sley_pretty::DecorateSpec,
 ) {
     let Some(refs) = decorations.get(oid) else {
         return;
@@ -9940,7 +9939,7 @@ fn emit_log_decorate(
 
 /// Re-render a single decoration entry under the decorate spec's tag/pointer
 /// overrides. The stored entry uses the default " -> " pointer and "tag: " tag.
-fn log_decorate_entry(entry: &str, spec: &log_format::DecorateSpec) -> String {
+fn log_decorate_entry(entry: &str, spec: &sley_pretty::DecorateSpec) -> String {
     if let Some(rest) = entry.strip_prefix("HEAD -> ") {
         format!("HEAD{}{}", spec.pointer, log_decorate_entry(rest, spec))
     } else if let Some(rest) = entry.strip_prefix("tag: ") {
@@ -9955,7 +9954,7 @@ fn log_decorate_entry(entry: &str, spec: &log_format::DecorateSpec) -> String {
 fn log_describe_placeholder(
     ctx: &LogDescribeContext<'_>,
     oid: &ObjectId,
-    spec: &log_format::DescribeSpec,
+    spec: &sley_pretty::DescribeSpec,
 ) -> Result<String> {
     let result = crate::commands::describe::describe_for_format(
         ctx.git_dir,

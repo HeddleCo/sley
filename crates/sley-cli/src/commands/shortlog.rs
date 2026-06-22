@@ -752,7 +752,7 @@ fn shortlog_trailer_group_keys(
     email: bool,
     mailmap: &commands::utility::Mailmap,
 ) -> Result<Vec<String>> {
-    let opts = commands::for_each_ref::parse_for_each_ref_trailer_options(&format!(
+    let opts = sley_pretty::parse_for_each_ref_trailer_options(&format!(
         "key={token},valueonly,only,unfold"
     ))
     .map_err(|_| GitError::Command(format!("invalid trailer group {token}")))?;
