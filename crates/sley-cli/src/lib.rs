@@ -2532,11 +2532,6 @@ pub(crate) struct DiffEntryRawRenderOptions {
 }
 
 pub(crate) enum DiffEntryStatSource<'a> {
-    Entries {
-        db: &'a FileObjectDatabase,
-        worktree_root: Option<&'a Path>,
-        use_worktree_new: bool,
-    },
     Materialized(&'a [DiffStatEntryData<'a>]),
 }
 
@@ -2587,22 +2582,6 @@ where
             .as_ref()
             .expect("stat source provided for numstat")
         {
-            DiffEntryStatSource::Entries {
-                db,
-                worktree_root,
-                use_worktree_new,
-            } => {
-                for entry in entries {
-                    write_diff_numstat_entry(
-                        stdout,
-                        entry,
-                        context.stat.z,
-                        db,
-                        *worktree_root,
-                        *use_worktree_new,
-                    )?;
-                }
-            }
             DiffEntryStatSource::Materialized(stat_entries) => {
                 for entry in *stat_entries {
                     write_diff_numstat_materialized_entry(
@@ -2623,29 +2602,6 @@ where
             .as_ref()
             .expect("stat source provided for diffstat")
         {
-            DiffEntryStatSource::Entries {
-                db,
-                worktree_root,
-                use_worktree_new,
-            } => match context.stat.widths {
-                Some(widths) => write_diff_stat_with_widths(
-                    stdout,
-                    entries,
-                    db,
-                    *worktree_root,
-                    *use_worktree_new,
-                    context.stat.options,
-                    widths,
-                )?,
-                None => write_diff_stat(
-                    stdout,
-                    entries,
-                    db,
-                    *worktree_root,
-                    *use_worktree_new,
-                    context.stat.options,
-                )?,
-            },
             DiffEntryStatSource::Materialized(stat_entries) => match context.stat.widths {
                 Some(widths) => write_diff_stat_materialized_with_widths(
                     stdout,
@@ -2665,11 +2621,6 @@ where
             .as_ref()
             .expect("stat source provided for shortstat")
         {
-            DiffEntryStatSource::Entries {
-                db,
-                worktree_root,
-                use_worktree_new,
-            } => write_diff_shortstat(stdout, entries, db, *worktree_root, *use_worktree_new)?,
             DiffEntryStatSource::Materialized(stat_entries) => {
                 write_diff_shortstat_materialized(stdout, stat_entries)?;
             }
@@ -3527,20 +3478,6 @@ fn diff_patch_mode_suffix(entry: &sley_diff_merge::NameStatusEntry) -> String {
     }
 }
 
-fn write_diff_numstat_entry(
-    stdout: &mut dyn Write,
-    entry: &sley_diff_merge::NameStatusEntry,
-    z: bool,
-    db: &FileObjectDatabase,
-    worktree_root: Option<&Path>,
-    use_worktree_new: bool,
-) -> Result<()> {
-    let old_content = diff_entry_old_content(entry, db)?;
-    let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
-    let stats = diff_line_stats(old_content.as_deref(), new_content.as_deref());
-    write_diff_numstat_materialized_entry(stdout, entry, stats, z)
-}
-
 fn write_diff_numstat_materialized_entry(
     stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
@@ -3580,17 +3517,6 @@ fn write_diff_numstat_counts(stdout: &mut dyn Write, stats: DiffLineStats) -> Re
     Ok(())
 }
 
-fn write_diff_shortstat(
-    stdout: &mut dyn Write,
-    entries: &[sley_diff_merge::NameStatusEntry],
-    db: &FileObjectDatabase,
-    worktree_root: Option<&Path>,
-    use_worktree_new: bool,
-) -> Result<()> {
-    let stat_entries = collect_diff_stat_entries(entries, db, worktree_root, use_worktree_new)?;
-    write_diff_shortstat_materialized(stdout, &stat_entries)
-}
-
 fn write_diff_shortstat_materialized(
     stdout: &mut dyn Write,
     entries: &[DiffStatEntryData<'_>],
@@ -3600,38 +3526,6 @@ fn write_diff_shortstat_materialized(
     }
     let (inserted, deleted) = diff_stat_totals(entries);
     write_diff_stat_summary_line(stdout, entries.len(), inserted, deleted)
-}
-
-fn write_diff_stat(
-    stdout: &mut dyn Write,
-    entries: &[sley_diff_merge::NameStatusEntry],
-    db: &FileObjectDatabase,
-    worktree_root: Option<&Path>,
-    use_worktree_new: bool,
-    options: DiffStatOptions,
-) -> Result<()> {
-    // Legacy entry point used by porcelain renderers (merge, stash, bisect, ...)
-    // that have not been migrated to pass widths explicitly. git's porcelain
-    // commands scale the stat to the terminal and respect the diff.stat*Width
-    // config, so resolve both here.
-    let mut widths = DiffStatWidths::terminal();
-    if let Ok(cwd) = env::current_dir()
-        && let Ok(git_dir) = discover_git_dir(&cwd)
-        && let Ok(config) = commands::remote_cmds::read_repo_config(&git_dir)
-    {
-        widths.resolve_config(&config);
-    } else {
-        widths.resolve_config_defaults();
-    }
-    write_diff_stat_with_widths(
-        stdout,
-        entries,
-        db,
-        worktree_root,
-        use_worktree_new,
-        options,
-        widths,
-    )
 }
 
 /// The `--stat=<width>[,<name-width>[,<count>]]` / `--stat-*-width` knobs plus
@@ -3729,20 +3623,6 @@ fn diff_stat_scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
 /// matches for everything the t-suite exercises.
 fn diff_stat_display_width(name: &str) -> i64 {
     name.chars().count() as i64
-}
-
-/// Faithful port of git diff.c `show_stats()`.
-fn write_diff_stat_with_widths(
-    stdout: &mut dyn Write,
-    entries: &[sley_diff_merge::NameStatusEntry],
-    db: &FileObjectDatabase,
-    worktree_root: Option<&Path>,
-    use_worktree_new: bool,
-    options: DiffStatOptions,
-    widths: DiffStatWidths,
-) -> Result<()> {
-    let stat_entries = collect_diff_stat_entries(entries, db, worktree_root, use_worktree_new)?;
-    write_diff_stat_materialized_with_widths(stdout, &stat_entries, options, widths)
 }
 
 fn write_diff_stat_materialized_with_widths(

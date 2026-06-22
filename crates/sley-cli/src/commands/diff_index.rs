@@ -520,6 +520,11 @@ fn render(
     let show_name_status = output.name_status;
     let show_name_only = output.name_only;
     let show_patch = output.patch;
+    let stat_entries = if show_numstat || show_stat || show_shortstat {
+        collect_diff_stat_entries(entries, ctx.db, ctx.worktree_root, ctx.use_worktree_new)?
+    } else {
+        Vec::new()
+    };
 
     if show_raw {
         for entry in entries {
@@ -537,24 +542,14 @@ fn render(
         }
     }
     if show_numstat {
-        for entry in entries {
-            write_diff_numstat_entry(
-                &mut stdout,
-                entry,
-                ctx.z,
-                ctx.db,
-                ctx.worktree_root,
-                ctx.use_worktree_new,
-            )?;
+        for entry in &stat_entries {
+            write_diff_numstat_materialized_entry(&mut stdout, entry.entry, entry.stats, ctx.z)?;
         }
     }
     if show_stat {
-        write_diff_stat(
+        write_diff_stat_materialized(
             &mut stdout,
-            entries,
-            ctx.db,
-            ctx.worktree_root,
-            ctx.use_worktree_new,
+            &stat_entries,
             DiffStatOptions {
                 compact_summary: output.compact_summary,
                 stat_count: None,
@@ -563,12 +558,9 @@ fn render(
         )?;
     }
     if show_shortstat {
-        write_diff_shortstat(
+        write_diff_shortstat_materialized(
             &mut stdout,
-            entries,
-            ctx.db,
-            ctx.worktree_root,
-            ctx.use_worktree_new,
+            &stat_entries,
         )?;
     }
     if show_summary {

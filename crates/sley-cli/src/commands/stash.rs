@@ -3073,6 +3073,11 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
             if !has_visual_mode {
                 show_stat = true;
             }
+            let stat_entries = if show_numstat || show_stat || compact_summary || show_shortstat {
+                collect_diff_stat_entries(&entries, &db, None, false)?
+            } else {
+                Vec::new()
+            };
             let mut wrote_prefix_output = false;
             if show_raw {
                 for entry in &entries {
@@ -3081,18 +3086,20 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 wrote_prefix_output = !entries.is_empty();
             }
             if show_numstat {
-                for entry in &entries {
-                    write_diff_numstat_entry(&mut stdout, entry, false, &db, None, false)?;
+                for entry in &stat_entries {
+                    write_diff_numstat_materialized_entry(
+                        &mut stdout,
+                        entry.entry,
+                        entry.stats,
+                        false,
+                    )?;
                 }
                 wrote_prefix_output = !entries.is_empty();
             }
             if show_stat || compact_summary {
-                write_diff_stat(
+                write_diff_stat_materialized(
                     &mut stdout,
-                    &entries,
-                    &db,
-                    None,
-                    false,
+                    &stat_entries,
                     DiffStatOptions {
                         compact_summary,
                         stat_count: None,
@@ -3102,7 +3109,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 wrote_prefix_output |= !entries.is_empty();
             }
             if show_shortstat {
-                write_diff_shortstat(&mut stdout, &entries, &db, None, false)?;
+                write_diff_shortstat_materialized(&mut stdout, &stat_entries)?;
                 wrote_prefix_output |= !entries.is_empty();
             }
             if show_summary {

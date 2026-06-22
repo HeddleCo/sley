@@ -1833,12 +1833,10 @@ fn bisect_show_commit(repo: &BisectRepo, oid: &ObjectId, out: &mut dyn Write) ->
             sley_diff_merge::RenameDetectionOptions::default(),
         )?,
     };
-    write_diff_stat(
+    let stat_entries = collect_diff_stat_entries(&entries, &db, None, false)?;
+    write_diff_stat_materialized(
         out,
-        &entries,
-        &db,
-        None,
-        false,
+        &stat_entries,
         DiffStatOptions {
             compact_summary: false,
             stat_count: None,
