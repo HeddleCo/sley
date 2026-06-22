@@ -1456,10 +1456,10 @@ pub fn install_repack_result_with_bitmap(
     // pack is never removed for an object the new index cannot serve.
     let present: HashSet<ObjectId> = parsed_index.entries.iter().map(|entry| entry.oid).collect();
 
-    prune_packs_contained_in(
+    prune_obsolete_pack_paths(
         &objects_dir,
         format,
-        &present,
+        &result.obsolete_packs,
         &new_pack_path,
         &result.retained_pack_stems,
     )?;
@@ -2148,12 +2148,23 @@ fn existing_pack_files(pack_dir: &Path) -> Result<Vec<PathBuf>> {
 /// Remove pre-existing packs whose every object is contained in `present`,
 /// skipping `keep` (the pack just written), `.keep` packs, and `.promisor` packs.
 /// A stale multi-pack-index that references any removed pack is removed too.
-fn prune_packs_contained_in(
+fn prune_obsolete_pack_paths(
     objects_dir: &Path,
     format: ObjectFormat,
-    present: &HashSet<ObjectId>,
+    packs: &[PathBuf],
     keep: &Path,
     retained_pack_stems: &[String],
+) -> Result<()> {
+    prune_pack_paths_matching(objects_dir, format, packs.iter(), keep, retained_pack_stems, |_| Ok(true))
+}
+
+fn prune_pack_paths_matching<'a>(
+    objects_dir: &Path,
+    format: ObjectFormat,
+    packs: impl IntoIterator<Item = &'a PathBuf>,
+    keep: &Path,
+    retained_pack_stems: &[String],
+    mut should_prune: impl FnMut(&Path) -> Result<bool>,
 ) -> Result<()> {
     let pack_dir = objects_dir.join("pack");
     let keep_stem = keep.file_stem().map(|stem| stem.to_owned());
@@ -2161,7 +2172,7 @@ fn prune_packs_contained_in(
         retained_pack_stems.iter().map(String::as_str).collect();
     let mut removed_stems: HashSet<String> = HashSet::new();
 
-    for pack_path in existing_pack_files(&pack_dir)? {
+    for pack_path in packs {
         if pack_path == keep {
             continue;
         }
@@ -2181,24 +2192,11 @@ fn prune_packs_contained_in(
         {
             continue;
         }
-        let index_path = pack_path.with_extension("idx");
-        if !index_path.exists() {
-            // Without an index we cannot prove containment; leave it alone.
+        if !should_prune(pack_path)? {
             continue;
         }
-        let index = PackIndex::parse(&fs::read(&index_path)?, format)?;
-        if !index
-            .entries
-            .iter()
-            .all(|entry| present.contains(&entry.oid))
-        {
-            continue;
-        }
-        // Every object in this pack is safely in the new pack and it has no Git
-        // policy sidecar that says to keep it: remove the pack, its index, and
-        // cache sidecars derived from them.
         remove_file_if_exists(&pack_path)?;
-        remove_file_if_exists(&index_path)?;
+        remove_file_if_exists(&pack_path.with_extension("idx"))?;
         for ext in ["rev", "mtimes", "bitmap"] {
             remove_file_if_exists(&pack_path.with_extension(ext))?;
         }
