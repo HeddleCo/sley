@@ -81,6 +81,7 @@ pub mod plumbing {
     pub use sley_notes;
     pub use sley_object;
     pub use sley_odb;
+    pub use sley_pretty;
     pub use sley_refs;
     #[cfg(feature = "remote")]
     pub use sley_remote;
@@ -104,6 +105,7 @@ pub use sley_object::{
 };
 pub use sley_object::{EntryKind, TreeBuilder as TreeEditor};
 pub use sley_odb::FileObjectDatabase as ObjectDatabase;
+pub use sley_pretty as pretty;
 pub use sley_refs::{
     FileRefStore as RefStore, RefDeleteError, RefPrecondition, RefTarget as ReferenceTarget,
 };
