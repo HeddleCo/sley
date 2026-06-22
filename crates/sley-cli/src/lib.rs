@@ -6283,6 +6283,22 @@ fn for_each_ref_contents<'a>(
     Ok(Some(contents))
 }
 
+fn for_each_ref_validate_tag_pointer(
+    tag_oid: &ObjectId,
+    contents: &ForEachRefContents<'_>,
+    target_oid: &ObjectId,
+    target: &sley_object::EncodedObject,
+) -> Result<()> {
+    if contents
+        .tag_object_type
+        .is_some_and(|object_type| object_type != target.object_type)
+    {
+        eprintln!("error: bad tag pointer to {target_oid} in {tag_oid}");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
 struct ForEachRefFormatContext<'a> {
     git_dir: &'a Path,
     db: &'a FileObjectDatabase,

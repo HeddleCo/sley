@@ -2160,7 +2160,8 @@ fn print_tag_list(
             };
             let object = db.read_object(&oid)?;
             let contents = for_each_ref_contents(format, &object)?;
-            let peeled_object = tag_format_peeled_object(git_dir, db, format, contents.as_ref())?;
+            let peeled_object =
+                tag_format_peeled_object(git_dir, db, format, &oid, contents.as_ref())?;
             let object_disk_size = for_each_ref_loose_object_disk_size(git_dir, &oid)?;
             let format_context = ForEachRefFormatContext {
                 git_dir,
@@ -2316,7 +2317,8 @@ fn populate_tag_sort_metadata(
         };
         let object = db.read_object(&oid)?;
         let contents = for_each_ref_contents(format, &object)?;
-        let peeled_object = tag_format_peeled_object(git_dir, db, format, contents.as_ref())?;
+        let peeled_object =
+            tag_format_peeled_object(git_dir, db, format, &oid, contents.as_ref())?;
         let peeled_authordate =
             tag_sort_peeled_date_key(peeled_object.as_ref(), ForEachRefDateSortField::Author);
         let peeled_committerdate =
@@ -2443,12 +2445,16 @@ fn tag_format_peeled_object(
     git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
+    tag_oid: &ObjectId,
     contents: Option<&ForEachRefContents<'_>>,
 ) -> Result<Option<ForEachRefPeeledObject<'static>>> {
     let Some(peeled_oid) = contents.and_then(|contents| contents.tag_object.as_ref()) else {
         return Ok(None);
     };
     let peeled_object = db.read_object(peeled_oid)?;
+    if let Some(contents) = contents {
+        for_each_ref_validate_tag_pointer(tag_oid, contents, peeled_oid, &peeled_object)?;
+    }
     let object_disk_size = for_each_ref_loose_object_disk_size(git_dir, peeled_oid)?;
     let (tree, parents, message, author, committer, creator) =
         if peeled_object.object_type == ObjectType::Commit {

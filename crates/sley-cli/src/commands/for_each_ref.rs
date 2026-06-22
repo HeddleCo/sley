@@ -547,6 +547,14 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         let peeled_object = if let (Some(peeled_oid), Some(peeled_encoded_object)) =
             (peeled_oid, peeled_encoded_object.as_ref())
         {
+            if let Some(contents) = contents.as_ref() {
+                for_each_ref_validate_tag_pointer(
+                    &oid,
+                    contents,
+                    &peeled_oid,
+                    peeled_encoded_object,
+                )?;
+            }
             let object_disk_size = if needs.peeled_disk {
                 for_each_ref_loose_object_disk_size(&git_dir, &peeled_oid)?
             } else {
@@ -2057,6 +2065,15 @@ fn for_each_ref_sort_peeled_object(
         return Ok(None);
     };
     let object = context.db.read_object(&oid)?;
+    let tag_oid = resolve_for_each_ref_target(context.store, reference)?
+        .map(|(oid, _)| oid)
+        .unwrap_or(oid);
+    for_each_ref_validate_tag_pointer(
+        &tag_oid,
+        &contents,
+        &oid,
+        &object,
+    )?;
     Ok(Some((oid, (*object).clone())))
 }
 
