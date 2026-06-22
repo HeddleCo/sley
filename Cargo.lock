@@ -1155,6 +1155,7 @@ dependencies = [
  "sley-fetch",
  "sley-formats",
  "sley-fsck",
+ "sley-grep",
  "sley-index",
  "sley-notes",
  "sley-object",

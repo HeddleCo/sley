@@ -2,7 +2,7 @@ use crate::*;
 
 pub(crate) trait GrepArgOptions {
     fn grep_patterns_mut(&mut self) -> &mut Vec<String>;
-    fn grep_pattern_kind_mut(&mut self) -> &mut crate::grep_source::PatternKind;
+    fn grep_pattern_kind_mut(&mut self) -> &mut sley_grep::PatternKind;
     fn grep_pattern_kind_explicit_mut(&mut self) -> &mut bool;
     fn grep_ignore_case_mut(&mut self) -> &mut bool;
     fn grep_all_match_mut(&mut self) -> &mut bool;
@@ -28,19 +28,19 @@ where
         "--invert-grep" => *options.grep_invert_mut() = true,
         "-i" | "--regexp-ignore-case" => *options.grep_ignore_case_mut() = true,
         "-F" | "--fixed-strings" => {
-            *options.grep_pattern_kind_mut() = crate::grep_source::PatternKind::Fixed;
+            *options.grep_pattern_kind_mut() = sley_grep::PatternKind::Fixed;
             *options.grep_pattern_kind_explicit_mut() = true;
         }
         "--basic-regexp" => {
-            *options.grep_pattern_kind_mut() = crate::grep_source::PatternKind::Basic;
+            *options.grep_pattern_kind_mut() = sley_grep::PatternKind::Basic;
             *options.grep_pattern_kind_explicit_mut() = true;
         }
         "-E" | "--extended-regexp" => {
-            *options.grep_pattern_kind_mut() = crate::grep_source::PatternKind::Extended;
+            *options.grep_pattern_kind_mut() = sley_grep::PatternKind::Extended;
             *options.grep_pattern_kind_explicit_mut() = true;
         }
         "-P" | "--perl-regexp" => {
-            *options.grep_pattern_kind_mut() = crate::grep_source::PatternKind::Perl;
+            *options.grep_pattern_kind_mut() = sley_grep::PatternKind::Perl;
             *options.grep_pattern_kind_explicit_mut() = true;
         }
         _ => return Ok(false),

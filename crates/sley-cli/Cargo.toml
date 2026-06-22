@@ -23,6 +23,7 @@ sley-core = { path = "../sley-core" }
 sley-diff-merge = { path = "../sley-diff-merge" }
 sley-fetch = { path = "../sley-fetch" }
 sley-formats = { path = "../sley-formats" }
+sley-grep = { path = "../sley-grep" }
 sley-fsck = { path = "../sley-fsck" }
 sley-index = { path = "../sley-index" }
 sley-notes = { path = "../sley-notes" }

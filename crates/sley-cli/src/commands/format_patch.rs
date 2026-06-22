@@ -253,7 +253,7 @@ struct FormatPatchOptions {
     relative_prefix: Option<Vec<u8>>,
     /// `--grep=<pattern>` commit-message filters.
     grep_patterns: Vec<String>,
-    grep_pattern_kind: crate::grep_source::PatternKind,
+    grep_pattern_kind: sley_grep::PatternKind,
     grep_pattern_kind_explicit: bool,
     grep_ignore_case: bool,
     grep_all_match: bool,
@@ -364,7 +364,7 @@ impl Default for FormatPatchOptions {
             relative_mode: RelativeMode::Config,
             relative_prefix: None,
             grep_patterns: Vec::new(),
-            grep_pattern_kind: crate::grep_source::PatternKind::Basic,
+            grep_pattern_kind: sley_grep::PatternKind::Basic,
             grep_pattern_kind_explicit: false,
             grep_ignore_case: false,
             grep_all_match: false,
@@ -379,7 +379,7 @@ impl super::grep_args::GrepArgOptions for FormatPatchOptions {
         &mut self.grep_patterns
     }
 
-    fn grep_pattern_kind_mut(&mut self) -> &mut crate::grep_source::PatternKind {
+    fn grep_pattern_kind_mut(&mut self) -> &mut sley_grep::PatternKind {
         &mut self.grep_pattern_kind
     }
 

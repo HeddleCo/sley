@@ -740,7 +740,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut grep_all_match = false;
     let mut invert_grep = false;
     let mut regexp_ignore_case = false;
-    let mut pattern_kind = crate::grep_source::PatternKind::Basic;
+    let mut pattern_kind = sley_grep::PatternKind::Basic;
     // Whether a CLI pattern-type flag (`-F`/`-E`/`-P`/`--basic-regexp`) was
     // given; if not, `grep.patternType` config supplies the default.
     let mut pattern_kind_explicit = false;
@@ -940,19 +940,19 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--invert-grep" => invert_grep = true,
             "-i" | "--regexp-ignore-case" => regexp_ignore_case = true,
             "-F" | "--fixed-strings" => {
-                pattern_kind = crate::grep_source::PatternKind::Fixed;
+                pattern_kind = sley_grep::PatternKind::Fixed;
                 pattern_kind_explicit = true;
             }
             "--basic-regexp" => {
-                pattern_kind = crate::grep_source::PatternKind::Basic;
+                pattern_kind = sley_grep::PatternKind::Basic;
                 pattern_kind_explicit = true;
             }
             "-E" | "--extended-regexp" => {
-                pattern_kind = crate::grep_source::PatternKind::Extended;
+                pattern_kind = sley_grep::PatternKind::Extended;
                 pattern_kind_explicit = true;
             }
             "-P" | "--perl-regexp" => {
-                pattern_kind = crate::grep_source::PatternKind::Perl;
+                pattern_kind = sley_grep::PatternKind::Perl;
                 pattern_kind_explicit = true;
             }
             // Pickaxe: `-S<string>`, `-G<regex>`, `--find-object=<oid>`. git's
@@ -2266,10 +2266,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // the basic/extended toggle", which for log is BRE.
     if !pattern_kind_explicit && let Some(value) = config.get("grep", None, "patterntype") {
         pattern_kind = match value.trim().to_ascii_lowercase().as_str() {
-            "fixed" => crate::grep_source::PatternKind::Fixed,
-            "basic" => crate::grep_source::PatternKind::Basic,
-            "extended" => crate::grep_source::PatternKind::Extended,
-            "perl" => crate::grep_source::PatternKind::Perl,
+            "fixed" => sley_grep::PatternKind::Fixed,
+            "basic" => sley_grep::PatternKind::Basic,
+            "extended" => sley_grep::PatternKind::Extended,
+            "perl" => sley_grep::PatternKind::Perl,
             _ => pattern_kind,
         };
     }

@@ -506,9 +506,9 @@ fn parse_loc(spec: &str, data: &[u8], ends: &[usize], lines: i64, begin: i64) ->
     let pattern = &spec[1..j];
     // begin-- (human terms → 0-based), search from that line.
     let search_from = anchor - 1;
-    let regex = grep_source::Regex::compile_bytes(
+    let regex = sley_grep::Regex::compile_bytes(
         pattern.as_bytes(),
-        grep_source::RegexMode::Bre,
+        sley_grep::RegexMode::Bre,
         false,
         false,
     )
@@ -533,7 +533,7 @@ fn parse_loc(spec: &str, data: &[u8], ends: &[usize], lines: i64, begin: i64) ->
 /// individually, which makes `^`/`$` anchor at the line boundaries). Returns
 /// `None` when no line in `[from0, lines)` matches.
 fn find_regex_line(
-    regex: &grep_source::Regex,
+    regex: &sley_grep::Regex,
     data: &[u8],
     ends: &[usize],
     lines: i64,
@@ -576,9 +576,9 @@ fn parse_range_funcname(
     let pattern = &range_part[idx + 1..];
     let anchor0 = anchor - 1; // human → 0-based
     let start_off = ends.get(anchor0.max(0) as usize).copied().unwrap_or(0);
-    let regex = grep_source::Regex::compile_bytes(
+    let regex = sley_grep::Regex::compile_bytes(
         pattern.as_bytes(),
-        grep_source::RegexMode::Bre,
+        sley_grep::RegexMode::Bre,
         false,
         false,
     )
