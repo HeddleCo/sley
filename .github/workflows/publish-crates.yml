@@ -1,6 +1,6 @@
 name: Publish crates
 
-# Publishes the sley library facade and its 20-crate lib dependency closure to
+# Publishes the sley library facade and its 24-crate lib dependency closure to
 # crates.io. The default run is a DRY RUN (no upload) — a human flips `dry_run`
 # to false to perform the real publish. The token comes from the repo secret
 # CRATES_IO_API_KEY (set as CARGO_REGISTRY_TOKEN for cargo).
@@ -61,22 +61,26 @@ jobs:
             sley-core
             sley-config
             sley-index
-            sley-mmap
             sley-object
             sley-formats
+            sley-mmap
             sley-pack
             sley-odb
-            sley-pathspec
-            sley-protocol
             sley-refs
             sley-diff-merge
+            sley-grep
+            sley-diff-format
+            sley-pathspec
             sley-rev
-            sley-transport
-            sley-fetch
             sley-worktree
-            sley-remote
             sley-sequencer
             sley-notes
+            sley-strbuf-expand
+            sley-pretty
+            sley-protocol
+            sley-transport
+            sley-fetch
+            sley-remote
             sley
           )
 
@@ -94,8 +98,8 @@ jobs:
             POS[$c]=$i
             i=$((i + 1))
           done
-          if [ "${#CRATES[@]}" -ne 20 ]; then
-            echo "Expected 20 crates, got ${#CRATES[@]}" >&2
+          if [ "${#CRATES[@]}" -ne 24 ]; then
+            echo "Expected 24 crates, got ${#CRATES[@]}" >&2
             exit 1
           fi
           META="$(cargo metadata --format-version 1 --all-features --no-deps)"
