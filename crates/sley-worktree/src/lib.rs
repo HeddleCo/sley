@@ -1326,7 +1326,21 @@ pub fn add_update_all_tracked_filtered(
     let stat_cache = IndexStatCache::from_index_mtime_only(index_mtime);
     let prechecks =
         tracked_only_non_clean_prechecks_parallel(worktree_root, &index, &stat_cache, false)?;
-    if prechecks.is_empty() {
+    // Unmerged paths are skipped by the stage-0-only precheck above, but git's
+    // bare `add -u` resolves them too. Collect each conflicted path once (the
+    // index is sorted by (path, stage), so consecutive dedup yields unique
+    // paths) and stage the worktree content after the regular pass.
+    let unmerged_paths: Vec<Vec<u8>> = {
+        let mut paths = index
+            .entries
+            .iter()
+            .filter(|entry| entry.stage() != Stage::Normal)
+            .map(|entry| entry.path.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        paths.dedup();
+        paths
+    };
+    if prechecks.is_empty() && unmerged_paths.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -1372,6 +1386,25 @@ pub fn add_update_all_tracked_filtered(
                     actions.push(action);
                 }
             }
+        }
+    }
+
+    for path in unmerged_paths {
+        let (action, dirty) = add_update_tracked_path(
+            worktree_root,
+            git_dir,
+            format,
+            Some(clean_config),
+            trust_filemode,
+            &odb,
+            &stat_cache,
+            &mut clean_filter,
+            &mut index,
+            &path,
+        )?;
+        index_dirty |= dirty;
+        if let Some(action) = action {
+            actions.push(action);
         }
     }
 
@@ -1792,9 +1825,15 @@ fn add_update_tracked_path(
         return Ok((None, false));
     }
     let entry = index.entries[range.start].clone();
-    if entry.stage() != Stage::Normal {
-        return Ok((None, false));
-    }
+    // git's `add -u` (and `-A`) also resolves unmerged paths: `add_files_to_cache`
+    // stages the worktree content over every conflict stage, collapsing the path
+    // to a single stage-0 entry (or removing it when the file is gone). For such a
+    // path the cached `entry` is one of the higher stages, so the stat-cache reuse
+    // fast path below must be skipped and the staged result must always replace the
+    // whole path range. `replace_index_entries_with_entry` already splices out all
+    // stages, so reusing this function gives identical clean-filter/symlink/gitlink
+    // handling for the resolution.
+    let is_unmerged = entry.stage() != Stage::Normal;
     let absolute = worktree_root.join(repo_path_to_os_path(git_path)?);
     let metadata = match fs::symlink_metadata(&absolute) {
         Ok(metadata) => metadata,
@@ -1826,7 +1865,8 @@ fn add_update_tracked_path(
             trust_filemode,
         );
         updated_entry.mode = sley_index::GITLINK_MODE;
-        let changed = updated_entry.oid != entry.oid || updated_entry.mode != entry.mode;
+        let changed =
+            is_unmerged || updated_entry.oid != entry.oid || updated_entry.mode != entry.mode;
         if updated_entry != entry {
             replace_index_entries_with_entry(&mut index.entries, updated_entry);
             return Ok((
@@ -1839,7 +1879,7 @@ fn add_update_tracked_path(
     if !(metadata.is_file() || metadata.file_type().is_symlink()) {
         return Ok((None, false));
     }
-    if stat_cache.reuse_index_entry(&entry, &metadata).is_some() {
+    if !is_unmerged && stat_cache.reuse_index_entry(&entry, &metadata).is_some() {
         return Ok((None, false));
     }
 
@@ -1891,7 +1931,8 @@ fn add_update_tracked_path(
     if is_symlink {
         updated_entry.mode = 0o120000;
     }
-    let changed = updated_entry.oid != entry.oid || updated_entry.mode != entry.mode;
+    let changed =
+        is_unmerged || updated_entry.oid != entry.oid || updated_entry.mode != entry.mode;
     if updated_entry != entry {
         replace_index_entries_with_entry(&mut index.entries, updated_entry);
         return Ok((
