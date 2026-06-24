@@ -961,6 +961,10 @@ pub struct MergeBlobOptions<'a> {
     pub base_label: &'a str,
     /// Which marker style to emit.
     pub style: ConflictStyle,
+    /// How to resolve a textual conflict. [`MergeFavor::Union`] keeps both sides'
+    /// lines with no markers (and a non-conflicted result); other values leave
+    /// markers (favouring ours/theirs is applied by the caller at the file level).
+    pub favor: MergeFavor,
 }
 
 impl Default for MergeBlobOptions<'_> {
@@ -970,6 +974,7 @@ impl Default for MergeBlobOptions<'_> {
             theirs_label: "theirs",
             base_label: "base",
             style: ConflictStyle::Merge,
+            favor: MergeFavor::None,
         }
     }
 }
@@ -1196,6 +1201,14 @@ impl<'a> MergeWriter<'a> {
         base: &[DiffLine<'_>],
         theirs: &[DiffLine<'_>],
     ) {
+        // Union: keep both sides' lines (ours then theirs) with no markers, and do
+        // NOT flag a conflict — git's `XDL_MERGE_FAVOR_UNION`.
+        if self.options.favor == MergeFavor::Union {
+            self.emit_section(ours);
+            self.ensure_newline();
+            self.emit_section(theirs);
+            return;
+        }
         self.conflicted = true;
         self.write_marker(b'<', self.options.ours_label);
         self.emit_section(ours);
@@ -5613,6 +5626,9 @@ pub enum MergeFavor {
     Ours,
     /// On a textual conflict, take theirs' content wholesale.
     Theirs,
+    /// On a textual conflict, keep BOTH sides' lines (ours then theirs) with no
+    /// markers — git's `merge=union` attribute / `--union` (`XDL_MERGE_FAVOR_UNION`).
+    Union,
 }
 
 /// Options controlling a [`merge_trees`] run.
@@ -6176,6 +6192,7 @@ pub fn merge_entry_maps(
                     theirs_label: &theirs_label,
                     base_label: options.ancestor_label,
                     style: options.style,
+                    favor: options.favor,
                 },
             );
 
@@ -7863,6 +7880,7 @@ fn apply_dir_rename_two_to_one_conflicts(
                     theirs_label: &qualify_label(options.theirs_label, &conflict.theirs_label_path),
                     base_label: options.ancestor_label,
                     style: options.style,
+                    favor: options.favor,
                 },
             )
         } else {
@@ -8243,6 +8261,7 @@ mod tests {
             theirs_label: "theirs",
             base_label: "base",
             style: ConflictStyle::Merge,
+            favor: MergeFavor::None,
         }
     }
 
@@ -8406,6 +8425,7 @@ mod tests {
             theirs_label: "",
             base_label: "",
             style: ConflictStyle::Merge,
+            favor: MergeFavor::None,
         };
         let result = merge_blobs(base, ours, theirs, &options);
         assert!(result.conflicted);

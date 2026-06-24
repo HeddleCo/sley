@@ -728,6 +728,7 @@ fn try_replay_resolution_variant(
             theirs_label: "",
             base_label: "",
             style: sley_diff_merge::ConflictStyle::Merge,
+            favor: sley_diff_merge::MergeFavor::None,
         },
     );
     if merged.conflicted {

@@ -1542,6 +1542,7 @@ fn conflict_note_body(
                     theirs_label: remote_ref,
                     base_label: "base",
                     style: ConflictStyle::Merge,
+                    favor: sley_diff_merge::MergeFavor::None,
                 },
             )
             .content)

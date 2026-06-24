@@ -14476,6 +14476,7 @@ fn checkout_merge_unmerged_path(
                 CheckoutConflictStyle::Merge => sley_diff_merge::ConflictStyle::Merge,
                 CheckoutConflictStyle::Diff3 => sley_diff_merge::ConflictStyle::Diff3,
             },
+            favor: sley_diff_merge::MergeFavor::None,
         },
     );
     let file_path = worktree_path(worktree_root, ours.path.as_bytes())?;

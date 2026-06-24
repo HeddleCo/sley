@@ -1182,6 +1182,7 @@ fn trivial_content_merge(
             theirs_label: ".their",
             base_label: ".base",
             style: sley_diff_merge::ConflictStyle::Merge,
+            favor: sley_diff_merge::MergeFavor::None,
         },
     );
     Ok(result.content)

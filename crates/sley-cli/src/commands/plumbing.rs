@@ -4909,8 +4909,15 @@ fn apply_three_way_path(
     cached: bool,
     check: bool,
     favor: sley_diff_merge::MergeFavor,
-    _union: bool,
+    union: bool,
 ) -> Result<bool> {
+    // `--union` keeps both sides of every textual conflict with no markers
+    // (git's `merge=union`); it overrides any `--ours`/`--theirs` favouring.
+    let favor = if union {
+        sley_diff_merge::MergeFavor::Union
+    } else {
+        favor
+    };
     // `merge.conflictStyle` selects the diff3 marker layout.
     let config = read_repo_config(git_dir)?;
     let style = match config.get("merge", None, "conflictstyle") {
