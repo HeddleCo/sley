@@ -1513,13 +1513,14 @@ pub fn add_exact_tracked_path_from_disk(
                 oid: entry.oid,
             },
         };
-        apply_clean_filter_with_attributes_cow_safecrlf(
+        apply_clean_filter_cow_inner(
             &clean_filter.config,
             &checks,
             git_path,
             &body,
             conv_flags,
             index_blob,
+            true,
         )?
         .into_owned()
     };
@@ -1911,13 +1912,14 @@ fn add_update_tracked_path(
                 oid: entry.oid,
             },
         };
-        apply_clean_filter_with_attributes_cow_safecrlf(
+        apply_clean_filter_cow_inner(
             &clean_filter.config,
             &checks,
             git_path,
             &body,
             conv_flags,
             index_blob,
+            true,
         )?
         .into_owned()
     };
@@ -2346,15 +2348,15 @@ fn update_index_paths_impl(
                     // for this path.
                     let checks =
                         matcher.attributes_for_path(&git_path, &requested_filter_attrs, false);
-                    apply_clean_filter_with_attributes_cow_safecrlf(
-                        config, &checks, &git_path, &body, conv_flags, index_blob,
+                    apply_clean_filter_cow_inner(
+                        config, &checks, &git_path, &body, conv_flags, index_blob, true,
                     )?
                     .into_owned()
                 }
                 (Some(config), Some(UpdateIndexCleanFilter::PathLocal)) => {
                     let checks = filter_attribute_checks(worktree_root, &git_path)?;
-                    apply_clean_filter_with_attributes_cow_safecrlf(
-                        config, &checks, &git_path, &body, conv_flags, index_blob,
+                    apply_clean_filter_cow_inner(
+                        config, &checks, &git_path, &body, conv_flags, index_blob, true,
                     )?
                     .into_owned()
                 }
@@ -11617,6 +11619,9 @@ struct ContentFilterPlan {
     ident: bool,
     /// `filter.<name>` driver, if assigned via attributes and configured.
     driver: Option<FilterDriver>,
+    /// `working-tree-encoding` attribute: the worktree charset to decode from
+    /// on checkin / encode to on checkout.
+    encoding: WtEncoding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11626,6 +11631,320 @@ struct FilterDriver {
     clean: Option<String>,
     smudge: Option<String>,
     required: bool,
+}
+
+/// The resolved `working-tree-encoding` attribute (convert.c
+/// `git_path_check_encoding`): an unset / empty / `UTF-8` value means no
+/// conversion; `working-tree-encoding` (true) / `working-tree-encoding=false`
+/// are rejected; any other value names a charset the worktree file is stored in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WtEncoding {
+    /// No reencoding (unset, empty, or the default UTF-8).
+    None,
+    /// `working-tree-encoding` set as a boolean — `true`/`false` are invalid.
+    Invalid,
+    /// A named encoding (the original attribute value, preserved for messages).
+    Named(Vec<u8>),
+}
+
+impl WtEncoding {
+    fn from_attr(state: Option<&AttributeState>) -> WtEncoding {
+        match state {
+            // Unset (`-working-tree-encoding`) or no attribute: nothing to do.
+            None | Some(AttributeState::Unset) => WtEncoding::None,
+            // `working-tree-encoding` with no value is the boolean true.
+            Some(AttributeState::Set) => WtEncoding::Invalid,
+            Some(AttributeState::Value(value)) => {
+                // An empty value (`working-tree-encoding=`) or UTF-8 (the
+                // in-repo default) needs no conversion.
+                if value.is_empty() || encoding_name_is_utf8(value) {
+                    WtEncoding::None
+                } else {
+                    WtEncoding::Named(value.clone())
+                }
+            }
+        }
+    }
+}
+
+/// Whether `name` denotes UTF-8 (`same_encoding(name, "UTF-8")`): the leading
+/// `UTF` prefix and an optional `-` are skipped, then the remainder compared
+/// case-insensitively against `8`.
+fn encoding_name_is_utf8(name: &[u8]) -> bool {
+    utf_suffix(name).is_some_and(|suffix| suffix == "8")
+}
+
+/// Strip a leading case-insensitive `UTF` and optional `-`, returning the
+/// uppercased remainder (e.g. `utf-16le` → `16LE`, `UTF-16LE-BOM` →
+/// `16LE-BOM`). `None` when `name` is not a UTF family encoding or not UTF-8.
+fn utf_suffix(name: &[u8]) -> Option<String> {
+    let upper: String = std::str::from_utf8(name).ok()?.to_ascii_uppercase();
+    let rest = upper.strip_prefix("UTF")?;
+    Some(rest.strip_prefix('-').unwrap_or(rest).to_string())
+}
+
+#[derive(Clone, Copy)]
+enum BomProblem {
+    Prohibited,
+    Required,
+}
+
+/// The byte order mark validation from convert.c `validate_encoding`: an
+/// explicit-endianness UTF encoding must not start with a BOM, while a
+/// byte-order-agnostic one (`UTF-16` / `UTF-32`) must.
+fn utf_bom_problem(suffix: &str, data: &[u8]) -> Option<BomProblem> {
+    let has16 = data.starts_with(&[0xFF, 0xFE]) || data.starts_with(&[0xFE, 0xFF]);
+    let has32 =
+        data.starts_with(&[0xFF, 0xFE, 0, 0]) || data.starts_with(&[0, 0, 0xFE, 0xFF]);
+    match suffix {
+        "16LE" | "16BE" => has16.then_some(BomProblem::Prohibited),
+        "32LE" | "32BE" => has32.then_some(BomProblem::Prohibited),
+        "16" => (!has16).then_some(BomProblem::Required),
+        "32" => (!has32).then_some(BomProblem::Required),
+        _ => None,
+    }
+}
+
+/// `true` on a little-endian host — matches glibc iconv's native byte order for
+/// the byte-order-agnostic `UTF-16` / `UTF-32` output (LE BOM + LE bytes on x86).
+const HOST_LE: bool = cfg!(target_endian = "little");
+
+/// Decode worktree-encoded bytes to UTF-8 (encode_to_git's reencode), or `None`
+/// when the encoding is unsupported or the bytes are not valid in it.
+fn decode_to_utf8(suffix: &str, data: &[u8]) -> Option<Vec<u8>> {
+    match suffix {
+        "16LE" => decode_utf16(data, true),
+        "16BE" => decode_utf16(data, false),
+        "16" | "16LE-BOM" | "16BE-BOM" => {
+            let (le, body) = strip_utf16_bom(data);
+            decode_utf16(body, le)
+        }
+        "32LE" => decode_utf32(data, true),
+        "32BE" => decode_utf32(data, false),
+        "32" | "32LE-BOM" | "32BE-BOM" => {
+            let (le, body) = strip_utf32_bom(data);
+            decode_utf32(body, le)
+        }
+        _ => None,
+    }
+}
+
+/// Encode UTF-8 bytes to the worktree encoding (encode_to_worktree's reencode),
+/// or `None` when the encoding is unsupported or the input is not valid UTF-8.
+fn encode_from_utf8(suffix: &str, utf8: &[u8]) -> Option<Vec<u8>> {
+    match suffix {
+        "16LE" => encode_utf16(utf8, true, false),
+        "16BE" => encode_utf16(utf8, false, false),
+        "16LE-BOM" => encode_utf16(utf8, true, true),
+        "16BE-BOM" => encode_utf16(utf8, false, true),
+        "16" => encode_utf16(utf8, HOST_LE, true),
+        "32LE" => encode_utf32(utf8, true, false),
+        "32BE" => encode_utf32(utf8, false, false),
+        "32LE-BOM" => encode_utf32(utf8, true, true),
+        "32BE-BOM" => encode_utf32(utf8, false, true),
+        "32" => encode_utf32(utf8, HOST_LE, true),
+        _ => None,
+    }
+}
+
+fn strip_utf16_bom(data: &[u8]) -> (bool, &[u8]) {
+    if data.starts_with(&[0xFF, 0xFE]) {
+        (true, &data[2..])
+    } else if data.starts_with(&[0xFE, 0xFF]) {
+        (false, &data[2..])
+    } else {
+        (HOST_LE, data)
+    }
+}
+
+fn strip_utf32_bom(data: &[u8]) -> (bool, &[u8]) {
+    if data.starts_with(&[0xFF, 0xFE, 0, 0]) {
+        (true, &data[4..])
+    } else if data.starts_with(&[0, 0, 0xFE, 0xFF]) {
+        (false, &data[4..])
+    } else {
+        (HOST_LE, data)
+    }
+}
+
+fn decode_utf16(data: &[u8], le: bool) -> Option<Vec<u8>> {
+    if !data.len().is_multiple_of(2) {
+        return None;
+    }
+    let units = data.chunks_exact(2).map(|chunk| {
+        let pair = [chunk[0], chunk[1]];
+        if le {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        }
+    });
+    let mut out = String::new();
+    for unit in char::decode_utf16(units) {
+        out.push(unit.ok()?);
+    }
+    Some(out.into_bytes())
+}
+
+fn decode_utf32(data: &[u8], le: bool) -> Option<Vec<u8>> {
+    if !data.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = String::new();
+    for chunk in data.chunks_exact(4) {
+        let quad = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        let cp = if le {
+            u32::from_le_bytes(quad)
+        } else {
+            u32::from_be_bytes(quad)
+        };
+        out.push(char::from_u32(cp)?);
+    }
+    Some(out.into_bytes())
+}
+
+fn encode_utf16(utf8: &[u8], le: bool, bom: bool) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(utf8).ok()?;
+    let mut out = Vec::with_capacity(utf8.len() * 2 + 2);
+    if bom {
+        out.extend_from_slice(if le { &[0xFF, 0xFE] } else { &[0xFE, 0xFF] });
+    }
+    for unit in text.encode_utf16() {
+        out.extend_from_slice(&if le {
+            unit.to_le_bytes()
+        } else {
+            unit.to_be_bytes()
+        });
+    }
+    Some(out)
+}
+
+fn encode_utf32(utf8: &[u8], le: bool, bom: bool) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(utf8).ok()?;
+    let mut out = Vec::with_capacity(utf8.len() * 4 + 4);
+    if bom {
+        out.extend_from_slice(if le {
+            &[0xFF, 0xFE, 0, 0]
+        } else {
+            &[0, 0, 0xFE, 0xFF]
+        });
+    }
+    for ch in text.chars() {
+        let cp = ch as u32;
+        out.extend_from_slice(&if le { cp.to_le_bytes() } else { cp.to_be_bytes() });
+    }
+    Some(out)
+}
+
+/// Reject a `working-tree-encoding` boolean (`true`/`false`) before any
+/// conversion runs — `git_path_check_encoding` dies on it regardless of
+/// direction.
+fn check_wt_encoding_valid(encoding: &WtEncoding) -> Result<()> {
+    if matches!(encoding, WtEncoding::Invalid) {
+        eprintln!("fatal: true/false are no valid working-tree-encodings");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+/// encode_to_git: decode worktree-encoded `data` to UTF-8 for storage in the
+/// object database. Runs the BOM validation first (fatal when writing an
+/// object). Returns the borrowed input unchanged when there is no encoding.
+fn encode_to_git<'a>(
+    encoding: &WtEncoding,
+    path: &[u8],
+    data: Cow<'a, [u8]>,
+    write_object: bool,
+) -> Result<Cow<'a, [u8]>> {
+    let name = match encoding {
+        WtEncoding::None => return Ok(data),
+        WtEncoding::Invalid => return check_wt_encoding_valid(encoding).map(|()| data),
+        WtEncoding::Named(name) => name,
+    };
+    if data.is_empty() {
+        return Ok(data);
+    }
+    let display = String::from_utf8_lossy(path);
+    let enc = String::from_utf8_lossy(name);
+    if let Some(suffix) = utf_suffix(name)
+        && let Some(problem) = utf_bom_problem(&suffix, &data)
+    {
+        let number = &suffix[..2.min(suffix.len())];
+        match problem {
+            BomProblem::Prohibited => {
+                eprintln!(
+                    "hint: The file '{display}' contains a byte order mark (BOM). \
+Please use UTF-{number} as working-tree-encoding."
+                );
+                report_encode_failure(
+                    write_object,
+                    &format!("BOM is prohibited in '{display}' if encoded as {enc}"),
+                )?;
+                return Ok(data);
+            }
+            BomProblem::Required => {
+                eprintln!(
+                    "hint: The file '{display}' is missing a byte order mark (BOM). \
+Please use UTF-{number}BE or UTF-{number}LE (depending on the byte order) as \
+working-tree-encoding."
+                );
+                report_encode_failure(
+                    write_object,
+                    &format!("BOM is required in '{display}' if encoded as {enc}"),
+                )?;
+                return Ok(data);
+            }
+        }
+    }
+    match utf_suffix(name).and_then(|suffix| decode_to_utf8(&suffix, &data)) {
+        Some(utf8) => Ok(Cow::Owned(utf8)),
+        None => {
+            report_encode_failure(
+                write_object,
+                &format!("failed to encode '{display}' from {enc} to UTF-8"),
+            )?;
+            Ok(data)
+        }
+    }
+}
+
+/// encode_to_worktree: reencode UTF-8 `data` to the worktree encoding on
+/// checkout. A failure is reported (never fatal) and the content left as-is,
+/// matching convert.c `encode_to_worktree`.
+fn encode_to_worktree<'a>(
+    encoding: &WtEncoding,
+    path: &[u8],
+    data: Cow<'a, [u8]>,
+) -> Result<Cow<'a, [u8]>> {
+    let name = match encoding {
+        WtEncoding::None => return Ok(data),
+        WtEncoding::Invalid => return check_wt_encoding_valid(encoding).map(|()| data),
+        WtEncoding::Named(name) => name,
+    };
+    if data.is_empty() {
+        return Ok(data);
+    }
+    match utf_suffix(name).and_then(|suffix| encode_from_utf8(&suffix, &data)) {
+        Some(encoded) => Ok(Cow::Owned(encoded)),
+        None => {
+            let display = String::from_utf8_lossy(path);
+            let enc = String::from_utf8_lossy(name);
+            eprintln!("error: failed to encode '{display}' from UTF-8 to {enc}");
+            Ok(data)
+        }
+    }
+}
+
+/// Emit a clean-side encoding failure: fatal (`die`) when writing an object,
+/// otherwise an `error:` diagnostic that lets the caller keep the content as-is.
+fn report_encode_failure(write_object: bool, message: &str) -> Result<()> {
+    if write_object {
+        eprintln!("fatal: {message}");
+        Err(GitError::Exit(128))
+    } else {
+        eprintln!("error: {message}");
+        Ok(())
+    }
 }
 
 /// Decode one crlf-family attribute (`text` or its legacy alias `crlf`) into a
@@ -11660,6 +11979,10 @@ impl ContentFilterPlan {
         let ident_attr = checks.iter().find(|check| check.attribute == b"ident");
         let eol_attr = checks.iter().find(|check| check.attribute == b"eol");
         let filter_attr = checks.iter().find(|check| check.attribute == b"filter");
+        let encoding_attr = checks
+            .iter()
+            .find(|check| check.attribute == b"working-tree-encoding");
+        let encoding = WtEncoding::from_attr(encoding_attr.and_then(|check| check.state.as_ref()));
 
         // Resolve the eol attribute first; `eol=crlf|lf` also forces text.
         let eol_value = eol_attr.and_then(|check| match &check.state {
@@ -11749,6 +12072,7 @@ impl ContentFilterPlan {
             eol,
             ident,
             driver,
+            encoding,
         }
     }
 
@@ -12756,11 +13080,34 @@ pub fn apply_clean_filter_with_attributes_cow_safecrlf<'a>(
     flags: ConvFlags,
     index_blob: SafeCrlfIndexBlob<'_>,
 ) -> Result<Cow<'a, [u8]>> {
+    // Non-object-writing callers (diff/status comparison): an encoding failure
+    // is reported but not fatal.
+    apply_clean_filter_cow_inner(config, attributes, path, content, flags, index_blob, false)
+}
+
+/// Clean conversion core. `write_object` is set on the paths that hash content
+/// into the object database (add / hash-object): there, an invalid
+/// `working-tree-encoding` (bad BOM, undecodable bytes) is fatal, mirroring
+/// convert.c's `CONV_WRITE_OBJECT` die.
+fn apply_clean_filter_cow_inner<'a>(
+    config: &GitConfig,
+    attributes: &[AttributeCheck],
+    path: &[u8],
+    content: &'a [u8],
+    flags: ConvFlags,
+    index_blob: SafeCrlfIndexBlob<'_>,
+    write_object: bool,
+) -> Result<Cow<'a, [u8]>> {
     let plan = ContentFilterPlan::resolve(config, attributes);
+    check_wt_encoding_valid(&plan.encoding)?;
     let mut data = Cow::Borrowed(content);
     if let Some(driver) = &plan.driver {
         data = run_driver(driver, driver.clean.as_deref(), "clean", None, path, data)?;
     }
+    // encode_to_git runs before the EOL pass (convert.c order: filter →
+    // encode_to_git → crlf_to_git): the worktree charset is decoded to UTF-8 so
+    // the line-ending stats and conversion below see real LF/CRLF bytes.
+    data = encode_to_git(&plan.encoding, path, data, write_object)?;
     // The safecrlf check scans the (post-driver) buffer once for line-ending
     // stats. Gate it tightly so the extra scan never runs on the dominant
     // pass-through paths: only when safecrlf is enabled, the path is a real
@@ -12841,6 +13188,7 @@ fn apply_smudge_filter_with_attributes_cow_format<'a>(
     format: ObjectFormat,
 ) -> Result<Cow<'a, [u8]>> {
     let plan = ContentFilterPlan::resolve(config, attributes);
+    check_wt_encoding_valid(&plan.encoding)?;
     let mut data = Cow::Borrowed(content);
     if plan.ident {
         data = ident_to_worktree_cow(format, data)?;
@@ -12851,6 +13199,10 @@ fn apply_smudge_filter_with_attributes_cow_format<'a>(
     {
         data = Cow::Owned(convert_lf_to_crlf(&data));
     }
+    // encode_to_worktree runs after the EOL pass (convert.c order:
+    // crlf_to_worktree → encode_to_worktree → smudge filter): the UTF-8 blob is
+    // line-ending-converted, then reencoded into the worktree charset.
+    data = encode_to_worktree(&plan.encoding, path, data)?;
     if let Some(driver) = &plan.driver {
         data = run_driver(
             driver,
@@ -13095,6 +13447,7 @@ fn filter_attribute_names() -> Vec<Vec<u8>> {
         b"ident".to_vec(),
         b"eol".to_vec(),
         b"filter".to_vec(),
+        b"working-tree-encoding".to_vec(),
     ]
 }
 
