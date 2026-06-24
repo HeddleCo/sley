@@ -131,6 +131,10 @@ struct BlameOptions {
     /// `--color-by-age`: color each line's metadata by commit age
     /// (`color.blame.highlightRecent`).
     color_by_age: bool,
+    /// Diff algorithm override from the CLI (`--diff-algorithm`, `--minimal`,
+    /// `--patience`, `--histogram`); the last such option wins. `None` falls back
+    /// to `diff.algorithm` config, then Myers.
+    diff_algorithm: Option<sley_diff_merge::DiffAlgorithm>,
 }
 
 /// Metadata for the all-zero pseudo-commit blame builds for the working-tree
@@ -380,6 +384,15 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
 
     let color_plan = build_color_plan(&repo, &options);
 
+    // The diff algorithm driving blame attribution: a CLI override wins,
+    // otherwise `diff.algorithm` config, otherwise Myers.
+    let diff_algorithm = options.diff_algorithm.unwrap_or_else(|| {
+        repo.config()
+            .get("diff", None, "algorithm")
+            .and_then(|name| parse_blame_diff_algorithm(name).ok())
+            .unwrap_or(sley_diff_merge::DiffAlgorithm::Myers)
+    });
+
     let (lines, previous_map) = compute_blame(
         db,
         format,
@@ -392,6 +405,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         options.copy_score,
         virtual_final,
         &ignore_set,
+        diff_algorithm,
     )?;
 
     // Resolve the -L ranges against the real line count, then render. The
@@ -579,6 +593,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
     let mut encoding: Option<String> = None;
     let mut color_lines = false;
     let mut color_by_age = false;
+    let mut diff_algorithm: Option<sley_diff_merge::DiffAlgorithm> = None;
     // Positionals collected before `--`; afterwards everything is a path.
     let mut positionals: Vec<String> = Vec::new();
     let mut paths_after_dd: Vec<String> = Vec::new();
@@ -657,6 +672,19 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
             "--incremental" => incremental = true,
             "--color-lines" => color_lines = true,
             "--color-by-age" => color_by_age = true,
+            "--minimal" => diff_algorithm = Some(sley_diff_merge::DiffAlgorithm::Minimal),
+            "--patience" => diff_algorithm = Some(sley_diff_merge::DiffAlgorithm::Patience),
+            "--histogram" => diff_algorithm = Some(sley_diff_merge::DiffAlgorithm::Histogram),
+            "--diff-algorithm" => {
+                let Some(value) = iter.next() else {
+                    return Err(blame_option_requires_value("diff-algorithm"));
+                };
+                diff_algorithm = Some(parse_blame_diff_algorithm(value)?);
+            }
+            other if other.starts_with("--diff-algorithm=") => {
+                diff_algorithm =
+                    Some(parse_blame_diff_algorithm(&other["--diff-algorithm=".len()..])?);
+            }
             "--encoding" => {
                 let Some(value) = iter.next() else {
                     return Err(blame_option_requires_value("encoding"));
@@ -747,7 +775,25 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
         encoding,
         color_lines,
         color_by_age,
+        diff_algorithm,
     }))
+}
+
+/// Parse a `--diff-algorithm <value>` argument to a [`DiffAlgorithm`]. An
+/// unknown value is the same fatal git reports.
+fn parse_blame_diff_algorithm(value: &str) -> Result<sley_diff_merge::DiffAlgorithm> {
+    use sley_diff_merge::DiffAlgorithm;
+    Ok(match value {
+        "myers" | "default" => DiffAlgorithm::Myers,
+        "minimal" => DiffAlgorithm::Minimal,
+        "patience" => DiffAlgorithm::Patience,
+        "histogram" => DiffAlgorithm::Histogram,
+        other => {
+            eprintln!("fatal: option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\"");
+            let _ = other;
+            return Err(GitError::Exit(128));
+        }
+    })
 }
 
 /// Decide which positional is the revision and which is the path, using the
@@ -1294,6 +1340,7 @@ fn compute_blame(
     copy_score: usize,
     virtual_final: bool,
     ignore_set: &HashSet<ObjectId>,
+    diff_algorithm: sley_diff_merge::DiffAlgorithm,
 ) -> Result<(Vec<LineBlame>, PreviousMap)> {
     let final_lines = sley_diff_merge::split_lines(final_blob);
     let line_count = final_lines.len();
@@ -1441,7 +1488,8 @@ fn compute_blame(
 
             let parent_lines = sley_diff_merge::split_lines(&parent_blob);
             let mut still_ours = Vec::new();
-            let passed = pass_blame_to_parent(&parent_lines, &child_lines, &mut owned);
+            let passed =
+                pass_blame_to_parent(&parent_lines, &child_lines, &mut owned, diff_algorithm);
             still_ours.append(&mut owned);
             owned = still_ours;
             if !passed.is_empty() {
@@ -1478,6 +1526,7 @@ fn compute_blame(
                     &parent_fps,
                     &child_fps,
                     &mut owned,
+                    diff_algorithm,
                 );
                 if !passed.is_empty() {
                     queue_entries(&mut suspects, &mut queue, parent_origin, passed);
@@ -1555,8 +1604,9 @@ fn pass_blame_to_parent(
     parent_lines: &[sley_diff_merge::DiffLine<'_>],
     child_lines: &[sley_diff_merge::DiffLine<'_>],
     owned: &mut Vec<BlameEntry>,
+    algorithm: sley_diff_merge::DiffAlgorithm,
 ) -> Vec<BlameEntry> {
-    let hunks = diff_hunks(parent_lines, child_lines);
+    let hunks = diff_hunks(parent_lines, child_lines, algorithm);
 
     let mut passed: Vec<BlameEntry> = Vec::new();
     let mut still_ours: Vec<BlameEntry> = Vec::new();
@@ -1632,12 +1682,21 @@ struct DiffHunk {
 fn diff_hunks(
     parent_lines: &[sley_diff_merge::DiffLine<'_>],
     child_lines: &[sley_diff_merge::DiffLine<'_>],
+    algorithm: sley_diff_merge::DiffAlgorithm,
 ) -> Vec<DiffHunk> {
-    if let Some(hunks) = contiguous_parent_hunks(parent_lines, child_lines) {
+    // The contiguous-append shortcut matches git's Myers behavior for "add a
+    // header and append a function" edits; the alternative algorithms
+    // (patience/histogram) produce their own anchoring, so only take the
+    // shortcut for the Myers family.
+    if matches!(
+        algorithm,
+        sley_diff_merge::DiffAlgorithm::Myers | sley_diff_merge::DiffAlgorithm::Minimal
+    ) && let Some(hunks) = contiguous_parent_hunks(parent_lines, child_lines)
+    {
         return hunks;
     }
 
-    let ops = sley_diff_merge::myers_diff_lines(parent_lines, child_lines);
+    let ops = sley_diff_merge::diff_lines_with_algorithm(parent_lines, child_lines, algorithm);
     let mut hunks = Vec::new();
     let mut a = 0usize; // parent line cursor
     let mut b = 0usize; // child line cursor
@@ -2562,8 +2621,9 @@ fn pass_blame_to_parent_ignore(
     parent_fps: &[Fingerprint],
     child_fps: &[Fingerprint],
     owned: &mut Vec<BlameEntry>,
+    algorithm: sley_diff_merge::DiffAlgorithm,
 ) -> Vec<BlameEntry> {
-    let hunks = diff_hunks(parent_lines, child_lines);
+    let hunks = diff_hunks(parent_lines, child_lines, algorithm);
 
     let mut passed: Vec<BlameEntry> = Vec::new();
     let mut still_ours: Vec<BlameEntry> = Vec::new();
@@ -3797,7 +3857,7 @@ mod tests {
         // parent: a b c   child: a X c  -> one hunk replacing line 2 (0-based 1).
         let p = lines(b"a\nb\nc\n");
         let c = lines(b"a\nX\nc\n");
-        let h = diff_hunks(&p, &c);
+        let h = diff_hunks(&p, &c, sley_diff_merge::DiffAlgorithm::Myers);
         assert_eq!(h.len(), 1);
         assert_eq!((h[0].start_a, h[0].count_a), (1, 1));
         assert_eq!((h[0].start_b, h[0].count_b), (1, 1));
@@ -3808,7 +3868,7 @@ mod tests {
         // parent: a c   child: a b c -> insert one child line at index 1.
         let p = lines(b"a\nc\n");
         let c = lines(b"a\nb\nc\n");
-        let h = diff_hunks(&p, &c);
+        let h = diff_hunks(&p, &c, sley_diff_merge::DiffAlgorithm::Myers);
         assert_eq!(h.len(), 1);
         assert_eq!(h[0].count_a, 0);
         assert_eq!((h[0].start_b, h[0].count_b), (1, 1));
@@ -3818,7 +3878,7 @@ mod tests {
     fn diff_hunks_identical_is_empty() {
         let p = lines(b"a\nb\n");
         let c = lines(b"a\nb\n");
-        assert!(diff_hunks(&p, &c).is_empty());
+        assert!(diff_hunks(&p, &c, sley_diff_merge::DiffAlgorithm::Myers).is_empty());
     }
 
     /// A chunk that is wholly preserved by the parent migrates entirely, with
@@ -3835,7 +3895,7 @@ mod tests {
             num_lines: 3,
             ..Default::default()
         }];
-        let passed = pass_blame_to_parent(&p, &c, &mut owned);
+        let passed = pass_blame_to_parent(&p, &c, &mut owned, sley_diff_merge::DiffAlgorithm::Myers);
         // The inserted line (child s_lno 0) stays with the child; lines 1..3 go
         // to the parent at parent-s_lno 0..2.
         let ours_lines: usize = owned.iter().map(|e| e.num_lines).sum();
@@ -3859,7 +3919,7 @@ mod tests {
             num_lines: 3,
             ..Default::default()
         }];
-        let passed = pass_blame_to_parent(&p, &c, &mut owned);
+        let passed = pass_blame_to_parent(&p, &c, &mut owned, sley_diff_merge::DiffAlgorithm::Myers);
         let ours: usize = owned.iter().map(|e| e.num_lines).sum();
         let to_parent: usize = passed.iter().map(|e| e.num_lines).sum();
         assert_eq!(ours, 1, "the changed middle line is charged to the child");
