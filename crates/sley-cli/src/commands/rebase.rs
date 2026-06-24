@@ -1070,6 +1070,8 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         String::new()
     } else {
         match args.positional.first() {
+            // `git rebase -` is shorthand for the previous branch, like checkout.
+            Some(name) if name == "-" => "@{-1}".to_string(),
             Some(name) => name.clone(),
             None => match default_upstream_name(ctx, &refs) {
                 Some(name) => name,
@@ -1136,6 +1138,25 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             }
         }
     };
+
+    // git refuses to switch to a branch that is checked out in another worktree
+    // (die_if_checked_out). Only fires when a <branch> argument is switched to;
+    // the current worktree is ignored, so rebasing the branch checked out here
+    // is fine.
+    if switch_to.is_some()
+        && let Some(head_name) = &head_name
+        && let Some(other) = commands::worktree::branch_checked_out_worktree(
+            &ctx.common_git_dir,
+            head_name,
+            Some(&ctx.worktree_root),
+        )?
+    {
+        eprintln!(
+            "fatal: '{branch_name}' is already used by worktree at '{}'",
+            other.display()
+        );
+        return Err(GitError::Exit(128));
+    }
 
     // git creates the autostash BEFORE running the pre-rebase hook, and a hook
     // refusal restores it (builtin/rebase.c: create_autostash → pre-rebase →
