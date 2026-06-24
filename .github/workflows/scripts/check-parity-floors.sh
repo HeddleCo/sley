@@ -768,11 +768,20 @@ declare -A FLOOR=(
     # todo generation (label/reset/merge -C/-c) + topology replay. t3430 2->17;
     # t3404 held 80, t3418 11->12; cross-guard t5520-pull held 75 (pull-rebase now
     # routes through the rewritten rebase.rs) and t6132 held 23 (log.rs/lib.rs merge).
-    # wave-40 reconcile: floor was 19 but main measured 16 on 2026-06-22 (PRE-EXISTING
-    # inverted floor, NOT caused by wave-40 — wave-40's rebase lane actually IMPROVED
-    # this 16->17). Corrected to measured 17; historical 19 noted for the follow-up
-    # investigation to restore the lost 2 cells.
-    [t3430-rebase-merges.sh]=17
+    # wave-41 (R1 lane t3430-mergeguard): #28 restored 17->18 by fixing bare
+    # `add -u` to resolve unmerged paths (add_update_all_tracked_filtered drove a
+    # stage-0-only precheck and silently skipped conflicted paths). Latent until
+    # 06db7262 correctly made collect_short_status render conflicts as AA/UU
+    # (matching git) instead of D?; `rebase --continue`'s unmerged gate reads both
+    # status columns, so the now-correct AA exposed the add bug. #30/#32 stay
+    # failing in the FULL run though they PASS in isolation: they cascade off #29
+    # ("--rebase-merges with strategies"), which needs custom merge-strategy driver
+    # support (`-s override`) that sley lacks. That rebase-merge now CORRECTLY
+    # conflicts (verified: real `git rebase -ir` default-strategy conflicts the
+    # same add/add G.t), so the historical "19" depended on a since-fixed silent
+    # mis-merge. Restoring 19 needs custom `-s <strategy>` support (separate
+    # feature), not a floor change.
+    [t3430-rebase-merges.sh]=18
     # wave-13 (2026-06-19, integ/wave13A onto f3eeb950): 6-slice batch, all
     # measured at the integ tip against one binary, cargo test --workspace green,
     # cross-guards held (t4014=202 t4013=191 t4205=110 t5505=126 t5520=75 t2007=2).
