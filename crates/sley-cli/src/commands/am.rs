@@ -63,6 +63,9 @@ struct AmOptions {
     scissors: bool,
     /// Prompt before applying each patch (`-i`/`--interactive`).
     interactive: bool,
+    /// Prepend this directory to every path in each patch (`--directory=<dir>`,
+    /// forwarded to `git apply --directory`).
+    directory: Option<String>,
     /// Input patch container format (`--patch-format=<format>`), or auto-detect.
     patch_format: AmPatchFormat,
     /// `-p<n>`: number of leading path components to strip from patch names.
@@ -428,6 +431,7 @@ pub(crate) fn start_rebase_apply(
         ignore_whitespace: params.ignore_whitespace,
         scissors: false,
         interactive: false,
+        directory: None,
         patch_format: AmPatchFormat::Mbox,
         p_value: 1,
     };
@@ -541,6 +545,7 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         ignore_whitespace: false,
         scissors: false,
         interactive: false,
+        directory: None,
         patch_format: AmPatchFormat::Auto,
         p_value: 1,
     };
@@ -625,7 +630,9 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             value if let Some(rest) = value.strip_prefix("-p") => {
                 options.p_value = rest.parse::<usize>().unwrap_or(1);
             }
-            value if value.starts_with("--directory=") => {}
+            value if let Some(dir) = value.strip_prefix("--directory=") => {
+                options.directory = Some(dir.to_string());
+            }
             value if value.starts_with('-') && value != "-" => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
                 am_usage();
@@ -1192,7 +1199,9 @@ fn parse_message(lines: &[Vec<u8>], cleanup: SubjectCleanup) -> Result<AmPatch> 
                 // `@<secs> <tz>`) directly; accept that too so the round-trip
                 // through the state dir preserves the author date.
                 author_date =
-                    parse_rfc2822_date(value).or_else(|| parse_raw_git_date_normalized(value));
+                    parse_rfc2822_date(value)
+                        .or_else(|| parse_raw_git_date_normalized(value))
+                        .or_else(|| parse_git_default_date(value));
             }
             "subject" => subject = clean_subject(value, cleanup),
             "message-id" if !value.is_empty() => message_id = Some(value.clone()),
@@ -1363,7 +1372,9 @@ fn consume_in_body_headers(
             "date" => {
                 *author_date_raw = Some(value.clone());
                 *author_date =
-                    parse_rfc2822_date(value).or_else(|| parse_raw_git_date_normalized(value));
+                    parse_rfc2822_date(value)
+                        .or_else(|| parse_raw_git_date_normalized(value))
+                        .or_else(|| parse_git_default_date(value));
             }
             "subject" => *subject = clean_subject(value, cleanup),
             _ => {}
@@ -1582,6 +1593,35 @@ fn parse_rfc2822_date(value: &str) -> Option<String> {
     Some(format!("{seconds} {}", timezone.0))
 }
 
+/// Parse git's "default" (asctime-style) date as `mailinfo` accepts it:
+/// `[<DoW>] <Mon> <day> <HH:MM:SS> <year> [<tz>]`, e.g.
+/// `Thu Dec 4 16:00:00 2008 -0800`. Distinct from RFC 2822 by the
+/// month-before-day token order; the timezone defaults to `+0000` when absent.
+fn parse_git_default_date(value: &str) -> Option<String> {
+    let mut tokens: Vec<&str> = value.split_whitespace().collect();
+    if let Some(first) = tokens.first() {
+        if WEEKDAYS.contains(&first.trim_end_matches(',')) {
+            tokens.remove(0);
+        }
+    }
+    if tokens.len() < 4 {
+        return None;
+    }
+    let month = month_index(tokens[0])?;
+    let day: u32 = tokens[1].parse().ok()?;
+    let (hour, minute, second) = parse_clock(tokens[2])?;
+    let year: i64 = tokens[3].parse().ok()?;
+    let timezone = tokens
+        .get(4)
+        .and_then(|token| parse_timezone(token))
+        .unwrap_or_else(|| ("+0000".to_string(), 0));
+
+    let days = days_from_civil(year, month, day as i64);
+    let local_seconds = days * 86_400 + (hour as i64) * 3600 + (minute as i64) * 60 + second as i64;
+    let seconds = local_seconds - timezone.1;
+    Some(format!("{seconds} {}", timezone.0))
+}
+
 /// Parse a raw git date (`<seconds> <±HHMM>` or `@<seconds> <±HHMM>`) into the
 /// normalised `<seconds> <±HHMM>` form `author_date` carries. Returns `None` if
 /// the value is not exactly two whitespace-separated raw-date fields.
@@ -1726,7 +1766,14 @@ fn write_am_state_dir(
         bool_flag(options.interactive),
     )?;
     fs::write(state_dir.join("applying"), b"")?;
-    fs::write(state_dir.join("apply-opt"), b"")?;
+    // git records the forwarded `git apply` options here (sq-quoted) so resumes
+    // reproduce them. We only carry `--directory`; the others are applied
+    // in-process at apply time.
+    let apply_opt = match &options.directory {
+        Some(dir) => format!("--directory={}\n", am_sq_quote(dir)),
+        None => String::new(),
+    };
+    fs::write(state_dir.join("apply-opt"), apply_opt)?;
     fs::write(state_dir.join("p-value"), format!("{}\n", options.p_value))?;
     // abort-safety records the HEAD the series is currently sitting on so
     // --abort can detect a HEAD the user moved out from under us. An unborn HEAD
@@ -1932,6 +1979,79 @@ impl AmResumeOverrides {
             || self.quiet.is_some()
             || self.signoff.is_some()
             || self.reject.is_some()
+    }
+}
+
+/// git's `sq_quote`: wrap in single quotes, rendering any embedded quote as the
+/// `'\''` sequence. Used to store `--directory=<dir>` in the `apply-opt` state.
+fn am_sq_quote(value: &str) -> String {
+    let mut out = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Inverse of [`am_sq_quote`] for a single sq-quoted token.
+fn am_sq_unquote(value: &str) -> String {
+    let mut chars = value.chars().peekable();
+    if chars.peek() != Some(&'\'') {
+        return value.to_string();
+    }
+    chars.next();
+    let mut out = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            // Either the closing quote, or the `'\''` (escaped quote) sequence.
+            if chars.peek() == Some(&'\\') {
+                chars.next();
+                if chars.next() == Some('\'') {
+                    out.push('\'');
+                    // The next char re-opens the quote (consume it).
+                    chars.next();
+                    continue;
+                }
+            }
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Read the `--directory=<dir>` forwarded apply option from the `apply-opt`
+/// state so a resumed `--skip`/`--continue` reproduces it (t4252).
+fn read_am_apply_directory(state_dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(state_dir.join("apply-opt")).ok()?;
+    let line = raw.strip_suffix('\n').unwrap_or(&raw);
+    line.strip_prefix("--directory=")
+        .map(|token| am_sq_unquote(token))
+}
+
+/// Prepend `--directory=<dir>` to every path in the parsed patch (git's
+/// `git apply --directory`): each `old_path`/`new_path` becomes `<dir>/<path>`.
+fn am_prepend_directory(file_patches: &mut [sley_diff_merge::FilePatch], dir: &str) {
+    let prefix = {
+        let mut p = dir.as_bytes().to_vec();
+        if !p.ends_with(b"/") {
+            p.push(b'/');
+        }
+        p
+    };
+    for file in file_patches.iter_mut() {
+        for path in [file.old_path.as_mut(), file.new_path.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            let mut joined = prefix.clone();
+            joined.extend_from_slice(path);
+            *path = joined;
+        }
     }
 }
 
@@ -2227,7 +2347,7 @@ fn apply_one_patch(
     quiet: bool,
     p_value: usize,
 ) -> Result<ApplyResult> {
-    let file_patches = sley_diff_merge::parse_unified_patch_with_options(
+    let mut file_patches = sley_diff_merge::parse_unified_patch_with_options(
         &patch.diff,
         false,
         &sley_diff_merge::PatchPathOptions {
@@ -2236,6 +2356,11 @@ fn apply_one_patch(
             root: Vec::new(),
         },
     )?;
+    // `--directory=<dir>` (persisted in apply-opt) prepends <dir>/ to every path
+    // before the patch is applied (t4252 "apply to a funny path").
+    if let Some(dir) = read_am_apply_directory(state_dir) {
+        am_prepend_directory(&mut file_patches, &dir);
+    }
 
     match try_straight_apply(worktree_root, &file_patches, ignore_whitespace)? {
         Some(actions) => {
