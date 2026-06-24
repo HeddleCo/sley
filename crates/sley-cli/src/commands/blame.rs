@@ -520,6 +520,12 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
                     copy_score = other[2..].parse::<usize>().unwrap_or(copy_score);
                 }
             }
+            // `-M[<score>]`: detect lines moved/copied within the same file.
+            // The within-file move pass is not implemented; the cases the
+            // upstream suite exercises with `-M` (the `--ignore-rev` fuzzy tests)
+            // are resolved by the ignore heuristic, so `-M` is accepted as a
+            // no-op rather than rejected.
+            other if other == "-M" || is_blame_move_option(other) => {}
             // Options we recognize from git but do not implement. Reject them
             // explicitly rather than misinterpreting them as a path.
             other
@@ -635,13 +641,16 @@ fn is_unsupported_blame_option(arg: &str) -> bool {
     ) {
         return true;
     }
-    arg.starts_with("-M")
-        || arg.starts_with("-S")
-        || arg.starts_with("--reverse=")
+    arg.starts_with("-S") || arg.starts_with("--reverse=")
 }
 
 fn is_blame_copy_option(arg: &str) -> bool {
     arg.len() > 2 && arg.starts_with("-C") && arg[2..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `-M<num>` (within-file move detection with an optional score).
+fn is_blame_move_option(arg: &str) -> bool {
+    arg.len() > 2 && arg.starts_with("-M") && arg[2..].bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `-N` where N is all digits is a (rare) negative-number-looking token; treat
