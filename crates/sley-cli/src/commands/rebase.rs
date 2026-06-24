@@ -1258,10 +1258,27 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             && upstream_base[0] == onto
             && is_linear_history(&db, ctx.format, &onto, &orig_head)?;
         if can_ff && !force {
-            if let Some(switch_to) = &switch_to
-                && head_name.is_some()
-            {
-                checkout_up_to_date(ctx, &db, switch_to, &orig_head)?;
+            if let Some(switch_to) = &switch_to {
+                if head_name.is_some() {
+                    checkout_up_to_date(ctx, &db, switch_to, &orig_head)?;
+                } else {
+                    // The <branch> argument names a non-branch (e.g. a tag): git
+                    // still switches to it before reporting up-to-date, so detach
+                    // HEAD onto its commit (RESET_HEAD_DETACH path).
+                    reset_index_and_worktree_to_commit_for_rebase(ctx, &orig_head)?;
+                    let refs = ctx.refs();
+                    let old =
+                        head_commit_oid(&refs)?.unwrap_or_else(|| ObjectId::null(ctx.format));
+                    let committer = commit_identity_from_env("COMMITTER")?;
+                    detach_head_with_reflog(
+                        ctx,
+                        old,
+                        orig_head,
+                        ctx.reflog("start", Some(&format!("checkout {switch_to}"))),
+                        committer,
+                    )?;
+                    run_rebase_post_checkout_hook(&old, &orig_head)?;
+                }
             }
             if !args.quiet {
                 if branch_name == "HEAD" {
@@ -1907,6 +1924,20 @@ fn make_script_commits(
     let mut excluded = std::collections::HashSet::new();
     if let Some(upstream) = upstream {
         let mut queue = vec![*upstream];
+        while let Some(oid) = queue.pop() {
+            if !excluded.insert(oid) {
+                continue;
+            }
+            let record = read_rev_list_commit_record(db, ctx.format, oid)?;
+            queue.extend(record.parents.iter().copied());
+        }
+    } else if let Some(cherry_base) = cherry_base {
+        // `--root --onto <newbase>` with no upstream: a related onto does not
+        // actually go to the root — only back to the merge base of the onto and
+        // orig_head (t3421 "does not go to root"). Disjoint histories have no
+        // merge base, so the whole branch (to the root) is rebased.
+        let bases = merge_bases(&ctx.common_git_dir, db, ctx.format, cherry_base, orig_head)?;
+        let mut queue: Vec<ObjectId> = bases;
         while let Some(oid) = queue.pop() {
             if !excluded.insert(oid) {
                 continue;
@@ -3853,8 +3884,13 @@ fn pick_one_commit(
 
     let parent = record.parents.first().copied();
 
-    // Fast-forward when the pick's parent is exactly HEAD.
-    if opts.allow_ff && !create_root && !is_fixup && parent == Some(head) {
+    // Fast-forward when the pick's parent is exactly HEAD, or when recreating
+    // the root (`--root` with no `--onto`): git treats HEAD == squash_onto as
+    // "unborn" (sequencer.c), so a parentless commit fast-forwards onto it and
+    // is reused as-is, leaving a no-op `--root` rebase at the original commits.
+    let ff_to_head = parent == Some(head);
+    let ff_root = create_root && parent.is_none();
+    if opts.allow_ff && !is_fixup && (ff_to_head || ff_root) {
         let target_tree = commit_tree_oid(db, ctx.format, &oid)?;
         let overwritten = checkout_would_overwrite_untracked(ctx, db, &target_tree)?;
         if !overwritten.is_empty() {
