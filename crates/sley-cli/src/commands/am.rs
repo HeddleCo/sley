@@ -63,6 +63,9 @@ struct AmOptions {
     scissors: bool,
     /// Input patch container format (`--patch-format=<format>`), or auto-detect.
     patch_format: AmPatchFormat,
+    /// `-p<n>`: number of leading path components to strip from patch names.
+    /// Default 1; `--no-prefix` patches need `-p0`.
+    p_value: usize,
 }
 
 impl AmOptions {
@@ -396,6 +399,7 @@ pub(crate) fn start_rebase_apply(
         ignore_whitespace: params.ignore_whitespace,
         scissors: false,
         patch_format: AmPatchFormat::Mbox,
+        p_value: 1,
     };
 
     let refs = FileRefStore::new(git_dir, format);
@@ -506,6 +510,7 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         ignore_whitespace: false,
         scissors: false,
         patch_format: AmPatchFormat::Auto,
+        p_value: 1,
     };
     let mut positional_only = false;
     let mut index = 0;
@@ -578,7 +583,15 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
                 return Err(GitError::Exit(129));
             }
             value if value.starts_with("--exclude=") || value.starts_with("--include=") => {}
-            value if value.starts_with("--directory=") || value.starts_with("-p") => {}
+            "-p" => {
+                let value = args.get(index + 1).map(String::as_str).unwrap_or("");
+                options.p_value = value.parse::<usize>().unwrap_or(1);
+                index += 1;
+            }
+            value if let Some(rest) = value.strip_prefix("-p") => {
+                options.p_value = rest.parse::<usize>().unwrap_or(1);
+            }
+            value if value.starts_with("--directory=") => {}
             value if value.starts_with('-') && value != "-" => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
                 am_usage();
@@ -1676,6 +1689,7 @@ fn write_am_state_dir(
     fs::write(state_dir.join("utf8"), b"t\n")?;
     fs::write(state_dir.join("applying"), b"")?;
     fs::write(state_dir.join("apply-opt"), b"")?;
+    fs::write(state_dir.join("p-value"), format!("{}\n", options.p_value))?;
     // abort-safety records the HEAD we started from so --abort can verify the
     // worktree has not been moved out from under us.
     fs::write(state_dir.join("abort-safety"), format!("{head_oid}\n"))?;
@@ -1874,6 +1888,7 @@ fn run_am_series(
     let three_way = read_state_bool(state_dir, "threeway");
     let empty_action = read_empty_action(state_dir);
     let ignore_whitespace = read_state_bool(state_dir, "ignore-whitespace");
+    let p_value = read_state_usize(state_dir, "p-value").unwrap_or(1);
     let commit_opts = read_am_commit_opts(state_dir);
 
     let mut number = start;
@@ -1938,6 +1953,7 @@ fn run_am_series(
             three_way,
             ignore_whitespace,
             quiet,
+            p_value,
         )? {
             ApplyResult::Committed => number += 1,
             ApplyResult::Conflict => {
@@ -2029,8 +2045,17 @@ fn apply_one_patch(
     three_way: bool,
     ignore_whitespace: bool,
     quiet: bool,
+    p_value: usize,
 ) -> Result<ApplyResult> {
-    let file_patches = sley_diff_merge::parse_unified_patch(&patch.diff)?;
+    let file_patches = sley_diff_merge::parse_unified_patch_with_options(
+        &patch.diff,
+        false,
+        &sley_diff_merge::PatchPathOptions {
+            p_value,
+            p_value_known: true,
+            root: Vec::new(),
+        },
+    )?;
 
     match try_straight_apply(worktree_root, &file_patches, ignore_whitespace)? {
         Some(actions) => {
