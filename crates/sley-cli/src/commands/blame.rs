@@ -112,6 +112,13 @@ struct BlameOptions {
     /// of the working-tree / committed copy (`-` reads standard input). Builds a
     /// "External file (--contents)" pseudo-commit on top of the start rev.
     contents_from: Option<String>,
+    /// `--ignore-rev <rev>` (repeatable): revisions whose changes are skipped
+    /// when blaming, attributing those lines to an earlier commit instead.
+    ignore_revs: Vec<String>,
+    /// `--ignore-revs-file <file>` (repeatable): files of object names to ignore.
+    /// An empty string clears the accumulated list (CLI and config), mirroring
+    /// git's `build_ignorelist`.
+    ignore_revs_files: Vec<String>,
 }
 
 /// Metadata for the all-zero pseudo-commit blame builds for the working-tree
@@ -179,6 +186,9 @@ struct LineBlame {
     origin_lineno: usize,
     /// The raw line bytes, including a trailing newline when present.
     content: Vec<u8>,
+    /// `--ignore-rev` markers carried from the blame entry (`?` / `*`).
+    ignored: bool,
+    unblamable: bool,
 }
 
 pub(crate) fn cmd_blame(args: &[String]) -> Result<()> {
@@ -331,6 +341,21 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         }
     };
 
+    // Resolve the `--ignore-rev` set and the `blame.markIgnoredLines` /
+    // `blame.markUnblamableLines` display flags (the latter via `repo.config()`,
+    // which already folds in `-c` overrides).
+    let ignore_set = build_ignore_set(&repo, &options)?;
+    let marks = BlameMarks {
+        ignored: repo
+            .config()
+            .get_bool("blame", None, "markignoredlines")
+            .unwrap_or(false),
+        unblamable: repo
+            .config()
+            .get_bool("blame", None, "markunblamablelines")
+            .unwrap_or(false),
+    };
+
     let (lines, previous_map) = compute_blame(
         db,
         format,
@@ -342,6 +367,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         options.copy_level,
         options.copy_score,
         virtual_final,
+        &ignore_set,
     )?;
 
     // Resolve the -L ranges against the real line count, then render. The
@@ -362,7 +388,17 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         &options,
         fake.as_ref(),
         &previous_map,
+        marks,
     )
+}
+
+/// `blame.markIgnoredLines` / `blame.markUnblamableLines` display flags: whether
+/// to prefix the object-name column with `?` / `*` (and emit the `ignored` /
+/// `unblamable` porcelain keywords) for `--ignore-rev` lines.
+#[derive(Clone, Copy, Default)]
+struct BlameMarks {
+    ignored: bool,
+    unblamable: bool,
 }
 
 /// Either run with parsed options or print help and exit successfully.
@@ -393,6 +429,8 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
     let mut porcelain = false;
     let mut line_porcelain = false;
     let mut contents_from: Option<String> = None;
+    let mut ignore_revs: Vec<String> = Vec::new();
+    let mut ignore_revs_files: Vec<String> = Vec::new();
     // Positionals collected before `--`; afterwards everything is a path.
     let mut positionals: Vec<String> = Vec::new();
     let mut paths_after_dd: Vec<String> = Vec::new();
@@ -449,6 +487,24 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
             }
             other if other.starts_with("--contents=") => {
                 contents_from = Some(other["--contents=".len()..].to_string());
+            }
+            "--ignore-rev" => {
+                let Some(value) = iter.next() else {
+                    return Err(blame_option_requires_value("ignore-rev"));
+                };
+                ignore_revs.push(value.clone());
+            }
+            other if other.starts_with("--ignore-rev=") => {
+                ignore_revs.push(other["--ignore-rev=".len()..].to_string());
+            }
+            "--ignore-revs-file" => {
+                let Some(value) = iter.next() else {
+                    return Err(blame_option_requires_value("ignore-revs-file"));
+                };
+                ignore_revs_files.push(value.clone());
+            }
+            other if other.starts_with("--ignore-revs-file=") => {
+                ignore_revs_files.push(other["--ignore-revs-file=".len()..].to_string());
             }
             other if other.starts_with("--abbrev=") => {
                 let value = &other["--abbrev=".len()..];
@@ -519,6 +575,8 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
         line_porcelain,
         author_field_explicit,
         contents_from,
+        ignore_revs,
+        ignore_revs_files,
     }))
 }
 
@@ -772,6 +830,105 @@ fn read_index_blob(
     Ok(Some(object.body.clone()))
 }
 
+/// Build the `--ignore-rev` / `--ignore-revs-file` / `blame.ignoreRevsFile`
+/// commit set, mirroring git's `build_ignorelist`. Files are processed first
+/// (config entries, then CLI ones, in order; an empty filename clears the set so
+/// far), then the explicit `--ignore-rev` revisions.
+fn build_ignore_set(
+    repo: &RepositoryContext,
+    options: &BlameOptions,
+) -> Result<HashSet<ObjectId>> {
+    let db = repo.objects();
+    let format = repo.format();
+    let mut set: HashSet<ObjectId> = HashSet::new();
+
+    // Config `blame.ignoreRevsFile` entries come first, then CLI `-ignore-revs-file`.
+    let mut files: Vec<String> = repo
+        .config()
+        .get_all("blame", None, "ignorerevsfile")
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect();
+    files.extend(options.ignore_revs_files.iter().cloned());
+
+    for file in &files {
+        if file.is_empty() {
+            set.clear();
+            continue;
+        }
+        parse_ignore_revs_file(repo, file, &mut set)?;
+    }
+
+    for rev in &options.ignore_revs {
+        let commit = repo
+            .resolve_revision(rev)
+            .ok()
+            .and_then(|oid| sley_rev::peel_to_commit(db, format, &oid).ok());
+        match commit {
+            Some(oid) => {
+                set.insert(oid);
+            }
+            None => {
+                eprintln!("fatal: cannot find revision {rev} to ignore");
+                return Err(GitError::Exit(128));
+            }
+        }
+    }
+
+    Ok(set)
+}
+
+/// Parse one `--ignore-revs-file`, adding each named commit to `set`. Mirrors
+/// `oidset_parse_file_carefully` with the `peel_to_commit_oid` tweak: trailing
+/// `#` comments and surrounding whitespace are stripped, blank lines skipped, an
+/// unparsable token is the "invalid object name" fatal, and an object that does
+/// not peel to a commit (e.g. a tree) is silently ignored.
+fn parse_ignore_revs_file(
+    repo: &RepositoryContext,
+    path: &str,
+    set: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    let db = repo.objects();
+    let format = repo.format();
+    let full = {
+        let p = Path::new(path);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            repo.cwd().join(path)
+        }
+    };
+    let Ok(content) = std::fs::read(&full) else {
+        eprintln!("fatal: could not open object name list: {path}");
+        return Err(GitError::Exit(128));
+    };
+    for raw in content.split(|b| *b == b'\n') {
+        // Strip a trailing `#` comment, then surrounding ASCII whitespace.
+        let line = match raw.iter().position(|b| *b == b'#') {
+            Some(idx) => &raw[..idx],
+            None => raw,
+        };
+        let start = line.iter().position(|b| !is_ascii_space(*b));
+        let Some(start) = start else { continue };
+        let end = line.iter().rposition(|b| !is_ascii_space(*b)).unwrap() + 1;
+        let token = &line[start..end];
+        let Ok(text) = std::str::from_utf8(token) else {
+            eprintln!("fatal: invalid object name: {}", String::from_utf8_lossy(token));
+            return Err(GitError::Exit(128));
+        };
+        let Ok(oid) = ObjectId::from_hex(format, text) else {
+            eprintln!("fatal: invalid object name: {text}");
+            return Err(GitError::Exit(128));
+        };
+        // Peel to a commit; a non-commit (e.g. a tree) is silently accepted.
+        if let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid) {
+            set.insert(commit);
+        }
+    }
+    Ok(())
+}
+
 /// Whether the repository is bare. Mirrors git's `is_bare_repository`: an
 /// explicit `core.bare` wins, otherwise infer from the absence of a work tree.
 fn blame_is_bare(repo: &RepositoryContext) -> bool {
@@ -923,7 +1080,7 @@ struct OriginKey {
     virtual_worktree: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct BlameEntry {
     /// 0-based start line in the final image.
     lno: usize,
@@ -932,6 +1089,15 @@ struct BlameEntry {
     /// Number of lines this entry covers (in both the final image and the
     /// suspect's blob).
     num_lines: usize,
+    /// `--ignore-rev`: this run's blame was passed *through* an ignored commit
+    /// (git's `blame_entry.ignored`). Rendered with a `?` marker /
+    /// `ignored` porcelain keyword when `blame.markIgnoredLines` is set.
+    ignored: bool,
+    /// `--ignore-rev`: this run's lines were added by an ignored commit and
+    /// could not be matched to any parent line (git's `blame_entry.unblamable`).
+    /// Rendered with a `*` marker / `unblamable` porcelain keyword when
+    /// `blame.markUnblamableLines` is set.
+    unblamable: bool,
 }
 
 /// Core blame: assign each final-image line to a commit, mirroring git's
@@ -958,6 +1124,7 @@ fn compute_blame(
     copy_level: u8,
     copy_score: usize,
     virtual_final: bool,
+    ignore_set: &HashSet<ObjectId>,
 ) -> Result<(Vec<LineBlame>, PreviousMap)> {
     let final_lines = sley_diff_merge::split_lines(final_blob);
     let line_count = final_lines.len();
@@ -1000,7 +1167,10 @@ fn compute_blame(
     if !virtual_final {
         blob_cache.insert((start_key.commit, start_key.path.clone()), Some(final_blob.to_vec()));
     }
-    suspects.insert(start_key.clone(), vec![BlameEntry { lno: 0, s_lno: 0, num_lines: line_count }]);
+    suspects.insert(
+        start_key.clone(),
+        vec![BlameEntry { lno: 0, s_lno: 0, num_lines: line_count, ..Default::default() }],
+    );
 
     // Commit-date priority queue, newest first (git's
     // compare_commits_by_commit_date). We materialise the comparator lazily via
@@ -1104,6 +1274,42 @@ fn compute_blame(
             }
         }
 
+        // `--ignore-rev`: this commit is ignored, so the lines it changed (left
+        // in `owned` by the normal pass) are not charged to it. Instead each is
+        // fuzzily matched to a parent line and passed there marked `ignored`, or
+        // kept marked `unblamable`. Mirrors git's second `pass_blame_to_parent`
+        // loop (ignore_diffs = 1) over the scapegoats.
+        if ignore_set.contains(&commit_oid) && !owned.is_empty() {
+            let child_fps = line_fingerprints(&child_lines);
+            for parent in &parents {
+                if owned.is_empty() {
+                    break;
+                }
+                let Some(parent_origin) =
+                    find_parent_origin(db, format, &origin, parent, copy_level > 1)?
+                else {
+                    continue;
+                };
+                let parent_blob =
+                    cached_blob(db, format, parent, &parent_origin.path, &mut blob_cache)?;
+                let Some(parent_blob) = parent_blob else {
+                    continue;
+                };
+                let parent_lines = sley_diff_merge::split_lines(&parent_blob);
+                let parent_fps = line_fingerprints(&parent_lines);
+                let passed = pass_blame_to_parent_ignore(
+                    &parent_lines,
+                    &child_lines,
+                    &parent_fps,
+                    &child_fps,
+                    &mut owned,
+                );
+                if !passed.is_empty() {
+                    queue_entries(&mut suspects, &mut queue, parent_origin, passed);
+                }
+            }
+        }
+
         if copy_level > 0 && !owned.is_empty() {
             let copied = find_copies_in_parents(
                 db,
@@ -1148,6 +1354,8 @@ fn compute_blame(
                 origin_path: repo_path.to_string(),
                 origin_lineno: line_index + 1,
                 content: final_lines[line_index].content.to_vec(),
+                ignored: false,
+                unblamable: false,
             }),
         }
     }
@@ -1343,6 +1551,8 @@ fn pass_entry(entry: &mut BlameEntry, offset: isize, passed: &mut Vec<BlameEntry
         lno: entry.lno,
         s_lno,
         num_lines: entry.num_lines,
+        ignored: entry.ignored,
+        unblamable: entry.unblamable,
     });
 }
 
@@ -1353,6 +1563,8 @@ fn split_entry_at(e: &mut BlameEntry, head_len: usize) -> BlameEntry {
         lno: e.lno + head_len,
         s_lno: e.s_lno + head_len,
         num_lines: e.num_lines - head_len,
+        ignored: e.ignored,
+        unblamable: e.unblamable,
     };
     e.num_lines = head_len;
     tail
@@ -1436,6 +1648,8 @@ fn charge_remaining(
                     origin_path: origin.path.clone(),
                     origin_lineno: entry.s_lno + k + 1,
                     content: final_lines[final_line].content.to_vec(),
+                    ignored: entry.ignored,
+                    unblamable: entry.unblamable,
                 });
             }
         }
@@ -1667,6 +1881,8 @@ fn push_entry_slice(
         lno: entry.lno + offset,
         s_lno: source_lno,
         num_lines: len,
+        ignored: entry.ignored,
+        unblamable: entry.unblamable,
     });
 }
 
@@ -1684,6 +1900,546 @@ fn blame_entry_score(
             .count();
     }
     score
+}
+
+// ===========================================================================
+// `--ignore-rev` fuzzy line matching (blame.c fingerprints + guess_line_blames)
+// ===========================================================================
+
+/// A line fingerprint: the multiset of consecutive character bigrams of the
+/// line (git's `struct fingerprint`). Letters are lowercased and runs of
+/// whitespace collapse to a `\0` boundary, so similar lines that differ only in
+/// case or spacing still share most of their bigrams. Whitespace-pair bigrams
+/// (`hash == 0`) are ignored.
+#[derive(Clone, Default)]
+struct Fingerprint {
+    counts: HashMap<u32, i32>,
+}
+
+/// Lowercase an ASCII letter (C-locale `tolower`); leave other bytes untouched.
+fn ascii_tolower(byte: u8) -> u8 {
+    if byte.is_ascii_uppercase() {
+        byte + 32
+    } else {
+        byte
+    }
+}
+
+/// C-locale `isspace`.
+fn is_ascii_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// Build the fingerprint of one line (its content, newline excluded — git
+/// folds the trailing newline into the same `\0` boundary as end-of-line).
+fn get_fingerprint(line: &[u8]) -> Fingerprint {
+    let mut counts: HashMap<u32, i32> = HashMap::new();
+    let mut c0: u32 = 0;
+    for i in 0..=line.len() {
+        let c1: u32 = if i == line.len() || is_ascii_space(line[i]) {
+            0
+        } else {
+            ascii_tolower(line[i]) as u32
+        };
+        let hash = c0 | (c1 << 8);
+        if hash != 0 {
+            *counts.entry(hash).or_insert(0) += 1;
+        }
+        c0 = c1;
+    }
+    Fingerprint { counts }
+}
+
+/// Fingerprints for every line of a blob, in line order.
+fn line_fingerprints(lines: &[sley_diff_merge::DiffLine<'_>]) -> Vec<Fingerprint> {
+    lines.iter().map(|line| get_fingerprint(line.content)).collect()
+}
+
+/// git's `fingerprint_similarity`: the size of the bigram-multiset intersection
+/// (sum of per-bigram minimum counts).
+fn fingerprint_similarity(a: &Fingerprint, b: &Fingerprint) -> i32 {
+    let mut intersection = 0;
+    for (hash, count_b) in &b.counts {
+        if let Some(count_a) = a.counts.get(hash) {
+            intersection += (*count_a).min(*count_b);
+        }
+    }
+    intersection
+}
+
+/// git's `fingerprint_subtract`: remove `b`'s bigrams from `a` (saturating at
+/// zero), so a line in A that has been claimed can't be matched as strongly
+/// again.
+fn fingerprint_subtract(a: &mut Fingerprint, b: &Fingerprint) {
+    for (hash, count_b) in &b.counts {
+        if let Some(count_a) = a.counts.get_mut(hash) {
+            if *count_a <= *count_b {
+                a.counts.remove(hash);
+            } else {
+                *count_a -= *count_b;
+            }
+        }
+    }
+}
+
+/// git's `line_number_mapping`: maps a line number in B to its proportional
+/// position in A.
+struct LineNumberMapping {
+    destination_start: i32,
+    destination_length: i32,
+    source_start: i32,
+    source_length: i32,
+}
+
+fn map_line_number(line_number: i32, mapping: &LineNumberMapping) -> i32 {
+    ((line_number - mapping.source_start) * 2 + 1) * mapping.destination_length
+        / (mapping.source_length * 2)
+        + mapping.destination_start
+}
+
+const CERTAINTY_NOT_CALCULATED: i32 = -1;
+const CERTAIN_NOTHING_MATCHES: i32 = -2;
+
+/// State threaded through the recursive fuzzy matcher. Arrays indexed by
+/// `b_idx = absolute_B_line - orig_start_b` (git re-bases pointers per
+/// recursion; we keep absolute-into-B indices, which is equivalent).
+struct FuzzyState<'a> {
+    parent_fps: &'a mut [Fingerprint],
+    target_fps: &'a [Fingerprint],
+    similarities: Vec<i32>,
+    certainties: Vec<i32>,
+    second_best_result: Vec<i32>,
+    result: Vec<i32>,
+    max_search_distance_a: i32,
+    max_search_distance_b: i32,
+    orig_start_b: i32,
+    mapping: LineNumberMapping,
+}
+
+/// Index into the flat `similarities` array (git's `get_similarity`).
+fn similarity_index(
+    line_a: i32,
+    b_idx: i32,
+    closest_line_a: i32,
+    max_search_distance_a: i32,
+) -> usize {
+    (line_a - closest_line_a + max_search_distance_a + b_idx * (max_search_distance_a * 2 + 1))
+        as usize
+}
+
+/// git's `find_best_line_matches` for a single line in B.
+fn find_best_line_matches(state: &mut FuzzyState, start_a: i32, length_a: i32, abs_b: i32) {
+    let b_idx = (abs_b - state.orig_start_b) as usize;
+    if state.certainties[b_idx] != CERTAINTY_NOT_CALCULATED {
+        return;
+    }
+
+    let closest_local_line_a = map_line_number(abs_b, &state.mapping) - start_a;
+    let mut search_start = closest_local_line_a - state.max_search_distance_a;
+    if search_start < 0 {
+        search_start = 0;
+    }
+    let mut search_end = closest_local_line_a + state.max_search_distance_a + 1;
+    if search_end > length_a {
+        search_end = length_a;
+    }
+
+    let mut best_similarity = 0;
+    let mut second_best_similarity = 0;
+    let mut best_similarity_index = 0;
+    let mut second_best_similarity_index = 0;
+
+    for i in search_start..search_end {
+        let sim_idx = similarity_index(
+            i,
+            b_idx as i32,
+            closest_local_line_a,
+            state.max_search_distance_a,
+        );
+        if state.similarities[sim_idx] == -1 {
+            let sim = fingerprint_similarity(
+                &state.target_fps[abs_b as usize],
+                &state.parent_fps[(start_a + i) as usize],
+            ) * (1000 - (i - closest_local_line_a).abs());
+            state.similarities[sim_idx] = sim;
+        }
+        let similarity = state.similarities[sim_idx];
+        if similarity > best_similarity {
+            second_best_similarity = best_similarity;
+            second_best_similarity_index = best_similarity_index;
+            best_similarity = similarity;
+            best_similarity_index = i;
+        } else if similarity > second_best_similarity {
+            second_best_similarity = similarity;
+            second_best_similarity_index = i;
+        }
+    }
+
+    if best_similarity == 0 {
+        state.certainties[b_idx] = CERTAIN_NOTHING_MATCHES;
+        state.result[b_idx] = -1;
+    } else {
+        state.certainties[b_idx] = best_similarity * 2 - second_best_similarity;
+        state.result[b_idx] = start_a + best_similarity_index;
+        state.second_best_result[b_idx] = start_a + second_best_similarity_index;
+    }
+}
+
+/// git's `fuzzy_find_matching_lines_recurse`: pick the most confidently matched
+/// line as a partition, subtract its fingerprint, invalidate contradicting
+/// neighbours, then recurse on either side.
+fn fuzzy_recurse(
+    state: &mut FuzzyState,
+    start_a: i32,
+    start_b: i32,
+    length_a: i32,
+    length_b: i32,
+) {
+    let mut most_certain_local_line_b: i32 = -1;
+    let mut most_certain_line_certainty: i32 = -1;
+    for i in 0..length_b {
+        let abs_b = start_b + i;
+        find_best_line_matches(state, start_a, length_a, abs_b);
+        let b_idx = (abs_b - state.orig_start_b) as usize;
+        if state.certainties[b_idx] > most_certain_line_certainty {
+            most_certain_line_certainty = state.certainties[b_idx];
+            most_certain_local_line_b = i;
+        }
+    }
+
+    if most_certain_local_line_b == -1 {
+        return;
+    }
+
+    let most_certain_abs_b = start_b + most_certain_local_line_b;
+    let most_certain_b_idx = (most_certain_abs_b - state.orig_start_b) as usize;
+    let most_certain_line_a = state.result[most_certain_b_idx];
+
+    // Subtract the chosen B line's fingerprint from its matched A line.
+    let (left, right) = state
+        .parent_fps
+        .split_at_mut(most_certain_line_a as usize);
+    let target_fp = &state.target_fps[most_certain_abs_b as usize];
+    fingerprint_subtract(&mut right[0], target_fp);
+    let _ = left;
+
+    let mut invalidate_min = most_certain_local_line_b - state.max_search_distance_b;
+    let mut invalidate_max = most_certain_local_line_b + state.max_search_distance_b + 1;
+    if invalidate_min < 0 {
+        invalidate_min = 0;
+    }
+    if invalidate_max > length_b {
+        invalidate_max = length_b;
+    }
+
+    // The matched A fingerprint changed: discard cached similarities against it.
+    for i in invalidate_min..invalidate_max {
+        let abs_b = start_b + i;
+        let closest_local_line_a = map_line_number(abs_b, &state.mapping) - start_a;
+        if (most_certain_line_a - start_a - closest_local_line_a).abs()
+            > state.max_search_distance_a
+        {
+            continue;
+        }
+        let sim_idx = similarity_index(
+            most_certain_line_a - start_a,
+            abs_b - state.orig_start_b,
+            closest_local_line_a,
+            state.max_search_distance_a,
+        );
+        state.similarities[sim_idx] = -1;
+    }
+
+    // Discard matches whose ordering now contradicts the partition.
+    let mut i = most_certain_local_line_b - 1;
+    while i >= invalidate_min {
+        let b_idx = (start_b + i - state.orig_start_b) as usize;
+        if state.certainties[b_idx] >= 0
+            && (state.result[b_idx] >= most_certain_line_a
+                || state.second_best_result[b_idx] >= most_certain_line_a)
+        {
+            state.certainties[b_idx] = CERTAINTY_NOT_CALCULATED;
+        }
+        i -= 1;
+    }
+    for i in (most_certain_local_line_b + 1)..invalidate_max {
+        let b_idx = (start_b + i - state.orig_start_b) as usize;
+        if state.certainties[b_idx] >= 0
+            && (state.result[b_idx] <= most_certain_line_a
+                || state.second_best_result[b_idx] <= most_certain_line_a)
+        {
+            state.certainties[b_idx] = CERTAINTY_NOT_CALCULATED;
+        }
+    }
+
+    if most_certain_local_line_b > 0 {
+        fuzzy_recurse(
+            state,
+            start_a,
+            start_b,
+            most_certain_line_a + 1 - start_a,
+            most_certain_local_line_b,
+        );
+    }
+    if most_certain_local_line_b + 1 < length_b {
+        let second_half_start_a = most_certain_line_a;
+        let offset_b = most_certain_local_line_b + 1;
+        let second_half_start_b = start_b + offset_b;
+        let second_half_length_a = length_a + start_a - second_half_start_a;
+        let second_half_length_b = length_b + start_b - second_half_start_b;
+        fuzzy_recurse(
+            state,
+            second_half_start_a,
+            second_half_start_b,
+            second_half_length_a,
+            second_half_length_b,
+        );
+    }
+}
+
+/// git's `fuzzy_find_matching_lines`: for each line of the target chunk
+/// `[tlno, same)`, return the absolute parent line it best matches, or `-1`.
+/// `parent_slno` is the parent chunk start, `parent_len` its length.
+fn fuzzy_find_matching_lines(
+    parent_fps: &[Fingerprint],
+    target_fps: &[Fingerprint],
+    tlno: i32,
+    parent_slno: i32,
+    same: i32,
+    parent_len: i32,
+) -> Option<Vec<i32>> {
+    let start_a = parent_slno;
+    let length_a = parent_len;
+    let start_b = tlno;
+    let length_b = same - tlno;
+
+    if length_a <= 0 {
+        return None;
+    }
+
+    let mut max_search_distance_a = 10;
+    if max_search_distance_a >= length_a {
+        max_search_distance_a = if length_a != 0 { length_a - 1 } else { 0 };
+    }
+    let max_search_distance_b =
+        ((2 * max_search_distance_a + 1) * length_b - 1) / length_a;
+
+    let similarity_count = (length_b * (max_search_distance_a * 2 + 1)) as usize;
+    let mut parent_copy = parent_fps.to_vec();
+    let mut state = FuzzyState {
+        parent_fps: &mut parent_copy,
+        target_fps,
+        similarities: vec![-1; similarity_count],
+        certainties: vec![CERTAINTY_NOT_CALCULATED; length_b as usize],
+        second_best_result: vec![-1; length_b as usize],
+        result: vec![-1; length_b as usize],
+        max_search_distance_a,
+        max_search_distance_b,
+        orig_start_b: start_b,
+        mapping: LineNumberMapping {
+            destination_start: start_a,
+            destination_length: length_a,
+            source_start: start_b,
+            source_length: length_b,
+        },
+    };
+
+    fuzzy_recurse(&mut state, start_a, start_b, length_a, length_b);
+    Some(state.result)
+}
+
+/// git's `scan_parent_range`: the second-pass fallback that scans a range of
+/// parent lines for the best fingerprint match of one target line.
+fn scan_parent_range(
+    parent_fps: &[Fingerprint],
+    target_fps: &[Fingerprint],
+    t_idx: usize,
+    from: usize,
+    nr_lines: usize,
+) -> i32 {
+    const FINGERPRINT_FILE_THRESHOLD: i32 = 10;
+    let mut best_sim_val = FINGERPRINT_FILE_THRESHOLD;
+    let mut best_sim_idx: i32 = -1;
+    for p_idx in from..(from + nr_lines) {
+        let sim = fingerprint_similarity(&target_fps[t_idx], &parent_fps[p_idx]);
+        if sim < best_sim_val {
+            continue;
+        }
+        if sim == best_sim_val
+            && best_sim_idx != -1
+            && (best_sim_idx - t_idx as i32).abs() < (p_idx as i32 - t_idx as i32).abs()
+        {
+            continue;
+        }
+        best_sim_val = sim;
+        best_sim_idx = p_idx as i32;
+    }
+    best_sim_idx
+}
+
+/// Where a target line in an ignored commit's change should be attributed.
+#[derive(Clone, Copy)]
+struct LineTracker {
+    /// True when the line maps to a parent line (→ passes to parent, `ignored`);
+    /// false when it has no parent match (→ stays, `unblamable`).
+    is_parent: bool,
+    /// The matched parent line (parent space) when `is_parent`, else the
+    /// target line (target space).
+    s_lno: i32,
+}
+
+fn are_lines_adjacent(first: &LineTracker, second: &LineTracker) -> bool {
+    first.is_parent == second.is_parent && first.s_lno + 1 == second.s_lno
+}
+
+/// git's `guess_line_blames`: for each line of the changed region `[tlno,
+/// same)`, decide whether it maps to a parent line (fuzzy match in the diff
+/// chunk, else anywhere in the parent) or is unblamable.
+fn guess_line_blames(
+    parent_fps: &[Fingerprint],
+    target_fps: &[Fingerprint],
+    tlno: i32,
+    offset: i32,
+    same: i32,
+    parent_len: i32,
+) -> Vec<LineTracker> {
+    let parent_slno = tlno + offset;
+    let fuzzy_matches =
+        fuzzy_find_matching_lines(parent_fps, target_fps, tlno, parent_slno, same, parent_len);
+    let count = (same - tlno) as usize;
+    let mut line_blames = Vec::with_capacity(count);
+    for i in 0..count {
+        let target_idx = tlno + i as i32;
+        let best_idx = match &fuzzy_matches {
+            Some(m) if m[i] >= 0 => m[i],
+            _ => scan_parent_range(
+                parent_fps,
+                target_fps,
+                target_idx as usize,
+                0,
+                parent_fps.len(),
+            ),
+        };
+        if best_idx >= 0 {
+            line_blames.push(LineTracker { is_parent: true, s_lno: best_idx });
+        } else {
+            line_blames.push(LineTracker { is_parent: false, s_lno: target_idx });
+        }
+    }
+    line_blames
+}
+
+/// git's `ignore_blame_entry`: split a blame entry over the changed region into
+/// runs that go to the parent (`ignored`) or stay (`unblamable`), per the
+/// `line_blames` decisions. `region_start` is `tlno` (the first target line the
+/// `line_blames` array describes).
+fn ignore_blame_entry(
+    entry: &BlameEntry,
+    region_start: usize,
+    line_blames: &[LineTracker],
+    passed: &mut Vec<BlameEntry>,
+    still_ours: &mut Vec<BlameEntry>,
+) {
+    let n = entry.num_lines;
+    let base = entry.s_lno - region_start;
+    let mut i = 0usize;
+    while i < n {
+        let mut len = 1usize;
+        while i + len < n
+            && are_lines_adjacent(&line_blames[base + i + len - 1], &line_blames[base + i + len])
+        {
+            len += 1;
+        }
+        let head = &line_blames[base + i];
+        let part = BlameEntry {
+            lno: entry.lno + i,
+            s_lno: if head.is_parent {
+                head.s_lno as usize
+            } else {
+                entry.s_lno + i
+            },
+            num_lines: len,
+            ignored: if head.is_parent { true } else { entry.ignored },
+            unblamable: if head.is_parent { entry.unblamable } else { true },
+        };
+        if head.is_parent {
+            passed.push(part);
+        } else {
+            still_ours.push(part);
+        }
+        i += len;
+    }
+}
+
+/// The `--ignore-rev` analogue of [`pass_blame_to_parent`] (git's `blame_chunk`
+/// with `ignore_diffs = 1`): unchanged lines before each diff hunk pass to the
+/// parent normally; lines inside a hunk are routed by `guess_line_blames` —
+/// fuzzy-matched lines pass to the parent marked `ignored`, the rest stay marked
+/// `unblamable`.
+fn pass_blame_to_parent_ignore(
+    parent_lines: &[sley_diff_merge::DiffLine<'_>],
+    child_lines: &[sley_diff_merge::DiffLine<'_>],
+    parent_fps: &[Fingerprint],
+    child_fps: &[Fingerprint],
+    owned: &mut Vec<BlameEntry>,
+) -> Vec<BlameEntry> {
+    let hunks = diff_hunks(parent_lines, child_lines);
+
+    let mut passed: Vec<BlameEntry> = Vec::new();
+    let mut still_ours: Vec<BlameEntry> = Vec::new();
+
+    owned.sort_by_key(|e| e.s_lno);
+    let mut entries = std::mem::take(owned).into_iter().peekable();
+    let mut deferred: Vec<BlameEntry> = Vec::new();
+    let mut offset: isize = 0;
+
+    for hunk in &hunks {
+        let tlno = hunk.start_b;
+        let same = hunk.start_b + hunk.count_b;
+
+        // Pre-chunk common region: pass to the parent (flags preserved).
+        while let Some(mut e) = take_next_before(&mut deferred, &mut entries, tlno) {
+            if e.s_lno + e.num_lines > tlno {
+                let head_len = tlno - e.s_lno;
+                let tail = split_entry_at(&mut e, head_len);
+                pass_entry(&mut e, offset, &mut passed);
+                put_back(&mut deferred, tail);
+            } else {
+                pass_entry(&mut e, offset, &mut passed);
+            }
+        }
+
+        // Changed region [tlno, same): guess each line's origin.
+        let line_blames = guess_line_blames(
+            parent_fps,
+            child_fps,
+            tlno as i32,
+            offset as i32,
+            same as i32,
+            hunk.count_a as i32,
+        );
+        while let Some(mut e) = take_next_before(&mut deferred, &mut entries, same) {
+            if e.s_lno + e.num_lines > same {
+                let head_len = same - e.s_lno;
+                let tail = split_entry_at(&mut e, head_len);
+                ignore_blame_entry(&e, tlno, &line_blames, &mut passed, &mut still_ours);
+                put_back(&mut deferred, tail);
+            } else {
+                ignore_blame_entry(&e, tlno, &line_blames, &mut passed, &mut still_ours);
+            }
+        }
+
+        offset = hunk.start_a as isize + hunk.count_a as isize
+            - (hunk.start_b as isize + hunk.count_b as isize);
+    }
+
+    // Trailing common region: pass to the parent.
+    while let Some(mut e) = take_next_before(&mut deferred, &mut entries, usize::MAX) {
+        pass_entry(&mut e, offset, &mut passed);
+    }
+
+    *owned = still_ours;
+    passed
 }
 
 /// The set of `tip` and all commits reachable from it (its ancestor closure),
@@ -2014,9 +2770,12 @@ fn render_blame(
     options: &BlameOptions,
     fake: Option<&FakeCommit>,
     previous_map: &PreviousMap,
+    marks: BlameMarks,
 ) -> Result<()> {
     if options.porcelain {
-        return render_porcelain(git_dir, format, db, lines, selected, options, fake, previous_map);
+        return render_porcelain(
+            git_dir, format, db, lines, selected, options, fake, previous_map, marks,
+        );
     }
 
     let (abbrev, hex_width) = blame_display_abbrev(git_dir, format, options)?;
@@ -2070,14 +2829,34 @@ fn render_blame(
             continue;
         }
 
-        let sha = render_sha(
-            &blame.commit,
-            abbrev,
-            blame.boundary,
-            options.show_root,
-            hex_width,
-            options.blank_boundary,
-        );
+        // The `--ignore-rev` markers (`*` unblamable, `?` ignored) consume one
+        // hex column each, after any boundary `^`. Only the marker case needs
+        // the alternate renderer; everything else keeps `render_sha` (which also
+        // handles the excessive-`--abbrev` boundary widths).
+        let want_mark =
+            (marks.unblamable && blame.unblamable) || (marks.ignored && blame.ignored);
+        let sha = if want_mark {
+            render_object_name_marked(
+                &blame.commit,
+                blame.boundary,
+                options.show_root,
+                hex_width,
+                options.blank_boundary,
+                marks,
+                blame.ignored,
+                blame.unblamable,
+                format.hex_len(),
+            )
+        } else {
+            render_sha(
+                &blame.commit,
+                abbrev,
+                blame.boundary,
+                options.show_root,
+                hex_width,
+                options.blank_boundary,
+            )
+        };
 
         if options.suppress_author {
             // `<sha> <lineno>) <line>`
@@ -2113,6 +2892,7 @@ fn render_blame(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_porcelain(
     _git_dir: &Path,
     format: ObjectFormat,
@@ -2122,6 +2902,7 @@ fn render_porcelain(
     options: &BlameOptions,
     fake: Option<&FakeCommit>,
     previous_map: &PreviousMap,
+    marks: BlameMarks,
 ) -> Result<()> {
     // git's MORE_THAN_ONE_PATH: a commit blamed for lines via two or more
     // distinct paths repeats its `previous`/`filename` info on every group so a
@@ -2215,6 +2996,15 @@ fn render_porcelain(
                         true,
                     )?;
                 }
+            }
+            // git's `emit_porcelain_per_line_details`: the `unblamable` / `ignored`
+            // keyword for `--ignore-rev` lines, once per line before its content.
+            let current = &lines[selected[idx + offset] - 1];
+            if marks.unblamable && current.unblamable {
+                writeln!(handle, "unblamable")?;
+            }
+            if marks.ignored && current.ignored {
+                writeln!(handle, "ignored")?;
             }
             handle.write_all(b"\t")?;
             handle.write_all(strip_trailing_newline(&lines[selected[idx + offset] - 1].content))?;
@@ -2450,6 +3240,47 @@ fn blame_display_abbrev(
     Ok((boundary_abbrev, hex_width))
 }
 
+/// Render the object-name column with `--ignore-rev` markers. Mirrors git's
+/// emit loop: a boundary `^`, then `*` (unblamable) and `?` (ignored), each
+/// consuming one column from the `hex_width` budget before the hex digits.
+#[allow(clippy::too_many_arguments)]
+fn render_object_name_marked(
+    commit: &ObjectId,
+    boundary: bool,
+    show_root: bool,
+    hex_width: usize,
+    blank_boundary: bool,
+    marks: BlameMarks,
+    ignored: bool,
+    unblamable: bool,
+    hexsz: usize,
+) -> String {
+    let mut out = String::new();
+    let mut length: isize = hex_width as isize;
+    let is_boundary = boundary && !show_root;
+    let blank = is_boundary && blank_boundary;
+    if is_boundary && !blank {
+        out.push('^');
+        length -= 1;
+    }
+    if marks.unblamable && unblamable {
+        out.push('*');
+        length -= 1;
+    }
+    if marks.ignored && ignored {
+        out.push('?');
+        length -= 1;
+    }
+    let n = (length.max(0) as usize).min(hexsz);
+    if blank {
+        out.push_str(&" ".repeat(n));
+    } else {
+        let hex = commit.to_hex();
+        out.push_str(&hex[..n.min(hex.len())]);
+    }
+    out
+}
+
 /// Render the object-name column for one entry.
 ///
 /// Non-boundary: `abbrev + 1` hex digits. Boundary: `^` followed by `abbrev`
@@ -2620,6 +3451,7 @@ mod tests {
             lno: 0,
             s_lno: 0,
             num_lines: 3,
+            ..Default::default()
         }];
         let passed = pass_blame_to_parent(&p, &c, &mut owned);
         // The inserted line (child s_lno 0) stays with the child; lines 1..3 go
@@ -2643,6 +3475,7 @@ mod tests {
             lno: 0,
             s_lno: 0,
             num_lines: 3,
+            ..Default::default()
         }];
         let passed = pass_blame_to_parent(&p, &c, &mut owned);
         let ours: usize = owned.iter().map(|e| e.num_lines).sum();
@@ -2657,6 +3490,7 @@ mod tests {
             lno: 10,
             s_lno: 4,
             num_lines: 5,
+            ..Default::default()
         };
         let tail = split_entry_at(&mut e, 2);
         assert_eq!((e.lno, e.s_lno, e.num_lines), (10, 4, 2));
