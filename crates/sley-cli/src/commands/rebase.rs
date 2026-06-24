@@ -1278,7 +1278,15 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         if can_ff && !force {
             if let Some(switch_to) = &switch_to {
                 if head_name.is_some() {
-                    checkout_up_to_date(ctx, &db, switch_to, &orig_head)?;
+                    // If switching to the branch fails (e.g. untracked files
+                    // would be clobbered), restore the autostash and drop all
+                    // state so no rebase is left in progress (`rebase --quit`
+                    // must then report "no rebase in progress").
+                    if let Err(err) = checkout_up_to_date(ctx, &db, switch_to, &orig_head) {
+                        apply_autostash(ctx);
+                        seq::remove_merge_state(&ctx.git_dir);
+                        return Err(err);
+                    }
                 } else {
                     // The <branch> argument names a non-branch (e.g. a tag): git
                     // still switches to it before reporting up-to-date, so detach

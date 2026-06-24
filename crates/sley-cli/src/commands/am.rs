@@ -3584,15 +3584,14 @@ fn finish_rebase_apply(state_dir: &Path) -> Result<()> {
         "detached HEAD".to_string()
     };
 
-    // Restore any autostash before the "Successfully rebased" line — git applies
-    // it then prints "Applied autostash." ahead of the success message. The
+    // Restore any autostash. git's apply backend (git am) prints "Applied
+    // autostash." but — unlike the sequencer/merge backend — does NOT print a
+    // "Successfully rebased and updated" line, so we don't emit one here. The
     // apply backend records its autostash in `rebase-apply/autostash`; the state
     // dir is removed by the caller's finish, so consume the file before then.
+    let _ = head_display;
     apply_rebase_autostash(&common_git_dir, state_dir)?;
 
-    if !quiet {
-        eprintln!("Successfully rebased and updated {head_display}.");
-    }
     Ok(())
 }
 
