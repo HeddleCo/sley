@@ -95,6 +95,18 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 untracked_mode = sley_worktree::StatusUntrackedMode::All;
                 explicit_untracked = true;
             }
+            // `-s` bundled with `-u<mode>` (e.g. `-suno`): in a single-dash
+            // cluster, `-u` consumes the remainder of the cluster as its mode
+            // argument, so `-suno` is `-s -u no`.
+            value if value.starts_with("-su") && value.len() > 3 => {
+                short = true;
+                explicit_short = true;
+                porcelain_v1 = false;
+                porcelain_v2 = false;
+                explicit_long = false;
+                untracked_mode = parse_status_untracked_mode(&value[3..])?;
+                explicit_untracked = true;
+            }
             "--no-short" => {
                 short = false;
                 explicit_short = true;
@@ -2142,6 +2154,14 @@ impl StatusUnmergedPath {
     fn has_index_side(&self) -> bool {
         self.stages.contains(&2)
     }
+
+    /// Upstream `stagemask`: bit 0 = stage 1 (base), bit 1 = stage 2 (ours),
+    /// bit 2 = stage 3 (theirs).
+    fn stagemask(&self) -> u8 {
+        self.stages
+            .iter()
+            .fold(0u8, |mask, &stage| mask | (1 << (stage - 1)))
+    }
 }
 
 fn status_unmerged_paths(git_dir: &Path, format: ObjectFormat) -> Result<Vec<StatusUnmergedPath>> {
@@ -2177,6 +2197,7 @@ fn status_unmerged_label(stages: &BTreeSet<u16>) -> &'static str {
         (true, true, true) => "both modified:",
         (true, true, false) => "deleted by them:",
         (true, false, true) => "deleted by us:",
+        (true, false, false) => "both deleted:",
         (false, true, true) => "both added:",
         (false, true, false) => "added by us:",
         (false, false, true) => "added by them:",
@@ -2711,7 +2732,33 @@ fn build_status_long_sink_inner(
         {
             sink.hint("  (use \"git restore --staged <file>...\" to unstage)");
         }
-        sink.hint("  (use \"git add <file>...\" to mark resolution)");
+        // Mark-resolution hint depends on the mix of conflict kinds present
+        // (wt_longstatus_print_unmerged_header): stagemask 1 = both deleted,
+        // 3/5 = delete/modify, anything else = a "not-deleted" conflict.
+        let mut both_deleted = false;
+        let mut del_mod_conflict = false;
+        let mut not_deleted = false;
+        for entry in &unmerged {
+            match entry.stagemask() {
+                0 => {}
+                1 => both_deleted = true,
+                3 | 5 => del_mod_conflict = true,
+                _ => not_deleted = true,
+            }
+        }
+        if !both_deleted {
+            if !del_mod_conflict {
+                sink.hint("  (use \"git add <file>...\" to mark resolution)");
+            } else {
+                sink.hint(
+                    "  (use \"git add/rm <file>...\" as appropriate to mark resolution)",
+                );
+            }
+        } else if !del_mod_conflict && !not_deleted {
+            sink.hint("  (use \"git rm <file>...\" to mark resolution)");
+        } else {
+            sink.hint("  (use \"git add/rm <file>...\" as appropriate to mark resolution)");
+        }
         for entry in unmerged {
             sink.line(format!(
                 "\t{:<17}{}",
@@ -3382,12 +3429,30 @@ fn status_long_change_label(code: u8) -> Option<&'static str> {
     }
 }
 
+/// A short-status code pair identifies an unmerged (conflicted) path. Upstream's
+/// HEAD-vs-index diff records these as `DIFF_STATUS_UNMERGED` and they do NOT set
+/// `s->committable` — so `commit --dry-run` must not treat the `D`/`A` half of a
+/// conflict pair as a real staged change.
+fn status_short_is_unmerged(index: u8, worktree: u8) -> bool {
+    matches!(
+        (index, worktree),
+        (b'D', b'D')
+            | (b'A', b'U')
+            | (b'U', b'D')
+            | (b'U', b'A')
+            | (b'D', b'U')
+            | (b'A', b'A')
+            | (b'U', b'U')
+    )
+}
+
 pub(crate) fn status_entries_have_index_changes(
     entries: &[sley_worktree::ShortStatusEntry],
 ) -> bool {
-    entries
-        .iter()
-        .any(|entry| status_long_change_label(entry.index).is_some())
+    entries.iter().any(|entry| {
+        !status_short_is_unmerged(entry.index, entry.worktree)
+            && status_long_change_label(entry.index).is_some()
+    })
 }
 
 fn status_porcelain_v2_code(code: u8) -> char {
