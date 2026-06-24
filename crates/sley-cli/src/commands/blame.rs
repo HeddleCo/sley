@@ -2077,6 +2077,12 @@ fn split_copy_matches(
     copied: &mut Vec<BlameEntry>,
     remaining: &mut Vec<BlameEntry>,
 ) {
+    let line_in_source = |idx: usize| {
+        source_lines.iter().any(|line| {
+            line.content == final_lines[idx].content
+                && line.has_newline == final_lines[idx].has_newline
+        })
+    };
     let mut cursor = 0usize;
     while cursor < entry.num_lines {
         let final_idx = entry.lno + cursor;
@@ -2085,8 +2091,17 @@ fn split_copy_matches(
                 && line.has_newline == final_lines[final_idx].has_newline
         });
         let Some(source_start) = source_idx else {
-            push_entry_slice(&entry, cursor, 1, remaining, entry.s_lno + cursor);
-            cursor += 1;
+            // Coalesce the whole run of lines absent from the source into one
+            // remaining entry, so a *later* candidate can still match it as a
+            // contiguous block (git splits the suspect only at match boundaries).
+            // Fragmenting into single lines would drop every run below the copy
+            // score threshold.
+            let mut len = 1usize;
+            while cursor + len < entry.num_lines && !line_in_source(entry.lno + cursor + len) {
+                len += 1;
+            }
+            push_entry_slice(&entry, cursor, len, remaining, entry.s_lno + cursor);
+            cursor += len;
             continue;
         };
 
