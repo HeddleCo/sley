@@ -80,6 +80,7 @@ struct RebaseArgs {
     fork_point: Option<bool>,
     reapply_cherry_picks: Option<bool>,
     update_refs: Option<bool>,
+    rerere_autoupdate: Option<bool>,
     rebase_merges: Option<RebaseMergesArg>,
     strategy: Option<String>,
     strategy_opts: Vec<String>,
@@ -129,6 +130,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
         fork_point: None,
         reapply_cherry_picks: None,
         update_refs: None,
+        rerere_autoupdate: None,
         rebase_merges: None,
         strategy: None,
         strategy_opts: Vec::new(),
@@ -280,7 +282,8 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
                 out.gpg_sign = None;
                 out.no_gpg_sign = true;
             }
-            "--rerere-autoupdate" | "--no-rerere-autoupdate" => {}
+            "--rerere-autoupdate" => out.rerere_autoupdate = Some(true),
+            "--no-rerere-autoupdate" => out.rerere_autoupdate = Some(false),
             "--allow-empty-message" => {}
             "--committer-date-is-author-date" => {
                 out.committer_date_is_author_date = true;
@@ -470,6 +473,7 @@ struct MachineOpts {
     no_gpg_sign: bool,
     strategy: Option<String>,
     strategy_opts: Vec<String>,
+    rerere_autoupdate: Option<bool>,
     head_name: Option<String>,
     onto: ObjectId,
     orig_head: ObjectId,
@@ -536,6 +540,14 @@ fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
             opts.strategy_opts.join("\n") + "\n",
         )?;
     }
+    match opts.rerere_autoupdate {
+        Some(true) => fs::write(dir.join("allow_rerere_autoupdate"), b"--rerere-autoupdate\n")?,
+        Some(false) => fs::write(
+            dir.join("allow_rerere_autoupdate"),
+            b"--no-rerere-autoupdate\n",
+        )?,
+        None => {}
+    }
     Ok(())
 }
 
@@ -564,6 +576,11 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
     let strategy_opts = fs::read_to_string(ctx.state_path("strategy_opts"))
         .map(|text| text.lines().map(str::to_string).collect())
         .unwrap_or_default();
+    let rerere_autoupdate = match seq::read_state_line(&ctx.git_dir, "allow_rerere_autoupdate") {
+        Some(line) if line.contains("--no-rerere-autoupdate") => Some(false),
+        Some(line) if line.contains("--rerere-autoupdate") => Some(true),
+        _ => None,
+    };
     Ok(MachineOpts {
         quiet: exists("quiet"),
         verbose: exists("verbose"),
@@ -578,6 +595,7 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
         no_gpg_sign: exists("no_gpg_sign"),
         strategy,
         strategy_opts,
+        rerere_autoupdate,
         head_name: if head_name.starts_with("refs/") {
             Some(head_name)
         } else {
@@ -1052,6 +1070,8 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         String::new()
     } else {
         match args.positional.first() {
+            // `git rebase -` is shorthand for the previous branch, like checkout.
+            Some(name) if name == "-" => "@{-1}".to_string(),
             Some(name) => name.clone(),
             None => match default_upstream_name(ctx, &refs) {
                 Some(name) => name,
@@ -1118,6 +1138,25 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             }
         }
     };
+
+    // git refuses to switch to a branch that is checked out in another worktree
+    // (die_if_checked_out). Only fires when a <branch> argument is switched to;
+    // the current worktree is ignored, so rebasing the branch checked out here
+    // is fine.
+    if switch_to.is_some()
+        && let Some(head_name) = &head_name
+        && let Some(other) = commands::worktree::branch_checked_out_worktree(
+            &ctx.common_git_dir,
+            head_name,
+            Some(&ctx.worktree_root),
+        )?
+    {
+        eprintln!(
+            "fatal: '{branch_name}' is already used by worktree at '{}'",
+            other.display()
+        );
+        return Err(GitError::Exit(128));
+    }
 
     // git creates the autostash BEFORE running the pre-rebase hook, and a hook
     // refusal restores it (builtin/rebase.c: create_autostash → pre-rebase →
@@ -1260,7 +1299,15 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         if can_ff && !force {
             if let Some(switch_to) = &switch_to {
                 if head_name.is_some() {
-                    checkout_up_to_date(ctx, &db, switch_to, &orig_head)?;
+                    // If switching to the branch fails (e.g. untracked files
+                    // would be clobbered), restore the autostash and drop all
+                    // state so no rebase is left in progress (`rebase --quit`
+                    // must then report "no rebase in progress").
+                    if let Err(err) = checkout_up_to_date(ctx, &db, switch_to, &orig_head) {
+                        apply_autostash(ctx);
+                        seq::remove_merge_state(&ctx.git_dir);
+                        return Err(err);
+                    }
                 } else {
                     // The <branch> argument names a non-branch (e.g. a tag): git
                     // still switches to it before reporting up-to-date, so detach
@@ -1367,6 +1414,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         no_gpg_sign: args.no_gpg_sign,
         strategy: args.strategy.clone(),
         strategy_opts: args.strategy_opts.clone(),
+        rerere_autoupdate: args.rerere_autoupdate,
         head_name: head_name.clone(),
         onto,
         orig_head,
@@ -1405,14 +1453,24 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         )?;
         records
             .iter()
-            .map(|record| RebaseTodoItem {
-                command: TodoCommand::Pick,
-                flags: 0,
-                oid: Some(record.oid),
-                arg: format!("# {}", commit_subject(&record.commit.message)),
-                raw: String::new(),
+            .map(|record| -> Result<RebaseTodoItem> {
+                let parent_tree = match record.parents.first() {
+                    Some(parent) => commit_tree_oid(&db, ctx.format, parent)?,
+                    None => ObjectId::empty_tree(ctx.format),
+                };
+                let mut arg = format!("# {}", commit_subject(&record.commit.message));
+                if record.commit.tree == parent_tree {
+                    arg.push_str(" # empty");
+                }
+                Ok(RebaseTodoItem {
+                    command: TodoCommand::Pick,
+                    flags: 0,
+                    oid: Some(record.oid),
+                    arg,
+                    raw: String::new(),
+                })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?
     };
 
     write_basic_state(ctx, &opts)?;
@@ -1428,6 +1486,13 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         });
     }
 
+    // Upstream order: insert update-ref commands first (after each decorated
+    // pick), THEN autosquash (which slots fixups in just before the trailing
+    // update-refs), THEN exec. The state file records the final ref set.
+    if config_update_refs {
+        items = add_update_ref_commands(ctx, &items)?;
+    }
+
     if autosquash {
         items = rearrange_squash(ctx, &db, items)?;
     }
@@ -1437,7 +1502,6 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     }
 
     if config_update_refs {
-        items = add_update_ref_commands(ctx, &items)?;
         write_rebase_update_refs_state(ctx, &items)?;
     }
 
@@ -1494,11 +1558,19 @@ fn run_apply_backend(
 ) -> Result<()> {
     // Build the pick series exactly like the merge backend does (skip merges and
     // empty commits unless --keep-empty), then turn each into an apply patch.
+    // For `--root --onto <newbase>` there is no upstream to exclude, but commits
+    // already present in the onto must still be dropped (cherry-pick detection
+    // against the new base), matching the merge backend.
+    let cherry_base = if args.root && args.onto_name.is_some() {
+        Some(onto)
+    } else {
+        upstream
+    };
     let records = make_script_commits(
         ctx,
         db,
         upstream,
-        upstream,
+        cherry_base,
         orig_head,
         // The apply backend drops begin-empty commits by default (git am skips
         // empty patches); `--keep-empty` would have forced the merge backend.
@@ -2004,36 +2076,48 @@ fn make_script_commits(
         order.push(oid);
         records.insert(oid, record);
     }
-    // Topological order, parents first.
-    let mut indegree: BTreeMap<ObjectId, usize> = BTreeMap::new();
-    let mut children: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
-    for (oid, record) in &records {
-        indegree.entry(*oid).or_insert(0);
+    // git make_script ordering: REV_SORT_IN_GRAPH_ORDER + reverse. Build the
+    // newest-first topological order with a LIFO frontier, releasing each
+    // commit's in-set parents in parent order so the *second* parent is popped
+    // first (matching git's prio_queue), then reverse for the oldest-first pick
+    // order. A diamond's shared ancestor is held until all its children emit.
+    let mut remaining_children: BTreeMap<ObjectId, usize> = BTreeMap::new();
+    for record in records.values() {
         for parent in &record.parents {
             if records.contains_key(parent) {
-                *indegree.entry(*oid).or_insert(0) += 1;
-                children.entry(*parent).or_default().push(*oid);
+                *remaining_children.entry(*parent).or_insert(0) += 1;
             }
         }
     }
-    let mut ready: Vec<ObjectId> = indegree
+    // Seed the frontier with the no-in-set-children commits (the tips) in
+    // discovery order, so orig_head drives the walk.
+    let mut stack: Vec<ObjectId> = order
         .iter()
-        .filter(|&(_, &deg)| deg == 0)
-        .map(|(oid, _)| *oid)
+        .filter(|oid| remaining_children.get(*oid).copied().unwrap_or(0) == 0)
+        .copied()
         .collect();
-    let mut sorted = Vec::new();
-    while let Some(oid) = ready.pop() {
-        sorted.push(oid);
-        if let Some(kids) = children.get(&oid) {
-            for kid in kids.clone() {
-                let deg = indegree.get_mut(&kid).expect("child has indegree");
-                *deg -= 1;
-                if *deg == 0 {
-                    ready.push(kid);
+    let mut newest_first = Vec::new();
+    let mut emitted = std::collections::HashSet::new();
+    while let Some(oid) = stack.pop() {
+        if !emitted.insert(oid) {
+            continue;
+        }
+        newest_first.push(oid);
+        if let Some(record) = records.get(&oid) {
+            for parent in &record.parents {
+                if records.contains_key(parent) {
+                    let count = remaining_children
+                        .get_mut(parent)
+                        .expect("in-set parent counted");
+                    *count -= 1;
+                    if *count == 0 {
+                        stack.push(*parent);
+                    }
                 }
             }
         }
     }
+    let sorted: Vec<ObjectId> = newest_first.into_iter().rev().collect();
     let mut out = Vec::new();
     for oid in sorted {
         let record = records.remove(&oid).expect("record collected");
@@ -2162,9 +2246,28 @@ fn make_script_with_merges(
     }
 
     let branch_labels = branch_labels_by_oid(ctx)?;
-    let mut used_labels = std::collections::HashSet::new();
-    used_labels.insert("onto".to_string());
-    let mut labels: BTreeMap<ObjectId, String> = BTreeMap::new();
+    let mut state = LabelState::new(ctx, db);
+    // Upstream passes `base_rev...orig_head` (symmetric range) to make_script, so
+    // the BOTTOM commit registered as "onto" is the merge-base, not `upstream`
+    // itself. Registering the merge-base(s) makes the first-parent walk reset
+    // "onto" when it reaches the real base (so the rebased branch lands on the
+    // new onto) while genuine cousin bases still get their own OID label.
+    if let Some(upstream) = upstream {
+        let bases = merge_bases(&ctx.common_git_dir, db, ctx.format, upstream, orig_head)?;
+        // `merge_bases` may include non-maximal common ancestors here; register
+        // only the maximal ones (a true merge-base is not an ancestor of another
+        // base), so an ancestor of the real base is not mistakenly labelled onto.
+        for (i, base) in bases.iter().enumerate() {
+            let dominated = bases.iter().enumerate().any(|(j, other)| {
+                i != j
+                    && sley_rev::is_ancestor(&ctx.common_git_dir, ctx.format, db, base, other)
+                        .unwrap_or(false)
+            });
+            if !dominated {
+                state.register_onto(base);
+            }
+        }
+    }
     let mut commit_todo: BTreeMap<ObjectId, RebaseTodoItem> = BTreeMap::new();
     let mut tips = Vec::new();
 
@@ -2195,17 +2298,16 @@ fn make_script_with_merges(
                     arg.push(' ');
                 }
                 let label = if records.contains_key(parent) {
+                    if !tips.contains(parent) {
+                        tips.push(*parent);
+                    }
                     let base = branch_labels
                         .get(parent)
                         .cloned()
                         .unwrap_or_else(|| message_label.clone());
-                    let label = ensure_label(ctx, parent, &base, &mut labels, &mut used_labels, db);
-                    if !tips.contains(parent) {
-                        tips.push(*parent);
-                    }
-                    label
+                    state.label_oid(parent, Some(&base))
                 } else {
-                    label_for_oid(ctx, parent, &mut labels, &mut used_labels, db)
+                    state.label_oid(parent, None)
                 };
                 arg.push_str(&label);
             }
@@ -2222,13 +2324,17 @@ fn make_script_with_merges(
                 },
             );
         } else {
+            let mut arg = format!("# {}", commit_subject(&record.commit.message));
+            if is_empty {
+                arg.push_str(" # empty");
+            }
             commit_todo.insert(
                 *oid,
                 RebaseTodoItem {
                     command: TodoCommand::Pick,
                     flags: 0,
                     oid: Some(*oid),
-                    arg: format!("# {}", commit_subject(&record.commit.message)),
+                    arg,
                     raw: String::new(),
                 },
             );
@@ -2243,14 +2349,7 @@ fn make_script_with_merges(
                 continue;
             }
             if !child_seen.insert(*parent) {
-                ensure_label(
-                    ctx,
-                    parent,
-                    "branch-point",
-                    &mut labels,
-                    &mut used_labels,
-                    db,
-                );
+                state.label_oid(parent, Some("branch-point"));
             }
         }
     }
@@ -2273,7 +2372,7 @@ fn make_script_with_merges(
         let Some(mut current) = Some(tip) else {
             continue;
         };
-        let branch_label = labels.get(&tip).cloned();
+        let branch_label = state.label_of(&tip).map(|s| s.to_string());
         out.push(RebaseTodoItem::comment(""));
         if let Some(label) = branch_label {
             out.push(RebaseTodoItem::comment(&format!("# Branch {label}")));
@@ -2302,13 +2401,29 @@ fn make_script_with_merges(
                 }
             }
             Some(oid) => {
-                if let Some(label) = labels.get(&oid) {
-                    format!(
-                        "{label} # {}",
-                        commit_subject(&records[&oid].commit.message)
-                    )
+                // Faithful port of upstream phase-3 reset target: prefer an
+                // existing label; otherwise (unless rebasing cousins) mint an
+                // OID label so the side branch keeps its original base — this
+                // is exactly what makes cousins *not* rebase by default.
+                let to: Option<String> = if let Some(label) = state.label_of(&oid) {
+                    Some(label.to_string())
+                } else if mode != RebaseMergesMode::RebaseCousins {
+                    Some(state.label_oid(&oid, None))
                 } else {
-                    "onto".to_string()
+                    None
+                };
+                match to {
+                    None => "onto".to_string(),
+                    Some(t) if t == "onto" => "onto".to_string(),
+                    Some(t) => {
+                        let subject = match records.get(&oid) {
+                            Some(rec) => commit_subject(&rec.commit.message),
+                            None => commit_subject(
+                                &read_rev_list_commit_record(db, ctx.format, oid)?.commit.message,
+                            ),
+                        };
+                        format!("{t} # {subject}")
+                    }
                 }
             }
         };
@@ -2324,12 +2439,12 @@ fn make_script_with_merges(
             if let Some(item) = commit_todo.get(&oid) {
                 out.push(item.clone());
             }
-            if let Some(label) = labels.get(&oid) {
+            if let Some(label) = state.label_of(&oid) {
                 out.push(RebaseTodoItem {
                     command: TodoCommand::Label,
                     flags: 0,
                     oid: None,
-                    arg: label.clone(),
+                    arg: label.to_string(),
                     raw: String::new(),
                 });
             }
@@ -2352,68 +2467,165 @@ fn branch_labels_by_oid(ctx: &Ctx) -> Result<BTreeMap<ObjectId, String>> {
     Ok(out)
 }
 
-fn ensure_label(
-    ctx: &Ctx,
-    oid: &ObjectId,
-    base: &str,
-    labels: &mut BTreeMap<ObjectId, String>,
-    used: &mut std::collections::HashSet<String>,
-    db: &FileObjectDatabase,
-) -> String {
-    if let Some(label) = labels.get(oid) {
-        return label.clone();
-    }
-    let mut label = sanitize_label(base);
-    if label.is_empty() {
-        label = find_unique_abbrev_hex(ctx, db, oid);
-    }
-    let original = label.clone();
-    let mut n = 2usize;
-    while used.contains(&label) {
-        label = format!("{original}-{n}");
-        n += 1;
-    }
-    used.insert(label.clone());
-    labels.insert(*oid, label.clone());
-    label
+/// `GIT_MAX_LABEL_LENGTH` from upstream sequencer.c: `NAME_MAX - LOCK_SUFFIX_LEN
+/// - 16`. With `NAME_MAX == 255` and `strlen(".lock") == 5` this is 234.
+const GIT_MAX_LABEL_LENGTH: usize = 255 - 5 - 16;
+
+/// Faithful port of upstream sequencer.c `struct label_state` + `label_oid()`.
+/// Tracks the commit→label mapping and the set of used labels (case-insensitive,
+/// matching upstream's `strihash`), minting labels for branch tips, branch
+/// points and cousin bases exactly as upstream does.
+struct LabelState<'a> {
+    ctx: &'a Ctx,
+    db: &'a FileObjectDatabase,
+    commit2label: BTreeMap<ObjectId, String>,
+    used: std::collections::HashSet<String>,
+    max_label_length: usize,
 }
 
-fn label_for_oid(
-    ctx: &Ctx,
-    oid: &ObjectId,
-    labels: &mut BTreeMap<ObjectId, String>,
-    used: &mut std::collections::HashSet<String>,
-    db: &FileObjectDatabase,
-) -> String {
-    ensure_label(
-        ctx,
-        oid,
-        &find_unique_abbrev_hex(ctx, db, oid),
-        labels,
-        used,
-        db,
-    )
-}
-
-fn sanitize_label(input: &str) -> String {
-    let mut out = String::new();
-    let mut last_dash = false;
-    for ch in input.trim().chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.') {
-            out.push(ch);
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
+impl<'a> LabelState<'a> {
+    fn new(ctx: &'a Ctx, db: &'a FileObjectDatabase) -> Self {
+        let max_label_length = rebase_config_value(ctx, "rebase", "maxLabelLength")
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(GIT_MAX_LABEL_LENGTH);
+        LabelState {
+            ctx,
+            db,
+            commit2label: BTreeMap::new(),
+            used: std::collections::HashSet::new(),
+            max_label_length,
         }
     }
-    while out.ends_with(['-', '.']) {
-        out.pop();
+
+    /// Pre-register the `onto` commit so a reset that walks back to it resets
+    /// onto, and so no other commit can be labelled "onto".
+    fn register_onto(&mut self, oid: &ObjectId) {
+        self.commit2label.insert(*oid, "onto".to_string());
+        self.used.insert("onto".to_string());
     }
-    if out == "onto" {
-        out.push_str("-2");
+
+    fn label_of(&self, oid: &ObjectId) -> Option<&str> {
+        self.commit2label.get(oid).map(|s| s.as_str())
     }
-    out
+
+    fn taken(&self, label: &str) -> bool {
+        self.used.contains(&label.to_ascii_lowercase())
+    }
+
+    /// Port of upstream `label_oid()`. `base == None` for "uninteresting"
+    /// commits (use a unique abbreviation, extended on collision); `Some(base)`
+    /// sanitizes/truncates the base and disambiguates full-OID/`#`/colliding
+    /// labels with a `-N` suffix.
+    fn label_oid(&mut self, oid: &ObjectId, base: Option<&str>) -> String {
+        if let Some(existing) = self.commit2label.get(oid) {
+            return existing.clone();
+        }
+        let label = match base {
+            None => {
+                let mut p = find_unique_abbrev_hex(self.ctx, self.db, oid);
+                if self.taken(&p) {
+                    let hex = oid.to_hex();
+                    let mut chosen = hex.clone();
+                    for i in (p.len() + 1)..hex.len() {
+                        if !self.taken(&hex[..i]) {
+                            chosen = hex[..i].to_string();
+                            break;
+                        }
+                    }
+                    p = chosen;
+                }
+                p
+            }
+            Some(base) => {
+                let mut buf = sanitize_label(base, self.max_label_length);
+                if buf.is_empty() {
+                    buf = format!("rev-{}", find_unique_abbrev_hex(self.ctx, self.db, oid));
+                }
+                let hexsz = oid.to_hex().len();
+                let is_full_hex =
+                    buf.len() == hexsz && buf.bytes().all(|b| b.is_ascii_hexdigit());
+                if is_full_hex || buf == "#" || self.taken(&buf) {
+                    let stem = buf.clone();
+                    let mut i = 2;
+                    loop {
+                        let cand = format!("{stem}-{i}");
+                        if !self.taken(&cand) {
+                            buf = cand;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                buf
+            }
+        };
+        self.used.insert(label.to_ascii_lowercase());
+        self.commit2label.insert(*oid, label.clone());
+        label
+    }
+}
+
+/// Port of upstream label sanitization: keep ASCII alphanumerics and valid
+/// multi-byte UTF-8 sequences verbatim, replace runs of other bytes with a
+/// single dash (never leading), and truncate to `max_len` bytes without
+/// splitting a UTF-8 character. Trailing dashes are intentionally kept.
+fn sanitize_label(base: &str, max_len: usize) -> String {
+    let bytes = base.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    let mut label_is_utf8 = true;
+    while i < bytes.len() && out.len() + 1 < max_len {
+        let b = bytes[i];
+        if b.is_ascii_alphanumeric() || (!label_is_utf8 && b & 0x80 != 0) {
+            out.push(b);
+            i += 1;
+        } else if b & 0x80 != 0 {
+            match utf8_char_len(&bytes[i..]) {
+                Some(n) => {
+                    if out.len() + n > max_len {
+                        break;
+                    }
+                    out.extend_from_slice(&bytes[i..i + n]);
+                    i += n;
+                }
+                None => {
+                    label_is_utf8 = false;
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        } else {
+            if !out.is_empty() && *out.last().unwrap() != b'-' {
+                out.push(b'-');
+            }
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Byte length of the valid UTF-8 character starting at `bytes[0]`, or `None`
+/// if it is not a well-formed multi-byte sequence.
+fn utf8_char_len(bytes: &[u8]) -> Option<usize> {
+    let b0 = bytes[0];
+    let n = if b0 & 0xE0 == 0xC0 {
+        2
+    } else if b0 & 0xF0 == 0xE0 {
+        3
+    } else if b0 & 0xF8 == 0xF0 {
+        4
+    } else {
+        return None;
+    };
+    if bytes.len() < n {
+        return None;
+    }
+    for &cb in &bytes[1..n] {
+        if cb & 0xC0 != 0x80 {
+            return None;
+        }
+    }
+    Some(n)
 }
 
 fn merge_label_from_message(message: &[u8]) -> String {
@@ -2676,9 +2888,13 @@ fn add_update_ref_commands(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<Vec<Re
         let Some(oid) = item.oid else {
             continue;
         };
-        let Some(refs) = refs_by_oid.remove(&oid) else {
+        let Some(mut refs) = refs_by_oid.remove(&oid) else {
             continue;
         };
+        // git builds the decoration list by prepending each ref as it loads
+        // them sorted, so refs at one commit emit in reverse-sorted order.
+        refs.sort();
+        refs.reverse();
         for refname in refs {
             out.push(RebaseTodoItem {
                 command: TodoCommand::UpdateRef,
@@ -2715,6 +2931,180 @@ fn write_rebase_update_refs_state(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result
         text.push('\n');
     }
     fs::write(ctx.state_path("update-refs"), text)?;
+    Ok(())
+}
+
+/// One `(refname, before, after)` record in the `update-refs` state file. The
+/// file stores three lines per ref; `after` is the all-zero OID until the ref's
+/// `update-ref` todo command runs (recording the then-current HEAD).
+struct UpdateRefRecord {
+    refname: String,
+    before: ObjectId,
+    after: ObjectId,
+}
+
+fn read_update_refs_state(ctx: &Ctx) -> Result<Vec<UpdateRefRecord>> {
+    let path = ctx.state_path("update-refs");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Ok(Vec::new());
+    };
+    let mut lines = text.lines();
+    let mut out = Vec::new();
+    while let Some(refname) = lines.next() {
+        let (Some(before), Some(after)) = (lines.next(), lines.next()) else {
+            break;
+        };
+        let before = ObjectId::from_hex(ctx.format, before.trim())
+            .map_err(|_| GitError::InvalidObject("invalid update-refs before-oid".into()))?;
+        let after = ObjectId::from_hex(ctx.format, after.trim())
+            .map_err(|_| GitError::InvalidObject("invalid update-refs after-oid".into()))?;
+        out.push(UpdateRefRecord {
+            refname: refname.to_string(),
+            before,
+            after,
+        });
+    }
+    Ok(out)
+}
+
+fn write_update_refs_records(ctx: &Ctx, records: &[UpdateRefRecord]) -> Result<()> {
+    let path = ctx.state_path("update-refs");
+    if records.is_empty() {
+        let _ = fs::remove_file(&path);
+        return Ok(());
+    }
+    let mut text = String::new();
+    for rec in records {
+        text.push_str(&rec.refname);
+        text.push('\n');
+        text.push_str(&rec.before.to_hex());
+        text.push('\n');
+        text.push_str(&rec.after.to_hex());
+        text.push('\n');
+    }
+    fs::write(&path, text)?;
+    Ok(())
+}
+
+/// Port of upstream `do_update_ref`: record the current HEAD as the `after`
+/// value for `refname` in the update-refs state (applied later at finish).
+fn do_update_ref(ctx: &Ctx, refname: &str) -> Result<()> {
+    let mut records = read_update_refs_state(ctx)?;
+    if records.is_empty() {
+        return Ok(());
+    }
+    let refs = ctx.refs();
+    let head = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
+    for rec in &mut records {
+        if rec.refname == refname {
+            rec.after = head;
+            break;
+        }
+    }
+    write_update_refs_records(ctx, &records)
+}
+
+/// Port of upstream `do_update_refs`: at finish, apply every recorded ref
+/// update (compare-and-swap `before` -> `after`), reporting the refs updated
+/// and any that failed (e.g. moved out from under the rebase). Refs are
+/// reported sorted by name. Returns an error if any update failed.
+fn do_update_refs(ctx: &Ctx, quiet: bool) -> Result<()> {
+    let mut records = read_update_refs_state(ctx)?;
+    if records.is_empty() {
+        return Ok(());
+    }
+    records.sort_by(|a, b| a.refname.cmp(&b.refname));
+    let refs = FileRefStore::new(&ctx.common_git_dir, ctx.format);
+    let committer = commit_identity_from_env("COMMITTER")?;
+    let zero = ObjectId::null(ctx.format);
+    let mut updated = Vec::new();
+    let mut failed = Vec::new();
+    for rec in &records {
+        // Skip refs whose update-ref command never ran (after still zero).
+        if rec.after == zero {
+            continue;
+        }
+        let current = sley_refs::resolve_ref_peeled(&refs, &rec.refname)?.unwrap_or(zero);
+        if current != rec.before {
+            eprintln!("error: update_ref failed for ref '{}': ", rec.refname);
+            failed.push(rec.refname.clone());
+            continue;
+        }
+        let mut tx = refs.transaction();
+        tx.update(RefUpdate {
+            name: rec.refname.clone(),
+            expected: Some(RefTarget::Direct(rec.before)),
+            new: RefTarget::Direct(rec.after),
+            reflog: Some(ReflogEntry {
+                old_oid: rec.before,
+                new_oid: rec.after,
+                committer: committer.clone(),
+                message: b"rewritten during rebase".to_vec(),
+            }),
+        });
+        match tx.commit() {
+            Ok(()) => updated.push(rec.refname.clone()),
+            Err(_) => {
+                eprintln!("error: update_ref failed for ref '{}': ", rec.refname);
+                failed.push(rec.refname.clone());
+            }
+        }
+    }
+    if !quiet && (!updated.is_empty() || !failed.is_empty()) {
+        eprint!("Updated the following refs with --update-refs:\n");
+        for refname in &updated {
+            eprintln!("\t{refname}");
+        }
+        if !failed.is_empty() {
+            eprint!("Failed to update the following refs with --update-refs:\n");
+            for refname in &failed {
+                eprintln!("\t{refname}");
+            }
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(GitError::Exit(1))
+    }
+}
+
+/// Port of upstream `todo_list_filter_update_refs`: after the todo is (re)read
+/// on `--continue`/`--edit-todo`, drop state entries whose ref no longer has an
+/// `update-ref` line (and was not yet updated), and add un-updated entries for
+/// any new `update-ref` lines.
+fn filter_update_refs(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<()> {
+    let mut records = read_update_refs_state(ctx)?;
+    if records.is_empty() {
+        return Ok(());
+    }
+    let zero = ObjectId::null(ctx.format);
+    let todo_refs: std::collections::HashSet<&str> = items
+        .iter()
+        .filter(|item| item.command == TodoCommand::UpdateRef)
+        .map(|item| todo_arg_before_comment(&item.arg).trim())
+        .collect();
+    let mut updated = false;
+    let before_len = records.len();
+    records.retain(|rec| rec.after != zero || todo_refs.contains(rec.refname.as_str()));
+    if records.len() != before_len {
+        updated = true;
+    }
+    let store = FileRefStore::new(&ctx.common_git_dir, ctx.format);
+    for refname in &todo_refs {
+        if !records.iter().any(|rec| rec.refname == *refname) {
+            let before = sley_refs::resolve_ref_peeled(&store, refname)?.unwrap_or(zero);
+            records.push(UpdateRefRecord {
+                refname: (*refname).to_string(),
+                before,
+                after: zero,
+            });
+            updated = true;
+        }
+    }
+    if updated {
+        write_update_refs_records(ctx, &records)?;
+    }
     Ok(())
 }
 
@@ -2805,6 +3195,10 @@ fn complete_action(
         }
         new_items = parsed;
     }
+
+    // Reconcile the update-refs state with the (possibly user-edited) todo:
+    // drop refs whose update-ref line was removed, add any newly-inserted ones.
+    filter_update_refs(ctx, &new_items)?;
 
     let mut todo = TodoList {
         items: new_items,
@@ -3211,7 +3605,10 @@ fn pick_commits(
                     PickOutcome::Fail(code) => return Err(GitError::Exit(code)),
                 }
             }
-            TodoCommand::UpdateRef => {}
+            TodoCommand::UpdateRef => {
+                let refname = todo_arg_before_comment(&item.arg).trim().to_string();
+                do_update_ref(ctx, &refname)?;
+            }
             TodoCommand::Noop | TodoCommand::Drop | TodoCommand::Comment | TodoCommand::Revert => {}
         }
 
@@ -3384,6 +3781,18 @@ fn do_reset(ctx: &Ctx, db: &FileObjectDatabase, opts: &MachineOpts, name: &str) 
     detach_head_with_reflog(ctx, old, target, ctx.reflog("reset", Some(name)), committer)
 }
 
+/// The active `[new root]` marker commit: `opts.squash_onto` if set, else the
+/// squash-onto state file. `reset [new root]` mints this synthetic empty root
+/// on the fly (writing only the state file) even for non-`--root` rebases, so
+/// both the merge-into-root fast-forward and the pick-as-root-commit paths must
+/// consult the file, not just `opts`.
+fn effective_squash_onto(ctx: &Ctx, opts: &MachineOpts) -> Option<ObjectId> {
+    opts.squash_onto.or_else(|| {
+        seq::read_state_line(&ctx.git_dir, "squash-onto")
+            .and_then(|raw| ObjectId::from_hex(ctx.format, raw.trim()).ok())
+    })
+}
+
 fn do_merge(
     ctx: &Ctx,
     db: &FileObjectDatabase,
@@ -3415,7 +3824,15 @@ fn do_merge(
         None => None,
     };
 
-    if opts.squash_onto == Some(head) && merge_heads.len() == 1 {
+    // A "merge" into a "[new root]" is a fast-forward to the merge head. The
+    // synthetic root may have been minted on the fly by an earlier `reset [new
+    // root]`, which records it only in the squash-onto state file, so consult
+    // that too rather than just `opts.squash_onto`.
+    if effective_squash_onto(ctx, opts) == Some(head) {
+        if merge_heads.len() > 1 {
+            eprintln!("error: octopus merge cannot be executed on top of a [new root]");
+            return Ok(PickOutcome::Fail(1));
+        }
         let target = merge_heads[0].1;
         reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
         let committer = commit_identity_from_env("COMMITTER")?;
@@ -3547,6 +3964,7 @@ fn do_merge(
             println!("Auto-merging {display}");
             println!("CONFLICT (content): Merge conflict in {display}");
         }
+        let _ = commands::rerere::repo_rerere(&ctx.git_dir, ctx.format, opts.rerere_autoupdate);
         print_conflict_hints();
         if let Some(record) = &original {
             return stop_with_patch(ctx, db, opts, record, item, 1, false);
@@ -3871,7 +4289,7 @@ fn pick_one_commit(
 
     let is_fixup = item.command.is_fixup();
     let final_fixup = is_fixup && !next_is_fixup(todo);
-    let create_root = opts.squash_onto == Some(head);
+    let create_root = effective_squash_onto(ctx, opts) == Some(head);
     if create_root && is_fixup {
         eprintln!("error: cannot fixup root commit");
         return Ok(PickOutcome::Fail(1));
@@ -4054,6 +4472,11 @@ fn pick_one_commit(
             fs::write(ctx.git_dir.join("MERGE_MSG"), &merge_msg)?;
             fs::write(ctx.state_path("message"), &merge_msg)?;
         }
+
+        // Record the conflict in the rerere database and, if a resolution is
+        // known, replay it (staging it when rerere.autoUpdate / --rerere-
+        // autoupdate is in effect).
+        let _ = commands::rerere::repo_rerere(&ctx.git_dir, ctx.format, opts.rerere_autoupdate);
 
         eprintln!(
             "error: could not apply {}... {}",
@@ -4885,6 +5308,10 @@ fn machine_commit(
     };
     detach_head_with_reflog(ctx, head, new_oid, reflog_message, committer)?;
 
+    // Record any rerere resolution for the just-committed conflict (matches
+    // git invoking rerere() on commit), so a later identical conflict replays.
+    let _ = commands::rerere::record_resolved_after_commit(&ctx.git_dir, ctx.format);
+
     // Post-commit cleanup.
     let _ = fs::remove_file(ctx.git_dir.join("CHERRY_PICK_HEAD"));
     let _ = fs::remove_file(ctx.git_dir.join("MERGE_MSG"));
@@ -5010,8 +5437,10 @@ fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
         eprintln!("Successfully rebased and updated {head_name_display}.");
     }
 
+    let update_refs_result = do_update_refs(ctx, opts.quiet);
+
     seq::remove_merge_state(&ctx.git_dir);
-    Ok(())
+    update_refs_result
 }
 
 fn rewritten_list_path(ctx: &Ctx) -> PathBuf {
@@ -5266,6 +5695,7 @@ fn rebase_continue(ctx: &Ctx) -> Result<()> {
     }
 
     let mut todo = read_populate_todo(ctx, &db)?;
+    filter_update_refs(ctx, &todo.items)?;
     if ctx.state_path("dropped").exists() {
         if check_todo_dropped_commits_against_backup(ctx, &db, &todo.items)? {
             return Err(GitError::Exit(1));
@@ -5575,6 +6005,9 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
     } else if check_todo_dropped_commits(ctx, &db, &items, &new_items)? {
         return Err(GitError::Exit(1));
     }
+    // Reconcile the update-refs state with the edited todo (drop removed
+    // update-ref lines, add new ones).
+    filter_update_refs(ctx, &new_items)?;
     write_todo_file(ctx, &todo_path, &new_items, false, false, None, None, &db)?;
     Ok(())
 }

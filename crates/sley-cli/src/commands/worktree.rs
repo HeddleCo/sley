@@ -2420,7 +2420,7 @@ fn create_linked_worktree_admin_dir(common_git_dir: &Path, path: &Path) -> Resul
     ))
 }
 
-fn branch_checked_out_worktree(
+pub(crate) fn branch_checked_out_worktree(
     common_git_dir: &Path,
     refname: &str,
     ignore_path: Option<&Path>,
