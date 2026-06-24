@@ -71,6 +71,14 @@ struct AmOptions {
     /// `-p<n>`: number of leading path components to strip from patch names.
     /// Default 1; `--no-prefix` patches need `-p0`.
     p_value: usize,
+    /// The `git apply` options forwarded verbatim, in git's recreate-opt form
+    /// (`-C1`, `-p2`, `--whitespace=fix`, `--directory=<dir>`, `--reject`,
+    /// `--ignore-whitespace`, `--exclude=<path>`, `--include=<path>`). git's
+    /// `OPT_PASSTHRU_ARGV` collects these into `state->git_apply_opts`, sq-quotes
+    /// them into `rebase-apply/apply-opt`, and re-passes them to every `git apply`
+    /// across the series and on resume (t4252). We persist + replay them the same
+    /// way, applying them in-process.
+    git_apply_opts: Vec<String>,
 }
 
 impl AmOptions {
@@ -437,6 +445,13 @@ pub(crate) fn start_rebase_apply(
         directory: None,
         patch_format: AmPatchFormat::Mbox,
         p_value: 1,
+        // The rebase apply backend forwards only `--ignore-whitespace` (when the
+        // user passed it); the rest default off, matching `git rebase --apply`.
+        git_apply_opts: if params.ignore_whitespace {
+            vec!["--ignore-whitespace".to_string()]
+        } else {
+            Vec::new()
+        },
     };
 
     let refs = FileRefStore::new(git_dir, format);
@@ -551,6 +566,7 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         directory: None,
         patch_format: AmPatchFormat::Auto,
         p_value: 1,
+        git_apply_opts: Vec::new(),
     };
     let mut positional_only = false;
     let mut index = 0;
@@ -571,7 +587,10 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             "--no-3way" => options.three_way = false,
             "-i" | "--interactive" => options.interactive = true,
             "--no-interactive" => options.interactive = false,
-            "--ignore-whitespace" => options.ignore_whitespace = true,
+            "--ignore-whitespace" | "--ignore-space-change" => {
+                options.ignore_whitespace = true;
+                options.git_apply_opts.push(arg.clone());
+            }
             "--no-ignore-whitespace" => options.ignore_whitespace = false,
             "-k" | "--keep" => {
                 options.keep_non_patch = true;
@@ -615,26 +634,59 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             "-u"
             | "--utf8"
             | "--no-utf8"
-            | "--whitespace"
             | "--rerere-autoupdate"
             | "--no-rerere-autoupdate"
             | "--allow-empty" => {}
-            value if value.starts_with("--whitespace=") => {}
+            // Forwarded `git apply` options: collected into git_apply_opts in git's
+            // recreate-opt form (`--whitespace=fix`, `-C1`, `-p2`, `--reject`, …),
+            // persisted to apply-opt, and re-applied for every patch + on resume.
+            "--whitespace" => {
+                let value = args.get(index + 1).map(String::as_str).unwrap_or("");
+                options.git_apply_opts.push(format!("--whitespace={value}"));
+                index += 1;
+            }
+            value if let Some(action) = value.strip_prefix("--whitespace=") => {
+                options.git_apply_opts.push(format!("--whitespace={action}"));
+            }
+            "--reject" => options.git_apply_opts.push("--reject".to_string()),
+            "--no-reject" => options.git_apply_opts.push("--no-reject".to_string()),
             value if let Some(invalid) = value.strip_prefix("--empty=") => {
                 eprintln!("error: invalid value for '--empty': '{invalid}'");
                 return Err(GitError::Exit(129));
             }
-            value if value.starts_with("--exclude=") || value.starts_with("--include=") => {}
+            value if let Some(rest) = value.strip_prefix("--exclude=") => {
+                options.git_apply_opts.push(format!("--exclude={rest}"));
+            }
+            value if let Some(rest) = value.strip_prefix("--include=") => {
+                options.git_apply_opts.push(format!("--include={rest}"));
+            }
+            "-C" => {
+                let value = args.get(index + 1).map(String::as_str).unwrap_or("");
+                options.git_apply_opts.push(format!("-C{value}"));
+                index += 1;
+            }
+            value if let Some(rest) = value.strip_prefix("-C") => {
+                options.git_apply_opts.push(format!("-C{rest}"));
+            }
             "-p" => {
                 let value = args.get(index + 1).map(String::as_str).unwrap_or("");
                 options.p_value = value.parse::<usize>().unwrap_or(1);
+                options.git_apply_opts.push(format!("-p{value}"));
                 index += 1;
             }
             value if let Some(rest) = value.strip_prefix("-p") => {
                 options.p_value = rest.parse::<usize>().unwrap_or(1);
+                options.git_apply_opts.push(format!("-p{rest}"));
+            }
+            "--directory" => {
+                let value = args.get(index + 1).map(String::as_str).unwrap_or("");
+                options.directory = Some(value.to_string());
+                options.git_apply_opts.push(format!("--directory={value}"));
+                index += 1;
             }
             value if let Some(dir) = value.strip_prefix("--directory=") => {
                 options.directory = Some(dir.to_string());
+                options.git_apply_opts.push(format!("--directory={dir}"));
             }
             value if value.starts_with('-') && value != "-" => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
@@ -1784,25 +1836,21 @@ fn write_am_state_dir(
         bool_flag(options.ignore_date),
     )?;
     fs::write(state_dir.join("no-verify"), bool_flag(options.no_verify))?;
-    fs::write(
-        state_dir.join("ignore-whitespace"),
-        bool_flag(options.ignore_whitespace),
-    )?;
     fs::write(state_dir.join("utf8"), b"t\n")?;
     fs::write(
         state_dir.join("interactive"),
         bool_flag(options.interactive),
     )?;
     fs::write(state_dir.join("applying"), b"")?;
-    // git records the forwarded `git apply` options here (sq-quoted) so resumes
-    // reproduce them. We only carry `--directory`; the others are applied
-    // in-process at apply time.
-    let apply_opt = match &options.directory {
-        Some(dir) => format!("--directory={}\n", am_sq_quote(dir)),
-        None => String::new(),
-    };
-    fs::write(state_dir.join("apply-opt"), apply_opt)?;
-    fs::write(state_dir.join("p-value"), format!("{}\n", options.p_value))?;
+    // git records the forwarded `git apply` options here, sq-quoted as a single
+    // line (`sq_quote_argv`), and re-passes them to `git apply` for every patch
+    // and on resume (am.c `am_setup`/`am_load`). We persist them the same way and
+    // re-apply them in-process — `-C`, `-p`, `--whitespace`, `--directory`,
+    // `--reject`, `--ignore-whitespace` all round-trip through apply-opt.
+    fs::write(
+        state_dir.join("apply-opt"),
+        format!("{}\n", sq_quote_argv(&options.git_apply_opts)),
+    )?;
     // abort-safety records the HEAD the series is currently sitting on so
     // --abort can detect a HEAD the user moved out from under us. An unborn HEAD
     // records the empty string (git's am_setup writes "" for no HEAD).
@@ -2010,55 +2058,188 @@ impl AmResumeOverrides {
     }
 }
 
-/// git's `sq_quote`: wrap in single quotes, rendering any embedded quote as the
-/// `'\''` sequence. Used to store `--directory=<dir>` in the `apply-opt` state.
-fn am_sq_quote(value: &str) -> String {
-    let mut out = String::from("'");
-    for ch in value.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
+/// The forwarded `git apply` options, parsed out of the `apply-opt` state line
+/// (or the command line at start). Mirrors the subset of `git apply` flags that
+/// `git am` passes through (`state->git_apply_opts`) and that change how a
+/// fragment is placed or materialised.
+#[derive(Clone, Default)]
+struct AmApplyOpts {
+    /// `-p<n>`: leading path components to strip. `None` means the default (1).
+    p_value: Option<usize>,
+    /// `-C<n>`: the context-fuzz floor (git's `p_context`). `None` means no fuzz
+    /// (git's default `UINT_MAX`): a hunk whose full context fails is rejected.
+    context: Option<usize>,
+    /// `--whitespace=<action>`: whitespace-error handling. Only `fix` changes the
+    /// applied bytes (it strips trailing whitespace from added lines).
+    whitespace: Option<String>,
+    /// `--directory=<dir>`: prepend `<dir>/` to every patched path.
+    directory: Option<String>,
+    /// `--reject`: apply the hunks that match and write `.rej` files for the rest.
+    reject: bool,
+    /// `--ignore-whitespace` / `--ignore-space-change`: match context/deleted
+    /// lines with a whitespace-collapsing comparison.
+    ignore_whitespace: bool,
+}
+
+impl AmApplyOpts {
+    /// `-p<n>` strip level, defaulting to git's 1.
+    fn p_value(&self) -> usize {
+        self.p_value.unwrap_or(1)
     }
-    out.push('\'');
+    /// Whether `--whitespace=fix` is in effect (the only action that rewrites the
+    /// applied content).
+    fn whitespace_fix(&self) -> bool {
+        self.whitespace.as_deref() == Some("fix")
+    }
+}
+
+/// git's `sq_quote_argv`: emit each argument prefixed by a space and wrapped in
+/// single quotes, rendering an embedded `'` (or `!`) as the `'\''` escape. This
+/// is the exact byte layout `git am` writes to `rebase-apply/apply-opt`.
+fn sq_quote_argv(args: &[String]) -> String {
+    let mut out = String::new();
+    for arg in args {
+        out.push(' ');
+        out.push('\'');
+        for ch in arg.chars() {
+            if ch == '\'' || ch == '!' {
+                out.push('\'');
+                out.push('\\');
+                out.push(ch);
+                out.push('\'');
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('\'');
+    }
     out
 }
 
-/// Inverse of [`am_sq_quote`] for a single sq-quoted token.
-fn am_sq_unquote(value: &str) -> String {
-    let mut chars = value.chars().peekable();
-    if chars.peek() != Some(&'\'') {
-        return value.to_string();
-    }
-    chars.next();
-    let mut out = String::new();
-    while let Some(ch) = chars.next() {
-        if ch == '\'' {
-            // Either the closing quote, or the `'\''` (escaped quote) sequence.
-            if chars.peek() == Some(&'\\') {
-                chars.next();
-                if chars.next() == Some('\'') {
-                    out.push('\'');
-                    // The next char re-opens the quote (consume it).
-                    chars.next();
-                    continue;
-                }
-            }
+/// git's `sq_dequote` (quote.c `sq_dequote_step`): split an sq-quoted line back
+/// into the original argument tokens. Each token is wrapped in `'…'`; a literal
+/// `'` (or `!`) inside is the `'\''` escape — close-quote, backslash-escaped
+/// char, reopen-quote — which git decodes by emitting the escaped char and
+/// stepping over the reopening quote. Tokens are separated by unquoted
+/// whitespace; an unquoted run is tolerated and copied verbatim.
+fn sq_dequote_to_vec(input: &str) -> Vec<String> {
+    let bytes = input.as_bytes();
+    let n = bytes.len();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    loop {
+        while i < n && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= n {
             break;
         }
-        out.push(ch);
+        if bytes[i] != b'\'' {
+            // Not sq-quoted: copy the bare run verbatim (defensive — git's am
+            // always quotes, but we never want to drop a token).
+            let start = i;
+            while i < n && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            tokens.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
+            continue;
+        }
+        // `src` mirrors git's pointer; the loop reads with a leading `++src`.
+        let mut token = Vec::new();
+        let mut src = i;
+        loop {
+            src += 1;
+            if src >= n {
+                break; // unterminated quote; take what we have
+            }
+            let c = bytes[src];
+            if c != b'\'' {
+                token.push(c);
+                continue;
+            }
+            // Stepped out of the single-quoted span; inspect the next char.
+            src += 1;
+            if src >= n {
+                break;
+            }
+            if bytes[src] == b'\\'
+                && src + 2 < n
+                && (bytes[src + 1] == b'\'' || bytes[src + 1] == b'!')
+                && bytes[src + 2] == b'\''
+            {
+                // `'\''` / `'\!'`: emit the escaped char and step over the
+                // reopening quote (the next loop iteration's `++src` skips it).
+                token.push(bytes[src + 1]);
+                src += 2;
+                continue;
+            }
+            // Otherwise the token ended at the closing quote.
+            break;
+        }
+        i = src;
+        tokens.push(String::from_utf8_lossy(&token).into_owned());
     }
-    out
+    tokens
 }
 
-/// Read the `--directory=<dir>` forwarded apply option from the `apply-opt`
-/// state so a resumed `--skip`/`--continue` reproduces it (t4252).
-fn read_am_apply_directory(state_dir: &Path) -> Option<String> {
-    let raw = fs::read_to_string(state_dir.join("apply-opt")).ok()?;
-    let line = raw.strip_suffix('\n').unwrap_or(&raw);
-    line.strip_prefix("--directory=")
-        .map(|token| am_sq_unquote(token))
+/// Parse the forwarded `git apply` option tokens (in git's recreate-opt form)
+/// into the structured [`AmApplyOpts`] the in-process apply consumes.
+fn parse_am_apply_opts(tokens: &[String]) -> AmApplyOpts {
+    let mut opts = AmApplyOpts::default();
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i].as_str();
+        match token {
+            "--reject" => opts.reject = true,
+            "--no-reject" => opts.reject = false,
+            "--ignore-whitespace" | "--ignore-space-change" => opts.ignore_whitespace = true,
+            "--whitespace" => {
+                if let Some(value) = tokens.get(i + 1) {
+                    opts.whitespace = Some(value.clone());
+                    i += 1;
+                }
+            }
+            "-C" => {
+                if let Some(value) = tokens.get(i + 1) {
+                    opts.context = value.parse().ok();
+                    i += 1;
+                }
+            }
+            "-p" => {
+                if let Some(value) = tokens.get(i + 1) {
+                    opts.p_value = value.parse().ok();
+                    i += 1;
+                }
+            }
+            "--directory" => {
+                if let Some(value) = tokens.get(i + 1) {
+                    opts.directory = Some(value.clone());
+                    i += 1;
+                }
+            }
+            _ => {
+                if let Some(action) = token.strip_prefix("--whitespace=") {
+                    opts.whitespace = Some(action.to_string());
+                } else if let Some(rest) = token.strip_prefix("-C") {
+                    opts.context = rest.parse().ok();
+                } else if let Some(rest) = token.strip_prefix("-p") {
+                    opts.p_value = rest.parse().ok();
+                } else if let Some(dir) = token.strip_prefix("--directory=") {
+                    opts.directory = Some(dir.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+    opts
+}
+
+/// Read the forwarded `git apply` options back from `rebase-apply/apply-opt` so a
+/// resumed `--skip`/`--continue`/`--retry` reproduces them for every patch (the
+/// `git am` "do not lose the options" guarantee — t4252).
+fn read_am_apply_opts(state_dir: &Path) -> AmApplyOpts {
+    let raw = fs::read_to_string(state_dir.join("apply-opt")).unwrap_or_default();
+    parse_am_apply_opts(&sq_dequote_to_vec(&raw))
 }
 
 /// Prepend `--directory=<dir>` to every path in the parsed patch (git's
@@ -2168,8 +2349,7 @@ fn run_am_series(
     let saved_quiet = read_state_bool(state_dir, "quiet");
     let saved_three_way = read_state_bool(state_dir, "threeway");
     let empty_action = read_empty_action(state_dir);
-    let ignore_whitespace = read_state_bool(state_dir, "ignore-whitespace");
-    let p_value = read_state_usize(state_dir, "p-value").unwrap_or(1);
+    let saved_apply_opts = read_am_apply_opts(state_dir);
     let saved_commit_opts = read_am_commit_opts(state_dir);
     let mut interactive = read_state_bool(state_dir, "interactive");
 
@@ -2191,6 +2371,12 @@ fn run_am_series(
         let mut commit_opts = saved_commit_opts;
         if resumed && let Some(signoff) = overrides.signoff {
             commit_opts.signoff = signoff;
+        }
+        // The resumed patch may also override `--reject`/`--no-reject` (t4153 #6);
+        // the rest of the forwarded apply options come straight from apply-opt.
+        let mut apply_opts = saved_apply_opts.clone();
+        if resumed && let Some(reject) = overrides.reject {
+            apply_opts.reject = reject;
         }
         fs::write(state_dir.join("next"), format!("{number}\n"))?;
         let mut patch = read_patch_file(state_dir, number)?;
@@ -2266,9 +2452,8 @@ fn run_am_series(
             &patch,
             commit_opts,
             three_way,
-            ignore_whitespace,
+            &apply_opts,
             quiet,
-            p_value,
         )? {
             ApplyResult::Committed => number += 1,
             ApplyResult::Conflict => {
@@ -2371,26 +2556,25 @@ fn apply_one_patch(
     patch: &AmPatch,
     commit_opts: AmCommitOpts,
     three_way: bool,
-    ignore_whitespace: bool,
+    apply_opts: &AmApplyOpts,
     quiet: bool,
-    p_value: usize,
 ) -> Result<ApplyResult> {
     let mut file_patches = sley_diff_merge::parse_unified_patch_with_options(
         &patch.diff,
         false,
         &sley_diff_merge::PatchPathOptions {
-            p_value,
+            p_value: apply_opts.p_value(),
             p_value_known: true,
             root: Vec::new(),
         },
     )?;
     // `--directory=<dir>` (persisted in apply-opt) prepends <dir>/ to every path
     // before the patch is applied (t4252 "apply to a funny path").
-    if let Some(dir) = read_am_apply_directory(state_dir) {
-        am_prepend_directory(&mut file_patches, &dir);
+    if let Some(dir) = &apply_opts.directory {
+        am_prepend_directory(&mut file_patches, dir);
     }
 
-    match try_straight_apply(worktree_root, &file_patches, ignore_whitespace)? {
+    match try_straight_apply(worktree_root, &file_patches, apply_opts)? {
         Some(actions) => {
             apply_actions(worktree_root, &actions)?;
             let new_oid = stage_and_commit(
@@ -2457,7 +2641,7 @@ enum ApplyFileAction {
 fn try_straight_apply(
     worktree_root: &Path,
     file_patches: &[sley_diff_merge::FilePatch],
-    ignore_whitespace: bool,
+    apply_opts: &AmApplyOpts,
 ) -> Result<Option<Vec<ApplyFileAction>>> {
     let mut actions = Vec::new();
     for patch in file_patches {
@@ -2482,15 +2666,37 @@ fn try_straight_apply(
         } else {
             Vec::new()
         };
-        let content = match sley_diff_merge::apply_file_patch(&base, patch) {
+        // `--whitespace=fix` rewrites added lines (strip trailing whitespace)
+        // before they are applied, so the materialised file loses the whitespace
+        // errors (t4252 "interrupted am --whitespace=fix" loses the space after
+        // "Six"). The preimage (context/deleted lines) is untouched, so matching
+        // is unaffected.
+        let fixed_patch;
+        let patch_to_apply: &sley_diff_merge::FilePatch = if apply_opts.whitespace_fix() {
+            fixed_patch = am_whitespace_fix_patch(patch);
+            &fixed_patch
+        } else {
+            patch
+        };
+        let content = match sley_diff_merge::apply_file_patch(&base, patch_to_apply) {
             sley_diff_merge::ApplyOutcome::Applied(content) => content,
             sley_diff_merge::ApplyOutcome::Rejected => {
-                // `git am --ignore-whitespace` (apply.c `ignore_ws_change`):
-                // when a hunk fails to match byte-for-byte, retry with a
-                // whitespace-collapsing line matcher, keeping the *target's*
-                // context lines so only the patch's real change lands.
-                if ignore_whitespace {
-                    match apply_file_patch_ignore_ws(&base, patch) {
+                // `-C<n>` (apply.c `p_context`): retry with the context-fuzz loop,
+                // dropping leading/trailing context down to the floor `n` so a
+                // hunk whose outer context does not match still lands (t4252
+                // "interrupted am -C1"). git lowers `p_context` only when `-C`
+                // was given; the default is no fuzz at all.
+                if let Some(p_context) = apply_opts.context {
+                    match am_apply_context_fuzz(&base, patch_to_apply, p_context) {
+                        Some(content) => content,
+                        None => return Ok(None),
+                    }
+                } else if apply_opts.ignore_whitespace {
+                    // `git am --ignore-whitespace` (apply.c `ignore_ws_change`):
+                    // when a hunk fails to match byte-for-byte, retry with a
+                    // whitespace-collapsing line matcher, keeping the *target's*
+                    // context lines so only the patch's real change lands.
+                    match apply_file_patch_ignore_ws(&base, patch_to_apply) {
                         Some(content) => content,
                         None => return Ok(None),
                     }
@@ -2521,6 +2727,190 @@ fn try_straight_apply(
         }
     }
     Ok(Some(actions))
+}
+
+/// `git apply --whitespace=fix`: rewrite each *added* line to remove the
+/// whitespace errors git fixes by default. We implement the "blank-at-eol" fix
+/// (strip trailing spaces/tabs), which is the one the materialised content
+/// depends on (t4252 "interrupted am --whitespace=fix" drops the space after
+/// "Six"). Context and deleted lines are left untouched, so hunk matching is
+/// unaffected.
+fn am_whitespace_fix_patch(patch: &sley_diff_merge::FilePatch) -> sley_diff_merge::FilePatch {
+    use sley_diff_merge::HunkLine;
+    let mut fixed = patch.clone();
+    for hunk in &mut fixed.hunks {
+        for line in &mut hunk.lines {
+            if let HunkLine::Insert(bytes) = line {
+                while matches!(bytes.last(), Some(b' ') | Some(b'\t')) {
+                    bytes.pop();
+                }
+            }
+        }
+    }
+    fixed
+}
+
+/// Apply a file patch with `-C<n>` context fuzz (apply.c `apply_one_fragment`):
+/// each hunk's full preimage is matched byte-for-byte against the running image,
+/// and on failure the begin/end anchors are relaxed and then leading/trailing
+/// context lines are dropped — down to the floor `p_context` — until a position
+/// matches. Returns `None` if any hunk cannot be placed even after reducing
+/// context to the floor (the whole patch then fails, like git).
+fn am_apply_context_fuzz(
+    base: &[u8],
+    patch: &sley_diff_merge::FilePatch,
+    p_context: usize,
+) -> Option<Vec<u8>> {
+    use sley_diff_merge::HunkLine;
+    if patch.is_delete && patch.hunks.is_empty() {
+        return Some(Vec::new());
+    }
+    let base_for_match: &[u8] = if patch.is_new { b"" } else { base };
+    let mut image: Vec<Vec<u8>> = ws_split_lines(base_for_match);
+    let mut running_offset: isize = 0;
+
+    for hunk in &patch.hunks {
+        // Build the preimage (context + deleted) and postimage (context +
+        // inserted), each line carrying its trailing newline so they splice into
+        // the line image. Track the leading/trailing context-run lengths git's
+        // fuzz loop reduces. Exact matching means a context line in the postimage
+        // equals the image line it overwrites, so the patch's bytes can be spliced
+        // in directly.
+        let mut preimage: Vec<Vec<u8>> = Vec::new();
+        let mut postimage: Vec<Vec<u8>> = Vec::new();
+        let mut leading = 0usize;
+        let mut trailing = 0usize;
+        let mut seen_change = false;
+        for line in &hunk.lines {
+            match line {
+                HunkLine::Context(b) => {
+                    if !seen_change {
+                        leading += 1;
+                    }
+                    trailing += 1;
+                    let mut with_nl = b.clone();
+                    with_nl.push(b'\n');
+                    preimage.push(with_nl.clone());
+                    postimage.push(with_nl);
+                }
+                HunkLine::Delete(b) => {
+                    seen_change = true;
+                    trailing = 0;
+                    let mut with_nl = b.clone();
+                    with_nl.push(b'\n');
+                    preimage.push(with_nl);
+                }
+                HunkLine::Insert(b) => {
+                    seen_change = true;
+                    trailing = 0;
+                    let mut with_nl = b.clone();
+                    with_nl.push(b'\n');
+                    postimage.push(with_nl);
+                }
+            }
+        }
+        // Honour a missing final newline on either side of the hunk.
+        if hunk.old_no_newline
+            && let Some(last) = preimage.last_mut()
+            && last.last() == Some(&b'\n')
+        {
+            last.pop();
+        }
+        if hunk.new_no_newline
+            && let Some(last) = postimage.last_mut()
+            && last.last() == Some(&b'\n')
+        {
+            last.pop();
+        }
+
+        let mut match_beginning = hunk.old_start <= 1;
+        let mut match_end = trailing == 0;
+        let base_pos: isize = if hunk.new_start > 0 {
+            hunk.new_start as isize - 1
+        } else {
+            0
+        };
+        let mut pos = base_pos + running_offset;
+
+        let applied_pos = loop {
+            if let Some(found) = am_find_pos(&image, &preimage, pos, match_beginning, match_end) {
+                break found;
+            }
+            // At the context floor with no match: reject the hunk (and patch).
+            if leading <= p_context && trailing <= p_context {
+                return None;
+            }
+            // Relax the begin/end anchors before reducing context (git's order).
+            if match_beginning || match_end {
+                match_beginning = false;
+                match_end = false;
+                continue;
+            }
+            // Reduce context: drop the larger of leading/trailing (both if equal).
+            if leading >= trailing {
+                if preimage.is_empty() || postimage.is_empty() {
+                    return None;
+                }
+                preimage.remove(0);
+                postimage.remove(0);
+                pos -= 1;
+                leading -= 1;
+            }
+            if trailing > leading {
+                if preimage.is_empty() || postimage.is_empty() {
+                    return None;
+                }
+                preimage.pop();
+                postimage.pop();
+                trailing -= 1;
+            }
+        };
+
+        let pre_len = preimage.len();
+        let post_len = postimage.len();
+        image.splice(applied_pos..applied_pos + pre_len, postimage);
+        running_offset += post_len as isize - pre_len as isize;
+    }
+    Some(image.concat())
+}
+
+/// Find a position where `preimage` matches `image` exactly (apply.c
+/// `find_pos`). `match_beginning` forces the file start; `match_end` forces the
+/// file end; otherwise the search ping-pongs outward from `pos`.
+fn am_find_pos(
+    image: &[Vec<u8>],
+    preimage: &[Vec<u8>],
+    pos: isize,
+    match_beginning: bool,
+    match_end: bool,
+) -> Option<usize> {
+    if preimage.len() > image.len() {
+        return None;
+    }
+    let max_start = image.len() - preimage.len();
+    let matches = |start: usize| -> bool {
+        preimage
+            .iter()
+            .enumerate()
+            .all(|(i, line)| &image[start + i] == line)
+    };
+    if match_beginning {
+        return matches(0).then_some(0);
+    }
+    if match_end {
+        return matches(max_start).then_some(max_start);
+    }
+    let hint = pos.clamp(0, max_start as isize) as usize;
+    for delta in 0..=max_start {
+        let forward = hint + delta;
+        if forward <= max_start && matches(forward) {
+            return Some(forward);
+        }
+        if delta > 0 && hint >= delta && matches(hint - delta) {
+            return Some(hint - delta);
+        }
+    }
+    None
 }
 
 /// Apply a file patch with `--ignore-whitespace` (apply.c `ignore_ws_change`):
