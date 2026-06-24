@@ -805,15 +805,39 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     };
     if let Some(target) = branch_target {
         prefetch_local_promisor_checkout_blobs(&git_dir, format, &config, &target)?;
-        if resolve_ref_peeled(&store, "HEAD")? == Some(target)
-            && checkout_index_empty(&git_dir, format)?
-        {
+        let head_at_target = resolve_ref_peeled(&store, "HEAD")? == Some(target);
+        if head_at_target && checkout_index_empty(&git_dir, format)? {
             sley_worktree::reset_index_and_worktree_to_commit(
                 &worktree_root,
                 &git_dir,
                 format,
                 &target,
             )?;
+        } else if head_at_target && checkout_old_head != target {
+            // `checkout -B <current-branch> <start>` force-reset the branch we are
+            // already on. The ref moved before the worktree switch, so the helpers
+            // below would compare the new HEAD against itself and skip the update.
+            // Switch the worktree from the pre-reset HEAD tree to the new target
+            // here (a two-way merge that carries local modifications, like git);
+            // the downstream switch then no-ops on the worktree but still writes
+            // the HEAD reflog and prints the message.
+            let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+            let old_tree = commands::merge_rebase::commit_tree_oid(&db, format, &checkout_old_head)?;
+            let target_tree = commands::merge_rebase::commit_tree_oid(&db, format, &target)?;
+            if let Err(err) = commands::read_tree::checkout_two_way_engine(
+                &git_dir,
+                &worktree_root,
+                format,
+                &db,
+                Some(&old_tree),
+                &target_tree,
+                commands::read_tree::UnpackPorcelain::Checkout,
+                recurse_submodules,
+                force,
+            ) {
+                checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+                return Err(err);
+            }
         }
     }
     if branch_target.is_none() {

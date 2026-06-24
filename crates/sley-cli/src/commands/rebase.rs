@@ -64,7 +64,7 @@ struct RebaseArgs {
     stat: Option<bool>,
     autostash: Option<bool>,
     autosquash: Option<bool>,
-    keep_empty: bool,
+    keep_empty: Option<bool>,
     empty: EmptyMode,
     force: bool,
     exec: Vec<String>,
@@ -113,7 +113,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
         stat: None,
         autostash: None,
         autosquash: None,
-        keep_empty: false,
+        keep_empty: None,
         empty: EmptyMode::Unspecified,
         force: false,
         exec: Vec::new(),
@@ -203,8 +203,8 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             }
             "--autosquash" => out.autosquash = Some(true),
             "--no-autosquash" => out.autosquash = Some(false),
-            "-k" | "--keep-empty" => out.keep_empty = true,
-            "--no-keep-empty" => out.keep_empty = false,
+            "-k" | "--keep-empty" => out.keep_empty = Some(true),
+            "--no-keep-empty" => out.keep_empty = Some(false),
             _ if arg.starts_with("--empty=") => {
                 out.empty = match &arg["--empty=".len()..] {
                     "drop" => EmptyMode::Drop,
@@ -1010,7 +1010,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         || !args.exec.is_empty()
         || args.autosquash == Some(true)
         || args.empty != EmptyMode::Unspecified
-        || args.keep_empty
+        || args.keep_empty.is_some()
         || args.reapply_cherry_picks.is_some()
         || (args.root && args.onto_name.is_none())
         || rebase_merges.is_some()
@@ -1211,6 +1211,9 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     } else {
         args.empty
     };
+    // git's default is keep_empty=1 (begin-empty commits kept) for the
+    // merge/interactive backend; `--no-keep-empty` drops them.
+    let keep_empty = args.keep_empty.unwrap_or(true);
     let reschedule_failed_exec = args.reschedule_failed_exec.unwrap_or_else(|| {
         rebase_config_bool(ctx, "rebase", "rescheduleFailedExec").unwrap_or(false)
     });
@@ -1346,7 +1349,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             &db,
             upstream.as_ref(),
             &orig_head,
-            args.keep_empty,
+            keep_empty,
             args.reapply_cherry_picks.unwrap_or(false),
             mode,
             args.root && args.onto_name.is_some(),
@@ -1357,7 +1360,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             &db,
             upstream.as_ref(),
             &orig_head,
-            args.keep_empty,
+            keep_empty,
             args.reapply_cherry_picks.unwrap_or(false),
         )?;
         records
@@ -1456,7 +1459,9 @@ fn run_apply_backend(
         db,
         upstream,
         orig_head,
-        args.keep_empty,
+        // The apply backend drops begin-empty commits by default (git am skips
+        // empty patches); `--keep-empty` would have forced the merge backend.
+        args.keep_empty.unwrap_or(false),
         args.reapply_cherry_picks.unwrap_or(false),
     )?;
 

@@ -5477,7 +5477,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         [flag, key] if flag == "--sort" && key == "refname" => {
             print_branch_list(store, BranchListMode::Local)
         }
-        [flag] if branch_version_sort_value(flag).is_some() => {
+        [flag] if flag.starts_with("--sort=") && branch_version_sort_value(flag).is_some() => {
             let descending = branch_version_sort_value(flag).expect("guard checked branch sort value");
             print_branch_list_version_sorted(store, BranchListMode::Local, descending)
         }
@@ -5485,7 +5485,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             let descending = branch_version_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_version_sorted(store, BranchListMode::Local, descending)
         }
-        [flag] if branch_objectname_sort_value(flag).is_some() => {
+        [flag] if flag.starts_with("--sort=") && branch_objectname_sort_value(flag).is_some() => {
             let descending =
                 branch_objectname_sort_value(flag).expect("guard checked branch sort value");
             print_branch_list_objectname_sorted(store, BranchListMode::Local, descending)
@@ -5495,7 +5495,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 branch_objectname_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objectname_sorted(store, BranchListMode::Local, descending)
         }
-        [flag] if branch_objecttype_sort_value(flag).is_some() => {
+        [flag] if flag.starts_with("--sort=") && branch_objecttype_sort_value(flag).is_some() => {
             let descending =
                 branch_objecttype_sort_value(flag).expect("guard checked branch sort value");
             print_branch_list_objecttype_sorted(
@@ -5517,7 +5517,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 descending,
             )
         }
-        [flag] if branch_objectsize_sort_value(flag).is_some() => {
+        [flag] if flag.starts_with("--sort=") && branch_objectsize_sort_value(flag).is_some() => {
             let descending =
                 branch_objectsize_sort_value(flag).expect("guard checked branch sort value");
             print_branch_list_objectsize_sorted(
@@ -5539,7 +5539,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 descending,
             )
         }
-        [flag] if branch_date_sort_value(flag).is_some() => {
+        [flag] if flag.starts_with("--sort=") && branch_date_sort_value(flag).is_some() => {
             let (field, descending) =
                 branch_date_sort_value(flag).expect("guard checked branch sort value");
             print_branch_list_date_sorted(
@@ -5563,12 +5563,12 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
                 descending,
             )
         }
-        [flag] if branch_upstream_sort_value(flag).is_some() => {
+        [flag] if flag.starts_with("--sort=") && branch_upstream_sort_value(flag).is_some() => {
             let descending =
                 branch_upstream_sort_value(flag).expect("guard checked branch sort value");
             print_branch_list_upstream_sorted(git_dir, store, BranchListMode::Local, descending)
         }
-        [flag] if branch_push_sort_value(flag).is_some() => {
+        [flag] if flag.starts_with("--sort=") && branch_push_sort_value(flag).is_some() => {
             let descending = branch_push_sort_value(flag).expect("guard checked branch sort value");
             print_branch_list_push_sorted(git_dir, store, BranchListMode::Local, descending)
         }
