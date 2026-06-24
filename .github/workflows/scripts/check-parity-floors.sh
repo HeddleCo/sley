@@ -514,7 +514,7 @@ declare -A FLOOR=(
     [t3105-ls-tree-output.sh]=60
     # codex-wave-6: rebase porcelain t3400@18 / incompatible-options t3422@52.
     # wave-40 (rebase sequencer): t3400 19->30.
-    [t3400-rebase.sh]=30
+    [t3400-rebase.sh]=33
     [t3422-rebase-incompatible-options.sh]=52
     [t3403-rebase-skip.sh]=16
     # codex-wave-8 (rebase-i r2): squash/fixup conflict-resume cleanup, partial
@@ -522,11 +522,11 @@ declare -A FLOOR=(
     # cherry-pick error precedence. t3404 63->80. Neighbors held: t3400=19,
     # t3403=16, t3406=32, t3420=40; sequencer t3501/t3510/t3502 held.
     # wave-40 (rebase sequencer + apply -3 incidental): t3404 120->123.
-    [t3404-rebase-interactive.sh]=123
+    [t3404-rebase-interactive.sh]=127
     [t3406-rebase-message.sh]=32
-    [t3418-rebase-continue.sh]=12
+    [t3418-rebase-continue.sh]=24
     # wave-40 (rebase sequencer): t3420 40->41.
-    [t3420-rebase-autostash.sh]=41
+    [t3420-rebase-autostash.sh]=44
     [t5327-multi-pack-bitmaps-rev.sh]=314
     [t5332-multi-pack-reuse.sh]=9
     # wave-24 (2026-06-21): diff-various log-pickaxe 206->216, rm submodule-safety 69->81,
@@ -555,7 +555,7 @@ declare -A FLOOR=(
     # recov-wave (2026-06-20): diff whitespace --ignore-* modes 114->119 (guard t4013 +1->206).
     [t4015-diff-whitespace.sh]=129
     [t4018-diff-funcname.sh]=287
-    [t4124-apply-ws-rule.sh]=67
+    [t4124-apply-ws-rule.sh]=84
     [t4019-diff-wserror.sh]=19
     [t4034-diff-words.sh]=64
     [t5407-post-rewrite-hook.sh]=17
@@ -706,8 +706,8 @@ declare -A FLOOR=(
     # -C/-c message machinery), update-ref --stdin ref-transaction hook + git-faithful
     # error surface, sparse-checkout builtin + the sparse-index collapse/expand format.
     # NEW floors locking the gains (t1400 also bumped 232->238 above):
-    [t3415-rebase-autosquash.sh]=22
-    [t3437-rebase-fixup-options.sh]=7
+    [t3415-rebase-autosquash.sh]=24
+    [t3437-rebase-fixup-options.sh]=9
     [t1404-update-ref-errors.sh]=38
     [t1416-ref-transaction-hooks.sh]=7
     # codex-wave-9 (sparse-checkout engine): cone/non-cone + escaped-cone patterns,
@@ -781,7 +781,7 @@ declare -A FLOOR=(
     # same add/add G.t), so the historical "19" depended on a since-fixed silent
     # mis-merge. Restoring 19 needs custom `-s <strategy>` support (separate
     # feature), not a floor change.
-    [t3430-rebase-merges.sh]=18
+    [t3430-rebase-merges.sh]=34
     # wave-13 (2026-06-19, integ/wave13A onto f3eeb950): 6-slice batch, all
     # measured at the integ tip against one binary, cargo test --workspace green,
     # cross-guards held (t4014=202 t4013=191 t4205=110 t5505=126 t5520=75 t2007=2).
@@ -892,6 +892,7 @@ declare -A FLOOR=(
     [t2016-checkout-patch.sh]=4
     # wave-41 (apply engine round 2): t4108 3-way fallback 4->17.
     [t4108-apply-threeway.sh]=17
+    [t4117-apply-reject.sh]=8
     # wave-21 (2026-06-19, integ/wave21 onto 01421060): hard-tail, 4 disjoint slices. submodule
     # recursion in pull/am (t5572 34->40, t4255 1->17 — wired to the wave-20 worktree core;
     # t3426-rebase-submodule stayed 0/29, needs deeper sequencer/index gitlink work = future
@@ -1045,29 +1046,29 @@ declare -A FLOOR=(
     [t4120-apply-popt.sh]=12
     [t4128-apply-root.sh]=12
     [t4139-apply-escape.sh]=12
-    [t4135-apply-weird-filenames.sh]=18
-    [t4119-apply-config.sh]=8
+    [t4135-apply-weird-filenames.sh]=19
+    [t4119-apply-config.sh]=11
     # Lane B (rebase sequencer): --empty disposition, --root --onto, topology no-op,
     # copy-notes. New gate files: t3424=19 (empty, was 0), t3412=25 (root, full),
     # t3421=61 (topology). (t3400/t3404/t3420 raised in place above.)
     [t3424-rebase-empty.sh]=19
     [t3412-rebase-root.sh]=25
-    [t3421-rebase-topology-linear.sh]=61
+    [t3421-rebase-topology-linear.sh]=63
     # Lane C (am state machine): faithful clean_index abort/skip, unborn-branch,
     # --retry+option-override, am -i, rerere, --directory. New gate files:
     # t4151=20 (abort, was 0 -> full), t4257=4 (interactive, full), t4153=4, t4252=2.
     [t4151-am-abort.sh]=20
     [t4257-am-interactive.sh]=4
-    [t4153-am-resume-override-opts.sh]=4
-    [t4252-am-options.sh]=2
+    [t4153-am-resume-override-opts.sh]=5
+    [t4252-am-options.sh]=7
     # wave-41 (2026-06-24): apply engine round 2 — binary codec, 3-way fallback,
     # typechange, index/mode. New gate files: t4103=24 (binary, was 5 -> full),
     # t4114=12 (typechange, full), t4129=19 (samemode), t4111=4 (subdir).
     # (t4108 raised 4->17 in place above.)
     [t4103-apply-binary.sh]=24
     [t4114-apply-typechange.sh]=12
-    [t4129-apply-samemode.sh]=19
-    [t4111-apply-subdir.sh]=4
+    [t4129-apply-samemode.sh]=22
+    [t4111-apply-subdir.sh]=10
 )
 
 fail=0

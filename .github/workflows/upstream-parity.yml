@@ -197,6 +197,7 @@ jobs:
             t7060-wtstatus.sh
             t2016-checkout-patch.sh
             t4108-apply-threeway.sh
+            t4117-apply-reject.sh
             t5572-pull-submodule.sh
             t4255-am-submodule.sh
             t1502-rev-parse-parseopt.sh
