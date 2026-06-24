@@ -951,7 +951,11 @@ fn diff_files_entry_is_racy_clean_equivalent(
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Ok(false);
     }
-    if index_entry.size != diff_files_index_size(&metadata) {
+    // An entry whose cached stat was left zeroed (e.g. written by a merge or
+    // rebase without a stat refresh) is racily clean: its size is unreliable, so
+    // re-hash rather than trusting a size mismatch (git re-checks such entries).
+    let stat_zeroed = index_entry.mtime_seconds == 0 && index_entry.mtime_nanoseconds == 0;
+    if !stat_zeroed && index_entry.size != diff_files_index_size(&metadata) {
         return Ok(false);
     }
     let body = fs::read(&absolute)?;

@@ -80,6 +80,7 @@ struct RebaseArgs {
     fork_point: Option<bool>,
     reapply_cherry_picks: Option<bool>,
     update_refs: Option<bool>,
+    rerere_autoupdate: Option<bool>,
     rebase_merges: Option<RebaseMergesArg>,
     strategy: Option<String>,
     strategy_opts: Vec<String>,
@@ -129,6 +130,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
         fork_point: None,
         reapply_cherry_picks: None,
         update_refs: None,
+        rerere_autoupdate: None,
         rebase_merges: None,
         strategy: None,
         strategy_opts: Vec::new(),
@@ -280,7 +282,8 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
                 out.gpg_sign = None;
                 out.no_gpg_sign = true;
             }
-            "--rerere-autoupdate" | "--no-rerere-autoupdate" => {}
+            "--rerere-autoupdate" => out.rerere_autoupdate = Some(true),
+            "--no-rerere-autoupdate" => out.rerere_autoupdate = Some(false),
             "--allow-empty-message" => {}
             "--committer-date-is-author-date" => {
                 out.committer_date_is_author_date = true;
@@ -470,6 +473,7 @@ struct MachineOpts {
     no_gpg_sign: bool,
     strategy: Option<String>,
     strategy_opts: Vec<String>,
+    rerere_autoupdate: Option<bool>,
     head_name: Option<String>,
     onto: ObjectId,
     orig_head: ObjectId,
@@ -536,6 +540,14 @@ fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
             opts.strategy_opts.join("\n") + "\n",
         )?;
     }
+    match opts.rerere_autoupdate {
+        Some(true) => fs::write(dir.join("allow_rerere_autoupdate"), b"--rerere-autoupdate\n")?,
+        Some(false) => fs::write(
+            dir.join("allow_rerere_autoupdate"),
+            b"--no-rerere-autoupdate\n",
+        )?,
+        None => {}
+    }
     Ok(())
 }
 
@@ -564,6 +576,11 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
     let strategy_opts = fs::read_to_string(ctx.state_path("strategy_opts"))
         .map(|text| text.lines().map(str::to_string).collect())
         .unwrap_or_default();
+    let rerere_autoupdate = match seq::read_state_line(&ctx.git_dir, "allow_rerere_autoupdate") {
+        Some(line) if line.contains("--no-rerere-autoupdate") => Some(false),
+        Some(line) if line.contains("--rerere-autoupdate") => Some(true),
+        _ => None,
+    };
     Ok(MachineOpts {
         quiet: exists("quiet"),
         verbose: exists("verbose"),
@@ -578,6 +595,7 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
         no_gpg_sign: exists("no_gpg_sign"),
         strategy,
         strategy_opts,
+        rerere_autoupdate,
         head_name: if head_name.starts_with("refs/") {
             Some(head_name)
         } else {
@@ -1367,6 +1385,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         no_gpg_sign: args.no_gpg_sign,
         strategy: args.strategy.clone(),
         strategy_opts: args.strategy_opts.clone(),
+        rerere_autoupdate: args.rerere_autoupdate,
         head_name: head_name.clone(),
         onto,
         orig_head,
@@ -3912,6 +3931,7 @@ fn do_merge(
             println!("Auto-merging {display}");
             println!("CONFLICT (content): Merge conflict in {display}");
         }
+        let _ = commands::rerere::repo_rerere(&ctx.git_dir, ctx.format, opts.rerere_autoupdate);
         print_conflict_hints();
         if let Some(record) = &original {
             return stop_with_patch(ctx, db, opts, record, item, 1, false);
@@ -4419,6 +4439,11 @@ fn pick_one_commit(
             fs::write(ctx.git_dir.join("MERGE_MSG"), &merge_msg)?;
             fs::write(ctx.state_path("message"), &merge_msg)?;
         }
+
+        // Record the conflict in the rerere database and, if a resolution is
+        // known, replay it (staging it when rerere.autoUpdate / --rerere-
+        // autoupdate is in effect).
+        let _ = commands::rerere::repo_rerere(&ctx.git_dir, ctx.format, opts.rerere_autoupdate);
 
         eprintln!(
             "error: could not apply {}... {}",
@@ -5249,6 +5274,10 @@ fn machine_commit(
         ctx.reflog(commit.reflog_sub, Some(&subject))
     };
     detach_head_with_reflog(ctx, head, new_oid, reflog_message, committer)?;
+
+    // Record any rerere resolution for the just-committed conflict (matches
+    // git invoking rerere() on commit), so a later identical conflict replays.
+    let _ = commands::rerere::record_resolved_after_commit(&ctx.git_dir, ctx.format);
 
     // Post-commit cleanup.
     let _ = fs::remove_file(ctx.git_dir.join("CHERRY_PICK_HEAD"));
