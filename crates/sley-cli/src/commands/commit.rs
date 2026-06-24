@@ -4,7 +4,7 @@
 // descendant-privacy; see commands::stash for the rationale.
 use super::status::{
     StatusLongDisplay, SubmoduleIgnoreResolver, apply_submodule_ignore, build_status_long_sink,
-    commit_comment_string, print_status_long, status_comment_prefix,
+    commit_comment_string, print_status_long, resolve_status_rename_config, status_comment_prefix,
     status_entries_have_index_changes, status_submodule_summary,
 };
 use crate::*;
@@ -2180,6 +2180,9 @@ fn cmd_commit_long_status_preview(
         comment_prefix: status_comment_prefix(&config),
         submodule_summary,
         sparse_footer: None,
+        // `commit --dry-run` has no `-M`/`--no-renames`; rename detection comes
+        // from `status.renames`/`diff.renames` config alone.
+        rename_config: resolve_status_rename_config(&config, None, None),
     };
     print_status_long(&git_dir, format, entries, &display)?;
     if committable {
@@ -3098,6 +3101,7 @@ fn render_commit_template_status(
         comment_prefix: Some(comment_char.to_string()),
         submodule_summary,
         sparse_footer: None,
+        rename_config: resolve_status_rename_config(&config, None, None),
     };
     let sink = build_status_long_sink(git_dir, format, entries, &display)?;
     let mut buf: Vec<u8> = Vec::new();

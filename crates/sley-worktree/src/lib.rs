@@ -19012,9 +19012,20 @@ impl WorktreeEntriesWalk<'_> {
 
     fn should_record_tracked_entry(&self, git_path: &[u8], entry: &TrackedEntry) -> bool {
         self.record_clean_tracked
+            || self.is_intent_to_add(git_path)
             || self
                 .tracked_entry_for(git_path)
                 .is_none_or(|tracked| tracked != *entry)
+    }
+
+    /// An intent-to-add (`git add -N`) entry must always be recorded into the
+    /// worktree snapshot: even when its bytes match the empty-blob placeholder,
+    /// status reports it as worktree-added (`.A`), so it can never be folded
+    /// away as a clean match.
+    fn is_intent_to_add(&self, git_path: &[u8]) -> bool {
+        self.stat_cache
+            .and_then(|cache| cache.index_entry(git_path))
+            .is_some_and(IndexEntry::is_intent_to_add)
     }
 }
 
@@ -19167,7 +19178,7 @@ fn collect_worktree_entries(
                 .and_then(|cache| cache.reuse_tracked_entry(&git_path, &metadata))
             {
                 context.mark_tracked_present(&git_path);
-                if context.record_clean_tracked {
+                if context.record_clean_tracked || context.is_intent_to_add(&git_path) {
                     context.entries.insert(git_path, tracked);
                 }
                 continue;

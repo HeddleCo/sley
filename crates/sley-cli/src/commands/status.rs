@@ -30,7 +30,11 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     let mut column_untracked = false;
     let mut ahead_behind = true;
     let mut explicit_ahead_behind = false;
-    let mut detect_renames = true;
+    // `--no-renames` / `--renames` (Some(true)/Some(false)) and
+    // `-M`/`--find-renames[=<n>]` (Some(optional-score)); resolved against
+    // `status.renames`/`diff.renames` config after the parse loop.
+    let mut cli_no_renames: Option<bool> = None;
+    let mut cli_rename_score: Option<Option<String>> = None;
     // `git status -v` verbosity: 0 (none), 1 (append the staged HEAD-vs-index
     // diff), 2+ (also append the index-vs-worktree diff). `-vv` and repeated
     // `-v` accumulate; `--no-verbose` resets to 0 (wt-status verbose level).
@@ -93,6 +97,18 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 porcelain_v2 = false;
                 explicit_long = false;
                 untracked_mode = sley_worktree::StatusUntrackedMode::All;
+                explicit_untracked = true;
+            }
+            // `-s` bundled with `-u<mode>` (e.g. `-suno`): in a single-dash
+            // cluster, `-u` consumes the remainder of the cluster as its mode
+            // argument, so `-suno` is `-s -u no`.
+            value if value.starts_with("-su") && value.len() > 3 => {
+                short = true;
+                explicit_short = true;
+                porcelain_v1 = false;
+                porcelain_v2 = false;
+                explicit_long = false;
+                untracked_mode = parse_status_untracked_mode(&value[3..])?;
                 explicit_untracked = true;
             }
             "--no-short" => {
@@ -161,8 +177,14 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             }
             "-v" | "--verbose" => verbose = verbose.saturating_add(1),
             "--no-verbose" => verbose = 0,
-            "--no-renames" => detect_renames = false,
-            "--renames" | "--find-renames" => detect_renames = true,
+            "--no-renames" => cli_no_renames = Some(true),
+            "--renames" => cli_no_renames = Some(false),
+            "--find-renames" => cli_rename_score = Some(None),
+            value if value.starts_with("--find-renames=") => {
+                let rest = &value["--find-renames=".len()..];
+                let rest = rest.strip_prefix('=').unwrap_or(rest);
+                cli_rename_score = Some(Some(rest.to_string()));
+            }
             "--column"
             | "--column="
             | "--column=auto"
@@ -206,9 +228,13 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             }
             "--show-stash" => show_stash = true,
             "--no-show-stash" => show_stash = false,
-            "-M" => detect_renames = true,
-            value if value.starts_with("-M") && value.len() > 2 => detect_renames = true,
-            value if value.starts_with("--find-renames=") => detect_renames = true,
+            "-M" => cli_rename_score = Some(None),
+            value if value.starts_with("-M") && value.len() > 2 => {
+                // `-M<n>`; a leading `=` after `-M` is stripped (opt_parse_rename_score).
+                let rest = &value[2..];
+                let rest = rest.strip_prefix('=').unwrap_or(rest);
+                cli_rename_score = Some(Some(rest.to_string()));
+            }
             value if value.starts_with("--short=") => {
                 return status_option_takes_no_value_error("short");
             }
@@ -347,6 +373,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
         .get_bool("status", None, "relativePaths")
         .unwrap_or(true);
     let comment_prefix = status_comment_prefix(&config);
+    let rename_config = resolve_status_rename_config(&config, cli_no_renames, cli_rename_score);
     // status needs a work tree; emit git's diagnostic (bare / no-worktree, or
     // the core.bare+core.worktree conflict) when one isn't available.
     let worktree_root = require_work_tree(&git_dir)?;
@@ -373,7 +400,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
                 z,
                 porcelain_v1,
                 relative_paths,
-                detect_renames,
+                rename_config,
             },
         )?;
         if !pathspec.has_filters() && !show_ignored && explicit_untracked {
@@ -432,7 +459,17 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
         }
     }
     if porcelain_v2 {
-        print_status_porcelain_v2(&git_dir, format, &config, entries, branch, ahead_behind, z)?;
+        print_status_porcelain_v2(
+            &git_dir,
+            format,
+            &config,
+            entries,
+            branch,
+            ahead_behind,
+            z,
+            show_stash,
+            &rename_config,
+        )?;
     } else if z {
         let mut stdout = io::stdout().lock();
         if branch {
@@ -479,6 +516,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             comment_prefix,
             submodule_summary,
             sparse_footer: status_sparse_footer(&git_dir, format)?,
+            rename_config,
         };
         print_status_long_with_column(&git_dir, format, entries, &display, column_untracked)?;
         // `git status -v` appends the staged diff (HEAD vs index). `-vv` instead
@@ -541,6 +579,134 @@ fn status_usage() -> Result<()> {
     Err(GitError::Exit(129))
 }
 
+/// What kind of rename/copy detection `git status` performs, mirroring
+/// `diff_options.detect_rename` (`DIFF_DETECT_RENAME` / `DIFF_DETECT_COPY`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusRenameDetect {
+    Off,
+    Renames,
+    Copies,
+}
+
+/// Resolved `status.renames` / `diff.renames` / `-M` / `--no-renames` settings.
+/// Thresholds are similarity percentages (0..=100), matching `blob_similarity`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StatusRenameConfig {
+    pub(crate) detect: StatusRenameDetect,
+    pub(crate) rename_threshold: u8,
+    pub(crate) copy_threshold: u8,
+}
+
+impl StatusRenameConfig {
+    fn enabled(&self) -> bool {
+        self.detect != StatusRenameDetect::Off
+    }
+}
+
+/// git's default `-M`/`-C` similarity floor (`DEFAULT_RENAME_SCORE` = 50%).
+const STATUS_DEFAULT_RENAME_THRESHOLD: u8 = 50;
+
+/// `git_config_rename`: map a `status.renames`/`diff.renames` value to a
+/// `detect_rename` code (0 = off, 1 = renames, 2 = copies). A bare key with no
+/// value means renames-on.
+fn status_config_rename_value(value: Option<&str>) -> i8 {
+    match value {
+        None => 1,
+        Some(v) => {
+            let lower = v.to_ascii_lowercase();
+            if lower == "copies" || lower == "copy" {
+                2
+            } else if parse_git_config_bool(v) {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// `git config_bool`-style truthiness for rename config values.
+fn parse_git_config_bool(value: &str) -> bool {
+    !matches!(
+        value.to_ascii_lowercase().as_str(),
+        "false" | "no" | "off" | "0" | ""
+    )
+}
+
+/// `parse_rename_score`, expressed as a similarity percentage (0..=100). Accepts
+/// the `<n>`, `<n>%`, and `.<frac>` forms git's diff option parser does.
+fn parse_status_rename_score_percent(arg: &str) -> u8 {
+    let mut num: u64 = 0;
+    let mut scale: u64 = 1;
+    let mut dot = false;
+    for ch in arg.bytes() {
+        match ch {
+            b'.' if !dot => {
+                scale = 1;
+                dot = true;
+            }
+            b'%' => {
+                scale = if dot { scale * 100 } else { 100 };
+                break;
+            }
+            b'0'..=b'9' => {
+                if scale < 100_000 {
+                    scale *= 10;
+                    num = num * 10 + u64::from(ch - b'0');
+                }
+            }
+            _ => break,
+        }
+    }
+    if num >= scale {
+        100
+    } else {
+        (100 * num / scale) as u8
+    }
+}
+
+/// Resolve `git status` rename detection from config + CLI, mirroring
+/// builtin/commit.c: `diff.renames` is a default (only applied when unset),
+/// `status.renames` overrides it, then `--no-renames` / `--renames` and
+/// `-M`/`--find-renames[=<n>]` apply on top.
+pub(crate) fn resolve_status_rename_config(
+    config: &GitConfig,
+    cli_no_renames: Option<bool>,
+    cli_rename_score: Option<Option<String>>,
+) -> StatusRenameConfig {
+    let mut detect: i8 = -1;
+    if let Some(v) = config.get("diff", None, "renames")
+        && detect == -1
+    {
+        detect = status_config_rename_value(Some(v));
+    }
+    if let Some(v) = config.get("status", None, "renames") {
+        detect = status_config_rename_value(Some(v));
+    }
+    let mut threshold = STATUS_DEFAULT_RENAME_THRESHOLD;
+    if let Some(no) = cli_no_renames {
+        detect = if no { 0 } else { 1 };
+    }
+    if let Some(score) = cli_rename_score {
+        if detect < 1 {
+            detect = 1;
+        }
+        if let Some(score) = score {
+            threshold = parse_status_rename_score_percent(&score);
+        }
+    }
+    let detect = match detect {
+        0 => StatusRenameDetect::Off,
+        2 => StatusRenameDetect::Copies,
+        _ => StatusRenameDetect::Renames,
+    };
+    StatusRenameConfig {
+        detect,
+        rename_threshold: threshold,
+        copy_threshold: threshold,
+    }
+}
+
 /// Display knobs for the long ("porcelain off") `git status` output, derived
 /// from the command line plus `status.*` / `advice.*` config.
 pub(crate) struct StatusLongDisplay {
@@ -564,6 +730,9 @@ pub(crate) struct StatusLongDisplay {
     /// formats. A sparse index uses Git's terse wording; a full sparse checkout
     /// reports the tracked-file percentage present in the worktree.
     pub(crate) sparse_footer: Option<StatusSparseFooter>,
+    /// Resolved `status.renames`/`diff.renames`/`-M` rename detection for the
+    /// "Changes to be committed" section.
+    pub(crate) rename_config: StatusRenameConfig,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -597,7 +766,7 @@ struct StatusShortStreamDisplay {
     z: bool,
     porcelain_v1: bool,
     relative_paths: bool,
-    detect_renames: bool,
+    rename_config: StatusRenameConfig,
 }
 
 fn print_status_short_stream(
@@ -659,7 +828,7 @@ fn print_status_short_stream(
         );
     }
     let mut ignore_resolver = None;
-    if display.detect_renames {
+    if display.rename_config.enabled() {
         let collection_options = status_collection_options_for_pathspec(options, pathspec);
         let mut entries = crate::collect_short_status_with_options(
             worktree_root,
@@ -680,7 +849,9 @@ fn print_status_short_stream(
             )?,
         );
         entries = status_collapse_pathspec_untracked_entries(entries, options, pathspec);
-        for entry in status_entries_with_exact_renames(worktree_root, git_dir, format, entries)? {
+        for entry in
+            status_entries_with_renames(worktree_root, git_dir, format, entries, &display.rename_config)?
+        {
             let mut entry = entry;
             if !display.porcelain_v1 && display.relative_paths {
                 entry.entry.path = pathspec.display(&entry.entry.path);
@@ -1006,6 +1177,188 @@ fn status_entries_with_exact_renames(
     Ok(output)
 }
 
+/// Resolve rename/copy detection for `git status` output. With detection off,
+/// every entry passes through unpaired. Otherwise exact-OID renames are detected
+/// first (always scored 100), then inexact (content-similarity) renames and —
+/// when `status.renames=copies` — copies are detected among the leftovers.
+fn status_entries_with_renames(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    entries: Vec<sley_worktree::ShortStatusEntry>,
+    rename_config: &StatusRenameConfig,
+) -> Result<Vec<StatusOutputEntry>> {
+    if !rename_config.enabled() {
+        return Ok(entries
+            .into_iter()
+            .map(|entry| StatusOutputEntry {
+                entry,
+                rename_from: None,
+            })
+            .collect());
+    }
+    let mut output = status_entries_with_exact_renames(worktree_root, git_dir, format, entries)?;
+    status_apply_inexact_staged_renames(git_dir, format, &mut output, rename_config)?;
+    Ok(output)
+}
+
+/// Inexact rename/copy detection over the HEAD-vs-index (staged) changes that the
+/// exact pass left unpaired. Mirrors diffcore-rename's similarity matching:
+/// staged adds are paired with the most-similar staged delete at or above the
+/// rename threshold; under copy detection, any remaining add is also matched to
+/// its most-similar source (renames consume their source delete, copies do not).
+/// Only the clean-worktree staged columns are considered — the cases the t7525
+/// rename suite and `git diff -M` parity exercise.
+fn status_apply_inexact_staged_renames(
+    git_dir: &Path,
+    format: ObjectFormat,
+    output: &mut Vec<StatusOutputEntry>,
+    rename_config: &StatusRenameConfig,
+) -> Result<()> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+
+    fn read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Option<Vec<u8>> {
+        db.read_object(oid).ok().map(|obj| obj.body.clone())
+    }
+
+    let is_staged_add = |entry: &StatusOutputEntry| {
+        entry.rename_from.is_none()
+            && entry.entry.index == b'A'
+            && entry.entry.worktree == b' '
+            && entry.entry.index_oid.is_some()
+            && !entry.entry.index_mode.is_some_and(sley_index::is_gitlink)
+    };
+    let is_staged_delete = |entry: &StatusOutputEntry| {
+        entry.rename_from.is_none()
+            && entry.entry.index == b'D'
+            && entry.entry.worktree == b' '
+            && entry.entry.head_oid.is_some()
+            && !entry.entry.head_mode.is_some_and(sley_index::is_gitlink)
+    };
+
+    let source_indices: Vec<usize> = output
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| is_staged_delete(e))
+        .map(|(i, _)| i)
+        .collect();
+    let target_indices: Vec<usize> = output
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| is_staged_add(e))
+        .map(|(i, _)| i)
+        .collect();
+    if source_indices.is_empty() || target_indices.is_empty() {
+        return Ok(());
+    }
+
+    // Cache source/target blob bytes once.
+    let source_blobs: Vec<Option<Vec<u8>>> = source_indices
+        .iter()
+        .map(|&i| output[i].entry.head_oid.and_then(|oid| read_blob(&db, &oid)))
+        .collect();
+    let target_blobs: Vec<Option<Vec<u8>>> = target_indices
+        .iter()
+        .map(|&i| output[i].entry.index_oid.and_then(|oid| read_blob(&db, &oid)))
+        .collect();
+
+    // Score every (target, source) pair once.
+    let mut pairs: Vec<(u8, usize, usize)> = Vec::new();
+    for (ti, target_blob) in target_blobs.iter().enumerate() {
+        let Some(target_blob) = target_blob else {
+            continue;
+        };
+        for (si, source_blob) in source_blobs.iter().enumerate() {
+            let Some(source_blob) = source_blob else {
+                continue;
+            };
+            let score = sley_diff_merge::blob_similarity(source_blob, target_blob);
+            pairs.push((score, ti, si));
+        }
+    }
+    // Highest similarity first; diffcore-rename prefers the best alignment.
+    pairs.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let detect_copies = rename_config.detect == StatusRenameDetect::Copies;
+    let mut target_paired: Vec<Option<(usize, bool)>> = vec![None; target_indices.len()];
+
+    if detect_copies {
+        // Copy detection: each target takes its most-similar source (sources may
+        // be shared). Then, for every source used by ≥1 target, the LAST target
+        // in pathname order is the rename and the earlier ones are copies —
+        // diffcore's `--p->one->rename_used > 0 ? COPIED : RENAMED` resolution.
+        for &(score, ti, si) in &pairs {
+            if score < rename_config.copy_threshold {
+                break;
+            }
+            if target_paired[ti].is_some() {
+                continue;
+            }
+            target_paired[ti] = Some((si, true));
+        }
+        let mut rename_target_for_source = vec![None; source_indices.len()];
+        for (ti, pairing) in target_paired.iter().enumerate() {
+            if let Some((si, _)) = pairing {
+                let slot = &mut rename_target_for_source[*si];
+                if slot.is_none_or(|prev| ti > prev) {
+                    *slot = Some(ti);
+                }
+            }
+        }
+        for ti in rename_target_for_source.into_iter().flatten() {
+            if let Some((si, _)) = target_paired[ti] {
+                target_paired[ti] = Some((si, false));
+            }
+        }
+    } else {
+        // Rename-only: each source delete renames to at most one target, going to
+        // the highest-similarity pairing first (diffcore's score-sorted matrix).
+        let mut source_renamed = vec![false; source_indices.len()];
+        for &(score, ti, si) in &pairs {
+            if score < rename_config.rename_threshold {
+                break;
+            }
+            if target_paired[ti].is_some() || source_renamed[si] {
+                continue;
+            }
+            target_paired[ti] = Some((si, false));
+            source_renamed[si] = true;
+        }
+    }
+
+    // Apply: relabel each paired add, and mark renamed sources for removal.
+    let mut remove = vec![false; output.len()];
+    for (ti, pairing) in target_paired.iter().enumerate() {
+        let Some((si, is_copy)) = *pairing else {
+            continue;
+        };
+        let target_idx = target_indices[ti];
+        let source_idx = source_indices[si];
+        let source = &output[source_idx].entry;
+        let source_path = source.path.clone();
+        let source_head_mode = source.head_mode;
+        let source_head_oid = source.head_oid;
+        let target = &mut output[target_idx];
+        target.entry.index = if is_copy { b'C' } else { b'R' };
+        target.entry.head_mode = source_head_mode;
+        target.entry.head_oid = source_head_oid;
+        target.rename_from = Some(source_path);
+        if !is_copy {
+            remove[source_idx] = true;
+        }
+    }
+
+    if remove.iter().any(|&r| r) {
+        let mut idx = 0;
+        output.retain(|_| {
+            let keep = !remove[idx];
+            idx += 1;
+            keep
+        });
+    }
+    Ok(())
+}
+
 fn status_entries_are_exact_rename(
     deleted: &sley_worktree::ShortStatusEntry,
     added: &sley_worktree::ShortStatusEntry,
@@ -1253,6 +1606,8 @@ fn print_status_porcelain_v2(
     branch: bool,
     ahead_behind: bool,
     z: bool,
+    show_stash: bool,
+    rename_config: &StatusRenameConfig,
 ) -> Result<()> {
     let mut stdout = io::stdout().lock();
     let separator = if z { b'\0' } else { b'\n' };
@@ -1262,10 +1617,22 @@ fn print_status_porcelain_v2(
             stdout.write_all(&[separator])?;
         }
     }
+    // `# stash <count>` follows the branch headers when `--show-stash` is set
+    // and at least one stash entry exists (wt_porcelain_v2_print_stash).
+    if show_stash {
+        let stash_count = status_stash_count(git_dir, format)?;
+        if stash_count > 0 {
+            write!(stdout, "# stash {stash_count}")?;
+            stdout.write_all(&[separator])?;
+        }
+    }
     let zero = zero_oid(format)?;
-    let entries = match worktree_root_for_git_dir(git_dir) {
-        Ok(worktree_root) => status_entries_with_exact_renames(&worktree_root, git_dir, format, entries)?,
-        Err(_) => entries
+    let worktree_root = worktree_root_for_git_dir(git_dir).ok();
+    let entries = match worktree_root.as_ref() {
+        Some(worktree_root) => {
+            status_entries_with_renames(worktree_root, git_dir, format, entries, rename_config)?
+        }
+        None => entries
             .into_iter()
             .map(|entry| StatusOutputEntry {
                 entry,
@@ -1273,8 +1640,52 @@ fn print_status_porcelain_v2(
             })
             .collect(),
     };
+    // Conflicted paths render as `u` records, read straight from the index
+    // stages (the short-status entries carry no per-stage modes/oids). These
+    // paths are skipped in the 1/2/?/! stream below.
+    let unmerged = match worktree_root.as_ref() {
+        Some(worktree_root) => {
+            let trust_filemode = config.get_bool("core", None, "fileMode").unwrap_or(true);
+            status_unmerged_v2_records(git_dir, worktree_root, format, trust_filemode)?
+        }
+        None => BTreeMap::new(),
+    };
+    let mut emitted_unmerged: BTreeSet<Vec<u8>> = BTreeSet::new();
     for output in entries {
         let entry = output.entry;
+        if let Some(record) = unmerged.get(&entry.path) {
+            if emitted_unmerged.insert(entry.path.clone()) {
+                let submodule_token = if record
+                    .stage_modes
+                    .iter()
+                    .any(|&mode| sley_index::is_gitlink(mode))
+                {
+                    "S..."
+                } else {
+                    "N..."
+                };
+                write!(
+                    stdout,
+                    "u {} {} {:06o} {:06o} {:06o} {:06o} {} {} {} ",
+                    status_porcelain_v2_unmerged_key(record.stagemask),
+                    submodule_token,
+                    record.stage_modes[0],
+                    record.stage_modes[1],
+                    record.stage_modes[2],
+                    record.worktree_mode,
+                    record.stage_oids[0].to_hex(),
+                    record.stage_oids[1].to_hex(),
+                    record.stage_oids[2].to_hex(),
+                )?;
+                if z {
+                    stdout.write_all(&entry.path)?;
+                } else {
+                    stdout.write_all(status_quote_path(&entry.path, false).as_bytes())?;
+                }
+                stdout.write_all(&[separator])?;
+            }
+            continue;
+        }
         if entry.index == b'!' && entry.worktree == b'!' {
             stdout.write_all(b"! ")?;
             if z {
@@ -2142,6 +2553,14 @@ impl StatusUnmergedPath {
     fn has_index_side(&self) -> bool {
         self.stages.contains(&2)
     }
+
+    /// Upstream `stagemask`: bit 0 = stage 1 (base), bit 1 = stage 2 (ours),
+    /// bit 2 = stage 3 (theirs).
+    fn stagemask(&self) -> u8 {
+        self.stages
+            .iter()
+            .fold(0u8, |mask, &stage| mask | (1 << (stage - 1)))
+    }
 }
 
 fn status_unmerged_paths(git_dir: &Path, format: ObjectFormat) -> Result<Vec<StatusUnmergedPath>> {
@@ -2168,6 +2587,92 @@ fn status_unmerged_paths(git_dir: &Path, format: ObjectFormat) -> Result<Vec<Sta
         .collect())
 }
 
+/// Per-path conflict data for the porcelain v2 `u` record: stage 1/2/3 modes and
+/// oids (0/zero when a stage is absent), the worktree file mode, and the
+/// stagemask that selects the `DD`/`AU`/… key.
+struct StatusUnmergedV2 {
+    stagemask: u8,
+    stage_modes: [u32; 3],
+    stage_oids: [ObjectId; 3],
+    worktree_mode: u32,
+}
+
+fn status_unmerged_v2_records(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    trust_filemode: bool,
+) -> Result<BTreeMap<Vec<u8>, StatusUnmergedV2>> {
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(BTreeMap::new());
+    };
+    let zero = ObjectId::null(format);
+    let mut by_path: BTreeMap<Vec<u8>, StatusUnmergedV2> = BTreeMap::new();
+    for entry in index.entries {
+        let stage = index_entry_stage(&entry);
+        if stage == 0 {
+            continue;
+        }
+        let record = by_path
+            .entry(entry.path.into_bytes())
+            .or_insert_with(|| StatusUnmergedV2 {
+                stagemask: 0,
+                stage_modes: [0; 3],
+                stage_oids: [zero; 3],
+                worktree_mode: 0,
+            });
+        let slot = (stage - 1) as usize;
+        record.stage_modes[slot] = entry.mode;
+        record.stage_oids[slot] = entry.oid;
+        record.stagemask |= 1 << slot;
+    }
+    for (path, record) in &mut by_path {
+        record.worktree_mode =
+            status_worktree_blob_mode(worktree_root, path, trust_filemode)?.unwrap_or(0);
+    }
+    Ok(by_path)
+}
+
+/// The canonical worktree blob mode (`100644`/`100755`/`120000`) for `path`, or
+/// `None` when it is absent or a directory. Honors `core.fileMode`: with the
+/// executable bit untrusted, a regular file always reports `100644`.
+fn status_worktree_blob_mode(
+    worktree_root: &Path,
+    path: &[u8],
+    trust_filemode: bool,
+) -> Result<Option<u32>> {
+    let absolute = worktree_root.join(repo_path_to_path(path));
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(Some(0o120000));
+    }
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = trust_filemode && (metadata.permissions().mode() & 0o111 != 0);
+        Ok(Some(if executable { 0o100755 } else { 0o100644 }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = trust_filemode;
+        Ok(Some(0o100644))
+    }
+}
+
 fn status_unmerged_label(stages: &BTreeSet<u16>) -> &'static str {
     match (
         stages.contains(&1),
@@ -2177,6 +2682,7 @@ fn status_unmerged_label(stages: &BTreeSet<u16>) -> &'static str {
         (true, true, true) => "both modified:",
         (true, true, false) => "deleted by them:",
         (true, false, true) => "deleted by us:",
+        (true, false, false) => "both deleted:",
         (false, true, true) => "both added:",
         (false, true, false) => "added by us:",
         (false, false, true) => "added by them:",
@@ -2556,6 +3062,7 @@ fn build_status_long_sink_inner(
         comment_prefix,
         submodule_summary,
         sparse_footer,
+        rename_config,
     } = display;
     let commit_preview = *commit_preview;
     let show_stash = *show_stash;
@@ -2586,7 +3093,9 @@ fn build_status_long_sink_inner(
     let unmerged_paths: BTreeSet<Vec<u8>> =
         unmerged.iter().map(|entry| entry.path.clone()).collect();
     let entries = match worktree_root_for_git_dir(git_dir) {
-        Ok(worktree_root) => status_entries_with_exact_renames(&worktree_root, git_dir, format, entries)?,
+        Ok(worktree_root) => {
+            status_entries_with_renames(&worktree_root, git_dir, format, entries, rename_config)?
+        }
         Err(_) => entries
             .into_iter()
             .map(|entry| StatusOutputEntry {
@@ -2711,7 +3220,33 @@ fn build_status_long_sink_inner(
         {
             sink.hint("  (use \"git restore --staged <file>...\" to unstage)");
         }
-        sink.hint("  (use \"git add <file>...\" to mark resolution)");
+        // Mark-resolution hint depends on the mix of conflict kinds present
+        // (wt_longstatus_print_unmerged_header): stagemask 1 = both deleted,
+        // 3/5 = delete/modify, anything else = a "not-deleted" conflict.
+        let mut both_deleted = false;
+        let mut del_mod_conflict = false;
+        let mut not_deleted = false;
+        for entry in &unmerged {
+            match entry.stagemask() {
+                0 => {}
+                1 => both_deleted = true,
+                3 | 5 => del_mod_conflict = true,
+                _ => not_deleted = true,
+            }
+        }
+        if !both_deleted {
+            if !del_mod_conflict {
+                sink.hint("  (use \"git add <file>...\" to mark resolution)");
+            } else {
+                sink.hint(
+                    "  (use \"git add/rm <file>...\" as appropriate to mark resolution)",
+                );
+            }
+        } else if !del_mod_conflict && !not_deleted {
+            sink.hint("  (use \"git rm <file>...\" to mark resolution)");
+        } else {
+            sink.hint("  (use \"git add/rm <file>...\" as appropriate to mark resolution)");
+        }
         for entry in unmerged {
             sink.line(format!(
                 "\t{:<17}{}",
@@ -3378,20 +3913,53 @@ fn status_long_change_label(code: u8) -> Option<&'static str> {
         b'M' => Some("modified:"),
         b'D' => Some("deleted:"),
         b'R' => Some("renamed:"),
+        b'C' => Some("copied:"),
         _ => None,
     }
+}
+
+/// A short-status code pair identifies an unmerged (conflicted) path. Upstream's
+/// HEAD-vs-index diff records these as `DIFF_STATUS_UNMERGED` and they do NOT set
+/// `s->committable` — so `commit --dry-run` must not treat the `D`/`A` half of a
+/// conflict pair as a real staged change.
+fn status_short_is_unmerged(index: u8, worktree: u8) -> bool {
+    matches!(
+        (index, worktree),
+        (b'D', b'D')
+            | (b'A', b'U')
+            | (b'U', b'D')
+            | (b'U', b'A')
+            | (b'D', b'U')
+            | (b'A', b'A')
+            | (b'U', b'U')
+    )
 }
 
 pub(crate) fn status_entries_have_index_changes(
     entries: &[sley_worktree::ShortStatusEntry],
 ) -> bool {
-    entries
-        .iter()
-        .any(|entry| status_long_change_label(entry.index).is_some())
+    entries.iter().any(|entry| {
+        !status_short_is_unmerged(entry.index, entry.worktree)
+            && status_long_change_label(entry.index).is_some()
+    })
 }
 
 fn status_porcelain_v2_code(code: u8) -> char {
     if code == b' ' { '.' } else { code as char }
+}
+
+/// Map an unmerged stagemask to the porcelain v2 `u`-record key
+/// (wt_porcelain_v2_print_unmerged_entry).
+fn status_porcelain_v2_unmerged_key(stagemask: u8) -> &'static str {
+    match stagemask {
+        1 => "DD",
+        2 => "AU",
+        3 => "UD",
+        4 => "UA",
+        5 => "DU",
+        6 => "AA",
+        _ => "UU",
+    }
 }
 
 fn status_porcelain_v2_branch_headers(
