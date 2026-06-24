@@ -3362,6 +3362,10 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let mut p_value_known = false;
     let mut directory_root: Vec<u8> = Vec::new();
     let mut unsafe_paths = false;
+    let mut unidiff_zero = false;
+    // Whether `--whitespace=` was given on the command line; when not, the
+    // default action comes from `apply.whitespace` config (git's precedence).
+    let mut ws_action_explicit = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -3381,6 +3385,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             | "--ignore-space-change" => {}
             "--unsafe-paths" => unsafe_paths = true,
             "--no-unsafe-paths" => unsafe_paths = false,
+            "--unidiff-zero" => unidiff_zero = true,
             "-R" | "--reverse" => {
                 return Err(GitError::Unsupported(
                     "apply --reverse is not supported yet".into(),
@@ -3405,6 +3410,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             "--whitespace" => {
                 if let Some(value) = iter.next() {
                     ws_action = parse_ws_action(value)?;
+                    ws_action_explicit = true;
                 }
             }
             "-p" => {
@@ -3429,6 +3435,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             }
             value if let Some(rest) = value.strip_prefix("--whitespace=") => {
                 ws_action = parse_ws_action(rest)?;
+                ws_action_explicit = true;
             }
             value if let Some(path) = value.strip_prefix("--build-fake-ancestor=") => {
                 build_fake_ancestor = Some(path.to_string());
@@ -3454,6 +3461,14 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(&git_dir)?;
+    // `apply.whitespace` config supplies the default whitespace action when the
+    // command line did not give an explicit `--whitespace=`.
+    if !ws_action_explicit
+        && let Some(value) = read_repo_config(&git_dir)?.get("apply", None, "whitespace")
+        && let Ok(action) = parse_ws_action(value)
+    {
+        ws_action = action;
+    }
     let path_options = sley_diff_merge::PatchPathOptions {
         p_value,
         p_value_known,
@@ -3570,9 +3585,12 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
 
     // Phase 1: compute every result first (git applies a patch atomically).
     let mut actions = Vec::new();
+    let apply_file_options = sley_diff_merge::ApplyFileOptions { unidiff_zero };
     for patch in &patches {
         let base = read_patch_base(&worktree_root, patch)?;
-        let content = match sley_diff_merge::apply_file_patch(&base, patch) {
+        let outcome =
+            sley_diff_merge::apply_file_patch_with_options(&base, patch, &apply_file_options);
+        let content = match outcome {
             sley_diff_merge::ApplyOutcome::Applied(content) => content,
             sley_diff_merge::ApplyOutcome::Rejected => {
                 let name = patch

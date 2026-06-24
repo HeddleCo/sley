@@ -4271,6 +4271,24 @@ pub fn parse_unified_patch_with_options(
 /// handled byte-accurately. Clean exact-position applies are byte-identical to
 /// the previous behaviour.
 pub fn apply_file_patch(base: &[u8], patch: &FilePatch) -> ApplyOutcome {
+    apply_file_patch_with_options(base, patch, &ApplyFileOptions::default())
+}
+
+/// Options for [`apply_file_patch_with_options`], mirroring the `git apply`
+/// flags that change fragment placement.
+#[derive(Clone, Default)]
+pub struct ApplyFileOptions {
+    /// `--unidiff-zero`: trust the line numbers of context-free hunks instead of
+    /// forcing them to anchor at the file's beginning/end.
+    pub unidiff_zero: bool,
+}
+
+/// Apply a single-file patch with explicit fragment-placement options.
+pub fn apply_file_patch_with_options(
+    base: &[u8],
+    patch: &FilePatch,
+    options: &ApplyFileOptions,
+) -> ApplyOutcome {
     // A pure deletion with no hunks yields an empty file.
     if patch.is_delete && patch.hunks.is_empty() {
         return ApplyOutcome::Applied(Vec::new());
@@ -4289,7 +4307,7 @@ pub fn apply_file_patch(base: &[u8], patch: &FilePatch) -> ApplyOutcome {
     let mut running_offset: isize = 0;
 
     for hunk in &patch.hunks {
-        match apply_one_hunk(&mut image, hunk, running_offset) {
+        match apply_one_hunk(&mut image, hunk, running_offset, options.unidiff_zero) {
             Some(drift) => running_offset += drift,
             None => return ApplyOutcome::Rejected,
         }
@@ -4305,7 +4323,12 @@ pub fn apply_file_patch(base: &[u8], patch: &FilePatch) -> ApplyOutcome {
 /// Faithful to git's `apply_one_fragment`: build preimage/postimage, try the
 /// full preimage at progressively-reduced context, and on a match replace the
 /// matched preimage region with the postimage.
-fn apply_one_hunk(image: &mut Vec<Line>, hunk: &Hunk, running_offset: isize) -> Option<isize> {
+fn apply_one_hunk(
+    image: &mut Vec<Line>,
+    hunk: &Hunk,
+    running_offset: isize,
+    unidiff_zero: bool,
+) -> Option<isize> {
     // preimage = context + deletes (the old side we must find in the image).
     // postimage = context + inserts (what replaces it). They share their
     // leading/trailing *context* runs, which fuzz peels off symmetrically.
@@ -4364,17 +4387,26 @@ fn apply_one_hunk(image: &mut Vec<Line>, hunk: &Hunk, running_offset: isize) -> 
     }
 
     // A hunk that is `@@ -1,L ... @@` (or `@@ -0,0 ... @@` for an add-to-empty)
-    // must match the beginning. A hunk with no trailing context must match the
-    // end. (`git am`/`apply` do not pass `--unidiff-zero`, so old_start == 1
-    // still implies match_beginning.)
-    let mut match_beginning = hunk.old_start <= 1;
-    let mut match_end = trailing == 0;
+    // must match the beginning, and a hunk with no trailing context must match
+    // the end — UNLESS `--unidiff-zero` was given, which tells apply to trust the
+    // line numbers of a context-free hunk (`match_beginning = !oldpos ||
+    // (oldpos == 1 && !unidiff_zero)`, `match_end = !unidiff_zero && !trailing`).
+    let mut match_beginning = hunk.old_start == 0 || (hunk.old_start == 1 && !unidiff_zero);
+    let mut match_end = !unidiff_zero && trailing == 0;
 
     // git anchors the search at `newpos-1` (0-based), carried by the running
     // offset from earlier hunks. The anchor (`pos` in git) shifts up whenever a
     // *leading* context line is peeled, because the preimage then begins one
-    // line later in its own content.
-    let mut expected = expected_position(hunk, running_offset);
+    // line later in its own content. For a context-free pure insertion the
+    // preimage is empty and matches anywhere, so the anchor alone decides the
+    // result — there we must use the new-side line number exactly as git's
+    // `newpos - 1` does (the old-side `oldpos` differs for `@@ -1,0 +2,1 @@`
+    // inserts).
+    let mut expected = if preimage.is_empty() {
+        new_side_position(hunk, running_offset)
+    } else {
+        expected_position(hunk, running_offset)
+    };
     // The full hunk's expected position never moves, so the returned drift is
     // measured against it (not the context-reduced anchor).
     let hunk_expected = expected;
@@ -4481,6 +4513,17 @@ fn expected_position(hunk: &Hunk, running_offset: isize) -> isize {
         0
     } else {
         hunk.old_start as isize - 1
+    };
+    base + running_offset
+}
+
+/// git's `pos = frag->newpos ? newpos - 1 : 0` anchor, used for a context-free
+/// pure insertion whose empty preimage matches anywhere.
+fn new_side_position(hunk: &Hunk, running_offset: isize) -> isize {
+    let base = if hunk.new_start == 0 {
+        0
+    } else {
+        hunk.new_start as isize - 1
     };
     base + running_offset
 }
