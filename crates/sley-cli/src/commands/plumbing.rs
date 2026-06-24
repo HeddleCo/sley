@@ -3356,6 +3356,12 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     // git's default when applying is `warn`; the value is overridden by the
     // last `--whitespace=` seen.
     let mut ws_action = WsAction::Warn;
+    // `-p<n>` strip count (git's `p_value`), `--directory=<dir>` root, and the
+    // `--unsafe-paths` gate that allows writing outside the working tree.
+    let mut p_value: usize = 1;
+    let mut p_value_known = false;
+    let mut directory_root: Vec<u8> = Vec::new();
+    let mut unsafe_paths = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -3367,11 +3373,14 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             "--recount" => recount = true,
             "-q"
             | "--quiet"
+            | "-v"
+            | "--verbose"
             | "--allow-empty"
-            | "--unsafe-paths"
             | "-l"
             | "--ignore-whitespace"
             | "--ignore-space-change" => {}
+            "--unsafe-paths" => unsafe_paths = true,
+            "--no-unsafe-paths" => unsafe_paths = false,
             "-R" | "--reverse" => {
                 return Err(GitError::Unsupported(
                     "apply --reverse is not supported yet".into(),
@@ -3398,7 +3407,20 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                     ws_action = parse_ws_action(value)?;
                 }
             }
-            "-p" | "-C" | "--directory" | "--exclude" | "--include" => {
+            "-p" => {
+                let Some(value) = iter.next() else {
+                    return Err(GitError::Command("apply -p requires a value".into()));
+                };
+                p_value = parse_apply_p_value(value)?;
+                p_value_known = true;
+            }
+            "--directory" => {
+                let Some(value) = iter.next() else {
+                    return Err(GitError::Command("apply --directory requires a value".into()));
+                };
+                directory_root = normalize_apply_directory(value)?;
+            }
+            "-C" | "--exclude" | "--include" => {
                 iter.next();
             }
             "--" => {
@@ -3411,11 +3433,15 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             value if let Some(path) = value.strip_prefix("--build-fake-ancestor=") => {
                 build_fake_ancestor = Some(path.to_string());
             }
+            value if let Some(rest) = value.strip_prefix("--directory=") => {
+                directory_root = normalize_apply_directory(rest)?;
+            }
+            value if let Some(rest) = value.strip_prefix("-p") => {
+                p_value = parse_apply_p_value(rest)?;
+                p_value_known = true;
+            }
             value
-                if value.starts_with("-p")
-                    || value.starts_with("--directory=")
-                    || value.starts_with("--exclude=")
-                    || value.starts_with("--include=") => {}
+                if value.starts_with("--exclude=") || value.starts_with("--include=") => {}
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!(
                     "unsupported apply option {value}"
@@ -3428,21 +3454,31 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(&git_dir)?;
+    let path_options = sley_diff_merge::PatchPathOptions {
+        p_value,
+        p_value_known,
+        root: directory_root.clone(),
+    };
     let inputs = read_apply_inputs(&files)?;
     let mut patches = Vec::new();
     for (name, input) in &inputs {
         validate_apply_input(input, name)?;
         patches.extend(
-            sley_diff_merge::parse_unified_patch_with_recount(input, recount).map_err(|err| {
-                match err {
+            sley_diff_merge::parse_unified_patch_with_options(input, recount, &path_options)
+                .map_err(|err| match err {
                     GitError::InvalidFormat(message)
                         if message.starts_with("malformed hunk header") =>
                     {
                         apply_corrupt_patch_error(input, name)
                     }
+                    GitError::InvalidFormat(message)
+                        if message.starts_with("git diff header lacks filename") =>
+                    {
+                        eprintln!("error: {message}");
+                        GitError::Exit(1)
+                    }
                     other => other,
-                }
-            })?,
+                })?,
         );
     }
     if let Some(path) = build_fake_ancestor {
@@ -3611,6 +3647,64 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Parse a `-p<n>` value like git's `strtol_i`: a base-10 integer with no
+/// trailing junk and not negative. On failure, emit git's message and exit 128.
+fn parse_apply_p_value(arg: &str) -> Result<usize> {
+    match arg.parse::<i64>() {
+        Ok(n) if n >= 0 => Ok(n as usize),
+        _ => {
+            eprintln!("fatal: option -p expects a non-negative integer, got '{arg}'");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+/// Normalize a `--directory=<dir>` value like git's `strbuf_normalize_path`
+/// (collapsing `.`/`//`/`..`, rejecting upward escapes) and append a trailing
+/// slash. On failure, emit git's message and exit 129 (usage).
+fn normalize_apply_directory(arg: &str) -> Result<Vec<u8>> {
+    match normalize_directory_path(arg.as_bytes()) {
+        Some(mut root) => {
+            if !root.is_empty() && root.last() != Some(&b'/') {
+                root.push(b'/');
+            }
+            Ok(root)
+        }
+        None => {
+            eprintln!("error: unable to normalize directory: '{arg}'");
+            Err(GitError::Exit(129))
+        }
+    }
+}
+
+fn normalize_directory_path(arg: &[u8]) -> Option<Vec<u8>> {
+    let absolute = arg.first() == Some(&b'/');
+    let mut comps: Vec<&[u8]> = Vec::new();
+    for comp in arg.split(|&b| b == b'/') {
+        if comp.is_empty() || comp == b"." {
+            continue;
+        }
+        if comp == b".." {
+            if comps.pop().is_none() && !absolute {
+                return None;
+            }
+            continue;
+        }
+        comps.push(comp);
+    }
+    let mut out = Vec::new();
+    if absolute {
+        out.push(b'/');
+    }
+    for (i, c) in comps.iter().enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(c);
+    }
+    Some(out)
 }
 
 fn write_apply_fake_ancestor_index(

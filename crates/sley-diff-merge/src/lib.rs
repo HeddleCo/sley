@@ -1,5 +1,6 @@
 use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result, object_id_for_bytes};
 
+mod name;
 pub mod range;
 pub mod render;
 pub mod ws;
@@ -4200,11 +4201,47 @@ pub fn parse_unified_patch(input: &[u8]) -> Result<Vec<FilePatch>> {
 /// Parse a unified/git diff, optionally ignoring hunk header line counts and
 /// recounting them from the hunk body. This mirrors `git apply --recount`.
 pub fn parse_unified_patch_with_recount(input: &[u8], recount: bool) -> Result<Vec<FilePatch>> {
+    parse_unified_patch_with_options(input, recount, &PatchPathOptions::default())
+}
+
+/// Path-resolution options for [`parse_unified_patch_with_options`], mirroring
+/// `git apply`'s `-p<n>` strip (`p_value`) and `--directory=<root>` prefix.
+#[derive(Clone)]
+pub struct PatchPathOptions {
+    /// Number of leading path components to strip (`-p<n>`); default 1.
+    pub p_value: usize,
+    /// Whether `p_value` was given explicitly. When false, traditional (non-git)
+    /// diffs guess it from the `---`/`+++` lines.
+    pub p_value_known: bool,
+    /// `--directory=<dir>` root, normalised with a trailing slash (or empty).
+    pub root: Vec<u8>,
+}
+
+impl Default for PatchPathOptions {
+    fn default() -> Self {
+        PatchPathOptions {
+            p_value: 1,
+            p_value_known: false,
+            root: Vec::new(),
+        }
+    }
+}
+
+/// Parse a unified/git diff, applying `-p<n>` strip and `--directory` prefix to
+/// every resolved pathname exactly as `git apply` does.
+pub fn parse_unified_patch_with_options(
+    input: &[u8],
+    recount: bool,
+    options: &PatchPathOptions,
+) -> Result<Vec<FilePatch>> {
     let lines = split_patch_lines(input);
     let mut parser = PatchParser {
         lines: &lines,
         index: 0,
         recount,
+        p_value: options.p_value,
+        p_value_known: options.p_value_known,
+        root: options.root.clone(),
     };
     parser.parse()
 }
@@ -4588,6 +4625,12 @@ struct PatchParser<'a> {
     lines: &'a [&'a [u8]],
     index: usize,
     recount: bool,
+    /// `-p<n>` strip count (git's `state->p_value`); shared across the input so
+    /// a guessed value sticks for subsequent traditional patches.
+    p_value: usize,
+    p_value_known: bool,
+    /// `--directory` root (normalised, trailing slash) prepended to every name.
+    root: Vec<u8>,
 }
 
 impl<'a> PatchParser<'a> {
@@ -4614,36 +4657,41 @@ impl<'a> PatchParser<'a> {
 
     /// Parse one file's headers and hunks. When `diff_line` is `Some`, the
     /// current line is the `diff --git` header (already inspected by the
-    /// caller); otherwise parsing starts at a `--- ` line.
+    /// caller); otherwise parsing starts at a `--- ` line of a traditional diff.
     fn parse_file(&mut self, diff_line: Option<&[u8]>) -> Result<FilePatch> {
-        let mut patch = FilePatch {
-            old_path: None,
-            new_path: None,
-            old_mode: None,
-            new_mode: None,
-            hunks: Vec::new(),
-            is_new: false,
-            is_delete: false,
-            is_rename: false,
-            is_copy: false,
-            similarity: None,
-            dissimilarity: None,
-        };
-        // Default paths from `diff --git a/x b/x` if present (overridden by
-        // `---`/`+++` lines when those carry real paths).
-        if let Some(diff_line) = diff_line {
-            if let Some((a, b)) = parse_diff_git_paths(diff_line) {
-                patch.old_path = Some(a);
-                patch.new_path = Some(b);
-            }
-            self.index += 1;
+        match diff_line {
+            Some(diff_line) => self.parse_git_file(diff_line),
+            None => self.parse_traditional_file(),
         }
+    }
+
+    /// p_value with one component removed — git uses `p_value - 1` for the
+    /// `rename`/`copy from`/`to` extended headers, whose names lack the `a/`/`b/`
+    /// prefix the `---`/`+++` lines carry.
+    fn p_minus_one(&self) -> usize {
+        self.p_value.saturating_sub(1)
+    }
+
+    /// Parse a git (`diff --git`) file section, resolving every pathname through
+    /// git's `git_header_name` / `find_name` with the active `-p<n>`/`--directory`.
+    fn parse_git_file(&mut self, diff_line: &[u8]) -> Result<FilePatch> {
+        let mut patch = empty_file_patch();
+        // `def_name`: the common name from the `diff --git` line, used when the
+        // section carries no explicit `---`/`+++`/rename names.
+        let rest = &diff_line[b"diff --git ".len()..];
+        let mut def_name = name::git_header_name(self.p_value, rest);
+        if let (Some(d), false) = (def_name.as_mut(), self.root.is_empty()) {
+            let mut s = self.root.clone();
+            s.extend_from_slice(d);
+            *d = s;
+        }
+        self.index += 1;
 
         // Extended headers until the first `---`/`@@`/next `diff --git`.
         while self.index < self.lines.len() {
             let line = self.lines[self.index];
             if line.starts_with(b"--- ") {
-                self.parse_old_file_header(line, &mut patch);
+                self.parse_git_old_header(&line[b"--- ".len()..], &mut patch);
                 self.index += 1;
                 break;
             } else if line.starts_with(b"@@ ") {
@@ -4651,7 +4699,7 @@ impl<'a> PatchParser<'a> {
                 break;
             } else if line.starts_with(b"diff --git ") {
                 // Next file began with no body for this one.
-                return Ok(patch);
+                break;
             } else if let Some(rest) = strip_prefix(line, b"old mode ") {
                 patch.old_mode = parse_octal(rest);
             } else if let Some(rest) = strip_prefix(line, b"new mode ") {
@@ -4659,27 +4707,29 @@ impl<'a> PatchParser<'a> {
             } else if let Some(rest) = strip_prefix(line, b"new file mode ") {
                 patch.is_new = true;
                 patch.new_mode = parse_octal(rest);
+                patch.new_path = def_name.clone();
             } else if let Some(rest) = strip_prefix(line, b"deleted file mode ") {
                 patch.is_delete = true;
                 patch.old_mode = parse_octal(rest);
+                patch.old_path = def_name.clone();
             } else if let Some(rest) = strip_prefix(line, b"rename from ") {
                 patch.is_rename = true;
-                patch.old_path = Some(rest.to_vec());
+                patch.old_path = name::find_name(rest, None, self.p_minus_one(), 0, &self.root);
             } else if let Some(rest) = strip_prefix(line, b"rename to ") {
                 patch.is_rename = true;
-                patch.new_path = Some(rest.to_vec());
+                patch.new_path = name::find_name(rest, None, self.p_minus_one(), 0, &self.root);
             } else if let Some(rest) = strip_prefix(line, b"copy from ") {
                 patch.is_copy = true;
-                patch.old_path = Some(rest.to_vec());
+                patch.old_path = name::find_name(rest, None, self.p_minus_one(), 0, &self.root);
             } else if let Some(rest) = strip_prefix(line, b"copy to ") {
                 patch.is_copy = true;
-                patch.new_path = Some(rest.to_vec());
+                patch.new_path = name::find_name(rest, None, self.p_minus_one(), 0, &self.root);
             } else if let Some(rest) = strip_prefix(line, b"similarity index ") {
                 patch.similarity = parse_percent(rest);
             } else if let Some(rest) = strip_prefix(line, b"dissimilarity index ") {
                 patch.dissimilarity = parse_percent(rest);
             } else {
-                // `index ..`, `similarity index`, `copy from/to`, etc. — ignore.
+                // `index ..`, `GIT binary patch`, etc. — ignore.
                 self.index += 1;
                 continue;
             }
@@ -4688,11 +4738,119 @@ impl<'a> PatchParser<'a> {
 
         // `+++` header (the old-file branch above already advanced past `---`).
         if self.index < self.lines.len() && self.lines[self.index].starts_with(b"+++ ") {
-            self.parse_new_file_header(self.lines[self.index], &mut patch);
+            let line = self.lines[self.index];
+            self.parse_git_new_header(&line[b"+++ ".len()..], &mut patch);
             self.index += 1;
         }
 
-        // Hunks.
+        // No explicit names anywhere: fall back to `def_name`, or fail like git
+        // when `-p<n>` stripped every component away.
+        if patch.old_path.is_none() && patch.new_path.is_none() {
+            match &def_name {
+                Some(d) => {
+                    patch.old_path = Some(d.clone());
+                    patch.new_path = Some(d.clone());
+                }
+                None => {
+                    return Err(GitError::InvalidFormat(format!(
+                        "git diff header lacks filename information when removing {} \
+                         leading pathname components",
+                        self.p_value
+                    )));
+                }
+            }
+        }
+
+        self.parse_hunks(&mut patch)?;
+        Ok(patch)
+    }
+
+    fn parse_git_old_header(&self, rest: &[u8], patch: &mut FilePatch) {
+        if name::is_dev_null(rest) {
+            patch.is_new = true;
+            patch.old_path = None;
+        } else if patch.old_path.is_none() {
+            patch.old_path = name::find_name(rest, None, self.p_value, name::TERM_TAB, &self.root);
+        }
+    }
+
+    fn parse_git_new_header(&self, rest: &[u8], patch: &mut FilePatch) {
+        if name::is_dev_null(rest) {
+            patch.is_delete = true;
+            patch.new_path = None;
+        } else if patch.new_path.is_none() {
+            patch.new_path = name::find_name(rest, None, self.p_value, name::TERM_TAB, &self.root);
+        }
+    }
+
+    /// Parse a traditional (non-git) diff section, mirroring git's
+    /// `parse_traditional_patch`: guess the strip count, recognise epoch
+    /// timestamps as creation/deletion, and prefer the shorter of the two names.
+    fn parse_traditional_file(&mut self) -> Result<FilePatch> {
+        let mut patch = empty_file_patch();
+        let first_line = self.lines[self.index];
+        let first = first_line[b"--- ".len()..].to_vec();
+        self.index += 1;
+        let second = if self.index < self.lines.len()
+            && self.lines[self.index].starts_with(b"+++ ")
+        {
+            let s = self.lines[self.index][b"+++ ".len()..].to_vec();
+            self.index += 1;
+            Some(s)
+        } else {
+            None
+        };
+
+        if let Some(second) = &second {
+            if !self.p_value_known {
+                let p0 = name::guess_p_value(&first, &self.root);
+                let q0 = name::guess_p_value(second, &self.root);
+                let p = if p0.is_none() { q0 } else { p0 };
+                if let Some(pv) = p
+                    && Some(pv) == q0
+                {
+                    self.p_value = pv;
+                    self.p_value_known = true;
+                }
+            }
+
+            if name::is_dev_null(&first) {
+                patch.is_new = true;
+                patch.new_path =
+                    name::find_name_traditional(second, None, self.p_value, &self.root);
+            } else if name::is_dev_null(second) {
+                patch.is_delete = true;
+                patch.old_path =
+                    name::find_name_traditional(&first, None, self.p_value, &self.root);
+            } else {
+                let first_name =
+                    name::find_name_traditional(&first, None, self.p_value, &self.root);
+                let name = name::find_name_traditional(
+                    second,
+                    first_name.as_deref(),
+                    self.p_value,
+                    &self.root,
+                );
+                if name::has_epoch_timestamp(&first) {
+                    patch.is_new = true;
+                    patch.new_path = name;
+                } else if name::has_epoch_timestamp(second) {
+                    patch.is_delete = true;
+                    patch.old_path = name;
+                } else {
+                    patch.old_path = name.clone();
+                    patch.new_path = name;
+                }
+            }
+        }
+
+        self.parse_hunks(&mut patch)?;
+        Ok(patch)
+    }
+
+    /// Parse the hunk bodies that follow a file header, stopping at the next
+    /// file header.
+    fn parse_hunks(&mut self, patch: &mut FilePatch) -> Result<()> {
         while self.index < self.lines.len() {
             let line = self.lines[self.index];
             if line.starts_with(b"@@ ") {
@@ -4708,41 +4866,7 @@ impl<'a> PatchParser<'a> {
                 self.index += 1;
             }
         }
-
-        Ok(patch)
-    }
-
-    fn parse_old_file_header(&self, line: &[u8], patch: &mut FilePatch) {
-        let rest = strip_prefix(line, b"--- ").unwrap_or(line);
-        let path = strip_header_path(rest);
-        match path {
-            HeaderPath::DevNull => {
-                patch.is_new = true;
-                patch.old_path = None;
-            }
-            HeaderPath::Path(p) => {
-                // Only override if we did not already learn a real path.
-                if patch.old_path.is_none() || !(patch.is_rename || patch.is_copy) {
-                    patch.old_path = Some(p);
-                }
-            }
-        }
-    }
-
-    fn parse_new_file_header(&self, line: &[u8], patch: &mut FilePatch) {
-        let rest = strip_prefix(line, b"+++ ").unwrap_or(line);
-        let path = strip_header_path(rest);
-        match path {
-            HeaderPath::DevNull => {
-                patch.is_delete = true;
-                patch.new_path = None;
-            }
-            HeaderPath::Path(p) => {
-                if patch.new_path.is_none() || !(patch.is_rename || patch.is_copy) {
-                    patch.new_path = Some(p);
-                }
-            }
-        }
+        Ok(())
     }
 
     fn parse_hunk(&mut self) -> Result<Hunk> {
@@ -4852,53 +4976,21 @@ impl<'a> PatchParser<'a> {
     }
 }
 
-enum HeaderPath {
-    DevNull,
-    Path(Vec<u8>),
-}
-
-/// Extract the path from a `---`/`+++` header tail, stripping a leading `a/` or
-/// `b/` prefix, an optional trailing timestamp (separated by a tab), and
-/// recognising `/dev/null`.
-fn strip_header_path(rest: &[u8]) -> HeaderPath {
-    // Cut a trailing tab-delimited timestamp if present.
-    let path = match rest.iter().position(|&b| b == b'\t') {
-        Some(tab) => &rest[..tab],
-        None => rest,
-    };
-    let path = trim_ascii_end(path);
-    if path == b"/dev/null" {
-        return HeaderPath::DevNull;
+/// An all-empty [`FilePatch`] for the parser to fill in.
+fn empty_file_patch() -> FilePatch {
+    FilePatch {
+        old_path: None,
+        new_path: None,
+        old_mode: None,
+        new_mode: None,
+        hunks: Vec::new(),
+        is_new: false,
+        is_delete: false,
+        is_rename: false,
+        is_copy: false,
+        similarity: None,
+        dissimilarity: None,
     }
-    // Strip a leading `a/` or `b/` (git's default prefixes).
-    let stripped = if path.starts_with(b"a/") || path.starts_with(b"b/") {
-        &path[2..]
-    } else {
-        path
-    };
-    HeaderPath::Path(stripped.to_vec())
-}
-
-/// Parse the two paths out of `diff --git a/<x> b/<y>`. Returns the paths with
-/// their `a/`/`b/` prefixes stripped. Returns `None` when the line cannot be
-/// split unambiguously (e.g. paths containing spaces, which git would quote).
-fn parse_diff_git_paths(line: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    let rest = strip_prefix(line, b"diff --git ")?;
-    // Quoted paths are uncommon in this engine's inputs; bail and let the
-    // `---`/`+++` headers supply the names instead.
-    if rest.first() == Some(&b'"') {
-        return None;
-    }
-    // Find the split point: the boundary between the `a/...` and `b/...` halves.
-    // git separates them with a single space; the simplest robust heuristic is
-    // to look for ` b/` preceded by an `a/` start.
-    if !rest.starts_with(b"a/") {
-        return None;
-    }
-    let sep = find_subslice(rest, b" b/")?;
-    let a = &rest[2..sep];
-    let b = &rest[sep + 3..];
-    Some((a.to_vec(), b.to_vec()))
 }
 
 /// Parse an `@@ -l,s +l,s @@` header into `(old_start, old_len, new_start,
