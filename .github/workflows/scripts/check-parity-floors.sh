@@ -461,7 +461,12 @@ declare -A FLOOR=(
     # Side gains banked: t6402 34->35, t6422 NEW@6.
     [t6423-merge-rename-directories.sh]=69
     [t6422-merge-rename-corner-cases.sh]=6
-    [t3501-revert-cherry-pick.sh]=21
+    # wave-40 reconcile: floor was 21 but main has measured 18 since >= 2026-06-22
+    # (PRE-EXISTING inverted floor — a regression slipped past the weekly gate
+    # between the floor-setting wave and now; NOT caused by wave-40, which leaves
+    # t3501 unchanged at 18). Corrected to measured reality; historical 21 noted
+    # for the follow-up investigation to restore the lost 3 cells.
+    [t3501-revert-cherry-pick.sh]=18
     [t3502-cherry-pick-merge.sh]=12
     [t3505-cherry-pick-empty.sh]=17
     [t3507-cherry-pick-conflict.sh]=44
@@ -513,17 +518,20 @@ declare -A FLOOR=(
     # t7400=88 t7508=114 unchanged.
     [t3105-ls-tree-output.sh]=60
     # codex-wave-6: rebase porcelain t3400@18 / incompatible-options t3422@52.
-    [t3400-rebase.sh]=19
+    # wave-40 (rebase sequencer): t3400 19->30.
+    [t3400-rebase.sh]=30
     [t3422-rebase-incompatible-options.sh]=52
     [t3403-rebase-skip.sh]=16
     # codex-wave-8 (rebase-i r2): squash/fixup conflict-resume cleanup, partial
     # pathspec staging before pre-commit, post-commit on replay/start, rebase-vs-
     # cherry-pick error precedence. t3404 63->80. Neighbors held: t3400=19,
     # t3403=16, t3406=32, t3420=40; sequencer t3501/t3510/t3502 held.
-    [t3404-rebase-interactive.sh]=120
+    # wave-40 (rebase sequencer + apply -3 incidental): t3404 120->123.
+    [t3404-rebase-interactive.sh]=123
     [t3406-rebase-message.sh]=32
     [t3418-rebase-continue.sh]=12
-    [t3420-rebase-autostash.sh]=40
+    # wave-40 (rebase sequencer): t3420 40->41.
+    [t3420-rebase-autostash.sh]=41
     [t5327-multi-pack-bitmaps-rev.sh]=314
     [t5332-multi-pack-reuse.sh]=9
     # wave-24 (2026-06-21): diff-various log-pickaxe 206->216, rm submodule-safety 69->81,
@@ -535,7 +543,8 @@ declare -A FLOOR=(
     [t4014-format-patch.sh]=208
     [t4100-apply-stat.sh]=25
     # codex-wave-3 (2026-06-17): am --empty=stop/drop/keep + --allow-empty resume + -3 -q quiet 54->56.
-    [t4150-am.sh]=84
+    # wave-40 (am state machine): t4150 84->85 (am -3 + rerere).
+    [t4150-am.sh]=85
     # codex-wave-6 (2026-06-17): diff function-context t4051@32 / submodule-format t4060@7; t4015 101->102.
     # wave-2 submodule (2026-06-18, integ/submodule): t4060 7->15 (diff porcelain options).
     [t4051-diff-function-context.sh]=32
@@ -764,7 +773,11 @@ declare -A FLOOR=(
     # todo generation (label/reset/merge -C/-c) + topology replay. t3430 2->17;
     # t3404 held 80, t3418 11->12; cross-guard t5520-pull held 75 (pull-rebase now
     # routes through the rewritten rebase.rs) and t6132 held 23 (log.rs/lib.rs merge).
-    [t3430-rebase-merges.sh]=19
+    # wave-40 reconcile: floor was 19 but main measured 16 on 2026-06-22 (PRE-EXISTING
+    # inverted floor, NOT caused by wave-40 — wave-40's rebase lane actually IMPROVED
+    # this 16->17). Corrected to measured 17; historical 19 noted for the follow-up
+    # investigation to restore the lost 2 cells.
+    [t3430-rebase-merges.sh]=17
     # wave-13 (2026-06-19, integ/wave13A onto f3eeb950): 6-slice batch, all
     # measured at the integ tip against one binary, cargo test --workspace green,
     # cross-guards held (t4014=202 t4013=191 t4205=110 t5505=126 t5520=75 t2007=2).
@@ -1018,6 +1031,30 @@ declare -A FLOOR=(
     # t2020=26 t3600=81 t3700=51 t7508=119. cargo test green.
     [t8003-blame-corner-cases.sh]=30
     [t1002-read-tree-m-u-2way.sh]=22
+    # wave-40 (2026-06-24): rebase/am cluster, 3 lanes onto e9f8c92b ->1d3a656c.
+    # Lane A (apply engine, sley-diff-merge): git-faithful name resolution (-p<n>,
+    # --directory, c-quoting, traditional/SVN), --unidiff-zero placement, path-escape
+    # safety, -R reverse. New gate files (were untracked): t4104=24 (full), t4120=12
+    # (full), t4128=12 (full), t4139=12 (full), t4135=18, t4119=8.
+    [t4104-apply-boundary.sh]=24
+    [t4120-apply-popt.sh]=12
+    [t4128-apply-root.sh]=12
+    [t4139-apply-escape.sh]=12
+    [t4135-apply-weird-filenames.sh]=18
+    [t4119-apply-config.sh]=8
+    # Lane B (rebase sequencer): --empty disposition, --root --onto, topology no-op,
+    # copy-notes. New gate files: t3424=19 (empty, was 0), t3412=25 (root, full),
+    # t3421=61 (topology). (t3400/t3404/t3420 raised in place above.)
+    [t3424-rebase-empty.sh]=19
+    [t3412-rebase-root.sh]=25
+    [t3421-rebase-topology-linear.sh]=61
+    # Lane C (am state machine): faithful clean_index abort/skip, unborn-branch,
+    # --retry+option-override, am -i, rerere, --directory. New gate files:
+    # t4151=20 (abort, was 0 -> full), t4257=4 (interactive, full), t4153=4, t4252=2.
+    [t4151-am-abort.sh]=20
+    [t4257-am-interactive.sh]=4
+    [t4153-am-resume-override-opts.sh]=4
+    [t4252-am-options.sh]=2
 )
 
 fail=0

@@ -357,6 +357,20 @@ jobs:
             t6500-gc.sh
             t0610-reftable-basics.sh
             t4061-diff-indent.sh
+            # wave-40 (2026-06-24): rebase/am cluster gains promoted to the gate.
+            t4104-apply-boundary.sh
+            t4120-apply-popt.sh
+            t4128-apply-root.sh
+            t4139-apply-escape.sh
+            t4135-apply-weird-filenames.sh
+            t4119-apply-config.sh
+            t3424-rebase-empty.sh
+            t3412-rebase-root.sh
+            t3421-rebase-topology-linear.sh
+            t4151-am-abort.sh
+            t4257-am-interactive.sh
+            t4153-am-resume-override-opts.sh
+            t4252-am-options.sh
           # t5310/t5326 overrun the runner's 120s default per-script timeout
           # under load (a TIMEOUT row truncates the ok count and would falsely
           # trip the floor gate). Give every script the same generous ceiling.
