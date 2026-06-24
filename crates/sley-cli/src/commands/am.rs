@@ -275,15 +275,18 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let mut input = read_am_input(&options.mboxes)?;
+    let mut input_files = read_am_input_files(&options.mboxes)?;
     // git's mailsplit strips a trailing CR from each line by default; only
     // `--keep-cr` keeps it. Normalising CRLF -> LF here lets a CRLF mail apply
     // and commit byte-identically to its LF original.
     if !options.keep_cr {
-        input = strip_cr(&input);
+        for file in &mut input_files {
+            *file = strip_cr(file);
+        }
     }
+    let combined: Vec<u8> = input_files.concat();
 
-    let patch_format = detect_am_patch_format(&options.mboxes, &input, options.patch_format)?;
+    let patch_format = detect_am_patch_format(&options.mboxes, &combined, options.patch_format)?;
 
     // git treats explicit files and stdin differently. A file must pass
     // patch-format detection. Stdin is assumed to be mbox, so empty stdin is just
@@ -294,7 +297,7 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let patches = parse_am_patches(&options, patch_format, &input)?;
+    let patches = parse_am_patches(&options, patch_format, &input_files, &combined)?;
     // No messages at all (empty/whitespace stdin) — nothing to do.
     if patches.is_empty() {
         return Ok(());
@@ -772,17 +775,24 @@ fn strip_cr(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Read every mbox file (or stdin when none are given) into one buffer.
-fn read_am_input(mboxes: &[String]) -> Result<Vec<u8>> {
-    let mut input = Vec::new();
+/// Read every mbox file (or stdin when none are given), keeping one buffer *per
+/// file* rather than concatenating them. git's `mailsplit` splits each input
+/// file independently, so a file that is a single bare patch (no mbox `From `
+/// separator) becomes one message — concatenating first would merge several such
+/// files into one garbled message (t4252 `am-test-*-?` globs pass two such
+/// files). stdin is returned as a single one-element list.
+fn read_am_input_files(mboxes: &[String]) -> Result<Vec<Vec<u8>>> {
     if mboxes.is_empty() {
+        let mut input = Vec::new();
         io::stdin().read_to_end(&mut input)?;
+        Ok(vec![input])
     } else {
+        let mut files = Vec::with_capacity(mboxes.len());
         for mbox in mboxes {
-            input.extend_from_slice(&fs::read(mbox)?);
+            files.push(fs::read(mbox)?);
         }
+        Ok(files)
     }
-    Ok(input)
 }
 
 fn parse_am_patch_format(value: &str) -> Result<AmPatchFormat> {
@@ -850,24 +860,42 @@ fn detect_am_patch_format(
 fn parse_am_patches(
     options: &AmOptions,
     format: AmPatchFormat,
-    input: &[u8],
+    input_files: &[Vec<u8>],
+    combined: &[u8],
 ) -> Result<Vec<AmPatch>> {
     match format {
-        AmPatchFormat::Mbox | AmPatchFormat::Auto => parse_mbox(input, options.subject_cleanup()),
-        AmPatchFormat::Mboxrd => parse_mboxrd(input, options.subject_cleanup()),
+        // git's mailsplit splits each file independently, then am parses every
+        // resulting message. Parse each file's buffer on its own and concatenate
+        // so two bare single-patch files (no `From ` separator) do not merge into
+        // one garbled message (t4252); a single file with several `From `-
+        // separated messages still splits correctly inside parse_mbox.
+        AmPatchFormat::Mbox | AmPatchFormat::Auto => {
+            let mut patches = Vec::new();
+            for file in input_files {
+                patches.extend(parse_mbox(file, options.subject_cleanup())?);
+            }
+            Ok(patches)
+        }
+        AmPatchFormat::Mboxrd => {
+            let mut patches = Vec::new();
+            for file in input_files {
+                patches.extend(parse_mboxrd(file, options.subject_cleanup())?);
+            }
+            Ok(patches)
+        }
         AmPatchFormat::Stgit => parse_foreign_patches(
             &options.mboxes,
-            input,
+            combined,
             options.subject_cleanup(),
             stgit_patch_to_mail,
         ),
         AmPatchFormat::Hg => parse_foreign_patches(
             &options.mboxes,
-            input,
+            combined,
             options.subject_cleanup(),
             hg_patch_to_mail,
         ),
-        AmPatchFormat::StgitSeries => parse_stgit_series(options, input),
+        AmPatchFormat::StgitSeries => parse_stgit_series(options, combined),
     }
 }
 
