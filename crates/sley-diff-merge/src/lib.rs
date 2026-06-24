@@ -5208,7 +5208,12 @@ impl<'a> PatchParser<'a> {
     fn parse_hunks(&mut self, patch: &mut FilePatch) -> Result<()> {
         while self.index < self.lines.len() {
             let line = self.lines[self.index];
-            if line.starts_with(b"@@ ") {
+            // git's `parse_single_patch` only treats a line as a fragment when it
+            // begins with `@@ -` (old side first). A `@@ +…` line — e.g. the
+            // malformed header a Subversion-generated diff emits — is not a hunk;
+            // it (and the lines after it) are skipped as commentary, so a deletion
+            // with no real hunk still applies from its metadata alone.
+            if line.starts_with(b"@@ -") {
                 let hunk = self.parse_hunk()?;
                 patch.hunks.push(hunk);
             } else if line.starts_with(b"diff --git ") {

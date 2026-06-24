@@ -4421,7 +4421,10 @@ fn validate_apply_input(input: &[u8], name: &str) -> Result<()> {
             after_file_header = true;
             continue;
         }
-        if line.starts_with(b"@@ ") {
+        // Only `@@ -…` is a fragment header (git's `parse_single_patch`). A
+        // `@@ +…` line (e.g. a Subversion-generated diff) is not a hunk; it falls
+        // through to the garbage/commentary handling below.
+        if line.starts_with(b"@@ -") {
             if !saw_header {
                 eprintln!(
                     "error: patch fragment without header at {name}:{line_nr}: {}",
