@@ -576,6 +576,7 @@ fn render(
         }
         for entry in entries {
             let options = DiffRenderOptions {
+                binary: false,
                 db: ctx.db,
                 worktree_root: ctx.worktree_root,
                 use_worktree_new: ctx.use_worktree_new,

@@ -17,6 +17,9 @@ path = "src/main.rs"
 [dependencies]
 encoding_rs = "0.8"
 filetime = "0.2"
+# Binary patch payloads (`git apply` of a `GIT binary patch`) are zlib-deflated;
+# the backend is unified to zlib-rs by the transitive sley-odb default feature.
+flate2 = { version = "1", default-features = false }
 sley-archive = { path = "../sley-archive" }
 sley-config = { path = "../sley-config" }
 sley-core = { path = "../sley-core" }

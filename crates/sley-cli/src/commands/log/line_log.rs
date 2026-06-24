@@ -423,6 +423,7 @@ fn render_line_log_patch(
             out,
             &entry,
             crate::DiffRenderOptions {
+                binary: false,
                 db,
                 worktree_root: None,
                 use_worktree_new: false,

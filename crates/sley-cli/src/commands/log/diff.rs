@@ -371,6 +371,7 @@ impl LogDiffContext<'_> {
                     out,
                     entry,
                     DiffRenderOptions {
+                        binary: false,
                         db: self.db,
                         worktree_root: None,
                         use_worktree_new: false,

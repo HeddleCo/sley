@@ -4164,6 +4164,55 @@ pub struct FilePatch {
     pub similarity: Option<u8>,
     /// Dissimilarity score from `dissimilarity index N%`, used for rewrite summaries.
     pub dissimilarity: Option<u8>,
+    /// Hex object id prefixes from the `index <old>..<new>[ mode]` line, if any.
+    /// Carried verbatim (abbreviated or full); the binary apply and the `-3`
+    /// fallback need these to resolve the pre-/post-image blobs.
+    pub old_oid_hex: Option<Vec<u8>>,
+    pub new_oid_hex: Option<Vec<u8>>,
+    /// True when the patch is binary: either a `GIT binary patch` block (with
+    /// `binary` payload) or a metadata-only `Binary files ... differ` line
+    /// (no payload — the postimage must be reconstructed from the object store).
+    pub is_binary: bool,
+    /// The `GIT binary patch` payload, when this is a binary file patch. The
+    /// fragment bytes are still zlib-deflated (the caller inflates them with
+    /// the recorded original length), matching git's two-hunk forward/reverse
+    /// layout.
+    pub binary: Option<BinaryPatch>,
+    /// True for git (`diff --git`) patches, whose names are relative to the
+    /// repository top-level; false for traditional diffs, whose names are
+    /// relative to the current directory (git's `is_toplevel_relative`). The
+    /// `apply` cwd-prefix is only prepended to non-toplevel-relative patches.
+    pub is_toplevel_relative: bool,
+}
+
+/// A `GIT binary patch` payload: a mandatory forward hunk (preimage → postimage)
+/// and an optional reverse hunk (postimage → preimage), mirroring git's
+/// `parse_binary`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryPatch {
+    pub forward: BinaryHunk,
+    pub reverse: Option<BinaryHunk>,
+}
+
+/// One binary hunk: the encoding method and the still-deflated data, plus the
+/// declared original (inflated) length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryHunk {
+    pub method: BinaryMethod,
+    /// Length of the data *after* inflation (the `literal <N>` / `delta <N>`
+    /// number). The caller inflates `deflated` to exactly this many bytes.
+    pub origlen: usize,
+    /// base85-decoded, still zlib-deflated bytes.
+    pub deflated: Vec<u8>,
+}
+
+/// How a binary hunk encodes the postimage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryMethod {
+    /// The inflated bytes ARE the postimage (`literal <N>`).
+    Literal,
+    /// The inflated bytes are a git delta to apply to the preimage (`delta <N>`).
+    Delta,
 }
 
 /// Outcome of applying a [`FilePatch`] to a base buffer.
@@ -4323,6 +4372,17 @@ pub fn reverse_file_patch(patch: &FilePatch) -> FilePatch {
         is_copy: patch.is_copy,
         similarity: patch.similarity,
         dissimilarity: patch.dissimilarity,
+        // Swap the index OIDs so a reverse-applied binary patch resolves the
+        // (formerly new) preimage and (formerly old) postimage correctly.
+        old_oid_hex: patch.new_oid_hex.clone(),
+        new_oid_hex: patch.old_oid_hex.clone(),
+        is_binary: patch.is_binary,
+        binary: patch.binary.as_ref().map(|binary| BinaryPatch {
+            // `-R` swaps forward and reverse hunks (git's apply_in_reverse).
+            forward: binary.reverse.clone().unwrap_or_else(|| binary.forward.clone()),
+            reverse: Some(binary.forward.clone()),
+        }),
+        is_toplevel_relative: patch.is_toplevel_relative,
     }
 }
 
@@ -4773,6 +4833,14 @@ impl<'a> PatchParser<'a> {
         }
         self.index += 1;
 
+        // Git patches name files relative to the repository top-level, so the
+        // `apply` cwd-prefix is never prepended to them (git's is_toplevel_relative).
+        patch.is_toplevel_relative = true;
+
+        // Set once a `GIT binary patch` / `Binary files … differ` body is seen,
+        // so the file is not run through the textual hunk parser afterwards.
+        let mut binary_seen = false;
+
         // Extended headers until the first `---`/`@@`/next `diff --git`.
         while self.index < self.lines.len() {
             let line = self.lines[self.index];
@@ -4787,17 +4855,22 @@ impl<'a> PatchParser<'a> {
                 // Next file began with no body for this one.
                 break;
             } else if let Some(rest) = strip_prefix(line, b"old mode ") {
-                patch.old_mode = parse_octal(rest);
+                patch.old_mode = Some(self.parse_mode_line(rest)?);
             } else if let Some(rest) = strip_prefix(line, b"new mode ") {
-                patch.new_mode = parse_octal(rest);
+                patch.new_mode = Some(self.parse_mode_line(rest)?);
             } else if let Some(rest) = strip_prefix(line, b"new file mode ") {
                 patch.is_new = true;
-                patch.new_mode = parse_octal(rest);
+                patch.new_mode = Some(self.parse_mode_line(rest)?);
                 patch.new_path = def_name.clone();
             } else if let Some(rest) = strip_prefix(line, b"deleted file mode ") {
                 patch.is_delete = true;
-                patch.old_mode = parse_octal(rest);
+                patch.old_mode = Some(self.parse_mode_line(rest)?);
                 patch.old_path = def_name.clone();
+            } else if let Some(rest) = strip_prefix(line, b"index ") {
+                // `index <old>..<new>[ <mode>]`: capture the blob OIDs (needed by
+                // the binary apply and the `-3` fallback) and the unchanged-file
+                // mode (git's gitdiff_index → gitdiff_oldmode).
+                self.parse_index_line(rest, &mut patch)?;
             } else if let Some(rest) = strip_prefix(line, b"rename from ") {
                 patch.is_rename = true;
                 patch.old_path = name::find_name(rest, None, self.p_minus_one(), 0, &self.root);
@@ -4814,8 +4887,22 @@ impl<'a> PatchParser<'a> {
                 patch.similarity = parse_percent(rest);
             } else if let Some(rest) = strip_prefix(line, b"dissimilarity index ") {
                 patch.dissimilarity = parse_percent(rest);
+            } else if line == b"GIT binary patch" {
+                // The binary payload follows (no `---`/`+++`, no `@@` hunks).
+                let gitbin_line = self.index + 1;
+                patch.is_binary = true;
+                patch.binary = Some(self.parse_binary_block(gitbin_line)?);
+                binary_seen = true;
+                break;
+            } else if apply_is_binary_files_differ(line) {
+                // A `--binary`-less diff records only `Binary files … differ`;
+                // the postimage has to come from the object store at apply time.
+                patch.is_binary = true;
+                binary_seen = true;
+                self.index += 1;
+                break;
             } else {
-                // `index ..`, `GIT binary patch`, etc. — ignore.
+                // Unrecognised commentary line — ignore.
                 self.index += 1;
                 continue;
             }
@@ -4823,7 +4910,10 @@ impl<'a> PatchParser<'a> {
         }
 
         // `+++` header (the old-file branch above already advanced past `---`).
-        if self.index < self.lines.len() && self.lines[self.index].starts_with(b"+++ ") {
+        if !binary_seen
+            && self.index < self.lines.len()
+            && self.lines[self.index].starts_with(b"+++ ")
+        {
             let line = self.lines[self.index];
             self.parse_git_new_header(&line[b"+++ ".len()..], &mut patch);
             self.index += 1;
@@ -4847,8 +4937,143 @@ impl<'a> PatchParser<'a> {
             }
         }
 
-        self.parse_hunks(&mut patch)?;
+        // Binary patches carry no `@@` hunks.
+        if !binary_seen {
+            self.parse_hunks(&mut patch)?;
+        }
         Ok(patch)
+    }
+
+    /// Parse a `index <old>..<new>[ <mode>]` line, capturing the blob OIDs and,
+    /// when present, the unchanged-file mode (git's `gitdiff_index`).
+    fn parse_index_line(&self, rest: &[u8], patch: &mut FilePatch) -> Result<()> {
+        let Some(dotdot) = find_subslice(rest, b"..") else {
+            return Ok(());
+        };
+        let old = &rest[..dotdot];
+        let after = &rest[dotdot + 2..];
+        // `new` runs to the first space (mode) or end of line.
+        let (new, mode_part) = match after.iter().position(|&b| b == b' ') {
+            Some(space) => (&after[..space], Some(&after[space + 1..])),
+            None => (after, None),
+        };
+        if !old.is_empty() {
+            patch.old_oid_hex = Some(old.to_vec());
+        }
+        if !new.is_empty() {
+            patch.new_oid_hex = Some(new.to_vec());
+        }
+        if let Some(mode) = mode_part
+            && !mode.is_empty()
+        {
+            patch.old_mode = Some(self.parse_mode_line(mode)?);
+        }
+        Ok(())
+    }
+
+    /// Parse a `<octal mode>` field, mirroring git's `parse_mode_line`: leading
+    /// octal digits terminated by whitespace or end of line. Errors otherwise.
+    fn parse_mode_line(&self, rest: &[u8]) -> Result<u32> {
+        let mut value: u32 = 0;
+        let mut i = 0;
+        while i < rest.len() && (b'0'..=b'7').contains(&rest[i]) {
+            value = value
+                .checked_mul(8)
+                .and_then(|value| value.checked_add((rest[i] - b'0') as u32))
+                .ok_or_else(|| self.invalid_mode_error(rest))?;
+            i += 1;
+        }
+        if i == 0 || (i < rest.len() && !rest[i].is_ascii_whitespace()) {
+            return Err(self.invalid_mode_error(rest));
+        }
+        Ok(value)
+    }
+
+    fn invalid_mode_error(&self, rest: &[u8]) -> GitError {
+        GitError::InvalidFormat(format!(
+            "invalid mode on line {}: {}",
+            self.index + 1,
+            lossy(rest)
+        ))
+    }
+
+    /// Parse a `GIT binary patch` body: a mandatory forward hunk and an optional
+    /// reverse hunk, each base85-encoded over zlib-deflated data. Mirrors git's
+    /// `parse_binary`. `gitbin_line` is the 1-based line of the `GIT binary patch`
+    /// marker (used in the "unrecognized binary patch" message).
+    fn parse_binary_block(&mut self, gitbin_line: usize) -> Result<BinaryPatch> {
+        // self.index points at "GIT binary patch"; advance past it.
+        self.index += 1;
+        let forward = match self.parse_binary_hunk()? {
+            Some(hunk) => hunk,
+            None => {
+                return Err(GitError::InvalidFormat(format!(
+                    "binary-unrecognized:{gitbin_line}"
+                )));
+            }
+        };
+        let reverse = self.parse_binary_hunk()?;
+        Ok(BinaryPatch { forward, reverse })
+    }
+
+    /// Parse one binary hunk (method line + base85 data lines + blank terminator),
+    /// or `Ok(None)` when the current line is not a `literal`/`delta` method line.
+    fn parse_binary_hunk(&mut self) -> Result<Option<BinaryHunk>> {
+        if self.index >= self.lines.len() {
+            return Ok(None);
+        }
+        let line = self.lines[self.index];
+        let (method, num) = if let Some(rest) = strip_prefix(line, b"delta ") {
+            (BinaryMethod::Delta, rest)
+        } else if let Some(rest) = strip_prefix(line, b"literal ") {
+            (BinaryMethod::Literal, rest)
+        } else {
+            return Ok(None);
+        };
+        let origlen = parse_leading_usize(num);
+        self.index += 1;
+
+        let mut deflated = Vec::new();
+        loop {
+            if self.index >= self.lines.len() {
+                // Ran out of input before the blank terminator (truncated patch).
+                return Err(self.corrupt_binary_error());
+            }
+            let data = self.lines[self.index];
+            if data.is_empty() {
+                // Blank line terminates the hunk.
+                self.index += 1;
+                break;
+            }
+            // git counts the trailing newline in its line length; our split-off
+            // lines do not carry it, so `git llen == data.len() + 1`.
+            let len = data.len();
+            if len < 6 || !(len - 1).is_multiple_of(5) {
+                return Err(self.corrupt_binary_error());
+            }
+            let max_byte_length = (len - 1) / 5 * 4;
+            let byte_length = match data[0] {
+                b'A'..=b'Z' => (data[0] - b'A') as usize + 1,
+                b'a'..=b'z' => (data[0] - b'a') as usize + 27,
+                _ => return Err(self.corrupt_binary_error()),
+            };
+            if max_byte_length < byte_length || byte_length <= max_byte_length.saturating_sub(4) {
+                return Err(self.corrupt_binary_error());
+            }
+            let decoded =
+                decode_base85(&data[1..], byte_length).ok_or_else(|| self.corrupt_binary_error())?;
+            deflated.extend_from_slice(&decoded);
+            self.index += 1;
+        }
+        Ok(Some(BinaryHunk {
+            method,
+            origlen,
+            deflated,
+        }))
+    }
+
+    fn corrupt_binary_error(&self) -> GitError {
+        GitError::InvalidFormat(format!("binary-corrupt:{}", self.index + 1))
     }
 
     fn parse_git_old_header(&self, rest: &[u8], patch: &mut FilePatch) {
@@ -5076,6 +5301,11 @@ fn empty_file_patch() -> FilePatch {
         is_copy: false,
         similarity: None,
         dissimilarity: None,
+        old_oid_hex: None,
+        new_oid_hex: None,
+        is_binary: false,
+        binary: None,
+        is_toplevel_relative: false,
     }
 }
 
@@ -5123,21 +5353,6 @@ fn parse_usize(bytes: &[u8]) -> Option<usize> {
     Some(value)
 }
 
-fn parse_octal(bytes: &[u8]) -> Option<u32> {
-    let trimmed = trim_ascii_end(bytes);
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut value: u32 = 0;
-    for &b in trimmed {
-        if !(b'0'..=b'7').contains(&b) {
-            return None;
-        }
-        value = value.checked_mul(8)?.checked_add((b - b'0') as u32)?;
-    }
-    Some(value)
-}
-
 fn parse_percent(bytes: &[u8]) -> Option<u8> {
     let trimmed = trim_ascii_end(bytes)
         .strip_suffix(b"%")
@@ -5152,6 +5367,164 @@ fn strip_prefix<'b>(line: &'b [u8], prefix: &[u8]) -> Option<&'b [u8]> {
     } else {
         None
     }
+}
+
+/// Whether a diff body line is a metadata-only binary marker (`Binary files …
+/// differ` / `Files … differ`), git's binhdr detection.
+fn apply_is_binary_files_differ(line: &[u8]) -> bool {
+    line.ends_with(b" differ")
+        && (line.starts_with(b"Binary files ") || line.starts_with(b"Files "))
+}
+
+/// Parse leading decimal digits (git uses `strtoul`, which ignores trailing
+/// junk). Returns 0 when there are no leading digits.
+fn parse_leading_usize(bytes: &[u8]) -> usize {
+    let mut value = 0usize;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        value = value.saturating_mul(10).saturating_add((b - b'0') as usize);
+    }
+    value
+}
+
+/// git's base85 alphabet (`base85.c` `en85`).
+const BASE85_ALPHABET: &[u8; 85] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
+
+fn base85_value(ch: u8) -> Option<u32> {
+    BASE85_ALPHABET
+        .iter()
+        .position(|&c| c == ch)
+        .map(|index| index as u32)
+}
+
+/// Decode `len` bytes from a base85 buffer (5 chars → 4 bytes, big-endian), a
+/// port of git's `decode_85`. Returns `None` on an invalid alphabet character or
+/// an overflowing 5-char group. `buffer` must contain `ceil(len/4) * 5` chars.
+fn decode_base85(buffer: &[u8], len: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(len);
+    let mut pos = 0usize;
+    let mut remaining = len;
+    while remaining > 0 {
+        let mut acc: u32 = 0;
+        // First four characters never overflow a u32 (85^4 < 2^32).
+        for _ in 0..4 {
+            let de = base85_value(*buffer.get(pos)?)?;
+            pos += 1;
+            acc = acc * 85 + de;
+        }
+        let de = base85_value(*buffer.get(pos)?)?;
+        pos += 1;
+        // The fifth character can overflow; reject it as git does.
+        if 0xffff_ffffu32 / 85 < acc {
+            return None;
+        }
+        acc *= 85;
+        if 0xffff_ffffu32 - de < acc {
+            return None;
+        }
+        acc += de;
+
+        let cnt = remaining.min(4);
+        remaining -= cnt;
+        let bytes = acc.to_be_bytes();
+        out.extend_from_slice(&bytes[..cnt]);
+    }
+    Some(out)
+}
+
+/// Apply a git delta (`delta.c` `patch_delta`) to reconstruct the postimage from
+/// `base`. The delta begins with the base size and result size as varints,
+/// followed by copy (`0x80` bit set: offset/size from base) and insert (literal
+/// bytes) opcodes. Returns `None` on any malformed/inconsistent delta.
+pub fn git_patch_delta(base: &[u8], delta: &[u8]) -> Option<Vec<u8>> {
+    let mut data = 0usize;
+    let read_hdr_size = |data: &mut usize| -> Option<usize> {
+        let mut size = 0usize;
+        let mut shift = 0u32;
+        loop {
+            let cmd = *delta.get(*data)?;
+            *data += 1;
+            size |= ((cmd & 0x7f) as usize).checked_shl(shift)?;
+            shift += 7;
+            if cmd & 0x80 == 0 {
+                break;
+            }
+        }
+        Some(size)
+    };
+
+    let base_size = read_hdr_size(&mut data)?;
+    if base_size != base.len() {
+        return None;
+    }
+    let result_size = read_hdr_size(&mut data)?;
+    let mut out = Vec::with_capacity(result_size);
+
+    while data < delta.len() {
+        let cmd = delta[data];
+        data += 1;
+        if cmd & 0x80 != 0 {
+            // Copy from base.
+            let mut cp_off = 0usize;
+            let mut cp_size = 0usize;
+            if cmd & 0x01 != 0 {
+                cp_off = *delta.get(data)? as usize;
+                data += 1;
+            }
+            if cmd & 0x02 != 0 {
+                cp_off |= (*delta.get(data)? as usize) << 8;
+                data += 1;
+            }
+            if cmd & 0x04 != 0 {
+                cp_off |= (*delta.get(data)? as usize) << 16;
+                data += 1;
+            }
+            if cmd & 0x08 != 0 {
+                cp_off |= (*delta.get(data)? as usize) << 24;
+                data += 1;
+            }
+            if cmd & 0x10 != 0 {
+                cp_size = *delta.get(data)? as usize;
+                data += 1;
+            }
+            if cmd & 0x20 != 0 {
+                cp_size |= (*delta.get(data)? as usize) << 8;
+                data += 1;
+            }
+            if cmd & 0x40 != 0 {
+                cp_size |= (*delta.get(data)? as usize) << 16;
+                data += 1;
+            }
+            if cp_size == 0 {
+                cp_size = 0x10000;
+            }
+            let end = cp_off.checked_add(cp_size)?;
+            if end > base.len() || cp_size > result_size {
+                return None;
+            }
+            out.extend_from_slice(&base[cp_off..end]);
+        } else if cmd != 0 {
+            // Insert literal bytes from the delta.
+            let len = cmd as usize;
+            let end = data.checked_add(len)?;
+            if end > delta.len() {
+                return None;
+            }
+            out.extend_from_slice(&delta[data..end]);
+            data = end;
+        } else {
+            // Opcode 0 is reserved.
+            return None;
+        }
+    }
+
+    if data != delta.len() || out.len() != result_size {
+        return None;
+    }
+    Some(out)
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -8123,7 +8496,11 @@ index ccccccc..ddddddd 100644
 
         assert_eq!(patches[0].old_path.as_deref(), Some(b"one.txt".as_slice()));
         assert_eq!(patches[0].new_path.as_deref(), Some(b"one.txt".as_slice()));
-        assert_eq!(patches[0].old_mode, None);
+        // The `index <a>..<b> 100644` line carries the unchanged-file mode, which
+        // git's gitdiff_index records as old_mode.
+        assert_eq!(patches[0].old_mode, Some(0o100644));
+        assert_eq!(patches[0].old_oid_hex.as_deref(), Some(b"aaaaaaa".as_slice()));
+        assert_eq!(patches[0].new_oid_hex.as_deref(), Some(b"bbbbbbb".as_slice()));
         assert_eq!(patches[0].hunks.len(), 1);
         let h = &patches[0].hunks[0];
         assert_eq!(

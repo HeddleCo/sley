@@ -3383,7 +3383,11 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             | "--allow-empty"
             | "-l"
             | "--ignore-whitespace"
-            | "--ignore-space-change" => {}
+            | "--ignore-space-change"
+            // Historical no-ops kept for compatibility: binary patches always
+            // apply when the data/index is present (git's OPT_HIDDEN aliases).
+            | "--allow-binary-replacement"
+            | "--binary" => {}
             "--unsafe-paths" => unsafe_paths = true,
             "--no-unsafe-paths" => unsafe_paths = false,
             "--unidiff-zero" => unidiff_zero = true,
@@ -3458,6 +3462,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(&git_dir)?;
     // `apply.whitespace` config supplies the default whitespace action when the
     // command line did not give an explicit `--whitespace=`.
@@ -3489,6 +3494,28 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                     {
                         eprintln!("error: {message}");
                         GitError::Exit(1)
+                    }
+                    GitError::InvalidFormat(message)
+                        if message.starts_with("binary-corrupt:") =>
+                    {
+                        let line = message.strip_prefix("binary-corrupt:").unwrap_or("");
+                        eprintln!("error: corrupt binary patch at {name}:{line}: ");
+                        GitError::Exit(128)
+                    }
+                    GitError::InvalidFormat(message)
+                        if message.starts_with("binary-unrecognized:") =>
+                    {
+                        let line = message.strip_prefix("binary-unrecognized:").unwrap_or("");
+                        eprintln!("error: unrecognized binary patch at {name}:{line}");
+                        eprintln!(
+                            "error: No valid patches in input (allow with \"--allow-empty\")"
+                        );
+                        GitError::Exit(128)
+                    }
+                    GitError::InvalidFormat(message) if message.starts_with("invalid mode on line") =>
+                    {
+                        eprintln!("error: {message}");
+                        GitError::Exit(128)
                     }
                     other => other,
                 })?,
@@ -3529,6 +3556,10 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     };
     if !matches!(ws_action, WsAction::Nowarn) {
         for patch in &mut patches {
+            // Binary patches carry no textual hunks to whitespace-check.
+            if patch.is_binary {
+                continue;
+            }
             let target = patch
                 .new_path
                 .as_deref()
@@ -3592,6 +3623,35 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let apply_file_options = sley_diff_merge::ApplyFileOptions { unidiff_zero };
     for patch in &patches {
         let base = read_patch_base(&worktree_root, patch)?;
+        // Binary patches reconstruct the postimage from the recorded blob OIDs
+        // (and the `GIT binary patch` payload), not from textual hunks.
+        if patch.is_binary {
+            match apply_binary_outcome(&db, format, patch, &base)? {
+                BinaryApply::Deletion => {
+                    if let Some(old) = &patch.old_path {
+                        actions.push(ApplyAction::Remove { path: old.clone() });
+                    }
+                }
+                BinaryApply::Content(content) => {
+                    let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone())
+                    else {
+                        return Err(GitError::InvalidFormat("patch missing target path".into()));
+                    };
+                    let mode = apply_write_mode(&worktree_root, patch, &target)?;
+                    actions.push(ApplyAction::Write {
+                        path: target,
+                        mode,
+                        content,
+                    });
+                    if patch.is_rename
+                        && let Some(old) = &patch.old_path
+                    {
+                        actions.push(ApplyAction::Remove { path: old.clone() });
+                    }
+                }
+            }
+            continue;
+        }
         let outcome =
             sley_diff_merge::apply_file_patch_with_options(&base, patch, &apply_file_options);
         let content = match outcome {
@@ -4360,6 +4420,113 @@ fn read_patch_base(worktree_root: &Path, patch: &sley_diff_merge::FilePatch) -> 
     let rel = std::str::from_utf8(old)
         .map_err(|_| GitError::InvalidFormat("non-utf8 patch path".into()))?;
     Ok(fs::read(worktree_root.join(rel)).unwrap_or_default())
+}
+
+/// Outcome of applying a binary file patch.
+enum BinaryApply {
+    /// The postimage bytes to write.
+    Content(Vec<u8>),
+    /// The new blob OID is null — the file is removed.
+    Deletion,
+}
+
+/// Apply a `GIT binary patch` (or a metadata-only `Binary files … differ`)
+/// against `image` (the current preimage bytes). Mirrors apply.c's `apply_binary`:
+/// require a full index line, verify the preimage matches `old_oid`, then either
+/// read the postimage straight from the object store or reconstruct it from the
+/// binary fragment and verify it hashes to `new_oid`.
+fn apply_binary_outcome(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    patch: &sley_diff_merge::FilePatch,
+    image: &[u8],
+) -> Result<BinaryApply> {
+    let name = String::from_utf8_lossy(
+        patch
+            .old_path
+            .as_deref()
+            .or(patch.new_path.as_deref())
+            .unwrap_or(b""),
+    )
+    .into_owned();
+    let hexsz = format.hex_len();
+    let is_full = |hex: Option<&Vec<u8>>| {
+        hex.is_some_and(|hex| hex.len() == hexsz && hex.iter().all(u8::is_ascii_hexdigit))
+    };
+    // For safety, git requires full hex object IDs for old and new.
+    if !is_full(patch.old_oid_hex.as_ref()) || !is_full(patch.new_oid_hex.as_ref()) {
+        eprintln!("error: cannot apply binary patch to '{name}' without full index line");
+        return Err(GitError::Exit(1));
+    }
+    let old_hex = String::from_utf8_lossy(patch.old_oid_hex.as_ref().unwrap()).into_owned();
+    let new_hex = String::from_utf8_lossy(patch.new_oid_hex.as_ref().unwrap()).into_owned();
+
+    // The preimage must match what the patch was prepared against.
+    if !patch.is_new && patch.old_path.is_some() {
+        let got = sley_core::object_id_for_bytes(format, "blob", image)?.to_hex();
+        if got != old_hex {
+            eprintln!(
+                "error: the patch applies to '{name}' ({got}), which does not match the \
+                 current contents."
+            );
+            return Err(GitError::Exit(1));
+        }
+    } else if !image.is_empty() {
+        eprintln!("error: the patch applies to an empty '{name}' but it is not empty");
+        return Err(GitError::Exit(1));
+    }
+
+    let new_oid = ObjectId::from_hex(format, &new_hex)?;
+    if new_oid.is_null() {
+        return Ok(BinaryApply::Deletion);
+    }
+
+    // If we already have the postimage object, use it directly.
+    if db.contains(&new_oid)? {
+        let object = db.read_object(&new_oid)?;
+        return Ok(BinaryApply::Content(object.body.clone()));
+    }
+
+    // Otherwise reconstruct it from the binary fragment and verify the result.
+    let Some(binary) = &patch.binary else {
+        eprintln!("error: missing binary patch data for '{name}'");
+        return Err(GitError::Exit(1));
+    };
+    let frag = &binary.forward;
+    let binary_apply_failed = || {
+        eprintln!("error: binary patch does not apply to '{name}'");
+        GitError::Exit(1)
+    };
+    let inflated = inflate_zlib_exact(&frag.deflated, frag.origlen).ok_or_else(binary_apply_failed)?;
+    let post = match frag.method {
+        sley_diff_merge::BinaryMethod::Literal => inflated,
+        sley_diff_merge::BinaryMethod::Delta => {
+            sley_diff_merge::git_patch_delta(image, &inflated).ok_or_else(binary_apply_failed)?
+        }
+    };
+    let got = sley_core::object_id_for_bytes(format, "blob", &post)?.to_hex();
+    if got != new_hex {
+        eprintln!(
+            "error: binary patch to '{name}' creates incorrect result \
+             (expecting {new_hex}, got {got})"
+        );
+        return Err(GitError::Exit(1));
+    }
+    Ok(BinaryApply::Content(post))
+}
+
+/// Inflate a single zlib stream, expecting exactly `expected_len` bytes out.
+fn inflate_zlib_exact(deflated: &[u8], expected_len: usize) -> Option<Vec<u8>> {
+    use flate2::{Decompress, FlushDecompress};
+    let mut decoder = Decompress::new(true);
+    let mut out = Vec::with_capacity(expected_len);
+    decoder
+        .decompress_vec(deflated, &mut out, FlushDecompress::Finish)
+        .ok()?;
+    if out.len() != expected_len {
+        return None;
+    }
+    Some(out)
 }
 
 /// Parse the `--whitespace=<action>` value into a [`WsAction`].

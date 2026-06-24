@@ -77,6 +77,8 @@ pub(crate) struct DiffOptions {
     pub(crate) raw_abbrev: Option<Option<usize>>,
     pub(crate) patch_abbrev: Option<usize>,
     pub(crate) patch_full_index: bool,
+    /// `--binary`: emit `GIT binary patch` blocks (implies full index).
+    pub(crate) patch_binary: bool,
     pub(crate) color_always: bool,
     pub(crate) color_moved: Option<Option<sley_diff_merge::render::ColorMovedMode>>,
     pub(crate) color_moved_ws: Option<sley_diff_merge::render::ColorMovedWs>,
@@ -157,6 +159,7 @@ impl Default for DiffOptions {
             raw_abbrev: None,
             patch_abbrev: None,
             patch_full_index: false,
+            patch_binary: false,
             color_always: false,
             color_moved: None,
             color_moved_ws: None,
@@ -1190,6 +1193,10 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
         }
         (_, Some("no-abbrev")) => options.raw_abbrev = Some(None),
         (_, Some("full-index")) => options.patch_full_index = true,
+        (_, Some("binary")) => {
+            options.patch_binary = true;
+            options.patch_full_index = true;
+        }
         (_, Some("no-prefix")) => {
             options.src_prefix.clear();
             options.dst_prefix.clear();

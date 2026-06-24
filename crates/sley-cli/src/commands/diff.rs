@@ -897,6 +897,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         raw_abbrev,
         patch_abbrev,
         patch_full_index,
+        patch_binary,
         mut color_always,
         color_moved,
         color_moved_ws,
@@ -1873,6 +1874,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         .as_ref()
                         .map(|(old, new)| (old.as_deref(), new.as_deref()));
                     let options = DiffRenderOptions {
+                        binary: patch_binary,
                         db: &db,
                         worktree_root: worktree_root.as_deref(),
                         use_worktree_new,
@@ -2771,6 +2773,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
         );
         for entry in &entries {
             let options = DiffRenderOptions {
+                binary: false,
                 db: &db,
                 worktree_root: None,
                 use_worktree_new: false,

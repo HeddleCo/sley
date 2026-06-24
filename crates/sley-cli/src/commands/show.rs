@@ -1457,6 +1457,7 @@ fn write_commit_diff_patch(
             |_| false,
             |stdout, entry| {
                 let patch_options = DiffRenderOptions {
+                    binary: false,
                     db,
                     worktree_root: None,
                     use_worktree_new: false,

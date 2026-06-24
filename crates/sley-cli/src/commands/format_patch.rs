@@ -3574,6 +3574,7 @@ fn format_patch_diff_options<'a>(
     abbrev: usize,
 ) -> crate::DiffRenderOptions<'a> {
     crate::DiffRenderOptions {
+        binary: false,
         db,
         worktree_root: None,
         use_worktree_new: false,

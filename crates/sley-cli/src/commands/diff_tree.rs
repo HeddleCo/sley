@@ -127,6 +127,8 @@ struct DiffTreeOptions {
     /// Patch/index-line abbreviation width.
     patch_abbrev: Option<usize>,
     patch_full_index: bool,
+    /// `--binary`: emit `GIT binary patch` blocks (implies full index).
+    patch_binary: bool,
     src_prefix: String,
     dst_prefix: String,
     /// `--check`: emit a whitespace-error report instead of the diff body.
@@ -177,6 +179,7 @@ impl Default for DiffTreeOptions {
             raw_abbrev: None,
             patch_abbrev: None,
             patch_full_index: false,
+            patch_binary: false,
             src_prefix: "a/".to_string(),
             dst_prefix: "b/".to_string(),
             check: false,
@@ -347,6 +350,10 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
                 options.patch_abbrev = Some(width);
             }
             "--full-index" => options.patch_full_index = true,
+            "--binary" => {
+                options.patch_binary = true;
+                options.patch_full_index = true;
+            }
             "--no-prefix" => {
                 options.src_prefix.clear();
                 options.dst_prefix.clear();
@@ -1137,6 +1144,7 @@ fn run_diff_request(
         |_| false,
         |stdout, entry| {
             let patch_options = DiffRenderOptions {
+                binary: context.options.patch_binary,
                 db: context.db,
                 worktree_root: None,
                 use_worktree_new: false,

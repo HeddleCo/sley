@@ -871,6 +871,7 @@ fn rerere_diff(git_dir: &Path, format: ObjectFormat) -> Result<()> {
             &mut rendered,
             &diff_entry,
             DiffRenderOptions {
+                binary: false,
                 db: &db,
                 worktree_root: None,
                 use_worktree_new: false,

@@ -552,6 +552,7 @@ fn build_patch_text(
             &mut raw,
             entry,
             DiffRenderOptions {
+                binary: false,
                 db,
                 worktree_root: None,
                 use_worktree_new: false,

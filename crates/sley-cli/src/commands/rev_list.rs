@@ -1770,6 +1770,7 @@ fn rev_list_render_tree_to_tree_patch(
             &mut out,
             entry,
             DiffRenderOptions {
+                binary: false,
                 db,
                 worktree_root: None,
                 use_worktree_new: false,

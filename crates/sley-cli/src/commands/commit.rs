@@ -2814,6 +2814,7 @@ fn append_commit_diff_index_patch(
             out,
             &entry,
             DiffRenderOptions {
+                binary: false,
                 db: &db,
                 worktree_root: worktree.then_some(worktree_root.as_path()),
                 use_worktree_new: worktree,
