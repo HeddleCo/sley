@@ -3454,8 +3454,15 @@ fn apply_three_way(
     // when straight application failed.
     let index_oids = parse_patch_index_oids(&patch.diff);
 
-    let mut base_map = ours_map.clone();
-    let mut theirs_map = ours_map.clone();
+    // git's `build_fake_ancestor`: the synthetic merge base and the "theirs" tree
+    // contain ONLY the files the patch touches (preimage / postimage), NOT a copy
+    // of HEAD. Seeding them from `ours_map` would leave a renamed-away file's new
+    // location present in the base, defeating the rename detection merge-recursive
+    // relies on (t4153 "--3way overrides --no-3way": file→file2 rename must follow
+    // so side1's change lands on file2). Files HEAD has but the patch does not
+    // touch appear only in "ours" and the merge keeps them as add-in-ours.
+    let mut base_map = MergeTreeMap::new();
+    let mut theirs_map = MergeTreeMap::new();
     for file in file_patches {
         let path = file
             .new_path
@@ -3541,7 +3548,7 @@ fn apply_three_way(
     // Report the paths that differ between the reconstructed base and HEAD, the
     // way git's "reconstruct a base tree" step does (`<status>\t<path>`).
     if !quiet {
-        print_three_way_base_status(&base_map, &ours_map);
+        print_three_way_base_status(&base_map, &ours_map, &theirs_map);
     }
 
     if !quiet {
@@ -3597,13 +3604,21 @@ fn apply_three_way(
 /// Print the `<status>\t<path>` lines git emits while reconstructing the base
 /// tree for a 3-way merge: `A` added, `D` deleted, `M` modified relative to the
 /// reconstructed base.
-fn print_three_way_base_status(base_map: &MergeTreeMap, ours_map: &MergeTreeMap) {
+fn print_three_way_base_status(
+    base_map: &MergeTreeMap,
+    ours_map: &MergeTreeMap,
+    theirs_map: &MergeTreeMap,
+) {
+    // git shows the diff that reconstructs the (fake-ancestor) base from HEAD,
+    // restricted to the paths the patch touches — i.e. the keys of the fake
+    // ancestor's base/their trees. The direction is ours→base, so a file HEAD no
+    // longer has (renamed away) shows as `A` while a modified file shows `M`.
     let mut paths: BTreeSet<&Vec<u8>> = BTreeSet::new();
     paths.extend(base_map.keys());
-    paths.extend(ours_map.keys());
+    paths.extend(theirs_map.keys());
     for path in paths {
-        let status = match (base_map.get(path), ours_map.get(path)) {
-            (Some(base), Some(ours)) if base != ours => Some('M'),
+        let status = match (ours_map.get(path), base_map.get(path)) {
+            (Some(ours), Some(base)) if ours != base => Some('M'),
             (None, Some(_)) => Some('A'),
             (Some(_), None) => Some('D'),
             _ => None,
