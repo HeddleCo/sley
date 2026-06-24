@@ -371,6 +371,11 @@ jobs:
             t4257-am-interactive.sh
             t4153-am-resume-override-opts.sh
             t4252-am-options.sh
+            # wave-41 (2026-06-24): apply engine round 2 gains.
+            t4103-apply-binary.sh
+            t4114-apply-typechange.sh
+            t4129-apply-samemode.sh
+            t4111-apply-subdir.sh
           # t5310/t5326 overrun the runner's 120s default per-script timeout
           # under load (a TIMEOUT row truncates the ok count and would falsely
           # trip the floor gate). Give every script the same generous ceiling.

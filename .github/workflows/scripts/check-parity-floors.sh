@@ -890,7 +890,8 @@ declare -A FLOOR=(
     # are patch-engine NEIGHBORS of add-i's add_patch.rs/plumbing.rs — floored at 4 (confirmed
     # == base, no regression) to guard the class per the d3f746e6 neighbor-guard lesson.
     [t2016-checkout-patch.sh]=4
-    [t4108-apply-threeway.sh]=4
+    # wave-41 (apply engine round 2): t4108 3-way fallback 4->17.
+    [t4108-apply-threeway.sh]=17
     # wave-21 (2026-06-19, integ/wave21 onto 01421060): hard-tail, 4 disjoint slices. submodule
     # recursion in pull/am (t5572 34->40, t4255 1->17 — wired to the wave-20 worktree core;
     # t3426-rebase-submodule stayed 0/29, needs deeper sequencer/index gitlink work = future
@@ -1059,6 +1060,14 @@ declare -A FLOOR=(
     [t4257-am-interactive.sh]=4
     [t4153-am-resume-override-opts.sh]=4
     [t4252-am-options.sh]=2
+    # wave-41 (2026-06-24): apply engine round 2 — binary codec, 3-way fallback,
+    # typechange, index/mode. New gate files: t4103=24 (binary, was 5 -> full),
+    # t4114=12 (typechange, full), t4129=19 (samemode), t4111=4 (subdir).
+    # (t4108 raised 4->17 in place above.)
+    [t4103-apply-binary.sh]=24
+    [t4114-apply-typechange.sh]=12
+    [t4129-apply-samemode.sh]=19
+    [t4111-apply-subdir.sh]=4
 )
 
 fail=0
