@@ -4538,6 +4538,539 @@ pub fn render_reject_hunk(hunk: &Hunk) -> Vec<u8> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Whitespace-aware apply (`git apply --whitespace=fix` / `--ignore-space-change`)
+//
+// A faithful port of git's `apply_one_fragment` matching path (`match_fragment`,
+// `find_pos`, `line_by_line_fuzzy_match`, `update_pre_post_images`,
+// `update_image`). It adds the matching concerns that need the whitespace rule —
+// blank-at-EOF tolerance, whitespace-corrected / whitespace-ignoring context
+// matching, and removal of newly-added blank lines at EOF — on top of the plain
+// exact-match engine above. The patch's `+` lines are expected to already carry
+// their whitespace fixes (the apply command's whitespace pass applies them);
+// this routine fixes the *context* lines as part of matching.
+// ---------------------------------------------------------------------------
+
+/// Options for [`apply_file_patch_ws`].
+#[derive(Clone, Copy)]
+pub struct WsApplyOptions {
+    /// `--unidiff-zero`.
+    pub unidiff_zero: bool,
+    /// The per-path whitespace rule.
+    pub ws_rule: ws::WsRule,
+    /// `--whitespace=fix` (git's `correct_ws_error`).
+    pub ws_fix: bool,
+    /// `--ignore-space-change` / `--ignore-whitespace` (git's `ignore_ws_change`).
+    pub ws_ignore_change: bool,
+}
+
+/// Outcome of [`apply_file_patch_ws`].
+pub enum WsApplyOutcome {
+    /// Applied; carries the bytes and the count of blank lines removed at EOF.
+    Applied {
+        content: Vec<u8>,
+        blank_at_eof_removed: usize,
+    },
+    /// At least one hunk could not be placed.
+    Rejected,
+}
+
+/// A pre/postimage line carrying git's `LINE_COMMON` flag (set for context lines,
+/// clear for added/deleted lines).
+#[derive(Clone)]
+struct WsImageLine {
+    content: Vec<u8>,
+    no_newline: bool,
+    common: bool,
+}
+
+impl WsImageLine {
+    fn bytes(&self) -> Vec<u8> {
+        let mut out = self.content.clone();
+        if !self.no_newline {
+            out.push(b'\n');
+        }
+        out
+    }
+}
+
+fn line_bytes(line: &Line) -> Vec<u8> {
+    let mut out = line.content.clone();
+    if !line.no_newline {
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Split ws-fixed line bytes back into a [`WsImageLine`] (content sans trailing
+/// newline, plus the no-newline flag).
+fn ws_line_from_bytes(bytes: Vec<u8>, common: bool) -> WsImageLine {
+    if bytes.last() == Some(&b'\n') {
+        WsImageLine {
+            content: bytes[..bytes.len() - 1].to_vec(),
+            no_newline: false,
+            common,
+        }
+    } else {
+        WsImageLine {
+            content: bytes,
+            no_newline: true,
+            common,
+        }
+    }
+}
+
+/// Whitespace-aware single-file apply — git's `apply_one_fragment` matching path.
+pub fn apply_file_patch_ws(base: &[u8], patch: &FilePatch, opts: &WsApplyOptions) -> WsApplyOutcome {
+    if patch.is_delete && patch.hunks.is_empty() {
+        return WsApplyOutcome::Applied {
+            content: Vec::new(),
+            blank_at_eof_removed: 0,
+        };
+    }
+    let base_for_match: &[u8] = if patch.is_new { b"" } else { base };
+    let mut image = split_blob_lines(base_for_match);
+    let mut running_offset: isize = 0;
+    let mut blank_removed = 0usize;
+    for hunk in &patch.hunks {
+        match apply_one_fragment_ws(&mut image, hunk, running_offset, opts, &mut blank_removed) {
+            Some(drift) => running_offset += drift,
+            None => return WsApplyOutcome::Rejected,
+        }
+    }
+    WsApplyOutcome::Applied {
+        content: join_lines(&image),
+        blank_at_eof_removed: blank_removed,
+    }
+}
+
+fn apply_one_fragment_ws(
+    image: &mut Vec<Line>,
+    hunk: &Hunk,
+    running_offset: isize,
+    opts: &WsApplyOptions,
+    blank_removed: &mut usize,
+) -> Option<isize> {
+    let blank_eof = opts.ws_rule & ws::WS_BLANK_AT_EOF != 0;
+    let mut preimage: Vec<WsImageLine> = Vec::new();
+    let mut postimage: Vec<WsImageLine> = Vec::new();
+    let mut leading = 0usize;
+    let mut trailing = 0usize;
+    let mut seen_change = false;
+    // git's `new_blank_lines_at_end`: blank lines added at the end, where a blank
+    // *context* line does not reset the run but a non-blank line does.
+    let mut new_blank_lines_at_end = 0usize;
+    for hl in &hunk.lines {
+        let mut added_blank_line = false;
+        let mut is_blank_context = false;
+        match hl {
+            HunkLine::Context(bytes) => {
+                if blank_eof && ws::ws_blank_line(bytes) {
+                    is_blank_context = true;
+                }
+                preimage.push(WsImageLine {
+                    content: bytes.clone(),
+                    no_newline: false,
+                    common: true,
+                });
+                postimage.push(WsImageLine {
+                    content: bytes.clone(),
+                    no_newline: false,
+                    common: true,
+                });
+                if !seen_change {
+                    leading += 1;
+                }
+                trailing += 1;
+            }
+            HunkLine::Delete(bytes) => {
+                preimage.push(WsImageLine {
+                    content: bytes.clone(),
+                    no_newline: false,
+                    common: false,
+                });
+                seen_change = true;
+                trailing = 0;
+            }
+            HunkLine::Insert(bytes) => {
+                postimage.push(WsImageLine {
+                    content: bytes.clone(),
+                    no_newline: false,
+                    common: false,
+                });
+                if blank_eof && ws::ws_blank_line(bytes) {
+                    added_blank_line = true;
+                }
+                seen_change = true;
+                trailing = 0;
+            }
+        }
+        if added_blank_line {
+            new_blank_lines_at_end += 1;
+        } else if is_blank_context {
+            // leave the running count alone
+        } else {
+            new_blank_lines_at_end = 0;
+        }
+    }
+    if hunk.old_no_newline
+        && let Some(last) = preimage.last_mut()
+    {
+        last.no_newline = true;
+    }
+    if hunk.new_no_newline
+        && let Some(last) = postimage.last_mut()
+    {
+        last.no_newline = true;
+    }
+
+    let mut match_beginning = hunk.old_start == 0 || (hunk.old_start == 1 && !opts.unidiff_zero);
+    let mut match_end = !opts.unidiff_zero && trailing == 0;
+
+    let mut expected = if preimage.is_empty() {
+        new_side_position(hunk, running_offset)
+    } else {
+        expected_position(hunk, running_offset)
+    };
+    let hunk_expected = expected;
+    let mut leading_v = leading;
+    let mut trailing_v = trailing;
+
+    let applied_pos = loop {
+        if let Some(pos) = find_pos_ws(
+            image,
+            &mut preimage,
+            &mut postimage,
+            expected,
+            opts,
+            match_beginning,
+            match_end,
+        ) {
+            break pos;
+        }
+        #[allow(clippy::absurd_extreme_comparisons)]
+        if leading_v <= MIN_FUZZ_CONTEXT && trailing_v <= MIN_FUZZ_CONTEXT {
+            return None;
+        }
+        if match_beginning || match_end {
+            match_beginning = false;
+            match_end = false;
+            continue;
+        }
+        if leading_v >= trailing_v {
+            preimage.remove(0);
+            postimage.remove(0);
+            expected -= 1;
+            leading_v -= 1;
+        }
+        if trailing_v > leading_v {
+            preimage.pop();
+            postimage.pop();
+            trailing_v -= 1;
+        }
+    };
+
+    // Remove the blank lines added at EOF when the hunk lands at (or beyond) the
+    // end of the image — git's `--whitespace=fix` blank-at-EOF correction.
+    if new_blank_lines_at_end > 0
+        && preimage.len() + applied_pos >= image.len()
+        && blank_eof
+        && opts.ws_fix
+    {
+        for _ in 0..new_blank_lines_at_end {
+            postimage.pop();
+        }
+        *blank_removed += new_blank_lines_at_end;
+    }
+
+    // git's `update_image`: the preimage may extend beyond EOF, so only the part
+    // that falls within the image is removed.
+    let preimage_limit = preimage.len().min(image.len() - applied_pos);
+    let replacement: Vec<Line> = postimage
+        .iter()
+        .map(|line| Line {
+            content: line.content.clone(),
+            no_newline: line.no_newline,
+        })
+        .collect();
+    image.splice(applied_pos..applied_pos + preimage_limit, replacement);
+    Some(applied_pos as isize - hunk_expected)
+}
+
+/// Port of git's `find_pos`: ping-pong outward from `expected` calling
+/// [`match_fragment_ws`] at each candidate line. On a match the preimage and the
+/// common lines of the postimage may be rewritten in place (whitespace fix).
+fn find_pos_ws(
+    image: &[Line],
+    preimage: &mut Vec<WsImageLine>,
+    postimage: &mut Vec<WsImageLine>,
+    expected: isize,
+    opts: &WsApplyOptions,
+    match_beginning: bool,
+    match_end: bool,
+) -> Option<usize> {
+    let line_nr = image.len();
+    let pre_nr = preimage.len();
+    let mut line: isize = if match_beginning {
+        0
+    } else if match_end {
+        line_nr as isize - pre_nr as isize
+    } else {
+        expected
+    };
+    if line < 0 {
+        line = 0;
+    }
+    if line as usize > line_nr {
+        line = line_nr as isize;
+    }
+    let start = line as usize;
+    let mut backwards = start;
+    let mut forwards = start;
+    let mut current = start;
+    let mut i: u64 = 0;
+    loop {
+        if match_fragment_ws(
+            image,
+            preimage,
+            postimage,
+            current,
+            opts,
+            match_beginning,
+            match_end,
+        ) {
+            return Some(current);
+        }
+        loop {
+            if backwards == 0 && forwards == line_nr {
+                return None;
+            }
+            if i & 1 == 1 {
+                if backwards == 0 {
+                    i += 1;
+                    continue;
+                }
+                backwards -= 1;
+                current = backwards;
+            } else {
+                if forwards == line_nr {
+                    i += 1;
+                    continue;
+                }
+                forwards += 1;
+                current = forwards;
+            }
+            break;
+        }
+        i += 1;
+    }
+}
+
+/// Port of git's `match_fragment`. Returns whether `preimage` matches `image` at
+/// `current_lno`, trying (in order) an exact match, then — when `--whitespace=fix`
+/// or `--ignore-space-change` is in effect — a whitespace-corrected or
+/// whitespace-ignoring match, rewriting the preimage and the postimage's common
+/// lines to the matched whitespace on success.
+fn match_fragment_ws(
+    image: &[Line],
+    preimage: &mut Vec<WsImageLine>,
+    postimage: &mut Vec<WsImageLine>,
+    current_lno: usize,
+    opts: &WsApplyOptions,
+    match_beginning: bool,
+    match_end: bool,
+) -> bool {
+    let blank_eof = opts.ws_rule & ws::WS_BLANK_AT_EOF != 0;
+    let preimage_limit: usize;
+    if preimage.len() + current_lno <= image.len() {
+        preimage_limit = preimage.len();
+        if match_end && (preimage.len() + current_lno != image.len()) {
+            return false;
+        }
+    } else if opts.ws_fix && blank_eof {
+        // The hunk extends beyond EOF and we are removing blank lines there; only
+        // the in-image prefix must match, the rest of the preimage must be blank.
+        preimage_limit = image.len() - current_lno;
+    } else {
+        return false;
+    }
+
+    if match_beginning && current_lno != 0 {
+        return false;
+    }
+
+    if preimage_limit == preimage.len() {
+        // Try an exact byte match of the whole preimage.
+        let mut exact = true;
+        if match_end && current_lno + preimage_limit != image.len() {
+            exact = false;
+        }
+        if exact {
+            for i in 0..preimage_limit {
+                let img = &image[current_lno + i];
+                let pre = &preimage[i];
+                if img.content != pre.content || img.no_newline != pre.no_newline {
+                    exact = false;
+                    break;
+                }
+            }
+        }
+        if exact {
+            return true;
+        }
+    } else {
+        // The preimage extends beyond EOF: there must be at least one non-blank
+        // context line within the in-image prefix.
+        let mut all_blank = true;
+        for line in preimage.iter().take(preimage_limit) {
+            if !line.content.iter().all(|&b| ws::is_space(b)) {
+                all_blank = false;
+                break;
+            }
+        }
+        if all_blank {
+            return false;
+        }
+    }
+
+    // No exact match. Try fuzzy / whitespace-corrected matching.
+    if opts.ws_ignore_change {
+        return fuzzy_match_ws(image, preimage, postimage, current_lno, preimage_limit);
+    }
+    if !opts.ws_fix {
+        return false;
+    }
+
+    // Whitespace-corrected match: fix the in-image preimage lines and the target
+    // lines, requiring equality; the beyond-EOF preimage lines must become blank.
+    let mut fixed: Vec<WsImageLine> = Vec::with_capacity(preimage.len());
+    for i in 0..preimage_limit {
+        let fixed_pre = ws::ws_fix_bytes(&preimage[i].bytes(), opts.ws_rule);
+        let fixed_tgt = ws::ws_fix_bytes(&line_bytes(&image[current_lno + i]), opts.ws_rule);
+        if fixed_pre != fixed_tgt {
+            return false;
+        }
+        fixed.push(ws_line_from_bytes(fixed_pre, preimage[i].common));
+    }
+    for line in preimage.iter().skip(preimage_limit) {
+        let fixed_pre = ws::ws_fix_bytes(&line.bytes(), opts.ws_rule);
+        if !fixed_pre.iter().all(|&b| ws::is_space(b)) {
+            return false;
+        }
+        fixed.push(ws_line_from_bytes(fixed_pre, line.common));
+    }
+    update_pre_post_images_ws(preimage, postimage, fixed);
+    true
+}
+
+/// Port of git's `line_by_line_fuzzy_match` (the `--ignore-space-change` path):
+/// compare each line ignoring whitespace runs; on success the matched lines use
+/// the *target's* whitespace in-image and the *preimage's* whitespace beyond EOF.
+fn fuzzy_match_ws(
+    image: &[Line],
+    preimage: &mut Vec<WsImageLine>,
+    postimage: &mut Vec<WsImageLine>,
+    current_lno: usize,
+    preimage_limit: usize,
+) -> bool {
+    for i in 0..preimage_limit {
+        if !fuzzy_matchlines(&line_bytes(&image[current_lno + i]), &preimage[i].bytes()) {
+            return false;
+        }
+    }
+    // The beyond-EOF preimage lines must be all whitespace.
+    for line in preimage.iter().skip(preimage_limit) {
+        if !line.bytes().iter().all(|&b| ws::is_space(b)) {
+            return false;
+        }
+    }
+    // Build the fixed preimage: in-image lines take the target's whitespace, the
+    // beyond-EOF lines keep the preimage's whitespace.
+    let mut fixed: Vec<WsImageLine> = Vec::with_capacity(preimage.len());
+    for i in 0..preimage_limit {
+        let img = &image[current_lno + i];
+        fixed.push(WsImageLine {
+            content: img.content.clone(),
+            no_newline: img.no_newline,
+            common: preimage[i].common,
+        });
+    }
+    for line in preimage.iter().skip(preimage_limit) {
+        fixed.push(line.clone());
+    }
+    update_pre_post_images_ws(preimage, postimage, fixed);
+    true
+}
+
+/// Port of git's `fuzzy_matchlines`: compare two lines ignoring whitespace
+/// differences (any whitespace run matches any other; line endings are ignored).
+fn fuzzy_matchlines(s1: &[u8], s2: &[u8]) -> bool {
+    let trim = |s: &[u8]| {
+        let mut end = s.len();
+        while end > 0 && (s[end - 1] == b'\r' || s[end - 1] == b'\n') {
+            end -= 1;
+        }
+        end
+    };
+    let end1 = trim(s1);
+    let end2 = trim(s2);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < end1 && j < end2 {
+        if ws::is_space(s1[i]) {
+            if !ws::is_space(s2[j]) {
+                return false;
+            }
+            while i < end1 && ws::is_space(s1[i]) {
+                i += 1;
+            }
+            while j < end2 && ws::is_space(s2[j]) {
+                j += 1;
+            }
+        } else if s1[i] != s2[j] {
+            return false;
+        } else {
+            i += 1;
+            j += 1;
+        }
+    }
+    i == end1 && j == end2
+}
+
+/// Port of git's `update_pre_post_images`: replace the preimage with the fixed
+/// lines (carrying the original common flags), then rewrite each *common* line of
+/// the postimage to use the fixed preimage's content. A common postimage line
+/// whose fixed-preimage counterpart ran out (a trailing blank trimmed at EOF) is
+/// dropped (git's `reduced`).
+fn update_pre_post_images_ws(
+    preimage: &mut Vec<WsImageLine>,
+    postimage: &mut Vec<WsImageLine>,
+    fixed: Vec<WsImageLine>,
+) {
+    *preimage = fixed;
+    let mut new_post: Vec<WsImageLine> = Vec::with_capacity(postimage.len());
+    let mut ctx = 0usize;
+    for line in postimage.iter() {
+        if !line.common {
+            new_post.push(line.clone());
+            continue;
+        }
+        while ctx < preimage.len() && !preimage[ctx].common {
+            ctx += 1;
+        }
+        if ctx >= preimage.len() {
+            // preimage ran out (a fixed-away trailing blank): drop this line.
+            continue;
+        }
+        new_post.push(WsImageLine {
+            content: preimage[ctx].content.clone(),
+            no_newline: preimage[ctx].no_newline,
+            common: true,
+        });
+        ctx += 1;
+    }
+    *postimage = new_post;
+}
+
 /// Splice a single hunk into `image`, returning the offset (applied position −
 /// expected position) so later hunks can carry it forward, or `None` if the
 /// hunk cannot be located (which rejects the whole patch).

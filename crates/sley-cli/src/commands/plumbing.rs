@@ -3390,6 +3390,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let mut unidiff_zero = false;
     let mut reverse = false;
     let mut reject = false;
+    let mut ignore_space_change = false;
     // Whether `--whitespace=` was given on the command line; when not, the
     // default action comes from `apply.whitespace` config (git's precedence).
     let mut ws_action_explicit = false;
@@ -3408,12 +3409,14 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             | "--verbose"
             | "--allow-empty"
             | "-l"
-            | "--ignore-whitespace"
-            | "--ignore-space-change"
             // Historical no-ops kept for compatibility: binary patches always
             // apply when the data/index is present (git's OPT_HIDDEN aliases).
             | "--allow-binary-replacement"
             | "--binary" => {}
+            // git's `ignore_ws_change`: match context lines ignoring whitespace
+            // differences (collapsing runs); applies the post-image as written.
+            "--ignore-whitespace" | "--ignore-space-change" => ignore_space_change = true,
+            "--no-ignore-whitespace" => ignore_space_change = false,
             "--unsafe-paths" => unsafe_paths = true,
             "--no-unsafe-paths" => unsafe_paths = false,
             "--unidiff-zero" => unidiff_zero = true,
@@ -3818,6 +3821,36 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             let result =
                 sley_diff_merge::apply_file_patch_rejecting(&base, patch, &apply_file_options);
             (result.content, result.rejected)
+        } else if matches!(ws_action, WsAction::Fix) || ignore_space_change {
+            // `--whitespace=fix` / `--ignore-space-change`: match (and, in fix mode,
+            // whitespace-correct) context lines and trim blank lines added at EOF.
+            let target = patch
+                .new_path
+                .as_deref()
+                .or(patch.old_path.as_deref())
+                .unwrap_or(b"");
+            let mut rule = ws_resolver.rule_for_path(target)?;
+            if patch.new_mode == Some(0o120000) {
+                rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
+            }
+            let ws_opts = sley_diff_merge::WsApplyOptions {
+                unidiff_zero,
+                ws_rule: rule,
+                ws_fix: matches!(ws_action, WsAction::Fix),
+                ws_ignore_change: ignore_space_change,
+            };
+            match sley_diff_merge::apply_file_patch_ws(&base, patch, &ws_opts) {
+                sley_diff_merge::WsApplyOutcome::Applied { content, .. } => (content, Vec::new()),
+                sley_diff_merge::WsApplyOutcome::Rejected => {
+                    let name = patch
+                        .new_path
+                        .as_deref()
+                        .or(patch.old_path.as_deref())
+                        .unwrap_or(b"");
+                    eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
+                    return Err(GitError::Exit(1));
+                }
+            }
         } else {
             match sley_diff_merge::apply_file_patch_with_options(&base, patch, &apply_file_options)
             {
@@ -5360,8 +5393,11 @@ fn apply_patch_whitespace(
         }
     }
 
-    // Blank-at-EOF: compare the trailing-blank run of the pre- and post-images.
-    if rule & ws::WS_BLANK_AT_EOF != 0 {
+    // Blank-at-EOF warning for warn/error modes: compare the trailing-blank run
+    // of the pre- and post-images. In `fix` mode the whitespace-aware apply
+    // (`apply_file_patch_ws`, via `new_blank_lines_at_end`) does the removal, so
+    // this pass only reports for the non-fix actions.
+    if rule & ws::WS_BLANK_AT_EOF != 0 && !fixing {
         let postimage = match sley_diff_merge::apply_file_patch(base, patch) {
             sley_diff_merge::ApplyOutcome::Applied(content) => content,
             sley_diff_merge::ApplyOutcome::Rejected => return,
@@ -5371,47 +5407,15 @@ fn apply_patch_whitespace(
         if l2 > l1 {
             let at = ws::count_lines(&postimage);
             let blank_at_eof = at - l2 + 1;
-            if fixing {
-                // Trim the extra blank lines off the last hunk's trailing
-                // inserts.
-                let extra = l2 - l1;
-                trim_trailing_blank_inserts(patch, extra);
-                *error_count += 1;
+            *error_count += 1;
+            if *error_count <= squelch_limit {
+                let err = ws::whitespace_error_string(ws::WS_BLANK_AT_EOF);
+                eprintln!("{patch_input_file}:{blank_at_eof}: {err}.");
             } else {
-                *error_count += 1;
-                if *error_count <= squelch_limit {
-                    let err = ws::whitespace_error_string(ws::WS_BLANK_AT_EOF);
-                    eprintln!("{patch_input_file}:{blank_at_eof}: {err}.");
-                } else {
-                    *squelched += 1;
-                }
+                *squelched += 1;
             }
         }
     }
-}
-
-/// Drop up to `count` trailing blank `Insert` lines from the patch's last hunk
-/// (the `--whitespace=fix` blank-at-EOF correction).
-fn trim_trailing_blank_inserts(patch: &mut sley_diff_merge::FilePatch, mut count: usize) {
-    use sley_diff_merge::HunkLine;
-    use sley_diff_merge::ws;
-    let Some(hunk) = patch.hunks.last_mut() else {
-        return;
-    };
-    while count > 0 {
-        match hunk.lines.last() {
-            Some(HunkLine::Insert(bytes)) if ws::ws_blank_line(bytes) => {
-                hunk.lines.pop();
-                if hunk.new_len > 0 {
-                    hunk.new_len -= 1;
-                }
-                count -= 1;
-            }
-            _ => break,
-        }
-    }
-    // The last surviving inserted line keeps the file's terminal newline state.
-    hunk.new_no_newline = false;
 }
 
 pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {

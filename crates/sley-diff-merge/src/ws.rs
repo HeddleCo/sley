@@ -293,8 +293,17 @@ pub fn whitespace_error_string(ws: WsRule) -> String {
 /// ASCII `isspace`, matching git's C locale behaviour (space, `\t`, `\n`,
 /// `\x0b`, `\x0c`, `\r`).
 #[inline]
-fn is_space(b: u8) -> bool {
+pub fn is_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// Whitespace-fix a whole line (including any trailing newline) and return the
+/// fixed bytes — [`ws_fix_copy`] into a fresh buffer. Used by `git apply`'s
+/// whitespace-corrected fragment matching.
+pub fn ws_fix_bytes(src: &[u8], ws_rule: WsRule) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len());
+    ws_fix_copy(&mut out, src, ws_rule);
+    out
 }
 
 /// The painted spans produced by [`ws_check_emit`] for `--ws-error-highlight`.
