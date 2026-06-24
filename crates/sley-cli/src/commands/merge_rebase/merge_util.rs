@@ -583,6 +583,53 @@ pub(crate) fn three_way_merge_trees_inner_with_info(
     favor: sley_diff_merge::MergeFavor,
     style: sley_diff_merge::ConflictStyle,
 ) -> Result<(MergePathResults, MergeConflictPaths, MergeInfoMessages)> {
+    three_way_merge_trees_inner_with_info_opts(
+        db,
+        format,
+        base,
+        ours,
+        theirs,
+        ours_label,
+        theirs_label,
+        ancestor_label,
+        favor,
+        style,
+        // Rename-aware merge with git's default settings: detection on, 50%
+        // threshold, `merge.directoryRenames` honoured.
+        RenameMergeConfig {
+            detect_renames: true,
+            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            directory_renames: directory_renames_config(),
+        },
+    )
+}
+
+/// Rename-detection settings threaded into a 3-way merge. `git merge-recursive`
+/// (and `git merge -s recursive/ort`) lets the caller tune these via
+/// `--find-renames`/`--rename-threshold`/`--no-renames` and the
+/// `merge.renames`/`diff.renames` config; the porcelains that don't expose those
+/// knobs use [`RenameMergeConfig::default`] (git's defaults).
+#[derive(Clone, Copy)]
+pub(crate) struct RenameMergeConfig {
+    pub(crate) detect_renames: bool,
+    pub(crate) rename_threshold: u8,
+    pub(crate) directory_renames: sley_diff_merge::DirectoryRenames,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_way_merge_trees_inner_with_info_opts(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    base: &MergeTreeMap,
+    ours: &MergeTreeMap,
+    theirs: &MergeTreeMap,
+    ours_label: &str,
+    theirs_label: &str,
+    ancestor_label: &str,
+    favor: sley_diff_merge::MergeFavor,
+    style: sley_diff_merge::ConflictStyle,
+    renames: RenameMergeConfig,
+) -> Result<(MergePathResults, MergeConflictPaths, MergeInfoMessages)> {
     let merge = sley_diff_merge::merge_entry_maps(
         db,
         format,
@@ -594,15 +641,16 @@ pub(crate) fn three_way_merge_trees_inner_with_info(
             theirs_label,
             ancestor_label,
             favor,
-            // Rename-aware merge: a file renamed on one side and modified on the
-            // other follows the rename (the merge-ort single-base rename case).
-            detect_renames: true,
-            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            // Directory-rename detection honours `merge.directoryRenames` (git's
-            // default is `conflict`). When one side renames a directory and the
-            // other adds files under the old directory, those files re-home into
-            // the renamed directory.
-            directory_renames: directory_renames_config(),
+            detect_renames: renames.detect_renames,
+            rename_threshold: renames.rename_threshold,
+            // Directory-rename detection only fires when file-rename detection is
+            // enabled (it is inferred from the file renames found). With renames
+            // off, force it off too so `--no-renames` disables both.
+            directory_renames: if renames.detect_renames {
+                renames.directory_renames
+            } else {
+                sley_diff_merge::DirectoryRenames::False
+            },
             style,
         },
     )?;

@@ -3486,25 +3486,322 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     Err(GitError::Exit(1))
 }
 
+/// git's `parse_rename_score` (`diff.c`): parse a `--find-renames`/
+/// `--rename-threshold` argument such as `25%`, `100%`, `0.5`, or a bare number
+/// into a similarity threshold *percentage* (`0..=100`). Returns `None` for
+/// anything git rejects (a non-numeric body, a trailing garbage character, an
+/// empty string) — exactly the leftover-character check git applies via
+/// `*arg != 0`.
+///
+/// git accumulates `num`/`scale` over the digits (capping `scale` at 100000),
+/// resets `scale` on a single `.`, folds a trailing `%`, and computes an internal
+/// score out of `MAX_SCORE` (60000): `num >= scale` saturates to `MAX_SCORE`,
+/// otherwise `MAX_SCORE * num / scale`. We then map that score to the engine's
+/// percentage threshold by `score / 600` (the inverse of the engine's reported
+/// similarity), which reproduces git's `score >= minimum_score` comparison at the
+/// multiples-of-600 boundaries the thresholds resolve to.
+fn parse_rename_score_threshold(arg: &str) -> Option<u8> {
+    let bytes = arg.as_bytes();
+    let mut num: u64 = 0;
+    let mut scale: u64 = 1;
+    let mut dot = false;
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let ch = bytes[idx];
+        if !dot && ch == b'.' {
+            scale = 1;
+            dot = true;
+        } else if ch == b'%' {
+            scale = if dot { scale * 100 } else { 100 };
+            idx += 1; // `%` is always the last character.
+            break;
+        } else if ch.is_ascii_digit() {
+            if scale < 100000 {
+                scale *= 10;
+                num = num * 10 + u64::from(ch - b'0');
+            }
+        } else {
+            break;
+        }
+        idx += 1;
+    }
+    // git's caller rejects the option unless the whole argument was consumed.
+    if idx != bytes.len() {
+        return None;
+    }
+    const MAX_SCORE: u64 = 60000;
+    let score = if num >= scale {
+        MAX_SCORE
+    } else {
+        MAX_SCORE * num / scale
+    };
+    Some((score / 600).min(100) as u8)
+}
+
+/// `git config_rename` truthiness for `diff.renames`/`merge.renames`: `copies`/
+/// `copy` and any truthy boolean enable rename detection; an explicit false
+/// disables it.
+fn config_rename_enabled(value: &str) -> bool {
+    if value.eq_ignore_ascii_case("copies") || value.eq_ignore_ascii_case("copy") {
+        return true;
+    }
+    parse_maybe_bool(value).unwrap_or(true)
+}
+
+/// Resolve the default rename-detection enablement from config, mirroring
+/// merge-ort's `merge_recursive_config`: `diff.renames` seeds it, then
+/// `merge.renames` overrides. Unset → `true`.
+fn merge_recursive_renames_default() -> bool {
+    let Some(config) = effective_config_with_overrides() else {
+        return true;
+    };
+    let mut detect = true;
+    if let Some(value) = config.get("diff", None, "renames") {
+        detect = config_rename_enabled(value);
+    }
+    if let Some(value) = config.get("merge", None, "renames") {
+        detect = config_rename_enabled(value);
+    }
+    detect
+}
+
+/// `git merge-recursive <base>... -- <head> <remote>`: a 3-way merge with an
+/// explicitly-given ancestor (or several, folded into a virtual ancestor),
+/// writing the result into the *index* (stage 0 when resolved, stages 1/2/3 when
+/// conflicted) and the worktree. Unlike `git merge` it never computes a merge
+/// base, never touches HEAD/MERGE_HEAD, and never commits. Exit 0 on a clean
+/// merge, 1 when any path conflicts.
+///
+/// It honours the rename-detection knobs `--find-renames[=<n>]`,
+/// `--rename-threshold=<n>`, and `--no-renames` (last wins, left to right),
+/// falling back to `merge.renames`/`diff.renames` config when none is given.
 pub(crate) fn cmd_merge_recursive(args: &[String]) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+
     let Some(separator) = args.iter().position(|arg| arg == "--") else {
         return Err(GitError::Command(
             "merge-recursive requires '<base> -- <head> <remote>'".into(),
         ));
     };
-    let Some(remote) = args.get(separator + 2) else {
-        return Err(GitError::Command(
-            "merge-recursive requires '<base> -- <head> <remote>'".into(),
-        ));
+    let head = args.get(separator + 1).ok_or_else(|| {
+        GitError::Command("merge-recursive requires '<base> -- <head> <remote>'".into())
+    })?;
+    let remote = args.get(separator + 2).ok_or_else(|| {
+        GitError::Command("merge-recursive requires '<base> -- <head> <remote>'".into())
+    })?;
+
+    // Options and the base list precede the `--`. Options begin with `-`; every
+    // other token is a merge base. Rename settings follow git's last-wins order.
+    let mut detect_renames = merge_recursive_renames_default();
+    let mut rename_threshold = sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
+    let mut favor = sley_diff_merge::MergeFavor::None;
+    let mut base_revs: Vec<&String> = Vec::new();
+    for arg in &args[..separator] {
+        if let Some(opt) = arg.strip_prefix("--") {
+            if opt == "no-renames" {
+                detect_renames = false;
+            } else if opt == "find-renames" {
+                // Bare form: enable detection and reset to the default threshold
+                // (git stores rename_score 0, which diffcore maps to 50%).
+                detect_renames = true;
+                rename_threshold = sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
+            } else if let Some(value) = opt
+                .strip_prefix("find-renames=")
+                .or_else(|| opt.strip_prefix("rename-threshold="))
+            {
+                let Some(threshold) = parse_rename_score_threshold(value) else {
+                    eprintln!("error: unknown option `{}'", &arg[2..]);
+                    return Err(GitError::Exit(129));
+                };
+                detect_renames = true;
+                rename_threshold = threshold;
+            } else if opt == "ours" {
+                favor = sley_diff_merge::MergeFavor::Ours;
+            } else if opt == "theirs" {
+                favor = sley_diff_merge::MergeFavor::Theirs;
+            } else if matches!(
+                opt,
+                "renormalize"
+                    | "no-renormalize"
+                    | "patience"
+                    | "histogram"
+                    | "minimal"
+                    | "subtree"
+                    | "ignore-space-change"
+                    | "ignore-all-space"
+                    | "ignore-space-at-eol"
+                    | "ignore-cr-at-eol"
+            ) || opt.starts_with("diff-algorithm=")
+                || opt.starts_with("subtree=")
+            {
+                // Accepted for compatibility; not material to the merge result here.
+            } else {
+                eprintln!("error: unknown option `{}'", &arg[2..]);
+                return Err(GitError::Exit(129));
+            }
+        } else {
+            base_revs.push(arg);
+        }
+    }
+
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+
+    // Resolve the explicit ancestor(s) into a single (possibly virtual) base tree.
+    let base_map = if base_revs.is_empty() {
+        MergeTreeMap::new()
+    } else {
+        let bases = base_revs
+            .iter()
+            .map(|rev| resolve_revision(&git_dir, format, rev))
+            .collect::<Result<Vec<_>>>()?;
+        virtual_ancestor_entry_map(&db, format, &bases, &common_git_dir)?
     };
-    if let Ok(mut suppress) = SUPPRESS_RERERE_ONCE.lock() {
-        *suppress = true;
+
+    let head_oid = resolve_revision(&git_dir, format, head)?;
+    let remote_oid = resolve_revision(&git_dir, format, remote)?;
+    let head_tree = commit_tree_oid(&db, format, &head_oid)?;
+    let remote_tree = commit_tree_oid(&db, format, &remote_oid)?;
+    let ours_map = stash_tree_entry_map(&db, format, &head_tree)?;
+    let theirs_map = stash_tree_entry_map(&db, format, &remote_tree)?;
+
+    let (results, conflicts, info_messages) = three_way_merge_trees_inner_with_info_opts(
+        &db,
+        format,
+        &base_map,
+        &ours_map,
+        &theirs_map,
+        head,
+        remote,
+        "merged common ancestors",
+        favor,
+        sley_diff_merge::ConflictStyle::Merge,
+        RenameMergeConfig {
+            detect_renames,
+            rename_threshold,
+            directory_renames: directory_renames_config(),
+        },
+    )?;
+
+    write_merge_recursive_index(&git_dir, format, &results)?;
+    apply_merge_recursive_worktree(&db, &worktree_root, &results, &ours_map)?;
+
+    print_merge_info_messages(&info_messages);
+    print_merge_conflict_messages(&results);
+
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(GitError::Exit(1))
     }
-    let result = cmd_merge(std::slice::from_ref(remote));
-    if let Ok(mut suppress) = SUPPRESS_RERERE_ONCE.lock() {
-        *suppress = false;
+}
+
+/// Write the result of a `merge-recursive` run into the repository index: stage 0
+/// for resolved paths (and for the advisory directory-rename location/collision
+/// conflicts, which git stages cleanly), stages 1/2/3 for genuine conflicts.
+fn write_merge_recursive_index(
+    git_dir: &Path,
+    format: ObjectFormat,
+    results: &MergePathResults,
+) -> Result<()> {
+    let mut entries = Vec::new();
+    for (path, result) in results {
+        match result {
+            MergePathResult::Resolved(Some((mode, oid))) => {
+                entries.push(merge_index_entry(path, *mode, *oid, 0));
+            }
+            MergePathResult::Resolved(None) => {}
+            MergePathResult::Conflict {
+                ours,
+                kind:
+                    Some(
+                        sley_diff_merge::MergeConflictKind::DirRenameLocation { .. }
+                        | sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { .. },
+                    ),
+                ..
+            } => {
+                if let Some((mode, oid)) = ours {
+                    entries.push(merge_index_entry(path, *mode, *oid, 0));
+                }
+            }
+            MergePathResult::Conflict {
+                base, ours, theirs, ..
+            } => {
+                if let Some((mode, oid)) = base {
+                    entries.push(merge_index_entry(path, *mode, *oid, 1));
+                }
+                if let Some((mode, oid)) = ours {
+                    entries.push(merge_index_entry(path, *mode, *oid, 2));
+                }
+                if let Some((mode, oid)) = theirs {
+                    entries.push(merge_index_entry(path, *mode, *oid, 3));
+                }
+            }
+        }
     }
-    result
+    entries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| (left.flags >> 12).cmp(&(right.flags >> 12)))
+    });
+    let index = Index {
+        version: 2,
+        entries,
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    fs::write(
+        sley_worktree::repository_index_path(git_dir),
+        index.write(format)?,
+    )?;
+    Ok(())
+}
+
+/// Materialize a `merge-recursive` result into the worktree: write resolved/
+/// conflicted content, and remove paths the merge dropped when the worktree still
+/// holds the tracked (ours) version (git's rename/delete "Gollum's ring" safety).
+fn apply_merge_recursive_worktree(
+    db: &FileObjectDatabase,
+    worktree_root: &Path,
+    results: &MergePathResults,
+    ours_map: &MergeTreeMap,
+) -> Result<()> {
+    for (path, result) in results {
+        match result {
+            MergePathResult::Resolved(Some((mode, oid))) => {
+                if ours_map.get(path) != Some(&(*mode, *oid)) {
+                    let content = merge_worktree_content(db, *mode, oid)?;
+                    merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+                }
+            }
+            MergePathResult::Resolved(None) => {
+                if worktree_file_matches_ours(db, worktree_root, path, ours_map.get(path))? {
+                    merge_remove_worktree_file(worktree_root, path)?;
+                }
+            }
+            MergePathResult::Conflict { worktree, .. } => match worktree {
+                Some((mode, content)) => {
+                    merge_write_worktree_file(worktree_root, path, content, *mode)?;
+                }
+                None if matches!(
+                    result,
+                    MergePathResult::Conflict {
+                        kind: Some(sley_diff_merge::MergeConflictKind::DirRenameSplit { .. }),
+                        ..
+                    }
+                ) => {}
+                None => {
+                    if worktree_file_matches_ours(db, worktree_root, path, ours_map.get(path))? {
+                        merge_remove_worktree_file(worktree_root, path)?;
+                    }
+                }
+            },
+        }
+    }
+    Ok(())
 }
 
 fn print_merge_info_messages(messages: &[sley_diff_merge::MergeInfoMessage]) {
