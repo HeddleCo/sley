@@ -1536,6 +1536,13 @@ pub struct RenameDetectionOptions {
     /// to [`DEFAULT_RENAME_THRESHOLD`]; git uses the same default for `-C` as for
     /// `-M` unless `-C<n>` overrides it.
     pub copy_threshold: u8,
+    /// Cap on the inexact rename matrix (git's `diff.renameLimit` /
+    /// `merge.renameLimit`): when the number of candidate sources times the
+    /// number of candidate destinations exceeds `rename_limit²`, inexact
+    /// detection is skipped entirely (only exact-OID renames survive). `0` means
+    /// unlimited — git's `too_many_rename_candidates` treats a non-positive limit
+    /// the same way.
+    pub rename_limit: usize,
 }
 
 impl Default for RenameDetectionOptions {
@@ -1545,6 +1552,7 @@ impl Default for RenameDetectionOptions {
             detect_inexact: false,
             rename_threshold: DEFAULT_RENAME_THRESHOLD,
             copy_threshold: DEFAULT_RENAME_THRESHOLD,
+            rename_limit: 0,
         }
     }
 }
@@ -3012,6 +3020,18 @@ fn detect_inexact_renames(
     }
 
     if deleted.is_empty() || added.is_empty() {
+        return changes;
+    }
+
+    // git's `too_many_rename_candidates`: if the rename matrix would exceed a
+    // `rename_limit` square, skip inexact detection wholesale (exact-OID renames
+    // were already resolved upstream). A non-positive limit is unlimited.
+    if options.rename_limit > 0
+        && deleted
+            .len()
+            .saturating_mul(added.len())
+            .gt(&options.rename_limit.saturating_mul(options.rename_limit))
+    {
         return changes;
     }
 
@@ -6401,6 +6421,10 @@ pub struct MergeTreesOptions<'a> {
     pub detect_renames: bool,
     /// Minimum similarity (`0..=100`) for inexact rename detection.
     pub rename_threshold: u8,
+    /// Cap on the inexact rename matrix (`merge.renameLimit`/`diff.renameLimit`).
+    /// `0` means unlimited; otherwise inexact detection is skipped when the
+    /// candidate source × destination count exceeds `rename_limit²`.
+    pub rename_limit: usize,
     /// Directory-rename detection mode. When [`DirectoryRenames::False`], a file
     /// added on one side under a directory that the *other* side renamed stays
     /// put. When enabled, such files are re-homed into the renamed directory,
@@ -6434,6 +6458,7 @@ impl Default for MergeTreesOptions<'_> {
             favor: MergeFavor::None,
             detect_renames: false,
             rename_threshold: DEFAULT_RENAME_THRESHOLD,
+            rename_limit: 0,
             directory_renames: DirectoryRenames::False,
             style: ConflictStyle::Merge,
         }
@@ -7679,6 +7704,7 @@ fn detect_merge_renames(
         theirs_map,
         RenameSide::Ours,
         options.rename_threshold,
+        options.rename_limit,
         &mut renames,
     )?;
     // Renames on theirs: the other side that carries its change is ours.
@@ -7690,6 +7716,7 @@ fn detect_merge_renames(
         ours_map,
         RenameSide::Theirs,
         options.rename_threshold,
+        options.rename_limit,
         &mut renames,
     )?;
 
@@ -7844,6 +7871,7 @@ fn collect_side_renames(
     other_map: &MergeEntryMap,
     side: RenameSide,
     threshold: u8,
+    rename_limit: usize,
     renames: &mut MergeRenames,
 ) -> Result<SideRenames> {
     // Diff base->side with inexact rename detection; the resulting `Renamed`
@@ -7860,6 +7888,7 @@ fn collect_side_renames(
         detect_inexact: true,
         rename_threshold: threshold,
         copy_threshold: threshold,
+        rename_limit,
     };
     let changes = diff_name_status_maps_with_renames(
         &base_tree,
@@ -8981,6 +9010,7 @@ fn apply_rename_two_to_one_and_add_conflicts(
 /// 2to1 or rename/add): stage 2 = `ours_leaf`, stage 3 = `theirs_leaf`, no
 /// common ancestor, worktree = their two-way merge. Replaces any existing slot
 /// (the path-keyed core's add/add result) for the destination.
+#[allow(clippy::too_many_arguments)]
 fn write_two_sided_dest_conflict(
     db: &FileObjectDatabase,
     dest: &[u8],
@@ -10197,6 +10227,7 @@ new mode 100755
             detect_inexact: true,
             rename_threshold: DEFAULT_RENAME_THRESHOLD,
             copy_threshold: DEFAULT_RENAME_THRESHOLD,
+        rename_limit: 0,
         };
         let entries = diff_name_status_trees_with_rename_options(
             &db,
@@ -10246,6 +10277,7 @@ new mode 100755
             detect_inexact: true,
             rename_threshold: 60,
             copy_threshold: 60,
+        rename_limit: 0,
         };
         let entries = diff_name_status_trees_with_rename_options(
             &db,
@@ -10309,6 +10341,7 @@ new mode 100755
                 detect_inexact: inexact,
                 rename_threshold: DEFAULT_RENAME_THRESHOLD,
                 copy_threshold: DEFAULT_RENAME_THRESHOLD,
+            rename_limit: 0,
             };
             let entries = diff_name_status_trees_with_rename_options(
                 &db,
@@ -10358,6 +10391,7 @@ new mode 100755
             detect_inexact: true,
             rename_threshold: DEFAULT_RENAME_THRESHOLD,
             copy_threshold: DEFAULT_RENAME_THRESHOLD,
+        rename_limit: 0,
         };
         let entries = diff_name_status_trees_with_rename_options(
             &db,
@@ -11472,6 +11506,7 @@ new mode 100755
             detect_inexact: true,
             rename_threshold: DEFAULT_RENAME_THRESHOLD,
             copy_threshold: DEFAULT_RENAME_THRESHOLD,
+        rename_limit: 0,
         };
 
         // Reference: full flatten + same detection.

@@ -2364,6 +2364,27 @@ pub(crate) fn directory_renames_config() -> sley_diff_merge::DirectoryRenames {
     }
 }
 
+/// Resolve the effective inexact-rename matrix cap for a merge, mirroring
+/// merge-ort's `merge_recursive_config`: `diff.renameLimit` seeds it and
+/// `merge.renameLimit` overrides. Unset falls back to git's default of 1000
+/// (`diff_rename_limit_default`). A configured value of 0 (or negative) means
+/// unlimited.
+pub(crate) fn merge_rename_limit_config() -> usize {
+    let Some(config) = effective_config_with_overrides() else {
+        return 1000;
+    };
+    // `merge.renameLimit` wins over `diff.renameLimit`; check it first.
+    let limit = config
+        .get("merge", None, "renameLimit")
+        .or_else(|| config.get("diff", None, "renameLimit"))
+        .and_then(|value| value.trim().parse::<i64>().ok());
+    match limit {
+        None => 1000,
+        Some(value) if value <= 0 => 0,
+        Some(value) => value as usize,
+    }
+}
+
 /// `branch.<branch>.mergeoptions` from the effective config (all layers plus
 /// `-c`/env injection), exactly the value git's `git_merge_config` picks up.
 fn branch_mergeoptions_value(branch: &str) -> Option<String> {
@@ -3682,6 +3703,7 @@ pub(crate) fn cmd_merge_recursive(args: &[String]) -> Result<()> {
         RenameMergeConfig {
             detect_renames,
             rename_threshold,
+            rename_limit: merge_rename_limit_config(),
             directory_renames: directory_renames_config(),
         },
     )?;

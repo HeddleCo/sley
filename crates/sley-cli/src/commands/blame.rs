@@ -1260,6 +1260,7 @@ fn find_parent_origin(
             detect_inexact: true,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+        rename_limit: 0,
         },
     )?;
 

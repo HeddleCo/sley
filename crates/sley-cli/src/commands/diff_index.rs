@@ -318,6 +318,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         detect_inexact: true,
         rename_threshold,
         copy_threshold,
+    rename_limit: 0,
     };
 
     let entries = if cached {

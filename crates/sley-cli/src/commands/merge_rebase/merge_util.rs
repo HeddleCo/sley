@@ -599,6 +599,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info(
         RenameMergeConfig {
             detect_renames: true,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_limit: merge_rename_limit_config(),
             directory_renames: directory_renames_config(),
         },
     )
@@ -613,6 +614,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info(
 pub(crate) struct RenameMergeConfig {
     pub(crate) detect_renames: bool,
     pub(crate) rename_threshold: u8,
+    pub(crate) rename_limit: usize,
     pub(crate) directory_renames: sley_diff_merge::DirectoryRenames,
 }
 
@@ -643,6 +645,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts(
             favor,
             detect_renames: renames.detect_renames,
             rename_threshold: renames.rename_threshold,
+            rename_limit: renames.rename_limit,
             // Directory-rename detection only fires when file-rename detection is
             // enabled (it is inferred from the file renames found). With renames
             // off, force it off too so `--no-renames` disables both.

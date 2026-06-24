@@ -18,8 +18,9 @@ pub(crate) use merge::{
     conclude_in_progress_merge, conclude_rebase_step_via_commit, directory_renames_config,
     effective_config_with_overrides, index_unmerged_paths, parse_maybe_bool,
     print_branch_commit_summary, print_commit_shortstat_between_trees,
-    read_merge_message_from_file, read_worktree_index, rebase_in_progress, save_merge_autostash,
-    set_reflog_action_override, verify_fast_forward_untracked_safe,
+    merge_rename_limit_config, read_merge_message_from_file, read_worktree_index,
+    rebase_in_progress, save_merge_autostash, set_reflog_action_override,
+    verify_fast_forward_untracked_safe,
 };
 pub(crate) use merge_base::{
     cmd_merge_base, commit_tree_oid, head_commit_oid, merge_base_fork_point, merge_bases,

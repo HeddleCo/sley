@@ -1372,6 +1372,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         detect_inexact: true,
         rename_threshold,
         copy_threshold,
+    rename_limit: 0,
     };
     let mut precomputed_staged_gitlinks = None;
     let entries = if !diff_trees.is_empty() {

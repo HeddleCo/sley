@@ -562,6 +562,7 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         detect_inexact: true,
         rename_threshold: o.rename_threshold,
         copy_threshold: o.copy_threshold,
+    rename_limit: 0,
     };
 
     // `git diff-files` selects changed paths by the cached *stat*, not by content:
