@@ -108,7 +108,37 @@ struct BlameOptions {
     /// on the command line; if not, `blame.showEmail` config supplies the
     /// default.
     author_field_explicit: bool,
+    /// `--contents=<file>`: use `<file>`'s contents as the final image instead
+    /// of the working-tree / committed copy (`-` reads standard input). Builds a
+    /// "External file (--contents)" pseudo-commit on top of the start rev.
+    contents_from: Option<String>,
 }
+
+/// Metadata for the all-zero pseudo-commit blame builds for the working-tree
+/// (or `--contents`) final image. Mirrors git's `fake_working_tree_commit`:
+/// "Not Committed Yet"/"External file (--contents)" identity, the current time,
+/// a `Version of <path> from <source>` subject, and a `previous` pointer back
+/// to the real parent the fake commit sits on top of.
+#[derive(Clone)]
+struct FakeCommit {
+    /// Author/committer display name.
+    name: String,
+    /// Author/committer email local part (rendered as `<email>`).
+    email: String,
+    /// Seconds since the epoch (the moment blame ran).
+    time: i64,
+    /// Porcelain `summary` line (`Version of <path> from <source>`).
+    summary: String,
+    /// Porcelain `previous <commit> <path>` pointer to the real parent, when the
+    /// path exists there.
+    previous: Option<(ObjectId, String)>,
+}
+
+/// Per-origin `previous` pointers for porcelain output: maps a blamed
+/// `(commit, path)` to the `(commit, path)` of the first parent the blame walk
+/// descended into from it (git's `blame_origin->previous`). Root/boundary
+/// commits with no such parent are simply absent.
+type PreviousMap = HashMap<(ObjectId, String), (ObjectId, String)>;
 
 /// A `-L` argument before it is resolved against the file's line count.
 struct RawRange {
@@ -224,40 +254,84 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         None => ("HEAD".to_string(), None),
     };
 
+    // A *positive* end of the history range is a non-`^`, non-empty-`..`
+    // revision. With no positive end (and not bare), git builds a fake
+    // working-tree commit on top of HEAD; `--contents` always builds one (git's
+    // `setup_scoreboard`: fake when `contents_from || !final`).
+    let has_positive_final = match &rev {
+        None => false,
+        Some(r) if r.starts_with('^') => false,
+        Some(r) if r.contains("..") => !r.split_once("..").map(|(_, b)| b).unwrap_or("").is_empty(),
+        Some(_) => true,
+    };
+
     // Resolve the requested revision (default HEAD) to a commit.
     let start_oid = repo.resolve_revision(&rev_spec)?;
     let start_commit = sley_rev::peel_to_commit(db, format, &start_oid)?;
 
     // Turn the cwd-relative path into a repository-root-relative path the way
-    // git's pathspec handling does, then locate the blob at the start commit.
-    //
-    // TODO(convert): blame's only convert step in upstream is `convert_to_git`
-    // (clean) in `setup_scoreboard`, applied to *working-tree*-sourced content
-    // (a dirty worktree copy or `--contents <file>`) to normalize it before
-    // diffing against committed blobs. Committed blobs read from the object
-    // store (`fill_origin_blob`) are NOT converted — they are already in
-    // git-normalized form. sley's blame always reads its final image from
-    // committed blobs (the working-tree overlay and `--contents` are
-    // unimplemented; see the module doc), so there is nothing to convert here
-    // and applying smudge would diverge from git. When the working-tree overlay
-    // lands, route that worktree-sourced content through
-    // `sley_worktree::apply_clean_filter` before it enters `compute_blame`.
-    let repo_path = blame_repo_relative_path(cwd, git_dir, &path)?;
-    let (final_blob, virtual_final) = match read_path_blob(db, format, &start_commit, &repo_path)? {
-        Some(blob) => (blob, false),
-        None => match read_index_blob(git_dir, db, format, &repo_path)? {
-            Some(blob) if rev.is_none() || rev_spec == "HEAD" => (blob, true),
-            _ => {
-            // git reports the repository-relative path here, not the literal
-            // argument (so blaming a missing file from a subdirectory still
-            // names `<dir>/<file>`).
-            eprintln!("fatal: no such path '{repo_path}' in {rev_spec}");
-            return Err(GitError::Exit(128));
-        }
-        },
+    // git's pathspec handling does. A bare repository has no work tree to take a
+    // cwd prefix from, so the argument is already repo-root-relative there.
+    let bare = blame_is_bare(&repo);
+    let repo_path = if bare {
+        normalize_repo_path(&path)?
+    } else {
+        blame_repo_relative_path(cwd, git_dir, &path)?
     };
 
-    let lines = compute_blame(
+    // Decide whether to build the fake working-tree / `--contents` commit, the
+    // way `setup_scoreboard` does: always with `--contents`, otherwise only when
+    // no positive final rev was named AND the repository is not bare (a bare repo
+    // with no rev blames HEAD directly — there is no work tree to overlay).
+    let build_fake = options.contents_from.is_some() || (!has_positive_final && !bare);
+
+    let (final_blob, virtual_final, fake) = if build_fake {
+        // The fake commit's blob is the `--contents` file or the work-tree copy;
+        // its single (real) parent is `start_commit` (HEAD by default). git
+        // applies `convert_to_git` (clean) here; sley has no filter layer for
+        // blame yet, so the bytes are used as-is (matches git for unfiltered
+        // paths, which is all the upstream suite exercises).
+        let blob = match &options.contents_from {
+            Some(spec) => read_contents_file(cwd, spec)?,
+            None => read_worktree_image(db, format, &repo, &start_commit, &repo_path)?,
+        };
+        // The porcelain `previous` pointer is the real parent when it has the
+        // path; a brand-new (only-staged) file has no such parent.
+        let previous = read_path_blob(db, format, &start_commit, &repo_path)?
+            .map(|_| (start_commit, repo_path.clone()));
+        let (name, email) = if options.contents_from.is_some() {
+            ("External file (--contents)".to_string(), "external.file".to_string())
+        } else {
+            ("Not Committed Yet".to_string(), "not.committed.yet".to_string())
+        };
+        let source = match &options.contents_from {
+            Some(spec) if spec == "-" => "standard input".to_string(),
+            Some(spec) => spec.clone(),
+            None => repo_path.clone(),
+        };
+        let fake = FakeCommit {
+            name,
+            email,
+            time: now_seconds(),
+            summary: format!("Version of {repo_path} from {source}"),
+            previous,
+        };
+        (blob, true, Some(fake))
+    } else {
+        // No fake commit: read the final image straight from the start rev's tree.
+        match read_path_blob(db, format, &start_commit, &repo_path)? {
+            Some(blob) => (blob, false, None),
+            None => {
+                // git reports the repository-relative path here, not the literal
+                // argument (so blaming a missing file from a subdirectory still
+                // names `<dir>/<file>`).
+                eprintln!("fatal: no such path '{repo_path}' in {rev_spec}");
+                return Err(GitError::Exit(128));
+            }
+        }
+    };
+
+    let (lines, previous_map) = compute_blame(
         db,
         format,
         &start_commit,
@@ -279,7 +353,16 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
     if selected.is_empty() {
         return Ok(());
     }
-    render_blame(git_dir, format, db, &lines, &selected, &options)
+    render_blame(
+        git_dir,
+        format,
+        db,
+        &lines,
+        &selected,
+        &options,
+        fake.as_ref(),
+        &previous_map,
+    )
 }
 
 /// Either run with parsed options or print help and exit successfully.
@@ -309,6 +392,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
     let mut show_name = false;
     let mut porcelain = false;
     let mut line_porcelain = false;
+    let mut contents_from: Option<String> = None;
     // Positionals collected before `--`; afterwards everything is a path.
     let mut positionals: Vec<String> = Vec::new();
     let mut paths_after_dd: Vec<String> = Vec::new();
@@ -356,6 +440,15 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
                     return Err(blame_option_requires_value("L"));
                 };
                 ranges.push(parse_line_range(value)?);
+            }
+            "--contents" => {
+                let Some(value) = iter.next() else {
+                    return Err(blame_option_requires_value("contents"));
+                };
+                contents_from = Some(value.clone());
+            }
+            other if other.starts_with("--contents=") => {
+                contents_from = Some(other["--contents=".len()..].to_string());
             }
             other if other.starts_with("--abbrev=") => {
                 let value = &other["--abbrev=".len()..];
@@ -425,6 +518,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
         porcelain,
         line_porcelain,
         author_field_explicit,
+        contents_from,
     }))
 }
 
@@ -485,10 +579,6 @@ fn is_unsupported_blame_option(arg: &str) -> bool {
     }
     arg.starts_with("-M")
         || arg.starts_with("-S")
-        || arg.starts_with("--contents")
-        || arg.starts_with("--ignore-rev")
-        || arg.starts_with("--ignore-revs-file")
-        || arg.starts_with("--diff-algorithm")
         || arg.starts_with("--reverse=")
 }
 
@@ -658,6 +748,7 @@ fn read_path_blob(
     Ok(Some(object.body.clone()))
 }
 
+/// Read the blob for `repo_path` from the index (any normal-stage entry).
 fn read_index_blob(
     git_dir: &Path,
     db: &FileObjectDatabase,
@@ -679,6 +770,103 @@ fn read_index_blob(
         return Ok(None);
     }
     Ok(Some(object.body.clone()))
+}
+
+/// Whether the repository is bare. Mirrors git's `is_bare_repository`: an
+/// explicit `core.bare` wins, otherwise infer from the absence of a work tree.
+fn blame_is_bare(repo: &RepositoryContext) -> bool {
+    if let Some(bare) = repo.config().get_bool("core", None, "bare") {
+        return bare;
+    }
+    repo.worktree_root().is_err()
+}
+
+/// Seconds since the epoch at the moment blame runs. git stamps the fake
+/// working-tree commit with the current time (`time(&now)` in
+/// `fake_working_tree_commit`).
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Read the `--contents=<file>` final image. `-` reads standard input; a
+/// relative path is resolved against the process cwd (where git's
+/// `fake_working_tree_commit` opens it).
+fn read_contents_file(cwd: &Path, spec: &str) -> Result<Vec<u8>> {
+    if spec == "-" {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        io::stdin()
+            .read_to_end(&mut buf)
+            .map_err(|err| GitError::Io(err.to_string()))?;
+        return Ok(buf);
+    }
+    let path = Path::new(spec);
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(spec)
+    };
+    std::fs::read(&full).map_err(|_| {
+        eprintln!("fatal: Cannot stat '{spec}'");
+        GitError::Exit(128)
+    })
+}
+
+/// Read the work-tree copy of `repo_path` for the fake working-tree commit. git
+/// reads the actual file from disk (`lstat`/`strbuf_read_file`) after
+/// `verify_working_tree_path` confirms the path is known; a path that is absent
+/// from the work tree, the start rev, and the index is the "no such path"
+/// fatal.
+fn read_worktree_image(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    repo: &RepositoryContext,
+    start_commit: &ObjectId,
+    repo_path: &str,
+) -> Result<Vec<u8>> {
+    // `verify_working_tree_path`: an untracked path (absent from the start
+    // commit's tree and from the index in *any* stage) is the "no such path"
+    // fatal, even when a file by that name exists on disk. An unmerged path
+    // (stages 1/2/3, no stage 0) still counts as known, so a conflicted file
+    // blames against HEAD rather than erroring.
+    let committed = read_path_blob(db, format, start_commit, repo_path)?;
+    let in_index = path_in_index_any_stage(repo.git_dir(), format, repo_path)?;
+    if committed.is_none() && !in_index {
+        eprintln!("fatal: no such path '{repo_path}' in HEAD");
+        return Err(GitError::Exit(128));
+    }
+    // Read the actual work-tree file (git's `strbuf_read_file`).
+    if let Ok(root) = repo.worktree_root() {
+        if let Ok(bytes) = std::fs::read(root.join(repo_path)) {
+            return Ok(bytes);
+        }
+    }
+    // The path is tracked but unreadable from the work tree (e.g. staged then
+    // removed): fall back to the staged copy, then the committed blob.
+    if let Some(blob) = read_index_blob(repo.git_dir(), db, format, repo_path)? {
+        return Ok(blob);
+    }
+    if let Some(blob) = committed {
+        return Ok(blob);
+    }
+    eprintln!("fatal: no such path '{repo_path}' in HEAD");
+    Err(GitError::Exit(128))
+}
+
+/// Whether `repo_path` is present in the index in any stage (0–3). Mirrors
+/// git's `verify_working_tree_path`, which treats an unmerged entry (stages
+/// 1/2/3) as a known path.
+fn path_in_index_any_stage(git_dir: &Path, format: ObjectFormat, repo_path: &str) -> Result<bool> {
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(false);
+    };
+    Ok(index
+        .entries
+        .iter()
+        .any(|entry| entry.path.as_bytes() == repo_path.as_bytes()))
 }
 
 /// Walk `repo_path` component-by-component through `tree_oid`, returning the
@@ -770,14 +958,17 @@ fn compute_blame(
     copy_level: u8,
     copy_score: usize,
     virtual_final: bool,
-) -> Result<Vec<LineBlame>> {
+) -> Result<(Vec<LineBlame>, PreviousMap)> {
     let final_lines = sley_diff_merge::split_lines(final_blob);
     let line_count = final_lines.len();
+
+    // Per-origin `previous` pointers for porcelain (`blame_origin->previous`).
+    let mut previous_map: PreviousMap = HashMap::new();
 
     // Final attribution per line, filled in as commits are found guilty.
     let mut result: Vec<Option<LineBlame>> = (0..line_count).map(|_| None).collect();
     if line_count == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), previous_map));
     }
 
     // `git blame ^<rev>`: `<rev>` and all its ancestors are uninteresting
@@ -801,7 +992,14 @@ fn compute_blame(
         path: repo_path.to_string(),
         virtual_worktree: virtual_final,
     };
-    blob_cache.insert((start_key.commit, start_key.path.clone()), Some(final_blob.to_vec()));
+    // Seed the blob cache with the final image only for a *real* start commit.
+    // The virtual work-tree origin shares its commit id with the real start
+    // commit (its single parent), so seeding `(commit, path)` here would poison
+    // the parent's committed-blob read and make every line pass through. The
+    // virtual origin gets its image from `final_blob` directly instead.
+    if !virtual_final {
+        blob_cache.insert((start_key.commit, start_key.path.clone()), Some(final_blob.to_vec()));
+    }
     suspects.insert(start_key.clone(), vec![BlameEntry { lno: 0, s_lno: 0, num_lines: line_count }]);
 
     // Commit-date priority queue, newest first (git's
@@ -824,11 +1022,17 @@ fn compute_blame(
             continue;
         }
 
-        // Resolve this commit and its blob for the path.
+        // Resolve this commit and its blob for the path. The virtual work-tree
+        // origin's image is the supplied `final_blob` (the worktree / contents
+        // bytes), not the start commit's committed blob.
         let commit_oid = origin.commit;
         let commit_obj = db.read_object(&commit_oid)?;
         let commit = Commit::parse(format, &commit_obj.body)?;
-        let child_blob = cached_blob(db, format, &commit_oid, &origin.path, &mut blob_cache)?;
+        let child_blob = if origin.virtual_worktree {
+            Some(final_blob.to_vec())
+        } else {
+            cached_blob(db, format, &commit_oid, &origin.path, &mut blob_cache)?
+        };
         let Some(child_blob) = child_blob else {
             // The path is absent at this commit (shouldn't normally happen for a
             // suspect): charge everything here so no line is lost.
@@ -863,6 +1067,16 @@ fn compute_blame(
             else {
                 continue;
             };
+            // Record the first parent origin we descend into as this suspect's
+            // porcelain `previous` pointer (set once, like git's
+            // `origin->previous`). Skip the virtual work-tree origin: its blamed
+            // lines surface as the null commit, whose `previous` comes from the
+            // FakeCommit metadata instead.
+            if !origin.virtual_worktree {
+                previous_map
+                    .entry((origin.commit, origin.path.clone()))
+                    .or_insert_with(|| (parent_origin.commit, parent_origin.path.clone()));
+            }
             let parent_blob =
                 cached_blob(db, format, parent, &parent_origin.path, &mut blob_cache)?;
             let Some(parent_blob) = parent_blob else {
@@ -937,7 +1151,7 @@ fn compute_blame(
             }),
         }
     }
-    Ok(out)
+    Ok((out, previous_map))
 }
 
 /// Diff the suspect blob (`child_lines`) against `parent_lines` and split every
@@ -1798,9 +2012,11 @@ fn render_blame(
     lines: &[LineBlame],
     selected: &[usize],
     options: &BlameOptions,
+    fake: Option<&FakeCommit>,
+    previous_map: &PreviousMap,
 ) -> Result<()> {
     if options.porcelain {
-        return render_porcelain(git_dir, format, db, lines, selected, options);
+        return render_porcelain(git_dir, format, db, lines, selected, options, fake, previous_map);
     }
 
     let (abbrev, hex_width) = blame_display_abbrev(git_dir, format, options)?;
@@ -1821,7 +2037,7 @@ fn render_blame(
     if !options.suppress_author {
         for &line_no in selected {
             let blame = &lines[line_no - 1];
-            let (author, date) = author_and_date(db, format, blame, options, &mailmap)?;
+            let (author, date) = author_and_date(db, format, blame, options, &mailmap, fake)?;
             author_strings.push(author);
             date_strings.push(date);
         }
@@ -1904,7 +2120,31 @@ fn render_porcelain(
     lines: &[LineBlame],
     selected: &[usize],
     options: &BlameOptions,
+    fake: Option<&FakeCommit>,
+    previous_map: &PreviousMap,
 ) -> Result<()> {
+    // git's MORE_THAN_ONE_PATH: a commit blamed for lines via two or more
+    // distinct paths repeats its `previous`/`filename` info on every group so a
+    // porcelain consumer can attribute each line to the right path. Computed
+    // over the whole blame (all of `lines`), not just the `-L` selection,
+    // matching git's pass over `sb->ent`.
+    let mut paths_by_commit: HashMap<ObjectId, HashSet<&str>> = HashMap::new();
+    for line in lines {
+        paths_by_commit
+            .entry(line.commit)
+            .or_default()
+            .insert(line.origin_path.as_str());
+    }
+    let multi_path: HashSet<ObjectId> = paths_by_commit
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .map(|(commit, _)| commit)
+        .collect();
+
+    // METAINFO_SHOWN: a commit's metadata block is emitted only on its first
+    // appearance (unless `--line-porcelain`, which repeats it for every line).
+    let mut shown: HashSet<ObjectId> = HashSet::new();
+
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     let mut idx = 0usize;
@@ -1927,22 +2167,33 @@ fn render_porcelain(
             group_len += 1;
         }
 
-        write!(
+        // The entry's first header line always carries the run length (4th
+        // field), even for a single line (git's `emit_porcelain`).
+        writeln!(
             handle,
-            "{} {} {}",
+            "{} {} {} {}",
             blame.commit.to_hex(),
             blame.origin_lineno,
-            line_no
+            line_no,
+            group_len
         )?;
-        if group_len > 1 {
-            write!(handle, " {group_len}")?;
-        }
-        handle.write_all(b"\n")?;
-        porcelain_details(&mut handle, db, format, blame)?;
+        emit_porcelain_details(
+            &mut handle,
+            db,
+            format,
+            blame,
+            options,
+            fake,
+            previous_map,
+            &multi_path,
+            &mut shown,
+            options.line_porcelain,
+        )?;
 
         for offset in 0..group_len {
             if offset > 0 {
                 let current = &lines[selected[idx + offset] - 1];
+                // Continuation lines carry only three fields (no run length).
                 writeln!(
                     handle,
                     "{} {} {}",
@@ -1951,7 +2202,18 @@ fn render_porcelain(
                     selected[idx + offset]
                 )?;
                 if options.line_porcelain {
-                    porcelain_details(&mut handle, db, format, current)?;
+                    emit_porcelain_details(
+                        &mut handle,
+                        db,
+                        format,
+                        current,
+                        options,
+                        fake,
+                        previous_map,
+                        &multi_path,
+                        &mut shown,
+                        true,
+                    )?;
                 }
             }
             handle.write_all(b"\t")?;
@@ -1963,25 +2225,70 @@ fn render_porcelain(
     Ok(())
 }
 
-fn porcelain_details(
+/// git's `emit_porcelain_details`: emit the per-commit metadata block (once,
+/// unless `repeat`), then the path info (`previous`/`filename`) when the block
+/// was emitted or the commit spans multiple paths.
+#[allow(clippy::too_many_arguments)]
+fn emit_porcelain_details(
     handle: &mut impl Write,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     blame: &LineBlame,
+    options: &BlameOptions,
+    fake: Option<&FakeCommit>,
+    previous_map: &PreviousMap,
+    multi_path: &HashSet<ObjectId>,
+    shown: &mut HashSet<ObjectId>,
+    repeat: bool,
 ) -> Result<()> {
-    if blame.commit.is_null() {
-        writeln!(handle, "author Not Committed Yet")?;
-        writeln!(handle, "author-mail <not.committed.yet>")?;
-        writeln!(handle, "author-time 0")?;
-        writeln!(handle, "author-tz +0000")?;
-        writeln!(handle, "committer Not Committed Yet")?;
-        writeln!(handle, "committer-mail <not.committed.yet>")?;
-        writeln!(handle, "committer-time 0")?;
-        writeln!(handle, "committer-tz +0000")?;
-        writeln!(handle, "summary Version of {} from the index", blame.origin_path)?;
-        writeln!(handle, "filename {}", blame.origin_path)?;
-        return Ok(());
+    let emitted =
+        emit_one_suspect_detail(handle, db, format, blame, options, fake, shown, repeat)?;
+    if emitted || multi_path.contains(&blame.commit) {
+        write_filename_info(handle, blame, fake, previous_map)?;
     }
+    Ok(())
+}
+
+/// git's `emit_one_suspect_detail`: the author/committer/summary[/boundary]
+/// block for one commit. Returns whether anything was emitted (false when the
+/// commit's block was already shown and `repeat` is off).
+fn emit_one_suspect_detail(
+    handle: &mut impl Write,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    blame: &LineBlame,
+    options: &BlameOptions,
+    fake: Option<&FakeCommit>,
+    shown: &mut HashSet<ObjectId>,
+    repeat: bool,
+) -> Result<bool> {
+    if !repeat && shown.contains(&blame.commit) {
+        return Ok(false);
+    }
+    shown.insert(blame.commit);
+
+    if blame.commit.is_null() {
+        let (name, email, time) = match fake {
+            Some(f) => (f.name.as_str(), f.email.as_str(), f.time),
+            None => ("Not Committed Yet", "not.committed.yet", 0),
+        };
+        let summary = match fake {
+            Some(f) => f.summary.clone(),
+            None => format!("Version of {} from {}", blame.origin_path, blame.origin_path),
+        };
+        writeln!(handle, "author {name}")?;
+        writeln!(handle, "author-mail <{email}>")?;
+        writeln!(handle, "author-time {time}")?;
+        writeln!(handle, "author-tz +0000")?;
+        writeln!(handle, "committer {name}")?;
+        writeln!(handle, "committer-mail <{email}>")?;
+        writeln!(handle, "committer-time {time}")?;
+        writeln!(handle, "committer-tz +0000")?;
+        writeln!(handle, "summary {summary}")?;
+        // The fake work-tree commit is never a boundary.
+        return Ok(true);
+    }
+
     let object = db.read_object(&blame.commit)?;
     let commit = Commit::parse(format, &object.body)?;
     let author = Signature::from_ident_line(&commit.author);
@@ -2044,13 +2351,56 @@ fn porcelain_details(
             .map(|sig| sig.time.offset_token())
             .unwrap_or_else(|| "+0000".to_string())
     )?;
-    writeln!(
-        handle,
-        "summary {}",
-        String::from_utf8_lossy(commit.message.split(|b| *b == b'\n').next().unwrap_or_default())
-    )?;
+    writeln!(handle, "summary {}", commit_summary(&commit.message, &blame.commit))?;
+    if blame.boundary && !options.show_root {
+        writeln!(handle, "boundary")?;
+    }
+    Ok(true)
+}
+
+/// git's `write_filename_info`: the `previous <commit> <path>` pointer (when
+/// the blame walk descended into a parent) followed by `filename <path>`.
+fn write_filename_info(
+    handle: &mut impl Write,
+    blame: &LineBlame,
+    fake: Option<&FakeCommit>,
+    previous_map: &PreviousMap,
+) -> Result<()> {
+    let previous = if blame.commit.is_null() {
+        fake.and_then(|f| f.previous.clone())
+    } else {
+        previous_map
+            .get(&(blame.commit, blame.origin_path.clone()))
+            .cloned()
+    };
+    if let Some((commit, path)) = previous {
+        writeln!(handle, "previous {} {}", commit.to_hex(), path)?;
+    }
     writeln!(handle, "filename {}", blame.origin_path)?;
     Ok(())
+}
+
+/// git's `find_commit_subject`: skip leading blank/whitespace-only lines of the
+/// commit body and take the first non-blank line as the porcelain `summary`. An
+/// empty message renders as the parenthesized object name.
+fn commit_summary(message: &[u8], oid: &ObjectId) -> String {
+    let mut start = 0usize;
+    while start < message.len() {
+        let eol = message[start..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map(|p| start + p)
+            .unwrap_or(message.len());
+        let line = &message[start..eol];
+        let blank = line
+            .iter()
+            .all(|b| matches!(*b, b' ' | b'\t' | b'\r' | 0x0b | 0x0c));
+        if !blank {
+            return String::from_utf8_lossy(line).into_owned();
+        }
+        start = eol + 1;
+    }
+    format!("({})", oid.to_hex())
 }
 
 /// Render the object-name column for annotate-compat (`-c`) mode: exactly
@@ -2135,16 +2485,23 @@ fn author_and_date(
     blame: &LineBlame,
     options: &BlameOptions,
     mailmap: &commands::utility::Mailmap,
+    fake: Option<&FakeCommit>,
 ) -> Result<(String, String)> {
     if blame.commit.is_null() {
+        // The all-zero pseudo-commit: "Not Committed Yet" / "External file
+        // (--contents)" with the time blame ran (git stamps it with `now`).
+        let (name, email, time) = match fake {
+            Some(f) => (f.name.as_str(), f.email.as_str(), f.time),
+            None => ("Not Committed Yet", "not.committed.yet", 0),
+        };
         return Ok((
             match options.author_field {
-                AuthorField::Name => "Not Committed Yet".to_string(),
-                AuthorField::Email => "<not.committed.yet>".to_string(),
+                AuthorField::Name => name.to_string(),
+                AuthorField::Email => format!("<{email}>"),
             },
             match options.date_field {
-                DateField::Iso => "1970-01-01 00:00:00 +0000".to_string(),
-                DateField::Raw => "0 +0000".to_string(),
+                DateField::Iso => format_blame_iso_utc(time),
+                DateField::Raw => format!("{time} +0000"),
             },
         ));
     }
@@ -2170,6 +2527,12 @@ fn author_and_date(
     let date = for_each_ref_identity_date(identity, &date_mode).unwrap_or_default();
 
     Ok((author, date))
+}
+
+/// Format a UTC unix timestamp as blame's ISO column (`YYYY-MM-DD HH:MM:SS
+/// +0000`). Used for the fake working-tree commit, which git stamps `+0000`.
+fn format_blame_iso_utc(time: i64) -> String {
+    DateMode::Iso.render(time, "+0000").unwrap_or_default()
 }
 
 /// Strip a single trailing `\n` from a stored line. A `\r` (CRLF) is left in
