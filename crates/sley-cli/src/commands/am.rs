@@ -61,6 +61,8 @@ struct AmOptions {
     ignore_whitespace: bool,
     /// Cut message text at a scissors line before mailinfo header/body parsing.
     scissors: bool,
+    /// Prompt before applying each patch (`-i`/`--interactive`).
+    interactive: bool,
     /// Input patch container format (`--patch-format=<format>`), or auto-detect.
     patch_format: AmPatchFormat,
     /// `-p<n>`: number of leading path components to strip from patch names.
@@ -205,6 +207,14 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         // Command-line options given alongside a resume verb override the saved
         // session options for the resumed patch (git's `am_run` resume; t4153).
         let overrides = parse_am_resume_overrides(&option_args);
+        // `-i`/`--interactive` is a per-invocation flag (git never persists it);
+        // record the current value so the resumed driver / am_resolve see it.
+        if state_dir.exists() {
+            let interactive = option_args
+                .iter()
+                .any(|arg| arg == "-i" || arg == "--interactive");
+            let _ = fs::write(state_dir.join("interactive"), bool_flag(interactive));
+        }
         return match resume {
             "--abort" => am_abort(&git_dir, &worktree_root, format, &state_dir),
             "--quit" => am_quit(&state_dir),
@@ -417,6 +427,7 @@ pub(crate) fn start_rebase_apply(
         keep_cr: false,
         ignore_whitespace: params.ignore_whitespace,
         scissors: false,
+        interactive: false,
         patch_format: AmPatchFormat::Mbox,
         p_value: 1,
     };
@@ -529,6 +540,7 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         keep_cr: false,
         ignore_whitespace: false,
         scissors: false,
+        interactive: false,
         patch_format: AmPatchFormat::Auto,
         p_value: 1,
     };
@@ -549,6 +561,8 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             "--no-signoff" => options.signoff = false,
             "-3" | "--3way" => options.three_way = true,
             "--no-3way" => options.three_way = false,
+            "-i" | "--interactive" => options.interactive = true,
+            "--no-interactive" => options.interactive = false,
             "--ignore-whitespace" => options.ignore_whitespace = true,
             "--no-ignore-whitespace" => options.ignore_whitespace = false,
             "-k" | "--keep" => {
@@ -1707,6 +1721,10 @@ fn write_am_state_dir(
         bool_flag(options.ignore_whitespace),
     )?;
     fs::write(state_dir.join("utf8"), b"t\n")?;
+    fs::write(
+        state_dir.join("interactive"),
+        bool_flag(options.interactive),
+    )?;
     fs::write(state_dir.join("applying"), b"")?;
     fs::write(state_dir.join("apply-opt"), b"")?;
     fs::write(state_dir.join("p-value"), format!("{}\n", options.p_value))?;
@@ -1917,6 +1935,48 @@ impl AmResumeOverrides {
     }
 }
 
+/// The user's choice at the `am -i` prompt for one patch.
+enum AmInteractiveDecision {
+    /// Apply this patch (`y`).
+    Apply,
+    /// Skip this patch (`n`).
+    Skip,
+    /// Apply this and every remaining patch without prompting (`a`).
+    AcceptAll,
+}
+
+/// git's `do_interactive`: show the commit body and prompt whether to apply the
+/// current patch. Loops on `e`/`v` (edit/view — no-ops here, no editor/pager in
+/// the non-interactive test harness) until a decisive `y`/`n`/`a` is read.
+fn am_do_interactive(message: &[u8]) -> Result<AmInteractiveDecision> {
+    use std::io::Write;
+    let message = String::from_utf8_lossy(message);
+    loop {
+        println!("Commit Body is:");
+        println!("--------------------------");
+        print!("{message}");
+        if !message.ends_with('\n') {
+            println!();
+        }
+        println!("--------------------------");
+        print!("Apply? [y]es/[n]o/[e]dit/[v]iew patch/[a]ccept all: ");
+        std::io::stdout().flush().ok();
+        let mut reply = String::new();
+        if std::io::stdin().read_line(&mut reply)? == 0 {
+            return Err(GitError::Command(
+                "unable to read from stdin; aborting".into(),
+            ));
+        }
+        match reply.chars().next() {
+            Some('y') | Some('Y') => return Ok(AmInteractiveDecision::Apply),
+            Some('a') | Some('A') => return Ok(AmInteractiveDecision::AcceptAll),
+            Some('n') | Some('N') => return Ok(AmInteractiveDecision::Skip),
+            // 'e' (edit) / 'v' (view) — re-prompt.
+            _ => continue,
+        }
+    }
+}
+
 /// Parse the option overrides a resume verb (`--retry`/`--continue`) may carry.
 /// Only options that change saved session state are tracked; others are ignored
 /// (the resume path does not run the full `parse_am_options`).
@@ -1963,6 +2023,7 @@ fn run_am_series(
     let ignore_whitespace = read_state_bool(state_dir, "ignore-whitespace");
     let p_value = read_state_usize(state_dir, "p-value").unwrap_or(1);
     let saved_commit_opts = read_am_commit_opts(state_dir);
+    let mut interactive = read_state_bool(state_dir, "interactive");
 
     let mut number = start;
     while number <= last {
@@ -1986,6 +2047,22 @@ fn run_am_series(
         fs::write(state_dir.join("next"), format!("{number}\n"))?;
         let mut patch = read_patch_file(state_dir, number)?;
         write_current_patch_state(state_dir, &patch)?;
+
+        // git's `am_run`: in interactive mode, prompt before each patch. `n`
+        // skips it (HEAD unchanged), `a` applies this and stops prompting.
+        if interactive {
+            match am_do_interactive(&patch.message)? {
+                AmInteractiveDecision::Apply => {}
+                AmInteractiveDecision::Skip => {
+                    number += 1;
+                    continue;
+                }
+                AmInteractiveDecision::AcceptAll => {
+                    interactive = false;
+                    fs::write(state_dir.join("interactive"), bool_flag(false))?;
+                }
+            }
+        }
 
         if patch.diff.is_empty() {
             match empty_action {
@@ -3910,6 +3987,29 @@ fn am_continue(
         println!("already introduced the same changes; you might want to skip this patch.");
         am_print_resolve_hints();
         return Err(GitError::Exit(128));
+    }
+
+    // git's `am_resolve`: in interactive mode, prompt before committing the
+    // resolution. `n` advances past this patch without committing it (t4257
+    // "interactive am can resolve conflict").
+    if read_state_bool(state_dir, "interactive") {
+        match am_do_interactive(&patch.message)? {
+            AmInteractiveDecision::Apply => {}
+            AmInteractiveDecision::AcceptAll => {
+                fs::write(state_dir.join("interactive"), bool_flag(false))?;
+            }
+            AmInteractiveDecision::Skip => {
+                return run_am_series(
+                    git_dir,
+                    common_git_dir,
+                    worktree_root,
+                    format,
+                    state_dir,
+                    next + 1,
+                    AmResumeOverrides::default(),
+                );
+            }
+        }
     }
 
     let new_oid = create_am_commit(
