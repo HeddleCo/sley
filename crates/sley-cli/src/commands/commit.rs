@@ -784,12 +784,15 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         eprintln!("fatal: options '-m' and '-F' cannot be used together");
         return Err(GitError::Exit(128));
     }
-    if (include_without_paths || only_without_paths)
-        && pathspec_args.is_empty()
-        && pathspec_from_file.is_none()
-        && !fixup_commit
+    // git: die only when no paths and (--include, or --only without --amend and
+    // without --allow-empty). `git commit --allow-empty --only` is valid.
+    let amend_style = amend
+        || fixup_commit
             .as_ref()
-            .is_some_and(CommitFixup::is_amend_style)
+            .is_some_and(CommitFixup::is_amend_style);
+    if pathspec_args.is_empty()
+        && pathspec_from_file.is_none()
+        && (include_without_paths || (only_without_paths && !amend_style && !allow_empty))
     {
         eprintln!("fatal: No paths with --include/--only does not make sense.");
         return Err(GitError::Exit(128));

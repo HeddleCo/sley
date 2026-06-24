@@ -1405,14 +1405,24 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         )?;
         records
             .iter()
-            .map(|record| RebaseTodoItem {
-                command: TodoCommand::Pick,
-                flags: 0,
-                oid: Some(record.oid),
-                arg: format!("# {}", commit_subject(&record.commit.message)),
-                raw: String::new(),
+            .map(|record| -> Result<RebaseTodoItem> {
+                let parent_tree = match record.parents.first() {
+                    Some(parent) => commit_tree_oid(&db, ctx.format, parent)?,
+                    None => ObjectId::empty_tree(ctx.format),
+                };
+                let mut arg = format!("# {}", commit_subject(&record.commit.message));
+                if record.commit.tree == parent_tree {
+                    arg.push_str(" # empty");
+                }
+                Ok(RebaseTodoItem {
+                    command: TodoCommand::Pick,
+                    flags: 0,
+                    oid: Some(record.oid),
+                    arg,
+                    raw: String::new(),
+                })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?
     };
 
     write_basic_state(ctx, &opts)?;
@@ -1428,6 +1438,13 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         });
     }
 
+    // Upstream order: insert update-ref commands first (after each decorated
+    // pick), THEN autosquash (which slots fixups in just before the trailing
+    // update-refs), THEN exec. The state file records the final ref set.
+    if config_update_refs {
+        items = add_update_ref_commands(ctx, &items)?;
+    }
+
     if autosquash {
         items = rearrange_squash(ctx, &db, items)?;
     }
@@ -1437,7 +1454,6 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     }
 
     if config_update_refs {
-        items = add_update_ref_commands(ctx, &items)?;
         write_rebase_update_refs_state(ctx, &items)?;
     }
 
@@ -2256,13 +2272,17 @@ fn make_script_with_merges(
                 },
             );
         } else {
+            let mut arg = format!("# {}", commit_subject(&record.commit.message));
+            if is_empty {
+                arg.push_str(" # empty");
+            }
             commit_todo.insert(
                 *oid,
                 RebaseTodoItem {
                     command: TodoCommand::Pick,
                     flags: 0,
                     oid: Some(*oid),
-                    arg: format!("# {}", commit_subject(&record.commit.message)),
+                    arg,
                     raw: String::new(),
                 },
             );
@@ -2816,9 +2836,13 @@ fn add_update_ref_commands(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<Vec<Re
         let Some(oid) = item.oid else {
             continue;
         };
-        let Some(refs) = refs_by_oid.remove(&oid) else {
+        let Some(mut refs) = refs_by_oid.remove(&oid) else {
             continue;
         };
+        // git builds the decoration list by prepending each ref as it loads
+        // them sorted, so refs at one commit emit in reverse-sorted order.
+        refs.sort();
+        refs.reverse();
         for refname in refs {
             out.push(RebaseTodoItem {
                 command: TodoCommand::UpdateRef,
@@ -2855,6 +2879,180 @@ fn write_rebase_update_refs_state(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result
         text.push('\n');
     }
     fs::write(ctx.state_path("update-refs"), text)?;
+    Ok(())
+}
+
+/// One `(refname, before, after)` record in the `update-refs` state file. The
+/// file stores three lines per ref; `after` is the all-zero OID until the ref's
+/// `update-ref` todo command runs (recording the then-current HEAD).
+struct UpdateRefRecord {
+    refname: String,
+    before: ObjectId,
+    after: ObjectId,
+}
+
+fn read_update_refs_state(ctx: &Ctx) -> Result<Vec<UpdateRefRecord>> {
+    let path = ctx.state_path("update-refs");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Ok(Vec::new());
+    };
+    let mut lines = text.lines();
+    let mut out = Vec::new();
+    while let Some(refname) = lines.next() {
+        let (Some(before), Some(after)) = (lines.next(), lines.next()) else {
+            break;
+        };
+        let before = ObjectId::from_hex(ctx.format, before.trim())
+            .map_err(|_| GitError::InvalidObject("invalid update-refs before-oid".into()))?;
+        let after = ObjectId::from_hex(ctx.format, after.trim())
+            .map_err(|_| GitError::InvalidObject("invalid update-refs after-oid".into()))?;
+        out.push(UpdateRefRecord {
+            refname: refname.to_string(),
+            before,
+            after,
+        });
+    }
+    Ok(out)
+}
+
+fn write_update_refs_records(ctx: &Ctx, records: &[UpdateRefRecord]) -> Result<()> {
+    let path = ctx.state_path("update-refs");
+    if records.is_empty() {
+        let _ = fs::remove_file(&path);
+        return Ok(());
+    }
+    let mut text = String::new();
+    for rec in records {
+        text.push_str(&rec.refname);
+        text.push('\n');
+        text.push_str(&rec.before.to_hex());
+        text.push('\n');
+        text.push_str(&rec.after.to_hex());
+        text.push('\n');
+    }
+    fs::write(&path, text)?;
+    Ok(())
+}
+
+/// Port of upstream `do_update_ref`: record the current HEAD as the `after`
+/// value for `refname` in the update-refs state (applied later at finish).
+fn do_update_ref(ctx: &Ctx, refname: &str) -> Result<()> {
+    let mut records = read_update_refs_state(ctx)?;
+    if records.is_empty() {
+        return Ok(());
+    }
+    let refs = ctx.refs();
+    let head = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
+    for rec in &mut records {
+        if rec.refname == refname {
+            rec.after = head;
+            break;
+        }
+    }
+    write_update_refs_records(ctx, &records)
+}
+
+/// Port of upstream `do_update_refs`: at finish, apply every recorded ref
+/// update (compare-and-swap `before` -> `after`), reporting the refs updated
+/// and any that failed (e.g. moved out from under the rebase). Refs are
+/// reported sorted by name. Returns an error if any update failed.
+fn do_update_refs(ctx: &Ctx, quiet: bool) -> Result<()> {
+    let mut records = read_update_refs_state(ctx)?;
+    if records.is_empty() {
+        return Ok(());
+    }
+    records.sort_by(|a, b| a.refname.cmp(&b.refname));
+    let refs = FileRefStore::new(&ctx.common_git_dir, ctx.format);
+    let committer = commit_identity_from_env("COMMITTER")?;
+    let zero = ObjectId::null(ctx.format);
+    let mut updated = Vec::new();
+    let mut failed = Vec::new();
+    for rec in &records {
+        // Skip refs whose update-ref command never ran (after still zero).
+        if rec.after == zero {
+            continue;
+        }
+        let current = sley_refs::resolve_ref_peeled(&refs, &rec.refname)?.unwrap_or(zero);
+        if current != rec.before {
+            eprintln!("error: update_ref failed for ref '{}': ", rec.refname);
+            failed.push(rec.refname.clone());
+            continue;
+        }
+        let mut tx = refs.transaction();
+        tx.update(RefUpdate {
+            name: rec.refname.clone(),
+            expected: Some(RefTarget::Direct(rec.before)),
+            new: RefTarget::Direct(rec.after),
+            reflog: Some(ReflogEntry {
+                old_oid: rec.before,
+                new_oid: rec.after,
+                committer: committer.clone(),
+                message: b"rewritten during rebase".to_vec(),
+            }),
+        });
+        match tx.commit() {
+            Ok(()) => updated.push(rec.refname.clone()),
+            Err(_) => {
+                eprintln!("error: update_ref failed for ref '{}': ", rec.refname);
+                failed.push(rec.refname.clone());
+            }
+        }
+    }
+    if !quiet && (!updated.is_empty() || !failed.is_empty()) {
+        eprint!("Updated the following refs with --update-refs:\n");
+        for refname in &updated {
+            eprintln!("\t{refname}");
+        }
+        if !failed.is_empty() {
+            eprint!("Failed to update the following refs with --update-refs:\n");
+            for refname in &failed {
+                eprintln!("\t{refname}");
+            }
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(GitError::Exit(1))
+    }
+}
+
+/// Port of upstream `todo_list_filter_update_refs`: after the todo is (re)read
+/// on `--continue`/`--edit-todo`, drop state entries whose ref no longer has an
+/// `update-ref` line (and was not yet updated), and add un-updated entries for
+/// any new `update-ref` lines.
+fn filter_update_refs(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<()> {
+    let mut records = read_update_refs_state(ctx)?;
+    if records.is_empty() {
+        return Ok(());
+    }
+    let zero = ObjectId::null(ctx.format);
+    let todo_refs: std::collections::HashSet<&str> = items
+        .iter()
+        .filter(|item| item.command == TodoCommand::UpdateRef)
+        .map(|item| todo_arg_before_comment(&item.arg).trim())
+        .collect();
+    let mut updated = false;
+    let before_len = records.len();
+    records.retain(|rec| rec.after != zero || todo_refs.contains(rec.refname.as_str()));
+    if records.len() != before_len {
+        updated = true;
+    }
+    let store = FileRefStore::new(&ctx.common_git_dir, ctx.format);
+    for refname in &todo_refs {
+        if !records.iter().any(|rec| rec.refname == *refname) {
+            let before = sley_refs::resolve_ref_peeled(&store, refname)?.unwrap_or(zero);
+            records.push(UpdateRefRecord {
+                refname: (*refname).to_string(),
+                before,
+                after: zero,
+            });
+            updated = true;
+        }
+    }
+    if updated {
+        write_update_refs_records(ctx, &records)?;
+    }
     Ok(())
 }
 
@@ -2945,6 +3143,10 @@ fn complete_action(
         }
         new_items = parsed;
     }
+
+    // Reconcile the update-refs state with the (possibly user-edited) todo:
+    // drop refs whose update-ref line was removed, add any newly-inserted ones.
+    filter_update_refs(ctx, &new_items)?;
 
     let mut todo = TodoList {
         items: new_items,
@@ -3351,7 +3553,10 @@ fn pick_commits(
                     PickOutcome::Fail(code) => return Err(GitError::Exit(code)),
                 }
             }
-            TodoCommand::UpdateRef => {}
+            TodoCommand::UpdateRef => {
+                let refname = todo_arg_before_comment(&item.arg).trim().to_string();
+                do_update_ref(ctx, &refname)?;
+            }
             TodoCommand::Noop | TodoCommand::Drop | TodoCommand::Comment | TodoCommand::Revert => {}
         }
 
@@ -5170,8 +5375,10 @@ fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
         eprintln!("Successfully rebased and updated {head_name_display}.");
     }
 
+    let update_refs_result = do_update_refs(ctx, opts.quiet);
+
     seq::remove_merge_state(&ctx.git_dir);
-    Ok(())
+    update_refs_result
 }
 
 fn rewritten_list_path(ctx: &Ctx) -> PathBuf {
@@ -5426,6 +5633,7 @@ fn rebase_continue(ctx: &Ctx) -> Result<()> {
     }
 
     let mut todo = read_populate_todo(ctx, &db)?;
+    filter_update_refs(ctx, &todo.items)?;
     if ctx.state_path("dropped").exists() {
         if check_todo_dropped_commits_against_backup(ctx, &db, &todo.items)? {
             return Err(GitError::Exit(1));
@@ -5735,6 +5943,9 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
     } else if check_todo_dropped_commits(ctx, &db, &items, &new_items)? {
         return Err(GitError::Exit(1));
     }
+    // Reconcile the update-refs state with the edited todo (drop removed
+    // update-ref lines, add new ones).
+    filter_update_refs(ctx, &new_items)?;
     write_todo_file(ctx, &todo_path, &new_items, false, false, None, None, &db)?;
     Ok(())
 }
