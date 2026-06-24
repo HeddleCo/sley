@@ -3164,8 +3164,8 @@ pub fn blob_similarity(a: &[u8], b: &[u8]) -> u8 {
         return 100;
     }
 
-    let src = span_hash_counts(a);
-    let dst = span_hash_counts(b);
+    let src = span_hash_counts(a, blob_is_text(a));
+    let dst = span_hash_counts(b, blob_is_text(b));
     let common = common_span_bytes(&src, &dst);
 
     // Match git's diffcore-rename integer math exactly. git computes an internal
@@ -3187,7 +3187,7 @@ pub fn blob_similarity(a: &[u8], b: &[u8]) -> u8 {
 ///
 /// The returned map is `hash -> total_span_bytes`. Summing all values yields
 /// `data.len()`, so the byte accounting is exact.
-fn span_hash_counts(data: &[u8]) -> BTreeMap<u64, usize> {
+fn span_hash_counts(data: &[u8], is_text: bool) -> BTreeMap<u64, usize> {
     let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
     let mut idx = 0usize;
     let len = data.len();
@@ -3202,6 +3202,13 @@ fn span_hash_counts(data: &[u8]) -> BTreeMap<u64, usize> {
         loop {
             let c = data[idx] as u32;
             idx += 1;
+            // Ignore CR in a CRLF sequence for text blobs, so a file that only
+            // differs by LF<->CRLF is still scored as (near-)identical — git's
+            // `hash_chars()` does the same, which is what makes a CRLF-only
+            // rename detectable.
+            if is_text && c == u32::from(b'\r') && idx < len && data[idx] == b'\n' {
+                continue;
+            }
             span_len += 1;
             accum1 = (accum1 << 7) ^ (accum2 >> 25);
             accum2 = (accum2 << 7) ^ (accum1 >> 25);
@@ -3229,10 +3236,18 @@ fn span_hash_counts(data: &[u8]) -> BTreeMap<u64, usize> {
 /// `--dirstat`'s default "changes" damage is
 /// `(src.len() - src_copied) + literal_added`.
 pub fn count_changes(src: &[u8], dst: &[u8]) -> (usize, usize) {
-    let src_counts = span_hash_counts(src);
-    let dst_counts = span_hash_counts(dst);
+    let src_counts = span_hash_counts(src, blob_is_text(src));
+    let dst_counts = span_hash_counts(dst, blob_is_text(dst));
     let copied = common_span_bytes(&src_counts, &dst_counts);
     (copied, dst.len() - copied)
+}
+
+/// Whether a blob is treated as text for span hashing (git's
+/// `diff_filespec_is_binary` / `buffer_is_binary`): a NUL byte within the first
+/// 8000 bytes marks it binary, in which case CRs are hashed literally.
+fn blob_is_text(data: &[u8]) -> bool {
+    const FIRST_FEW_BYTES: usize = 8000;
+    !data.iter().take(FIRST_FEW_BYTES).any(|&byte| byte == 0)
 }
 
 fn common_span_bytes(src: &BTreeMap<u64, usize>, dst: &BTreeMap<u64, usize>) -> usize {
