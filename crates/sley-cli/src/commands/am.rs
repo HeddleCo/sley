@@ -3166,6 +3166,11 @@ fn apply_three_way(
                 String::from_utf8_lossy(path)
             );
         }
+        // git's `fall_back_threeway` runs rerere on the conflicted result: it
+        // records the preimage and, when a matching resolution was recorded
+        // earlier, replays it into the worktree (t4150 "am -3 works with
+        // rerere"). A no-op unless rerere.enabled.
+        commands::rerere::repo_rerere(git_dir, format, None)?;
         eprintln!("error: Failed to merge in the changes.");
         Ok(ApplyResult::Conflict)
     }
@@ -3933,6 +3938,10 @@ fn am_abort(
         return Ok(());
     }
 
+    // git's `am_abort` clears rerere's merge-resolution metadata once it has
+    // decided it is safe to rewind. A no-op unless rerere.enabled.
+    commands::rerere::rerere_clear(git_dir)?;
+
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let orig_head = fs::read_to_string(state_dir.join("orig-head"))
         .ok()
@@ -4014,6 +4023,10 @@ fn am_skip(
     state_dir: &Path,
 ) -> Result<()> {
     am_require_in_progress(state_dir)?;
+    // git's `am_skip` clears the in-progress rerere state for the skipped patch
+    // (am_rerere_clear) so its unresolved preimage is not left behind (t4151
+    // "am --skip ... test ! -f .git/MERGE_RR"). A no-op unless rerere.enabled.
+    commands::rerere::rerere_clear(git_dir)?;
     // git's `am_skip` runs `clean_index(HEAD, HEAD)`: discard the current
     // patch's partial application (conflict markers, unmerged entries, files the
     // patch added) and reset to HEAD, while preserving worktree-only changes to
@@ -4146,6 +4159,10 @@ fn am_continue(
         commit_opts,
     )?;
     record_rebase_rewrite(state_dir, format, next, &new_oid)?;
+    // git's `am_resolve` runs rerere so a resolved conflict is recorded for
+    // future replay (t4150 "am -3 works with rerere"). A no-op unless rerere
+    // is enabled and a MERGE_RR is in progress.
+    commands::rerere::record_resolved_after_commit(git_dir, format)?;
     run_am_series(
         git_dir,
         common_git_dir,
