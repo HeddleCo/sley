@@ -19736,6 +19736,7 @@ mod tests {
             eol: EolConversion::Crlf,
             ident: false,
             driver: None,
+            encoding: WtEncoding::None,
         };
         assert!(auto.will_convert_lf_to_crlf(b"a\nb\n"));
         assert!(!auto.will_convert_lf_to_crlf(b"a\r\nb\n")); // has CRLF
@@ -19749,6 +19750,7 @@ mod tests {
             eol: EolConversion::Crlf,
             ident: false,
             driver: None,
+            encoding: WtEncoding::None,
         };
         assert!(text.will_convert_lf_to_crlf(b"a\r\nb\nc\n"));
         assert!(!text.will_convert_lf_to_crlf(b"a\r\nb\r\n")); // no naked LF
