@@ -2008,36 +2008,48 @@ fn make_script_commits(
         order.push(oid);
         records.insert(oid, record);
     }
-    // Topological order, parents first.
-    let mut indegree: BTreeMap<ObjectId, usize> = BTreeMap::new();
-    let mut children: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
-    for (oid, record) in &records {
-        indegree.entry(*oid).or_insert(0);
+    // git make_script ordering: REV_SORT_IN_GRAPH_ORDER + reverse. Build the
+    // newest-first topological order with a LIFO frontier, releasing each
+    // commit's in-set parents in parent order so the *second* parent is popped
+    // first (matching git's prio_queue), then reverse for the oldest-first pick
+    // order. A diamond's shared ancestor is held until all its children emit.
+    let mut remaining_children: BTreeMap<ObjectId, usize> = BTreeMap::new();
+    for record in records.values() {
         for parent in &record.parents {
             if records.contains_key(parent) {
-                *indegree.entry(*oid).or_insert(0) += 1;
-                children.entry(*parent).or_default().push(*oid);
+                *remaining_children.entry(*parent).or_insert(0) += 1;
             }
         }
     }
-    let mut ready: Vec<ObjectId> = indegree
+    // Seed the frontier with the no-in-set-children commits (the tips) in
+    // discovery order, so orig_head drives the walk.
+    let mut stack: Vec<ObjectId> = order
         .iter()
-        .filter(|&(_, &deg)| deg == 0)
-        .map(|(oid, _)| *oid)
+        .filter(|oid| remaining_children.get(*oid).copied().unwrap_or(0) == 0)
+        .copied()
         .collect();
-    let mut sorted = Vec::new();
-    while let Some(oid) = ready.pop() {
-        sorted.push(oid);
-        if let Some(kids) = children.get(&oid) {
-            for kid in kids.clone() {
-                let deg = indegree.get_mut(&kid).expect("child has indegree");
-                *deg -= 1;
-                if *deg == 0 {
-                    ready.push(kid);
+    let mut newest_first = Vec::new();
+    let mut emitted = std::collections::HashSet::new();
+    while let Some(oid) = stack.pop() {
+        if !emitted.insert(oid) {
+            continue;
+        }
+        newest_first.push(oid);
+        if let Some(record) = records.get(&oid) {
+            for parent in &record.parents {
+                if records.contains_key(parent) {
+                    let count = remaining_children
+                        .get_mut(parent)
+                        .expect("in-set parent counted");
+                    *count -= 1;
+                    if *count == 0 {
+                        stack.push(*parent);
+                    }
                 }
             }
         }
     }
+    let sorted: Vec<ObjectId> = newest_first.into_iter().rev().collect();
     let mut out = Vec::new();
     for oid in sorted {
         let record = records.remove(&oid).expect("record collected");
@@ -2167,8 +2179,26 @@ fn make_script_with_merges(
 
     let branch_labels = branch_labels_by_oid(ctx)?;
     let mut state = LabelState::new(ctx, db);
+    // Upstream passes `base_rev...orig_head` (symmetric range) to make_script, so
+    // the BOTTOM commit registered as "onto" is the merge-base, not `upstream`
+    // itself. Registering the merge-base(s) makes the first-parent walk reset
+    // "onto" when it reaches the real base (so the rebased branch lands on the
+    // new onto) while genuine cousin bases still get their own OID label.
     if let Some(upstream) = upstream {
-        state.register_onto(upstream);
+        let bases = merge_bases(&ctx.common_git_dir, db, ctx.format, upstream, orig_head)?;
+        // `merge_bases` may include non-maximal common ancestors here; register
+        // only the maximal ones (a true merge-base is not an ancestor of another
+        // base), so an ancestor of the real base is not mistakenly labelled onto.
+        for (i, base) in bases.iter().enumerate() {
+            let dominated = bases.iter().enumerate().any(|(j, other)| {
+                i != j
+                    && sley_rev::is_ancestor(&ctx.common_git_dir, ctx.format, db, base, other)
+                        .unwrap_or(false)
+            });
+            if !dominated {
+                state.register_onto(base);
+            }
+        }
     }
     let mut commit_todo: BTreeMap<ObjectId, RebaseTodoItem> = BTreeMap::new();
     let mut tips = Vec::new();
@@ -3494,6 +3524,18 @@ fn do_reset(ctx: &Ctx, db: &FileObjectDatabase, opts: &MachineOpts, name: &str) 
     detach_head_with_reflog(ctx, old, target, ctx.reflog("reset", Some(name)), committer)
 }
 
+/// The active `[new root]` marker commit: `opts.squash_onto` if set, else the
+/// squash-onto state file. `reset [new root]` mints this synthetic empty root
+/// on the fly (writing only the state file) even for non-`--root` rebases, so
+/// both the merge-into-root fast-forward and the pick-as-root-commit paths must
+/// consult the file, not just `opts`.
+fn effective_squash_onto(ctx: &Ctx, opts: &MachineOpts) -> Option<ObjectId> {
+    opts.squash_onto.or_else(|| {
+        seq::read_state_line(&ctx.git_dir, "squash-onto")
+            .and_then(|raw| ObjectId::from_hex(ctx.format, raw.trim()).ok())
+    })
+}
+
 fn do_merge(
     ctx: &Ctx,
     db: &FileObjectDatabase,
@@ -3525,7 +3567,15 @@ fn do_merge(
         None => None,
     };
 
-    if opts.squash_onto == Some(head) && merge_heads.len() == 1 {
+    // A "merge" into a "[new root]" is a fast-forward to the merge head. The
+    // synthetic root may have been minted on the fly by an earlier `reset [new
+    // root]`, which records it only in the squash-onto state file, so consult
+    // that too rather than just `opts.squash_onto`.
+    if effective_squash_onto(ctx, opts) == Some(head) {
+        if merge_heads.len() > 1 {
+            eprintln!("error: octopus merge cannot be executed on top of a [new root]");
+            return Ok(PickOutcome::Fail(1));
+        }
         let target = merge_heads[0].1;
         reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
         let committer = commit_identity_from_env("COMMITTER")?;
@@ -3981,7 +4031,7 @@ fn pick_one_commit(
 
     let is_fixup = item.command.is_fixup();
     let final_fixup = is_fixup && !next_is_fixup(todo);
-    let create_root = opts.squash_onto == Some(head);
+    let create_root = effective_squash_onto(ctx, opts) == Some(head);
     if create_root && is_fixup {
         eprintln!("error: cannot fixup root commit");
         return Ok(PickOutcome::Fail(1));
