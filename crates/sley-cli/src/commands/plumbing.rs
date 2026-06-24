@@ -3961,6 +3961,15 @@ fn check_apply_path_safety(
         .filter(|p| !p.is_delete && p.new_mode == Some(0o120000))
         .filter_map(|p| p.new_path.as_deref())
         .collect();
+    // A symlink removed by the patch is no longer an obstacle: git applies the
+    // patches in order, so a `symlink → directory` typechange (delete the
+    // symlink, create files beneath the new directory) is allowed.
+    let deleted_symlinks: Vec<&[u8]> = patches
+        .iter()
+        .filter(|p| p.is_delete)
+        .filter_map(|p| p.old_path.as_deref())
+        .filter(|path| worktree_component_is_symlink(worktree_root, path))
+        .collect();
     for patch in patches {
         if patch.is_delete {
             continue;
@@ -3973,6 +3982,9 @@ fn check_apply_path_safety(
                 continue;
             }
             let ancestor = &name[..i];
+            if deleted_symlinks.iter().any(|s| *s == ancestor) {
+                continue;
+            }
             if created_symlinks.iter().any(|s| *s == ancestor)
                 || worktree_component_is_symlink(worktree_root, ancestor)
             {
@@ -4617,7 +4629,19 @@ fn read_patch_base(worktree_root: &Path, patch: &sley_diff_merge::FilePatch) -> 
     };
     let rel = std::str::from_utf8(old)
         .map_err(|_| GitError::InvalidFormat("non-utf8 patch path".into()))?;
-    Ok(fs::read(worktree_root.join(rel)).unwrap_or_default())
+    let full = worktree_root.join(rel);
+    // A symlink's blob content is its target path, not the bytes it points at —
+    // read the link rather than following it (symlink↔file/dir typechanges).
+    if fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink()) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            return Ok(fs::read_link(&full)
+                .map(|target| target.into_os_string().into_vec())
+                .unwrap_or_default());
+        }
+    }
+    Ok(fs::read(full).unwrap_or_default())
 }
 
 /// Outcome of applying a binary file patch.
