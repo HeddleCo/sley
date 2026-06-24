@@ -170,7 +170,7 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
     let mut option_args = Vec::new();
     for arg in args {
         match arg.as_str() {
-            "--abort" | "--quit" | "--continue" | "-r" | "--resolved" | "--skip" => {
+            "--abort" | "--quit" | "--continue" | "-r" | "--resolved" | "--skip" | "--retry" => {
                 if let Some(existing) = resume {
                     return am_incompatible_resume_error(existing, arg);
                 }
@@ -202,6 +202,9 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
     }
 
     if let Some(resume) = resume {
+        // Command-line options given alongside a resume verb override the saved
+        // session options for the resumed patch (git's `am_run` resume; t4153).
+        let overrides = parse_am_resume_overrides(&option_args);
         return match resume {
             "--abort" => am_abort(&git_dir, &worktree_root, format, &state_dir),
             "--quit" => am_quit(&state_dir),
@@ -218,6 +221,15 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
                 &worktree_root,
                 format,
                 &state_dir,
+                overrides,
+            ),
+            "--retry" => am_retry(
+                &git_dir,
+                &common_git_dir,
+                &worktree_root,
+                format,
+                &state_dir,
+                overrides,
             ),
             _ => Ok(()),
         };
@@ -305,6 +317,7 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         format,
         &state_dir,
         1,
+        AmResumeOverrides::default(),
     )
 }
 
@@ -455,6 +468,7 @@ pub(crate) fn start_rebase_apply(
         format,
         &state_dir,
         1,
+        AmResumeOverrides::default(),
     )
 }
 
@@ -473,7 +487,7 @@ pub(crate) fn rebase_apply_continue(
     format: ObjectFormat,
 ) -> Result<()> {
     let state_dir = git_dir.join("rebase-apply");
-    am_continue(git_dir, common_git_dir, worktree_root, format, &state_dir)
+    am_continue(git_dir, common_git_dir, worktree_root, format, &state_dir, AmResumeOverrides::default())
 }
 
 /// `git rebase --apply --skip`.
@@ -1880,12 +1894,59 @@ fn read_am_commit_opts(state_dir: &Path) -> AmCommitOpts {
 // Series driver
 // ===========================================================================
 
+/// Command-line options that, when a session is *resumed* (`--retry`/
+/// `--continue`/`--skip`), override the saved session options — but only for the
+/// single patch being resumed. git applies the override in-memory for that
+/// patch, then `am_load`s the saved state for every subsequent patch (am.c's
+/// `am_run` resume loop), so e.g. `am --signoff --continue` signs off only the
+/// resumed commit (t4153).
+#[derive(Clone, Copy, Default)]
+struct AmResumeOverrides {
+    three_way: Option<bool>,
+    quiet: Option<bool>,
+    signoff: Option<bool>,
+    reject: Option<bool>,
+}
+
+impl AmResumeOverrides {
+    fn any(&self) -> bool {
+        self.three_way.is_some()
+            || self.quiet.is_some()
+            || self.signoff.is_some()
+            || self.reject.is_some()
+    }
+}
+
+/// Parse the option overrides a resume verb (`--retry`/`--continue`) may carry.
+/// Only options that change saved session state are tracked; others are ignored
+/// (the resume path does not run the full `parse_am_options`).
+fn parse_am_resume_overrides(option_args: &[String]) -> AmResumeOverrides {
+    let mut overrides = AmResumeOverrides::default();
+    for arg in option_args {
+        match arg.as_str() {
+            "-3" | "--3way" => overrides.three_way = Some(true),
+            "--no-3way" => overrides.three_way = Some(false),
+            "-q" | "--quiet" => overrides.quiet = Some(true),
+            "--no-quiet" => overrides.quiet = Some(false),
+            "-s" | "--signoff" => overrides.signoff = Some(true),
+            "--no-signoff" => overrides.signoff = Some(false),
+            "--reject" => overrides.reject = Some(true),
+            "--no-reject" => overrides.reject = Some(false),
+            _ => {}
+        }
+    }
+    overrides
+}
+
 /// Apply patches `start..=last` from the state directory, committing each.
 ///
 /// On a clean apply this advances HEAD per patch and, after the final patch,
 /// removes the state directory. On a conflict it leaves the state in place,
 /// prints git's hint block, and exits 128 so the user can resolve and
 /// `--continue` / `--skip` / `--abort`.
+///
+/// `overrides` (non-empty only on `--retry`) override the saved options for the
+/// resumed patch at `start`; subsequent patches use the saved session options.
 fn run_am_series(
     git_dir: &Path,
     common_git_dir: &Path,
@@ -1893,17 +1954,35 @@ fn run_am_series(
     format: ObjectFormat,
     state_dir: &Path,
     start: usize,
+    overrides: AmResumeOverrides,
 ) -> Result<()> {
     let last = read_state_usize(state_dir, "last")?;
-    let quiet = read_state_bool(state_dir, "quiet");
-    let three_way = read_state_bool(state_dir, "threeway");
+    let saved_quiet = read_state_bool(state_dir, "quiet");
+    let saved_three_way = read_state_bool(state_dir, "threeway");
     let empty_action = read_empty_action(state_dir);
     let ignore_whitespace = read_state_bool(state_dir, "ignore-whitespace");
     let p_value = read_state_usize(state_dir, "p-value").unwrap_or(1);
-    let commit_opts = read_am_commit_opts(state_dir);
+    let saved_commit_opts = read_am_commit_opts(state_dir);
 
     let mut number = start;
     while number <= last {
+        // The resumed patch (only `start`, only under `--retry`) honours the
+        // command-line overrides; everything after it reverts to saved options.
+        let resumed = overrides.any() && number == start;
+        let quiet = if resumed {
+            overrides.quiet.unwrap_or(saved_quiet)
+        } else {
+            saved_quiet
+        };
+        let three_way = if resumed {
+            overrides.three_way.unwrap_or(saved_three_way)
+        } else {
+            saved_three_way
+        };
+        let mut commit_opts = saved_commit_opts;
+        if resumed && let Some(signoff) = overrides.signoff {
+            commit_opts.signoff = signoff;
+        }
         fs::write(state_dir.join("next"), format!("{number}\n"))?;
         let mut patch = read_patch_file(state_dir, number)?;
         write_current_patch_state(state_dir, &patch)?;
@@ -3763,6 +3842,7 @@ fn am_skip(
         format,
         state_dir,
         next + 1,
+        AmResumeOverrides::default(),
     )
 }
 
@@ -3774,10 +3854,20 @@ fn am_continue(
     worktree_root: &Path,
     format: ObjectFormat,
     state_dir: &Path,
+    overrides: AmResumeOverrides,
 ) -> Result<()> {
     am_require_in_progress(state_dir)?;
-    let commit_opts = read_am_commit_opts(state_dir);
-    let quiet = read_state_bool(state_dir, "quiet");
+    // Command-line options override the saved session options for the resumed
+    // (continued) commit only; the remaining patches use the saved options
+    // (am.c's `am_run` reloads them after the first patch). e.g.
+    // `am --signoff --continue` signs off only this commit (t4153).
+    let mut commit_opts = read_am_commit_opts(state_dir);
+    if let Some(signoff) = overrides.signoff {
+        commit_opts.signoff = signoff;
+    }
+    let quiet = overrides
+        .quiet
+        .unwrap_or_else(|| read_state_bool(state_dir, "quiet"));
     let next = read_state_usize(state_dir, "next")?;
     let patch = read_patch_file(state_dir, next)?;
 
@@ -3838,6 +3928,31 @@ fn am_continue(
         format,
         state_dir,
         next + 1,
+        AmResumeOverrides::default(),
+    )
+}
+
+/// `git am --retry`: re-apply the current (failed) patch from scratch, honouring
+/// any command-line option overrides (git's RESUME_APPLY). The override applies
+/// to this patch only; subsequent patches use the saved session options.
+fn am_retry(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    state_dir: &Path,
+    overrides: AmResumeOverrides,
+) -> Result<()> {
+    am_require_in_progress(state_dir)?;
+    let next = read_state_usize(state_dir, "next")?;
+    run_am_series(
+        git_dir,
+        common_git_dir,
+        worktree_root,
+        format,
+        state_dir,
+        next,
+        overrides,
     )
 }
 
@@ -3866,14 +3981,14 @@ fn am_continue_allow_empty(
             .any(|entry| (entry.flags >> 12) & 0x3 != 0)
     });
     if has_unmerged {
-        return am_continue(git_dir, common_git_dir, worktree_root, format, state_dir);
+        return am_continue(git_dir, common_git_dir, worktree_root, format, state_dir, AmResumeOverrides::default());
     }
 
     let refs = FileRefStore::new(git_dir, format);
     if let Some(head_oid) = head_commit_oid(&refs)?
         && am_index_is_dirty(git_dir, common_git_dir, format, &head_oid)?
     {
-        return am_continue(git_dir, common_git_dir, worktree_root, format, state_dir);
+        return am_continue(git_dir, common_git_dir, worktree_root, format, state_dir, AmResumeOverrides::default());
     }
 
     let commit_opts = read_am_commit_opts(state_dir);
@@ -3901,6 +4016,7 @@ fn am_continue_allow_empty(
         format,
         state_dir,
         next + 1,
+        AmResumeOverrides::default(),
     )
 }
 
