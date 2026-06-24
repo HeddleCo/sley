@@ -207,6 +207,9 @@ pub(crate) struct ResolvedDriver {
     /// `Some(true)` = `-diff` / binary=true; `Some(false)` = `diff` set /
     /// binary=false; `None` = auto-detect.
     pub(crate) binary: Option<bool>,
+    /// `diff.<driver>.textconv`: a command run on the blob to produce a text
+    /// representation before diffing / blaming / `cat-file --textconv`.
+    pub(crate) textconv: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +266,7 @@ impl UserdiffResolver {
                     word_regex: None,
                     external: None,
                     binary: Some(false),
+                    textconv: None,
                 })))
             }
             Some(sley_worktree::AttributeState::Unset) => {
@@ -272,6 +276,7 @@ impl UserdiffResolver {
                     word_regex: None,
                     external: None,
                     binary: Some(true),
+                    textconv: None,
                 })))
             }
             Some(sley_worktree::AttributeState::Value(name)) => self.driver_by_name(&name),
@@ -311,6 +316,7 @@ impl UserdiffResolver {
             word_regex: builtin.word_regex.map(<[u8]>::to_vec),
             external: None,
             binary: None,
+            textconv: None,
         })))
     }
 
@@ -331,6 +337,7 @@ impl UserdiffResolver {
         let mut command: Option<String> = None;
         let mut trust_exit_code = false;
         let mut binary: Option<bool> = None;
+        let mut textconv: Option<String> = None;
         for section in &config.sections {
             if !section.name.eq_ignore_ascii_case("diff")
                 || section.subsection.as_deref() != Some(name)
@@ -378,7 +385,11 @@ impl UserdiffResolver {
                             .and_then(sley_config::parse_config_bool)
                             .unwrap_or(true);
                     }
-                    "textconv" | "cachetextconv" | "algorithm" => {
+                    "textconv" => {
+                        any = true;
+                        textconv = entry.value.clone();
+                    }
+                    "cachetextconv" | "algorithm" => {
                         any = true;
                     }
                     _ => {}
@@ -399,8 +410,94 @@ impl UserdiffResolver {
                 trust_exit_code,
             }),
             binary,
+            textconv,
         }))
     }
+}
+
+/// Whether a tree/index entry mode names a regular file. Upstream's
+/// `diff_filespec_load_driver` only resolves the path's `diff=<driver>`
+/// attribute for regular files; symlinks (and gitlinks) fall back to the
+/// builtin "default" driver, which has no textconv — so a textconv program is
+/// never run on a symlink's blob (its target path).
+pub(crate) fn mode_is_regular_file(mode: u32) -> bool {
+    mode & 0o170000 == 0o100000
+}
+
+impl UserdiffResolver {
+    /// Resolve the `diff.<driver>.textconv` command for `path`, honouring the
+    /// regular-file gate (`mode_is_regular_file`). Returns `None` when the path
+    /// has no `diff` attribute, the named driver defines no textconv, or the
+    /// entry is not a regular file.
+    pub(crate) fn textconv_for_path(&self, path: &[u8], mode: u32) -> Result<Option<String>> {
+        if !mode_is_regular_file(mode) {
+            return Ok(None);
+        }
+        Ok(self
+            .driver_for_path(path)?
+            .and_then(|driver| driver.textconv.clone()))
+    }
+}
+
+/// Run a `diff.<driver>.textconv` command over `content`, returning the
+/// converted bytes. Mirrors upstream `run_textconv`: the blob content is
+/// written to a temporary file whose name is appended as the command's sole
+/// positional argument, the command runs through the shell, and its stdout is
+/// captured. A spawn / non-zero-exit / read failure returns `None` (upstream's
+/// `run_textconv` yields NULL there, which `fill_textconv` turns into a fatal).
+pub(crate) fn run_textconv(command: &str, content: &[u8]) -> Result<Option<Vec<u8>>> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut temp_path = std::env::temp_dir();
+    temp_path.push(format!(
+        "sley-textconv-{}-{}.tmp",
+        std::process::id(),
+        unique
+    ));
+
+    std::fs::write(&temp_path, content)
+        .map_err(|err| GitError::Io(format!("textconv tempfile: {err}")))?;
+
+    // Upstream builds the child with `use_shell` and args `[pgm, tempname]`,
+    // which `prepare_shell_cmd` turns into `sh -c '<pgm> "$@"' <pgm> <tempname>`
+    // — the tempfile becomes "$1" rather than being string-concatenated, so a
+    // command ending in `<` (redirect) sees it as its input file.
+    let (shell, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("/bin/sh", "-c")
+    };
+    let output = if cfg!(windows) {
+        std::process::Command::new(shell)
+            .arg(flag)
+            .arg(format!("{command} {}", temp_path.display()))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .output()
+    } else {
+        std::process::Command::new(shell)
+            .arg(flag)
+            .arg(format!("{command} \"$@\""))
+            .arg(command)
+            .arg(&temp_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .output()
+    };
+    let _ = std::fs::remove_file(&temp_path);
+
+    let output = match output {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(output.stdout))
 }
 
 fn parse_config_bool_like(value: &str) -> Option<bool> {

@@ -275,12 +275,20 @@ impl CatFileOptions {
             if !self.positional.is_empty() {
                 return cat_file_batch_modes_take_no_arguments();
             }
+            // `--textconv`/`--filters` combined with a batch mode: each input line
+            // is `<oid> <path>` and the emitted body is the transformed content.
+            let transform_mode = self
+                .cmd_mode
+                .as_ref()
+                .map(|selection| selection.mode)
+                .filter(|mode| matches!(mode, CatFileCmdMode::Textconv | CatFileCmdMode::Filters));
             return Ok(CatFileInvocation::Batch(CatFileBatchRequest {
                 mode,
                 format,
                 input_nul: self.input_nul,
                 output_nul: self.output_nul,
                 batch_all_objects,
+                transform_mode,
                 // Upstream defaults `--buffer` to on when `--batch-all-objects` is in effect,
                 // off otherwise; an explicit `--[no-]buffer` overrides.
                 buffer: self.buffer.unwrap_or(batch_all_objects),
@@ -311,6 +319,7 @@ impl CatFileOptions {
                 mode: CatFileObjectMode::Command(mode),
                 object_name: self.positional[0].clone(),
                 use_mailmap: self.use_mailmap,
+                force_path: self.path.clone(),
             }));
         }
 
@@ -328,6 +337,7 @@ impl CatFileOptions {
             mode: CatFileObjectMode::Typed(object_type),
             object_name: self.positional[1].clone(),
             use_mailmap: self.use_mailmap,
+            force_path: None,
         }))
     }
 }
@@ -336,6 +346,9 @@ struct CatFileObjectRequest {
     mode: CatFileObjectMode,
     object_name: String,
     use_mailmap: bool,
+    /// `--path=<path>`: forces the path used for `--textconv`/`--filters`
+    /// attribute lookup, letting the object be named by raw blob id.
+    force_path: Option<String>,
 }
 
 impl CatFileObjectRequest {
@@ -347,6 +360,9 @@ impl CatFileObjectRequest {
             use_mailmap: self.use_mailmap,
         };
         match self.mode {
+            CatFileObjectMode::Command(mode @ (CatFileCmdMode::Textconv | CatFileCmdMode::Filters)) => {
+                query.print_transform(mode, self.force_path.as_deref())
+            }
             CatFileObjectMode::Command(mode) => query.print_command_mode(mode),
             CatFileObjectMode::Typed(object_type) => query.print_typed_body(object_type),
         }
@@ -414,8 +430,19 @@ impl RepositoryObjectView {
         &self.common_git_dir
     }
 
+    fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
     fn format(&self) -> ObjectFormat {
         self.format
+    }
+
+    /// Peel `rev` to a tree id (commit/tag/tree all accepted). Used to tell a
+    /// bad rev (`invalid object name`) apart from a good rev whose path is
+    /// missing (`path ... does not exist`).
+    fn peel_to_tree(&self, rev: &str) -> Result<ObjectId> {
+        sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db).peel_to_tree(rev)
     }
 
     fn db(&self) -> &FileObjectDatabase {
@@ -493,15 +520,113 @@ impl ObjectQuery<'_> {
             CatFileCmdMode::Type => self.print_type(),
             CatFileCmdMode::Size => self.print_size(),
             CatFileCmdMode::Pretty => self.print_pretty(),
-            CatFileCmdMode::Textconv | CatFileCmdMode::Filters => Err(GitError::Unsupported(
-                format!("cat-file {} is not supported yet", mode.as_str()),
-            )),
+            // `--textconv`/`--filters` are dispatched to `print_transform` before
+            // reaching here (they need the recorded path + mode, not just an oid).
+            CatFileCmdMode::Textconv | CatFileCmdMode::Filters => unreachable!(
+                "--textconv/--filters are handled by print_transform"
+            ),
             // Never reaches execution: `--batch-all-objects` is folded into a batch
             // request or rejected during option validation.
             CatFileCmdMode::BatchAllObjects => unreachable!(
                 "--batch-all-objects is handled during option validation, not execution"
             ),
         }
+    }
+
+    /// `--textconv` / `--filters`: resolve `<rev>:<path>` (or `:<path>`, or a
+    /// bare blob id plus `--path`), read the blob, then emit either its textconv
+    /// output (`--textconv`, when a `diff.<driver>.textconv` applies) or its
+    /// smudged worktree form (`--filters`). Mirrors `cat_one_file`'s `'c'`/`'w'`
+    /// arms feeding `textconv_object` / `filter_object`.
+    fn print_transform(&self, mode: CatFileCmdMode, force_path: Option<&str>) -> Result<()> {
+        let (oid, file_mode, path) = self.resolve_transform_target(force_path)?;
+        let object = match self.view.db().read_object(&oid) {
+            Ok(object) => object,
+            Err(_) => return cat_file_not_a_valid_object_name(self.name),
+        };
+
+        let output: Vec<u8> = if object.object_type == ObjectType::Blob {
+            cat_file_transform_blob(self.view, mode, path.as_bytes(), file_mode, &object.body)?
+        } else {
+            object.body.clone()
+        };
+
+        io::stdout().write_all(&output)?;
+        io::stdout().flush()?;
+        Ok(())
+    }
+
+    /// Mirror `get_oid_with_context` for the `--textconv`/`--filters` arms:
+    /// resolve the object id, its file mode, and the path used for attribute
+    /// lookup. With `--path` the name is a bare object id (no `REQUIRE_PATH`);
+    /// without it the name must carry a path (`<rev>:<path>` or `:<path>`).
+    fn resolve_transform_target(
+        &self,
+        force_path: Option<&str>,
+    ) -> Result<(ObjectId, u32, String)> {
+        if let Some(forced) = force_path {
+            let oid = match self.view.resolve_object_name(self.name) {
+                Ok(oid) => oid,
+                Err(_) => return cat_file_not_a_valid_object_name(self.name),
+            };
+            // obj_context.mode == S_IFINVALID → 0100644.
+            return Ok((oid, 0o100644, forced.to_string()));
+        }
+
+        match find_path_colon(self.name) {
+            None => {
+                // A bare object name under REQUIRE_PATH: an error either way, but
+                // the diagnostic differs by whether the name resolves at all.
+                if self.view.resolve_object_name(self.name).is_ok() {
+                    eprintln!(
+                        "fatal: <object>:<path> required, only <object> '{}' given",
+                        self.name
+                    );
+                } else {
+                    eprintln!("fatal: Not a valid object name {}", self.name);
+                }
+                Err(GitError::Exit(128))
+            }
+            Some(0) => {
+                let (stage, path) = parse_index_stage_path(&self.name[1..]);
+                let (oid, mode) = self.resolve_index_entry(stage, path)?;
+                Ok((oid, mode, path.to_string()))
+            }
+            Some(idx) => {
+                let rev = &self.name[..idx];
+                let path = &self.name[idx + 1..];
+                match self.view.resolve_path(rev, path) {
+                    Ok(entry) => Ok((entry.oid, entry.mode.unwrap_or(0o100644), path.to_string())),
+                    Err(_) => {
+                        // Distinguish a bad rev from a good rev with a missing path.
+                        if self.view.peel_to_tree(rev).is_ok() {
+                            eprintln!("fatal: path '{path}' does not exist in '{rev}'");
+                        } else {
+                            eprintln!("fatal: invalid object name '{rev}'.");
+                        }
+                        Err(GitError::Exit(128))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Look up `path` at merge `stage` in the on-disk index, returning its blob
+    /// id and recorded mode (the mode lets the caller skip textconv on symlinks).
+    fn resolve_index_entry(&self, stage: u8, path: &str) -> Result<(ObjectId, u32)> {
+        let index_path = sley_worktree::repository_index_path(self.view.git_dir());
+        let bytes =
+            std::fs::read(&index_path).map_err(|err| GitError::Io(format!("read index: {err}")))?;
+        let index = sley_index::Index::parse(&bytes, self.view.format())?;
+        let want = path.as_bytes();
+        for entry in &index.entries {
+            if entry.path == want && ((entry.flags >> 12) & 0x3) as u8 == stage {
+                return Ok((entry.oid, entry.mode));
+            }
+        }
+        Err(GitError::not_found(format!(
+            "path '{path}' is not in the index"
+        )))
     }
 
     /// `-e`: existence only. Upstream uses `odb_has_object`, which never parses the object, so
@@ -671,6 +796,9 @@ struct CatFileBatchRequest {
     input_nul: bool,
     output_nul: bool,
     batch_all_objects: bool,
+    /// `--textconv`/`--filters` alongside `--batch`: transform each blob body
+    /// before emitting it (input lines are `<oid> <path>`).
+    transform_mode: Option<CatFileCmdMode>,
     buffer: bool,
     follow_symlinks: bool,
     filter: CatFileObjectsFilter,
@@ -884,7 +1012,8 @@ impl CatFileBatchRequest {
         let mut stdout = BufWriter::with_capacity(128 * 1024, stdout.lock());
         let terminator = if self.output_nul { b'\0' } else { b'\n' };
         let emit = |stdout: &mut dyn Write, line: &str| -> Result<()> {
-            let (object_name, rest) = cat_file_batch_input(line, batch_format.as_ref());
+            let (object_name, rest) =
+                cat_file_batch_input(line, batch_format.as_ref(), self.transform_mode.is_some());
             print_cat_file_batch_record(
                 stdout,
                 CatFileBatchRecord {
@@ -892,6 +1021,7 @@ impl CatFileBatchRequest {
                     object_name,
                     rest,
                     batch_format: batch_format.as_ref(),
+                    transform_mode: self.transform_mode,
                     check_only,
                     terminator,
                     apply_replace,
@@ -1030,6 +1160,8 @@ impl CatFileBatchRequest {
                 object_name,
                 rest: "",
                 batch_format,
+                // `--batch-command` does not pair with `--textconv`/`--filters`.
+                transform_mode: None,
                 check_only,
                 terminator,
                 apply_replace,
@@ -1161,6 +1293,9 @@ struct CatFileBatchRecord<'a> {
     object_name: &'a str,
     rest: &'a str,
     batch_format: Option<&'a CatFileBatchFormat<'a>>,
+    /// `--textconv`/`--filters`: transform the blob body using `rest` as the
+    /// path (mode hardcoded to `0100644`, as upstream's `print_object_or_die`).
+    transform_mode: Option<CatFileCmdMode>,
     check_only: bool,
     terminator: u8,
     apply_replace: bool,
@@ -1337,6 +1472,8 @@ fn print_cat_file_batch_record(
         None
     };
     let body: &[u8] = mailmapped_body.as_deref().unwrap_or(&object.body);
+    // The header always reports the *original* object size (upstream emits the
+    // default `<oid> <type> <size>` line from object info before transforming).
     print_cat_file_batch_header(
         stdout,
         &record,
@@ -1345,7 +1482,25 @@ fn print_cat_file_batch_record(
         body.len() as u64,
         object_mode.as_deref(),
     )?;
-    stdout.write_all(body)?;
+    if let Some(transform_mode) = record.transform_mode
+        && object.object_type == ObjectType::Blob
+    {
+        if record.rest.is_empty() {
+            eprintln!("fatal: missing path for '{oid}'");
+            return Err(GitError::Exit(128));
+        }
+        // Upstream's `print_object_or_die` passes the regular-file mode 0100644.
+        let transformed = cat_file_transform_blob(
+            record.view,
+            transform_mode,
+            record.rest.as_bytes(),
+            0o100644,
+            body,
+        )?;
+        stdout.write_all(&transformed)?;
+    } else {
+        stdout.write_all(body)?;
+    }
     stdout.write_all(&[record.terminator])?;
     Ok(())
 }
@@ -1533,8 +1688,12 @@ fn print_cat_file_batch_header(
 fn cat_file_batch_input<'a>(
     line: &'a str,
     batch_format: Option<&CatFileBatchFormat<'_>>,
+    split_on_whitespace: bool,
 ) -> (&'a str, &'a str) {
-    if batch_format.is_some_and(CatFileBatchFormat::needs_rest) {
+    // Upstream sets `data.split_on_whitespace` when the format carries `%(rest)`
+    // *or* a transform mode is in effect, splitting `<oid> <path>` at the first
+    // whitespace.
+    if split_on_whitespace || batch_format.is_some_and(CatFileBatchFormat::needs_rest) {
         line.split_once(char::is_whitespace)
             .map(|(object_name, rest)| (object_name, rest.trim_start()))
             .unwrap_or((line, ""))
@@ -1719,6 +1878,121 @@ Emit object (blob or tree) with conversion or filter (stand-alone, or with batch
     --[no-]filter <args>  object filtering
 
 ";
+
+/// Find the byte offset of the top-level `:` separating `<rev>:<path>`,
+/// respecting `@{...}` / `^{...}` bracket spans (so `HEAD@{0}:x` splits at the
+/// final colon). A leading `:` (index form) reports offset 0. Returns `None`
+/// for a bare object name (no path component). Mirrors the scan in upstream's
+/// `get_oid_with_context_1`.
+fn find_path_colon(name: &str) -> Option<usize> {
+    let bytes = name.as_bytes();
+    if bytes.first() == Some(&b':') {
+        return Some(0);
+    }
+    let mut depth = 0u32;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if (c == b'@' || c == b'^') && bytes.get(i + 1) == Some(&b'{') {
+            depth += 1;
+            i += 1;
+        } else if depth > 0 && c == b'}' {
+            depth -= 1;
+        } else if depth == 0 && c == b':' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse the portion after a leading `:` into `(stage, path)`. `:<path>` is
+/// stage 0; `:N:<path>` (N in 0..=3) selects stage N.
+fn parse_index_stage_path(rest: &str) -> (u8, &str) {
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && matches!(bytes[0], b'0'..=b'3') {
+        (bytes[0] - b'0', &rest[2..])
+    } else {
+        (0, rest)
+    }
+}
+
+/// Transform a blob body for `--textconv` / `--filters`. `--filters` smudges
+/// the blob into its worktree form (`convert_to_working_tree`); `--textconv`
+/// runs the path's `diff.<driver>.textconv` over the *smudged* content (matching
+/// `prep_temp_blob` → `convert_to_working_tree` → textconv), or streams the blob
+/// unchanged when no textconv driver applies. `file_mode` gates symlink skipping
+/// (batch mode passes the regular-file mode `0100644`, as upstream does).
+fn cat_file_transform_blob(
+    view: &RepositoryObjectView,
+    mode: CatFileCmdMode,
+    path: &[u8],
+    file_mode: u32,
+    body: &[u8],
+) -> Result<Vec<u8>> {
+    let git_dir = view.git_dir();
+    let format = view.format();
+    match mode {
+        CatFileCmdMode::Filters => {
+            // `filter_object` only smudges a regular-file blob; a symlink (or
+            // other non-regular mode) streams raw.
+            if commands::userdiff::mode_is_regular_file(file_mode) {
+                let config = read_repo_config(git_dir).unwrap_or_default();
+                let worktree_root = worktree_root_for_git_dir(git_dir)?;
+                sley_worktree::apply_smudge_filter(
+                    &worktree_root,
+                    git_dir,
+                    format,
+                    &config,
+                    path,
+                    body,
+                )
+            } else {
+                Ok(body.to_vec())
+            }
+        }
+        CatFileCmdMode::Textconv => {
+            let config = read_repo_config(git_dir).unwrap_or_default();
+            let attributes = worktree_root_for_git_dir(git_dir)
+                .ok()
+                .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+                .transpose()?;
+            let resolver = commands::userdiff::UserdiffResolver::with_attributes(
+                attributes,
+                Some(config.clone()),
+            );
+            match resolver.textconv_for_path(path, file_mode)? {
+                Some(command) => {
+                    // Upstream feeds textconv the *worktree* form of the blob
+                    // (prep_temp_blob → convert_to_working_tree), so eol/smudge
+                    // conversions are applied before the textconv program runs.
+                    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+                    let smudged = sley_worktree::apply_smudge_filter(
+                        &worktree_root,
+                        git_dir,
+                        format,
+                        &config,
+                        path,
+                        body,
+                    )?;
+                    match commands::userdiff::run_textconv(&command, &smudged)? {
+                        Some(converted) => Ok(converted),
+                        None => {
+                            // Upstream's fill_textconv dies when run_textconv
+                            // yields NULL.
+                            eprintln!("fatal: unable to read files to diff");
+                            Err(GitError::Exit(128))
+                        }
+                    }
+                }
+                // No textconv driver → upstream's `'c'` arm falls through to `'p'`
+                // and streams the blob unchanged.
+                None => Ok(body.to_vec()),
+            }
+        }
+        _ => unreachable!("cat_file_transform_blob only handles --textconv/--filters"),
+    }
+}
 
 /// Print `fatal: <message>`, a blank line, then the usage block; exit 129. Mirrors git's
 /// `usage_msg_opt`/`usage_msg_optf`.
