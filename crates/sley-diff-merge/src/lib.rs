@@ -4360,11 +4360,19 @@ pub fn reverse_file_patch(patch: &FilePatch) -> FilePatch {
             }
         })
         .collect();
+    // git's `reverse_patches` only swaps the modes when the patch actually
+    // carries a new mode (a mode change) or is a deletion; a content-only patch
+    // keeps its (old) mode so the type-mismatch check still compares against it.
+    let (old_mode, new_mode) = if patch.new_mode.is_some() || patch.is_delete {
+        (patch.new_mode, patch.old_mode)
+    } else {
+        (patch.old_mode, patch.new_mode)
+    };
     FilePatch {
         old_path: patch.new_path.clone(),
         new_path: patch.old_path.clone(),
-        old_mode: patch.new_mode,
-        new_mode: patch.old_mode,
+        old_mode,
+        new_mode,
         hunks,
         is_new: patch.is_delete,
         is_delete: patch.is_new,

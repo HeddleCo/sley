@@ -241,6 +241,11 @@ pub(crate) fn merge_remove_worktree_file(worktree_root: &Path, path: &[u8]) -> R
         }
         Ok(_) => fs::remove_file(&full)?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        // ENOTDIR: a path component is a (non-directory) file, so the target
+        // cannot exist — it was already removed (e.g. a directory→file typechange
+        // cleared the parent before this delete ran). git's `unlink_or_warn`
+        // treats this as already-gone; mirror that.
+        Err(err) if err.raw_os_error() == Some(20) => {}
         Err(err) => return Err(err.into()),
     }
     merge_prune_empty_dirs(worktree_root, full.parent());

@@ -3319,12 +3319,33 @@ fn clean_trace2_directories_visited(value: usize) {
 enum ApplyAction {
     Write {
         path: Vec<u8>,
+        /// Worktree mode (executable bit / symlink) used when materialising.
         mode: u32,
+        /// Canonical mode for the index entry (`--index`/`--cached`).
+        index_mode: u32,
         content: Vec<u8>,
     },
     Remove {
         path: Vec<u8>,
     },
+}
+
+/// git's `canon_mode`: the index never stores arbitrary permission bits — a
+/// regular file is `100644` or `100755` (owner-exec bit only), a symlink
+/// `120000`, a gitlink `160000`.
+fn canon_mode(mode: u32) -> u32 {
+    match mode & 0o170000 {
+        0o100000 | 0 => {
+            if mode & 0o100 != 0 {
+                0o100755
+            } else {
+                0o100644
+            }
+        }
+        0o120000 => 0o120000,
+        0o040000 => 0o040000,
+        _ => 0o160000,
+    }
 }
 
 /// `git apply --whitespace=<action>` modes (apply.c's `ws_error_action`).
@@ -3350,6 +3371,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let mut summary = false;
     let mut recount = false;
     let mut update_index = false;
+    let mut cached = false;
     let mut intent_to_add = false;
     let mut build_fake_ancestor: Option<String> = None;
     let mut files = Vec::new();
@@ -3394,6 +3416,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             "-R" | "--reverse" => reverse = true,
             "--no-reverse" => reverse = false,
             "--index" => update_index = true,
+            "--cached" => cached = true,
             "-N" | "--intent-to-add" => intent_to_add = true,
             "--no-intent-to-add" => intent_to_add = false,
             "--build-fake-ancestor" => {
@@ -3404,7 +3427,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 };
                 build_fake_ancestor = Some(path.to_string());
             }
-            "-3" | "--3way" | "--cached" => {
+            "-3" | "--3way" => {
                 return Err(GitError::Unsupported(format!(
                     "apply {arg} is not supported yet"
                 )));
@@ -3459,10 +3482,33 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             value => files.push(value.to_string()),
         }
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(cwd.clone())?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    // git's `state->prefix`: the current directory relative to the work tree,
+    // with a trailing slash (empty at the top level). Prepended to the names of
+    // non-toplevel-relative (traditional) patches so that `git apply` from a
+    // subdirectory operates on files under that subdirectory. Both paths are
+    // canonicalised so a symlinked temp/work tree does not defeat the strip.
+    let prefix: Vec<u8> = {
+        let canonical_root =
+            fs::canonicalize(&worktree_root).unwrap_or_else(|_| worktree_root.clone());
+        let canonical_cwd = fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+        canonical_cwd
+            .strip_prefix(&canonical_root)
+            .ok()
+            .map(|rel| rel.to_string_lossy().into_owned())
+            .filter(|rel| !rel.is_empty())
+            .map(|mut rel| {
+                if !rel.ends_with('/') {
+                    rel.push('/');
+                }
+                rel.into_bytes()
+            })
+            .unwrap_or_default()
+    };
     let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(&git_dir)?;
     // `apply.whitespace` config supplies the default whitespace action when the
     // command line did not give an explicit `--whitespace=`.
@@ -3526,6 +3572,32 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     // front).
     if reverse {
         patches = patches.iter().map(sley_diff_merge::reverse_file_patch).collect();
+    }
+    // git's `prefix_patch` + `use_patch`: prepend the cwd prefix to every
+    // non-toplevel-relative (traditional) patch, then drop any patch whose
+    // resolved name does not live under the prefix.
+    if !prefix.is_empty() {
+        for patch in &mut patches {
+            if patch.is_toplevel_relative {
+                continue;
+            }
+            for name in [patch.old_path.as_mut(), patch.new_path.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                let mut prefixed = prefix.clone();
+                prefixed.extend_from_slice(name);
+                *name = prefixed;
+            }
+        }
+        patches.retain(|patch| {
+            let name = patch
+                .new_path
+                .as_deref()
+                .or(patch.old_path.as_deref())
+                .unwrap_or(b"");
+            name.starts_with(&prefix) && name.len() > prefix.len()
+        });
     }
     if let Some(path) = build_fake_ancestor {
         write_apply_fake_ancestor_index(&git_dir, format, &patches, &inputs, &path)?;
@@ -3615,8 +3687,29 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     // Path-safety: refuse to read/create/delete files that escape the working
     // tree. git turns `--unsafe-paths` off whenever the index is touched
     // (`--index`/`--cached`), so the gate only relaxes for pure worktree applies.
-    let unsafe_paths = unsafe_paths && !update_index;
+    let touch_index = update_index || cached;
+    let unsafe_paths = unsafe_paths && !touch_index;
     check_apply_path_safety(&worktree_root, &patches, unsafe_paths)?;
+
+    // When `--index`/`--cached` is in effect, read the current index once: its
+    // entry modes feed the canonical index-mode decision (preserve an unchanged
+    // mode) and the type-mismatch warnings.
+    let mut index = if touch_index {
+        Some(read_apply_index(&git_dir, format)?)
+    } else {
+        None
+    };
+    let index_modes: HashMap<Vec<u8>, u32> = index
+        .as_ref()
+        .map(|index| {
+            index
+                .entries
+                .iter()
+                .filter(|entry| (entry.flags >> 12) & 0x3 == 0)
+                .map(|entry| (entry.path.to_vec(), entry.mode))
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Phase 1: compute every result first (git applies a patch atomically).
     let mut actions = Vec::new();
@@ -3638,9 +3731,12 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                         return Err(GitError::InvalidFormat("patch missing target path".into()));
                     };
                     let mode = apply_write_mode(&worktree_root, patch, &target)?;
+                    let index_mode =
+                        apply_index_mode_and_warn(patch, &target, mode, &index_modes);
                     actions.push(ApplyAction::Write {
                         path: target,
                         mode,
+                        index_mode,
                         content,
                     });
                     if patch.is_rename
@@ -3675,9 +3771,11 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 return Err(GitError::InvalidFormat("patch missing target path".into()));
             };
             let mode = apply_write_mode(&worktree_root, patch, &target)?;
+            let index_mode = apply_index_mode_and_warn(patch, &target, mode, &index_modes);
             actions.push(ApplyAction::Write {
                 path: target,
                 mode,
+                index_mode,
                 content,
             });
             if patch.is_rename
@@ -3691,39 +3789,46 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     if check {
         return Ok(());
     }
-    // Phase 2: materialize.
+    // Phase 2: materialize. `--cached` updates only the index; `--index` updates
+    // both the worktree and the index; a plain apply updates only the worktree.
     let mut index_paths = Vec::new();
     for action in &actions {
         match action {
             ApplyAction::Write {
                 path,
                 mode,
+                index_mode,
                 content,
-            } => merge_write_worktree_file(&worktree_root, path, content, *mode)?,
-            ApplyAction::Remove { path } => merge_remove_worktree_file(&worktree_root, path)?,
+            } => {
+                if !cached {
+                    merge_write_worktree_file(&worktree_root, path, content, *mode)?;
+                }
+                if let Some(index) = index.as_mut() {
+                    let oid = db.write_object(EncodedObject::new(ObjectType::Blob, content.clone()))?;
+                    apply_index_upsert(index, path, *index_mode, oid);
+                }
+            }
+            ApplyAction::Remove { path } => {
+                if !cached {
+                    merge_remove_worktree_file(&worktree_root, path)?;
+                }
+                if let Some(index) = index.as_mut() {
+                    index.entries.retain(|entry| entry.path.as_bytes() != path.as_slice());
+                }
+            }
         }
         index_paths.push(PathBuf::from(
             std::str::from_utf8(action.path())
                 .map_err(|err| GitError::InvalidPath(err.to_string()))?,
         ));
     }
-    if update_index && !index_paths.is_empty() {
-        let config = read_repo_config(&git_dir)?;
-        sley_worktree::update_index_paths_filtered(
-            &worktree_root,
-            &git_dir,
-            format,
-            &index_paths,
-            sley_worktree::UpdateIndexOptions {
-                add: true,
-                remove: true,
-                force_remove: false,
-                chmod: None,
-                info_only: false,
-                ignore_skip_worktree_entries: false,
-                allow_skip_worktree_entries: false,
-            },
-            &config,
+    if let Some(mut index) = index {
+        index
+            .entries
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        fs::write(
+            sley_worktree::repository_index_path(&git_dir),
+            index.write(format)?,
         )?;
     } else if intent_to_add && !index_paths.is_empty() {
         add_intent_to_add(
@@ -4384,6 +4489,77 @@ fn apply_write_mode(
         Ok(metadata) => Ok(metadata_to_git_mode(&metadata)),
         Err(_) => Ok(patch.old_mode.unwrap_or(0o100644)),
     }
+}
+
+/// Compute the canonical index-entry mode for a `--index`/`--cached` apply and
+/// emit git's "has type … expected …" warning when the current index entry's
+/// mode disagrees with the patch's expected old mode.
+fn apply_index_mode_and_warn(
+    patch: &sley_diff_merge::FilePatch,
+    target: &[u8],
+    worktree_mode: u32,
+    index_modes: &HashMap<Vec<u8>, u32>,
+) -> u32 {
+    let existing = index_modes.get(target).copied();
+    if !patch.is_new
+        && let Some(old_mode) = patch.old_mode
+        && let Some(actual) = existing
+        && canon_mode(actual) != canon_mode(old_mode)
+    {
+        eprintln!(
+            "warning: {} has type {:o}, expected {:o}",
+            String::from_utf8_lossy(target),
+            canon_mode(actual),
+            canon_mode(old_mode)
+        );
+    }
+    // An explicit new mode (new file / mode change) wins; otherwise preserve the
+    // existing index entry's mode, falling back to the materialised worktree mode.
+    if let Some(new_mode) = patch.new_mode {
+        canon_mode(new_mode)
+    } else if let Some(actual) = existing {
+        actual
+    } else {
+        canon_mode(worktree_mode)
+    }
+}
+
+/// Read the repository index for an `--index`/`--cached` apply, returning an
+/// empty in-memory index when none exists yet.
+fn read_apply_index(git_dir: &Path, format: ObjectFormat) -> Result<Index> {
+    let path = sley_worktree::repository_index_path(git_dir);
+    match fs::read(&path) {
+        Ok(bytes) => Index::parse(&bytes, format),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Upsert a stage-0 index entry (replacing any existing entries for the path).
+fn apply_index_upsert(index: &mut Index, path: &[u8], mode: u32, oid: ObjectId) {
+    index.entries.retain(|entry| entry.path.as_bytes() != path);
+    let flags = (path.len().min(0x0fff)) as u16;
+    index.entries.push(IndexEntry {
+        ctime_seconds: 0,
+        ctime_nanoseconds: 0,
+        mtime_seconds: 0,
+        mtime_nanoseconds: 0,
+        dev: 0,
+        ino: 0,
+        mode,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        oid,
+        flags,
+        flags_extended: 0,
+        path: BString::from(path),
+    });
 }
 
 fn metadata_to_git_mode(metadata: &fs::Metadata) -> u32 {
