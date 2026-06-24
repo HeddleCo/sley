@@ -3701,8 +3701,10 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 .or(patch.old_path.as_deref())
                 .unwrap_or(b"");
             let mut rule = ws_resolver.rule_for_path(target)?;
-            // A symlink's incomplete line is not news (apply.c clears it).
-            if patch.new_mode == Some(0o120000) {
+            // A symlink's incomplete line is not news (apply.c clears it). git
+            // uses the post-image mode (new_mode, else old_mode — the index-line
+            // mode lands in old_mode for a content-only symlink patch).
+            if patch.new_mode.or(patch.old_mode) == Some(0o120000) {
                 rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
             }
             let base =
@@ -3727,19 +3729,20 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     }
     if ws_error_count > 0 {
         let n = ws_error_count;
+        // git's `%d line(s) add(s)/applied` plural forms. The "errors" word is
+        // always plural in this message, even for a single line.
+        let adds = if n == 1 { "line adds" } else { "lines add" };
         match ws_action {
+            // `die_on_ws_error`: an `error:`-prefixed summary, then a non-zero exit.
+            WsAction::Error | WsAction::ErrorAll => {
+                eprintln!("error: {n} {adds} whitespace errors.");
+            }
             WsAction::Fix => {
-                eprintln!(
-                    "warning: {n} line{} applied after fixing whitespace errors.",
-                    if n == 1 { " adds" } else { "s add" }
-                );
+                let applied = if n == 1 { "line applied" } else { "lines applied" };
+                eprintln!("warning: {n} {applied} after fixing whitespace errors.");
             }
             _ => {
-                eprintln!(
-                    "warning: {n} line{} whitespace error{}.",
-                    if n == 1 { " adds" } else { "s add" },
-                    if n == 1 { "" } else { "s" }
-                );
+                eprintln!("warning: {n} {adds} whitespace errors.");
             }
         }
     }
@@ -3830,7 +3833,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 .or(patch.old_path.as_deref())
                 .unwrap_or(b"");
             let mut rule = ws_resolver.rule_for_path(target)?;
-            if patch.new_mode == Some(0o120000) {
+            if patch.new_mode.or(patch.old_mode) == Some(0o120000) {
                 rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
             }
             let ws_opts = sley_diff_merge::WsApplyOptions {
@@ -5350,46 +5353,90 @@ fn apply_patch_whitespace(
     // that flag is set — so a clean-on-its-own line (e.g. `8 spaces + tab`,
     // which the indent-with-non-tab check passes) is still re-indented when a
     // sibling line in the same patch is dirty. We mirror that by pre-scanning.
+    // The index of the new side's final line (last context/insert) in each hunk:
+    // a `+` line is "incomplete" (no trailing newline) only when it is that line
+    // and the hunk records the new side as unterminated. Everywhere else a `+`
+    // line carries a trailing newline, which `ws_check`/`ws_fix` must see so that
+    // `incomplete-line` does not fire on every introduced line.
+    let last_new_index = |hunk: &sley_diff_merge::Hunk| -> Option<usize> {
+        hunk.lines
+            .iter()
+            .rposition(|line| matches!(line, HunkLine::Context(_) | HunkLine::Insert(_)))
+    };
+    let probe_bytes = |bytes: &[u8], incomplete: bool| -> Vec<u8> {
+        let mut probe = bytes.to_vec();
+        if !incomplete {
+            probe.push(b'\n');
+        }
+        probe
+    };
+
     let patch_has_ws_error = patch.hunks.iter().any(|hunk| {
-        hunk.lines.iter().any(|hl| match hl {
-            HunkLine::Insert(bytes) => ws::ws_check(bytes, rule) != 0,
+        let last_new = last_new_index(hunk);
+        hunk.lines.iter().enumerate().any(|(index, hl)| match hl {
+            HunkLine::Insert(bytes) => {
+                let incomplete = hunk.new_no_newline && Some(index) == last_new;
+                ws::ws_check(&probe_bytes(bytes, incomplete), rule) != 0
+            }
             _ => false,
         })
     });
 
     for hunk in &mut patch.hunks {
-        let mut lineno = hunk.new_start; // 1-based new-file line of next +/space
-        for hl in &mut hunk.lines {
-            match hl {
-                HunkLine::Context(_) => {
-                    lineno += 1;
-                }
-                HunkLine::Delete(_) => {}
-                HunkLine::Insert(bytes) => {
-                    let bad = ws::ws_check(bytes, rule);
-                    if fixing {
-                        // Re-indent/strip every introduced line once any line
-                        // in the patch is dirty (git's global-flag semantics).
-                        if patch_has_ws_error {
-                            let fixed = ws::ws_fix_line_content(bytes, rule);
-                            if fixed != *bytes {
-                                *bytes = fixed;
-                                *error_count += 1;
-                            }
-                        }
-                    } else if bad != 0 {
+        let last_new = last_new_index(hunk);
+        let mut clear_new_no_newline = false;
+        for index in 0..hunk.lines.len() {
+            if !matches!(hunk.lines[index], HunkLine::Insert(_)) {
+                continue;
+            }
+            let input_line = hunk.line_input_lines.get(index).copied().unwrap_or(0);
+            let incomplete = hunk.new_no_newline && Some(index) == last_new;
+            let HunkLine::Insert(bytes) = &hunk.lines[index] else {
+                unreachable!()
+            };
+            let probe = probe_bytes(bytes, incomplete);
+            if fixing {
+                // Re-indent/strip every introduced line once any line in the
+                // patch is dirty (git's global-flag semantics).
+                if patch_has_ws_error {
+                    let fixed = ws::ws_fix_bytes(&probe, rule);
+                    // Recover the content: drop the newline we appended, or — for a
+                    // genuinely-incomplete line — the newline `ws_fix` added to
+                    // complete it (the `incomplete-line` correction).
+                    let trailing_nl = fixed.last() == Some(&b'\n');
+                    let content = if trailing_nl {
+                        fixed[..fixed.len() - 1].to_vec()
+                    } else {
+                        fixed.clone()
+                    };
+                    let completed = incomplete && trailing_nl;
+                    let HunkLine::Insert(bytes) = &mut hunk.lines[index] else {
+                        unreachable!()
+                    };
+                    if &content != bytes || completed {
+                        *bytes = content;
                         *error_count += 1;
-                        if *error_count <= squelch_limit {
-                            let err = ws::whitespace_error_string(bad);
-                            eprintln!("{patch_input_file}:{lineno}: {err}.");
-                            eprintln!("+{}", String::from_utf8_lossy(bytes));
-                        } else {
-                            *squelched += 1;
+                        if completed {
+                            clear_new_no_newline = true;
                         }
                     }
-                    lineno += 1;
+                }
+            } else {
+                let bad = ws::ws_check(&probe, rule);
+                if bad != 0 {
+                    *error_count += 1;
+                    if *error_count <= squelch_limit {
+                        let err = ws::whitespace_error_string(bad);
+                        eprintln!("{patch_input_file}:{input_line}: {err}.");
+                        eprintln!("{}", String::from_utf8_lossy(bytes));
+                    } else {
+                        *squelched += 1;
+                    }
                 }
             }
+        }
+        if clear_new_no_newline {
+            hunk.new_no_newline = false;
         }
     }
 

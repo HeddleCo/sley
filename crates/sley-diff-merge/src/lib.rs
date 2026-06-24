@@ -4151,6 +4151,10 @@ pub struct Hunk {
     pub old_no_newline: bool,
     /// The last context/inserted line of the new file lacks a trailing newline.
     pub new_no_newline: bool,
+    /// The 1-based line number (in the patch input) of each entry in `lines`,
+    /// used by `git apply`'s whitespace-error reporting (git's `state->linenr`).
+    /// Empty when the patch was not parsed from input (e.g. synthesised hunks).
+    pub line_input_lines: Vec<usize>,
 }
 
 /// A patch targeting a single file. Produced by [`parse_unified_patch`].
@@ -4377,6 +4381,9 @@ pub fn reverse_file_patch(patch: &FilePatch) -> FilePatch {
                 lines,
                 old_no_newline: hunk.new_no_newline,
                 new_no_newline: hunk.old_no_newline,
+                // Reversal keeps the line order (only the +/- sense flips), so the
+                // per-line patch-input line numbers carry over unchanged.
+                line_input_lines: hunk.line_input_lines.clone(),
             }
         })
         .collect();
@@ -5866,6 +5873,7 @@ impl<'a> PatchParser<'a> {
             lines: Vec::new(),
             old_no_newline: false,
             new_no_newline: false,
+            line_input_lines: Vec::new(),
         };
         let mut old_seen = 0usize;
         let mut new_seen = 0usize;
@@ -5891,6 +5899,7 @@ impl<'a> PatchParser<'a> {
                 // content is the empty string (git emits a bare ` `, but some
                 // tooling/email transport strips the trailing space).
                 hunk.lines.push(HunkLine::Context(Vec::new()));
+                hunk.line_input_lines.push(self.index + 1);
                 old_seen += 1;
                 new_seen += 1;
                 self.index += 1;
@@ -5899,15 +5908,18 @@ impl<'a> PatchParser<'a> {
             match line[0] {
                 b' ' => {
                     hunk.lines.push(HunkLine::Context(line[1..].to_vec()));
+                    hunk.line_input_lines.push(self.index + 1);
                     old_seen += 1;
                     new_seen += 1;
                 }
                 b'+' => {
                     hunk.lines.push(HunkLine::Insert(line[1..].to_vec()));
+                    hunk.line_input_lines.push(self.index + 1);
                     new_seen += 1;
                 }
                 b'-' => {
                     hunk.lines.push(HunkLine::Delete(line[1..].to_vec()));
+                    hunk.line_input_lines.push(self.index + 1);
                     old_seen += 1;
                 }
                 b'\\' => {
