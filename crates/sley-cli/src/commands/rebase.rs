@@ -1512,10 +1512,6 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         return Err(GitError::Exit(1));
     }
 
-    if let Ok(path) = std::env::var("SLEY_DUMP_TODO") {
-        let _ = fs::write(&path, todo_to_text(ctx, &items, true, false, &db));
-    }
-
     complete_action(
         ctx,
         &db,
