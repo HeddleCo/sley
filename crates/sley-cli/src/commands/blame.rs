@@ -345,15 +345,16 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
     let (final_blob, virtual_final, fake) = if build_fake {
         // The fake commit's blob is the `--contents` file or the work-tree copy;
         // its single (real) parent is `start_commit` (HEAD by default). The bytes
-        // are work-tree-form already, so route them through textconv (a regular
-        // file) — git applies the path's textconv driver to the work-tree side of
-        // the blame diff too, and this keeps the final image in the same converted
-        // space as the committed blobs `cached_blob` produces.
-        let raw = match &options.contents_from {
-            Some(spec) => read_contents_file(cwd, spec)?,
+        // are work-tree-form already, so route them through textconv using the
+        // path's real mode — git applies the path's textconv driver to the
+        // work-tree side of the blame diff too (skipping symlinks), and this keeps
+        // the final image in the same converted space as the committed blobs
+        // `cached_blob` produces. `--contents` is always a regular-file image.
+        let (raw, mode) = match &options.contents_from {
+            Some(spec) => (read_contents_file(cwd, spec)?, 0o100644),
             None => read_worktree_image(db, format, &repo, &start_commit, &repo_path)?,
         };
-        let blob = textconv.convert(&repo_path, 0o100644, raw)?;
+        let blob = textconv.convert(&repo_path, mode, raw)?;
         // The porcelain `previous` pointer is the real parent when it has the
         // path; a brand-new (only-staged) file has no such parent.
         let previous = read_path_blob(db, format, &start_commit, &repo_path)?
@@ -1318,7 +1319,8 @@ fn read_worktree_image(
     repo: &RepositoryContext,
     start_commit: &ObjectId,
     repo_path: &str,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, u32)> {
+    use std::os::unix::ffi::OsStrExt as _;
     // `verify_working_tree_path`: an untracked path (absent from the start
     // commit's tree and from the index in *any* stage) is the "no such path"
     // fatal, even when a file by that name exists on disk. An unmerged path
@@ -1330,19 +1332,29 @@ fn read_worktree_image(
         eprintln!("fatal: no such path '{repo_path}' in HEAD");
         return Err(GitError::Exit(128));
     }
-    // Read the actual work-tree file (git's `strbuf_read_file`).
+    // Read the actual work-tree file. A symlink contributes its *link text*
+    // (git's `strbuf_readlink`), not the pointed-at file's contents, with a
+    // 0o120000 mode so textconv is skipped; a regular file is read verbatim
+    // (git's `strbuf_read_file`) and reported as a regular blob.
     if let Ok(root) = repo.worktree_root() {
-        if let Ok(bytes) = std::fs::read(root.join(repo_path)) {
-            return Ok(bytes);
+        let absolute = root.join(repo_path);
+        if let Ok(meta) = std::fs::symlink_metadata(&absolute) {
+            if meta.file_type().is_symlink() {
+                if let Ok(target) = std::fs::read_link(&absolute) {
+                    return Ok((target.as_os_str().as_bytes().to_vec(), 0o120000));
+                }
+            } else if let Ok(bytes) = std::fs::read(&absolute) {
+                return Ok((bytes, 0o100644));
+            }
         }
     }
     // The path is tracked but unreadable from the work tree (e.g. staged then
     // removed): fall back to the staged copy, then the committed blob.
-    if let Some((blob, _mode)) = read_index_blob(repo.git_dir(), db, format, repo_path)? {
-        return Ok(blob);
+    if let Some((blob, mode)) = read_index_blob(repo.git_dir(), db, format, repo_path)? {
+        return Ok((blob, mode));
     }
-    if let Some((blob, _mode)) = committed {
-        return Ok(blob);
+    if let Some((blob, mode)) = committed {
+        return Ok((blob, mode));
     }
     eprintln!("fatal: no such path '{repo_path}' in HEAD");
     Err(GitError::Exit(128))
