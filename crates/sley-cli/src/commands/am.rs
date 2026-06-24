@@ -3454,6 +3454,41 @@ fn am_clean_index(
         return Ok(());
     }
 
+    // Partition the touched paths into restores (present in orig_head) and
+    // removals (added by the apply / gone in orig_head).
+    let mut checkout_paths: Vec<PathBuf> = Vec::new();
+    let mut remove_paths: Vec<&Vec<u8>> = Vec::new();
+    for p in &touched {
+        if r_map.contains_key(p) {
+            checkout_paths.push(am_bytes_to_pathbuf(p));
+        } else {
+            remove_paths.push(p);
+        }
+    }
+
+    // D/F precheck (git's `verify_clean_subdirectory`): refuse to restore a
+    // tracked file over a directory holding untracked content, and do so BEFORE
+    // touching the index or worktree so `am --abort` fails cleanly with the
+    // directory intact (t4151 "return failed exit status when it fails").
+    let mut df_conflict = false;
+    for path in &checkout_paths {
+        let full = worktree_root.join(path);
+        if full.is_dir()
+            && fs::read_dir(&full)
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false)
+        {
+            eprintln!(
+                "error: Updating '{}' would lose untracked files in it",
+                path.display()
+            );
+            df_conflict = true;
+        }
+    }
+    if df_conflict {
+        return Err(GitError::Exit(128));
+    }
+
     // The resulting index is exactly orig_head's tree.
     match orig_head {
         Some(orig) => {
@@ -3473,14 +3508,9 @@ fn am_clean_index(
         }
     }
 
-    // Worktree: rewrite the touched paths present in orig_head; remove the rest.
-    let mut checkout_paths: Vec<PathBuf> = Vec::new();
-    for p in &touched {
-        if r_map.contains_key(p) {
-            checkout_paths.push(am_bytes_to_pathbuf(p));
-        } else {
-            am_remove_worktree_path(worktree_root, p)?;
-        }
+    // Worktree: remove the apply-added paths, then rewrite the restores.
+    for p in &remove_paths {
+        am_remove_worktree_path(worktree_root, p)?;
     }
     if !checkout_paths.is_empty() {
         let config = commands::remote_cmds::read_repo_config(git_dir).unwrap_or_default();
@@ -3631,14 +3661,21 @@ fn am_abort(
     // here (e.g. a directory where a tracked file must be restored) aborts with
     // a non-zero exit and the state dir intact (t4151 "return failed exit
     // status when it fails").
-    am_clean_index(
+    if am_clean_index(
         git_dir,
         &common_git_dir,
         worktree_root,
         format,
         curr_head.as_ref(),
         orig_head.as_ref(),
-    )?;
+    )
+    .is_err()
+    {
+        // git's `am_abort`: `if (clean_index(...)) die("failed to clean index")`.
+        // HEAD is not moved and the state dir is left in place.
+        eprintln!("fatal: failed to clean index");
+        return Err(GitError::Exit(128));
+    }
 
     match &orig_head {
         Some(orig) => {
