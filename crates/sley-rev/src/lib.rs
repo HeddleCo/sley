@@ -265,7 +265,7 @@ pub fn resolve_revision_with_reader<R: ObjectReader>(
     reader: &R,
     rev: &str,
 ) -> Result<ObjectId> {
-    resolve_revision_inner(git_dir, format, reader, rev, None)
+    resolve_revision_inner(git_dir, format, reader, rev, None, ObjectDisambiguation::Any)
 }
 
 /// Like [`resolve_revision_with_reader`], but resolves `@{upstream}` / `@{push}`
@@ -285,7 +285,84 @@ pub fn resolve_revision_with_config<R: ObjectReader>(
     rev: &str,
     config: &GitConfig,
 ) -> Result<ObjectId> {
-    resolve_revision_inner(git_dir, format, reader, rev, Some(config))
+    resolve_revision_inner(
+        git_dir,
+        format,
+        reader,
+        rev,
+        Some(config),
+        ObjectDisambiguation::Any,
+    )
+}
+
+/// Resolve `rev` to an [`ObjectId`], preferring objects that satisfy
+/// `disambiguation` when (and only when) `rev` falls through to short
+/// object-id prefix resolution. Ref names always take precedence over a
+/// same-spelled short hex prefix, mirroring git's `get_oid_basic`
+/// (`repo_dwim_ref` is consulted before `get_short_oid`); the disambiguation
+/// flag only narrows the candidate set at the short-OID stage.
+pub fn resolve_revision_with_disambiguation(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    rev: &str,
+    disambiguation: ObjectDisambiguation,
+) -> Result<ObjectId> {
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    resolve_revision_inner(git_dir, format, &db, rev, None, disambiguation)
+}
+
+/// `commit-ish` variant of [`resolve_revision_with_reader`]: a ref still wins
+/// over a same-spelled short hex prefix, but an ambiguous bare prefix is
+/// narrowed to its commit-ish candidates (used by the revision walker setup so
+/// `cherry-pick <ref>` / `revert <ref>` honour ref precedence while keeping the
+/// commit-ish disambiguation for genuine bare-OID prefixes).
+pub fn resolve_revision_commitish_with_reader<R: ObjectReader>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &R,
+    rev: &str,
+) -> Result<ObjectId> {
+    resolve_revision_inner(
+        git_dir,
+        format,
+        reader,
+        rev,
+        None,
+        ObjectDisambiguation::Commitish,
+    )
+}
+
+/// Like [`resolve_revision_commitish_with_reader`] but resolves `@{upstream}` /
+/// `@{push}` against a caller-supplied effective config. See
+/// [`resolve_revision_with_config`].
+pub fn resolve_revision_commitish_with_config<R: ObjectReader>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &R,
+    rev: &str,
+    config: &GitConfig,
+) -> Result<ObjectId> {
+    resolve_revision_inner(
+        git_dir,
+        format,
+        reader,
+        rev,
+        Some(config),
+        ObjectDisambiguation::Commitish,
+    )
+}
+
+/// Commit-ish revision resolution that builds its own on-disk reader. See
+/// [`resolve_revision_commitish_with_reader`].
+pub fn resolve_revision_commitish(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    rev: &str,
+) -> Result<ObjectId> {
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    resolve_revision_commitish_with_reader(git_dir, format, &db, rev)
 }
 
 /// Resolve a revision expression to the full refname that names it, when the
@@ -349,6 +426,7 @@ fn resolve_revision_inner<R: ObjectReader>(
     reader: &R,
     rev: &str,
     config: Option<&GitConfig>,
+    disambiguation: ObjectDisambiguation,
 ) -> Result<ObjectId> {
     let parsed = RevisionSpecRef::parse(rev)?;
     match parsed.kind() {
@@ -379,22 +457,17 @@ fn resolve_revision_inner<R: ObjectReader>(
                 "revision {rev} has empty base"
             )));
         }
-        let base_oid = match disambiguation_for_suffix(suffix) {
-            Some(disambiguation) if is_short_hex_prefix(format, base) => {
-                resolve_short_object_id_with_reader(git_dir, format, reader, base, disambiguation)?
-                    .into_result(base)?
-            }
-            _ => resolve_revision_inner(git_dir, format, reader, base, config)?,
-        };
+        // Resolve the base through the ref-first path so a ref always wins over
+        // a same-spelled short hex prefix (e.g. `added^` must take `added` the
+        // ref, not a `added…` object prefix). The suffix dictates the type a
+        // bare prefix must satisfy, which only applies once ref lookup misses.
+        let base_disambiguation =
+            disambiguation_for_suffix(suffix).unwrap_or(ObjectDisambiguation::Any);
+        let base_oid =
+            resolve_revision_inner(git_dir, format, reader, base, config, base_disambiguation)?;
         return apply_revision_suffix(git_dir, reader, format, &base_oid, suffix, rev);
     }
-    resolve_revision_name(git_dir, format, rev)
-}
-
-fn is_short_hex_prefix(format: ObjectFormat, value: &str) -> bool {
-    value.len() >= 4
-        && value.len() < format.hex_len()
-        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    resolve_revision_name(git_dir, format, rev, disambiguation)
 }
 
 fn disambiguation_for_suffix(suffix: RevisionSuffix<'_>) -> Option<ObjectDisambiguation> {
@@ -437,7 +510,14 @@ impl<'a, R: ObjectReader> RevisionResolver<'a, R> {
     }
 
     pub fn resolve(&self, rev: &str) -> Result<ObjectId> {
-        resolve_revision_inner(self.git_dir, self.format, self.reader, rev, self.config)
+        resolve_revision_inner(
+            self.git_dir,
+            self.format,
+            self.reader,
+            rev,
+            self.config,
+            ObjectDisambiguation::Any,
+        )
     }
 
     pub fn peel_to_blob(&self, rev: &str) -> Result<ObjectId> {
@@ -471,6 +551,7 @@ fn resolve_revision_name(
     git_dir: &Path,
     format: sley_core::ObjectFormat,
     rev: &str,
+    disambiguation: ObjectDisambiguation,
 ) -> Result<ObjectId> {
     if rev.len() == format.hex_len() && rev.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return ObjectId::from_hex(format, rev);
@@ -479,12 +560,15 @@ fn resolve_revision_name(
     if let Some(oid) = resolve_revision_ref(&refs, rev)? {
         return Ok(oid);
     }
+    // Ref lookup missed: now a bare hex prefix may name an object. This is the
+    // single point where short object-id prefixes resolve, so ref names always
+    // win over a same-spelled prefix; `disambiguation` narrows the candidate
+    // set here (and only here), matching git's `get_short_oid`.
     if rev.len() >= 4
         && rev.len() < format.hex_len()
         && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        return resolve_short_object_id(git_dir, format, rev, ObjectDisambiguation::Any)?
-            .into_result(rev);
+        return resolve_short_object_id(git_dir, format, rev, disambiguation)?.into_result(rev);
     }
     // git's get_describe_name: `<tag>-<count>-g<hex>` (describe output) resolves
     // to the abbreviated commit named by the trailing `-g<hex>`.
@@ -1309,7 +1393,8 @@ fn resolve_previous_checkout(
         seen += 1;
         if seen == n {
             let from = from.to_string();
-            return resolve_revision_name(git_dir, format, &from).map_err(|_| {
+            return resolve_revision_name(git_dir, format, &from, ObjectDisambiguation::Any)
+                .map_err(|_| {
                 GitError::not_found(format!(
                     "could not resolve previous branch '{from}' for {rev}"
                 ))
@@ -4745,18 +4830,11 @@ pub fn resolve_rev_path_entry<R: ObjectReader>(
     rev: &str,
     path: &str,
 ) -> Result<ResolvedTreePath> {
-    let rev_oid = if is_short_hex_prefix(format, rev) {
-        resolve_short_object_id_with_reader(
-            git_dir,
-            format,
-            reader,
-            rev,
-            ObjectDisambiguation::Treeish,
-        )?
-        .into_result(rev)?
-    } else {
-        resolve_revision_with_reader(git_dir, format, reader, rev)?
-    };
+    // Ref-first resolution with a tree-ish disambiguation: a ref named like a
+    // short hex prefix (e.g. `added:path`) resolves to the ref, while a genuine
+    // bare prefix is narrowed to its tree-ish candidates.
+    let rev_oid =
+        resolve_revision_inner(git_dir, format, reader, rev, None, ObjectDisambiguation::Treeish)?;
     let tree_oid = peel_to_tree(reader, format, &rev_oid)?;
     resolve_tree_path_entry(reader, format, &tree_oid, path)
         .ok_or_else(|| GitError::not_found(format!("path '{path}' does not exist in '{rev}'")))

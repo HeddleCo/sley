@@ -671,17 +671,16 @@ fn resolve_revision_commitish_with_config_optional<R: ObjectReader>(
     rev: &str,
     config: Option<&GitConfig>,
 ) -> Result<ObjectId> {
-    if super::is_short_hex_prefix(format, rev) {
-        return resolve_short_object_id_with_reader(
-            git_dir,
-            format,
-            reader,
-            rev,
-            ObjectDisambiguation::Commitish,
-        )?
-        .into_result(rev);
+    // A ref must win over a same-spelled short hex prefix (e.g. `cherry-pick
+    // added`, where `added` is both a ref and a valid hex prefix). Route through
+    // the ref-first resolver; the commit-ish disambiguation only narrows a bare
+    // prefix once ref lookup misses.
+    match config {
+        Some(config) => {
+            super::resolve_revision_commitish_with_config(git_dir, format, reader, rev, config)
+        }
+        None => super::resolve_revision_commitish_with_reader(git_dir, format, reader, rev),
     }
-    resolve_revision_with_config_optional(git_dir, format, reader, rev, config)
 }
 
 fn read_commit<R: ObjectReader>(

@@ -379,13 +379,11 @@ fn rev_parse_resolve_revision_arg(
     format: ObjectFormat,
     rev: &str,
 ) -> Result<ObjectId> {
-    if rev.len() >= 4
-        && rev.len() < format.hex_len()
-        && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && let Some(disambiguation) = rev_parse_core_disambiguate(git_dir)
-    {
-        return sley_rev::resolve_short_object_id(git_dir, format, rev, disambiguation)?
-            .into_result(rev);
+    if let Some(disambiguation) = rev_parse_core_disambiguate(git_dir) {
+        // `core.disambiguate` narrows a bare prefix to the configured type, but a
+        // ref still wins over a same-spelled prefix (git consults refs before
+        // get_short_oid). Route through the ref-first resolver.
+        return sley_rev::resolve_revision_with_disambiguation(git_dir, format, rev, disambiguation);
     }
     resolve_revision(git_dir, format, rev)
 }
@@ -449,19 +447,10 @@ fn rev_parse_resolve_commitish(
     format: ObjectFormat,
     rev: &str,
 ) -> Result<ObjectId> {
-    if rev.len() >= 4
-        && rev.len() < format.hex_len()
-        && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return sley_rev::resolve_short_object_id(
-            git_dir,
-            format,
-            rev,
-            sley_rev::ObjectDisambiguation::Commitish,
-        )?
-        .into_result(rev);
-    }
-    resolve_revision(git_dir, format, rev)
+    // Ref-first resolution: a ref named like a short hex prefix (a range
+    // endpoint such as `added...HEAD`) must resolve to the ref, with the
+    // commit-ish disambiguation narrowing only a genuine bare prefix.
+    sley_rev::resolve_revision_commitish(git_dir, format, rev)
 }
 
 fn rev_parse_split_range(rev: &str) -> Option<(&str, &str, bool)> {

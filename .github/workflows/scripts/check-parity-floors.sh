@@ -461,12 +461,7 @@ declare -A FLOOR=(
     # Side gains banked: t6402 34->35, t6422 NEW@6.
     [t6423-merge-rename-directories.sh]=69
     [t6422-merge-rename-corner-cases.sh]=6
-    # wave-40 reconcile: floor was 21 but main has measured 18 since >= 2026-06-22
-    # (PRE-EXISTING inverted floor — a regression slipped past the weekly gate
-    # between the floor-setting wave and now; NOT caused by wave-40, which leaves
-    # t3501 unchanged at 18). Corrected to measured reality; historical 21 noted
-    # for the follow-up investigation to restore the lost 3 cells.
-    [t3501-revert-cherry-pick.sh]=18
+    [t3501-revert-cherry-pick.sh]=21
     [t3502-cherry-pick-merge.sh]=12
     [t3505-cherry-pick-empty.sh]=17
     [t3507-cherry-pick-conflict.sh]=44
