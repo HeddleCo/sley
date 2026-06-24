@@ -292,6 +292,12 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
+    // Record ORIG_HEAD (git's am_setup) so `am --abort` knows where to rewind.
+    // An unborn HEAD gets none — abort then drops the branch instead.
+    if let Some(head_oid) = head_oid {
+        fs::write(state_dir.join("orig-head"), format!("{head_oid}\n"))?;
+    }
+
     run_am_series(
         &git_dir,
         &common_git_dir,
@@ -1690,9 +1696,14 @@ fn write_am_state_dir(
     fs::write(state_dir.join("applying"), b"")?;
     fs::write(state_dir.join("apply-opt"), b"")?;
     fs::write(state_dir.join("p-value"), format!("{}\n", options.p_value))?;
-    // abort-safety records the HEAD we started from so --abort can verify the
-    // worktree has not been moved out from under us.
-    fs::write(state_dir.join("abort-safety"), format!("{head_oid}\n"))?;
+    // abort-safety records the HEAD the series is currently sitting on so
+    // --abort can detect a HEAD the user moved out from under us. An unborn HEAD
+    // records the empty string (git's am_setup writes "" for no HEAD).
+    if head_oid.is_null() {
+        fs::write(state_dir.join("abort-safety"), b"")?;
+    } else {
+        fs::write(state_dir.join("abort-safety"), format!("{head_oid}\n"))?;
+    }
     for (index, patch) in patches.iter().enumerate() {
         let name = format!("{:04}", index + 1);
         fs::write(state_dir.join(name), encode_patch_file(patch))?;
@@ -1959,6 +1970,19 @@ fn run_am_series(
             ApplyResult::Conflict => {
                 am_print_conflict_hints();
                 println!("Patch failed at {number:04} {}", patch.subject);
+                // Record the stop tip as the abort-safety point (git's am_next)
+                // so `am --abort` can tell whether the user moved HEAD after the
+                // failure. The rebase backend keeps its rewind target here, so
+                // only a bare `git am` (no head-name marker) updates it.
+                if !state_dir.join("head-name").exists() {
+                    let refs = FileRefStore::new(git_dir, format);
+                    match head_commit_oid(&refs)? {
+                        Some(oid) => {
+                            fs::write(state_dir.join("abort-safety"), format!("{oid}\n"))?
+                        }
+                        None => fs::write(state_dir.join("abort-safety"), b"")?,
+                    }
+                }
                 return Err(GitError::Exit(128));
             }
         }
@@ -2507,7 +2531,22 @@ fn create_am_commit(
         }),
     });
     tx.commit()?;
-    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &new_oid)?;
+    // git's `am` applies each patch with `git apply --index`, which updates the
+    // index *and* worktree only for the patched paths, then commits the tree —
+    // it never resets the whole worktree. `apply_actions`/`stage_and_commit`
+    // already wrote the patched files and index; refresh the index stat so the
+    // just-applied paths read back clean, while leaving every OTHER worktree
+    // file untouched (so a local edit to an unrelated file survives the series,
+    // t4151 "am --skip continue after failed am").
+    sley_worktree::refresh_index_paths(
+        worktree_root,
+        git_dir,
+        format,
+        &[],
+        /* quiet */ true,
+        /* ignore_missing */ true,
+        /* really_refresh */ false,
+    )?;
     // git runs post-applypatch but ignores its exit status — it is purely
     // informational, run after the commit has already landed (builtin/am.c
     // calls `run_hooks` without checking the result). Swallow any failure.
@@ -3301,6 +3340,162 @@ fn am_require_in_progress(state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Stage (0–3) of an index entry, read from the on-disk flag bits.
+fn am_entry_stage(entry: &IndexEntry) -> u8 {
+    ((entry.flags >> 12) & 0x3) as u8
+}
+
+/// Worktree path bytes → a relative `PathBuf`.
+fn am_bytes_to_pathbuf(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+}
+
+/// Path → (mode, oid) leaf map for a commit's tree (empty for an unborn HEAD).
+fn am_commit_leaf_map(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit: Option<&ObjectId>,
+) -> Result<std::collections::BTreeMap<Vec<u8>, (u32, ObjectId)>> {
+    let mut map = std::collections::BTreeMap::new();
+    if let Some(commit) = commit {
+        let tree = commit_tree_oid(db, format, commit)?;
+        let index = sley_worktree::index_from_tree(db, format, &tree)?;
+        for entry in index.entries {
+            map.insert(entry.path.as_bytes().to_vec(), (entry.mode, entry.oid));
+        }
+    }
+    Ok(map)
+}
+
+/// Remove the worktree file at `rel` and prune any parent directories left
+/// empty, mirroring git's worktree update. A directory in the way (or any other
+/// error) is left intact — removal is best-effort.
+fn am_remove_worktree_path(worktree_root: &Path, rel: &[u8]) -> Result<()> {
+    let path = worktree_root.join(am_bytes_to_pathbuf(rel));
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Ok(()),
+    }
+    let mut parent = path.parent();
+    while let Some(dir) = parent {
+        if dir == worktree_root || fs::remove_dir(dir).is_err() {
+            break;
+        }
+        parent = dir.parent();
+    }
+    Ok(())
+}
+
+/// git's `clean_index(curr_head, orig_head)` (builtin/am.c): restore the index
+/// and worktree from a partial-apply state back to `orig_head`. Only the paths
+/// the apply *touched* (unmerged, or staged away from `curr_head`) and the paths
+/// that differ between the two trees are rewritten; every other worktree file is
+/// left exactly as-is, so worktree-only modifications to unchanged tracked files
+/// and untracked files both survive (t4151 "am --abort cleans relevant files",
+/// "am --skip continue after failed am", "leaves index stat info alone").
+///
+/// `curr_head`/`orig_head` are commit oids, or `None` for an unborn HEAD (the
+/// empty tree). Propagates the worktree-write error (e.g. a directory where a
+/// restored file must go) so `am --abort` reports a failed exit status (t4151
+/// "git am --abort return failed exit status when it fails").
+fn am_clean_index(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    curr_head: Option<&ObjectId>,
+    orig_head: Option<&ObjectId>,
+) -> Result<()> {
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let h_map = am_commit_leaf_map(&db, format, curr_head)?;
+    let r_map = am_commit_leaf_map(&db, format, orig_head)?;
+
+    // Current index, split into resolved (stage 0) entries and unmerged paths.
+    let index = read_repository_index(git_dir, format)?;
+    let mut i0: std::collections::BTreeMap<Vec<u8>, (u32, ObjectId)> =
+        std::collections::BTreeMap::new();
+    let mut unmerged: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    if let Some(index) = &index {
+        for entry in &index.entries {
+            let path = entry.path.as_bytes().to_vec();
+            if am_entry_stage(entry) == 0 {
+                i0.insert(path, (entry.mode, entry.oid));
+            } else {
+                unmerged.insert(path);
+            }
+        }
+    }
+
+    // "Touched" = paths the partial apply changed (unmerged, or index diverged
+    // from curr_head) plus paths the rewind itself changes (curr_head vs
+    // orig_head). Untouched paths keep their worktree state.
+    let mut touched: std::collections::BTreeSet<Vec<u8>> = unmerged;
+    for p in i0.keys().chain(h_map.keys()) {
+        if i0.get(p) != h_map.get(p) {
+            touched.insert(p.clone());
+        }
+    }
+    for p in h_map.keys().chain(r_map.keys()) {
+        if h_map.get(p) != r_map.get(p) {
+            touched.insert(p.clone());
+        }
+    }
+
+    if touched.is_empty() {
+        // The index already matches orig_head and the worktree is clean for every
+        // affected path: leave both (and their cached stat info) untouched.
+        return Ok(());
+    }
+
+    // The resulting index is exactly orig_head's tree.
+    match orig_head {
+        Some(orig) => {
+            sley_worktree::reset_index_to_commit(worktree_root, git_dir, format, orig)?;
+        }
+        None => {
+            sley_worktree::write_repository_index(
+                git_dir,
+                format,
+                Index {
+                    version: 2,
+                    entries: Vec::new(),
+                    extensions: Vec::new(),
+                    checksum: None,
+                },
+            )?;
+        }
+    }
+
+    // Worktree: rewrite the touched paths present in orig_head; remove the rest.
+    let mut checkout_paths: Vec<PathBuf> = Vec::new();
+    for p in &touched {
+        if r_map.contains_key(p) {
+            checkout_paths.push(am_bytes_to_pathbuf(p));
+        } else {
+            am_remove_worktree_path(worktree_root, p)?;
+        }
+    }
+    if !checkout_paths.is_empty() {
+        let config = commands::remote_cmds::read_repo_config(git_dir).unwrap_or_default();
+        sley_worktree::checkout_index_paths(
+            worktree_root,
+            git_dir,
+            format,
+            &checkout_paths,
+            sley_worktree::CheckoutIndexPathOptions {
+                force: true,
+                merge: false,
+                stage: None,
+                conflict_style: sley_worktree::CheckoutConflictStyle::Merge,
+                smudge_config: Some(&config),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 /// `git am --abort`: restore the branch to where the series started and drop
 /// the state directory.
 fn am_abort(
@@ -3314,28 +3509,29 @@ fn am_abort(
     // (a `refs/heads/...` ref when attached, the literal "detached HEAD"
     // otherwise) plus the starting commit in `orig-head`. `git rebase --apply
     // --abort` returns HEAD to where the rebase started; a bare `git am --abort`
-    // keeps the existing HEAD shape and restores `abort-safety`.
+    // runs git's `safe_to_abort` + `clean_index` and rewinds to ORIG_HEAD.
     let head_name_raw = fs::read_to_string(state_dir.join("head-name"))
         .ok()
         .map(|raw| raw.trim().to_string());
     let is_rebase = head_name_raw.is_some();
-    let rebase_branch = head_name_raw
-        .as_deref()
-        .filter(|name| name.starts_with("refs/heads/"))
-        .map(str::to_string);
-    let orig_head = fs::read_to_string(state_dir.join("orig-head"))
-        .ok()
-        .and_then(|raw| ObjectId::from_hex(format, raw.trim()).ok());
-    let safety = fs::read_to_string(state_dir.join("abort-safety")).unwrap_or_default();
-    let safety = safety.trim();
-    if !safety.is_empty()
-        && let Ok(oid) = ObjectId::from_hex(format, safety)
-    {
-        let refs = FileRefStore::new(git_dir, format);
-        let current = head_commit_oid(&refs)?;
-        let committer = commit_identity_from_env("COMMITTER")?;
-        let mut tx = refs.transaction();
-        if is_rebase {
+
+    if is_rebase {
+        let rebase_branch = head_name_raw
+            .as_deref()
+            .filter(|name| name.starts_with("refs/heads/"))
+            .map(str::to_string);
+        let orig_head = fs::read_to_string(state_dir.join("orig-head"))
+            .ok()
+            .and_then(|raw| ObjectId::from_hex(format, raw.trim()).ok());
+        let safety = fs::read_to_string(state_dir.join("abort-safety")).unwrap_or_default();
+        let safety = safety.trim();
+        if !safety.is_empty()
+            && let Ok(oid) = ObjectId::from_hex(format, safety)
+        {
+            let refs = FileRefStore::new(git_dir, format);
+            let current = head_commit_oid(&refs)?;
+            let committer = commit_identity_from_env("COMMITTER")?;
+            let mut tx = refs.transaction();
             // git builtin/rebase.c abort: `<action> (abort): returning to
             // <head_name OR orig_head_sha>` — the branch ref when attached, the
             // starting commit's hex when the rebase was on a detached HEAD.
@@ -3374,28 +3570,105 @@ fn am_abort(
                     });
                 }
             }
-        } else {
+            tx.commit()?;
+            sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &oid)?;
+        }
+        // Drop state directly: `finish_am` would re-run the rebase finish (which
+        // moves to the rebased tip), but on abort we have already restored
+        // orig_head.
+        if state_dir.exists() {
+            fs::remove_dir_all(state_dir)?;
+        }
+        return Ok(());
+    }
+
+    // Bare `git am --abort` — git's `am_abort` / `safe_to_abort`.
+    //
+    // A recorded `dirtyindex` means we never started applying (the index was
+    // dirty when `am` ran); abort just drops the state and leaves HEAD, index,
+    // and worktree exactly as the user left them (t4151 "keep dirty index").
+    if state_dir.join("dirtyindex").exists() {
+        if state_dir.exists() {
+            fs::remove_dir_all(state_dir)?;
+        }
+        return Ok(());
+    }
+
+    let refs = FileRefStore::new(git_dir, format);
+    let curr_head = head_commit_oid(&refs)?;
+    let safety = fs::read_to_string(state_dir.join("abort-safety")).unwrap_or_default();
+    let safety = safety.trim();
+    let safety_oid = if safety.is_empty() {
+        None
+    } else {
+        ObjectId::from_hex(format, safety).ok()
+    };
+    // If HEAD no longer matches the recorded safety point, the user advanced it
+    // after the failure: do not rewind (git's safe_to_abort warning). Keep their
+    // local commits / dirty index intact and just drop the state.
+    if curr_head != safety_oid {
+        eprintln!(
+            "warning: You seem to have moved HEAD since the last 'am' failure.\n\
+             Not rewinding to ORIG_HEAD"
+        );
+        if state_dir.exists() {
+            fs::remove_dir_all(state_dir)?;
+        }
+        return Ok(());
+    }
+
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let orig_head = fs::read_to_string(state_dir.join("orig-head"))
+        .ok()
+        .and_then(|raw| ObjectId::from_hex(format, raw.trim()).ok());
+
+    // Restore the index + worktree to ORIG_HEAD BEFORE moving HEAD. A failure
+    // here (e.g. a directory where a tracked file must be restored) aborts with
+    // a non-zero exit and the state dir intact (t4151 "return failed exit
+    // status when it fails").
+    am_clean_index(
+        git_dir,
+        &common_git_dir,
+        worktree_root,
+        format,
+        curr_head.as_ref(),
+        orig_head.as_ref(),
+    )?;
+
+    match &orig_head {
+        Some(orig) => {
+            let committer = commit_identity_from_env("COMMITTER")?;
             let target_ref = match refs.read_ref("HEAD")? {
                 Some(RefTarget::Symbolic(branch)) => branch,
                 _ => "HEAD".to_string(),
             };
+            let mut tx = refs.transaction();
             tx.update(RefUpdate {
                 name: target_ref,
                 expected: None,
-                new: RefTarget::Direct(oid),
+                new: RefTarget::Direct(*orig),
                 reflog: Some(ReflogEntry {
-                    old_oid: current.unwrap_or(zero_oid(format)?),
-                    new_oid: oid,
+                    old_oid: curr_head.unwrap_or(zero_oid(format)?),
+                    new_oid: *orig,
                     committer,
                     message: b"am --abort".to_vec(),
                 }),
             });
+            tx.commit()?;
         }
-        tx.commit()?;
-        sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &oid)?;
+        None => {
+            // The series started on an unborn branch (no ORIG_HEAD). If `am`
+            // created the first commit before stopping, the branch is now born;
+            // delete it so HEAD returns to its unborn state (git's
+            // `delete_ref(curr_branch)`), leaving the symbolic HEAD intact.
+            if curr_head.is_some()
+                && let Some(RefTarget::Symbolic(branch)) = refs.read_ref("HEAD")?
+            {
+                let _ = refs.delete_ref(&branch);
+            }
+        }
     }
-    // Drop state directly: `finish_am` would re-run the rebase finish (which moves
-    // to the rebased tip), but on abort we have already restored orig_head.
+
     if state_dir.exists() {
         fs::remove_dir_all(state_dir)?;
     }
@@ -3418,13 +3691,29 @@ fn am_skip(
     state_dir: &Path,
 ) -> Result<()> {
     am_require_in_progress(state_dir)?;
-    let head_oid = resolve_revision(git_dir, format, "HEAD")?;
-    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &head_oid)?;
+    // git's `am_skip` runs `clean_index(HEAD, HEAD)`: discard the current
+    // patch's partial application (conflict markers, unmerged entries, files the
+    // patch added) and reset to HEAD, while preserving worktree-only changes to
+    // unchanged files and untracked files (t4151 "am --skip continue after
+    // failed am", "leaves index stat info alone"). HEAD is unborn on an orphan
+    // branch, in which case the index is simply cleared.
+    let refs = FileRefStore::new(git_dir, format);
+    let head_oid = head_commit_oid(&refs)?;
+    am_clean_index(
+        git_dir,
+        common_git_dir,
+        worktree_root,
+        format,
+        head_oid.as_ref(),
+        head_oid.as_ref(),
+    )?;
     let next = read_state_usize(state_dir, "next")?;
     // git's `am_skip` records the skipped commit in `rewritten` too: `<orig> <HEAD>`,
     // where HEAD is the (cleaned) tip at skip time (am.c:2131). The post-rewrite
     // hook then reports a skipped commit as rewritten to the commit it folded into.
-    record_rebase_rewrite(state_dir, format, next, &head_oid)?;
+    if let Some(head_oid) = &head_oid {
+        record_rebase_rewrite(state_dir, format, next, head_oid)?;
+    }
     run_am_series(
         git_dir,
         common_git_dir,
