@@ -7087,6 +7087,24 @@ pub fn merge_entry_maps(
         clean = false;
     }
 
+    // Rename/rename(2to1) and rename/add: two distinct contents collide on one
+    // destination (and the rename source(s) are consumed). Detected from the full
+    // per-side rename sets, applied here so the destination carries both sides'
+    // content-merged stages instead of the path-keyed core's raw add/add.
+    if !renames.rename_rename_two_to_one.is_empty() || !renames.rename_adds.is_empty() {
+        apply_rename_two_to_one_and_add_conflicts(
+            db,
+            base_map,
+            ours_map,
+            theirs_map,
+            &renames,
+            &mut paths,
+            &mut leaves,
+            options,
+        )?;
+        clean = false;
+    }
+
     // Rename/delete conflicts: a file renamed on one side whose source the other
     // side deleted. The merge core resolved the destination cleanly (only the
     // renaming side has it), but git flags this as a conflict — keep the renamed
@@ -7589,12 +7607,40 @@ struct MergeRenames {
     rename_deletes: BTreeMap<Vec<u8>, RenameDelete>,
     /// Rename/rename(1to2) conflicts keyed by source path.
     rename_rename_one_to_two: BTreeMap<Vec<u8>, RenameRenameOneToTwo>,
+    /// Rename/rename(2to1) conflicts keyed by the shared *destination* path:
+    /// ours renamed `ours_source`->dest and theirs renamed `theirs_source`->dest.
+    rename_rename_two_to_one: BTreeMap<Vec<u8>, RenameRenameTwoToOne>,
+    /// Rename/add conflicts keyed by *destination*: one side renamed a file to
+    /// `dest` while the other side added a different file at the same `dest`.
+    rename_adds: BTreeMap<Vec<u8>, RenameAdd>,
 }
 
 #[derive(Clone)]
 struct RenameRenameOneToTwo {
     ours_dest: Vec<u8>,
     theirs_dest: Vec<u8>,
+}
+
+/// A rename/rename(2to1): two distinct sources renamed onto one destination, one
+/// rename per side. Each side's content at the destination is the 3-way merge of
+/// its rename (the other side's change to that source follows the rename).
+#[derive(Clone)]
+struct RenameRenameTwoToOne {
+    /// The source ours renamed onto the destination.
+    ours_source: Vec<u8>,
+    /// The source theirs renamed onto the destination.
+    theirs_source: Vec<u8>,
+}
+
+/// A rename/add: one side renamed a file onto `dest`, the other side added an
+/// unrelated file at `dest`. The renaming side's content is the 3-way merge of
+/// its rename; the adding side contributes its added blob verbatim.
+#[derive(Clone)]
+struct RenameAdd {
+    /// The pre-rename source path on the renaming side.
+    source: Vec<u8>,
+    /// Which side performed the rename (the other side added at `dest`).
+    side: RenameSide,
 }
 
 /// Every file rename observed on one side (base->side), as `(old, new)` pairs.
@@ -7648,8 +7694,110 @@ fn detect_merge_renames(
     )?;
 
     collect_rename_rename_one_to_two(&mut renames, &ours_side, &theirs_side);
+    collect_rename_rename_two_to_one_and_adds(
+        &mut renames,
+        &ours_side,
+        &theirs_side,
+        base_map,
+        ours_map,
+        theirs_map,
+    );
 
     Ok((renames, ours_side, theirs_side))
+}
+
+/// Detect rename/rename(2to1) and rename/add conflicts from the complete per-side
+/// rename sets. Both arise when a one-sided rename's destination is *occupied* on
+/// the other side (so [`collect_side_renames`] left it out of `dest_to_source`):
+///
+/// * 2to1 — both sides renamed (distinct sources) onto the same destination.
+/// * rename/add — one side renamed onto a path the other side *added* fresh
+///   (the destination is new to the other side, not a base path it kept and not
+///   itself a rename destination on that side).
+fn collect_rename_rename_two_to_one_and_adds(
+    renames: &mut MergeRenames,
+    ours_side: &SideRenames,
+    theirs_side: &SideRenames,
+    base_map: &MergeEntryMap,
+    ours_map: &MergeEntryMap,
+    theirs_map: &MergeEntryMap,
+) {
+    let ours_by_dest: BTreeMap<&[u8], &[u8]> = ours_side
+        .pairs
+        .iter()
+        .map(|(old, new)| (new.as_slice(), old.as_slice()))
+        .collect();
+    let theirs_by_dest: BTreeMap<&[u8], &[u8]> = theirs_side
+        .pairs
+        .iter()
+        .map(|(old, new)| (new.as_slice(), old.as_slice()))
+        .collect();
+
+    // 2to1: a destination that is a rename target on BOTH sides from different
+    // sources. (Same source on both sides is a rename/rename(1to1), handled by
+    // the path-keyed core; same source to two dests is the 1to2 case above.)
+    for (dest, ours_src) in &ours_by_dest {
+        let Some(theirs_src) = theirs_by_dest.get(dest) else {
+            continue;
+        };
+        if ours_src == theirs_src {
+            continue;
+        }
+        // Don't disturb a destination the 1to2 pass already claimed.
+        if renames.rename_rename_one_to_two.contains_key(*dest) {
+            continue;
+        }
+        renames.rename_rename_two_to_one.insert(
+            dest.to_vec(),
+            RenameRenameTwoToOne {
+                ours_source: ours_src.to_vec(),
+                theirs_source: theirs_src.to_vec(),
+            },
+        );
+    }
+
+    // rename/add on ours: ours renamed onto `dest`, which theirs added (present
+    // on theirs, absent from base, and not a theirs rename target).
+    for (dest, ours_src) in &ours_by_dest {
+        if renames.rename_rename_two_to_one.contains_key(*dest)
+            || renames.rename_rename_one_to_two.contains_key(*dest)
+        {
+            continue;
+        }
+        if theirs_map.contains_key(*dest)
+            && !base_map.contains_key(*dest)
+            && !theirs_by_dest.contains_key(dest)
+        {
+            renames.rename_adds.insert(
+                dest.to_vec(),
+                RenameAdd {
+                    source: ours_src.to_vec(),
+                    side: RenameSide::Ours,
+                },
+            );
+        }
+    }
+    // rename/add on theirs: symmetric.
+    for (dest, theirs_src) in &theirs_by_dest {
+        if renames.rename_rename_two_to_one.contains_key(*dest)
+            || renames.rename_rename_one_to_two.contains_key(*dest)
+            || renames.rename_adds.contains_key(*dest)
+        {
+            continue;
+        }
+        if ours_map.contains_key(*dest)
+            && !base_map.contains_key(*dest)
+            && !ours_by_dest.contains_key(dest)
+        {
+            renames.rename_adds.insert(
+                dest.to_vec(),
+                RenameAdd {
+                    source: theirs_src.to_vec(),
+                    side: RenameSide::Theirs,
+                },
+            );
+        }
+    }
 }
 
 fn collect_rename_rename_one_to_two(
@@ -8663,6 +8811,246 @@ fn apply_dir_rename_two_to_one_conflicts(
             theirs_path: conflict.theirs_source.clone(),
         });
         slot.auto_merged = !mode_conflict;
+    }
+    Ok(())
+}
+
+/// 3-way merge one rename's content into a single leaf entry: `base` is the
+/// source's ancestor blob, `ours`/`theirs` the two sides' content (one of which
+/// is the renamed file, the other the other side's change to the source). Both
+/// present and differing → a real content merge; otherwise the surviving side's
+/// entry is carried as-is.
+fn rename_merged_leaf(
+    db: &FileObjectDatabase,
+    base: Option<(u32, ObjectId)>,
+    ours: Option<(u32, ObjectId)>,
+    theirs: Option<(u32, ObjectId)>,
+    options: &MergeTreesOptions<'_>,
+) -> Result<Option<(u32, ObjectId)>> {
+    match (ours, theirs) {
+        (None, None) => Ok(None),
+        (Some(entry), None) | (None, Some(entry)) => Ok(Some(entry)),
+        (Some((ours_mode, ours_oid)), Some((theirs_mode, theirs_oid))) => {
+            if (ours_mode, ours_oid) == (theirs_mode, theirs_oid) {
+                return Ok(Some((ours_mode, ours_oid)));
+            }
+            if !is_mergeable_file_mode(ours_mode) || !is_mergeable_file_mode(theirs_mode) {
+                return Ok(Some((ours_mode, ours_oid)));
+            }
+            let base_bytes = match base {
+                Some((_, oid)) => merge_blob_bytes(db, &oid)?,
+                None => Vec::new(),
+            };
+            let result = merge_blobs(
+                &base_bytes,
+                &merge_blob_bytes(db, &ours_oid)?,
+                &merge_blob_bytes(db, &theirs_oid)?,
+                &MergeBlobOptions {
+                    ours_label: options.ours_label,
+                    theirs_label: options.theirs_label,
+                    base_label: options.ancestor_label,
+                    style: options.style,
+                    favor: options.favor,
+                },
+            );
+            let (mode, _) = merge_file_modes(base.map(|(mode, _)| mode), ours_mode, theirs_mode);
+            let oid = db.write_object(EncodedObject::new(ObjectType::Blob, result.content))?;
+            Ok(Some((mode, oid)))
+        }
+    }
+}
+
+/// Apply rename/rename(2to1) and rename/add conflicts: two distinct contents
+/// land on one destination path. Each side's content at the destination is the
+/// 3-way merge of its own rename (so the other side's change to the renamed
+/// source follows the rename); the two results become stages 2 and 3 with no
+/// common ancestor, and the worktree holds their two-way merge. The rename
+/// source paths are consumed (removed from the path set) so they don't surface as
+/// a spurious modify/delete.
+#[allow(clippy::too_many_arguments)]
+fn apply_rename_two_to_one_and_add_conflicts(
+    db: &FileObjectDatabase,
+    base_map: &MergeEntryMap,
+    ours_map: &MergeEntryMap,
+    theirs_map: &MergeEntryMap,
+    renames: &MergeRenames,
+    paths: &mut Vec<MergedPath>,
+    leaves: &mut MergeEntryMap,
+    options: &MergeTreesOptions<'_>,
+) -> Result<()> {
+    let mut consumed_sources: Vec<Vec<u8>> = Vec::new();
+
+    for (dest, conflict) in &renames.rename_rename_two_to_one {
+        // Ours renamed `ours_source`->dest; theirs' change to `ours_source`
+        // follows the rename. Symmetric for theirs.
+        let ours_leaf = rename_merged_leaf(
+            db,
+            base_map.get(&conflict.ours_source).copied(),
+            ours_map.get(dest).copied(),
+            theirs_map.get(&conflict.ours_source).copied(),
+            options,
+        )?;
+        let theirs_leaf = rename_merged_leaf(
+            db,
+            base_map.get(&conflict.theirs_source).copied(),
+            ours_map.get(&conflict.theirs_source).copied(),
+            theirs_map.get(dest).copied(),
+            options,
+        )?;
+        write_two_sided_dest_conflict(
+            db,
+            dest,
+            ours_leaf,
+            theirs_leaf,
+            MergeConflictKind::RenameRenameTwoToOne {
+                ours_path: conflict.ours_source.clone(),
+                theirs_path: conflict.theirs_source.clone(),
+            },
+            options,
+            paths,
+            leaves,
+        )?;
+        consumed_sources.push(conflict.ours_source.clone());
+        consumed_sources.push(conflict.theirs_source.clone());
+    }
+
+    for (dest, add) in &renames.rename_adds {
+        let (ours_leaf, theirs_leaf) = match add.side {
+            RenameSide::Ours => (
+                rename_merged_leaf(
+                    db,
+                    base_map.get(&add.source).copied(),
+                    ours_map.get(dest).copied(),
+                    theirs_map.get(&add.source).copied(),
+                    options,
+                )?,
+                theirs_map.get(dest).copied(),
+            ),
+            RenameSide::Theirs => (
+                ours_map.get(dest).copied(),
+                rename_merged_leaf(
+                    db,
+                    base_map.get(&add.source).copied(),
+                    ours_map.get(&add.source).copied(),
+                    theirs_map.get(dest).copied(),
+                    options,
+                )?,
+            ),
+        };
+        write_two_sided_dest_conflict(
+            db,
+            dest,
+            ours_leaf,
+            theirs_leaf,
+            MergeConflictKind::Content { add_add: true },
+            options,
+            paths,
+            leaves,
+        )?;
+        consumed_sources.push(add.source.clone());
+    }
+
+    // The rename source paths are consumed by the rename: the other side's
+    // change to them followed the rename to the destination, so they resolve to
+    // a clean deletion (not the path-keyed core's modify/delete). Marking them
+    // `Resolved(None)` lets the worktree writer remove the now-stale source file
+    // rather than leaving it as a stray untracked file.
+    for source in &consumed_sources {
+        leaves.remove(source);
+        if let Some(slot) = paths.iter_mut().find(|path| &path.path == source) {
+            slot.stages = MergeStages::default();
+            slot.result = None;
+            slot.worktree = None;
+            slot.conflict = None;
+            slot.auto_merged = false;
+        } else {
+            paths.push(MergedPath {
+                path: source.clone(),
+                stages: MergeStages::default(),
+                result: None,
+                worktree: None,
+                conflict: None,
+                auto_merged: false,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Record a destination path that holds two unmerged contents (rename/rename
+/// 2to1 or rename/add): stage 2 = `ours_leaf`, stage 3 = `theirs_leaf`, no
+/// common ancestor, worktree = their two-way merge. Replaces any existing slot
+/// (the path-keyed core's add/add result) for the destination.
+fn write_two_sided_dest_conflict(
+    db: &FileObjectDatabase,
+    dest: &[u8],
+    ours_leaf: Option<(u32, ObjectId)>,
+    theirs_leaf: Option<(u32, ObjectId)>,
+    kind: MergeConflictKind,
+    options: &MergeTreesOptions<'_>,
+    paths: &mut Vec<MergedPath>,
+    leaves: &mut MergeEntryMap,
+) -> Result<()> {
+    let ours_bytes = match ours_leaf {
+        Some((mode, oid)) => Some((mode, merge_worktree_bytes(db, mode, &oid)?)),
+        None => None,
+    };
+    let theirs_bytes = match theirs_leaf {
+        Some((mode, oid)) => Some((mode, merge_worktree_bytes(db, mode, &oid)?)),
+        None => None,
+    };
+    let (worktree_mode, worktree_content, result_leaf) = match (&ours_bytes, &theirs_bytes) {
+        (Some((ours_mode, ours_content)), Some((theirs_mode, theirs_content))) => {
+            let merged = merge_blobs(
+                &[],
+                ours_content,
+                theirs_content,
+                &MergeBlobOptions {
+                    ours_label: options.ours_label,
+                    theirs_label: options.theirs_label,
+                    base_label: options.ancestor_label,
+                    style: options.style,
+                    favor: options.favor,
+                },
+            );
+            let mode = if ours_mode == theirs_mode {
+                *ours_mode
+            } else {
+                0o100644
+            };
+            let oid = db.write_object(EncodedObject::new(
+                ObjectType::Blob,
+                merged.content.clone(),
+            ))?;
+            (mode, merged.content, Some((mode, oid)))
+        }
+        (Some((mode, content)), None) | (None, Some((mode, content))) => {
+            (*mode, content.clone(), ours_leaf.or(theirs_leaf))
+        }
+        (None, None) => (0o100644, Vec::new(), None),
+    };
+
+    let slot = MergedPath {
+        path: dest.to_vec(),
+        stages: MergeStages {
+            base: None,
+            ours: ours_leaf,
+            theirs: theirs_leaf,
+        },
+        result: result_leaf,
+        worktree: Some((worktree_mode, worktree_content)),
+        conflict: Some(kind),
+        auto_merged: true,
+    };
+    if let Some(existing) = paths.iter_mut().find(|path| path.path == dest) {
+        *existing = slot;
+    } else {
+        paths.push(slot);
+    }
+    if let Some(leaf) = result_leaf {
+        leaves.insert(dest.to_vec(), leaf);
+    } else {
+        leaves.remove(dest);
     }
     Ok(())
 }
