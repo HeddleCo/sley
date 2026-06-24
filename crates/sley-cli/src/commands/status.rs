@@ -467,6 +467,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             branch,
             ahead_behind,
             z,
+            show_stash,
             &rename_config,
         )?;
     } else if z {
@@ -1605,6 +1606,7 @@ fn print_status_porcelain_v2(
     branch: bool,
     ahead_behind: bool,
     z: bool,
+    show_stash: bool,
     rename_config: &StatusRenameConfig,
 ) -> Result<()> {
     let mut stdout = io::stdout().lock();
@@ -1615,12 +1617,22 @@ fn print_status_porcelain_v2(
             stdout.write_all(&[separator])?;
         }
     }
-    let zero = zero_oid(format)?;
-    let entries = match worktree_root_for_git_dir(git_dir) {
-        Ok(worktree_root) => {
-            status_entries_with_renames(&worktree_root, git_dir, format, entries, rename_config)?
+    // `# stash <count>` follows the branch headers when `--show-stash` is set
+    // and at least one stash entry exists (wt_porcelain_v2_print_stash).
+    if show_stash {
+        let stash_count = status_stash_count(git_dir, format)?;
+        if stash_count > 0 {
+            write!(stdout, "# stash {stash_count}")?;
+            stdout.write_all(&[separator])?;
         }
-        Err(_) => entries
+    }
+    let zero = zero_oid(format)?;
+    let worktree_root = worktree_root_for_git_dir(git_dir).ok();
+    let entries = match worktree_root.as_ref() {
+        Some(worktree_root) => {
+            status_entries_with_renames(worktree_root, git_dir, format, entries, rename_config)?
+        }
+        None => entries
             .into_iter()
             .map(|entry| StatusOutputEntry {
                 entry,
@@ -1628,8 +1640,52 @@ fn print_status_porcelain_v2(
             })
             .collect(),
     };
+    // Conflicted paths render as `u` records, read straight from the index
+    // stages (the short-status entries carry no per-stage modes/oids). These
+    // paths are skipped in the 1/2/?/! stream below.
+    let unmerged = match worktree_root.as_ref() {
+        Some(worktree_root) => {
+            let trust_filemode = config.get_bool("core", None, "fileMode").unwrap_or(true);
+            status_unmerged_v2_records(git_dir, worktree_root, format, trust_filemode)?
+        }
+        None => BTreeMap::new(),
+    };
+    let mut emitted_unmerged: BTreeSet<Vec<u8>> = BTreeSet::new();
     for output in entries {
         let entry = output.entry;
+        if let Some(record) = unmerged.get(&entry.path) {
+            if emitted_unmerged.insert(entry.path.clone()) {
+                let submodule_token = if record
+                    .stage_modes
+                    .iter()
+                    .any(|&mode| sley_index::is_gitlink(mode))
+                {
+                    "S..."
+                } else {
+                    "N..."
+                };
+                write!(
+                    stdout,
+                    "u {} {} {:06o} {:06o} {:06o} {:06o} {} {} {} ",
+                    status_porcelain_v2_unmerged_key(record.stagemask),
+                    submodule_token,
+                    record.stage_modes[0],
+                    record.stage_modes[1],
+                    record.stage_modes[2],
+                    record.worktree_mode,
+                    record.stage_oids[0].to_hex(),
+                    record.stage_oids[1].to_hex(),
+                    record.stage_oids[2].to_hex(),
+                )?;
+                if z {
+                    stdout.write_all(&entry.path)?;
+                } else {
+                    stdout.write_all(status_quote_path(&entry.path, false).as_bytes())?;
+                }
+                stdout.write_all(&[separator])?;
+            }
+            continue;
+        }
         if entry.index == b'!' && entry.worktree == b'!' {
             stdout.write_all(b"! ")?;
             if z {
@@ -2529,6 +2585,92 @@ fn status_unmerged_paths(git_dir: &Path, format: ObjectFormat) -> Result<Vec<Sta
             stages,
         })
         .collect())
+}
+
+/// Per-path conflict data for the porcelain v2 `u` record: stage 1/2/3 modes and
+/// oids (0/zero when a stage is absent), the worktree file mode, and the
+/// stagemask that selects the `DD`/`AU`/… key.
+struct StatusUnmergedV2 {
+    stagemask: u8,
+    stage_modes: [u32; 3],
+    stage_oids: [ObjectId; 3],
+    worktree_mode: u32,
+}
+
+fn status_unmerged_v2_records(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    trust_filemode: bool,
+) -> Result<BTreeMap<Vec<u8>, StatusUnmergedV2>> {
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(BTreeMap::new());
+    };
+    let zero = ObjectId::null(format);
+    let mut by_path: BTreeMap<Vec<u8>, StatusUnmergedV2> = BTreeMap::new();
+    for entry in index.entries {
+        let stage = index_entry_stage(&entry);
+        if stage == 0 {
+            continue;
+        }
+        let record = by_path
+            .entry(entry.path.into_bytes())
+            .or_insert_with(|| StatusUnmergedV2 {
+                stagemask: 0,
+                stage_modes: [0; 3],
+                stage_oids: [zero; 3],
+                worktree_mode: 0,
+            });
+        let slot = (stage - 1) as usize;
+        record.stage_modes[slot] = entry.mode;
+        record.stage_oids[slot] = entry.oid;
+        record.stagemask |= 1 << slot;
+    }
+    for (path, record) in &mut by_path {
+        record.worktree_mode =
+            status_worktree_blob_mode(worktree_root, path, trust_filemode)?.unwrap_or(0);
+    }
+    Ok(by_path)
+}
+
+/// The canonical worktree blob mode (`100644`/`100755`/`120000`) for `path`, or
+/// `None` when it is absent or a directory. Honors `core.fileMode`: with the
+/// executable bit untrusted, a regular file always reports `100644`.
+fn status_worktree_blob_mode(
+    worktree_root: &Path,
+    path: &[u8],
+    trust_filemode: bool,
+) -> Result<Option<u32>> {
+    let absolute = worktree_root.join(repo_path_to_path(path));
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(Some(0o120000));
+    }
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = trust_filemode && (metadata.permissions().mode() & 0o111 != 0);
+        Ok(Some(if executable { 0o100755 } else { 0o100644 }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = trust_filemode;
+        Ok(Some(0o100644))
+    }
 }
 
 fn status_unmerged_label(stages: &BTreeSet<u16>) -> &'static str {
@@ -3804,6 +3946,20 @@ pub(crate) fn status_entries_have_index_changes(
 
 fn status_porcelain_v2_code(code: u8) -> char {
     if code == b' ' { '.' } else { code as char }
+}
+
+/// Map an unmerged stagemask to the porcelain v2 `u`-record key
+/// (wt_porcelain_v2_print_unmerged_entry).
+fn status_porcelain_v2_unmerged_key(stagemask: u8) -> &'static str {
+    match stagemask {
+        1 => "DD",
+        2 => "AU",
+        3 => "UD",
+        4 => "UA",
+        5 => "DU",
+        6 => "AA",
+        _ => "UU",
+    }
 }
 
 fn status_porcelain_v2_branch_headers(
