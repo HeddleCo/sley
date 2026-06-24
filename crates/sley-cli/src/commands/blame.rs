@@ -108,6 +108,9 @@ struct BlameOptions {
     /// on the command line; if not, `blame.showEmail` config supplies the
     /// default.
     author_field_explicit: bool,
+    /// `--textconv` (default) / `--no-textconv`: run each path's
+    /// `diff.<driver>.textconv` over blob content before diffing/rendering.
+    textconv: bool,
 }
 
 /// A `-L` argument before it is resolved against the file's line count.
@@ -242,11 +245,34 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
     // and applying smudge would diverge from git. When the working-tree overlay
     // lands, route that worktree-sourced content through
     // `sley_worktree::apply_clean_filter` before it enters `compute_blame`.
+    // `--textconv` (default) renders blob content through the path's
+    // `diff.<driver>.textconv`. Build the attribute/config-driven resolver once;
+    // a bare repo (no worktree) simply has nothing to convert.
+    let textconv = TextconvContext {
+        enabled: options.textconv,
+        resolver: repo
+            .worktree_root()
+            .ok()
+            .and_then(|root| sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok())
+            .map(|attrs| {
+                commands::userdiff::UserdiffResolver::with_attributes(
+                    Some(attrs),
+                    Some(repo.config().clone()),
+                )
+            }),
+        config: repo.config().clone(),
+        worktree_root: repo.worktree_root().ok().map(Path::to_path_buf),
+        git_dir: git_dir.to_path_buf(),
+        format,
+    };
+
     let repo_path = blame_repo_relative_path(cwd, git_dir, &path)?;
     let (final_blob, virtual_final) = match read_path_blob(db, format, &start_commit, &repo_path)? {
-        Some(blob) => (blob, false),
+        Some((blob, mode)) => (textconv.convert(&repo_path, mode, blob)?, false),
         None => match read_index_blob(git_dir, db, format, &repo_path)? {
-            Some(blob) if rev.is_none() || rev_spec == "HEAD" => (blob, true),
+            Some((blob, mode)) if rev.is_none() || rev_spec == "HEAD" => {
+                (textconv.convert(&repo_path, mode, blob)?, true)
+            }
             _ => {
             // git reports the repository-relative path here, not the literal
             // argument (so blaming a missing file from a subdirectory still
@@ -268,6 +294,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         options.copy_level,
         options.copy_score,
         virtual_final,
+        &textconv,
     )?;
 
     // Resolve the -L ranges against the real line count, then render. The
@@ -309,6 +336,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
     let mut show_name = false;
     let mut porcelain = false;
     let mut line_porcelain = false;
+    let mut textconv = true;
     // Positionals collected before `--`; afterwards everything is a path.
     let mut positionals: Vec<String> = Vec::new();
     let mut paths_after_dd: Vec<String> = Vec::new();
@@ -347,6 +375,8 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
             }
             "--progress" => progress = true,
             "--no-progress" => progress = false,
+            "--textconv" => textconv = true,
+            "--no-textconv" => textconv = false,
             "--abbrev" => abbrev_override = Some(0),
             // `--no-abbrev` shows the full object name, like `-l` / `--abbrev`
             // with the full hash length.
@@ -425,6 +455,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
         porcelain,
         line_porcelain,
         author_field_explicit,
+        textconv,
     }))
 }
 
@@ -641,21 +672,71 @@ fn normalize_repo_path(input: &str) -> Result<String> {
 
 /// Read the blob bytes for `repo_path` in `commit`'s tree. Returns `None` when
 /// the path is absent (or names a non-blob, which blame treats as absent).
+/// Per-blame textconv state. When enabled (the `--textconv` default), each
+/// origin blob is rendered through its path's `diff.<driver>.textconv` over the
+/// *smudged* worktree form (matching upstream's `fill_origin_blob` →
+/// `fill_textconv` → `prep_temp_blob`), so both the diffs the blame walk
+/// computes and the rendered lines reflect the converted content.
+struct TextconvContext {
+    enabled: bool,
+    resolver: Option<commands::userdiff::UserdiffResolver>,
+    config: GitConfig,
+    worktree_root: Option<PathBuf>,
+    git_dir: PathBuf,
+    format: ObjectFormat,
+}
+
+impl TextconvContext {
+    /// Convert `blob` for `path`/`mode`, or return it unchanged when textconv is
+    /// disabled, the path has no textconv driver, or the entry is not a regular
+    /// file (symlinks fall back to the default driver, as in git).
+    fn convert(&self, path: &str, mode: u32, blob: Vec<u8>) -> Result<Vec<u8>> {
+        if !self.enabled {
+            return Ok(blob);
+        }
+        let (Some(resolver), Some(worktree_root)) =
+            (self.resolver.as_ref(), self.worktree_root.as_ref())
+        else {
+            return Ok(blob);
+        };
+        let Some(command) = resolver.textconv_for_path(path.as_bytes(), mode)? else {
+            return Ok(blob);
+        };
+        let smudged = sley_worktree::apply_smudge_filter(
+            worktree_root,
+            &self.git_dir,
+            self.format,
+            &self.config,
+            path.as_bytes(),
+            &blob,
+        )?;
+        match commands::userdiff::run_textconv(&command, &smudged)? {
+            Some(converted) => Ok(converted),
+            None => {
+                eprintln!("fatal: unable to read files to diff");
+                Err(GitError::Exit(128))
+            }
+        }
+    }
+}
+
+/// Read the blob at `repo_path` in `commit`'s tree, returning its bytes and the
+/// tree entry's file mode (the mode lets textconv skip symlinks).
 fn read_path_blob(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     commit: &ObjectId,
     repo_path: &str,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<(Vec<u8>, u32)>> {
     let tree_oid = sley_rev::peel_to_tree(db, format, commit)?;
-    let Some(blob_oid) = lookup_tree_path(db, format, &tree_oid, repo_path)? else {
+    let Some((blob_oid, mode)) = lookup_tree_path(db, format, &tree_oid, repo_path)? else {
         return Ok(None);
     };
     let object = read_object_maybe_prefetch_promisor(db, &blob_oid)?;
     if object.object_type != ObjectType::Blob {
         return Ok(None);
     }
-    Ok(Some(object.body.clone()))
+    Ok(Some((object.body.clone(), mode)))
 }
 
 fn read_index_blob(
@@ -663,7 +744,7 @@ fn read_index_blob(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     repo_path: &str,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<(Vec<u8>, u32)>> {
     let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
         return Ok(None);
     };
@@ -678,7 +759,7 @@ fn read_index_blob(
     if object.object_type != ObjectType::Blob {
         return Ok(None);
     }
-    Ok(Some(object.body.clone()))
+    Ok(Some((object.body.clone(), entry.mode)))
 }
 
 /// Walk `repo_path` component-by-component through `tree_oid`, returning the
@@ -689,7 +770,7 @@ fn lookup_tree_path(
     format: ObjectFormat,
     tree_oid: &ObjectId,
     repo_path: &str,
-) -> Result<Option<ObjectId>> {
+) -> Result<Option<(ObjectId, u32)>> {
     let components: Vec<&str> = repo_path.split('/').filter(|p| !p.is_empty()).collect();
     if components.is_empty() {
         return Ok(None);
@@ -712,7 +793,7 @@ fn lookup_tree_path(
             return Ok(None);
         };
         if idx == last {
-            return Ok(Some(oid));
+            return Ok(Some((oid, mode)));
         }
         if sley_object::tree_entry_object_type(mode) != ObjectType::Tree {
             return Ok(None);
@@ -770,6 +851,7 @@ fn compute_blame(
     copy_level: u8,
     copy_score: usize,
     virtual_final: bool,
+    textconv: &TextconvContext,
 ) -> Result<Vec<LineBlame>> {
     let final_lines = sley_diff_merge::split_lines(final_blob);
     let line_count = final_lines.len();
@@ -828,7 +910,8 @@ fn compute_blame(
         let commit_oid = origin.commit;
         let commit_obj = db.read_object(&commit_oid)?;
         let commit = Commit::parse(format, &commit_obj.body)?;
-        let child_blob = cached_blob(db, format, &commit_oid, &origin.path, &mut blob_cache)?;
+        let child_blob =
+            cached_blob(db, format, &commit_oid, &origin.path, &mut blob_cache, textconv)?;
         let Some(child_blob) = child_blob else {
             // The path is absent at this commit (shouldn't normally happen for a
             // suspect): charge everything here so no line is lost.
@@ -864,7 +947,7 @@ fn compute_blame(
                 continue;
             };
             let parent_blob =
-                cached_blob(db, format, parent, &parent_origin.path, &mut blob_cache)?;
+                cached_blob(db, format, parent, &parent_origin.path, &mut blob_cache, textconv)?;
             let Some(parent_blob) = parent_blob else {
                 // Path absent in this parent: it preserves nothing, so all
                 // chunks stay with the current commit for the next parent.
@@ -900,6 +983,7 @@ fn compute_blame(
                 copy_score,
                 &mut owned,
                 &final_lines,
+                textconv,
             )?;
             for (copy_origin, entries) in copied {
                 queue_entries(&mut suspects, &mut queue, copy_origin, entries);
@@ -1291,6 +1375,7 @@ fn find_copies_in_parents(
     copy_score: usize,
     owned: &mut Vec<BlameEntry>,
     final_lines: &[sley_diff_merge::DiffLine<'_>],
+    textconv: &TextconvContext,
 ) -> Result<Vec<(OriginKey, Vec<BlameEntry>)>> {
     let mut copied_by_origin: Vec<(OriginKey, Vec<BlameEntry>)> = Vec::new();
     for parent in parents {
@@ -1305,9 +1390,10 @@ fn find_copies_in_parents(
             if path == origin.path {
                 continue;
             }
-            let Some(blob) = read_path_blob(db, format, parent, &path)? else {
+            let Some((raw, mode)) = read_path_blob(db, format, parent, &path)? else {
                 continue;
             };
+            let blob = textconv.convert(&path, mode, raw)?;
             let source_lines = sley_diff_merge::split_lines(&blob);
             let mut next_owned = Vec::new();
             let mut copied = Vec::new();
@@ -1523,12 +1609,18 @@ fn cached_blob(
     commit: &ObjectId,
     repo_path: &str,
     cache: &mut HashMap<(ObjectId, String), Option<Vec<u8>>>,
+    textconv: &TextconvContext,
 ) -> Result<Option<Vec<u8>>> {
     let key = (*commit, repo_path.to_string());
     if let Some(hit) = cache.get(&key) {
         return Ok(hit.clone());
     }
-    let blob = read_path_blob(db, format, commit, repo_path)?;
+    // The cache stores the *converted* form so textconv runs once per
+    // (commit, path); upstream's fill_origin_blob caches likewise.
+    let blob = match read_path_blob(db, format, commit, repo_path)? {
+        Some((raw, mode)) => Some(textconv.convert(repo_path, mode, raw)?),
+        None => None,
+    };
     cache.insert(key, blob.clone());
     Ok(blob)
 }
