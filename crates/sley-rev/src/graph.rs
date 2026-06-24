@@ -83,6 +83,8 @@ pub struct Graph {
     use_color: bool,
 
     commit: Option<ObjectId>,
+    /// Whether the current commit is a `--boundary` commit (drawn as `o`).
+    boundary: bool,
     /// The current commit's interesting parents (pre-filtered by the caller).
     parents: Vec<ObjectId>,
     num_parents: usize,
@@ -117,6 +119,7 @@ impl Graph {
             colors_max,
             use_color,
             commit: None,
+            boundary: false,
             parents: Vec::new(),
             num_parents: 0,
             width: 0,
@@ -295,7 +298,16 @@ impl Graph {
     /// already be filtered to the interesting set (and truncated to the first
     /// parent in first-parent mode).
     pub fn update(&mut self, commit: ObjectId, parents: &[ObjectId]) {
+        self.update_boundary(commit, parents, false);
+    }
+
+    /// As [`update`], but marks the commit as a `--boundary` commit so it is
+    /// drawn with `o` instead of `*` (upstream `graph->commit->object.flags &
+    /// BOUNDARY`). Boundary commits are leaves in the drawn graph — callers
+    /// pass no shown parents.
+    pub fn update_boundary(&mut self, commit: ObjectId, parents: &[ObjectId], boundary: bool) {
         self.commit = Some(commit);
+        self.boundary = boundary;
         self.parents = parents.to_vec();
         self.num_parents = parents.len();
 
@@ -385,7 +397,7 @@ impl Graph {
     }
 
     fn output_commit_char(&self, line: &mut Line) {
-        line.addch('*');
+        line.addch(if self.boundary { 'o' } else { '*' });
     }
 
     /// Draw the horizontal dashes of an octopus merge.

@@ -1448,6 +1448,10 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         return Err(GitError::Exit(1));
     }
 
+    if let Ok(path) = std::env::var("SLEY_DUMP_TODO") {
+        let _ = fs::write(&path, todo_to_text(ctx, &items, true, false, &db));
+    }
+
     complete_action(
         ctx,
         &db,
@@ -2162,9 +2166,10 @@ fn make_script_with_merges(
     }
 
     let branch_labels = branch_labels_by_oid(ctx)?;
-    let mut used_labels = std::collections::HashSet::new();
-    used_labels.insert("onto".to_string());
-    let mut labels: BTreeMap<ObjectId, String> = BTreeMap::new();
+    let mut state = LabelState::new(ctx, db);
+    if let Some(upstream) = upstream {
+        state.register_onto(upstream);
+    }
     let mut commit_todo: BTreeMap<ObjectId, RebaseTodoItem> = BTreeMap::new();
     let mut tips = Vec::new();
 
@@ -2195,17 +2200,16 @@ fn make_script_with_merges(
                     arg.push(' ');
                 }
                 let label = if records.contains_key(parent) {
+                    if !tips.contains(parent) {
+                        tips.push(*parent);
+                    }
                     let base = branch_labels
                         .get(parent)
                         .cloned()
                         .unwrap_or_else(|| message_label.clone());
-                    let label = ensure_label(ctx, parent, &base, &mut labels, &mut used_labels, db);
-                    if !tips.contains(parent) {
-                        tips.push(*parent);
-                    }
-                    label
+                    state.label_oid(parent, Some(&base))
                 } else {
-                    label_for_oid(ctx, parent, &mut labels, &mut used_labels, db)
+                    state.label_oid(parent, None)
                 };
                 arg.push_str(&label);
             }
@@ -2243,14 +2247,7 @@ fn make_script_with_merges(
                 continue;
             }
             if !child_seen.insert(*parent) {
-                ensure_label(
-                    ctx,
-                    parent,
-                    "branch-point",
-                    &mut labels,
-                    &mut used_labels,
-                    db,
-                );
+                state.label_oid(parent, Some("branch-point"));
             }
         }
     }
@@ -2273,7 +2270,7 @@ fn make_script_with_merges(
         let Some(mut current) = Some(tip) else {
             continue;
         };
-        let branch_label = labels.get(&tip).cloned();
+        let branch_label = state.label_of(&tip).map(|s| s.to_string());
         out.push(RebaseTodoItem::comment(""));
         if let Some(label) = branch_label {
             out.push(RebaseTodoItem::comment(&format!("# Branch {label}")));
@@ -2302,13 +2299,29 @@ fn make_script_with_merges(
                 }
             }
             Some(oid) => {
-                if let Some(label) = labels.get(&oid) {
-                    format!(
-                        "{label} # {}",
-                        commit_subject(&records[&oid].commit.message)
-                    )
+                // Faithful port of upstream phase-3 reset target: prefer an
+                // existing label; otherwise (unless rebasing cousins) mint an
+                // OID label so the side branch keeps its original base — this
+                // is exactly what makes cousins *not* rebase by default.
+                let to: Option<String> = if let Some(label) = state.label_of(&oid) {
+                    Some(label.to_string())
+                } else if mode != RebaseMergesMode::RebaseCousins {
+                    Some(state.label_oid(&oid, None))
                 } else {
-                    "onto".to_string()
+                    None
+                };
+                match to {
+                    None => "onto".to_string(),
+                    Some(t) if t == "onto" => "onto".to_string(),
+                    Some(t) => {
+                        let subject = match records.get(&oid) {
+                            Some(rec) => commit_subject(&rec.commit.message),
+                            None => commit_subject(
+                                &read_rev_list_commit_record(db, ctx.format, oid)?.commit.message,
+                            ),
+                        };
+                        format!("{t} # {subject}")
+                    }
                 }
             }
         };
@@ -2324,12 +2337,12 @@ fn make_script_with_merges(
             if let Some(item) = commit_todo.get(&oid) {
                 out.push(item.clone());
             }
-            if let Some(label) = labels.get(&oid) {
+            if let Some(label) = state.label_of(&oid) {
                 out.push(RebaseTodoItem {
                     command: TodoCommand::Label,
                     flags: 0,
                     oid: None,
-                    arg: label.clone(),
+                    arg: label.to_string(),
                     raw: String::new(),
                 });
             }
@@ -2352,68 +2365,165 @@ fn branch_labels_by_oid(ctx: &Ctx) -> Result<BTreeMap<ObjectId, String>> {
     Ok(out)
 }
 
-fn ensure_label(
-    ctx: &Ctx,
-    oid: &ObjectId,
-    base: &str,
-    labels: &mut BTreeMap<ObjectId, String>,
-    used: &mut std::collections::HashSet<String>,
-    db: &FileObjectDatabase,
-) -> String {
-    if let Some(label) = labels.get(oid) {
-        return label.clone();
-    }
-    let mut label = sanitize_label(base);
-    if label.is_empty() {
-        label = find_unique_abbrev_hex(ctx, db, oid);
-    }
-    let original = label.clone();
-    let mut n = 2usize;
-    while used.contains(&label) {
-        label = format!("{original}-{n}");
-        n += 1;
-    }
-    used.insert(label.clone());
-    labels.insert(*oid, label.clone());
-    label
+/// `GIT_MAX_LABEL_LENGTH` from upstream sequencer.c: `NAME_MAX - LOCK_SUFFIX_LEN
+/// - 16`. With `NAME_MAX == 255` and `strlen(".lock") == 5` this is 234.
+const GIT_MAX_LABEL_LENGTH: usize = 255 - 5 - 16;
+
+/// Faithful port of upstream sequencer.c `struct label_state` + `label_oid()`.
+/// Tracks the commit→label mapping and the set of used labels (case-insensitive,
+/// matching upstream's `strihash`), minting labels for branch tips, branch
+/// points and cousin bases exactly as upstream does.
+struct LabelState<'a> {
+    ctx: &'a Ctx,
+    db: &'a FileObjectDatabase,
+    commit2label: BTreeMap<ObjectId, String>,
+    used: std::collections::HashSet<String>,
+    max_label_length: usize,
 }
 
-fn label_for_oid(
-    ctx: &Ctx,
-    oid: &ObjectId,
-    labels: &mut BTreeMap<ObjectId, String>,
-    used: &mut std::collections::HashSet<String>,
-    db: &FileObjectDatabase,
-) -> String {
-    ensure_label(
-        ctx,
-        oid,
-        &find_unique_abbrev_hex(ctx, db, oid),
-        labels,
-        used,
-        db,
-    )
-}
-
-fn sanitize_label(input: &str) -> String {
-    let mut out = String::new();
-    let mut last_dash = false;
-    for ch in input.trim().chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.') {
-            out.push(ch);
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
+impl<'a> LabelState<'a> {
+    fn new(ctx: &'a Ctx, db: &'a FileObjectDatabase) -> Self {
+        let max_label_length = rebase_config_value(ctx, "rebase", "maxLabelLength")
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(GIT_MAX_LABEL_LENGTH);
+        LabelState {
+            ctx,
+            db,
+            commit2label: BTreeMap::new(),
+            used: std::collections::HashSet::new(),
+            max_label_length,
         }
     }
-    while out.ends_with(['-', '.']) {
-        out.pop();
+
+    /// Pre-register the `onto` commit so a reset that walks back to it resets
+    /// onto, and so no other commit can be labelled "onto".
+    fn register_onto(&mut self, oid: &ObjectId) {
+        self.commit2label.insert(*oid, "onto".to_string());
+        self.used.insert("onto".to_string());
     }
-    if out == "onto" {
-        out.push_str("-2");
+
+    fn label_of(&self, oid: &ObjectId) -> Option<&str> {
+        self.commit2label.get(oid).map(|s| s.as_str())
     }
-    out
+
+    fn taken(&self, label: &str) -> bool {
+        self.used.contains(&label.to_ascii_lowercase())
+    }
+
+    /// Port of upstream `label_oid()`. `base == None` for "uninteresting"
+    /// commits (use a unique abbreviation, extended on collision); `Some(base)`
+    /// sanitizes/truncates the base and disambiguates full-OID/`#`/colliding
+    /// labels with a `-N` suffix.
+    fn label_oid(&mut self, oid: &ObjectId, base: Option<&str>) -> String {
+        if let Some(existing) = self.commit2label.get(oid) {
+            return existing.clone();
+        }
+        let label = match base {
+            None => {
+                let mut p = find_unique_abbrev_hex(self.ctx, self.db, oid);
+                if self.taken(&p) {
+                    let hex = oid.to_hex();
+                    let mut chosen = hex.clone();
+                    for i in (p.len() + 1)..hex.len() {
+                        if !self.taken(&hex[..i]) {
+                            chosen = hex[..i].to_string();
+                            break;
+                        }
+                    }
+                    p = chosen;
+                }
+                p
+            }
+            Some(base) => {
+                let mut buf = sanitize_label(base, self.max_label_length);
+                if buf.is_empty() {
+                    buf = format!("rev-{}", find_unique_abbrev_hex(self.ctx, self.db, oid));
+                }
+                let hexsz = oid.to_hex().len();
+                let is_full_hex =
+                    buf.len() == hexsz && buf.bytes().all(|b| b.is_ascii_hexdigit());
+                if is_full_hex || buf == "#" || self.taken(&buf) {
+                    let stem = buf.clone();
+                    let mut i = 2;
+                    loop {
+                        let cand = format!("{stem}-{i}");
+                        if !self.taken(&cand) {
+                            buf = cand;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                buf
+            }
+        };
+        self.used.insert(label.to_ascii_lowercase());
+        self.commit2label.insert(*oid, label.clone());
+        label
+    }
+}
+
+/// Port of upstream label sanitization: keep ASCII alphanumerics and valid
+/// multi-byte UTF-8 sequences verbatim, replace runs of other bytes with a
+/// single dash (never leading), and truncate to `max_len` bytes without
+/// splitting a UTF-8 character. Trailing dashes are intentionally kept.
+fn sanitize_label(base: &str, max_len: usize) -> String {
+    let bytes = base.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    let mut label_is_utf8 = true;
+    while i < bytes.len() && out.len() + 1 < max_len {
+        let b = bytes[i];
+        if b.is_ascii_alphanumeric() || (!label_is_utf8 && b & 0x80 != 0) {
+            out.push(b);
+            i += 1;
+        } else if b & 0x80 != 0 {
+            match utf8_char_len(&bytes[i..]) {
+                Some(n) => {
+                    if out.len() + n > max_len {
+                        break;
+                    }
+                    out.extend_from_slice(&bytes[i..i + n]);
+                    i += n;
+                }
+                None => {
+                    label_is_utf8 = false;
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        } else {
+            if !out.is_empty() && *out.last().unwrap() != b'-' {
+                out.push(b'-');
+            }
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Byte length of the valid UTF-8 character starting at `bytes[0]`, or `None`
+/// if it is not a well-formed multi-byte sequence.
+fn utf8_char_len(bytes: &[u8]) -> Option<usize> {
+    let b0 = bytes[0];
+    let n = if b0 & 0xE0 == 0xC0 {
+        2
+    } else if b0 & 0xF0 == 0xE0 {
+        3
+    } else if b0 & 0xF8 == 0xF0 {
+        4
+    } else {
+        return None;
+    };
+    if bytes.len() < n {
+        return None;
+    }
+    for &cb in &bytes[1..n] {
+        if cb & 0xC0 != 0x80 {
+            return None;
+        }
+    }
+    Some(n)
 }
 
 fn merge_label_from_message(message: &[u8]) -> String {

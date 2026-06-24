@@ -750,6 +750,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // instead of newline.
     let mut null_terminate = false;
     let mut graph = false;
+    let mut boundary = false;
     let mut show_linear_break = false;
     let mut show_source = false;
     let mut ignored_missing_input = false;
@@ -874,7 +875,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--tags"
             | "--remotes"
             | "--no-ignore-missing" => setup_args.push(arg.clone()),
-            "--boundary" => {}
+            "--boundary" => boundary = true,
             "--ignore-missing" => {
                 ignored_missing_input = true;
                 setup_args.push(arg.clone());
@@ -2917,6 +2918,40 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         selected
             .retain(|record| decorations.contains_key(&record.oid) || record.parents.is_empty());
     }
+    // `--boundary` (with `--graph`): the uninteresting commits directly adjacent
+    // to the shown set are git's BOUNDARY commits. Emit them as leaf nodes (`o`)
+    // so a merge whose excluded parent sits on the range boundary still renders
+    // its fork. Owned in `boundary_storage` so `selected` (a Vec of refs) can
+    // borrow them.
+    let mut boundary_oids: HashSet<ObjectId> = HashSet::new();
+    let boundary_storage: Vec<sley_rev::CommitRecord>;
+    if boundary && graph {
+        let shown_set: HashSet<ObjectId> = selected.iter().map(|record| record.oid).collect();
+        let mut seen = HashSet::new();
+        let mut records: Vec<sley_rev::CommitRecord> = Vec::new();
+        for record in &selected {
+            for parent in &record.parents {
+                if !shown_set.contains(parent) && seen.insert(*parent) {
+                    if let Ok(rec) =
+                        sley_rev::revlist::read_rev_list_commit_record(&db, format, *parent)
+                    {
+                        boundary_oids.insert(*parent);
+                        records.push(rec);
+                    }
+                }
+            }
+        }
+        // Boundary commits are ancestors of the shown set; emit them after it,
+        // newest-first among themselves (matching the topo-ordered output).
+        records.sort_by_key(|record| {
+            std::cmp::Reverse(commit_identity_timestamp_i64(&record.commit.committer).unwrap_or(0))
+        });
+        boundary_storage = records;
+        selected.extend(boundary_storage.iter());
+    } else {
+        boundary_storage = Vec::new();
+    }
+    let _ = &boundary_storage;
     // For `--graph`, a parent is "interesting" iff it will be shown — judged
     // against the full selection BEFORE `--skip`/`-n` truncation (matching
     // upstream `get_commit_action`, which is truncation-blind).
@@ -2988,16 +3023,22 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         let mut prev_missing_newline = false;
         let mut diff_block = Vec::new();
         for (index, record) in selected.iter().enumerate() {
-            let mut interesting: Vec<ObjectId> = record
-                .parents
-                .iter()
-                .filter(|parent| shown.contains(*parent))
-                .copied()
-                .collect();
+            let is_boundary = boundary_oids.contains(&record.oid);
+            let mut interesting: Vec<ObjectId> = if is_boundary {
+                // Boundary commits are leaves in the drawn graph.
+                Vec::new()
+            } else {
+                record
+                    .parents
+                    .iter()
+                    .filter(|parent| shown.contains(*parent))
+                    .copied()
+                    .collect()
+            };
             if first_parent {
                 interesting.truncate(1);
             }
-            graph_state.update(record.oid, &interesting);
+            graph_state.update_boundary(record.oid, &interesting, is_boundary);
             match &output {
                 LogOutput::Compiled {
                     compiled,
