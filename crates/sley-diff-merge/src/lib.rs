@@ -4283,6 +4283,49 @@ pub struct ApplyFileOptions {
     pub unidiff_zero: bool,
 }
 
+/// Reverse a file patch (`git apply -R`): swap the old/new names, modes, hunk
+/// ranges, and no-newline flags, exchange add↔delete status, and flip every
+/// `Insert`/`Delete` line. Applying the result undoes the original patch.
+pub fn reverse_file_patch(patch: &FilePatch) -> FilePatch {
+    let hunks = patch
+        .hunks
+        .iter()
+        .map(|hunk| {
+            let lines = hunk
+                .lines
+                .iter()
+                .map(|line| match line {
+                    HunkLine::Context(b) => HunkLine::Context(b.clone()),
+                    HunkLine::Insert(b) => HunkLine::Delete(b.clone()),
+                    HunkLine::Delete(b) => HunkLine::Insert(b.clone()),
+                })
+                .collect();
+            Hunk {
+                old_start: hunk.new_start,
+                old_len: hunk.new_len,
+                new_start: hunk.old_start,
+                new_len: hunk.old_len,
+                lines,
+                old_no_newline: hunk.new_no_newline,
+                new_no_newline: hunk.old_no_newline,
+            }
+        })
+        .collect();
+    FilePatch {
+        old_path: patch.new_path.clone(),
+        new_path: patch.old_path.clone(),
+        old_mode: patch.new_mode,
+        new_mode: patch.old_mode,
+        hunks,
+        is_new: patch.is_delete,
+        is_delete: patch.is_new,
+        is_rename: patch.is_rename,
+        is_copy: patch.is_copy,
+        similarity: patch.similarity,
+        dissimilarity: patch.dissimilarity,
+    }
+}
+
 /// Apply a single-file patch with explicit fragment-placement options.
 pub fn apply_file_patch_with_options(
     base: &[u8],

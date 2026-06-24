@@ -3363,6 +3363,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let mut directory_root: Vec<u8> = Vec::new();
     let mut unsafe_paths = false;
     let mut unidiff_zero = false;
+    let mut reverse = false;
     // Whether `--whitespace=` was given on the command line; when not, the
     // default action comes from `apply.whitespace` config (git's precedence).
     let mut ws_action_explicit = false;
@@ -3386,11 +3387,8 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             "--unsafe-paths" => unsafe_paths = true,
             "--no-unsafe-paths" => unsafe_paths = false,
             "--unidiff-zero" => unidiff_zero = true,
-            "-R" | "--reverse" => {
-                return Err(GitError::Unsupported(
-                    "apply --reverse is not supported yet".into(),
-                ));
-            }
+            "-R" | "--reverse" => reverse = true,
+            "--no-reverse" => reverse = false,
             "--index" => update_index = true,
             "-N" | "--intent-to-add" => intent_to_add = true,
             "--no-intent-to-add" => intent_to_add = false,
@@ -3495,6 +3493,12 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                     other => other,
                 })?,
         );
+    }
+    // `-R`/`--reverse`: undo the patch by reversing each file patch before any
+    // whitespace handling or application (git reverses the parsed patches up
+    // front).
+    if reverse {
+        patches = patches.iter().map(sley_diff_merge::reverse_file_patch).collect();
     }
     if let Some(path) = build_fake_ancestor {
         write_apply_fake_ancestor_index(&git_dir, format, &patches, &inputs, &path)?;
