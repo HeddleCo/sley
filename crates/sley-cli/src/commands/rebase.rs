@@ -1562,11 +1562,19 @@ fn run_apply_backend(
 ) -> Result<()> {
     // Build the pick series exactly like the merge backend does (skip merges and
     // empty commits unless --keep-empty), then turn each into an apply patch.
+    // For `--root --onto <newbase>` there is no upstream to exclude, but commits
+    // already present in the onto must still be dropped (cherry-pick detection
+    // against the new base), matching the merge backend.
+    let cherry_base = if args.root && args.onto_name.is_some() {
+        Some(onto)
+    } else {
+        upstream
+    };
     let records = make_script_commits(
         ctx,
         db,
         upstream,
-        upstream,
+        cherry_base,
         orig_head,
         // The apply backend drops begin-empty commits by default (git am skips
         // empty patches); `--keep-empty` would have forced the merge backend.
