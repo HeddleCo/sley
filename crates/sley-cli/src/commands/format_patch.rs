@@ -256,6 +256,10 @@ struct FormatPatchOptions {
     grep_ignore_case: bool,
     grep_all_match: bool,
     grep_invert: bool,
+    /// `--root`: treat a single revision argument as a `<revision range>`
+    /// (formatting it and its ancestors as creation patches) instead of the
+    /// default `<since>..HEAD` interpretation.
+    root: bool,
     /// Revision setup arguments (single committish, ranges, `--`, pathspecs).
     setup_args: Vec<String>,
 }
@@ -367,6 +371,7 @@ impl Default for FormatPatchOptions {
             grep_ignore_case: false,
             grep_all_match: false,
             grep_invert: false,
+            root: false,
             setup_args: Vec::new(),
         }
     }
@@ -3184,6 +3189,11 @@ fn format_patch_bare_exclude(options: &FormatPatchOptions) -> Option<&str> {
     if options.count.is_some() {
         return None;
     }
+    // `--root` treats a lone revision as a range (`<rev>` and its ancestors)
+    // rather than the `<rev>..HEAD` since-form, so never derive a `^<rev>`.
+    if options.root {
+        return None;
+    }
     let args = &options.setup_args;
     let dashdash = args.iter().position(|arg| arg == "--");
     let rev_end = dashdash.unwrap_or(args.len());
@@ -4072,6 +4082,7 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             }
             "--encode-email-headers" => options.encode_email_headers = Some(true),
             "--no-encode-email-headers" => options.encode_email_headers = Some(false),
+            "--root" => options.root = true,
             // `-<n>`: limit to the last n commits.
             value
                 if value.starts_with('-')
