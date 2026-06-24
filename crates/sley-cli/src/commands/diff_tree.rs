@@ -1338,6 +1338,7 @@ fn compute_entries(
             detect_inexact: options.detect_renames || options.detect_copies,
             rename_threshold: options.rename_threshold,
             copy_threshold: options.copy_threshold,
+        rename_limit: 0,
         };
         let mut entries = match left {
             Some(left) => sley_diff_merge::diff_name_status_trees_with_rename_options(

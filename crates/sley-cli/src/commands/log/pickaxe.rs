@@ -154,6 +154,7 @@ pub(super) fn diff_filter_commit_matches(
                 detect_inexact: true,
                 rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_limit: 0,
             },
         )?,
         (Some(parent), false) => {
@@ -210,6 +211,7 @@ pub(super) fn log_follow_single_path<'a>(
                     detect_inexact: true,
                     rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                     copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                rename_limit: 0,
                 },
             )?,
             (Some(parent), false) => sley_diff_merge::diff_name_status_trees_with_options(
@@ -286,6 +288,7 @@ pub(super) fn pickaxe_commit_matches(
                 detect_inexact: true,
                 rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_limit: 0,
             },
         )?,
         (Some(parent), false) => {

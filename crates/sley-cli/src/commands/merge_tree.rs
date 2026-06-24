@@ -419,6 +419,7 @@ fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
             favor: strategy,
             detect_renames,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_limit: 0,
             directory_renames: sley_diff_merge::DirectoryRenames::Conflict,
             style: sley_diff_merge::ConflictStyle::Merge,
         },

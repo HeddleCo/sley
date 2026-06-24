@@ -18,19 +18,21 @@ pub(crate) use merge::{
     conclude_in_progress_merge, conclude_rebase_step_via_commit, directory_renames_config,
     effective_config_with_overrides, index_unmerged_paths, parse_maybe_bool,
     print_branch_commit_summary, print_commit_shortstat_between_trees,
-    read_merge_message_from_file, read_worktree_index, rebase_in_progress, save_merge_autostash,
-    set_reflog_action_override, verify_fast_forward_untracked_safe,
+    merge_rename_limit_config, read_merge_message_from_file, read_worktree_index,
+    rebase_in_progress, save_merge_autostash, set_reflog_action_override,
+    verify_fast_forward_untracked_safe,
 };
 pub(crate) use merge_base::{
     cmd_merge_base, commit_tree_oid, head_commit_oid, merge_base_fork_point, merge_bases,
     merge_bases_default_many,
 };
 pub(crate) use merge_util::{
-    MergePathResult, MergePathResults, MergeTreeMap, clear_merge_df_blockers,
+    MergePathResult, MergePathResults, MergeTreeMap, RenameMergeConfig, clear_merge_df_blockers,
     merge_favor_from_strategy_opt, merge_favor_from_strategy_opts, merge_index_entry,
     merge_read_blob, merge_refuse_if_current_working_directory_becomes_file,
     merge_remove_worktree_file, merge_worktree_content, merge_write_worktree_file,
-    three_way_merge_trees, three_way_merge_trees_inner_with_info, three_way_merge_trees_styled,
+    three_way_merge_trees, three_way_merge_trees_inner_with_info,
+    three_way_merge_trees_inner_with_info_opts, three_way_merge_trees_styled,
     three_way_merge_trees_with_favor, virtual_ancestor_entry_map, worktree_file_matches_ours,
 };
 pub(crate) use pull::{
