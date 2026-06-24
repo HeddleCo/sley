@@ -119,6 +119,12 @@ struct BlameOptions {
     /// An empty string clears the accumulated list (CLI and config), mirroring
     /// git's `build_ignorelist`.
     ignore_revs_files: Vec<String>,
+    /// `--incremental`: emit each blamed range as it is found, in walk order,
+    /// with porcelain-style commit details.
+    incremental: bool,
+    /// `--encoding=<enc>`: output encoding for author/summary metadata
+    /// (`none` keeps the bytes as stored). Defaults to `i18n.logOutputEncoding`.
+    encoding: Option<String>,
 }
 
 /// Metadata for the all-zero pseudo-commit blame builds for the working-tree
@@ -189,6 +195,9 @@ struct LineBlame {
     /// `--ignore-rev` markers carried from the blame entry (`?` / `*`).
     ignored: bool,
     unblamable: bool,
+    /// Order in which this line's commit was found guilty during the walk, used
+    /// to emit `--incremental` output in walk order (newest commit first).
+    charge_seq: usize,
 }
 
 pub(crate) fn cmd_blame(args: &[String]) -> Result<()> {
@@ -356,6 +365,13 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
             .unwrap_or(false),
     };
 
+    // The output encoding for author/summary metadata: `--encoding` wins,
+    // otherwise `i18n.logOutputEncoding` (falling back to commitEncoding, UTF-8).
+    let output_encoding = match &options.encoding {
+        Some(enc) => enc.clone(),
+        None => log_output_encoding(repo.config()),
+    };
+
     let (lines, previous_map) = compute_blame(
         db,
         format,
@@ -389,6 +405,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         fake.as_ref(),
         &previous_map,
         marks,
+        &output_encoding,
     )
 }
 
@@ -431,6 +448,8 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
     let mut contents_from: Option<String> = None;
     let mut ignore_revs: Vec<String> = Vec::new();
     let mut ignore_revs_files: Vec<String> = Vec::new();
+    let mut incremental = false;
+    let mut encoding: Option<String> = None;
     // Positionals collected before `--`; afterwards everything is a path.
     let mut positionals: Vec<String> = Vec::new();
     let mut paths_after_dd: Vec<String> = Vec::new();
@@ -505,6 +524,16 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
             }
             other if other.starts_with("--ignore-revs-file=") => {
                 ignore_revs_files.push(other["--ignore-revs-file=".len()..].to_string());
+            }
+            "--incremental" => incremental = true,
+            "--encoding" => {
+                let Some(value) = iter.next() else {
+                    return Err(blame_option_requires_value("encoding"));
+                };
+                encoding = Some(value.clone());
+            }
+            other if other.starts_with("--encoding=") => {
+                encoding = Some(other["--encoding=".len()..].to_string());
             }
             other if other.starts_with("--abbrev=") => {
                 let value = &other["--abbrev=".len()..];
@@ -583,6 +612,8 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
         contents_from,
         ignore_revs,
         ignore_revs_files,
+        incremental,
+        encoding,
     }))
 }
 
@@ -629,13 +660,9 @@ fn resolve_positionals(
 fn is_unsupported_blame_option(arg: &str) -> bool {
     if matches!(
         arg,
-        "--incremental"
-            | "-n"
-            | "--show-number"
+        "-n" | "--show-number"
             | "-w"
             | "--reverse"
-            | "--color-lines"
-            | "--color-by-age"
             | "--show-stats"
             | "--score-debug"
     ) {
@@ -1186,6 +1213,9 @@ fn compute_blame(
     // `pop_newest_commit`, caching each commit's date.
     let mut queue: Vec<OriginKey> = vec![start_key];
 
+    // Monotonic charge-event counter for `--incremental` walk ordering.
+    let mut next_seq = 0usize;
+
     while let Some(origin) = pop_newest_origin(&mut queue, db, format, &mut date_cache)? {
         let Some(mut owned) = suspects.remove(&origin) else {
             continue;
@@ -1197,7 +1227,8 @@ fn compute_blame(
         // Uninteresting (`^<rev>`) commits are boundaries: charge their lines
         // with the boundary marker and stop — do not pass blame to parents.
         if uninteresting.contains(&origin.commit) {
-            charge_remaining(&mut result, &final_lines, &origin, true, owned);
+            charge_remaining(&mut result, &final_lines, &origin, true, owned, next_seq);
+            next_seq += 1;
             continue;
         }
 
@@ -1215,7 +1246,8 @@ fn compute_blame(
         let Some(child_blob) = child_blob else {
             // The path is absent at this commit (shouldn't normally happen for a
             // suspect): charge everything here so no line is lost.
-            charge_remaining(&mut result, &final_lines, &origin, false, owned);
+            charge_remaining(&mut result, &final_lines, &origin, false, owned, next_seq);
+            next_seq += 1;
             continue;
         };
         let child_lines = sley_diff_merge::split_lines(&child_blob);
@@ -1231,7 +1263,8 @@ fn compute_blame(
         if parents.is_empty() {
             // Root commit (or `--first-parent` past a root): every remaining
             // line is its own. Render as a boundary unless `--root`.
-            charge_remaining(&mut result, &final_lines, &origin, true, owned);
+            charge_remaining(&mut result, &final_lines, &origin, true, owned, next_seq);
+            next_seq += 1;
             continue;
         }
 
@@ -1347,7 +1380,8 @@ fn compute_blame(
             } else {
                 origin.clone()
             };
-            charge_remaining(&mut result, &final_lines, &guilty, false, owned);
+            charge_remaining(&mut result, &final_lines, &guilty, false, owned, next_seq);
+            next_seq += 1;
         }
     }
 
@@ -1365,6 +1399,7 @@ fn compute_blame(
                 content: final_lines[line_index].content.to_vec(),
                 ignored: false,
                 unblamable: false,
+                charge_seq: usize::MAX,
             }),
         }
     }
@@ -1637,13 +1672,15 @@ fn queue_entries(
     }
 }
 
-/// Charge every remaining chunk to `commit_oid` as a final attribution.
+/// Charge every remaining chunk to `commit_oid` as a final attribution. `seq` is
+/// the walk-order sequence number of this charge event (for `--incremental`).
 fn charge_remaining(
     result: &mut [Option<LineBlame>],
     final_lines: &[sley_diff_merge::DiffLine<'_>],
     origin: &OriginKey,
     boundary: bool,
     owned: Vec<BlameEntry>,
+    seq: usize,
 ) {
     for entry in owned {
         for k in 0..entry.num_lines {
@@ -1659,6 +1696,7 @@ fn charge_remaining(
                     content: final_lines[final_line].content.to_vec(),
                     ignored: entry.ignored,
                     unblamable: entry.unblamable,
+                    charge_seq: seq,
                 });
             }
         }
@@ -2780,7 +2818,13 @@ fn render_blame(
     fake: Option<&FakeCommit>,
     previous_map: &PreviousMap,
     marks: BlameMarks,
+    output_encoding: &str,
 ) -> Result<()> {
+    if options.incremental {
+        return render_incremental(
+            db, format, lines, selected, fake, previous_map, output_encoding, options.show_root,
+        );
+    }
     if options.porcelain {
         return render_porcelain(
             git_dir, format, db, lines, selected, options, fake, previous_map, marks,
@@ -3150,7 +3194,7 @@ fn emit_one_suspect_detail(
             .map(|sig| sig.time.offset_token())
             .unwrap_or_else(|| "+0000".to_string())
     )?;
-    writeln!(handle, "summary {}", commit_summary(&commit.message, &blame.commit))?;
+    write_field(handle, b"summary ", &commit_summary_bytes(&commit.message, &blame.commit))?;
     if blame.boundary && !options.show_root {
         writeln!(handle, "boundary")?;
     }
@@ -3179,10 +3223,159 @@ fn write_filename_info(
     Ok(())
 }
 
+/// git's `--incremental` output (`found_guilty_entry`): emit each contiguous
+/// blamed run in walk order (newest commit first, by charge sequence), with the
+/// per-commit detail block (once per commit) followed by `previous`/`filename`.
+/// Author and summary metadata are reencoded to `output_encoding`.
+#[allow(clippy::too_many_arguments)]
+fn render_incremental(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    lines: &[LineBlame],
+    selected: &[usize],
+    fake: Option<&FakeCommit>,
+    previous_map: &PreviousMap,
+    output_encoding: &str,
+    show_root: bool,
+) -> Result<()> {
+    // Group the selected lines into contiguous runs (one git `blame_entry`).
+    struct Run {
+        first_line: usize,
+        len: usize,
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    let mut idx = 0usize;
+    while idx < selected.len() {
+        let line_no = selected[idx];
+        let blame = &lines[line_no - 1];
+        let mut len = 1usize;
+        while idx + len < selected.len() {
+            let next_line_no = selected[idx + len];
+            if next_line_no != line_no + len {
+                break;
+            }
+            let next = &lines[next_line_no - 1];
+            if next.commit != blame.commit
+                || next.origin_path != blame.origin_path
+                || next.origin_lineno != blame.origin_lineno + len
+                || next.charge_seq != blame.charge_seq
+            {
+                break;
+            }
+            len += 1;
+        }
+        runs.push(Run { first_line: line_no, len });
+        idx += len;
+    }
+    // Walk order: by charge sequence (newest commit first), then file position.
+    runs.sort_by_key(|run| (lines[run.first_line - 1].charge_seq, run.first_line));
+
+    let mut shown: HashSet<ObjectId> = HashSet::new();
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    for run in &runs {
+        let blame = &lines[run.first_line - 1];
+        writeln!(
+            handle,
+            "{} {} {} {}",
+            blame.commit.to_hex(),
+            blame.origin_lineno,
+            run.first_line,
+            run.len
+        )?;
+        if shown.insert(blame.commit) {
+            emit_incremental_detail(
+                &mut handle,
+                db,
+                format,
+                blame,
+                fake,
+                output_encoding,
+                blame.boundary && !show_root,
+            )?;
+        }
+        write_filename_info(&mut handle, blame, fake, previous_map)?;
+    }
+    Ok(())
+}
+
+/// The per-commit metadata block for `--incremental`, reencoding the author /
+/// committer / summary to `output_encoding` and writing them as raw bytes.
+fn emit_incremental_detail(
+    handle: &mut impl Write,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    blame: &LineBlame,
+    fake: Option<&FakeCommit>,
+    output_encoding: &str,
+    boundary: bool,
+) -> Result<()> {
+    if blame.commit.is_null() {
+        let (name, email, time) = match fake {
+            Some(f) => (f.name.as_str(), f.email.as_str(), f.time),
+            None => ("Not Committed Yet", "not.committed.yet", 0),
+        };
+        let summary = match fake {
+            Some(f) => f.summary.clone(),
+            None => format!("Version of {} from {}", blame.origin_path, blame.origin_path),
+        };
+        writeln!(handle, "author {name}")?;
+        writeln!(handle, "author-mail <{email}>")?;
+        writeln!(handle, "author-time {time}")?;
+        writeln!(handle, "author-tz +0000")?;
+        writeln!(handle, "committer {name}")?;
+        writeln!(handle, "committer-mail <{email}>")?;
+        writeln!(handle, "committer-time {time}")?;
+        writeln!(handle, "committer-tz +0000")?;
+        writeln!(handle, "summary {summary}")?;
+        return Ok(());
+    }
+
+    let object = db.read_object(&blame.commit)?;
+    let commit = Commit::parse(format, &object.body)?;
+    let from_enc = blame_commit_encoding_name(&commit);
+    let author_bytes = log_reencode_message(&commit.author, &from_enc, output_encoding);
+    let committer_bytes = log_reencode_message(&commit.committer, &from_enc, output_encoding);
+    let message_bytes = log_reencode_message(&commit.message, &from_enc, output_encoding);
+
+    emit_incremental_ident(handle, "author", &author_bytes)?;
+    emit_incremental_ident(handle, "committer", &committer_bytes)?;
+    write_field(handle, b"summary ", &commit_summary_bytes(&message_bytes, &blame.commit))?;
+    if boundary {
+        writeln!(handle, "boundary")?;
+    }
+    Ok(())
+}
+
+/// Emit the `<who>`, `<who>-mail`, `<who>-time`, `<who>-tz` lines from a raw
+/// (already reencoded) identity line, writing the name/email as raw bytes.
+fn emit_incremental_ident(handle: &mut impl Write, who: &str, ident: &[u8]) -> Result<()> {
+    let sig = Signature::from_ident_line(ident);
+    let name = sig.as_ref().map(|s| s.name.as_bytes()).unwrap_or(b"");
+    let email = sig.as_ref().map(|s| s.email.as_bytes()).unwrap_or(b"");
+    let time = sig.as_ref().map(|s| s.time.seconds).unwrap_or(0);
+    let tz = sig
+        .as_ref()
+        .map(|s| s.time.offset_token())
+        .unwrap_or_else(|| "+0000".to_string());
+    handle.write_all(who.as_bytes())?;
+    handle.write_all(b" ")?;
+    handle.write_all(name)?;
+    handle.write_all(b"\n")?;
+    handle.write_all(who.as_bytes())?;
+    handle.write_all(b"-mail <")?;
+    handle.write_all(email)?;
+    handle.write_all(b">\n")?;
+    writeln!(handle, "{who}-time {time}")?;
+    writeln!(handle, "{who}-tz {tz}")?;
+    Ok(())
+}
+
 /// git's `find_commit_subject`: skip leading blank/whitespace-only lines of the
-/// commit body and take the first non-blank line as the porcelain `summary`. An
-/// empty message renders as the parenthesized object name.
-fn commit_summary(message: &[u8], oid: &ObjectId) -> String {
+/// commit body and return the first non-blank line as the porcelain `summary`
+/// (raw bytes, so a reencoded non-UTF-8 subject round-trips). An empty message
+/// renders as the parenthesized object name.
+fn commit_summary_bytes(message: &[u8], oid: &ObjectId) -> Vec<u8> {
     let mut start = 0usize;
     while start < message.len() {
         let eol = message[start..]
@@ -3195,11 +3388,29 @@ fn commit_summary(message: &[u8], oid: &ObjectId) -> String {
             .iter()
             .all(|b| matches!(*b, b' ' | b'\t' | b'\r' | 0x0b | 0x0c));
         if !blank {
-            return String::from_utf8_lossy(line).into_owned();
+            return line.to_vec();
         }
         start = eol + 1;
     }
-    format!("({})", oid.to_hex())
+    format!("({})", oid.to_hex()).into_bytes()
+}
+
+/// The commit's stored encoding (its `encoding` header, default UTF-8), used as
+/// the source encoding when reencoding author/summary for output.
+fn blame_commit_encoding_name(commit: &Commit) -> String {
+    commit
+        .encoding
+        .as_deref()
+        .map(|enc| String::from_utf8_lossy(enc).into_owned())
+        .unwrap_or_else(|| "UTF-8".to_string())
+}
+
+/// Write a porcelain/incremental `<key> <value>\n` field with a raw byte value.
+fn write_field(handle: &mut impl Write, key: &[u8], value: &[u8]) -> Result<()> {
+    handle.write_all(key)?;
+    handle.write_all(value)?;
+    handle.write_all(b"\n")?;
+    Ok(())
 }
 
 /// Render the object-name column for annotate-compat (`-c`) mode: exactly
