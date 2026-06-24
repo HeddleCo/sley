@@ -11475,6 +11475,25 @@ fn is_reserved_attribute_name(attribute: &[u8]) -> bool {
 }
 
 fn report_invalid_attribute_name(attribute: &[u8], source: &[u8], line_number: usize) {
+    // Upstream parses each `.gitattributes` into its attr stack exactly once, so
+    // a bad name warns once per file. sley re-reads attribute sources per query
+    // (e.g. `git add` resolves the staged file's attributes more than once),
+    // which would duplicate the warning; suppress exact repeats within the
+    // process, keyed on (name, source, line) so distinct files still each warn.
+    static REPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    let mut key = attribute.to_vec();
+    key.push(0);
+    key.extend_from_slice(source);
+    key.push(0);
+    key.extend_from_slice(line_number.to_string().as_bytes());
+    if let Ok(mut seen) = REPORTED
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        && !seen.insert(key)
+    {
+        return;
+    }
     eprintln!(
         "{} is not a valid attribute name: {}:{}",
         String::from_utf8_lossy(attribute),

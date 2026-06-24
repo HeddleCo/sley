@@ -464,6 +464,13 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             }
         }
     };
+    // `--attr-source` / `GIT_ATTR_SOURCE` names a tree to read `.gitattributes`
+    // from; with no repository there is nothing to resolve it against, so git
+    // dies as soon as the default attr source is computed (attr.c).
+    if repo.is_none() && std::env::var_os("GIT_ATTR_SOURCE").is_some() {
+        eprintln!("fatal: cannot use --attr-source or GIT_ATTR_SOURCE without repo");
+        return Err(GitError::Exit(128));
+    }
     if no_index || opts.untracked || repo.is_none() {
         let pattern_type = cli_pattern_type.unwrap_or(PatternTypeOption::Bre);
         opts.kind = match pattern_type {
