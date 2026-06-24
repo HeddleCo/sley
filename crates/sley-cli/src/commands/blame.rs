@@ -125,6 +125,12 @@ struct BlameOptions {
     /// `--encoding=<enc>`: output encoding for author/summary metadata
     /// (`none` keeps the bytes as stored). Defaults to `i18n.logOutputEncoding`.
     encoding: Option<String>,
+    /// `--color-lines`: color the metadata of lines repeated from the previous
+    /// output line (`color.blame.repeatedLines`).
+    color_lines: bool,
+    /// `--color-by-age`: color each line's metadata by commit age
+    /// (`color.blame.highlightRecent`).
+    color_by_age: bool,
 }
 
 /// Metadata for the all-zero pseudo-commit blame builds for the working-tree
@@ -372,6 +378,8 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         None => log_output_encoding(repo.config()),
     };
 
+    let color_plan = build_color_plan(&repo, &options);
+
     let (lines, previous_map) = compute_blame(
         db,
         format,
@@ -406,6 +414,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         &previous_map,
         marks,
         &output_encoding,
+        color_plan.as_ref(),
     )
 }
 
@@ -416,6 +425,124 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
 struct BlameMarks {
     ignored: bool,
     unblamable: bool,
+}
+
+/// How to color the per-line metadata in the standard output (git's
+/// `OUTPUT_COLOR_LINE` / `OUTPUT_SHOW_AGE_WITH_COLOR`).
+enum ColorPlan {
+    /// `--color-lines`: lines repeated from the previous output line get
+    /// `repeated`; the first of a run is uncolored.
+    Lines { repeated: String },
+    /// `--color-by-age`: each line's metadata is colored by commit age, picking
+    /// the first `(hop, color)` field whose hop the author time does not exceed.
+    Age { fields: Vec<(i64, String)> },
+}
+
+/// Resolve a git color spec (`color.blame.*` value) to its ANSI sequence,
+/// concatenating attribute words (`bold yellow`).
+fn blame_parse_color(spec: &str) -> String {
+    let mut out = String::new();
+    for word in spec.split_whitespace() {
+        if let Some(ansi) = git_color_name_to_ansi(word) {
+            out.push_str(ansi);
+        }
+    }
+    out
+}
+
+/// Parse a `color.blame.highlightRecent` field list (git's `parse_color_fields`):
+/// alternating color/date starting with a color and ending with a color, which
+/// becomes the open-ended sentinel `(i64::MAX, color)`. Returns `None` on a
+/// malformed spec.
+fn parse_color_fields(spec: &str) -> Option<Vec<(i64, String)>> {
+    let mut fields: Vec<(i64, String)> = Vec::new();
+    let mut expect_color = true;
+    let mut pending = String::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if expect_color {
+            pending = blame_parse_color(part);
+            expect_color = false;
+        } else {
+            let hop = crate::commands::approxidate::parse_approxidate(part)?;
+            fields.push((hop, std::mem::take(&mut pending)));
+            pending = String::new();
+            expect_color = true;
+        }
+    }
+    if expect_color {
+        // Ended on a date — git's "must end with a color".
+        return None;
+    }
+    fields.push((i64::MAX, pending));
+    Some(fields)
+}
+
+/// git's `determine_line_heat`: the color for a commit of the given author time.
+fn determine_line_heat(author_time: i64, fields: &[(i64, String)]) -> &str {
+    let dated = fields.len().saturating_sub(1);
+    let mut i = 0;
+    while i < dated && author_time > fields[i].0 {
+        i += 1;
+    }
+    &fields[i].1
+}
+
+/// Build the standard-output coloring plan from the `--color-*` flags and the
+/// `blame.coloring` / `color.blame.*` config. Coloring is disabled in compat
+/// (`-c` / annotate) mode.
+fn build_color_plan(repo: &RepositoryContext, options: &BlameOptions) -> Option<ColorPlan> {
+    if options.compat {
+        return None;
+    }
+    let (mut lines, mut age) = (options.color_lines, options.color_by_age);
+    if !lines && !age {
+        match repo.config().get("blame", None, "coloring") {
+            Some("repeatedLines") => lines = true,
+            Some("highlightRecent") => age = true,
+            _ => {}
+        }
+    }
+    if lines {
+        let repeated = repo
+            .config()
+            .get("color", Some("blame"), "repeatedlines")
+            .map(blame_parse_color)
+            .filter(|ansi| !ansi.is_empty())
+            .unwrap_or_else(|| "\x1b[36m".to_string());
+        return Some(ColorPlan::Lines { repeated });
+    }
+    if age {
+        let spec = repo
+            .config()
+            .get("color", Some("blame"), "highlightrecent")
+            .map(str::to_string)
+            .unwrap_or_else(|| "blue,12 month ago,white,1 month ago,red".to_string());
+        return parse_color_fields(&spec).map(|fields| ColorPlan::Age { fields });
+    }
+    None
+}
+
+/// The author timestamp used for age coloring: the commit's author time, or the
+/// fake work-tree commit's time for the null commit.
+fn blame_author_time(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    blame: &LineBlame,
+    fake: Option<&FakeCommit>,
+) -> i64 {
+    if blame.commit.is_null() {
+        return fake.map(|f| f.time).unwrap_or(0);
+    }
+    let Ok(object) = db.read_object(&blame.commit) else {
+        return 0;
+    };
+    let Ok(commit) = Commit::parse(format, &object.body) else {
+        return 0;
+    };
+    Signature::from_ident_line(&commit.author)
+        .map(|sig| sig.time.seconds)
+        .unwrap_or(0)
 }
 
 /// Either run with parsed options or print help and exit successfully.
@@ -450,6 +577,8 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
     let mut ignore_revs_files: Vec<String> = Vec::new();
     let mut incremental = false;
     let mut encoding: Option<String> = None;
+    let mut color_lines = false;
+    let mut color_by_age = false;
     // Positionals collected before `--`; afterwards everything is a path.
     let mut positionals: Vec<String> = Vec::new();
     let mut paths_after_dd: Vec<String> = Vec::new();
@@ -526,6 +655,8 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
                 ignore_revs_files.push(other["--ignore-revs-file=".len()..].to_string());
             }
             "--incremental" => incremental = true,
+            "--color-lines" => color_lines = true,
+            "--color-by-age" => color_by_age = true,
             "--encoding" => {
                 let Some(value) = iter.next() else {
                     return Err(blame_option_requires_value("encoding"));
@@ -614,6 +745,8 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
         ignore_revs_files,
         incremental,
         encoding,
+        color_lines,
+        color_by_age,
     }))
 }
 
@@ -2808,6 +2941,7 @@ fn resolve_range(
 }
 
 /// Print the selected lines in git blame's default format.
+#[allow(clippy::too_many_arguments)]
 fn render_blame(
     git_dir: &Path,
     format: ObjectFormat,
@@ -2819,6 +2953,7 @@ fn render_blame(
     previous_map: &PreviousMap,
     marks: BlameMarks,
     output_encoding: &str,
+    color: Option<&ColorPlan>,
 ) -> Result<()> {
     if options.incremental {
         return render_incremental(
@@ -2911,6 +3046,30 @@ fn render_blame(
             )
         };
 
+        // `--color-lines` / `--color-by-age`: wrap the metadata prefix in a
+        // color and reset before the content. `--color-lines` colors only lines
+        // whose commit matches the previous output line; `--color-by-age` colors
+        // every line by commit age.
+        let (color_str, reset_str): (&str, &str) = match color {
+            Some(ColorPlan::Age { fields }) => {
+                let time = blame_author_time(db, format, blame, fake);
+                (determine_line_heat(time, fields), "\x1b[m")
+            }
+            Some(ColorPlan::Lines { repeated }) => {
+                let repeated_line = display_idx > 0
+                    && lines[selected[display_idx - 1] - 1].commit == blame.commit;
+                if repeated_line {
+                    (repeated.as_str(), "\x1b[m")
+                } else {
+                    ("", "")
+                }
+            }
+            None => ("", ""),
+        };
+        if !color_str.is_empty() {
+            handle.write_all(color_str.as_bytes())?;
+        }
+
         if options.suppress_author {
             // `<sha> <lineno>) <line>`
             if options.show_name {
@@ -2938,6 +3097,9 @@ fn render_blame(
                     "{sha} ({author:<author_width$} {date} {line_no:>lineno_width$}) "
                 )?;
             }
+        }
+        if !reset_str.is_empty() {
+            handle.write_all(reset_str.as_bytes())?;
         }
         handle.write_all(content)?;
         handle.write_all(b"\n")?;
