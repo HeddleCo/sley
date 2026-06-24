@@ -469,6 +469,29 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    // A bare `git reset` (whole-tree `--mixed`) on an unborn HEAD resets the
+    // index to the empty tree: just clear it (git's `reset_index` against an
+    // unborn HEAD) instead of treating the cwd as a pathspec that matches no
+    // tracked file. `git checkout --orphan X && git reset` relies on this.
+    if !saw_separator
+        && positionals.is_empty()
+        && !pathspec_from_file_provided
+        && resolve_revision(&git_dir, format, "HEAD").is_err()
+    {
+        fs::write(
+            sley_worktree::repository_index_path(&git_dir),
+            Index {
+                version: 2,
+                entries: Vec::new(),
+                extensions: Vec::new(),
+                checksum: None,
+            }
+            .write(format)?,
+        )?;
+        sley_sequencer::replay::remove_branch_state(&git_dir);
+        return Ok(());
+    }
+
     let mut source_tree = None;
     let mut paths = if let Some(index) = separator_index {
         let (before_separator, after_separator) = positionals.split_at(index);

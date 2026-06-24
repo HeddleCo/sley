@@ -2737,10 +2737,15 @@ fn apply_three_way(
     quiet: bool,
 ) -> Result<ApplyResult> {
     let refs = FileRefStore::new(git_dir, format);
-    let head_oid = head_commit_oid(&refs)?
-        .ok_or_else(|| GitError::Command("am: HEAD disappeared mid-series".into()))?;
+    // The "ours" side of the 3-way is the current HEAD tree, or the empty tree
+    // when applying onto an unborn branch (git's `am -3` reconstructs against an
+    // empty index there — t4151 "am -3 stops on conflict on unborn branch").
+    let head_oid = head_commit_oid(&refs)?;
     let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    let head_tree = commit_tree_oid(&db, format, &head_oid)?;
+    let head_tree = match &head_oid {
+        Some(oid) => commit_tree_oid(&db, format, oid)?,
+        None => ObjectId::empty_tree(format),
+    };
     let ours_map = stash_tree_entry_map(&db, format, &head_tree)?;
 
     // The merge base for each file is the patch's *pre-image* blob, named by the
