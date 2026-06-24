@@ -364,6 +364,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
     // `blame.markUnblamableLines` display flags (the latter via `repo.config()`,
     // which already folds in `-c` overrides).
     let ignore_set = build_ignore_set(&repo, &options)?;
+    let grafts = read_graft_file(git_dir, format);
     let marks = BlameMarks {
         ignored: repo
             .config()
@@ -406,6 +407,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         virtual_final,
         &ignore_set,
         diff_algorithm,
+        &grafts,
     )?;
 
     // Resolve the -L ranges against the real line count, then render. The
@@ -1144,6 +1146,38 @@ fn parse_ignore_revs_file(
     Ok(())
 }
 
+/// Parse `<git_dir>/info/grafts` into a commit → parents override map (git's
+/// `read_graft_line` / `register_commit_graft`). Each non-comment line is a
+/// whitespace-separated list of object names: the first names a commit, the rest
+/// its grafted parents. Lines that don't parse are skipped. Empty map when the
+/// file is absent.
+fn read_graft_file(git_dir: &Path, format: ObjectFormat) -> HashMap<ObjectId, Vec<ObjectId>> {
+    let mut map: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    let Ok(content) = std::fs::read(git_dir.join("info").join("grafts")) else {
+        return map;
+    };
+    for raw in content.split(|b| *b == b'\n') {
+        let line = match raw.iter().position(|b| *b == b'#') {
+            Some(idx) => &raw[..idx],
+            None => raw,
+        };
+        let tokens: Vec<&[u8]> = line
+            .split(|b| b.is_ascii_whitespace())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let Some(first) = tokens.first() else { continue };
+        let Ok(text) = std::str::from_utf8(first) else { continue };
+        let Ok(commit) = ObjectId::from_hex(format, text) else { continue };
+        let parents = tokens[1..]
+            .iter()
+            .filter_map(|t| std::str::from_utf8(t).ok())
+            .filter_map(|t| ObjectId::from_hex(format, t).ok())
+            .collect();
+        map.insert(commit, parents);
+    }
+    map
+}
+
 /// Whether the repository is bare. Mirrors git's `is_bare_repository`: an
 /// explicit `core.bare` wins, otherwise infer from the absence of a work tree.
 fn blame_is_bare(repo: &RepositoryContext) -> bool {
@@ -1341,6 +1375,7 @@ fn compute_blame(
     virtual_final: bool,
     ignore_set: &HashSet<ObjectId>,
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    grafts: &HashMap<ObjectId, Vec<ObjectId>>,
 ) -> Result<(Vec<LineBlame>, PreviousMap)> {
     let final_lines = sley_diff_merge::split_lines(final_blob);
     let line_count = final_lines.len();
@@ -1434,6 +1469,9 @@ fn compute_blame(
 
         let mut parents = if origin.virtual_worktree {
             vec![origin.commit]
+        } else if let Some(grafted) = grafts.get(&origin.commit) {
+            // `.git/info/grafts` overrides this commit's parents.
+            grafted.clone()
         } else {
             commit.parents.clone()
         };
