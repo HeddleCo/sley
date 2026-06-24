@@ -873,6 +873,11 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
     if parsed.positional.len() > 2 {
         return Err(rebase_usage_error());
     }
+    // With --root there is no upstream argument, so only an optional <branch>
+    // is allowed (git: `--root [<branch>]`, errors when argc > 1).
+    if parsed.root && parsed.positional.len() > 1 {
+        return Err(rebase_usage_error());
+    }
 
     // The apply backend keeps its state in `.git/rebase-apply/` (marked by a
     // `head-name` file). When such a rebase is in progress, the resume verbs
@@ -1041,20 +1046,20 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     }
 
     // Resolve upstream.
-    let upstream_name = match args.positional.first() {
-        Some(name) => name.clone(),
-        None => {
-            if args.root {
-                String::new()
-            } else {
-                match default_upstream_name(ctx, &refs) {
-                    Some(name) => name,
-                    None => {
-                        print_missing_upstream_advice(ctx, &refs);
-                        return Err(GitError::Exit(1));
-                    }
+    // With --root there is no upstream argument: the lone positional (if any) is
+    // the <branch> to rebase, so it must not be consumed as the upstream.
+    let upstream_name = if args.root {
+        String::new()
+    } else {
+        match args.positional.first() {
+            Some(name) => name.clone(),
+            None => match default_upstream_name(ctx, &refs) {
+                Some(name) => name,
+                None => {
+                    print_missing_upstream_advice(ctx, &refs);
+                    return Err(GitError::Exit(1));
                 }
-            }
+            },
         }
     };
     let upstream = if args.root {
@@ -1071,8 +1076,10 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         }
     };
 
-    // Branch / orig_head / head_name.
-    let (branch_name, head_name, orig_head, switch_to) = match args.positional.get(1) {
+    // Branch / orig_head / head_name. With --root the branch is positional 0
+    // (no upstream); otherwise it follows the upstream at positional 1.
+    let branch_index = if args.root { 0 } else { 1 };
+    let (branch_name, head_name, orig_head, switch_to) = match args.positional.get(branch_index) {
         Some(branch) => {
             let full = format!("refs/heads/{branch}");
             if let Ok(Some(RefTarget::Direct(oid))) = refs.read_ref(&full) {
@@ -1124,8 +1131,15 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     }
 
     if !args.no_verify {
-        let mut hook_args = vec![upstream_name.as_str()];
-        if args.positional.get(1).is_some() {
+        // git passes "--root" as the upstream argument to the pre-rebase hook
+        // when rebasing from the root (builtin/rebase.c sets upstream_arg).
+        let upstream_arg = if args.root {
+            "--root"
+        } else {
+            upstream_name.as_str()
+        };
+        let mut hook_args = vec![upstream_arg];
+        if args.positional.get(branch_index).is_some() {
             hook_args.push(branch_name.as_str());
         }
         if let Err(err) = commands::hooks::run_hook_l("pre-rebase", &hook_args) {
@@ -1355,10 +1369,19 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             args.root && args.onto_name.is_some(),
         )?
     } else {
+        // For `--root --onto <newbase>` there is no upstream to exclude, but git
+        // still drops commits already present in the onto (cherry-pick
+        // detection against the new base). Use the onto as the patch-id base.
+        let cherry_base = if args.root && args.onto_name.is_some() {
+            Some(&onto)
+        } else {
+            upstream.as_ref()
+        };
         let records = make_script_commits(
             ctx,
             &db,
             upstream.as_ref(),
+            cherry_base,
             &orig_head,
             keep_empty,
             args.reapply_cherry_picks.unwrap_or(false),
@@ -1457,6 +1480,7 @@ fn run_apply_backend(
     let records = make_script_commits(
         ctx,
         db,
+        upstream,
         upstream,
         orig_head,
         // The apply backend drops begin-empty commits by default (git am skips
@@ -1874,6 +1898,7 @@ fn make_script_commits(
     ctx: &Ctx,
     db: &FileObjectDatabase,
     upstream: Option<&ObjectId>,
+    cherry_base: Option<&ObjectId>,
     orig_head: &ObjectId,
     keep_empty: bool,
     reapply_cherry_picks: bool,
@@ -1899,11 +1924,13 @@ fn make_script_commits(
     // already has it. Skipped when --reapply-cherry-picks is set.
     let upstream_patch_ids: std::collections::HashSet<Vec<u8>> = if reapply_cherry_picks {
         std::collections::HashSet::new()
-    } else if let Some(upstream) = upstream {
+    } else if let Some(cherry_base) = cherry_base {
         // Bound the comparison to the symmetric difference: only consider
-        // upstream commits reachable from upstream but not from the merge base
-        // (matching git's `upstream...orig_head` left side).
-        let bases = merge_bases(&ctx.common_git_dir, db, ctx.format, upstream, orig_head)?;
+        // cherry-base commits reachable from it but not from the merge base
+        // (matching git's `<base>...orig_head` left side). For `--root --onto
+        // <newbase>` the base is the onto; unrelated histories have no merge
+        // base, so every onto commit's patch-id is considered.
+        let bases = merge_bases(&ctx.common_git_dir, db, ctx.format, cherry_base, orig_head)?;
         let mut base_reachable = std::collections::HashSet::new();
         let mut bq: Vec<ObjectId> = bases.clone();
         while let Some(oid) = bq.pop() {
@@ -1914,7 +1941,7 @@ fn make_script_commits(
             bq.extend(record.parents.iter().copied());
         }
         let mut ids = std::collections::HashSet::new();
-        let mut uq = vec![*upstream];
+        let mut uq = vec![*cherry_base];
         let mut seen = std::collections::HashSet::new();
         while let Some(oid) = uq.pop() {
             if base_reachable.contains(&oid) || !seen.insert(oid) {
