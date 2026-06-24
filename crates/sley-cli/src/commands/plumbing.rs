@@ -3843,6 +3843,13 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     }
     // Phase 2: materialize. `--cached` updates only the index; `--index` updates
     // both the worktree and the index; a plain apply updates only the worktree.
+    // Worktree files are moded `(exec ? 0777 : 0666) & ~umask` like git, so derive
+    // the umask once (skipped for `--cached`, which never touches the worktree).
+    let umask_complement = if cached {
+        0o755
+    } else {
+        worktree_umask_complement(&worktree_base)
+    };
     let mut index_paths = Vec::new();
     for action in &actions {
         match action {
@@ -3853,7 +3860,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 content,
             } => {
                 if !cached {
-                    merge_write_worktree_file(&worktree_base, path, content, *mode)?;
+                    apply_write_worktree_file(&worktree_base, path, content, *mode, umask_complement)?;
                 }
                 if let Some(index) = index.as_mut() {
                     let oid = db.write_object(EncodedObject::new(ObjectType::Blob, content.clone()))?;
@@ -4363,6 +4370,10 @@ fn validate_apply_input(input: &[u8], name: &str) -> Result<()> {
     let mut expect_new_header = false;
     let mut after_file_header = false;
     let mut saw_hunk = false;
+    // git's `metadata_changes`: a hunk-less patch is only "garbage" when it also
+    // carries no metadata change (new/delete/mode/rename/copy). A `new file mode`
+    // patch with a bogus trailing line still creates an (empty) file.
+    let mut saw_metadata = false;
     for (idx, line) in lines.iter().enumerate() {
         let line_nr = idx + 1;
         if line.starts_with(b"diff --git ") || line.starts_with(b"diff ") {
@@ -4370,6 +4381,16 @@ fn validate_apply_input(input: &[u8], name: &str) -> Result<()> {
             expect_new_header = false;
             after_file_header = false;
             saw_hunk = false;
+            saw_metadata = false;
+            continue;
+        }
+        if line.starts_with(b"rename from ")
+            || line.starts_with(b"rename to ")
+            || line.starts_with(b"copy from ")
+            || line.starts_with(b"copy to ")
+        {
+            saw_header = true;
+            saw_metadata = true;
             continue;
         }
         if let Some(rest) = apply_strip_prefix(line, b"old mode ")
@@ -4386,6 +4407,7 @@ fn validate_apply_input(input: &[u8], name: &str) -> Result<()> {
                 return Err(GitError::Exit(1));
             }
             saw_header = true;
+            saw_metadata = true;
             continue;
         }
         if line.starts_with(b"--- ") {
@@ -4419,7 +4441,7 @@ fn validate_apply_input(input: &[u8], name: &str) -> Result<()> {
             saw_hunk = true;
             continue;
         }
-        if after_file_header && !saw_hunk && !line.is_empty() {
+        if after_file_header && !saw_hunk && !saw_metadata && !line.is_empty() {
             eprintln!("error: patch with only garbage at {name}:{line_nr}");
             return Err(GitError::Exit(1));
         }
@@ -4694,6 +4716,70 @@ fn read_patch_base(
         return Ok(blob);
     }
     Ok(read_worktree_blob_bytes(worktree_root, old)?.unwrap_or_default())
+}
+
+/// Write a worktree file for `git apply`, mirroring git's `try_create_file`: a
+/// regular file is (re)created with mode `(exec ? 0777 : 0666)` masked by the
+/// process umask, not forced to the canonical `0644`/`0755`. (Under the usual
+/// umask `022` this is identical — `0755`/`0644` — but it respects an unusual
+/// umask, e.g. `0077` -> `0700`/`0600`, and never widens via `core.sharedRepository`.)
+/// `umask_complement` is `0777 & ~umask`, derived once per invocation.
+fn apply_write_worktree_file(
+    worktree_base: &Path,
+    path: &[u8],
+    content: &[u8],
+    mode: u32,
+    umask_complement: u32,
+) -> Result<()> {
+    merge_write_worktree_file(worktree_base, path, content, mode)?;
+    // Only regular files carry a umask-derived mode; symlinks/gitlinks are left
+    // as `merge_write_worktree_file` created them.
+    #[cfg(unix)]
+    if (mode & 0o170000) == 0o100000 {
+        use std::os::unix::fs::PermissionsExt;
+        let rel = std::str::from_utf8(path)
+            .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
+        let target = if mode & 0o100 != 0 {
+            umask_complement
+        } else {
+            umask_complement & 0o666
+        };
+        fs::set_permissions(
+            worktree_base.join(rel),
+            fs::Permissions::from_mode(target),
+        )?;
+    }
+    let _ = umask_complement;
+    Ok(())
+}
+
+/// `0777 & ~umask`, derived (without `unsafe`/libc) by creating a probe file with
+/// mode `0777` and reading the OS-applied result. Used to mode worktree files
+/// exactly as git's `open(..., (mode & 0100) ? 0777 : 0666)` does.
+fn worktree_umask_complement(dir: &Path) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let probe = dir.join(format!(".sley-apply-umask-{}", std::process::id()));
+        let _ = fs::remove_file(&probe);
+        let mode = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o777)
+            .open(&probe)
+            .ok()
+            .and_then(|_| fs::metadata(&probe).ok())
+            .map(|metadata| metadata.permissions().mode() & 0o777)
+            .unwrap_or(0o755);
+        let _ = fs::remove_file(&probe);
+        mode
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        0o755
+    }
 }
 
 /// Read the blob-form bytes of a worktree path (the symlink target for a
