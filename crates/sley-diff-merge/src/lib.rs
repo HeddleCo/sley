@@ -4447,6 +4447,97 @@ pub fn apply_file_patch_with_options(
     ApplyOutcome::Applied(join_lines(&image))
 }
 
+/// The outcome of a hunk-by-hunk apply (`git apply --reject`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectApply {
+    /// The bytes after every hunk that applied (rejected hunks are skipped).
+    pub content: Vec<u8>,
+    /// Indices into `patch.hunks` of the hunks that did not apply.
+    pub rejected: Vec<usize>,
+}
+
+/// Apply a single-file patch hunk-by-hunk, collecting the hunks that do not
+/// apply rather than rejecting the whole patch — `git apply --reject`.
+///
+/// Each hunk is tried independently against the running image; an applied hunk
+/// contributes its offset to later hunks (git's `apply_fragments` carries the
+/// running line shift), a rejected hunk is recorded and left out. The returned
+/// `content` is the image after all applicable hunks; `rejected` lists the
+/// 0-based indices of the hunks the caller must write to `<file>.rej`.
+pub fn apply_file_patch_rejecting(
+    base: &[u8],
+    patch: &FilePatch,
+    options: &ApplyFileOptions,
+) -> RejectApply {
+    if patch.is_delete && patch.hunks.is_empty() {
+        return RejectApply {
+            content: Vec::new(),
+            rejected: Vec::new(),
+        };
+    }
+    let base_for_match: &[u8] = if patch.is_new { b"" } else { base };
+    let mut image = split_blob_lines(base_for_match);
+    let mut running_offset: isize = 0;
+    let mut rejected = Vec::new();
+    for (index, hunk) in patch.hunks.iter().enumerate() {
+        match apply_one_hunk(&mut image, hunk, running_offset, options.unidiff_zero) {
+            Some(drift) => running_offset += drift,
+            None => rejected.push(index),
+        }
+    }
+    RejectApply {
+        content: join_lines(&image),
+        rejected,
+    }
+}
+
+/// Reconstruct the unified-diff text of one hunk for a `.rej` file. Mirrors the
+/// raw fragment text git copies into `<file>.rej`: the `@@ -os[,oc] +ns[,nc] @@`
+/// header (the `,1` count is omitted, matching git) followed by each line with
+/// its ` `/`+`/`-` prefix, plus the `\ No newline at end of file` note where the
+/// old/new side's final line is unterminated.
+pub fn render_reject_hunk(hunk: &Hunk) -> Vec<u8> {
+    fn range(start: usize, count: usize) -> String {
+        if count == 1 {
+            start.to_string()
+        } else {
+            format!("{start},{count}")
+        }
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(b"@@ -");
+    out.extend_from_slice(range(hunk.old_start, hunk.old_len).as_bytes());
+    out.extend_from_slice(b" +");
+    out.extend_from_slice(range(hunk.new_start, hunk.new_len).as_bytes());
+    out.extend_from_slice(b" @@\n");
+    // The last old-side line is the last Context/Delete; the last new-side line
+    // is the last Context/Insert. Their no-newline state drives the markers.
+    let last_old = hunk
+        .lines
+        .iter()
+        .rposition(|line| matches!(line, HunkLine::Context(_) | HunkLine::Delete(_)));
+    let last_new = hunk
+        .lines
+        .iter()
+        .rposition(|line| matches!(line, HunkLine::Context(_) | HunkLine::Insert(_)));
+    for (index, line) in hunk.lines.iter().enumerate() {
+        let (prefix, content) = match line {
+            HunkLine::Context(bytes) => (b' ', bytes),
+            HunkLine::Insert(bytes) => (b'+', bytes),
+            HunkLine::Delete(bytes) => (b'-', bytes),
+        };
+        out.push(prefix);
+        out.extend_from_slice(content);
+        out.push(b'\n');
+        let old_incomplete = hunk.old_no_newline && Some(index) == last_old;
+        let new_incomplete = hunk.new_no_newline && Some(index) == last_new;
+        if old_incomplete || new_incomplete {
+            out.extend_from_slice(b"\\ No newline at end of file\n");
+        }
+    }
+    out
+}
+
 /// Splice a single hunk into `image`, returning the offset (applied position −
 /// expected position) so later hunks can carry it forward, or `None` if the
 /// hunk cannot be located (which rejects the whole patch).

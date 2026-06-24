@@ -3389,6 +3389,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let mut unsafe_paths = false;
     let mut unidiff_zero = false;
     let mut reverse = false;
+    let mut reject = false;
     // Whether `--whitespace=` was given on the command line; when not, the
     // default action comes from `apply.whitespace` config (git's precedence).
     let mut ws_action_explicit = false;
@@ -3418,6 +3419,8 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             "--unidiff-zero" => unidiff_zero = true,
             "-R" | "--reverse" => reverse = true,
             "--no-reverse" => reverse = false,
+            "--reject" => reject = true,
+            "--no-reject" => reject = false,
             "--index" => update_index = true,
             "--cached" => cached = true,
             "-N" | "--intent-to-add" => intent_to_add = true,
@@ -3484,6 +3487,11 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             }
             value => files.push(value.to_string()),
         }
+    }
+    // git's `apply_state_init`: `--reject` and `--3way` are mutually exclusive.
+    if reject && three_way {
+        eprintln!("error: options '--reject' and '--3way' cannot be used together");
+        return Err(GitError::Exit(128));
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(cwd.clone())?;
@@ -3764,6 +3772,10 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
 
     // Phase 1: compute every result first (git applies a patch atomically).
     let mut actions = Vec::new();
+    // `--reject`: rejected-hunk `.rej` writeouts collected here (path, bytes), and
+    // a flag so the whole command exits 1 at the end (git's `apply_with_reject`).
+    let mut reject_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut had_reject = false;
     let apply_file_options = sley_diff_merge::ApplyFileOptions { unidiff_zero };
     for patch in &patches {
         let base =
@@ -3800,21 +3812,53 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             }
             continue;
         }
-        let outcome =
-            sley_diff_merge::apply_file_patch_with_options(&base, patch, &apply_file_options);
-        let content = match outcome {
-            sley_diff_merge::ApplyOutcome::Applied(content) => content,
-            sley_diff_merge::ApplyOutcome::Rejected => {
-                let name = patch
-                    .new_path
-                    .as_deref()
-                    .or(patch.old_path.as_deref())
-                    .unwrap_or(b"");
-                eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
-                return Err(GitError::Exit(1));
+        // `--reject` applies hunk-by-hunk and keeps going past a failing hunk,
+        // writing the rejects to `<file>.rej`; the default path is all-or-nothing.
+        let (content, rejected_hunks) = if reject {
+            let result =
+                sley_diff_merge::apply_file_patch_rejecting(&base, patch, &apply_file_options);
+            (result.content, result.rejected)
+        } else {
+            match sley_diff_merge::apply_file_patch_with_options(&base, patch, &apply_file_options)
+            {
+                sley_diff_merge::ApplyOutcome::Applied(content) => (content, Vec::new()),
+                sley_diff_merge::ApplyOutcome::Rejected => {
+                    let name = patch
+                        .new_path
+                        .as_deref()
+                        .or(patch.old_path.as_deref())
+                        .unwrap_or(b"");
+                    eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
+                    return Err(GitError::Exit(1));
+                }
             }
         };
-        if patch.is_delete {
+        if !rejected_hunks.is_empty() {
+            had_reject = true;
+            let rej_target = patch
+                .new_path
+                .as_deref()
+                .or(patch.old_path.as_deref())
+                .unwrap_or(b"")
+                .to_vec();
+            // git's `write_out_one_reject`: a deliberately non-`--git` header
+            // (`diff a/X b/X\t(rejected hunks)`) followed by each rejected hunk's
+            // raw unified text.
+            let mut rej = Vec::new();
+            rej.extend_from_slice(b"diff a/");
+            rej.extend_from_slice(&rej_target);
+            rej.extend_from_slice(b" b/");
+            rej.extend_from_slice(&rej_target);
+            rej.extend_from_slice(b"\t(rejected hunks)\n");
+            for &index in &rejected_hunks {
+                rej.extend_from_slice(&sley_diff_merge::render_reject_hunk(&patch.hunks[index]));
+            }
+            reject_writes.push((rej_target, rej));
+            apply_say_reject(patch, &rejected_hunks, patch.hunks.len());
+        }
+        // A clean deletion removes the file; otherwise (modify/rename/new, or a
+        // partial `--reject` apply) write the resulting bytes.
+        if patch.is_delete && rejected_hunks.is_empty() {
             if let Some(old) = &patch.old_path {
                 actions.push(ApplyAction::Remove { path: old.clone() });
             }
@@ -3898,7 +3942,51 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             &index_paths,
         )?;
     }
+    // `--reject`: write each `<file>.rej` (git opens it `O_CREAT|O_EXCL`, unlinking
+    // a stale one first), then exit 1 because the patch did not fully apply.
+    for (target, bytes) in &reject_writes {
+        let rel = std::str::from_utf8(target)
+            .map_err(|err| GitError::InvalidPath(err.to_string()))?;
+        let mut rej_path = worktree_base.join(rel).into_os_string();
+        rej_path.push(".rej");
+        let rej_path = PathBuf::from(rej_path);
+        let _ = fs::remove_file(&rej_path);
+        fs::write(&rej_path, bytes)?;
+    }
+    if had_reject {
+        return Err(GitError::Exit(1));
+    }
     Ok(())
+}
+
+/// git's `write_out_one_reject` chatter: the "Applying patch <name> with N
+/// reject(s)..." line plus a per-hunk "applied cleanly" / "Rejected hunk #N."
+/// note, all on stderr (printed at the default verbosity).
+fn apply_say_reject(patch: &sley_diff_merge::FilePatch, rejected: &[usize], hunk_count: usize) {
+    let name = match (patch.old_path.as_deref(), patch.new_path.as_deref()) {
+        (Some(old), Some(new)) if old != new => format!(
+            "{} => {}",
+            status_quote_path(old, false),
+            status_quote_path(new, false)
+        ),
+        _ => status_quote_path(
+            patch.new_path.as_deref().or(patch.old_path.as_deref()).unwrap_or(b""),
+            false,
+        ),
+    };
+    let n = rejected.len();
+    eprintln!(
+        "Applying patch {name} with {n} reject{}...",
+        if n == 1 { "" } else { "s" }
+    );
+    let rejected_set: std::collections::HashSet<usize> = rejected.iter().copied().collect();
+    for index in 0..hunk_count {
+        if rejected_set.contains(&index) {
+            eprintln!("Rejected hunk #{}.", index + 1);
+        } else {
+            eprintln!("Hunk #{} applied cleanly.", index + 1);
+        }
+    }
 }
 
 /// Parse a `-p<n>` value like git's `strtol_i`: a base-10 integer with no
