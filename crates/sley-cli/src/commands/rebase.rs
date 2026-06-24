@@ -5066,6 +5066,14 @@ fn run_post_rewrite_hook(ctx: &Ctx) -> Result<()> {
     if input.is_empty() {
         return Ok(());
     }
+    // Copy notes from each rewritten commit to its replacement, per
+    // `notes.rewrite.rebase` / `notes.rewriteRef` (git does this internally,
+    // independent of the post-rewrite hook). Best-effort: a failure here must
+    // not fail the (already-finished) rebase.
+    let pairs = parse_rewritten_list(ctx, &input);
+    if let Err(err) = copy_notes_for_rewrite(ctx, &pairs) {
+        eprintln!("warning: failed to copy notes: {err}");
+    }
     let _ = commands::hooks::run_hook(
         "post-rewrite",
         commands::hooks::HookRun {
@@ -5074,6 +5082,144 @@ fn run_post_rewrite_hook(ctx: &Ctx) -> Result<()> {
             ..commands::hooks::HookRun::default()
         },
     );
+    Ok(())
+}
+
+/// Parse the `rewritten-list` (one `<old-sha> <new-sha>` pair per line) into
+/// resolved object id pairs, skipping any malformed line.
+fn parse_rewritten_list(ctx: &Ctx, input: &[u8]) -> Vec<(ObjectId, ObjectId)> {
+    let text = String::from_utf8_lossy(input);
+    let mut pairs = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(old), Some(new)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if let (Ok(old), Ok(new)) = (
+            ObjectId::from_hex(ctx.format, old),
+            ObjectId::from_hex(ctx.format, new),
+        ) {
+            pairs.push((old, new));
+        }
+    }
+    pairs
+}
+
+/// Match a `notes.rewriteRef` pattern against a concrete ref name. Supports a
+/// trailing `*` wildcard (e.g. `refs/notes/*`) and exact names, mirroring the
+/// common spellings git's `for_each_glob_ref` accepts here.
+fn notes_rewrite_ref_matches(pattern: &str, refname: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => refname.starts_with(prefix),
+        None => pattern == refname,
+    }
+}
+
+/// Copy notes from rewritten commits to their replacements, honouring
+/// `notes.rewrite.rebase` (default on), `notes.rewriteRef` (+ the
+/// `GIT_NOTES_REWRITE_REF` env list) and `notes.rewriteMode` (default
+/// `concatenate`).
+fn copy_notes_for_rewrite(ctx: &Ctx, rewritten: &[(ObjectId, ObjectId)]) -> Result<()> {
+    if rewritten.is_empty() {
+        return Ok(());
+    }
+    let Ok(config) = read_repo_config(&ctx.git_dir) else {
+        return Ok(());
+    };
+    // notes.rewrite.rebase defaults to true; an explicit false disables copying.
+    if config.get_bool("notes", Some("rewrite"), "rebase") == Some(false) {
+        return Ok(());
+    }
+    let mut patterns: Vec<String> = config
+        .get_all("notes", None, "rewriteRef")
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect();
+    if let Ok(env_refs) = env::var("GIT_NOTES_REWRITE_REF") {
+        patterns.extend(env_refs.split(':').filter(|s| !s.is_empty()).map(str::to_string));
+    }
+    if patterns.is_empty() {
+        return Ok(());
+    }
+    let mode = env::var("GIT_NOTES_REWRITE_MODE")
+        .ok()
+        .or_else(|| config.get("notes", None, "rewriteMode").map(str::to_string))
+        .unwrap_or_else(|| "concatenate".to_string());
+    if mode == "ignore" {
+        return Ok(());
+    }
+    let store = ctx.refs();
+    let identity = sley_notes::NotesCommitIdentity {
+        author: commit_identity_from_env("AUTHOR")?,
+        committer: commit_identity_from_env("COMMITTER")?,
+    };
+    for reference in store.list_refs()? {
+        if !reference.name.starts_with("refs/notes/")
+            || !patterns
+                .iter()
+                .any(|pattern| notes_rewrite_ref_matches(pattern, &reference.name))
+        {
+            continue;
+        }
+        let notes_ref = sley_notes::NotesRef::expand(&reference.name);
+        for (old, new) in rewritten {
+            let Some(source_blob) =
+                sley_notes::read_note_for(&ctx.git_dir, ctx.format, &store, &notes_ref, old)?
+            else {
+                continue;
+            };
+            let dest_blob =
+                sley_notes::read_note_for(&ctx.git_dir, ctx.format, &store, &notes_ref, new)?;
+            // git's note_tree_insert skips when source and destination notes are
+            // the same blob (avoids doubling when a commit is re-rebased to the
+            // same id that already carries the copied note).
+            if dest_blob == Some(source_blob) {
+                continue;
+            }
+            let source = sley_notes::read_note_bytes(
+                &ctx.git_dir,
+                ctx.format,
+                &store,
+                &notes_ref,
+                old,
+            )?
+            .unwrap_or_default();
+            // `overwrite` replaces; concatenate/cat_sort_uniq append to any note
+            // already on the replacement commit, separated by a blank line
+            // (combine_notes_concatenate).
+            let combined = if mode == "overwrite" || dest_blob.is_none() {
+                source
+            } else {
+                let mut cur = sley_notes::read_note_bytes(
+                    &ctx.git_dir,
+                    ctx.format,
+                    &store,
+                    &notes_ref,
+                    new,
+                )?
+                .unwrap_or_default();
+                if cur.last() == Some(&b'\n') {
+                    cur.pop();
+                }
+                cur.extend_from_slice(b"\n\n");
+                cur.extend_from_slice(&source);
+                cur
+            };
+            let expected = sley_notes::notes_ref_expected(&store, &notes_ref)?;
+            sley_notes::upsert_note_bytes_for(
+                &ctx.git_dir,
+                ctx.format,
+                &store,
+                &notes_ref,
+                new,
+                &combined,
+                "Notes added by 'git rebase'",
+                &identity,
+                expected,
+            )?;
+        }
+    }
     Ok(())
 }
 
