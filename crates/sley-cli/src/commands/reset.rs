@@ -492,6 +492,47 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    // A bare `git reset` (whole-tree `--mixed`) on a born HEAD resets the entire
+    // index to HEAD — git models this as an *empty* pathspec (whole tree),
+    // identical to `git reset HEAD`. It must NOT be treated as a synthesized
+    // worktree-root pathspec, which would spuriously fail with "pathspec did not
+    // match any file(s)" whenever neither the index nor the HEAD tree has an
+    // entry under the root (e.g. right after `git commit --allow-empty`, the very
+    // first thing t4111's `reset_subdir` does). Route it through the same
+    // whole-tree reset the explicit `git reset HEAD` path uses.
+    if !saw_separator
+        && positionals.is_empty()
+        && !pathspec_from_file_provided
+        && let Ok(head_oid) = resolve_revision_commitish(&git_dir, format, "HEAD")
+    {
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let old_head = resolve_revision(&git_dir, format, "HEAD").unwrap_or(head_oid);
+        let target_commit = sley_rev::peel_to_commit(&db, format, &head_oid)?;
+        let ita_candidates = if intent_to_add {
+            reset_intent_to_add_candidates(&git_dir, &db, format, &target_commit)?
+        } else {
+            Vec::new()
+        };
+        write_reset_orig_head(&git_dir, &old_head, format)?;
+        sley_worktree::reset_index_to_commit(
+            worktree_root.clone(),
+            git_dir.clone(),
+            format,
+            &target_commit,
+        )?;
+        if intent_to_add && !ita_candidates.is_empty() {
+            apply_reset_intent_to_add(&git_dir, format, &ita_candidates)?;
+        }
+        if refresh {
+            refresh_reset_index(&worktree_root, &git_dir, format)?;
+        }
+        sley_sequencer::replay::remove_branch_state(&git_dir);
+        if !quiet {
+            print_reset_unstaged_changes(&worktree_root, &git_dir, format)?;
+        }
+        return Ok(());
+    }
+
     let mut source_tree = None;
     let mut paths = if let Some(index) = separator_index {
         let (before_separator, after_separator) = positionals.split_at(index);

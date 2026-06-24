@@ -412,17 +412,34 @@ pub(crate) fn find_name_traditional(
 
 /// git's `guess_p_value`: returns the strip count implied by a `---`/`+++`
 /// name, or `None` when it cannot be determined.
-pub(crate) fn guess_p_value(nameline: &[u8], root: &[u8]) -> Option<usize> {
+pub(crate) fn guess_p_value(nameline: &[u8], root: &[u8], prefix: &[u8]) -> Option<usize> {
     if is_dev_null(nameline) {
         return None;
     }
     let name = find_name_traditional(nameline, None, 0, root)?;
-    match name.iter().position(|&b| b == b'/') {
-        None => Some(0),
-        // A subdir prefix (state->prefix) would refine this; sley does not yet
-        // run apply from a subdir, so an embedded slash is "unknown".
-        Some(_) => None,
+    let Some(slash) = name.iter().position(|&b| b == b'/') else {
+        return Some(0);
+    };
+    // git's `guess_p_value`: when running from a subdirectory (`state->prefix`),
+    // a name that begins with the prefix (or with the prefix after its first
+    // component, e.g. `a/sub/dir/file`) reveals how many leading components to
+    // strip so the rest matches our directory. Without a prefix an embedded
+    // slash leaves the strip count unknown.
+    if prefix.is_empty() {
+        return None;
     }
+    if name.starts_with(prefix) {
+        return Some(count_slashes(prefix));
+    }
+    if name[slash + 1..].starts_with(prefix) {
+        return Some(count_slashes(prefix) + 1);
+    }
+    None
+}
+
+/// Count the `/` separators in a path, matching git's `count_slashes`.
+fn count_slashes(path: &[u8]) -> usize {
+    path.iter().filter(|&&b| b == b'/').count()
 }
 
 /// git's `has_epoch_timestamp`: does the `---`/`+++` line carry a GNU epoch
@@ -662,7 +679,7 @@ mod tests {
         // diff-with spaces: "--- post image.txt.orig\t<ts>" / "+++ post image.txt\t<ts>"
         let first = b"post image.txt.orig\t2010-08-18 20:13:31.544002255 -0500";
         let second = b"post image.txt\t2010-08-18 20:13:31.544002255 -0500";
-        assert_eq!(guess_p_value(first, b""), Some(0));
+        assert_eq!(guess_p_value(first, b"", b""), Some(0));
         let fname = find_name_traditional(first, None, 0, b"");
         let name = find_name_traditional(second, fname.as_deref(), 0, b"");
         assert_eq!(name, Some(b"post image.txt".to_vec()));

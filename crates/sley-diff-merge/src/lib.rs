@@ -4264,6 +4264,11 @@ pub struct PatchPathOptions {
     pub p_value_known: bool,
     /// `--directory=<dir>` root, normalised with a trailing slash (or empty).
     pub root: Vec<u8>,
+    /// The cwd prefix (`state->prefix`): the current directory relative to the
+    /// work tree, with a trailing slash (empty at the top level). Used only to
+    /// guess `-p<n>` for traditional patches run from a subdirectory; the prefix
+    /// itself is prepended to names by the caller, not here.
+    pub prefix: Vec<u8>,
 }
 
 impl Default for PatchPathOptions {
@@ -4272,6 +4277,7 @@ impl Default for PatchPathOptions {
             p_value: 1,
             p_value_known: false,
             root: Vec::new(),
+            prefix: Vec::new(),
         }
     }
 }
@@ -4291,6 +4297,7 @@ pub fn parse_unified_patch_with_options(
         p_value: options.p_value,
         p_value_known: options.p_value_known,
         root: options.root.clone(),
+        prefix: options.prefix.clone(),
     };
     parser.parse()
 }
@@ -4785,6 +4792,9 @@ struct PatchParser<'a> {
     p_value_known: bool,
     /// `--directory` root (normalised, trailing slash) prepended to every name.
     root: Vec<u8>,
+    /// The cwd prefix (`state->prefix`), used only to guess `-p<n>` for
+    /// traditional patches run from a subdirectory.
+    prefix: Vec<u8>,
 }
 
 impl<'a> PatchParser<'a> {
@@ -5122,8 +5132,8 @@ impl<'a> PatchParser<'a> {
 
         if let Some(second) = &second {
             if !self.p_value_known {
-                let p0 = name::guess_p_value(&first, &self.root);
-                let q0 = name::guess_p_value(second, &self.root);
+                let p0 = name::guess_p_value(&first, &self.root, &self.prefix);
+                let q0 = name::guess_p_value(second, &self.root, &self.prefix);
                 let p = if p0.is_none() { q0 } else { p0 };
                 if let Some(pv) = p
                     && Some(pv) == q0
@@ -5133,14 +5143,16 @@ impl<'a> PatchParser<'a> {
                 }
             }
 
-            if name::is_dev_null(&first) {
+            let name = if name::is_dev_null(&first) {
                 patch.is_new = true;
-                patch.new_path =
-                    name::find_name_traditional(second, None, self.p_value, &self.root);
+                let name = name::find_name_traditional(second, None, self.p_value, &self.root);
+                patch.new_path = name.clone();
+                name
             } else if name::is_dev_null(second) {
                 patch.is_delete = true;
-                patch.old_path =
-                    name::find_name_traditional(&first, None, self.p_value, &self.root);
+                let name = name::find_name_traditional(&first, None, self.p_value, &self.root);
+                patch.old_path = name.clone();
+                name
             } else {
                 let first_name =
                     name::find_name_traditional(&first, None, self.p_value, &self.root);
@@ -5152,14 +5164,25 @@ impl<'a> PatchParser<'a> {
                 );
                 if name::has_epoch_timestamp(&first) {
                     patch.is_new = true;
-                    patch.new_path = name;
+                    patch.new_path = name.clone();
                 } else if name::has_epoch_timestamp(second) {
                     patch.is_delete = true;
-                    patch.old_path = name;
+                    patch.old_path = name.clone();
                 } else {
                     patch.old_path = name.clone();
-                    patch.new_path = name;
+                    patch.new_path = name.clone();
                 }
+                name
+            };
+            // git's `parse_traditional_patch`: a name that strips away every
+            // component (e.g. `-p2` against a one-component `file_in_root`) is a
+            // hard error — the whole apply fails rather than silently skipping the
+            // unresolved file.
+            if name.is_none() {
+                return Err(GitError::InvalidFormat(format!(
+                    "unable to find filename in patch at line {}",
+                    self.index
+                )));
             }
         }
 

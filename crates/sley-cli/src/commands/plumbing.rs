@@ -3495,10 +3495,20 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     // non-toplevel-relative (traditional) patches so that `git apply` from a
     // subdirectory operates on files under that subdirectory. Both paths are
     // canonicalised so a symlinked temp/work tree does not defeat the strip.
-    let prefix: Vec<u8> = {
+    // git's setup: when the cwd is inside the git directory itself (e.g. running
+    // from `.git` or `.git/objects`), there is no worktree prefix — pathnames in a
+    // traditional patch resolve relative to the top level (so an index entry is
+    // `file`, not `.git/file`), but a plain (non-`--cached`/`--index`) apply still
+    // reads/writes the *worktree* file relative to the actual cwd (`.git/file`).
+    let canonical_cwd = fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+    let canonical_git_dir = fs::canonicalize(&git_dir).unwrap_or_else(|_| git_dir.clone());
+    let cwd_in_git_dir =
+        canonical_cwd == canonical_git_dir || canonical_cwd.starts_with(&canonical_git_dir);
+    let prefix: Vec<u8> = if cwd_in_git_dir {
+        Vec::new()
+    } else {
         let canonical_root =
             fs::canonicalize(&worktree_root).unwrap_or_else(|_| worktree_root.clone());
-        let canonical_cwd = fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
         canonical_cwd
             .strip_prefix(&canonical_root)
             .ok()
@@ -3511,6 +3521,14 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 rel.into_bytes()
             })
             .unwrap_or_default()
+    };
+    // Base directory worktree files are resolved against. Normally the worktree
+    // top (the patch name already carries the cwd prefix); when the cwd is inside
+    // the git dir the name carries no prefix, so worktree files live under the cwd.
+    let worktree_base: PathBuf = if cwd_in_git_dir {
+        cwd.clone()
+    } else {
+        worktree_root.clone()
     };
     let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(&git_dir)?;
     // `apply.whitespace` config supplies the default whitespace action when the
@@ -3525,6 +3543,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         p_value,
         p_value_known,
         root: directory_root.clone(),
+        prefix: prefix.clone(),
     };
     let inputs = read_apply_inputs(&files)?;
     let mut patches = Vec::new();
@@ -3540,6 +3559,12 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                     }
                     GitError::InvalidFormat(message)
                         if message.starts_with("git diff header lacks filename") =>
+                    {
+                        eprintln!("error: {message}");
+                        GitError::Exit(1)
+                    }
+                    GitError::InvalidFormat(message)
+                        if message.starts_with("unable to find filename in patch") =>
                     {
                         eprintln!("error: {message}");
                         GitError::Exit(1)
@@ -3617,6 +3642,30 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         .map(|(name, _)| name.as_str())
         .unwrap_or("<stdin>");
 
+    // When `--index`/`--cached` is in effect, read the current index once: it
+    // supplies the preimage for every patch (`git apply` reads the staged blob,
+    // not the worktree, under `--cached`/`--index`), the entry modes that feed
+    // the canonical index-mode decision, and the type-mismatch warnings. `--index`
+    // (but not `--cached`) also requires the worktree to match the index.
+    let touch_index = update_index || cached;
+    let verify_worktree_match = update_index && !cached;
+    let mut index = if touch_index {
+        Some(read_apply_index(&git_dir, format)?)
+    } else {
+        None
+    };
+    let index_modes: HashMap<Vec<u8>, u32> = index
+        .as_ref()
+        .map(|index| {
+            index
+                .entries
+                .iter()
+                .filter(|entry| (entry.flags >> 12) & 0x3 == 0)
+                .map(|entry| (entry.path.to_vec(), entry.mode))
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Phase 0: whitespace handling. Resolve the per-path rule, then warn/error
     // or fix the introduced (`+`) lines per `--whitespace=<action>`. In `fix`
     // mode this rewrites the patch's Insert lines (and trims new blank lines at
@@ -3645,7 +3694,8 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             if patch.new_mode == Some(0o120000) {
                 rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
             }
-            let base = read_patch_base(&worktree_root, patch)?;
+            let base =
+                read_patch_base(&worktree_base, patch, index.as_ref(), &db, verify_worktree_match)?;
             apply_patch_whitespace(
                 patch,
                 &base,
@@ -3690,9 +3740,8 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     // Path-safety: refuse to read/create/delete files that escape the working
     // tree. git turns `--unsafe-paths` off whenever the index is touched
     // (`--index`/`--cached`), so the gate only relaxes for pure worktree applies.
-    let touch_index = update_index || cached;
     let unsafe_paths = unsafe_paths && !touch_index;
-    check_apply_path_safety(&worktree_root, &patches, unsafe_paths)?;
+    check_apply_path_safety(&worktree_base, &patches, unsafe_paths)?;
 
     // `--3way`: reconstruct the recorded pre-image, apply the patch to it to form
     // "theirs", and 3-way merge against the current state. Falls through to the
@@ -3713,31 +3762,12 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    // When `--index`/`--cached` is in effect, read the current index once: its
-    // entry modes feed the canonical index-mode decision (preserve an unchanged
-    // mode) and the type-mismatch warnings.
-    let mut index = if touch_index {
-        Some(read_apply_index(&git_dir, format)?)
-    } else {
-        None
-    };
-    let index_modes: HashMap<Vec<u8>, u32> = index
-        .as_ref()
-        .map(|index| {
-            index
-                .entries
-                .iter()
-                .filter(|entry| (entry.flags >> 12) & 0x3 == 0)
-                .map(|entry| (entry.path.to_vec(), entry.mode))
-                .collect()
-        })
-        .unwrap_or_default();
-
     // Phase 1: compute every result first (git applies a patch atomically).
     let mut actions = Vec::new();
     let apply_file_options = sley_diff_merge::ApplyFileOptions { unidiff_zero };
     for patch in &patches {
-        let base = read_patch_base(&worktree_root, patch)?;
+        let base =
+            read_patch_base(&worktree_base, patch, index.as_ref(), &db, verify_worktree_match)?;
         // Binary patches reconstruct the postimage from the recorded blob OIDs
         // (and the `GIT binary patch` payload), not from textual hunks.
         if patch.is_binary {
@@ -3752,7 +3782,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                     else {
                         return Err(GitError::InvalidFormat("patch missing target path".into()));
                     };
-                    let mode = apply_write_mode(&worktree_root, patch, &target)?;
+                    let mode = apply_write_mode(&worktree_base, patch, &target)?;
                     let index_mode =
                         apply_index_mode_and_warn(patch, &target, mode, &index_modes);
                     actions.push(ApplyAction::Write {
@@ -3792,7 +3822,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone()) else {
                 return Err(GitError::InvalidFormat("patch missing target path".into()));
             };
-            let mode = apply_write_mode(&worktree_root, patch, &target)?;
+            let mode = apply_write_mode(&worktree_base, patch, &target)?;
             let index_mode = apply_index_mode_and_warn(patch, &target, mode, &index_modes);
             actions.push(ApplyAction::Write {
                 path: target,
@@ -3823,7 +3853,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 content,
             } => {
                 if !cached {
-                    merge_write_worktree_file(&worktree_root, path, content, *mode)?;
+                    merge_write_worktree_file(&worktree_base, path, content, *mode)?;
                 }
                 if let Some(index) = index.as_mut() {
                     let oid = db.write_object(EncodedObject::new(ObjectType::Blob, content.clone()))?;
@@ -3832,7 +3862,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             }
             ApplyAction::Remove { path } => {
                 if !cached {
-                    merge_remove_worktree_file(&worktree_root, path)?;
+                    merge_remove_worktree_file(&worktree_base, path)?;
                 }
                 if let Some(index) = index.as_mut() {
                     index.entries.retain(|entry| entry.path.as_bytes() != path.as_slice());
@@ -4620,14 +4650,56 @@ impl ApplyAction {
 
 /// Read the worktree base content a patch applies against (empty for a new
 /// file). Shared by the whitespace pass and the apply pass.
-fn read_patch_base(worktree_root: &Path, patch: &sley_diff_merge::FilePatch) -> Result<Vec<u8>> {
+fn read_patch_base(
+    worktree_root: &Path,
+    patch: &sley_diff_merge::FilePatch,
+    index: Option<&Index>,
+    db: &FileObjectDatabase,
+    verify_worktree_match: bool,
+) -> Result<Vec<u8>> {
     if patch.is_new {
         return Ok(Vec::new());
     }
     let Some(old) = patch.old_path.as_deref().or(patch.new_path.as_deref()) else {
         return Ok(Vec::new());
     };
-    let rel = std::str::from_utf8(old)
+    // `--cached`/`--index`: git's `load_patch_target` reads the preimage from the
+    // index blob (`read_file_or_gitlink(ce)`), not the working tree — so a
+    // `--cached` apply against an index that differs from the worktree uses the
+    // staged content. `--index` (not `--cached`) additionally requires the
+    // worktree to match the index (`verify_index_match`), erroring otherwise.
+    if let Some(index) = index {
+        let entry = index
+            .entries
+            .iter()
+            .find(|entry| entry.path.as_bytes() == old && (entry.flags >> 12) & 0x3 == 0);
+        let Some(entry) = entry else {
+            eprintln!(
+                "error: {}: does not exist in index",
+                String::from_utf8_lossy(old)
+            );
+            return Err(GitError::Exit(1));
+        };
+        let blob = db.read_object(&entry.oid)?.body.clone();
+        if verify_worktree_match
+            && let Some(worktree) = read_worktree_blob_bytes(worktree_root, old)?
+            && worktree != blob
+        {
+            eprintln!(
+                "error: {}: does not match index",
+                String::from_utf8_lossy(old)
+            );
+            return Err(GitError::Exit(1));
+        }
+        return Ok(blob);
+    }
+    Ok(read_worktree_blob_bytes(worktree_root, old)?.unwrap_or_default())
+}
+
+/// Read the blob-form bytes of a worktree path (the symlink target for a
+/// symlink, the file bytes otherwise), or `None` when the path does not exist.
+fn read_worktree_blob_bytes(worktree_root: &Path, path: &[u8]) -> Result<Option<Vec<u8>>> {
+    let rel = std::str::from_utf8(path)
         .map_err(|_| GitError::InvalidFormat("non-utf8 patch path".into()))?;
     let full = worktree_root.join(rel);
     // A symlink's blob content is its target path, not the bytes it points at —
@@ -4637,11 +4709,11 @@ fn read_patch_base(worktree_root: &Path, patch: &sley_diff_merge::FilePatch) -> 
         {
             use std::os::unix::ffi::OsStringExt;
             return Ok(fs::read_link(&full)
-                .map(|target| target.into_os_string().into_vec())
-                .unwrap_or_default());
+                .ok()
+                .map(|target| target.into_os_string().into_vec()));
         }
     }
-    Ok(fs::read(full).unwrap_or_default())
+    Ok(fs::read(full).ok())
 }
 
 /// Outcome of applying a binary file patch.

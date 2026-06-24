@@ -2354,6 +2354,7 @@ fn apply_one_patch(
             p_value,
             p_value_known: true,
             root: Vec::new(),
+            prefix: Vec::new(),
         },
     )?;
     // `--directory=<dir>` (persisted in apply-opt) prepends <dir>/ to every path
