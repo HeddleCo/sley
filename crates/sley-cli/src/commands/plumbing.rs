@@ -3562,6 +3562,12 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     }
     let patches = patches;
 
+    // Path-safety: refuse to read/create/delete files that escape the working
+    // tree. git turns `--unsafe-paths` off whenever the index is touched
+    // (`--index`/`--cached`), so the gate only relaxes for pure worktree applies.
+    let unsafe_paths = unsafe_paths && !update_index;
+    check_apply_path_safety(&worktree_root, &patches, unsafe_paths)?;
+
     // Phase 1: compute every result first (git applies a patch atomically).
     let mut actions = Vec::new();
     for patch in &patches {
@@ -3705,6 +3711,92 @@ fn normalize_directory_path(arg: &[u8]) -> Option<Vec<u8>> {
         out.extend_from_slice(c);
     }
     Some(out)
+}
+
+/// Refuse paths that escape the working tree, mirroring git's
+/// `check_unsafe_path` (`verify_path`) and `path_is_beyond_symlink`. Runs before
+/// any write so the apply stays atomic.
+fn check_apply_path_safety(
+    worktree_root: &Path,
+    patches: &[sley_diff_merge::FilePatch],
+    unsafe_paths: bool,
+) -> Result<()> {
+    // verify_path: a `..` or absolute component is never written, unless the
+    // user opted into `--unsafe-paths` for a pure worktree apply.
+    if !unsafe_paths {
+        for patch in patches {
+            let old = if patch.is_delete || (!patch.is_new && !patch.is_copy) {
+                patch.old_path.as_deref()
+            } else {
+                None
+            };
+            let new = if patch.is_delete {
+                None
+            } else {
+                patch.new_path.as_deref()
+            };
+            for name in [old, new].into_iter().flatten() {
+                if !apply_path_is_valid(name) {
+                    eprintln!("error: invalid path '{}'", String::from_utf8_lossy(name));
+                    return Err(GitError::Exit(1));
+                }
+            }
+        }
+    }
+
+    // path_is_beyond_symlink: a symlink created (or already present) must not be
+    // an ancestor directory of any other affected file (e.g. `tmp -> ..` then
+    // `tmp/foo`).
+    let created_symlinks: Vec<&[u8]> = patches
+        .iter()
+        .filter(|p| !p.is_delete && p.new_mode == Some(0o120000))
+        .filter_map(|p| p.new_path.as_deref())
+        .collect();
+    for patch in patches {
+        if patch.is_delete {
+            continue;
+        }
+        let Some(name) = patch.new_path.as_deref().or(patch.old_path.as_deref()) else {
+            continue;
+        };
+        for (i, &b) in name.iter().enumerate() {
+            if b != b'/' {
+                continue;
+            }
+            let ancestor = &name[..i];
+            if created_symlinks.iter().any(|s| *s == ancestor)
+                || worktree_component_is_symlink(worktree_root, ancestor)
+            {
+                eprintln!(
+                    "error: affected file '{}' is beyond a symbolic link",
+                    String::from_utf8_lossy(name)
+                );
+                return Err(GitError::Exit(1));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// git's `verify_path` essentials: reject empty, absolute, or `..`-containing
+/// paths.
+fn apply_path_is_valid(name: &[u8]) -> bool {
+    if name.is_empty() || name[0] == b'/' {
+        return false;
+    }
+    name.split(|&b| b == b'/').all(|comp| comp != b"..")
+}
+
+fn worktree_component_is_symlink(worktree_root: &Path, component: &[u8]) -> bool {
+    let Ok(rel) = std::str::from_utf8(component) else {
+        return false;
+    };
+    if rel.is_empty() {
+        return false;
+    }
+    std::fs::symlink_metadata(worktree_root.join(rel))
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 fn write_apply_fake_ancestor_index(
