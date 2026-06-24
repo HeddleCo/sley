@@ -1077,10 +1077,94 @@ fn emit_region(
                 // Both sides made the same change: no conflict.
                 writer.emit_lines(our_region);
             } else {
-                writer.emit_conflict(our_region, base_region, their_region);
+                writer.emit_conflict_refined(our_region, base_region, their_region);
             }
         }
     }
+}
+
+/// One unit produced by zealous conflict refinement: either context lines shared
+/// by both sides (emitted verbatim) or a minimal conflict spanning the named
+/// ours/theirs line ranges.
+enum RefineItem {
+    Context(std::ops::Range<usize>),
+    Conflict(std::ops::Range<usize>, std::ops::Range<usize>),
+}
+
+/// git's `xdl_refine_conflicts` + `xdl_simplify_non_conflicts` (level
+/// `XDL_MERGE_ZEALOUS`): re-diff the two conflicting sides against each other,
+/// factor the lines they share out of the conflict as context, and split the
+/// remainder into the minimal set of conflicting hunks — then re-merge any two
+/// conflicts separated by 3 or fewer context lines (the smaller-output rule).
+///
+/// Ranges index into `ours`/`theirs`; `Context` ranges are in ours coordinates
+/// (the shared lines are identical on both sides).
+fn refine_conflict_items(ours: &[DiffLine<'_>], theirs: &[DiffLine<'_>]) -> Vec<RefineItem> {
+    // Coalesce the ours-vs-theirs diff into alternating context (equal) and
+    // conflict (changed) runs.
+    let ops = myers_diff_lines(ours, theirs);
+    let mut raw: Vec<RefineItem> = Vec::new();
+    let mut oi = 0usize;
+    let mut ti = 0usize;
+    let mut pending: Option<(usize, usize, usize, usize)> = None; // o0,o1,t0,t1
+    for op in ops {
+        match op {
+            DiffOp::Equal(n) => {
+                if let Some((o0, o1, t0, t1)) = pending.take() {
+                    raw.push(RefineItem::Conflict(o0..o1, t0..t1));
+                }
+                raw.push(RefineItem::Context(oi..oi + n));
+                oi += n;
+                ti += n;
+            }
+            DiffOp::Delete(n) => {
+                let entry = pending.get_or_insert((oi, oi, ti, ti));
+                entry.1 = oi + n;
+                oi += n;
+            }
+            DiffOp::Insert(n) => {
+                let entry = pending.get_or_insert((oi, oi, ti, ti));
+                entry.3 = ti + n;
+                ti += n;
+            }
+        }
+    }
+    if let Some((o0, o1, t0, t1)) = pending.take() {
+        raw.push(RefineItem::Conflict(o0..o1, t0..t1));
+    }
+
+    // Merge two conflicts when the context between them is <= 3 lines: the
+    // absorbed context lines are identical on both sides, so they fold into the
+    // combined conflict's ours and theirs ranges alike.
+    let mut out: Vec<RefineItem> = Vec::new();
+    let mut idx = 0usize;
+    while idx < raw.len() {
+        match &raw[idx] {
+            RefineItem::Context(range) => {
+                let small = range.len() <= 3;
+                let prev_conflict = matches!(out.last(), Some(RefineItem::Conflict(..)));
+                let next_conflict = matches!(raw.get(idx + 1), Some(RefineItem::Conflict(..)));
+                if small && prev_conflict && next_conflict {
+                    let Some(RefineItem::Conflict(po, pt)) = out.pop() else {
+                        unreachable!()
+                    };
+                    let RefineItem::Conflict(no, nt) = &raw[idx + 1] else {
+                        unreachable!()
+                    };
+                    out.push(RefineItem::Conflict(po.start..no.end, pt.start..nt.end));
+                    idx += 2;
+                } else {
+                    out.push(RefineItem::Context(range.clone()));
+                    idx += 1;
+                }
+            }
+            RefineItem::Conflict(o, t) => {
+                out.push(RefineItem::Conflict(o.clone(), t.clone()));
+                idx += 1;
+            }
+        }
+    }
+    out
 }
 
 /// A matched (equal) region between `base` and one side: `base_start..+len`
@@ -1222,6 +1306,34 @@ impl<'a> MergeWriter<'a> {
         self.emit_section(theirs);
         self.ensure_newline();
         self.write_marker(b'>', self.options.theirs_label);
+    }
+
+    /// Emit a conflict with git's zealous refinement applied. The default
+    /// (non-diff3) merge re-diffs the two sides to shrink the conflict to the
+    /// lines that genuinely differ (`xdl_refine_conflicts`); diff3-style output
+    /// keeps the conflict whole (the base section straddles it), a favored merge
+    /// resolves at a coarser granularity, and an empty side cannot be refined —
+    /// all three fall back to a single unrefined conflict hunk.
+    fn emit_conflict_refined(
+        &mut self,
+        ours: &[DiffLine<'_>],
+        base: &[DiffLine<'_>],
+        theirs: &[DiffLine<'_>],
+    ) {
+        if self.options.style == ConflictStyle::Diff3
+            || self.options.favor != MergeFavor::None
+            || ours.is_empty()
+            || theirs.is_empty()
+        {
+            self.emit_conflict(ours, base, theirs);
+            return;
+        }
+        for item in refine_conflict_items(ours, theirs) {
+            match item {
+                RefineItem::Context(range) => self.emit_lines(&ours[range]),
+                RefineItem::Conflict(o, t) => self.emit_conflict(&ours[o], &[], &theirs[t]),
+            }
+        }
     }
 
     /// Emit one side's lines inside a conflict, preserving their exact bytes.
