@@ -3372,6 +3372,9 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let mut recount = false;
     let mut update_index = false;
     let mut cached = false;
+    let mut three_way = false;
+    let mut merge_favor = sley_diff_merge::MergeFavor::None;
+    let mut union = false;
     let mut intent_to_add = false;
     let mut build_fake_ancestor: Option<String> = None;
     let mut files = Vec::new();
@@ -3427,11 +3430,11 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 };
                 build_fake_ancestor = Some(path.to_string());
             }
-            "-3" | "--3way" => {
-                return Err(GitError::Unsupported(format!(
-                    "apply {arg} is not supported yet"
-                )));
-            }
+            "-3" | "--3way" => three_way = true,
+            "--no-3way" => three_way = false,
+            "--ours" => merge_favor = sley_diff_merge::MergeFavor::Ours,
+            "--theirs" => merge_favor = sley_diff_merge::MergeFavor::Theirs,
+            "--union" => union = true,
             "--whitespace" => {
                 if let Some(value) = iter.next() {
                     ws_action = parse_ws_action(value)?;
@@ -3690,6 +3693,25 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let touch_index = update_index || cached;
     let unsafe_paths = unsafe_paths && !touch_index;
     check_apply_path_safety(&worktree_root, &patches, unsafe_paths)?;
+
+    // `--3way`: reconstruct the recorded pre-image, apply the patch to it to form
+    // "theirs", and 3-way merge against the current state. Falls through to the
+    // direct apply below when the pre-image blobs are not available.
+    if three_way
+        && apply_three_way_path(
+            &git_dir,
+            &worktree_root,
+            format,
+            &db,
+            &patches,
+            cached,
+            check,
+            merge_favor,
+            union,
+        )?
+    {
+        return Ok(());
+    }
 
     // When `--index`/`--cached` is in effect, read the current index once: its
     // entry modes feed the canonical index-mode decision (preserve an unchanged
@@ -4689,6 +4711,277 @@ fn apply_binary_outcome(
         return Err(GitError::Exit(1));
     }
     Ok(BinaryApply::Content(post))
+}
+
+/// `git apply --3way`: reconstruct the recorded pre-image of every patch, apply
+/// the patch to it to form "theirs", and 3-way merge against the current index
+/// ("ours"). Returns `Ok(true)` when the 3-way path handled the apply, `Ok(false)`
+/// when a pre-image blob was unavailable (the caller falls back to direct apply).
+#[allow(clippy::too_many_arguments)]
+fn apply_three_way_path(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    patches: &[sley_diff_merge::FilePatch],
+    cached: bool,
+    check: bool,
+    favor: sley_diff_merge::MergeFavor,
+    _union: bool,
+) -> Result<bool> {
+    // `merge.conflictStyle` selects the diff3 marker layout.
+    let config = read_repo_config(git_dir)?;
+    let style = match config.get("merge", None, "conflictstyle") {
+        Some("diff3") | Some("zdiff3") => sley_diff_merge::ConflictStyle::Diff3,
+        _ => sley_diff_merge::ConflictStyle::Merge,
+    };
+
+    // A path touched by more than one patch (e.g. a delete followed by a re-add)
+    // needs git's sequential per-patch semantics, not a single batched 3-way
+    // merge; fall back to the direct apply, which materialises them in order.
+    let mut seen_paths = std::collections::HashSet::new();
+    for patch in patches {
+        if let Some(path) = patch.new_path.as_ref().or(patch.old_path.as_ref())
+            && !seen_paths.insert(path.clone())
+        {
+            return Ok(false);
+        }
+    }
+
+    // "ours" = the current index (stage 0 entries).
+    let index = read_apply_index(git_dir, format)?;
+    let mut ours_map: commands::merge_rebase::MergeTreeMap = std::collections::BTreeMap::new();
+    for entry in &index.entries {
+        if (entry.flags >> 12) & 0x3 == 0 {
+            ours_map.insert(entry.path.to_vec(), (entry.mode, entry.oid));
+        }
+    }
+
+    // git's `load_preimage` reads the worktree and aborts the whole 3-way when a
+    // touched file does not match its index entry (a dirty work tree), leaving
+    // everything untouched. Skipped for `--cached`, whose "ours" is the index.
+    if !cached {
+        for patch in patches {
+            let Some(path) = patch.old_path.as_ref().or(patch.new_path.as_ref()) else {
+                continue;
+            };
+            // Covers both a modify (load_preimage) and an add/add (load_current):
+            // the worktree file must match its index entry, else abort untouched.
+            if let Some((_, index_oid)) = ours_map.get(path)
+                && let Ok(rel) = std::str::from_utf8(path)
+            {
+                let content = fs::read(worktree_root.join(rel)).unwrap_or_default();
+                let worktree_oid = sley_core::object_id_for_bytes(format, "blob", &content)?;
+                if &worktree_oid != index_oid {
+                    eprintln!(
+                        "error: {}: does not match index",
+                        String::from_utf8_lossy(path)
+                    );
+                    return Err(GitError::Exit(1));
+                }
+            }
+        }
+    }
+
+    let mut base_map = ours_map.clone();
+    let mut theirs_map = ours_map.clone();
+    for patch in patches {
+        let Some(path) = patch.new_path.clone().or_else(|| patch.old_path.clone()) else {
+            return Ok(false);
+        };
+        let old_path = patch.old_path.clone().unwrap_or_else(|| path.clone());
+        let inherited = ours_map
+            .get(&old_path)
+            .or_else(|| ours_map.get(&path))
+            .map(|(mode, _)| *mode)
+            .unwrap_or(0o100644);
+
+        // Reconstruct the pre-image the patch was prepared against.
+        let base_bytes = if patch.is_new {
+            Vec::new()
+        } else if let Some(bytes) = apply_resolve_preimage_blob(git_dir, format, db, patch)? {
+            bytes
+        } else {
+            // Pre-image blob unavailable — fall back to direct application.
+            return Ok(false);
+        };
+
+        // Apply the patch to the pre-image to get "theirs".
+        let post = if patch.is_binary {
+            match apply_binary_outcome(db, format, patch, &base_bytes)? {
+                BinaryApply::Content(content) => Some(content),
+                BinaryApply::Deletion => None,
+            }
+        } else if patch.is_delete {
+            None
+        } else {
+            match sley_diff_merge::apply_file_patch(&base_bytes, patch) {
+                sley_diff_merge::ApplyOutcome::Applied(content) => Some(content),
+                sley_diff_merge::ApplyOutcome::Rejected => return Ok(false),
+            }
+        };
+
+        let base_mode = canon_mode(patch.old_mode.unwrap_or(inherited));
+        let new_mode = canon_mode(patch.new_mode.or(patch.old_mode).unwrap_or(inherited));
+
+        if patch.is_new {
+            base_map.remove(&path);
+        } else {
+            let base_oid = db.write_object(EncodedObject::new(ObjectType::Blob, base_bytes))?;
+            base_map.insert(old_path.clone(), (base_mode, base_oid));
+        }
+        match post {
+            None => {
+                theirs_map.remove(&path);
+            }
+            Some(content) => {
+                let post_oid = db.write_object(EncodedObject::new(ObjectType::Blob, content))?;
+                theirs_map.insert(path.clone(), (new_mode, post_oid));
+                if patch.is_rename {
+                    theirs_map.remove(&old_path);
+                }
+            }
+        }
+    }
+
+    let (results, conflicts, _info) = commands::merge_rebase::three_way_merge_trees_inner_with_info(
+        db,
+        format,
+        &base_map,
+        &ours_map,
+        &theirs_map,
+        "ours",
+        "theirs",
+        "merged common ancestors",
+        favor,
+        style,
+    )?;
+
+    if !check {
+        apply_write_three_way(git_dir, worktree_root, format, db, &ours_map, &results, cached)?;
+    }
+
+    if conflicts.is_empty() {
+        Ok(true)
+    } else {
+        // git's fall_back_threeway runs rerere on the conflicted result: it
+        // records the preimage and replays any previously-recorded resolution
+        // into the worktree. A no-op unless rerere.enabled.
+        if !check && !cached {
+            commands::rerere::repo_rerere(git_dir, format, None)?;
+        }
+        // git exits non-zero, leaving conflict markers + a conflicted index.
+        Err(GitError::Exit(1))
+    }
+}
+
+/// Resolve a patch's pre-image blob via its `index <old>..<new>` OID, returning
+/// `None` when the OID cannot be resolved or the object is absent.
+fn apply_resolve_preimage_blob(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    patch: &sley_diff_merge::FilePatch,
+) -> Result<Option<Vec<u8>>> {
+    let Some(hex) = patch.old_oid_hex.as_ref() else {
+        return Ok(None);
+    };
+    let Ok(hex) = std::str::from_utf8(hex) else {
+        return Ok(None);
+    };
+    if hex.bytes().all(|b| b == b'0') {
+        return Ok(None);
+    }
+    let oid = if hex.len() == format.hex_len() {
+        ObjectId::from_hex(format, hex)?
+    } else {
+        match sley_rev::resolve_short_object_id(
+            git_dir,
+            format,
+            hex,
+            sley_rev::ObjectDisambiguation::Blob,
+        )? {
+            sley_rev::ShortObjectIdResolution::Unique(oid) => oid,
+            _ => return Ok(None),
+        }
+    };
+    if !db.contains(&oid)? {
+        return Ok(None);
+    }
+    Ok(Some(db.read_object(&oid)?.body.clone()))
+}
+
+/// Write the 3-way merge result: a conflicted index (stages 1/2/3) for conflicts,
+/// stage-0 entries otherwise, plus the worktree (unless `--cached`).
+fn apply_write_three_way(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    ours_map: &commands::merge_rebase::MergeTreeMap,
+    results: &std::collections::BTreeMap<Vec<u8>, commands::merge_rebase::MergePathResult>,
+    cached: bool,
+) -> Result<()> {
+    use commands::merge_rebase::{MergePathResult, merge_index_entry};
+    let mut entries = Vec::new();
+    for (path, result) in results {
+        match result {
+            MergePathResult::Resolved(Some((mode, oid))) => {
+                entries.push(merge_index_entry(path, *mode, *oid, 0));
+            }
+            MergePathResult::Resolved(None) => {}
+            MergePathResult::Conflict {
+                base, ours, theirs, ..
+            } => {
+                if let Some((mode, oid)) = base {
+                    entries.push(merge_index_entry(path, *mode, *oid, 1));
+                }
+                if let Some((mode, oid)) = ours {
+                    entries.push(merge_index_entry(path, *mode, *oid, 2));
+                }
+                if let Some((mode, oid)) = theirs {
+                    entries.push(merge_index_entry(path, *mode, *oid, 3));
+                }
+            }
+        }
+    }
+    entries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| (left.flags >> 12).cmp(&(right.flags >> 12)))
+    });
+    let new_index = Index {
+        version: 2,
+        entries,
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    fs::write(
+        sley_worktree::repository_index_path(git_dir),
+        new_index.write(format)?,
+    )?;
+
+    if cached {
+        return Ok(());
+    }
+    for (path, result) in results {
+        match result {
+            MergePathResult::Resolved(Some((mode, oid))) => {
+                if ours_map.get(path) != Some(&(*mode, *oid)) {
+                    let content = commands::merge_rebase::merge_read_blob(db, oid)?;
+                    merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+                }
+            }
+            MergePathResult::Resolved(None) => merge_remove_worktree_file(worktree_root, path)?,
+            MergePathResult::Conflict { worktree, .. } => match worktree {
+                Some((mode, content)) => {
+                    merge_write_worktree_file(worktree_root, path, content, *mode)?;
+                }
+                None => merge_remove_worktree_file(worktree_root, path)?,
+            },
+        }
+    }
+    Ok(())
 }
 
 /// Inflate a single zlib stream, expecting exactly `expected_len` bytes out.

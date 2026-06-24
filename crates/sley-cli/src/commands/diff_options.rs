@@ -755,6 +755,12 @@ fn diff_option_specs() -> &'static [OptionSpec<'static>] {
         ),
         opt_bool(
             None,
+            Some("binary"),
+            OptFlags::NONE,
+            "output a binary diff that can be applied",
+        ),
+        opt_bool(
+            None,
             Some("no-prefix"),
             OptFlags::NONEG,
             "do not show source or destination prefix",

@@ -3137,6 +3137,15 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         virtual_ancestor_entry_map(&write_db, format, &bases, &common_git_dir)?
     };
 
+    // `merge.conflictStyle`: diff3/zdiff3 add the `|||||||` common-ancestor
+    // section to conflict markers (git honours this for `git merge`).
+    let conflict_style = effective_config_with_overrides()
+        .and_then(|config| config.get("merge", None, "conflictstyle").map(str::to_string))
+        .map(|value| match value.as_str() {
+            "diff3" | "zdiff3" => sley_diff_merge::ConflictStyle::Diff3,
+            _ => sley_diff_merge::ConflictStyle::Merge,
+        })
+        .unwrap_or(sley_diff_merge::ConflictStyle::Merge);
     let (results, conflicts, info_messages) = three_way_merge_trees_inner_with_info(
         &write_db,
         format,
@@ -3147,7 +3156,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         &theirs_label,
         "merged common ancestors",
         options.favor,
-        sley_diff_merge::ConflictStyle::Merge,
+        conflict_style,
     )?;
 
     // git's pre-merge `verify_uptodate` (unpack-trees): a real 3-way merge
