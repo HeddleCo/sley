@@ -391,6 +391,21 @@ pub fn submodule_dirt(sub_root: &Path) -> u8 {
     dirt
 }
 
+/// As [`submodule_dirt`], but fail the way git does when the gitlink is
+/// *populated yet broken* — a `.git` file whose `gitdir:` pointer is gone (the
+/// submodule's git directory was moved/deleted). git's `status` / `diff-index`
+/// die with "fatal: not a git repository: …" in this case; an unpopulated
+/// gitlink (no `.git` at all) stays clean. Used on the status paths so
+/// `git status` and `git describe --dirty` surface the breakage (and
+/// `--broken` can tolerate it).
+pub fn submodule_dirt_checked(sub_root: &Path) -> Result<u8> {
+    if let Some(target) = sley_diff_merge::gitlink_broken_gitdir(sub_root) {
+        eprintln!("fatal: not a git repository: {}", target.display());
+        return Err(GitError::Exit(128));
+    }
+    Ok(submodule_dirt(sub_root))
+}
+
 fn embedded_repo_object_format(sub_root: &Path) -> Option<ObjectFormat> {
     let git_dir = sley_diff_merge::gitlink_git_dir(sub_root)?;
     sley_config::read_repo_config(&git_dir, None)
@@ -7370,7 +7385,7 @@ fn tracked_only_submodule_status(
     }
     let absolute = worktree_root.join(repo_path_to_os_path(path)?);
     let dirt = if absolute.is_dir() {
-        submodule_dirt(&absolute)
+        submodule_dirt_checked(&absolute)?
     } else {
         0
     };
@@ -19126,7 +19141,7 @@ fn collect_worktree_entries(
                 context.mark_tracked_present(&git_path);
                 let oid = sley_diff_merge::gitlink_head_oid(&path, context.format)
                     .unwrap_or(index_entry.oid);
-                let dirt = submodule_dirt(&path);
+                let dirt = submodule_dirt_checked(&path)?;
                 if dirt != 0 {
                     context.submodule_dirt.insert(git_path.clone(), dirt);
                 }

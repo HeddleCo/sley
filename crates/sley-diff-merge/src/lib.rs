@@ -58,6 +58,37 @@ pub fn gitlink_git_dir(sub_root: &Path) -> Option<PathBuf> {
     }
 }
 
+/// When `sub_root` holds a *broken* gitlink — a `.git` file whose `gitdir:`
+/// pointer names a directory that no longer exists (e.g. the submodule's git
+/// directory was moved out of `.git/modules/`) — return that unresolved gitdir
+/// path. git's status / diff-index fail fatally ("not a git repository: …")
+/// here. Returns `None` for a valid gitlink (a `.git` directory, or a `.git`
+/// file with a live gitdir) and for an *unpopulated* gitlink (no `.git` entry at
+/// all), both of which git treats as non-fatal (the latter as unchanged).
+pub fn gitlink_broken_gitdir(sub_root: &Path) -> Option<PathBuf> {
+    let dot_git = sub_root.join(".git");
+    let metadata = fs::symlink_metadata(&dot_git).ok()?;
+    if !metadata.is_file() {
+        // No `.git` (unpopulated) or a real `.git` directory — not broken.
+        return None;
+    }
+    let contents = fs::read_to_string(&dot_git).ok()?;
+    let target = contents.strip_prefix("gitdir:")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let target_path = if Path::new(target).is_absolute() {
+        PathBuf::from(target)
+    } else {
+        sub_root.join(target)
+    };
+    if target_path.is_dir() {
+        None
+    } else {
+        Some(target_path)
+    }
+}
+
 /// Resolve the commit checked out in the embedded repository at `sub_root`
 /// (the value a gitlink entry for that path records): its git directory's
 /// HEAD, followed through symbolic refs. `None` when `sub_root` is not a
