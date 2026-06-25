@@ -460,7 +460,7 @@ declare -A FLOOR=(
     # remapping for rename/delete. t6423 34->41 (raw 41/82, 2 known breakages).
     # Side gains banked: t6402 34->35, t6422 NEW@6.
     [t6423-merge-rename-directories.sh]=69
-    [t6422-merge-rename-corner-cases.sh]=6
+    [t6422-merge-rename-corner-cases.sh]=13
     [t3501-revert-cherry-pick.sh]=21
     [t3502-cherry-pick-merge.sh]=12
     [t3505-cherry-pick-empty.sh]=17
@@ -590,9 +590,9 @@ declare -A FLOOR=(
     # output + -L /regex/ ranges + -b/--first-parent/^rev/abbrev parity): NEW floors.
     # t8002 54->117, t8001 44->99, t8012 44->98. Residual: :funcname ranges,
     # --contents working-tree overlay, --progress, --color-lines/--color-by-age.
-    [t8002-blame.sh]=128
-    [t8001-annotate.sh]=110
-    [t8012-blame-colors.sh]=109
+    [t8002-blame.sh]=135
+    [t8001-annotate.sh]=117
+    [t8012-blame-colors.sh]=119
     # t3903-stash FLAKY: cell #46 "stash symlink to file (stage rm)" oscillates 82/83
     # (symlink<->file type-change race, independent of any wave — flips on a pristine
     # origin/main binary). Floor lowered 83->82 (safe lower bound) — banking 83 from a
@@ -864,7 +864,7 @@ declare -A FLOOR=(
     # t6200=37) — the attrs<->sparse sley-worktree/lib.rs auto-merge is behaviorally safe.
     [t7512-status-help.sh]=36
     [t7509-commit-authorship.sh]=12
-    [t0003-attributes.sh]=51
+    [t0003-attributes.sh]=55
     # statusreg fix (2026-06-19, fix 7c64536d onto 928204fc): NOT a stale floor — a REAL
     # regression. A bisect proved t7508=114/t7502=75 were hermetically real (held through
     # parent f1e672fa); commit d3f746e6 "Improve commit porcelain parity" dropped t7508 114->49
@@ -877,8 +877,8 @@ declare -A FLOOR=(
     # 52->77 (75->77), blast-radius t7506-status-submodule 28->34. t7060/t7064 newly floored.
     # All cross-guards held. LESSON: commit-porcelain slices MUST floor-guard t7508 (commit
     # --status renders the status template) — this regression was masked because they weren't.
-    [t7064-wtstatus-pv2.sh]=21
-    [t7060-wtstatus.sh]=7
+    [t7064-wtstatus-pv2.sh]=27
+    [t7060-wtstatus.sh]=12
     # wave-20 (2026-06-19, integ/wave20 onto ae0cfe8f): sweep-picked weak-bucket assault, 4
     # disjoint slices (zero merge conflicts). submodule recursion in worktree commands —
     # t2013-checkout-submodule 28->51, t7112-reset-submodule 37->54, t1013-read-tree-submodule
@@ -1069,6 +1069,21 @@ declare -A FLOOR=(
     [t4114-apply-typechange.sh]=12
     [t4129-apply-samemode.sh]=22
     [t4111-apply-subdir.sh]=10
+    [t8013-blame-ignore-revs.sh]=19
+    [t8011-blame-split-file.sh]=10
+    [t8014-blame-ignore-fuzzy.sh]=15
+    [t8008-blame-formats.sh]=5
+    [t8006-blame-textconv.sh]=16
+    [t8007-cat-file-textconv.sh]=15
+    [t8010-cat-file-filters.sh]=9
+    [t8004-blame-with-conflicts.sh]=3
+    [t8015-blame-diff-algorithm.sh]=3
+    [t0028-working-tree-encoding.sh]=13
+    [t0022-crlf-rename.sh]=2
+    [t6434-merge-recursive-rename-options.sh]=27
+    [t6412-merge-large-rename.sh]=9
+    [t7525-status-rename.sh]=15
+
 )
 
 fail=0
