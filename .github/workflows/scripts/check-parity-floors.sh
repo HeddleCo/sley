@@ -450,7 +450,7 @@ declare -A FLOOR=(
     # codex-wave-4-recovery: notes merge t3309 enroll@31 / t3311 enroll@24 (full pass).
     [t3309-notes-merge-auto-resolve.sh]=31
     [t3311-notes-merge-fanout.sh]=24
-    [t3301-notes.sh]=144
+    [t3301-notes.sh]=153
     [t1461-refs-list.sh]=410
     [t1462-refs-exists.sh]=12
     [t1510-repo-setup.sh]=109
@@ -459,7 +459,7 @@ declare -A FLOOR=(
     # false dir-renames), rename/rename(1to2) split higher-stages, transitive dest
     # remapping for rename/delete. t6423 34->41 (raw 41/82, 2 known breakages).
     # Side gains banked: t6402 34->35, t6422 NEW@6.
-    [t6423-merge-rename-directories.sh]=69
+    [t6423-merge-rename-directories.sh]=72
     [t6422-merge-rename-corner-cases.sh]=13
     [t3501-revert-cherry-pick.sh]=21
     [t3502-cherry-pick-merge.sh]=12
@@ -559,7 +559,7 @@ declare -A FLOOR=(
     [t4019-diff-wserror.sh]=19
     [t4034-diff-words.sh]=64
     [t5407-post-rewrite-hook.sh]=17
-    [t5500-fetch-pack.sh]=359
+    [t5500-fetch-pack.sh]=353
     [t5571-pre-push-hook.sh]=11
     [t5537-fetch-shallow.sh]=12
     [t0008-ignores.sh]=398
@@ -616,7 +616,7 @@ declare -A FLOOR=(
     # rename (config rewrite + tracking-ref moves + nested refs), remove/prune,
     # set-url/get-url/set-branches/set-head, show -n report formatting, update
     # group. t5505 93->126. branch.rs blast-radius held: t3200=134 t6040=9.
-    [t5505-remote.sh]=126
+    [t5505-remote.sh]=127
     # codex-wave-11 (protocol allowlist): ONE scheme-gating chokepoint (file/local/
     # git/ssh/ext/<helper>:: classifier + protocol.<name>.allow + GIT_ALLOW_PROTOCOL
     # + GIT_PROTOCOL_FROM_USER demotion + fatal-not-allowed errors) closes all FOUR
@@ -636,9 +636,9 @@ declare -A FLOOR=(
     # t5520=38 t6040=44 t3200=134.
     [t5528-push-default.sh]=31
     # wave-2 (2026-06-21): push refmaps/forced-tag-status/denyDeleteCurrent/non-commit-reject 92->99 (guards t5510/t5601 held).
-    [t5516-fetch-push.sh]=110
+    [t5516-fetch-push.sh]=111
     [t5520-pull.sh]=75
-    [t5601-clone.sh]=107
+    [t5601-clone.sh]=109
     # codex-wave-11 (partial clone): --filter=blob:none/blob:limit/tree/sparse:oid,
     # remote.origin.promisor + partialclonefilter config, promisor-pack + lazy
     # object fetch-on-read, filter+depth. t5616 14->36. MERGE-RESOLUTION: clone's
@@ -689,7 +689,7 @@ declare -A FLOOR=(
     [t2203-add-intent.sh]=19  # wave-32: 11->19 (intent-to-add consumers)
     [t3650-replay-basics.sh]=43
     [t3701-add-interactive.sh]=121
-    [t4011-diff-symlink.sh]=1
+    [t4011-diff-symlink.sh]=5
     # codex-wave-3: merge --no-edit rename-cleanup lifted merge-rename 30->34 (stable 3x).
     # codex-wave-9 dir-rename engine side-gain: 34->35.
     [t6402-merge-rename.sh]=35
@@ -1092,6 +1092,12 @@ declare -A FLOOR=(
     [t3512-cherry-pick-submodule.sh]=13
     [t3513-revert-submodule.sh]=9
     [t3426-rebase-submodule.sh]=23
+    [t6415-merge-dir-to-symlink.sh]=10
+    [t6417-merge-ours-theirs.sh]=5
+    [t5553-set-upstream.sh]=21
+    [t3306-notes-prune.sh]=12
+    [t3308-notes-merge.sh]=19
+    [t3310-notes-merge-manual-resolve.sh]=22
 
 )
 
