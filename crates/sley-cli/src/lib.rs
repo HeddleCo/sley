@@ -188,6 +188,15 @@ fn dispatch_with_aliases(
         let Some(command) = args.first().cloned() else {
             return dispatch_command(&args, global_config);
         };
+        // git's main-level dashed options/pseudo-commands (`--version`,
+        // `--list-cmds=...`, `--exec-path`, ...) are handled by `handle_options`
+        // before the `run_argv` alias loop; they are never alias or external
+        // command names (alias keys cannot start with `-`). Dispatch them
+        // directly so they reach `dispatch_command`'s option arms instead of
+        // being misdiagnosed as an unknown external command.
+        if command.starts_with('-') {
+            return dispatch_command(&args, global_config);
+        }
         // A name is alias-expandable when it is not a built-in, or it is a
         // *deprecated* built-in (which an alias is allowed to override).
         let try_alias = !commands::alias::is_builtin_command(&command)
