@@ -1280,7 +1280,16 @@ fn stage_submodule_paths(
     path: &str,
     oid: ObjectId,
 ) -> Result<()> {
-    super::plumbing::cmd_add(&[worktree_root.join(".gitmodules").display().to_string()])?;
+    // git's `configure_added_submodule` stages `.gitmodules` with
+    // `git add --force -- .gitmodules` unconditionally, so a repository that
+    // gitignores `.gitmodules` (or the whole submodule path under `--force`)
+    // still registers the new submodule rather than tripping the ignored-file
+    // guard. Mirror that force exactly.
+    super::plumbing::cmd_add(&[
+        "--force".to_string(),
+        "--".to_string(),
+        worktree_root.join(".gitmodules").display().to_string(),
+    ])?;
     sley_worktree::update_index_cacheinfo(
         git_dir,
         format,

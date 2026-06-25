@@ -244,6 +244,7 @@ pub(crate) fn has_command_specific_help(command: &str) -> bool {
             | "patch-id"
             | "shortlog"
             | "show-branch"
+            | "submodule"
             | "verify-commit"
             | "verify-tag"
     )
