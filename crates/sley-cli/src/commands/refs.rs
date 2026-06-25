@@ -1629,8 +1629,29 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
                 );
                 return Err(GitError::Exit(1));
             }
+            // A name whose stored content does not parse as a ref (an arbitrary
+            // file such as `.git/my-private-file`) is not a symref we can follow;
+            // git resolves the chain leniently and then validates the final name,
+            // so fall through to the safety gate below rather than surfacing the
+            // raw parse error.
+            Err(GitError::InvalidFormat(_)) => EffectiveRefName {
+                requested: positional[0].clone(),
+                effective: positional[0].clone(),
+            },
             Err(err) => return Err(err),
         };
+        // git's delete-time gate (`transaction_refname_valid`, null new-oid):
+        // the effective ref name must be `refname_is_safe` — under refs/ or an
+        // uppercase/underscore pseudo-ref. A one-level name like
+        // `my-private-file` is creatable but NOT deletable, and `update-ref -d`
+        // must not be a way to unlink loose files in `.git`.
+        if !sley_refs::refname_is_safe(&effective.effective) {
+            eprintln!(
+                "error: refusing to update ref with bad name '{}'",
+                effective.effective
+            );
+            return Err(GitError::Exit(1));
+        }
         if deref
             && effective.requested == effective.effective
             && matches!(

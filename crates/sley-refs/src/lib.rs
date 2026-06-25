@@ -5202,6 +5202,39 @@ pub fn validate_ref_name_for_update(name: &str) -> Result<()> {
     check_refname_format(name, true)
 }
 
+/// git's `refname_is_safe` (refs.c): the gate applied when *deleting* a ref
+/// (`transaction_refname_valid` with a null new-oid). It is stricter than the
+/// create-time `check_refname_format(_, REFNAME_ALLOW_ONELEVEL)`:
+///   - a name under `refs/` is safe when the remainder is non-empty, has no
+///     leading/trailing `/`, and does not escape `refs/` (`..`, absolute,
+///     backslash component);
+///   - any other (one-level) name is safe only when every byte is an uppercase
+///     ASCII letter or `_` — the pseudo-ref shape (`HEAD`, `ORIG_HEAD`).
+///
+/// So a one-level name like `my-private-file` is *creatable* (`update-ref
+/// my-private-file <oid>`) yet refused for deletion (`update-ref -d
+/// my-private-file` → "refusing to update ref with bad name"), which is what
+/// keeps `update-ref -d` from unlinking arbitrary files inside `.git`.
+pub fn refname_is_safe(refname: &str) -> bool {
+    if let Some(rest) = refname.strip_prefix("refs/") {
+        if rest.is_empty() || rest.starts_with('/') || rest.ends_with('/') || rest.contains('\\') {
+            return false;
+        }
+        let path = Path::new(rest);
+        !path.is_absolute()
+            && !path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                )
+            })
+    } else {
+        !refname.is_empty() && refname.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+    }
+}
+
 /// git's is_root_ref_syntax (refs.c): a ref name made only of uppercase ASCII,
 /// `-`, and `_` (e.g. HEAD, FETCH_HEAD, MERGE_HEAD). Such names live in the
 /// per-worktree gitdir rather than the common refs/ tree. An empty name is not
