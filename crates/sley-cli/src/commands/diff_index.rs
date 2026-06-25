@@ -358,10 +358,15 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             )?
         }
     };
-    let mut submodule_config = submodule_diff_config(git_dir, worktree_root, ignore_submodules_cli);
-    if ignore_submodules_cli.is_none() && submodule_config.base == SubmoduleIgnoreMode::Untracked {
-        submodule_config.base = SubmoduleIgnoreMode::Dirty;
-    }
+    // diff-index's implicit default ignores untracked content in submodules
+    // (`repo_diff_setup` sets `ignore_untracked_in_submodules`) but still
+    // reports modified tracked content — i.e. `Untracked`, NOT `Dirty`. An
+    // earlier WIP-recovery commit (f5e5bf0a) forced the default to `Dirty`,
+    // which suppressed `Submodule <x> contains modified content` for a
+    // worktree-dirty submodule whose checked-out commit still matched the
+    // staged oid (t4041/t4060 "submodule contains modified content" cells).
+    // Keep the `submodule_diff_config` default (`Untracked`) as-is.
+    let submodule_config = submodule_diff_config(git_dir, worktree_root, ignore_submodules_cli);
     let mut entries = apply_submodule_ignore_filter(entries, &submodule_config);
     let submodule_dirt = match (!cached, worktree_root) {
         (true, Some(root)) => {
