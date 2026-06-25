@@ -133,6 +133,9 @@ struct DiffTreeOptions {
     dst_prefix: String,
     /// `--check`: emit a whitespace-error report instead of the diff body.
     check: bool,
+    /// `--exit-code` / `--quiet`: exit with status 1 when any difference is
+    /// found (0 otherwise). `--quiet` additionally suppresses the diff output.
+    exit_code: bool,
     /// Whitespace-ignore flags (`-w`, `-b`, `--ignore-space-at-eol`,
     /// `--ignore-cr-at-eol`).
     ws_ignore: sley_diff_merge::WsIgnore,
@@ -183,6 +186,7 @@ impl Default for DiffTreeOptions {
             src_prefix: "a/".to_string(),
             dst_prefix: "b/".to_string(),
             check: false,
+            exit_code: false,
             ws_ignore: sley_diff_merge::WsIgnore::default(),
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
@@ -294,6 +298,15 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             "--name-only" => options.output.name_only = true,
             "--name-status" => options.output.name_status = true,
             "-s" | "--no-patch" => {
+                options.output = DiffTreeOutput {
+                    silent: true,
+                    ..DiffTreeOutput::default()
+                };
+            }
+            "--exit-code" => options.exit_code = true,
+            "--quiet" => {
+                // `--quiet` implies `-s` (no diff body) plus exit-with-status.
+                options.exit_code = true;
                 options.output = DiffTreeOutput {
                     silent: true,
                     ..DiffTreeOutput::default()
@@ -634,9 +647,11 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
         }
     }
 
-    let _ = has_differences;
     if options.check && request_context.check_failed.get() {
         return Err(GitError::Exit(2));
+    }
+    if options.exit_code && has_differences {
+        return Err(GitError::Exit(1));
     }
     Ok(())
 }

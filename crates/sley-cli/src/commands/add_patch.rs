@@ -15,13 +15,105 @@ use std::process::{Command, Stdio};
 
 use sley_core::{GitError, Result};
 
-/// Which kind of patch session (add / reset / checkout / stash). Only `Add`
-/// is wired today; the enum keeps the prompt-mode table addressable for the
-/// other callers to grow into.
+/// Which kind of patch session. Mirrors add-patch.c's `patch_mode_*` table:
+/// each variant fixes the diff command, the apply direction, and the prompt
+/// wording. `Add`/`Reset` stage/unstage to the index by reconstructing the
+/// index blob; the checkout/worktree variants reassemble the selected hunks
+/// into a patch and pipe it to `apply` (matching git's `apply_patch`).
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum PatchMode {
     Add,
     Reset,
+    /// `checkout -p` / `restore -p` with no tree-ish: `diff-files`, discard the
+    /// selected hunks from the working tree (`apply -R`).
+    CheckoutIndex,
+    /// `checkout -p HEAD`: `diff-index HEAD`, discard from index and worktree.
+    CheckoutHead,
+    /// `checkout -p <rev>`: apply to index and worktree. git diffs with
+    /// `diff-index -R <rev>` and applies forward; sley instead diffs forward
+    /// (`diff-index <rev>`) and reverse-applies — net-identical, and it sidesteps
+    /// `diff-index -R`'s broken worktree-side rendering.
+    CheckoutNothead,
+    /// `restore -p --source=HEAD`: `diff-index HEAD`, discard from worktree only.
+    WorktreeHead,
+    /// `restore -p --source=<rev>`: apply to worktree only. Same forward-diff +
+    /// reverse-apply substitution as [`PatchMode::CheckoutNothead`].
+    WorktreeNothead,
+}
+
+/// Which prompt-noun a hunk uses (git's `enum prompt_mode_type`).
+#[derive(Clone, Copy)]
+enum PromptKind {
+    ModeChange,
+    Deletion,
+    Addition,
+    Hunk,
+}
+
+impl PatchMode {
+    /// True for the modes that reverse-apply their (forward) diff. Every
+    /// checkout/worktree mode does: the index/head modes discard worktree
+    /// changes, and the not-head modes substitute a reverse-apply for git's
+    /// `diff-index -R` (see [`PatchMode::CheckoutNothead`]).
+    fn is_reverse(self) -> bool {
+        matches!(
+            self,
+            PatchMode::CheckoutIndex
+                | PatchMode::CheckoutHead
+                | PatchMode::CheckoutNothead
+                | PatchMode::WorktreeHead
+                | PatchMode::WorktreeNothead
+        )
+    }
+
+    /// True for the modes that touch BOTH the index and the working tree
+    /// (git's `apply_for_checkout`).
+    fn applies_for_checkout(self) -> bool {
+        matches!(self, PatchMode::CheckoutHead | PatchMode::CheckoutNothead)
+    }
+
+    /// True for the new patch modes that reassemble a patch and pipe it to
+    /// `apply`, rather than reconstructing the index blob directly.
+    fn applies_via_patch(self) -> bool {
+        !matches!(self, PatchMode::Add | PatchMode::Reset)
+    }
+}
+
+/// The `Stage/Discard/Apply ... [hunk]` prompt verb for a given mode + noun,
+/// mirroring add-patch.c's per-mode `prompt_mode` tables.
+fn prompt_text(mode: PatchMode, kind: PromptKind) -> &'static str {
+    match mode {
+        PatchMode::Add | PatchMode::Reset => match kind {
+            PromptKind::ModeChange => "Stage mode change",
+            PromptKind::Deletion => "Stage deletion",
+            PromptKind::Addition => "Stage addition",
+            PromptKind::Hunk => "Stage this hunk",
+        },
+        PatchMode::CheckoutIndex | PatchMode::WorktreeHead => match kind {
+            PromptKind::ModeChange => "Discard mode change from worktree",
+            PromptKind::Deletion => "Discard deletion from worktree",
+            PromptKind::Addition => "Discard addition from worktree",
+            PromptKind::Hunk => "Discard this hunk from worktree",
+        },
+        PatchMode::CheckoutHead => match kind {
+            PromptKind::ModeChange => "Discard mode change from index and worktree",
+            PromptKind::Deletion => "Discard deletion from index and worktree",
+            PromptKind::Addition => "Discard addition from index and worktree",
+            PromptKind::Hunk => "Discard this hunk from index and worktree",
+        },
+        PatchMode::CheckoutNothead => match kind {
+            PromptKind::ModeChange => "Apply mode change to index and worktree",
+            PromptKind::Deletion => "Apply deletion to index and worktree",
+            PromptKind::Addition => "Apply addition to index and worktree",
+            PromptKind::Hunk => "Apply this hunk to index and worktree",
+        },
+        PatchMode::WorktreeNothead => match kind {
+            PromptKind::ModeChange => "Apply mode change to worktree",
+            PromptKind::Deletion => "Apply deletion to worktree",
+            PromptKind::Addition => "Apply addition to worktree",
+            PromptKind::Hunk => "Apply this hunk to worktree",
+        },
+    }
 }
 
 /// Per-session config knobs (context, inter-hunk-context, auto-advance).
@@ -583,20 +675,7 @@ fn count_splittable(body: &[String]) -> usize {
 // Prompt strings (PatchMode::Add)
 // ---------------------------------------------------------------------------
 
-fn prompt_mode_change() -> &'static str {
-    "Stage mode change"
-}
-fn prompt_deletion() -> &'static str {
-    "Stage deletion"
-}
-fn prompt_addition() -> &'static str {
-    "Stage addition"
-}
-fn prompt_hunk() -> &'static str {
-    "Stage this hunk"
-}
-
-const HELP_TEXT: &str = "y - stage this hunk\n\
+const HELP_TEXT: &str ="y - stage this hunk\n\
     n - do not stage this hunk\n\
     q - quit; do not stage this hunk or any of the remaining ones\n\
     a - stage this hunk and all later hunks in the file\n\
@@ -619,19 +698,27 @@ const NAV_HELP: &str = "j - go to the next undecided hunk, roll over at the bott
 // ---------------------------------------------------------------------------
 
 /// Run the `add -p` REPL over the given paths. Reads decisions from `stdin`.
+/// `revision` is the resolved tree-ish for the `diff-index` modes (the literal
+/// `"HEAD"` for the head modes, an OID hex for the not-head modes, `None` for
+/// the index/diff-files modes).
 pub(crate) fn run_add_patch(
     mode: PatchMode,
     paths: &[String],
+    revision: Option<&str>,
     stdin: &mut impl BufRead,
     cfg: PatchConfig,
 ) -> Result<()> {
     // Produce the diff for the requested paths, mirroring add-patch.c's
-    // `parse_diff` command build: `diff-files [--unified=<n>]
-    // [--inter-hunk-context=<n>] [--diff-algorithm=<algo>] --no-color
-    // --ignore-submodules=dirty -p -- <pathspec>...`.
+    // `parse_diff` command build: `<diff_cmd> [--unified=<n>]
+    // [--inter-hunk-context=<n>] [--diff-algorithm=<algo>] [<revision>]
+    // --no-color --ignore-submodules=dirty -p -- <pathspec>...`.
     let mut owned: Vec<String> = match mode {
-        PatchMode::Add => vec!["diff-files".to_string()],
+        PatchMode::Add | PatchMode::CheckoutIndex => vec!["diff-files".to_string()],
         PatchMode::Reset => vec!["diff".to_string(), "--cached".to_string()],
+        PatchMode::CheckoutHead
+        | PatchMode::WorktreeHead
+        | PatchMode::CheckoutNothead
+        | PatchMode::WorktreeNothead => vec!["diff-index".to_string()],
     };
     if let Some(context) = cfg.context {
         owned.push(format!("--unified={context}"));
@@ -641,6 +728,17 @@ pub(crate) fn run_add_patch(
     }
     if let Some(algorithm) = &cfg.diff_algorithm {
         owned.push(format!("--diff-algorithm={algorithm}"));
+    }
+    // The `diff-index` modes need the tree-ish operand before the output flags.
+    if matches!(
+        mode,
+        PatchMode::CheckoutHead
+            | PatchMode::CheckoutNothead
+            | PatchMode::WorktreeHead
+            | PatchMode::WorktreeNothead
+    ) && let Some(rev) = revision
+    {
+        owned.push(rev.to_string());
     }
     owned.push("--no-color".to_string());
     owned.push("--ignore-submodules=dirty".to_string());
@@ -688,7 +786,7 @@ pub(crate) fn run_add_patch(
         if file_idx >= nfiles {
             break;
         }
-        let nav = patch_update_file(&mut files[file_idx], stdin, &cfg, file_idx, nfiles)?;
+        let nav = patch_update_file(mode, &mut files[file_idx], stdin, &cfg, file_idx, nfiles)?;
         match nav {
             FileNav::Quit => {
                 // `q` aborts the whole session: the current file's already-decided
@@ -718,6 +816,7 @@ pub(crate) fn run_add_patch(
             match mode {
                 PatchMode::Add => apply_file_to_index(fd)?,
                 PatchMode::Reset => apply_file_to_index_reverse(fd)?,
+                _ => apply_file_via_patch(fd, mode, stdin)?,
             }
             applied_any = true;
         }
@@ -783,6 +882,7 @@ enum FileNav {
 
 /// The per-file decision loop.
 fn patch_update_file(
+    mode: PatchMode,
     fd: &mut FileDiff,
     stdin: &mut impl BufRead,
     cfg: &PatchConfig,
@@ -864,13 +964,13 @@ fn patch_update_file(
         // Build prompt. git's selection: deletion > addition > (mode_change at
         // index 0) > hunk.
         let kind = if fd.deleted {
-            prompt_deletion()
+            prompt_text(mode, PromptKind::Deletion)
         } else if fd.added {
-            prompt_addition()
+            prompt_text(mode, PromptKind::Addition)
         } else if fd.mode_change.is_some() && hunk_index == 0 {
-            prompt_mode_change()
+            prompt_text(mode, PromptKind::ModeChange)
         } else {
-            prompt_hunk()
+            prompt_text(mode, PromptKind::Hunk)
         };
         let suffix = build_suffix(fd, hunk_index, undecided_next, undecided_prev, cfg, nfiles);
         let was = match fd.hunks[hunk_index].use_hunk {
@@ -1763,6 +1863,127 @@ fn mode_change_used(fd: &FileDiff) -> bool {
 }
 
 /// Apply the USE_HUNK hunks of one file to the index.
+/// Reassemble a unified diff containing only this file's `USE` hunks, mirroring
+/// add-patch.c's `reassemble_patch`: skipped hunks shift the new-side offsets of
+/// the kept hunks (the running `delta`), and the mode-change pseudo-hunk at
+/// index 0 is not part of the textual patch.
+fn reassemble_patch(fd: &FileDiff) -> String {
+    let mut out = String::new();
+    for line in &fd.header {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let mode_change = if fd.mode_change.is_some() { 1 } else { 0 };
+    let mut delta: i64 = 0;
+    for hunk in fd.hunks.iter().skip(mode_change) {
+        if hunk.use_hunk != HunkUse::Use {
+            // A dropped hunk shifts every later kept hunk's new-side offset.
+            delta += hunk.old_count - hunk.new_count;
+            continue;
+        }
+        out.push_str(&format_hunk_header(hunk, delta));
+        // `heading` carries its own trailing newline when present.
+        if hunk.heading.is_empty() {
+            out.push('\n');
+        }
+        for line in &hunk.body {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Apply this file's selected hunks the way git does for the checkout/worktree
+/// modes: reassemble a patch and pipe it to `apply` (to the index and/or the
+/// working tree, forward or reversed, per the mode).
+fn apply_file_via_patch(fd: &FileDiff, mode: PatchMode, stdin: &mut impl BufRead) -> Result<()> {
+    let patch = reassemble_patch(fd);
+    let patch = patch.as_bytes();
+    let reverse = mode.is_reverse();
+    if mode.applies_for_checkout() {
+        return apply_for_checkout(patch, reverse, stdin);
+    }
+    // Worktree-only modes: a single `apply [-R]` against the working tree.
+    let mut args: Vec<&str> = vec!["apply"];
+    if reverse {
+        args.push("-R");
+    }
+    let (_out, ok) = run_capture_status(&args, Some(patch)).map_err(|e| GitError::Io(e.to_string()))?;
+    if !ok {
+        eprintln!("error: 'git apply' failed");
+    }
+    Ok(())
+}
+
+/// git's `apply_for_checkout`: try the reassembled patch against both the index
+/// (`--cached`) and the working tree; apply to both only if both check clean,
+/// otherwise prompt to apply to the worktree alone (or, if only the index would
+/// take it, just show the patch).
+fn apply_for_checkout(patch: &[u8], reverse: bool, stdin: &mut impl BufRead) -> Result<()> {
+    let reverse_arg: Option<&str> = if reverse { Some("-R") } else { None };
+    let check = |extra: &[&str]| -> bool {
+        let mut args: Vec<&str> = vec!["apply"];
+        args.extend_from_slice(extra);
+        if let Some(r) = reverse_arg {
+            args.push(r);
+        }
+        args.push("--check");
+        run_capture_status(&args, Some(patch))
+            .map(|(_, ok)| ok)
+            .unwrap_or(false)
+    };
+    let apply = |extra: &[&str]| {
+        let mut args: Vec<&str> = vec!["apply"];
+        args.extend_from_slice(extra);
+        if let Some(r) = reverse_arg {
+            args.push(r);
+        }
+        let _ = run_capture_status(&args, Some(patch));
+    };
+    let applies_index = check(&["--cached"]);
+    let applies_worktree = check(&[]);
+    if applies_index && applies_worktree {
+        apply(&["--cached"]);
+        apply(&[]);
+        return Ok(());
+    }
+    if !applies_index {
+        eprintln!("error: The selected hunks do not apply to the index!");
+        if prompt_yesno("Apply them to the worktree anyway? ", stdin) {
+            apply(&[]);
+            return Ok(());
+        }
+        eprintln!("Nothing was applied.");
+    } else {
+        // The index would take the patch but the worktree would not: as a last
+        // resort, git just shows the patch to the user.
+        print!("{}", String::from_utf8_lossy(patch));
+        let _ = io::stdout().flush();
+    }
+    Ok(())
+}
+
+/// git's `prompt_yesno`: print the prompt to stdout, read a line, and return
+/// true for a `y*` answer. EOF and `n*` answers return false.
+fn prompt_yesno(prompt: &str, stdin: &mut impl BufRead) -> bool {
+    loop {
+        print!("{prompt}");
+        let _ = io::stdout().flush();
+        match read_line(stdin) {
+            None => return false,
+            Some(line) => {
+                let answer = line.trim();
+                match answer.chars().next().map(|c| c.to_ascii_lowercase()) {
+                    Some('y') => return true,
+                    Some('n') => return false,
+                    _ => continue,
+                }
+            }
+        }
+    }
+}
+
 fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
     // A staged deletion: drop the path from the index entirely.
     if fd.deleted {

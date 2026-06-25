@@ -1727,6 +1727,7 @@ fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> 
             &created.git_dir,
             created.format,
             &created.pathspec_paths,
+            false,
         )?;
     }
     for path in &created.untracked_paths {

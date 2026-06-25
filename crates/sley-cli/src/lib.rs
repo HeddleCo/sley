@@ -1498,10 +1498,18 @@ fn read_pathspecs_from_file(path: &Path, nul: bool) -> Result<Vec<PathBuf>> {
                 entry
             };
             if entry.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(String::from_utf8_lossy(entry).into_owned()))
+                return None;
             }
+            // Git unquotes C-style quoted pathspecs read in LF mode (e.g.
+            // `"file\101.t"` -> `fileA.t`); with `--pathspec-file-nul` the bytes
+            // are taken verbatim, so a leading quote stays literal.
+            if !nul && entry.first() == Some(&b'"') {
+                let mut unquoted = Vec::new();
+                if commands::ref_command_stream::unquote_c_style(entry, &mut unquoted).is_some() {
+                    return Some(PathBuf::from(String::from_utf8_lossy(&unquoted).into_owned()));
+                }
+            }
+            Some(PathBuf::from(String::from_utf8_lossy(entry).into_owned()))
         })
         .collect())
 }

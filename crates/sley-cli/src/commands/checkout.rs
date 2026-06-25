@@ -21,6 +21,10 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut branch_mode = CheckoutBranchMode::Existing;
     let mut ignore_other_worktrees = false;
     let mut track = None::<crate::commands::branch::BranchTrackMode>;
+    let mut overlay_mode: Option<bool> = None;
+    let mut overwrite_ignore = true;
+    let mut pathspec_from_file: Option<PathBuf> = None;
+    let mut pathspec_file_nul = false;
     let mut positional = Vec::new();
     let mut dashdash_index = None;
     let mut iter = args.iter();
@@ -98,6 +102,27 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 inter_hunk_context = true;
             }
             "--progress" | "--no-progress" => {}
+            // `-l`/`--log` forces a reflog for the newly created branch. sley
+            // always materializes a reflog on the first commit, so this only
+            // needs to be recognized (and not mistaken for a start-point arg).
+            "-l" | "--log" => {}
+            "--overlay" => overlay_mode = Some(true),
+            "--no-overlay" => overlay_mode = Some(false),
+            "--overwrite-ignore" => overwrite_ignore = true,
+            "--no-overwrite-ignore" => overwrite_ignore = false,
+            "--pathspec-file-nul" => pathspec_file_nul = true,
+            "--no-pathspec-file-nul" => pathspec_file_nul = false,
+            "--pathspec-from-file" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("checkout --pathspec-from-file requires a value".into())
+                })?;
+                pathspec_from_file = Some(PathBuf::from(value));
+            }
+            "--no-pathspec-from-file" => pathspec_from_file = None,
+            value if value.starts_with("--pathspec-from-file=") => {
+                let value = &value["--pathspec-from-file=".len()..];
+                pathspec_from_file = Some(PathBuf::from(value));
+            }
             "--ignore-other-worktrees" => ignore_other_worktrees = true,
             "--no-ignore-other-worktrees" => ignore_other_worktrees = false,
             "--recurse-submodules" => recurse_submodules = Some(true),
@@ -178,16 +203,57 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
-    if patch {
-        println!("No changes.");
-        return Ok(());
+    // `--orphan` cannot set up branch tracking.
+    if matches!(branch_mode, CheckoutBranchMode::Create { orphan: true, .. }) && track.is_some() {
+        eprintln!("fatal: '--orphan' cannot be used with '-t'");
+        return Err(GitError::Exit(128));
     }
-
+    // `-p --overlay` is forbidden; only the implicit-overlay default pairs with -p.
+    if patch && overlay_mode == Some(true) {
+        eprintln!("fatal: options '-p' and '--overlay' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if pathspec_file_nul && pathspec_from_file.is_none() {
+        eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+        return Err(GitError::Exit(128));
+    }
+    if pathspec_from_file.is_some() {
+        // Git rejects pathspec args, then --detach, then --patch (in that order).
+        let trailing_pathspec_args = match dashdash_index {
+            Some(index) => positional.len() > index,
+            None => positional.len() > 1,
+        };
+        if trailing_pathspec_args {
+            eprintln!(
+                "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
+            );
+            return Err(GitError::Exit(128));
+        }
+        if matches!(branch_mode, CheckoutBranchMode::Detach) {
+            eprintln!(
+                "fatal: options '--pathspec-from-file' and '--detach' cannot be used together"
+            );
+            return Err(GitError::Exit(128));
+        }
+        if patch {
+            eprintln!("fatal: options '--pathspec-from-file' and '--patch' cannot be used together");
+            return Err(GitError::Exit(128));
+        }
+    }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let checkout_config = read_repo_config(&git_dir)?;
+    if patch {
+        return checkout_run_patch(
+            &git_dir,
+            format,
+            &positional,
+            dashdash_index,
+            no_auto_advance,
+        );
+    }
     let recurse_submodules = recurse_submodules.unwrap_or_else(|| {
         checkout_config
             .get_bool("submodule", None, "recurse")
@@ -248,7 +314,25 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     // Pathspec checkout: `checkout [<tree-ish>] [--] <pathspec>...` restores
     // paths (and, with a tree-ish, index entries) instead of switching HEAD.
     if matches!(branch_mode, CheckoutBranchMode::Existing) {
-        let (source, paths): (Option<&str>, &[String]) = match dashdash_index {
+        let file_pathspecs: Vec<String>;
+        let (source, paths): (Option<&str>, &[String]) = if let Some(pathspec_file) =
+            pathspec_from_file.as_ref()
+        {
+            // `--pathspec-from-file`: the lone positional (if any) is the tree-ish
+            // source; the pathspecs come from the file (option validation above
+            // already rejected trailing pathspec arguments).
+            let source = match positional.as_slice() {
+                [] => None,
+                [rev] => Some(rev.as_str()),
+                _ => unreachable!("trailing pathspec args were rejected during validation"),
+            };
+            file_pathspecs = read_pathspecs_from_file(pathspec_file, pathspec_file_nul)?
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
+            (source, file_pathspecs.as_slice())
+        } else {
+            match dashdash_index {
             Some(index) => {
                 let (before, after) = positional.split_at(index);
                 match before {
@@ -301,6 +385,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 }
             }
             None => (None, &[]),
+            }
         };
         if !paths.is_empty() {
             let resolved_paths: Vec<PathBuf> = paths
@@ -331,6 +416,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         format,
                         &tree,
                         &resolved_paths,
+                        // git checkout defaults to overlay mode (leave paths
+                        // absent from the tree-ish); --no-overlay removes them.
+                        overlay_mode.unwrap_or(true),
                     )?;
                 }
                 None => {
@@ -701,6 +789,12 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     );
                     return Err(GitError::Exit(128));
                 }
+                // --orphan cannot reuse an existing branch name (there is no
+                // force variant); reject before touching the index or HEAD.
+                if store.read_ref(&branch_ref_name(&branch)?)?.is_some() {
+                    eprintln!("fatal: a branch named '{branch}' already exists");
+                    return Err(GitError::Exit(128));
+                }
                 if let Some(start) = positional.first().map(String::as_str) {
                     let Some(start_oid) = resolve_checkout_start_oid(&git_dir, format, start)?
                     else {
@@ -709,11 +803,17 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         );
                         return Err(GitError::Exit(128));
                     };
-                    sley_worktree::reset_index_and_worktree_to_commit(
-                        &worktree_root,
+                    // Switch the index + worktree to the start point through the
+                    // shared two-way engine (git's merge_working_tree), so local
+                    // modifications that would be overwritten abort the switch
+                    // and leave HEAD on the current branch.
+                    checkout_twoway_dirty(
                         &git_dir,
+                        &worktree_root,
                         format,
-                        &start_oid,
+                        Some(&start_oid),
+                        recurse_submodules,
+                        force,
                     )?;
                 }
                 checkout_switch_to_unborn_branch(&git_dir, &branch)?;
@@ -1732,9 +1832,10 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     if patch {
-        return Err(GitError::Unsupported(
-            "restore patch selection is not implemented".into(),
-        ));
+        let cwd = env::current_dir()?;
+        let git_dir = discover_git_dir(&cwd)?;
+        let format = repository_object_format(&git_dir)?;
+        return restore_run_patch(&git_dir, format, &paths, source.as_deref(), staged, worktree);
     }
     if let Some(pathspec_file) = pathspec_from_file {
         paths.extend(read_pathspecs_from_file(&pathspec_file, pathspec_file_nul)?);
@@ -1766,6 +1867,8 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         None
     };
     if staged && worktree {
+        // git restore defaults to no-overlay: paths absent from the source are
+        // removed from the index and working tree.
         if let Some(tree_oid) = source_tree.as_ref() {
             sley_worktree::restore_index_and_worktree_paths_from_tree(
                 worktree_root,
@@ -1773,6 +1876,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
                 format,
                 tree_oid,
                 &resolved_paths,
+                false,
             )?;
         } else {
             sley_worktree::restore_index_and_worktree_paths_from_head(
@@ -1780,6 +1884,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
                 git_dir,
                 format,
                 &resolved_paths,
+                false,
             )?;
         }
     } else if staged {
@@ -2148,6 +2253,142 @@ enum CheckoutBranchMode {
         force: bool,
         orphan: bool,
     },
+}
+
+/// Resolve a `checkout -p` / `restore -p` tree-ish to the OID hex that the
+/// `diff-index` modes pass on the command line. `<a>...<b>` ranges become their
+/// merge base (git replaces them because `diff-index` does not parse `...`); a
+/// plain ref/oid is handed to `diff-index` verbatim.
+fn checkout_patch_resolve_revision(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+) -> Result<String> {
+    if let Some((left, right)) = rev.split_once("...") {
+        let left = if left.is_empty() { "HEAD" } else { left };
+        let right = if right.is_empty() { "HEAD" } else { right };
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let left = commands::diff::diff_resolve_commit_arg(git_dir, format, &db, left)?;
+        let right = commands::diff::diff_resolve_commit_arg(git_dir, format, &db, right)?;
+        let base = commands::diff::diff_single_merge_base(git_dir, format, &db, &left, &right)?;
+        return Ok(base.to_hex());
+    }
+    Ok(rev.to_string())
+}
+
+/// Whether `arg` should be treated as the tree-ish operand of a `checkout -p`
+/// (rather than a pathspec): an explicit `HEAD`/`@`, a `...` range, or anything
+/// that resolves to a commit/tree-ish.
+fn checkout_patch_arg_is_revision(git_dir: &Path, format: ObjectFormat, arg: &str) -> bool {
+    arg == "HEAD"
+        || arg == "@"
+        || arg.contains("...")
+        || checkout_resolve_start_oid(git_dir, format, arg).is_ok()
+        || {
+            let db = FileObjectDatabase::from_git_dir(git_dir, format);
+            commands::diff::diff_resolve_commit_arg(git_dir, format, &db, arg).is_ok()
+        }
+}
+
+/// `git checkout -p [<tree-ish>] [--] [<pathspec>...]`: pick the patch mode from
+/// the tree-ish (none / HEAD / other) and run the shared interactive engine.
+fn checkout_run_patch(
+    git_dir: &Path,
+    format: ObjectFormat,
+    positional: &[String],
+    dashdash_index: Option<usize>,
+    no_auto_advance: bool,
+) -> Result<()> {
+    let (rev, pathspecs): (Option<&str>, &[String]) = match dashdash_index {
+        Some(index) => {
+            let (before, after) = positional.split_at(index);
+            match before {
+                [] => (None, after),
+                [rev] => (Some(rev.as_str()), after),
+                _ => {
+                    return Err(GitError::Command(
+                        "checkout with multiple tree-ish arguments is not supported".into(),
+                    ));
+                }
+            }
+        }
+        None => {
+            if !positional.is_empty()
+                && checkout_patch_arg_is_revision(git_dir, format, &positional[0])
+            {
+                (Some(positional[0].as_str()), &positional[1..])
+            } else {
+                (None, positional)
+            }
+        }
+    };
+
+    let (mode, revision): (commands::add_patch::PatchMode, Option<String>) = match rev {
+        None => (commands::add_patch::PatchMode::CheckoutIndex, None),
+        Some(rev) if rev == "HEAD" || rev == "@" => (
+            commands::add_patch::PatchMode::CheckoutHead,
+            Some("HEAD".to_string()),
+        ),
+        Some(rev) => (
+            commands::add_patch::PatchMode::CheckoutNothead,
+            Some(checkout_patch_resolve_revision(git_dir, format, rev)?),
+        ),
+    };
+
+    let cfg = commands::add_interactive::resolve_patch_config(git_dir, None, None, !no_auto_advance)?;
+    let stdin = io::stdin();
+    let mut handle = stdin.lock();
+    commands::add_patch::run_add_patch(mode, pathspecs, revision.as_deref(), &mut handle, cfg)
+}
+
+/// `git restore -p [--source=<rev>] [--staged] [--worktree] [<pathspec>...]`:
+/// pick the patch mode from `--staged`/`--worktree` and `--source`, then run the
+/// shared interactive engine. Default restore (worktree only) discards from the
+/// working tree; `--staged --worktree` touches both like `checkout -p`.
+fn restore_run_patch(
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    source: Option<&str>,
+    staged: bool,
+    worktree: bool,
+) -> Result<()> {
+    let pathspecs: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let (mode, revision): (commands::add_patch::PatchMode, Option<String>) = if staged && !worktree {
+        // `restore --staged -p` unstages selected hunks (ADD_P_RESET).
+        (commands::add_patch::PatchMode::Reset, None)
+    } else {
+        // `--staged --worktree` touches the index too (ADD_P_CHECKOUT); the
+        // default worktree restore touches only the working tree (ADD_P_WORKTREE).
+        let touches_index = staged && worktree;
+        match source {
+            None => (commands::add_patch::PatchMode::CheckoutIndex, None),
+            Some(rev) if rev == "HEAD" || rev == "@" => {
+                let mode = if touches_index {
+                    commands::add_patch::PatchMode::CheckoutHead
+                } else {
+                    commands::add_patch::PatchMode::WorktreeHead
+                };
+                (mode, Some("HEAD".to_string()))
+            }
+            Some(rev) => {
+                let resolved = checkout_patch_resolve_revision(git_dir, format, rev)?;
+                let mode = if touches_index {
+                    commands::add_patch::PatchMode::CheckoutNothead
+                } else {
+                    commands::add_patch::PatchMode::WorktreeNothead
+                };
+                (mode, Some(resolved))
+            }
+        }
+    };
+    let cfg = commands::add_interactive::resolve_patch_config(git_dir, None, None, true)?;
+    let stdin = io::stdin();
+    let mut handle = stdin.lock();
+    commands::add_patch::run_add_patch(mode, &pathspecs, revision.as_deref(), &mut handle, cfg)
 }
 
 fn checkout_switch_to_unborn_branch(git_dir: &Path, branch: &str) -> Result<()> {
