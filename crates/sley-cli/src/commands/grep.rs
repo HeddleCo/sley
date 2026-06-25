@@ -1535,6 +1535,7 @@ fn grep_index_level(
         let flags = entry.flags;
         let oid = entry.oid;
         let is_ita = entry.is_intent_to_add();
+        let is_skip_wt = entry.is_skip_worktree();
         // Either advance one entry, or (after processing an unmerged path) past all
         // of its higher-stage siblings, mirroring git's `if (ce_stage(ce))` skip.
         let next = |processed: bool, i: usize| -> usize {
@@ -1575,7 +1576,7 @@ fn grep_index_level(
 
         // Skip SKIP_WORKTREE entries unless --cached, unless sparse-clearing
         // restored a present file.
-        let skip_wt = (flags & 0x4000) != 0
+        let skip_wt = is_skip_wt
             && !(clear_sparse
                 && source
                     .worktree_root
