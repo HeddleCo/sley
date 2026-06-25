@@ -200,6 +200,22 @@ pub(crate) fn render_standard_notes(
     render_notes_block(git_dir, format, &store, &refs, oid)
 }
 
+/// Resolve the standard notes display refs without rendering. git loads the
+/// display notes trees at revision setup; a valueless `-c notes.displayRef` is a
+/// fatal parse error surfaced there. Callers (e.g. `diff-tree --notes`) invoke
+/// this early so that error fires before any output.
+pub(crate) fn resolve_standard_notes_refs(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<String>> {
+    let store = FileRefStore::new(git_dir, format);
+    let display = NotesDisplay {
+        use_default: Some(true),
+        ..NotesDisplay::default()
+    };
+    display.resolve_refs(git_dir, &store)
+}
+
 /// Render the `Notes:` / `Notes (<name>):` block(s) for `oid` across the
 /// resolved display refs, matching git's `format_note`: a leading blank line,
 /// the label, then each note line indented by four spaces. Returns the bytes to
@@ -371,6 +387,40 @@ fn emit_encoded_compiled_log_format_no_notes(
     let encoded = log_reencode_message(&line, "UTF-8", context.output_encoding);
     out.extend_from_slice(&encoded);
     Ok(())
+}
+
+/// Render a user (`--format=`) spec to stdout for `git show`, expanding `%N`
+/// from the standard notes display refs when `show_notes` is set. git computes
+/// `ctx.notes_message` (raw) for userformats and `%N` injects it; the plain
+/// atom resolver no-ops `%N`, so route through the notes-aware emitter when the
+/// format actually references notes. Returns the number of bytes written.
+pub(crate) fn print_log_custom_format_with_notes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    record: &sley_rev::CommitRecord,
+    compiled: &CompiledLogFormat,
+    context: &LogFormatContext<'_>,
+    show_notes: bool,
+) -> Result<usize> {
+    let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+    if show_notes && compiled_format_uses_notes(compiled) {
+        let store = FileRefStore::new(git_dir, format);
+        let display = NotesDisplay {
+            use_default: Some(true),
+            ..NotesDisplay::default()
+        };
+        let refs = display.resolve_refs(git_dir, &store)?;
+        emit_compiled_log_format_with_notes(
+            git_dir, format, &store, &refs, record, compiled, context, &mut line,
+        )?;
+    } else {
+        emit_compiled_log_format(record, compiled, context, &mut line, 0..compiled.tokens.len())?;
+    }
+    let out = log_reencode_message(&line, "UTF-8", context.output_encoding);
+    let emitted = out.len();
+    io::stdout().write_all(&out)?;
+    io::stdout().flush()?;
+    Ok(emitted)
 }
 
 struct LogFormatNoteResolver<'a, 'b> {
@@ -3139,6 +3189,18 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         }
                         graph_show_commit(&mut graph_state, prefix, &mut out)?;
                         let mut msg = render_log_raw_pretty(record);
+                        if let Some((notes_store, display_notes_refs)) = display_notes.as_ref()
+                            && !display_notes_refs.is_empty()
+                        {
+                            let notes = render_notes_block(
+                                &git_dir,
+                                format,
+                                notes_store,
+                                display_notes_refs,
+                                &record.oid,
+                            )?;
+                            msg.extend_from_slice(&notes);
+                        }
                         if let Some(log_diff) = &log_diff {
                             let mut padding = String::new();
                             graph_state.padding_line(&mut padding);
@@ -3331,6 +3393,21 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         }
                         printed_entries += 1;
                         let mut raw = render_log_raw_pretty(record);
+                        // git appends the notes block after the message and
+                        // before the diff for every built-in format (here, raw)
+                        // once notes display is active (`--show-notes`).
+                        if let Some((notes_store, display_notes_refs)) = display_notes.as_ref()
+                            && !display_notes_refs.is_empty()
+                        {
+                            let notes = render_notes_block(
+                                &git_dir,
+                                format,
+                                notes_store,
+                                display_notes_refs,
+                                &record.oid,
+                            )?;
+                            raw.extend_from_slice(&notes);
+                        }
                         if !diff_block.is_empty() {
                             raw.extend_from_slice(diff_opts.block_separator_for(record));
                             raw.extend_from_slice(&diff_block);

@@ -122,6 +122,11 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
             refuse_non_ref("merge")?;
             notes_merge_cmd(&git_dir, format, &notes_ref, sub_args)
         }
+        "prune" => {
+            refuse_outside("prune")?;
+            refuse_non_ref("prune")?;
+            notes_prune(&git_dir, format, &notes_ref, sub_args)
+        }
         "get-ref" => notes_get_ref(&notes_ref, sub_args),
         other => notes_unknown_subcommand_error(other),
     }
@@ -129,6 +134,18 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
 
 fn notes_ref_handle(notes_ref: &str) -> NotesRef {
     NotesRef::expand(notes_ref)
+}
+
+/// git's `expand_loose_notes_ref`: the merge remote spec is used verbatim when
+/// it already resolves to an object (e.g. `refs/remote-notes/origin/x`, an
+/// existing ref outside refs/notes/); otherwise it is expanded under
+/// refs/notes/ like any notes-ref name (`x` -> `refs/notes/x`).
+fn expand_loose_notes_ref(git_dir: &Path, format: ObjectFormat, spec: &str) -> NotesRef {
+    if resolve_revision(git_dir, format, spec).is_ok() {
+        NotesRef(spec.to_string())
+    } else {
+        notes_ref_handle(spec)
+    }
 }
 
 /// The notes ref name as git's `init_notes_check` sees it for the
@@ -925,6 +942,92 @@ fn notes_remove(
     Ok(())
 }
 
+/// `git notes prune [-n] [-v]` — drop notes whose annotated object is no longer
+/// present in the object database. `-n`/`--dry-run` lists the prunable note
+/// targets without removing them; `-v`/`--verbose` lists them *and* removes;
+/// with neither, prunes silently. Mirrors `prune_notes` in upstream `notes.c`:
+/// `-n` implies VERBOSE|DRYRUN, `-v` implies VERBOSE, default prints nothing.
+fn notes_prune(
+    git_dir: &Path,
+    format: ObjectFormat,
+    notes_ref: &str,
+    args: &[String],
+) -> Result<()> {
+    let mut show_only = false;
+    let mut verbose = false;
+    let mut positional_only = false;
+    let mut had_positional = false;
+    for arg in args {
+        if positional_only {
+            had_positional = true;
+            continue;
+        }
+        match arg.as_str() {
+            "--" => positional_only = true,
+            "-n" | "--dry-run" => show_only = true,
+            "--no-dry-run" => show_only = false,
+            "-v" | "--verbose" => verbose = true,
+            "--no-verbose" => verbose = false,
+            value if value.starts_with('-') && value.len() > 1 && value != "-" => {
+                return Err(notes_unknown_option(value, NotesUsage::Prune));
+            }
+            _ => had_positional = true,
+        }
+    }
+    if had_positional {
+        // git: `prune` takes no positional arguments — any extra is a usage error.
+        eprintln!("error: too many arguments");
+        print_notes_usage(NotesUsage::Prune);
+        return Err(GitError::Exit(129));
+    }
+
+    let store = FileRefStore::new(git_dir, format);
+    let handle = notes_ref_handle(notes_ref);
+    let mut notes = list_notes(git_dir, format, &store, &handle)?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+
+    // Collect prunable targets in the order git emits them: `prune_notes_helper`
+    // prepends each hit while walking the tree in ascending-oid order, so the
+    // resulting list is processed in descending-oid order.
+    let mut prunable: Vec<ObjectId> = Vec::new();
+    for note in &notes {
+        if !db.contains(&note.annotated)? {
+            prunable.push(note.annotated);
+        }
+    }
+    prunable.reverse();
+
+    // `-n` => print + don't remove; `-v` => print + remove; default => remove silently.
+    let print_each = show_only || verbose;
+    let remove_each = !show_only;
+    let mut removed_any = false;
+    for target in &prunable {
+        if print_each {
+            println!("{}", target.to_hex());
+        }
+        if remove_each {
+            remove_note(&mut notes, target);
+            removed_any = true;
+        }
+    }
+
+    // git always calls commit_notes when not dry-running, but commit_notes is a
+    // no-op on an unchanged tree, so only commit when something was pruned.
+    if removed_any {
+        write_notes(
+            git_dir,
+            format,
+            &store,
+            &handle,
+            &notes,
+            "Notes removed by 'git notes prune'",
+            &notes_commit_identity()?,
+            notes_ref_expected(&store, &handle)?,
+        )?;
+    }
+    Ok(())
+}
+
 fn notes_copy(
     git_dir: &Path,
     format: ObjectFormat,
@@ -1315,7 +1418,7 @@ fn notes_merge_cmd(
     let store = FileRefStore::new(git_dir, format);
     let local_ref = notes_ref_handle(notes_ref);
     let remote_arg = parsed.remote.as_deref().unwrap_or_default();
-    let remote_ref = notes_ref_handle(remote_arg);
+    let remote_ref = expand_loose_notes_ref(git_dir, format, remote_arg);
     let strategy = resolve_notes_merge_strategy(notes_ref, parsed.strategy.as_deref())?;
     let message = format!(
         "Merged notes from {} into {}",
@@ -1377,8 +1480,25 @@ fn parse_notes_merge_args(args: &[String]) -> Result<NotesMergeArgs> {
         }
         match arg.as_str() {
             "--" => positional_only = true,
-            "-q" | "--quiet" => parsed.verbosity -= 1,
-            "-v" | "--verbose" => parsed.verbosity += 1,
+            "--quiet" => parsed.verbosity -= 1,
+            "--verbose" => parsed.verbosity += 1,
+            // git's parse-options clusters short flags: `-vvv` is three `-v`,
+            // `-qq` two `-q`, `-vq` a mix. Each `v` raises and each `q` lowers
+            // verbosity (OPT__VERBOSITY).
+            value
+                if value.starts_with('-')
+                    && !value.starts_with("--")
+                    && value.len() > 1
+                    && value[1..].chars().all(|ch| ch == 'v' || ch == 'q') =>
+            {
+                for ch in value[1..].chars() {
+                    if ch == 'v' {
+                        parsed.verbosity += 1;
+                    } else {
+                        parsed.verbosity -= 1;
+                    }
+                }
+            }
             "--commit" => parsed.commit = true,
             "--abort" => parsed.abort = true,
             "-s" | "--strategy" => {
@@ -1597,6 +1717,33 @@ fn read_notes_merge_state(git_dir: &Path, format: ObjectFormat) -> Result<(Objec
 
 fn commit_notes_merge_state(git_dir: &Path, format: ObjectFormat) -> Result<()> {
     let (partial, notes_ref) = read_notes_merge_state(git_dir, format)?;
+    let store = FileRefStore::new(git_dir, format);
+
+    // git finalizes by updating notes_ref from NOTES_MERGE_PARTIAL^1 under a
+    // compare-and-swap. If notes_ref has moved since the merge began, the update
+    // is refused with a ref-lock error and the merge state is left intact for
+    // the user to retry or abort. Surface that here before resolving conflicts.
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let partial_commit = Commit::parse(format, &db.read_object(&partial)?.body)?;
+    let expected = partial_commit.parents.first().copied();
+    let current = match store.read_ref(notes_ref.as_str())? {
+        Some(RefTarget::Direct(oid)) => Some(oid),
+        _ => None,
+    };
+    if current != expected {
+        let show = |oid: Option<ObjectId>| {
+            oid.map(|oid| oid.to_hex())
+                .unwrap_or_else(|| "0".repeat(format.hex_len()))
+        };
+        eprintln!(
+            "fatal: cannot lock ref '{}': is at {} but expected {}",
+            notes_ref.as_str(),
+            show(current),
+            show(expected)
+        );
+        return Err(GitError::Exit(128));
+    }
+
     let worktree = git_dir.join("NOTES_MERGE_WORKTREE");
     let mut resolved = Vec::new();
     for entry in fs::read_dir(&worktree)? {
@@ -1613,7 +1760,6 @@ fn commit_notes_merge_state(git_dir: &Path, format: ObjectFormat) -> Result<()> 
         resolved.push((annotated, body));
     }
     resolved.sort_by_key(|(oid, _)| oid.to_hex());
-    let store = FileRefStore::new(git_dir, format);
     finalize_notes_merge(
         git_dir,
         format,
@@ -1725,6 +1871,7 @@ enum NotesUsage {
     Merge,
     Show,
     Remove,
+    Prune,
     GetRef,
 }
 
@@ -1870,6 +2017,14 @@ fn print_notes_usage(usage: NotesUsage) {
 
     --[no-]ignore-missing attempt to remove non-existent note is not an error
     --[no-]stdin          read object names from the standard input
+
+"#
+        }
+        NotesUsage::Prune => {
+            r#"usage: git notes prune [<options>]
+
+    -n, --dry-run         do not remove, show only
+    -v, --verbose         report pruned notes
 
 "#
         }

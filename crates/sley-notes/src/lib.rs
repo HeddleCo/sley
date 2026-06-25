@@ -10,7 +10,7 @@
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{
-    BString, Commit, EncodedObject, ObjectType, Tree, TreeEntries, TreeEntry,
+    BString, Commit, EncodedObject, ObjectType, Tree, TreeBuilder, TreeEntries, TreeEntry,
     tree_entry_object_type,
 };
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
@@ -502,13 +502,25 @@ pub fn merge_notes(
 
     let notes = notes_vec_from_map(merged);
     let parents = vec![local_oid, remote_oid];
+    // git appends a "Conflicts:" section listing every conflicting object to the
+    // partial merge commit's message (`merge_one_change_manual`); `--commit`
+    // later reuses that message verbatim, so the finalized merge records which
+    // notes conflicted.
+    let mut commit_message = message.as_bytes().to_vec();
+    if !conflicts.is_empty() {
+        commit_message.extend_from_slice(b"\n\nConflicts:\n");
+        for conflict in &conflicts {
+            commit_message
+                .extend_from_slice(format!("\t{}\n", conflict.annotated.to_hex()).as_bytes());
+        }
+    }
     let result = commit_notes_update_with_parents(
         git_dir,
         format,
         store,
         local_ref,
         &notes,
-        message.as_bytes(),
+        &commit_message,
         identity,
         &parents,
         Some(RefTarget::Direct(local_oid)),
@@ -1066,7 +1078,16 @@ fn commit_notes_update_with_parents(
     update_ref: bool,
 ) -> Result<ObjectId> {
     let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let tree_oid = write_notes_tree(&mut db, notes)?;
+    // Preserve any non-note entries carried by the base notes commit. git keeps a
+    // sorted "non_note" list while loading a notes tree and weaves it back on
+    // write so arbitrary blobs/dirs living in a notes tree survive note edits
+    // (t3304). The base is the first parent — the commit whose tree was read,
+    // mutated, and is being rewritten here.
+    let non_notes = match parents.first() {
+        Some(parent) => collect_non_notes_from_commit(&db, format, parent)?,
+        None => Vec::new(),
+    };
+    let tree_oid = write_notes_tree_preserving(&mut db, notes, &non_notes)?;
 
     let commit_oid = create_commit(
         &mut db,
@@ -1200,6 +1221,176 @@ fn write_fanout_notes_tree(db: &mut FileObjectDatabase, notes: &[Note]) -> Resul
             entries: root_entries,
         }
         .write(),
+    ))
+}
+
+/// A flattened tree entry: full slash-separated path, mode, and object id.
+type PathEntry = (Vec<u8>, u32, ObjectId);
+
+/// A tree entry inside a notes tree that is *not* a note: an arbitrary blob or
+/// directory whose path does not spell out an object id under git's fanout
+/// scheme. git records these while loading a notes tree and writes them back
+/// untouched (`struct non_note` in upstream `notes.c`).
+#[derive(Debug, Clone)]
+struct NonNote {
+    /// Full slash-separated path from the notes-tree root (e.g. `de/adbeef`).
+    path: Vec<u8>,
+    mode: u32,
+    oid: ObjectId,
+}
+
+/// Read the non-note entries from a notes commit's tree, mirroring git's
+/// `load_subtree`: an entry is a note iff its name fills the remaining hex
+/// nibbles of an object id and is a hex blob; a two-hex directory is a fanout
+/// level to recurse into; everything else is a non-note recorded at its full
+/// path (a non-fanout directory is kept wholesale, not descended into).
+fn collect_non_notes_from_commit(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+) -> Result<Vec<NonNote>> {
+    let object = db.read_object(commit_oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Ok(Vec::new());
+    }
+    let commit = Commit::parse(format, &object.body)?;
+    let mut out = Vec::new();
+    collect_non_notes_rec(db, format, &commit.tree, &[], 0, &mut out)?;
+    Ok(out)
+}
+
+fn collect_non_notes_rec(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    prefix: &[u8],
+    consumed_hex: usize,
+    out: &mut Vec<NonNote>,
+) -> Result<()> {
+    let object = db.read_object(tree_oid)?;
+    if object.object_type != ObjectType::Tree {
+        return Ok(());
+    }
+    let hex_len = format.hex_len();
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
+        let name = entry.name;
+        let name_len = name.len();
+        let is_tree = tree_entry_object_type(entry.mode) == ObjectType::Tree;
+        let is_hex = !name.is_empty() && name.iter().all(u8::is_ascii_hexdigit);
+
+        if consumed_hex < hex_len && name_len == hex_len - consumed_hex {
+            // Slot for the remainder of an object id: a hex blob here is a note.
+            if !is_tree && is_hex {
+                continue;
+            }
+        } else if name_len == 2 && is_tree && is_hex {
+            // A two-hex directory is a fanout level — descend, consuming 2 nibbles.
+            let mut child_prefix = prefix.to_vec();
+            child_prefix.extend_from_slice(name);
+            child_prefix.push(b'/');
+            collect_non_notes_rec(db, format, &entry.oid, &child_prefix, consumed_hex + 2, out)?;
+            continue;
+        }
+
+        // Anything else is a non-note: keep it at its full path, mode and oid.
+        let mut full = prefix.to_vec();
+        full.extend_from_slice(name);
+        out.push(NonNote {
+            path: full,
+            mode: entry.mode,
+            oid: entry.oid,
+        });
+    }
+    Ok(())
+}
+
+/// Write the notes tree, weaving in preserved non-note entries. With no
+/// non-notes this defers to the byte-identical flat/fanout writers so every
+/// existing notes tree is unaffected.
+fn write_notes_tree_preserving(
+    db: &mut FileObjectDatabase,
+    notes: &[Note],
+    non_notes: &[NonNote],
+) -> Result<ObjectId> {
+    if non_notes.is_empty() {
+        return write_notes_tree(db, notes);
+    }
+    write_woven_notes_tree(db, notes, non_notes)
+}
+
+/// The on-disk path for each note under the same flat-vs-fanout rule as
+/// [`write_notes_tree`] (flat below 256 notes, one-level 2/38 fanout above).
+fn note_disk_paths(notes: &[Note]) -> Vec<PathEntry> {
+    if notes.len() >= 256 {
+        notes
+            .iter()
+            .map(|note| {
+                let hex = note.annotated.to_hex();
+                let (prefix, suffix) = hex.split_at(2);
+                let mut path = prefix.as_bytes().to_vec();
+                path.push(b'/');
+                path.extend_from_slice(suffix.as_bytes());
+                (path, 0o100644u32, note.blob)
+            })
+            .collect()
+    } else {
+        notes
+            .iter()
+            .map(|note| (note.annotated.to_hex().into_bytes(), 0o100644u32, note.blob))
+            .collect()
+    }
+}
+
+fn write_woven_notes_tree(
+    db: &mut FileObjectDatabase,
+    notes: &[Note],
+    non_notes: &[NonNote],
+) -> Result<ObjectId> {
+    // Notes win on an exact path collision (git prefers the note), so seed the
+    // map with notes and only fill in a non-note where no note already sits.
+    let mut paths: BTreeMap<Vec<u8>, (u32, ObjectId)> = BTreeMap::new();
+    for (path, mode, oid) in note_disk_paths(notes) {
+        paths.insert(path, (mode, oid));
+    }
+    for non_note in non_notes {
+        paths
+            .entry(non_note.path.clone())
+            .or_insert((non_note.mode, non_note.oid));
+    }
+    let entries: Vec<PathEntry> = paths
+        .into_iter()
+        .map(|(path, (mode, oid))| (path, mode, oid))
+        .collect();
+    build_nested_tree(db, &entries)
+}
+
+/// Build (and write) nested tree objects from full slash-separated paths,
+/// returning the root tree oid. Entries are grouped by first path component;
+/// each level is emitted in git's canonical order via [`TreeBuilder`].
+fn build_nested_tree(
+    db: &mut FileObjectDatabase,
+    entries: &[PathEntry],
+) -> Result<ObjectId> {
+    let mut builder = TreeBuilder::new();
+    let mut subdirs: BTreeMap<Vec<u8>, Vec<PathEntry>> = BTreeMap::new();
+    for (path, mode, oid) in entries {
+        match path.iter().position(|byte| *byte == b'/') {
+            None => builder.upsert_raw(path.clone(), *mode, *oid),
+            Some(slash) => {
+                let component = path[..slash].to_vec();
+                let rest = path[slash + 1..].to_vec();
+                subdirs.entry(component).or_default().push((rest, *mode, *oid));
+            }
+        }
+    }
+    for (component, children) in subdirs {
+        let subtree_oid = build_nested_tree(db, &children)?;
+        builder.upsert_raw(component, 0o040000, subtree_oid);
+    }
+    db.write_object(EncodedObject::new(
+        ObjectType::Tree,
+        builder.build().write(),
     ))
 }
 
