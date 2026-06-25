@@ -784,6 +784,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let mut depth = None::<u32>;
     let mut expect_depth_value = false;
     let mut all = false;
+    let mut set_upstream = false;
     let mut recurse_submodules_cli = FetchRecurseSubmodules::Default;
     for arg in args {
         if expect_depth_value {
@@ -829,6 +830,8 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             "--no-quiet" | "--no-verbose" => verbosity = 0,
             "--all" => all = true,
             "--no-all" => all = false,
+            "-u" | "--set-upstream" => set_upstream = true,
+            "--no-set-upstream" => set_upstream = false,
             "--dry-run" => dry_run = true,
             "--no-dry-run" => dry_run = false,
             "--no-write-fetch-head" => no_write_fetch_head = true,
@@ -995,6 +998,14 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
                 return Err(err);
             }
         };
+    if set_upstream {
+        crate::commands::remote_cmds::fetch_set_upstream_from_outcome(
+            &git_dir,
+            format,
+            &remote,
+            &fetch_outcome,
+        )?;
+    }
     if dry_run {
         return Ok(());
     }

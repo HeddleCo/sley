@@ -3391,6 +3391,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     // `git fetch --all`/`--multiple`: fetch from a resolved list of remotes.
     let mut fetch_all_remotes = None::<bool>;
     let mut fetch_multiple = false;
+    let mut set_upstream = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -3555,6 +3556,8 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 server_options_from_cli = true;
             }
             "--unshallow" => unshallow = true,
+            "--set-upstream" => set_upstream = true,
+            "--no-set-upstream" => set_upstream = false,
             "-u" | "--update-head-ok" => options.update_head_ok = true,
             "--update-shallow" => options.update_shallow = true,
             "--deepen" => {
@@ -3758,6 +3761,9 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         trace2_fetch_refetch_maintenance();
     }
     let outcome = result?;
+    if set_upstream {
+        fetch_set_upstream_from_outcome(&git_dir, format, &source, &outcome)?;
+    }
     let config = read_repo_config(&git_dir)?;
     trace2_local_transfer_negotiation(&config, upload_pack_command.as_deref());
     let recurse_submodules = resolve_fetch_recurse_submodules(
@@ -5448,7 +5454,10 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         // once the remote's advertisement is known.
         let remote = mirror_all_remote(&git_dir, &store, &positional)?;
         (remote, vec!["refs/*:refs/*".to_string()])
-    } else if all_refs || tags {
+    } else if all_refs || (tags && positional.len() < 2) {
+        // `--all`/`--mirror` forbid explicit refspecs (checked above), and a bare
+        // `--tags` (no refspec) pushes only the tag wildcard. git appends
+        // `refs/tags/*` as its own refspec rather than replacing the default.
         let remote = mirror_all_remote(&git_dir, &store, &positional)?;
         let mut specs = Vec::new();
         if all_refs {
@@ -5467,7 +5476,13 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             mirror = true;
             force = true;
         }
-        (resolved.remote, resolved.refspecs)
+        let mut specs = resolved.refspecs;
+        // builtin/push.c: `--tags` appends `refs/tags/*` after the explicit
+        // refspecs, so `git push --tags <remote> <refspec>` pushes both.
+        if tags {
+            specs.push("refs/tags/*:refs/tags/*".to_string());
+        }
+        (resolved.remote, specs)
     };
     refspecs = expand_push_tag_shorthand(&refspecs)?;
     default_head_push_destinations(&store, &mut refspecs)?;
@@ -7838,6 +7853,102 @@ fn configure_push_upstreams_from_report(
             key: "merge".into(),
         };
         config_set_value(&mut config, &merge_key, &reference.dst, false);
+    }
+    write_repo_config(git_dir, &config)
+}
+
+/// Implements builtin/fetch.c's `--set-upstream` post-fetch configuration.
+///
+/// The relevant upstream is the fetched branch meant to be merged with the
+/// current one — git's `ref_map` entry with no local peer ref. In sley that is a
+/// [`FetchRefUpdate`] with no `dst` (a FETCH_HEAD-only entry). When exactly one
+/// exists and the current branch is real, mirror `install_branch_config` by
+/// writing `branch.<current>.{remote,merge}`; the various ambiguous/unsupported
+/// cases emit the same warnings git does and write nothing.
+pub(crate) fn fetch_set_upstream_from_outcome(
+    git_dir: &Path,
+    format: ObjectFormat,
+    remote: &str,
+    outcome: &sley_remote::FetchOutcome,
+) -> Result<()> {
+    let store = FileRefStore::new(git_dir, format);
+    let current_branch = store.current_branch().ok().flatten();
+
+    let mut source_ref: Option<&str> = None;
+    for update in &outcome.ref_updates {
+        if update.dst.is_none() {
+            if source_ref.is_some() {
+                eprintln!(
+                    "warning: multiple branches detected, incompatible with --set-upstream"
+                );
+                return Ok(());
+            }
+            source_ref = Some(update.src.as_str());
+        }
+    }
+    let Some(source_ref) = source_ref else {
+        eprintln!(
+            "warning: no source branch found;\nyou need to specify exactly one branch with the --set-upstream option"
+        );
+        return Ok(());
+    };
+
+    let Some(branch) = current_branch.as_deref() else {
+        let shortname = source_ref.strip_prefix("refs/heads/").unwrap_or(source_ref);
+        eprintln!(
+            "warning: could not set upstream of HEAD to '{shortname}' from '{remote}' when it does not point to any branch."
+        );
+        return Ok(());
+    };
+
+    if source_ref == "HEAD" || source_ref.starts_with("refs/heads/") {
+        install_fetch_branch_config(git_dir, branch, remote, source_ref)?;
+    } else if source_ref.starts_with("refs/remotes/") {
+        eprintln!("warning: not setting upstream for a remote remote-tracking branch");
+    } else if source_ref.starts_with("refs/tags/") {
+        eprintln!("warning: not setting upstream for a remote tag");
+    } else {
+        eprintln!("warning: unknown branch type");
+    }
+    Ok(())
+}
+
+/// Mirror git's `install_branch_config(0, ...)`: write `branch.<local>.remote`
+/// and `branch.<local>.merge`, plus `branch.<local>.rebase` when
+/// `branch.autosetuprebase` is `remote`/`always`. The verbose "set up to track"
+/// message is suppressed (flag 0), matching `git fetch/pull --set-upstream`.
+fn install_fetch_branch_config(
+    git_dir: &Path,
+    local: &str,
+    origin: &str,
+    merge_ref: &str,
+) -> Result<()> {
+    let mut config = read_repo_config(git_dir)?;
+    let remote_key = ConfigKey {
+        section: "branch".into(),
+        subsection: Some(local.to_string()),
+        key: "remote".into(),
+    };
+    config_set_value(&mut config, &remote_key, origin, false);
+    let merge_key = ConfigKey {
+        section: "branch".into(),
+        subsection: Some(local.to_string()),
+        key: "merge".into(),
+    };
+    config_set_value(&mut config, &merge_key, merge_ref, false);
+    if let Some(autosetuprebase) =
+        clone_effective_config_value(git_dir, "branch", "autosetuprebase")
+        && matches!(
+            autosetuprebase.to_ascii_lowercase().as_str(),
+            "remote" | "always"
+        )
+    {
+        let rebase_key = ConfigKey {
+            section: "branch".into(),
+            subsection: Some(local.to_string()),
+            key: "rebase".into(),
+        };
+        config_set_value(&mut config, &rebase_key, "true", false);
     }
     write_repo_config(git_dir, &config)
 }
