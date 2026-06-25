@@ -3167,6 +3167,11 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             _ => sley_diff_merge::ConflictStyle::Merge,
         })
         .unwrap_or(sley_diff_merge::ConflictStyle::Merge);
+    // The diff3 ancestor label mirrors merge-ort's `ancestor_name`: "empty tree"
+    // when there is no common ancestor, the merge base's abbreviated oid for a
+    // unique base, and "merged common ancestors" for a recursive (multi-base)
+    // merge. The abbreviation width matches `git rev-parse --short`.
+    let ancestor_label = merge_diff3_ancestor_label(&common_git_dir, format, &bases);
     let (results, conflicts, info_messages) = three_way_merge_trees_inner_with_info(
         &write_db,
         format,
@@ -3175,7 +3180,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         &theirs_map,
         &ours_label,
         &theirs_label,
-        "merged common ancestors",
+        &ancestor_label,
         options.favor,
         conflict_style,
     )?;
@@ -3573,6 +3578,25 @@ fn config_rename_enabled(value: &str) -> bool {
 }
 
 /// Resolve the default rename-detection enablement from config, mirroring
+/// The diff3 common-ancestor label for a two-head merge, mirroring merge-ort's
+/// `ancestor_name`: "empty tree" with no common ancestor, the unique merge
+/// base's abbreviated oid (same width as `git rev-parse --short`), or "merged
+/// common ancestors" for a recursive merge over several bases.
+fn merge_diff3_ancestor_label(git_dir: &Path, format: ObjectFormat, bases: &[ObjectId]) -> String {
+    match bases {
+        [] => "empty tree".to_string(),
+        [base] => {
+            let hex = base.to_hex();
+            let width = crate::repository_abbrev(git_dir, format)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| format.hex_len());
+            hex[..width.min(hex.len())].to_string()
+        }
+        _ => "merged common ancestors".to_string(),
+    }
+}
+
 /// merge-ort's `merge_recursive_config`: `diff.renames` seeds it, then
 /// `merge.renames` overrides. Unset → `true`.
 fn merge_recursive_renames_default() -> bool {

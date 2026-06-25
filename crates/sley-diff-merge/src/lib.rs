@@ -7263,7 +7263,11 @@ pub fn merge_entry_maps(
             // side shows the new path, the other side the old path), e.g.
             // `<<<<<<< HEAD:old.txt` / `>>>>>>> feature:new.txt`.
             let rehome = rehomed_paths.get(&path);
-            let (ours_label, theirs_label) = match rename {
+            // git's `merge_3way` qualifies all three labels with their per-side
+            // path (`<name>:<path>`) whenever the three paths are not identical —
+            // pathnames[0] is the base/ancestor path (the rename source). When
+            // they are identical (no rename), it uses the bare names.
+            let (base_label_owned, ours_label, theirs_label) = match rename {
                 Some(MergeRename { source, side }) => {
                     let (ours_path, theirs_path) = match side {
                         // theirs renamed -> ours kept the source path.
@@ -7272,6 +7276,7 @@ pub fn merge_entry_maps(
                         RenameSide::Ours => (path.as_slice(), source.as_slice()),
                     };
                     (
+                        qualify_label(options.ancestor_label, source.as_slice()),
                         qualify_label(options.ours_label, ours_path),
                         qualify_label(options.theirs_label, theirs_path),
                     )
@@ -7285,11 +7290,13 @@ pub fn merge_entry_maps(
                         .map_or(path.as_slice(), |info| info.old_path.as_slice());
                     if ours_path != path.as_slice() || theirs_path != path.as_slice() {
                         (
+                            qualify_label(options.ancestor_label, path.as_slice()),
                             qualify_label(options.ours_label, ours_path),
                             qualify_label(options.theirs_label, theirs_path),
                         )
                     } else {
                         (
+                            options.ancestor_label.to_string(),
                             options.ours_label.to_string(),
                             options.theirs_label.to_string(),
                         )
@@ -7303,7 +7310,7 @@ pub fn merge_entry_maps(
                 &MergeBlobOptions {
                     ours_label: &ours_label,
                     theirs_label: &theirs_label,
-                    base_label: options.ancestor_label,
+                    base_label: &base_label_owned,
                     style: options.style,
                     favor: options.favor,
                     ws_ignore: options.ws_ignore,
