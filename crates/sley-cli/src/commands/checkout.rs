@@ -562,6 +562,11 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             } else if !is_branch
                 && let Ok(target_oid) = checkout_resolve_start_oid(&git_dir, format, branch)
             {
+                // A tag (or other peelable object) detaches HEAD at the *commit*
+                // it points to; `resolve_revision` yields the tag object itself,
+                // so peel it before detaching (matches `git checkout <tag>`).
+                let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+                let target_oid = sley_rev::peel_to_commit(&db, format, &target_oid)?;
                 let config = read_repo_config(&git_dir)?;
                 prefetch_local_promisor_checkout_blobs(&git_dir, format, &config, &target_oid)?;
                 let old_head_direct = checkout_direct_head(&store)?;

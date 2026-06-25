@@ -1216,16 +1216,92 @@ fn bisect_terms_print(
     }
 }
 
-fn cmd_bisect_visualize(_args: &[String]) -> Result<()> {
+fn cmd_bisect_visualize(args: &[String]) -> Result<()> {
     let repo = BisectRepo::open()?;
     let mut terms = BisectTerms::default();
     get_terms(&repo, &mut terms);
     if bisect_next_check(&repo, &terms, None) != 0 {
         return Err(GitError::Exit(1));
     }
-    Err(GitError::Unsupported(
-        "git bisect visualize is not implemented".into(),
-    ))
+
+    // Faithful port of builtin/bisect.c:bisect_visualize. Choose the viewer, then
+    // append `--bisect -- <BISECT_NAMES>` so it is scoped to the current bisection
+    // range and the start pathspec. With no args, prefer `gitk` only in a
+    // graphical environment where it exists; otherwise (and whenever the first
+    // arg is an option) fall back to `git log`.
+    let mut cmd: Vec<String> = Vec::new();
+    let mut git_cmd = false;
+    if args.is_empty() {
+        if bisect_visualize_use_gitk() {
+            cmd.push("gitk".to_string());
+        } else {
+            cmd.push("log".to_string());
+            git_cmd = true;
+        }
+    } else {
+        if args[0].starts_with('-') {
+            cmd.push("log".to_string());
+            git_cmd = true;
+        } else if args[0] != "tig" && !args[0].starts_with("git") {
+            git_cmd = true;
+        }
+        cmd.extend(args.iter().cloned());
+    }
+    cmd.push("--bisect".to_string());
+    cmd.push("--".to_string());
+    // Append the sq-quoted start pathspec recorded in BISECT_NAMES (empty when
+    // `git bisect start` was given no paths). git appends it verbatim after the
+    // `--`, so the tokens become pathspecs.
+    if let Ok(contents) = fs::read_to_string(repo.state_path("BISECT_NAMES")) {
+        for line in contents.lines() {
+            for token in sq_dequote_args(line.trim()) {
+                if !token.is_empty() {
+                    cmd.push(token);
+                }
+            }
+        }
+    }
+
+    // `git log` is sley's own command — run it in-process rather than shelling out
+    // to an external git. Any other git subcommand re-enters sley; an external
+    // viewer (gitk/tig/...) is spawned directly, exactly as git would.
+    if git_cmd && cmd.first().map(String::as_str) == Some("log") {
+        return crate::commands::log::cmd_log(&cmd[1..]);
+    }
+    let (program, rest): (String, &[String]) = if git_cmd {
+        (
+            std::env::current_exe()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "sley".to_string()),
+            &cmd,
+        )
+    } else {
+        (cmd[0].clone(), &cmd[1..])
+    };
+    let status = std::process::Command::new(&program).args(rest).status()?;
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(code) => Err(GitError::Exit(code)),
+        None => Err(GitError::Exit(1)),
+    }
+}
+
+/// builtin/bisect.c uses `gitk` only when a graphical session is detected
+/// (`DISPLAY`/`SESSIONNAME`/`MSYSTEM`/`SECURITYSESSIONID`) and `gitk` is on
+/// `PATH`. In a headless test/CI environment this is false, so `git log` is used.
+fn bisect_visualize_use_gitk() -> bool {
+    let graphical = ["DISPLAY", "SESSIONNAME", "MSYSTEM", "SECURITYSESSIONID"]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some());
+    graphical && exists_in_path("gitk")
+}
+
+/// Whether `program` is found as an executable on `PATH`.
+fn exists_in_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
 }
 
 // ---------------------------------------------------------------------------

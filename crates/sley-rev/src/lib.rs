@@ -4178,12 +4178,30 @@ fn read_commit_tree(
     Ok(Commit::parse_ref(format, &object.body)?.tree)
 }
 
+/// Read a commit's parent oids directly from the object store (for off-graph
+/// commits the `--simplify-merges` pass pulls in — boundary/UNINTERESTING
+/// parents that are not present as a `CommitRecord` but still participate in
+/// redundancy and root-parent decisions).
+fn read_commit_parents(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Vec<ObjectId>> {
+    let object = db.read_object(oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    Ok(Commit::parse_ref(format, &object.body)?.parents)
+}
+
 /// git's `one_relevant_parent`: pick the single parent a TREESAME commit can be
 /// simplified onto, or `None` if there is no unique relevant parent.
 fn one_relevant_parent<'a>(
     parents: &'a [ObjectId],
-    reachable: &HashSet<ObjectId>,
-    record_oids: &HashSet<ObjectId>,
+    relevant_set: &HashSet<ObjectId>,
     first_parent: bool,
 ) -> Option<&'a ObjectId> {
     if parents.is_empty() {
@@ -4192,10 +4210,13 @@ fn one_relevant_parent<'a>(
     if first_parent || parents.len() == 1 {
         return parents.first();
     }
+    // git's `relevant_commit`: an in-set commit OR a `^`-excluded boundary
+    // (BOTTOM) commit. Bottoms are relevant even though they are not shown, so a
+    // TREESAME commit whose only on-graph parent is the boundary still simplifies
+    // onto that boundary.
     let mut relevant: Option<&ObjectId> = None;
     for parent in parents {
-        let is_relevant = reachable.contains(parent) || record_oids.contains(parent);
-        if is_relevant {
+        if relevant_set.contains(parent) {
             if relevant.is_some() {
                 return None;
             }
@@ -4213,8 +4234,7 @@ fn rewrite_one(
     start: &ObjectId,
     simplify: &HashMap<ObjectId, CommitSimplify>,
     parents_of: &HashMap<ObjectId, Vec<ObjectId>>,
-    reachable: &HashSet<ObjectId>,
-    record_oids: &HashSet<ObjectId>,
+    relevant_set: &HashSet<ObjectId>,
     first_parent: bool,
 ) -> Option<ObjectId> {
     let mut current = *start;
@@ -4231,7 +4251,7 @@ fn rewrite_one(
             // rewrite_one_noparents: the edge is dropped.
             return None;
         }
-        match one_relevant_parent(parents, reachable, record_oids, first_parent) {
+        match one_relevant_parent(parents, relevant_set, first_parent) {
             Some(parent) => current = *parent,
             None => return Some(current),
         }
@@ -4343,13 +4363,15 @@ pub fn simplify_history_with_bottoms(
     )?;
 
     if options.simplify_merges {
-        return Ok(simplify_merges_pass(
+        return simplify_merges_pass(
+            db,
+            format,
             records,
             &simplify,
-            &record_oids,
             &relevant_set,
+            pathspec,
             options,
-        ));
+        );
     }
 
     // Effective parent list for each commit: the diverted single parent when
@@ -4463,8 +4485,7 @@ pub fn simplify_history_with_bottoms(
                 parent,
                 &simplify,
                 &parents_of,
-                &reachable,
-                &record_oids,
+                &relevant_set,
                 options.first_parent,
             ) {
                 // Drop duplicate parents introduced by rewriting (git's
@@ -4494,29 +4515,59 @@ pub fn simplify_history_with_bottoms(
 /// though they are not shown. `record_oids` is the strict output-membership set
 /// (excludes the bottoms) used only to decide what may appear in the result.
 fn simplify_merges_pass(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
     records: Vec<CommitRecord>,
     simplify: &HashMap<ObjectId, CommitSimplify>,
-    _record_oids: &HashSet<ObjectId>,
     relevant_set: &HashSet<ObjectId>,
+    pathspec: &Pathspec,
     options: SimplifyOptions,
-) -> Vec<CommitRecord> {
-    let real_parents: HashMap<ObjectId, Vec<ObjectId>> =
-        records.iter().map(|r| (r.oid, r.parents.clone())).collect();
+) -> Result<Vec<CommitRecord>> {
+    // Strict output-membership set (the candidate list); a parent not in it is a
+    // boundary / UNINTERESTING commit pulled into the pass.
+    let record_oids: HashSet<ObjectId> = records.iter().map(|r| r.oid).collect();
+    // Real parent edges. Seeded with the in-list commits; off-graph
+    // (boundary / UNINTERESTING) parents that git pulls into the simplify pass
+    // are loaded lazily from the object store and memoised here. `RefCell` gives
+    // the several read-only closures below shared access with interior mutation.
+    let parent_cache: std::cell::RefCell<HashMap<ObjectId, Vec<ObjectId>>> =
+        std::cell::RefCell::new(records.iter().map(|r| (r.oid, r.parents.clone())).collect());
+    let get_parents = |oid: &ObjectId| -> Vec<ObjectId> {
+        if let Some(ps) = parent_cache.borrow().get(oid) {
+            return ps.clone();
+        }
+        let ps = read_commit_parents(db, format, oid).unwrap_or_default();
+        parent_cache.borrow_mut().insert(*oid, ps.clone());
+        ps
+    };
+    let is_root = |oid: &ObjectId| -> bool { get_parents(oid).is_empty() };
     let treesame = |oid: &ObjectId| simplify.get(oid).map(|s| s.treesame).unwrap_or(false);
     let relevant = |oid: &ObjectId| relevant_set.contains(oid);
+    // git's `parent->object.flags & TREESAME` for a *root* parent: a root is
+    // TREESAME iff its tree adds no pathspec-matched path. In-list roots already
+    // have this in `simplify`; off-graph roots are computed from the store.
+    let root_treesame = |oid: &ObjectId| -> bool {
+        if let Some(s) = simplify.get(oid) {
+            return s.treesame;
+        }
+        let Ok(tree) = read_commit_tree(db, format, oid) else {
+            return false;
+        };
+        tree_same_as_empty_for_pathspec(db, format, &tree, pathspec).unwrap_or(false)
+    };
 
-    // Ancestry within the interesting set, computed lazily over real parent
-    // edges. `is_ancestor_in_set(a, b)` is true iff `a` is a proper ancestor of
-    // `b` reachable through commits in the set (git uses `reduce_heads`, which is
-    // `remove_redundant` over the full repo; within a topo-consistent
-    // interesting set the in-set walk is equivalent for redundant-parent marking
-    // because every intermediate is itself interesting).
-    let is_ancestor_in_set = |anc: &ObjectId, desc: &ObjectId| -> bool {
+    // Ancestry over the *real* DAG (git's `reduce_heads`/`remove_redundant`
+    // operates on the full repository, not just the in-list set). Walks real
+    // parent edges, loading off-graph ancestors from the store on demand, so a
+    // boundary parent that is an ancestor of another surviving parent is still
+    // recognised as redundant (e.g. `B..F`: merge D's parents simplify to the
+    // boundary B and the root A, and A is an ancestor of B).
+    let is_ancestor = |anc: &ObjectId, desc: &ObjectId| -> bool {
         if anc == desc {
             return false;
         }
         let mut seen: HashSet<ObjectId> = HashSet::new();
-        let mut stack: Vec<ObjectId> = real_parents.get(desc).cloned().unwrap_or_default();
+        let mut stack: Vec<ObjectId> = get_parents(desc);
         while let Some(oid) = stack.pop() {
             if oid == *anc {
                 return true;
@@ -4524,9 +4575,7 @@ fn simplify_merges_pass(
             if !seen.insert(oid) {
                 continue;
             }
-            if let Some(ps) = real_parents.get(&oid) {
-                stack.extend(ps.iter().copied());
-            }
+            stack.extend(get_parents(&oid));
         }
         false
     };
@@ -4563,6 +4612,18 @@ fn simplify_merges_pass(
     // `get_commit_action` display filter.
     let mut display_treesame: HashMap<ObjectId, bool> = HashMap::new();
 
+    // git's `simplify_one` pulls every referenced parent into the pass. A parent
+    // that is not itself in the candidate list is UNINTERESTING or a `^`-boundary
+    // commit, which simplifies to *itself* (revision.c:3500) — pre-seed those so
+    // children waiting on them become ready instead of stalling.
+    for record in &records {
+        for parent in &record.parents {
+            if !record_oids.contains(parent) {
+                simplified.entry(*parent).or_insert(*parent);
+            }
+        }
+    }
+
     // Worklist seeded with all commits in reverse order; re-queue a commit whose
     // parents are not yet resolved.
     let mut order: Vec<ObjectId> = records.iter().rev().map(|r| r.oid).collect();
@@ -4573,7 +4634,7 @@ fn simplify_merges_pass(
             if simplified.contains_key(oid) {
                 continue;
             }
-            let parents = real_parents.get(oid).cloned().unwrap_or_default();
+            let parents = get_parents(oid);
             // A root commit simplifies to itself (no parents to rewrite).
             if parents.is_empty() {
                 display_treesame.insert(*oid, treesame(oid));
@@ -4630,7 +4691,7 @@ fn simplify_merges_pass(
                 let ids: Vec<ObjectId> = surviving.iter().map(|(_, s)| *s).collect();
                 for a in &ids {
                     for b in &ids {
-                        if a != b && is_ancestor_in_set(a, b) {
+                        if a != b && is_ancestor(a, b) {
                             marked.insert(*a);
                             break;
                         }
@@ -4639,8 +4700,7 @@ fn simplify_merges_pass(
                 // mark_treesame_root_parents: a surviving parent that is itself a
                 // root and is TREESAME (to the empty tree) — drop it.
                 for (_, s) in &surviving {
-                    let is_root = real_parents.get(s).map(|ps| ps.is_empty()).unwrap_or(true);
-                    if is_root && treesame(s) {
+                    if is_root(s) && root_treesame(s) {
                         marked.insert(*s);
                     }
                 }
@@ -4744,7 +4804,7 @@ fn simplify_merges_pass(
     // simplifies to itself but is TREESAME is still dropped unless it is a merge
     // of ≥2 relevant parents (to tie topology together) or a shown pull-merge —
     // `--simplify-merges` always wants ancestry (rewrite_parents).
-    records
+    let out = records
         .into_iter()
         .filter(|r| simplified.get(&r.oid) == Some(&r.oid))
         .filter(|r| {
@@ -4768,7 +4828,8 @@ fn simplify_merges_pass(
                 commit: r.commit,
             }
         })
-        .collect()
+        .collect();
+    Ok(out)
 }
 
 /// git's `PULL_MERGE` flag for `--show-pulls`: in `try_to_simplify_commit`, a

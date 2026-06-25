@@ -9508,25 +9508,44 @@ fn commit_graph_generation(
     if let Some(generation) = cache.get(oid) {
         return Ok(*generation);
     }
-    let record = records
+    // V1 topological-level generation: 1 + max(parent generations). Computed with
+    // an explicit work stack rather than recursion — a recursive walk overflows
+    // the call stack on deep histories (the commit-graph write covers every
+    // reachable commit, which can be tens of thousands deep). The memoised result
+    // is identical to the recursive form.
+    let mut stack: Vec<ObjectId> = vec![*oid];
+    while let Some(&current) = stack.last() {
+        if cache.contains_key(&current) {
+            stack.pop();
+            continue;
+        }
+        let record = records
+            .get(&current)
+            .ok_or_else(|| GitError::InvalidObject(format!("commit {current} missing from walk")))?;
+        let mut max_parent = 0u32;
+        let mut ready = true;
+        for parent in &record.parents {
+            match cache.get(parent) {
+                Some(generation) => max_parent = max_parent.max(*generation),
+                None => {
+                    // Defer until the parent is resolved; it is pushed above
+                    // `current`, which is re-examined once all parents are ready.
+                    stack.push(*parent);
+                    ready = false;
+                }
+            }
+        }
+        if ready {
+            let generation = max_parent
+                .checked_add(1)
+                .ok_or_else(|| GitError::InvalidFormat("commit generation overflow".into()))?;
+            cache.insert(current, generation);
+            stack.pop();
+        }
+    }
+    Ok(*cache
         .get(oid)
-        .ok_or_else(|| GitError::InvalidObject(format!("commit {oid} missing from walk")))?;
-    let generation = if record.parents.is_empty() {
-        1
-    } else {
-        record
-            .parents
-            .iter()
-            .map(|parent| commit_graph_generation(parent, records, cache))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| GitError::InvalidFormat("commit generation overflow".into()))?
-    };
-    cache.insert(*oid, generation);
-    Ok(generation)
+        .expect("generation computed for requested commit"))
 }
 
 fn commit_graph_commit_time(commit: &Commit) -> Result<u64> {

@@ -1634,33 +1634,52 @@ fn write_commit_graph_generation_overflow(entries: &[CommitGraphWriteEntry]) -> 
 }
 
 fn corrected_commit_dates(entries: &[CommitGraphWriteEntry]) -> Result<Vec<u64>> {
-    fn corrected_at(
-        idx: usize,
-        entries: &[CommitGraphWriteEntry],
-        cache: &mut [Option<u64>],
-    ) -> Result<u64> {
-        if let Some(value) = cache[idx] {
-            return Ok(value);
-        }
-        let entry = &entries[idx];
-        let mut corrected = entry.commit_time;
-        for parent in &entry.parents {
-            let parent_idx = entries
-                .binary_search_by(|entry| entry.oid.as_bytes().cmp(parent.as_bytes()))
-                .map_err(|_| {
-                    GitError::InvalidFormat(format!(
-                        "commit-graph parent {parent} is missing from graph"
-                    ))
-                })?;
-            corrected = corrected.max(corrected_at(parent_idx, entries, cache)?.saturating_add(1));
-        }
-        cache[idx] = Some(corrected);
-        Ok(corrected)
-    }
+    // corrected[idx] = max(commit_time, max over parents of corrected[parent] + 1)
+    //
+    // Computed with an explicit work stack rather than recursion: a recursive
+    // post-order walk overflows the call stack on deep histories (the commit-graph
+    // write covers every reachable commit, which can be tens of thousands deep —
+    // e.g. `git describe`'s deep-repo fixtures). The memoised result is identical.
+    let resolve_parent = |parent: &ObjectId| -> Result<usize> {
+        entries
+            .binary_search_by(|entry| entry.oid.as_bytes().cmp(parent.as_bytes()))
+            .map_err(|_| {
+                GitError::InvalidFormat(format!("commit-graph parent {parent} is missing from graph"))
+            })
+    };
 
-    let mut cache = vec![None; entries.len()];
-    for idx in 0..entries.len() {
-        corrected_at(idx, entries, &mut cache)?;
+    let mut cache: Vec<Option<u64>> = vec![None; entries.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for start in 0..entries.len() {
+        if cache[start].is_some() {
+            continue;
+        }
+        stack.push(start);
+        while let Some(&idx) = stack.last() {
+            if cache[idx].is_some() {
+                stack.pop();
+                continue;
+            }
+            let entry = &entries[idx];
+            let mut corrected = entry.commit_time;
+            let mut ready = true;
+            for parent in &entry.parents {
+                let parent_idx = resolve_parent(parent)?;
+                match cache[parent_idx] {
+                    Some(value) => corrected = corrected.max(value.saturating_add(1)),
+                    None => {
+                        // Defer until the parent is resolved; it is pushed above
+                        // `idx`, which is re-examined once all parents are ready.
+                        stack.push(parent_idx);
+                        ready = false;
+                    }
+                }
+            }
+            if ready {
+                cache[idx] = Some(corrected);
+                stack.pop();
+            }
+        }
     }
     cache
         .into_iter()
