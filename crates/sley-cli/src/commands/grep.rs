@@ -2811,4 +2811,22 @@ mod tests {
         assert_eq!(slash_count(b"a/b/c"), 2);
         assert_eq!(slash_count(b"v"), 0);
     }
+
+    #[test]
+    fn pager_basename_strips_dir_for_less_and_vi() {
+        // git's `len > 4 && is_dir_sep(pager[len-5])` trailing-4 rule.
+        assert_eq!(pager_basename("./less"), "less");
+        assert_eq!(pager_basename("/usr/bin/less"), "less");
+        assert_eq!(pager_basename("less"), "less");
+        assert_eq!(pager_basename("vi"), "vi");
+        assert_eq!(pager_basename("printf x"), "printf x");
+    }
+
+    #[test]
+    fn submodule_prefix_joins_with_trailing_slash() {
+        assert_eq!(join_prefix(b"", b"submodule"), b"submodule");
+        assert_eq!(submodule_prefix(b"", b"submodule"), b"submodule/");
+        assert_eq!(submodule_prefix(b"submodule/", b"sub"), b"submodule/sub/");
+        assert_eq!(join_prefix(b"submodule/", b"a"), b"submodule/a");
+    }
 }

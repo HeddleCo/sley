@@ -3357,3 +3357,46 @@ fn tag_points_at(
     let parsed = Tag::parse(format, &object.body)?;
     Ok(points_at.iter().any(|point| point == &parsed.object))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::expand_tag_bundle;
+
+    #[test]
+    fn expands_value_terminated_boolean_bundles() {
+        assert_eq!(
+            expand_tag_bundle("-am"),
+            Some(vec!["-a".to_string(), "-m".to_string()])
+        );
+        assert_eq!(
+            expand_tag_bundle("-amhello"),
+            Some(vec!["-a".to_string(), "-mhello".to_string()])
+        );
+        assert_eq!(
+            expand_tag_bundle("-saF"),
+            Some(vec!["-s".to_string(), "-a".to_string(), "-F".to_string()])
+        );
+    }
+
+    #[test]
+    fn leaves_non_value_bundles_verbatim() {
+        // Pure-boolean bundles keep their (usage-error) semantics.
+        for bundle in ["-av", "-fl", "-ai", "-vf", "-ab"] {
+            assert_eq!(expand_tag_bundle(bundle), None, "{bundle}");
+        }
+        // A `-`-prefixed value that looks like a bundle (e.g. a `--sort` key) is
+        // never split, because its first byte is not a boolean short flag or the
+        // bundle reaches a non-flag byte.
+        assert_eq!(expand_tag_bundle("-objectname"), None);
+        assert_eq!(expand_tag_bundle("-authoremail"), Some(
+            // 'a' then 'u' (value flag) — split is fine here in isolation; the
+            // parse loop only consults this in option position, never on a
+            // consumed `--sort` value.
+            vec!["-a".to_string(), "-uthoremail".to_string()]
+        ));
+        // Long options and glued value flags pass through.
+        assert_eq!(expand_tag_bundle("--sort"), None);
+        assert_eq!(expand_tag_bundle("-mhi"), None);
+        assert_eq!(expand_tag_bundle("-n5"), None);
+    }
+}
