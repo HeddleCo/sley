@@ -2390,16 +2390,16 @@ fn write_diff_summary_entry(
         }
         sley_diff_merge::NameStatus::Renamed(score) => {
             if let Some(old_path) = &entry.old_path {
-                let old_path = status_quote_path(old_path, false);
-                let path = status_quote_path(&entry.path, false);
-                writeln!(stdout, " rename {old_path} => {path} ({score}%)")?;
+                // git's `show_rename_copy` compresses a common path prefix/suffix
+                // into `pfx{a => b}sfx` via `pprint_rename`.
+                let pretty = diff_stat_pprint_rename(old_path, &entry.path);
+                writeln!(stdout, " rename {pretty} ({score}%)")?;
             }
         }
         sley_diff_merge::NameStatus::Copied(score) => {
             if let Some(old_path) = &entry.old_path {
-                let old_path = status_quote_path(old_path, false);
-                let path = status_quote_path(&entry.path, false);
-                writeln!(stdout, " copy {old_path} => {path} ({score}%)")?;
+                let pretty = diff_stat_pprint_rename(old_path, &entry.path);
+                writeln!(stdout, " copy {pretty} ({score}%)")?;
             }
         }
         sley_diff_merge::NameStatus::Modified => {
