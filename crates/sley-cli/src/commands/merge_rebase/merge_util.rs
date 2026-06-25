@@ -670,8 +670,10 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts(
         // index/worktree writers to stage `DirRenameLocation` at stage 0.
         let advisory_location = matches!(
             entry.conflict,
-            Some(sley_diff_merge::MergeConflictKind::DirRenameLocation { .. })
-                | Some(sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { .. })
+            Some(sley_diff_merge::MergeConflictKind::DirRenameLocation {
+                back_to_self: false,
+                ..
+            }) | Some(sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { .. })
         );
         if entry.conflict.is_some() {
             conflicts.push(entry.path.clone());
