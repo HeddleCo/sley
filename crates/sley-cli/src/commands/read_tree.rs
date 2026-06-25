@@ -1336,6 +1336,12 @@ fn is_submodule_active(repo_config: &GitConfig, name: &str, path: &str) -> bool 
 /// directory-prefix match (git's `match_pathspec` for a literal pathspec).
 fn pathspec_matches_submodule(spec: &str, path: &str) -> bool {
     let spec = spec.trim_end_matches('/');
+    // git's `clone --recurse-submodules` records `submodule.active = .`; a `.`
+    // (or empty) pathspec matches every path from the repository root, so every
+    // submodule is active.
+    if spec.is_empty() || spec == "." {
+        return true;
+    }
     path == spec || path.starts_with(&format!("{spec}/"))
 }
 

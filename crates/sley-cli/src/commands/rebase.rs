@@ -1760,12 +1760,26 @@ fn print_missing_upstream_advice(ctx: &Ctx, refs: &FileRefStore) {
 
 fn require_clean_work_tree(ctx: &Ctx, action: &str, with_hint: bool) -> Result<()> {
     let status = crate::collect_short_status(&ctx.worktree_root, &ctx.git_dir, ctx.format)?;
-    let has_unstaged = status
-        .iter()
-        .any(|entry| entry.worktree != b' ' && entry.worktree != b'?' && entry.index != b'?');
+    // git's rebase clean-check runs `has_unstaged_changes` / `has_uncommitted_
+    // changes` with `ignore_submodules = 1`, so a submodule that has moved its
+    // HEAD or is dirty never blocks the rebase (t3426 "rebase interactive ignores
+    // modified submodules"). Skip any gitlink (submodule) path on both sides.
+    let is_submodule = |entry: &sley_worktree::ShortStatusEntry| {
+        entry.submodule.is_some()
+            || [entry.head_mode, entry.index_mode, entry.worktree_mode]
+                .into_iter()
+                .flatten()
+                .any(sley_index::is_gitlink)
+    };
+    let has_unstaged = status.iter().any(|entry| {
+        !is_submodule(entry)
+            && entry.worktree != b' '
+            && entry.worktree != b'?'
+            && entry.index != b'?'
+    });
     let has_staged = status
         .iter()
-        .any(|entry| entry.index != b' ' && entry.index != b'?');
+        .any(|entry| !is_submodule(entry) && entry.index != b' ' && entry.index != b'?');
     if !has_unstaged && !has_staged {
         return Ok(());
     }

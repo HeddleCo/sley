@@ -2651,15 +2651,26 @@ fn try_straight_apply(
         // ("already exists in working directory"), which the am/rebase caller
         // turns into a conflict. Without this, a "new file" patch silently
         // clobbers an existing file instead of conflicting.
+        // A working-tree *directory* at the target is fine (git's check_to_create
+        // returns 0 for S_ISDIR): an added gitlink populates an existing empty
+        // submodule directory rather than conflicting. Any other existing entry
+        // still fails the create (→ conflict / `git am` aborts).
         if patch.is_new
             && let Some(target) = patch.new_path.as_deref().or(patch.old_path.as_deref())
             && let Ok(rel) = std::str::from_utf8(target)
-            && worktree_root.join(rel).exists()
+            && let Ok(meta) = std::fs::symlink_metadata(worktree_root.join(rel))
+            && !(meta.is_dir() && patch.new_mode == Some(0o160000))
         {
             return Ok(None);
         }
         let base = if patch.is_new {
             Vec::new()
+        } else if patch.old_mode == Some(0o160000) {
+            // Gitlink (submodule) preimage: the working tree is a submodule
+            // directory, not a readable blob, so synthesize `Subproject commit
+            // <old>\n` from the patch's own old-side lines (git's
+            // `SUBMODULE_PATCH_WITHOUT_INDEX` path).
+            am_gitlink_preimage_from_patch(patch)
         } else if let Some(old) = patch.old_path.as_deref().or(patch.new_path.as_deref()) {
             let rel = std::str::from_utf8(old)
                 .map_err(|_| GitError::InvalidFormat("non-utf8 patch path".into()))?;
@@ -3064,17 +3075,46 @@ fn ws_fuzzy_matchlines(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn apply_actions(worktree_root: &Path, actions: &[ApplyFileAction]) -> Result<()> {
+    // git's `write_out_results` materializes in two phases: every removal happens
+    // before any write. This matters when a directory's tracked children are
+    // removed and the directory is then (re)created as a gitlink — single-phase
+    // ordering would prune the just-emptied directory after the create.
     for action in actions {
-        match action {
-            ApplyFileAction::Write {
-                path,
-                mode,
-                content,
-            } => merge_write_worktree_file(worktree_root, path, content, *mode)?,
-            ApplyFileAction::Remove { path } => merge_remove_worktree_file(worktree_root, path)?,
+        if let ApplyFileAction::Remove { path } = action {
+            merge_remove_worktree_file(worktree_root, path)?;
+        }
+    }
+    for action in actions {
+        if let ApplyFileAction::Write {
+            path,
+            mode,
+            content,
+        } = action
+        {
+            merge_write_worktree_file(worktree_root, path, content, *mode)?;
         }
     }
     Ok(())
+}
+
+/// Reconstruct a gitlink patch's preimage (`Subproject commit <old>\n`) from its
+/// first hunk's old-side lines, used when the submodule has no readable blob in
+/// the working tree (git's `SUBMODULE_PATCH_WITHOUT_INDEX`).
+fn am_gitlink_preimage_from_patch(patch: &sley_diff_merge::FilePatch) -> Vec<u8> {
+    let mut base = Vec::new();
+    if let Some(hunk) = patch.hunks.first() {
+        for line in &hunk.lines {
+            match line {
+                sley_diff_merge::HunkLine::Context(bytes)
+                | sley_diff_merge::HunkLine::Delete(bytes) => {
+                    base.extend_from_slice(bytes);
+                    base.push(b'\n');
+                }
+                sley_diff_merge::HunkLine::Insert(_) => {}
+            }
+        }
+    }
+    base
 }
 
 /// Stage the files this patch touched into the index and create the commit,
@@ -3564,6 +3604,47 @@ fn apply_three_way(
         "HEAD",
         &patch.subject,
     )?;
+
+    // git's merge refuses to clobber untracked working-tree files: a path the
+    // merge would create that is absent from "ours" (HEAD) but present in the
+    // working tree as an untracked non-directory aborts the whole merge before
+    // anything is written. This is what makes "replace submodule with a directory
+    // must fail" and the untracked-file-in-the-way cases fail like git. Scoped to
+    // submodule batches so plain `am -3` keeps its existing behaviour.
+    if file_patches.iter().any(file_patch_touches_gitlink) {
+        let mut overwritten: Vec<&Vec<u8>> = Vec::new();
+        for (path, result) in &results {
+            let writes = matches!(
+                result,
+                MergePathResult::Resolved(Some(_))
+                    | MergePathResult::Conflict {
+                        worktree: Some(_),
+                        ..
+                    }
+            );
+            if !writes || ours_map.contains_key(path) {
+                continue;
+            }
+            if let Ok(rel) = std::str::from_utf8(path)
+                && std::fs::symlink_metadata(worktree_root.join(rel))
+                    .is_ok_and(|meta| !meta.is_dir())
+            {
+                overwritten.push(path);
+            }
+        }
+        if !overwritten.is_empty() {
+            eprintln!(
+                "error: The following untracked working tree files would be overwritten by merge:"
+            );
+            for path in &overwritten {
+                eprintln!("\t{}", String::from_utf8_lossy(path));
+            }
+            eprintln!("Please move or remove them before you merge.");
+            eprintln!("Aborting");
+            eprintln!("error: Failed to merge in the changes.");
+            return Ok(ApplyResult::Conflict);
+        }
+    }
 
     // git prints "Auto-merging <path>" for every file changed on both sides.
     if !quiet {
