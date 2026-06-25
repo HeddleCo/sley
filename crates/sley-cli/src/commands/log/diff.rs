@@ -83,6 +83,14 @@ pub(super) struct LogDiffOptions {
     pub(super) text: bool,
     /// `-O<file>`: reorder diff entries according to an orderfile.
     pub(super) order_file: Option<String>,
+    /// `--rotate-to=<path>` / `--skip-to=<path>`: rotate (or, with `rotate_skip`,
+    /// drop) each commit's path-sorted diff so it begins at `<path>`. `git log`
+    /// is non-strict: a target naming no diffed path pivots at the first path
+    /// lexically `>=` it and silently no-ops when none qualifies.
+    pub(super) rotate_to: Option<String>,
+    /// `true` when the rotate request came from `--skip-to` rather than
+    /// `--rotate-to`.
+    pub(super) rotate_skip: bool,
     /// Resolved `--indent-heuristic` / `diff.indentHeuristic` (default
     /// git-enabled).
     pub(super) indent_heuristic: bool,
@@ -110,6 +118,8 @@ impl Default for LogDiffOptions {
             ignore_regexes: Vec::new(),
             text: false,
             order_file: None,
+            rotate_to: None,
+            rotate_skip: false,
             indent_heuristic: true,
         }
     }
@@ -300,7 +310,16 @@ impl LogDiffContext<'_> {
         } else {
             entries
         };
-        let entries = apply_diff_order_file(entries, self.opts.order_file.as_deref())?;
+        let mut entries = apply_diff_order_file(entries, self.opts.order_file.as_deref())?;
+        if let Some(target) = self.opts.rotate_to.as_deref() {
+            // `git log`/`git show` are non-strict (`rotate_to_strict == 0`).
+            commands::diff_order::rotate_entries(
+                &mut entries,
+                target.as_bytes(),
+                self.opts.rotate_skip,
+                false,
+            )?;
+        }
         if entries.is_empty() {
             return Ok(());
         }
