@@ -615,6 +615,16 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     eprintln!("fatal: '--ours/--theirs' needs the paths to check out");
                     return Err(GitError::Exit(128));
                 }
+                if positional.is_empty() {
+                    // `git checkout` with no branch and no paths stays on the
+                    // current branch: git reports local changes on stdout and
+                    // succeeds (no error), leaving the index/worktree untouched.
+                    let store = FileRefStore::new(&git_dir, format);
+                    if let Ok(Some(head)) = resolve_ref_peeled(&store, "HEAD") {
+                        let _ = checkout_show_local_changes(&git_dir, &head, quiet, force);
+                    }
+                    return Ok(());
+                }
                 return Err(GitError::Command(
                     "checkout currently supports: checkout [-q] <branch> or checkout [-q] -b|-B <branch> [<start>]".into(),
                 ));
