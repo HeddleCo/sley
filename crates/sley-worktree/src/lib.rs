@@ -17419,7 +17419,12 @@ pub fn move_index_and_worktree_path(
     };
     let destination_has_trailing_separator = path_has_trailing_separator(&destination_absolute);
     let destination_absolute = normalize_absolute_path_lexically(&destination_absolute);
-    let mut destination_absolute = if destination_absolute.is_dir() {
+    // When the destination is an existing directory, the source is moved *into*
+    // it (`dst/basename`). Record that so the trailing-separator check below does
+    // not then reject `git mv file dir/` — git only errors on a trailing slash
+    // when the named directory does not exist.
+    let destination_was_existing_dir = destination_absolute.is_dir();
+    let mut destination_absolute = if destination_was_existing_dir {
         let Some(file_name) = source_absolute.file_name() else {
             return Err(GitError::InvalidPath(format!(
                 "invalid source path {}",
@@ -17454,6 +17459,7 @@ pub fn move_index_and_worktree_path(
     let source_path = git_path_bytes(source_relative)?;
     let destination_path = git_path_bytes(destination_relative)?;
     if destination_has_trailing_separator
+        && !destination_was_existing_dir
         && !destination_absolute.is_dir()
         && !source_absolute.is_dir()
     {

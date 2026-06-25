@@ -6791,6 +6791,12 @@ pub enum MergeConflictKind {
         added_in: String,
         /// The side label that renamed the directory (`branch_with_dir_rename`).
         dir_renamed_in: String,
+        /// True when the directory rename moved the file back onto its own base
+        /// source path (rename-to-self) and the other side modified that path. The
+        /// `CONFLICT (file location)` message is the same, but git records the
+        /// path UNMERGED (stages 1/2/3) instead of staging the re-homed content
+        /// cleanly: the index writers stage these 1/2/3, not at stage 0.
+        back_to_self: bool,
     },
     /// A directory rename would have moved one or more paths onto this path, but
     /// it is already occupied (a file/dir in the way) or several sources map
@@ -7032,6 +7038,7 @@ pub fn merge_entry_maps(
     let mut dir_rename_two_to_one: Vec<DirRenameTwoToOne> = Vec::new();
     let mut dir_rename_collisions: Vec<DirRenameCollision> = Vec::new();
     let mut dir_rename_splits: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut dir_rename_back_to_self: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut info_messages = Vec::new();
     let mut cleanup_paths: BTreeSet<Vec<u8>> = renames
         .dest_to_source
@@ -7058,6 +7065,7 @@ pub fn merge_entry_maps(
         rehomed_paths = outcome.rehomed;
         dir_rename_collisions = outcome.collisions;
         dir_rename_splits = outcome.splits;
+        dir_rename_back_to_self = outcome.back_to_self;
         info_messages = outcome.info_messages;
         dir_rename_dirty = outcome.dirty;
         remap_rename_destinations(&mut renames, &rehomed_paths);
@@ -7522,14 +7530,35 @@ pub fn merge_entry_maps(
                         options.ours_label.to_string(),
                     )
                 };
+                // Rename-to-self via a directory rename (merge-ort 12i2): the
+                // re-home landed the file back on its own base source path where
+                // the other side modified it. git records this UNMERGED (UU) even
+                // though the trivial 3-way at the destination resolves cleanly
+                // (the renamed side's content equals base). Stage the three
+                // versions so the index carries the conflict.
+                let back_to_self = dir_rename_back_to_self.contains(dest);
                 if let Some(slot) = paths.iter_mut().find(|p| &p.path == dest)
                     && slot.conflict.is_none()
                 {
+                    if back_to_self {
+                        slot.stages = MergeStages {
+                            base: eff_base.get(dest).copied(),
+                            ours: eff_ours.get(dest).copied(),
+                            theirs: eff_theirs.get(dest).copied(),
+                        };
+                        slot.worktree = match &slot.result {
+                            Some((mode, oid)) => {
+                                Some((*mode, merge_worktree_bytes(db, *mode, oid)?))
+                            }
+                            None => slot.worktree.clone(),
+                        };
+                    }
                     slot.conflict = Some(MergeConflictKind::DirRenameLocation {
                         old_path: info.old_path.clone(),
                         renamed_from: info.renamed_from.clone(),
                         added_in,
                         dir_renamed_in,
+                        back_to_self,
                     });
                 } else {
                     info_messages.push(MergeInfoMessage::DirRenameLocationConflict {
@@ -8582,6 +8611,12 @@ struct DirRenameOutcome {
     collisions: Vec<DirRenameCollision>,
     /// Split source dirs that were relevant to a path on the other side.
     splits: BTreeSet<Vec<u8>>,
+    /// Destinations where a directory rename moved a file back onto its own base
+    /// source path (rename-to-self) and the other side modified that path. git
+    /// records these as an unmerged file-location conflict (`UU`) rather than a
+    /// clean auto-resolution; the trivial 3-way at the destination would
+    /// otherwise resolve cleanly because the renamed side's content equals base.
+    back_to_self: BTreeSet<Vec<u8>>,
     /// True if a directory-level collision or split made the merge dirty even in
     /// `=true` mode (e.g. two paths re-homed onto one destination).
     dirty: bool,
@@ -8619,6 +8654,7 @@ fn apply_directory_renames(
     let mut rehomed = BTreeMap::new();
     let mut collisions = Vec::new();
     let mut splits = BTreeSet::new();
+    let mut back_to_self = BTreeSet::new();
     let mut info_messages = Vec::new();
     let mut dirty = false;
 
@@ -8666,6 +8702,7 @@ fn apply_directory_renames(
         true,
         &mut rehomed,
         &mut collisions,
+        &mut back_to_self,
         &mut dirty,
     );
     apply_rehome_moves(
@@ -8678,6 +8715,7 @@ fn apply_directory_renames(
         false,
         &mut rehomed,
         &mut collisions,
+        &mut back_to_self,
         &mut dirty,
     );
 
@@ -8688,6 +8726,7 @@ fn apply_directory_renames(
         rehomed,
         collisions,
         splits,
+        back_to_self,
         dirty,
         info_messages,
     }
@@ -8860,6 +8899,7 @@ fn apply_rehome_moves(
     side_is_ours: bool,
     rehomed: &mut BTreeMap<Vec<u8>, RehomeSides>,
     collisions: &mut Vec<DirRenameCollision>,
+    back_to_self: &mut BTreeSet<Vec<u8>>,
     dirty: &mut bool,
 ) {
     for mv in moves {
@@ -8939,6 +8979,9 @@ fn apply_rehome_moves(
             }
         }
         if moved {
+            if rename_back_to_modified_source {
+                back_to_self.insert(mv.to.clone());
+            }
             let info = RehomeInfo {
                 old_path: mv.from.clone(),
                 renamed_from: mv.renamed_from.clone(),

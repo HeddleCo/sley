@@ -3373,7 +3373,10 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 ours,
                 kind:
                     Some(
-                        sley_diff_merge::MergeConflictKind::DirRenameLocation { .. }
+                        sley_diff_merge::MergeConflictKind::DirRenameLocation {
+                            back_to_self: false,
+                            ..
+                        }
                         | sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { .. },
                     ),
                 ..
@@ -3740,7 +3743,10 @@ fn write_merge_recursive_index(
                 ours,
                 kind:
                     Some(
-                        sley_diff_merge::MergeConflictKind::DirRenameLocation { .. }
+                        sley_diff_merge::MergeConflictKind::DirRenameLocation {
+                            back_to_self: false,
+                            ..
+                        }
                         | sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { .. },
                     ),
                 ..
@@ -3993,6 +3999,7 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
                 renamed_from,
                 added_in,
                 dir_renamed_in,
+                back_to_self: _,
             }) => match renamed_from {
                 Some(source) => println!(
                     "CONFLICT (file location): {src} renamed to {old} in {added_in}, inside a directory that was renamed in {dir_renamed_in}, suggesting it should perhaps be moved to {path_str}.",

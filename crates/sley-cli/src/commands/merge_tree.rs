@@ -803,6 +803,7 @@ fn render_merge_outcome(
                 renamed_from,
                 added_in,
                 dir_renamed_in,
+                back_to_self: _,
             } => {
                 let new_path = String::from_utf8_lossy(path);
                 let message = match renamed_from {
