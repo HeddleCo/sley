@@ -513,6 +513,7 @@ fn merge_three_way(
                 base_label,
                 style: sley_diff_merge::ConflictStyle::Merge,
                 favor: sley_diff_merge::MergeFavor::None,
+                ws_ignore: sley_diff_merge::WsIgnore::EMPTY,
             },
         )
         .content

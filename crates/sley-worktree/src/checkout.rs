@@ -1022,6 +1022,7 @@ pub(crate) fn checkout_merge_unmerged_path(
                 CheckoutConflictStyle::Diff3 => sley_diff_merge::ConflictStyle::Diff3,
             },
             favor: sley_diff_merge::MergeFavor::None,
+            ws_ignore: sley_diff_merge::WsIgnore::EMPTY,
         },
     );
     let file_path = worktree_path(worktree_root, ours.path.as_bytes())?;

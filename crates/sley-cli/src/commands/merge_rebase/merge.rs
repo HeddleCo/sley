@@ -3623,6 +3623,7 @@ pub(crate) fn cmd_merge_recursive(args: &[String]) -> Result<()> {
     let mut detect_renames = merge_recursive_renames_default();
     let mut rename_threshold = sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
     let mut favor = sley_diff_merge::MergeFavor::None;
+    let mut ws_ignore = sley_diff_merge::WsIgnore::EMPTY;
     let mut base_revs: Vec<&String> = Vec::new();
     for arg in &args[..separator] {
         if let Some(opt) = arg.strip_prefix("--") {
@@ -3647,6 +3648,14 @@ pub(crate) fn cmd_merge_recursive(args: &[String]) -> Result<()> {
                 favor = sley_diff_merge::MergeFavor::Ours;
             } else if opt == "theirs" {
                 favor = sley_diff_merge::MergeFavor::Theirs;
+            } else if opt == "ignore-space-change" {
+                ws_ignore.space_change = true;
+            } else if opt == "ignore-all-space" {
+                ws_ignore.all_space = true;
+            } else if opt == "ignore-space-at-eol" {
+                ws_ignore.space_at_eol = true;
+            } else if opt == "ignore-cr-at-eol" {
+                ws_ignore.cr_at_eol = true;
             } else if matches!(
                 opt,
                 "renormalize"
@@ -3655,10 +3664,6 @@ pub(crate) fn cmd_merge_recursive(args: &[String]) -> Result<()> {
                     | "histogram"
                     | "minimal"
                     | "subtree"
-                    | "ignore-space-change"
-                    | "ignore-all-space"
-                    | "ignore-space-at-eol"
-                    | "ignore-cr-at-eol"
             ) || opt.starts_with("diff-algorithm=")
                 || opt.starts_with("subtree=")
             {
@@ -3703,6 +3708,7 @@ pub(crate) fn cmd_merge_recursive(args: &[String]) -> Result<()> {
         "merged common ancestors",
         favor,
         sley_diff_merge::ConflictStyle::Merge,
+        ws_ignore,
         RenameMergeConfig {
             detect_renames,
             rename_threshold,

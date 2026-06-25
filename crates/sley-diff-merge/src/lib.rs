@@ -404,6 +404,14 @@ pub struct WsIgnore {
 }
 
 impl WsIgnore {
+    /// No whitespace-ignore flavour active (the exact, byte-for-byte comparison).
+    pub const EMPTY: Self = Self {
+        all_space: false,
+        space_change: false,
+        space_at_eol: false,
+        cr_at_eol: false,
+    };
+
     /// True when no whitespace-ignore flavour is active.
     pub fn is_empty(&self) -> bool {
         !(self.all_space || self.space_change || self.space_at_eol || self.cr_at_eol)
@@ -996,6 +1004,13 @@ pub struct MergeBlobOptions<'a> {
     /// lines with no markers (and a non-conflicted result); other values leave
     /// markers (favouring ours/theirs is applied by the caller at the file level).
     pub favor: MergeFavor,
+    /// Whitespace-insensitivity for the 3-way line matching, mirroring
+    /// `-Xignore-space-change`/`-Xignore-all-space`/`-Xignore-space-at-eol` (git's
+    /// `ll_opts.xdl_opts`). When non-empty, regions that differ only by ignored
+    /// whitespace are not conflicts, and unchanged spans emit ours' actual bytes
+    /// (xdl_merge copies the common parts from file1). Empty (the default) is the
+    /// exact, byte-for-byte merge.
+    pub ws_ignore: WsIgnore,
 }
 
 impl Default for MergeBlobOptions<'_> {
@@ -1006,6 +1021,7 @@ impl Default for MergeBlobOptions<'_> {
             base_label: "base",
             style: ConflictStyle::Merge,
             favor: MergeFavor::None,
+            ws_ignore: WsIgnore::EMPTY,
         }
     }
 }
@@ -1044,9 +1060,11 @@ pub fn merge_blobs(
     let theirs_lines = split_lines(theirs);
 
     // Per-side matched (equal) base regions, paired with the corresponding side
-    // ranges, computed via Myers.
-    let ours_matches = matching_regions(&base_lines, &ours_lines);
-    let theirs_matches = matching_regions(&base_lines, &theirs_lines);
+    // ranges, computed via Myers. Under `ws_ignore`, lines that differ only by
+    // ignored whitespace match, so whitespace-only changes are absorbed into the
+    // stable spans rather than surfacing as conflicts.
+    let ours_matches = matching_regions(&base_lines, &ours_lines, options.ws_ignore);
+    let theirs_matches = matching_regions(&base_lines, &theirs_lines, options.ws_ignore);
 
     // Intersect the two match lists to get segments of base that are unchanged
     // on BOTH sides, each carrying the exact aligned side indices. Between these
@@ -1064,10 +1082,12 @@ pub fn merge_blobs(
         let base_region = &base_lines[base_idx..seg.base_start];
         let our_region = &ours_lines[our_idx..seg.ours_start];
         let their_region = &theirs_lines[their_idx..seg.theirs_start];
-        emit_region(&mut writer, base_region, our_region, their_region);
+        emit_region(&mut writer, base_region, our_region, their_region, options.ws_ignore);
 
-        // The stable segment itself is identical on all three: emit base lines.
-        writer.emit_lines(&base_lines[seg.base_start..seg.base_start + seg.len]);
+        // The stable segment matched on both sides. Emit ours' actual bytes
+        // (xdl_merge copies common spans from file1): identical to base under an
+        // exact match, and ours' whitespace under `ws_ignore`.
+        writer.emit_lines(&ours_lines[seg.ours_start..seg.ours_start + seg.len]);
 
         base_idx = seg.base_start + seg.len;
         our_idx = seg.ours_start + seg.len;
@@ -1081,6 +1101,7 @@ pub fn merge_blobs(
         &base_lines[base_idx..],
         &ours_lines[our_idx..],
         &theirs_lines[their_idx..],
+        options.ws_ignore,
     );
 
     writer.finish()
@@ -1093,25 +1114,41 @@ fn emit_region(
     base_region: &[DiffLine<'_>],
     our_region: &[DiffLine<'_>],
     their_region: &[DiffLine<'_>],
+    ws_ignore: WsIgnore,
 ) {
     if our_region.is_empty() && their_region.is_empty() {
         return;
     }
-    let our_changed = our_region != base_region;
-    let their_changed = their_region != base_region;
+    // Under `ws_ignore`, "changed" means changed beyond ignored whitespace; with
+    // the empty default the comparison is exact byte equality.
+    let our_changed = !regions_match(our_region, base_region, ws_ignore);
+    let their_changed = !regions_match(their_region, base_region, ws_ignore);
     match (our_changed, their_changed) {
-        (false, false) => writer.emit_lines(base_region),
+        (false, false) => writer.emit_lines(our_region),
         (true, false) => writer.emit_lines(our_region),
         (false, true) => writer.emit_lines(their_region),
         (true, true) => {
-            if our_region == their_region {
-                // Both sides made the same change: no conflict.
+            if regions_match(our_region, their_region, ws_ignore) {
+                // Both sides made the same change (up to ignored whitespace): no
+                // conflict. xdl_merge keeps ours' bytes.
                 writer.emit_lines(our_region);
             } else {
                 writer.emit_conflict_refined(our_region, base_region, their_region);
             }
         }
     }
+}
+
+/// Whether two line slices are equal, exactly when `ws_ignore` is empty and up to
+/// the active whitespace-ignore canonicalization otherwise.
+fn regions_match(a: &[DiffLine<'_>], b: &[DiffLine<'_>], ws_ignore: WsIgnore) -> bool {
+    if ws_ignore.is_empty() {
+        return a == b;
+    }
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            canonicalize_line(x.content, ws_ignore) == canonicalize_line(y.content, ws_ignore)
+        })
 }
 
 /// One unit produced by zealous conflict refinement: either context lines shared
@@ -1221,8 +1258,18 @@ struct StableSegment {
 /// Each `Equal(n)` run becomes a [`MatchRegion`]; the regions are returned in
 /// increasing base order. (Equal runs are coalesced by the diff, so adjacent
 /// regions are already maximal.)
-fn matching_regions(base: &[DiffLine<'_>], side: &[DiffLine<'_>]) -> Vec<MatchRegion> {
-    let ops = myers_diff_lines(base, side);
+fn matching_regions(
+    base: &[DiffLine<'_>],
+    side: &[DiffLine<'_>],
+    ws_ignore: WsIgnore,
+) -> Vec<MatchRegion> {
+    let ops = if ws_ignore.is_empty() {
+        myers_diff_lines(base, side)
+    } else {
+        // The 3-way content merge uses the Myers line diff (git's ll-merge xdl
+        // default); the whitespace flags affect only the equality test.
+        myers_diff_lines_ws(base, side, ws_ignore, DiffAlgorithm::Myers)
+    };
     let mut regions = Vec::new();
     let mut base_idx = 0usize;
     let mut side_idx = 0usize;
@@ -6687,6 +6734,9 @@ pub struct MergeTreesOptions<'a> {
     pub directory_renames: DirectoryRenames,
     /// Conflict-marker style for textual conflicts (`merge.conflictStyle`).
     pub style: ConflictStyle,
+    /// Whitespace-insensitivity for textual 3-way merges, mirroring
+    /// `-Xignore-space-change`/`-Xignore-all-space`/`-Xignore-space-at-eol`.
+    pub ws_ignore: WsIgnore,
 }
 
 /// How directory-rename detection behaves, mirroring git's
@@ -6715,6 +6765,7 @@ impl Default for MergeTreesOptions<'_> {
             rename_limit: 0,
             directory_renames: DirectoryRenames::False,
             style: ConflictStyle::Merge,
+            ws_ignore: WsIgnore::EMPTY,
         }
     }
 }
@@ -7255,6 +7306,7 @@ pub fn merge_entry_maps(
                     base_label: options.ancestor_label,
                     style: options.style,
                     favor: options.favor,
+                    ws_ignore: options.ws_ignore,
                 },
             );
 
@@ -9253,6 +9305,7 @@ fn apply_dir_rename_two_to_one_conflicts(
                     base_label: options.ancestor_label,
                     style: options.style,
                     favor: options.favor,
+                    ws_ignore: options.ws_ignore,
                 },
             )
         } else {
@@ -9322,6 +9375,7 @@ fn rename_merged_leaf(
                     base_label: options.ancestor_label,
                     style: options.style,
                     favor: options.favor,
+                    ws_ignore: options.ws_ignore,
                 },
             );
             let (mode, _) = merge_file_modes(base.map(|(mode, _)| mode), ours_mode, theirs_mode);
@@ -9483,6 +9537,7 @@ fn write_two_sided_dest_conflict(
                     base_label: options.ancestor_label,
                     style: options.style,
                     favor: options.favor,
+                    ws_ignore: options.ws_ignore,
                 },
             );
             let mode = if ours_mode == theirs_mode {
@@ -9875,6 +9930,7 @@ mod tests {
             base_label: "base",
             style: ConflictStyle::Merge,
             favor: MergeFavor::None,
+            ws_ignore: WsIgnore::EMPTY,
         }
     }
 
@@ -10039,6 +10095,7 @@ mod tests {
             base_label: "",
             style: ConflictStyle::Merge,
             favor: MergeFavor::None,
+            ws_ignore: WsIgnore::EMPTY,
         };
         let result = merge_blobs(base, ours, theirs, &options);
         assert!(result.conflicted);
@@ -10057,6 +10114,45 @@ mod tests {
             result.content,
             b"<<<<<<< ours\nx\ny\n=======\np\nq\n>>>>>>> theirs\n".to_vec(),
         );
+    }
+
+    #[test]
+    fn merge_ignore_space_change_resolves_clean_keeping_ours() {
+        // ours: only-whitespace change (collapsed run); theirs: real change.
+        // Under -Xignore-space-change the whitespace-only line is not a conflict
+        // and ours' actual bytes survive (xdl_merge copies common spans from
+        // file1); theirs' real change to a different line wins on its own line.
+        let base = b"alpha   beta\nsecond line\n";
+        let ours = b"alpha beta\nsecond line\n"; // collapsed the run
+        let theirs = b"alpha   beta\nsecond CHANGED\n"; // real change on line 2
+        let options = MergeBlobOptions {
+            ws_ignore: WsIgnore {
+                space_change: true,
+                ..WsIgnore::EMPTY
+            },
+            ..merge_opts()
+        };
+        let result = merge_blobs(base, ours, theirs, &options);
+        assert!(!result.conflicted, "whitespace-only divergence is not a conflict");
+        assert_eq!(result.content, b"alpha beta\nsecond CHANGED\n".to_vec());
+    }
+
+    #[test]
+    fn merge_ignore_space_change_still_conflicts_on_real_divergence() {
+        // Both sides make a real (non-whitespace) change to the same line: still
+        // a conflict even under -Xignore-space-change.
+        let base = b"one\n";
+        let ours = b"OURS\n";
+        let theirs = b"THEIRS\n";
+        let options = MergeBlobOptions {
+            ws_ignore: WsIgnore {
+                space_change: true,
+                ..WsIgnore::EMPTY
+            },
+            ..merge_opts()
+        };
+        let result = merge_blobs(base, ours, theirs, &options);
+        assert!(result.conflicted);
     }
 
     #[test]

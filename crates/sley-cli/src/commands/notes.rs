@@ -1663,6 +1663,7 @@ fn conflict_note_body(
                     base_label: "base",
                     style: ConflictStyle::Merge,
                     favor: sley_diff_merge::MergeFavor::None,
+                    ws_ignore: sley_diff_merge::WsIgnore::EMPTY,
                 },
             )
             .content)

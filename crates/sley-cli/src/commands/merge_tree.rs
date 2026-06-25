@@ -422,6 +422,7 @@ fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
             rename_limit: 0,
             directory_renames: sley_diff_merge::DirectoryRenames::Conflict,
             style: sley_diff_merge::ConflictStyle::Merge,
+            ws_ignore: sley_diff_merge::WsIgnore::EMPTY,
         },
     ) {
         Ok(merge) => merge,
@@ -1211,6 +1212,7 @@ fn trivial_content_merge(
             base_label: ".base",
             style: sley_diff_merge::ConflictStyle::Merge,
             favor: sley_diff_merge::MergeFavor::None,
+            ws_ignore: sley_diff_merge::WsIgnore::EMPTY,
         },
     );
     Ok(result.content)

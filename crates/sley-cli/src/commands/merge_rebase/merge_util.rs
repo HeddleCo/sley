@@ -594,6 +594,8 @@ pub(crate) fn three_way_merge_trees_inner_with_info(
         ancestor_label,
         favor,
         style,
+        // Porcelains that don't expose `-Xignore-space-*` use the exact merge.
+        sley_diff_merge::WsIgnore::EMPTY,
         // Rename-aware merge with git's default settings: detection on, 50%
         // threshold, `merge.directoryRenames` honoured.
         RenameMergeConfig {
@@ -630,6 +632,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts(
     ancestor_label: &str,
     favor: sley_diff_merge::MergeFavor,
     style: sley_diff_merge::ConflictStyle,
+    ws_ignore: sley_diff_merge::WsIgnore,
     renames: RenameMergeConfig,
 ) -> Result<(MergePathResults, MergeConflictPaths, MergeInfoMessages)> {
     let merge = sley_diff_merge::merge_entry_maps(
@@ -655,6 +658,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts(
                 sley_diff_merge::DirectoryRenames::False
             },
             style,
+            ws_ignore,
         },
     )?;
 
