@@ -560,34 +560,36 @@ fn update_one_submodule(
         }
     }
 
-    // `update` (without --init) only touches *initialized* submodules: ones
-    // whose url was copied into .git/config. A .gitmodules-only entry gets
-    // upstream's two-line stderr nudge and is skipped.
-    let url = config
-        .get("submodule", Some(&submodule.name), "url")
-        .map(str::to_string);
-    let url = match url {
-        Some(url) => Some(url),
-        None if submodule_is_active(config, submodule) => submodule
-            .url
-            .as_deref()
-            .map(|url| resolve_submodule_init_url(worktree_root, config, url)),
-        None => None,
-    };
-    let Some(url) = url else {
-        // git only emits this nudge when an explicit pathspec named the
-        // uninitialized submodule (`warn_if_uninitialized`); a bare `update`
-        // silently skips uninitialized ones.
+    // git's `prepare_to_clone_next_submodule`: an INACTIVE submodule is the
+    // only one skipped here — with the two-line "not initialized" nudge when an
+    // explicit pathspec named it (`warn_if_uninitialized`), silent otherwise.
+    if !submodule_is_active(config, submodule) {
         if !options.paths.is_empty() {
             eprintln!("Submodule path '{display}' not initialized");
             eprintln!("Maybe you want to use 'update --init'?");
         }
         return Ok(UpdateOutcome::Done);
-    };
-    if url.is_empty() {
-        eprintln!("fatal: cannot clone submodule '{display}' without a URL");
-        return Err(GitError::Exit(128));
     }
+    // Active: resolve the clone url from `.git/config`, falling back to the
+    // (relative-resolved) `.gitmodules` url. git then `die`s immediately if no
+    // url resolves — BEFORE the populated/needs-cloning check — so an active
+    // submodule whose url was unset fails loudly rather than being skipped.
+    let url = config
+        .get("submodule", Some(&submodule.name), "url")
+        .map(str::to_string)
+        .or_else(|| {
+            submodule
+                .url
+                .as_deref()
+                .map(|url| resolve_submodule_init_url(worktree_root, config, url))
+        });
+    let Some(url) = url.filter(|url| !url.is_empty()) else {
+        eprintln!(
+            "fatal: cannot clone submodule '{}' without a URL",
+            submodule.name
+        );
+        return Err(GitError::Exit(128));
+    };
 
     let just_populated = submodule_head(&path).is_err();
     if just_populated {
@@ -1346,6 +1348,18 @@ fn cmd_submodule_init(args: &[String], quiet: bool) -> Result<()> {
         // `.git/config`. (The old single-guard form skipped the update copy for
         // an already-url-registered submodule; t7406 #29/#30/#35 re-init after
         // editing `.gitmodules update`.)
+        // git's `init_submodule` sets the active flag in an INDEPENDENT guard:
+        // any submodule not already active (via `submodule.<name>.active` or the
+        // `submodule.active` pathspec) gets `submodule.<name>.active=true`, even
+        // when its url is already registered. (sley previously nested this in
+        // the url-copy guard, so a url-registered-but-inactive submodule — e.g.
+        // one excluded from a `clone --recurse-submodules=<pathspec>` — never
+        // got its active flag, breaking the `submodule.<name>.active` query and
+        // the active+no-url `submodule update` guard.)
+        if !submodule_is_active(&config, submodule) {
+            set_submodule_config_value(&mut config, &submodule.name, "active", "true");
+            changed = true;
+        }
         if config
             .get("submodule", Some(&submodule.name), "url")
             .is_none()
@@ -1357,7 +1371,6 @@ fn cmd_submodule_init(args: &[String], quiet: bool) -> Result<()> {
                 return Err(GitError::Exit(128));
             };
             let url = resolve_submodule_init_url(&worktree_root, &config, url);
-            set_submodule_config_value(&mut config, &submodule.name, "active", "true");
             set_submodule_config_value(&mut config, &submodule.name, "url", &url);
             if !quiet {
                 let display =
