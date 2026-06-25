@@ -176,51 +176,176 @@ pub fn run(args: Vec<String>) -> Result<()> {
 fn dispatch_with_aliases(
     args: &[String],
     global_config: &[GlobalConfigOverride],
-    alias_depth: usize,
+    _alias_depth: usize,
 ) -> Result<()> {
-    if alias_depth >= commands::alias::MAX_ALIAS_DEPTH {
-        eprintln!("fatal: alias loop detected");
-        return Err(GitError::Exit(128));
-    }
-    if let Some(command) = args.first().map(String::as_str) {
-        if !commands::alias::is_builtin_command(command) {
-            match commands::alias::expand_alias(command)? {
-                commands::alias::AliasExpansion::Shell(shell) => {
-                    return commands::alias::run_shell_alias(&shell, &args[1..]);
+    // git's `run_argv` loop: repeatedly expand the leading command name through
+    // the `alias.*` namespace until it resolves to a built-in (or external)
+    // command, tracking the expansion chain for loop detection.
+    let mut args: Vec<String> = args.to_vec();
+    let mut expanded_aliases: Vec<String> = Vec::new();
+    for _ in 0..commands::alias::MAX_ALIAS_DEPTH {
+        let Some(command) = args.first().cloned() else {
+            return dispatch_command(&args, global_config);
+        };
+        // A name is alias-expandable when it is not a built-in, or it is a
+        // *deprecated* built-in (which an alias is allowed to override).
+        let try_alias = !commands::alias::is_builtin_command(&command)
+            || commands::alias::is_deprecated_command(&command);
+        if try_alias {
+            match commands::alias::alias_lookup(&command)? {
+                commands::alias::AliasLookup::None => {}
+                commands::alias::AliasLookup::MissingValue(key) => {
+                    eprintln!("error: missing value for '{key}'");
+                    return Err(GitError::Exit(128));
                 }
-                commands::alias::AliasExpansion::Args(mut expanded) => {
+                commands::alias::AliasLookup::Value(alias_string) => {
+                    // `git <alias> -h` prints what the alias resolves to.
+                    if args.len() == 2 && args[1] == "-h" {
+                        eprintln!("'{command}' is aliased to '{alias_string}'");
+                    }
+                    if let Some(shell) = alias_string.strip_prefix('!') {
+                        return commands::alias::run_shell_alias(shell, &args[1..]);
+                    }
+                    let mut expanded = commands::alias::split_alias_value(&alias_string);
                     expanded.extend(args[1..].iter().cloned());
                     // An alias body may begin with global options (`-c`, `-C`,
-                    // `--config-env`, ...), e.g. `alias.x = "-c foo=bar config foo"`.
-                    // git re-parses those before dispatching the real subcommand,
-                    // so `-c` in an alias folds into the injected parameters just
-                    // like a command-line `-c`. Re-run the global-option parser on
-                    // the expanded args (which folds any `-c`/`--config-env` and
-                    // applies `-C`); only override git-dir/work-tree when the alias
-                    // explicitly set them so a top-level `--git-dir` survives.
-                    let nested = apply_global_options(&expanded)?;
-                    if nested.git_dir.is_some() {
-                        set_global_git_dir(nested.git_dir.clone());
+                    // `--config-env`, ...); git re-parses those before the real
+                    // subcommand. Fold any `-c`/`--config-env` and apply `-C`,
+                    // then take the remaining argv (with the real command first)
+                    // for recursion / loop detection.
+                    let new_args = reapply_global_options(&expanded)?;
+                    let Some(real_command) = new_args.first().cloned() else {
+                        eprintln!("fatal: empty alias for {command}");
+                        return Err(GitError::Exit(128));
+                    };
+                    if real_command == command {
+                        eprintln!("fatal: recursive alias: {command}");
+                        return Err(GitError::Exit(128));
                     }
-                    if nested.work_tree.is_some() {
-                        set_global_work_tree(nested.work_tree);
+                    expanded_aliases.push(command);
+                    if let Some(seen) = expanded_aliases
+                        .iter()
+                        .position(|name| name == &real_command)
+                    {
+                        report_alias_loop(&expanded_aliases, seen);
+                        return Err(GitError::Exit(128));
                     }
-                    if nested.attr_source.is_some() {
-                        set_global_attr_source(nested.attr_source);
-                    }
-                    if nested.bare {
-                        set_global_bare(true);
-                    }
-                    if nested.pathspec_flags != PathspecFlags::default() {
-                        set_global_pathspec_flags(nested.pathspec_flags);
-                    }
-                    return dispatch_with_aliases(nested.args, global_config, alias_depth + 1);
+                    args = new_args;
+                    continue;
                 }
-                commands::alias::AliasExpansion::None => {}
             }
         }
+        if commands::alias::is_builtin_command(&command) {
+            return dispatch_command(&args, global_config);
+        }
+        // Not a built-in and not an alias: try it as an external `git-<cmd>`,
+        // falling back to git's "not a git command" diagnostic.
+        return run_external_or_unknown(&command, &args);
     }
-    dispatch_command(args, global_config)
+    // Backstop: exceeded the expansion-iteration limit without converging.
+    eprintln!("fatal: alias loop detected");
+    Err(GitError::Exit(128))
+}
+
+/// Re-parse leading global options on an expanded alias argv, applying them the
+/// same way the top-level parser does, and return the remaining argv.
+fn reapply_global_options(expanded: &[String]) -> Result<Vec<String>> {
+    let nested = apply_global_options(expanded)?;
+    if nested.git_dir.is_some() {
+        set_global_git_dir(nested.git_dir.clone());
+    }
+    if nested.work_tree.is_some() {
+        set_global_work_tree(nested.work_tree);
+    }
+    if nested.attr_source.is_some() {
+        set_global_attr_source(nested.attr_source);
+    }
+    if nested.bare {
+        set_global_bare(true);
+    }
+    if nested.pathspec_flags != PathspecFlags::default() {
+        set_global_pathspec_flags(nested.pathspec_flags);
+    }
+    Ok(nested.args.to_vec())
+}
+
+/// Print git's `alias loop detected` diagnostic for the accumulated expansion
+/// chain, marking the already-seen entry with ` <==` and the latest with ` ==>`.
+fn report_alias_loop(expanded_aliases: &[String], seen: usize) {
+    let mut chain = String::new();
+    let last = expanded_aliases.len().saturating_sub(1);
+    for (index, name) in expanded_aliases.iter().enumerate() {
+        chain.push_str("\n  ");
+        chain.push_str(name);
+        if index == seen {
+            chain.push_str(" <==");
+        } else if index == last {
+            chain.push_str(" ==>");
+        }
+    }
+    eprintln!(
+        "fatal: alias loop detected: expansion of '{}' does not terminate:{}",
+        expanded_aliases[0], chain
+    );
+}
+
+/// Dispatch a non-built-in, non-alias command as an external `git-<cmd>`,
+/// emitting git's `trace: run_command:` line and falling back to the
+/// "not a git command" diagnostic when no such external exists.
+fn run_external_or_unknown(command: &str, args: &[String]) -> Result<()> {
+    let external = format!("git-{command}");
+    let mut argv = Vec::with_capacity(args.len());
+    argv.push(external.clone());
+    argv.extend(args[1..].iter().cloned());
+    if setup::git_trace_enabled() {
+        let mut line = String::from("trace: run_command:");
+        for arg in &argv {
+            line.push(' ');
+            line.push_str(&setup::trace_quote_sq(arg));
+        }
+        setup::git_trace_line("run-command.c:672", &line);
+    }
+    if let Some(path) = locate_external_in_path(&external) {
+        let status = std::process::Command::new(path)
+            .args(&args[1..])
+            .status()
+            .map_err(|err| GitError::Io(err.to_string()))?;
+        return match status.code() {
+            Some(0) => Ok(()),
+            Some(code) => Err(GitError::Exit(code)),
+            None => Err(GitError::Exit(1)),
+        };
+    }
+    commands::help::unknown_command(command, 1)
+}
+
+/// Locate an executable `git-<cmd>` on `PATH` (git's `locate_in_PATH`), or
+/// `None` when no such external command exists.
+fn locate_external_in_path(name: &str) -> Option<PathBuf> {
+    let path_var = env::var_os("PATH")?;
+    for dir in env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<()> {
