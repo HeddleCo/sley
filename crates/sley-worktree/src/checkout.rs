@@ -1250,6 +1250,7 @@ pub fn restore_index_and_worktree_paths_from_head(
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
     paths: &[PathBuf],
+    overlay: bool,
 ) -> Result<RestoreResult> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
@@ -1274,6 +1275,7 @@ pub fn restore_index_and_worktree_paths_from_head(
         index,
         &head_entries,
         paths,
+        overlay,
     )
 }
 
@@ -1283,6 +1285,7 @@ pub fn restore_index_and_worktree_paths_from_tree(
     format: ObjectFormat,
     tree_oid: &ObjectId,
     paths: &[PathBuf],
+    overlay: bool,
 ) -> Result<RestoreResult> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
@@ -1307,6 +1310,7 @@ pub fn restore_index_and_worktree_paths_from_tree(
         index,
         &source_entries,
         paths,
+        overlay,
     )
 }
 
@@ -1318,6 +1322,7 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
     index: Index,
     source_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     paths: &[PathBuf],
+    overlay: bool,
 ) -> Result<RestoreResult> {
     let index_version = index.version;
     let extensions = index_extensions_without_cache_tree(&index.extensions);
@@ -1367,7 +1372,14 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
                     path.clone(),
                     restore_head_entry_to_worktree_and_index(worktree_root, db, &path, entry)?,
                 );
+            } else if overlay {
+                // Overlay mode (git checkout default): a path that matches the
+                // pathspec but is absent from the source tree is left untouched
+                // in both the index and the working tree.
+                continue;
             } else {
+                // No-overlay mode (git restore default, checkout --no-overlay):
+                // drop the path from the index and the working tree.
                 index_entries.remove(&path);
                 remove_worktree_file(worktree_root, &path)?;
             }

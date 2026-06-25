@@ -403,6 +403,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         format,
                         &tree,
                         &resolved_paths,
+                        // git checkout defaults to overlay mode (leave paths
+                        // absent from the tree-ish); --no-overlay removes them.
+                        overlay_mode.unwrap_or(true),
                     )?;
                 }
                 None => {
@@ -1838,6 +1841,8 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         None
     };
     if staged && worktree {
+        // git restore defaults to no-overlay: paths absent from the source are
+        // removed from the index and working tree.
         if let Some(tree_oid) = source_tree.as_ref() {
             sley_worktree::restore_index_and_worktree_paths_from_tree(
                 worktree_root,
@@ -1845,6 +1850,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
                 format,
                 tree_oid,
                 &resolved_paths,
+                false,
             )?;
         } else {
             sley_worktree::restore_index_and_worktree_paths_from_head(
@@ -1852,6 +1858,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
                 git_dir,
                 format,
                 &resolved_paths,
+                false,
             )?;
         }
     } else if staged {
