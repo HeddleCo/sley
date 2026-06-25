@@ -193,6 +193,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         return commands::add_patch::run_add_patch(
             commands::add_patch::PatchMode::Reset,
             &positionals,
+            None,
             &mut stdin,
             cfg,
         );

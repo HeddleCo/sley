@@ -870,6 +870,7 @@ fn run_patch_menu(
     super::add_patch::run_add_patch(
         super::add_patch::PatchMode::Add,
         &selected_paths,
+        None,
         stdin,
         cfg,
     )
@@ -904,7 +905,7 @@ pub(crate) fn cmd_add_patch(
     let cfg = resolve_patch_config(&git_dir, context, interhunk, auto_advance)?;
     let stdin = io::stdin();
     let mut handle = stdin.lock();
-    super::add_patch::run_add_patch(super::add_patch::PatchMode::Add, paths, &mut handle, cfg)
+    super::add_patch::run_add_patch(super::add_patch::PatchMode::Add, paths, None, &mut handle, cfg)
 }
 
 /// Resolve the diff-tuning [`PatchConfig`] the way add-patch.c's
@@ -912,7 +913,7 @@ pub(crate) fn cmd_add_patch(
 /// / `diff.algorithm` config (rejecting negative context), then let an explicit
 /// `-U` / `--inter-hunk-context` from the command line override (also rejecting
 /// negatives). The die messages match git byte-for-byte (t3701 #88/#90/#91).
-fn resolve_patch_config(
+pub(crate) fn resolve_patch_config(
     git_dir: &std::path::Path,
     cli_context: Option<i64>,
     cli_interhunk: Option<i64>,

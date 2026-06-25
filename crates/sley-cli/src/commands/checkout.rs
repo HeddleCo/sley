@@ -240,16 +240,20 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(128));
         }
     }
-    if patch {
-        println!("No changes.");
-        return Ok(());
-    }
-
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let checkout_config = read_repo_config(&git_dir)?;
+    if patch {
+        return checkout_run_patch(
+            &git_dir,
+            format,
+            &positional,
+            dashdash_index,
+            no_auto_advance,
+        );
+    }
     let recurse_submodules = recurse_submodules.unwrap_or_else(|| {
         checkout_config
             .get_bool("submodule", None, "recurse")
@@ -1828,9 +1832,10 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     if patch {
-        return Err(GitError::Unsupported(
-            "restore patch selection is not implemented".into(),
-        ));
+        let cwd = env::current_dir()?;
+        let git_dir = discover_git_dir(&cwd)?;
+        let format = repository_object_format(&git_dir)?;
+        return restore_run_patch(&git_dir, format, &paths, source.as_deref(), staged, worktree);
     }
     if let Some(pathspec_file) = pathspec_from_file {
         paths.extend(read_pathspecs_from_file(&pathspec_file, pathspec_file_nul)?);
@@ -2248,6 +2253,142 @@ enum CheckoutBranchMode {
         force: bool,
         orphan: bool,
     },
+}
+
+/// Resolve a `checkout -p` / `restore -p` tree-ish to the OID hex that the
+/// `diff-index` modes pass on the command line. `<a>...<b>` ranges become their
+/// merge base (git replaces them because `diff-index` does not parse `...`); a
+/// plain ref/oid is handed to `diff-index` verbatim.
+fn checkout_patch_resolve_revision(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+) -> Result<String> {
+    if let Some((left, right)) = rev.split_once("...") {
+        let left = if left.is_empty() { "HEAD" } else { left };
+        let right = if right.is_empty() { "HEAD" } else { right };
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let left = commands::diff::diff_resolve_commit_arg(git_dir, format, &db, left)?;
+        let right = commands::diff::diff_resolve_commit_arg(git_dir, format, &db, right)?;
+        let base = commands::diff::diff_single_merge_base(git_dir, format, &db, &left, &right)?;
+        return Ok(base.to_hex());
+    }
+    Ok(rev.to_string())
+}
+
+/// Whether `arg` should be treated as the tree-ish operand of a `checkout -p`
+/// (rather than a pathspec): an explicit `HEAD`/`@`, a `...` range, or anything
+/// that resolves to a commit/tree-ish.
+fn checkout_patch_arg_is_revision(git_dir: &Path, format: ObjectFormat, arg: &str) -> bool {
+    arg == "HEAD"
+        || arg == "@"
+        || arg.contains("...")
+        || checkout_resolve_start_oid(git_dir, format, arg).is_ok()
+        || {
+            let db = FileObjectDatabase::from_git_dir(git_dir, format);
+            commands::diff::diff_resolve_commit_arg(git_dir, format, &db, arg).is_ok()
+        }
+}
+
+/// `git checkout -p [<tree-ish>] [--] [<pathspec>...]`: pick the patch mode from
+/// the tree-ish (none / HEAD / other) and run the shared interactive engine.
+fn checkout_run_patch(
+    git_dir: &Path,
+    format: ObjectFormat,
+    positional: &[String],
+    dashdash_index: Option<usize>,
+    no_auto_advance: bool,
+) -> Result<()> {
+    let (rev, pathspecs): (Option<&str>, &[String]) = match dashdash_index {
+        Some(index) => {
+            let (before, after) = positional.split_at(index);
+            match before {
+                [] => (None, after),
+                [rev] => (Some(rev.as_str()), after),
+                _ => {
+                    return Err(GitError::Command(
+                        "checkout with multiple tree-ish arguments is not supported".into(),
+                    ));
+                }
+            }
+        }
+        None => {
+            if !positional.is_empty()
+                && checkout_patch_arg_is_revision(git_dir, format, &positional[0])
+            {
+                (Some(positional[0].as_str()), &positional[1..])
+            } else {
+                (None, positional)
+            }
+        }
+    };
+
+    let (mode, revision): (commands::add_patch::PatchMode, Option<String>) = match rev {
+        None => (commands::add_patch::PatchMode::CheckoutIndex, None),
+        Some(rev) if rev == "HEAD" || rev == "@" => (
+            commands::add_patch::PatchMode::CheckoutHead,
+            Some("HEAD".to_string()),
+        ),
+        Some(rev) => (
+            commands::add_patch::PatchMode::CheckoutNothead,
+            Some(checkout_patch_resolve_revision(git_dir, format, rev)?),
+        ),
+    };
+
+    let cfg = commands::add_interactive::resolve_patch_config(git_dir, None, None, !no_auto_advance)?;
+    let stdin = io::stdin();
+    let mut handle = stdin.lock();
+    commands::add_patch::run_add_patch(mode, pathspecs, revision.as_deref(), &mut handle, cfg)
+}
+
+/// `git restore -p [--source=<rev>] [--staged] [--worktree] [<pathspec>...]`:
+/// pick the patch mode from `--staged`/`--worktree` and `--source`, then run the
+/// shared interactive engine. Default restore (worktree only) discards from the
+/// working tree; `--staged --worktree` touches both like `checkout -p`.
+fn restore_run_patch(
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    source: Option<&str>,
+    staged: bool,
+    worktree: bool,
+) -> Result<()> {
+    let pathspecs: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let (mode, revision): (commands::add_patch::PatchMode, Option<String>) = if staged && !worktree {
+        // `restore --staged -p` unstages selected hunks (ADD_P_RESET).
+        (commands::add_patch::PatchMode::Reset, None)
+    } else {
+        // `--staged --worktree` touches the index too (ADD_P_CHECKOUT); the
+        // default worktree restore touches only the working tree (ADD_P_WORKTREE).
+        let touches_index = staged && worktree;
+        match source {
+            None => (commands::add_patch::PatchMode::CheckoutIndex, None),
+            Some(rev) if rev == "HEAD" || rev == "@" => {
+                let mode = if touches_index {
+                    commands::add_patch::PatchMode::CheckoutHead
+                } else {
+                    commands::add_patch::PatchMode::WorktreeHead
+                };
+                (mode, Some("HEAD".to_string()))
+            }
+            Some(rev) => {
+                let resolved = checkout_patch_resolve_revision(git_dir, format, rev)?;
+                let mode = if touches_index {
+                    commands::add_patch::PatchMode::CheckoutNothead
+                } else {
+                    commands::add_patch::PatchMode::WorktreeNothead
+                };
+                (mode, Some(resolved))
+            }
+        }
+    };
+    let cfg = commands::add_interactive::resolve_patch_config(git_dir, None, None, true)?;
+    let stdin = io::stdin();
+    let mut handle = stdin.lock();
+    commands::add_patch::run_add_patch(mode, &pathspecs, revision.as_deref(), &mut handle, cfg)
 }
 
 fn checkout_switch_to_unborn_branch(git_dir: &Path, branch: &str) -> Result<()> {
