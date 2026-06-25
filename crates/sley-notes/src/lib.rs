@@ -502,13 +502,25 @@ pub fn merge_notes(
 
     let notes = notes_vec_from_map(merged);
     let parents = vec![local_oid, remote_oid];
+    // git appends a "Conflicts:" section listing every conflicting object to the
+    // partial merge commit's message (`merge_one_change_manual`); `--commit`
+    // later reuses that message verbatim, so the finalized merge records which
+    // notes conflicted.
+    let mut commit_message = message.as_bytes().to_vec();
+    if !conflicts.is_empty() {
+        commit_message.extend_from_slice(b"\n\nConflicts:\n");
+        for conflict in &conflicts {
+            commit_message
+                .extend_from_slice(format!("\t{}\n", conflict.annotated.to_hex()).as_bytes());
+        }
+    }
     let result = commit_notes_update_with_parents(
         git_dir,
         format,
         store,
         local_ref,
         &notes,
-        message.as_bytes(),
+        &commit_message,
         identity,
         &parents,
         Some(RefTarget::Direct(local_oid)),

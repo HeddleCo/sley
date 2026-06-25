@@ -1717,6 +1717,33 @@ fn read_notes_merge_state(git_dir: &Path, format: ObjectFormat) -> Result<(Objec
 
 fn commit_notes_merge_state(git_dir: &Path, format: ObjectFormat) -> Result<()> {
     let (partial, notes_ref) = read_notes_merge_state(git_dir, format)?;
+    let store = FileRefStore::new(git_dir, format);
+
+    // git finalizes by updating notes_ref from NOTES_MERGE_PARTIAL^1 under a
+    // compare-and-swap. If notes_ref has moved since the merge began, the update
+    // is refused with a ref-lock error and the merge state is left intact for
+    // the user to retry or abort. Surface that here before resolving conflicts.
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let partial_commit = Commit::parse(format, &db.read_object(&partial)?.body)?;
+    let expected = partial_commit.parents.first().copied();
+    let current = match store.read_ref(notes_ref.as_str())? {
+        Some(RefTarget::Direct(oid)) => Some(oid),
+        _ => None,
+    };
+    if current != expected {
+        let show = |oid: Option<ObjectId>| {
+            oid.map(|oid| oid.to_hex())
+                .unwrap_or_else(|| "0".repeat(format.hex_len()))
+        };
+        eprintln!(
+            "fatal: cannot lock ref '{}': is at {} but expected {}",
+            notes_ref.as_str(),
+            show(current),
+            show(expected)
+        );
+        return Err(GitError::Exit(128));
+    }
+
     let worktree = git_dir.join("NOTES_MERGE_WORKTREE");
     let mut resolved = Vec::new();
     for entry in fs::read_dir(&worktree)? {
@@ -1733,7 +1760,6 @@ fn commit_notes_merge_state(git_dir: &Path, format: ObjectFormat) -> Result<()> 
         resolved.push((annotated, body));
     }
     resolved.sort_by_key(|(oid, _)| oid.to_hex());
-    let store = FileRefStore::new(git_dir, format);
     finalize_notes_merge(
         git_dir,
         format,
