@@ -482,11 +482,20 @@ fn var_editor(specific_key: Option<&str>) -> Result<String> {
 }
 
 fn var_pager() -> String {
-    env::var("GIT_PAGER")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(|| var_effective_config_value("core.pager"))
-        .unwrap_or_else(|| "cat".into())
+    // git's `git var GIT_PAGER` == `git_pager(repo, 1)`: `GIT_PAGER`, then
+    // `core.pager`, then the `PAGER` env, then the compiled default (`less`). An
+    // empty value or `cat` disables paging, which `var` reports as `cat`.
+    let pager = match env::var("GIT_PAGER") {
+        Ok(value) => value,
+        Err(_) => var_effective_config_value("core.pager")
+            .or_else(|| env::var("PAGER").ok())
+            .unwrap_or_else(|| "less".into()),
+    };
+    if pager.is_empty() || pager == "cat" {
+        "cat".into()
+    } else {
+        pager
+    }
 }
 
 fn var_default_branch() -> String {

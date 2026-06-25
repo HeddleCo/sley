@@ -17,6 +17,7 @@ use sley_grep::{
 use crate::*;
 use sley_pathspec::{parse_normalized_pathspec_element, pathspec_attrs_match_with};
 use std::borrow::Cow;
+use std::cell::RefCell;
 
 /// Parsed command-line options for `git grep`.
 struct GrepOptions {
@@ -59,6 +60,16 @@ struct GrepOptions {
     heading: bool,
     break_between_files: bool,
     color: bool,
+    /// `--recurse-submodules` / `submodule.recurse`: descend into populated,
+    /// active submodules, prefixing their paths with the gitlink path.
+    recurse_submodules: bool,
+    /// Whether `--recurse-submodules`/`--no-recurse-submodules` was given on the
+    /// command line (so it overrides the `submodule.recurse` config default).
+    recurse_submodules_set: bool,
+    /// `-O`/`--open-files-in-pager`: outer `None` = not requested; `Some(None)` =
+    /// the default pager (resolved from `git_pager`); `Some(Some(p))` = an
+    /// explicit pager command.
+    open_pager: Option<Option<String>>,
     revs: Vec<String>,
     pathspecs: Vec<String>,
 }
@@ -101,6 +112,9 @@ impl GrepOptions {
             heading: false,
             break_between_files: false,
             color: false,
+            recurse_submodules: false,
+            recurse_submodules_set: false,
+            open_pager: None,
             revs: Vec::new(),
             pathspecs: Vec::new(),
         }
@@ -410,8 +424,20 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             value if value.starts_with("--color=") => {
                 opts.color = !matches!(value.strip_prefix("--color="), Some("never" | "false"));
             }
-            "--recurse-submodules" | "--no-recurse-submodules" => {
-                // Accepted-but-no-op flags whose default behaviour we already match.
+            "--recurse-submodules" => {
+                opts.recurse_submodules = true;
+                opts.recurse_submodules_set = true;
+            }
+            "--no-recurse-submodules" => {
+                opts.recurse_submodules = false;
+                opts.recurse_submodules_set = true;
+            }
+            "-O" | "--open-files-in-pager" => opts.open_pager = Some(None),
+            value if let Some(v) = value.strip_prefix("--open-files-in-pager=") => {
+                opts.open_pager = Some(Some(v.to_string()));
+            }
+            value if let Some(v) = value.strip_prefix("-O") => {
+                opts.open_pager = Some(Some(v.to_string()));
             }
             "--threads" => {
                 let _ = iter.next();
@@ -471,6 +497,35 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         eprintln!("fatal: cannot use --attr-source or GIT_ATTR_SOURCE without repo");
         return Err(GitError::Exit(128));
     }
+
+    // Resolve `--recurse-submodules` (CLI override beats the `submodule.recurse`
+    // config default). git ignores it without an index (`--no-index`/no repo).
+    let mut recurse = opts.recurse_submodules;
+    if !opts.recurse_submodules_set
+        && let Some(repo) = repo.as_ref()
+    {
+        recurse = resolve_recurse_submodules(repo.config())?;
+    }
+    if no_index || repo.is_none() {
+        recurse = false;
+    }
+    if recurse && opts.untracked {
+        eprintln!("fatal: --untracked not supported with --recurse-submodules");
+        return Err(GitError::Exit(128));
+    }
+    opts.recurse_submodules = recurse;
+
+    // `-O`/`--open-files-in-pager`: resolve the pager command up front (its
+    // resolution can read `core.pager`) and, when active, redirect matched file
+    // names into a collector instead of stdout.
+    let pager_cmd = resolve_open_pager(&opts.open_pager, repo.as_ref().map(|r| r.config()));
+    if pager_cmd.is_some() {
+        // show_in_pager forces color off in the (suppressed) grep output.
+        opts.color = false;
+    }
+    let pager_collector: Option<RefCell<Vec<Vec<u8>>>> =
+        pager_cmd.as_ref().map(|_| RefCell::new(Vec::new()));
+
     if no_index || opts.untracked || repo.is_none() {
         let pattern_type = cli_pattern_type.unwrap_or(PatternTypeOption::Bre);
         opts.kind = match pattern_type {
@@ -480,7 +535,19 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             _ => PatternKind::Basic,
         };
         let color_config = repo.as_ref().map(|repo| repo.config());
-        return grep_no_index(&opts, color_config, &positionals, DASHDASH);
+        let any = grep_no_index(
+            &opts,
+            color_config,
+            &positionals,
+            DASHDASH,
+            pager_collector.as_ref(),
+        )?;
+        if let (Some(pager), Some(collector)) = (&pager_cmd, &pager_collector)
+            && any
+        {
+            run_open_pager(pager, &opts, &collector.borrow())?;
+        }
+        return if any { Ok(()) } else { Err(GitError::Exit(1)) };
     }
 
     let repo = repo.expect("repository discovery succeeded above");
@@ -559,6 +626,12 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         }
     }
 
+    // `-O` works only on the worktree, never against `--cached` or a tree-ish.
+    if pager_cmd.is_some() && (opts.cached || !opts.revs.is_empty()) {
+        eprintln!("fatal: --open-files-in-pager only works on the worktree");
+        return Err(GitError::Exit(128));
+    }
+
     let matcher = GrepMatcher::compile(GrepCompileConfig {
         patterns: &opts.patterns,
         kind: opts.kind,
@@ -586,6 +659,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         opts: &opts,
         pathspec: &pathspec,
         colors: GrepColors::from_config(repo.config(), opts.color),
+        pager: pager_collector.as_ref(),
     };
 
     let mut any_match = false;
@@ -600,7 +674,9 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
                 worktree_root,
                 format,
                 db,
+                config: repo.config(),
             },
+            b"",
             &plan,
             &mut out,
         )?;
@@ -614,7 +690,11 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
                     format,
                     tree_oid: &tree_oid,
                     rev,
+                    config: repo.config(),
+                    common_dir: repo.git_dir(),
+                    worktree_root: worktree_root.as_deref(),
                 },
+                b"",
                 &plan,
                 &mut out,
             )?;
@@ -623,6 +703,12 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
     }
 
     pathspec.report_unmatched()?;
+
+    if let (Some(pager), Some(collector)) = (&pager_cmd, &pager_collector)
+        && any_match
+    {
+        run_open_pager(pager, &opts, &collector.borrow())?;
+    }
 
     if any_match {
         Ok(())
@@ -639,6 +725,9 @@ struct GrepPlan<'a> {
     opts: &'a GrepOptions,
     pathspec: &'a GrepPathspec,
     colors: GrepColors,
+    /// `-O`: when set, matched file display paths are collected here (instead of
+    /// printed) so they can be handed to the pager once the search completes.
+    pager: Option<&'a RefCell<Vec<Vec<u8>>>>,
 }
 
 struct GrepColors {
@@ -906,12 +995,103 @@ fn grep_fallback_to_no_index() -> Result<bool> {
     Ok(fallback)
 }
 
+/// Resolve the `submodule.recurse` config default (file entries first, then
+/// `-c`-injected parameters; last value wins). git reads this in
+/// `grep_cmd_config` before the command-line `--recurse-submodules` override.
+fn resolve_recurse_submodules(config: &GitConfig) -> Result<bool> {
+    let mut value = config.get_bool("submodule", None, "recurse").unwrap_or(false);
+    for param in injected_config_parameters()? {
+        if param.canonical_key.eq_ignore_ascii_case("submodule.recurse") {
+            value = parse_grep_bool(param.value.as_deref());
+        }
+    }
+    Ok(value)
+}
+
+/// git's `git_pager(repo, 1)`: `GIT_PAGER` env, then `core.pager`, then `PAGER`
+/// env, then the compiled default (`less`). An empty value or `cat` disables
+/// paging (returns `None`).
+fn git_pager(config: Option<&GitConfig>) -> Option<String> {
+    let pager = std::env::var("GIT_PAGER")
+        .ok()
+        .or_else(|| config.and_then(|c| c.get("core", None, "pager").map(str::to_string)))
+        .or_else(|| std::env::var("PAGER").ok())
+        .unwrap_or_else(|| "less".to_string());
+    if pager.is_empty() || pager == "cat" {
+        None
+    } else {
+        Some(pager)
+    }
+}
+
+/// Resolve the `-O`/`--open-files-in-pager` argument to the actual pager command,
+/// or `None` when `-O` was not requested (or its default resolution disables
+/// paging). An explicit `-O<cmd>` is taken verbatim.
+fn resolve_open_pager(
+    open_pager: &Option<Option<String>>,
+    config: Option<&GitConfig>,
+) -> Option<String> {
+    match open_pager {
+        None => None,
+        Some(Some(explicit)) => Some(explicit.clone()),
+        Some(None) => git_pager(config),
+    }
+}
+
+/// git's pager basename test: when the command is longer than 4 bytes and the
+/// fifth-from-last byte is a directory separator, only the trailing 4 bytes are
+/// compared (so `./less` and `/usr/bin/less` both reduce to `less`).
+fn pager_basename(pager: &str) -> &str {
+    let bytes = pager.as_bytes();
+    if bytes.len() > 4 && bytes[bytes.len() - 5] == b'/' {
+        &pager[pager.len() - 4..]
+    } else {
+        pager
+    }
+}
+
+/// Run the resolved `-O` pager over the matched files (git's `run_pager`). The
+/// pager string is executed as a shell command with the (optional `+/` jump and)
+/// file arguments passed positionally, mirroring `run_command(use_shell=1)`.
+fn run_open_pager(pager: &str, opts: &GrepOptions, files: &[Vec<u8>]) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let base = pager_basename(pager);
+    let mut extra: Vec<std::ffi::OsString> = Vec::new();
+    // less honors `-I` for a case-insensitive search.
+    if opts.ignore_case && base == "less" {
+        extra.push(std::ffi::OsString::from("-I"));
+    }
+    // A single pattern jumps less/vi to the first match (`+/*PAT` / `+/PAT`).
+    if opts.patterns.len() == 1 && (base == "less" || base == "vi") {
+        let star = if base == "less" { "*" } else { "" };
+        extra.push(std::ffi::OsString::from(format!("+/{star}{}", opts.patterns[0])));
+    }
+    for file in files {
+        extra.push(std::ffi::OsStr::from_bytes(file).to_os_string());
+    }
+
+    // `sh -c '<pager> "$@"' <pager> <extra...>`: the pager string is the shell
+    // snippet and the file list expands as positional parameters.
+    let status = ProcessCommand::new("sh")
+        .arg("-c")
+        .arg(format!("{pager} \"$@\""))
+        .arg(pager)
+        .args(&extra)
+        .status()?;
+    if !status.success() {
+        return Err(GitError::Exit(status.code().unwrap_or(1)));
+    }
+    Ok(())
+}
+
 fn grep_no_index(
     opts: &GrepOptions,
     color_config: Option<&GitConfig>,
     positionals: &[String],
     dashdash: &str,
-) -> Result<()> {
+    pager: Option<&RefCell<Vec<Vec<u8>>>>,
+) -> Result<bool> {
     let cwd = env::current_dir()?;
     let cwd_canon = fs::canonicalize(&cwd)?;
     let raw_paths = no_index_paths(positionals, dashdash)?;
@@ -933,6 +1113,7 @@ fn grep_no_index(
         colors: color_config
             .map(|config| GrepColors::from_config(config, opts.color))
             .unwrap_or_else(GrepColors::none),
+        pager,
     };
     let ignore = if opts.exclude_standard {
         NoIndexIgnore::from_cwd(&cwd)?
@@ -962,11 +1143,7 @@ fn grep_no_index(
         )?;
         any_match = any_match || matched;
     }
-    if any_match {
-        Ok(())
-    } else {
-        Err(GitError::Exit(1))
-    }
+    Ok(any_match)
 }
 
 fn no_index_paths(positionals: &[String], dashdash: &str) -> Result<Vec<String>> {
@@ -1122,120 +1299,427 @@ fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
 // Source iteration
 // ---------------------------------------------------------------------------
 
+/// An owned handle on a submodule repository, opened during `--recurse-submodules`
+/// so its index/object database/config outlive the recursive grep call.
+struct OwnedSubrepo {
+    git_dir: PathBuf,
+    worktree_root: Option<PathBuf>,
+    format: ObjectFormat,
+    db: FileObjectDatabase,
+    config: GitConfig,
+}
+
+/// `<gitdir>/modules/<name>`: git's `submodule_name_to_gitdir` location for a
+/// submodule's git directory.
+fn submodule_name_to_gitdir(common_dir: &Path, name: &str) -> PathBuf {
+    common_dir.join("modules").join(name)
+}
+
+/// Open a submodule via its populated worktree gitlink (`<worktree>/.git`), as
+/// `grep_cache`'s recursion does. Returns `None` for an unpopulated/unresolvable
+/// gitlink.
+fn open_submodule_worktree(worktree_root: &Path, sub_rel: &[u8]) -> Option<OwnedSubrepo> {
+    let sub_worktree = worktree_root.join(bytes_to_path(sub_rel));
+    let git_dir = sley_diff_merge::gitlink_git_dir(&sub_worktree)?;
+    let common = common_git_dir_for_git_dir(&git_dir).ok()?;
+    let format = repository_object_format(&common).ok()?;
+    let db = FileObjectDatabase::from_git_dir(&common, format);
+    let config = read_repo_config(&git_dir).ok()?;
+    Some(OwnedSubrepo {
+        git_dir: common,
+        worktree_root: Some(sub_worktree),
+        format,
+        db,
+        config,
+    })
+}
+
+/// Open a submodule's object database for tree-mode recursion. git's
+/// `repo_submodule_init` resolves the gitdir from the populated worktree gitlink
+/// first (handling an in-place, non-absorbed submodule) and otherwise from the
+/// absorbed `<common>/modules/<name>` location (handling a worktree path that no
+/// longer matches the gitlink's recorded path, e.g. a moved submodule grepped at
+/// a historic rev). Returns the opened repo plus the submodule's worktree (when
+/// populated), for the nested recursion level.
+fn open_submodule_tree(
+    worktree_root: Option<&Path>,
+    common_dir: &Path,
+    name: &str,
+    path: &[u8],
+) -> Option<OwnedSubrepo> {
+    let sub_worktree = worktree_root.map(|root| root.join(bytes_to_path(path)));
+    let git_dir = sub_worktree
+        .as_deref()
+        .and_then(sley_diff_merge::gitlink_git_dir)
+        .or_else(|| {
+            let absorbed = submodule_name_to_gitdir(common_dir, name);
+            absorbed.is_dir().then_some(absorbed)
+        })?;
+    let common = common_git_dir_for_git_dir(&git_dir).ok()?;
+    let format = repository_object_format(&common).ok()?;
+    let db = FileObjectDatabase::from_git_dir(&common, format);
+    let config = read_repo_config(&git_dir).ok()?;
+    Some(OwnedSubrepo {
+        git_dir: common,
+        worktree_root: sub_worktree.filter(|root| root.exists()),
+        format,
+        db,
+        config,
+    })
+}
+
+/// git's `is_tree_submodule_active`: an entry's path maps (via `.gitmodules`) to a
+/// submodule name, then `submodule.<name>.active`, `submodule.active`, and finally
+/// the presence of `submodule.<name>.url` decide activeness.
+fn submodule_active(
+    config: &GitConfig,
+    submodules: &sley_submodule::SubmoduleConfigSet,
+    path: &[u8],
+) -> bool {
+    let Ok(path_str) = std::str::from_utf8(path) else {
+        return false;
+    };
+    let Some(module) = submodules.from_path(path_str) else {
+        return false;
+    };
+    let name = module.name.as_str();
+    if let Some(active) = config.get_bool("submodule", Some(name), "active") {
+        return active;
+    }
+    let active_specs: Vec<&str> = config
+        .get_all("submodule", None, "active")
+        .into_iter()
+        .flatten()
+        .collect();
+    if !active_specs.is_empty() {
+        return active_specs.iter().any(|spec| {
+            sley_pathspec::PathspecElement::parse(
+                spec.as_bytes(),
+                sley_pathspec::PathspecMatchMagic::default(),
+            )
+            .map(|element| element.matches_path(path))
+            .unwrap_or(false)
+        });
+    }
+    config.get("submodule", Some(name), "url").is_some()
+}
+
+/// Load the submodule set from a worktree `.gitmodules`, falling back to the
+/// `.gitmodules` blob recorded in the index (git reads the worktree file when it
+/// exists, else the index/HEAD copy).
+fn load_gitmodules_worktree(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+) -> sley_submodule::SubmoduleConfigSet {
+    if let Ok(config) = GitConfig::read(worktree_root.join(".gitmodules")) {
+        return sley_submodule::SubmoduleConfigSet::parse(&config);
+    }
+    if let Ok(Some(index)) = sley_worktree::read_repository_index(git_dir, format) {
+        for entry in &index.entries {
+            let name: &[u8] = &entry.path;
+            if name == b".gitmodules".as_slice() && (entry.flags >> 12) & 0x3 == 0 {
+                if let Ok(object) = db.read_object(&entry.oid)
+                    && let Ok(config) = GitConfig::parse(&object.body)
+                {
+                    return sley_submodule::SubmoduleConfigSet::parse(&config);
+                }
+                break;
+            }
+        }
+    }
+    sley_submodule::SubmoduleConfigSet::default()
+}
+
+/// Load the submodule set from a tree's `.gitmodules` blob (git's
+/// `gitmodules_config_oid` for the grepped tree).
+fn load_gitmodules_tree(
+    db: &FileObjectDatabase,
+    flat: &sley_diff_merge::MergeEntryMap,
+) -> sley_submodule::SubmoduleConfigSet {
+    if let Some((_, oid)) = flat.get(b".gitmodules".as_slice())
+        && let Ok(object) = db.read_object(oid)
+        && let Ok(config) = GitConfig::parse(&object.body)
+    {
+        return sley_submodule::SubmoduleConfigSet::parse(&config);
+    }
+    sley_submodule::SubmoduleConfigSet::default()
+}
+
+/// Concatenate a submodule path prefix with an entry path.
+fn join_prefix(prefix: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut joined = Vec::with_capacity(prefix.len() + name.len());
+    joined.extend_from_slice(prefix);
+    joined.extend_from_slice(name);
+    joined
+}
+
+/// The recursion prefix for a submodule at `name` under `prefix` (a trailing
+/// slash separates it from the submodule's own entries).
+fn submodule_prefix(prefix: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut joined = join_prefix(prefix, name);
+    joined.push(b'/');
+    joined
+}
+
 /// Greps the working tree (default) or the index (`--cached`).
 struct GrepIndexSource<'a> {
     git_dir: &'a Path,
     worktree_root: &'a Path,
     format: ObjectFormat,
     db: &'a FileObjectDatabase,
+    config: &'a GitConfig,
 }
 
 fn grep_index_source(
     source: GrepIndexSource<'_>,
+    prefix: &[u8],
     plan: &GrepPlan<'_>,
     out: &mut impl Write,
+) -> Result<bool> {
+    let mut printed_file = false;
+    grep_index_level(&source, prefix, plan, out, &mut printed_file)
+}
+
+fn grep_index_level(
+    source: &GrepIndexSource<'_>,
+    prefix: &[u8],
+    plan: &GrepPlan<'_>,
+    out: &mut impl Write,
+    printed_file: &mut bool,
 ) -> Result<bool> {
     let Some(index) = sley_worktree::read_repository_index(source.git_dir, source.format)? else {
         return Ok(false);
     };
     const CE_VALID: u16 = 0x8000;
+
+    // git's `clear_skip_worktree_from_present_files`: under sparse checkout a
+    // SKIP_WORKTREE entry whose file is actually present in the worktree loses the
+    // bit, so the live file is searched. `core.sparseCheckout` is written to the
+    // per-worktree config (`extensions.worktreeConfig`), so it is consulted first.
+    let worktree_config = GitConfig::read(source.git_dir.join("config.worktree")).unwrap_or_default();
+    let sparse_enabled = worktree_config
+        .get_bool("core", None, "sparseCheckout")
+        .or_else(|| source.config.get_bool("core", None, "sparseCheckout"))
+        .unwrap_or(false);
+    let expect_outside = worktree_config
+        .get_bool("sparse", None, "expectFilesOutsideOfPatterns")
+        .or_else(|| {
+            source
+                .config
+                .get_bool("sparse", None, "expectFilesOutsideOfPatterns")
+        })
+        .unwrap_or(false);
+    let clear_sparse = sparse_enabled && !expect_outside;
+
+    let submodules = if plan.opts.recurse_submodules {
+        Some(load_gitmodules_worktree(
+            source.worktree_root,
+            source.git_dir,
+            source.format,
+            source.db,
+        ))
+    } else {
+        None
+    };
+
+    let entries = &index.entries;
     let mut any = false;
-    let mut printed_file = false;
-    for entry in &index.entries {
-        // Skip higher merge stages.
-        if (entry.flags >> 12) & 0x3 != 0 {
+    let mut i = 0;
+    while i < entries.len() {
+        let entry = &entries[i];
+        let stage = (entry.flags >> 12) & 0x3;
+        let path = entry.path.to_vec();
+        let mode = entry.mode;
+        let flags = entry.flags;
+        let oid = entry.oid;
+        let is_ita = entry.is_intent_to_add();
+        let is_skip_wt = entry.is_skip_worktree();
+        // Either advance one entry, or (after processing an unmerged path) past all
+        // of its higher-stage siblings, mirroring git's `if (ce_stage(ce))` skip.
+        let next = |processed: bool, i: usize| -> usize {
+            if processed && stage != 0 {
+                let mut j = i + 1;
+                while j < entries.len() && {
+                    let other: &[u8] = &entries[j].path;
+                    other == path.as_slice()
+                } {
+                    j += 1;
+                }
+                j
+            } else {
+                i + 1
+            }
+        };
+
+        if mode == 0o160000 {
+            if let Some(submodules) = &submodules
+                && submodule_active(source.config, submodules, &path)
+                && let Some(sub) = open_submodule_worktree(source.worktree_root, &path)
+                && let Some(sub_worktree) = sub.worktree_root.as_deref()
+            {
+                let sub_source = GrepIndexSource {
+                    git_dir: &sub.git_dir,
+                    worktree_root: sub_worktree,
+                    format: sub.format,
+                    db: &sub.db,
+                    config: &sub.config,
+                };
+                let sub_prefix = submodule_prefix(prefix, &path);
+                let matched = grep_index_level(&sub_source, &sub_prefix, plan, out, printed_file)?;
+                any = any || matched;
+            }
+            i = next(false, i);
             continue;
         }
-        if entry.mode == 0o160000 {
+
+        // Skip SKIP_WORKTREE entries unless --cached, unless sparse-clearing
+        // restored a present file.
+        let skip_wt = is_skip_wt
+            && !(clear_sparse
+                && source
+                    .worktree_root
+                    .join(bytes_to_path(&path))
+                    .symlink_metadata()
+                    .is_ok());
+        if !plan.opts.cached && skip_wt {
+            i = next(false, i);
             continue;
         }
-        // Skip skip-worktree entries unless --cached (git: `!cached && skip_worktree`).
-        if !plan.opts.cached && entry.is_skip_worktree() {
+
+        let full = join_prefix(prefix, &path);
+        if !plan.pathspec.matches(&full)
+            || !plan.pathspec.within_max_depth(&full, plan.opts.max_depth)
+        {
+            i = next(false, i);
             continue;
         }
-        let path = &entry.path;
-        if !plan.pathspec.matches(path) {
-            continue;
-        }
-        if !plan.pathspec.within_max_depth(path, plan.opts.max_depth) {
-            continue;
-        }
-        // git: if `cached || CE_VALID`, use the cached blob, but skip stage-N and
-        // intent-to-add entries entirely (they carry no real content to grep).
-        // Otherwise grep the live worktree file.
-        let use_cached = plan.opts.cached || (entry.flags & CE_VALID) != 0;
+
+        // git: with `cached || CE_VALID` use the recorded blob (skipping stage and
+        // intent-to-add entries, which carry no real content); else the live file.
+        let use_cached = plan.opts.cached || (flags & CE_VALID) != 0;
         if !plan.opts.cached
             && plan.opts.files_without_match
-            && (entry.flags & CE_VALID) != 0
-            && entry.oid == ObjectId::empty_blob(source.format)
+            && (flags & CE_VALID) != 0
+            && oid == ObjectId::empty_blob(source.format)
         {
+            i = next(false, i);
             continue;
         }
         let content: Cow<'_, [u8]> = if use_cached {
-            if entry.is_intent_to_add() {
+            if stage != 0 || is_ita {
+                i = next(false, i);
                 continue;
             }
-            let object = source.db.read_object(&entry.oid)?;
+            let object = source.db.read_object(&oid)?;
             Cow::Owned(object.body.to_vec())
         } else {
-            let absolute = source.worktree_root.join(bytes_to_path(path));
+            let absolute = source.worktree_root.join(bytes_to_path(&path));
             match fs::read(&absolute) {
                 Ok(bytes) => Cow::Owned(bytes),
-                Err(_) => continue,
+                Err(_) => {
+                    i = next(false, i);
+                    continue;
+                }
             }
         };
-        let display = plan.pathspec.display(path);
-        let matched = grep_buffer(&content, &display, None, plan, out, &mut printed_file)?;
+        let display = plan.pathspec.display(&full);
+        let matched = grep_buffer(&content, &display, None, plan, out, printed_file)?;
         any = any || matched;
+        i = next(true, i);
     }
     Ok(any)
 }
 
-/// Greps a tree-ish, recursing through subtrees.
+/// Greps a tree-ish, recursing through subtrees and (with
+/// `--recurse-submodules`) into submodule trees.
 struct GrepTreeSource<'a> {
     db: &'a FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: &'a ObjectId,
     rev: &'a str,
+    config: &'a GitConfig,
+    /// The repository's common dir, for resolving `modules/<name>` submodule git
+    /// directories. For a nested level this is the parent submodule's git dir.
+    common_dir: &'a Path,
+    /// The repository's worktree root (when populated), for resolving a
+    /// submodule's in-place gitlink. For a nested level this is the parent
+    /// submodule's worktree.
+    worktree_root: Option<&'a Path>,
 }
 
 fn grep_tree_source(
     source: GrepTreeSource<'_>,
+    prefix: &[u8],
     plan: &GrepPlan<'_>,
     out: &mut impl Write,
 ) -> Result<bool> {
-    // Flatten via the canonical primitive, then keep only the entries the
-    // original tree-blob walk emitted: plain blobs and symlinks, but never
-    // gitlinks (mode 0o160000). `flatten_tree` yields a path-sorted map, which
-    // is the order `git grep <tree-ish>` prints in.
-    let entries: Vec<(Vec<u8>, ObjectId)> =
-        sley_diff_merge::flatten_tree(source.db, source.format, source.tree_oid)?
-            .into_iter()
-            .filter(|(_, (mode, _))| *mode != 0o160000)
-            .map(|(path, (_mode, oid))| (path, oid))
-            .collect();
-    let mut any = false;
     let mut printed_file = false;
-    for (path, oid) in entries {
+    grep_tree_level(&source, prefix, plan, out, &mut printed_file)
+}
+
+fn grep_tree_level(
+    source: &GrepTreeSource<'_>,
+    prefix: &[u8],
+    plan: &GrepPlan<'_>,
+    out: &mut impl Write,
+    printed_file: &mut bool,
+) -> Result<bool> {
+    // `flatten_tree` yields a path-sorted map (blobs, symlinks, and gitlinks),
+    // which is the order `git grep <tree-ish>` prints in.
+    let flat = sley_diff_merge::flatten_tree(source.db, source.format, source.tree_oid)?;
+    let submodules = if plan.opts.recurse_submodules {
+        Some(load_gitmodules_tree(source.db, &flat))
+    } else {
+        None
+    };
+
+    let mut any = false;
+    for (path, (mode, oid)) in &flat {
+        let full = join_prefix(prefix, path);
+        if *mode == 0o160000 {
+            if let Some(submodules) = &submodules
+                && submodule_active(source.config, submodules, path)
+                && let Ok(path_str) = std::str::from_utf8(path)
+                && let Some(name) = submodules.from_path(path_str).map(|m| m.name.clone())
+                && let Some(sub) =
+                    open_submodule_tree(source.worktree_root, source.common_dir, &name, path)
+                && let Ok(sub_tree) = sley_rev::peel_to_tree(&sub.db, sub.format, oid)
+            {
+                let sub_source = GrepTreeSource {
+                    db: &sub.db,
+                    format: sub.format,
+                    tree_oid: &sub_tree,
+                    rev: source.rev,
+                    config: &sub.config,
+                    common_dir: &sub.git_dir,
+                    worktree_root: sub.worktree_root.as_deref(),
+                };
+                let sub_prefix = submodule_prefix(prefix, path);
+                let matched = grep_tree_level(&sub_source, &sub_prefix, plan, out, printed_file)?;
+                any = any || matched;
+            }
+            continue;
+        }
         if !plan
             .pathspec
-            .matches_tree(&path, source.db, source.format, source.tree_oid)?
+            .matches_tree(&full, source.db, source.format, source.tree_oid)?
         {
             continue;
         }
-        if !plan.pathspec.within_max_depth(&path, plan.opts.max_depth) {
+        if !plan.pathspec.within_max_depth(&full, plan.opts.max_depth) {
             continue;
         }
-        let display = plan.pathspec.display(&path);
-        let object = source.db.read_object(&oid)?;
-        let content = &object.body;
+        let display = plan.pathspec.display(&full);
+        let object = source.db.read_object(oid)?;
         let matched = grep_buffer(
-            content,
+            &object.body,
             &display,
             Some(source.rev),
             plan,
             out,
-            &mut printed_file,
+            printed_file,
         )?;
         any = any || matched;
     }
@@ -1304,6 +1788,16 @@ fn grep_buffer(
     {
         hits.clear();
         any = false;
+    }
+
+    // `-O`: name-only collection into the pager list (git sets `name_only` and
+    // redirects `output` to `append_path`). The file's display path is recorded
+    // once when it has any match; nothing is written to stdout.
+    if let Some(collector) = plan.pager {
+        if any {
+            collector.borrow_mut().push(display_path.to_vec());
+        }
+        return Ok(any);
     }
 
     if opts.name_only_quiet {
@@ -2316,5 +2810,23 @@ mod tests {
     fn max_depth_slash_count() {
         assert_eq!(slash_count(b"a/b/c"), 2);
         assert_eq!(slash_count(b"v"), 0);
+    }
+
+    #[test]
+    fn pager_basename_strips_dir_for_less_and_vi() {
+        // git's `len > 4 && is_dir_sep(pager[len-5])` trailing-4 rule.
+        assert_eq!(pager_basename("./less"), "less");
+        assert_eq!(pager_basename("/usr/bin/less"), "less");
+        assert_eq!(pager_basename("less"), "less");
+        assert_eq!(pager_basename("vi"), "vi");
+        assert_eq!(pager_basename("printf x"), "printf x");
+    }
+
+    #[test]
+    fn submodule_prefix_joins_with_trailing_slash() {
+        assert_eq!(join_prefix(b"", b"submodule"), b"submodule");
+        assert_eq!(submodule_prefix(b"", b"submodule"), b"submodule/");
+        assert_eq!(submodule_prefix(b"submodule/", b"sub"), b"submodule/sub/");
+        assert_eq!(join_prefix(b"submodule/", b"a"), b"submodule/a");
     }
 }

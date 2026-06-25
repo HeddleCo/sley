@@ -4,6 +4,41 @@
 use crate::*;
 use std::borrow::Cow;
 
+/// Split a bundle of short tag options whose trailing flag takes a value
+/// (e.g. `-am` => `[-a, -m]`), the way git's `parse_options` does. Returns
+/// `Some(tokens)` only when `arg` is a run of boolean short flags
+/// (`-a/-s/-f/-d/-v/-e/-i/-l`) terminated by a value-taking flag (`-m/-u/-F`),
+/// keeping any glued value so the existing per-flag arms (`-m<msg>`, `-u<key>`)
+/// see it. Everything else — pure-boolean bundles (`-av`, `-fl`, …), long
+/// options, `-n<num>`, glued value flags — returns `None` and is parsed
+/// verbatim, preserving its (often error) semantics. The caller only consults
+/// this in option position, so an option's `-`-prefixed value (e.g.
+/// `--sort -authoremail`) is never misread as a bundle.
+fn expand_tag_bundle(arg: &str) -> Option<Vec<String>> {
+    const BOOL_FLAGS: &[u8] = b"asfdveil";
+    const VALUE_FLAGS: &[u8] = b"muF";
+    let bytes = arg.as_bytes();
+    if !arg.starts_with('-') || arg.starts_with("--") || bytes.len() < 2 || !BOOL_FLAGS.contains(&bytes[1])
+    {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    let mut idx = 1;
+    while idx < bytes.len() {
+        let ch = bytes[idx];
+        if BOOL_FLAGS.contains(&ch) {
+            tokens.push(format!("-{}", ch as char));
+            idx += 1;
+        } else if VALUE_FLAGS.contains(&ch) {
+            tokens.push(format!("-{}", &arg[idx..]));
+            return Some(tokens);
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
 pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
@@ -56,9 +91,30 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     let mut empty_file_noop = false;
     let mut positional = Vec::new();
     let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
+    // Short-flag bundles whose trailing flag takes a value (`-am`) are split into
+    // separate tokens pushed back here, so the existing per-flag arms handle them.
+    // Because a bundle's value flag is always its last token, value-taking arms
+    // still read their argument from `iter` (the queue is empty by then), and an
+    // option's `-`-prefixed value is consumed before it could be misread.
+    let mut pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    loop {
+        let owned = match pending.pop_front() {
+            Some(arg) => arg,
+            None => match iter.next() {
+                Some(arg) => arg.clone(),
+                None => break,
+            },
+        };
+        if let Some(tokens) = expand_tag_bundle(&owned) {
+            for token in tokens.into_iter().rev() {
+                pending.push_front(token);
+            }
+            continue;
+        }
+        let arg = &owned;
         match arg.as_str() {
             "--" => {
+                positional.extend(pending.drain(..));
                 positional.extend(iter.cloned());
                 break;
             }
@@ -3300,4 +3356,47 @@ fn tag_points_at(
     }
     let parsed = Tag::parse(format, &object.body)?;
     Ok(points_at.iter().any(|point| point == &parsed.object))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_tag_bundle;
+
+    #[test]
+    fn expands_value_terminated_boolean_bundles() {
+        assert_eq!(
+            expand_tag_bundle("-am"),
+            Some(vec!["-a".to_string(), "-m".to_string()])
+        );
+        assert_eq!(
+            expand_tag_bundle("-amhello"),
+            Some(vec!["-a".to_string(), "-mhello".to_string()])
+        );
+        assert_eq!(
+            expand_tag_bundle("-saF"),
+            Some(vec!["-s".to_string(), "-a".to_string(), "-F".to_string()])
+        );
+    }
+
+    #[test]
+    fn leaves_non_value_bundles_verbatim() {
+        // Pure-boolean bundles keep their (usage-error) semantics.
+        for bundle in ["-av", "-fl", "-ai", "-vf", "-ab"] {
+            assert_eq!(expand_tag_bundle(bundle), None, "{bundle}");
+        }
+        // A `-`-prefixed value that looks like a bundle (e.g. a `--sort` key) is
+        // never split, because its first byte is not a boolean short flag or the
+        // bundle reaches a non-flag byte.
+        assert_eq!(expand_tag_bundle("-objectname"), None);
+        assert_eq!(expand_tag_bundle("-authoremail"), Some(
+            // 'a' then 'u' (value flag) — split is fine here in isolation; the
+            // parse loop only consults this in option position, never on a
+            // consumed `--sort` value.
+            vec!["-a".to_string(), "-uthoremail".to_string()]
+        ));
+        // Long options and glued value flags pass through.
+        assert_eq!(expand_tag_bundle("--sort"), None);
+        assert_eq!(expand_tag_bundle("-mhi"), None);
+        assert_eq!(expand_tag_bundle("-n5"), None);
+    }
 }
