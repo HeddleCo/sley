@@ -39,6 +39,12 @@ enum ShowCommitFormat {
     Medium,
     /// `--pretty=short`: `commit`/`Author:` + indented message.
     Short,
+    /// `--pretty=full`: `commit`/`Author:`/`Commit:` + indented message.
+    Full,
+    /// `--pretty=fuller`: author + committer identities with dates.
+    Fuller,
+    /// `--pretty=raw`: the raw commit object headers + raw message.
+    Raw,
     /// `--oneline`: `<abbrev-oid> <subject>`.
     Oneline,
     /// `--pretty=oneline`/`--format=oneline`: `<full-oid> <subject>`.
@@ -231,9 +237,13 @@ fn show_compiled_format_uses_mailmap(compiled: &CompiledLogFormat) -> bool {
 
 fn show_commit_format_needs_mailmap(format: &ShowCommitFormat, use_mailmap: bool) -> bool {
     match format {
-        ShowCommitFormat::Medium | ShowCommitFormat::Short => use_mailmap,
+        ShowCommitFormat::Medium
+        | ShowCommitFormat::Short
+        | ShowCommitFormat::Full
+        | ShowCommitFormat::Fuller => use_mailmap,
         ShowCommitFormat::Custom { compiled, .. } => show_compiled_format_uses_mailmap(compiled),
-        ShowCommitFormat::Oneline | ShowCommitFormat::FullOneline => false,
+        // `--pretty=raw` shows the raw, un-mailmapped identity lines.
+        ShowCommitFormat::Raw | ShowCommitFormat::Oneline | ShowCommitFormat::FullOneline => false,
     }
 }
 
@@ -727,7 +737,16 @@ fn show_commit(
     }
 
     match &options.commit_format {
-        ShowCommitFormat::Medium | ShowCommitFormat::Short => {
+        ShowCommitFormat::Raw => {
+            // `--pretty=raw` emits the raw object headers + raw message; no
+            // decoration or notes are shown.
+            let raw = crate::commands::log::render_log_raw_pretty(&record);
+            stdout.write_all(&raw)?;
+        }
+        ShowCommitFormat::Medium
+        | ShowCommitFormat::Short
+        | ShowCommitFormat::Full
+        | ShowCommitFormat::Fuller => {
             write!(
                 stdout,
                 "commit {}",
@@ -745,17 +764,47 @@ fn show_commit(
                     .join(" ");
                 writeln!(stdout, "Merge: {parents}")?;
             }
-            writeln!(
-                stdout,
-                "Author: {}",
-                commit_identity_mailmapped(&commit.author, mailmap)
-            )?;
-            if matches!(options.commit_format, ShowCommitFormat::Medium) {
+            if matches!(options.commit_format, ShowCommitFormat::Fuller) {
                 writeln!(
                     stdout,
-                    "Date:   {}",
+                    "Author:     {}",
+                    commit_identity_mailmapped(&commit.author, mailmap)
+                )?;
+                writeln!(
+                    stdout,
+                    "AuthorDate: {}",
                     commit_identity_date(&commit.author, &options.date_mode)
                 )?;
+                writeln!(
+                    stdout,
+                    "Commit:     {}",
+                    commit_identity_mailmapped(&commit.committer, mailmap)
+                )?;
+                writeln!(
+                    stdout,
+                    "CommitDate: {}",
+                    commit_identity_date(&commit.committer, &options.date_mode)
+                )?;
+            } else {
+                writeln!(
+                    stdout,
+                    "Author: {}",
+                    commit_identity_mailmapped(&commit.author, mailmap)
+                )?;
+                if matches!(options.commit_format, ShowCommitFormat::Full) {
+                    writeln!(
+                        stdout,
+                        "Commit: {}",
+                        commit_identity_mailmapped(&commit.committer, mailmap)
+                    )?;
+                }
+                if matches!(options.commit_format, ShowCommitFormat::Medium) {
+                    writeln!(
+                        stdout,
+                        "Date:   {}",
+                        commit_identity_date(&commit.author, &options.date_mode)
+                    )?;
+                }
             }
             writeln!(stdout)?;
             let display_message = commit_message_for_commit_encoding(commit, &output_encoding);
@@ -1967,6 +2016,9 @@ fn parse_pretty_value(value: &str) -> Result<ShowCommitFormat> {
     match value {
         "" | "medium" | "default" => Ok(ShowCommitFormat::Medium),
         "short" => Ok(ShowCommitFormat::Short),
+        "full" => Ok(ShowCommitFormat::Full),
+        "fuller" => Ok(ShowCommitFormat::Fuller),
+        "raw" => Ok(ShowCommitFormat::Raw),
         "oneline" => Ok(ShowCommitFormat::FullOneline),
         // `reference`: `<abbrev-hash> (<subject>, <short-author-date>)`.
         "reference" => Ok(ShowCommitFormat::Custom {
@@ -1975,7 +2027,7 @@ fn parse_pretty_value(value: &str) -> Result<ShowCommitFormat> {
         }),
         // Built-in named layouts sley does not yet render. Reject explicitly
         // rather than mis-formatting them as literal text.
-        "full" | "fuller" | "email" | "mboxrd" | "raw" => Err(GitError::Unsupported(format!(
+        "email" | "mboxrd" => Err(GitError::Unsupported(format!(
             "show does not support --pretty={value}"
         ))),
         other if other.contains('%') => Ok(ShowCommitFormat::Custom {

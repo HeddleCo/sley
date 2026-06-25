@@ -181,6 +181,9 @@ struct SetupRevisionsParser<'a, R> {
     pending_hidden: Option<HiddenRefsSection>,
     not: bool,
     default_revision: Option<String>,
+    /// `--reflog`: add every reflog entry (old + new oid, across HEAD and all
+    /// refs) as a pending positive tip. Expanded in `finish`.
+    reflog: bool,
 }
 
 impl<'a, R> SetupRevisionsParser<'a, R>
@@ -196,6 +199,7 @@ where
             pending_hidden: None,
             not: false,
             default_revision: None,
+            reflog: false,
         }
     }
 
@@ -343,6 +347,8 @@ where
                 "--no-all" => self
                     .ref_selectors
                     .retain(|selector| selector.kind != RefSelectorKind::All),
+                "--reflog" => self.reflog = true,
+                "--no-reflog" => self.reflog = false,
                 "--glob" => {
                     let value = iter
                         .next()
@@ -405,6 +411,7 @@ where
     fn finish(mut self) -> Result<SetupRevisions> {
         if !self.setup.options.has_revisions()
             && self.ref_selectors.is_empty()
+            && !self.reflog
             && let Some(default_revision) = self.default_revision.take()
         {
             let saved_not = self.not;
@@ -413,7 +420,37 @@ where
             self.not = saved_not;
         }
         self.expand_ref_selectors()?;
+        if self.reflog {
+            self.expand_reflog()?;
+        }
         Ok(self.setup)
+    }
+
+    /// `--reflog`: add every reflog entry (old + new oid) across HEAD and all
+    /// refs as a positive tip, mirroring git's `add_reflogs_to_pending` /
+    /// `add_one_commit`. Entries are read oldest-first per reflog; the first
+    /// occurrence of each commit oid wins (later duplicates are dropped), and
+    /// the zero oid and any oid that is not an existing commit are skipped.
+    fn expand_reflog(&mut self) -> Result<()> {
+        self.setup.options.had_ref_selector = true;
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        for (selector, oid) in reflog_entry_oids(self.ctx.git_dir, self.ctx.format) {
+            if !seen.insert(oid) {
+                continue;
+            }
+            // Only real commits become tips; reflogs can name the zero oid
+            // (already filtered) or, after pruning, a missing object.
+            if peel_to_commit(self.ctx.reader, self.ctx.format, &oid).is_err() {
+                continue;
+            }
+            self.setup.options.positives.push(RevisionTip {
+                oid,
+                rev: selector.clone(),
+                source_name: Some(selector),
+                from_ref_selector: true,
+            });
+        }
+        Ok(())
     }
 
     fn add_ref_selector(
@@ -658,6 +695,61 @@ where
             }
         }
         Ok(())
+    }
+}
+
+/// Enumerate `(selector, oid)` for every reflog entry across HEAD and all refs,
+/// oldest entry first, old oid then new oid — git's `add_reflogs_to_pending`
+/// traversal. HEAD's reflog is read first, then per-ref reflogs in sorted path
+/// order so the result is independent of directory-iteration order (and so
+/// `rev-list --reflog` and `log --reflog`, two separate processes, agree).
+fn reflog_entry_oids(git_dir: &Path, format: ObjectFormat) -> Vec<(String, ObjectId)> {
+    let logs_dir = git_dir.join("logs");
+    let zero = "0".repeat(format.hex_len());
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    let head_log = logs_dir.join("HEAD");
+    if head_log.is_file() {
+        files.push(("HEAD".to_string(), head_log));
+    }
+    let mut ref_files: Vec<(String, PathBuf)> = Vec::new();
+    collect_reflog_files(&logs_dir.join("refs"), &logs_dir, &mut ref_files);
+    ref_files.sort_by(|a, b| a.0.cmp(&b.0));
+    files.extend(ref_files);
+
+    let mut out = Vec::new();
+    for (name, path) in files {
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in contents.lines() {
+            // `<old> <new> <ident> <ts> <tz>\t<message>`: the first two
+            // space-separated tokens are the old and new oids.
+            let mut fields = line.split(' ');
+            for hex in [fields.next(), fields.next()].into_iter().flatten() {
+                if hex != zero
+                    && let Ok(oid) = ObjectId::from_hex(format, hex)
+                {
+                    out.push((name.clone(), oid));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Recursively collect reflog files under `dir`, naming each by its path
+/// relative to `logs_root` (so `logs/refs/heads/main` → `refs/heads/main`).
+fn collect_reflog_files(dir: &Path, logs_root: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_reflog_files(&path, logs_root, out);
+        } else if let Ok(rel) = path.strip_prefix(logs_root) {
+            out.push((rel.to_string_lossy().replace('\\', "/"), path));
+        }
     }
 }
 

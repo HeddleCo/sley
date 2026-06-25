@@ -567,7 +567,7 @@ fn log_cached_mailmap<'a>(
     Ok(cache.as_ref().expect("mailmap cache was just initialized"))
 }
 
-fn render_log_raw_pretty(record: &sley_rev::CommitRecord) -> Vec<u8> {
+pub(crate) fn render_log_raw_pretty(record: &sley_rev::CommitRecord) -> Vec<u8> {
     let mut out = Vec::new();
     writeln!(out, "commit {}", record.oid).expect("write to Vec cannot fail");
     writeln!(out, "tree {}", record.commit.tree).expect("write to Vec cannot fail");
@@ -876,6 +876,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--no-walk=unsorted"
             | "--do-walk"
             | "--all"
+            | "--reflog"
+            | "--no-reflog"
             | "--branches"
             | "--tags"
             | "--remotes"
@@ -3319,7 +3321,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     }
                     if kind == LogDefaultKind::Raw {
                         if printed_entries > 0 {
-                            writeln!(out)?;
+                            // `-z` separates commits with NUL instead of the
+                            // blank-line separator (git's line_termination).
+                            if null_terminate {
+                                out.write_all(b"\0")?;
+                            } else {
+                                writeln!(out)?;
+                            }
                         }
                         printed_entries += 1;
                         let mut raw = render_log_raw_pretty(record);
@@ -3331,7 +3339,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         continue;
                     }
                     if printed_entries > 0 {
-                        writeln!(out)?;
+                        // `-z` separates commits with NUL instead of the
+                        // blank-line separator (git's line_termination).
+                        if null_terminate {
+                            out.write_all(b"\0")?;
+                        } else {
+                            writeln!(out)?;
+                        }
                     }
                     printed_entries += 1;
                     if show_signature {
