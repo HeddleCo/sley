@@ -1901,9 +1901,12 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             }
             return Ok(());
         }
-        return Err(GitError::Command(
-            "update-index currently supports: [--add] [--remove|--force-remove] [--stdin] [-z] <path>...".into(),
-        ));
+        // No paths, no cacheinfo/unresolve, no refresh/again, no index-mutating
+        // flag: there is nothing to update. git's `update-index` treats this as a
+        // no-op success (`git update-index`, or a sticky `--add`/`--verbose` with
+        // no paths, all exit 0 without touching the index), so mirror that rather
+        // than rejecting it.
+        return Ok(());
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
