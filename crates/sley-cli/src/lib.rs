@@ -9819,6 +9819,14 @@ fn emit_log_one_token(
                 )
                 .map_err(io::Error::from)?;
             }
+            FormatToken::AuthorDateHuman => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&record.commit.author, &DateMode::Human)
+                )
+                .map_err(io::Error::from)?;
+            }
             FormatToken::CommitterName => out.extend_from_slice(committer_name.as_bytes()),
             FormatToken::CommitterEmail => out.extend_from_slice(committer_email.as_bytes()),
             FormatToken::CommitterEmailLocal => {
@@ -9875,6 +9883,14 @@ fn emit_log_one_token(
                     out,
                     "{}",
                     commit_identity_date(&record.commit.committer, &DateMode::Rfc2822)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterDateHuman => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&record.commit.committer, &DateMode::Human)
                 )
                 .map_err(io::Error::from)?;
             }
@@ -10417,6 +10433,7 @@ fn emit_compiled_log_format_metadata_inner(
             | FormatToken::AuthorDateIsoStrict
             | FormatToken::AuthorDateShort
             | FormatToken::AuthorDateRfc2822
+            | FormatToken::AuthorDateHuman
             | FormatToken::CommitterName
             | FormatToken::CommitterEmail
             | FormatToken::CommitterEmailLocal
@@ -10429,6 +10446,7 @@ fn emit_compiled_log_format_metadata_inner(
             | FormatToken::CommitterDateIsoStrict
             | FormatToken::CommitterDateShort
             | FormatToken::CommitterDateRfc2822
+            | FormatToken::CommitterDateHuman
             | FormatToken::Padding(_)
             | FormatToken::Wrap(_)
             | FormatToken::Trailers(_)
@@ -10583,6 +10601,14 @@ pub(crate) fn emit_compiled_stash_format(
                 )
                 .map_err(io::Error::from)?;
             }
+            FormatToken::AuthorDateHuman => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&commit.author, &DateMode::Human)
+                )
+                .map_err(io::Error::from)?;
+            }
             FormatToken::CommitterName | FormatToken::CommitterNameMapped => {
                 out.extend_from_slice(committer_name.as_bytes())
             }
@@ -10633,6 +10659,14 @@ pub(crate) fn emit_compiled_stash_format(
                     out,
                     "{}",
                     commit_identity_date(&commit.committer, &DateMode::Rfc2822)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterDateHuman => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&commit.committer, &DateMode::Human)
                 )
                 .map_err(io::Error::from)?;
             }

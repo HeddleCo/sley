@@ -300,6 +300,7 @@ pub enum FormatToken {
     AuthorDateIsoStrict,
     AuthorDateShort,
     AuthorDateRfc2822,
+    AuthorDateHuman,
     CommitterName,
     CommitterEmail,
     CommitterEmailLocal,
@@ -313,6 +314,7 @@ pub enum FormatToken {
     CommitterDateIsoStrict,
     CommitterDateShort,
     CommitterDateRfc2822,
+    CommitterDateHuman,
     Newline,
     HexByte(u8),
     GRefname,
@@ -572,7 +574,9 @@ impl CompiledLogFormat {
                 | FormatToken::CommitterDateIso
                 | FormatToken::CommitterDateIsoStrict
                 | FormatToken::CommitterDateShort
-                | FormatToken::CommitterDateRfc2822 => 32,
+                | FormatToken::CommitterDateRfc2822
+                | FormatToken::AuthorDateHuman
+                | FormatToken::CommitterDateHuman => 32,
                 FormatToken::AuthorName
                 | FormatToken::CommitterName
                 | FormatToken::AuthorEmail
@@ -731,14 +735,18 @@ fn parse_parenthesized_atom(
     };
     let inner = &value[1..end];
     let consumed = end + 1;
-    let literal = || Some((FormatToken::Literal(format!("%({inner})")), consumed));
+    // On a parse failure (unknown directive or bad options) git does NOT swallow
+    // the whole `%(...)`; `format_commit_item` returns 0 and strbuf_expand emits a
+    // literal `%` then resumes scanning from the `(`. Returning `Ok(None)` here
+    // makes the expand framework do exactly that (push `%`, cursor → `(`), so any
+    // inner placeholder such as `%x3B` is still expanded. (t4205 %decorate typo.)
     if let Some(opts) = inner.strip_prefix("trailers") {
         let opts = opts.strip_prefix(':').unwrap_or("");
         if !(inner == "trailers" || inner.starts_with("trailers:"))
             || (!opts.is_empty()
                 && parse_for_each_ref_trailer_options(opts).is_err())
         {
-            return Ok(literal());
+            return Ok(None);
         }
         table.add_fields(FormatFields::BODY);
         Ok(Some((FormatToken::Trailers(opts.to_string()), consumed)))
@@ -750,7 +758,7 @@ fn parse_parenthesized_atom(
                 table.add_fields(FormatFields::DECORATIONS);
                 Ok(Some((FormatToken::Decorate(spec), consumed)))
             }
-            None => Ok(literal()),
+            None => Ok(None),
         }
     } else if inner == "describe" || inner.starts_with("describe:") {
         let opts = inner.strip_prefix("describe").unwrap_or("");
@@ -760,10 +768,10 @@ fn parse_parenthesized_atom(
                 table.add_fields(FormatFields::BODY);
                 Ok(Some((FormatToken::Describe(spec), consumed)))
             }
-            None => Ok(literal()),
+            None => Ok(None),
         }
     } else {
-        Ok(literal())
+        Ok(None)
     }
 }
 
@@ -893,6 +901,8 @@ fn parse_identity_atom(
         Some('s') => FormatToken::CommitterDateShort,
         Some('D') if author => FormatToken::AuthorDateRfc2822,
         Some('D') => FormatToken::CommitterDateRfc2822,
+        Some('h') if author => FormatToken::AuthorDateHuman,
+        Some('h') => FormatToken::CommitterDateHuman,
         Some(other) => {
             let prefix = if author { 'a' } else { 'c' };
             return Err(GitError::Command(format!(

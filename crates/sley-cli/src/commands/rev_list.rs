@@ -92,6 +92,8 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             | "--do-walk"
             | "--all"
             | "--no-all"
+            | "--reflog"
+            | "--no-reflog"
             | "--branches"
             | "--tags"
             | "--remotes"
