@@ -7906,7 +7906,6 @@ struct LsFilesPathspec {
     prefix: Vec<u8>,
     full_name: bool,
     filters: Vec<LsFilesPathFilter>,
-    cwd_depth: usize,
     attributes: Option<sley_worktree::StandardAttributeMatcher>,
 }
 
@@ -7924,7 +7923,6 @@ impl LsFilesPathspec {
             Err(_) => (Path::new(""), root.as_path()),
         };
         let prefix = relative.to_string_lossy().replace('\\', "/").into_bytes();
-        let cwd_depth = path_component_count(&prefix);
         let magic = effective_pathspec_flags();
         let mut filters = Vec::new();
         for arg in path_args {
@@ -7968,7 +7966,6 @@ impl LsFilesPathspec {
             prefix,
             full_name,
             filters,
-            cwd_depth,
             attributes,
         })
     }
@@ -7989,26 +7986,15 @@ impl LsFilesPathspec {
         if !self.matches(path) {
             return None;
         }
-        if self.full_name {
+        if self.full_name || self.prefix.is_empty() {
             return Some(path.to_vec());
         }
-        if self.prefix.is_empty() {
-            return Some(path.to_vec());
-        }
-        if let Some(rest) = path.strip_prefix(self.prefix.as_slice()) {
-            let rest = rest.strip_prefix(b"/")?;
-            if rest.is_empty() {
-                return path.ends_with(b"/").then(|| b"./".to_vec());
-            }
-            Some(rest.to_vec())
-        } else {
-            let mut display = Vec::new();
-            for _ in 0..self.cwd_depth {
-                display.extend_from_slice(b"../");
-            }
-            display.extend_from_slice(path);
-            Some(display)
-        }
+        // git renders the matched path relative to the cwd prefix (which it
+        // treats as ending in '/'), emitting `../` for each prefix component
+        // not shared with `path` — not "up to root then the full path".
+        let mut prefix = self.prefix.clone();
+        prefix.push(b'/');
+        Some(relative_path_bytes(path, &prefix))
     }
 
     fn matches(&self, path: &[u8]) -> bool {
@@ -8081,6 +8067,85 @@ fn path_component_count(path: &[u8]) -> usize {
     path.split(|byte| *byte == b'/')
         .filter(|component| !component.is_empty())
         .count()
+}
+
+/// Render `input` relative to `prefix`, a faithful byte-level port of git's
+/// `relative_path()` (path.c) for the POSIX, both-relative case (no DOS drive).
+/// `prefix` is the cwd prefix and must end with `/` when non-empty, matching
+/// git's `cmd_prefix`. Emits `../` for each `prefix` component not shared with
+/// `input`, then the unshared tail of `input`.
+fn relative_path_bytes(input: &[u8], prefix: &[u8]) -> Vec<u8> {
+    let in_len = input.len();
+    let prefix_len = prefix.len();
+    if in_len == 0 {
+        return b"./".to_vec();
+    }
+    if prefix_len == 0 {
+        return input.to_vec();
+    }
+    let is_sep = |byte: u8| byte == b'/';
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut prefix_off = 0usize;
+    let mut in_off = 0usize;
+    while i < prefix_len && j < in_len && prefix[i] == input[j] {
+        if is_sep(prefix[i]) {
+            while i < prefix_len && is_sep(prefix[i]) {
+                i += 1;
+            }
+            while j < in_len && is_sep(input[j]) {
+                j += 1;
+            }
+            prefix_off = i;
+            in_off = j;
+        } else {
+            i += 1;
+            j += 1;
+        }
+    }
+
+    if i >= prefix_len && prefix_off < prefix_len {
+        if j >= in_len {
+            in_off = in_len;
+        } else if is_sep(input[j]) {
+            while j < in_len && is_sep(input[j]) {
+                j += 1;
+            }
+            in_off = j;
+        } else {
+            i = prefix_off;
+        }
+    } else if j >= in_len && in_off < in_len && i < prefix_len && is_sep(prefix[i]) {
+        while i < prefix_len && is_sep(prefix[i]) {
+            i += 1;
+        }
+        in_off = in_len;
+    }
+
+    let input = &input[in_off..];
+    if i >= prefix_len {
+        if input.is_empty() {
+            return b"./".to_vec();
+        }
+        return input.to_vec();
+    }
+
+    let mut out = Vec::new();
+    while i < prefix_len {
+        if is_sep(prefix[i]) {
+            out.extend_from_slice(b"../");
+            while i < prefix_len && is_sep(prefix[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    if !is_sep(prefix[prefix_len - 1]) {
+        out.extend_from_slice(b"../");
+    }
+    out.extend_from_slice(input);
+    out
 }
 
 fn log_option_takes_no_value_error(option: &str) -> Result<()> {
