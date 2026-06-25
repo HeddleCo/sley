@@ -236,10 +236,20 @@ fn reapply_after_set_matches_git() {
     }
     let (git_repo, rs_repo) = paired_repos("reapply");
     assert_parity(&git_repo, &rs_repo, &["sparse-checkout", "set", "a"]);
-    // Drop an out-of-cone file back into the worktree, then reapply should remove
-    // it again identically in both implementations.
-    write_file(&git_repo, "c/file.txt", "c\n");
-    write_file(&rs_repo, "c/file.txt", "c\n");
+    // Drop an out-of-cone file back into the worktree, then reapply should treat it
+    // identically in both implementations.
+    //
+    // The reappeared content is *modified* (differs from HEAD) on purpose. If it
+    // matched HEAD byte-for-byte, whether `reapply` removes it silently or leaves
+    // it with a "not up to date" warning would hinge on git's racy-clean detection
+    // (Documentation/technical/racy-git): when the rewritten file's mtime falls in
+    // the same second as the cached stat, git cannot trust the stat and re-hashes,
+    // so its remove-vs-leave decision becomes wall-clock-dependent. That made this
+    // test flaky against the (non-deterministic) git oracle, especially under load.
+    // A genuinely-modified file is unambiguously "not up to date" for both git and
+    // sley, so both deterministically leave it and emit the identical warning.
+    write_file(&git_repo, "c/file.txt", "locally modified\n");
+    write_file(&rs_repo, "c/file.txt", "locally modified\n");
     assert_parity(&git_repo, &rs_repo, &["sparse-checkout", "reapply"]);
     assert_parity(&git_repo, &rs_repo, &["sparse-checkout", "list"]);
 }
