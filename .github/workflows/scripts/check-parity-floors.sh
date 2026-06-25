@@ -1158,6 +1158,14 @@ declare -A FLOOR=(
     [t3060-ls-files-with-tree.sh]=8
     [t3005-ls-files-relative.sh]=4
     [t1600-index.sh]=7
+    [t0602-reffiles-fsck.sh]=23
+    [t0600-reffiles-backend.sh]=19
+    [t0614-reftable-fsck.sh]=6
+    [t0613-reftable-write-options.sh]=2
+    [t4056-diff-order.sh]=23
+    [t7814-grep-recurse-submodules.sh]=25
+    [t7811-grep-open.sh]=10
+    [t7817-grep-sparse-checkout.sh]=5
 
 )
 
