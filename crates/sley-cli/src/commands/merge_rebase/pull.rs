@@ -1110,6 +1110,11 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         if verbosity >= 0 {
             println!("Already up to date.");
         }
+        // git's pull still runs `git submodule update` after an up-to-date merge,
+        // so a `--recurse-submodules` pull re-syncs a submodule worktree that an
+        // earlier `--no-recurse-submodules` pull advanced the gitlink for without
+        // checking out.
+        pull_update_submodules_after_merge(update_recurse_submodules, verbosity)?;
         return Ok(());
     }
     let fast_forward = if merge_oids.len() == 1 {
@@ -1144,7 +1149,9 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             merge_args.push("--quiet".to_string());
         }
         merge_args.push("FETCH_HEAD".to_string());
-        return cmd_merge(&merge_args);
+        cmd_merge(&merge_args)?;
+        pull_update_submodules_after_merge(update_recurse_submodules, verbosity)?;
+        return Ok(());
     }
     if effective_rebase.enabled() {
         let mut rebase_args = Vec::new();
@@ -1187,5 +1194,27 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     } else {
         merge_args.extend(merge_oids.iter().map(ToString::to_string));
     }
-    cmd_merge(&merge_args)
+    cmd_merge(&merge_args)?;
+    pull_update_submodules_after_merge(update_recurse_submodules, verbosity)?;
+    Ok(())
+}
+
+/// git's pull `update_submodules`: after the superproject merge, check out each
+/// active submodule's working tree to the recorded gitlink commit
+/// (`git submodule update --recursive`). This runs even when the merge was a
+/// no-op ("Already up to date"), so a submodule left stale by an earlier
+/// `--no-recurse-submodules` pull is brought back in sync on the next
+/// `--recurse-submodules` pull. Scoped to the merge paths; `pull --rebase`
+/// keeps its own (local-commit-preserving) submodule handling.
+fn pull_update_submodules_after_merge(recurse: bool, verbosity: i32) -> Result<()> {
+    if !recurse {
+        return Ok(());
+    }
+    let mut args = Vec::new();
+    if verbosity < 0 {
+        args.push("--quiet".to_string());
+    }
+    args.push("update".to_string());
+    args.push("--recursive".to_string());
+    commands::submodule::cmd_submodule(&args)
 }
