@@ -4342,6 +4342,32 @@ fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
+/// Recursively remove an empty directory tree at `path` (git's
+/// `remove_empty_directories`). A no-op when `path` is absent or is a file; an
+/// error if any directory in the tree contains a non-directory entry.
+fn remove_empty_dir_tree(path: &Path) -> std::io::Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if !meta.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_empty_dir_tree(&entry.path())?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "directory not empty",
+            ));
+        }
+    }
+    fs::remove_dir(path)
+}
+
 fn stage_lock_file(lock_path: &Path, contents: &[u8]) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -4362,9 +4388,10 @@ fn stage_pending_change(change: &PendingPathChange) -> Result<()> {
 fn apply_pending_change(change: &PendingPathChange) -> Result<()> {
     match &change.action {
         PendingPathAction::Write { .. } => {
-            if change.path.is_dir() {
-                fs::remove_dir(&change.path).map_err(|err| GitError::Io(err.to_string()))?;
-            }
+            // git's `remove_empty_directories`: an empty directory tree sitting
+            // where the loose ref file belongs (e.g. leftover `refs/x/foo/bar/`)
+            // is cleared before the rename so the ref can be written.
+            remove_empty_dir_tree(&change.path).map_err(|err| GitError::Io(err.to_string()))?;
             fs::rename(&change.lock_path, &change.path).map_err(|err| GitError::Io(err.to_string()))
         }
         PendingPathAction::Delete => {
