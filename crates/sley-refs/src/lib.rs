@@ -4359,10 +4359,7 @@ fn remove_empty_dir_tree(path: &Path) -> std::io::Result<()> {
         if entry.file_type()?.is_dir() {
             remove_empty_dir_tree(&entry.path())?;
         } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "directory not empty",
-            ));
+            return Err(std::io::Error::other("directory not empty"));
         }
     }
     fs::remove_dir(path)

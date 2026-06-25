@@ -3791,6 +3791,7 @@ pub(crate) fn cmd_pack_refs(args: &[String]) -> Result<()> {
     let store = FileRefStore::new(&git_dir, format)
         .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?);
     if store.uses_reftable()? {
+        validate_reftable_write_options(&git_dir)?;
         if options.auto && store.reftable_table_count()? <= 2 {
             return Ok(());
         }
@@ -3819,6 +3820,44 @@ pub(crate) fn cmd_pack_refs(args: &[String]) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+/// git's `reftable_be_config`: validate the reftable writer options that the
+/// backend reads at init. An out-of-bounds `reftable.blockSize` /
+/// `reftable.restartInterval` is fatal before any work is done.
+fn validate_reftable_write_options(git_dir: &Path) -> Result<()> {
+    let Ok(config) = read_repo_config(git_dir) else {
+        return Ok(());
+    };
+    if let Some(value) = config.get("reftable", None, "blockSize")
+        && let Some(block_size) = parse_reftable_config_ulong(value)
+        && block_size > 16_777_215
+    {
+        eprintln!("fatal: reftable block size cannot exceed 16MB");
+        return Err(GitError::Exit(128));
+    }
+    if let Some(value) = config.get("reftable", None, "restartInterval")
+        && let Some(restart_interval) = parse_reftable_config_ulong(value)
+        && restart_interval > 65_535
+    {
+        eprintln!("fatal: reftable block size cannot exceed 65535");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+/// Parse a config value as git's `git_config_ulong` does for the cases the
+/// reftable options need: a plain integer with an optional `k`/`m`/`g` scaling
+/// suffix.
+fn parse_reftable_config_ulong(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let (digits, scale) = match value.as_bytes().last() {
+        Some(b'k') | Some(b'K') => (&value[..value.len() - 1], 1024),
+        Some(b'm') | Some(b'M') => (&value[..value.len() - 1], 1024 * 1024),
+        Some(b'g') | Some(b'G') => (&value[..value.len() - 1], 1024 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    digits.trim().parse::<u64>().ok().map(|n| n * scale)
 }
 
 fn parse_pack_refs_options(args: &[String]) -> Result<PackRefsOptions> {
