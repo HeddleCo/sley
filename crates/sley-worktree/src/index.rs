@@ -11,6 +11,63 @@ use crate::index_io::*;
 use crate::status::*;
 use crate::types_admin::*;
 
+/// git's `INDEX_FORMAT_DEFAULT` (read-cache.c).
+const INDEX_FORMAT_DEFAULT: u32 = 3;
+
+/// Pick the base version for a freshly-created index, mirroring git's
+/// `get_index_format_default`: `GIT_INDEX_VERSION` wins when set (warning +
+/// default on a malformed / out-of-range value), otherwise `feature.manyFiles`
+/// (→4) then an `index.version` override (warning on out-of-range). The writer's
+/// `normalize_index_version_for_extended_flags` later collapses 2/3 by
+/// extended-flag need; a chosen version 4 is preserved.
+fn fresh_index_default_version(git_dir: &Path) -> u32 {
+    if let Some(raw) = env::var_os("GIT_INDEX_VERSION") {
+        let raw = raw.to_string_lossy();
+        return match raw.parse::<u32>() {
+            Ok(version) if (2..=4).contains(&version) => version,
+            _ => {
+                eprintln!(
+                    "warning: GIT_INDEX_VERSION set, but the value is invalid.\nUsing version {INDEX_FORMAT_DEFAULT}"
+                );
+                INDEX_FORMAT_DEFAULT
+            }
+        };
+    }
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    let mut version = if config.get_bool("feature", None, "manyFiles").unwrap_or(false) {
+        4
+    } else {
+        INDEX_FORMAT_DEFAULT
+    };
+    if let Some(raw) = config.get("index", None, "version") {
+        match raw.trim().parse::<i64>() {
+            Ok(value) if (2..=4).contains(&value) => version = value as u32,
+            _ => {
+                eprintln!(
+                    "warning: index.version set, but the value is invalid.\nUsing version {INDEX_FORMAT_DEFAULT}"
+                );
+                return INDEX_FORMAT_DEFAULT;
+            }
+        }
+    }
+    version
+}
+
+/// Load the repository index, or materialize a fresh empty index whose version
+/// is chosen by [`fresh_index_default_version`]. Used by the `add` /
+/// `update-index` entrypoints so a brand-new index honors
+/// `GIT_INDEX_VERSION` / `index.version` / `feature.manyFiles`, like git.
+fn read_index_or_fresh(git_dir: &Path, format: ObjectFormat) -> Result<Index> {
+    match read_repository_index(git_dir, format)? {
+        Some(index) => Ok(index),
+        None => {
+            let mut index = empty_index();
+            index.version = fresh_index_default_version(git_dir);
+            Ok(index)
+        }
+    }
+}
+
 pub fn add_paths_to_index(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
@@ -42,7 +99,7 @@ pub fn update_index_paths(
     options: UpdateIndexOptions,
 ) -> Result<UpdateIndexResult> {
     let git_dir = git_dir.as_ref();
-    let index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
+    let index = read_index_or_fresh(git_dir, format)?;
     update_index_paths_with_index(worktree_root, git_dir, format, index, paths, options)
 }
 
@@ -100,7 +157,7 @@ pub fn update_index_ordered_paths_filtered(
     verbose: bool,
 ) -> Result<UpdateIndexResult> {
     let git_dir = git_dir.as_ref();
-    let index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
+    let index = read_index_or_fresh(git_dir, format)?;
     update_index_ordered_paths_filtered_with_index(
         worktree_root,
         git_dir,
@@ -177,7 +234,7 @@ pub fn update_index_paths_filtered(
     config: &GitConfig,
 ) -> Result<UpdateIndexResult> {
     let git_dir = git_dir.as_ref();
-    let index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
+    let index = read_index_or_fresh(git_dir, format)?;
     update_index_paths_filtered_with_index(
         worktree_root,
         git_dir,
