@@ -314,6 +314,17 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             }
             "--rename-empty" => options.rename_empty = true,
             "--no-rename-empty" => options.rename_empty = false,
+            // -l<n>: the rename/copy matrix limit. `0` is git's "big default"
+            // (unlimited); diff-tree's detector is already unbounded, so we
+            // validate the value for parity and otherwise ignore it.
+            value if let Some(rest) = value.strip_prefix("-l")
+                && !rest.is_empty()
+                && rest.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                let _: u64 = rest
+                    .parse()
+                    .map_err(|_| GitError::Command(format!("invalid argument to -l: {rest}")))?;
+            }
             value if value.starts_with("-M") && value.len() > 2 => {
                 log_validate_similarity_option(&value[2..], "find-renames")?;
                 options.detect_renames = true;
@@ -1782,6 +1793,7 @@ fn detect_top_level_renames(
             db,
             options.rename_threshold,
             options.rename_empty,
+            options.detect_copies,
         );
     }
     if options.detect_copies {
@@ -1814,6 +1826,7 @@ fn detect_top_level_rename_pass(
     db: &FileObjectDatabase,
     threshold: u8,
     rename_empty: bool,
+    want_copies: bool,
 ) -> Vec<sley_diff_merge::NameStatusEntry> {
     let deleted: Vec<usize> = changes
         .iter()
@@ -1854,6 +1867,40 @@ fn detect_top_level_rename_pass(
                 assigned.insert(dst_idx, (src_idx, 100));
                 break;
             }
+        }
+    }
+
+    // Basename pre-pass (git's `find_basename_matches`): before the global
+    // matrix, pair unique-basename src/dst at the stricter basename score so a
+    // same-basename rename wins over a globally-more-similar different basename.
+    // git skips this when copies are also wanted (`!want_copies`).
+    if threshold <= 100 && !want_copies {
+        let src_paths: Vec<&[u8]> =
+            deleted.iter().map(|&i| &changes[i].path[..]).collect();
+        let dst_paths: Vec<&[u8]> = added.iter().map(|&i| &changes[i].path[..]).collect();
+        let basename_pairs = sley_diff_merge::basename_rename_matches(
+            &src_paths,
+            &dst_paths,
+            &src_used,
+            &dst_used,
+            threshold,
+            |si, di| {
+                let src_oid = changes[deleted[si]].old_oid.as_ref()?;
+                let dst_oid = changes[added[di]].new_oid.as_ref()?;
+                if !rename_empty
+                    && (is_empty_blob_oid(src_oid) || is_empty_blob_oid(dst_oid))
+                {
+                    return None;
+                }
+                let src_bytes = read_blob_for_similarity(db, src_oid)?;
+                let dst_bytes = read_blob_for_similarity(db, dst_oid)?;
+                Some(sley_diff_merge::blob_similarity(&src_bytes, &dst_bytes))
+            },
+        );
+        for (si, di, score) in basename_pairs {
+            src_used[si] = true;
+            dst_used[di] = true;
+            assigned.insert(added[di], (deleted[si], score));
         }
     }
 

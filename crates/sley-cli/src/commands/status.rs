@@ -1039,21 +1039,41 @@ fn status_entries_with_exact_renames(
             }
         }
         if entry.index == b'A' {
-            let mut staged_match = entries
-                .iter()
-                .enumerate()
-                .find(|(candidate_index, candidate)| {
-                    !used[*candidate_index] && status_entries_are_exact_rename(candidate, entry)
-                })
-                .map(|(candidate_index, candidate)| (candidate_index, None, candidate.clone()));
-            if staged_match.is_none() {
+            // git's `find_identical_files`: among the identical-OID delete
+            // candidates, prefer one that shares the added path's basename (the
+            // first such wins; otherwise the first candidate overall). Search the
+            // in-line deletes first, then the deferred staged-delete pool.
+            let added_base = sley_diff_merge::path_basename(&entry.path);
+            let mut staged_match: Option<(usize, Option<usize>, sley_worktree::ShortStatusEntry)> =
+                None;
+            let mut chosen_same_basename = false;
+            for (candidate_index, candidate) in entries.iter().enumerate() {
+                if used[candidate_index] || !status_entries_are_exact_rename(candidate, entry) {
+                    continue;
+                }
+                let same = sley_diff_merge::path_basename(&candidate.path) == added_base;
+                if staged_match.is_none() || (same && !chosen_same_basename) {
+                    staged_match = Some((candidate_index, None, candidate.clone()));
+                    chosen_same_basename = same;
+                    if same {
+                        break;
+                    }
+                }
+            }
+            if !chosen_same_basename {
                 for (staged_index, candidate) in staged_deletes.iter().enumerate() {
-                    if staged_used[staged_index] {
+                    if staged_used[staged_index]
+                        || !status_entries_are_exact_rename(candidate, entry)
+                    {
                         continue;
                     }
-                    if status_entries_are_exact_rename(candidate, entry) {
+                    let same = sley_diff_merge::path_basename(&candidate.path) == added_base;
+                    if staged_match.is_none() || (same && !chosen_same_basename) {
                         staged_match = Some((index, Some(staged_index), candidate.clone()));
-                        break;
+                        chosen_same_basename = same;
+                        if same {
+                            break;
+                        }
                     }
                 }
             }
