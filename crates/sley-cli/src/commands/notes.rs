@@ -136,6 +136,18 @@ fn notes_ref_handle(notes_ref: &str) -> NotesRef {
     NotesRef::expand(notes_ref)
 }
 
+/// git's `expand_loose_notes_ref`: the merge remote spec is used verbatim when
+/// it already resolves to an object (e.g. `refs/remote-notes/origin/x`, an
+/// existing ref outside refs/notes/); otherwise it is expanded under
+/// refs/notes/ like any notes-ref name (`x` -> `refs/notes/x`).
+fn expand_loose_notes_ref(git_dir: &Path, format: ObjectFormat, spec: &str) -> NotesRef {
+    if resolve_revision(git_dir, format, spec).is_ok() {
+        NotesRef(spec.to_string())
+    } else {
+        notes_ref_handle(spec)
+    }
+}
+
 /// The notes ref name as git's `init_notes_check` sees it for the
 /// outside-refs/notes refusal. `--ref` is run through `expand_notes_ref` (bare
 /// names gain a `refs/notes/` prefix), but `GIT_NOTES_REF` / `core.notesRef` are
@@ -1406,7 +1418,7 @@ fn notes_merge_cmd(
     let store = FileRefStore::new(git_dir, format);
     let local_ref = notes_ref_handle(notes_ref);
     let remote_arg = parsed.remote.as_deref().unwrap_or_default();
-    let remote_ref = notes_ref_handle(remote_arg);
+    let remote_ref = expand_loose_notes_ref(git_dir, format, remote_arg);
     let strategy = resolve_notes_merge_strategy(notes_ref, parsed.strategy.as_deref())?;
     let message = format!(
         "Merged notes from {} into {}",
@@ -1468,8 +1480,25 @@ fn parse_notes_merge_args(args: &[String]) -> Result<NotesMergeArgs> {
         }
         match arg.as_str() {
             "--" => positional_only = true,
-            "-q" | "--quiet" => parsed.verbosity -= 1,
-            "-v" | "--verbose" => parsed.verbosity += 1,
+            "--quiet" => parsed.verbosity -= 1,
+            "--verbose" => parsed.verbosity += 1,
+            // git's parse-options clusters short flags: `-vvv` is three `-v`,
+            // `-qq` two `-q`, `-vq` a mix. Each `v` raises and each `q` lowers
+            // verbosity (OPT__VERBOSITY).
+            value
+                if value.starts_with('-')
+                    && !value.starts_with("--")
+                    && value.len() > 1
+                    && value[1..].chars().all(|ch| ch == 'v' || ch == 'q') =>
+            {
+                for ch in value[1..].chars() {
+                    if ch == 'v' {
+                        parsed.verbosity += 1;
+                    } else {
+                        parsed.verbosity -= 1;
+                    }
+                }
+            }
             "--commit" => parsed.commit = true,
             "--abort" => parsed.abort = true,
             "-s" | "--strategy" => {
