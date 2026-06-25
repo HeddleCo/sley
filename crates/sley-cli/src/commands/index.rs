@@ -730,6 +730,24 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         None
     };
     let eol = eol_context.as_ref();
+    if recurse_submodules {
+        recurse_ls_files_submodules(
+            &mut stdout,
+            &git_dir,
+            &worktree_root,
+            format,
+            b"",
+            output_stage,
+            terminator,
+            &pathspec,
+            oid_abbrev,
+        )?;
+        stdout.flush()?;
+        if error_unmatch {
+            pathspec.exit_if_unmatched()?;
+        }
+        return Ok(());
+    }
     if let Some(with_tree) = with_tree.as_deref() {
         write_ls_files_with_tree(
             &mut stdout,
@@ -1047,6 +1065,139 @@ fn write_ls_files_with_tree(
         }
     }
     Ok(())
+}
+
+/// `ls-files --recurse-submodules`: list this repo's index, and for every
+/// gitlink that is an *active* submodule (git's `is_submodule_active`), recurse
+/// into the submodule's index instead — prefixing its paths with the submodule
+/// path. Inactive gitlinks are listed as the gitlink entry itself. Mirrors
+/// builtin/ls-files.c `show_ce` + `show_submodule`.
+#[allow(clippy::too_many_arguments)]
+fn recurse_ls_files_submodules(
+    stdout: &mut io::Stdout,
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    prefix: &[u8],
+    output_stage: bool,
+    terminator: u8,
+    pathspec: &LsFilesPathspec,
+    oid_abbrev: Option<usize>,
+) -> Result<()> {
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(());
+    };
+    let index = ls_files_display_index(git_dir, format, index, false)?;
+    let candidates = ls_files_oid_candidates(&index);
+    let config = read_repo_config(git_dir)?;
+    let gitmodules = GitConfig::read(worktree_root.join(".gitmodules")).ok();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+
+    for entry in &index.entries {
+        let mut full = prefix.to_vec();
+        full.extend_from_slice(&entry.path);
+
+        if entry.mode == 0o160000
+            && submodule_is_active_for_path(&config, gitmodules.as_ref(), &entry.path)
+        {
+            let sub_root = worktree_root.join(repo_path_to_path(&entry.path));
+            if let Some(sub_git_dir) = submodule_git_dir_for_path(&db, &sub_root, &entry.path) {
+                let sub_format = repository_object_format(&sub_git_dir).unwrap_or(format);
+                let mut sub_prefix = full.clone();
+                sub_prefix.push(b'/');
+                recurse_ls_files_submodules(
+                    stdout,
+                    &sub_git_dir,
+                    &sub_root,
+                    sub_format,
+                    &sub_prefix,
+                    output_stage,
+                    terminator,
+                    pathspec,
+                    oid_abbrev,
+                )?;
+                continue;
+            }
+            // Active but unresolvable git dir: fall through and list the gitlink.
+        }
+
+        if let Some(display) = pathspec.display(&full) {
+            if output_stage {
+                write!(
+                    stdout,
+                    "{:06o} {} {}\t",
+                    entry.mode,
+                    ls_files_oid(&entry.oid, oid_abbrev, &candidates),
+                    index_entry_stage(entry)
+                )?;
+            }
+            write_ls_files_path(stdout, &display, terminator)?;
+            stdout.write_all(&[terminator])?;
+        }
+    }
+    Ok(())
+}
+
+/// git's `is_submodule_active` for a gitlink `path` relative to the repo whose
+/// `config`/`gitmodules` are given: honor `submodule.<name>.active`, then the
+/// `submodule.active` pathspec list, then fall back to `submodule.<name>.url`.
+fn submodule_is_active_for_path(
+    config: &GitConfig,
+    gitmodules: Option<&GitConfig>,
+    path: &[u8],
+) -> bool {
+    let Some(name) = gitmodules.and_then(|gm| submodule_name_for_path(gm, path)) else {
+        return false;
+    };
+    if let Some(active) = config.get_bool("submodule", Some(&name), "active") {
+        return active;
+    }
+    let specs: Vec<&str> = config
+        .get_all("submodule", None, "active")
+        .into_iter()
+        .flatten()
+        .collect();
+    if !specs.is_empty() {
+        return submodule_active_specs_match(&specs, path);
+    }
+    config.get("submodule", Some(&name), "url").is_some()
+}
+
+/// Map a gitlink `path` to its `.gitmodules` submodule name (the subsection of
+/// the `submodule.<name>` whose `path` value equals `path`).
+fn submodule_name_for_path(gitmodules: &GitConfig, path: &[u8]) -> Option<String> {
+    let path_str = std::str::from_utf8(path).ok()?;
+    for section in &gitmodules.sections {
+        if !section.name.eq_ignore_ascii_case("submodule") {
+            continue;
+        }
+        let Some(name) = &section.subsection else {
+            continue;
+        };
+        let mut sub_path = None;
+        for entry in &section.entries {
+            if entry.key.eq_ignore_ascii_case("path") {
+                sub_path = entry.value.as_deref();
+            }
+        }
+        if sub_path == Some(path_str) {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+/// Whether any `submodule.active` pathspec matches the submodule `path`. A
+/// minimal matcher (exact path or a directory-prefix match), sufficient for the
+/// `submodule.active` cases git exercises.
+fn submodule_active_specs_match(specs: &[&str], path: &[u8]) -> bool {
+    let Ok(path_str) = std::str::from_utf8(path) else {
+        return false;
+    };
+    specs.iter().any(|spec| {
+        let spec = spec.trim_end_matches('/');
+        spec == "." || spec == path_str || path_str.starts_with(&format!("{spec}/"))
+    })
 }
 
 /// Per-invocation state for `ls-files --format`. Holds everything an atom may
