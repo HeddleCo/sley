@@ -2846,36 +2846,64 @@ fn detect_exact_renames(
         .filter(|(_, entry)| entry.status == NameStatus::Added)
         .map(|(idx, entry)| (idx, entry.path.clone()))
         .collect::<Vec<_>>();
-    let deleted = changes
+    // Candidate sources in path order (git's `rename_src` ordering), so the
+    // best-source search tie-breaks deterministically.
+    let mut sources = changes
         .iter()
         .filter(|entry| entry.status == NameStatus::Deleted)
-        .map(|entry| entry.path.clone())
+        .filter_map(|entry| {
+            left_entries
+                .get(entry.path.as_bytes())
+                .map(|left| (entry.path.clone(), left.oid))
+        })
         .collect::<Vec<_>>();
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut src_used = vec![false; sources.len()];
     let mut consumed = BTreeSet::new();
     let mut renamed_old_paths = BTreeSet::new();
     let mut result = Vec::new();
 
-    for old_path in deleted {
-        let Some(left) = left_entries.get(old_path.as_bytes()) else {
+    // git's `find_identical_files`: for each destination, among the still-unused
+    // sources with the identical OID, prefer one that shares the destination's
+    // basename (score 2 short-circuits; otherwise the first such source wins).
+    // Iterating destinations (not sources) is what lets a same-basename source
+    // win over an alphabetically-earlier different-basename one.
+    for (idx, new_path) in &added {
+        let Some(right) = right_entries.get(new_path.as_bytes()) else {
             continue;
         };
-        if let Some((idx, new_path)) = added.iter().find(|(idx, new_path)| {
-            !consumed.contains(idx)
-                && right_entries.get(new_path.as_bytes()).is_some_and(|right| {
-                    right.oid == left.oid && (rename_empty || !is_empty_blob_oid(&left.oid))
-                })
-        }) {
+        if !rename_empty && is_empty_blob_oid(&right.oid) {
+            continue;
+        }
+        let mut best: Option<usize> = None;
+        let mut best_score = -1i32;
+        for (si, (src_path, src_oid)) in sources.iter().enumerate() {
+            if src_used[si] || *src_oid != right.oid {
+                continue;
+            }
+            let score = 1 + i32::from(path_basename(src_path) == path_basename(new_path));
+            if score > best_score {
+                best = Some(si);
+                best_score = score;
+                if score == 2 {
+                    break;
+                }
+            }
+        }
+        if let Some(si) = best {
+            src_used[si] = true;
             consumed.insert(*idx);
+            let old_path = sources[si].0.clone();
+            let left = &left_entries[old_path.as_bytes()];
             renamed_old_paths.insert(old_path.clone());
-            let right = right_entries.get(new_path.as_bytes());
             result.push(NameStatusEntry {
                 status: NameStatus::Renamed(100),
                 path: new_path.clone(),
                 old_path: Some(old_path),
                 old_mode: Some(left.mode),
-                new_mode: right.map(|entry| entry.mode),
+                new_mode: Some(right.mode),
                 old_oid: Some(left.oid),
-                new_oid: right.map(|entry| entry.oid),
+                new_oid: Some(right.oid),
             });
         }
     }
@@ -3035,10 +3063,45 @@ fn detect_inexact_renames(
         return changes;
     }
 
-    // Score every (delete, add) pair; keep only those meeting the threshold.
+    let mut src_used = vec![false; deleted.len()];
+    let mut dst_used = vec![false; added.len()];
+    // destination changes-index -> (source changes-index, score).
+    let mut rename_of: BTreeMap<usize, (usize, u8)> = BTreeMap::new();
+
+    // Basename pre-pass (git's `find_basename_matches`): before the global
+    // matrix, pair unique-basename src/dst at the stricter basename score, so a
+    // same-basename rename wins over a globally-more-similar different basename.
+    // git only does this for pure rename detection (`!want_copies`); when copies
+    // are also wanted it culls differently and skips the basename heuristic.
+    if !options.base.detect_copies {
+        let src_paths: Vec<&[u8]> = deleted.iter().map(|(idx, _)| &changes[*idx].path[..]).collect();
+        let dst_paths: Vec<&[u8]> = added.iter().map(|(idx, _)| &changes[*idx].path[..]).collect();
+        let basename_pairs = basename_rename_matches(
+            &src_paths,
+            &dst_paths,
+            &src_used,
+            &dst_used,
+            threshold,
+            |si, di| Some(blob_similarity(&deleted[si].1, &added[di].1)),
+        );
+        for (si, di, score) in basename_pairs {
+            src_used[si] = true;
+            dst_used[di] = true;
+            rename_of.insert(added[di].0, (deleted[si].0, score));
+        }
+    }
+
+    // Score every remaining (delete, add) pair; keep only those meeting the
+    // threshold.
     let mut pairs: Vec<ScoredPair> = Vec::new();
     for (si, (_, src_bytes)) in deleted.iter().enumerate() {
+        if src_used[si] {
+            continue;
+        }
         for (di, (_, dst_bytes)) in added.iter().enumerate() {
+            if dst_used[di] {
+                continue;
+            }
             let score = blob_similarity(src_bytes, dst_bytes);
             if score >= threshold {
                 pairs.push(ScoredPair {
@@ -3058,11 +3121,6 @@ fn detect_inexact_renames(
             .then_with(|| a.dst.cmp(&b.dst))
     });
 
-    // Greedily assign each source/destination once.
-    let mut src_used = vec![false; deleted.len()];
-    let mut dst_used = vec![false; added.len()];
-    // destination changes-index -> (source changes-index, score).
-    let mut rename_of: BTreeMap<usize, (usize, u8)> = BTreeMap::new();
     for pair in pairs {
         if src_used[pair.src] || dst_used[pair.dst] {
             continue;
@@ -3311,6 +3369,99 @@ pub fn blob_similarity(a: &[u8], b: &[u8]) -> u8 {
     let internal = (common as u64 * MAX_SCORE) / max_size as u64;
     let score = internal * 100 / MAX_SCORE;
     score.min(100) as u8
+}
+
+/// The basename of a slash-separated path: the portion after the last `/`
+/// (git's `get_basename`).
+pub fn path_basename(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&byte| byte == b'/') {
+        Some(slash) => &path[slash + 1..],
+        None => path,
+    }
+}
+
+/// The stricter score a basename match must reach: git's `min_basename_score`
+/// with the default `GIT_BASENAME_FACTOR` of 0.5, i.e. halfway between the
+/// rename threshold and 100%. (For the default 50% threshold this is 75%.)
+pub fn basename_min_score(threshold: u8) -> u8 {
+    let threshold = threshold.min(100);
+    threshold + (100 - threshold) / 2
+}
+
+/// git's `find_basename_matches`: among the still-unmatched rename sources and
+/// destinations, pair those whose basename is UNIQUE on *both* sides and whose
+/// similarity meets [`basename_min_score`]. Returns the `(src_local, dst_local,
+/// score)` pairings to apply *before* the full O(n·m) similarity matrix, so a
+/// same-basename rename wins over a globally-more-similar different-basename
+/// candidate (diffcore-rename.c).
+///
+/// `src_paths`/`dst_paths` are the candidate paths, indexed in parallel with the
+/// `src_used`/`dst_used` flags (entries already consumed by exact-OID matching).
+/// `similarity(src_local, dst_local)` returns the blob similarity for a pair, or
+/// `None` when a blob is unreadable / ineligible. Only unique basenames are
+/// considered: git's plain-diff path has no directory-rename fallback, so an
+/// ambiguous basename is skipped entirely.
+pub fn basename_rename_matches(
+    src_paths: &[&[u8]],
+    dst_paths: &[&[u8]],
+    src_used: &[bool],
+    dst_used: &[bool],
+    threshold: u8,
+    mut similarity: impl FnMut(usize, usize) -> Option<u8>,
+) -> Vec<(usize, usize, u8)> {
+    let min_score = basename_min_score(threshold);
+    // basename -> Some(unique local index), or None once a second candidate with
+    // the same basename appears (ambiguous).
+    let mut src_by_base: HashMap<&[u8], Option<usize>> = HashMap::new();
+    for (si, path) in src_paths.iter().enumerate() {
+        if src_used.get(si).copied().unwrap_or(false) {
+            continue;
+        }
+        src_by_base
+            .entry(path_basename(path))
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(si));
+    }
+    let mut dst_by_base: HashMap<&[u8], Option<usize>> = HashMap::new();
+    for (di, path) in dst_paths.iter().enumerate() {
+        if dst_used.get(di).copied().unwrap_or(false) {
+            continue;
+        }
+        dst_by_base
+            .entry(path_basename(path))
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(di));
+    }
+    let mut matches = Vec::new();
+    let mut dst_taken = vec![false; dst_paths.len()];
+    for (si, path) in src_paths.iter().enumerate() {
+        if src_used.get(si).copied().unwrap_or(false) {
+            continue;
+        }
+        let base = path_basename(path);
+        // Both basenames must be unique among the remaining candidates.
+        let Some(Some(src_idx)) = src_by_base.get(base).copied() else {
+            continue;
+        };
+        if src_idx != si {
+            continue;
+        }
+        let Some(Some(dst_idx)) = dst_by_base.get(base).copied() else {
+            continue;
+        };
+        if dst_used.get(dst_idx).copied().unwrap_or(false) || dst_taken[dst_idx] {
+            continue;
+        }
+        let Some(score) = similarity(si, dst_idx) else {
+            continue;
+        };
+        if score < min_score {
+            continue;
+        }
+        dst_taken[dst_idx] = true;
+        matches.push((si, dst_idx, score));
+    }
+    matches
 }
 
 /// Break `data` into spans and return, per span hash, the total number of bytes
