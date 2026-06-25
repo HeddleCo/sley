@@ -89,6 +89,20 @@ impl From<std::io::Error> for RefDeleteError {
     }
 }
 
+/// Parse the leading object id of a loose ref body, tolerating any trailing
+/// content that begins with whitespace (git's `parse_loose_ref_contents`).
+fn parse_leading_oid(format: ObjectFormat, value: &str) -> Option<ObjectId> {
+    let hexsz = format.hex_len();
+    let bytes = value.as_bytes();
+    if bytes.len() < hexsz {
+        return None;
+    }
+    if bytes.len() > hexsz && !bytes[hexsz].is_ascii_whitespace() {
+        return None;
+    }
+    ObjectId::from_hex(format, &value[..hexsz]).ok()
+}
+
 pub fn parse_loose_ref(format: ObjectFormat, name: impl Into<String>, bytes: &[u8]) -> Result<Ref> {
     let name = name.into();
     let value = std::str::from_utf8(bytes)
@@ -107,11 +121,16 @@ pub fn parse_loose_ref(format: ObjectFormat, name: impl Into<String>, bytes: &[u
     let target = if let Some(symbolic) = value.strip_prefix("ref: ") {
         RefTarget::Symbolic(symbolic.to_string())
     } else {
-        RefTarget::Direct(ObjectId::from_hex(format, value).map_err(|_| {
+        // git's parse_loose_ref_contents reads the leading <hexsz> hex digits
+        // and tolerates trailing content as long as it begins with whitespace
+        // (a bare "<oid> garbage" still resolves to <oid>; `refs verify` flags
+        // the trailing separately as trailingRefContent).
+        let oid = parse_leading_oid(format, value).ok_or_else(|| {
             GitError::InvalidFormat(format!(
                 "reference {name} has neither a valid OID nor a target"
             ))
-        })?)
+        })?;
+        RefTarget::Direct(oid)
     };
     Ok(Ref { name, target })
 }
@@ -4323,6 +4342,29 @@ fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
+/// Recursively remove an empty directory tree at `path` (git's
+/// `remove_empty_directories`). A no-op when `path` is absent or is a file; an
+/// error if any directory in the tree contains a non-directory entry.
+fn remove_empty_dir_tree(path: &Path) -> std::io::Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if !meta.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_empty_dir_tree(&entry.path())?;
+        } else {
+            return Err(std::io::Error::other("directory not empty"));
+        }
+    }
+    fs::remove_dir(path)
+}
+
 fn stage_lock_file(lock_path: &Path, contents: &[u8]) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -4343,9 +4385,10 @@ fn stage_pending_change(change: &PendingPathChange) -> Result<()> {
 fn apply_pending_change(change: &PendingPathChange) -> Result<()> {
     match &change.action {
         PendingPathAction::Write { .. } => {
-            if change.path.is_dir() {
-                fs::remove_dir(&change.path).map_err(|err| GitError::Io(err.to_string()))?;
-            }
+            // git's `remove_empty_directories`: an empty directory tree sitting
+            // where the loose ref file belongs (e.g. leftover `refs/x/foo/bar/`)
+            // is cleared before the rename so the ref can be written.
+            remove_empty_dir_tree(&change.path).map_err(|err| GitError::Io(err.to_string()))?;
             fs::rename(&change.lock_path, &change.path).map_err(|err| GitError::Io(err.to_string()))
         }
         PendingPathAction::Delete => {

@@ -5746,6 +5746,9 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     let mut report_unreachable = false;
     let mut strict = false;
     let mut connectivity_only = false;
+    // `--references` (the default) runs the ref-store consistency check
+    // (`refs verify`) alongside the object walk; `--no-references` skips it.
+    let mut references = true;
     // `--tags` restricts the root set to tags; `--root` additionally pins the
     // root tree(s). Both default off (a bare `git fsck` walks all refs).
     let mut only_tags = false;
@@ -5769,8 +5772,9 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
             "--no-name-objects" => name_objects = false,
             // These affect output/perf only; object-content checks are
             // unconditional in this implementation, so accept and ignore them.
-            "--full" | "--no-full" | "--root" | "--cache" | "--no-cache" | "--lost-found"
-            | "--references" | "--no-references" => {}
+            "--references" => references = true,
+            "--no-references" => references = false,
+            "--full" | "--no-full" | "--root" | "--cache" | "--no-cache" | "--lost-found" => {}
             value if value.starts_with("--") => {
                 return Err(GitError::Command(format!(
                     "fsck currently supports --no-progress and basic object connectivity; unsupported option {value}"
@@ -5792,6 +5796,20 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
         for (key, value) in config.fsck_entries() {
             severity.set(&key, &value);
         }
+    }
+    // The ref-store consistency check shares the same severity table; clone it
+    // before the object walk consumes `severity`.
+    let refs_severity = severity.clone();
+
+    // git runs `fsck_refs` (the `refs verify` consistency check) before the
+    // object walk when `--references` is in effect (the default). Its findings
+    // count toward ERROR_REFS.
+    let mut refs_verify_bits = 0i32;
+    if references
+        && crate::commands::refs_verify::verify_for_fsck(refs_severity, false, &git_dir)
+            .unwrap_or(false)
+    {
+        refs_verify_bits |= sley_fsck::ERROR_REFS;
     }
 
     // Explicit object-id arguments override the default ref-walk roots. git
@@ -5965,6 +5983,7 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     // ERROR_REACHABLE / ERROR_REFS — not ERROR_OBJECT.
     exit_bits |= ref_error_bits;
     exit_bits |= index_error_bits;
+    exit_bits |= refs_verify_bits;
 
     // git's fsck verifies the commit-graph when `core.commitGraph` is true (the
     // default; unset ⇒ true) by shelling out to `commit-graph verify`. We run the

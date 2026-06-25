@@ -99,6 +99,23 @@ pub enum MsgId {
     GitattributesSymlink,
     GitignoreSymlink,
     MailmapSymlink,
+    // ref consistency (`git refs verify` / `git fsck --references`)
+    BadRefName,
+    BadRefContent,
+    BadRefFiletype,
+    BadReferentName,
+    BadRefOid,
+    BadHeadTarget,
+    RefMissingNewline,
+    TrailingRefContent,
+    SymrefTargetIsNotARef,
+    SymlinkRef,
+    BadPackedRefHeader,
+    BadPackedRefEntry,
+    PackedRefEntryNotTerminated,
+    PackedRefUnsorted,
+    EmptyPackedRefsFile,
+    BadReftableTableName,
 }
 
 impl MsgId {
@@ -164,6 +181,22 @@ impl MsgId {
             MsgId::GitattributesSymlink => "gitattributesSymlink",
             MsgId::GitignoreSymlink => "gitignoreSymlink",
             MsgId::MailmapSymlink => "mailmapSymlink",
+            MsgId::BadRefName => "badRefName",
+            MsgId::BadRefContent => "badRefContent",
+            MsgId::BadRefFiletype => "badRefFiletype",
+            MsgId::BadReferentName => "badReferentName",
+            MsgId::BadRefOid => "badRefOid",
+            MsgId::BadHeadTarget => "badHeadTarget",
+            MsgId::RefMissingNewline => "refMissingNewline",
+            MsgId::TrailingRefContent => "trailingRefContent",
+            MsgId::SymrefTargetIsNotARef => "symrefTargetIsNotARef",
+            MsgId::SymlinkRef => "symlinkRef",
+            MsgId::BadPackedRefHeader => "badPackedRefHeader",
+            MsgId::BadPackedRefEntry => "badPackedRefEntry",
+            MsgId::PackedRefEntryNotTerminated => "packedRefEntryNotTerminated",
+            MsgId::PackedRefUnsorted => "packedRefUnsorted",
+            MsgId::EmptyPackedRefsFile => "emptyPackedRefsFile",
+            MsgId::BadReftableTableName => "badReftableTableName",
         }
     }
 
@@ -211,6 +244,16 @@ impl MsgId {
             | MsgId::GitattributesBlob
             | MsgId::GitattributesLarge
             | MsgId::GitattributesLineLength
+            | MsgId::BadRefName
+            | MsgId::BadRefContent
+            | MsgId::BadRefFiletype
+            | MsgId::BadReferentName
+            | MsgId::BadRefOid
+            | MsgId::BadHeadTarget
+            | MsgId::BadPackedRefHeader
+            | MsgId::BadPackedRefEntry
+            | MsgId::PackedRefEntryNotTerminated
+            | MsgId::PackedRefUnsorted
             | MsgId::BadTree => DefaultSeverity::Error,
             // WARN in git's table.
             MsgId::NulInCommit
@@ -225,11 +268,17 @@ impl MsgId {
             | MsgId::GitattributesSymlink
             | MsgId::GitignoreSymlink
             | MsgId::MailmapSymlink
+            | MsgId::BadReftableTableName
             | MsgId::LargePathname => DefaultSeverity::Warn,
             // INFO in git's table (rendered as warning, ignored when promoted off).
-            MsgId::BadFilemode | MsgId::BadTagName | MsgId::MissingTaggerEntry => {
-                DefaultSeverity::Info
-            }
+            MsgId::BadFilemode
+            | MsgId::BadTagName
+            | MsgId::MissingTaggerEntry
+            | MsgId::RefMissingNewline
+            | MsgId::TrailingRefContent
+            | MsgId::SymrefTargetIsNotARef
+            | MsgId::SymlinkRef
+            | MsgId::EmptyPackedRefsFile => DefaultSeverity::Info,
             // IGNORE in git's table (only surfaces when elevated by config).
             MsgId::ExtraHeaderEntry | MsgId::BadGpgsig => DefaultSeverity::Ignore,
         }

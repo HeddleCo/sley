@@ -4557,6 +4557,7 @@ pub(crate) fn cmd_refs(args: &[String]) -> Result<()> {
     match subcommand {
         "list" => commands::for_each_ref::for_each_ref_core(&args[1..], "git refs list"),
         "exists" => cmd_refs_exists(&args[1..]),
+        "verify" => commands::refs_verify::cmd_refs_verify(&args[1..]),
         "migrate" => cmd_refs_migrate(&args[1..]),
         "optimize" => commands::pack::cmd_pack_refs(&args[1..]),
         "-h" | "--help" => {

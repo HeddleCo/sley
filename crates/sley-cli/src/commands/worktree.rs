@@ -221,6 +221,12 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     write_worktree_linking_files(&common_git_dir, &admin_dir, &path, relative_paths)?;
     fs::write(admin_dir.join("commondir"), "../..\n")?;
     let reftable_refs = FileRefStore::new(&common_git_dir, format).uses_reftable()?;
+    // git's files backend creates the per-worktree `refs/` directory when a
+    // worktree is added (the reftable path writes its own `refs/heads` stub
+    // below). Tools that probe `$(git rev-parse --git-dir)/refs` rely on it.
+    if !reftable_refs {
+        fs::create_dir_all(admin_dir.join("refs"))?;
+    }
     // An inferred-orphan worktree has no source commit, so — matching git — it
     // writes no ORIG_HEAD and points HEAD at the unborn branch.
     if !add_head.orphan && !reftable_refs {
