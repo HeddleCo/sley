@@ -20,7 +20,7 @@ use sley_object::{
 };
 use sley_odb::{
     FileObjectDatabase, LooseObjectIntegrity, ObjectPrefixResolution, ObjectReader, ObjectWriter,
-    build_reachable_pack, collect_reachable_object_ids, install_bundle_pack,
+    build_reachable_pack, collect_reachable_object_ids, grafted_parents, install_bundle_pack,
     install_reachable_pack, prune_unreachable_loose, repository_object_ids, repository_objects_dir,
 };
 use sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
@@ -1420,7 +1420,12 @@ fn ancestor_depths(
             )));
         }
         let commit = Commit::parse_ref(format, &object.body)?;
-        for parent in commit.parents {
+        // Honor the shallow boundary: a commit listed in `$GIT_DIR/shallow` is
+        // grafted to have no parents, so the walk stops there instead of trying
+        // to read a parent the shallow repo never received. Matches git's
+        // graft-aware `parse_commit` (without a `.git/shallow` file this is a
+        // no-op, so non-shallow ancestry walks are unchanged).
+        for parent in grafted_parents(db, &oid, commit.parents) {
             pending.push_back((parent, depth + 1));
         }
     }

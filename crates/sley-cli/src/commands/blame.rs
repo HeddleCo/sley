@@ -1334,8 +1334,13 @@ fn read_worktree_image(
     }
     // Read the actual work-tree file. A symlink contributes its *link text*
     // (git's `strbuf_readlink`), not the pointed-at file's contents, with a
-    // 0o120000 mode so textconv is skipped; a regular file is read verbatim
-    // (git's `strbuf_read_file`) and reported as a regular blob.
+    // 0o120000 mode so textconv is skipped; a regular file is read and run
+    // through the clean filter (git's `fake_working_tree_commit` applies
+    // `convert_to_git`, normalizing CRLF→LF / running `clean`/ident per the
+    // path's attributes and `core.autocrlf`) so the fake commit's blob lands in
+    // the same git-form space as the committed blobs it is diffed against. For a
+    // path with no EOL/filter attributes this is a no-op, so plain blobs are
+    // byte-identical to a verbatim read.
     if let Ok(root) = repo.worktree_root() {
         let absolute = root.join(repo_path);
         if let Ok(meta) = std::fs::symlink_metadata(&absolute) {
@@ -1344,7 +1349,30 @@ fn read_worktree_image(
                     return Ok((target.as_os_str().as_bytes().to_vec(), 0o120000));
                 }
             } else if let Ok(bytes) = std::fs::read(&absolute) {
-                return Ok((bytes, 0o100644));
+                // git's `convert_to_git` honors `has_crlf_in_index`: an auto
+                // (`core.autocrlf` / `text=auto`) path whose recorded blob
+                // already holds CRLF is left unconverted (the "safer autocrlf"
+                // rule), so a file committed with CRLF still blames against its
+                // CRLF blob. Mirror that by skipping the CRLF→LF clean when the
+                // committed blob already contains CRLF — the one case where the
+                // raw work-tree CRLF already matches the recorded image. When the
+                // recorded blob is LF (the common case), cleaning the work-tree
+                // copy normalizes its CRLF back to the committed LF form.
+                let recorded_has_crlf = committed
+                    .as_ref()
+                    .is_some_and(|(blob, _)| blob.windows(2).any(|w| w == b"\r\n"));
+                let image = if recorded_has_crlf {
+                    bytes
+                } else {
+                    sley_worktree::apply_clean_filter(
+                        &root,
+                        repo.git_dir(),
+                        repo.config(),
+                        repo_path.as_bytes(),
+                        &bytes,
+                    )?
+                };
+                return Ok((image, 0o100644));
             }
         }
     }
