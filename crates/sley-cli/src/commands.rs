@@ -63,6 +63,7 @@ pub(crate) mod read_tree;
 pub(crate) mod rebase;
 pub(crate) mod ref_command_stream;
 pub(crate) mod refs;
+pub(crate) mod refs_verify;
 pub(crate) mod remote_cmds;
 pub(crate) mod replay;
 pub(crate) mod rerere;
