@@ -15448,7 +15448,12 @@ fn write_worktree_blob_entry(
 ///   `body` is the smudged content for the regular-file arm.
 /// * everything else → a regular file holding `body`, with the user-execute bit
 ///   set iff `mode` has it (`set_worktree_file_mode`).
-fn write_blob_body_or_symlink(
+///
+/// Exposed crate-publicly so out-of-crate worktree materializers (e.g.
+/// `sley-cli`'s `stash -u` untracked-tree restore) route through the same
+/// type-by-mode primitive instead of re-deriving an `fs::write` that drops the
+/// symlink arm.
+pub fn write_blob_body_or_symlink(
     file_path: &Path,
     mode: u32,
     body: &[u8],

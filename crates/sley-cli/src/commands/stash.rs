@@ -1074,24 +1074,12 @@ fn restore_stash_tree_entries_to_worktree(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, &object.body)?;
-        set_stash_restored_file_mode(&path, entry.mode)?;
+        // Route through the shared type-by-mode primitive so a stashed *untracked*
+        // symlink (mode 0o120000) restores as a real symlink, not a regular file
+        // holding the link target as content. This is the last site of the
+        // symlink-write bug class the W46 keystone closed for checkout/restore.
+        sley_worktree::write_blob_body_or_symlink(&path, entry.mode, &object.body, &object.body)?;
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_stash_restored_file_mode(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = fs::metadata(path)?.permissions();
-    permissions.set_mode(if mode == 0o100755 { 0o755 } else { 0o644 });
-    fs::set_permissions(path, permissions)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_stash_restored_file_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
