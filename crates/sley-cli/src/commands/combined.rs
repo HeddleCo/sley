@@ -298,13 +298,19 @@ pub(crate) fn write_combined_patch(
     path: &CombinedPath,
 ) -> Result<bool> {
     let num_parent = path.parents.len();
+    // A gitlink (submodule) oid is a commit, not a blob: git's combine-diff
+    // `grab_blob` synthesizes `Subproject commit <hex>\n` for `S_ISGITLINK(mode)`
+    // before any object read, exactly as the non-combined diff path does. Reading
+    // it as a blob would error or yield garbage.
     let result_blob = match &path.result_oid {
+        Some(oid) if path.result_mode == 0o160000 => gitlink_diff_content(oid, false),
         Some(oid) => read_blob(ctx.db, oid)?,
         None => Vec::new(),
     };
     let mut parent_blobs: Vec<Vec<u8>> = Vec::with_capacity(num_parent);
     for parent in &path.parents {
         parent_blobs.push(match &parent.oid {
+            Some(oid) if parent.mode == 0o160000 => gitlink_diff_content(oid, false),
             Some(oid) => read_blob(ctx.db, oid)?,
             None => Vec::new(),
         });
