@@ -1040,7 +1040,7 @@ impl FileRefStore {
         if self.uses_reftable()? {
             let mut refs = BTreeMap::<String, Ref>::new();
             for reference in self
-                .reftable_store_with_storage(self.common_dir.clone())
+                .reftable_store_with_storage(self.shared_reftable_storage_dir())
                 .list_reftable_refs_with_prefix(prefix)?
             {
                 refs.insert(reference.name.clone(), reference);
@@ -2010,6 +2010,23 @@ impl FileRefStore {
         }
     }
 
+    /// Directory holding the *shared* (non-per-worktree) reftable stack.
+    ///
+    /// Normally this is the common dir, but an `extensions.refStorage` /
+    /// `GIT_REFERENCE_BACKEND` URI with a `://path` payload relocates the
+    /// stack to that path (e.g. `reftable:///abs/path`). `storage_dir` cannot
+    /// stand in for this: for a *linked worktree* with no alternate path it is
+    /// the per-worktree gitdir, not the shared stack. So resolve the shared
+    /// location explicitly from the configured backend, mirroring the path
+    /// resolution in `FileRefStore::new`. (Without this, shared refs under an
+    /// alternate-path backend are looked up in the empty default `reftable/`.)
+    fn shared_reftable_storage_dir(&self) -> PathBuf {
+        match configured_ref_storage_backend(&self.common_dir) {
+            Some((_, Some(path))) => path,
+            _ => self.common_dir.clone(),
+        }
+    }
+
     fn reftable_store_for_ref(&self, name: &str) -> Result<(FileRefStore, String)> {
         if let Some((worktree, rewritten)) = reftable_other_worktree_ref(name) {
             let storage_dir = self.common_dir.join("worktrees").join(worktree);
@@ -2022,7 +2039,7 @@ impl FileRefStore {
             return Ok((self.reftable_store_with_storage(self.git_dir.clone()), name.to_string()));
         }
         Ok((
-            self.reftable_store_with_storage(self.common_dir.clone()),
+            self.reftable_store_with_storage(self.shared_reftable_storage_dir()),
             name.to_string(),
         ))
     }
