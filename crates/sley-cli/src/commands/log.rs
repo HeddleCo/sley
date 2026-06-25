@@ -1072,6 +1072,28 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             value if value.starts_with("-O") => {
                 diff_opts.order_file = Some(value[2..].to_string());
             }
+            "--rotate-to" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| log_option_requires_value_error("rotate-to"))?;
+                diff_opts.rotate_to = Some(value.to_string());
+                diff_opts.rotate_skip = false;
+            }
+            value if value.starts_with("--rotate-to=") => {
+                diff_opts.rotate_to = Some(value["--rotate-to=".len()..].to_string());
+                diff_opts.rotate_skip = false;
+            }
+            "--skip-to" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| log_option_requires_value_error("skip-to"))?;
+                diff_opts.rotate_to = Some(value.to_string());
+                diff_opts.rotate_skip = true;
+            }
+            value if value.starts_with("--skip-to=") => {
+                diff_opts.rotate_to = Some(value["--skip-to=".len()..].to_string());
+                diff_opts.rotate_skip = true;
+            }
             "--diff-filter" => {
                 let value = iter
                     .next()

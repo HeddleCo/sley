@@ -942,6 +942,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         diff_filter,
         ignore_submodules_cli,
         merge_base,
+        orderfile,
+        rotate_to,
+        rotate_skip,
         mut path_args,
         explicit_paths,
     } = commands::diff_options::setup_diff_options(args)?;
@@ -1223,6 +1226,15 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             _ => {}
         }
     }
+    // `-O<orderfile>` / `diff.orderfile`: a CLI `-O` overrides config, and
+    // `-O/dev/null` cancels a configured orderfile (it reads as zero patterns).
+    // The file itself is only read once a non-empty diff exists, matching git's
+    // `diffcore_order` (which early-returns when the queue is empty).
+    let resolved_orderfile = orderfile.or_else(|| {
+        repo_config
+            .as_ref()
+            .and_then(|config| config.get("diff", None, "orderfile").map(str::to_owned))
+    });
     if let Some(opts) = dirstat.as_mut() {
         // diff.dirstat config forms the base (bad parameters warn); explicit
         // --dirstat parameters apply on top (bad parameters are fatal).
@@ -1342,6 +1354,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 ws_ignore,
                 diff_algorithm,
                 line_prefix: line_prefix.as_deref(),
+                orderfile: resolved_orderfile.as_deref(),
             },
         )?;
         if (quiet || exit_code) && has_differences {
@@ -1604,6 +1617,27 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     } else {
         entries
     };
+    // `-O<orderfile>` / `diff.orderfile` then `--rotate-to` / `--skip-to`, the
+    // last steps of git's `diffcore_std` (both no-op on an empty diff).
+    let mut entries = entries;
+    if !entries.is_empty()
+        && let Some(orderfile) = resolved_orderfile.as_deref()
+    {
+        let patterns = commands::diff_order::read_orderfile(orderfile)?;
+        commands::diff_order::order_entries(&mut entries, &patterns);
+    }
+    if !entries.is_empty()
+        && let Some(target) = rotate_to.as_deref()
+    {
+        // Plumbing `git diff` is strict: a `--rotate-to`/`--skip-to` naming no
+        // diffed path is fatal (builtin/diff.c sets `rotate_to_strict`).
+        commands::diff_order::rotate_entries(
+            &mut entries,
+            target.as_bytes(),
+            rotate_skip,
+            true,
+        )?;
+    }
     let has_differences = !entries.is_empty();
     // `--check`: report whitespace errors introduced by the new side, in place
     // of the normal patch body (git's DIFF_FORMAT_CHECKDIFF). It exits 2 on a
@@ -1986,9 +2020,22 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 }
             }
         }
-        let mut output = io::stdout();
+        // `--output=<file>` redirects the formatted diff to a file (git's
+        // `diff_opt_output`); otherwise it goes to stdout.
+        let mut file_output;
+        let mut std_output;
+        let output: &mut dyn Write = if let Some(path) = output.as_deref() {
+            file_output = fs::File::create(path).map_err(|err| {
+                eprintln!("fatal: cannot open '{path}': {err}");
+                GitError::Exit(128)
+            })?;
+            &mut file_output
+        } else {
+            std_output = io::stdout();
+            &mut std_output
+        };
         if let Some(prefix) = line_prefix.as_deref() {
-            write_line_prefixed(&mut output, &stdout, prefix.as_bytes())?;
+            write_line_prefixed(output, &stdout, prefix.as_bytes())?;
         } else {
             output.write_all(&stdout)?;
         }
@@ -2011,6 +2058,9 @@ struct CombinedDiffOptions<'a> {
     ws_ignore: sley_diff_merge::WsIgnore,
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
     line_prefix: Option<&'a str>,
+    /// `-O<orderfile>` / `diff.orderfile`: reorder the combined paths by the
+    /// orderfile patterns (`diffcore_order` runs for combined diffs too).
+    orderfile: Option<&'a str>,
 }
 
 fn write_diff_combined_three_tree(
@@ -2025,6 +2075,10 @@ fn write_diff_combined_three_tree(
     paths.retain(|path| pathspec.matches(&path.path));
     if paths.is_empty() {
         return Ok(false);
+    }
+    if let Some(orderfile) = options.orderfile {
+        let patterns = commands::diff_order::read_orderfile(orderfile)?;
+        commands::diff_order::order_by_path(&mut paths, &patterns, |path| &path.path);
     }
 
     let name_status = options

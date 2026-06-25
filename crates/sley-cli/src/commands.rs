@@ -27,6 +27,7 @@ pub(crate) mod diff;
 pub(crate) mod diff_files;
 pub(crate) mod diff_index;
 pub(crate) mod diff_options;
+pub(crate) mod diff_order;
 pub(crate) mod diff_tree;
 pub(crate) mod diff_words;
 pub(crate) mod difftool;

@@ -131,6 +131,17 @@ pub(crate) struct DiffOptions {
     pub(crate) diff_filter: DiffFilter,
     pub(crate) ignore_submodules_cli: Option<SubmoduleIgnoreMode>,
     pub(crate) merge_base: bool,
+    /// `-O<file>`: path-ordering file (`diffcore_order`). `Some` when given on
+    /// the CLI; a CLI `-O` overrides the `diff.orderfile` config. `-O/dev/null`
+    /// is the documented way to cancel a configured orderfile (it reads as zero
+    /// patterns, so every path keeps its tree order).
+    pub(crate) orderfile: Option<String>,
+    /// `--rotate-to=<path>` / `--skip-to=<path>`: rotate (or, with `skip`, drop)
+    /// the path-sorted diff so it begins at `<path>` (`diffcore_rotate`).
+    pub(crate) rotate_to: Option<String>,
+    /// `true` when the rotate request came from `--skip-to` (drop the leading
+    /// entries) rather than `--rotate-to` (move them to the end).
+    pub(crate) rotate_skip: bool,
     pub(crate) path_args: Vec<String>,
     pub(crate) explicit_paths: Vec<String>,
 }
@@ -204,6 +215,9 @@ impl Default for DiffOptions {
             diff_filter: DiffFilter::default(),
             ignore_submodules_cli: None,
             merge_base: false,
+            orderfile: None,
+            rotate_to: None,
+            rotate_skip: false,
             path_args: Vec::new(),
             explicit_paths: Vec::new(),
         }
@@ -458,6 +472,27 @@ fn diff_option_specs() -> &'static [OptionSpec<'static>] {
             "<file>",
             OptFlags::NONEG,
             "output to a specific file",
+        ),
+        opt_str(
+            Some('O'),
+            None,
+            "<file>",
+            OptFlags::NONEG,
+            "control the order in which files appear in the output",
+        ),
+        opt_str(
+            None,
+            Some("rotate-to"),
+            "<path>",
+            OptFlags::NONEG,
+            "show the change in the specified path first",
+        ),
+        opt_str(
+            None,
+            Some("skip-to"),
+            "<path>",
+            OptFlags::NONEG,
+            "skip the output to the specified path",
         ),
         opt_str(
             None,
@@ -920,6 +955,15 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
         (_, Some("quiet")) => options.quiet = bool_value(option),
         (_, Some("exit-code")) => options.exit_code = bool_value(option),
         (_, Some("output")) => options.output = Some(str_value(option).to_string()),
+        (Some('O'), None) => options.orderfile = Some(str_value(option).to_string()),
+        (_, Some("rotate-to")) => {
+            options.rotate_to = Some(str_value(option).to_string());
+            options.rotate_skip = false;
+        }
+        (_, Some("skip-to")) => {
+            options.rotate_to = Some(str_value(option).to_string());
+            options.rotate_skip = true;
+        }
         (_, Some("line-prefix")) => options.line_prefix = Some(str_value(option).to_string()),
         (Some('c'), None) => options.combined = Some(false),
         (_, Some("cc")) => options.combined = Some(true),
