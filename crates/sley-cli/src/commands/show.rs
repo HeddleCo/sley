@@ -138,6 +138,10 @@ struct ShowOptions {
     /// pretty format or `--no-notes` suppresses them, `--notes`/`--show-notes`
     /// forces them on.
     show_notes: bool,
+    /// Whether a notes flag (`--notes`/`--show-notes`/`--no-notes`) was given.
+    /// git enables notes for a `%N` userformat only when no flag was passed
+    /// (`!show_notes_given`), so a `--no-notes` still wins.
+    notes_given: bool,
     /// Explicit `--root` / `--no-root` override. When unset, `log.showRoot`
     /// controls whether a root commit shows the empty-tree diff.
     show_root: Option<bool>,
@@ -279,6 +283,7 @@ impl Default for ShowOptions {
             decorate: LogDecorationMode::Off,
             // Default `git show` (medium, no `--pretty`) displays notes.
             show_notes: true,
+            notes_given: false,
             show_root: None,
             ws_ignore: sley_diff_merge::WsIgnore::default(),
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
@@ -848,10 +853,15 @@ fn show_commit(
                 db: context.db,
                 config: context.config,
             };
-            print_log_format(
+            // `git show --format=…` is a userformat: `%N` injects the note
+            // (raw), so route through the notes-aware emitter when notes are
+            // enabled. A format without `%N` is unaffected.
+            crate::commands::log::print_log_custom_format_with_notes(
+                context.git_dir,
+                context.format,
                 &record,
                 compiled,
-                LogFormatContext {
+                &LogFormatContext {
                     abbrev_len: options.abbrev_len,
                     decorations,
                     marker: '>',
@@ -866,6 +876,9 @@ fn show_commit(
                     color: false,
                     output_encoding: &output_encoding,
                 },
+                // git enables notes for a `%N` userformat unless a notes flag
+                // explicitly turned them off; otherwise honour the flag.
+                !options.notes_given || options.show_notes,
             )?;
         }
     }
@@ -1785,8 +1798,14 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             value if let Some(encoding) = value.strip_prefix("--encoding=") => {
                 options.output_encoding = Some(encoding.to_string());
             }
-            "--notes" | "--show-notes" => options.show_notes = true,
-            "--no-notes" => options.show_notes = false,
+            "--notes" | "--show-notes" => {
+                options.show_notes = true;
+                options.notes_given = true;
+            }
+            "--no-notes" => {
+                options.show_notes = false;
+                options.notes_given = true;
+            }
             // --- oid abbreviation ------------------------------------------------
             "--abbrev-commit" => options.abbrev_commit = true,
             "--no-abbrev-commit" => options.abbrev_commit = false,

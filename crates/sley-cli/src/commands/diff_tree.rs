@@ -507,6 +507,12 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
     let git_dir = repo.git_dir();
     let format = repo.format();
     let db = repo.objects();
+    // git loads the display notes refs at revision setup; a valueless
+    // `-c notes.displayRef` is a fatal parse error that must surface before any
+    // output. Resolve them up front (and discard) when notes display is on.
+    if options.show_notes {
+        crate::commands::log::resolve_standard_notes_refs(git_dir, format)?;
+    }
     let setup = sley_rev::setup_revisions(
         &options.setup_args,
         &sley_rev::RevisionSetupContext {
