@@ -1482,7 +1482,7 @@ fn cmd_submodule_deinit(args: &[String], quiet: bool) -> Result<()> {
 }
 
 fn cmd_submodule_sync(args: &[String], quiet: bool) -> Result<()> {
-    let (paths, quiet, _recursive) = parse_submodule_sync_options(args, quiet)?;
+    let (paths, quiet, recursive, super_prefix) = parse_submodule_sync_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -1491,26 +1491,143 @@ fn cmd_submodule_sync(args: &[String], quiet: bool) -> Result<()> {
     let mut config = read_repo_config(&git_dir)?;
     let mut changed = false;
     for submodule in selected {
-        if config
-            .get("submodule", Some(&submodule.name), "url")
-            .is_none()
-        {
-            continue;
-        }
-        let Some(url) = &submodule.url else {
-            continue;
-        };
-        let url = resolve_submodule_sync_url(&worktree_root, &config, url);
-        set_submodule_config_value(&mut config, &submodule.name, "url", &url);
-        if !quiet {
-            println!("Synchronizing submodule url for '{}'", submodule.path);
-        }
-        changed = true;
+        sync_one_submodule(
+            &git_dir,
+            &worktree_root,
+            &cwd,
+            &mut config,
+            &mut changed,
+            submodule,
+            quiet,
+            recursive,
+            &super_prefix,
+        )?;
     }
     if changed {
         write_repo_config(&git_dir, &config)?;
     }
     Ok(())
+}
+
+/// Port of `sync_submodule` (`builtin/submodule--helper.c`). For an active
+/// submodule: re-derive the superproject `.git/config` url and (when populated)
+/// the submodule's own `remote.<default>.url` from the `.gitmodules` url —
+/// resolving the latter with the worktree-relative `up_path` so a relative url
+/// stays relative to the submodule — then optionally recurse.
+#[allow(clippy::too_many_arguments)]
+fn sync_one_submodule(
+    git_dir: &Path,
+    worktree_root: &Path,
+    cwd: &Path,
+    config: &mut GitConfig,
+    changed: &mut bool,
+    submodule: &SubmoduleConfigEntry,
+    quiet: bool,
+    recursive: bool,
+    super_prefix: &str,
+) -> Result<()> {
+    // `is_submodule_active`: sync only touches submodules registered in
+    // `.git/config` (a `submodule.<name>.url`).
+    if config
+        .get("submodule", Some(&submodule.name), "url")
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    // git derives TWO urls: `super_config_url` (no up_path) for the
+    // superproject's `.git/config`, and `sub_origin_url` (with up_path) for the
+    // submodule's own remote — a relative url must stay relative to the deeper
+    // submodule worktree. A non-relative url is used verbatim for both.
+    let up_path = submodule_up_path(&submodule.path);
+    let (super_config_url, sub_origin_url) = match &submodule.url {
+        Some(url) if url.starts_with("../") || url.starts_with("./") => {
+            resolve_sync_urls(worktree_root, config, url, &up_path)
+        }
+        Some(url) => (url.clone(), url.clone()),
+        None => (String::new(), String::new()),
+    };
+
+    let display = submodule_displaypath(cwd, worktree_root, &submodule.path, super_prefix)?;
+    if !quiet {
+        println!("Synchronizing submodule url for '{display}'");
+    }
+    set_submodule_config_value(config, &submodule.name, "url", &super_config_url);
+    *changed = true;
+
+    // Only a populated submodule has a git dir whose remote we can update.
+    let submodule_root = worktree_root.join(&submodule.path);
+    let Some(sub_git_dir) = resolve_submodule_repo_gitdir(&submodule_root) else {
+        return Ok(());
+    };
+    let sub_format = repository_object_format(&sub_git_dir)?;
+    let mut sub_config = read_repo_config(&sub_git_dir)?;
+    let abs_path = normalize_lexical_path(&submodule_root);
+    let remote = submodule_default_remote_name(
+        worktree_root,
+        git_dir,
+        &abs_path,
+        &sub_git_dir,
+        sub_format,
+        &sub_config,
+    )?;
+    set_config_value(&mut sub_config, "remote", Some(&remote), "url", &sub_origin_url);
+    write_repo_config(&sub_git_dir, &sub_config)?;
+
+    if recursive {
+        recurse_submodule_sync(&submodule_root, &display, quiet)?;
+    }
+    Ok(())
+}
+
+/// `get_up_path`: one `../` per component of the submodule's worktree-relative
+/// path — the prefix that takes the submodule worktree back to the superproject.
+fn submodule_up_path(path: &str) -> String {
+    let components = path.split('/').filter(|part| !part.is_empty()).count();
+    "../".repeat(components)
+}
+
+/// Resolve a relative `.gitmodules` url against the superproject's default-remote
+/// url to the `(super_config_url, sub_origin_url)` pair git records. `sync`
+/// suppresses the missing-remote warning, so both go straight through the
+/// `relative_url` primitive (no `init`-style warning).
+fn resolve_sync_urls(
+    worktree_root: &Path,
+    config: &GitConfig,
+    url: &str,
+    up_path: &str,
+) -> (String, String) {
+    let remote = superproject_default_remote_name(worktree_root, config);
+    let base = config.get("remote", Some(&remote), "url");
+    let cwd_fallback = worktree_root.to_string_lossy();
+    let super_config_url = sley_submodule::resolve_relative_url(url, base, &cwd_fallback, None);
+    let sub_origin_url =
+        sley_submodule::resolve_relative_url(url, base, &cwd_fallback, Some(up_path));
+    (super_config_url, sub_origin_url)
+}
+
+/// Recurse `submodule sync --recursive` into the populated submodule at
+/// `submodule_root`, carrying `--super-prefix=<display>/` so nested displaypaths
+/// anchor at the recursion root (git's `sync_submodule` `OPT_RECURSIVE` branch).
+fn recurse_submodule_sync(submodule_root: &Path, display: &str, quiet: bool) -> Result<()> {
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
+    let mut command = ProcessCommand::new(exe);
+    command.arg("submodule");
+    if quiet {
+        command.arg("--quiet");
+    }
+    command.arg("sync").arg("--recursive");
+    command.arg(format!("--super-prefix={display}/"));
+    io::stdout().flush()?;
+    let status = command
+        .current_dir(submodule_root)
+        .status()
+        .map_err(|err| GitError::Io(err.to_string()))?;
+    if status.success() {
+        return Ok(());
+    }
+    eprintln!("fatal: failed to recurse into submodule '{display}'");
+    Err(GitError::Exit(128))
 }
 
 fn cmd_submodule_absorbgitdirs(args: &[String], quiet: bool) -> Result<()> {
@@ -2141,10 +2258,11 @@ fn submodule_set_url_usage<T>() -> Result<T> {
 fn parse_submodule_sync_options(
     args: &[String],
     mut quiet: bool,
-) -> Result<(Vec<&str>, bool, bool)> {
+) -> Result<(Vec<&str>, bool, bool, String)> {
     let mut paths = Vec::new();
     let mut positional_only = false;
     let mut recursive = false;
+    let mut super_prefix = String::new();
     for arg in args {
         if positional_only {
             paths.push(arg.as_str());
@@ -2155,11 +2273,16 @@ fn parse_submodule_sync_options(
             "--quiet" | "-q" => quiet = true,
             "--recursive" => recursive = true,
             "--no-recursive" => return submodule_usage(),
+            // Internal: git's `--super-prefix=<path>/`, carried by the recursive
+            // child so its nested displaypaths anchor at the recursion root.
+            value if value.starts_with("--super-prefix=") => {
+                super_prefix = value["--super-prefix=".len()..].to_string();
+            }
             value if value.starts_with('-') => return submodule_usage(),
             value => paths.push(value),
         }
     }
-    Ok((paths, quiet, recursive))
+    Ok((paths, quiet, recursive, super_prefix))
 }
 
 fn parse_submodule_absorbgitdirs_options(
@@ -3583,17 +3706,35 @@ fn submodule_helper_get_default_remote(args: &[String]) -> Result<()> {
     };
     let sub_format = repository_object_format(&sub_git_dir)?;
     let sub_config = read_repo_config(&sub_git_dir)?;
-
-    // The submodule's configured url (resolved if relative) — git matches it
-    // against the sub-repo's remotes before any branch/default heuristic.
-    let mut remote_name = None;
-    if let Some(url) = configured_submodule_url(&worktree_root, &super_git_dir, &abs_path)? {
-        remote_name = remote_name_for_url(&sub_config, &url);
-    }
-    let remote_name =
-        remote_name.unwrap_or_else(|| repo_default_remote(&sub_config, &sub_git_dir, sub_format));
+    let remote_name = submodule_default_remote_name(
+        &worktree_root,
+        &super_git_dir,
+        &abs_path,
+        &sub_git_dir,
+        sub_format,
+        &sub_config,
+    )?;
     println!("{remote_name}");
     Ok(())
+}
+
+/// Core of `get_default_remote_submodule`: the default remote NAME for the
+/// already-resolved submodule (`abs_path` worktree, `sub_git_dir` git dir).
+/// url-match first (a remote whose url equals the submodule's relative-resolved
+/// `.gitmodules` url), then `repo_default_remote`.
+fn submodule_default_remote_name(
+    worktree_root: &Path,
+    super_git_dir: &Path,
+    abs_path: &Path,
+    sub_git_dir: &Path,
+    sub_format: ObjectFormat,
+    sub_config: &GitConfig,
+) -> Result<String> {
+    let mut remote_name = None;
+    if let Some(url) = configured_submodule_url(worktree_root, super_git_dir, abs_path)? {
+        remote_name = remote_name_for_url(sub_config, &url);
+    }
+    Ok(remote_name.unwrap_or_else(|| repo_default_remote(sub_config, sub_git_dir, sub_format)))
 }
 
 /// Resolve the git dir for a populated submodule worktree at `worktree`: a `.git`
