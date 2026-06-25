@@ -925,7 +925,7 @@ declare -A FLOOR=(
     # t3415=22 t4015=114 t5516=92 t5520=75); cargo test green. NEW floors below: t2016/t4108
     # are patch-engine NEIGHBORS of add-i's add_patch.rs/plumbing.rs — floored at 4 (confirmed
     # == base, no regression) to guard the class per the d3f746e6 neighbor-guard lesson.
-    [t2016-checkout-patch.sh]=4
+    [t2016-checkout-patch.sh]=19
     # wave-41 (apply engine round 2): t4108 3-way fallback 4->17.
     [t4108-apply-threeway.sh]=17
     [t4117-apply-reject.sh]=8
@@ -1128,12 +1128,36 @@ declare -A FLOOR=(
     [t3512-cherry-pick-submodule.sh]=13
     [t3513-revert-submodule.sh]=9
     [t3426-rebase-submodule.sh]=23
-    [t6415-merge-dir-to-symlink.sh]=10
+    [t6415-merge-dir-to-symlink.sh]=11
     [t6417-merge-ours-theirs.sh]=5
     [t5553-set-upstream.sh]=21
     [t3306-notes-prune.sh]=12
     [t3308-notes-merge.sh]=19
     [t3310-notes-merge-manual-resolve.sh]=22
+    [t6406-merge-attr.sh]=3
+    [t6418-merge-text-auto.sh]=5
+    [t6427-diff3-conflict-markers.sh]=7
+    [t6432-merge-recursive-space-options.sh]=10
+    [t6439-merge-co-error-msgs.sh]=1
+    [t2071-restore-patch.sh]=15
+    [t2080-parallel-checkout-basics.sh]=1
+    [t2026-checkout-pathspec-file.sh]=11
+    [t2017-checkout-orphan.sh]=12
+    [t2021-checkout-overwrite.sh]=4
+    [t2025-checkout-no-overlay.sh]=4
+    [t2022-checkout-paths.sh]=3
+    [t7425-submodule-gitdir-path-extension.sh]=7
+    [t7403-submodule-sync.sh]=18
+    [t7426-submodule-get-default-remote.sh]=15
+    [t7408-submodule-reference.sh]=14
+    [t7416-submodule-dash-url.sh]=18
+    [t7412-submodule-absorbgitdirs.sh]=12
+    [t7424-submodule-mixed-ref-formats.sh]=3
+    [t3007-ls-files-recurse-submodules.sh]=24
+    [t3013-ls-files-format.sh]=20
+    [t3060-ls-files-with-tree.sh]=8
+    [t3005-ls-files-relative.sh]=4
+    [t1600-index.sh]=7
 
 )
 
