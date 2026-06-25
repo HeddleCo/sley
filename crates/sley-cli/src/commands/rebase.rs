@@ -7,10 +7,10 @@
 //! `--skip` / `--quit` / `--edit-todo`, and autostash handling.
 
 use crate::commands::merge_rebase::{
-    MergePathResult, commit_tree_oid, head_commit_oid, merge_bases, merge_favor_from_strategy_opts,
-    merge_index_entry, merge_read_blob, merge_remove_worktree_file, merge_write_worktree_file,
-    print_branch_commit_summary, print_commit_shortstat_between_trees, three_way_merge_trees,
-    three_way_merge_trees_with_favor,
+    MergePathResult, commit_tree_oid, effective_config_with_overrides, head_commit_oid, merge_bases,
+    merge_favor_from_strategy_opts, merge_index_entry, merge_read_blob, merge_remove_worktree_file,
+    merge_write_worktree_file, print_branch_commit_summary, print_commit_shortstat_between_trees,
+    three_way_merge_trees, three_way_merge_trees_inner_with_info, three_way_merge_trees_with_favor,
 };
 use crate::commands::replay::{comment_char, launch_editor, strip_comment_lines};
 use crate::*;
@@ -685,6 +685,19 @@ fn find_unique_abbrev_hex(ctx: &Ctx, db: &FileObjectDatabase, oid: &ObjectId) ->
         .flatten()
         .unwrap_or(hex.len());
     find_unique_abbrev_hex_with_width(db, oid, configured.min(hex.len()))
+}
+
+/// `merge.conflictStyle` for a rebase pick's 3-way merge (honouring `-c`
+/// overrides). diff3 and zdiff3 both add the `|||||||` base section; sley does
+/// not yet distinguish the zealous variant.
+fn rebase_merge_conflict_style() -> sley_diff_merge::ConflictStyle {
+    effective_config_with_overrides()
+        .and_then(|config| config.get("merge", None, "conflictstyle").map(str::to_string))
+        .map(|value| match value.as_str() {
+            "diff3" | "zdiff3" => sley_diff_merge::ConflictStyle::Diff3,
+            _ => sley_diff_merge::ConflictStyle::Merge,
+        })
+        .unwrap_or(sley_diff_merge::ConflictStyle::Merge)
 }
 
 fn find_unique_abbrev_hex_with_width(
@@ -4405,7 +4418,11 @@ fn pick_one_commit(
         find_unique_abbrev_hex(ctx, db, &record.oid),
         commit_subject(&record.commit.message)
     );
-    let (results, conflicts) = three_way_merge_trees_with_favor(
+    // The base is the parent of the commit being picked, so its diff3 ancestor
+    // label is `parent of <msg.label>` (sequencer.c set_replay_opts /
+    // `parent_label`). Honour merge.conflictStyle for the picked merge.
+    let ancestor_label = format!("parent of {theirs_label}");
+    let (results, conflicts, _info) = three_way_merge_trees_inner_with_info(
         &write_db,
         ctx.format,
         &base_map,
@@ -4413,7 +4430,9 @@ fn pick_one_commit(
         &theirs_map,
         "HEAD",
         &theirs_label,
+        &ancestor_label,
         merge_favor_from_strategy_opts(&opts.strategy_opts),
+        rebase_merge_conflict_style(),
     )?;
 
     // Compose the message (fixup/squash machinery).

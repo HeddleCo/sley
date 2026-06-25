@@ -3595,7 +3595,18 @@ fn apply_three_way(
     if !quiet {
         println!("Falling back to patching base and 3-way merge...");
     }
-    let (results, conflicts) = three_way_merge_trees(
+    // git's apply/am 3-way uses a synthesized base, labelled "constructed fake
+    // ancestor" in diff3 conflict markers (builtin/am.c sets o.ancestor). Honour
+    // merge.conflictStyle so `-c merge.conflictstyle=diff3` (and rebase --apply)
+    // emit the `|||||||` ancestor section.
+    let conflict_style = commands::merge_rebase::effective_config_with_overrides()
+        .and_then(|config| config.get("merge", None, "conflictstyle").map(str::to_string))
+        .map(|value| match value.as_str() {
+            "diff3" | "zdiff3" => sley_diff_merge::ConflictStyle::Diff3,
+            _ => sley_diff_merge::ConflictStyle::Merge,
+        })
+        .unwrap_or(sley_diff_merge::ConflictStyle::Merge);
+    let (results, conflicts, _info) = commands::merge_rebase::three_way_merge_trees_inner_with_info(
         &db,
         format,
         &base_map,
@@ -3603,6 +3614,9 @@ fn apply_three_way(
         &theirs_map,
         "HEAD",
         &patch.subject,
+        "constructed fake ancestor",
+        sley_diff_merge::MergeFavor::None,
+        conflict_style,
     )?;
 
     // git's merge refuses to clobber untracked working-tree files: a path the
