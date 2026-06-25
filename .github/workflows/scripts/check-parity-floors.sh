@@ -489,7 +489,11 @@ declare -A FLOOR=(
     [t6003-rev-list-topo-order.sh]=36
     [t6012-rev-list-simplify.sh]=42
     [t4205-log-pretty-formats.sh]=120
-    [t4216-log-bloom.sh]=161
+    # w48 recov: 161->160 (wrong-floor). Integ-measured; base e9f8c92b == HEAD ==
+    # 160 (no in-session commit-graph/bloom change). Failing cells (#133/#135 etc.)
+    # need a split-chain Bloom reader that walks non-latest graph layers; the
+    # hand-tuned filter-count normalize hack covers fewer combinations than 161.
+    [t4216-log-bloom.sh]=160
     [t5318-commit-graph.sh]=95
     [t3432-rebase-fast-forward.sh]=219
     # wave-25 (2026-06-21): fetch-push push-caps/status-report 99->111 (banked 110, 1-cell
@@ -528,7 +532,11 @@ declare -A FLOOR=(
     # wave-40 (rebase sequencer): t3420 40->41.
     [t3420-rebase-autostash.sh]=44
     [t5327-multi-pack-bitmaps-rev.sh]=314
-    [t5332-multi-pack-reuse.sh]=9
+    # w48 recov: 9->7 (wrong-floor). Integ-measured; base e9f8c92b == HEAD == 7
+    # (no in-session pack_objects.rs change). Failing cells (#6,#8-11,#13,#14)
+    # need MIDX-bitmap *partial* (word-range) pack reuse; sley only does whole-pack
+    # verbatim reuse, so 7 is the real ceiling.
+    [t5332-multi-pack-reuse.sh]=7
     # wave-24 (2026-06-21): diff-various log-pickaxe 206->216, rm submodule-safety 69->81,
     # clone SSH-transport+partial-clone 86->109/109 (banked 107 = full-pass minus 2-cell
     # handshake-flake margin; t5601 historically parallel-flake-prone). Guards neutral:
@@ -563,7 +571,12 @@ declare -A FLOOR=(
     [t5571-pre-push-hook.sh]=11
     [t5537-fetch-shallow.sh]=12
     [t0008-ignores.sh]=398
-    [t0012-help.sh]=153
+    # w48 recov: 153->152. In-session net-positive tradeoff (900a98df, w44):
+    # `submodule -h` now exits 0 (+3 t7400) matching git's real submodule *shell
+    # script*, which costs the sley-only cell #135 (generated only because sley
+    # lists `submodule` in --list-cmds=builtins where git lists `submodule--helper`;
+    # the cell's 129 expectation conflicts with git's exit-0). Net +2.
+    [t0012-help.sh]=152
     # wave-2 submodule (2026-06-18, integ/submodule): t7400 87->88.
     # codex-wave-11 (submodule verbs): add/init/status/sync/deinit/update/foreach/
     # set-url/set-branch, relative-URL resolution, .gitmodules+config writes. t7400
@@ -666,7 +679,12 @@ declare -A FLOOR=(
     # RE-DISPATCHED off post-worktree-repair main (the first auto-merge regressed
     # t2406 24->14); rebuilt clean — t2406 HELD at 24. Shared-file floors held:
     # t7700=29 t5300=46 t5324=11 t1450=96 t2400=214 t5505=126 t5516=72.
-    [t7900-maintenance.sh]=64
+    # w48 recov: 64->62 (wrong-floor). Integ-measured; base e9f8c92b == HEAD == 62
+    # (no in-session pack.rs change). Failing cells need unimplemented maintenance
+    # behavior: --prefetch suppressing opportunistic tracking (#21), loose-objects
+    # deferring the prune to run #2 (#22), and per-task incremental-repack/geometric
+    # argv composition (#24,#27-31,#34,#47).
+    [t7900-maintenance.sh]=62
     # wave-1 integration (2026-06-18, integ/wave1): NEW floors for the difftool epic
     # (codex/parity-difftool: difftool.rs/mergetool.rs/tool_launch.rs) + status-cache
     # (codex/parity-status-cache: workspace.rs/index.rs). All measured on the integrated
@@ -717,7 +735,11 @@ declare -A FLOOR=(
     # Auto-merge of sley-diff-merge/lib.rs vs wave-9 dir-rename verified SAFE: merge
     # floors held (t6423=41 t6402=35 t6422=6 t7600=83 t6430=23).
     [t1091-sparse-checkout-builtin.sh]=64
-    [t1092-sparse-checkout-compatibility.sh]=61
+    # w48 recov: 61->58 (wrong-floor, integ-measured). Floor 61 banked by 3547af47
+    # from the integ binary; base e9f8c92b measures only 56 and HEAD 58 — the
+    # session IMPROVED it (+2), it never regressed in-session. The 58->61 residual
+    # are integ-only sparse state-change cells never landed on main.
+    [t1092-sparse-checkout-compatibility.sh]=58
     # wave-9 engine-completion (2026-06-17): merge porcelain (octopus + --squash/--abort/
     # --continue/--quit state machine), submodule engine (relative_url primitive + summary/
     # foreach/update), mailmap canonicalization engine. Bumps applied above: t7600 38->44,
@@ -743,7 +765,11 @@ declare -A FLOOR=(
     # side t5520 32->38).
     [t7601-merge-pull-config.sh]=65
     [t7700-repack.sh]=29
-    [t7703-repack-geometric.sh]=11
+    # w48 recov: 11->10 (wrong-floor). Integ-measured; base e9f8c92b == HEAD == 10
+    # (no in-session change). The 8 failing cells all depend on `test_commit_bulk`/
+    # fast-import emitting a pack per import, but sley's fast-import always writes
+    # loose objects (fastimport.unpacklimit accepted-and-ignored), so 10 is real.
+    [t7703-repack-geometric.sh]=10
     [t7704-repack-cruft.sh]=15
     [t6500-gc.sh]=34  # wave-38: 15->35 (repack/prune/auto-heuristic/commit-graph), banked 34 margin
     [t0610-reftable-basics.sh]=89  # wave-39: 71->91 FULL (D/F+symref conflicts, linked-wt stack routing, compaction races; banked 89 margin)
@@ -762,7 +788,13 @@ declare -A FLOOR=(
     [t6022-rev-list-missing.sh]=40
     [t1013-read-tree-submodule.sh]=58
     [t2013-checkout-submodule.sh]=57
-    [t7112-reset-submodule.sh]=70
+    # w48 recov: 70->69 (wrong-floor, integ-measured). Floor 70 banked by pre-session
+    # 42702e6b from the integ binary, then reverted (base e9f8c92b measures only 9);
+    # the in-session re-land 036f1fb2 restored it to 69 — one short. The residual
+    # cell #58 (dir->gitlink reset --merge leaves an empty submodule placeholder)
+    # needs the unpack-trees engine to emit the gitlink write in a dir->gitlink
+    # twoway-merge; out of scope for this recovery. Session NET +60.
+    [t7112-reset-submodule.sh]=69
     [t6438-submodule-directory-file-conflicts.sh]=48
     # wave-12 Batch B (rebasemerges, integ/wave12B onto 81856328): --rebase-merges
     # todo generation (label/reset/merge -C/-c) + topology replay. t3430 2->17;
@@ -797,7 +829,11 @@ declare -A FLOOR=(
     # t4014=202). t4015 105->114.
     [t5526-fetch-submodules.sh]=55
     [t2204-add-ignored.sh]=47
-    [t6020-bundle-misc.sh]=28
+    # w48 recov: 28->27 (wrong-floor). Integ-measured; base e9f8c92b == HEAD == 27
+    # (no in-session bundle change). Marginal cell #33 needs `ls-remote <bundle>`
+    # (reading a bundle file as a remote), unimplemented; the rest need partial-clone
+    # filtered bundles / --since thin bundles / bare-repo bundle clone.
+    [t6020-bundle-misc.sh]=27
     [t4068-diff-symmetric-merge-base.sh]=36
     [t1423-ref-backend.sh]=27
     # consolidation round 1 (2026-06-19, integ/consol1 onto 9d28b991): behavior-neutral
