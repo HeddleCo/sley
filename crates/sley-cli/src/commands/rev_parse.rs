@@ -1905,6 +1905,17 @@ fn is_inside_work_tree(
         };
         return cwd_starts_with(cwd, worktree);
     }
+    // No SetupResult was threaded in (internal callers such as relative-path
+    // normalization): honor an explicit `--work-tree` / `GIT_WORK_TREE` override
+    // before the directory-layout probe. Without this, `rev-parse HEAD:./path`
+    // run from a directory *outside* a relocated work tree mis-detects as inside
+    // it and emits "outside repository" instead of git's "relative path syntax
+    // can't be used outside working tree" (t1506 "relative path when cwd is
+    // outside worktree").
+    if let Some(work_tree) = explicit_work_tree() {
+        let root = resolve_cli_path(&env::current_dir()?, work_tree.to_string_lossy().as_ref());
+        return cwd_starts_with(cwd, &root);
+    }
     // A bare repository has no work tree, so we are never inside one. This
     // covers `core.bare = true` set on a `.git`-named directory, which the
     // directory-layout probe below would otherwise treat as having a worktree.
