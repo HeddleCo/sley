@@ -10176,11 +10176,31 @@ fn rename_remote_tracking_refs(
     let refs = store.list_refs()?;
     let mut tx = store.transaction();
     let mut old_ref_names = Vec::new();
+    // Each renamed ref's reflog, captured *before* deletion (deleting the old ref
+    // also unlinks its reflog, so the dir-move below cannot preserve it). Tuple is
+    // (old full name, new full name, resolving oid for a direct ref, prior
+    // entries), used to reconstruct the reflog at the new name and append git's
+    // "remote: renamed …" record.
+    let mut renamed_reflogs = Vec::new();
     for reference in refs {
         let Some(suffix) = reference.name.strip_prefix(&old_prefix) else {
             continue;
         };
         old_ref_names.push(reference.name.clone());
+        let new_name = format!("{new_prefix}{suffix}");
+        let direct_oid = match &reference.target {
+            RefTarget::Direct(oid) => Some(*oid),
+            RefTarget::Symbolic(_) => None,
+        };
+        let prior_entries = store.read_reflog(&reference.name)?;
+        if !prior_entries.is_empty() {
+            renamed_reflogs.push((
+                reference.name.clone(),
+                new_name.clone(),
+                direct_oid,
+                prior_entries,
+            ));
+        }
         let target = match reference.target {
             RefTarget::Symbolic(target) => RefTarget::Symbolic(
                 target
@@ -10191,7 +10211,7 @@ fn rename_remote_tracking_refs(
             direct => direct,
         };
         tx.update(RefUpdate {
-            name: format!("{new_prefix}{suffix}"),
+            name: new_name,
             expected: None,
             new: target,
             reflog: None,
@@ -10214,6 +10234,21 @@ fn rename_remote_tracking_refs(
     if !nested {
         remove_remote_ref_dir(git_dir, "refs", old)?;
         rename_remote_ref_dir(git_dir, "logs/refs", old, new)?;
+    }
+    // builtin/remote.c `rename_one_reflog`: copy the prior reflog to the new ref
+    // and append a final "remote: renamed …" record (only for refs that resolve).
+    // Done last so the dir-move above cannot clobber the rewritten reflog.
+    for (old_name, new_name, direct_oid, prior_entries) in renamed_reflogs {
+        let mut entries = prior_entries;
+        if let Some(oid) = direct_oid {
+            entries.push(ReflogEntry {
+                old_oid: oid,
+                new_oid: oid,
+                committer: commit_identity_from_env("COMMITTER")?,
+                message: format!("remote: renamed {old_name} to {new_name}").into_bytes(),
+            });
+        }
+        store.write_reflog(&new_name, &entries)?;
     }
     Ok(())
 }
