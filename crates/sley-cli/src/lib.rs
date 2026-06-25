@@ -123,6 +123,7 @@ pub(crate) fn collect_short_status_with_options(
 }
 
 mod commands;
+mod ownership;
 mod remote;
 mod repo_path;
 mod repository;
@@ -11548,10 +11549,16 @@ fn discover_git_dir_by_walk(start: impl AsRef<Path>) -> Result<PathBuf> {
         }
         let dot_git = candidate.join(".git");
         match probe_dot_git(&dot_git)? {
-            DotGitProbe::Repo(git_dir) => return Ok(git_dir),
+            DotGitProbe::Repo { git_dir, via_gitfile } => {
+                let gitfile = via_gitfile.then(|| dot_git.as_path());
+                ownership::ensure_valid_ownership(Some(candidate), &git_dir, gitfile)?;
+                return Ok(git_dir);
+            }
             DotGitProbe::Continue => {}
         }
         if candidate.join("HEAD").is_file() && candidate.join("objects").is_dir() {
+            ownership::note_implicit_bare_repository(candidate)?;
+            ownership::ensure_valid_ownership(None, candidate, None)?;
             return Ok(candidate.to_path_buf());
         }
     }
@@ -11561,8 +11568,9 @@ fn discover_git_dir_by_walk(start: impl AsRef<Path>) -> Result<PathBuf> {
 /// The result of examining a `.git` entry during the discovery walk, mirroring
 /// git's `read_gitfile_gently` + the `setup_git_directory_gently_1` switch.
 enum DotGitProbe {
-    /// `.git` names a usable git directory (the resolved path).
-    Repo(PathBuf),
+    /// `.git` names a usable git directory (the resolved path); `via_gitfile`
+    /// records whether discovery went through a `.git` *file* (gitlink).
+    Repo { git_dir: PathBuf, via_gitfile: bool },
     /// `.git` is absent or an invalid-but-non-fatal directory; keep walking up.
     Continue,
 }
@@ -11597,7 +11605,10 @@ fn probe_dot_git(dot_git: &Path) -> Result<DotGitProbe> {
         // (`is_git_directory`); an empty or partial `.git` directory is ignored,
         // and discovery continues upward.
         if is_git_dir_candidate(dot_git) {
-            return Ok(DotGitProbe::Repo(dot_git.to_path_buf()));
+            return Ok(DotGitProbe::Repo {
+                git_dir: dot_git.to_path_buf(),
+                via_gitfile: false,
+            });
         }
         return Ok(DotGitProbe::Continue);
     }
@@ -11660,7 +11671,10 @@ fn classify_gitfile(dot_git: &Path, size: u64) -> Result<DotGitProbe> {
         )));
     }
     fs::canonicalize(&target)
-        .map(DotGitProbe::Repo)
+        .map(|git_dir| DotGitProbe::Repo {
+            git_dir,
+            via_gitfile: true,
+        })
         .map_err(|err| GitError::Io(err.to_string()))
 }
 
