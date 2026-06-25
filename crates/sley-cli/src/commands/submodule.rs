@@ -1771,30 +1771,46 @@ fn index_gitlink_paths(
     worktree_root: &Path,
     paths: &[&str],
 ) -> Result<Vec<String>> {
-    let Some(index) = read_repository_index(git_dir, format)? else {
-        return Ok(Vec::new());
-    };
+    // git's `module_list_compute` tracks which pathspecs matched ANY index entry
+    // (gitlink or not) and `report_path_error`s — exit 1 — for any pathspec that
+    // matched nothing (e.g. `absorbgitdirs missing`).
+    let normalized: Vec<String> = paths
+        .iter()
+        .map(|spec| normalize_submodule_pathspec(cwd, worktree_root, spec))
+        .collect();
+    let mut matched = vec![false; paths.len()];
+    let index = read_repository_index(git_dir, format)?;
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for entry in &index.entries {
-        if !sley_index::is_gitlink(entry.mode) {
-            continue;
+    if let Some(index) = &index {
+        for entry in &index.entries {
+            let Ok(path) = std::str::from_utf8(&entry.path) else {
+                continue;
+            };
+            for (i, spec) in normalized.iter().enumerate() {
+                if submodule_path_matches_pathspec(path, spec) {
+                    matched[i] = true;
+                }
+            }
+            if !sley_index::is_gitlink(entry.mode) {
+                continue;
+            }
+            if !seen.insert(path.to_string()) {
+                continue;
+            }
+            if !paths.is_empty()
+                && !normalized
+                    .iter()
+                    .any(|spec| submodule_path_matches_pathspec(path, spec))
+            {
+                continue;
+            }
+            result.push(path.to_string());
         }
-        let Ok(path) = std::str::from_utf8(&entry.path) else {
-            continue;
-        };
-        if !seen.insert(path.to_string()) {
-            continue;
-        }
-        if !paths.is_empty()
-            && !paths.iter().any(|spec| {
-                let normalized = normalize_submodule_pathspec(cwd, worktree_root, spec);
-                submodule_path_matches_pathspec(path, &normalized)
-            })
-        {
-            continue;
-        }
-        result.push(path.to_string());
+    }
+    if let Some((spec, _)) = paths.iter().zip(&matched).find(|(_, hit)| !**hit) {
+        eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
+        return Err(GitError::Exit(1));
     }
     Ok(result)
 }
