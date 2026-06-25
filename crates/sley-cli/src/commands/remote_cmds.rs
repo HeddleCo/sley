@@ -1402,23 +1402,36 @@ fn clone_default_branch_name() -> String {
 }
 
 fn absolutize_local_clone_source(cwd: &Path, repository: &str) -> String {
-    let Ok(parsed) = parse_remote_url(repository) else {
-        return repository.to_string();
-    };
-    if parsed.transport != RemoteTransport::Local {
+    if let Ok(parsed) = parse_remote_url(repository)
+        && parsed.transport == RemoteTransport::Local
+    {
+        let path = PathBuf::from(&parsed.path);
+        let absolute = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        if local_repository_git_dir_path(&absolute).is_ok() {
+            return absolute.to_string_lossy().into_owned();
+        }
         return repository.to_string();
     }
-    let path = PathBuf::from(&parsed.path);
-    let absolute = if path.is_absolute() {
-        path
+    // A spelling that parses as a scp-style `host:path` (or a non-local scheme)
+    // is still cloned locally when a repository exists at that literal
+    // filesystem path: git's `get_repo_path` probes the raw argument first and,
+    // when it resolves, `is_local` wins over the ssh interpretation (t5601
+    // "clone local path foo:bar"). Absolutize so downstream classification sees
+    // a leading-slash path rather than re-deriving ssh.
+    let literal = PathBuf::from(repository);
+    let absolute = if literal.is_absolute() {
+        literal
     } else {
-        cwd.join(path)
+        cwd.join(&literal)
     };
     if local_repository_git_dir_path(&absolute).is_ok() {
-        absolute.to_string_lossy().into_owned()
-    } else {
-        repository.to_string()
+        return absolute.to_string_lossy().into_owned();
     }
+    repository.to_string()
 }
 
 /// Clone a repository over smart HTTP(S). Covers the common non-bare case;
