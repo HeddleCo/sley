@@ -48,6 +48,7 @@ pub(crate) const BUILTIN_COMMANDS: &[&str] = &[
     "filter-branch",
     "fmt-merge-msg",
     "for-each-ref",
+    "for-each-repo",
     "format-patch",
     "fsck",
     "gc",
