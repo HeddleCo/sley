@@ -11421,20 +11421,157 @@ fn discover_git_dir_by_walk(start: impl AsRef<Path>) -> Result<PathBuf> {
             break;
         }
         let dot_git = candidate.join(".git");
-        if dot_git.is_dir() {
-            return Ok(dot_git);
-        }
-        if dot_git.is_file()
-            && let Some(git_dir) = read_gitdir_file(&dot_git)?
-            && is_git_dir_candidate(&git_dir)
-        {
-            return fs::canonicalize(git_dir).map_err(|err| GitError::Io(err.to_string()));
+        match probe_dot_git(&dot_git)? {
+            DotGitProbe::Repo(git_dir) => return Ok(git_dir),
+            DotGitProbe::Continue => {}
         }
         if candidate.join("HEAD").is_file() && candidate.join("objects").is_dir() {
             return Ok(candidate.to_path_buf());
         }
     }
     Err(GitError::repository_not_found("not a git repository"))
+}
+
+/// The result of examining a `.git` entry during the discovery walk, mirroring
+/// git's `read_gitfile_gently` + the `setup_git_directory_gently_1` switch.
+enum DotGitProbe {
+    /// `.git` names a usable git directory (the resolved path).
+    Repo(PathBuf),
+    /// `.git` is absent or an invalid-but-non-fatal directory; keep walking up.
+    Continue,
+}
+
+/// Classify a `.git` entry like git's discovery loop. Fatal classifications
+/// (a non-regular-file `.git`, a malformed gitfile, or a gitfile pointing at a
+/// non-repository) surface as a `fatal:`-prefixed [`GitError::InvalidFormat`],
+/// which the top-level error reporter prints verbatim — while callers that probe
+/// repositories gently (`discover_git_dir(..).ok()`) simply observe "no repo".
+///
+/// `stat`-style metadata (symlinks followed) is used so a `.git` symlink to a
+/// directory is a repo, a symlink to a FIFO is rejected, etc.
+fn probe_dot_git(dot_git: &Path) -> Result<DotGitProbe> {
+    let metadata = match fs::metadata(dot_git) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            // ENOENT / ENOTDIR: no `.git` here (git's READ_GITFILE_ERR_MISSING).
+            if err.kind() == io::ErrorKind::NotFound
+                || err.raw_os_error() == Some(libc_enotdir())
+            {
+                return Ok(DotGitProbe::Continue);
+            }
+            return Err(invalid_gitfile_error(&format!(
+                "error reading '{}'",
+                dot_git.display()
+            )));
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        // A `.git` directory is a repo only if it actually looks like one
+        // (`is_git_directory`); an empty or partial `.git` directory is ignored,
+        // and discovery continues upward.
+        if is_git_dir_candidate(dot_git) {
+            return Ok(DotGitProbe::Repo(dot_git.to_path_buf()));
+        }
+        return Ok(DotGitProbe::Continue);
+    }
+    if file_type.is_file() {
+        return classify_gitfile(dot_git, metadata.len());
+    }
+    // FIFO, socket, device, … — git dies with "not a regular file".
+    Err(invalid_gitfile_error(&format!(
+        "not a regular file: '{}'",
+        dot_git.display()
+    )))
+}
+
+/// Read and validate a `.git` *gitfile* (`gitdir: <path>`), mirroring the tail
+/// of git's `read_gitfile_gently`: oversize, a missing/blank `gitdir:` prefix,
+/// and a target that is not itself a repository are all fatal.
+fn classify_gitfile(dot_git: &Path, size: u64) -> Result<DotGitProbe> {
+    const MAX_GITFILE_SIZE: u64 = 1 << 20;
+    if size > MAX_GITFILE_SIZE {
+        return Err(invalid_gitfile_error(&format!(
+            "too large to be a .git file: '{}'",
+            dot_git.display()
+        )));
+    }
+    let contents = match fs::read(dot_git) {
+        Ok(contents) => contents,
+        Err(_) => {
+            return Err(invalid_gitfile_error(&format!(
+                "error reading {}",
+                dot_git.display()
+            )));
+        }
+    };
+    let Some(rest) = contents.strip_prefix(b"gitdir: ") else {
+        return Err(invalid_gitfile_error(&format!(
+            "invalid gitfile format: {}",
+            dot_git.display()
+        )));
+    };
+    let trimmed = trim_trailing_newlines(rest);
+    if trimmed.is_empty() {
+        return Err(invalid_gitfile_error(&format!(
+            "no path in gitfile: {}",
+            dot_git.display()
+        )));
+    }
+    let raw_target = PathBuf::from(os_string_from_bytes(trimmed));
+    let target = if raw_target.is_absolute() {
+        raw_target
+    } else {
+        match dot_git.parent() {
+            Some(parent) => parent.join(&raw_target),
+            None => raw_target,
+        }
+    };
+    if !is_git_dir_candidate(&target) {
+        return Err(invalid_gitfile_error(&format!(
+            "not a git repository: {}",
+            target.display()
+        )));
+    }
+    fs::canonicalize(&target)
+        .map(DotGitProbe::Repo)
+        .map_err(|err| GitError::Io(err.to_string()))
+}
+
+/// Build the non-eager fatal error for an invalid `.git`: a `fatal:`-prefixed
+/// [`GitError::InvalidFormat`] so the message is printed once, by the top-level
+/// reporter, only when the error actually propagates (not when a gentle prober
+/// swallows it with `.ok()`).
+fn invalid_gitfile_error(message: &str) -> GitError {
+    GitError::InvalidFormat(format!("fatal: {message}"))
+}
+
+/// Strip trailing `\n`/`\r` bytes, matching git's gitfile trim.
+fn trim_trailing_newlines(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+/// `ENOTDIR` for the running platform (a `.git` whose parent component is not a
+/// directory reports this rather than `ENOENT`).
+fn libc_enotdir() -> i32 {
+    20
+}
+
+/// Reconstruct an `OsString` from raw bytes (git stores paths as bytes; the
+/// gitfile target is reproduced byte-for-byte on unix).
+#[cfg(unix)]
+fn os_string_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(bytes.to_vec())
+}
+
+#[cfg(not(unix))]
+fn os_string_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
+    std::ffi::OsString::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// The `GIT_CEILING_DIRECTORIES` list: colon-separated absolute paths that
