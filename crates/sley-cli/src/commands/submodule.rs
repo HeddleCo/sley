@@ -2425,15 +2425,45 @@ fn resolve_submodule_relative_url(
     url: &str,
     warn_on_missing_remote: bool,
 ) -> String {
-    let base = config.get("remote", Some("origin"), "url");
+    // git's `resolve_relative_url` resolves against `remote.<default>.url`, where
+    // the default remote is the HEAD branch's remote, else the sole remote, else
+    // "origin" (`get_default_remote`). Hardcoding "origin" misresolves a super-
+    // project whose only remote was renamed (e.g. a nested submodule whose
+    // `origin` is now `upstream`).
+    let remote = superproject_default_remote_name(worktree_root, config);
+    let base = config.get("remote", Some(&remote), "url");
     if base.is_none() && warn_on_missing_remote && (url.starts_with("../") || url.starts_with("./"))
     {
         eprintln!(
-            "warning: could not look up configuration 'remote.origin.url'. Assuming this repository is its own authoritative upstream."
+            "warning: could not look up configuration 'remote.{remote}.url'. Assuming this repository is its own authoritative upstream."
         );
     }
     let cwd_fallback = worktree_root.to_string_lossy();
     sley_submodule::resolve_relative_url(url, base, &cwd_fallback, None)
+}
+
+/// The superproject's default remote name (`get_default_remote`): its HEAD
+/// branch's `branch.<name>.remote`, else the sole remote, else "origin".
+fn superproject_default_remote_name(worktree_root: &Path, config: &GitConfig) -> String {
+    let dot_git = worktree_root.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        Some(dot_git)
+    } else if dot_git.is_file() {
+        read_gitdir_file(&dot_git).ok().flatten()
+    } else {
+        None
+    };
+    if let Some(git_dir) = git_dir
+        && let Ok(format) = repository_object_format(&git_dir)
+    {
+        return repo_default_remote(config, &git_dir, format);
+    }
+    let remotes = distinct_remote_names(config);
+    if remotes.len() == 1 {
+        remotes[0].clone()
+    } else {
+        "origin".to_string()
+    }
 }
 
 fn resolve_submodule_init_url(worktree_root: &Path, config: &GitConfig, url: &str) -> String {
@@ -3480,4 +3510,202 @@ fn display_submodule_ref(name: &str) -> String {
         return tag.to_string();
     }
     name.strip_prefix("refs/").unwrap_or(name).to_string()
+}
+
+/// `git submodule--helper <subcommand>`: the plumbing entry point git's porcelain
+/// shells out to. Only the subcommands the upstream test-suite exercises directly
+/// are wired here; the porcelain verbs go through `cmd_submodule`.
+pub(crate) fn cmd_submodule_helper(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("get-default-remote") => submodule_helper_get_default_remote(&args[1..]),
+        Some(other) => {
+            eprintln!("fatal: '{other}' is not a valid submodule--helper subcommand");
+            Err(GitError::Exit(1))
+        }
+        None => {
+            eprintln!("usage: git submodule--helper");
+            Err(GitError::Exit(129))
+        }
+    }
+}
+
+/// Port of `module_get_default_remote` (`builtin/submodule--helper.c`): resolve
+/// the default remote NAME of the submodule populated at `<path>`. The lookup is
+/// url-first — a remote whose configured url matches the submodule's (relative-
+/// resolved) `.gitmodules` url wins — then falls back to `repo_default_remote`
+/// (the HEAD branch's remote, else the sole remote, else "origin").
+fn submodule_helper_get_default_remote(args: &[String]) -> Result<()> {
+    const USAGE: &str = "usage: git submodule--helper get-default-remote <path>";
+    let mut paths = Vec::new();
+    let mut end_opts = false;
+    for arg in args {
+        if !end_opts && arg == "--" {
+            end_opts = true;
+            continue;
+        }
+        if !end_opts && arg == "-h" {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        if !end_opts && arg.len() > 1 && arg.starts_with('-') {
+            eprintln!("{USAGE}");
+            return Err(GitError::Exit(129));
+        }
+        paths.push(arg.clone());
+    }
+    if paths.len() != 1 {
+        eprintln!("{USAGE}");
+        return Err(GitError::Exit(129));
+    }
+    let path_arg = &paths[0];
+
+    let cwd = env::current_dir()?;
+    let super_git_dir = discover_git_dir(&cwd)?;
+    let worktree_root = worktree_root_for_git_dir(&super_git_dir)?;
+
+    // git prepends the `prefix` (cwd relative to the worktree root) to a
+    // relative path; `cwd.join(path_arg)` reaches the same worktree location.
+    let abs_path = if Path::new(path_arg).is_absolute() {
+        PathBuf::from(path_arg)
+    } else {
+        cwd.join(path_arg)
+    };
+    let abs_path = normalize_lexical_path(&abs_path);
+
+    // `repo_submodule_init`: try the populated worktree's `.git` first, then the
+    // superproject's `modules/<name>` git dir for a configured-but-unpopulated
+    // submodule. Either failure is git's "could not get a repository handle".
+    let sub_git_dir = resolve_submodule_repo_gitdir(&abs_path)
+        .or_else(|| modules_gitdir_for_worktree_path(&worktree_root, &super_git_dir, &abs_path));
+    let Some(sub_git_dir) = sub_git_dir else {
+        eprintln!("fatal: could not get a repository handle for submodule '{path_arg}'");
+        return Err(GitError::Exit(128));
+    };
+    let sub_format = repository_object_format(&sub_git_dir)?;
+    let sub_config = read_repo_config(&sub_git_dir)?;
+
+    // The submodule's configured url (resolved if relative) — git matches it
+    // against the sub-repo's remotes before any branch/default heuristic.
+    let mut remote_name = None;
+    if let Some(url) = configured_submodule_url(&worktree_root, &super_git_dir, &abs_path)? {
+        remote_name = remote_name_for_url(&sub_config, &url);
+    }
+    let remote_name =
+        remote_name.unwrap_or_else(|| repo_default_remote(&sub_config, &sub_git_dir, sub_format));
+    println!("{remote_name}");
+    Ok(())
+}
+
+/// Resolve the git dir for a populated submodule worktree at `worktree`: a `.git`
+/// subdir, or a `gitdir:`-pointer file. Returns `None` when neither is present
+/// (so the caller can fall back / die without walking up to the superproject).
+fn resolve_submodule_repo_gitdir(worktree: &Path) -> Option<PathBuf> {
+    let dot_git = worktree.join(".git");
+    if dot_git.is_dir() {
+        return fs::canonicalize(&dot_git).ok();
+    }
+    if dot_git.is_file()
+        && let Ok(Some(target)) = read_gitdir_file(&dot_git)
+        && target.is_dir()
+    {
+        return fs::canonicalize(&target).ok();
+    }
+    None
+}
+
+/// `repo_submodule_init`'s fallback: a configured submodule whose worktree is not
+/// populated still has its git dir at `<super>/modules/<name>`. Look the name up
+/// from the superproject `.gitmodules` keyed by the worktree-relative path.
+fn modules_gitdir_for_worktree_path(
+    worktree_root: &Path,
+    super_git_dir: &Path,
+    abs_path: &Path,
+) -> Option<PathBuf> {
+    let rel = abs_path.strip_prefix(worktree_root).ok()?;
+    let rel = rel.to_str()?;
+    let submodules = read_submodule_configs(worktree_root).ok()?;
+    let name = &submodules.iter().find(|sub| sub.path == rel)?.name;
+    let gitdir = super_git_dir.join("modules").join(name);
+    gitdir.is_dir().then_some(gitdir)
+}
+
+/// The submodule's `.gitmodules` url for the worktree at `abs_path`, resolved to
+/// the concrete form when relative (matching what `submodule add` records as the
+/// sub-repo's `origin.url`). `None` when the path is not a configured submodule.
+fn configured_submodule_url(
+    worktree_root: &Path,
+    super_git_dir: &Path,
+    abs_path: &Path,
+) -> Result<Option<String>> {
+    let Ok(rel) = abs_path.strip_prefix(worktree_root) else {
+        return Ok(None);
+    };
+    let Some(rel) = rel.to_str() else {
+        return Ok(None);
+    };
+    let submodules = read_submodule_configs(worktree_root)?;
+    let Some(url) = submodules
+        .iter()
+        .find(|sub| sub.path == rel)
+        .and_then(|sub| sub.url.clone())
+    else {
+        return Ok(None);
+    };
+    if url.starts_with("../") || url.starts_with("./") {
+        let super_config = read_repo_config(super_git_dir)?;
+        Ok(Some(resolve_submodule_sync_url(
+            worktree_root,
+            &super_config,
+            &url,
+        )))
+    } else {
+        Ok(Some(url))
+    }
+}
+
+/// `repo_remote_from_url`: the name of the first remote with a url exactly equal
+/// to `url` (remotes in config first-appearance order).
+fn remote_name_for_url(config: &GitConfig, url: &str) -> Option<String> {
+    for name in distinct_remote_names(config) {
+        if config
+            .get_all("remote", Some(&name), "url")
+            .into_iter()
+            .flatten()
+            .any(|configured| configured == url)
+        {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// `repo_default_remote`: the HEAD branch's `branch.<name>.remote`, else the sole
+/// remote's name when exactly one is configured, else "origin".
+fn repo_default_remote(config: &GitConfig, git_dir: &Path, format: ObjectFormat) -> String {
+    let store = FileRefStore::new(git_dir, format);
+    if let Ok(Some(RefTarget::Symbolic(target))) = store.read_ref("HEAD")
+        && let Some(branch) = target.strip_prefix("refs/heads/")
+        && let Some(remote) = config.get("branch", Some(branch), "remote")
+    {
+        return remote.to_string();
+    }
+    let remotes = distinct_remote_names(config);
+    if remotes.len() == 1 {
+        return remotes[0].clone();
+    }
+    "origin".to_string()
+}
+
+/// Remote names in first-appearance order across the config sections.
+fn distinct_remote_names(config: &GitConfig) -> Vec<String> {
+    let mut names = Vec::new();
+    for section in &config.sections {
+        if section.name == "remote"
+            && let Some(sub) = &section.subsection
+            && !names.iter().any(|existing| existing == sub)
+        {
+            names.push(sub.clone());
+        }
+    }
+    names
 }

@@ -349,6 +349,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "stripspace" => commands::utility::cmd_stripspace(&args[1..]),
         "stash" => commands::stash::cmd_stash(&args[1..]),
         "submodule" => commands::submodule::cmd_submodule(&args[1..]),
+        "submodule--helper" => commands::submodule::cmd_submodule_helper(&args[1..]),
         "symbolic-ref" => commands::refs::cmd_symbolic_ref(&args[1..]),
         "status" => commands::status::cmd_status(&args[1..]),
         "switch" => commands::checkout::cmd_switch(&args[1..]),
