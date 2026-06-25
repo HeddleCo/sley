@@ -2614,10 +2614,40 @@ fn augment_with_stat_dirty_entries(
     Ok(content_changes)
 }
 
+/// Hash the worktree file or symlink at `path` into the `(mode, oid)` blob entry
+/// git would record for it. `metadata` must already describe a regular file or a
+/// symlink — gitlink and directory classification is the caller's concern, since
+/// those need the index/HEAD context this leaf does not have. This is the single
+/// owner of the symlink-vs-regular body-source and mode split that `diff-files`
+/// ([`worktree_oid_matches_index`]), the candidate-path collector
+/// ([`worktree_entry_for_path`]), and the index↔worktree walk
+/// ([`index_worktree_change_for_entry`]) all share; before consolidation each
+/// open-coded it with a bare `0o120000`.
+fn classify_worktree_entry(
+    path: &Path,
+    metadata: &fs::Metadata,
+    format: ObjectFormat,
+) -> Result<TrackedEntry> {
+    let is_symlink = metadata.file_type().is_symlink();
+    let body = if is_symlink {
+        symlink_target_bytes(path)?
+    } else {
+        fs::read(path)?
+    };
+    let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
+    let mode = if is_symlink {
+        sley_index::SYMLINK_MODE
+    } else {
+        file_mode(metadata)
+    };
+    Ok(TrackedEntry { mode, oid })
+}
+
 /// Whether the worktree file at `git_path` hashes to the index entry's oid (mode
 /// included). Used to resolve a racily-clean `diff-files` entry: git re-hashes the
-/// content and only reports it changed when the bytes truly differ. Mirrors the
-/// worktree-oid computation in [`worktree_entry_for_path`].
+/// content and only reports it changed when the bytes truly differ. Shares the
+/// worktree-oid computation with [`worktree_entry_for_path`] via
+/// [`classify_worktree_entry`].
 fn worktree_oid_matches_index(
     worktree_root: &Path,
     git_path: &[u8],
@@ -2625,20 +2655,9 @@ fn worktree_oid_matches_index(
     index_entry: &TrackedEntry,
     format: ObjectFormat,
 ) -> Result<bool> {
-    let file_type = metadata.file_type();
     let path = worktree_path_for_repo_path(worktree_root, git_path);
-    let body = if file_type.is_symlink() {
-        symlink_target_bytes(&path)?
-    } else {
-        fs::read(&path)?
-    };
-    let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
-    let mode = if file_type.is_symlink() {
-        0o120000
-    } else {
-        file_mode(metadata)
-    };
-    Ok(oid == index_entry.oid && mode == index_entry.mode)
+    let entry = classify_worktree_entry(&path, metadata, format)?;
+    Ok(entry.oid == index_entry.oid && entry.mode == index_entry.mode)
 }
 
 pub fn diff_name_status_trees_with_options(
@@ -4202,18 +4221,7 @@ fn worktree_entry_for_path(
     if let Some(entry) = stat_cache.and_then(|cache| cache.reusable_entry(git_path, &metadata)) {
         return Ok(Some(tracked_entry_from_index(entry)));
     }
-    let body = if file_type.is_symlink() {
-        symlink_target_bytes(&path)?
-    } else {
-        fs::read(&path)?
-    };
-    let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
-    let mode = if file_type.is_symlink() {
-        0o120000
-    } else {
-        file_mode(&metadata)
-    };
-    Ok(Some(TrackedEntry { mode, oid }))
+    Ok(Some(classify_worktree_entry(&path, &metadata, format)?))
 }
 
 fn index_worktree_change_for_entry(
@@ -4253,18 +4261,7 @@ fn index_worktree_change_for_entry(
         if index_entry.reusable_with(stat_cache, &metadata) {
             return Ok(None);
         }
-        let body = if file_type.is_symlink() {
-            symlink_target_bytes(path)?
-        } else {
-            fs::read(path)?
-        };
-        let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
-        let mode = if file_type.is_symlink() {
-            0o120000
-        } else {
-            file_mode(&metadata)
-        };
-        Some(TrackedEntry { mode, oid })
+        Some(classify_worktree_entry(path, &metadata, format)?)
     } else {
         None
     };
@@ -4370,7 +4367,7 @@ fn worktree_blob_cache_for_unique_paths<'a>(
             continue;
         }
         let path = worktree_path_for_repo_path(worktree_root, git_path);
-        let body = if entry.mode == 0o120000 {
+        let body = if sley_index::is_symlink_mode(entry.mode) {
             symlink_target_bytes(&path)?
         } else {
             fs::read(&path)?
@@ -7309,8 +7306,8 @@ pub fn merge_entry_maps(
             });
         } else if let (Some(&(ours_mode, ours_oid)), Some(&(theirs_mode, theirs_oid))) =
             (ours.as_ref(), theirs.as_ref())
-            && ours_mode == 0o120000
-            && theirs_mode == 0o120000
+            && sley_index::is_symlink_mode(ours_mode)
+            && sley_index::is_symlink_mode(theirs_mode)
         {
             // Both sides are symlinks that diverged from the base and from each
             // other (the trivial oid resolutions above already took the agreeing

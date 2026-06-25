@@ -53,6 +53,22 @@ pub fn is_gitlink(mode: u32) -> bool {
     (mode & GIT_MODE_TYPE_MASK) == GITLINK_MODE
 }
 
+/// The raw git file mode of a symbolic link (git's `S_IFLNK`). An index or tree
+/// entry with this mode stores its link target as the blob body; the worktree
+/// representation is a symlink, not a regular file. Like [`GITLINK_MODE`], the
+/// type is the single greppable owner so no consumer re-derives `mode ==
+/// 0o120000` or open-codes the symlink-vs-file body/mode split.
+pub const SYMLINK_MODE: u32 = 0o120000;
+
+/// git's `S_ISLNK(mode)`: whether a raw git file mode names a symbolic link.
+/// Masks with [`GIT_MODE_TYPE_MASK`] so a mode with extra bits still classifies
+/// by type, exactly as [`is_gitlink`] does — this is the ONE definition every
+/// consumer must call instead of testing `mode == 0o120000` inline.
+#[inline]
+pub fn is_symlink_mode(mode: u32) -> bool {
+    (mode & GIT_MODE_TYPE_MASK) == SYMLINK_MODE
+}
+
 /// git's `ce_match_stat_basic` `S_IFGITLINK` arm, factored out so every
 /// stat-verdict consumer (`update-index --refresh`, `diff-files`, `status`)
 /// shares one gitlink rule instead of re-deriving it.
@@ -1813,7 +1829,7 @@ pub fn file_mtime_parts(metadata: &fs::Metadata) -> Option<(u64, u64)> {
 /// Git file mode for the filesystem entry described by `metadata`.
 pub fn worktree_metadata_mode(metadata: &fs::Metadata) -> u32 {
     if metadata.file_type().is_symlink() {
-        0o120000
+        SYMLINK_MODE
     } else if metadata.is_dir() {
         0o040000
     } else {
@@ -2655,6 +2671,21 @@ mod tests {
         assert!(!is_gitlink(0o120000)); // symlink
         assert!(!is_gitlink(0o040000)); // tree / on-disk directory mode
         assert!(!is_gitlink(0));
+    }
+
+    #[test]
+    fn is_symlink_mode_matches_git_s_islnk() {
+        // Only the symlink file-type bits classify as a symlink; blobs,
+        // executables, gitlinks, and trees do not.
+        assert!(is_symlink_mode(SYMLINK_MODE));
+        assert!(is_symlink_mode(0o120000));
+        // Permission bits ORed onto the symlink type still classify (mask).
+        assert!(is_symlink_mode(0o120000 | 0o755));
+        assert!(!is_symlink_mode(0o100644));
+        assert!(!is_symlink_mode(0o100755));
+        assert!(!is_symlink_mode(0o160000)); // gitlink
+        assert!(!is_symlink_mode(0o040000)); // tree / on-disk directory mode
+        assert!(!is_symlink_mode(0));
     }
 
     #[test]
