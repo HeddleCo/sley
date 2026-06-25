@@ -4,6 +4,56 @@
 use crate::*;
 use std::borrow::Cow;
 
+/// Expand a bundle of short tag options (e.g. `-am` => `-a -m`), the way git's
+/// `parse_options` does. Only bundles whose leading byte is a boolean short flag
+/// (`-a/-s/-f/-d/-v/-e/-i/-l`) are split; a value-taking flag (`-m/-u/-n/-F`)
+/// ends the bundle, keeping any glued value so the existing per-flag arms (which
+/// already handle `-m<msg>`, `-u<key>`, `-n<num>`) see it. Everything else —
+/// long options, `--`, glued value flags, and post-`--` positionals — passes
+/// through untouched.
+fn expand_tag_short_flags(args: &[String]) -> Vec<String> {
+    const BOOL_FLAGS: &[u8] = b"asfdveil";
+    const VALUE_FLAGS: &[u8] = b"munF";
+    let mut out = Vec::with_capacity(args.len());
+    let mut saw_dashdash = false;
+    for arg in args {
+        let bytes = arg.as_bytes();
+        if saw_dashdash || arg == "--" || !arg.starts_with('-') || arg.starts_with("--") || bytes.len() < 2
+        {
+            if arg == "--" {
+                saw_dashdash = true;
+            }
+            out.push(arg.clone());
+            continue;
+        }
+        // Only treat as a bundle when the first short flag is a boolean one;
+        // otherwise the existing glued-value arms (`-m…`, `-u…`, `-n…`) must see
+        // the argument verbatim.
+        if !BOOL_FLAGS.contains(&bytes[1]) {
+            out.push(arg.clone());
+            continue;
+        }
+        let mut idx = 1;
+        while idx < bytes.len() {
+            let ch = bytes[idx];
+            if BOOL_FLAGS.contains(&ch) {
+                out.push(format!("-{}", ch as char));
+                idx += 1;
+            } else if VALUE_FLAGS.contains(&ch) {
+                // The flag and any glued value terminate the bundle.
+                out.push(format!("-{}", &arg[idx..]));
+                idx = bytes.len();
+            } else {
+                // Unknown bundled byte: hand the remainder back verbatim so the
+                // parser reports it the same way it would unbundled.
+                out.push(format!("-{}", &arg[idx..]));
+                idx = bytes.len();
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
@@ -55,7 +105,8 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     let mut cleanup_mode = TagCleanupMode::Strip;
     let mut empty_file_noop = false;
     let mut positional = Vec::new();
-    let mut iter = args.iter().peekable();
+    let expanded = expand_tag_short_flags(args);
+    let mut iter = expanded.iter().peekable();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--" => {

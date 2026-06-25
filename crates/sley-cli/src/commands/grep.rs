@@ -1496,15 +1496,22 @@ fn grep_index_level(
 
     // git's `clear_skip_worktree_from_present_files`: under sparse checkout a
     // SKIP_WORKTREE entry whose file is actually present in the worktree loses the
-    // bit, so the live file is searched.
-    let clear_sparse = source
-        .config
+    // bit, so the live file is searched. `core.sparseCheckout` is written to the
+    // per-worktree config (`extensions.worktreeConfig`), so it is consulted first.
+    let worktree_config = GitConfig::read(source.git_dir.join("config.worktree")).unwrap_or_default();
+    let sparse_enabled = worktree_config
         .get_bool("core", None, "sparseCheckout")
-        .unwrap_or(false)
-        && !source
-            .config
-            .get_bool("sparse", None, "expectFilesOutsideOfPatterns")
-            .unwrap_or(false);
+        .or_else(|| source.config.get_bool("core", None, "sparseCheckout"))
+        .unwrap_or(false);
+    let expect_outside = worktree_config
+        .get_bool("sparse", None, "expectFilesOutsideOfPatterns")
+        .or_else(|| {
+            source
+                .config
+                .get_bool("sparse", None, "expectFilesOutsideOfPatterns")
+        })
+        .unwrap_or(false);
+    let clear_sparse = sparse_enabled && !expect_outside;
 
     let submodules = if plan.opts.recurse_submodules {
         Some(load_gitmodules_worktree(
