@@ -11,6 +11,83 @@ use crate::index_io::*;
 use crate::status::*;
 use crate::types_admin::*;
 
+/// git's `INDEX_FORMAT_DEFAULT` (read-cache.c).
+const INDEX_FORMAT_DEFAULT: u32 = 3;
+
+/// Pick the base version for a freshly-created index, mirroring git's
+/// `get_index_format_default`: `GIT_INDEX_VERSION` wins when set (warning +
+/// default on a malformed / out-of-range value), otherwise `feature.manyFiles`
+/// (→4) then an `index.version` override (warning on out-of-range). The writer's
+/// `normalize_index_version_for_extended_flags` later collapses 2/3 by
+/// extended-flag need; a chosen version 4 is preserved.
+fn fresh_index_default_version(git_dir: &Path) -> u32 {
+    if let Some(raw) = env::var_os("GIT_INDEX_VERSION") {
+        let raw = raw.to_string_lossy();
+        return match raw.parse::<u32>() {
+            Ok(version) if (2..=4).contains(&version) => version,
+            _ => {
+                eprintln!(
+                    "warning: GIT_INDEX_VERSION set, but the value is invalid.\nUsing version {INDEX_FORMAT_DEFAULT}"
+                );
+                INDEX_FORMAT_DEFAULT
+            }
+        };
+    }
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    let mut version = if config.get_bool("feature", None, "manyFiles").unwrap_or(false) {
+        4
+    } else {
+        INDEX_FORMAT_DEFAULT
+    };
+    if let Some(raw) = config.get("index", None, "version") {
+        match raw.trim().parse::<i64>() {
+            Ok(value) if (2..=4).contains(&value) => version = value as u32,
+            _ => {
+                eprintln!(
+                    "warning: index.version set, but the value is invalid.\nUsing version {INDEX_FORMAT_DEFAULT}"
+                );
+                return INDEX_FORMAT_DEFAULT;
+            }
+        }
+    }
+    version
+}
+
+/// Whether `config` requests a null trailing index hash. git's repo-settings:
+/// `feature.manyFiles` defaults skip-hash on, and an explicit `index.skipHash`
+/// (last) overrides it.
+pub fn index_skip_hash_from_config(config: &GitConfig) -> bool {
+    let many_files = config.get_bool("feature", None, "manyFiles").unwrap_or(false);
+    config
+        .get_bool("index", None, "skipHash")
+        .unwrap_or(many_files)
+}
+
+/// Overwrite the trailing `format.raw_len()` checksum bytes with zeroes (the
+/// null oid), for an `index.skipHash` write.
+fn zero_trailing_index_hash(bytes: &mut [u8], format: ObjectFormat) {
+    let raw = format.raw_len();
+    let len = bytes.len();
+    if len >= raw {
+        bytes[len - raw..].fill(0);
+    }
+}
+
+/// Load the repository index, or materialize a fresh empty index whose version
+/// is chosen by [`fresh_index_default_version`]. Used by the `add` /
+/// `update-index` entrypoints so a brand-new index honors
+/// `GIT_INDEX_VERSION` / `index.version` / `feature.manyFiles`, like git.
+fn read_index_or_fresh(git_dir: &Path, format: ObjectFormat) -> Result<Index> {
+    match read_repository_index(git_dir, format)? {
+        Some(index) => Ok(index),
+        None => {
+            let mut index = empty_index();
+            index.version = fresh_index_default_version(git_dir);
+            Ok(index)
+        }
+    }
+}
+
 pub fn add_paths_to_index(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
@@ -42,7 +119,7 @@ pub fn update_index_paths(
     options: UpdateIndexOptions,
 ) -> Result<UpdateIndexResult> {
     let git_dir = git_dir.as_ref();
-    let index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
+    let index = read_index_or_fresh(git_dir, format)?;
     update_index_paths_with_index(worktree_root, git_dir, format, index, paths, options)
 }
 
@@ -100,7 +177,7 @@ pub fn update_index_ordered_paths_filtered(
     verbose: bool,
 ) -> Result<UpdateIndexResult> {
     let git_dir = git_dir.as_ref();
-    let index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
+    let index = read_index_or_fresh(git_dir, format)?;
     update_index_ordered_paths_filtered_with_index(
         worktree_root,
         git_dir,
@@ -177,7 +254,7 @@ pub fn update_index_paths_filtered(
     config: &GitConfig,
 ) -> Result<UpdateIndexResult> {
     let git_dir = git_dir.as_ref();
-    let index = read_repository_index(git_dir, format)?.unwrap_or_else(empty_index);
+    let index = read_index_or_fresh(git_dir, format)?;
     update_index_paths_filtered_with_index(
         worktree_root,
         git_dir,
@@ -1331,7 +1408,13 @@ pub(crate) fn update_index_paths_impl(
     if !pending_large.is_empty() {
         write_pending_large_blobs(&odb, &pending_large, large_policy)?;
     }
-    write_repository_index_ref(git_dir, format, &index)?;
+    // git's `index.skipHash` / `feature.manyFiles` decide whether the trailing
+    // checksum is written. `clean_config` carries the full effective config
+    // (file + command-line `-c`) for the add/update-index callers.
+    let skip_hash = clean_config
+        .map(index_skip_hash_from_config)
+        .unwrap_or(false);
+    write_repository_index_ref_skip_hash(git_dir, format, &index, skip_hash)?;
     if verbose {
         let mut stdout = std::io::stdout().lock();
         for line in &reports {
@@ -2334,11 +2417,39 @@ pub fn write_repository_index_ref(
     write_repository_index_ref_with_split(git_dir, format, index, split)
 }
 
+/// As [`write_repository_index_ref`], but `skip_hash` writes a null trailing
+/// checksum (git's `index.skipHash` / `feature.manyFiles`).
+pub fn write_repository_index_ref_skip_hash(
+    git_dir: &Path,
+    format: ObjectFormat,
+    index: &Index,
+    skip_hash: bool,
+) -> Result<()> {
+    let split = index.split_index_link(format)?.is_some()
+        || repository_index_is_split(git_dir, format)?
+        || git_test_split_index_enabled();
+    write_repository_index_ref_with_split_skip_hash(git_dir, format, index, split, skip_hash)
+}
+
 pub(crate) fn write_repository_index_ref_with_split(
     git_dir: &Path,
     format: ObjectFormat,
     index: &Index,
     split: bool,
+) -> Result<()> {
+    write_repository_index_ref_with_split_skip_hash(git_dir, format, index, split, false)
+}
+
+/// As [`write_repository_index_ref_with_split`], but `skip_hash` leaves the
+/// trailing checksum as the null oid (git's `index.skipHash`). Only the
+/// non-split write honors it (the case `add`/`update-index` exercise); the
+/// reader accepts a null trailing hash regardless (see verify_hdr).
+pub(crate) fn write_repository_index_ref_with_split_skip_hash(
+    git_dir: &Path,
+    format: ObjectFormat,
+    index: &Index,
+    split: bool,
+    skip_hash: bool,
 ) -> Result<()> {
     let index_path = repository_index_path(git_dir);
     if !split || alternate_index_output_path(git_dir, &index_path) {
@@ -2348,11 +2459,14 @@ pub(crate) fn write_repository_index_ref_with_split(
         } else {
             Cow::Borrowed(index.extensions.as_slice())
         };
-        let bytes = if smudged_entries.is_empty() && matches!(extensions, Cow::Borrowed(_)) {
+        let mut bytes = if smudged_entries.is_empty() && matches!(extensions, Cow::Borrowed(_)) {
             index.write(format)?
         } else {
             write_index_with_entry_size_overrides(format, index, &smudged_entries, &extensions)?
         };
+        if skip_hash {
+            zero_trailing_index_hash(&mut bytes, format);
+        }
         fs::write(&index_path, bytes)?;
         apply_index_shared_file_mode(git_dir, &index_path, None)?;
         return Ok(());

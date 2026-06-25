@@ -448,6 +448,9 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     let mut debug = false;
     let mut sparse = false;
     let mut tag = false;
+    let mut killed = false;
+    let mut recurse_submodules = false;
+    let mut with_tree: Option<String> = None;
     let mut format_spec: Option<String> = None;
     let mut oid_abbrev = None;
     let mut path_args = Vec::new();
@@ -526,9 +529,21 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             }
             "-t" => tag = true,
             "--no-t" => tag = false,
-            "--recurse-submodules"
-            | "--no-recurse-submodules"
-            | "--no-killed" => {}
+            "-k" | "--killed" => killed = true,
+            "--no-killed" => killed = false,
+            "--recurse-submodules" => recurse_submodules = true,
+            "--no-recurse-submodules" => recurse_submodules = false,
+            "--with-tree" => {
+                let Some(value) = iter.next() else {
+                    return Err(GitError::Command(
+                        "ls-files --with-tree requires a value".into(),
+                    ));
+                };
+                with_tree = Some(value.clone());
+            }
+            value if let Some(value) = value.strip_prefix("--with-tree=") => {
+                with_tree = Some(value.to_string());
+            }
             "--no-resolve-undo" => resolve_undo = false,
             "--abbrev" => oid_abbrev = Some(7),
             "--no-abbrev" => oid_abbrev = None,
@@ -617,6 +632,34 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         exclude_patterns.extend(contents.split(|byte| *byte == b'\n').map(Vec::from));
     }
     let terminator = if nul { 0 } else { b'\n' };
+    // git: `--format` cannot be combined with the format-altering selectors.
+    // Mirrors builtin/ls-files.c's usage_msg_opt() check (exit 129).
+    if format_spec.is_some()
+        && (stage || others || killed || resolve_undo || deduplicate || show_eol || tag)
+    {
+        return Err(GitError::usage(
+            "--format cannot be used with -s, -o, -k, -t, --resolve-undo, --deduplicate, --eol",
+        ));
+    }
+    // git: `--recurse-submodules` rejects worktree-dependent modes and
+    // `--with-tree`; `--error-unmatch` is separately unsupported. Both die(128).
+    if recurse_submodules
+        && (deleted || others || unmerged || killed || modified || resolve_undo || with_tree.is_some())
+    {
+        eprintln!("fatal: ls-files --recurse-submodules unsupported mode");
+        return Err(GitError::Exit(128));
+    }
+    if recurse_submodules && error_unmatch {
+        eprintln!("fatal: ls-files --recurse-submodules does not support --error-unmatch");
+        return Err(GitError::Exit(128));
+    }
+    // git: `--with-tree` cannot combine with stage/unmerged output (die 128).
+    if with_tree.is_some() && (stage || unmerged) {
+        eprintln!(
+            "fatal: options 'ls-files --with-tree' and '-s/-u' cannot be used together"
+        );
+        return Err(GitError::Exit(128));
+    }
     let selected = cached || others || deleted || modified || unmerged || resolve_undo;
     let output_stage = stage || unmerged;
     if ignored && !others && !cached {
@@ -687,18 +730,33 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         None
     };
     let eol = eol_context.as_ref();
-    if let Some(format_spec) = format_spec.as_deref() {
-        if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
-            let index =
-                ls_files_display_index(&git_dir, format, index, sparse && !(deleted || modified))?;
-            write_ls_files_formatted(
-                &mut stdout,
-                index.entries.iter(),
-                format_spec,
-                terminator,
-                &pathspec,
-            )?;
+    if recurse_submodules {
+        recurse_ls_files_submodules(
+            &mut stdout,
+            &git_dir,
+            &worktree_root,
+            format,
+            b"",
+            output_stage,
+            terminator,
+            &pathspec,
+            oid_abbrev,
+        )?;
+        stdout.flush()?;
+        if error_unmatch {
+            pathspec.exit_if_unmatched()?;
         }
+        return Ok(());
+    }
+    if let Some(with_tree) = with_tree.as_deref() {
+        write_ls_files_with_tree(
+            &mut stdout,
+            &git_dir,
+            format,
+            with_tree,
+            terminator,
+            &pathspec,
+        )?;
         stdout.flush()?;
         if error_unmatch {
             pathspec.exit_if_unmatched()?;
@@ -752,6 +810,53 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     } else {
         Vec::new()
     };
+    if let Some(format_spec) = format_spec.as_deref() {
+        if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
+            let index =
+                ls_files_display_index(&git_dir, format, index, sparse && !(deleted || modified))?;
+            let oid_candidates = ls_files_oid_candidates(&index);
+            let ctx = LsFilesFormatContext {
+                spec: format_spec,
+                needs_eol: format_spec.contains("(eol"),
+                eol: EolContext {
+                    worktree_root: worktree_root.clone(),
+                    db: FileObjectDatabase::from_git_dir(&git_dir, format),
+                },
+                abbrev: oid_abbrev,
+                candidates: &oid_candidates,
+            };
+            // git: with no selector `show_cached` defaults on; `-m`/`-d` turn it
+            // off unless `-c` is also given. Each entry is emitted once per
+            // matching condition, in cache order (cached, deleted, modified).
+            let want_cached = cached || !(modified || deleted);
+            for entry in &index.entries {
+                let Some(path) = pathspec.display(&entry.path) else {
+                    continue;
+                };
+                let is_deleted =
+                    deleted && deleted_entries.iter().any(|e| e.path == entry.path);
+                let is_modified =
+                    modified && modified_entries.iter().any(|e| e.path == entry.path);
+                // git emits the line once per matching condition, in cache order
+                // (cached, then deleted, then modified).
+                for emit in [want_cached, is_deleted, is_modified] {
+                    if !emit {
+                        continue;
+                    }
+                    write_ls_files_format(&mut stdout, entry, &path, &ctx)?;
+                    stdout.write_all(&[terminator])?;
+                    if debug {
+                        write_ls_files_debug(&mut stdout, entry)?;
+                    }
+                }
+            }
+        }
+        stdout.flush()?;
+        if error_unmatch {
+            pathspec.exit_if_unmatched()?;
+        }
+        return Ok(());
+    }
     if selected && !output_stage {
         if (cached || deleted || modified)
             && let Some(index) = sley_worktree::read_repository_index(&git_dir, format)?
@@ -882,19 +987,297 @@ fn write_ls_files_index_root_fast(
     })
 }
 
-fn write_ls_files_formatted<'a>(
+/// `ls-files --with-tree=<tree-ish>`: overlay `<tree-ish>` onto the index so
+/// that paths removed from the index since that tree still appear. Mirrors
+/// git's `overlay_tree_on_index` (read-cache.c): existing unmerged entries are
+/// hoisted to stage #3, the tree's leaves are appended at stage #1, the result
+/// is sorted by (name, stage), and a stage-#1 entry shadowed by a stage-#0
+/// entry of the same name is hidden (git's `CE_UPDATE` marker).
+fn write_ls_files_with_tree(
     stdout: &mut io::Stdout,
-    entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
-    format_spec: &str,
+    git_dir: &Path,
+    format: ObjectFormat,
+    with_tree: &str,
     terminator: u8,
     pathspec: &LsFilesPathspec,
 ) -> Result<()> {
-    for entry in entries {
-        let Some(path) = pathspec.display(&entry.path) else {
+    let repo = RepositoryContext::discover_current()?;
+    // Resolve <tree-ish> to a tree oid, dying with 128 like git on failure.
+    let tree_oid = match repo.resolve_revision(with_tree) {
+        Ok(oid) => {
+            if oid == ObjectId::empty_tree(format) {
+                oid
+            } else {
+                match sley_rev::peel_to_tree(repo.objects(), format, &oid) {
+                    Ok(tree) => tree,
+                    Err(_) => {
+                        eprintln!("fatal: not a tree-ish object: {with_tree}");
+                        return Err(GitError::Exit(128));
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            eprintln!("fatal: tree-ish {with_tree} not found.");
+            return Err(GitError::Exit(128));
+        }
+    };
+
+    // (path, stage) records for the overlaid index.
+    let mut entries: Vec<(Vec<u8>, u8)> = Vec::new();
+    if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
+        // git ensures a full index before overlaying.
+        let index = ls_files_display_index(git_dir, format, index, false)?;
+        for entry in &index.entries {
+            let stage = if index_entry_stage(entry) != 0 { 3 } else { 0 };
+            entries.push((entry.path.to_vec(), stage));
+        }
+    }
+    for (path, _value) in sley_diff_merge::flatten_tree(repo.objects(), format, &tree_oid)? {
+        entries.push((path, 1));
+    }
+    // git's cmp_cache_name_compare: name, then stage.
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    let mut hidden = vec![false; entries.len()];
+    let mut last_stage0: Option<usize> = None;
+    for idx in 0..entries.len() {
+        match entries[idx].1 {
+            0 => last_stage0 = Some(idx),
+            1 => {
+                if let Some(s0) = last_stage0
+                    && entries[s0].0 == entries[idx].0
+                {
+                    hidden[idx] = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (idx, (path, _stage)) in entries.iter().enumerate() {
+        if hidden[idx] {
+            continue;
+        }
+        if let Some(display) = pathspec.display(path) {
+            write_ls_files_path(stdout, &display, terminator)?;
+            stdout.write_all(&[terminator])?;
+        }
+    }
+    Ok(())
+}
+
+/// `ls-files --recurse-submodules`: list this repo's index, and for every
+/// gitlink that is an *active* submodule (git's `is_submodule_active`), recurse
+/// into the submodule's index instead — prefixing its paths with the submodule
+/// path. Inactive gitlinks are listed as the gitlink entry itself. Mirrors
+/// builtin/ls-files.c `show_ce` + `show_submodule`.
+#[allow(clippy::too_many_arguments)]
+fn recurse_ls_files_submodules(
+    stdout: &mut io::Stdout,
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    prefix: &[u8],
+    output_stage: bool,
+    terminator: u8,
+    pathspec: &LsFilesPathspec,
+    oid_abbrev: Option<usize>,
+) -> Result<()> {
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(());
+    };
+    let index = ls_files_display_index(git_dir, format, index, false)?;
+    let candidates = ls_files_oid_candidates(&index);
+    let config = read_repo_config(git_dir)?;
+    // git reads each (sub)repo's settings on index read and dies on a malformed
+    // `index.sparse` boolean (prepare_repo_settings -> repo_cfg_bool).
+    validate_repo_index_sparse_bool(git_dir, &config)?;
+    let gitmodules = GitConfig::read(worktree_root.join(".gitmodules")).ok();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+
+    for entry in &index.entries {
+        let mut full = prefix.to_vec();
+        full.extend_from_slice(&entry.path);
+
+        if entry.mode == 0o160000
+            && submodule_is_active_for_path(&config, gitmodules.as_ref(), &entry.path)
+        {
+            let sub_root = worktree_root.join(repo_path_to_path(&entry.path));
+            if let Some(sub_git_dir) = submodule_git_dir_for_path(&db, &sub_root, &entry.path) {
+                let sub_format = repository_object_format(&sub_git_dir).unwrap_or(format);
+                let mut sub_prefix = full.clone();
+                sub_prefix.push(b'/');
+                recurse_ls_files_submodules(
+                    stdout,
+                    &sub_git_dir,
+                    &sub_root,
+                    sub_format,
+                    &sub_prefix,
+                    output_stage,
+                    terminator,
+                    pathspec,
+                    oid_abbrev,
+                )?;
+                continue;
+            }
+            // Active but unresolvable git dir: fall through and list the gitlink.
+        }
+
+        if let Some(display) = pathspec.display(&full) {
+            if output_stage {
+                write!(
+                    stdout,
+                    "{:06o} {} {}\t",
+                    entry.mode,
+                    ls_files_oid(&entry.oid, oid_abbrev, &candidates),
+                    index_entry_stage(entry)
+                )?;
+            }
+            write_ls_files_path(stdout, &display, terminator)?;
+            stdout.write_all(&[terminator])?;
+        }
+    }
+    Ok(())
+}
+
+/// git rejects a non-boolean `index.sparse` while reading a repo's settings
+/// (prepare_repo_settings -> repo_cfg_bool -> git_config_bool dies). The
+/// effective value is the last one across base `config` and, when
+/// `extensions.worktreeConfig` is enabled, `config.worktree` (which wins).
+fn validate_repo_index_sparse_bool(git_dir: &Path, config: &GitConfig) -> Result<()> {
+    let worktree_config = config
+        .get_bool("extensions", None, "worktreeConfig")
+        .unwrap_or(false)
+        .then(|| GitConfig::read(git_dir.join("config.worktree")).ok())
+        .flatten();
+    // `config.worktree` wins over the base file when it sets index.sparse.
+    let target = match worktree_config.as_ref() {
+        Some(wt) if wt.get("index", None, "sparse").is_some() => wt,
+        _ => config,
+    };
+    if let Some(value) = target.get("index", None, "sparse")
+        && target.get_bool("index", None, "sparse").is_none()
+    {
+        eprintln!("fatal: bad boolean config value '{value}' for 'index.sparse'");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+/// git's `is_submodule_active` for a gitlink `path` relative to the repo whose
+/// `config`/`gitmodules` are given: honor `submodule.<name>.active`, then the
+/// `submodule.active` pathspec list, then fall back to `submodule.<name>.url`.
+fn submodule_is_active_for_path(
+    config: &GitConfig,
+    gitmodules: Option<&GitConfig>,
+    path: &[u8],
+) -> bool {
+    let Some(name) = gitmodules.and_then(|gm| submodule_name_for_path(gm, path)) else {
+        return false;
+    };
+    if let Some(active) = config.get_bool("submodule", Some(&name), "active") {
+        return active;
+    }
+    let specs: Vec<&str> = config
+        .get_all("submodule", None, "active")
+        .into_iter()
+        .flatten()
+        .collect();
+    if !specs.is_empty() {
+        return submodule_active_specs_match(&specs, path);
+    }
+    config.get("submodule", Some(&name), "url").is_some()
+}
+
+/// Map a gitlink `path` to its `.gitmodules` submodule name (the subsection of
+/// the `submodule.<name>` whose `path` value equals `path`).
+fn submodule_name_for_path(gitmodules: &GitConfig, path: &[u8]) -> Option<String> {
+    let path_str = std::str::from_utf8(path).ok()?;
+    for section in &gitmodules.sections {
+        if !section.name.eq_ignore_ascii_case("submodule") {
+            continue;
+        }
+        let Some(name) = &section.subsection else {
             continue;
         };
-        write_ls_files_format(stdout, entry, &path, format_spec)?;
-        stdout.write_all(&[terminator])?;
+        let mut sub_path = None;
+        for entry in &section.entries {
+            if entry.key.eq_ignore_ascii_case("path") {
+                sub_path = entry.value.as_deref();
+            }
+        }
+        if sub_path == Some(path_str) {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+/// Whether any `submodule.active` pathspec matches the submodule `path`. A
+/// minimal matcher (exact path or a directory-prefix match), sufficient for the
+/// `submodule.active` cases git exercises.
+fn submodule_active_specs_match(specs: &[&str], path: &[u8]) -> bool {
+    let Ok(path_str) = std::str::from_utf8(path) else {
+        return false;
+    };
+    specs.iter().any(|spec| {
+        let spec = spec.trim_end_matches('/');
+        spec == "." || spec == path_str || path_str.starts_with(&format!("{spec}/"))
+    })
+}
+
+/// Per-invocation state for `ls-files --format`. Holds everything an atom may
+/// need: the format string, an `EolContext` (worktree + odb) for the
+/// `objectsize`/`eolinfo`/`eolattr` atoms, and the abbreviation parameters for
+/// `objectname`.
+struct LsFilesFormatContext<'a> {
+    spec: &'a str,
+    /// Whether the spec references any `eol*` atom; gates the per-entry eol
+    /// computation so non-eol formats pay nothing.
+    needs_eol: bool,
+    eol: EolContext,
+    abbrev: Option<usize>,
+    candidates: &'a [ObjectId],
+}
+
+/// git's `object_type(ce_mode)`: gitlinks are commits, directories are trees,
+/// everything else (regular files, symlinks) is a blob.
+fn ls_files_object_type(mode: u32) -> ObjectType {
+    match mode & 0o170000 {
+        0o160000 => ObjectType::Commit,
+        0o040000 => ObjectType::Tree,
+        _ => ObjectType::Blob,
+    }
+}
+
+/// git's `expand_objectsize`: the blob size for blob-typed entries, a literal
+/// `-` otherwise. `padded` right-justifies the field in 7 columns.
+fn write_ls_files_objectsize(
+    stdout: &mut io::Stdout,
+    entry: &sley_index::IndexEntry,
+    eol: &EolContext,
+    padded: bool,
+) -> Result<()> {
+    if ls_files_object_type(entry.mode) == ObjectType::Blob {
+        let size = match eol.db.read_object_header(&entry.oid)? {
+            Some((_, size)) => size,
+            None => {
+                return Err(GitError::Command(format!(
+                    "could not get object info about '{}'",
+                    entry.oid
+                )));
+            }
+        };
+        if padded {
+            write!(stdout, "{size:>7}")?;
+        } else {
+            write!(stdout, "{size}")?;
+        }
+    } else if padded {
+        write!(stdout, "{:>7}", "-")?;
+    } else {
+        stdout.write_all(b"-")?;
     }
     Ok(())
 }
@@ -903,9 +1286,16 @@ fn write_ls_files_format(
     stdout: &mut io::Stdout,
     entry: &sley_index::IndexEntry,
     display_path: &[u8],
-    format_spec: &str,
+    ctx: &LsFilesFormatContext<'_>,
 ) -> Result<()> {
-    let mut rest = format_spec;
+    // git's write_eolinfo machinery resolves these fields once per entry.
+    let eol_info = if ctx.needs_eol {
+        let index_oid = is_regular_file_mode(entry.mode).then_some(&entry.oid);
+        Some(ctx.eol.info(&entry.path, index_oid)?)
+    } else {
+        None
+    };
+    let mut rest = ctx.spec;
     while let Some(start) = rest.find('%') {
         stdout.write_all(rest[..start].as_bytes())?;
         rest = &rest[start + 1..];
@@ -914,8 +1304,24 @@ fn write_ls_files_format(
                 let atom = &after_open[..end];
                 match atom {
                     "objectmode" => write!(stdout, "{:06o}", entry.mode)?,
-                    "objectname" => write!(stdout, "{}", entry.oid)?,
+                    "objectname" => stdout
+                        .write_all(ls_files_oid(&entry.oid, ctx.abbrev, ctx.candidates).as_bytes())?,
+                    "objecttype" => {
+                        stdout.write_all(ls_files_object_type(entry.mode).as_str().as_bytes())?
+                    }
+                    "objectsize" => write_ls_files_objectsize(stdout, entry, &ctx.eol, false)?,
+                    "objectsize:padded" => {
+                        write_ls_files_objectsize(stdout, entry, &ctx.eol, true)?
+                    }
                     "stage" => write!(stdout, "{}", index_entry_stage(entry))?,
+                    "eolinfo:index" => stdout.write_all(
+                        eol_info.as_ref().map(|i| i.index).unwrap_or("").as_bytes(),
+                    )?,
+                    "eolinfo:worktree" => stdout.write_all(
+                        eol_info.as_ref().map(|i| i.worktree).unwrap_or("").as_bytes(),
+                    )?,
+                    "eolattr" => stdout
+                        .write_all(eol_info.as_ref().map(|i| i.attr).unwrap_or("").as_bytes())?,
                     "path" => stdout.write_all(display_path)?,
                     _ => {
                         return Err(GitError::Command(format!(
@@ -1278,6 +1684,24 @@ impl EolContext {
         }
     }
 
+    /// Resolve the three `i/ w/ attr/` eol fields for `repo_path` (git's
+    /// `write_eolinfo` inputs). `index_oid` is the entry's blob oid for the
+    /// `i/` field (None for untracked files / non-regular entries).
+    fn info(
+        &self,
+        repo_path: &[u8],
+        index_oid: Option<&ObjectId>,
+    ) -> Result<sley_worktree::EolInfo> {
+        let index_content = index_oid.and_then(|oid| self.index_blob(oid));
+        let attr_checks = sley_worktree::eol_attribute_checks(&self.worktree_root, repo_path)?;
+        Ok(sley_worktree::eol_info_for_path(
+            &self.worktree_root,
+            repo_path,
+            index_content.as_deref(),
+            &attr_checks,
+        ))
+    }
+
     /// Write the `i/%-5s w/%-5s attr/%-17s\t` prefix for `path`.
     ///
     /// `index_oid` is the entry's blob oid for the `i/` field (None for
@@ -1289,14 +1713,7 @@ impl EolContext {
         repo_path: &[u8],
         index_oid: Option<&ObjectId>,
     ) -> Result<()> {
-        let index_content = index_oid.and_then(|oid| self.index_blob(oid));
-        let attr_checks = sley_worktree::eol_attribute_checks(&self.worktree_root, repo_path)?;
-        let info = sley_worktree::eol_info_for_path(
-            &self.worktree_root,
-            repo_path,
-            index_content.as_deref(),
-            &attr_checks,
-        );
+        let info = self.info(repo_path, index_oid)?;
         stdout.write_all(info.format_prefix().as_bytes())?;
         Ok(())
     }
