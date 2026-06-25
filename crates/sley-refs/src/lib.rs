@@ -181,16 +181,22 @@ fn parse_packed_refs_with_prefix(
         let (oid, name) = line
             .split_once(' ')
             .ok_or_else(|| packed_refs_unexpected_line(line))?;
-        saw_ref = true;
-        included_last_ref = name.starts_with(prefix);
-        if !included_last_ref {
-            continue;
-        }
+        // git validates EVERY packed-refs line as it reads the file, regardless
+        // of whether the ref matches the caller's prefix; a malformed line
+        // anywhere aborts with "unexpected line in .git/packed-refs" (t1463
+        // "reject packed-refs containing junk"). So validate before applying the
+        // prefix filter — skipping validation for non-matching lines would let
+        // junk pass silently.
         if oid.len() != format.hex_len()
             || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
             || validate_ref_name_for_read(name).is_err()
         {
             return Err(packed_refs_unexpected_line(line));
+        }
+        saw_ref = true;
+        included_last_ref = name.starts_with(prefix);
+        if !included_last_ref {
+            continue;
         }
         let oid = ObjectId::from_hex(format, oid)?;
         refs.push(PackedRef {
@@ -302,15 +308,18 @@ fn packed_ref_names_with_prefix(
         let (oid, name) = line
             .split_once(' ')
             .ok_or_else(|| packed_refs_unexpected_line(line))?;
-        saw_ref = true;
-        if !name.starts_with(prefix) {
-            continue;
-        }
+        // Validate every line before the prefix filter (see
+        // `parse_packed_refs_with_prefix`): git rejects a malformed packed-refs
+        // file even when the junk line is outside the requested prefix.
         if oid.len() != format.hex_len()
             || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
             || validate_ref_name_for_read(name).is_err()
         {
             return Err(packed_refs_unexpected_line(line));
+        }
+        saw_ref = true;
+        if !name.starts_with(prefix) {
+            continue;
         }
         let name = if strip_prefix {
             &name[prefix.len()..]
