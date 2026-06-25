@@ -484,6 +484,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     format,
                     &target_oid,
                 )?;
+                let _ = sley_worktree::refresh_index_cache_tree(&git_dir, format);
                 sley_sequencer::replay::remove_branch_state(&git_dir);
                 return Ok(());
             }
@@ -1011,6 +1012,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         }
     }
     sley_sequencer::replay::remove_branch_state(&git_dir);
+    // git's checkout rebuilds the index cache-tree after switching to a branch /
+    // commit (the index now matches that tree).
+    let _ = sley_worktree::refresh_index_cache_tree(&git_dir, format);
     let checkout_new_head = resolve_ref_peeled(&FileRefStore::new(&git_dir, format), "HEAD")?
         .unwrap_or(checkout_old_head);
     run_post_checkout_hook(&checkout_old_head, &checkout_new_head, true)?;

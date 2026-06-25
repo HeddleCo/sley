@@ -188,6 +188,13 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
         }
     }
 
+    // git's `read-tree` rebuilds the index cache-tree (a single-tree read makes
+    // the index match that tree exactly). Skip on dry-run, where the index is
+    // untouched.
+    if !parsed.dry_run {
+        let _ = sley_worktree::refresh_index_cache_tree(git_dir, format);
+    }
+
     Ok(())
 }
 

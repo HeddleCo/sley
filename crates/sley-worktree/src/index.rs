@@ -339,12 +339,14 @@ pub fn add_update_all_tracked_filtered(
     let odb = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut actions = Vec::new();
     let mut index_dirty = false;
+    let mut staged_paths: Vec<Vec<u8>> = Vec::new();
     let mut clean_filter = None;
     let trust_filemode = trust_executable_bit(clean_config);
     for (precheck, path) in pending {
         match precheck {
             TrackedOnlyPrecheck::Deleted(_) => {
                 if remove_index_entries_with_path(&mut index.entries, &path) {
+                    staged_paths.push(path.clone());
                     actions.push(AddUpdateTrackedAction::Remove(path));
                     index_dirty = true;
                 }
@@ -363,6 +365,9 @@ pub fn add_update_all_tracked_filtered(
                     &path,
                 )?;
                 index_dirty |= dirty;
+                if dirty {
+                    staged_paths.push(path.clone());
+                }
                 if let Some(action) = action {
                     actions.push(action);
                 }
@@ -384,6 +389,9 @@ pub fn add_update_all_tracked_filtered(
             &path,
         )?;
         index_dirty |= dirty;
+        if dirty {
+            staged_paths.push(path.clone());
+        }
         if let Some(action) = action {
             actions.push(action);
         }
@@ -391,7 +399,9 @@ pub fn add_update_all_tracked_filtered(
 
     if index_dirty {
         normalize_index_version_for_extended_flags(&mut index);
-        index.extensions = index_extensions_without_cache_tree(&index.extensions);
+        for path in &staged_paths {
+            invalidate_cache_tree_in_index(&mut index, format, path)?;
+        }
         write_repository_index_ref(git_dir, format, &index)?;
     }
     Ok(actions)
@@ -571,7 +581,7 @@ pub fn add_exact_tracked_path_with_index(
     )?;
     if dirty {
         normalize_index_version_for_extended_flags(&mut index);
-        index.extensions = index_extensions_without_cache_tree(&index.extensions);
+        invalidate_cache_tree_in_index(&mut index, format, git_path)?;
         write_repository_index_ref(git_dir, format, &index)?;
     }
     Ok(action)
@@ -1399,7 +1409,9 @@ pub(crate) fn update_index_paths_impl(
         updated.push(oid);
     }
     normalize_index_version_for_extended_flags(&mut index);
-    index.extensions = index_extensions_without_cache_tree(&index.extensions);
+    for path in &untracked_cache_invalidation_paths {
+        invalidate_cache_tree_in_index(&mut index, format, path)?;
+    }
     invalidate_untracked_cache_for_git_paths(
         &mut index,
         format,
@@ -3412,6 +3424,159 @@ pub(crate) fn write_tree_from_owned_index(
         checker,
         options.missing_ok,
     )
+}
+
+/// Build a fully-valid cache-tree (git's `TREE` extension) from an already-
+/// written tree object, read recursively. Each node records the recursive count
+/// of non-tree (index) entries it spans plus the subtree object id, matching
+/// git's `cache_tree`.
+pub fn build_cache_tree(
+    odb: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<sley_index::CacheTree> {
+    let object = read_expected_object(odb, tree_oid, ObjectType::Tree)?;
+    let tree = sley_object::Tree::parse(format, &object.body)?;
+    let mut entry_count: i32 = 0;
+    let mut subtrees = Vec::new();
+    for entry in &tree.entries {
+        // A directory (`0o040000`) is a subtree; everything else (blob, symlink,
+        // gitlink) counts as a single index entry.
+        if entry.mode == 0o040000 {
+            let child = build_cache_tree(odb, format, &entry.oid)?;
+            entry_count = entry_count.saturating_add(child.entry_count.max(0));
+            subtrees.push(sley_index::CacheTreeChild {
+                name: entry.name.to_vec(),
+                tree: child,
+            });
+        } else {
+            entry_count = entry_count.saturating_add(1);
+        }
+    }
+    Ok(sley_index::CacheTree {
+        entry_count,
+        oid: Some(*tree_oid),
+        subtrees,
+    })
+}
+
+/// Replace the on-disk index's cache-tree with a freshly built, fully-valid one
+/// for `tree_oid` — git's `cache_tree_update` after a tree-establishing
+/// operation (`write-tree`, `commit`, `read-tree`, `reset`, `checkout`,
+/// `merge`). A repository with no index file is left untouched.
+pub fn establish_index_cache_tree(
+    git_dir: &Path,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<()> {
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(());
+    }
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    let cache_tree = build_cache_tree(&odb, format, tree_oid)?;
+    let mut index = sley_index::read_repository_index(git_dir, format)?;
+    index.set_cache_tree(Some(&cache_tree))?;
+    write_repository_index_ref(git_dir, format, &index)?;
+    Ok(())
+}
+
+/// Rebuild the index's cache-tree from its own current entries (git's
+/// `cache_tree_update` after a tree-establishing command like `read-tree`,
+/// `reset`, `checkout`, `merge`, or `commit`). A no-op when the index is
+/// missing or contains unmerged entries (no single tree applies to a
+/// conflicted index).
+pub fn refresh_index_cache_tree(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(());
+    }
+    let mut index = sley_index::read_repository_index(git_dir, format)?;
+    if index
+        .entries
+        .iter()
+        .any(|entry| entry.stage() != sley_index::Stage::Normal || entry.is_intent_to_add())
+    {
+        return Ok(());
+    }
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    // Build a fresh tree, ignoring any stale cache-tree the index already
+    // carries, then cache it back.
+    index.set_cache_tree(None)?;
+    let mut checker = odb.presence_checker();
+    let tree = write_tree_from_owned_index(
+        &index,
+        format,
+        &WriteTreeOptions {
+            missing_ok: true,
+            prefix: None,
+        },
+        &odb,
+        &mut checker,
+    )?;
+    let cache_tree = build_cache_tree(&odb, format, &tree)?;
+    index.set_cache_tree(Some(&cache_tree))?;
+    write_repository_index_ref(git_dir, format, &index)?;
+    Ok(())
+}
+
+/// Invalidate the cache-tree nodes along each of `paths` (git's
+/// `cache_tree_invalidate_path` for a staged/updated index entry): the node for
+/// each containing directory, up to and including the root, is marked invalid
+/// (`entry_count = -1`, no cached oid), while sibling subtrees stay valid. A
+/// no-op when the index has no cache-tree.
+pub fn invalidate_index_cache_tree_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[Vec<u8>],
+) -> Result<()> {
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(());
+    }
+    let mut index = sley_index::read_repository_index(git_dir, format)?;
+    let Some(mut cache_tree) = index.cache_tree(format)? else {
+        return Ok(());
+    };
+    for path in paths {
+        cache_tree_invalidate_path(&mut cache_tree, path);
+    }
+    index.set_cache_tree(Some(&cache_tree))?;
+    write_repository_index_ref(git_dir, format, &index)?;
+    Ok(())
+}
+
+/// Invalidate the cache-tree nodes along `path` in an in-memory index, keeping
+/// the structure (so the dump still shows the surviving valid siblings). A no-op
+/// when the index carries no cache-tree.
+pub(crate) fn invalidate_cache_tree_in_index(
+    index: &mut Index,
+    format: ObjectFormat,
+    path: &[u8],
+) -> Result<()> {
+    if let Some(mut cache_tree) = index.cache_tree(format)? {
+        cache_tree_invalidate_path(&mut cache_tree, path);
+        index.set_cache_tree(Some(&cache_tree))?;
+    }
+    Ok(())
+}
+
+/// git's `cache_tree_invalidate_path`: invalidate this node and recurse into the
+/// existing subtree named by the leading path component. The final (file)
+/// component just invalidates its containing directory.
+fn cache_tree_invalidate_path(tree: &mut sley_index::CacheTree, path: &[u8]) {
+    tree.entry_count = -1;
+    tree.oid = None;
+    let Some(slash) = path.iter().position(|&byte| byte == b'/') else {
+        // A file directly in this directory: if its name collides with an
+        // existing subtree (a directory being replaced by a file), drop it.
+        tree.subtrees.retain(|child| child.name != path);
+        return;
+    };
+    let name = &path[..slash];
+    if let Some(child) = tree.subtrees.iter_mut().find(|child| child.name == name) {
+        cache_tree_invalidate_path(&mut child.tree, &path[slash + 1..]);
+    }
 }
 
 #[derive(Clone, Copy)]

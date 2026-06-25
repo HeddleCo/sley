@@ -37,11 +37,18 @@ pub(crate) fn cmd_write_tree(args: &[String]) -> Result<()> {
     }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
+    let prefixed = prefix.is_some();
     let oid = sley_worktree::write_tree_from_index_with_options(
-        git_dir,
+        &git_dir,
         format,
         sley_worktree::WriteTreeOptions { missing_ok, prefix },
     )?;
+    // git's `write-tree` writes the rebuilt cache-tree back into the index (so a
+    // subsequent `write-tree` is a no-op). A `--prefix` sub-tree write does not
+    // describe the whole index, so it leaves the cache-tree alone.
+    if !prefixed {
+        sley_worktree::establish_index_cache_tree(&git_dir, format, &oid)?;
+    }
     println!("{oid}");
     Ok(())
 }

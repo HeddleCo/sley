@@ -400,6 +400,9 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
                 )?;
             }
             apply_reset_sparse_checkout(&worktree_root, &git_dir, format)?;
+            // git's `--hard` reset rebuilds the index cache-tree (the index now
+            // matches the target tree exactly).
+            let _ = sley_worktree::refresh_index_cache_tree(&git_dir, format);
         }
         update_reset_head_ref(
             &git_dir,
@@ -454,6 +457,12 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         // `--no-refresh` skips it, leaving the entries stat-dirty (t7102 cell 28).
         if refresh {
             refresh_reset_index(&worktree_root, &git_dir, format)?;
+        }
+        if !intent_to_add {
+            // A whole-tree `--mixed` reset makes the index match the target
+            // tree; rebuild the cache-tree (skipped for `-N`, which leaves
+            // intent-to-add placeholders).
+            let _ = sley_worktree::refresh_index_cache_tree(&git_dir, format);
         }
         update_reset_head_ref(
             &git_dir,

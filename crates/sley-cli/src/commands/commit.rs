@@ -1426,6 +1426,11 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         sley_sequencer::commit_index(&git_dir, format, options)
     }?;
     commands::rerere::record_resolved_after_commit(&git_dir, format)?;
+    // git rebuilds the index's cache-tree after a commit so the next
+    // `write-tree`/status is a no-op. Build it from the index's own tree so the
+    // cache-tree never disagrees with the index (a partial commit leaves
+    // still-staged changes in the index).
+    let _ = sley_worktree::refresh_index_cache_tree(&git_dir, format);
     remove_commit_state_files(&git_dir);
     if let Some((summary_author, summary_committer, summary_message)) = summary {
         print_commit_summary(
