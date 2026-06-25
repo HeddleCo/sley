@@ -102,6 +102,10 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 inter_hunk_context = true;
             }
             "--progress" | "--no-progress" => {}
+            // `-l`/`--log` forces a reflog for the newly created branch. sley
+            // always materializes a reflog on the first commit, so this only
+            // needs to be recognized (and not mistaken for a start-point arg).
+            "-l" | "--log" => {}
             "--overlay" => overlay_mode = Some(true),
             "--no-overlay" => overlay_mode = Some(false),
             "--overwrite-ignore" => overwrite_ignore = true,
@@ -197,6 +201,11 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     }
     if inter_hunk_context && !patch {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
+        return Err(GitError::Exit(128));
+    }
+    // `--orphan` cannot set up branch tracking.
+    if matches!(branch_mode, CheckoutBranchMode::Create { orphan: true, .. }) && track.is_some() {
+        eprintln!("fatal: '--orphan' cannot be used with '-t'");
         return Err(GitError::Exit(128));
     }
     // `-p --overlay` is forbidden; only the implicit-overlay default pairs with -p.
@@ -776,6 +785,12 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     );
                     return Err(GitError::Exit(128));
                 }
+                // --orphan cannot reuse an existing branch name (there is no
+                // force variant); reject before touching the index or HEAD.
+                if store.read_ref(&branch_ref_name(&branch)?)?.is_some() {
+                    eprintln!("fatal: a branch named '{branch}' already exists");
+                    return Err(GitError::Exit(128));
+                }
                 if let Some(start) = positional.first().map(String::as_str) {
                     let Some(start_oid) = resolve_checkout_start_oid(&git_dir, format, start)?
                     else {
@@ -784,11 +799,17 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         );
                         return Err(GitError::Exit(128));
                     };
-                    sley_worktree::reset_index_and_worktree_to_commit(
-                        &worktree_root,
+                    // Switch the index + worktree to the start point through the
+                    // shared two-way engine (git's merge_working_tree), so local
+                    // modifications that would be overwritten abort the switch
+                    // and leave HEAD on the current branch.
+                    checkout_twoway_dirty(
                         &git_dir,
+                        &worktree_root,
                         format,
-                        &start_oid,
+                        Some(&start_oid),
+                        recurse_submodules,
+                        force,
                     )?;
                 }
                 checkout_switch_to_unborn_branch(&git_dir, &branch)?;
