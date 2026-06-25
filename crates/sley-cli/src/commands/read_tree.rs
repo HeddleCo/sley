@@ -805,7 +805,7 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
     fn verify_absent_overwrite(
         &self,
         path: &[u8],
-        _merge: &sley_unpack_trees::CacheEntry,
+        merge: &sley_unpack_trees::CacheEntry,
         reset: sley_unpack_trees::ResetType,
     ) -> Result<()> {
         // git's `verify_absent(ERROR_WOULD_LOSE_UNTRACKED_OVERWRITTEN)`: a brand
@@ -841,6 +841,27 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         // every tracked file under it is itself up to date. The writer then
         // removes the subtree.
         if metadata.is_dir() {
+            // git's `verify_clean_subdirectory` S_ISGITLINK arm: when the entry
+            // being extracted is a gitlink, the directory in the way IS the
+            // submodule's working tree — its contents belong to the submodule,
+            // not untracked superproject files to be lost. Resolve the
+            // submodule's checked-out HEAD: if it already equals the target
+            // gitlink oid there is nothing to update (clean); otherwise defer to
+            // `verify_clean_submodule` → `check_submodule_move_head`, which is a
+            // no-op for a path that is not a registered submodule and a
+            // would-lose guard for a populated/dirty one.
+            if sley_index::is_gitlink(merge.mode) {
+                let sub_head = sley_diff_merge::gitlink_head_oid(&file_path, self.format);
+                if sub_head == Some(merge.oid) {
+                    return Ok(());
+                }
+                return self.check_submodule_move_head(
+                    path,
+                    sub_head.as_ref(),
+                    &merge.oid,
+                    reset,
+                );
+            }
             return self.verify_clean_subdirectory(path, &file_path);
         }
         match self.porcelain {
