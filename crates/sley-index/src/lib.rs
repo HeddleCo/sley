@@ -330,7 +330,9 @@ impl<'a> BorrowedIndex<'a> {
         let checksum_offset = bytes.len() - hash_len;
         let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
         let checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
-        if actual_checksum != checksum {
+        // git's verify_hdr accepts a null trailing hash: it marks an index
+        // written with `index.skipHash` (the hash was deliberately not computed).
+        if !checksum.is_null() && actual_checksum != checksum {
             return Err(GitError::InvalidFormat(format!(
                 "index checksum mismatch: expected {checksum}, got {actual_checksum}"
             )));
@@ -481,7 +483,9 @@ impl Index {
         let checksum_offset = bytes.len() - hash_len;
         let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
         let checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
-        if actual_checksum != checksum {
+        // git's verify_hdr accepts a null trailing hash: it marks an index
+        // written with `index.skipHash` (the hash was deliberately not computed).
+        if !checksum.is_null() && actual_checksum != checksum {
             return Err(GitError::InvalidFormat(format!(
                 "index checksum mismatch: expected {checksum}, got {actual_checksum}"
             )));
@@ -565,7 +569,9 @@ impl Index {
         let checksum_offset = bytes.len() - hash_len;
         let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
         let checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
-        if actual_checksum != checksum {
+        // git's verify_hdr accepts a null trailing hash: it marks an index
+        // written with `index.skipHash` (the hash was deliberately not computed).
+        if !checksum.is_null() && actual_checksum != checksum {
             return Err(GitError::InvalidFormat(format!(
                 "index checksum mismatch: expected {checksum}, got {actual_checksum}"
             )));
@@ -649,7 +655,9 @@ impl Index {
         let checksum_offset = bytes.len() - hash_len;
         let actual_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
         let checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
-        if actual_checksum != checksum {
+        // git's verify_hdr accepts a null trailing hash: it marks an index
+        // written with `index.skipHash` (the hash was deliberately not computed).
+        if !checksum.is_null() && actual_checksum != checksum {
             return Err(GitError::InvalidFormat(format!(
                 "index checksum mismatch: expected {checksum}, got {actual_checksum}"
             )));

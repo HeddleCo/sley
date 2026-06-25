@@ -6372,6 +6372,11 @@ fn index_checksum_ok(bytes: &[u8], format: ObjectFormat) -> bool {
         return false;
     }
     let split = bytes.len() - hash_len;
+    // git's verify_hdr accepts a null trailing hash: it marks an `index.skipHash`
+    // index whose checksum was deliberately not computed.
+    if bytes[split..].iter().all(|byte| *byte == 0) {
+        return true;
+    }
     match sley_core::digest_bytes(format, &bytes[..split]) {
         Ok(actual) => actual.as_bytes() == &bytes[split..],
         Err(_) => false,
