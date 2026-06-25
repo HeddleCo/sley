@@ -4027,6 +4027,19 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
                     );
                 }
             }
+            Some(sley_diff_merge::MergeConflictKind::DistinctTypes {
+                original_path,
+                ours_renamed,
+                theirs_renamed,
+            }) => {
+                let renamed_both = ours_renamed.is_some() && theirs_renamed.is_some();
+                let which = if renamed_both { "both" } else { "one" };
+                println!(
+                    "CONFLICT (distinct types): {orig} had different types on each side; renamed {which} of them so each can be recorded somewhere.",
+                    orig = String::from_utf8_lossy(original_path),
+                );
+            }
+            Some(sley_diff_merge::MergeConflictKind::DistinctTypesStage) => {}
             None => {
                 println!("CONFLICT (content): Merge conflict in {path_str}");
             }

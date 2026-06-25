@@ -6824,6 +6824,28 @@ pub enum MergeConflictKind {
         /// The source path(s) the directory rename tried to move onto this path.
         sources: Vec<Vec<u8>>,
     },
+    /// The two sides hold different object types at one path (regular↔symlink,
+    /// regular↔gitlink, symlink↔gitlink). git's `process_entry` (merge-ort.c
+    /// ~4220) renames each *regular-file* side to `path~<branch>` so each type
+    /// can be recorded somewhere, ignoring `-Xours`/`-Xtheirs`, and emits a
+    /// single `CONFLICT (distinct types)` line. (gitlink↔gitlink and
+    /// symlink↔symlink share an `S_IFMT` and never reach this arm.) This kind is
+    /// attached to the leaf that carries the message — the side left at
+    /// `original_path` when only one side moved, else ours; the other renamed
+    /// leaf carries [`DistinctTypesStage`].
+    DistinctTypes {
+        /// The original colliding path (git's message subject and sort key).
+        original_path: Vec<u8>,
+        /// `Some(p)` when ours was renamed aside to `p`; `None` when ours stayed
+        /// at `original_path`.
+        ours_renamed: Option<Vec<u8>>,
+        /// `Some(p)` when theirs was renamed aside to `p`; `None` when theirs
+        /// stayed at `original_path`.
+        theirs_renamed: Option<Vec<u8>>,
+    },
+    /// The non-message-carrying leaf of a [`DistinctTypes`] conflict. The
+    /// user-facing line is emitted once by the [`DistinctTypes`] leaf.
+    DistinctTypesStage,
 }
 
 /// One resolved/conflicted path in the merged tree.
@@ -7363,9 +7385,92 @@ pub fn merge_entry_maps(
                     });
                 }
             }
+        } else if let (Some((ours_mode, ours_oid)), Some((theirs_mode, theirs_oid))) =
+            (ours, theirs)
+            && is_type_change(ours_mode, theirs_mode)
+        {
+            // Distinct types at one path: both sides present with different
+            // `S_IFMT` (regular↔symlink, regular↔gitlink, symlink↔gitlink).
+            // Mirror merge-ort's `process_entry`: rename each regular-file side
+            // to `path~<branch>` so each type is recorded somewhere; ignore
+            // `-Xours`/`-Xtheirs`. gitlink↔gitlink and symlink↔symlink share an
+            // `S_IFMT` and are handled by the arms above.
+            clean = false;
+            // git renames the regular-file side(s): only the regular side when
+            // exactly one is regular, both when neither is (symlink↔gitlink).
+            let (rename_ours, rename_theirs) = if is_mergeable_file_mode(ours_mode) {
+                (true, false)
+            } else if is_mergeable_file_mode(theirs_mode) {
+                (false, true)
+            } else {
+                (true, true)
+            };
+            // git keeps the base stage (index stage 1) for a side only when that
+            // side shares the base's file type.
+            let ours_base = base.filter(|(mode, _)| !is_type_change(*mode, ours_mode));
+            let theirs_base = base.filter(|(mode, _)| !is_type_change(*mode, theirs_mode));
+            // Name and reserve ours' aside-path first so the two renamed paths
+            // can never collide (`unique_df_path` consults `leaves`/`paths`).
+            let ours_path = if rename_ours {
+                unique_df_path(&path, options.ours_label, &leaves, &paths)
+            } else {
+                path.clone()
+            };
+            leaves.insert(ours_path.clone(), (ours_mode, ours_oid));
+            let theirs_path = if rename_theirs {
+                unique_df_path(&path, options.theirs_label, &leaves, &paths)
+            } else {
+                path.clone()
+            };
+            leaves.insert(theirs_path.clone(), (theirs_mode, theirs_oid));
+
+            // The message is emitted once, by the leaf left at `original_path`
+            // when only one side moved (matching git's keying), else by ours.
+            let ours_carries_message = !rename_ours || rename_theirs;
+            let distinct = MergeConflictKind::DistinctTypes {
+                original_path: path.clone(),
+                ours_renamed: rename_ours.then(|| ours_path.clone()),
+                theirs_renamed: rename_theirs.then(|| theirs_path.clone()),
+            };
+            let ours_worktree =
+                Some((ours_mode, merge_worktree_bytes(db, ours_mode, &ours_oid)?));
+            paths.push(MergedPath {
+                path: ours_path,
+                stages: MergeStages {
+                    base: ours_base,
+                    ours: Some((ours_mode, ours_oid)),
+                    theirs: None,
+                },
+                result: Some((ours_mode, ours_oid)),
+                worktree: ours_worktree,
+                conflict: Some(if ours_carries_message {
+                    distinct.clone()
+                } else {
+                    MergeConflictKind::DistinctTypesStage
+                }),
+                auto_merged: false,
+            });
+            let theirs_worktree =
+                Some((theirs_mode, merge_worktree_bytes(db, theirs_mode, &theirs_oid)?));
+            paths.push(MergedPath {
+                path: theirs_path,
+                stages: MergeStages {
+                    base: theirs_base,
+                    ours: None,
+                    theirs: Some((theirs_mode, theirs_oid)),
+                },
+                result: Some((theirs_mode, theirs_oid)),
+                worktree: theirs_worktree,
+                conflict: Some(if ours_carries_message {
+                    MergeConflictKind::DistinctTypesStage
+                } else {
+                    distinct
+                }),
+                auto_merged: false,
+            });
         } else {
-            // add/add of non-files, type changes, mode changes, etc. Keep the
-            // surviving side's content and record a generic content conflict.
+            // add/add of non-files, mode changes on same-type entries, etc. Keep
+            // the surviving side's content and record a generic content conflict.
             clean = false;
             let add_add = base.is_none();
             let surviving = ours.or(theirs);

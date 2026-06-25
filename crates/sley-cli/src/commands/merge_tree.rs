@@ -673,15 +673,21 @@ fn render_merge_outcome(
     theirs_label: &str,
 ) -> MergeOutcome {
     let mut conflicted: Vec<ConflictedStage> = Vec::new();
-    // Upstream emits all "Auto-merging" lines before all "CONFLICT" lines, so
-    // accumulate the two groups separately and concatenate.
-    let mut auto_messages: Vec<InfoMessage> = Vec::new();
-    let mut conflict_messages: Vec<InfoMessage> = Vec::new();
+    // Upstream's `display_messages` sorts the per-path message lists by path and
+    // prints each path's messages in insertion order ("Auto-merging" before any
+    // "CONFLICT" for the same path) — NOT all auto lines then all conflict lines.
+    // We replicate that by emitting into one list in path order, auto-then-
+    // conflict per path. `merge.paths` is path-sorted except for the `path~side`
+    // leaves a distinct-types/dir-file rename inserts mid-iteration, so sort a
+    // view of it first.
+    let mut messages: Vec<InfoMessage> = Vec::new();
+    let mut ordered: Vec<&sley_diff_merge::MergedPath> = merge.paths.iter().collect();
+    ordered.sort_by(|left, right| left.path.cmp(&right.path));
 
-    for entry in &merge.paths {
+    for entry in ordered {
         let path = &entry.path;
         if entry.auto_merged {
-            auto_messages.push(InfoMessage {
+            messages.push(InfoMessage {
                 paths: vec![path.clone()],
                 stable_type: "Auto-merging".to_string(),
                 message: format!("Auto-merging {}", String::from_utf8_lossy(path)),
@@ -693,7 +699,7 @@ fn render_merge_outcome(
         match kind {
             sley_diff_merge::MergeConflictKind::Content { add_add } => {
                 let conflict_kind = if *add_add { "add/add" } else { "content" };
-                conflict_messages.push(InfoMessage {
+                messages.push(InfoMessage {
                     paths: vec![path.clone()],
                     stable_type: "CONFLICT (contents)".to_string(),
                     message: format!(
@@ -703,7 +709,7 @@ fn render_merge_outcome(
                 });
             }
             sley_diff_merge::MergeConflictKind::RenameContent { .. } => {
-                conflict_messages.push(InfoMessage {
+                messages.push(InfoMessage {
                     paths: vec![path.clone()],
                     stable_type: "CONFLICT (contents)".to_string(),
                     message: format!(
@@ -716,7 +722,7 @@ fn render_merge_outcome(
                 ours_path,
                 theirs_path,
             } => {
-                conflict_messages.push(InfoMessage {
+                messages.push(InfoMessage {
                     paths: vec![ours_path.clone(), theirs_path.clone(), path.clone()],
                     stable_type: "CONFLICT (rename/rename)".to_string(),
                     message: format!(
@@ -734,7 +740,7 @@ fn render_merge_outcome(
                 ours_label,
                 theirs_label,
             } => {
-                conflict_messages.push(InfoMessage {
+                messages.push(InfoMessage {
                     paths: vec![old_path.clone(), ours_path.clone(), theirs_path.clone()],
                     stable_type: "CONFLICT (rename/rename)".to_string(),
                     message: format!(
@@ -747,7 +753,7 @@ fn render_merge_outcome(
             }
             sley_diff_merge::MergeConflictKind::RenameRenameOneToTwoStage => {}
             sley_diff_merge::MergeConflictKind::DirRenameSplit { source_dir } => {
-                conflict_messages.push(InfoMessage {
+                messages.push(InfoMessage {
                     paths: vec![source_dir.clone()],
                     stable_type: "CONFLICT (directory rename split)".to_string(),
                     message: format!(
@@ -760,7 +766,7 @@ fn render_merge_outcome(
                 deleted_in,
                 modified_in,
             } => {
-                conflict_messages.push(InfoMessage {
+                messages.push(InfoMessage {
                     paths: vec![path.clone()],
                     stable_type: "CONFLICT (modify/delete)".to_string(),
                     message: format!(
@@ -774,7 +780,7 @@ fn render_merge_outcome(
                 renamed_in,
                 deleted_in,
             } => {
-                conflict_messages.push(InfoMessage {
+                messages.push(InfoMessage {
                     paths: vec![old_path.clone(), path.clone()],
                     stable_type: "CONFLICT (rename/delete)".to_string(),
                     message: format!(
@@ -788,7 +794,7 @@ fn render_merge_outcome(
                 original_path,
                 moved_from,
             } => {
-                conflict_messages.push(InfoMessage {
+                messages.push(InfoMessage {
                     paths: vec![original_path.clone(), path.clone()],
                     stable_type: "CONFLICT (file/directory)".to_string(),
                     message: format!(
@@ -817,7 +823,7 @@ fn render_merge_outcome(
                         old = String::from_utf8_lossy(old_path),
                     ),
                 };
-                conflict_messages.push(InfoMessage {
+                messages.push(InfoMessage {
                     paths: vec![old_path.clone(), path.clone()],
                     stable_type: "CONFLICT (file location)".to_string(),
                     message,
@@ -829,7 +835,7 @@ fn render_merge_outcome(
                     .map(|s| String::from_utf8_lossy(s).into_owned())
                     .collect::<Vec<_>>()
                     .join(", ");
-                conflict_messages.push(InfoMessage {
+                messages.push(InfoMessage {
                     paths: vec![path.clone()],
                     stable_type: "CONFLICT (implicit dir rename)".to_string(),
                     message: format!(
@@ -838,6 +844,29 @@ fn render_merge_outcome(
                     ),
                 });
             }
+            sley_diff_merge::MergeConflictKind::DistinctTypes {
+                original_path,
+                ours_renamed,
+                theirs_renamed,
+            } => {
+                let mut msg_paths = vec![original_path.clone()];
+                msg_paths.extend(ours_renamed.clone());
+                msg_paths.extend(theirs_renamed.clone());
+                let renamed_both = ours_renamed.is_some() && theirs_renamed.is_some();
+                let which = if renamed_both { "both" } else { "one" };
+                messages.push(InfoMessage {
+                    paths: msg_paths,
+                    // Upstream's `type_short_descriptions[CONFLICT_DISTINCT_MODES]`
+                    // is "CONFLICT (distinct modes)" even though the human line
+                    // reads "distinct types".
+                    stable_type: "CONFLICT (distinct modes)".to_string(),
+                    message: format!(
+                        "CONFLICT (distinct types): {orig} had different types on each side; renamed {which} of them so each can be recorded somewhere.",
+                        orig = String::from_utf8_lossy(original_path),
+                    ),
+                });
+            }
+            sley_diff_merge::MergeConflictKind::DistinctTypesStage => {}
         }
         push_conflicted_stages(&mut conflicted, path, &entry.stages);
     }
@@ -848,9 +877,6 @@ fn render_merge_outcome(
             .cmp(&right.path)
             .then_with(|| left.stage.cmp(&right.stage))
     });
-
-    let mut messages = auto_messages;
-    messages.extend(conflict_messages);
 
     MergeOutcome {
         tree: merge.tree,
