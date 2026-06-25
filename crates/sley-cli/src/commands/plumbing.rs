@@ -3328,6 +3328,18 @@ enum ApplyAction {
     Remove {
         path: Vec<u8>,
     },
+    /// Add or update a gitlink (submodule) entry: the index records mode 160000
+    /// and the commit oid, and the working tree gets an (empty) directory. No
+    /// blob is written (git's `add_index_file` / `try_create_file` gitlink arms).
+    Gitlink {
+        path: Vec<u8>,
+        oid: ObjectId,
+    },
+    /// Remove a gitlink entry from the index, leaving its working-tree directory
+    /// in place (git's `remove_or_warn` rmdir's a submodule only when empty).
+    GitlinkRemove {
+        path: Vec<u8>,
+    },
 }
 
 /// git's `canon_mode`: the index never stores arbitrary permission bits — a
@@ -3658,7 +3670,12 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     // not the worktree, under `--cached`/`--index`), the entry modes that feed
     // the canonical index-mode decision, and the type-mismatch warnings. `--index`
     // (but not `--cached`) also requires the worktree to match the index.
-    let touch_index = update_index || cached;
+    // `--3way` is git's `check_index` (it reads and writes the index too), but
+    // sley's three-way path manages its own index writes; the direct fall-through
+    // only needs the index when a gitlink patch is present (the 3-way merge engine
+    // defers gitlinks to the direct apply, mirroring git's `try_threeway` early-out).
+    let has_gitlink_patch = patches.iter().any(apply_patch_is_gitlink);
+    let touch_index = update_index || cached || (three_way && has_gitlink_patch);
     let verify_worktree_match = update_index && !cached;
     let mut index = if touch_index {
         Some(read_apply_index(&git_dir, format)?)
@@ -3757,6 +3774,17 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let unsafe_paths = unsafe_paths && !touch_index;
     check_apply_path_safety(&worktree_base, &patches, unsafe_paths)?;
 
+    // git's `check_to_create`: a newly created path (or rename/copy target) must
+    // not already exist in the index or working tree, unless another patch in the
+    // batch removes it first (the type-change split: delete old, then create new
+    // at the same path — git's `ok_if_exists` via `was_deleted`/`to_be_deleted`).
+    // Scoped to submodule diffs so the long-standing lenient behaviour of plain
+    // applies is unchanged; this is what makes the "replace submodule with a
+    // directory must fail" / untracked-file-in-the-way cases abort like git.
+    if has_gitlink_patch && !check {
+        apply_check_to_create(&worktree_base, &patches, index.as_ref(), touch_index, cached)?;
+    }
+
     // `--3way`: reconstruct the recorded pre-image, apply the patch to it to form
     // "theirs", and 3-way merge against the current state. Falls through to the
     // direct apply below when the pre-image blobs are not available.
@@ -3784,6 +3812,55 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let mut had_reject = false;
     let apply_file_options = sley_diff_merge::ApplyFileOptions { unidiff_zero };
     for patch in &patches {
+        // Gitlink (submodule) patch: mode 160000 + `Subproject commit <sha>` body.
+        // git updates the index gitlink entry from the recorded commit oid (no
+        // blob is written) and, in the working tree, just ensures an (empty)
+        // directory exists; a removal drops the index entry but leaves the
+        // submodule directory in place.
+        if apply_patch_is_gitlink(patch) {
+            if patch.is_delete {
+                if let Some(old) = &patch.old_path {
+                    actions.push(ApplyAction::GitlinkRemove { path: old.clone() });
+                }
+                continue;
+            }
+            let base =
+                read_patch_base(&worktree_base, patch, index.as_ref(), &db, verify_worktree_match)?;
+            let content = match sley_diff_merge::apply_file_patch_with_options(
+                &base,
+                patch,
+                &apply_file_options,
+            ) {
+                sley_diff_merge::ApplyOutcome::Applied(content) => content,
+                sley_diff_merge::ApplyOutcome::Rejected => {
+                    let name = patch
+                        .new_path
+                        .as_deref()
+                        .or(patch.old_path.as_deref())
+                        .unwrap_or(b"");
+                    eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
+                    return Err(GitError::Exit(1));
+                }
+            };
+            let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone()) else {
+                return Err(GitError::InvalidFormat("patch missing target path".into()));
+            };
+            let oid = apply_gitlink_oid_from_content(&content, format, &target)?;
+            // file→gitlink type-change: git splits this into a delete (of the
+            // regular file) followed by a gitlink create; sley's own diff may
+            // instead emit one mode-change patch. Remove the old working-tree
+            // file first so the gitlink directory can be created in its place.
+            // Skipped when the old side is itself a gitlink (a normal modify) or
+            // when the path is newly added.
+            if !patch.is_new
+                && patch.old_mode.is_some_and(|mode| mode != 0o160000)
+                && let Some(old) = &patch.old_path
+            {
+                actions.push(ApplyAction::Remove { path: old.clone() });
+            }
+            actions.push(ApplyAction::Gitlink { path: target, oid });
+            continue;
+        }
         let base =
             read_patch_base(&worktree_base, patch, index.as_ref(), &db, verify_worktree_match)?;
         // Binary patches reconstruct the postimage from the recorded blob OIDs
@@ -3931,7 +4008,19 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         worktree_umask_complement(&worktree_base)
     };
     let mut index_paths = Vec::new();
-    for action in &actions {
+    // git's `write_out_results` runs in two phases: every removal happens before
+    // any creation. This matters when a directory's tracked children are removed
+    // and the directory is then (re)created as a gitlink — single-phase ordering
+    // would prune the just-emptied directory after the create and lose it.
+    let is_remove = |action: &&ApplyAction| {
+        matches!(
+            action,
+            ApplyAction::Remove { .. } | ApplyAction::GitlinkRemove { .. }
+        )
+    };
+    let mut ordered: Vec<&ApplyAction> = actions.iter().filter(is_remove).collect();
+    ordered.extend(actions.iter().filter(|action| !is_remove(action)));
+    for action in ordered {
         match action {
             ApplyAction::Write {
                 path,
@@ -3950,6 +4039,27 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             ApplyAction::Remove { path } => {
                 if !cached {
                     merge_remove_worktree_file(&worktree_base, path)?;
+                }
+                if let Some(index) = index.as_mut() {
+                    index.entries.retain(|entry| entry.path.as_bytes() != path.as_slice());
+                }
+            }
+            ApplyAction::Gitlink { path, oid } => {
+                if !cached {
+                    apply_gitlink_worktree_dir(&worktree_base, path)?;
+                }
+                if let Some(index) = index.as_mut() {
+                    apply_index_upsert(index, path, 0o160000, *oid);
+                }
+            }
+            ApplyAction::GitlinkRemove { path } => {
+                if !cached
+                    && let Ok(rel) = std::str::from_utf8(path)
+                {
+                    // git's `remove_or_warn` rmdir's a gitlink only when empty; a
+                    // populated submodule directory is left untouched (ENOTEMPTY
+                    // is silent).
+                    let _ = fs::remove_dir(worktree_base.join(rel));
                 }
                 if let Some(index) = index.as_mut() {
                     index.entries.retain(|entry| entry.path.as_bytes() != path.as_slice());
@@ -4754,6 +4864,142 @@ fn read_apply_index(git_dir: &Path, format: ObjectFormat) -> Result<Index> {
 }
 
 /// Upsert a stage-0 index entry (replacing any existing entries for the path).
+/// git's `check_to_create`: every newly created path (and rename/copy target)
+/// must not already exist in the index or working tree, unless another patch in
+/// the same batch removes it first. A working-tree *directory* at the target is
+/// fine (a submodule directory, or a directory git will populate). Mirrors the
+/// `EXISTS_IN_INDEX` / `EXISTS_IN_WORKTREE` errors that make a submodule diff
+/// abort atomically when its destination is occupied.
+fn apply_check_to_create(
+    worktree_base: &Path,
+    patches: &[sley_diff_merge::FilePatch],
+    index: Option<&Index>,
+    touch_index: bool,
+    cached: bool,
+) -> Result<()> {
+    // Paths some patch deletes (or renames away from): a create at such a path is
+    // permitted (git's `ok_if_exists`).
+    let mut deleted_paths: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    for patch in patches {
+        if (patch.is_delete || patch.is_rename)
+            && let Some(old) = patch.old_path.as_deref()
+        {
+            deleted_paths.insert(old);
+        }
+    }
+    for patch in patches {
+        if !(patch.is_new || patch.is_rename || patch.is_copy) {
+            continue;
+        }
+        let Some(new_name) = patch.new_path.as_deref() else {
+            continue;
+        };
+        if deleted_paths.contains(new_name) {
+            continue;
+        }
+        if touch_index
+            && let Some(index) = index
+            && index
+                .entries
+                .iter()
+                .any(|entry| entry.path.as_bytes() == new_name && (entry.flags >> 12) & 0x3 == 0)
+        {
+            eprintln!(
+                "error: {}: already exists in index",
+                String::from_utf8_lossy(new_name)
+            );
+            return Err(GitError::Exit(1));
+        }
+        if !cached
+            && let Ok(rel) = std::str::from_utf8(new_name)
+            && let Ok(meta) = fs::symlink_metadata(worktree_base.join(rel))
+            && !meta.is_dir()
+        {
+            eprintln!(
+                "error: {}: already exists in working directory",
+                String::from_utf8_lossy(new_name)
+            );
+            return Err(GitError::Exit(1));
+        }
+    }
+    Ok(())
+}
+
+/// A gitlink (submodule) patch carries mode 160000 on either side and a
+/// `Subproject commit <sha>` body. git's apply handles these specially: the
+/// index entry is set from the recorded commit oid without writing a blob, and
+/// the working tree gains only an (empty) directory.
+fn apply_patch_is_gitlink(patch: &sley_diff_merge::FilePatch) -> bool {
+    patch.old_mode == Some(0o160000) || patch.new_mode == Some(0o160000)
+}
+
+/// Reconstruct a gitlink patch's preimage (`Subproject commit <old>\n`) from its
+/// first hunk's old-side lines — git's `SUBMODULE_PATCH_WITHOUT_INDEX` path, used
+/// when the submodule has no index entry to read the recorded commit from.
+fn apply_gitlink_preimage_from_patch(patch: &sley_diff_merge::FilePatch) -> Vec<u8> {
+    let mut base = Vec::new();
+    if let Some(hunk) = patch.hunks.first() {
+        for line in &hunk.lines {
+            match line {
+                sley_diff_merge::HunkLine::Context(bytes)
+                | sley_diff_merge::HunkLine::Delete(bytes) => {
+                    base.extend_from_slice(bytes);
+                    base.push(b'\n');
+                }
+                sley_diff_merge::HunkLine::Insert(_) => {}
+            }
+        }
+    }
+    base
+}
+
+/// Parse the commit oid from a gitlink patch's post-image (`Subproject commit
+/// <hex>\n`), mirroring git's `add_index_file` gitlink arm.
+fn apply_gitlink_oid_from_content(
+    content: &[u8],
+    format: ObjectFormat,
+    path: &[u8],
+) -> Result<ObjectId> {
+    fn corrupt(path: &[u8]) -> GitError {
+        eprintln!(
+            "error: corrupt patch for submodule {}",
+            String::from_utf8_lossy(path)
+        );
+        GitError::Exit(1)
+    }
+    let rest = content
+        .strip_prefix(b"Subproject commit ")
+        .ok_or_else(|| corrupt(path))?;
+    let hex_len = format.hex_len();
+    if rest.len() < hex_len {
+        return Err(corrupt(path));
+    }
+    let hex = std::str::from_utf8(&rest[..hex_len]).map_err(|_| corrupt(path))?;
+    ObjectId::from_hex(format, hex).map_err(|_| corrupt(path))
+}
+
+/// Ensure a gitlink path exists as a directory in the working tree, mirroring
+/// git's `try_create_file`: an existing directory is left alone, otherwise the
+/// (empty) directory and any missing leading directories are created.
+fn apply_gitlink_worktree_dir(worktree_base: &Path, path: &[u8]) -> Result<()> {
+    let rel = std::str::from_utf8(path)
+        .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
+    let full = worktree_base.join(rel);
+    if let Ok(meta) = fs::symlink_metadata(&full)
+        && meta.is_dir()
+    {
+        return Ok(());
+    }
+    if let Some(parent) = full.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::create_dir(&full) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn apply_index_upsert(index: &mut Index, path: &[u8], mode: u32, oid: ObjectId) {
     index.entries.retain(|entry| entry.path.as_bytes() != path);
     let flags = (path.len().min(0x0fff)) as u16;
@@ -4792,7 +5038,10 @@ fn metadata_to_git_mode(metadata: &fs::Metadata) -> u32 {
 impl ApplyAction {
     fn path(&self) -> &[u8] {
         match self {
-            ApplyAction::Write { path, .. } | ApplyAction::Remove { path } => path,
+            ApplyAction::Write { path, .. }
+            | ApplyAction::Remove { path }
+            | ApplyAction::Gitlink { path, .. }
+            | ApplyAction::GitlinkRemove { path } => path,
         }
     }
 }
@@ -4812,6 +5061,24 @@ fn read_patch_base(
     let Some(old) = patch.old_path.as_deref().or(patch.new_path.as_deref()) else {
         return Ok(Vec::new());
     };
+    // Gitlink (submodule) preimage: synthesize `Subproject commit <sha>\n` from
+    // the index entry's recorded commit (git's `read_file_or_gitlink`), or, when
+    // no index entry exists, from the patch's own `-Subproject commit` line
+    // (git's `SUBMODULE_PATCH_WITHOUT_INDEX` / `preimage_oid_in_gitlink_patch`).
+    // The submodule's working-tree directory is never read as a blob. Keyed on
+    // the OLD-side mode only: a file→gitlink type-change has a regular-file
+    // preimage that must be read as a blob, not synthesized.
+    if patch.old_mode == Some(0o160000) {
+        if let Some(index) = index
+            && let Some(entry) = index
+                .entries
+                .iter()
+                .find(|entry| entry.path.as_bytes() == old && (entry.flags >> 12) & 0x3 == 0)
+        {
+            return Ok(format!("Subproject commit {}\n", entry.oid.to_hex()).into_bytes());
+        }
+        return Ok(apply_gitlink_preimage_from_patch(patch));
+    }
     // `--cached`/`--index`: git's `load_patch_target` reads the preimage from the
     // index blob (`read_file_or_gitlink(ce)`), not the working tree — so a
     // `--cached` apply against an index that differs from the worktree uses the
@@ -5051,6 +5318,13 @@ fn apply_three_way_path(
         Some("diff3") | Some("zdiff3") => sley_diff_merge::ConflictStyle::Diff3,
         _ => sley_diff_merge::ConflictStyle::Merge,
     };
+
+    // git's `try_threeway` refuses gitlink (submodule) patches outright, falling
+    // back to the direct apply. The 3-way merge engine here has no gitlink mode,
+    // so defer the whole patch set to the direct apply (which has a gitlink arm).
+    if patches.iter().any(apply_patch_is_gitlink) {
+        return Ok(false);
+    }
 
     // A path touched by more than one patch (e.g. a delete followed by a re-add)
     // needs git's sequential per-patch semantics, not a single batched 3-way
