@@ -448,6 +448,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     let mut debug = false;
     let mut sparse = false;
     let mut tag = false;
+    let mut killed = false;
     let mut format_spec: Option<String> = None;
     let mut oid_abbrev = None;
     let mut path_args = Vec::new();
@@ -526,9 +527,10 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             }
             "-t" => tag = true,
             "--no-t" => tag = false,
+            "-k" | "--killed" => killed = true,
+            "--no-killed" => killed = false,
             "--recurse-submodules"
-            | "--no-recurse-submodules"
-            | "--no-killed" => {}
+            | "--no-recurse-submodules" => {}
             "--no-resolve-undo" => resolve_undo = false,
             "--abbrev" => oid_abbrev = Some(7),
             "--no-abbrev" => oid_abbrev = None,
@@ -617,6 +619,15 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         exclude_patterns.extend(contents.split(|byte| *byte == b'\n').map(Vec::from));
     }
     let terminator = if nul { 0 } else { b'\n' };
+    // git: `--format` cannot be combined with the format-altering selectors.
+    // Mirrors builtin/ls-files.c's usage_msg_opt() check (exit 129).
+    if format_spec.is_some()
+        && (stage || others || killed || resolve_undo || deduplicate || show_eol || tag)
+    {
+        return Err(GitError::usage(
+            "--format cannot be used with -s, -o, -k, -t, --resolve-undo, --deduplicate, --eol",
+        ));
+    }
     let selected = cached || others || deleted || modified || unmerged || resolve_undo;
     let output_stage = stage || unmerged;
     if ignored && !others && !cached {
@@ -687,24 +698,6 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         None
     };
     let eol = eol_context.as_ref();
-    if let Some(format_spec) = format_spec.as_deref() {
-        if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
-            let index =
-                ls_files_display_index(&git_dir, format, index, sparse && !(deleted || modified))?;
-            write_ls_files_formatted(
-                &mut stdout,
-                index.entries.iter(),
-                format_spec,
-                terminator,
-                &pathspec,
-            )?;
-        }
-        stdout.flush()?;
-        if error_unmatch {
-            pathspec.exit_if_unmatched()?;
-        }
-        return Ok(());
-    }
     if resolve_undo {
         if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
             write_ls_files_resolve_undo(&mut stdout, &index, format, terminator, &pathspec)?;
@@ -752,6 +745,53 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     } else {
         Vec::new()
     };
+    if let Some(format_spec) = format_spec.as_deref() {
+        if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
+            let index =
+                ls_files_display_index(&git_dir, format, index, sparse && !(deleted || modified))?;
+            let oid_candidates = ls_files_oid_candidates(&index);
+            let ctx = LsFilesFormatContext {
+                spec: format_spec,
+                needs_eol: format_spec.contains("(eol"),
+                eol: EolContext {
+                    worktree_root: worktree_root.clone(),
+                    db: FileObjectDatabase::from_git_dir(&git_dir, format),
+                },
+                abbrev: oid_abbrev,
+                candidates: &oid_candidates,
+            };
+            // git: with no selector `show_cached` defaults on; `-m`/`-d` turn it
+            // off unless `-c` is also given. Each entry is emitted once per
+            // matching condition, in cache order (cached, deleted, modified).
+            let want_cached = cached || !(modified || deleted);
+            for entry in &index.entries {
+                let Some(path) = pathspec.display(&entry.path) else {
+                    continue;
+                };
+                let is_deleted =
+                    deleted && deleted_entries.iter().any(|e| e.path == entry.path);
+                let is_modified =
+                    modified && modified_entries.iter().any(|e| e.path == entry.path);
+                // git emits the line once per matching condition, in cache order
+                // (cached, then deleted, then modified).
+                for emit in [want_cached, is_deleted, is_modified] {
+                    if !emit {
+                        continue;
+                    }
+                    write_ls_files_format(&mut stdout, entry, &path, &ctx)?;
+                    stdout.write_all(&[terminator])?;
+                    if debug {
+                        write_ls_files_debug(&mut stdout, entry)?;
+                    }
+                }
+            }
+        }
+        stdout.flush()?;
+        if error_unmatch {
+            pathspec.exit_if_unmatched()?;
+        }
+        return Ok(());
+    }
     if selected && !output_stage {
         if (cached || deleted || modified)
             && let Some(index) = sley_worktree::read_repository_index(&git_dir, format)?
@@ -882,19 +922,57 @@ fn write_ls_files_index_root_fast(
     })
 }
 
-fn write_ls_files_formatted<'a>(
+/// Per-invocation state for `ls-files --format`. Holds everything an atom may
+/// need: the format string, an `EolContext` (worktree + odb) for the
+/// `objectsize`/`eolinfo`/`eolattr` atoms, and the abbreviation parameters for
+/// `objectname`.
+struct LsFilesFormatContext<'a> {
+    spec: &'a str,
+    /// Whether the spec references any `eol*` atom; gates the per-entry eol
+    /// computation so non-eol formats pay nothing.
+    needs_eol: bool,
+    eol: EolContext,
+    abbrev: Option<usize>,
+    candidates: &'a [ObjectId],
+}
+
+/// git's `object_type(ce_mode)`: gitlinks are commits, directories are trees,
+/// everything else (regular files, symlinks) is a blob.
+fn ls_files_object_type(mode: u32) -> ObjectType {
+    match mode & 0o170000 {
+        0o160000 => ObjectType::Commit,
+        0o040000 => ObjectType::Tree,
+        _ => ObjectType::Blob,
+    }
+}
+
+/// git's `expand_objectsize`: the blob size for blob-typed entries, a literal
+/// `-` otherwise. `padded` right-justifies the field in 7 columns.
+fn write_ls_files_objectsize(
     stdout: &mut io::Stdout,
-    entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
-    format_spec: &str,
-    terminator: u8,
-    pathspec: &LsFilesPathspec,
+    entry: &sley_index::IndexEntry,
+    eol: &EolContext,
+    padded: bool,
 ) -> Result<()> {
-    for entry in entries {
-        let Some(path) = pathspec.display(&entry.path) else {
-            continue;
+    if ls_files_object_type(entry.mode) == ObjectType::Blob {
+        let size = match eol.db.read_object_header(&entry.oid)? {
+            Some((_, size)) => size,
+            None => {
+                return Err(GitError::Command(format!(
+                    "could not get object info about '{}'",
+                    entry.oid
+                )));
+            }
         };
-        write_ls_files_format(stdout, entry, &path, format_spec)?;
-        stdout.write_all(&[terminator])?;
+        if padded {
+            write!(stdout, "{size:>7}")?;
+        } else {
+            write!(stdout, "{size}")?;
+        }
+    } else if padded {
+        write!(stdout, "{:>7}", "-")?;
+    } else {
+        stdout.write_all(b"-")?;
     }
     Ok(())
 }
@@ -903,9 +981,16 @@ fn write_ls_files_format(
     stdout: &mut io::Stdout,
     entry: &sley_index::IndexEntry,
     display_path: &[u8],
-    format_spec: &str,
+    ctx: &LsFilesFormatContext<'_>,
 ) -> Result<()> {
-    let mut rest = format_spec;
+    // git's write_eolinfo machinery resolves these fields once per entry.
+    let eol_info = if ctx.needs_eol {
+        let index_oid = is_regular_file_mode(entry.mode).then_some(&entry.oid);
+        Some(ctx.eol.info(&entry.path, index_oid)?)
+    } else {
+        None
+    };
+    let mut rest = ctx.spec;
     while let Some(start) = rest.find('%') {
         stdout.write_all(rest[..start].as_bytes())?;
         rest = &rest[start + 1..];
@@ -914,8 +999,24 @@ fn write_ls_files_format(
                 let atom = &after_open[..end];
                 match atom {
                     "objectmode" => write!(stdout, "{:06o}", entry.mode)?,
-                    "objectname" => write!(stdout, "{}", entry.oid)?,
+                    "objectname" => stdout
+                        .write_all(ls_files_oid(&entry.oid, ctx.abbrev, ctx.candidates).as_bytes())?,
+                    "objecttype" => {
+                        stdout.write_all(ls_files_object_type(entry.mode).as_str().as_bytes())?
+                    }
+                    "objectsize" => write_ls_files_objectsize(stdout, entry, &ctx.eol, false)?,
+                    "objectsize:padded" => {
+                        write_ls_files_objectsize(stdout, entry, &ctx.eol, true)?
+                    }
                     "stage" => write!(stdout, "{}", index_entry_stage(entry))?,
+                    "eolinfo:index" => stdout.write_all(
+                        eol_info.as_ref().map(|i| i.index).unwrap_or("").as_bytes(),
+                    )?,
+                    "eolinfo:worktree" => stdout.write_all(
+                        eol_info.as_ref().map(|i| i.worktree).unwrap_or("").as_bytes(),
+                    )?,
+                    "eolattr" => stdout
+                        .write_all(eol_info.as_ref().map(|i| i.attr).unwrap_or("").as_bytes())?,
                     "path" => stdout.write_all(display_path)?,
                     _ => {
                         return Err(GitError::Command(format!(
@@ -1278,6 +1379,24 @@ impl EolContext {
         }
     }
 
+    /// Resolve the three `i/ w/ attr/` eol fields for `repo_path` (git's
+    /// `write_eolinfo` inputs). `index_oid` is the entry's blob oid for the
+    /// `i/` field (None for untracked files / non-regular entries).
+    fn info(
+        &self,
+        repo_path: &[u8],
+        index_oid: Option<&ObjectId>,
+    ) -> Result<sley_worktree::EolInfo> {
+        let index_content = index_oid.and_then(|oid| self.index_blob(oid));
+        let attr_checks = sley_worktree::eol_attribute_checks(&self.worktree_root, repo_path)?;
+        Ok(sley_worktree::eol_info_for_path(
+            &self.worktree_root,
+            repo_path,
+            index_content.as_deref(),
+            &attr_checks,
+        ))
+    }
+
     /// Write the `i/%-5s w/%-5s attr/%-17s\t` prefix for `path`.
     ///
     /// `index_oid` is the entry's blob oid for the `i/` field (None for
@@ -1289,14 +1408,7 @@ impl EolContext {
         repo_path: &[u8],
         index_oid: Option<&ObjectId>,
     ) -> Result<()> {
-        let index_content = index_oid.and_then(|oid| self.index_blob(oid));
-        let attr_checks = sley_worktree::eol_attribute_checks(&self.worktree_root, repo_path)?;
-        let info = sley_worktree::eol_info_for_path(
-            &self.worktree_root,
-            repo_path,
-            index_content.as_deref(),
-            &attr_checks,
-        );
+        let info = self.info(repo_path, index_oid)?;
         stdout.write_all(info.format_prefix().as_bytes())?;
         Ok(())
     }
