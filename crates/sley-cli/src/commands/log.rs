@@ -546,7 +546,10 @@ fn log_output_needs_mailmap(output: &LogOutput, use_mailmap: bool) -> bool {
             use_mailmap
                 && matches!(
                     kind,
-                    LogDefaultKind::Medium | LogDefaultKind::Short | LogDefaultKind::Fuller
+                    LogDefaultKind::Medium
+                        | LogDefaultKind::Short
+                        | LogDefaultKind::Full
+                        | LogDefaultKind::Fuller
                 )
         }
         LogOutput::Compiled { compiled, .. } => compiled_format_uses_mailmap(compiled),
@@ -2185,6 +2188,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         match resolve_pretty_spec(&spec, format_kind, &config)? {
             ResolvedPretty::Oneline => preset_oneline = Some(true),
             ResolvedPretty::Default => output = LogOutput::Default(LogDefaultKind::Medium),
+            ResolvedPretty::Short => output = LogOutput::Default(LogDefaultKind::Short),
+            ResolvedPretty::Full => output = LogOutput::Default(LogDefaultKind::Full),
             ResolvedPretty::Fuller => output = LogOutput::Default(LogDefaultKind::Fuller),
             ResolvedPretty::Raw => output = LogOutput::Default(LogDefaultKind::Raw),
             ResolvedPretty::Reference => {
@@ -3220,6 +3225,16 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                                 use_mailmap.then_some(output_mailmap)
                             )
                         )?;
+                        if *kind == LogDefaultKind::Full {
+                            writeln!(
+                                msg,
+                                "Commit: {}",
+                                commit_identity_mailmapped(
+                                    &record.commit.committer,
+                                    use_mailmap.then_some(output_mailmap)
+                                )
+                            )?;
+                        }
                         if *kind == LogDefaultKind::Medium {
                             writeln!(
                                 msg,
@@ -3408,6 +3423,19 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             &grep_colors,
                         ))?;
                         writeln!(out)?;
+                        if kind == LogDefaultKind::Full {
+                            let committer = commit_identity_mailmapped(
+                                &record.commit.committer,
+                                use_mailmap.then_some(output_mailmap),
+                            );
+                            write!(out, "Commit: ")?;
+                            out.write_all(&log_highlight_matches(
+                                committer.as_bytes(),
+                                committer_filters.as_ref(),
+                                &grep_colors,
+                            ))?;
+                            writeln!(out)?;
+                        }
                     }
                     if kind == LogDefaultKind::Medium {
                         writeln!(
@@ -3591,6 +3619,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
 enum ResolvedPretty {
     Oneline,
     Default,
+    Short,
+    Full,
     Fuller,
     Raw,
     /// `--pretty=reference`: `%C(auto)%h (%s, %ad)` with a default short date
@@ -3634,7 +3664,9 @@ fn resolve_pretty_spec(
         }
         match current.as_str() {
             "oneline" => return Ok(ResolvedPretty::Oneline),
-            "short" | "medium" => return Ok(ResolvedPretty::Default),
+            "medium" => return Ok(ResolvedPretty::Default),
+            "short" => return Ok(ResolvedPretty::Short),
+            "full" => return Ok(ResolvedPretty::Full),
             "fuller" => return Ok(ResolvedPretty::Fuller),
             "raw" => return Ok(ResolvedPretty::Raw),
             "reference" => {
@@ -3743,6 +3775,8 @@ enum LogDefaultKind {
     Medium,
     /// `--pretty=short`: omits the `Date:` line.
     Short,
+    /// `--pretty=full`: author and committer identities, no dates.
+    Full,
     /// `--pretty=fuller`: author and committer identities with dates.
     Fuller,
     /// `--pretty=raw`: full object headers and raw identity lines.
