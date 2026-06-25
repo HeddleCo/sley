@@ -3319,6 +3319,25 @@ fn detect_inexact_copies(
         return changes;
     }
 
+    // git's `too_many_rename_candidates`: when the copy matrix would exceed a
+    // `rename_limit` square, skip inexact copy detection wholesale. Under
+    // `--find-copies-harder` the source set is every left-side path (not just the
+    // changed ones), so this O(sources × dests) matrix is the one most likely to
+    // blow up — yet the rename gate above guards only `detect_inexact_renames`.
+    // A non-positive limit is unlimited. Mirrors the identical gate there.
+    let dest_count = changes
+        .iter()
+        .filter(|entry| entry.status == NameStatus::Added)
+        .count();
+    if options.rename_limit > 0
+        && sources
+            .len()
+            .saturating_mul(dest_count)
+            .gt(&options.rename_limit.saturating_mul(options.rename_limit))
+    {
+        return changes;
+    }
+
     let mut result = Vec::with_capacity(changes.len());
     for entry in changes {
         if entry.status != NameStatus::Added {
@@ -10734,6 +10753,95 @@ new mode 100755
             entries.iter().all(|e| e.status != NameStatus::Deleted),
             "copy must not delete the source: {entries:?}"
         );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn inexact_copy_skipped_over_rename_limit() {
+        // git's `too_many_rename_candidates`: when the copy matrix
+        // (sources × dests) exceeds `rename_limit²`, inexact copy detection is
+        // skipped wholesale and the new file is reported as a plain Add — the
+        // same `A` real git emits (`git diff -C --find-copies-harder -l1` warns
+        // "rename detection was skipped" and shows `A copy.txt`). A `rename_limit`
+        // comfortably above the matrix still detects the copy, proving the gate
+        // fires *only* over-limit and not on any positive limit.
+        let root = temp_root();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
+            .expect("test operation should succeed");
+        let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
+
+        let orig = write_blob(&mut db, b"aaa\nbbb\nccc\nddd\neee\n");
+        let extra = write_blob(&mut db, b"111\n222\n333\n444\n555\n");
+        let copy = write_blob(&mut db, b"aaa\nbbb\nccc\nddd\nEEE\n");
+        // Two unchanged left files → under `--find-copies-harder` both are copy
+        // sources, so the matrix is 2 (sources) × 1 (dest) = 2.
+        let left = write_tree(
+            &mut db,
+            &[
+                (b"orig.txt", 0o100644, orig.clone()),
+                (b"extra.txt", 0o100644, extra.clone()),
+            ],
+        );
+        let right = write_tree(
+            &mut db,
+            &[
+                (b"orig.txt", 0o100644, orig),
+                (b"extra.txt", 0o100644, extra),
+                (b"copy.txt", 0o100644, copy),
+            ],
+        );
+
+        let opts_for = |rename_limit| RenameDetectionOptions {
+            base: DiffNameStatusOptions {
+                detect_renames: true,
+                detect_copies: true,
+                find_copies_harder: true,
+                rename_empty: true,
+            },
+            detect_inexact: true,
+            rename_threshold: DEFAULT_RENAME_THRESHOLD,
+            copy_threshold: DEFAULT_RENAME_THRESHOLD,
+            rename_limit,
+        };
+
+        // Over limit: 2 × 1 = 2 > 1² ⇒ copy detection skipped, copy.txt is Added.
+        let over = diff_name_status_trees_with_rename_options(
+            &db,
+            ObjectFormat::Sha1,
+            &left,
+            &right,
+            opts_for(1),
+        )
+        .expect("test operation should succeed");
+        let copy_over = over
+            .iter()
+            .find(|e| e.path == b"copy.txt")
+            .unwrap_or_else(|| panic!("no copy.txt entry: {over:?}"));
+        assert_eq!(
+            copy_over.status,
+            NameStatus::Added,
+            "over rename_limit, copy must degrade to a plain Add: {over:?}"
+        );
+
+        // Under limit: 2 × 1 = 2 ≤ 4² ⇒ copy still detected (score 80).
+        let under = diff_name_status_trees_with_rename_options(
+            &db,
+            ObjectFormat::Sha1,
+            &left,
+            &right,
+            opts_for(4),
+        )
+        .expect("test operation should succeed");
+        let copy_under = under
+            .iter()
+            .find(|e| e.path == b"copy.txt")
+            .unwrap_or_else(|| panic!("no copy.txt entry: {under:?}"));
+        assert_eq!(
+            copy_under.status,
+            NameStatus::Copied(80),
+            "below rename_limit, copy detection is unaffected: {under:?}"
+        );
+
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
