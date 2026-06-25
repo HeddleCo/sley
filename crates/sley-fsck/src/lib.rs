@@ -276,8 +276,19 @@ where
         if self.check_loaded_object_content(oid, &object, false) {
             return;
         }
-        if object.object_type == ObjectType::Tree {
-            self.check_unreachable_tree_paths(&object.body);
+        // git's object-enumeration pass (`fsck_obj`) link-walks every commit and
+        // tree it examines — even one reachable only through the enumeration —
+        // and reports their missing tree/parent/entry targets (verified against
+        // git 2.54: a blob referenced solely by a dangling commit's tree is
+        // reported `missing blob`; a dangling commit with a missing tree/parent
+        // is reported `broken link`/`missing`). The lone exception is a *tag*:
+        // an unreachable tag reports only `dangling tag`, never a broken link to
+        // its referent (see `unreachable_tag_referent_is_not_checked_as_a_broken_link`).
+        // So walk commits/trees here but leave tags content-only.
+        match object.object_type {
+            ObjectType::Commit => self.check_commit(oid, &object.body),
+            ObjectType::Tree => self.check_tree(oid, &object.body),
+            ObjectType::Tag | ObjectType::Blob => {}
         }
     }
 
@@ -512,23 +523,6 @@ where
                     oid: entry.oid,
                 },
             );
-        }
-    }
-
-    fn check_unreachable_tree_paths(&mut self, body: &[u8]) {
-        let Ok(entries) =
-            TreeEntries::new(self.format, body).collect::<std::result::Result<Vec<_>, _>>()
-        else {
-            return;
-        };
-        for entry in entries {
-            let is_symlink = entry.mode == 0o120000;
-            if !is_symlink && content::is_dotgitmodules_name(entry.name) {
-                self.gitmodules_found.insert(entry.oid);
-            }
-            if !is_symlink && content::is_dotgitattributes_name(entry.name) {
-                self.gitattributes_found.insert(entry.oid);
-            }
         }
     }
 
