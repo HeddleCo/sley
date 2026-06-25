@@ -449,6 +449,8 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     let mut sparse = false;
     let mut tag = false;
     let mut killed = false;
+    let mut recurse_submodules = false;
+    let mut with_tree: Option<String> = None;
     let mut format_spec: Option<String> = None;
     let mut oid_abbrev = None;
     let mut path_args = Vec::new();
@@ -529,8 +531,19 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             "--no-t" => tag = false,
             "-k" | "--killed" => killed = true,
             "--no-killed" => killed = false,
-            "--recurse-submodules"
-            | "--no-recurse-submodules" => {}
+            "--recurse-submodules" => recurse_submodules = true,
+            "--no-recurse-submodules" => recurse_submodules = false,
+            "--with-tree" => {
+                let Some(value) = iter.next() else {
+                    return Err(GitError::Command(
+                        "ls-files --with-tree requires a value".into(),
+                    ));
+                };
+                with_tree = Some(value.clone());
+            }
+            value if let Some(value) = value.strip_prefix("--with-tree=") => {
+                with_tree = Some(value.to_string());
+            }
             "--no-resolve-undo" => resolve_undo = false,
             "--abbrev" => oid_abbrev = Some(7),
             "--no-abbrev" => oid_abbrev = None,
@@ -628,6 +641,25 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             "--format cannot be used with -s, -o, -k, -t, --resolve-undo, --deduplicate, --eol",
         ));
     }
+    // git: `--recurse-submodules` rejects worktree-dependent modes and
+    // `--with-tree`; `--error-unmatch` is separately unsupported. Both die(128).
+    if recurse_submodules
+        && (deleted || others || unmerged || killed || modified || resolve_undo || with_tree.is_some())
+    {
+        eprintln!("fatal: ls-files --recurse-submodules unsupported mode");
+        return Err(GitError::Exit(128));
+    }
+    if recurse_submodules && error_unmatch {
+        eprintln!("fatal: ls-files --recurse-submodules does not support --error-unmatch");
+        return Err(GitError::Exit(128));
+    }
+    // git: `--with-tree` cannot combine with stage/unmerged output (die 128).
+    if with_tree.is_some() && (stage || unmerged) {
+        eprintln!(
+            "fatal: options 'ls-files --with-tree' and '-s/-u' cannot be used together"
+        );
+        return Err(GitError::Exit(128));
+    }
     let selected = cached || others || deleted || modified || unmerged || resolve_undo;
     let output_stage = stage || unmerged;
     if ignored && !others && !cached {
@@ -698,6 +730,21 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         None
     };
     let eol = eol_context.as_ref();
+    if let Some(with_tree) = with_tree.as_deref() {
+        write_ls_files_with_tree(
+            &mut stdout,
+            &git_dir,
+            format,
+            with_tree,
+            terminator,
+            &pathspec,
+        )?;
+        stdout.flush()?;
+        if error_unmatch {
+            pathspec.exit_if_unmatched()?;
+        }
+        return Ok(());
+    }
     if resolve_undo {
         if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
             write_ls_files_resolve_undo(&mut stdout, &index, format, terminator, &pathspec)?;
@@ -920,6 +967,86 @@ fn write_ls_files_index_root_fast(
         stdout.write_all(&[terminator])?;
         Ok(())
     })
+}
+
+/// `ls-files --with-tree=<tree-ish>`: overlay `<tree-ish>` onto the index so
+/// that paths removed from the index since that tree still appear. Mirrors
+/// git's `overlay_tree_on_index` (read-cache.c): existing unmerged entries are
+/// hoisted to stage #3, the tree's leaves are appended at stage #1, the result
+/// is sorted by (name, stage), and a stage-#1 entry shadowed by a stage-#0
+/// entry of the same name is hidden (git's `CE_UPDATE` marker).
+fn write_ls_files_with_tree(
+    stdout: &mut io::Stdout,
+    git_dir: &Path,
+    format: ObjectFormat,
+    with_tree: &str,
+    terminator: u8,
+    pathspec: &LsFilesPathspec,
+) -> Result<()> {
+    let repo = RepositoryContext::discover_current()?;
+    // Resolve <tree-ish> to a tree oid, dying with 128 like git on failure.
+    let tree_oid = match repo.resolve_revision(with_tree) {
+        Ok(oid) => {
+            if oid == ObjectId::empty_tree(format) {
+                oid
+            } else {
+                match sley_rev::peel_to_tree(repo.objects(), format, &oid) {
+                    Ok(tree) => tree,
+                    Err(_) => {
+                        eprintln!("fatal: not a tree-ish object: {with_tree}");
+                        return Err(GitError::Exit(128));
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            eprintln!("fatal: tree-ish {with_tree} not found.");
+            return Err(GitError::Exit(128));
+        }
+    };
+
+    // (path, stage) records for the overlaid index.
+    let mut entries: Vec<(Vec<u8>, u8)> = Vec::new();
+    if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
+        // git ensures a full index before overlaying.
+        let index = ls_files_display_index(git_dir, format, index, false)?;
+        for entry in &index.entries {
+            let stage = if index_entry_stage(entry) != 0 { 3 } else { 0 };
+            entries.push((entry.path.to_vec(), stage));
+        }
+    }
+    for (path, _value) in sley_diff_merge::flatten_tree(repo.objects(), format, &tree_oid)? {
+        entries.push((path, 1));
+    }
+    // git's cmp_cache_name_compare: name, then stage.
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    let mut hidden = vec![false; entries.len()];
+    let mut last_stage0: Option<usize> = None;
+    for idx in 0..entries.len() {
+        match entries[idx].1 {
+            0 => last_stage0 = Some(idx),
+            1 => {
+                if let Some(s0) = last_stage0
+                    && entries[s0].0 == entries[idx].0
+                {
+                    hidden[idx] = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (idx, (path, _stage)) in entries.iter().enumerate() {
+        if hidden[idx] {
+            continue;
+        }
+        if let Some(display) = pathspec.display(path) {
+            write_ls_files_path(stdout, &display, terminator)?;
+            stdout.write_all(&[terminator])?;
+        }
+    }
+    Ok(())
 }
 
 /// Per-invocation state for `ls-files --format`. Holds everything an atom may
