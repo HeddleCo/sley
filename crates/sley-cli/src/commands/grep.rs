@@ -692,6 +692,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
                     rev,
                     config: repo.config(),
                     common_dir: repo.git_dir(),
+                    worktree_root: worktree_root.as_deref(),
                 },
                 b"",
                 &plan,
@@ -1333,21 +1334,34 @@ fn open_submodule_worktree(worktree_root: &Path, sub_rel: &[u8]) -> Option<Owned
     })
 }
 
-/// Open a submodule's object database by name (`<common>/modules/<name>`), as
-/// `grep_submodule`'s tree recursion does — the worktree path may differ from the
-/// gitlink's recorded path (e.g. a moved submodule grepped at a historic rev).
-fn open_submodule_treedb(common_dir: &Path, name: &str) -> Option<OwnedSubrepo> {
-    let git_dir = submodule_name_to_gitdir(common_dir, name);
-    if !git_dir.is_dir() {
-        return None;
-    }
+/// Open a submodule's object database for tree-mode recursion. git's
+/// `repo_submodule_init` resolves the gitdir from the populated worktree gitlink
+/// first (handling an in-place, non-absorbed submodule) and otherwise from the
+/// absorbed `<common>/modules/<name>` location (handling a worktree path that no
+/// longer matches the gitlink's recorded path, e.g. a moved submodule grepped at
+/// a historic rev). Returns the opened repo plus the submodule's worktree (when
+/// populated), for the nested recursion level.
+fn open_submodule_tree(
+    worktree_root: Option<&Path>,
+    common_dir: &Path,
+    name: &str,
+    path: &[u8],
+) -> Option<OwnedSubrepo> {
+    let sub_worktree = worktree_root.map(|root| root.join(bytes_to_path(path)));
+    let git_dir = sub_worktree
+        .as_deref()
+        .and_then(sley_diff_merge::gitlink_git_dir)
+        .or_else(|| {
+            let absorbed = submodule_name_to_gitdir(common_dir, name);
+            absorbed.is_dir().then_some(absorbed)
+        })?;
     let common = common_git_dir_for_git_dir(&git_dir).ok()?;
     let format = repository_object_format(&common).ok()?;
     let db = FileObjectDatabase::from_git_dir(&common, format);
     let config = read_repo_config(&git_dir).ok()?;
     Some(OwnedSubrepo {
         git_dir: common,
-        worktree_root: None,
+        worktree_root: sub_worktree.filter(|root| root.exists()),
         format,
         db,
         config,
@@ -1621,6 +1635,10 @@ struct GrepTreeSource<'a> {
     /// The repository's common dir, for resolving `modules/<name>` submodule git
     /// directories. For a nested level this is the parent submodule's git dir.
     common_dir: &'a Path,
+    /// The repository's worktree root (when populated), for resolving a
+    /// submodule's in-place gitlink. For a nested level this is the parent
+    /// submodule's worktree.
+    worktree_root: Option<&'a Path>,
 }
 
 fn grep_tree_source(
@@ -1657,7 +1675,8 @@ fn grep_tree_level(
                 && submodule_active(source.config, submodules, path)
                 && let Ok(path_str) = std::str::from_utf8(path)
                 && let Some(name) = submodules.from_path(path_str).map(|m| m.name.clone())
-                && let Some(sub) = open_submodule_treedb(source.common_dir, &name)
+                && let Some(sub) =
+                    open_submodule_tree(source.worktree_root, source.common_dir, &name, path)
                 && let Ok(sub_tree) = sley_rev::peel_to_tree(&sub.db, sub.format, oid)
             {
                 let sub_source = GrepTreeSource {
@@ -1667,6 +1686,7 @@ fn grep_tree_level(
                     rev: source.rev,
                     config: &sub.config,
                     common_dir: &sub.git_dir,
+                    worktree_root: sub.worktree_root.as_deref(),
                 };
                 let sub_prefix = submodule_prefix(prefix, path);
                 let matched = grep_tree_level(&sub_source, &sub_prefix, plan, out, printed_file)?;
