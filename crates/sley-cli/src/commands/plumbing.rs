@@ -2433,6 +2433,7 @@ fn resolve_add_regular_actions(
     sley_worktree::stream_short_status(worktree_root, git_dir, format, |entry| {
         let actionable = (entry.index == b'?' && entry.worktree == b'?')
             || entry.worktree == b'M'
+            || entry.worktree == b'T'
             || entry.worktree == b'D';
         if !actionable {
             return Ok(sley_worktree::StreamControl::Continue);

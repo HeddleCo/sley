@@ -839,7 +839,7 @@ fn print_reset_unstaged_changes(
     format: ObjectFormat,
 ) -> Result<()> {
     let mut entries = crate::collect_short_status(worktree_root, git_dir, format)?;
-    entries.retain(|entry| matches!(entry.worktree, b'M' | b'D'));
+    entries.retain(|entry| matches!(entry.worktree, b'M' | b'T' | b'D'));
     // git's post-reset summary omits skip-worktree paths: `update_index_refresh`
     // never marks a CE_SKIP_WORKTREE entry stat-dirty, so it never appears in the
     // "Unstaged changes after reset:" list (t7102 cell 29). Drop those paths.

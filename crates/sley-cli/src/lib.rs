@@ -1168,7 +1168,13 @@ fn resolve_add_update_actions(
             if !include_untracked {
                 continue;
             }
-        } else if entry.worktree != b'M' && entry.worktree != b'D' && entry.worktree != b'A' {
+        } else if entry.worktree != b'M'
+            && entry.worktree != b'T'
+            && entry.worktree != b'D'
+            && entry.worktree != b'A'
+        {
+            // A typechange (`T`) stages like a modification: the path is re-added
+            // with its new worktree mode/content (the `else` Add branch below).
             continue;
         }
         let path = worktree_root.join(
