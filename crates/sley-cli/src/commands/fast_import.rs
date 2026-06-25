@@ -235,6 +235,18 @@ fn handle_commit(
                 &mut tree,
             )?;
             apply_filedelete(rest, &mut tree)?;
+        } else if let Some(rest) = line_after(line, b"N ") {
+            parser.next_command_line();
+            default_base_from_branch(
+                db,
+                store,
+                format,
+                &ref_name,
+                &mut base_fixed,
+                &mut parent,
+                &mut tree,
+            )?;
+            apply_notemodify(parser, db, store, marks, format, rest, &mut tree)?;
         } else if line == b"deleteall" {
             parser.next_command_line();
             // An explicit empty-tree directive: clear and fix the base so the
@@ -393,6 +405,54 @@ fn apply_filemodify(
 fn apply_filedelete(rest: &[u8], tree: &mut BTreeMap<Vec<u8>, TreeEntry>) -> Result<()> {
     let path = parse_path(rest)?;
     tree.remove(&path);
+    Ok(())
+}
+
+/// Apply an `N <dataref> <commit-ish>` notemodify: attach a note blob to the
+/// annotated object inside a notes tree. `<dataref>` is `inline` (an inline
+/// `data` block follows), an oid, or a mark; `<commit-ish>` is the annotated
+/// object. The note is stored flat, keyed by the annotated object's full hex —
+/// a valid (if un-fanned) notes layout that the notes reader handles, and which
+/// notes-writing commands later re-fan as needed.
+fn apply_notemodify(
+    parser: &mut StreamParser<'_>,
+    db: &mut FileObjectDatabase,
+    store: &FileRefStore,
+    marks: &HashMap<u64, ObjectId>,
+    format: ObjectFormat,
+    rest: &[u8],
+    tree: &mut BTreeMap<Vec<u8>, TreeEntry>,
+) -> Result<()> {
+    // rest = "<dataref> <commit-ish>"
+    let (dataref, committish) = split_field(rest);
+
+    let blob_oid = if dataref == b"inline" {
+        let Some(data_line) = parser.next_command_line() else {
+            return Err(GitError::Command(
+                "fast-import: N inline missing data block".into(),
+            ));
+        };
+        if line_after(data_line, b"data").is_none() {
+            return Err(GitError::Command(
+                "fast-import: N inline must be followed by data".into(),
+            ));
+        }
+        let content = parser.read_data(data_line)?;
+        db.write_object(EncodedObject::new(ObjectType::Blob, content))?
+    } else {
+        resolve_dataref(format, marks, dataref)?
+    };
+
+    let target = resolve_committish(db, store, format, marks, committish)?;
+    let path = target.to_hex().into_bytes();
+    tree.insert(
+        path.clone(),
+        TreeEntry {
+            mode: 0o100644,
+            name: BString::from(path),
+            oid: blob_oid,
+        },
+    );
     Ok(())
 }
 
