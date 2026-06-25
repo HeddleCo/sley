@@ -21,6 +21,10 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut branch_mode = CheckoutBranchMode::Existing;
     let mut ignore_other_worktrees = false;
     let mut track = None::<crate::commands::branch::BranchTrackMode>;
+    let mut overlay_mode: Option<bool> = None;
+    let mut overwrite_ignore = true;
+    let mut pathspec_from_file: Option<PathBuf> = None;
+    let mut pathspec_file_nul = false;
     let mut positional = Vec::new();
     let mut dashdash_index = None;
     let mut iter = args.iter();
@@ -98,6 +102,23 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 inter_hunk_context = true;
             }
             "--progress" | "--no-progress" => {}
+            "--overlay" => overlay_mode = Some(true),
+            "--no-overlay" => overlay_mode = Some(false),
+            "--overwrite-ignore" => overwrite_ignore = true,
+            "--no-overwrite-ignore" => overwrite_ignore = false,
+            "--pathspec-file-nul" => pathspec_file_nul = true,
+            "--no-pathspec-file-nul" => pathspec_file_nul = false,
+            "--pathspec-from-file" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("checkout --pathspec-from-file requires a value".into())
+                })?;
+                pathspec_from_file = Some(PathBuf::from(value));
+            }
+            "--no-pathspec-from-file" => pathspec_from_file = None,
+            value if value.starts_with("--pathspec-from-file=") => {
+                let value = &value["--pathspec-from-file=".len()..];
+                pathspec_from_file = Some(PathBuf::from(value));
+            }
             "--ignore-other-worktrees" => ignore_other_worktrees = true,
             "--no-ignore-other-worktrees" => ignore_other_worktrees = false,
             "--recurse-submodules" => recurse_submodules = Some(true),
@@ -178,6 +199,38 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
+    // `-p --overlay` is forbidden; only the implicit-overlay default pairs with -p.
+    if patch && overlay_mode == Some(true) {
+        eprintln!("fatal: options '-p' and '--overlay' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if pathspec_file_nul && pathspec_from_file.is_none() {
+        eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+        return Err(GitError::Exit(128));
+    }
+    if pathspec_from_file.is_some() {
+        // Git rejects pathspec args, then --detach, then --patch (in that order).
+        let trailing_pathspec_args = match dashdash_index {
+            Some(index) => positional.len() > index,
+            None => positional.len() > 1,
+        };
+        if trailing_pathspec_args {
+            eprintln!(
+                "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
+            );
+            return Err(GitError::Exit(128));
+        }
+        if matches!(branch_mode, CheckoutBranchMode::Detach) {
+            eprintln!(
+                "fatal: options '--pathspec-from-file' and '--detach' cannot be used together"
+            );
+            return Err(GitError::Exit(128));
+        }
+        if patch {
+            eprintln!("fatal: options '--pathspec-from-file' and '--patch' cannot be used together");
+            return Err(GitError::Exit(128));
+        }
+    }
     if patch {
         println!("No changes.");
         return Ok(());
@@ -248,7 +301,25 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     // Pathspec checkout: `checkout [<tree-ish>] [--] <pathspec>...` restores
     // paths (and, with a tree-ish, index entries) instead of switching HEAD.
     if matches!(branch_mode, CheckoutBranchMode::Existing) {
-        let (source, paths): (Option<&str>, &[String]) = match dashdash_index {
+        let file_pathspecs: Vec<String>;
+        let (source, paths): (Option<&str>, &[String]) = if let Some(pathspec_file) =
+            pathspec_from_file.as_ref()
+        {
+            // `--pathspec-from-file`: the lone positional (if any) is the tree-ish
+            // source; the pathspecs come from the file (option validation above
+            // already rejected trailing pathspec arguments).
+            let source = match positional.as_slice() {
+                [] => None,
+                [rev] => Some(rev.as_str()),
+                _ => unreachable!("trailing pathspec args were rejected during validation"),
+            };
+            file_pathspecs = read_pathspecs_from_file(pathspec_file, pathspec_file_nul)?
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
+            (source, file_pathspecs.as_slice())
+        } else {
+            match dashdash_index {
             Some(index) => {
                 let (before, after) = positional.split_at(index);
                 match before {
@@ -301,6 +372,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 }
             }
             None => (None, &[]),
+            }
         };
         if !paths.is_empty() {
             let resolved_paths: Vec<PathBuf> = paths
