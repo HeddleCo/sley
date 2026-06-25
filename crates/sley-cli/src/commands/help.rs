@@ -861,6 +861,29 @@ fn print_all_commands() {
         "Developer-facing file formats, protocols and other interfaces",
         DEVELOPER_INTERFACES,
     );
+    print_alias_section();
+}
+
+/// List configured `alias.*` entries under git's "Command aliases" heading
+/// (omitted entirely when no aliases are defined).
+fn print_alias_section() {
+    let Ok(aliases) = crate::commands::alias::list_aliases() else {
+        return;
+    };
+    if aliases.is_empty() {
+        return;
+    }
+    let width = aliases
+        .iter()
+        .map(|(name, _)| name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    print_heading("Command aliases");
+    for (name, value) in aliases {
+        let pad = width.saturating_sub(name.chars().count());
+        println!("   {name}{}   {value}", " ".repeat(pad));
+    }
 }
 
 fn print_command_section(title: &str, rows: &[(&str, &str)]) {
