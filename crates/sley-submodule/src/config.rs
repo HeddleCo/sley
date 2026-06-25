@@ -444,9 +444,12 @@ pub fn check_submodule_url(url: &str) -> bool {
             }
         }
     } else if let Some(curl_url) = url_to_curl_url(url) {
-        // TODO(submodule): port url_normalize for the full http(s) check.
-        // For now reject only an embedded newline in the decoded form, which is
-        // the concrete injection vector check_submodule_url guards.
+        // git runs the curl url through `url_normalize`, rejecting anything that
+        // is not a valid absolute URL: a missing/empty scheme, a missing "://",
+        // or a missing host for a non-`file:` scheme (CVE-2020-11008 family).
+        if !curl_url_is_normalizable(curl_url) {
+            return false;
+        }
         let decoded = url_decode(curl_url);
         if decoded.contains('\n') {
             return false;
@@ -456,21 +459,81 @@ pub fn check_submodule_url(url: &str) -> bool {
     true
 }
 
+/// Minimal port of git's `url_normalize` validity gate (`urlmatch.c`): whether a
+/// curl url is a normalizable absolute URL. Rejects (returns false) a url whose
+/// scheme is empty / not letter-led / not followed by "://", or whose host is
+/// missing — the conditions that make `url_normalize` return NULL and so make
+/// `check_submodule_url` reject the submodule url.
+fn curl_url_is_normalizable(url: &str) -> bool {
+    let bytes = url.as_bytes();
+    // scheme: a non-empty run of [A-Za-z0-9+.-] starting with a letter, then "://"
+    let scheme_len = bytes
+        .iter()
+        .take_while(|&&c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.'))
+        .count();
+    if scheme_len == 0
+        || !bytes[0].is_ascii_alphabetic()
+        || scheme_len + 3 > bytes.len()
+        || &bytes[scheme_len..scheme_len + 3] != b"://"
+    {
+        return false;
+    }
+    let scheme = &url[..scheme_len];
+    let after_scheme = &url[scheme_len + 3..];
+    // Skip an optional `user[:pass]@` that precedes the first `/?#`.
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let host_start = match after_scheme.find('@') {
+        Some(at) if at < authority_end => &after_scheme[at + 1..],
+        _ => after_scheme,
+    };
+    // A missing host (empty, or immediately a `:/?#`) is invalid for every
+    // scheme except `file:`.
+    let host_missing = host_start
+        .as_bytes()
+        .first()
+        .is_none_or(|c| matches!(c, b':' | b'/' | b'?' | b'#'));
+    if host_missing && !scheme.eq_ignore_ascii_case("file") {
+        return false;
+    }
+    true
+}
+
+/// `starts_with_dot_slash` (git `dir.h`, XPLATFORM): a leading `./` where the
+/// separator is EITHER `/` or `\` — the cross-platform form git uses for
+/// submodule urls, so a `.\`-prefixed url is relative on every OS.
+fn starts_with_dot_slash_xplat(url: &str) -> bool {
+    let bytes = url.as_bytes();
+    bytes.first() == Some(&b'.') && matches!(bytes.get(1), Some(b'/') | Some(b'\\'))
+}
+
+/// `starts_with_dot_dot_slash` (git `dir.h`, XPLATFORM): a leading `../` with a
+/// `/`-or-`\` separator.
+fn starts_with_dot_dot_slash_xplat(url: &str) -> bool {
+    let bytes = url.as_bytes();
+    bytes.first() == Some(&b'.')
+        && bytes.get(1) == Some(&b'.')
+        && matches!(bytes.get(2), Some(b'/') | Some(b'\\'))
+}
+
 fn submodule_url_is_relative(url: &str) -> bool {
-    url.starts_with("./") || url.starts_with("../")
+    starts_with_dot_slash_xplat(url) || starts_with_dot_dot_slash_xplat(url)
 }
 
 /// Port of `count_leading_dotdots` (git `submodule-config.c`): counts leading
-/// `../` components (skipping `./`) and returns the remaining suffix.
+/// `../` components (skipping `./`) and returns the remaining suffix. Both `/`
+/// and `\` count as the separator (XPLATFORM), matching git so a `..\`-escaping
+/// url is caught on every OS.
 fn count_leading_dotdots(url: &str) -> (usize, &str) {
     let mut result = 0;
     let mut rest = url;
     loop {
-        if let Some(stripped) = rest.strip_prefix("../") {
+        if starts_with_dot_dot_slash_xplat(rest) {
             result += 1;
-            rest = stripped;
-        } else if let Some(stripped) = rest.strip_prefix("./") {
-            rest = stripped;
+            rest = &rest[3..];
+        } else if starts_with_dot_slash_xplat(rest) {
+            rest = &rest[2..];
         } else {
             return (result, rest);
         }

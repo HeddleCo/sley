@@ -734,6 +734,12 @@ fn tree_links(format: ObjectFormat, body: &[u8]) -> sley_core::Result<Vec<Object
     let mut links = Vec::new();
     for entry in TreeEntries::new(format, body) {
         let entry = entry?;
+        // git's `fsck_walk_tree` skips gitlink (mode 160000) entries: a submodule
+        // commit lives in the submodule's own object store, so it is never a
+        // broken link / missing object in the superproject.
+        if entry.mode == 0o160000 {
+            continue;
+        }
         links.push(ObjectLink {
             object_type: tree_entry_object_type(entry.mode),
             oid: entry.oid,

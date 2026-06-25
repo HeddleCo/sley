@@ -118,6 +118,9 @@ struct SubmoduleAddOptions {
     quiet: bool,
     progress: bool,
     depth: Option<u32>,
+    /// `--reference`/`--reference-if-able`/`--dissociate` clone flags to forward
+    /// to the submodule clone verbatim (alternates borrowing).
+    reference_args: Vec<String>,
 }
 
 struct SubmoduleUpdateOptions<'a> {
@@ -134,6 +137,9 @@ struct SubmoduleUpdateOptions<'a> {
     depth: Option<u32>,
     /// `--filter <spec>` partial-clone filter (requires `--init`).
     filter: Option<String>,
+    /// `--reference`/`--reference-if-able`/`--dissociate` clone flags to forward
+    /// to each submodule clone (alternates borrowing).
+    reference_args: Vec<String>,
     /// git's `--super-prefix=<path>/`: the displaypath prefix carried into a
     /// recursive child so nested "Submodule path '<a/b>'" lines are anchored at
     /// the recursion root. Empty at the top level.
@@ -301,6 +307,7 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
             clone_args.push("-b".to_string());
             clone_args.push(branch.clone());
         }
+        clone_args.extend(options.reference_args.iter().cloned());
         clone_args.push("--separate-git-dir".to_string());
         clone_args.push(modules_git_dir.display().to_string());
         clone_args.push(real_repo.clone());
@@ -341,6 +348,7 @@ fn parse_submodule_add_options(args: &[String], mut quiet: bool) -> Result<Submo
     let mut progress = false;
     let mut depth = None;
     let mut values = Vec::new();
+    let mut reference_args = Vec::new();
     let mut positional_only = false;
     let mut index = 0;
     while index < args.len() {
@@ -379,13 +387,17 @@ fn parse_submodule_add_options(args: &[String], mut quiet: bool) -> Result<Submo
                 };
                 name = Some(value.clone());
             }
-            // Reference repositories are an object-sharing optimization sley
-            // does not implement yet; refuse loudly instead of cloning without
-            // the requested borrowing.
+            // `--reference[-if-able] <repo>` / `--dissociate`: forward to the
+            // submodule clone, which sets up the alternates borrowing.
             "--reference" | "--reference-if-able" => {
-                eprintln!("fatal: sley submodule add does not support --reference yet");
-                return Err(GitError::Exit(128));
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return submodule_usage();
+                };
+                reference_args.push(arg.clone());
+                reference_args.push(value.clone());
             }
+            "--dissociate" => reference_args.push("--dissociate".to_string()),
             "--branch" | "-b" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -403,8 +415,7 @@ fn parse_submodule_add_options(args: &[String], mut quiet: bool) -> Result<Submo
                 if value.starts_with("--reference=")
                     || value.starts_with("--reference-if-able=") =>
             {
-                eprintln!("fatal: sley submodule add does not support --reference yet");
-                return Err(GitError::Exit(128));
+                reference_args.push(value.to_string());
             }
             value if value.starts_with('-') => return submodule_usage(),
             value => values.push(value.to_string()),
@@ -421,6 +432,7 @@ fn parse_submodule_add_options(args: &[String], mut quiet: bool) -> Result<Submo
             quiet,
             progress,
             depth,
+            reference_args,
         }),
         [repository, path] => Ok(SubmoduleAddOptions {
             repository: repository.clone(),
@@ -431,6 +443,7 @@ fn parse_submodule_add_options(args: &[String], mut quiet: bool) -> Result<Submo
             quiet,
             progress,
             depth,
+            reference_args,
         }),
         _ => submodule_usage(),
     }
@@ -712,15 +725,97 @@ fn populate_submodule_worktree(
         if let Some(filter) = &options.filter {
             clone_args.push(format!("--filter={filter}"));
         }
+        clone_args.extend(options.reference_args.iter().cloned());
+        // git's `prepare_possible_alternates`: borrow each submodule's objects
+        // from the reference superproject's `modules/<name>` when the super has
+        // `submodule.alternateLocation=superproject` (clone --reference --recursive).
+        clone_args.extend(superproject_alternate_reference_args(git_dir, &submodule.name)?);
         clone_args.push("--separate-git-dir".to_string());
         clone_args.push(modules_git_dir.display().to_string());
         clone_args.push(url.to_string());
         clone_args.push(path.display().to_string());
         super::remote_cmds::cmd_clone(&clone_args)?;
+        // Propagate the alternate config into the just-cloned submodule so its
+        // OWN recursive update borrows for the next level down (nested case).
+        propagate_submodule_alternate_config(git_dir, &modules_git_dir)?;
         rewrite_submodule_gitdir_file(path, &modules_git_dir)?;
         set_submodule_core_worktree(path, &modules_git_dir)?;
     }
     Ok(())
+}
+
+/// git's `prepare_possible_alternates` + `add_possible_reference_from_superproject`:
+/// when the superproject sets `submodule.alternateLocation=superproject`, turn
+/// each of the superproject's own alternates (`<ref>/objects`) into a candidate
+/// submodule alternate (`<ref>/modules/<name>`) forwarded as `--reference`
+/// (strategy `die`) or `--reference-if-able` (strategy `info`). `ignore` adds
+/// nothing.
+fn superproject_alternate_reference_args(git_dir: &Path, name: &str) -> Result<Vec<String>> {
+    let common = common_git_dir_for_git_dir(git_dir)?;
+    let config = read_repo_config(&common)?;
+    if config.get("submodule", None, "alternateLocation") != Some("superproject") {
+        return Ok(Vec::new());
+    }
+    let flag = match config
+        .get("submodule", None, "alternateErrorStrategy")
+        .unwrap_or("die")
+    {
+        "ignore" => return Ok(Vec::new()),
+        "info" => "--reference-if-able",
+        _ => "--reference",
+    };
+    let alternates_file = common.join("objects").join("info").join("alternates");
+    let Ok(content) = fs::read_to_string(&alternates_file) else {
+        return Ok(Vec::new());
+    };
+    let mut args = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Each line is a "<reference-gitdir>/objects" path; the reference repo's
+        // gitdir is its parent and the submodule's borrowed gitdir is that
+        // repo's `modules/<name>`.
+        let Some(reference_git_dir) = Path::new(line).parent() else {
+            continue;
+        };
+        let candidate = reference_git_dir.join("modules").join(name);
+        args.push(flag.to_string());
+        args.push(candidate.to_string_lossy().into_owned());
+    }
+    Ok(args)
+}
+
+/// git's submodule-clone tail: copy `submodule.alternateLocation` /
+/// `submodule.alternateErrorStrategy` from the superproject into the freshly
+/// cloned submodule's config so its own recursive update borrows for the next
+/// nesting level.
+fn propagate_submodule_alternate_config(super_git_dir: &Path, modules_git_dir: &Path) -> Result<()> {
+    let super_config = read_repo_config(&common_git_dir_for_git_dir(super_git_dir)?)?;
+    let location = super_config
+        .get("submodule", None, "alternateLocation")
+        .map(str::to_string);
+    let strategy = super_config
+        .get("submodule", None, "alternateErrorStrategy")
+        .map(str::to_string);
+    if location.is_none() && strategy.is_none() {
+        return Ok(());
+    }
+    let mut config = read_repo_config(modules_git_dir)?;
+    if let Some(location) = location {
+        set_config_value(&mut config, "submodule", None, "alternateLocation", &location);
+    }
+    if let Some(strategy) = strategy {
+        set_config_value(
+            &mut config,
+            "submodule",
+            None,
+            "alternateErrorStrategy",
+            &strategy,
+        );
+    }
+    write_repo_config(modules_git_dir, &config)
 }
 
 /// `--remote`: fetch the submodule's default remote, then resolve the configured
@@ -1023,6 +1118,7 @@ fn parse_submodule_update_options(
     let mut cli_default = UpdateType::Unspecified;
     let mut depth = None;
     let mut filter = None;
+    let mut reference_args = Vec::new();
     let mut super_prefix = String::new();
     let mut paths = Vec::new();
     let mut positional_only = false;
@@ -1086,15 +1182,22 @@ fn parse_submodule_update_options(
                 };
                 filter = Some(value.clone());
             }
-            // See parse_submodule_add_options: refuse --reference rather than
-            // silently cloning without the requested object borrowing.
-            "--reference" => {
-                eprintln!("fatal: sley submodule update does not support --reference yet");
-                return Err(GitError::Exit(128));
+            // `--reference[-if-able] <repo>` / `--dissociate`: forward to each
+            // submodule clone (alternates borrowing).
+            "--reference" | "--reference-if-able" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return submodule_usage();
+                };
+                reference_args.push(arg.clone());
+                reference_args.push(value.clone());
             }
-            value if value.starts_with("--reference=") => {
-                eprintln!("fatal: sley submodule update does not support --reference yet");
-                return Err(GitError::Exit(128));
+            "--dissociate" => reference_args.push("--dissociate".to_string()),
+            value
+                if value.starts_with("--reference=")
+                    || value.starts_with("--reference-if-able=") =>
+            {
+                reference_args.push(value.to_string());
             }
             value if let Some(value) = value.strip_prefix("--filter=") => {
                 filter = Some(value.to_string());
@@ -1123,6 +1226,7 @@ fn parse_submodule_update_options(
         cli_default,
         depth,
         filter,
+        reference_args,
         super_prefix,
         paths,
     })
@@ -1482,7 +1586,7 @@ fn cmd_submodule_deinit(args: &[String], quiet: bool) -> Result<()> {
 }
 
 fn cmd_submodule_sync(args: &[String], quiet: bool) -> Result<()> {
-    let (paths, quiet, _recursive) = parse_submodule_sync_options(args, quiet)?;
+    let (paths, quiet, recursive, super_prefix) = parse_submodule_sync_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -1491,21 +1595,17 @@ fn cmd_submodule_sync(args: &[String], quiet: bool) -> Result<()> {
     let mut config = read_repo_config(&git_dir)?;
     let mut changed = false;
     for submodule in selected {
-        if config
-            .get("submodule", Some(&submodule.name), "url")
-            .is_none()
-        {
-            continue;
-        }
-        let Some(url) = &submodule.url else {
-            continue;
-        };
-        let url = resolve_submodule_sync_url(&worktree_root, &config, url);
-        set_submodule_config_value(&mut config, &submodule.name, "url", &url);
-        if !quiet {
-            println!("Synchronizing submodule url for '{}'", submodule.path);
-        }
-        changed = true;
+        sync_one_submodule(
+            &git_dir,
+            &worktree_root,
+            &cwd,
+            &mut config,
+            &mut changed,
+            submodule,
+            quiet,
+            recursive,
+            &super_prefix,
+        )?;
     }
     if changed {
         write_repo_config(&git_dir, &config)?;
@@ -1513,17 +1613,335 @@ fn cmd_submodule_sync(args: &[String], quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_submodule_absorbgitdirs(args: &[String], quiet: bool) -> Result<()> {
-    let (paths, quiet) = parse_submodule_absorbgitdirs_options(args, quiet)?;
-    let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-    let submodules = read_submodule_configs(&worktree_root)?;
-    let selected = filter_submodule_configs(&cwd, &worktree_root, &submodules, &paths)?;
-    for submodule in selected {
-        absorb_submodule_git_dir(&git_dir, &worktree_root, submodule, quiet)?;
+/// Port of `sync_submodule` (`builtin/submodule--helper.c`). For an active
+/// submodule: re-derive the superproject `.git/config` url and (when populated)
+/// the submodule's own `remote.<default>.url` from the `.gitmodules` url —
+/// resolving the latter with the worktree-relative `up_path` so a relative url
+/// stays relative to the submodule — then optionally recurse.
+#[allow(clippy::too_many_arguments)]
+fn sync_one_submodule(
+    git_dir: &Path,
+    worktree_root: &Path,
+    cwd: &Path,
+    config: &mut GitConfig,
+    changed: &mut bool,
+    submodule: &SubmoduleConfigEntry,
+    quiet: bool,
+    recursive: bool,
+    super_prefix: &str,
+) -> Result<()> {
+    // `is_submodule_active`: sync only touches submodules registered in
+    // `.git/config` (a `submodule.<name>.url`).
+    if config
+        .get("submodule", Some(&submodule.name), "url")
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    // git derives TWO urls: `super_config_url` (no up_path) for the
+    // superproject's `.git/config`, and `sub_origin_url` (with up_path) for the
+    // submodule's own remote — a relative url must stay relative to the deeper
+    // submodule worktree. A non-relative url is used verbatim for both.
+    let up_path = submodule_up_path(&submodule.path);
+    let (super_config_url, sub_origin_url) = match &submodule.url {
+        Some(url) if url.starts_with("../") || url.starts_with("./") => {
+            resolve_sync_urls(worktree_root, config, url, &up_path)
+        }
+        Some(url) => (url.clone(), url.clone()),
+        None => (String::new(), String::new()),
+    };
+
+    let display = submodule_displaypath(cwd, worktree_root, &submodule.path, super_prefix)?;
+    if !quiet {
+        println!("Synchronizing submodule url for '{display}'");
+    }
+    set_submodule_config_value(config, &submodule.name, "url", &super_config_url);
+    *changed = true;
+
+    // Only a populated submodule has a git dir whose remote we can update.
+    let submodule_root = worktree_root.join(&submodule.path);
+    let Some(sub_git_dir) = resolve_submodule_repo_gitdir(&submodule_root) else {
+        return Ok(());
+    };
+    let sub_format = repository_object_format(&sub_git_dir)?;
+    let mut sub_config = read_repo_config(&sub_git_dir)?;
+    let abs_path = normalize_lexical_path(&submodule_root);
+    let remote = submodule_default_remote_name(
+        worktree_root,
+        git_dir,
+        &abs_path,
+        &sub_git_dir,
+        sub_format,
+        &sub_config,
+    )?;
+    set_config_value(&mut sub_config, "remote", Some(&remote), "url", &sub_origin_url);
+    write_repo_config(&sub_git_dir, &sub_config)?;
+
+    if recursive {
+        recurse_submodule_sync(&submodule_root, &display, quiet)?;
     }
     Ok(())
+}
+
+/// `get_up_path`: one `../` per component of the submodule's worktree-relative
+/// path — the prefix that takes the submodule worktree back to the superproject.
+fn submodule_up_path(path: &str) -> String {
+    let components = path.split('/').filter(|part| !part.is_empty()).count();
+    "../".repeat(components)
+}
+
+/// Resolve a relative `.gitmodules` url against the superproject's default-remote
+/// url to the `(super_config_url, sub_origin_url)` pair git records. `sync`
+/// suppresses the missing-remote warning, so both go straight through the
+/// `relative_url` primitive (no `init`-style warning).
+fn resolve_sync_urls(
+    worktree_root: &Path,
+    config: &GitConfig,
+    url: &str,
+    up_path: &str,
+) -> (String, String) {
+    let (_remote, base) = superproject_remote_base(worktree_root, config);
+    let base = base.as_deref();
+    let cwd_fallback = worktree_root.to_string_lossy();
+    let super_config_url = sley_submodule::resolve_relative_url(url, base, &cwd_fallback, None);
+    let sub_origin_url =
+        sley_submodule::resolve_relative_url(url, base, &cwd_fallback, Some(up_path));
+    (super_config_url, sub_origin_url)
+}
+
+/// Recurse `submodule sync --recursive` into the populated submodule at
+/// `submodule_root`, carrying `--super-prefix=<display>/` so nested displaypaths
+/// anchor at the recursion root (git's `sync_submodule` `OPT_RECURSIVE` branch).
+fn recurse_submodule_sync(submodule_root: &Path, display: &str, quiet: bool) -> Result<()> {
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
+    let mut command = ProcessCommand::new(exe);
+    command.arg("submodule");
+    if quiet {
+        command.arg("--quiet");
+    }
+    command.arg("sync").arg("--recursive");
+    command.arg(format!("--super-prefix={display}/"));
+    io::stdout().flush()?;
+    let status = command
+        .current_dir(submodule_root)
+        .status()
+        .map_err(|err| GitError::Io(err.to_string()))?;
+    if status.success() {
+        return Ok(());
+    }
+    eprintln!("fatal: failed to recurse into submodule '{display}'");
+    Err(GitError::Exit(128))
+}
+
+fn cmd_submodule_absorbgitdirs(args: &[String], quiet: bool) -> Result<()> {
+    let (paths, quiet, super_prefix) = parse_submodule_absorbgitdirs_options(args, quiet)?;
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    // git's `module_list_compute`: iterate EVERY gitlink in the index (in index
+    // order), not just `.gitmodules`-configured ones — a gitlink with no mapping
+    // must still be visited so absorb can die "could not lookup name".
+    let gitlink_paths = index_gitlink_paths(&git_dir, format, &cwd, &worktree_root, &paths)?;
+    let configured = read_submodule_configs(&worktree_root)?;
+    for path in gitlink_paths {
+        let name = configured
+            .iter()
+            .find(|sub| sub.path == path)
+            .map(|sub| sub.name.as_str());
+        absorb_git_dir_into_superproject(
+            &git_dir,
+            &worktree_root,
+            &path,
+            name,
+            &super_prefix,
+            quiet,
+        )?;
+    }
+    Ok(())
+}
+
+/// `module_list_compute` for absorb: the worktree-relative paths of all gitlink
+/// index entries, de-duplicated across stages, filtered by the pathspec.
+fn index_gitlink_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+    cwd: &Path,
+    worktree_root: &Path,
+    paths: &[&str],
+) -> Result<Vec<String>> {
+    // git's `module_list_compute` tracks which pathspecs matched ANY index entry
+    // (gitlink or not) and `report_path_error`s — exit 1 — for any pathspec that
+    // matched nothing (e.g. `absorbgitdirs missing`).
+    let normalized: Vec<String> = paths
+        .iter()
+        .map(|spec| normalize_submodule_pathspec(cwd, worktree_root, spec))
+        .collect();
+    let mut matched = vec![false; paths.len()];
+    let index = read_repository_index(git_dir, format)?;
+    let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if let Some(index) = &index {
+        for entry in &index.entries {
+            let Ok(path) = std::str::from_utf8(&entry.path) else {
+                continue;
+            };
+            for (i, spec) in normalized.iter().enumerate() {
+                if submodule_path_matches_pathspec(path, spec) {
+                    matched[i] = true;
+                }
+            }
+            if !sley_index::is_gitlink(entry.mode) {
+                continue;
+            }
+            if !seen.insert(path.to_string()) {
+                continue;
+            }
+            if !paths.is_empty()
+                && !normalized
+                    .iter()
+                    .any(|spec| submodule_path_matches_pathspec(path, spec))
+            {
+                continue;
+            }
+            result.push(path.to_string());
+        }
+    }
+    if let Some((spec, _)) = paths.iter().zip(&matched).find(|(_, hit)| !**hit) {
+        eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
+        return Err(GitError::Exit(1));
+    }
+    Ok(result)
+}
+
+/// Port of `absorb_git_dir_into_superproject` (`submodule.c`): migrate an
+/// embedded `<path>/.git` directory into the superproject, re-link a gitfile that
+/// went stale after the superproject itself was absorbed, then recurse into the
+/// submodule for nested gitlinks. `name` is the `.gitmodules` mapping (None when
+/// the gitlink is unmapped — fatal only when a migration is actually needed).
+fn absorb_git_dir_into_superproject(
+    git_dir: &Path,
+    worktree_root: &Path,
+    path: &str,
+    name: Option<&str>,
+    super_prefix: &str,
+    quiet: bool,
+) -> Result<()> {
+    let sub_root = worktree_root.join(path);
+    let dot_git = sub_root.join(".git");
+    let display = format!("{super_prefix}{path}");
+
+    if dot_git.is_dir() {
+        // Populated with an embedded git dir. Already inside the superproject's
+        // git dir? Then it is absorbed; otherwise relocate it.
+        let common = common_git_dir_for_git_dir(git_dir)?;
+        let real_dot = fs::canonicalize(&dot_git)?;
+        let real_common = fs::canonicalize(&common)?;
+        if !real_dot.starts_with(&real_common) {
+            let Some(name) = name else {
+                eprintln!("fatal: could not lookup name for submodule '{path}'");
+                return Err(GitError::Exit(128));
+            };
+            relocate_submodule_git_dir(git_dir, &sub_root, name, &display, quiet)?;
+        }
+    } else if dot_git.is_file() {
+        // A gitfile that no longer resolves (the superproject moved and the link
+        // was not rewritten) must be re-pointed at the relocated git dir.
+        if !gitfile_resolves(&dot_git) {
+            let Some(name) = name else {
+                eprintln!("fatal: could not lookup name for submodule '{path}'");
+                return Err(GitError::Exit(128));
+            };
+            let modules_git_dir = git_dir.join("modules").join(name);
+            connect_work_tree_and_git_dir(&sub_root, &modules_git_dir)?;
+        }
+    } else {
+        // Unpopulated (no `.git`): nothing to absorb and nothing to recurse into.
+        return Ok(());
+    }
+
+    recurse_submodule_absorbgitdirs(&sub_root, &display, quiet)?;
+    Ok(())
+}
+
+/// Whether a `gitdir:` pointer file resolves to an existing git directory.
+fn gitfile_resolves(dot_git: &Path) -> bool {
+    matches!(read_gitdir_file(dot_git), Ok(Some(target)) if is_git_dir_candidate(&target))
+}
+
+/// git's `relocate_single_git_dir_into_superproject`: move the embedded
+/// `<sub>/.git` dir to `<git_dir>/modules/<name>`, print the migration banner,
+/// then re-link the worktree (`connect_work_tree_and_git_dir`).
+fn relocate_submodule_git_dir(
+    git_dir: &Path,
+    sub_root: &Path,
+    name: &str,
+    display: &str,
+    quiet: bool,
+) -> Result<()> {
+    let dot_git = sub_root.join(".git");
+    let modules_git_dir = git_dir.join("modules").join(name);
+    let Some(parent) = modules_git_dir.parent() else {
+        return Err(GitError::InvalidPath(format!(
+            "invalid submodule gitdir path {}",
+            modules_git_dir.display()
+        )));
+    };
+    fs::create_dir_all(parent)?;
+    let from_display = fs::canonicalize(&dot_git)?;
+    let to_display = if modules_git_dir.exists() {
+        fs::canonicalize(&modules_git_dir)?
+    } else {
+        fs::canonicalize(parent)?.join(
+            modules_git_dir
+                .file_name()
+                .ok_or_else(|| GitError::InvalidPath("invalid submodule gitdir".into()))?,
+        )
+    };
+    if !quiet {
+        eprintln!("Migrating git directory of '{display}' from");
+        eprintln!("'{}' to", from_display.display());
+        eprintln!("'{}'", to_display.display());
+    }
+    fs::rename(&dot_git, &modules_git_dir)?;
+    connect_work_tree_and_git_dir(sub_root, &modules_git_dir)
+}
+
+/// git's `connect_work_tree_and_git_dir`: write the `<sub>/.git` gitfile pointing
+/// at the (now relocated) git dir and record the matching `core.worktree`.
+fn connect_work_tree_and_git_dir(sub_root: &Path, modules_git_dir: &Path) -> Result<()> {
+    let dot_git = sub_root.join(".git");
+    let gitdir_link = relative_path_from_absolute_components(sub_root, modules_git_dir)?;
+    fs::write(&dot_git, format!("gitdir: {gitdir_link}\n"))?;
+    let mut config = read_repo_config(modules_git_dir)?;
+    let worktree = relative_path_from_absolute_components(modules_git_dir, sub_root)?;
+    set_config_value(&mut config, "core", None, "worktree", &worktree);
+    write_repo_config(modules_git_dir, &config)
+}
+
+/// git's `absorb_git_dir_into_superproject_recurse`: self-invoke
+/// `submodule absorbgitdirs --super-prefix=<display>/` inside the populated
+/// submodule so nested gitlinks are absorbed with anchored displaypaths.
+fn recurse_submodule_absorbgitdirs(sub_root: &Path, display: &str, quiet: bool) -> Result<()> {
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
+    let mut command = ProcessCommand::new(exe);
+    command.arg("submodule");
+    if quiet {
+        command.arg("--quiet");
+    }
+    command.arg("absorbgitdirs");
+    command.arg(format!("--super-prefix={display}/"));
+    io::stdout().flush()?;
+    let status = command
+        .current_dir(sub_root)
+        .status()
+        .map_err(|err| GitError::Io(err.to_string()))?;
+    if status.success() {
+        return Ok(());
+    }
+    let code = status.code().unwrap_or(128);
+    Err(GitError::Exit(code))
 }
 
 fn cmd_submodule_foreach(args: &[String], quiet: bool) -> Result<()> {
@@ -2141,10 +2559,11 @@ fn submodule_set_url_usage<T>() -> Result<T> {
 fn parse_submodule_sync_options(
     args: &[String],
     mut quiet: bool,
-) -> Result<(Vec<&str>, bool, bool)> {
+) -> Result<(Vec<&str>, bool, bool, String)> {
     let mut paths = Vec::new();
     let mut positional_only = false;
     let mut recursive = false;
+    let mut super_prefix = String::new();
     for arg in args {
         if positional_only {
             paths.push(arg.as_str());
@@ -2155,19 +2574,25 @@ fn parse_submodule_sync_options(
             "--quiet" | "-q" => quiet = true,
             "--recursive" => recursive = true,
             "--no-recursive" => return submodule_usage(),
+            // Internal: git's `--super-prefix=<path>/`, carried by the recursive
+            // child so its nested displaypaths anchor at the recursion root.
+            value if value.starts_with("--super-prefix=") => {
+                super_prefix = value["--super-prefix=".len()..].to_string();
+            }
             value if value.starts_with('-') => return submodule_usage(),
             value => paths.push(value),
         }
     }
-    Ok((paths, quiet, recursive))
+    Ok((paths, quiet, recursive, super_prefix))
 }
 
 fn parse_submodule_absorbgitdirs_options(
     args: &[String],
     mut quiet: bool,
-) -> Result<(Vec<&str>, bool)> {
+) -> Result<(Vec<&str>, bool, String)> {
     let mut paths = Vec::new();
     let mut positional_only = false;
+    let mut super_prefix = String::new();
     for arg in args {
         if positional_only {
             paths.push(arg.as_str());
@@ -2176,11 +2601,16 @@ fn parse_submodule_absorbgitdirs_options(
         match arg.as_str() {
             "--" => positional_only = true,
             "--quiet" | "-q" => quiet = true,
+            // Internal: git's `--super-prefix=<path>/`, carried by the recursive
+            // child so its migration messages anchor at the recursion root.
+            value if value.starts_with("--super-prefix=") => {
+                super_prefix = value["--super-prefix=".len()..].to_string();
+            }
             value if value.starts_with('-') => return submodule_usage(),
             value => paths.push(value),
         }
     }
-    Ok((paths, quiet))
+    Ok((paths, quiet, super_prefix))
 }
 
 fn parse_submodule_foreach_options(
@@ -2425,15 +2855,67 @@ fn resolve_submodule_relative_url(
     url: &str,
     warn_on_missing_remote: bool,
 ) -> String {
-    let base = config.get("remote", Some("origin"), "url");
+    // git's `resolve_relative_url` resolves against `remote.<default>.url`, where
+    // the default remote is the HEAD branch's remote, else the sole remote, else
+    // "origin" (`get_default_remote`). Hardcoding "origin" misresolves a super-
+    // project whose only remote was renamed (e.g. a nested submodule whose
+    // `origin` is now `upstream`).
+    let (remote, base) = superproject_remote_base(worktree_root, config);
     if base.is_none() && warn_on_missing_remote && (url.starts_with("../") || url.starts_with("./"))
     {
         eprintln!(
-            "warning: could not look up configuration 'remote.origin.url'. Assuming this repository is its own authoritative upstream."
+            "warning: could not look up configuration 'remote.{remote}.url'. Assuming this repository is its own authoritative upstream."
         );
     }
     let cwd_fallback = worktree_root.to_string_lossy();
-    sley_submodule::resolve_relative_url(url, base, &cwd_fallback, None)
+    sley_submodule::resolve_relative_url(url, base.as_deref(), &cwd_fallback, None)
+}
+
+/// The git dir backing the worktree at `worktree_root` (`.git` dir, or the target
+/// of a `.git` gitfile), if present.
+fn worktree_git_dir(worktree_root: &Path) -> Option<PathBuf> {
+    let dot_git = worktree_root.join(".git");
+    if dot_git.is_dir() {
+        Some(dot_git)
+    } else if dot_git.is_file() {
+        read_gitdir_file(&dot_git).ok().flatten()
+    } else {
+        None
+    }
+}
+
+/// The superproject's default remote NAME (`get_default_remote`) and its
+/// `remote.<name>.url`. Remotes and branch config live in the COMMON git dir
+/// (shared across linked worktrees), so the lookup reads that config — for a
+/// main worktree the common dir IS the git dir, making this identical to the
+/// per-worktree config. Falls back to the passed config when the common config
+/// can't be read.
+fn superproject_remote_base(
+    worktree_root: &Path,
+    fallback: &GitConfig,
+) -> (String, Option<String>) {
+    let git_dir = worktree_git_dir(worktree_root);
+    let common_config = git_dir
+        .as_deref()
+        .and_then(|gd| common_git_dir_for_git_dir(gd).ok())
+        .and_then(|common| read_repo_config(&common).ok());
+    let config = common_config.as_ref().unwrap_or(fallback);
+    let remote = match &git_dir {
+        Some(git_dir) if repository_object_format(git_dir).is_ok() => {
+            let format = repository_object_format(git_dir).unwrap_or(ObjectFormat::Sha1);
+            repo_default_remote(config, git_dir, format)
+        }
+        _ => {
+            let remotes = distinct_remote_names(config);
+            if remotes.len() == 1 {
+                remotes[0].clone()
+            } else {
+                "origin".to_string()
+            }
+        }
+    };
+    let base = config.get("remote", Some(&remote), "url").map(str::to_string);
+    (remote, base)
 }
 
 fn resolve_submodule_init_url(worktree_root: &Path, config: &GitConfig, url: &str) -> String {
@@ -2563,43 +3045,16 @@ fn absorb_submodule_git_dir(
     quiet: bool,
 ) -> Result<()> {
     let submodule_root = worktree_root.join(&submodule.path);
-    let dot_git = submodule_root.join(".git");
-    if !dot_git.is_dir() {
+    if !submodule_root.join(".git").is_dir() {
         return Ok(());
     }
-    let modules_git_dir = git_dir.join("modules").join(&submodule.name);
-    let Some(parent) = modules_git_dir.parent() else {
-        return Err(GitError::InvalidPath(format!(
-            "invalid submodule gitdir path {}",
-            modules_git_dir.display()
-        )));
-    };
-    fs::create_dir_all(parent)?;
-    let from_display = fs::canonicalize(&dot_git)?;
-    let to_display = if modules_git_dir.exists() {
-        fs::canonicalize(&modules_git_dir)?
-    } else {
-        fs::canonicalize(parent)?.join(
-            modules_git_dir
-                .file_name()
-                .ok_or_else(|| GitError::InvalidPath("invalid submodule gitdir".into()))?,
-        )
-    };
-    if !quiet {
-        eprintln!("Migrating git directory of '{}' from", submodule.path);
-        eprintln!("'{}' to", from_display.display());
-        eprintln!("'{}'", to_display.display());
-    }
-    fs::rename(&dot_git, &modules_git_dir)?;
-
-    let gitdir_link = relative_path_from_absolute_components(&submodule_root, &modules_git_dir)?;
-    fs::write(&dot_git, format!("gitdir: {gitdir_link}\n"))?;
-
-    let mut config = read_repo_config(&modules_git_dir)?;
-    let worktree = relative_path_from_absolute_components(&modules_git_dir, &submodule_root)?;
-    set_config_value(&mut config, "core", None, "worktree", &worktree);
-    write_repo_config(&modules_git_dir, &config)?;
-    Ok(())
+    relocate_submodule_git_dir(
+        git_dir,
+        &submodule_root,
+        &submodule.name,
+        &submodule.path,
+        quiet,
+    )
 }
 
 fn run_submodule_foreach_tree(
@@ -3086,6 +3541,17 @@ pub(crate) fn read_submodule_configs(worktree_root: &Path) -> Result<Vec<Submodu
         eprintln!("fatal: invalid value for 'submodule.{name}.update'");
         return Err(GitError::Exit(128));
     }
+    // git's `.gitmodules` parser warns (and drops the value) for a path/url that
+    // could be mistaken for a command-line option (`warn_command_line_option`).
+    // The typed parser already dropped it; surface the warning so a recursive
+    // clone/update reports "ignoring '<var>' ..." rather than silently failing.
+    for warning in &set.warnings {
+        if let sley_submodule::ParseWarning::CommandLineOption { var, value } = warning {
+            eprintln!(
+                "warning: ignoring '{var}' which may be interpreted as a command-line option: {value}"
+            );
+        }
+    }
     let mut submodules = Vec::new();
     for submodule in set.iter() {
         // A submodule with no `path` is not addressable; the old walk skipped
@@ -3480,4 +3946,220 @@ fn display_submodule_ref(name: &str) -> String {
         return tag.to_string();
     }
     name.strip_prefix("refs/").unwrap_or(name).to_string()
+}
+
+/// `git submodule--helper <subcommand>`: the plumbing entry point git's porcelain
+/// shells out to. Only the subcommands the upstream test-suite exercises directly
+/// are wired here; the porcelain verbs go through `cmd_submodule`.
+pub(crate) fn cmd_submodule_helper(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("get-default-remote") => submodule_helper_get_default_remote(&args[1..]),
+        Some(other) => {
+            eprintln!("fatal: '{other}' is not a valid submodule--helper subcommand");
+            Err(GitError::Exit(1))
+        }
+        None => {
+            eprintln!("usage: git submodule--helper");
+            Err(GitError::Exit(129))
+        }
+    }
+}
+
+/// Port of `module_get_default_remote` (`builtin/submodule--helper.c`): resolve
+/// the default remote NAME of the submodule populated at `<path>`. The lookup is
+/// url-first — a remote whose configured url matches the submodule's (relative-
+/// resolved) `.gitmodules` url wins — then falls back to `repo_default_remote`
+/// (the HEAD branch's remote, else the sole remote, else "origin").
+fn submodule_helper_get_default_remote(args: &[String]) -> Result<()> {
+    const USAGE: &str = "usage: git submodule--helper get-default-remote <path>";
+    let mut paths = Vec::new();
+    let mut end_opts = false;
+    for arg in args {
+        if !end_opts && arg == "--" {
+            end_opts = true;
+            continue;
+        }
+        if !end_opts && arg == "-h" {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        if !end_opts && arg.len() > 1 && arg.starts_with('-') {
+            eprintln!("{USAGE}");
+            return Err(GitError::Exit(129));
+        }
+        paths.push(arg.clone());
+    }
+    if paths.len() != 1 {
+        eprintln!("{USAGE}");
+        return Err(GitError::Exit(129));
+    }
+    let path_arg = &paths[0];
+
+    let cwd = env::current_dir()?;
+    let super_git_dir = discover_git_dir(&cwd)?;
+    let worktree_root = worktree_root_for_git_dir(&super_git_dir)?;
+
+    // git prepends the `prefix` (cwd relative to the worktree root) to a
+    // relative path; `cwd.join(path_arg)` reaches the same worktree location.
+    let abs_path = if Path::new(path_arg).is_absolute() {
+        PathBuf::from(path_arg)
+    } else {
+        cwd.join(path_arg)
+    };
+    let abs_path = normalize_lexical_path(&abs_path);
+
+    // `repo_submodule_init`: try the populated worktree's `.git` first, then the
+    // superproject's `modules/<name>` git dir for a configured-but-unpopulated
+    // submodule. Either failure is git's "could not get a repository handle".
+    let sub_git_dir = resolve_submodule_repo_gitdir(&abs_path)
+        .or_else(|| modules_gitdir_for_worktree_path(&worktree_root, &super_git_dir, &abs_path));
+    let Some(sub_git_dir) = sub_git_dir else {
+        eprintln!("fatal: could not get a repository handle for submodule '{path_arg}'");
+        return Err(GitError::Exit(128));
+    };
+    let sub_format = repository_object_format(&sub_git_dir)?;
+    let sub_config = read_repo_config(&sub_git_dir)?;
+    let remote_name = submodule_default_remote_name(
+        &worktree_root,
+        &super_git_dir,
+        &abs_path,
+        &sub_git_dir,
+        sub_format,
+        &sub_config,
+    )?;
+    println!("{remote_name}");
+    Ok(())
+}
+
+/// Core of `get_default_remote_submodule`: the default remote NAME for the
+/// already-resolved submodule (`abs_path` worktree, `sub_git_dir` git dir).
+/// url-match first (a remote whose url equals the submodule's relative-resolved
+/// `.gitmodules` url), then `repo_default_remote`.
+fn submodule_default_remote_name(
+    worktree_root: &Path,
+    super_git_dir: &Path,
+    abs_path: &Path,
+    sub_git_dir: &Path,
+    sub_format: ObjectFormat,
+    sub_config: &GitConfig,
+) -> Result<String> {
+    let mut remote_name = None;
+    if let Some(url) = configured_submodule_url(worktree_root, super_git_dir, abs_path)? {
+        remote_name = remote_name_for_url(sub_config, &url);
+    }
+    Ok(remote_name.unwrap_or_else(|| repo_default_remote(sub_config, sub_git_dir, sub_format)))
+}
+
+/// Resolve the git dir for a populated submodule worktree at `worktree`: a `.git`
+/// subdir, or a `gitdir:`-pointer file. Returns `None` when neither is present
+/// (so the caller can fall back / die without walking up to the superproject).
+fn resolve_submodule_repo_gitdir(worktree: &Path) -> Option<PathBuf> {
+    let dot_git = worktree.join(".git");
+    if dot_git.is_dir() {
+        return fs::canonicalize(&dot_git).ok();
+    }
+    if dot_git.is_file()
+        && let Ok(Some(target)) = read_gitdir_file(&dot_git)
+        && target.is_dir()
+    {
+        return fs::canonicalize(&target).ok();
+    }
+    None
+}
+
+/// `repo_submodule_init`'s fallback: a configured submodule whose worktree is not
+/// populated still has its git dir at `<super>/modules/<name>`. Look the name up
+/// from the superproject `.gitmodules` keyed by the worktree-relative path.
+fn modules_gitdir_for_worktree_path(
+    worktree_root: &Path,
+    super_git_dir: &Path,
+    abs_path: &Path,
+) -> Option<PathBuf> {
+    let rel = abs_path.strip_prefix(worktree_root).ok()?;
+    let rel = rel.to_str()?;
+    let submodules = read_submodule_configs(worktree_root).ok()?;
+    let name = &submodules.iter().find(|sub| sub.path == rel)?.name;
+    let gitdir = super_git_dir.join("modules").join(name);
+    gitdir.is_dir().then_some(gitdir)
+}
+
+/// The submodule's `.gitmodules` url for the worktree at `abs_path`, resolved to
+/// the concrete form when relative (matching what `submodule add` records as the
+/// sub-repo's `origin.url`). `None` when the path is not a configured submodule.
+fn configured_submodule_url(
+    worktree_root: &Path,
+    super_git_dir: &Path,
+    abs_path: &Path,
+) -> Result<Option<String>> {
+    let Ok(rel) = abs_path.strip_prefix(worktree_root) else {
+        return Ok(None);
+    };
+    let Some(rel) = rel.to_str() else {
+        return Ok(None);
+    };
+    let submodules = read_submodule_configs(worktree_root)?;
+    let Some(url) = submodules
+        .iter()
+        .find(|sub| sub.path == rel)
+        .and_then(|sub| sub.url.clone())
+    else {
+        return Ok(None);
+    };
+    if url.starts_with("../") || url.starts_with("./") {
+        let super_config = read_repo_config(super_git_dir)?;
+        Ok(Some(resolve_submodule_sync_url(
+            worktree_root,
+            &super_config,
+            &url,
+        )))
+    } else {
+        Ok(Some(url))
+    }
+}
+
+/// `repo_remote_from_url`: the name of the first remote with a url exactly equal
+/// to `url` (remotes in config first-appearance order).
+fn remote_name_for_url(config: &GitConfig, url: &str) -> Option<String> {
+    for name in distinct_remote_names(config) {
+        if config
+            .get_all("remote", Some(&name), "url")
+            .into_iter()
+            .flatten()
+            .any(|configured| configured == url)
+        {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// `repo_default_remote`: the HEAD branch's `branch.<name>.remote`, else the sole
+/// remote's name when exactly one is configured, else "origin".
+fn repo_default_remote(config: &GitConfig, git_dir: &Path, format: ObjectFormat) -> String {
+    let store = FileRefStore::new(git_dir, format);
+    if let Ok(Some(RefTarget::Symbolic(target))) = store.read_ref("HEAD")
+        && let Some(branch) = target.strip_prefix("refs/heads/")
+        && let Some(remote) = config.get("branch", Some(branch), "remote")
+    {
+        return remote.to_string();
+    }
+    let remotes = distinct_remote_names(config);
+    if remotes.len() == 1 {
+        return remotes[0].clone();
+    }
+    "origin".to_string()
+}
+
+/// Remote names in first-appearance order across the config sections.
+fn distinct_remote_names(config: &GitConfig) -> Vec<String> {
+    let mut names = Vec::new();
+    for section in &config.sections {
+        if section.name == "remote"
+            && let Some(sub) = &section.subsection
+            && !names.iter().any(|existing| existing == sub)
+        {
+            names.push(sub.clone());
+        }
+    }
+    names
 }

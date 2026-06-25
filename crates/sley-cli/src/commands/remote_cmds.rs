@@ -657,6 +657,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             checkout,
             depth,
             quiet,
+            &reference_alternates,
         );
     }
     if fetch_source_is_ssh(&repository)? {
@@ -695,6 +696,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             checkout,
             depth,
             quiet,
+            &reference_alternates,
         );
     }
     if fetch_source_is_git(&repository)? {
@@ -733,6 +735,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             checkout,
             depth,
             quiet,
+            &reference_alternates,
         );
     }
 
@@ -1130,6 +1133,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         checkout,
         depth,
         quiet,
+            &reference_alternates,
     )
 }
 
@@ -2814,9 +2818,38 @@ fn recurse_clone_submodules(
     checkout: bool,
     depth: Option<u32>,
     quiet: bool,
+    references: &[CloneReferenceAlternate],
 ) -> Result<()> {
     if active.is_empty() || bare || !checkout {
         return Ok(());
+    }
+    // git's `clone.c`: when `--recurse-submodules` is combined with
+    // `--reference[-if-able]`, record `submodule.alternateLocation=superproject`
+    // (+ the error strategy) so each recursive submodule clone borrows its
+    // objects from the matching `modules/<name>` of the reference superproject.
+    if !references.is_empty() {
+        let strategy = if references.iter().all(|reference| reference.if_able) {
+            "info"
+        } else {
+            "die"
+        };
+        let git_dir = discover_git_dir(destination)?;
+        let mut config = read_repo_config(&git_dir)?;
+        set_config_value(
+            &mut config,
+            "submodule",
+            None,
+            "alternateLocation",
+            "superproject",
+        );
+        set_config_value(
+            &mut config,
+            "submodule",
+            None,
+            "alternateErrorStrategy",
+            strategy,
+        );
+        write_repo_config(&git_dir, &config)?;
     }
     // git's `clone.c` treats `--recurse-submodules[=<pathspec>]` as the
     // `submodule.active` filter, NOT as explicit named pathspecs: it runs the

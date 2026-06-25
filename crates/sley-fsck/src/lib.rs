@@ -471,6 +471,12 @@ where
             if entry.oid.is_null() {
                 continue;
             }
+            // git's `fsck_walk_tree` skips gitlink (mode 160000) entries: a
+            // submodule commit lives in the submodule's own object store, not the
+            // superproject's, so it is never a broken link / missing object here.
+            if entry.mode == 0o160000 {
+                continue;
+            }
             if let Some(name) = &source_name {
                 let entry_name = String::from_utf8_lossy(entry.name);
                 self.object_names
