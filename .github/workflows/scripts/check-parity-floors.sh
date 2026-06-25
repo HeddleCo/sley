@@ -469,7 +469,7 @@ declare -A FLOOR=(
     [t4214-log-graph-octopus.sh]=17
     [t4215-log-skewed-merges.sh]=9
     [t6002-rev-list-bisect.sh]=53
-    [t6030-bisect-porcelain.sh]=95
+    [t6030-bisect-porcelain.sh]=96
     [t5310-pack-bitmaps.sh]=221
     [t5326-multi-pack-bitmaps.sh]=344
     # codex-wave-4-recovery: rev_list filters t6006 enroll@56 / t6112 enroll@48.
@@ -487,7 +487,7 @@ declare -A FLOOR=(
     [t2020-checkout-detach.sh]=26
     [t2070-restore.sh]=15
     [t6003-rev-list-topo-order.sh]=36
-    [t6012-rev-list-simplify.sh]=36
+    [t6012-rev-list-simplify.sh]=42
     [t4205-log-pretty-formats.sh]=108
     [t4216-log-bloom.sh]=161
     [t5318-commit-graph.sh]=95
@@ -533,7 +533,7 @@ declare -A FLOOR=(
     # clone SSH-transport+partial-clone 86->109/109 (banked 107 = full-pass minus 2-cell
     # handshake-flake margin; t5601 historically parallel-flake-prone). Guards neutral:
     # t4012=4 t4014=208 t4015=119 t4202=131 t5510=7 t5516=99 t5526=39 t3700=41 t7508=119.
-    [t4013-diff-various.sh]=216
+    [t4013-diff-various.sh]=230
     # codex-wave-3 (2026-06-17): format-patch --notes/format.notes, --output/format.outputDirectory, --numstat 154->164.
     [t4014-format-patch.sh]=208
     [t4100-apply-stat.sh]=25
@@ -553,7 +553,7 @@ declare -A FLOOR=(
     [t4045-diff-relative.sh]=30
     [t4047-diff-dirstat.sh]=41
     # recov-wave (2026-06-20): diff whitespace --ignore-* modes 114->119 (guard t4013 +1->206).
-    [t4015-diff-whitespace.sh]=129
+    [t4015-diff-whitespace.sh]=130
     [t4018-diff-funcname.sh]=287
     [t4124-apply-ws-rule.sh]=84
     [t4019-diff-wserror.sh]=19
@@ -569,8 +569,8 @@ declare -A FLOOR=(
     # set-url/set-branch, relative-URL resolution, .gitmodules+config writes. t7400
     # 88->113; side gain t7406 54->57. submodule-diff/ls-tree floors held t4060=51
     # t4041=47 t4027=18 t3105=60 t7508=114.
-    [t7400-submodule-basic.sh]=111
-    [t7506-status-submodule.sh]=35
+    [t7400-submodule-basic.sh]=116
+    [t7506-status-submodule.sh]=38
     # wave-26 (2026-06-21): protocol-v2 negotiation/ls-refs/fetch 21->38 (banked 36, 2-cell git:// handshake-flake margin);
     # wtstatus-ignore 8->25/25 (NEW floor+enroll); rev-parse-disambig 9->35 (NEW floor+enroll). Guards neutral:
     # t5700=9 t5701=25 t5601=109 t5516=111 t5510=7 t5526=39 t3600=81 t1500=81 t1502=37 t1507=29.
@@ -656,7 +656,7 @@ declare -A FLOOR=(
     # disjoint files, combined t7600 44->49 (stable 49x3). describe enrolled at 84 (74->84).
     # codex-wave-3 (2026-06-17): merge --no-edit acceptance + rename cleanup 49->50.
     [t7600-merge.sh]=83
-    [t6120-describe.sh]=98
+    [t6120-describe.sh]=103
     # wave-1 integration (2026-06-18, integ/wave1): codex/parity-maintenance lifted
     # t7900-maintenance 12->37 (cmd_maintenance gain in pack.rs). Stable 37x3 on the
     # integrated binary.
@@ -1083,6 +1083,11 @@ declare -A FLOOR=(
     [t6434-merge-recursive-rename-options.sh]=27
     [t6412-merge-large-rename.sh]=9
     [t7525-status-rename.sh]=15
+    [t4001-diff-rename.sh]=22
+    [t4007-rename-3.sh]=11
+    [t4003-diff-rename-1.sh]=4
+    [t4023-diff-rename-typechange.sh]=1
+    [t6111-rev-list-treesame.sh]=65
 
 )
 
