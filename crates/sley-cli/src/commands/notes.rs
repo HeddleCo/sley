@@ -122,6 +122,11 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
             refuse_non_ref("merge")?;
             notes_merge_cmd(&git_dir, format, &notes_ref, sub_args)
         }
+        "prune" => {
+            refuse_outside("prune")?;
+            refuse_non_ref("prune")?;
+            notes_prune(&git_dir, format, &notes_ref, sub_args)
+        }
         "get-ref" => notes_get_ref(&notes_ref, sub_args),
         other => notes_unknown_subcommand_error(other),
     }
@@ -920,6 +925,92 @@ fn notes_remove(
             "Notes removed by 'git notes remove'",
             &notes_commit_identity()?,
             notes_ref_expected(&store, &notes_ref_handle(notes_ref))?,
+        )?;
+    }
+    Ok(())
+}
+
+/// `git notes prune [-n] [-v]` — drop notes whose annotated object is no longer
+/// present in the object database. `-n`/`--dry-run` lists the prunable note
+/// targets without removing them; `-v`/`--verbose` lists them *and* removes;
+/// with neither, prunes silently. Mirrors `prune_notes` in upstream `notes.c`:
+/// `-n` implies VERBOSE|DRYRUN, `-v` implies VERBOSE, default prints nothing.
+fn notes_prune(
+    git_dir: &Path,
+    format: ObjectFormat,
+    notes_ref: &str,
+    args: &[String],
+) -> Result<()> {
+    let mut show_only = false;
+    let mut verbose = false;
+    let mut positional_only = false;
+    let mut had_positional = false;
+    for arg in args {
+        if positional_only {
+            had_positional = true;
+            continue;
+        }
+        match arg.as_str() {
+            "--" => positional_only = true,
+            "-n" | "--dry-run" => show_only = true,
+            "--no-dry-run" => show_only = false,
+            "-v" | "--verbose" => verbose = true,
+            "--no-verbose" => verbose = false,
+            value if value.starts_with('-') && value.len() > 1 && value != "-" => {
+                return Err(notes_unknown_option(value, NotesUsage::Prune));
+            }
+            _ => had_positional = true,
+        }
+    }
+    if had_positional {
+        // git: `prune` takes no positional arguments — any extra is a usage error.
+        eprintln!("error: too many arguments");
+        print_notes_usage(NotesUsage::Prune);
+        return Err(GitError::Exit(129));
+    }
+
+    let store = FileRefStore::new(git_dir, format);
+    let handle = notes_ref_handle(notes_ref);
+    let mut notes = list_notes(git_dir, format, &store, &handle)?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+
+    // Collect prunable targets in the order git emits them: `prune_notes_helper`
+    // prepends each hit while walking the tree in ascending-oid order, so the
+    // resulting list is processed in descending-oid order.
+    let mut prunable: Vec<ObjectId> = Vec::new();
+    for note in &notes {
+        if !db.contains(&note.annotated)? {
+            prunable.push(note.annotated);
+        }
+    }
+    prunable.reverse();
+
+    // `-n` => print + don't remove; `-v` => print + remove; default => remove silently.
+    let print_each = show_only || verbose;
+    let remove_each = !show_only;
+    let mut removed_any = false;
+    for target in &prunable {
+        if print_each {
+            println!("{}", target.to_hex());
+        }
+        if remove_each {
+            remove_note(&mut notes, target);
+            removed_any = true;
+        }
+    }
+
+    // git always calls commit_notes when not dry-running, but commit_notes is a
+    // no-op on an unchanged tree, so only commit when something was pruned.
+    if removed_any {
+        write_notes(
+            git_dir,
+            format,
+            &store,
+            &handle,
+            &notes,
+            "Notes removed by 'git notes prune'",
+            &notes_commit_identity()?,
+            notes_ref_expected(&store, &handle)?,
         )?;
     }
     Ok(())
@@ -1725,6 +1816,7 @@ enum NotesUsage {
     Merge,
     Show,
     Remove,
+    Prune,
     GetRef,
 }
 
@@ -1870,6 +1962,14 @@ fn print_notes_usage(usage: NotesUsage) {
 
     --[no-]ignore-missing attempt to remove non-existent note is not an error
     --[no-]stdin          read object names from the standard input
+
+"#
+        }
+        NotesUsage::Prune => {
+            r#"usage: git notes prune [<options>]
+
+    -n, --dry-run         do not remove, show only
+    -v, --verbose         report pruned notes
 
 "#
         }
