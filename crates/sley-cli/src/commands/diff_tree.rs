@@ -1660,7 +1660,7 @@ fn maybe_push_depth_limited_blob_change(
     let status = match (left, right) {
         (None, Some(_)) => sley_diff_merge::NameStatus::Added,
         (Some(_), None) => sley_diff_merge::NameStatus::Deleted,
-        (Some(_), Some(_)) => sley_diff_merge::NameStatus::Modified,
+        (Some(left), Some(right)) => sley_diff_merge::modify_or_type_change(left.mode, right.mode),
         (None, None) => return,
     };
     out.push(sley_diff_merge::NameStatusEntry {
@@ -1683,7 +1683,7 @@ fn push_depth_limited_tree_change(
     let status = match (left, right) {
         (None, Some(_)) => sley_diff_merge::NameStatus::Added,
         (Some(_), None) => sley_diff_merge::NameStatus::Deleted,
-        (Some(_), Some(_)) => sley_diff_merge::NameStatus::Modified,
+        (Some(left), Some(right)) => sley_diff_merge::modify_or_type_change(left.mode, right.mode),
         (None, None) => return,
     };
     out.push(sley_diff_merge::NameStatusEntry {

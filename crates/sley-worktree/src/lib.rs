@@ -5426,7 +5426,9 @@ fn collect_status_entries_head_matches_index(
             None if !worktree_present && skip_worktree => b' ',
             None if !worktree_present => b'D',
             Some(_) if intent_to_add => b'A',
-            Some(worktree_entry) if Some(worktree_entry) != visible_index_entry => b'M',
+            Some(worktree_entry) if Some(worktree_entry) != visible_index_entry => {
+                status_change_code(index_entry.mode, worktree_entry.mode)
+            }
             _ if submodule.is_some_and(|sub| sub.any()) => b'M',
             _ => b' ',
         };
@@ -5519,7 +5521,9 @@ fn collect_status_entries_with_head(
                 let index_code = match (head_entry, visible_index_entry) {
                     (None, Some(_)) => b'A',
                     (Some(_), None) => b'D',
-                    (Some(left), Some(right)) if left != right => b'M',
+                    (Some(left), Some(right)) if left != right => {
+                        status_change_code(left.mode, right.mode)
+                    }
                     _ => b' ',
                 };
                 let worktree_code = match (visible_index_entry, worktree_entry) {
@@ -5528,7 +5532,9 @@ fn collect_status_entries_with_head(
                     (None, None) if intent_to_add => b' ',
                     (Some(_), None) if !worktree_present && skip_worktree => b' ',
                     (Some(_), None) if !worktree_present => b'D',
-                    (Some(left), Some(right)) if left != right => b'M',
+                    (Some(left), Some(right)) if left != right => {
+                        status_change_code(left.mode, right.mode)
+                    }
                     _ if submodule.is_some_and(|sub| sub.any()) => b'M',
                     _ => b' ',
                 };
@@ -5668,7 +5674,9 @@ fn short_status_tracked_only(
         let index_code = match (head_entry, visible_index_entry) {
             (None, Some(_)) => b'A',
             (Some(_), None) => b'D',
-            (Some(head_entry), Some(index_entry)) if *head_entry != *index_entry => b'M',
+            (Some(head_entry), Some(index_entry)) if *head_entry != *index_entry => {
+                status_change_code(head_entry.mode, index_entry.mode)
+            }
             _ => b' ',
         };
         let worktree_code = match worktree_entry.as_ref() {
@@ -5676,7 +5684,9 @@ fn short_status_tracked_only(
             None if sparse_checkout_active && entry.is_skip_worktree() => b' ',
             None => b'D',
             Some(_) if entry.is_intent_to_add() => b'A',
-            Some(worktree_entry) if Some(worktree_entry) != visible_index_entry => b'M',
+            Some(worktree_entry) if Some(worktree_entry) != visible_index_entry => {
+                status_change_code(index_entry.mode, worktree_entry.mode)
+            }
             _ if submodule.is_some_and(|sub| sub.any()) => b'M',
             _ => b' ',
         };
@@ -6637,7 +6647,9 @@ fn short_status_tracked_only_head_matches_index_parallel(
                     None if entry.is_intent_to_add() => b' ',
                     None => b'D',
                     Some(_) if entry.is_intent_to_add() => b'A',
-                    Some(worktree_entry) if *worktree_entry != index_entry => b'M',
+                    Some(worktree_entry) if *worktree_entry != index_entry => {
+                        status_change_code(index_entry.mode, worktree_entry.mode)
+                    }
                     _ if submodule.is_some_and(|sub| sub.any()) => b'M',
                     _ => b' ',
                 };
@@ -6727,7 +6739,9 @@ fn short_status_borrowed_tracked_only_head_matches_index_parallel(
                     None if entry.is_intent_to_add() => b' ',
                     None => b'D',
                     Some(_) if entry.is_intent_to_add() => b'A',
-                    Some(worktree_entry) if *worktree_entry != index_entry => b'M',
+                    Some(worktree_entry) if *worktree_entry != index_entry => {
+                        status_change_code(index_entry.mode, worktree_entry.mode)
+                    }
                     _ if submodule.is_some_and(|sub| sub.any()) => b'M',
                     _ => b' ',
                 };
@@ -6824,7 +6838,9 @@ where
                     None if entry.is_intent_to_add() => b' ',
                     None => b'D',
                     Some(_) if entry.is_intent_to_add() => b'A',
-                    Some(worktree_entry) if *worktree_entry != index_entry => b'M',
+                    Some(worktree_entry) if *worktree_entry != index_entry => {
+                        status_change_code(index_entry.mode, worktree_entry.mode)
+                    }
                     _ if submodule.is_some_and(|sub| sub.any()) => b'M',
                     _ => b' ',
                 };
@@ -6895,7 +6911,9 @@ fn short_status_borrowed_tracked_only_head_matches_index_count_parallel(
                 )?;
                 let worktree_code = match worktree_entry.as_ref() {
                     None => b'D',
-                    Some(worktree_entry) if *worktree_entry != index_entry => b'M',
+                    Some(worktree_entry) if *worktree_entry != index_entry => {
+                        status_change_code(index_entry.mode, worktree_entry.mode)
+                    }
                     _ if submodule.is_some_and(|sub| sub.any()) => b'M',
                     _ => b' ',
                 };
@@ -6942,7 +6960,9 @@ fn short_status_tracked_only_with_head_parallel(
         let index_code = match (head_entry, visible_index_entry) {
             (None, Some(_)) => b'A',
             (Some(_), None) => b'D',
-            (Some(head_entry), Some(index_entry)) if *head_entry != *index_entry => b'M',
+            (Some(head_entry), Some(index_entry)) if *head_entry != *index_entry => {
+                status_change_code(head_entry.mode, index_entry.mode)
+            }
             _ => b' ',
         };
         let precheck = prechecks
@@ -6983,7 +7003,9 @@ fn short_status_tracked_only_with_head_parallel(
                     None if entry.is_intent_to_add() => b' ',
                     None => b'D',
                     Some(_) if entry.is_intent_to_add() => b'A',
-                    Some(worktree_entry) if *worktree_entry != index_entry => b'M',
+                    Some(worktree_entry) if *worktree_entry != index_entry => {
+                        status_change_code(index_entry.mode, worktree_entry.mode)
+                    }
                     _ if submodule.is_some_and(|sub| sub.any()) => b'M',
                     _ => b' ',
                 };
@@ -18040,6 +18062,20 @@ fn read_commit(db: &FileObjectDatabase, format: ObjectFormat, oid: &ObjectId) ->
 struct TrackedEntry {
     mode: u32,
     oid: ObjectId,
+}
+
+/// The short-status change byte for a pair of differing tracked entries: `T`
+/// (typechange) when the file-type bits (`S_IFMT`) of the two modes differ —
+/// regular↔symlink, regular↔gitlink — otherwise `M` (modified). git's diff
+/// machinery sets `DIFF_STATUS_TYPE_CHANGED` for the former
+/// (`diffcore.h`'s `DIFF_PAIR_TYPE_CHANGED`); `wt-status.c` renders it
+/// `typechange:` / `T`. An exec-bit-only change (100644↔100755) stays `M`.
+fn status_change_code(old_mode: u32, new_mode: u32) -> u8 {
+    if sley_diff_merge::is_type_change(old_mode, new_mode) {
+        b'T'
+    } else {
+        b'M'
+    }
 }
 
 /// git's racy-git stat cache: the stage-0 index entries keyed by path (so the

@@ -2402,7 +2402,10 @@ fn write_diff_summary_entry(
                 writeln!(stdout, " copy {pretty} ({score}%)")?;
             }
         }
-        sley_diff_merge::NameStatus::Modified => {
+        // A modify and a typechange both route through git's `diff_summary`
+        // `default:` arm → `show_mode_change`, which prints ` mode change a => b`
+        // whenever the two modes differ (a typechange's modes always differ).
+        sley_diff_merge::NameStatus::Modified | sley_diff_merge::NameStatus::TypeChanged => {
             if entry.old_mode != entry.new_mode
                 && let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
             {
@@ -3048,6 +3051,56 @@ pub(crate) fn write_diff_patch_entry(
     entry: &sley_diff_merge::NameStatusEntry,
     options: DiffRenderOptions<'_>,
 ) -> Result<()> {
+    // A symlink target that is an incomplete line is not a whitespace error:
+    // git clears `WS_INCOMPLETE_LINE` when the new side is a symlink (diff.c
+    // "symlink being an incomplete line is not a news"), so the `\ No newline at
+    // end of file` marker is rendered in the context color rather than
+    // highlighted. Applies before the typechange split below so the split's
+    // symlink-creation half inherits the cleared rule.
+    let mut options = options;
+    if entry.new_mode == Some(0o120000)
+        && let Some(ws_error) = options.ws_error.as_mut()
+    {
+        ws_error.rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
+    }
+    // A filepair whose two sides have different file types (regular↔symlink,
+    // regular↔gitlink, symlink↔gitlink) cannot be rendered as one textual diff.
+    // git's `run_diff` (diff.c) splits it into a deletion of the old side
+    // followed by a creation of the new side, each shown through the normal
+    // add/delete patch path. The single `T` status survives in raw/name-status/
+    // summary; only the patch body is split.
+    if let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
+        && sley_diff_merge::is_type_change(old_mode, new_mode)
+    {
+        let deletion = sley_diff_merge::NameStatusEntry {
+            status: sley_diff_merge::NameStatus::Deleted,
+            path: entry.path.clone(),
+            old_path: None,
+            old_mode: Some(old_mode),
+            new_mode: None,
+            old_oid: entry.old_oid,
+            new_oid: None,
+        };
+        let deletion_options = DiffRenderOptions {
+            no_index_contents: options.no_index_contents.map(|(old, _)| (old, None)),
+            ..options
+        };
+        write_diff_patch_entry(stdout, &deletion, deletion_options)?;
+        let creation = sley_diff_merge::NameStatusEntry {
+            status: sley_diff_merge::NameStatus::Added,
+            path: entry.path.clone(),
+            old_path: None,
+            old_mode: None,
+            new_mode: Some(new_mode),
+            old_oid: None,
+            new_oid: entry.new_oid,
+        };
+        let creation_options = DiffRenderOptions {
+            no_index_contents: options.no_index_contents.map(|(_, new)| (None, new)),
+            ..options
+        };
+        return write_diff_patch_entry(stdout, &creation, creation_options);
+    }
     if is_gitlink_pair(entry)
         && options.submodule_format != commands::diff_options::SubmoduleDiffFormat::Short
         && options.no_index_contents.is_none()
@@ -3199,6 +3252,7 @@ pub(crate) fn write_diff_patch_entry(
             }
         }
         sley_diff_merge::NameStatus::Modified
+        | sley_diff_merge::NameStatus::TypeChanged
         | sley_diff_merge::NameStatus::Renamed(_)
         | sley_diff_merge::NameStatus::Copied(_) => {
             if let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
@@ -3399,6 +3453,7 @@ fn write_diff_binary_patch_entry(
             }
         }
         sley_diff_merge::NameStatus::Modified
+        | sley_diff_merge::NameStatus::TypeChanged
         | sley_diff_merge::NameStatus::Renamed(_)
         | sley_diff_merge::NameStatus::Copied(_) => {
             if let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
@@ -5125,10 +5180,16 @@ fn diff_entry_new_content(
             GitError::Command("diff numstat requires a worktree for worktree comparisons".into())
         })?;
         let path = root.join(repo_path_to_path(&entry.path));
-        if path.exists() {
-            return Ok(Some(fs::read(path)?));
+        // A worktree symlink's "content" is its target path bytes (git's
+        // `diff_populate_filespec` uses `strbuf_readlink`), NOT the bytes of the
+        // file it points at — so never dereference it with `fs::read`.
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Ok(Some(sley_diff_merge::symlink_target_bytes(&path)?));
+            }
+            Ok(_) => return Ok(Some(fs::read(path)?)),
+            Err(_) => return Ok(None),
         }
-        return Ok(None);
     }
     entry
         .new_oid
@@ -5527,13 +5588,18 @@ fn reverse_diff_entry(entry: sley_diff_merge::NameStatusEntry) -> sley_diff_merg
             new_oid: entry.old_oid,
             ..entry
         },
-        sley_diff_merge::NameStatus::Modified => sley_diff_merge::NameStatusEntry {
-            old_mode: entry.new_mode,
-            new_mode: entry.old_mode,
-            old_oid: entry.new_oid,
-            new_oid: entry.old_oid,
-            ..entry
-        },
+        // A reversed typechange is still a typechange (the `S_IFMT` bits still
+        // differ once the two sides are swapped), so it keeps its status and just
+        // flips the mode/oid pair like a modify.
+        sley_diff_merge::NameStatus::Modified | sley_diff_merge::NameStatus::TypeChanged => {
+            sley_diff_merge::NameStatusEntry {
+                old_mode: entry.new_mode,
+                new_mode: entry.old_mode,
+                old_oid: entry.new_oid,
+                new_oid: entry.old_oid,
+                ..entry
+            }
+        }
         sley_diff_merge::NameStatus::Renamed(score) => {
             let new_path = entry
                 .old_path

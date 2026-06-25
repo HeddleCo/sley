@@ -3184,7 +3184,9 @@ fn stash_show_summary_outputs_entry(entry: &sley_diff_merge::NameStatusEntry) ->
         | sley_diff_merge::NameStatus::Deleted
         | sley_diff_merge::NameStatus::Renamed(_)
         | sley_diff_merge::NameStatus::Copied(_) => true,
-        sley_diff_merge::NameStatus::Modified => entry.old_mode != entry.new_mode,
+        sley_diff_merge::NameStatus::Modified | sley_diff_merge::NameStatus::TypeChanged => {
+            entry.old_mode != entry.new_mode
+        }
         sley_diff_merge::NameStatus::Unmerged => false,
     }
 }

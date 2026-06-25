@@ -3931,6 +3931,7 @@ fn status_long_change_label(code: u8) -> Option<&'static str> {
     match code {
         b'A' => Some("new file:"),
         b'M' => Some("modified:"),
+        b'T' => Some("typechange:"),
         b'D' => Some("deleted:"),
         b'R' => Some("renamed:"),
         b'C' => Some("copied:"),

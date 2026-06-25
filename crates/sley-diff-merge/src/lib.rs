@@ -1441,6 +1441,12 @@ pub enum NameStatus {
     Added,
     Deleted,
     Modified,
+    /// A path whose file type (`S_IFMT` bits of the mode) changed between the two
+    /// sides — regular↔symlink, regular↔gitlink, symlink↔gitlink. git renders this
+    /// as `T` (`DIFF_STATUS_TYPE_CHANGED`, set by `diffcore.h`'s
+    /// `DIFF_PAIR_TYPE_CHANGED` before rename/modify resolution). An exec-bit-only
+    /// change (100644↔100755) is NOT a typechange — same `S_IFMT`.
+    TypeChanged,
     Renamed(u8),
     Copied(u8),
     /// An unmerged (conflicted) path: the index holds higher-stage entries.
@@ -1455,6 +1461,7 @@ impl NameStatus {
             Self::Added => 'A',
             Self::Deleted => 'D',
             Self::Modified => 'M',
+            Self::TypeChanged => 'T',
             Self::Renamed(_) => 'R',
             Self::Copied(_) => 'C',
             Self::Unmerged => 'U',
@@ -1467,6 +1474,33 @@ impl NameStatus {
             Self::Copied(score) => format!("C{score:03}"),
             _ => self.code().to_string(),
         }
+    }
+}
+
+/// The bit mask isolating the file-type bits of a git mode (`S_IFMT`). Regular
+/// files are `0o100000`, symlinks `0o120000`, gitlinks `0o160000`, trees
+/// `0o040000`.
+pub const S_IFMT: u32 = 0o170000;
+
+/// Whether a pair of (non-zero) modes constitutes a git "typechange": the file
+/// type bits (`S_IFMT`) differ. Mirrors `diffcore.h`'s `DIFF_PAIR_TYPE_CHANGED`
+/// (`(S_IFMT & one->mode) != (S_IFMT & two->mode)`). An exec-bit-only change
+/// (`0o100644` ↔ `0o100755`) is NOT a typechange — same `S_IFMT`.
+#[must_use]
+pub const fn is_type_change(old_mode: u32, new_mode: u32) -> bool {
+    (old_mode & S_IFMT) != (new_mode & S_IFMT)
+}
+
+/// Classify a both-sides-present change whose entries already differ: a
+/// [`NameStatus::TypeChanged`] when the modes' `S_IFMT` bits differ, otherwise a
+/// plain [`NameStatus::Modified`]. git sets `DIFF_STATUS_TYPE_CHANGED` before any
+/// rename/modify resolution (`diff.c` ~6650).
+#[must_use]
+pub const fn modify_or_type_change(old_mode: u32, new_mode: u32) -> NameStatus {
+    if is_type_change(old_mode, new_mode) {
+        NameStatus::TypeChanged
+    } else {
+        NameStatus::Modified
     }
 }
 
@@ -2333,7 +2367,7 @@ fn diff_name_status_index_worktree_changes_from_snapshot(
         };
         if right != *left {
             changes.push(NameStatusEntry {
-                status: NameStatus::Modified,
+                status: modify_or_type_change(left.mode, right.mode),
                 path: git_path.clone().into(),
                 old_path: None,
                 old_mode: Some(left.mode),
@@ -2725,7 +2759,9 @@ fn raw_name_status_changes_for_unique_paths<'a>(
         let status = match (left, right) {
             (None, Some(_)) => Some(NameStatus::Added),
             (Some(_), None) => Some(NameStatus::Deleted),
-            (Some(left), Some(right)) if left != right => Some(NameStatus::Modified),
+            (Some(left), Some(right)) if left != right => {
+                Some(modify_or_type_change(left.mode, right.mode))
+            }
             _ => None,
         };
         if let Some(status) = status {
@@ -4240,7 +4276,7 @@ fn index_worktree_change_for_entry(
         return Ok(None);
     }
     Ok(Some(NameStatusEntry {
-        status: NameStatus::Modified,
+        status: modify_or_type_change(left.mode, right.mode),
         path: git_path.to_vec().into(),
         old_path: None,
         old_mode: Some(left.mode),
@@ -4415,15 +4451,20 @@ fn file_mode(_metadata: &fs::Metadata) -> u32 {
     0o100644
 }
 
+/// Read a symbolic link's target as git stores it: the raw target path bytes,
+/// with no trailing newline. This is the "content" of a symlink blob (mode
+/// `120000`) — git's `diff_populate_filespec` uses `strbuf_readlink` for a
+/// worktree symlink rather than dereferencing it.
 #[cfg(unix)]
-fn symlink_target_bytes(path: &Path) -> Result<Vec<u8>> {
+pub fn symlink_target_bytes(path: &Path) -> Result<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
     let target = fs::read_link(path)?;
     Ok(target.as_os_str().as_bytes().to_vec())
 }
 
+/// See the unix variant: the raw symlink target bytes git stores as the blob.
 #[cfg(not(unix))]
-fn symlink_target_bytes(path: &Path) -> Result<Vec<u8>> {
+pub fn symlink_target_bytes(path: &Path) -> Result<Vec<u8>> {
     let target = fs::read_link(path)?;
     Ok(target.to_string_lossy().replace('\\', "/").into_bytes())
 }

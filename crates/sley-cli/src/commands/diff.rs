@@ -2935,7 +2935,8 @@ fn no_index_entry_from_sides(old: Option<&NoIndexSide>, new: Option<&NoIndexSide
     let status = match (old, new) {
         (None, Some(_)) => sley_diff_merge::NameStatus::Added,
         (Some(_), None) => sley_diff_merge::NameStatus::Deleted,
-        _ => sley_diff_merge::NameStatus::Modified,
+        (Some(old), Some(new)) => sley_diff_merge::modify_or_type_change(old.mode, new.mode),
+        (None, None) => sley_diff_merge::NameStatus::Modified,
     };
     let path = new
         .or(old)
