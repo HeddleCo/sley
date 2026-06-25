@@ -4,54 +4,39 @@
 use crate::*;
 use std::borrow::Cow;
 
-/// Expand a bundle of short tag options (e.g. `-am` => `-a -m`), the way git's
-/// `parse_options` does. Only bundles whose leading byte is a boolean short flag
-/// (`-a/-s/-f/-d/-v/-e/-i/-l`) are split; a value-taking flag (`-m/-u/-n/-F`)
-/// ends the bundle, keeping any glued value so the existing per-flag arms (which
-/// already handle `-m<msg>`, `-u<key>`, `-n<num>`) see it. Everything else —
-/// long options, `--`, glued value flags, and post-`--` positionals — passes
-/// through untouched.
-fn expand_tag_short_flags(args: &[String]) -> Vec<String> {
+/// Split a bundle of short tag options whose trailing flag takes a value
+/// (e.g. `-am` => `[-a, -m]`), the way git's `parse_options` does. Returns
+/// `Some(tokens)` only when `arg` is a run of boolean short flags
+/// (`-a/-s/-f/-d/-v/-e/-i/-l`) terminated by a value-taking flag (`-m/-u/-F`),
+/// keeping any glued value so the existing per-flag arms (`-m<msg>`, `-u<key>`)
+/// see it. Everything else — pure-boolean bundles (`-av`, `-fl`, …), long
+/// options, `-n<num>`, glued value flags — returns `None` and is parsed
+/// verbatim, preserving its (often error) semantics. The caller only consults
+/// this in option position, so an option's `-`-prefixed value (e.g.
+/// `--sort -authoremail`) is never misread as a bundle.
+fn expand_tag_bundle(arg: &str) -> Option<Vec<String>> {
     const BOOL_FLAGS: &[u8] = b"asfdveil";
-    const VALUE_FLAGS: &[u8] = b"munF";
-    let mut out = Vec::with_capacity(args.len());
-    let mut saw_dashdash = false;
-    for arg in args {
-        let bytes = arg.as_bytes();
-        if saw_dashdash || arg == "--" || !arg.starts_with('-') || arg.starts_with("--") || bytes.len() < 2
-        {
-            if arg == "--" {
-                saw_dashdash = true;
-            }
-            out.push(arg.clone());
-            continue;
-        }
-        // Only treat as a bundle when the first short flag is a boolean one;
-        // otherwise the existing glued-value arms (`-m…`, `-u…`, `-n…`) must see
-        // the argument verbatim.
-        if !BOOL_FLAGS.contains(&bytes[1]) {
-            out.push(arg.clone());
-            continue;
-        }
-        let mut idx = 1;
-        while idx < bytes.len() {
-            let ch = bytes[idx];
-            if BOOL_FLAGS.contains(&ch) {
-                out.push(format!("-{}", ch as char));
-                idx += 1;
-            } else if VALUE_FLAGS.contains(&ch) {
-                // The flag and any glued value terminate the bundle.
-                out.push(format!("-{}", &arg[idx..]));
-                idx = bytes.len();
-            } else {
-                // Unknown bundled byte: hand the remainder back verbatim so the
-                // parser reports it the same way it would unbundled.
-                out.push(format!("-{}", &arg[idx..]));
-                idx = bytes.len();
-            }
+    const VALUE_FLAGS: &[u8] = b"muF";
+    let bytes = arg.as_bytes();
+    if !arg.starts_with('-') || arg.starts_with("--") || bytes.len() < 2 || !BOOL_FLAGS.contains(&bytes[1])
+    {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    let mut idx = 1;
+    while idx < bytes.len() {
+        let ch = bytes[idx];
+        if BOOL_FLAGS.contains(&ch) {
+            tokens.push(format!("-{}", ch as char));
+            idx += 1;
+        } else if VALUE_FLAGS.contains(&ch) {
+            tokens.push(format!("-{}", &arg[idx..]));
+            return Some(tokens);
+        } else {
+            return None;
         }
     }
-    out
+    None
 }
 
 pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
@@ -105,11 +90,31 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     let mut cleanup_mode = TagCleanupMode::Strip;
     let mut empty_file_noop = false;
     let mut positional = Vec::new();
-    let expanded = expand_tag_short_flags(args);
-    let mut iter = expanded.iter().peekable();
-    while let Some(arg) = iter.next() {
+    let mut iter = args.iter().peekable();
+    // Short-flag bundles whose trailing flag takes a value (`-am`) are split into
+    // separate tokens pushed back here, so the existing per-flag arms handle them.
+    // Because a bundle's value flag is always its last token, value-taking arms
+    // still read their argument from `iter` (the queue is empty by then), and an
+    // option's `-`-prefixed value is consumed before it could be misread.
+    let mut pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    loop {
+        let owned = match pending.pop_front() {
+            Some(arg) => arg,
+            None => match iter.next() {
+                Some(arg) => arg.clone(),
+                None => break,
+            },
+        };
+        if let Some(tokens) = expand_tag_bundle(&owned) {
+            for token in tokens.into_iter().rev() {
+                pending.push_front(token);
+            }
+            continue;
+        }
+        let arg = &owned;
         match arg.as_str() {
             "--" => {
+                positional.extend(pending.drain(..));
                 positional.extend(iter.cloned());
                 break;
             }
