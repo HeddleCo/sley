@@ -300,6 +300,7 @@ pub enum FormatToken {
     AuthorDateIsoStrict,
     AuthorDateShort,
     AuthorDateRfc2822,
+    AuthorDateHuman,
     CommitterName,
     CommitterEmail,
     CommitterEmailLocal,
@@ -313,6 +314,7 @@ pub enum FormatToken {
     CommitterDateIsoStrict,
     CommitterDateShort,
     CommitterDateRfc2822,
+    CommitterDateHuman,
     Newline,
     HexByte(u8),
     GRefname,
@@ -572,7 +574,9 @@ impl CompiledLogFormat {
                 | FormatToken::CommitterDateIso
                 | FormatToken::CommitterDateIsoStrict
                 | FormatToken::CommitterDateShort
-                | FormatToken::CommitterDateRfc2822 => 32,
+                | FormatToken::CommitterDateRfc2822
+                | FormatToken::AuthorDateHuman
+                | FormatToken::CommitterDateHuman => 32,
                 FormatToken::AuthorName
                 | FormatToken::CommitterName
                 | FormatToken::AuthorEmail
@@ -893,6 +897,8 @@ fn parse_identity_atom(
         Some('s') => FormatToken::CommitterDateShort,
         Some('D') if author => FormatToken::AuthorDateRfc2822,
         Some('D') => FormatToken::CommitterDateRfc2822,
+        Some('h') if author => FormatToken::AuthorDateHuman,
+        Some('h') => FormatToken::CommitterDateHuman,
         Some(other) => {
             let prefix = if author { 'a' } else { 'c' };
             return Err(GitError::Command(format!(
