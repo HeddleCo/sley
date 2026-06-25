@@ -14188,35 +14188,20 @@ fn checkout_commit_to_index_and_worktree_filtered(
 
     let mut index_entries = Vec::new();
     for (path, entry) in &target_entries {
-        // Gitlinks go through the shared materialization step (mkdir + zeroed
-        // stat); smudge filters never apply to a submodule directory.
-        if sley_index::is_gitlink(entry.mode) {
-            index_entries.push(materialize_tree_entry(&db, worktree_root, path, entry)?);
-            continue;
-        }
-        let object = read_expected_object(&db, &entry.oid, ObjectType::Blob)?;
-        let body: Cow<'_, [u8]> = match (smudge_config, &attributes) {
-            (Some(config), Some(matcher)) => {
-                let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
-                apply_smudge_filter_with_attributes_cow_format(
-                    config,
-                    &checks,
-                    path,
-                    &object.body,
-                    format,
-                )?
-            }
-            _ => Cow::Borrowed(&object.body),
-        };
-        let file_path = worktree_path(worktree_root, path)?;
-        prepare_blob_parent_dirs(worktree_root, &file_path)?;
-        remove_existing_worktree_path(&file_path)?;
-        fs::write(&file_path, &body)?;
-        set_worktree_file_mode(&file_path, entry.mode)?;
-        let metadata = fs::metadata(&file_path)?;
-        let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid, &metadata);
-        index_entry.mode = entry.mode;
-        index_entries.push(index_entry);
+        // Single type-by-mode materializer: gitlinks become a directory (mkdir,
+        // no blob read), symlinks (mode 120000) a real symlink to the raw blob
+        // bytes, and regular files the smudge-filtered content. Inlining the blob
+        // write here previously dropped the symlink arm and wrote the link target
+        // as a regular file — the whole symlink-checkout class.
+        index_entries.push(materialize_tree_entry_with_optional_smudge(
+            &db,
+            format,
+            worktree_root,
+            path,
+            entry,
+            smudge_config,
+            attributes.as_ref(),
+        )?);
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let extensions = preserved_index_extensions(git_dir, format)?;
@@ -14268,7 +14253,16 @@ fn materialize_tree_entry_with_optional_smudge(
     smudge_config: Option<&GitConfig>,
     attributes: Option<&AttributeMatcher>,
 ) -> Result<IndexEntry> {
-    if smudge_config.is_none() || sley_index::is_gitlink(entry.mode) {
+    // A symlink (mode 120000) is written as a *symlink* whose target is the raw,
+    // unfiltered blob bytes — git treats symlink content as an opaque path, so no
+    // smudge/EOL filter ever applies. Route it through the type-aware
+    // `materialize_tree_entry` (→ `write_worktree_blob_entry`) so it is never
+    // materialized as a regular file holding the target string. A gitlink (mkdir,
+    // no blob read) and the no-smudge case go through the same shared path.
+    if smudge_config.is_none()
+        || sley_index::is_gitlink(entry.mode)
+        || (entry.mode & 0o170000) == 0o120000
+    {
         return materialize_tree_entry(db, worktree_root, path, entry);
     }
     let config = smudge_config.expect("checked above");
@@ -15436,22 +15430,47 @@ fn write_worktree_blob_entry(
     // Clear whatever sits at the leaf — including a directory where the target
     // wants a plain file (reverse D/F) — before writing.
     remove_existing_worktree_path(&file_path)?;
-    if (entry.mode & 0o170000) == 0o120000 {
-        // Symlink entry (mode 120000): the blob body is the link target.
+    write_blob_body_or_symlink(&file_path, entry.mode, &object.body, &object.body)?;
+    Ok(file_path)
+}
+
+/// Write the materialized worktree object at `file_path` as the right *type* for
+/// `mode` — git's `entry.c` `write_entry` type-by-mode switch, factored into a
+/// single primitive so no checkout/reset/restore materializer can silently write
+/// a symlink blob as a regular file (the symlink-checkout bug class).
+///
+/// The caller is responsible for the pre-write steps (leading directories +
+/// removing any blocker at the leaf). Type by `mode`:
+/// * `0o120000` (symlink) → a real symlink whose target is `link_target`, the
+///   **raw** blob bytes. git treats symlink content as an opaque path, so the
+///   smudge/EOL filter never applies — pass the unfiltered blob here even when
+///   `body` is the smudged content for the regular-file arm.
+/// * everything else → a regular file holding `body`, with the user-execute bit
+///   set iff `mode` has it (`set_worktree_file_mode`).
+fn write_blob_body_or_symlink(
+    file_path: &Path,
+    mode: u32,
+    body: &[u8],
+    link_target: &[u8],
+) -> Result<()> {
+    if (mode & 0o170000) == 0o120000 {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
             let target =
-                std::path::PathBuf::from(std::ffi::OsString::from_vec(object.body.clone()));
-            std::os::unix::fs::symlink(&target, &file_path)?;
+                std::path::PathBuf::from(std::ffi::OsString::from_vec(link_target.to_vec()));
+            std::os::unix::fs::symlink(&target, file_path)?;
         }
         #[cfg(not(unix))]
-        fs::write(&file_path, &object.body)?;
+        {
+            let _ = link_target;
+            fs::write(file_path, body)?;
+        }
     } else {
-        fs::write(&file_path, &object.body)?;
-        set_worktree_file_mode(&file_path, entry.mode)?;
+        fs::write(file_path, body)?;
+        set_worktree_file_mode(file_path, mode)?;
     }
-    Ok(file_path)
+    Ok(())
 }
 
 /// Create the ancestor directories of a worktree blob path, removing any
@@ -16284,8 +16303,7 @@ fn materialize_index_entry_file(
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     prepare_blob_parent_dirs(worktree_root, file_path)?;
     remove_existing_worktree_path(file_path)?;
-    fs::write(file_path, &object.body)?;
-    set_worktree_file_mode(file_path, entry.mode)?;
+    write_blob_body_or_symlink(file_path, entry.mode, &object.body, &object.body)?;
     Ok(())
 }
 
@@ -17802,8 +17820,7 @@ fn restore_index_entry(
     };
     prepare_blob_parent_dirs(worktree_root, &file_path)?;
     remove_existing_worktree_path(&file_path)?;
-    fs::write(&file_path, &body)?;
-    set_worktree_file_mode(&file_path, entry.mode)?;
+    write_blob_body_or_symlink(&file_path, entry.mode, &body, &object.body)?;
     let metadata = fs::symlink_metadata(&file_path)?;
     Ok(Some(index_entry_with_refreshed_stat(entry, &metadata)))
 }
