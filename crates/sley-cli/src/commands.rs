@@ -33,6 +33,7 @@ pub(crate) mod difftool;
 pub(crate) mod fast_import;
 pub(crate) mod fetch_pack;
 pub(crate) mod filter_branch;
+pub(crate) mod for_each_repo;
 pub(crate) mod for_each_ref;
 pub(crate) mod format_patch;
 pub(crate) mod grep;

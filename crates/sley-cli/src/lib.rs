@@ -291,6 +291,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "difftool" => commands::difftool::cmd_difftool(&args[1..]),
         "fetch" => commands::remote_cmds::cmd_fetch(&args[1..]),
         "for-each-ref" => commands::for_each_ref::cmd_for_each_ref(&args[1..]),
+        "for-each-repo" => commands::for_each_repo::cmd_for_each_repo(&args[1..]),
         "refs" => commands::refs::cmd_refs(&args[1..]),
         "fsck" => commands::plumbing::cmd_fsck(&args[1..]),
         "get-tar-commit-id" => commands::utility::cmd_get_tar_commit_id(&args[1..]),
