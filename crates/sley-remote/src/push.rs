@@ -886,6 +886,14 @@ fn execute_push_local(
     let remote_db = FileObjectDatabase::from_git_dir(&remote_common_git_dir, request.format);
     let remote_excluded =
         collect_reachable_object_ids(&remote_db, request.format, remote_excluded_tips)?;
+
+    // git's `transfer.fsckObjects`: the receiving side fscks every object the
+    // push introduces and rejects the push when one fails (most importantly a
+    // malicious `.gitmodules` url). The local fast path copies objects directly
+    // rather than through `index-pack --strict`, so run the same gate here.
+    if remote_transfer_fsck_objects(&remote_common_git_dir) {
+        fsck_pushed_objects(&local_db, request.format, &starts, &remote_excluded)?;
+    }
     let packfile = if starts.is_empty() {
         Vec::new()
     } else {
@@ -913,6 +921,46 @@ fn execute_push_local(
         commands,
         report: Some(report),
     })
+}
+
+/// Whether the local remote enables `transfer.fsckObjects` (the receiving-side
+/// fsck gate). Reads only the remote's own config.
+fn remote_transfer_fsck_objects(remote_common_git_dir: &Path) -> bool {
+    GitConfig::read(remote_common_git_dir.join("config"))
+        .ok()
+        .and_then(|config| config.get_bool("transfer", None, "fsckObjects"))
+        .unwrap_or(false)
+}
+
+/// Run fsck over the objects this push introduces (reachable from `starts`,
+/// minus what the remote already has). On any error-severity finding, print it
+/// and reject the push — git's `transfer.fsckObjects` behavior.
+fn fsck_pushed_objects(
+    local_db: &FileObjectDatabase,
+    format: ObjectFormat,
+    starts: &[ObjectId],
+    remote_excluded: &std::collections::HashSet<ObjectId>,
+) -> Result<()> {
+    if starts.is_empty() {
+        return Ok(());
+    }
+    let new_objects: Vec<ObjectId> = collect_reachable_object_ids(local_db, format, starts.to_vec())?
+        .into_iter()
+        .filter(|oid| !remote_excluded.contains(oid))
+        .collect();
+    // The reader is the COMPLETE local db so link-walks never spuriously report
+    // a "missing object" for something the remote already holds; only genuine
+    // content errors (e.g. a disallowed .gitmodules url) in the new objects fail.
+    let report = sley_fsck::fsck_objects(local_db, format, [], new_objects);
+    if report.is_ok() {
+        return Ok(());
+    }
+    for issue in &report.issues {
+        if issue.severity == sley_fsck::IssueSeverity::Error {
+            eprintln!("fatal: {}", issue.message);
+        }
+    }
+    Err(GitError::Exit(128))
 }
 
 /// Fully resolved inputs for a status-reporting push to a local repository.
@@ -1072,6 +1120,12 @@ pub fn push_local_with_report(
         let remote_db = FileObjectDatabase::from_git_dir(request.remote_common_git_dir, format);
         let remote_excluded =
             collect_reachable_object_ids(&remote_db, format, remote_excluded_tips)?;
+        // git's `transfer.fsckObjects`: fsck the introduced objects on the
+        // receiving side and reject the push on a content error (a disallowed
+        // `.gitmodules` url, a malformed object, ...).
+        if remote_transfer_fsck_objects(request.remote_common_git_dir) {
+            fsck_pushed_objects(&local_db, format, &starts, &remote_excluded)?;
+        }
         let packfile = if starts.is_empty() {
             Vec::new()
         } else {
