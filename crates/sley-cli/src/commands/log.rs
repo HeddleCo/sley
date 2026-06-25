@@ -862,6 +862,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--simplify-merges"
             | "--show-pulls"
             | "--ancestry-path"
+            | "--exclude-first-parent-only"
+            | "--no-exclude-first-parent-only"
             | "--reverse"
             | "--topo-order"
             | "--date-order"
@@ -2337,9 +2339,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         }
         starts.push(commit);
     }
+    // git's `--exclude-first-parent-only`: the negative (`^`-excluded) tips'
+    // history is marked UNINTERESTING following only first parents, even when the
+    // positive walk follows all parents. So a merge brought in by an excluded
+    // tip's side branch stays interesting.
+    let exclude_first_parent = first_parent || revision_options.exclude_first_parent_only;
     let mut excluded = HashSet::new();
     for oid in &revision_options.negatives {
-        for record in rev_list_walk_commits(&db, format, [*oid], first_parent)? {
+        for record in rev_list_walk_commits(&db, format, [*oid], exclude_first_parent)? {
             excluded.insert(record.oid);
         }
     }

@@ -40,6 +40,10 @@ pub struct RevisionOptions {
     pub symmetric_ranges: Vec<RevisionSymmetricRange>,
     pub order: RevisionOrder,
     pub first_parent: bool,
+    /// `--exclude-first-parent-only`: when marking the `^`-excluded (negative)
+    /// tips' history UNINTERESTING, follow only the first parent of each merge.
+    /// Unlike `--first-parent`, this affects the *negative* walk only.
+    pub exclude_first_parent_only: bool,
     pub max_count: Option<usize>,
     pub skip: usize,
     pub reverse: bool,
@@ -227,6 +231,12 @@ where
                 "--reverse" => self.setup.options.reverse = true,
                 "--first-parent" => self.setup.options.first_parent = true,
                 "--no-first-parent" => self.setup.options.first_parent = false,
+                "--exclude-first-parent-only" => {
+                    self.setup.options.exclude_first_parent_only = true
+                }
+                "--no-exclude-first-parent-only" => {
+                    self.setup.options.exclude_first_parent_only = false
+                }
                 "--topo-order" => self.setup.options.order = RevisionOrder::Topo,
                 "--date-order" => self.setup.options.order = RevisionOrder::Date,
                 "--author-date-order" => self.setup.options.order = RevisionOrder::AuthorDate,
