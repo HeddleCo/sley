@@ -277,7 +277,7 @@ where
             return;
         }
         if object.object_type == ObjectType::Tree {
-            self.check_unreachable_tree_paths(&object.body);
+            self.check_unreachable_tree_paths(oid, &object.body);
         }
     }
 
@@ -454,46 +454,7 @@ where
         for entry in entries {
             let entry_object_type = fsck_tree_entry_object_type(entry.mode);
             let is_symlink = entry.mode == 0o120000;
-            if content::is_dotgitmodules_name(entry.name) {
-                if is_symlink {
-                    self.report_content(
-                        ObjectType::Tree,
-                        oid,
-                        content::MsgId::GitmodulesSymlink,
-                        ".gitmodules is a symbolic link",
-                    );
-                } else {
-                    self.gitmodules_found.insert(entry.oid.clone());
-                }
-            }
-            if content::is_dotgitattributes_name(entry.name) {
-                if is_symlink {
-                    self.report_content(
-                        ObjectType::Tree,
-                        oid,
-                        content::MsgId::GitattributesSymlink,
-                        ".gitattributes is a symlink",
-                    );
-                } else {
-                    self.gitattributes_found.insert(entry.oid.clone());
-                }
-            }
-            if is_symlink && content::is_dotgitignore_name(entry.name) {
-                self.report_content(
-                    ObjectType::Tree,
-                    oid,
-                    content::MsgId::GitignoreSymlink,
-                    ".gitignore is a symlink",
-                );
-            }
-            if is_symlink && content::is_dotmailmap_name(entry.name) {
-                self.report_content(
-                    ObjectType::Tree,
-                    oid,
-                    content::MsgId::MailmapSymlink,
-                    ".mailmap is a symlink",
-                );
-            }
+            self.check_tree_dotfile_entry(oid, entry.name, entry.oid, is_symlink);
             // A null-sha entry is reported by the content checker as a warning;
             // do not also walk it as a broken link (git skips null entries).
             if entry.oid.is_null() {
@@ -515,7 +476,7 @@ where
         }
     }
 
-    fn check_unreachable_tree_paths(&mut self, body: &[u8]) {
+    fn check_unreachable_tree_paths(&mut self, oid: ObjectId, body: &[u8]) {
         let Ok(entries) =
             TreeEntries::new(self.format, body).collect::<std::result::Result<Vec<_>, _>>()
         else {
@@ -523,12 +484,65 @@ where
         };
         for entry in entries {
             let is_symlink = entry.mode == 0o120000;
-            if !is_symlink && content::is_dotgitmodules_name(entry.name) {
-                self.gitmodules_found.insert(entry.oid);
+            self.check_tree_dotfile_entry(oid, entry.name, entry.oid, is_symlink);
+        }
+    }
+
+    /// git's `fsck_tree` security check for the magic dotfiles, shared by the
+    /// reachable (`check_tree`) and unreachable (`check_unreachable_tree_paths`)
+    /// walks so the two can never drift. A symlinked `.gitmodules` /
+    /// `.gitattributes` / `.gitignore` / `.mailmap` is an attack vector and must
+    /// be rejected on *every* tree object regardless of reachability — git runs
+    /// `fsck_tree` over the whole object database, not just ref-reachable trees.
+    /// Centralising it here closes the regression where the dangling-object walk
+    /// (added in "Preserve fsck dangling tag diagnostics") recorded only the
+    /// non-symlink dotfile blobs and silently dropped the symlink rejection.
+    fn check_tree_dotfile_entry(
+        &mut self,
+        oid: ObjectId,
+        name: &[u8],
+        entry_oid: ObjectId,
+        is_symlink: bool,
+    ) {
+        if content::is_dotgitmodules_name(name) {
+            if is_symlink {
+                self.report_content(
+                    ObjectType::Tree,
+                    oid,
+                    content::MsgId::GitmodulesSymlink,
+                    ".gitmodules is a symbolic link",
+                );
+            } else {
+                self.gitmodules_found.insert(entry_oid);
             }
-            if !is_symlink && content::is_dotgitattributes_name(entry.name) {
-                self.gitattributes_found.insert(entry.oid);
+        }
+        if content::is_dotgitattributes_name(name) {
+            if is_symlink {
+                self.report_content(
+                    ObjectType::Tree,
+                    oid,
+                    content::MsgId::GitattributesSymlink,
+                    ".gitattributes is a symlink",
+                );
+            } else {
+                self.gitattributes_found.insert(entry_oid);
             }
+        }
+        if is_symlink && content::is_dotgitignore_name(name) {
+            self.report_content(
+                ObjectType::Tree,
+                oid,
+                content::MsgId::GitignoreSymlink,
+                ".gitignore is a symlink",
+            );
+        }
+        if is_symlink && content::is_dotmailmap_name(name) {
+            self.report_content(
+                ObjectType::Tree,
+                oid,
+                content::MsgId::MailmapSymlink,
+                ".mailmap is a symlink",
+            );
         }
     }
 
