@@ -1090,6 +1090,9 @@ fn recurse_ls_files_submodules(
     let index = ls_files_display_index(git_dir, format, index, false)?;
     let candidates = ls_files_oid_candidates(&index);
     let config = read_repo_config(git_dir)?;
+    // git reads each (sub)repo's settings on index read and dies on a malformed
+    // `index.sparse` boolean (prepare_repo_settings -> repo_cfg_bool).
+    validate_repo_index_sparse_bool(git_dir, &config)?;
     let gitmodules = GitConfig::read(worktree_root.join(".gitmodules")).ok();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
 
@@ -1134,6 +1137,30 @@ fn recurse_ls_files_submodules(
             write_ls_files_path(stdout, &display, terminator)?;
             stdout.write_all(&[terminator])?;
         }
+    }
+    Ok(())
+}
+
+/// git rejects a non-boolean `index.sparse` while reading a repo's settings
+/// (prepare_repo_settings -> repo_cfg_bool -> git_config_bool dies). The
+/// effective value is the last one across base `config` and, when
+/// `extensions.worktreeConfig` is enabled, `config.worktree` (which wins).
+fn validate_repo_index_sparse_bool(git_dir: &Path, config: &GitConfig) -> Result<()> {
+    let worktree_config = config
+        .get_bool("extensions", None, "worktreeConfig")
+        .unwrap_or(false)
+        .then(|| GitConfig::read(git_dir.join("config.worktree")).ok())
+        .flatten();
+    // `config.worktree` wins over the base file when it sets index.sparse.
+    let target = match worktree_config.as_ref() {
+        Some(wt) if wt.get("index", None, "sparse").is_some() => wt,
+        _ => config,
+    };
+    if let Some(value) = target.get("index", None, "sparse")
+        && target.get_bool("index", None, "sparse").is_none()
+    {
+        eprintln!("fatal: bad boolean config value '{value}' for 'index.sparse'");
+        return Err(GitError::Exit(128));
     }
     Ok(())
 }
