@@ -3421,6 +3421,17 @@ pub(crate) fn read_submodule_configs(worktree_root: &Path) -> Result<Vec<Submodu
         eprintln!("fatal: invalid value for 'submodule.{name}.update'");
         return Err(GitError::Exit(128));
     }
+    // git's `.gitmodules` parser warns (and drops the value) for a path/url that
+    // could be mistaken for a command-line option (`warn_command_line_option`).
+    // The typed parser already dropped it; surface the warning so a recursive
+    // clone/update reports "ignoring '<var>' ..." rather than silently failing.
+    for warning in &set.warnings {
+        if let sley_submodule::ParseWarning::CommandLineOption { var, value } = warning {
+            eprintln!(
+                "warning: ignoring '{var}' which may be interpreted as a command-line option: {value}"
+            );
+        }
+    }
     let mut submodules = Vec::new();
     for submodule in set.iter() {
         // A submodule with no `path` is not addressable; the old walk skipped
