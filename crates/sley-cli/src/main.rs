@@ -1,7 +1,17 @@
 use sley_core::{GitError, cli_exit_code};
 
 fn main() {
-    if let Err(err) = sley_cli::run(std::env::args().skip(1).collect()) {
+    // Use args_os + lossy conversion rather than env::args(), which panics
+    // (Result::unwrap) on any argument that is not valid UTF-8. Git accepts
+    // arbitrary bytes on the command line (e.g. `commit -m` with a non-UTF-8
+    // message under i18n.commitencoding); a hard panic there is strictly worse
+    // than a lossy decode. Valid-UTF-8 args are byte-identical after the
+    // conversion, so this never changes behaviour for well-formed input.
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if let Err(err) = sley_cli::run(args) {
         report_cli_error(&err);
         std::process::exit(cli_exit_code(&err));
     }
