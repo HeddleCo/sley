@@ -58,6 +58,16 @@ enum SignatureMode {
     Suppress,
 }
 
+/// MIME `multipart/mixed` wrapping for `--attach`/`--inline` (git's
+/// `rev->mime_boundary` + `no_inline`). The `boundary` is the inner string
+/// (without git's 12-dash `mime_boundary_leader`); `inline` selects the second
+/// part's `Content-Disposition` (`inline` vs `attachment`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MimeAttach {
+    boundary: String,
+    inline: bool,
+}
+
 /// The `--cover-from-description=<mode>` / `format.coverFromDescription` state,
 /// mirroring git's `enum cover_from_description`. The default is `Message`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,10 +198,18 @@ struct FormatPatchOptions {
     signature_file: Option<String>,
     /// `--zero-commit`: use the all-zero oid in the mbox `From <oid>` line.
     zero_commit: bool,
+    /// `--attach[=<boundary>]` / `--inline[=<boundary>]`: wrap each patch as a
+    /// MIME `multipart/mixed` message whose second part is the diff, rendered as
+    /// an attachment (`--attach`) or inline (`--inline`). `None` is the default
+    /// (plain mbox patch). The boundary defaults to the git version string.
+    mime: Option<MimeAttach>,
     /// `-<n>`: limit to the last n commits of the default tip.
     count: Option<usize>,
     /// `--numbered-files`: name output files `1`, `2`, ... with no slug.
     numbered_files: bool,
+    /// `--suffix=<s>` / `format.filenameSuffix`: the output-file / MIME-attachment
+    /// filename suffix (git default `.patch`).
+    suffix: Option<String>,
     /// Use the full 40/64-hex blob ids in `index` lines (`--full-index`).
     full_index: bool,
     /// Abbreviation width for patch `index` lines (`--abbrev=<n>`).
@@ -341,8 +359,10 @@ impl Default for FormatPatchOptions {
             signature: SignatureMode::Default,
             signature_file: None,
             zero_commit: false,
+            mime: None,
             count: None,
             numbered_files: false,
+            suffix: None,
             full_index: false,
             abbrev: None,
             detect_renames: true,
@@ -684,6 +704,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
         .as_deref()
         .map(reroll_filename_prefix)
         .unwrap_or_default();
+    let filename_suffix = patch_filename_suffix(&options, config);
     let mut stdout = io::stdout();
     if let Some(cover) = &cover {
         // The cover is patch number `start_number - 1` (0 when numbering starts
@@ -693,7 +714,13 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
         let file_name = if options.numbered_files {
             cover_seq.to_string()
         } else {
-            build_patch_filename(&reroll_prefix, cover_seq, "cover-letter", patch_name_max)
+            build_patch_filename(
+                &reroll_prefix,
+                cover_seq,
+                "cover-letter",
+                patch_name_max,
+                &filename_suffix,
+            )
         };
         let file_path = out_dir_path.join(&file_name);
         fs::write(&file_path, cover)?;
@@ -726,7 +753,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
             seq.to_string()
         } else {
             let slug = sanitize_patch_subject(&record.commit.message);
-            build_patch_filename(&reroll_prefix, seq, &slug, patch_name_max)
+            build_patch_filename(&reroll_prefix, seq, &slug, patch_name_max, &filename_suffix)
         };
         let file_path = out_dir_path.join(&file_name);
         fs::write(&file_path, &buffer)?;
@@ -911,18 +938,13 @@ fn range_diff_previous_label(options: &FormatPatchOptions) -> Option<String> {
     (value > 0).then(|| format!("v{}", value - 1))
 }
 
-/// Parse a `GIT_COMMITTER_DATE` value of the form `@<unix> <tz>` (the canonical
-/// form git stores) into `(unix_seconds, timezone)`. Returns `None` for any
-/// other shape, in which case the cover falls back to the current time.
+/// Parse a `GIT_COMMITTER_DATE` value into `(unix_seconds, timezone)`. Defers to
+/// git's full commit-date parser so the canonical `@<unix> <tz>` / raw
+/// `<unix> <tz>` (test_tick) *and* human forms like `2006-06-26 00:06:00 +0000`
+/// (which the t4013 setup exports) all resolve. Returns `None` for any shape the
+/// parser rejects, in which case the caller falls back to the current time.
 fn parse_committer_date(value: &str) -> Option<(i64, String)> {
-    let trimmed = value.trim();
-    let rest = trimmed.strip_prefix('@')?;
-    let (secs_str, tz) = match rest.split_once(' ') {
-        Some((secs, tz)) => (secs, tz.trim().to_string()),
-        None => (rest, "+0000".to_string()),
-    };
-    let secs = secs_str.trim().parse::<i64>().ok()?;
-    Some((secs, tz))
+    crate::commands::approxidate::parse_commit_date(value)
 }
 
 /// Maximum subject length (characters) before cover-from-description `auto`
@@ -2184,12 +2206,15 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     // MIME block. git emits it right after the Subject, before the extra headers.
     let signoff_non_ascii =
         signoff_line.is_some() && committer_ident_has_non_ascii(config).unwrap_or(false);
-    let need_8bit_cte = signoff_non_ascii
-        || message_body_has_non_ascii(&commit.message)
-        || in_body_from
-            .as_deref()
-            .map(|h| h.bytes().any(|b| b >= 0x80))
-            .unwrap_or(false);
+    // `--attach`/`--inline` force git's `need_8bit_cte = -1` (NEVER): the plain
+    // text/plain CTE block is replaced by the multipart preamble below.
+    let need_8bit_cte = options.mime.is_none()
+        && (signoff_non_ascii
+            || message_body_has_non_ascii(&commit.message)
+            || in_body_from
+                .as_deref()
+                .map(|h| h.bytes().any(|b| b >= 0x80))
+                .unwrap_or(false));
     if need_8bit_cte {
         out.extend_from_slice(
             b"MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n",
@@ -2203,13 +2228,25 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     // Blank line, then optional in-body `From:` header (with its own trailing
     // blank line), then the commit body (message minus the subject line),
     // normalized to end in exactly one newline. With --signoff the trailer is
-    // appended to the body.
-    out.push(b'\n');
+    // appended to the body. Under `--attach`/`--inline` the blank line is
+    // supplied by the multipart preamble's trailing `\n\n` instead.
+    let body = format_patch_body(&commit.message, &subject_bytes, signoff_line);
+    if let Some(mime) = &options.mime {
+        write_mime_preamble(&mut out, mime);
+        // git renders the text/plain part's body (the in-body From + commit
+        // message) with its own leading newline on top of the preamble's
+        // header/body blank; a subject-only commit (empty body, no in-body From)
+        // omits it, leaving just the single preamble blank before `---`.
+        if !body.is_empty() || in_body_from.is_some() {
+            out.push(b'\n');
+        }
+    } else {
+        out.push(b'\n');
+    }
     if let Some(in_body) = in_body_from {
         out.extend_from_slice(in_body.as_bytes());
         out.push(b'\n');
     }
-    let body = format_patch_body(&commit.message, &subject_bytes, signoff_line);
     if options.mboxrd {
         write_mboxrd_escaped_body(&mut out, &body);
     } else {
@@ -2242,6 +2279,13 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
             out.push(b'\n');
         }
 
+        // MIME multipart: the diff goes into a second `text/x-patch` part,
+        // introduced by git's `stat_sep` between the diffstat and the hunks.
+        if let Some(mime) = &options.mime {
+            let filename = mime_patch_filename(options, config, commit, seq);
+            write_mime_part_header(&mut out, mime, &filename);
+        }
+
         for entry in &entries {
             write_diff_patch_entry(
                 &mut out,
@@ -2262,12 +2306,88 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     // suppressed signature (`--no-signature`, `--signature=""`, empty
     // `format.signature`) drops the whole `-- \n...` block *and* the trailing
     // blank line: git emits nothing past the diff's own final newline.
-    if let Some(signature) = &resolved.signature {
+    if let Some(mime) = &options.mime {
+        // git: `\n--<leader><boundary>--\n\n\n` closes the multipart, in place of
+        // the `-- \n<sig>` trailer (builtin/log.c, per patch).
+        write_mime_closing(&mut out, mime);
+    } else if let Some(signature) = &resolved.signature {
         out.extend_from_slice(b"-- \n");
         out.extend_from_slice(signature);
         out.extend_from_slice(b"\n\n");
     }
     Ok(out)
+}
+
+/// git's 12-dash `mime_boundary_leader` (diff.c). The actual delimiter lines are
+/// `--` + this + the boundary string (14 dashes total).
+const MIME_BOUNDARY_LEADER: &str = "------------";
+
+/// The `multipart/mixed` preamble: the MIME headers, the human-readable note,
+/// the first delimiter, and the first (`text/plain`) part's headers, ending in
+/// the blank line that separates them from the commit body. Mirrors git's
+/// `log_write_email_headers` strbuf for the `mime_boundary` case.
+fn write_mime_preamble(out: &mut Vec<u8>, mime: &MimeAttach) {
+    let b = &mime.boundary;
+    write_fmt_buf(
+        out,
+        format_args!(
+            "MIME-Version: 1.0\n\
+             Content-Type: multipart/mixed; boundary=\"{MIME_BOUNDARY_LEADER}{b}\"\n\
+             \n\
+             This is a multi-part message in MIME format.\n\
+             --{MIME_BOUNDARY_LEADER}{b}\n\
+             Content-Type: text/plain; charset=UTF-8; format=fixed\n\
+             Content-Transfer-Encoding: 8bit\n\n"
+        ),
+    );
+}
+
+/// The second (`text/x-patch`) part's headers, emitted between the diffstat and
+/// the diff hunks (git's `stat_sep`). The leading `\n` is git's separator.
+fn write_mime_part_header(out: &mut Vec<u8>, mime: &MimeAttach, filename: &str) {
+    let b = &mime.boundary;
+    let disposition = if mime.inline { "inline" } else { "attachment" };
+    write_fmt_buf(
+        out,
+        format_args!(
+            "\n--{MIME_BOUNDARY_LEADER}{b}\n\
+             Content-Type: text/x-patch; name=\"{filename}\"\n\
+             Content-Transfer-Encoding: 8bit\n\
+             Content-Disposition: {disposition}; filename=\"{filename}\"\n\n"
+        ),
+    );
+}
+
+/// The closing delimiter that terminates the multipart message.
+fn write_mime_closing(out: &mut Vec<u8>, mime: &MimeAttach) {
+    write_fmt_buf(
+        out,
+        format_args!("\n--{MIME_BOUNDARY_LEADER}{}--\n\n\n", mime.boundary),
+    );
+}
+
+/// The filename used for the MIME attachment part: the per-patch number under
+/// `--numbered-files`, else the `NNNN-slug.patch` name git's `fmt_output_commit`
+/// produces (the same name the file-output path writes).
+fn mime_patch_filename(
+    options: &FormatPatchOptions,
+    config: &GitConfig,
+    commit: &sley_object::Commit,
+    seq: usize,
+) -> String {
+    if options.numbered_files {
+        seq.to_string()
+    } else {
+        let slug = sanitize_patch_subject(&commit.message);
+        let reroll_prefix = options
+            .reroll_count
+            .as_deref()
+            .map(reroll_filename_prefix)
+            .unwrap_or_default();
+        let patch_name_max = resolve_patch_name_max(options, config);
+        let suffix = patch_filename_suffix(options, config);
+        build_patch_filename(&reroll_prefix, seq, &slug, patch_name_max, &suffix)
+    }
 }
 
 fn write_base_info(out: &mut Vec<u8>, base: &BaseInfo, format: ObjectFormat) {
@@ -3101,10 +3221,22 @@ fn select_commits(
         HashSet::new()
     };
 
-    // Keep non-excluded, non-merge commits (newest-first from the walk).
-    let mut selected: Vec<sley_rev::CommitRecord> = walked
+    // `walked` is a breadth-first traversal, which is NOT git's output order.
+    // format-patch is `git rev-list` reversed with merges dropped, so we must
+    // first reorder the reachable set into rev-list's committer-date order
+    // (the same `rev_list_date_order` the `rev-list` command uses) before
+    // dropping merges and reversing — otherwise a branchy range emits patches
+    // in the wrong sequence (and numbers them accordingly).
+    let reachable: Vec<&sley_rev::CommitRecord> = walked
+        .iter()
+        .filter(|record| !excluded.contains(&record.oid))
+        .collect();
+    let ordered = rev_list_date_order(reachable)?;
+    // Keep non-merge commits in rev-list (newest-first) order.
+    let mut selected: Vec<sley_rev::CommitRecord> = ordered
         .into_iter()
-        .filter(|record| !excluded.contains(&record.oid) && record.parents.len() <= 1)
+        .filter(|record| record.parents.len() <= 1)
+        .cloned()
         .collect();
     let grep_kind = log_grep_pattern_kind_from_config(
         repo.config(),
@@ -3500,21 +3632,36 @@ fn reroll_filename_prefix(reroll: &str) -> String {
     format!("{sanitized}-")
 }
 
-/// Build a patch output basename: `<reroll>NNNN-<slug>.patch`, hard-truncated so
-/// the whole basename fits in `patch_name_max` (git `fmt_output_subject`: the
+/// Build a patch output basename: `<reroll>NNNN-<slug><suffix>`, hard-truncated
+/// so the whole basename fits in `patch_name_max` (git `fmt_output_subject`: the
 /// part before the suffix is capped at `patch_name_max - (len(suffix) + 1)`).
 fn build_patch_filename(
     reroll_prefix: &str,
     seq: usize,
     slug: &str,
     patch_name_max: usize,
+    suffix: &str,
 ) -> String {
     let mut stem = format!("{reroll_prefix}{seq:04}-{slug}");
-    let max_len = patch_name_max - (PATCH_SUFFIX.len() + 1);
+    let max_len = patch_name_max.saturating_sub(suffix.len() + 1);
     if stem.len() > max_len {
         stem.truncate(max_len);
     }
-    format!("{stem}{PATCH_SUFFIX}")
+    format!("{stem}{suffix}")
+}
+
+/// The output-file / MIME-attachment filename suffix: `--suffix`, else
+/// `format.filenameSuffix`, else git's `.patch` default.
+fn patch_filename_suffix(options: &FormatPatchOptions, config: &GitConfig) -> String {
+    options
+        .suffix
+        .clone()
+        .or_else(|| {
+            config
+                .get("format", None, "filenamesuffix")
+                .map(|value| value.to_string())
+        })
+        .unwrap_or_else(|| PATCH_SUFFIX.to_string())
 }
 
 /// git's `format_sanitized_subject` over the commit subject (no length cap; the
@@ -3756,6 +3903,9 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                 options.start_number = Some(parse_format_patch_number(n, "--start-number")?);
             }
             "--numbered-files" => options.numbered_files = true,
+            value if let Some(suffix) = value.strip_prefix("--suffix=") => {
+                options.suffix = Some(suffix.to_string());
+            }
             "-s" | "--signoff" | "--signed-off-by" => options.signoff = true,
             "--stat" => options.stat = true,
             value
@@ -3998,7 +4148,6 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             // sley emits for the common path.
             "--no-color"
             | "--color"
-            | "--attach"
             | "--minimal"
             | "--patience"
             | "--histogram"
@@ -4009,7 +4158,34 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             | "--text"
             | "-a"
             | "--ita-invisible-in-index" => {}
-            value if value.starts_with("--attach=") => {}
+            // `--attach`/`--inline` wrap each patch in MIME multipart/mixed; the
+            // optional `=<boundary>` overrides the default (git version string).
+            // `--no-attach` clears it. git: builtin/log.c attach/inline handlers.
+            "--attach" => {
+                options.mime = Some(MimeAttach {
+                    boundary: sley_core::UPSTREAM_GIT_COMPAT_VERSION.to_string(),
+                    inline: false,
+                });
+            }
+            value if let Some(boundary) = value.strip_prefix("--attach=") => {
+                options.mime = Some(MimeAttach {
+                    boundary: boundary.to_string(),
+                    inline: false,
+                });
+            }
+            "--inline" => {
+                options.mime = Some(MimeAttach {
+                    boundary: sley_core::UPSTREAM_GIT_COMPAT_VERSION.to_string(),
+                    inline: true,
+                });
+            }
+            value if let Some(boundary) = value.strip_prefix("--inline=") => {
+                options.mime = Some(MimeAttach {
+                    boundary: boundary.to_string(),
+                    inline: true,
+                });
+            }
+            "--no-attach" => options.mime = None,
             "--no-prefix" => options.prefix_mode = Some(false),
             "--default-prefix" => options.prefix_mode = Some(true),
             "--relative" => options.relative_mode = RelativeMode::On(None),
