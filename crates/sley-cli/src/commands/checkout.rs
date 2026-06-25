@@ -583,6 +583,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 }
             }
             sley_sequencer::replay::remove_branch_state(&git_dir);
+            // A detached `git checkout <commit>` leaves the index matching the
+            // checked-out tree; rebuild its cache-tree.
+            let _ = sley_worktree::refresh_index_cache_tree(&git_dir, format);
             if !quiet {
                 checkout_print_previous_detached_head(
                     &git_dir,
@@ -698,6 +701,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     }
                 }
                 sley_sequencer::replay::remove_branch_state(&git_dir);
+                // The index now matches the detached commit's tree; rebuild the
+                // cache-tree.
+                let _ = sley_worktree::refresh_index_cache_tree(&git_dir, format);
                 if !quiet {
                     if old_head_direct.is_none() {
                         checkout_print_detached_head_advice(&config, branch);
@@ -948,6 +954,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     }
     if branch_target.is_none() {
         sley_sequencer::replay::remove_branch_state(&git_dir);
+        // A detached checkout (`git checkout <commit>`) leaves the index matching
+        // the checked-out tree; rebuild its cache-tree.
+        let _ = sley_worktree::refresh_index_cache_tree(&git_dir, format);
         if !quiet {
             checkout_message.print();
         }

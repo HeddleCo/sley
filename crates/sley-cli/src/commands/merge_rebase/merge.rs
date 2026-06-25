@@ -4390,11 +4390,14 @@ fn reset_index_and_worktree_to_commit_for_merge(
             format,
             commit,
             true,
-        )
+        )?;
     } else {
         sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, commit)?;
-        Ok(())
     }
+    // A fast-forward merge leaves the index matching the new commit's tree;
+    // rebuild the cache-tree (git's merge keeps it valid).
+    let _ = sley_worktree::refresh_index_cache_tree(git_dir, format);
+    Ok(())
 }
 
 // ===== pull / rebase / merge-continue =====
