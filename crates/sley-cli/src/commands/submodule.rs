@@ -118,6 +118,9 @@ struct SubmoduleAddOptions {
     quiet: bool,
     progress: bool,
     depth: Option<u32>,
+    /// `--reference`/`--reference-if-able`/`--dissociate` clone flags to forward
+    /// to the submodule clone verbatim (alternates borrowing).
+    reference_args: Vec<String>,
 }
 
 struct SubmoduleUpdateOptions<'a> {
@@ -134,6 +137,9 @@ struct SubmoduleUpdateOptions<'a> {
     depth: Option<u32>,
     /// `--filter <spec>` partial-clone filter (requires `--init`).
     filter: Option<String>,
+    /// `--reference`/`--reference-if-able`/`--dissociate` clone flags to forward
+    /// to each submodule clone (alternates borrowing).
+    reference_args: Vec<String>,
     /// git's `--super-prefix=<path>/`: the displaypath prefix carried into a
     /// recursive child so nested "Submodule path '<a/b>'" lines are anchored at
     /// the recursion root. Empty at the top level.
@@ -301,6 +307,7 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
             clone_args.push("-b".to_string());
             clone_args.push(branch.clone());
         }
+        clone_args.extend(options.reference_args.iter().cloned());
         clone_args.push("--separate-git-dir".to_string());
         clone_args.push(modules_git_dir.display().to_string());
         clone_args.push(real_repo.clone());
@@ -341,6 +348,7 @@ fn parse_submodule_add_options(args: &[String], mut quiet: bool) -> Result<Submo
     let mut progress = false;
     let mut depth = None;
     let mut values = Vec::new();
+    let mut reference_args = Vec::new();
     let mut positional_only = false;
     let mut index = 0;
     while index < args.len() {
@@ -379,13 +387,17 @@ fn parse_submodule_add_options(args: &[String], mut quiet: bool) -> Result<Submo
                 };
                 name = Some(value.clone());
             }
-            // Reference repositories are an object-sharing optimization sley
-            // does not implement yet; refuse loudly instead of cloning without
-            // the requested borrowing.
+            // `--reference[-if-able] <repo>` / `--dissociate`: forward to the
+            // submodule clone, which sets up the alternates borrowing.
             "--reference" | "--reference-if-able" => {
-                eprintln!("fatal: sley submodule add does not support --reference yet");
-                return Err(GitError::Exit(128));
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return submodule_usage();
+                };
+                reference_args.push(arg.clone());
+                reference_args.push(value.clone());
             }
+            "--dissociate" => reference_args.push("--dissociate".to_string()),
             "--branch" | "-b" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -403,8 +415,7 @@ fn parse_submodule_add_options(args: &[String], mut quiet: bool) -> Result<Submo
                 if value.starts_with("--reference=")
                     || value.starts_with("--reference-if-able=") =>
             {
-                eprintln!("fatal: sley submodule add does not support --reference yet");
-                return Err(GitError::Exit(128));
+                reference_args.push(value.to_string());
             }
             value if value.starts_with('-') => return submodule_usage(),
             value => values.push(value.to_string()),
@@ -421,6 +432,7 @@ fn parse_submodule_add_options(args: &[String], mut quiet: bool) -> Result<Submo
             quiet,
             progress,
             depth,
+            reference_args,
         }),
         [repository, path] => Ok(SubmoduleAddOptions {
             repository: repository.clone(),
@@ -431,6 +443,7 @@ fn parse_submodule_add_options(args: &[String], mut quiet: bool) -> Result<Submo
             quiet,
             progress,
             depth,
+            reference_args,
         }),
         _ => submodule_usage(),
     }
@@ -712,6 +725,7 @@ fn populate_submodule_worktree(
         if let Some(filter) = &options.filter {
             clone_args.push(format!("--filter={filter}"));
         }
+        clone_args.extend(options.reference_args.iter().cloned());
         clone_args.push("--separate-git-dir".to_string());
         clone_args.push(modules_git_dir.display().to_string());
         clone_args.push(url.to_string());
@@ -1023,6 +1037,7 @@ fn parse_submodule_update_options(
     let mut cli_default = UpdateType::Unspecified;
     let mut depth = None;
     let mut filter = None;
+    let mut reference_args = Vec::new();
     let mut super_prefix = String::new();
     let mut paths = Vec::new();
     let mut positional_only = false;
@@ -1086,15 +1101,22 @@ fn parse_submodule_update_options(
                 };
                 filter = Some(value.clone());
             }
-            // See parse_submodule_add_options: refuse --reference rather than
-            // silently cloning without the requested object borrowing.
-            "--reference" => {
-                eprintln!("fatal: sley submodule update does not support --reference yet");
-                return Err(GitError::Exit(128));
+            // `--reference[-if-able] <repo>` / `--dissociate`: forward to each
+            // submodule clone (alternates borrowing).
+            "--reference" | "--reference-if-able" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return submodule_usage();
+                };
+                reference_args.push(arg.clone());
+                reference_args.push(value.clone());
             }
-            value if value.starts_with("--reference=") => {
-                eprintln!("fatal: sley submodule update does not support --reference yet");
-                return Err(GitError::Exit(128));
+            "--dissociate" => reference_args.push("--dissociate".to_string()),
+            value
+                if value.starts_with("--reference=")
+                    || value.starts_with("--reference-if-able=") =>
+            {
+                reference_args.push(value.to_string());
             }
             value if let Some(value) = value.strip_prefix("--filter=") => {
                 filter = Some(value.to_string());
@@ -1123,6 +1145,7 @@ fn parse_submodule_update_options(
         cli_default,
         depth,
         filter,
+        reference_args,
         super_prefix,
         paths,
     })
