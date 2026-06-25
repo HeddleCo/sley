@@ -242,6 +242,14 @@ pub(crate) fn has_command_specific_help(command: &str) -> bool {
             | "maintenance"
             | "mktag"
             | "patch-id"
+            // `replay` parses `-h` itself (run_git_replay prints the full
+            // EXPERIMENTAL usage + option list, exit 129). Once `replay` was
+            // enrolled as a builtin command, the generic `-h` short-circuit in
+            // dispatch_command would otherwise emit the bare "usage: git replay
+            // [<options>]" stub instead (t3650 "exactly one of --onto,
+            // --advance, or --revert is required" compares `replay -h` against
+            // that full usage).
+            | "replay"
             | "shortlog"
             | "show-branch"
             | "submodule"

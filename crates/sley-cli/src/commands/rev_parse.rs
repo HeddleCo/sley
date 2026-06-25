@@ -1905,6 +1905,17 @@ fn is_inside_work_tree(
         };
         return cwd_starts_with(cwd, worktree);
     }
+    // No SetupResult was threaded in (internal callers such as relative-path
+    // normalization): honor an explicit `--work-tree` / `GIT_WORK_TREE` override
+    // before the directory-layout probe. Without this, `rev-parse HEAD:./path`
+    // run from a directory *outside* a relocated work tree mis-detects as inside
+    // it and emits "outside repository" instead of git's "relative path syntax
+    // can't be used outside working tree" (t1506 "relative path when cwd is
+    // outside worktree").
+    if let Some(work_tree) = explicit_work_tree() {
+        let root = resolve_cli_path(&env::current_dir()?, work_tree.to_string_lossy().as_ref());
+        return cwd_starts_with(cwd, &root);
+    }
     // A bare repository has no work tree, so we are never inside one. This
     // covers `core.bare = true` set on a `.git`-named directory, which the
     // directory-layout probe below would otherwise treat as having a worktree.
@@ -2024,9 +2035,14 @@ fn repository_ref_storage_format(git_dir: &Path) -> Result<&'static str> {
     // value). Mirror that: report the bad value plus the physical config line.
     for value in config.get_all("extensions", None, "refStorage") {
         let Some(value) = value else { continue };
-        // Git compares the backend name with `strcmp` (case-sensitive): only the
-        // exact lowercase `files`/`reftable` are valid; anything else is rejected.
-        if value == "files" || value == "reftable" {
+        // Git runs the value through `parse_reference_uri` first: the backend
+        // name is the substring before the first `://` (the remainder is the
+        // storage path payload), or the whole value when there is no `://`. The
+        // *scheme* — not the raw value — is then matched with `strcmp` against
+        // the lowercase `files`/`reftable`. So `files:///abs/path` is the valid
+        // `files` backend, while `db://.git`, `reftable:`, and `reftable@/p` are
+        // rejected. (The bad-value diagnostic still echoes the whole value.)
+        if matches!(ref_storage_scheme(value), "files" | "reftable") {
             continue;
         }
         eprintln!("error: invalid value for 'extensions.refstorage': '{value}'");
@@ -2037,12 +2053,29 @@ fn repository_ref_storage_format(git_dir: &Path) -> Result<&'static str> {
         );
         return Err(GitError::Exit(128));
     }
-    Ok(match config.get("extensions", None, "refStorage") {
-        // Validation above guarantees any surviving value is exactly `files` or
-        // `reftable`; only the latter selects the reftable backend.
-        Some("reftable") => RefStorageFormat::Reftable.name(),
-        _ => RefStorageFormat::Files.name(),
-    })
+    Ok(
+        match config
+            .get("extensions", None, "refStorage")
+            .map(ref_storage_scheme)
+        {
+            // Validation above guarantees any surviving scheme is exactly
+            // `files` or `reftable`; only the latter selects the reftable backend.
+            Some("reftable") => RefStorageFormat::Reftable.name(),
+            _ => RefStorageFormat::Files.name(),
+        },
+    )
+}
+
+/// Git's `parse_reference_uri`: the backend name of an `extensions.refStorage`
+/// (or `GIT_REFERENCE_BACKEND`) value is the substring before the first `://`;
+/// the remainder is the storage-path payload. Without a `://` the whole value
+/// is the backend name. Validation matches on this scheme, so a URI like
+/// `files:///abs/path` selects the `files` backend rather than an unknown one.
+fn ref_storage_scheme(value: &str) -> &str {
+    match value.split_once("://") {
+        Some((scheme, _payload)) => scheme,
+        None => value,
+    }
 }
 
 fn ref_storage_config_display_path(git_dir: &Path, common_git_dir: &Path) -> String {

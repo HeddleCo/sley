@@ -181,16 +181,22 @@ fn parse_packed_refs_with_prefix(
         let (oid, name) = line
             .split_once(' ')
             .ok_or_else(|| packed_refs_unexpected_line(line))?;
-        saw_ref = true;
-        included_last_ref = name.starts_with(prefix);
-        if !included_last_ref {
-            continue;
-        }
+        // git validates EVERY packed-refs line as it reads the file, regardless
+        // of whether the ref matches the caller's prefix; a malformed line
+        // anywhere aborts with "unexpected line in .git/packed-refs" (t1463
+        // "reject packed-refs containing junk"). So validate before applying the
+        // prefix filter — skipping validation for non-matching lines would let
+        // junk pass silently.
         if oid.len() != format.hex_len()
             || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
             || validate_ref_name_for_read(name).is_err()
         {
             return Err(packed_refs_unexpected_line(line));
+        }
+        saw_ref = true;
+        included_last_ref = name.starts_with(prefix);
+        if !included_last_ref {
+            continue;
         }
         let oid = ObjectId::from_hex(format, oid)?;
         refs.push(PackedRef {
@@ -302,15 +308,18 @@ fn packed_ref_names_with_prefix(
         let (oid, name) = line
             .split_once(' ')
             .ok_or_else(|| packed_refs_unexpected_line(line))?;
-        saw_ref = true;
-        if !name.starts_with(prefix) {
-            continue;
-        }
+        // Validate every line before the prefix filter (see
+        // `parse_packed_refs_with_prefix`): git rejects a malformed packed-refs
+        // file even when the junk line is outside the requested prefix.
         if oid.len() != format.hex_len()
             || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
             || validate_ref_name_for_read(name).is_err()
         {
             return Err(packed_refs_unexpected_line(line));
+        }
+        saw_ref = true;
+        if !name.starts_with(prefix) {
+            continue;
         }
         let name = if strip_prefix {
             &name[prefix.len()..]
@@ -1040,7 +1049,7 @@ impl FileRefStore {
         if self.uses_reftable()? {
             let mut refs = BTreeMap::<String, Ref>::new();
             for reference in self
-                .reftable_store_with_storage(self.common_dir.clone())
+                .reftable_store_with_storage(self.shared_reftable_storage_dir())
                 .list_reftable_refs_with_prefix(prefix)?
             {
                 refs.insert(reference.name.clone(), reference);
@@ -2010,6 +2019,23 @@ impl FileRefStore {
         }
     }
 
+    /// Directory holding the *shared* (non-per-worktree) reftable stack.
+    ///
+    /// Normally this is the common dir, but an `extensions.refStorage` /
+    /// `GIT_REFERENCE_BACKEND` URI with a `://path` payload relocates the
+    /// stack to that path (e.g. `reftable:///abs/path`). `storage_dir` cannot
+    /// stand in for this: for a *linked worktree* with no alternate path it is
+    /// the per-worktree gitdir, not the shared stack. So resolve the shared
+    /// location explicitly from the configured backend, mirroring the path
+    /// resolution in `FileRefStore::new`. (Without this, shared refs under an
+    /// alternate-path backend are looked up in the empty default `reftable/`.)
+    fn shared_reftable_storage_dir(&self) -> PathBuf {
+        match configured_ref_storage_backend(&self.common_dir) {
+            Some((_, Some(path))) => path,
+            _ => self.common_dir.clone(),
+        }
+    }
+
     fn reftable_store_for_ref(&self, name: &str) -> Result<(FileRefStore, String)> {
         if let Some((worktree, rewritten)) = reftable_other_worktree_ref(name) {
             let storage_dir = self.common_dir.join("worktrees").join(worktree);
@@ -2022,7 +2048,7 @@ impl FileRefStore {
             return Ok((self.reftable_store_with_storage(self.git_dir.clone()), name.to_string()));
         }
         Ok((
-            self.reftable_store_with_storage(self.common_dir.clone()),
+            self.reftable_store_with_storage(self.shared_reftable_storage_dir()),
             name.to_string(),
         ))
     }
@@ -5183,6 +5209,39 @@ pub fn validate_ref_name_for_update(name: &str) -> Result<()> {
         return Ok(());
     }
     check_refname_format(name, true)
+}
+
+/// git's `refname_is_safe` (refs.c): the gate applied when *deleting* a ref
+/// (`transaction_refname_valid` with a null new-oid). It is stricter than the
+/// create-time `check_refname_format(_, REFNAME_ALLOW_ONELEVEL)`:
+///   - a name under `refs/` is safe when the remainder is non-empty, has no
+///     leading/trailing `/`, and does not escape `refs/` (`..`, absolute,
+///     backslash component);
+///   - any other (one-level) name is safe only when every byte is an uppercase
+///     ASCII letter or `_` — the pseudo-ref shape (`HEAD`, `ORIG_HEAD`).
+///
+/// So a one-level name like `my-private-file` is *creatable* (`update-ref
+/// my-private-file <oid>`) yet refused for deletion (`update-ref -d
+/// my-private-file` → "refusing to update ref with bad name"), which is what
+/// keeps `update-ref -d` from unlinking arbitrary files inside `.git`.
+pub fn refname_is_safe(refname: &str) -> bool {
+    if let Some(rest) = refname.strip_prefix("refs/") {
+        if rest.is_empty() || rest.starts_with('/') || rest.ends_with('/') || rest.contains('\\') {
+            return false;
+        }
+        let path = Path::new(rest);
+        !path.is_absolute()
+            && !path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                )
+            })
+    } else {
+        !refname.is_empty() && refname.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+    }
 }
 
 /// git's is_root_ref_syntax (refs.c): a ref name made only of uppercase ASCII,
