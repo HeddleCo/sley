@@ -893,15 +893,16 @@ pub fn find_shared_symref(
 ) -> Result<Option<SharedSymrefWorktree>> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     for admin in worktree_admins(&common_git_dir)? {
+        // git's `is_shared_symref` returns 0 for a bare worktree: a bare main
+        // repo has no working tree, so its `HEAD` branch is never "checked out"
+        // and must not block updates (t5516 "… bare repository worktree").
+        let Some(path) = admin.path.clone() else {
+            continue;
+        };
         if worktree_uses_symref(&admin.git_dir, symref, target)? {
-            let path = admin
-                .path
-                .unwrap_or_else(|| admin.git_dir.clone())
-                .to_string_lossy()
-                .into_owned();
             return Ok(Some(SharedSymrefWorktree {
                 refname: target.to_string(),
-                path: PathBuf::from(path),
+                path,
             }));
         }
     }

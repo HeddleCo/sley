@@ -3635,12 +3635,11 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
-    if read_repo_config(&git_dir)?
-        .get_bool("core", None, "bare")
-        .unwrap_or(false)
-    {
-        options.update_head_ok = true;
-    }
+    // A bare repo with no working tree never has a "checked out" branch, so the
+    // current-branch fetch refusal is keyed off whether a *non-bare* worktree
+    // shares the symref (`find_shared_symref` skips bare worktrees) rather than a
+    // blanket update-head-ok for every bare repo — otherwise a bare repo's linked
+    // worktree branch could be overwritten by fetch (t5516 #120).
     let config = read_repo_config(&git_dir)?;
     let all_from_config = source.is_none()
         && fetch_all_remotes.is_none()
