@@ -492,6 +492,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "annotate" => commands::blame::cmd_annotate(&args[1..]),
         "bugreport" => commands::utility::cmd_bugreport(&args[1..]),
         "describe" => commands::describe::cmd_describe(&args[1..]),
+        "diagnose" => commands::diagnose::cmd_diagnose(&args[1..]),
         "shortlog" => commands::shortlog::cmd_shortlog(&args[1..]),
         "grep" => commands::grep::cmd_grep(&args[1..]),
         "last-modified" => commands::last_modified::cmd_last_modified(&args[1..]),

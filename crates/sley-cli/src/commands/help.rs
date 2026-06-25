@@ -37,6 +37,7 @@ pub(crate) const BUILTIN_COMMANDS: &[&str] = &[
     "count-objects",
     "daemon",
     "describe",
+    "diagnose",
     "diff",
     "diff-files",
     "diff-index",
