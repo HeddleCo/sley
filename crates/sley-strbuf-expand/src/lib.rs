@@ -225,9 +225,18 @@ impl<A> ExpandFormat<A> {
                         combined.extend_from_slice(&value);
                         value = combined;
                     }
+                    // Capture the output length BEFORE padding. A
+                    // `flush_left_and_steal` (`%>>`) pad steals trailing spaces
+                    // from `out`, shrinking it below this mark; git's
+                    // format_commit_item records orig_len here and inserts the
+                    // `% `/`%+` magic prefix at that position AFTER the padded
+                    // value is appended (and pops trailing `\n` for `%-` when no
+                    // content was added). With stealing the magic space lands
+                    // *inside* the freshly appended text, not at the seam.
+                    let orig_len = out.len();
                     apply_padding(out, &mut value, pending_padding.take());
-                    apply_magic(out, atom.magic, &value);
                     emit_atom(out, &atom.atom, &value)?;
+                    apply_magic_at(out, orig_len, atom.magic);
                 }
             }
         }
@@ -472,6 +481,26 @@ fn apply_magic(out: &mut Vec<u8>, magic: MagicPrefix, value: &[u8]) {
         while out.last().copied() == Some(b'\n') {
             out.pop();
         }
+    }
+}
+
+/// Apply a placeholder's magic prefix (`%+`/`% `/`%-`) the way git's
+/// `format_commit_item` does: relative to `orig_len`, the output length captured
+/// *before* the value (and any `%>>` steal) was applied. `% `/`%+` insert their
+/// space/newline at `orig_len` iff content was appended (so a `%>>` steal places
+/// the space inside the padded text); `%-` strips trailing newlines iff nothing
+/// was appended.
+fn apply_magic_at(out: &mut Vec<u8>, orig_len: usize, magic: MagicPrefix) {
+    let content_added = out.len() != orig_len;
+    match magic {
+        MagicPrefix::AddLfBeforeNonEmpty if content_added => out.insert(orig_len, b'\n'),
+        MagicPrefix::AddSpaceBeforeNonEmpty if content_added => out.insert(orig_len, b' '),
+        MagicPrefix::DeleteLfBeforeEmpty if !content_added => {
+            while out.last().copied() == Some(b'\n') {
+                out.pop();
+            }
+        }
+        _ => {}
     }
 }
 
