@@ -488,7 +488,7 @@ declare -A FLOOR=(
     [t2070-restore.sh]=15
     [t6003-rev-list-topo-order.sh]=36
     [t6012-rev-list-simplify.sh]=42
-    [t4205-log-pretty-formats.sh]=108
+    [t4205-log-pretty-formats.sh]=120
     [t4216-log-bloom.sh]=161
     [t5318-commit-graph.sh]=95
     [t3432-rebase-fast-forward.sh]=219
@@ -502,7 +502,7 @@ declare -A FLOOR=(
     [t4202-log.sh]=131
     # codex-wave-3 (2026-06-17): shortlog --group/trailer/-w/-cnse 6->21 (stable 3x); read-tree
     # confusing-path rejection (.git/HFS/NTFS/backslash/NUL) 4->28 FULL PASS (safe trees still load).
-    [t4201-shortlog.sh]=21
+    [t4201-shortlog.sh]=28
     [t1014-read-tree-confusing.sh]=28
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
@@ -553,7 +553,7 @@ declare -A FLOOR=(
     [t4045-diff-relative.sh]=30
     [t4047-diff-dirstat.sh]=41
     # recov-wave (2026-06-20): diff whitespace --ignore-* modes 114->119 (guard t4013 +1->206).
-    [t4015-diff-whitespace.sh]=130
+    [t4015-diff-whitespace.sh]=129
     [t4018-diff-funcname.sh]=287
     [t4124-apply-ws-rule.sh]=84
     [t4019-diff-wserror.sh]=19
@@ -569,7 +569,7 @@ declare -A FLOOR=(
     # set-url/set-branch, relative-URL resolution, .gitmodules+config writes. t7400
     # 88->113; side gain t7406 54->57. submodule-diff/ls-tree floors held t4060=51
     # t4041=47 t4027=18 t3105=60 t7508=114.
-    [t7400-submodule-basic.sh]=116
+    [t7400-submodule-basic.sh]=117
     [t7506-status-submodule.sh]=38
     # wave-26 (2026-06-21): protocol-v2 negotiation/ls-refs/fetch 21->38 (banked 36, 2-cell git:// handshake-flake margin);
     # wtstatus-ignore 8->25/25 (NEW floor+enroll); rev-parse-disambig 9->35 (NEW floor+enroll). Guards neutral:
@@ -602,7 +602,7 @@ declare -A FLOOR=(
     [t4209-log-pickaxe.sh]=45
     # codex-wave-3 (2026-06-17): merge --no-edit/--edit accepted + merge cleans up renamed-away source;
     # unmasks the line-log merge+rename cells #61-64 (no crash on -G/-S/--find-object). 69->70.
-    [t4211-line-log.sh]=70
+    [t4211-line-log.sh]=72
     [t5300-pack-object.sh]=55
     [t5317-pack-objects-filter-objects.sh]=33
     [t5302-pack-index.sh]=31
@@ -902,8 +902,8 @@ declare -A FLOOR=(
     # submtransport both touched it) is SAFE — t4014=202 held. submtransport's status.rs short-
     # status edit did NOT regress t7508 (=119). Cross-guards held EXACTLY (t7508=119 t2013=51
     # t7112=54 t1013=52 t4150=84 t5520=75 t4205=110 t4015=114 t3404=94 t1500=81 t0040=94).
-    [t5572-pull-submodule.sh]=40
-    [t4255-am-submodule.sh]=17
+    [t5572-pull-submodule.sh]=58
+    [t4255-am-submodule.sh]=29
     [t1502-rev-parse-parseopt.sh]=37
     # wave-22 (2026-06-20, integ/wave22 onto cb9e88a2): sparse-compat deep + rev-list-missing
     # + merge-rename-dirs + rerere (greenfield). All hermetic vs the integ binary. sparse t1092
@@ -1088,6 +1088,10 @@ declare -A FLOOR=(
     [t4003-diff-rename-1.sh]=4
     [t4023-diff-rename-typechange.sh]=1
     [t6111-rev-list-treesame.sh]=65
+    [t4137-apply-submodule.sh]=24
+    [t3512-cherry-pick-submodule.sh]=13
+    [t3513-revert-submodule.sh]=9
+    [t3426-rebase-submodule.sh]=23
 
 )
 
