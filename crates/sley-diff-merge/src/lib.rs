@@ -7299,6 +7299,46 @@ pub fn merge_entry_maps(
                 }),
                 auto_merged: false,
             });
+        } else if let (Some(&(ours_mode, ours_oid)), Some(&(theirs_mode, theirs_oid))) =
+            (ours.as_ref(), theirs.as_ref())
+            && ours_mode == 0o120000
+            && theirs_mode == 0o120000
+        {
+            // Both sides are symlinks that diverged from the base and from each
+            // other (the trivial oid resolutions above already took the agreeing
+            // cases). A symlink is never textually merged; git's
+            // `handle_content_merge` symlink arm (merge-ort.c) resolves CLEAN to
+            // a side under `-Xours`/`-Xtheirs`, and otherwise records a CONFLICT
+            // carrying ours' target.
+            match options.favor {
+                MergeFavor::Ours => {
+                    leaves.insert(path.clone(), (ours_mode, ours_oid));
+                    paths.push(clean_path_auto(path.clone(), Some((ours_mode, ours_oid)), false));
+                }
+                MergeFavor::Theirs => {
+                    leaves.insert(path.clone(), (theirs_mode, theirs_oid));
+                    paths.push(clean_path_auto(
+                        path.clone(),
+                        Some((theirs_mode, theirs_oid)),
+                        false,
+                    ));
+                }
+                MergeFavor::None | MergeFavor::Union => {
+                    clean = false;
+                    leaves.insert(path.clone(), (ours_mode, ours_oid));
+                    let worktree = Some((ours_mode, merge_worktree_bytes(db, ours_mode, &ours_oid)?));
+                    paths.push(MergedPath {
+                        path: path.clone(),
+                        stages: stages_for(&base, &ours, &theirs),
+                        result: Some((ours_mode, ours_oid)),
+                        worktree,
+                        conflict: Some(MergeConflictKind::Content {
+                            add_add: base.is_none(),
+                        }),
+                        auto_merged: false,
+                    });
+                }
+            }
         } else {
             // add/add of non-files, type changes, mode changes, etc. Keep the
             // surviving side's content and record a generic content conflict.
