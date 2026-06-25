@@ -397,20 +397,24 @@ pub mod trace2 {
         out
     }
 
-    /// Create the trace2 event target when tracing is enabled, even if this
-    /// command does not emit any data or region events.
+    /// Create the trace2 targets when tracing is enabled, even if this command
+    /// emits no data/region/perf events — git opens the `GIT_TRACE2_EVENT` and
+    /// `GIT_TRACE2_PERF` files at startup, so consumers (and test cleanups that
+    /// `rm` the file) can rely on their existence.
     pub fn touch() {
-        let Some(target) = std::env::var_os("GIT_TRACE2_EVENT") else {
-            return;
-        };
-        let target = target.to_string_lossy().into_owned();
-        if !target.starts_with('/') {
-            return;
+        for var in ["GIT_TRACE2_EVENT", "GIT_TRACE2_PERF"] {
+            let Some(target) = std::env::var_os(var) else {
+                continue;
+            };
+            let target = target.to_string_lossy().into_owned();
+            if !target.starts_with('/') {
+                continue;
+            }
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(target);
         }
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(target);
     }
 
     /// Emit a trace2 `data` event (upstream `trace2_data_string` /
@@ -536,6 +540,30 @@ pub mod trace2 {
         }
         let line = format!(
             "19:00:00.000000 file.c:1 | d0 | main | data | r1 | ? | ? | read_directory | ....{key}:{value}\n"
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&target)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+
+    /// Emit a trace2 perf `data` row tagged to the `setup` category (git's
+    /// `trace2_data_string("setup", ...)`), used for the
+    /// `implicit-bare-repository:<dir>` marker the safe.bareRepository tests
+    /// grep for. Only the grep-stable `<key>:<value>` tail is significant.
+    pub fn perf_setup_data(key: &str, value: impl Display) {
+        let Some(target) = std::env::var_os("GIT_TRACE2_PERF") else {
+            return;
+        };
+        let target = target.to_string_lossy().into_owned();
+        if !target.starts_with('/') {
+            return;
+        }
+        let line = format!(
+            "19:00:00.000000 setup.c:1 | d0 | main | data | r0 | ? | ? | setup | ....{key}:{value}\n"
         );
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)

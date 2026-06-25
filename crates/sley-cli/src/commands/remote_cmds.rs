@@ -740,6 +740,11 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     }
 
     let remote_git_dir = ls_remote_git_dir(&repository)?;
+    // A local clone reads the source repository directly, so it is subject to the
+    // same `safe.directory` ownership check git applies when opening any repo.
+    // The source is identified by its git directory (a clone needs no worktree),
+    // so an exception is added as `<source>/.git`.
+    crate::ownership::ensure_valid_ownership(None, &remote_git_dir, None)?;
     let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
     let format = repository_object_format(&remote_common_git_dir)?;
     if upload_pack.as_deref() == Some("false") {
