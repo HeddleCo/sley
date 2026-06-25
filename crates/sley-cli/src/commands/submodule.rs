@@ -726,15 +726,96 @@ fn populate_submodule_worktree(
             clone_args.push(format!("--filter={filter}"));
         }
         clone_args.extend(options.reference_args.iter().cloned());
+        // git's `prepare_possible_alternates`: borrow each submodule's objects
+        // from the reference superproject's `modules/<name>` when the super has
+        // `submodule.alternateLocation=superproject` (clone --reference --recursive).
+        clone_args.extend(superproject_alternate_reference_args(git_dir, &submodule.name)?);
         clone_args.push("--separate-git-dir".to_string());
         clone_args.push(modules_git_dir.display().to_string());
         clone_args.push(url.to_string());
         clone_args.push(path.display().to_string());
         super::remote_cmds::cmd_clone(&clone_args)?;
+        // Propagate the alternate config into the just-cloned submodule so its
+        // OWN recursive update borrows for the next level down (nested case).
+        propagate_submodule_alternate_config(git_dir, &modules_git_dir)?;
         rewrite_submodule_gitdir_file(path, &modules_git_dir)?;
         set_submodule_core_worktree(path, &modules_git_dir)?;
     }
     Ok(())
+}
+
+/// git's `prepare_possible_alternates` + `add_possible_reference_from_superproject`:
+/// when the superproject sets `submodule.alternateLocation=superproject`, turn
+/// each of the superproject's own alternates (`<ref>/objects`) into a candidate
+/// submodule alternate (`<ref>/modules/<name>`) forwarded as `--reference`
+/// (strategy `die`) or `--reference-if-able` (strategy `info`). `ignore` adds
+/// nothing.
+fn superproject_alternate_reference_args(git_dir: &Path, name: &str) -> Result<Vec<String>> {
+    let common = common_git_dir_for_git_dir(git_dir)?;
+    let config = read_repo_config(&common)?;
+    if config.get("submodule", None, "alternateLocation") != Some("superproject") {
+        return Ok(Vec::new());
+    }
+    let flag = match config
+        .get("submodule", None, "alternateErrorStrategy")
+        .unwrap_or("die")
+    {
+        "ignore" => return Ok(Vec::new()),
+        "info" => "--reference-if-able",
+        _ => "--reference",
+    };
+    let alternates_file = common.join("objects").join("info").join("alternates");
+    let Ok(content) = fs::read_to_string(&alternates_file) else {
+        return Ok(Vec::new());
+    };
+    let mut args = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Each line is a "<reference-gitdir>/objects" path; the reference repo's
+        // gitdir is its parent and the submodule's borrowed gitdir is that
+        // repo's `modules/<name>`.
+        let Some(reference_git_dir) = Path::new(line).parent() else {
+            continue;
+        };
+        let candidate = reference_git_dir.join("modules").join(name);
+        args.push(flag.to_string());
+        args.push(candidate.to_string_lossy().into_owned());
+    }
+    Ok(args)
+}
+
+/// git's submodule-clone tail: copy `submodule.alternateLocation` /
+/// `submodule.alternateErrorStrategy` from the superproject into the freshly
+/// cloned submodule's config so its own recursive update borrows for the next
+/// nesting level.
+fn propagate_submodule_alternate_config(super_git_dir: &Path, modules_git_dir: &Path) -> Result<()> {
+    let super_config = read_repo_config(&common_git_dir_for_git_dir(super_git_dir)?)?;
+    let location = super_config
+        .get("submodule", None, "alternateLocation")
+        .map(str::to_string);
+    let strategy = super_config
+        .get("submodule", None, "alternateErrorStrategy")
+        .map(str::to_string);
+    if location.is_none() && strategy.is_none() {
+        return Ok(());
+    }
+    let mut config = read_repo_config(modules_git_dir)?;
+    if let Some(location) = location {
+        set_config_value(&mut config, "submodule", None, "alternateLocation", &location);
+    }
+    if let Some(strategy) = strategy {
+        set_config_value(
+            &mut config,
+            "submodule",
+            None,
+            "alternateErrorStrategy",
+            &strategy,
+        );
+    }
+    write_repo_config(modules_git_dir, &config)
 }
 
 /// `--remote`: fetch the submodule's default remote, then resolve the configured
