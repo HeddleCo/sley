@@ -4564,7 +4564,11 @@ fn changed_gitlinks_for_commit_range(
                 });
             }
         }
-        pending.extend(commit.parents);
+        // Stop at the shallow boundary: a commit in `$GIT_DIR/shallow` is grafted
+        // to have no parents, so the walk does not try to read a parent the
+        // shallow repo never received. Without a `.git/shallow` file this is a
+        // no-op (non-shallow fetches are unchanged).
+        pending.extend(grafted_parents(db, &oid, commit.parents));
     }
     Ok(changed)
 }
