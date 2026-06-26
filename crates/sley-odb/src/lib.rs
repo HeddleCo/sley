@@ -14,11 +14,11 @@ use sley_object::{
 };
 use sley_pack::{
     MultiPackIndex, MultiPackIndexOidLookup, PackBitmapIndex, PackBitmapWriter, PackFile,
-    PackIndex, PackIndexByteSource, PackIndexEntry, PackIndexViewData, PackInput, PackWrite,
-    PackWriteOptions,
+    PackIndex, PackIndexByteSource, PackIndexEntry, PackIndexViewData, PackInput,
+    PackStreamIndexBuild, PackWrite, PackWriteOptions, PackWriteSummary,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -121,6 +121,39 @@ pub struct PackInstallResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawPackInstallResult {
     pub object_ids: Vec<ObjectId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawPackIndexResult {
+    pub pack_id: ObjectId,
+    pub index: Vec<u8>,
+    pub objects: Vec<RawPackIndexedObject>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawPackIndexedObject {
+    pub oid: ObjectId,
+    pub object_type: ObjectType,
+    pub size: u64,
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachablePackFile {
+    pub pack_path: PathBuf,
+    pub pack_size: u64,
+    pub checksum: ObjectId,
+    pub object_count: usize,
+    pub delta_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachablePackWriteSummary {
+    pub index: Vec<u8>,
+    pub checksum: ObjectId,
+    pub object_count: usize,
+    pub delta_count: u32,
+    pub pack_size: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -233,6 +266,95 @@ where
 {
     let pack = PackFile::parse(pack_bytes, format)?;
     write_pack_objects(pack, writer, "pack")
+}
+
+pub fn index_raw_pack(pack_bytes: &[u8], format: ObjectFormat) -> Result<RawPackIndexResult> {
+    let pack = PackFile::parse(pack_bytes, format)?;
+    let built = PackIndex::write_v2_for_pack(pack_bytes, format)?;
+    if built.pack_checksum != pack.checksum {
+        return Err(GitError::InvalidFormat(
+            "pack index checksum does not match parsed pack checksum".to_string(),
+        ));
+    }
+
+    let offsets = built
+        .entries
+        .iter()
+        .map(|entry| (entry.oid, entry.offset))
+        .collect::<HashMap<_, _>>();
+    let mut objects = Vec::with_capacity(pack.entries.len());
+    for object in pack.entries {
+        let offset = offsets.get(&object.entry.oid).copied().ok_or_else(|| {
+            GitError::InvalidFormat(format!(
+                "pack index is missing object {}",
+                object.entry.oid.to_hex()
+            ))
+        })?;
+        objects.push(RawPackIndexedObject {
+            oid: object.entry.oid,
+            object_type: object.object.object_type,
+            size: object.object.body.len() as u64,
+            offset,
+        });
+    }
+
+    Ok(RawPackIndexResult {
+        pack_id: built.pack_checksum,
+        index: built.index,
+        objects,
+    })
+}
+
+pub fn index_raw_pack_from_reader<R>(
+    reader: &mut R,
+    format: ObjectFormat,
+) -> Result<RawPackIndexResult>
+where
+    R: Read + Seek,
+{
+    Ok(stream_index_build_to_raw_result(
+        PackIndex::write_v2_for_pack_reader(reader, format)?,
+    ))
+}
+
+pub fn index_raw_pack_from_reader_with_len<R>(
+    reader: &mut R,
+    format: ObjectFormat,
+    pack_len: u64,
+) -> Result<RawPackIndexResult>
+where
+    R: Read,
+{
+    Ok(stream_index_build_to_raw_result(
+        PackIndex::write_v2_for_pack_reader_with_len(reader, format, pack_len)?,
+    ))
+}
+
+pub fn index_raw_pack_file(
+    path: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<RawPackIndexResult> {
+    Ok(stream_index_build_to_raw_result(
+        PackIndex::write_v2_for_pack_path(path, format)?,
+    ))
+}
+
+fn stream_index_build_to_raw_result(built: PackStreamIndexBuild) -> RawPackIndexResult {
+    let objects = built
+        .objects
+        .into_iter()
+        .map(|object| RawPackIndexedObject {
+            oid: object.oid,
+            object_type: object.object_type,
+            size: object.size,
+            offset: object.offset,
+        })
+        .collect::<Vec<_>>();
+    RawPackIndexResult {
+        pack_id: built.pack_checksum,
+        index: built.index,
+        objects,
+    }
 }
 
 fn write_pack_objects<W>(pack: PackFile, writer: &W, source: &str) -> Result<PackUnpackResult>
@@ -400,6 +522,87 @@ where
     // unaffected.
     let inputs = pack_inputs(&objects);
     PackFile::write_packed_with_known_ids(&inputs, format).map(Some)
+}
+
+pub fn build_reachable_pack_file<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    pack_path: impl AsRef<Path>,
+) -> Result<Option<ReachablePackFile>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    let objects = collect_reachable_pack_objects(reader, format, starts, excluded)?;
+    if objects.is_empty() {
+        return Ok(None);
+    }
+    let inputs = pack_inputs(&objects);
+    let pack_path = pack_path.as_ref();
+    if let Some(parent) = pack_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(pack_path)?;
+    let summary = PackFile::write_packed_with_known_ids_to_writer(
+        &inputs,
+        format,
+        &PackWriteOptions::new(),
+        &mut file,
+    )?;
+    file.sync_all()?;
+    Ok(Some(reachable_pack_file_result(pack_path, summary)))
+}
+
+pub fn write_reachable_pack_to_writer<R, I, W>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    writer: &mut W,
+) -> Result<Option<ReachablePackWriteSummary>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+    W: Write,
+{
+    let objects = collect_reachable_pack_objects(reader, format, starts, excluded)?;
+    if objects.is_empty() {
+        return Ok(None);
+    }
+    let inputs = pack_inputs(&objects);
+    let summary = PackFile::write_packed_with_known_ids_to_writer(
+        &inputs,
+        format,
+        &PackWriteOptions::new(),
+        writer,
+    )?;
+    Ok(Some(reachable_pack_write_summary(summary)))
+}
+
+fn reachable_pack_file_result(path: &Path, summary: PackWriteSummary) -> ReachablePackFile {
+    ReachablePackFile {
+        pack_path: path.to_path_buf(),
+        pack_size: summary.pack_size,
+        checksum: summary.checksum,
+        object_count: summary.entries.len(),
+        delta_count: summary.delta_count,
+    }
+}
+
+fn reachable_pack_write_summary(summary: PackWriteSummary) -> ReachablePackWriteSummary {
+    ReachablePackWriteSummary {
+        index: summary.index,
+        checksum: summary.checksum,
+        object_count: summary.entries.len(),
+        delta_count: summary.delta_count,
+        pack_size: summary.pack_size,
+    }
 }
 
 pub fn build_and_install_reachable_pack<R, I>(
@@ -2155,7 +2358,14 @@ fn prune_obsolete_pack_paths(
     keep: &Path,
     retained_pack_stems: &[String],
 ) -> Result<()> {
-    prune_pack_paths_matching(objects_dir, format, packs.iter(), keep, retained_pack_stems, |_| Ok(true))
+    prune_pack_paths_matching(
+        objects_dir,
+        format,
+        packs.iter(),
+        keep,
+        retained_pack_stems,
+        |_| Ok(true),
+    )
 }
 
 fn prune_pack_paths_matching<'a>(
@@ -4524,16 +4734,14 @@ impl FileObjectDatabase {
         if self.contains(&oid)? {
             return Ok(oid);
         }
-        let input = [PackInput {
-            oid: &oid,
-            object,
-        }];
+        let input = [PackInput { oid: &oid, object }];
         let options = PackWriteOptions::new()
             .with_window(0)
             .with_depth(0)
             .with_reorder(false)
             .with_compression_level(compression_level);
-        let pack = PackFile::write_packed_with_known_ids_and_options(&input, self.format, &options)?;
+        let pack =
+            PackFile::write_packed_with_known_ids_and_options(&input, self.format, &options)?;
         self.install_pack(&pack)?;
         Ok(oid)
     }
@@ -4570,7 +4778,8 @@ impl FileObjectDatabase {
             .with_depth(0)
             .with_reorder(false)
             .with_compression_level(compression_level);
-        let pack = PackFile::write_packed_with_known_ids_and_options(&inputs, self.format, &options)?;
+        let pack =
+            PackFile::write_packed_with_known_ids_and_options(&inputs, self.format, &options)?;
         self.install_pack(&pack)?;
         Ok(())
     }
@@ -7073,6 +7282,53 @@ mod tests {
         assert_eq!(pack.entries.len(), 1);
         assert_eq!(pack.entries[0].oid, oid);
 
+        let pack_path = root.join("reachable.pack");
+        let pack_file = build_reachable_pack_file(
+            &db,
+            format,
+            std::iter::once(oid),
+            &HashSet::new(),
+            &pack_path,
+        )
+        .expect("test operation should succeed")
+        .expect("reachable pack file should be built");
+        assert_eq!(pack_file.checksum, pack.checksum);
+        assert_eq!(pack_file.pack_size, pack.pack.len() as u64);
+        assert_eq!(pack_file.object_count, 1);
+        assert_eq!(
+            fs::read(&pack_file.pack_path).expect("test operation should succeed"),
+            pack.pack
+        );
+
+        let mut streamed_pack = Vec::new();
+        let streamed = write_reachable_pack_to_writer(
+            &db,
+            format,
+            std::iter::once(oid),
+            &HashSet::new(),
+            &mut streamed_pack,
+        )
+        .expect("test operation should succeed")
+        .expect("reachable pack should be streamed");
+        assert_eq!(streamed.checksum, pack.checksum);
+        assert_eq!(streamed.pack_size, pack.pack.len() as u64);
+        assert_eq!(streamed.object_count, 1);
+        assert_eq!(streamed_pack, pack.pack);
+
+        let mut sink = std::io::sink();
+        let dry_run = write_reachable_pack_to_writer(
+            &db,
+            format,
+            std::iter::once(oid),
+            &HashSet::new(),
+            &mut sink,
+        )
+        .expect("test operation should succeed")
+        .expect("reachable pack should stream to sink");
+        assert_eq!(dry_run.checksum, pack.checksum);
+        assert_eq!(dry_run.pack_size, pack.pack.len() as u64);
+        assert_eq!(dry_run.object_count, 1);
+
         let excluded = HashSet::from([oid]);
         assert!(
             build_reachable_pack(
@@ -7084,6 +7340,49 @@ mod tests {
             .expect("test operation should succeed")
             .is_none()
         );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn index_raw_pack_returns_validated_pack_metadata() {
+        let root = temp_root("sley-index-raw-pack");
+        let git_dir = root.join("repo.git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let graph = write_commit_graph(&mut db, b"pack indexed\n");
+        let commit_oid = graph[0].0;
+        let expected = graph
+            .iter()
+            .map(|(oid, object)| (*oid, (object.object_type, object.body.len() as u64)))
+            .collect::<HashMap<_, _>>();
+        let pack = build_reachable_pack(&db, format, std::iter::once(commit_oid), &HashSet::new())
+            .expect("test operation should succeed")
+            .expect("reachable pack should be built");
+
+        let indexed = index_raw_pack(&pack.pack, format).expect("test operation should succeed");
+        let mut cursor = std::io::Cursor::new(pack.pack.clone());
+        let streamed = index_raw_pack_from_reader(&mut cursor, format)
+            .expect("streamed pack indexing should match in-memory indexing");
+        assert_eq!(streamed, indexed);
+        let pack_path = root.join("reachable.pack");
+        fs::write(&pack_path, &pack.pack).expect("test operation should succeed");
+        let file_indexed = index_raw_pack_file(&pack_path, format)
+            .expect("file-backed pack indexing should match in-memory indexing");
+        assert_eq!(file_indexed, indexed);
+
+        assert_eq!(indexed.pack_id, pack.checksum);
+        assert_eq!(indexed.index, pack.index);
+        assert_eq!(indexed.objects.len(), 3);
+        for object in indexed.objects {
+            let (expected_type, expected_size) = expected
+                .get(&object.oid)
+                .copied()
+                .expect("indexed object should be reachable");
+            assert_eq!(object.object_type, expected_type);
+            assert_eq!(object.size, expected_size);
+            assert!(object.offset > 0);
+        }
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 

@@ -3,14 +3,17 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use flate2::{Compress, Compression, FlushCompress, Status};
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result, StreamingDigest};
 use sley_formats::Bundle;
 use sley_object::{EncodedObject, ObjectType};
 use std::borrow::Borrow;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +198,15 @@ pub struct PackWrite {
     pub delta_count: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackWriteSummary {
+    pub index: Vec<u8>,
+    pub checksum: ObjectId,
+    pub entries: Vec<PackIndexEntry>,
+    pub delta_count: u32,
+    pub pack_size: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackInput<'a> {
     pub oid: &'a ObjectId,
@@ -206,6 +218,22 @@ pub struct PackIndexBuild {
     pub index: Vec<u8>,
     pub pack_checksum: ObjectId,
     pub entries: Vec<PackIndexEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackStreamIndexBuild {
+    pub index: Vec<u8>,
+    pub pack_checksum: ObjectId,
+    pub entries: Vec<PackIndexEntry>,
+    pub objects: Vec<PackIndexedObject>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackIndexedObject {
+    pub oid: ObjectId,
+    pub object_type: ObjectType,
+    pub size: u64,
+    pub offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -858,6 +886,35 @@ impl PackFile {
         Self::write_packed_from_parts(objects, object_ids, format, options)
     }
 
+    pub fn write_packed_with_known_ids_to_writer<W>(
+        inputs: &[PackInput<'_>],
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+        writer: &mut W,
+    ) -> Result<PackWriteSummary>
+    where
+        W: Write,
+    {
+        if inputs.len() > u32::MAX as usize {
+            return Err(GitError::InvalidFormat("too many pack objects".into()));
+        }
+        let mut objects = Vec::with_capacity(inputs.len());
+        let mut object_ids = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if input.oid.format() != format {
+                return Err(GitError::InvalidObjectId(format!(
+                    "pack object id {} uses {}, pack uses {}",
+                    input.oid,
+                    input.oid.format().name(),
+                    format.name()
+                )));
+            }
+            objects.push(input.object);
+            object_ids.push(*input.oid);
+        }
+        Self::write_packed_from_parts_to_writer(objects, object_ids, format, options, writer)
+    }
+
     /// Write a thin pack: objects may be deltified against `external_bases`
     /// that are *not* included in the pack, referenced by ref-delta to their
     /// object id.
@@ -1001,6 +1058,149 @@ impl PackFile {
             entries: index_entries,
             delta_count,
         })
+    }
+
+    fn write_packed_from_parts_to_writer<W>(
+        objects: Vec<&EncodedObject>,
+        object_ids: Vec<ObjectId>,
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+        writer: &mut W,
+    ) -> Result<PackWriteSummary>
+    where
+        W: Write,
+    {
+        let mut seen = HashSet::with_capacity(object_ids.len());
+        for oid in &object_ids {
+            if !seen.insert(oid) {
+                return Err(GitError::InvalidFormat(format!(
+                    "pack contains duplicate object id {oid}"
+                )));
+            }
+        }
+
+        for oid in options.thin_bases.keys() {
+            if oid.format() != format {
+                return Err(GitError::InvalidObjectId(
+                    "thin pack base object id format does not match pack format".into(),
+                ));
+            }
+        }
+
+        let (plan, order) = plan_pack_deltas(&objects, &object_ids, options)?;
+        let mut output = PackDigestWriter::new(writer, format);
+        output.write_pack_bytes(b"PACK")?;
+        output.write_pack_bytes(&2u32.to_be_bytes())?;
+        output.write_pack_bytes(&(objects.len() as u32).to_be_bytes())?;
+
+        let mut index_entries = Vec::with_capacity(objects.len());
+        let mut delta_count = 0u32;
+        let mut written_offsets: Vec<Option<u64>> = vec![None; objects.len()];
+
+        for &idx in &order {
+            let offset = output.position();
+            let mut entry_header = Vec::new();
+            match &plan[idx].base {
+                PlannedBase::None => {
+                    write_entry_header(
+                        &mut entry_header,
+                        objects[idx].object_type,
+                        objects[idx].body.len() as u64,
+                    );
+                }
+                PlannedBase::InPack { base_idx, delta } => {
+                    delta_count += 1;
+                    let base_offset = written_offsets[*base_idx].ok_or_else(|| {
+                        GitError::InvalidFormat(
+                            "in-pack delta base emitted after dependent object".into(),
+                        )
+                    })?;
+                    if options.prefer_ofs_delta {
+                        write_pack_entry_header_kind(&mut entry_header, 6, delta.len() as u64);
+                        let relative = offset.checked_sub(base_offset).ok_or_else(|| {
+                            GitError::InvalidFormat("ofs-delta base offset is after delta".into())
+                        })?;
+                        write_ofs_delta_offset(&mut entry_header, relative)?;
+                    } else {
+                        write_pack_entry_header_kind(&mut entry_header, 7, delta.len() as u64);
+                        entry_header.extend_from_slice(object_ids[*base_idx].as_bytes());
+                    }
+                }
+                PlannedBase::External { base_oid, delta } => {
+                    delta_count += 1;
+                    write_pack_entry_header_kind(&mut entry_header, 7, delta.len() as u64);
+                    entry_header.extend_from_slice(base_oid.as_bytes());
+                }
+            }
+            let compressed_payload = compressed_payload(
+                planned_payload(&objects, &plan, idx),
+                options.compression_level,
+            )?;
+            let mut crc32 = crc32fast::Hasher::new();
+            crc32.update(&entry_header);
+            crc32.update(&compressed_payload);
+            output.write_pack_bytes(&entry_header)?;
+            output.write_pack_bytes(&compressed_payload)?;
+            written_offsets[idx] = Some(offset);
+            index_entries.push(PackIndexEntry {
+                oid: object_ids[idx],
+                crc32: crc32.finalize(),
+                offset,
+            });
+        }
+
+        let (checksum, pack_size) = output.finish()?;
+        let index = PackIndex::write_v2(format, &index_entries, &checksum)?;
+        Ok(PackWriteSummary {
+            index,
+            checksum,
+            entries: index_entries,
+            delta_count,
+            pack_size,
+        })
+    }
+}
+
+struct PackDigestWriter<'a, W> {
+    writer: &'a mut W,
+    digest: StreamingDigest,
+    position: u64,
+}
+
+impl<'a, W> PackDigestWriter<'a, W>
+where
+    W: Write,
+{
+    fn new(writer: &'a mut W, format: ObjectFormat) -> Self {
+        Self {
+            writer,
+            digest: StreamingDigest::new(format),
+            position: 0,
+        }
+    }
+
+    fn position(&self) -> u64 {
+        self.position
+    }
+
+    fn write_pack_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer.write_all(bytes)?;
+        self.digest.update(bytes);
+        self.position = self
+            .position
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(ObjectId, u64)> {
+        let checksum = self.digest.finalize()?;
+        self.writer.write_all(checksum.as_bytes())?;
+        self.position = self
+            .position
+            .checked_add(checksum.as_bytes().len() as u64)
+            .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
+        Ok((checksum, self.position))
     }
 }
 
@@ -1551,6 +1751,49 @@ impl PackIndex {
         })
     }
 
+    /// Validate and index a pack from the reader's current position to EOF.
+    ///
+    /// This produces the same v2 `.idx` bytes and object metadata as
+    /// [`PackIndex::write_v2_for_pack`] without requiring the caller to provide
+    /// the pack as one contiguous byte slice. The reader is left positioned at
+    /// EOF on success.
+    pub fn write_v2_for_pack_reader<R>(
+        reader: &mut R,
+        format: ObjectFormat,
+    ) -> Result<PackStreamIndexBuild>
+    where
+        R: Read + Seek,
+    {
+        let start = reader.stream_position()?;
+        let end = reader.seek(SeekFrom::End(0))?;
+        let pack_len = end
+            .checked_sub(start)
+            .ok_or_else(|| GitError::InvalidFormat("pack stream position overflow".into()))?;
+        reader.seek(SeekFrom::Start(start))?;
+        index_pack_from_reader(reader, format, pack_len)
+    }
+
+    pub fn write_v2_for_pack_reader_with_len<R>(
+        reader: &mut R,
+        format: ObjectFormat,
+        pack_len: u64,
+    ) -> Result<PackStreamIndexBuild>
+    where
+        R: Read,
+    {
+        index_pack_from_reader(reader, format, pack_len)
+    }
+
+    /// Validate and index a pack from a filesystem path without loading the
+    /// entire pack file into memory.
+    pub fn write_v2_for_pack_path(
+        path: impl AsRef<Path>,
+        format: ObjectFormat,
+    ) -> Result<PackStreamIndexBuild> {
+        let mut file = File::open(path)?;
+        Self::write_v2_for_pack_reader(&mut file, format)
+    }
+
     pub fn parse_v2_sha1(bytes: &[u8]) -> Result<Self> {
         Self::parse(bytes, ObjectFormat::Sha1)
     }
@@ -1912,6 +2155,409 @@ impl PackIndex {
         index.extend_from_slice(index_checksum.as_bytes());
         Ok(index)
     }
+}
+
+fn index_pack_from_reader<R>(
+    reader: &mut R,
+    format: ObjectFormat,
+    pack_len: u64,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+{
+    let mut stream = PackReadStream::new(reader, format, pack_len)?;
+    let mut header = [0u8; 12];
+    stream.read_pack_bytes(&mut header)?;
+    if &header[..4] != b"PACK" {
+        return Err(GitError::InvalidFormat("missing PACK signature".into()));
+    }
+    let version = u32_be(&header[4..8]);
+    if version != 2 && version != 3 {
+        return Err(GitError::Unsupported(format!("pack version {version}")));
+    }
+    let count = u32_be(&header[8..12]) as usize;
+    let mut parsed_entries = Vec::with_capacity(count);
+    let mut raw_entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let entry_offset = stream.pack_offset();
+        let mut entry_crc = crc32fast::Hasher::new();
+        let header = parse_entry_header_from_stream(&mut stream, &mut entry_crc)?;
+        let base = match header.kind {
+            PackObjectKind::OfsDelta => Some(DeltaBase::Offset(
+                parse_ofs_delta_base_offset_from_stream(&mut stream, &mut entry_crc, entry_offset)?,
+            )),
+            PackObjectKind::RefDelta => {
+                let mut raw = vec![0u8; format.raw_len()];
+                stream.read_entry_bytes(&mut raw, &mut entry_crc)?;
+                Some(DeltaBase::Ref(ObjectId::from_raw(format, &raw)?))
+            }
+            _ => None,
+        };
+        let (body, consumed) = inflate_entry_from_stream(
+            &mut stream,
+            &mut entry_crc,
+            header.size.min(usize::MAX as u64) as usize,
+        )?;
+        if body.len() as u64 != header.size {
+            return Err(GitError::InvalidObject(format!(
+                "pack object declared {} bytes, decoded {}",
+                header.size,
+                body.len()
+            )));
+        }
+        if consumed == 0 {
+            return Err(GitError::InvalidFormat(
+                "empty compressed pack entry".into(),
+            ));
+        }
+        raw_entries.push((entry_offset, entry_crc.finalize()));
+        if let Some(base) = base {
+            parsed_entries.push(ParsedPackEntry::Delta {
+                base,
+                compressed_size: consumed as u64,
+                delta_size: header.size,
+                offset: entry_offset,
+                delta: body,
+            });
+        } else {
+            let object_type = pack_object_kind_to_object_type(header.kind)?;
+            let object = EncodedObject::new(object_type, body);
+            let oid = object.object_id(format)?;
+            parsed_entries.push(ParsedPackEntry::Resolved(PackObject {
+                entry: PackEntry {
+                    oid,
+                    compressed_size: consumed as u64,
+                    uncompressed_size: header.size,
+                    offset: entry_offset,
+                },
+                object,
+            }));
+        }
+    }
+    if stream.pack_offset() != stream.trailer_pack_offset() {
+        return Err(GitError::InvalidFormat(format!(
+            "pack has {} trailing bytes before checksum",
+            stream.trailer_pack_offset() - stream.pack_offset()
+        )));
+    }
+    let expected = stream.read_trailer_oid()?;
+    let pack_checksum = stream.finish_digest()?;
+    if pack_checksum != expected {
+        return Err(GitError::InvalidFormat(format!(
+            "pack checksum mismatch: expected {expected}, got {pack_checksum}"
+        )));
+    }
+
+    let resolved = resolve_pack_entries(parsed_entries, format, &mut |_| Ok(None))?;
+    let entries = resolved
+        .iter()
+        .zip(raw_entries)
+        .map(|(object, (offset, crc32))| PackIndexEntry {
+            oid: object.entry.oid,
+            crc32,
+            offset,
+        })
+        .collect::<Vec<_>>();
+    let objects = resolved
+        .iter()
+        .map(|object| PackIndexedObject {
+            oid: object.entry.oid,
+            object_type: object.object.object_type,
+            size: object.object.body.len() as u64,
+            offset: object.entry.offset,
+        })
+        .collect::<Vec<_>>();
+    let index = PackIndex::write_v2(format, &entries, &pack_checksum)?;
+    Ok(PackStreamIndexBuild {
+        index,
+        pack_checksum,
+        entries,
+        objects,
+    })
+}
+
+fn pack_object_kind_to_object_type(kind: PackObjectKind) -> Result<ObjectType> {
+    match kind {
+        PackObjectKind::Commit => Ok(ObjectType::Commit),
+        PackObjectKind::Tree => Ok(ObjectType::Tree),
+        PackObjectKind::Blob => Ok(ObjectType::Blob),
+        PackObjectKind::Tag => Ok(ObjectType::Tag),
+        PackObjectKind::OfsDelta | PackObjectKind::RefDelta => Err(GitError::InvalidFormat(
+            "delta entry cannot be used as an object type".into(),
+        )),
+    }
+}
+
+struct PackReadStream<'a, R> {
+    reader: &'a mut R,
+    position: u64,
+    pack_len: u64,
+    trailer_position: u64,
+    digest: StreamingDigest,
+    format: ObjectFormat,
+    pending: VecDeque<u8>,
+}
+
+impl<'a, R> PackReadStream<'a, R>
+where
+    R: Read,
+{
+    fn new(reader: &'a mut R, format: ObjectFormat, pack_len: u64) -> Result<Self> {
+        let trailer_len = format.raw_len() as u64;
+        if pack_len < 12 + trailer_len {
+            return Err(GitError::InvalidFormat("pack file too short".into()));
+        }
+        Ok(Self {
+            reader,
+            position: 0,
+            pack_len,
+            trailer_position: pack_len - trailer_len,
+            digest: StreamingDigest::new(format),
+            format,
+            pending: VecDeque::new(),
+        })
+    }
+
+    fn pack_offset(&self) -> u64 {
+        self.position
+    }
+
+    fn trailer_pack_offset(&self) -> u64 {
+        self.trailer_position
+    }
+
+    fn read_pack_bytes(&mut self, bytes: &mut [u8]) -> Result<()> {
+        let end = self
+            .position
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
+        if end > self.trailer_position {
+            return Err(GitError::InvalidFormat(
+                "pack entry extends past checksum".into(),
+            ));
+        }
+        self.read_exact_raw(bytes)?;
+        self.position = end;
+        self.digest.update(bytes);
+        Ok(())
+    }
+
+    fn read_exact_raw(&mut self, bytes: &mut [u8]) -> Result<()> {
+        let mut written = 0usize;
+        while written < bytes.len() {
+            if let Some(byte) = self.pending.pop_front() {
+                bytes[written] = byte;
+                written += 1;
+                continue;
+            }
+            self.reader.read_exact(&mut bytes[written..])?;
+            break;
+        }
+        Ok(())
+    }
+
+    fn read_entry_bytes(&mut self, bytes: &mut [u8], crc: &mut crc32fast::Hasher) -> Result<()> {
+        self.read_pack_bytes(bytes)?;
+        crc.update(bytes);
+        Ok(())
+    }
+
+    fn read_entry_byte(&mut self, crc: &mut crc32fast::Hasher) -> Result<u8> {
+        let mut byte = [0u8; 1];
+        self.read_entry_bytes(&mut byte, crc)?;
+        Ok(byte[0])
+    }
+
+    fn read_compressed_chunk(&mut self, bytes: &mut [u8]) -> Result<usize> {
+        if self.position >= self.trailer_position {
+            return Ok(0);
+        }
+        let remaining = self.trailer_position - self.position;
+        let len = if remaining < bytes.len() as u64 {
+            remaining as usize
+        } else {
+            bytes.len()
+        };
+        let mut read = 0usize;
+        while read < len {
+            let Some(byte) = self.pending.pop_front() else {
+                break;
+            };
+            bytes[read] = byte;
+            read += 1;
+        }
+        if read < len {
+            read += self.reader.read(&mut bytes[read..len])?;
+        }
+        self.position = self
+            .position
+            .checked_add(read as u64)
+            .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
+        Ok(read)
+    }
+
+    fn accept_compressed_bytes(&mut self, bytes: &[u8], crc: &mut crc32fast::Hasher) {
+        self.digest.update(bytes);
+        crc.update(bytes);
+    }
+
+    fn push_back_compressed_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.position = self
+            .position
+            .checked_sub(bytes.len() as u64)
+            .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
+        for byte in bytes.iter().rev() {
+            self.pending.push_front(*byte);
+        }
+        Ok(())
+    }
+
+    fn read_trailer_oid(&mut self) -> Result<ObjectId> {
+        let mut raw = vec![0u8; self.format.raw_len()];
+        self.read_exact_raw(&mut raw)?;
+        self.position = self
+            .position
+            .checked_add(raw.len() as u64)
+            .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
+        if self.position != self.pack_len {
+            return Err(GitError::InvalidFormat(format!(
+                "pack has {} trailing bytes after checksum",
+                self.pack_len - self.position
+            )));
+        }
+        ObjectId::from_raw(self.format, &raw)
+    }
+
+    fn finish_digest(self) -> Result<ObjectId> {
+        self.digest.finalize()
+    }
+}
+
+const STREAM_INFLATE_CHUNK: usize = 32 * 1024;
+
+fn inflate_entry_from_stream<R>(
+    stream: &mut PackReadStream<'_, R>,
+    crc: &mut crc32fast::Hasher,
+    size_hint: usize,
+) -> Result<(Vec<u8>, usize)>
+where
+    R: Read,
+{
+    INFLATE.with(|cell| {
+        let mut decompress = cell.borrow_mut();
+        decompress.reset(true);
+        let mut out = Vec::new();
+        out.reserve(bounded_inflate_reserve(size_hint, STREAM_INFLATE_CHUNK));
+        let mut compressed_total = 0usize;
+        let mut input = [0u8; STREAM_INFLATE_CHUNK];
+        loop {
+            let read = stream.read_compressed_chunk(&mut input)?;
+            if read == 0 {
+                return Err(GitError::InvalidObject("truncated zlib stream".into()));
+            }
+            let mut cursor = 0usize;
+            while cursor < read {
+                if out.len() == out.capacity() {
+                    out.reserve(out.len().max(64));
+                }
+                let before_in = decompress.total_in();
+                let before_out = decompress.total_out();
+                let status = decompress
+                    .decompress_vec(
+                        &input[cursor..read],
+                        &mut out,
+                        flate2::FlushDecompress::None,
+                    )
+                    .map_err(|err| {
+                        GitError::InvalidObject(format!("zlib inflate failed: {err}"))
+                    })?;
+                let consumed = (decompress.total_in() - before_in) as usize;
+                let produced = decompress.total_out() - before_out;
+                if consumed > 0 {
+                    let consumed_end = cursor + consumed;
+                    stream.accept_compressed_bytes(&input[cursor..consumed_end], crc);
+                    compressed_total = compressed_total
+                        .checked_add(consumed)
+                        .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
+                    cursor = consumed_end;
+                }
+                match status {
+                    flate2::Status::StreamEnd => {
+                        stream.push_back_compressed_bytes(&input[cursor..read])?;
+                        return Ok((out, compressed_total));
+                    }
+                    _ if consumed == 0 && produced == 0 => {
+                        return Err(GitError::InvalidObject("truncated zlib stream".into()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+}
+
+fn parse_entry_header_from_stream<R>(
+    stream: &mut PackReadStream<'_, R>,
+    crc: &mut crc32fast::Hasher,
+) -> Result<EntryHeader>
+where
+    R: Read,
+{
+    let first = stream.read_entry_byte(crc)?;
+    let mut size = u64::from(first & 0x0f);
+    let kind = match (first >> 4) & 0x07 {
+        1 => PackObjectKind::Commit,
+        2 => PackObjectKind::Tree,
+        3 => PackObjectKind::Blob,
+        4 => PackObjectKind::Tag,
+        6 => PackObjectKind::OfsDelta,
+        7 => PackObjectKind::RefDelta,
+        other => {
+            return Err(GitError::InvalidFormat(format!(
+                "invalid pack object type {other}"
+            )));
+        }
+    };
+    let mut shift = 4;
+    let mut byte = first;
+    while byte & 0x80 != 0 {
+        byte = stream.read_entry_byte(crc)?;
+        let part = u64::from(byte & 0x7f);
+        size = size
+            .checked_add(
+                part.checked_shl(shift)
+                    .ok_or_else(|| GitError::InvalidFormat("pack size overflow".into()))?,
+            )
+            .ok_or_else(|| GitError::InvalidFormat("pack size overflow".into()))?;
+        shift += 7;
+    }
+    Ok(EntryHeader { kind, size })
+}
+
+fn parse_ofs_delta_base_offset_from_stream<R>(
+    stream: &mut PackReadStream<'_, R>,
+    crc: &mut crc32fast::Hasher,
+    entry_offset: u64,
+) -> Result<u64>
+where
+    R: Read,
+{
+    let mut byte = stream.read_entry_byte(crc)?;
+    let mut relative = u64::from(byte & 0x7f);
+    while byte & 0x80 != 0 {
+        byte = stream.read_entry_byte(crc)?;
+        relative = relative
+            .checked_add(1)
+            .and_then(|value| value.checked_shl(7))
+            .and_then(|value| value.checked_add(u64::from(byte & 0x7f)))
+            .ok_or_else(|| GitError::InvalidFormat("ofs-delta offset overflow".into()))?;
+    }
+    entry_offset
+        .checked_sub(relative)
+        .ok_or_else(|| GitError::InvalidFormat("ofs-delta points before pack start".into()))
 }
 
 /// The `.rev` table for a pack: index positions (the rank of each object in
@@ -4004,13 +4650,10 @@ fn compress_planned_payloads(
             handles.push(scope.spawn(move || -> Result<Vec<(usize, Vec<u8>)>> {
                 let mut chunk_payloads = Vec::with_capacity(chunk.len());
                 for (offset, &idx) in chunk.iter().enumerate() {
-                        chunk_payloads.push((
-                            chunk_start + offset,
-                            compressed_payload(
-                                planned_payload(objects, plan, idx),
-                                compression_level,
-                            )?,
-                        ));
+                    chunk_payloads.push((
+                        chunk_start + offset,
+                        compressed_payload(planned_payload(objects, plan, idx), compression_level)?,
+                    ));
                 }
                 Ok(chunk_payloads)
             }));
@@ -4594,14 +5237,12 @@ fn parse_midx_oid_fanout(
         let start = idx * 4;
         *slot = u32_be(&data[start..start + 4]);
         if *slot < previous {
-            return Err(GitError::InvalidFormat(
-                format!(
-                    "error: oid fanout out of order: fanout[{}] = {:x} > {:x} = fanout[{idx}]\nfatal: multi-pack-index required OID fanout chunk missing or corrupted",
-                    idx - 1,
-                    previous,
-                    *slot
-                ),
-            ));
+            return Err(GitError::InvalidFormat(format!(
+                "error: oid fanout out of order: fanout[{}] = {:x} > {:x} = fanout[{idx}]\nfatal: multi-pack-index required OID fanout chunk missing or corrupted",
+                idx - 1,
+                previous,
+                *slot
+            )));
         }
         previous = *slot;
     }
@@ -7225,6 +7866,46 @@ mod tests {
             object: &object,
         }];
         assert!(PackFile::write_packed_with_known_ids(&wrong_format, ObjectFormat::Sha1).is_err());
+    }
+
+    #[test]
+    fn write_packed_with_known_ids_to_writer_matches_in_memory_pack() {
+        let objects = similar_blob_family(6);
+        let object_ids = objects
+            .iter()
+            .map(|object| {
+                object
+                    .object_id(ObjectFormat::Sha1)
+                    .expect("test operation should succeed")
+            })
+            .collect::<Vec<_>>();
+        let inputs = objects
+            .iter()
+            .zip(&object_ids)
+            .map(|(object, oid)| PackInput { oid, object })
+            .collect::<Vec<_>>();
+        let options = PackWriteOptions::new();
+        let in_memory = PackFile::write_packed_with_known_ids_and_options(
+            &inputs,
+            ObjectFormat::Sha1,
+            &options,
+        )
+        .expect("test operation should succeed");
+        let mut written = Vec::new();
+        let streamed = PackFile::write_packed_with_known_ids_to_writer(
+            &inputs,
+            ObjectFormat::Sha1,
+            &options,
+            &mut written,
+        )
+        .expect("test operation should succeed");
+
+        assert_eq!(written, in_memory.pack);
+        assert_eq!(streamed.index, in_memory.index);
+        assert_eq!(streamed.checksum, in_memory.checksum);
+        assert_eq!(streamed.entries, in_memory.entries);
+        assert_eq!(streamed.delta_count, in_memory.delta_count);
+        assert_eq!(streamed.pack_size, in_memory.pack.len() as u64);
     }
 
     fn write_packed_deltifies_similar_blobs_and_round_trips(format: ObjectFormat) {
