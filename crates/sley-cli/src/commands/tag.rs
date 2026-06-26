@@ -2243,6 +2243,8 @@ fn print_tag_list(
                 push_track: None,
                 contents,
                 peeled_object,
+                signature: None,
+                peeled_signature: None,
                 mailmap: &mailmap,
                 ref_names: &ref_names,
                 warn_ambiguous_refs,

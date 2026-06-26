@@ -625,6 +625,23 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         } else {
             None
         };
+        // %(signature[:opt]) / %(*signature[:opt]) verify the embedded GPG/SSH
+        // signature of the ref object (or its peeled target), reusing the same
+        // verification backend as `git verify-commit`.
+        let signature = if needs.signature {
+            object
+                .as_ref()
+                .and_then(|object| for_each_ref_object_signature(&git_dir, &config, object))
+        } else {
+            None
+        };
+        let peeled_signature = if needs.peeled_signature {
+            peeled_chain
+                .as_ref()
+                .and_then(|(_, object)| for_each_ref_object_signature(&git_dir, &config, object))
+        } else {
+            None
+        };
         let deltabase = zero_oid(format)?;
         // `%(worktreepath)` reads from the hoisted map; the placeholder is the empty
         // path for refs not checked out anywhere, matching git.
@@ -671,6 +688,8 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             push_track,
             contents,
             peeled_object,
+            signature,
+            peeled_signature,
             mailmap: &mailmap,
             ref_names: &ref_names,
             warn_ambiguous_refs,
@@ -812,6 +831,11 @@ struct ForEachRefNeeds {
     /// `%(refname:short)` / `%(symref:short)` / `%(upstream:short)` /
     /// `%(push:short)` — needs the ref-name universe for shorten_unambiguous_ref.
     short_ref: bool,
+    /// `%(signature*)` — the ref object's GPG/SSH signature must be verified
+    /// (the verification reads the object body and consults the config).
+    signature: bool,
+    /// `%(*signature*)` — the peeled object's signature must be verified.
+    peeled_signature: bool,
 }
 
 /// Map a missing-object read failure to git's `fatal: missing object <oid> for
@@ -978,6 +1002,18 @@ impl ForEachRefNeeds {
                     // (no body read); the deref form needs the peeled tag target
                     // resolved so `context.peeled_object` is populated.
                     peeled
+                } else if other == "signature" || other.starts_with("signature:") {
+                    // %(signature[:opt]) verifies the (commit) object's embedded
+                    // signature: it reads the object body and consults the config
+                    // (gpg.format, allowedSigners, ...). The deref form verifies
+                    // the peeled tag target instead.
+                    if peeled {
+                        self.peeled_signature = true;
+                    } else {
+                        self.signature = true;
+                    }
+                    self.config = true;
+                    true
                 } else if other.starts_with("authordate:")
                     || other.starts_with("committerdate:")
                     || other.starts_with("taggerdate:")
@@ -1595,6 +1631,32 @@ impl ForEachRefSort {
 
 fn for_each_ref_sorts_need_config(sorts: &[ForEachRefSort]) -> bool {
     sorts.iter().any(|sort| sort.needs_config())
+}
+
+/// Verify the embedded signature of a ref's commit/tag object for the
+/// `%(signature[:opt])` atom family, mirroring git's `check_commit_signature`.
+///
+/// An *unsigned* commit still produces a verification result (git reports grade
+/// `N` with empty key/signer/fingerprints), so a missing signature maps to a
+/// default [`GpgVerification`] rather than `None`. Object types that cannot
+/// carry a signature (trees, blobs) yield `None`, leaving the atoms empty.
+fn for_each_ref_object_signature(
+    git_dir: &Path,
+    config: &GitConfig,
+    object: &sley_object::EncodedObject,
+) -> Option<commands::signing::GpgVerification> {
+    let payload_signature = match object.object_type {
+        ObjectType::Commit => commands::signing::commit_signature_payload(&object.body),
+        ObjectType::Tag => commands::signing::tag_signature_payload(&object.body)
+            .map(|(payload, signature)| (payload.to_vec(), signature.to_vec())),
+        _ => return None,
+    };
+    let Some((payload, signature)) = payload_signature else {
+        // Unsigned: git's check_commit_signature leaves result 'N' with empty
+        // identity fields, which a default verification models exactly.
+        return Some(commands::signing::GpgVerification::default());
+    };
+    commands::signing::verify_payload(git_dir, Some(config), &payload, &signature).ok()
 }
 
 fn for_each_ref_object_header(

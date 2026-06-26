@@ -6794,6 +6794,9 @@ struct ForEachRefFormatContext<'a> {
     push_track: Option<ForEachRefTrack>,
     contents: Option<ForEachRefContents<'a>>,
     peeled_object: Option<ForEachRefPeeledObject<'a>>,
+    // %(signature*) verification of the ref object and its peeled tag target.
+    signature: Option<commands::signing::GpgVerification>,
+    peeled_signature: Option<commands::signing::GpgVerification>,
     mailmap: &'a commands::utility::Mailmap,
     // All ref names in the store + `core.warnambiguousrefs`, for the
     // `:short` atoms' shorten_unambiguous_ref resolution.
@@ -6823,6 +6826,33 @@ struct ForEachRefPeeledObject<'a> {
     author: Option<Cow<'a, [u8]>>,
     committer: Option<Cow<'a, [u8]>>,
     creator: Option<Cow<'a, [u8]>>,
+}
+
+/// Emit one `%(signature[:opt])` (or `%(*signature[:opt])`) sub-field from a
+/// verified signature, mirroring git's `grab_signature` field mapping. `option`
+/// is the placeholder text after `signature` — `""` for the bare atom, or
+/// `":grade"`, `":key"`, … for the typed sub-fields.
+fn write_for_each_ref_signature(
+    stdout: &mut impl Write,
+    verification: &commands::signing::GpgVerification,
+    option: &str,
+) -> Result<()> {
+    match option.strip_prefix(':').unwrap_or("") {
+        // The bare atom prints gpg's human-readable verification output.
+        "" => stdout.write_all(&commands::signing::bare_signature_output(verification))?,
+        // grade: 'G'/'U'/'B'/'E'/'N' — git downgrades a good-but-untrusted
+        // signature to 'U', which pretty_code already encodes.
+        "grade" => stdout.write_all(&[verification.pretty_code()])?,
+        "key" => stdout.write_all(verification.key.as_bytes())?,
+        "signer" => stdout.write_all(verification.signer.as_bytes())?,
+        "fingerprint" => stdout.write_all(verification.fingerprint.as_bytes())?,
+        "primarykeyfingerprint" => {
+            stdout.write_all(verification.primary_fingerprint.as_bytes())?
+        }
+        "trustlevel" => stdout.write_all(verification.trust.as_bytes())?,
+        _ => {}
+    }
+    Ok(())
 }
 
 fn print_for_each_ref_format(
@@ -7024,6 +7054,36 @@ fn print_for_each_ref_format(
                 "push:trackshort" => {
                     if let Some(track) = context.push_track {
                         stdout.write_all(for_each_ref_track_short(track).as_bytes())?;
+                    }
+                }
+                "signature"
+                | "signature:grade"
+                | "signature:key"
+                | "signature:signer"
+                | "signature:fingerprint"
+                | "signature:primarykeyfingerprint"
+                | "signature:trustlevel" => {
+                    if let Some(signature) = context.signature.as_ref() {
+                        write_for_each_ref_signature(
+                            stdout,
+                            signature,
+                            &placeholder["signature".len()..],
+                        )?;
+                    }
+                }
+                "*signature"
+                | "*signature:grade"
+                | "*signature:key"
+                | "*signature:signer"
+                | "*signature:fingerprint"
+                | "*signature:primarykeyfingerprint"
+                | "*signature:trustlevel" => {
+                    if let Some(signature) = context.peeled_signature.as_ref() {
+                        write_for_each_ref_signature(
+                            stdout,
+                            signature,
+                            &placeholder["*signature".len()..],
+                        )?;
                     }
                 }
                 "subject" | "contents:subject" => {

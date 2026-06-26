@@ -9427,6 +9427,8 @@ fn print_branch_format_reference(
         push_track,
         contents,
         peeled_object: None,
+        signature: None,
+        peeled_signature: None,
         mailmap,
         ref_names,
         warn_ambiguous_refs,
