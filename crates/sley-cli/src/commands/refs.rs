@@ -1667,7 +1667,15 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             );
             return Err(GitError::Exit(1));
         }
-        return update_ref_delete(&store, format, &effective.effective, expected_oid.as_ref());
+        return update_ref_delete(
+            &store,
+            &git_dir,
+            format,
+            &effective.effective,
+            expected_oid.as_ref(),
+            &message,
+            create_reflog,
+        );
     }
     if positional.len() != 2 && positional.len() != 3 {
         return Err(GitError::Command(
@@ -1708,7 +1716,15 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
         check_update_ref_expected(format, &name, current.as_ref(), expected_oid)?;
     }
     if new_oid == zero_oid(format)? {
-        return update_ref_delete(&store, format, &name, None);
+        return update_ref_delete(
+            &store,
+            &git_dir,
+            format,
+            &name,
+            None,
+            &message,
+            create_reflog,
+        );
     }
     let old_oid = match current {
         Some(RefTarget::Direct(oid)) => oid,
@@ -3751,9 +3767,12 @@ fn update_ref_effective_ref(
 
 fn update_ref_delete(
     store: &FileRefStore,
+    git_dir: &Path,
     format: ObjectFormat,
     name: &str,
     expected: Option<&ObjectId>,
+    message: &[u8],
+    create_reflog: bool,
 ) -> Result<()> {
     let current = store.read_ref(name)?;
     if let Some(expected) = expected {
@@ -3776,6 +3795,18 @@ fn update_ref_delete(
             }
         }
     }
+    // Capture the deleted branch's tip and HEAD's pre-delete symref target so a
+    // deletion of the branch HEAD points at can be mirrored into HEAD's reflog
+    // (git logs the delete on the symref even though the branch's own reflog is
+    // unlinked).
+    let deleted_oid = match current.as_ref() {
+        Some(RefTarget::Direct(oid)) => Some(*oid),
+        _ => None,
+    };
+    let head_target = match store.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(target)) => Some(target),
+        _ => None,
+    };
     if current.is_some() {
         match current {
             Some(RefTarget::Symbolic(_)) => {
@@ -3785,6 +3816,20 @@ fn update_ref_delete(
                 store.delete_ref(name)?;
             }
         }
+    }
+    if let Some(deleted_oid) = deleted_oid
+        && head_target.as_deref() == Some(name)
+        && update_ref_should_write_reflog(git_dir, "HEAD", create_reflog)?
+    {
+        store.append_reflog(
+            "HEAD",
+            &ReflogEntry {
+                old_oid: deleted_oid,
+                new_oid: zero_oid(format)?,
+                committer: ref_reflog_committer(),
+                message: message.to_vec(),
+            },
+        )?;
     }
     Ok(())
 }
