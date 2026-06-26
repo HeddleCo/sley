@@ -2914,14 +2914,17 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         RevListOrdering::Default if walk => rev_list_date_order(selected)?,
         RevListOrdering::Default if !no_walk_unsorted => {
             // `--no-walk[=sorted]`: a plain stable commit-time sort (upstream
-            // `commit_list_sort_by_date`), newest first.
+            // `commit_list_sort_by_date`), newest first. A missing/unparsable
+            // committer date sorts as the epoch (git's `commit->date == 0`), so
+            // never abort the walk over it.
             let mut keyed = selected
                 .iter()
                 .map(|record| {
-                    commit_identity_timestamp_i64(&record.commit.committer)
-                        .map(|timestamp| (timestamp, *record))
+                    let timestamp =
+                        commit_identity_timestamp_i64(&record.commit.committer).unwrap_or(0);
+                    (timestamp, *record)
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Vec<_>>();
             keyed.sort_by_key(|(timestamp, _)| std::cmp::Reverse(*timestamp));
             keyed.into_iter().map(|(_, record)| record).collect()
         }
@@ -3372,7 +3375,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         writeln!(
                             msg,
                             "AuthorDate: {}",
-                            commit_identity_date(&record.commit.author, &date_mode)
+                            commit_identity_date_or_sentinel(&record.commit.author, &date_mode)
                         )?;
                         writeln!(
                             msg,
@@ -3385,7 +3388,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         writeln!(
                             msg,
                             "CommitDate: {}",
-                            commit_identity_date(&record.commit.committer, &date_mode)
+                            commit_identity_date_or_sentinel(&record.commit.committer, &date_mode)
                         )?;
                     } else {
                         writeln!(
@@ -3410,7 +3413,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             writeln!(
                                 msg,
                                 "Date:   {}",
-                                commit_identity_date(&record.commit.author, &date_mode)
+                                commit_identity_date_or_sentinel(&record.commit.author, &date_mode)
                             )?;
                         }
                     }
@@ -3591,7 +3594,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         writeln!(
                             out,
                             "AuthorDate: {}",
-                            commit_identity_date(&record.commit.author, &date_mode)
+                            commit_identity_date_or_sentinel(&record.commit.author, &date_mode)
                         )?;
                         let committer = commit_identity_mailmapped(
                             &record.commit.committer,
@@ -3607,7 +3610,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         writeln!(
                             out,
                             "CommitDate: {}",
-                            commit_identity_date(&record.commit.committer, &date_mode)
+                            commit_identity_date_or_sentinel(&record.commit.committer, &date_mode)
                         )?;
                     } else {
                         let author = commit_identity_mailmapped(
@@ -3639,7 +3642,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         writeln!(
                             out,
                             "Date:   {}",
-                            commit_identity_date(&record.commit.author, &date_mode)
+                            commit_identity_date_or_sentinel(&record.commit.author, &date_mode)
                         )?;
                     }
                     writeln!(out)?;

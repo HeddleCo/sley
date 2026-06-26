@@ -640,16 +640,19 @@ pub fn add_rev_list_revision_arg(
 }
 
 pub fn commit_identity_timestamp(raw: &[u8]) -> String {
-    let identity = String::from_utf8_lossy(raw);
-    identity
-        .rsplit_once(' ')
-        .and_then(|(left, _timezone)| left.rsplit_once(' ').map(|(_, timestamp)| timestamp))
-        .unwrap_or("")
-        .to_string()
+    // The raw timestamp digit-run (git's `%at`/`%ct`), located git's way so a
+    // broken email still yields the date and a whitespace-only date yields the
+    // empty string rather than a misparse.
+    sley_core::split_ident_line(raw)
+        .and_then(|fields| fields.date)
+        .map(|date| String::from_utf8_lossy(date).into_owned())
+        .unwrap_or_default()
 }
 
 pub fn commit_identity_timestamp_i64(raw: &[u8]) -> Result<i64> {
-    commit_identity_timestamp(raw)
-        .parse::<i64>()
-        .map_err(|_| GitError::InvalidObject("commit identity is missing timestamp".into()))
+    // git parses the committer date once at `parse_commit` time and stores
+    // `commit->date == 0` when it is missing or unparsable; downstream ordering,
+    // age filtering, and `--timestamp` output all see that epoch sentinel rather
+    // than failing. Mirror that: never error, just fall back to 0.
+    Ok(commit_identity_timestamp(raw).parse::<i64>().unwrap_or(0))
 }

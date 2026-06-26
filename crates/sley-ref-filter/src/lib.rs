@@ -898,31 +898,31 @@ pub fn for_each_ref_identity_email(identity: &[u8], mode: ForEachRefEmailMode) -
 }
 
 pub fn for_each_ref_identity_date_raw(identity: &[u8]) -> Option<&[u8]> {
-    let email_end = identity.iter().position(|byte| *byte == b'>')?;
-    let rest = identity.get(email_end + 1..)?.strip_prefix(b" ")?;
-    let timestamp_end = rest.iter().position(|byte| *byte == b' ')?;
-    let timezone = rest.get(timestamp_end + 1..)?;
-    if timezone.len() == 5
-        && matches!(timezone[0], b'+' | b'-')
-        && timezone[1..].iter().all(|byte| byte.is_ascii_digit())
-    {
-        Some(rest)
-    } else {
-        None
-    }
+    // Locate the timestamp+timezone tail git's way (scanning back from the end
+    // for the last '>'), then return the contiguous `<digits> <tz>` slice.
+    let fields = sley_core::split_ident_line(identity)?;
+    let date = fields.date?;
+    let tz = fields.tz?;
+    let base = identity.as_ptr() as usize;
+    let start = date.as_ptr() as usize - base;
+    let end = (tz.as_ptr() as usize - base) + tz.len();
+    Some(&identity[start..end])
 }
 
 pub fn for_each_ref_identity_date(identity: &[u8], mode: &DateMode) -> Option<String> {
-    let raw = std::str::from_utf8(for_each_ref_identity_date_raw(identity)?).ok()?;
-    let (timestamp, timezone) = raw.split_once(' ')?;
-    let timestamp = timestamp.parse::<i64>().ok()?;
-    mode.render(timestamp, timezone)
+    // git's show_ident_date semantics: an out-of-range timestamp renders the
+    // epoch sentinel rather than dropping the field; a missing date renders
+    // nothing (None).
+    let fields = sley_core::split_ident_line(identity)?;
+    let date = fields.date?;
+    let tz = fields.tz.unwrap_or(b"+0000");
+    Some(sley_core::ident_render_date(date, tz, mode))
 }
 
 pub fn for_each_ref_identity_timestamp(identity: &[u8]) -> Option<i64> {
-    let raw = std::str::from_utf8(for_each_ref_identity_date_raw(identity)?).ok()?;
-    let (timestamp, _) = raw.split_once(' ')?;
-    timestamp.parse::<i64>().ok()
+    let fields = sley_core::split_ident_line(identity)?;
+    let date = fields.date?;
+    std::str::from_utf8(date).ok()?.parse::<i64>().ok()
 }
 
 /// The signature begin-markers git recognizes (`gpg-interface.c` format table).
@@ -1217,6 +1217,26 @@ pub fn parse_for_each_ref_abbrev_width(value: &str) -> Result<usize> {
 
 pub fn commit_identity_date(raw: &[u8], mode: &DateMode) -> String {
     for_each_ref_identity_date(raw, mode).unwrap_or_default()
+}
+
+/// Render an ident's date for the structured header lines (`Date:`/`AuthorDate:`/
+/// `CommitDate:`), mirroring pretty.c's `pp_user_info`, which calls
+/// `show_ident_date` directly: a missing or unparsable date still prints the
+/// epoch sentinel (`Thu Jan 1 00:00:00 1970 +0000`) rather than an empty string.
+/// Use this for the medium/full/fuller layouts; use [`commit_identity_date`] for
+/// the `%ad`/`%cd` placeholders, which suppress a missing date entirely.
+pub fn commit_identity_date_or_sentinel(raw: &[u8], mode: &DateMode) -> String {
+    match sley_core::split_ident_line(raw) {
+        Some(fields) => {
+            let date = fields.date.unwrap_or(b"0");
+            let tz = fields.tz.unwrap_or(b"+0000");
+            sley_core::ident_render_date(date, tz, mode)
+        }
+        // No `<…>` pair at all: pp_user_info would skip the whole block, so the
+        // caller shouldn't reach here for a well-formed commit; fall back to the
+        // epoch sentinel to stay non-panicking.
+        None => sley_core::ident_render_date(b"0", b"+0000", mode),
+    }
 }
 
 #[cfg(test)]

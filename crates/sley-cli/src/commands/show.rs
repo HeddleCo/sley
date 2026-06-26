@@ -801,7 +801,7 @@ fn show_commit(
                 writeln!(
                     stdout,
                     "AuthorDate: {}",
-                    commit_identity_date(&commit.author, &options.date_mode)
+                    commit_identity_date_or_sentinel(&commit.author, &options.date_mode)
                 )?;
                 writeln!(
                     stdout,
@@ -811,7 +811,7 @@ fn show_commit(
                 writeln!(
                     stdout,
                     "CommitDate: {}",
-                    commit_identity_date(&commit.committer, &options.date_mode)
+                    commit_identity_date_or_sentinel(&commit.committer, &options.date_mode)
                 )?;
             } else {
                 writeln!(
@@ -830,7 +830,7 @@ fn show_commit(
                     writeln!(
                         stdout,
                         "Date:   {}",
-                        commit_identity_date(&commit.author, &options.date_mode)
+                        commit_identity_date_or_sentinel(&commit.author, &options.date_mode)
                     )?;
                 }
             }
@@ -1089,7 +1089,7 @@ fn write_show_commit_header(
             writeln!(
                 stdout,
                 "Date:   {}",
-                commit_identity_date(&commit.author, &options.date_mode)
+                commit_identity_date_or_sentinel(&commit.author, &options.date_mode)
             )?;
             writeln!(stdout)?;
             for line in String::from_utf8_lossy(&commit.message).lines() {
