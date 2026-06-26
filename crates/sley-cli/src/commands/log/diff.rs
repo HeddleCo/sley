@@ -393,6 +393,7 @@ impl LogDiffContext<'_> {
                     entry,
                     DiffRenderOptions {
                         binary: false,
+                        anchors: &[],
                         db: self.db,
                         worktree_root: None,
                         use_worktree_new: false,

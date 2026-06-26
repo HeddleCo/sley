@@ -594,8 +594,24 @@ fn line_key<'a>(line: &DiffLine<'a>) -> LineKey<'a> {
 /// blocks of lines are moved or repeated, though it is not guaranteed to be a
 /// shortest edit script.
 pub fn patience_diff_lines(old: &[DiffLine<'_>], new: &[DiffLine<'_>]) -> Vec<DiffOp> {
+    patience_diff_lines_anchored(old, new, &[])
+}
+
+/// As [`patience_diff_lines`], but pins lines whose content has any of `anchors`
+/// as a byte prefix into the common subsequence (git's `--anchored=<text>`).
+///
+/// Mirrors xdiff's `xpatience.c`: an anchor line that is unique in both ranges is
+/// forced to remain aligned (so *other* lines are moved instead), taken greedily
+/// in old-side order; an anchor that would break the increasing order with an
+/// already-pinned anchor is dropped. Anchors that are non-unique or absent have
+/// no effect, exactly as in git. With `anchors` empty this is plain patience.
+pub fn patience_diff_lines_anchored(
+    old: &[DiffLine<'_>],
+    new: &[DiffLine<'_>],
+    anchors: &[Vec<u8>],
+) -> Vec<DiffOp> {
     let mut ops: Vec<DiffOp> = Vec::new();
-    patience_recurse(old, new, 0, old.len(), 0, new.len(), &mut ops);
+    patience_recurse(old, new, 0, old.len(), 0, new.len(), anchors, &mut ops);
     coalesce_ops(ops)
 }
 
@@ -698,6 +714,11 @@ fn trim_common(
 }
 
 /// Recursive patience-diff worker over `old[a0..a1]` vs `new[b0..b1]`.
+///
+/// `anchors` carries the `--anchored=<text>` prefixes (empty for plain
+/// patience); they are re-evaluated at every recursion level, since a line that
+/// is non-unique in the whole file can become unique within a sub-range.
+#[allow(clippy::too_many_arguments)]
 fn patience_recurse(
     old: &[DiffLine<'_>],
     new: &[DiffLine<'_>],
@@ -705,6 +726,7 @@ fn patience_recurse(
     a1: usize,
     b0: usize,
     b1: usize,
+    anchors: &[Vec<u8>],
     out: &mut Vec<DiffOp>,
 ) {
     if emit_trivial_range(a0, a1, b0, b1, out) {
@@ -712,20 +734,20 @@ fn patience_recurse(
     }
     let (a0, a1, b0, b1, suffix) = trim_common(old, new, a0, a1, b0, b1, out);
     if !emit_trivial_range(a0, a1, b0, b1, out) {
-        match patience_anchors(old, new, a0, a1, b0, b1) {
-            Some(anchors) => {
+        match patience_anchors(old, new, a0, a1, b0, b1, anchors) {
+            Some(aligned) => {
                 // Walk the aligned anchors in order, recursing into each gap
                 // before emitting the anchor line as Equal.
                 let mut cur_a = a0;
                 let mut cur_b = b0;
-                for (ai, bi) in anchors {
-                    patience_recurse(old, new, cur_a, ai, cur_b, bi, out);
+                for (ai, bi) in aligned {
+                    patience_recurse(old, new, cur_a, ai, cur_b, bi, anchors, out);
                     out.push(DiffOp::Equal(1));
                     cur_a = ai + 1;
                     cur_b = bi + 1;
                 }
                 // Tail after the last anchor.
-                patience_recurse(old, new, cur_a, a1, cur_b, b1, out);
+                patience_recurse(old, new, cur_a, a1, cur_b, b1, anchors, out);
             }
             // No unique common line in this range: defer to Myers, which always
             // yields a valid (and minimal) script for the leftover block.
@@ -752,6 +774,7 @@ fn patience_anchors(
     a1: usize,
     b0: usize,
     b1: usize,
+    anchors: &[Vec<u8>],
 ) -> Option<Vec<(usize, usize)>> {
     // Count occurrences and remember the (single) position of each line in each
     // side's range. `count > 1` poisons the position so we can ignore it.
@@ -795,9 +818,25 @@ fn patience_anchors(
 
     // Patience sort: longest increasing subsequence of new-indices. `pairs` is
     // already sorted by old-index, so an LIS by new-index yields a set of
-    // anchors increasing in both coordinates.
-    let lis = longest_increasing_by_new(&pairs);
+    // anchors increasing in both coordinates. With `--anchored` text(s) present,
+    // pin the matching (unique-in-both) lines into the subsequence instead.
+    let lis = if anchors.is_empty() {
+        longest_increasing_by_new(&pairs)
+    } else {
+        let is_anchor: Vec<bool> = pairs
+            .iter()
+            .map(|&(_, nj)| line_matches_anchor(new[nj].content, anchors))
+            .collect();
+        longest_increasing_by_new_anchored(&pairs, &is_anchor)
+    };
     if lis.is_empty() { None } else { Some(lis) }
+}
+
+/// Whether `line` begins with any of the `--anchored` prefixes (git's
+/// `is_anchor`: a byte-prefix `strncmp` against the line's content, trailing
+/// newline included). An empty anchor prefix matches every line, matching git.
+fn line_matches_anchor(line: &[u8], anchors: &[Vec<u8>]) -> bool {
+    anchors.iter().any(|anchor| line.starts_with(anchor))
 }
 
 /// Longest increasing subsequence of `pairs` (sorted by old-index) keyed on the
@@ -843,6 +882,82 @@ fn longest_increasing_by_new(pairs: &[(usize, usize)]) -> Vec<(usize, usize)> {
     // Reconstruct by following predecessor links from the last tail.
     let mut result: Vec<(usize, usize)> = Vec::with_capacity(tails.len());
     let mut cur = tails.last().copied();
+    while let Some(i) = cur {
+        result.push(pairs[i]);
+        cur = prev[i];
+    }
+    result.reverse();
+    result
+}
+
+/// Longest increasing subsequence of `pairs` (sorted by old-index, keyed on the
+/// new-index) that is *forced* to pass through every includible anchor.
+///
+/// A direct port of git's anchored `find_longest_common_sequence`
+/// (xdiff/xpatience.c): entries are processed in old-index order and placed into
+/// the patience-sort `sequence` by their new-index. When an anchor entry
+/// (`is_anchor[i]`) is placed at position `k`, `anchor_i` is pinned to `k` and
+/// the running length is forced to `k + 1`; thereafter positions `<= anchor_i`
+/// can never be overridden, so the result must contain that anchor. A later
+/// anchor whose placement would fall at or before `anchor_i` is skipped, exactly
+/// matching git's greedy handling of mutually-incompatible anchors.
+fn longest_increasing_by_new_anchored(
+    pairs: &[(usize, usize)],
+    is_anchor: &[bool],
+) -> Vec<(usize, usize)> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    // sequence[k] = index into `pairs` of the smallest-new-index tail of an
+    // increasing subsequence of length k+1; `prev` links to the predecessor.
+    let mut sequence: Vec<usize> = Vec::with_capacity(pairs.len());
+    let mut prev: Vec<Option<usize>> = vec![None; pairs.len()];
+    let mut longest: usize = 0;
+    let mut anchor_i: isize = -1;
+    for (e, &(_, val)) in pairs.iter().enumerate() {
+        // i = largest position in sequence[0..longest] whose new-index < val,
+        // or -1 if none (git's fast-path + `binary_search`).
+        let i: isize = if longest == 0 || val > pairs[sequence[longest - 1]].1 {
+            longest as isize - 1
+        } else {
+            let mut lo = 0usize;
+            let mut hi = longest;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if pairs[sequence[mid]].1 < val {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo as isize - 1
+        };
+        prev[e] = if i < 0 {
+            None
+        } else {
+            Some(sequence[i as usize])
+        };
+        let pos = (i + 1) as usize;
+        if (pos as isize) <= anchor_i {
+            continue;
+        }
+        if pos == sequence.len() {
+            sequence.push(e);
+        } else {
+            sequence[pos] = e;
+        }
+        if is_anchor[e] {
+            anchor_i = pos as isize;
+            longest = pos + 1;
+        } else if pos == longest {
+            longest += 1;
+        }
+    }
+    if longest == 0 {
+        return Vec::new();
+    }
+    let mut result: Vec<(usize, usize)> = Vec::with_capacity(longest);
+    let mut cur = Some(sequence[longest - 1]);
     while let Some(i) = cur {
         result.push(pairs[i]);
         cur = prev[i];

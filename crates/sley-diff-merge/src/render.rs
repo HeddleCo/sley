@@ -28,7 +28,8 @@
 //! re-derive — while leaving the repository-coupled concerns in the consumer.
 
 use crate::{
-    DiffAlgorithm, DiffLine, DiffOp, WsIgnore, line_is_blank, myers_diff_lines_ws, split_lines,
+    DiffAlgorithm, DiffLine, DiffOp, WsIgnore, line_is_blank, myers_diff_lines_ws,
+    patience_diff_lines_anchored, split_lines,
 };
 use std::collections::HashMap;
 
@@ -230,6 +231,10 @@ pub struct HunkRenderOptions<'a, 'h> {
     /// `--color-moved`: classify moved `+`/`-` lines and paint them with the
     /// moved-color slots. `None` disables moved-code coloring.
     pub color_moved: Option<ColorMoved>,
+    /// `--anchored=<text>` prefixes (git's patience anchors). Only consulted when
+    /// `algorithm` is [`DiffAlgorithm::Patience`]; empty (the default) is plain
+    /// patience. Forces the matching unique lines to stay aligned.
+    pub anchors: &'a [Vec<u8>],
 }
 
 /// A half-open `[start, end)` line range (0-based) for `log -L` hunk
@@ -288,6 +293,7 @@ impl Default for HunkRenderOptions<'_, '_> {
             change_ignore: None,
             line_ranges: None,
             color_moved: None,
+            anchors: &[],
         }
     }
 }
@@ -334,7 +340,17 @@ pub fn render_hunks(
     }
     let old = split_lines(old_content.unwrap_or_default());
     let new = split_lines(new_content.unwrap_or_default());
-    let mut ops = myers_diff_lines_ws(&old, &new, options.ws_ignore, options.algorithm);
+    // `--anchored` only applies to the patience algorithm and on the raw
+    // (no whitespace-ignore) comparison — git forces patience and matches anchor
+    // text against the line bytes. Everything else takes the normal path.
+    let mut ops = if options.algorithm == DiffAlgorithm::Patience
+        && !options.anchors.is_empty()
+        && options.ws_ignore.is_empty()
+    {
+        patience_diff_lines_anchored(&old, &new, options.anchors)
+    } else {
+        myers_diff_lines_ws(&old, &new, options.ws_ignore, options.algorithm)
+    };
 
     // git's `xdl_change_compact`: slide each change group as far down as
     // possible, snap add/delete pairs back into alignment, and (under the

@@ -2565,6 +2565,9 @@ pub(crate) struct DiffRenderOptions<'a> {
     /// `--binary`: emit an applicable `GIT binary patch` block (literal-encoded,
     /// full index) for binary files instead of `Binary files … differ`.
     pub(crate) binary: bool,
+    /// `--anchored=<text>` prefixes (git's patience anchors). Only consulted when
+    /// `diff_algorithm` is patience; empty (the default) is plain patience.
+    pub(crate) anchors: &'a [Vec<u8>],
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2943,6 +2946,7 @@ pub(crate) fn render_tree_to_tree_patch(
             entry,
             DiffRenderOptions {
                 binary: false,
+                anchors: &[],
                 db,
                 worktree_root: None,
                 use_worktree_new: false,
@@ -3416,6 +3420,7 @@ pub(crate) fn write_diff_patch_entry(
         indent_heuristic: options.indent_heuristic,
         change_ignore: change_ignore.as_ref(),
         line_ranges: options.line_ranges,
+        anchors: options.anchors,
         ..Default::default()
     };
     let mut hunks = Vec::new();
@@ -4939,6 +4944,7 @@ fn write_submodule_inline_diff(
                 dirty_entry,
                 DiffRenderOptions {
                     binary: false,
+                    anchors: &[],
                     db: sub_db,
                     worktree_root: Some(sub_root),
                     use_worktree_new: true,
@@ -4984,6 +4990,7 @@ fn write_submodule_inline_diff(
             sub_entry,
             DiffRenderOptions {
                 binary: false,
+                anchors: &[],
                 db: sub_db,
                 worktree_root: nested_worktree_root.as_deref(),
                 use_worktree_new: false,

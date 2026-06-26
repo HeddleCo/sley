@@ -150,6 +150,8 @@ struct ShowOptions {
     ws_ignore: sley_diff_merge::WsIgnore,
     /// The line-diff algorithm (`--patience` / `--histogram` / Myers default).
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    /// `--anchored=<text>` prefixes (patience anchors); cleared by `--patience`.
+    anchored: Vec<Vec<u8>>,
     /// `--ignore-blank-lines`.
     ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
@@ -287,6 +289,7 @@ impl Default for ShowOptions {
             show_root: None,
             ws_ignore: sley_diff_merge::WsIgnore::default(),
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+            anchored: Vec::new(),
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
             word_diff_mode: None,
@@ -1523,6 +1526,7 @@ fn write_commit_diff_patch(
             |stdout, entry| {
                 let patch_options = DiffRenderOptions {
                     binary: false,
+                    anchors: &options.anchored,
                     db,
                     worktree_root: None,
                     use_worktree_new: false,
@@ -1891,8 +1895,15 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             // These influence rendering details sley does not yet model; accept
             // them so common invocations parse, matching how cmd_log treats them.
             "--minimal" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
-            "--patience" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
+            "--patience" => {
+                options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience;
+                options.anchored.clear();
+            }
             "--histogram" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram,
+            value if let Some(text) = value.strip_prefix("--anchored=") => {
+                options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience;
+                options.anchored.push(text.as_bytes().to_vec());
+            }
             "--ignore-all-space" | "-w" => options.ws_ignore.all_space = true,
             "--ignore-space-change" | "-b" => options.ws_ignore.space_change = true,
             "--ignore-space-at-eol" => options.ws_ignore.space_at_eol = true,

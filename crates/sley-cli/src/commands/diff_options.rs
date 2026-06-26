@@ -84,6 +84,10 @@ pub(crate) struct DiffOptions {
     pub(crate) color_moved_ws: Option<sley_diff_merge::render::ColorMovedWs>,
     pub(crate) diff_algorithm_control: bool,
     pub(crate) diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    /// `--anchored=<text>` prefixes; forces patience and pins matching lines.
+    /// Cleared by a later `--patience` (git's anchor reset), preserved across
+    /// `--histogram` (which just disables anchoring by changing the algorithm).
+    pub(crate) anchored: Vec<Vec<u8>>,
     pub(crate) diff_driver_control: bool,
     pub(crate) diff_hunk_control: bool,
     pub(crate) interhunk: Option<usize>,
@@ -176,6 +180,7 @@ impl Default for DiffOptions {
             color_moved_ws: None,
             diff_algorithm_control: false,
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+            anchored: Vec::new(),
             diff_driver_control: false,
             diff_hunk_control: false,
             interhunk: None,
@@ -1081,13 +1086,22 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
             .find_object_values
             .push(str_value(option).to_string()),
         (_, Some("minimal")) => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
-        (_, Some("patience")) => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
+        (_, Some("patience")) => {
+            // Both `--patience` and `--anchored` drive the patience engine, so an
+            // explicit `--patience` resets any anchors recorded earlier (git's
+            // `diff_opt_parse`).
+            options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience;
+            options.anchored.clear();
+        }
         (_, Some("histogram")) => {
             options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram
         }
         (_, Some("anchored")) => {
-            // The anchored algorithm is not implemented; keep bailing.
-            options.diff_algorithm_control = true;
+            // `--anchored=<text>` forces the patience algorithm and records the
+            // anchor prefix; a later `--patience`/`--histogram` can still override
+            // the algorithm (and `--patience` additionally clears the anchors).
+            options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience;
+            options.anchored.push(str_value(option).as_bytes().to_vec());
         }
         (_, Some("diff-algorithm")) => {
             let value = str_value(option);

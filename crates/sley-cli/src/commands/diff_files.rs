@@ -782,6 +782,7 @@ fn render_diff_files_entries(
         |stdout, entry| {
             let patch_options = DiffRenderOptions {
                 binary: false,
+                anchors: &[],
                 db: context.db,
                 worktree_root,
                 use_worktree_new,
