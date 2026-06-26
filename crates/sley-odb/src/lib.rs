@@ -118,6 +118,22 @@ pub struct PackInstallResult {
     pub object_ids: Vec<ObjectId>,
 }
 
+#[derive(Debug)]
+pub struct RawPackStreamingInstall {
+    format: ObjectFormat,
+    expected_pack_id: ObjectId,
+    expected_pack_size: u64,
+    options: RawPackInstallOptions,
+    pack_dir: PathBuf,
+    pack_name: String,
+    pack_path: PathBuf,
+    index_path: PathBuf,
+    temp_pack_path: PathBuf,
+    file: Option<fs::File>,
+    written: u64,
+    finished: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawPackInstallResult {
     pub object_ids: Vec<ObjectId>,
@@ -193,6 +209,118 @@ impl RawPackInstaller for ObjectDatabase {
         Ok(RawPackInstallResult {
             object_ids: result.written_objects,
         })
+    }
+}
+
+impl RawPackStreamingInstall {
+    pub fn bytes_written(&self) -> u64 {
+        self.written
+    }
+
+    pub fn pack_path(&self) -> &Path {
+        &self.pack_path
+    }
+
+    pub fn index_path(&self) -> &Path {
+        &self.index_path
+    }
+
+    pub fn finish(mut self) -> Result<PackInstallResult> {
+        let result = (|| -> Result<PackInstallResult> {
+            let mut file = self.file.take().ok_or_else(|| {
+                GitError::InvalidFormat("raw pack stream already finished".into())
+            })?;
+            file.flush()?;
+            file.sync_all()?;
+            drop(file);
+
+            if self.written != self.expected_pack_size {
+                return Err(GitError::InvalidFormat(format!(
+                    "raw pack stream length mismatch: expected {}, got {}",
+                    self.expected_pack_size, self.written
+                )));
+            }
+
+            let built = PackIndex::write_v2_for_pack_path(&self.temp_pack_path, self.format)?;
+            if built.pack_checksum != self.expected_pack_id {
+                return Err(GitError::InvalidFormat(format!(
+                    "raw pack stream checksum mismatch: expected {}, got {}",
+                    self.expected_pack_id, built.pack_checksum
+                )));
+            }
+
+            match fs::rename(&self.temp_pack_path, &self.pack_path) {
+                Ok(()) => {}
+                Err(_) if self.pack_path.exists() => {
+                    let _ = fs::remove_file(&self.temp_pack_path);
+                }
+                Err(err) => return Err(GitError::Io(err.to_string())),
+            }
+            write_pack_component(&self.index_path, &built.index)?;
+            let promisor_path = write_promisor_pack_sidecar(
+                &self.pack_dir,
+                &self.pack_name,
+                self.options.promisor,
+            )?;
+            Ok(PackInstallResult {
+                pack_name: self.pack_name.clone(),
+                pack_path: self.pack_path.clone(),
+                index_path: self.index_path.clone(),
+                promisor_path,
+                object_ids: built.entries.iter().map(|entry| entry.oid).collect(),
+            })
+        })();
+
+        if result.is_ok() {
+            self.finished = true;
+        } else {
+            let _ = fs::remove_file(&self.temp_pack_path);
+        }
+        result
+    }
+}
+
+impl Write for RawPackStreamingInstall {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let next_written = self.written.checked_add(buf.len() as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "pack size overflow")
+        })?;
+        if next_written > self.expected_pack_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "raw pack stream exceeds expected size {}; got at least {}",
+                    self.expected_pack_size, next_written
+                ),
+            ));
+        }
+        let file = self.file.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "raw pack stream already finished",
+            )
+        })?;
+        let written = file.write(buf)?;
+        self.written = self.written.checked_add(written as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "pack size overflow")
+        })?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for RawPackStreamingInstall {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.file.take();
+            let _ = fs::remove_file(&self.temp_pack_path);
+        }
     }
 }
 
@@ -4903,6 +5031,57 @@ impl FileObjectDatabase {
         self.install_raw_pack_with_options(pack_bytes, RawPackInstallOptions::default())
     }
 
+    pub fn begin_raw_pack_install(
+        &self,
+        expected_pack_id: ObjectId,
+        expected_pack_size: u64,
+    ) -> Result<RawPackStreamingInstall> {
+        self.begin_raw_pack_install_with_options(
+            expected_pack_id,
+            expected_pack_size,
+            RawPackInstallOptions::default(),
+        )
+    }
+
+    pub fn begin_raw_pack_install_with_options(
+        &self,
+        expected_pack_id: ObjectId,
+        expected_pack_size: u64,
+        options: RawPackInstallOptions,
+    ) -> Result<RawPackStreamingInstall> {
+        if expected_pack_id.format() != self.format {
+            return Err(GitError::InvalidObjectId(format!(
+                "pack checksum uses {}, store uses {}",
+                expected_pack_id.format().name(),
+                self.format.name()
+            )));
+        }
+        let pack_dir = self.objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir)?;
+        let pack_name = format!("pack-{}", expected_pack_id.to_hex());
+        let pack_path = pack_dir.join(format!("{pack_name}.pack"));
+        let index_path = pack_dir.join(format!("{pack_name}.idx"));
+        let temp_pack_path = unique_temp_path(&pack_dir);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_pack_path)?;
+        Ok(RawPackStreamingInstall {
+            format: self.format,
+            expected_pack_id,
+            expected_pack_size,
+            options,
+            pack_dir,
+            pack_name,
+            pack_path,
+            index_path,
+            temp_pack_path,
+            file: Some(file),
+            written: 0,
+            finished: false,
+        })
+    }
+
     pub fn install_raw_pack_with_options(
         &self,
         pack_bytes: &[u8],
@@ -7048,6 +7227,64 @@ mod tests {
         );
         assert!(db.contains(&oid).expect("test operation should succeed"));
         assert_eq!(read_object_for_assert(&db, &oid), object);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_database_streams_raw_pack_install_to_packfile() {
+        use std::io::Write as _;
+
+        let root = temp_root("sley-file-odb-stream-raw-pack");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let object = EncodedObject::new(ObjectType::Blob, b"streamed raw pack\n".to_vec());
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+
+        let mut install = db
+            .begin_raw_pack_install(pack.checksum, pack.pack.len() as u64)
+            .expect("test operation should succeed");
+        for chunk in pack.pack.chunks(5) {
+            install
+                .write_all(chunk)
+                .expect("test operation should succeed");
+        }
+        let result = install.finish().expect("test operation should succeed");
+
+        assert_eq!(result.pack_name, format!("pack-{}", pack.checksum.to_hex()));
+        assert_eq!(result.object_ids, vec![oid]);
+        assert_eq!(
+            fs::read(&result.pack_path).expect("test operation should succeed"),
+            pack.pack
+        );
+        assert!(result.index_path.exists());
+        assert!(db.contains(&oid).expect("test operation should succeed"));
+        assert_eq!(read_object_for_assert(&db, &oid), object);
+
+        let bad_id = ObjectId::from_raw(ObjectFormat::Sha1, &[0x42; 20])
+            .expect("test operation should succeed");
+        let mut bad_install = db
+            .begin_raw_pack_install(bad_id, pack.pack.len() as u64)
+            .expect("test operation should succeed");
+        bad_install
+            .write_all(&pack.pack)
+            .expect("test operation should succeed");
+        assert!(
+            bad_install.finish().is_err(),
+            "checksum mismatch should reject the streamed pack"
+        );
+        assert!(
+            !git_dir
+                .join("objects")
+                .join("pack")
+                .join(format!("pack-{}.pack", bad_id.to_hex()))
+                .exists()
+        );
+
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
