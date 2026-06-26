@@ -784,7 +784,14 @@ fn execute_push_http(
     let post_buffer = http_post_buffer(request.config);
     let mut response = crate::http::http_send_with_auth(&remote_url, credentials, |auth| {
         let headers = crate::http::http_authorization_headers(auth);
-        send_receive_pack_body(&client, &url, &content_type, &headers, &pack_request, post_buffer)
+        send_receive_pack_body(
+            &client,
+            &url,
+            &content_type,
+            &headers,
+            &pack_request,
+            post_buffer,
+        )
     })?;
     crate::http::http_check_status(&response, &url)?;
     crate::http::http_validate_content_type(
@@ -852,8 +859,7 @@ fn send_receive_pack_body(
     post_buffer: usize,
 ) -> Result<HttpResponse> {
     std::thread::scope(|scope| {
-        let (mut reader, writer) =
-            std::io::pipe().map_err(|err| GitError::Io(err.to_string()))?;
+        let (mut reader, writer) = std::io::pipe().map_err(|err| GitError::Io(err.to_string()))?;
         let generator = scope.spawn(move || -> Result<()> {
             // `writer` is dropped at the end of this closure, signalling EOF to
             // the reader even on the error path.
@@ -2431,8 +2437,15 @@ mod tests {
 
         // A post_buffer larger than the body → buffered Content-Length send.
         let buffered_client = RecordingClient::default();
-        send_receive_pack_body(&buffered_client, "http://h/git-receive-pack", "ct", &[], &req, usize::MAX)
-            .expect("buffered send");
+        send_receive_pack_body(
+            &buffered_client,
+            "http://h/git-receive-pack",
+            "ct",
+            &[],
+            &req,
+            usize::MAX,
+        )
+        .expect("buffered send");
         let (method, body) = buffered_client.take();
         assert_eq!(method, "post");
         assert_eq!(body, canonical);
@@ -2441,8 +2454,15 @@ mod tests {
         // (post_buffer + 1 bytes) plus the rest of the pipe must reproduce the
         // exact same bytes.
         let streamed_client = RecordingClient::default();
-        send_receive_pack_body(&streamed_client, "http://h/git-receive-pack", "ct", &[], &req, 8)
-            .expect("streamed send");
+        send_receive_pack_body(
+            &streamed_client,
+            "http://h/git-receive-pack",
+            "ct",
+            &[],
+            &req,
+            8,
+        )
+        .expect("streamed send");
         let (method, body) = streamed_client.take();
         assert_eq!(method, "post_reader");
         assert_eq!(body, canonical);
