@@ -617,7 +617,7 @@ fn log_cached_mailmap<'a>(
     Ok(cache.as_ref().expect("mailmap cache was just initialized"))
 }
 
-pub(crate) fn render_log_raw_pretty(record: &sley_rev::CommitRecord) -> Vec<u8> {
+pub(crate) fn render_log_raw_pretty(record: &sley_rev::CommitRecord, expand_tabs: i32) -> Vec<u8> {
     let mut out = Vec::new();
     writeln!(out, "commit {}", record.oid).expect("write to Vec cannot fail");
     writeln!(out, "tree {}", record.commit.tree).expect("write to Vec cannot fail");
@@ -632,10 +632,67 @@ pub(crate) fn render_log_raw_pretty(record: &sley_rev::CommitRecord) -> Vec<u8> 
     out.extend_from_slice(b"\n\n");
     for line in String::from_utf8_lossy(&record.commit.message).lines() {
         out.extend_from_slice(b"    ");
-        out.extend_from_slice(line.as_bytes());
+        out.extend_from_slice(&log_expand_tabs(line.as_bytes(), expand_tabs));
         out.push(b'\n');
     }
     out
+}
+
+/// Display width of a message segment for tab-stop computation, mirroring
+/// upstream pretty.c's `pp_utf8_width`: returns `None` when the segment is not
+/// well-formed UTF-8 or carries a control character with undefined width, in
+/// which case the caller stops trying to align the rest of the line.
+fn log_segment_width(bytes: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut width = 0usize;
+    for ch in text.chars() {
+        let cp = ch as u32;
+        if cp < 0x20 || cp == 0x7f {
+            return None;
+        }
+        width += 1;
+    }
+    Some(width)
+}
+
+/// Expand tabs in a single log-message line, mirroring upstream pretty.c's
+/// `strbuf_add_tabexpand`. Each tab is replaced with enough spaces to reach the
+/// next column that is a multiple of `tabwidth`, measured from the start of the
+/// current segment (the de-tab column counter resets after every tab, and the
+/// surrounding indent prefix is emitted separately so it is not counted here).
+/// A non-positive `tabwidth`, or a line without tabs, is returned unchanged.
+pub(crate) fn log_expand_tabs(line: &[u8], tabwidth: i32) -> Vec<u8> {
+    if tabwidth <= 0 || !line.contains(&b'\t') {
+        return line.to_vec();
+    }
+    let tabwidth = tabwidth as usize;
+    let mut out = Vec::with_capacity(line.len() + tabwidth);
+    let mut seg = line;
+    while let Some(pos) = seg.iter().position(|&b| b == b'\t') {
+        let before = &seg[..pos];
+        let Some(width) = log_segment_width(before) else {
+            // Badly formed UTF-8 / undefined-width char: give up on aligning
+            // and emit the remainder verbatim, as upstream does.
+            out.extend_from_slice(seg);
+            return out;
+        };
+        out.extend_from_slice(before);
+        let spaces = tabwidth - (width % tabwidth);
+        out.resize(out.len() + spaces, b' ');
+        seg = &seg[pos + 1..];
+    }
+    out.extend_from_slice(seg);
+    out
+}
+
+/// The default tab-expansion width for a built-in output kind, matching
+/// upstream pretty.c's `builtin_formats[]` table (`medium`/`full`/`fuller`
+/// expand to 8; `short`/`raw` do not expand).
+fn log_default_expand_tabs(kind: LogDefaultKind) -> i32 {
+    match kind {
+        LogDefaultKind::Medium | LogDefaultKind::Full | LogDefaultKind::Fuller => 8,
+        LogDefaultKind::Short | LogDefaultKind::Raw => 0,
+    }
 }
 
 fn log_source_label<'a>(
@@ -762,6 +819,9 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // newline; `--pretty=format:` separates entries instead.
     let mut pretty_spec: Option<(String, bool)> = None;
     let mut output_encoding_override: Option<String> = None;
+    // `--expand-tabs[=<n>]` / `--no-expand-tabs`. `None` means the CLI didn't
+    // decide, so the per-format default (`log_default_expand_tabs`) is used.
+    let mut expand_tabs_explicit: Option<i32> = None;
     let mut walk_reflogs = false;
     let mut min_parents = None;
     let mut max_parents = None;
@@ -1715,13 +1775,31 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 preset_oneline = None;
                 plain_oneline = false;
             }
-            "--pretty" | "--format" => {
+            // Bare `--pretty` is shorthand for `--pretty=medium` (it does not
+            // consume the following argument). Bare `--format` keeps requiring a
+            // value below.
+            "--pretty" => {
+                output = LogOutput::Default(LogDefaultKind::Medium);
+                pretty_spec = None;
+                preset_oneline = None;
+                plain_oneline = false;
+            }
+            "--format" => {
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command(format!("{arg} requires a value")))?;
-                pretty_spec = Some((value.to_string(), arg == "--format"));
+                pretty_spec = Some((value.to_string(), true));
                 preset_oneline = None;
                 plain_oneline = false;
+            }
+            "--expand-tabs" => expand_tabs_explicit = Some(8),
+            "--no-expand-tabs" => expand_tabs_explicit = Some(0),
+            value if value.starts_with("--expand-tabs=") => {
+                let raw = &value["--expand-tabs=".len()..];
+                let n: i32 = raw.parse().map_err(|_| {
+                    GitError::Command(format!("could not parse expand-tabs value '{raw}'"))
+                })?;
+                expand_tabs_explicit = Some(n.max(0));
             }
             value if value.starts_with("--pretty=") => {
                 pretty_spec = Some((value["--pretty=".len()..].to_string(), false));
@@ -3098,6 +3176,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     } else {
         &empty_mailmap
     };
+    // Resolve `--expand-tabs` (upstream revision.c): an explicit CLI value wins,
+    // otherwise fall back to the per-format default (medium/full/fuller expand
+    // to 8; everything else, including compiled/oneline formats, defaults off).
+    let expand_tabs_in_log: i32 = expand_tabs_explicit.unwrap_or_else(|| match &output {
+        LogOutput::Default(kind) => log_default_expand_tabs(*kind),
+        LogOutput::Compiled { .. } => 0,
+    });
 
     if let Some(shown) = &graph_shown {
         let palette = log_graph_color_palette(&config);
@@ -3210,7 +3295,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             out.write_all(b"\n")?;
                         }
                         graph_show_commit(&mut graph_state, prefix, &mut out)?;
-                        let mut msg = render_log_raw_pretty(record);
+                        let mut msg = render_log_raw_pretty(record, expand_tabs_in_log);
                         if let Some((notes_store, display_notes_refs)) = display_notes.as_ref()
                             && !display_notes_refs.is_empty()
                         {
@@ -3337,7 +3422,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             msg.push(b'\n');
                         } else {
                             msg.extend_from_slice(b"    ");
-                            msg.extend_from_slice(line);
+                            msg.extend_from_slice(&log_expand_tabs(line, expand_tabs_in_log));
                             msg.push(b'\n');
                         }
                     }
@@ -3414,7 +3499,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             }
                         }
                         printed_entries += 1;
-                        let mut raw = render_log_raw_pretty(record);
+                        let mut raw = render_log_raw_pretty(record, expand_tabs_in_log);
                         // git appends the notes block after the message and
                         // before the diff for every built-in format (here, raw)
                         // once notes display is active (`--show-notes`).
@@ -3563,7 +3648,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     for line in commit_message_lines(&display_message) {
                         write!(out, "    ")?;
                         out.write_all(&log_highlight_matches(
-                            line,
+                            &log_expand_tabs(line, expand_tabs_in_log),
                             grep_filters.as_ref(),
                             &grep_colors,
                         ))?;

@@ -173,6 +173,23 @@ struct ShowOptions {
     /// Revision/pathspec arguments passed to the shared revision parser.
     setup_args: Vec<String>,
     show_signature: Option<bool>,
+    /// `--expand-tabs[=<n>]` / `--no-expand-tabs`. `None` defers to the
+    /// per-format default ([`show_default_expand_tabs`]).
+    expand_tabs: Option<i32>,
+}
+
+/// The default tab-expansion width for a `git show` commit format, matching
+/// upstream pretty.c's `builtin_formats[]` table (`medium`/`full`/`fuller`
+/// expand to 8; everything else defaults off).
+fn show_default_expand_tabs(format: &ShowCommitFormat) -> i32 {
+    match format {
+        ShowCommitFormat::Medium | ShowCommitFormat::Full | ShowCommitFormat::Fuller => 8,
+        ShowCommitFormat::Short
+        | ShowCommitFormat::Raw
+        | ShowCommitFormat::Oneline
+        | ShowCommitFormat::FullOneline
+        | ShowCommitFormat::Custom { .. } => 0,
+    }
 }
 
 struct ShowContext<'a> {
@@ -301,6 +318,7 @@ impl Default for ShowOptions {
             indent_heuristic: None,
             setup_args: Vec::new(),
             show_signature: None,
+            expand_tabs: None,
         }
     }
 }
@@ -656,6 +674,11 @@ fn show_commit(
     let mut profile_last = profile_start;
     let options = context.options;
     let decorations = context.decorations;
+    // Resolve `--expand-tabs` for the message body: an explicit CLI value wins,
+    // otherwise use the per-format default (medium/full/fuller expand to 8).
+    let expand_tabs = options
+        .expand_tabs
+        .unwrap_or_else(|| show_default_expand_tabs(&options.commit_format));
     let output_encoding = options
         .output_encoding
         .clone()
@@ -745,7 +768,7 @@ fn show_commit(
         ShowCommitFormat::Raw => {
             // `--pretty=raw` emits the raw object headers + raw message; no
             // decoration or notes are shown.
-            let raw = crate::commands::log::render_log_raw_pretty(&record);
+            let raw = crate::commands::log::render_log_raw_pretty(&record, expand_tabs);
             stdout.write_all(&raw)?;
         }
         ShowCommitFormat::Medium
@@ -815,7 +838,7 @@ fn show_commit(
             let display_message = commit_message_for_commit_encoding(commit, &output_encoding);
             for line in commit_message_lines(&display_message) {
                 stdout.write_all(b"    ")?;
-                stdout.write_all(line)?;
+                stdout.write_all(&crate::commands::log::log_expand_tabs(line, expand_tabs))?;
                 stdout.write_all(b"\n")?;
             }
             if options.show_notes {
@@ -1797,6 +1820,14 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             }
             value if let Some(encoding) = value.strip_prefix("--encoding=") => {
                 options.output_encoding = Some(encoding.to_string());
+            }
+            "--expand-tabs" => options.expand_tabs = Some(8),
+            "--no-expand-tabs" => options.expand_tabs = Some(0),
+            value if let Some(raw) = value.strip_prefix("--expand-tabs=") => {
+                let n: i32 = raw.parse().map_err(|_| {
+                    GitError::Command(format!("could not parse expand-tabs value '{raw}'"))
+                })?;
+                options.expand_tabs = Some(n.max(0));
             }
             "--notes" | "--show-notes" => {
                 options.show_notes = true;
