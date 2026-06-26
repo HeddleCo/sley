@@ -1241,6 +1241,21 @@ pub fn move_index_and_worktree_path(
         &gitlink_moves,
     )?;
     let gitlink_gitdir_moves = prepare_moved_gitlink_gitdirs(worktree_root, &gitlink_moves)?;
+    if options.sparse && !directory_entries.is_empty() {
+        return sparse_directory_move(
+            worktree_root,
+            git_dir,
+            format,
+            source_path,
+            destination_path,
+            &directory_prefix,
+            directory_entries,
+            index,
+            options.force,
+            gitmodules_move,
+            &gitlink_gitdir_moves,
+        );
+    }
     if !directory_entries.is_empty() {
         let details: Vec<_> = directory_entries
             .iter()
@@ -1432,8 +1447,10 @@ fn sparse_single_file_move(
     };
     // git refuses to overwrite a destination that already exists in the index
     // when it is out-of-cone, unless --force is given (builtin/mv.c's
-    // "destination exists in the index").
-    if !destination_in_cone
+    // "destination exists in the index"). This is gated on cone mode: dst_mode's
+    // SPARSE/SKIP_WORKTREE_DIR bits are only assigned for cone-mode checkouts.
+    if cone_mode
+        && !destination_in_cone
         && !force
         && index.entries.iter().any(|entry| {
             entry.path.as_bytes() == destination_path.as_slice() && entry.stage() == Stage::Normal
@@ -1513,6 +1530,170 @@ fn sparse_single_file_move(
         skipped: false,
         fatal: None,
         details: Vec::new(),
+    })
+}
+
+/// Recursively remove `dir` and its subdirectories when they contain only
+/// (possibly nested) empty directories. Returns whether `dir` was removed.
+fn remove_empty_dirs_under(dir: &Path) -> Result<bool> {
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    let mut all_empty = true;
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            if !remove_empty_dirs_under(&path)? {
+                all_empty = false;
+            }
+        } else {
+            all_empty = false;
+        }
+    }
+    if all_empty {
+        fs::remove_dir(dir)?;
+    }
+    Ok(all_empty)
+}
+
+/// `git mv --sparse` of a directory: reconcile each contained entry with the
+/// destination's cone membership the same way `sparse_single_file_move` does a
+/// single file, then prune now-empty source directories. The source directory
+/// may be sparsified off disk, so this never relies on a whole-tree rename.
+#[allow(clippy::too_many_arguments)]
+fn sparse_directory_move(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    source_path: Vec<u8>,
+    destination_path: Vec<u8>,
+    directory_prefix: &[u8],
+    directory_entries: Vec<IndexEntry>,
+    mut index: Index,
+    force: bool,
+    gitmodules_move: Option<Vec<u8>>,
+    gitlink_gitdir_moves: &[GitlinkGitdirMove],
+) -> Result<MoveResult> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let active = crate::checkout::active_sparse_checkout(git_dir)?;
+    let cone_mode = matches!(
+        active.as_ref().map(|(_, mode)| mode),
+        Some(SparseCheckoutMode::Cone)
+    );
+    let path_in_cone = |path: &[u8]| match active.as_ref() {
+        Some((sparse, mode)) => crate::checkout::path_in_sparse_checkout(path, sparse, *mode),
+        None => true,
+    };
+    let mut details = Vec::new();
+    let mut new_entries = Vec::new();
+    let mut source_parents: Vec<PathBuf> = Vec::new();
+    for entry in &directory_entries {
+        let suffix = &entry.path.as_bytes()[source_path.len()..];
+        let mut destination = destination_path.clone();
+        destination.extend_from_slice(suffix);
+        let destination_in_cone = path_in_cone(&destination);
+        if cone_mode
+            && !destination_in_cone
+            && !force
+            && index.entries.iter().any(|existing| {
+                existing.path.as_bytes() == destination.as_slice()
+                    && existing.stage() == Stage::Normal
+                    && !existing.path.as_bytes().starts_with(directory_prefix)
+            })
+        {
+            eprintln!(
+                "fatal: destination exists in the index, source={}, destination={}",
+                String::from_utf8_lossy(entry.path.as_bytes()),
+                String::from_utf8_lossy(&destination)
+            );
+            return Err(GitError::Exit(128));
+        }
+        let mut destination_entry = entry.clone();
+        destination_entry.path = destination.clone().into();
+        destination_entry.refresh_name_length();
+        let source_absolute = worktree_path(worktree_root, entry.path.as_bytes())?;
+        let destination_absolute = worktree_path(worktree_root, &destination)?;
+        if let Some(parent) = source_absolute.parent() {
+            source_parents.push(parent.to_path_buf());
+        }
+        let source_present = fs::symlink_metadata(&source_absolute).is_ok();
+        if source_present {
+            if cone_mode && !destination_in_cone {
+                crate::checkout::remove_existing_worktree_path(&source_absolute)?;
+                if fs::symlink_metadata(&destination_absolute).is_ok() {
+                    crate::checkout::remove_existing_worktree_path(&destination_absolute)?;
+                }
+                crate::checkout::set_skip_worktree(&mut destination_entry);
+            } else {
+                if let Some(parent) = destination_absolute.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if fs::symlink_metadata(&destination_absolute).is_ok() {
+                    crate::checkout::remove_existing_worktree_path(&destination_absolute)?;
+                }
+                fs::rename(&source_absolute, &destination_absolute)?;
+                if destination_in_cone {
+                    crate::checkout::clear_skip_worktree(&mut destination_entry);
+                }
+                if let Ok(metadata) = fs::symlink_metadata(&destination_absolute) {
+                    destination_entry =
+                        index_entry_with_refreshed_stat(&destination_entry, &metadata);
+                }
+            }
+        } else if cone_mode && destination_in_cone {
+            crate::checkout::clear_skip_worktree(&mut destination_entry);
+            if fs::symlink_metadata(&destination_absolute).is_err() {
+                crate::checkout::materialize_index_entry_file(
+                    &db,
+                    worktree_root,
+                    &destination_absolute,
+                    &destination_entry,
+                )?;
+            }
+            if let Ok(metadata) = fs::symlink_metadata(&destination_absolute) {
+                destination_entry = index_entry_with_refreshed_stat(&destination_entry, &metadata);
+            }
+        }
+        details.push(MoveDetail {
+            source: entry.path.as_bytes().to_vec(),
+            destination: destination.clone(),
+            skipped: false,
+        });
+        new_entries.push(destination_entry);
+    }
+    let destination_paths: Vec<Vec<u8>> = new_entries
+        .iter()
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect();
+    index.entries.retain(|entry| {
+        !entry.path.as_bytes().starts_with(directory_prefix)
+            && !destination_paths
+                .iter()
+                .any(|path| path.as_slice() == entry.path.as_bytes())
+    });
+    index.entries.extend(new_entries);
+    // git's remove_empty_src_dirs strips directories the move emptied, including
+    // untracked empty subdirectories left behind under the source root.
+    let source_root = worktree_path(worktree_root, &source_path)?;
+    remove_empty_dirs_under(&source_root)?;
+    for parent in source_parents {
+        prune_empty_parents(worktree_root, Some(&parent))?;
+    }
+    apply_moved_gitlink_gitdirs(gitlink_gitdir_moves)?;
+    if let Some(edited) = gitmodules_move {
+        apply_prepared_gitmodules_move(worktree_root, git_dir, format, &mut index.entries, edited)?;
+    }
+    index
+        .entries
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    index.extensions.clear();
+    write_repository_index_ref(git_dir, format, &index)?;
+    Ok(MoveResult {
+        source: source_path,
+        destination: destination_path,
+        skipped: false,
+        fatal: None,
+        details,
     })
 }
 
