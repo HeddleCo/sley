@@ -576,7 +576,7 @@ declare -A FLOOR=(
     # script*, which costs the sley-only cell #135 (generated only because sley
     # lists `submodule` in --list-cmds=builtins where git lists `submodule--helper`;
     # the cell's 129 expectation conflicts with git's exit-0). Net +2.
-    [t0012-help.sh]=152
+    [t0012-help.sh]=154
     # wave-2 submodule (2026-06-18, integ/submodule): t7400 87->88.
     # codex-wave-11 (submodule verbs): add/init/status/sync/deinit/update/foreach/
     # set-url/set-branch, relative-URL resolution, .gitmodules+config writes. t7400
@@ -1166,6 +1166,12 @@ declare -A FLOOR=(
     [t7814-grep-recurse-submodules.sh]=25
     [t7811-grep-open.sh]=10
     [t7817-grep-sparse-checkout.sh]=5
+    [t0014-alias.sh]=21
+    [t0033-safe-directory.sh]=22
+    [t0035-safe-bare-repository.sh]=12
+    [t0092-diagnose.sh]=4
+    [t0068-for-each-repo.sh]=4
+    [t0009-git-dir-validation.sh]=6
 
 )
 
