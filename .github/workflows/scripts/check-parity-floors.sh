@@ -375,7 +375,7 @@ declare -A FLOOR=(
     # 271->275 RESTORED 2026-06-20 (wave-23 fixes): the wave-4 (eb1f4dfd) floor of 275
     # was silently regressed to 271 by a later reftable-migration commit; the badrefname
     # fix-slice restores the 4 cells. CI-reproducible (local plumbing, no transport).
-    [t1400-update-ref.sh]=275
+    [t1400-update-ref.sh]=296  # wave-52 refs: 275->296 (symref no-deref, batch-update symref/conflict rejections, empty default reflog msg, HEAD reflog on branch delete, packed+loose delete)
     [t1401-symbolic-ref.sh]=25
     # t1430 + t7450 NEW 2026-06-20 (wave-23): bad-ref-name validation + bad-git-dotfiles
     # security hardening. Enrolled in SLEY_TESTS below.
@@ -411,7 +411,7 @@ declare -A FLOOR=(
     [t2024-checkout-dwim.sh]=21
     [t2004-checkout-cache-temp.sh]=23
     [t3070-wildmatch.sh]=1861
-    [t6300-for-each-ref.sh]=410
+    [t6300-for-each-ref.sh]=427  # wave-52 refs: 414->427 (full-config layering for %(push), nested-tag peel, %(signature[:opt]) atom family, describe-arg up-front validation)
     # wave-51 revtail (sley-rev): rev-parse --prefix t1513 1->11, <branch>@{push} full
     # resolution t1514 3->9 (upstream fallback under push.default=simple), rev-list
     # --disk-usage packed t6115 8->17, grafts+--pretty=raw t6001 5->13, for-each-ref
@@ -429,7 +429,7 @@ declare -A FLOOR=(
     # t5505=126 t3200=134 held.
     [t6040-tracking-info.sh]=44
     # codex-wave-4 (2026-06-17): for-each-ref atoms (sley-ref-filter) t6302 enroll@17.
-    [t6302-for-each-ref-filter.sh]=55
+    [t6302-for-each-ref-filter.sh]=56  # wave-52 refs: 55->56 (incidental from for-each-ref full-config layering)
     # codex-wave-4: merge-tree --write-tree t4301 enroll@18; blame siblings t8001 99->110/t8002 117->128/t8012 98->109; sparse t1091 40->45.
     [t4301-merge-tree-write-tree.sh]=18
     # codex-wave-2 (2026-06-17): tag annotated-edit/TAG_EDITMSG/reflog/column 176->189 (stable 3x).
@@ -462,7 +462,7 @@ declare -A FLOOR=(
     [t3309-notes-merge-auto-resolve.sh]=31
     [t3311-notes-merge-fanout.sh]=24
     [t3301-notes.sh]=153
-    [t1461-refs-list.sh]=410
+    [t1461-refs-list.sh]=426  # wave-52 refs: 413->426 (shares for-each-ref-tests.sh with t6300: full-config %(push), nested-tag peel, %(signature[:opt]), describe-arg validation)
     [t1462-refs-exists.sh]=12
     [t1510-repo-setup.sh]=109
     # codex-wave-3: merge --no-edit rename-cleanup also fixed rename-dir merges 23->27 (stable 3x).

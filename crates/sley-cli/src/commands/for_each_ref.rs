@@ -320,6 +320,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         .collect::<Result<Vec<_>>>()?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     for_each_ref_validate_ahead_behind(&format_spec, &git_dir, format)?;
+    for_each_ref_validate_describe(&format_spec)?;
     // The abbreviation candidate set is only needed by `%(objectname:short...)`;
     // enumerating every object id is otherwise pure overhead.
     let objectname_candidates = if needs.candidates {
@@ -852,6 +853,23 @@ fn for_each_ref_missing_object(err: GitError, oid: &ObjectId, refname: &str) -> 
 /// git resolves every `%(ahead-behind:<committish>)` base up front, rejecting a
 /// bare `%(ahead-behind)` and dying on an unresolvable base before any ref is
 /// printed (builtin/for-each-ref.c + ref-filter.c's ahead/behind setup).
+/// git compiles the ref format once, up front, so a malformed `%(describe:...)`
+/// argument is rejected before any ref is matched (builtin/for-each-ref.c's
+/// `verify_ref_format`). Validate the describe options here so a bad argument
+/// fails even when the pattern matches zero refs (the per-ref render path would
+/// otherwise never reach the offending atom).
+fn for_each_ref_validate_describe(format_spec: &ForEachRefFormat) -> Result<()> {
+    for segment in format_spec.segments() {
+        let ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(placeholder)) = segment else {
+            continue;
+        };
+        if let Some((_peeled, opts)) = crate::for_each_ref_describe_atom(placeholder) {
+            crate::for_each_ref_parse_describe_opts(opts)?;
+        }
+    }
+    Ok(())
+}
+
 fn for_each_ref_validate_ahead_behind(
     format_spec: &ForEachRefFormat,
     git_dir: &Path,
