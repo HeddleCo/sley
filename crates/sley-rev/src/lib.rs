@@ -1552,9 +1552,7 @@ fn branch_get_push(branch: &str, config: &GitConfig) -> Result<UpstreamRef> {
         .get("branch", Some(branch), "pushRemote")
         .or_else(|| config.get("remote", None, "pushDefault"))
         .or_else(|| config.get("branch", Some(branch), "remote"))
-        .ok_or_else(|| {
-            GitError::not_found(format!("branch '{branch}' has no remote for pushing"))
-        })?
+        .ok_or_else(|| GitError::not_found(format!("branch '{branch}' has no remote for pushing")))?
         .to_string();
     let branch_refname = format!("refs/heads/{branch}");
 
@@ -1576,7 +1574,11 @@ fn branch_get_push(branch: &str, config: &GitConfig) -> Result<UpstreamRef> {
                 "push refspecs for '{pushremote}' do not include '{branch}'"
             ))
         })?;
-        return Ok(upstream_ref(tracking_for_push_dest(config, &pushremote, &dst)?));
+        return Ok(upstream_ref(tracking_for_push_dest(
+            config,
+            &pushremote,
+            &dst,
+        )?));
     }
 
     match config.get("push", None, "default").unwrap_or("simple") {
@@ -1619,9 +1621,11 @@ fn branch_get_upstream_refname(
     let merge = merge.filter(|merge| !merge.is_empty()).ok_or_else(|| {
         GitError::not_found(format!("no upstream configured for branch '{branch}'"))
     })?;
-    let remote = config.get("branch", Some(branch), "remote").ok_or_else(|| {
-        GitError::not_found(format!("no upstream configured for branch '{branch}'"))
-    })?;
+    let remote = config
+        .get("branch", Some(branch), "remote")
+        .ok_or_else(|| {
+            GitError::not_found(format!("no upstream configured for branch '{branch}'"))
+        })?;
     if remote == "." {
         return Ok(merge.to_string());
     }

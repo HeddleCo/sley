@@ -159,7 +159,9 @@ fn load_alias_config() -> Result<GitConfig> {
     let common_git_dir = git_dir
         .as_ref()
         .and_then(|dir| common_git_dir_for_git_dir(dir).ok());
-    let branch = git_dir.as_ref().and_then(|dir| repo_current_branch_name(dir));
+    let branch = git_dir
+        .as_ref()
+        .and_then(|dir| repo_current_branch_name(dir));
     let context = ConfigIncludeContext::new(common_git_dir.clone(), branch);
     let mut config = sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)?;
     let parameters = injected_config_parameters()?;

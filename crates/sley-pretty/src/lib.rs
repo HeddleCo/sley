@@ -1241,14 +1241,16 @@ mod tests {
 
     #[test]
     fn oid_only_format() {
-        let compiled = CompiledLogFormat::compile("%H", LogFormatDialect::Log).unwrap();
+        let compiled = CompiledLogFormat::compile("%H", LogFormatDialect::Log)
+            .expect("oid-only format should compile");
         assert!(compiled.is_oid_only());
         assert!(!compiled.uses_decorations());
     }
 
     #[test]
     fn g_placeholders_are_not_oid_only() {
-        let compiled = CompiledLogFormat::compile("%G?|%GS", LogFormatDialect::Log).unwrap();
+        let compiled = CompiledLogFormat::compile("%G?|%GS", LogFormatDialect::Log)
+            .expect("signature format should compile");
         assert!(!compiled.is_oid_only());
     }
 
@@ -1256,7 +1258,7 @@ mod tests {
     fn known_g_signature_atoms_are_not_literals() {
         let compiled =
             CompiledLogFormat::compile("%GG|%G?|%GS|%GK|%GF|%GP|%GT|%GX|%G", LogFormatDialect::Log)
-                .unwrap();
+                .expect("signature atom format should compile");
         assert_eq!(
             compiled.tokens,
             vec![
@@ -1283,27 +1285,31 @@ mod tests {
 
     #[test]
     fn decorations_tier_is_full() {
-        let compiled = CompiledLogFormat::compile("%h %d", LogFormatDialect::Log).unwrap();
+        let compiled = CompiledLogFormat::compile("%h %d", LogFormatDialect::Log)
+            .expect("decorated log format should compile");
         assert_eq!(compiled.tier(), FormatTier::Full);
         assert!(compiled.uses_decorations());
     }
 
     #[test]
     fn metadata_tier() {
-        let compiled = CompiledLogFormat::compile("%H %P", LogFormatDialect::RevList).unwrap();
+        let compiled = CompiledLogFormat::compile("%H %P", LogFormatDialect::RevList)
+            .expect("rev-list metadata format should compile");
         assert_eq!(compiled.tier(), FormatTier::Metadata);
         assert!(compiled.is_metadata_emitable());
     }
 
     #[test]
     fn metadata_not_emitable_with_subject() {
-        let compiled = CompiledLogFormat::compile("%H %s", LogFormatDialect::Log).unwrap();
+        let compiled = CompiledLogFormat::compile("%H %s", LogFormatDialect::Log)
+            .expect("metadata plus subject format should compile");
         assert!(!compiled.is_metadata_emitable());
     }
 
     #[test]
     fn log_oneline_preset_inserts_parents() {
-        let compiled = presets::log_oneline(false, false, true).unwrap();
+        let compiled = presets::log_oneline(false, false, true)
+            .expect("oneline preset with parents should compile");
         assert!(compiled.tokens.windows(3).any(|w| {
             matches!(w[0], FormatToken::OidAbbrev)
                 && matches!(w[1], FormatToken::Literal(ref text) if text == " ")
@@ -1313,7 +1319,8 @@ mod tests {
 
     #[test]
     fn escaped_percent_before_literal() {
-        let compiled = CompiledLogFormat::compile("%%H", LogFormatDialect::Log).unwrap();
+        let compiled = CompiledLogFormat::compile("%%H", LogFormatDialect::Log)
+            .expect("escaped percent format should compile");
         assert_eq!(
             compiled.tokens,
             vec![FormatToken::Percent, FormatToken::Literal("H".into())]
@@ -1323,7 +1330,8 @@ mod tests {
 
     #[test]
     fn log_format_gs_is_reflog_subject() {
-        let compiled = CompiledLogFormat::compile("%gs", LogFormatDialect::Log).unwrap();
+        let compiled = CompiledLogFormat::compile("%gs", LogFormatDialect::Log)
+            .expect("reflog subject format should compile");
         assert_eq!(compiled.tokens, vec![FormatToken::ReflogGs]);
     }
 }

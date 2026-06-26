@@ -999,9 +999,14 @@ fn grep_fallback_to_no_index() -> Result<bool> {
 /// `-c`-injected parameters; last value wins). git reads this in
 /// `grep_cmd_config` before the command-line `--recurse-submodules` override.
 fn resolve_recurse_submodules(config: &GitConfig) -> Result<bool> {
-    let mut value = config.get_bool("submodule", None, "recurse").unwrap_or(false);
+    let mut value = config
+        .get_bool("submodule", None, "recurse")
+        .unwrap_or(false);
     for param in injected_config_parameters()? {
-        if param.canonical_key.eq_ignore_ascii_case("submodule.recurse") {
+        if param
+            .canonical_key
+            .eq_ignore_ascii_case("submodule.recurse")
+        {
             value = parse_grep_bool(param.value.as_deref());
         }
     }
@@ -1065,7 +1070,10 @@ fn run_open_pager(pager: &str, opts: &GrepOptions, files: &[Vec<u8>]) -> Result<
     // A single pattern jumps less/vi to the first match (`+/*PAT` / `+/PAT`).
     if opts.patterns.len() == 1 && (base == "less" || base == "vi") {
         let star = if base == "less" { "*" } else { "" };
-        extra.push(std::ffi::OsString::from(format!("+/{star}{}", opts.patterns[0])));
+        extra.push(std::ffi::OsString::from(format!(
+            "+/{star}{}",
+            opts.patterns[0]
+        )));
     }
     for file in files {
         extra.push(std::ffi::OsStr::from_bytes(file).to_os_string());
@@ -1498,7 +1506,8 @@ fn grep_index_level(
     // SKIP_WORKTREE entry whose file is actually present in the worktree loses the
     // bit, so the live file is searched. `core.sparseCheckout` is written to the
     // per-worktree config (`extensions.worktreeConfig`), so it is consulted first.
-    let worktree_config = GitConfig::read(source.git_dir.join("config.worktree")).unwrap_or_default();
+    let worktree_config =
+        GitConfig::read(source.git_dir.join("config.worktree")).unwrap_or_default();
     let sparse_enabled = worktree_config
         .get_bool("core", None, "sparseCheckout")
         .or_else(|| source.config.get_bool("core", None, "sparseCheckout"))

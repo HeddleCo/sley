@@ -106,7 +106,7 @@ mod tests {
             },
             false,
         )
-        .unwrap();
+        .expect("CLI update strategy should be accepted");
         assert_eq!(got.kind, UpdateType::Rebase);
     }
 
@@ -121,7 +121,7 @@ mod tests {
             },
             false,
         )
-        .unwrap();
+        .expect("configured update strategy should be accepted");
         assert_eq!(got.kind, UpdateType::Rebase);
     }
 
@@ -136,14 +136,14 @@ mod tests {
             },
             false,
         )
-        .unwrap();
+        .expect("gitmodules update strategy should be accepted");
         assert_eq!(got.kind, UpdateType::Merge);
     }
 
     #[test]
     fn default_is_checkout() {
-        let got =
-            determine_update_strategy(UpdateType::Unspecified, None, &unspec(), false).unwrap();
+        let got = determine_update_strategy(UpdateType::Unspecified, None, &unspec(), false)
+            .expect("default update strategy should be accepted");
         assert_eq!(got, checkout());
     }
 
@@ -151,7 +151,7 @@ mod tests {
     fn command_from_config_carries_string() {
         let got =
             determine_update_strategy(UpdateType::Unspecified, Some("!false"), &unspec(), false)
-                .unwrap();
+                .expect("custom update command should be accepted");
         assert_eq!(got.kind, UpdateType::Command);
         assert_eq!(got.command.as_deref(), Some("false"));
     }
@@ -168,13 +168,13 @@ mod tests {
                 },
                 true,
             )
-            .unwrap();
+            .expect("just-cloned strategy should be accepted");
             assert_eq!(got.kind, UpdateType::Checkout, "downgrade {kind:?}");
         }
         // checkout / command are NOT downgraded.
         let got =
             determine_update_strategy(UpdateType::Unspecified, Some("!true"), &unspec(), true)
-                .unwrap();
+                .expect("custom update command should not be downgraded");
         assert_eq!(got.kind, UpdateType::Command);
     }
 
@@ -182,7 +182,7 @@ mod tests {
     fn invalid_config_value_errors() {
         let err =
             determine_update_strategy(UpdateType::Unspecified, Some("bogus"), &unspec(), false)
-                .unwrap_err();
+                .expect_err("invalid update strategy should error");
         assert_eq!(err, "bogus");
     }
 }

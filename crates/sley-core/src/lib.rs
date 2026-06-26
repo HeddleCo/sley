@@ -2052,14 +2052,14 @@ impl Sha256Hasher {
         let mut g = self.state[6];
         let mut hh = self.state[7];
 
-        for i in 0..64 {
+        for (&word, &constant) in w.iter().zip(Self::K.iter()) {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
             let temp1 = hh
                 .wrapping_add(s1)
                 .wrapping_add(ch)
-                .wrapping_add(Self::K[i])
-                .wrapping_add(w[i]);
+                .wrapping_add(constant)
+                .wrapping_add(word);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let temp2 = s0.wrapping_add(maj);
@@ -2353,7 +2353,8 @@ mod tests {
 
     #[test]
     fn split_ident_line_parses_well_formed_ident() {
-        let f = split_ident_line(b"A U Thor <author@example.com> 1112911993 -0700").unwrap();
+        let f = split_ident_line(b"A U Thor <author@example.com> 1112911993 -0700")
+            .expect("well formed ident should parse");
         assert_eq!(f.name, b"A U Thor");
         assert_eq!(f.email, b"author@example.com");
         assert_eq!(f.date, Some(&b"1112911993"[..]));
@@ -2364,7 +2365,8 @@ mod tests {
     fn split_ident_line_recovers_broken_email() {
         // git inserts junk after the '>': email stops at the first '>', but the
         // timestamp is found by scanning back from the end for the last '>'.
-        let f = split_ident_line(b"A U Thor <author@example.com>-<> 1112911993 -0700").unwrap();
+        let f = split_ident_line(b"A U Thor <author@example.com>-<> 1112911993 -0700")
+            .expect("broken-email ident should parse");
         assert_eq!(f.name, b"A U Thor");
         assert_eq!(f.email, b"author@example.com");
         assert_eq!(f.date, Some(&b"1112911993"[..]));
@@ -2373,7 +2375,8 @@ mod tests {
 
     #[test]
     fn split_ident_line_non_numeric_date_is_person_only() {
-        let f = split_ident_line(b"A U Thor <author@example.com> totally_bogus -0700").unwrap();
+        let f = split_ident_line(b"A U Thor <author@example.com> totally_bogus -0700")
+            .expect("ident without numeric date should still parse person");
         assert_eq!(f.email, b"author@example.com");
         assert_eq!(f.date, None);
         assert_eq!(f.tz, None);
@@ -2382,11 +2385,13 @@ mod tests {
     #[test]
     fn split_ident_line_whitespace_date_is_person_only() {
         // Trailing spaces after '>' with no timestamp -> no date.
-        let f = split_ident_line(b"A U Thor <author@example.com>    ").unwrap();
+        let f = split_ident_line(b"A U Thor <author@example.com>    ")
+            .expect("ident with trailing whitespace should parse person");
         assert_eq!(f.date, None);
         // A vertical tab is NOT git-isspace, so it stops the space-skip and the
         // (non-digit) VT yields no date either.
-        let f = split_ident_line(b"A U Thor <author@example.com>   \x0b").unwrap();
+        let f = split_ident_line(b"A U Thor <author@example.com>   \x0b")
+            .expect("ident with non-git-whitespace suffix should parse person");
         assert_eq!(f.date, None);
     }
 

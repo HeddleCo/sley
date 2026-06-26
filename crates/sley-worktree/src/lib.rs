@@ -1269,7 +1269,10 @@ mod tests {
         let path = b"src/nested/file.txt";
         let full = standard_attributes_for_path(&root, path, &filter_attribute_names(), false)
             .expect("test operation should succeed");
-        assert_eq!(filter_attribute_checks(&root, path).unwrap(), full);
+        assert_eq!(
+            filter_attribute_checks(&root, path).expect("attribute checks should load"),
+            full
+        );
 
         fs::remove_dir_all(root).expect("test operation should succeed");
     }

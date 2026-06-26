@@ -237,7 +237,11 @@ fn real_pathdup(path: &Path) -> Option<PathBuf> {
             // A relative path whose first component doesn't exist: anchor it at
             // the lexical absolutization of the cwd.
             let base = std::env::current_dir().ok()?;
-            return Some(append_tail(lexical_normalize(&base.join(path)), &tail, false));
+            return Some(append_tail(
+                lexical_normalize(&base.join(path)),
+                &tail,
+                false,
+            ));
         }
         if let Ok(resolved) = std::fs::canonicalize(parent) {
             return Some(append_tail(resolved, &tail, true));

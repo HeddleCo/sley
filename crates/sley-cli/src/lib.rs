@@ -3853,7 +3853,11 @@ fn write_diff_numstat_materialized_entry(
         write_diff_numstat_counts(stdout, stats)?;
         if let Some(old_path) = &entry.old_path {
             // Renames/copies print the brace-collapsed form, like the stat rows.
-            writeln!(stdout, "{}", diff_stat_pprint_rename(old_path, &entry.path, true))?;
+            writeln!(
+                stdout,
+                "{}",
+                diff_stat_pprint_rename(old_path, &entry.path, true)
+            )?;
         } else {
             let path = status_quote_path(&entry.path, false);
             writeln!(stdout, "{path}")?;
@@ -11743,7 +11747,10 @@ fn discover_git_dir_by_walk(start: impl AsRef<Path>) -> Result<PathBuf> {
         }
         let dot_git = candidate.join(".git");
         match probe_dot_git(&dot_git)? {
-            DotGitProbe::Repo { git_dir, via_gitfile } => {
+            DotGitProbe::Repo {
+                git_dir,
+                via_gitfile,
+            } => {
                 let gitfile = via_gitfile.then(|| dot_git.as_path());
                 ownership::ensure_valid_ownership(Some(candidate), &git_dir, gitfile)?;
                 return Ok(git_dir);
@@ -11782,9 +11789,7 @@ fn probe_dot_git(dot_git: &Path) -> Result<DotGitProbe> {
         Ok(metadata) => metadata,
         Err(err) => {
             // ENOENT / ENOTDIR: no `.git` here (git's READ_GITFILE_ERR_MISSING).
-            if err.kind() == io::ErrorKind::NotFound
-                || err.raw_os_error() == Some(libc_enotdir())
-            {
+            if err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(libc_enotdir()) {
                 return Ok(DotGitProbe::Continue);
             }
             return Err(invalid_gitfile_error(&format!(

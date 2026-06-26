@@ -18,7 +18,10 @@ fn expand_tag_bundle(arg: &str) -> Option<Vec<String>> {
     const BOOL_FLAGS: &[u8] = b"asfdveil";
     const VALUE_FLAGS: &[u8] = b"muF";
     let bytes = arg.as_bytes();
-    if !arg.starts_with('-') || arg.starts_with("--") || bytes.len() < 2 || !BOOL_FLAGS.contains(&bytes[1])
+    if !arg.starts_with('-')
+        || arg.starts_with("--")
+        || bytes.len() < 2
+        || !BOOL_FLAGS.contains(&bytes[1])
     {
         return None;
     }
@@ -3389,12 +3392,15 @@ mod tests {
         // never split, because its first byte is not a boolean short flag or the
         // bundle reaches a non-flag byte.
         assert_eq!(expand_tag_bundle("-objectname"), None);
-        assert_eq!(expand_tag_bundle("-authoremail"), Some(
-            // 'a' then 'u' (value flag) — split is fine here in isolation; the
-            // parse loop only consults this in option position, never on a
-            // consumed `--sort` value.
-            vec!["-a".to_string(), "-uthoremail".to_string()]
-        ));
+        assert_eq!(
+            expand_tag_bundle("-authoremail"),
+            Some(
+                // 'a' then 'u' (value flag) — split is fine here in isolation; the
+                // parse loop only consults this in option position, never on a
+                // consumed `--sort` value.
+                vec!["-a".to_string(), "-uthoremail".to_string()]
+            )
+        );
         // Long options and glued value flags pass through.
         assert_eq!(expand_tag_bundle("--sort"), None);
         assert_eq!(expand_tag_bundle("-mhi"), None);

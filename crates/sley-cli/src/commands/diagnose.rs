@@ -135,18 +135,22 @@ fn create_diagnostics_archive(zip_path: &Path, mode: DiagnoseMode) -> Result<()>
     log.push_str(&disk_info(&cwd));
     print!("{log}");
     let _ = std::io::stdout().flush();
-    extras.files.push(virtual_file("diagnostics.log", log.into_bytes()));
+    extras
+        .files
+        .push(virtual_file("diagnostics.log", log.into_bytes()));
 
     // packs-local.txt: object-directory file sizes.
     let objects_dir = git_dir.join("objects");
-    extras
-        .files
-        .push(virtual_file("packs-local.txt", pack_stats(&objects_dir).into_bytes()));
+    extras.files.push(virtual_file(
+        "packs-local.txt",
+        pack_stats(&objects_dir).into_bytes(),
+    ));
 
     // objects-local.txt: loose-object counts per fan-out.
-    extras
-        .files
-        .push(virtual_file("objects-local.txt", loose_object_stats(&objects_dir).into_bytes()));
+    extras.files.push(virtual_file(
+        "objects-local.txt",
+        loose_object_stats(&objects_dir).into_bytes(),
+    ));
 
     // --mode=all: include the raw `.git` metadata directories.
     if mode == DiagnoseMode::All {
@@ -169,8 +173,14 @@ fn create_diagnostics_archive(zip_path: &Path, mode: DiagnoseMode) -> Result<()>
     let empty_tree = ObjectId::empty_tree(format);
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let config = load_diagnose_config(&git_dir);
-    let convert =
-        sley_archive::ArchiveConvert::from_tree(&worktree, &git_dir, &config, &db, format, &empty_tree)?;
+    let convert = sley_archive::ArchiveConvert::from_tree(
+        &worktree,
+        &git_dir,
+        &config,
+        &db,
+        format,
+        &empty_tree,
+    )?;
     let options = ZipArchiveOptions {
         prefix: Vec::new(),
         strip_prefix: Vec::new(),
@@ -187,7 +197,13 @@ fn create_diagnostics_archive(zip_path: &Path, mode: DiagnoseMode) -> Result<()>
         ))
     })?;
     sley_archive::write_zip_archive_full(
-        &mut file, &db, format, &empty_tree, options, &convert, &extras,
+        &mut file,
+        &db,
+        format,
+        &empty_tree,
+        options,
+        &convert,
+        &extras,
     )?;
 
     eprintln!();
@@ -245,7 +261,10 @@ fn pack_stats(objects_dir: &Path) -> String {
                 if !metadata.is_file() {
                     return None;
                 }
-                Some((entry.file_name().to_string_lossy().into_owned(), metadata.len()))
+                Some((
+                    entry.file_name().to_string_lossy().into_owned(),
+                    metadata.len(),
+                ))
             })
             .collect();
         files.sort();

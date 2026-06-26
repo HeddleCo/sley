@@ -668,8 +668,7 @@ fn show_object(
                 && let Some((_, path)) = name.split_once(':')
                 && let Some(driver) = context.userdiff.driver_for_path(path.as_bytes())?
                 && let Some(command) = driver.textconv.as_deref()
-                && let Some(converted) =
-                    commands::userdiff::run_textconv(command, &object.body)?
+                && let Some(converted) = commands::userdiff::run_textconv(command, &object.body)?
             {
                 stdout.write_all(&converted)?;
                 return Ok(());

@@ -5923,8 +5923,8 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
         }
         has_promisor_remote = repo_has_promisor_remote(&config);
     }
-    let db =
-        FileObjectDatabase::from_git_dir(&git_dir, format).with_promisor_remote_present(has_promisor_remote);
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format)
+        .with_promisor_remote_present(has_promisor_remote);
     // The ref-store consistency check shares the same severity table; clone it
     // before the object walk consumes `severity`.
     let refs_severity = severity.clone();

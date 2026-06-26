@@ -951,7 +951,7 @@ mod tests {
     #[test]
     fn fsck_accepts_connected_commit_graph() {
         let format = ObjectFormat::Sha1;
-        let mut db = ObjectDatabase::new(format);
+        let db = ObjectDatabase::new(format);
         let blob = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"payload\n".to_vec()))
             .expect("test operation should succeed");
@@ -990,7 +990,7 @@ mod tests {
     #[test]
     fn fsck_reports_missing_tree_link() {
         let format = ObjectFormat::Sha1;
-        let mut db = ObjectDatabase::new(format);
+        let db = ObjectDatabase::new(format);
         let missing_tree = ObjectId::from_hex(format, "1111111111111111111111111111111111111111")
             .expect("test operation should succeed");
         let commit = db
@@ -1024,7 +1024,7 @@ mod tests {
     #[test]
     fn fsck_reports_dangling_tips_without_failing() {
         let format = ObjectFormat::Sha1;
-        let mut db = ObjectDatabase::new(format);
+        let db = ObjectDatabase::new(format);
         let blob = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"lost\n".to_vec()))
             .expect("test operation should succeed");
@@ -1053,7 +1053,7 @@ mod tests {
     #[test]
     fn unreachable_tag_referent_is_not_checked_as_a_broken_link() {
         let format = ObjectFormat::Sha1;
-        let mut db = ObjectDatabase::new(format);
+        let db = ObjectDatabase::new(format);
         let missing_tag = ObjectId::from_hex(format, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
             .expect("test operation should succeed");
         let tag = db
@@ -1112,7 +1112,7 @@ tagger T A Gger <tagger@example.com> 1234567890 +0000\n\n"
     #[test]
     fn unreachable_nonfatal_tag_content_error_does_not_fail_fsck() {
         let format = ObjectFormat::Sha1;
-        let mut db = ObjectDatabase::new(format);
+        let db = ObjectDatabase::new(format);
         let target = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"x".to_vec()))
             .expect("test operation should succeed");
@@ -1157,7 +1157,7 @@ tagger T A Gger <\n\
     #[test]
     fn fsck_unreachable_reports_all_unreachable_objects() {
         let format = ObjectFormat::Sha1;
-        let mut db = ObjectDatabase::new(format);
+        let db = ObjectDatabase::new(format);
         let blob = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"lost\n".to_vec()))
             .expect("test operation should succeed");

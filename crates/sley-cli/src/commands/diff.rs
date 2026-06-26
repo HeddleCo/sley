@@ -1639,12 +1639,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     {
         // Plumbing `git diff` is strict: a `--rotate-to`/`--skip-to` naming no
         // diffed path is fatal (builtin/diff.c sets `rotate_to_strict`).
-        commands::diff_order::rotate_entries(
-            &mut entries,
-            target.as_bytes(),
-            rotate_skip,
-            true,
-        )?;
+        commands::diff_order::rotate_entries(&mut entries, target.as_bytes(), rotate_skip, true)?;
     }
     let has_differences = !entries.is_empty();
     // `--check`: report whitespace errors introduced by the new side, in place

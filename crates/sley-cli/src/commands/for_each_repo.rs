@@ -167,7 +167,9 @@ fn read_repo_paths(key: &str) -> Result<ConfigOutcome> {
     let common_git_dir = git_dir
         .as_ref()
         .and_then(|dir| common_git_dir_for_git_dir(dir).ok());
-    let branch = git_dir.as_ref().and_then(|dir| repo_current_branch_name(dir));
+    let branch = git_dir
+        .as_ref()
+        .and_then(|dir| repo_current_branch_name(dir));
     let context = ConfigIncludeContext::new(common_git_dir.clone(), branch);
 
     let mut config = sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)
@@ -199,14 +201,22 @@ fn read_repo_paths(key: &str) -> Result<ConfigOutcome> {
 /// parts. The section is everything before the first dot, the variable
 /// everything after the last dot, and any text between is the subsection.
 fn split_canonical_key(canonical: &str) -> (&str, Option<String>, &str) {
-    let first = canonical.find('.').expect("canonical key has a section dot");
-    let last = canonical.rfind('.').expect("canonical key has a variable dot");
+    let first = canonical
+        .find('.')
+        .expect("canonical key has a section dot");
+    let last = canonical
+        .rfind('.')
+        .expect("canonical key has a variable dot");
     let section = &canonical[..first];
     let variable = &canonical[last + 1..];
     if first == last {
         (section, None, variable)
     } else {
-        (section, Some(canonical[first + 1..last].to_string()), variable)
+        (
+            section,
+            Some(canonical[first + 1..last].to_string()),
+            variable,
+        )
     }
 }
 

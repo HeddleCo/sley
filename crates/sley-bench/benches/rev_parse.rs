@@ -57,7 +57,10 @@ fn rev_parse_oid_resolve(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("sley_cli", count), &input, |b, input| {
             b.iter(|| {
                 let mut args = vec!["rev-parse".to_string()];
-                for line in std::str::from_utf8(input).unwrap().lines() {
+                for line in std::str::from_utf8(input)
+                    .expect("benchmark input should be UTF-8")
+                    .lines()
+                {
                     args.push(line.to_string());
                 }
                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -76,7 +79,10 @@ fn rev_parse_oid_resolve(c: &mut Criterion) {
                 let db = fixture.database();
                 b.iter(|| {
                     let mut resolved = 0usize;
-                    for line in std::str::from_utf8(input).unwrap().lines() {
+                    for line in std::str::from_utf8(input)
+                        .expect("benchmark input should be UTF-8")
+                        .lines()
+                    {
                         match db.resolve_prefix(black_box(line)) {
                             Ok(ObjectPrefixResolution::Unique(_)) => resolved += 1,
                             Ok(ObjectPrefixResolution::Ambiguous(_)) => {

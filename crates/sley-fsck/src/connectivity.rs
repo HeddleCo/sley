@@ -1026,7 +1026,7 @@ mod tests {
     /// A malformed commit body is reported as corrupt with git's wording.
     #[test]
     fn connectivity_reports_corrupt_commit_parse() {
-        let mut db = ObjectDatabase::new(fmt());
+        let db = ObjectDatabase::new(fmt());
         let bad = db
             .write_object(EncodedObject::new(
                 ObjectType::Commit,

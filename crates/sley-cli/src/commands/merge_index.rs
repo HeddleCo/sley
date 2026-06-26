@@ -9,10 +9,10 @@
 //! it works without an external `git-core` exec dir; any other program is run as
 //! a real child process.
 
-use crate::*;
 use crate::commands::merge_rebase::{
     merge_index_entry, merge_read_blob, merge_write_worktree_file, read_worktree_index,
 };
+use crate::*;
 use std::os::unix::ffi::OsStrExt;
 
 /// The repository-relative path bytes of an index entry.
@@ -91,9 +91,7 @@ pub(crate) fn cmd_merge_index(args: &[String]) -> Result<()> {
 
     let mut errors = 0u32;
     for path in &paths {
-        if !run_merge_program(
-            &program, &db, &git_dir, format, &mut index, path, quiet,
-        )? {
+        if !run_merge_program(&program, &db, &git_dir, format, &mut index, path, quiet)? {
             errors += 1;
             if !one_shot {
                 if !quiet {
@@ -205,9 +203,7 @@ fn merge_one_file(
             if our_oid == their_oid =>
         {
             if our_mode != their_mode {
-                eprintln!(
-                    "ERROR: File {path_str} added identically in both branches,"
-                );
+                eprintln!("ERROR: File {path_str} added identically in both branches,");
                 eprintln!("ERROR: but permissions conflict {our_mode:o}->{their_mode:o}.");
                 return Ok(false);
             }
@@ -322,7 +318,11 @@ fn sort_index_entries(index: &mut sley_index::Index) {
     });
 }
 
-fn write_merge_index(git_dir: &Path, format: ObjectFormat, index: &sley_index::Index) -> Result<()> {
+fn write_merge_index(
+    git_dir: &Path,
+    format: ObjectFormat,
+    index: &sley_index::Index,
+) -> Result<()> {
     let bytes = index.write(format)?;
     let index_path = sley_worktree::repository_index_path(git_dir);
     fs::write(index_path, bytes)?;
@@ -335,11 +335,12 @@ fn run_external_merge_program(
     stages: &MergeIndexStages,
     quiet: bool,
 ) -> Result<bool> {
-    let hex = |stage: Option<(u32, ObjectId)>| {
-        stage.map(|(_, oid)| oid.to_hex()).unwrap_or_default()
-    };
+    let hex =
+        |stage: Option<(u32, ObjectId)>| stage.map(|(_, oid)| oid.to_hex()).unwrap_or_default();
     let mode = |stage: Option<(u32, ObjectId)>| {
-        stage.map(|(mode, _)| format!("{mode:o}")).unwrap_or_default()
+        stage
+            .map(|(mode, _)| format!("{mode:o}"))
+            .unwrap_or_default()
     };
     let mut command = std::process::Command::new(program);
     command

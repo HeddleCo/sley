@@ -6,8 +6,8 @@
 //! engine backs `git fsck --references`.
 
 use crate::*;
-use sley_fsck::content::{MsgId, Severity};
 use sley_fsck::SeverityConfig;
+use sley_fsck::content::{MsgId, Severity};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -306,8 +306,11 @@ fn files_fsck_refs_content(
     is_symlink: bool,
 ) -> bool {
     if is_symlink {
-        let mut had_error =
-            opts.report(refname, MsgId::SymlinkRef, "use deprecated symbolic link for symref");
+        let mut had_error = opts.report(
+            refname,
+            MsgId::SymlinkRef,
+            "use deprecated symbolic link for symref",
+        );
         let referent = resolve_symlink_referent(common_dir, path);
         had_error |= files_fsck_symref_target(opts, refname, &referent, true);
         return had_error;
@@ -321,9 +324,7 @@ fn files_fsck_refs_content(
     };
 
     match parse_loose_ref_contents(format, &content) {
-        LooseRef::Symref(referent) => {
-            files_fsck_symref_target(opts, refname, &referent, false)
-        }
+        LooseRef::Symref(referent) => files_fsck_symref_target(opts, refname, &referent, false),
         LooseRef::Broken => {
             let trimmed = String::from_utf8_lossy(&content);
             let trimmed = trimmed.trim_end_matches(is_c_space);
@@ -664,10 +665,7 @@ fn packed_fsck_peeled_line(
         return opts.report(
             &path,
             MsgId::BadPackedRefEntry,
-            &format!(
-                "'{}' has invalid peeled oid",
-                String::from_utf8_lossy(rest)
-            ),
+            &format!("'{}' has invalid peeled oid", String::from_utf8_lossy(rest)),
         );
     }
     if rest.len() != hexsz {
@@ -839,7 +837,11 @@ fn reftable_fsck_symrefs(opts: &RefsVerifyOptions, git_dir: &Path, format: Objec
 
 /// Run the files-backend verify across every worktree. Returns whether any
 /// error (not warning) was emitted.
-pub(crate) fn verify_files(opts: &RefsVerifyOptions, format: ObjectFormat, common_dir: &Path) -> bool {
+pub(crate) fn verify_files(
+    opts: &RefsVerifyOptions,
+    format: ObjectFormat,
+    common_dir: &Path,
+) -> bool {
     let mut had_error = false;
     if opts.verbose {
         eprintln!("Checking references consistency");

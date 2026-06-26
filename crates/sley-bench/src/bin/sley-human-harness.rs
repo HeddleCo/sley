@@ -311,7 +311,7 @@ fn repository_auto_abbrev_width(git_dir: &Path, format: ObjectFormat) -> Result<
         return Ok(7.min(format.hex_len()));
     }
     let bits = u64::BITS as usize - object_count.saturating_sub(1).leading_zeros() as usize;
-    Ok(((bits + 1) / 2).max(7).min(format.hex_len()))
+    Ok(bits.div_ceil(2).max(7).min(format.hex_len()))
 }
 
 fn repository_approx_object_count(git_dir: &Path, _format: ObjectFormat) -> Result<u64, GitError> {

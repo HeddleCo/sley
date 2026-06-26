@@ -235,7 +235,13 @@ mod tests {
             Some("file".into()),
             vec![ConfigEntry::new("allow", Some("user".into()))],
         ));
-        assert!(is_transport_allowed("file", Some(&cfg), Some(true)).unwrap());
-        assert!(!is_transport_allowed("file", Some(&cfg), Some(false)).unwrap());
+        assert!(
+            is_transport_allowed("file", Some(&cfg), Some(true))
+                .expect("file transport should evaluate user-allowed policy")
+        );
+        assert!(
+            !is_transport_allowed("file", Some(&cfg), Some(false))
+                .expect("file transport should evaluate user-denied policy")
+        );
     }
 }
