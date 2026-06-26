@@ -456,7 +456,8 @@ declare -A FLOOR=(
     # readdir + checkout-- stat-refresh SCOPED to the call site (R4: reset's tree-sourced entries
     # stay zero-stat so `reset --mixed --no-refresh` is unaffected). Now DETERMINISTIC at 29
     # (stable 8x+). The flake was diff-files comparing raw vs clean-filtered bytes + stale cached stat.
-    [t0020-crlf.sh]=34
+    # 2026-06-26: oscillates 33/34 across isolated runs; W52 raised it to a flaky-high 34. Floor at stable-low 33.
+    [t0020-crlf.sh]=33
     # wave-2 (2026-06-21): clean/smudge filter-process + ident + eol/encoding conversion ordering 21->33.
     [t0021-conversion.sh]=33
     [t3920-crlf-messages.sh]=12
@@ -627,7 +628,8 @@ declare -A FLOOR=(
     # (symlink<->file type-change race, independent of any wave — flips on a pristine
     # origin/main binary). Floor lowered 83->82 (safe lower bound) — banking 83 from a
     # gitlink-rm-wave flaky read silently reddened the gate. Same class as t0020 27/28.
-    [t3903-stash.sh]=133
+    # 2026-06-26: still oscillates 132/133 isolated (tasks #22/#28). Floor at stable-low 132.
+    [t3903-stash.sh]=132
     [t3900-i18n-commit.sh]=38
     [t4209-log-pickaxe.sh]=45
     # codex-wave-3 (2026-06-17): merge --no-edit/--edit accepted + merge cleans up renamed-away source;
