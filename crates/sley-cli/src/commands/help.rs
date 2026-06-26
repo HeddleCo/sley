@@ -70,6 +70,7 @@ pub(crate) const BUILTIN_COMMANDS: &[&str] = &[
     "merge",
     "merge-base",
     "merge-file",
+    "merge-index",
     "merge-recursive",
     "merge-tree",
     "mergetool",
