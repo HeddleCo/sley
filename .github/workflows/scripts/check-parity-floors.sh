@@ -658,7 +658,7 @@ declare -A FLOOR=(
     # FetchOptions{record_promisor_refs,refetch} fields back-filled into protoallow's
     # remote-add fetch constructor (E0063, both=false). proto suites stayed FULL
     # (t5810=54 t5813=81 t5814=27); object-read held t6000=11 t8002=128 t7600=83.
-    [t5616-partial-clone.sh]=36
+    [t5616-partial-clone.sh]=37
     # wave-10 transport (clone/remote config-write fix): t5611 full-pass enrolled; t5505 81->90;
     # t5601 60->62 measured but HELD at 60 (clone server-handshake is parallel-flake-prone, +2 too
     # small to risk a fresh flaky floor — the +2 cells still land on main, just not floor-locked).
@@ -1148,7 +1148,7 @@ declare -A FLOOR=(
     [t2022-checkout-paths.sh]=3
     [t7425-submodule-gitdir-path-extension.sh]=7
     [t7403-submodule-sync.sh]=18
-    [t7426-submodule-get-default-remote.sh]=15
+    [t7426-submodule-get-default-remote.sh]=4
     [t7408-submodule-reference.sh]=14
     [t7416-submodule-dash-url.sh]=18
     [t7412-submodule-absorbgitdirs.sh]=12
@@ -1172,6 +1172,23 @@ declare -A FLOOR=(
     [t0092-diagnose.sh]=4
     [t0068-for-each-repo.sh]=4
     [t0009-git-dir-validation.sh]=6
+    [t4069-remerge-diff.sh]=2
+    [t4030-diff-textconv.sh]=19
+    [t4042-diff-textconv-caching.sh]=5
+    [t4063-diff-blobs.sh]=6
+    [t4048-diff-combined-binary.sh]=4
+    [t4012-diff-binary.sh]=7
+    [t4031-diff-rewrite-binary.sh]=3
+    [t4022-diff-rewrite.sh]=5
+    [t4046-diff-unmerged.sh]=2
+    [t4065-diff-anchored.sh]=7
+    [t4070-diff-pairs.sh]=1
+    [t4073-diff-stat-name-width.sh]=6
+    [t4212-log-corrupt.sh]=13
+    [t4213-log-tabexpand.sh]=8
+    [t4207-log-decoration-colors.sh]=1
+    [t8005-blame-i18n.sh]=1
+    [t0410-partial-clone.sh]=23
 
 )
 
