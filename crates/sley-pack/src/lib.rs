@@ -2449,8 +2449,7 @@ where
     INFLATE.with(|cell| {
         let mut decompress = cell.borrow_mut();
         decompress.reset(true);
-        let mut out = Vec::new();
-        out.reserve(bounded_inflate_reserve(size_hint, STREAM_INFLATE_CHUNK));
+        let mut out = Vec::with_capacity(bounded_inflate_reserve(size_hint, STREAM_INFLATE_CHUNK));
         let mut compressed_total = 0usize;
         let mut input = [0u8; STREAM_INFLATE_CHUNK];
         loop {
