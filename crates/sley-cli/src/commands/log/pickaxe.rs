@@ -261,6 +261,7 @@ pub(super) fn pickaxe_commit_matches(
     text: bool,
     detect_renames: bool,
     pathspec: Option<&DiffPathspec>,
+    userdiff: Option<&crate::commands::userdiff::UserdiffResolver>,
 ) -> Result<bool> {
     let parents = &record.commit.parents;
     let parent_tree = match parents.first() {
@@ -311,12 +312,25 @@ pub(super) fn pickaxe_commit_matches(
     }
     let skips_binary = pickaxe.skips_binary() && !text;
     for entry in &entries {
+        // Each side uses its own path for textconv driver lookup (the old side
+        // carries the pre-rename name).
+        let old_path = entry.old_path.as_deref().unwrap_or(&entry.path);
         let old = match entry.old_oid.as_ref() {
-            Some(oid) => Some(pickaxe_read_blob(db, oid)?),
+            Some(oid) => Some(pickaxe_textconv_side(
+                userdiff,
+                old_path,
+                entry.old_mode,
+                pickaxe_read_blob(db, oid)?,
+            )?),
             None => None,
         };
         let new = match entry.new_oid.as_ref() {
-            Some(oid) => Some(pickaxe_read_blob(db, oid)?),
+            Some(oid) => Some(pickaxe_textconv_side(
+                userdiff,
+                &entry.path,
+                entry.new_mode,
+                pickaxe_read_blob(db, oid)?,
+            )?),
             None => None,
         };
         // -G skips a filepair where either side is binary (unless --text).
@@ -382,6 +396,32 @@ fn pickaxe_entry_matches(
 fn pickaxe_read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
     let object = db.read_object(oid)?;
     Ok(object.body.to_vec())
+}
+
+/// Pickaxe matches against the textconv'd representation of each side, mirroring
+/// git's `diffcore_pickaxe` → `fill_textconv`: a regular-file blob whose diff
+/// driver defines `diff.<d>.textconv` is converted before -S/-G matching. With
+/// no resolver, a non-regular-file side, a driver lacking textconv, or a failed
+/// helper, the raw bytes are used unchanged.
+fn pickaxe_textconv_side(
+    userdiff: Option<&crate::commands::userdiff::UserdiffResolver>,
+    path: &[u8],
+    mode: Option<u32>,
+    raw: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let Some(resolver) = userdiff else {
+        return Ok(raw);
+    };
+    if !matches!(mode, Some(m) if (m & 0o170000) == 0o100000) {
+        return Ok(raw);
+    }
+    let Some(driver) = resolver.driver_for_path(path)? else {
+        return Ok(raw);
+    };
+    let Some(command) = driver.textconv.as_deref() else {
+        return Ok(raw);
+    };
+    Ok(crate::commands::userdiff::run_textconv(command, &raw)?.unwrap_or(raw))
 }
 
 /// git's `buffer_is_binary`: a NUL byte in the first 8000 bytes.

@@ -903,6 +903,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         color_moved_ws,
         diff_algorithm_control,
         diff_algorithm,
+        anchored,
         diff_driver_control,
         diff_hunk_control,
         interhunk,
@@ -1050,11 +1051,18 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 // is resolved below for the in-repo path, so here we fall back
                 // to git's enabled-by-default behavior absent an explicit flag.
                 indent_heuristic: indent_heuristic.unwrap_or(true),
+                anchored: &anchored,
             },
         );
     }
     let git_dir = discover_git_dir(&cwd)?;
     let repo_config = read_repo_config(&git_dir).ok();
+    // git's `quote_path_fully` (`core.quotePath`, default true): drives whether
+    // non-ASCII bytes in diffstat names are octal-escaped or shown verbatim.
+    let quote_path_fully = repo_config
+        .as_ref()
+        .and_then(|config| config.get_bool("core", None, "quotepath"))
+        .unwrap_or(true);
     let format = repository_object_format(&git_dir)?;
     if let Ok(config) = read_repo_config(&git_dir) {
         if let Some(value) = config.get("diff", None, "colormoved")
@@ -1843,6 +1851,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                             compact_summary,
                             stat_count,
                             color: color_always,
+                            quote_path_fully,
                         },
                         widths: Some(resolved_stat_widths),
                     },
@@ -1934,6 +1943,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         ignore_regexes: &ignore_regexes,
                         line_ranges: None,
                         indent_heuristic,
+                        anchors: &anchored,
+                        allow_textconv: true,
                     };
                     write_diff_patch_entry(stdout, entry, options)
                 },
@@ -1965,6 +1976,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                             compact_summary,
                             stat_count,
                             color: color_always,
+                            quote_path_fully,
                         },
                         widths: Some(resolved_stat_widths),
                     },
@@ -2681,6 +2693,7 @@ struct DiffNoIndexParams<'a> {
     ignore_blank_lines: bool,
     ignore_regexes: &'a [sley_grep::Regex],
     indent_heuristic: bool,
+    anchored: &'a [Vec<u8>],
 }
 
 struct NoIndexSide {
@@ -2829,6 +2842,8 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
         for entry in &entries {
             let options = DiffRenderOptions {
                 binary: false,
+                anchors: params.anchored,
+                allow_textconv: true,
                 db: &db,
                 worktree_root: None,
                 use_worktree_new: false,

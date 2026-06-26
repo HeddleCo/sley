@@ -1917,6 +1917,7 @@ fn bisect_show_commit(repo: &BisectRepo, oid: &ObjectId, out: &mut dyn Write) ->
             compact_summary: false,
             stat_count: None,
             color: false,
+            quote_path_fully: true,
         },
     )?;
     // `--summary`: creation/deletion/mode lines after the stat.

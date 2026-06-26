@@ -3724,6 +3724,8 @@ fn format_patch_diff_options<'a>(
 ) -> crate::DiffRenderOptions<'a> {
     crate::DiffRenderOptions {
         binary: false,
+        anchors: &[],
+        allow_textconv: false,
         db,
         worktree_root: None,
         use_worktree_new: false,
@@ -3830,6 +3832,7 @@ fn write_patch_diffstat(
             compact_summary: false,
             stat_count: options.stat_count,
             color: false,
+            quote_path_fully: true,
         },
         widths,
     )

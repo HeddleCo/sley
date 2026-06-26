@@ -231,6 +231,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                 pickaxe_text,
                 pickaxe_detect_renames,
                 None,
+                None,
             )?,
             None => false,
         };
@@ -424,6 +425,8 @@ fn render_line_log_patch(
             &entry,
             crate::DiffRenderOptions {
                 binary: false,
+                anchors: &[],
+                allow_textconv: false,
                 db,
                 worktree_root: None,
                 use_worktree_new: false,

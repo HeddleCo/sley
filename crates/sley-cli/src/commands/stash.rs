@@ -3093,6 +3093,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                         compact_summary,
                         stat_count: None,
                         color: false,
+                        quote_path_fully: true,
                     },
                 )?;
                 wrote_prefix_output |= !entries.is_empty();
@@ -3114,6 +3115,8 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 for entry in &entries {
                     let options = DiffRenderOptions {
                         binary: false,
+                        anchors: &[],
+                        allow_textconv: false,
                         db: &db,
                         worktree_root: None,
                         use_worktree_new: false,
@@ -4226,6 +4229,8 @@ fn write_stash_list_patch(
     for entry in &entries {
         let options = DiffRenderOptions {
             binary: false,
+            anchors: &[],
+            allow_textconv: false,
             db,
             worktree_root: None,
             use_worktree_new: false,

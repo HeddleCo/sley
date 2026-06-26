@@ -4537,13 +4537,13 @@ fn write_apply_summary_entry(
 ) -> Result<()> {
     if patch.is_rename {
         if let (Some(old_path), Some(new_path)) = (&patch.old_path, &patch.new_path) {
-            let path = diff_stat_pprint_rename(old_path, new_path);
+            let path = diff_stat_pprint_rename(old_path, new_path, true);
             let score = patch.similarity.unwrap_or(100);
             writeln!(stdout, " rename {path} ({score}%)")?;
         }
     } else if patch.is_copy {
         if let (Some(old_path), Some(new_path)) = (&patch.old_path, &patch.new_path) {
-            let path = diff_stat_pprint_rename(old_path, new_path);
+            let path = diff_stat_pprint_rename(old_path, new_path, true);
             let score = patch.similarity.unwrap_or(100);
             writeln!(stdout, " copy {path} ({score}%)")?;
         }

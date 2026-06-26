@@ -771,6 +771,7 @@ fn render_diff_files_entries(
                     compact_summary: o.compact_summary,
                     stat_count: o.stat_count,
                     color: false,
+                    quote_path_fully: true,
                 },
                 widths: None,
             },
@@ -781,6 +782,8 @@ fn render_diff_files_entries(
         |stdout, entry| {
             let patch_options = DiffRenderOptions {
                 binary: false,
+                anchors: &[],
+                allow_textconv: false,
                 db: context.db,
                 worktree_root,
                 use_worktree_new,

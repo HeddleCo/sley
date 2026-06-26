@@ -1939,6 +1939,7 @@ fn print_rebase_diffstat(
             compact_summary: false,
             stat_count: None,
             color: false,
+            quote_path_fully: true,
         },
     )?;
     // The "Changes from … to …" start diffstat sets

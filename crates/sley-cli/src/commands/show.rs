@@ -150,6 +150,12 @@ struct ShowOptions {
     ws_ignore: sley_diff_merge::WsIgnore,
     /// The line-diff algorithm (`--patience` / `--histogram` / Myers default).
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
+    /// `--anchored=<text>` prefixes (patience anchors); cleared by `--patience`.
+    anchored: Vec<Vec<u8>>,
+    /// `--textconv` / `--no-textconv`: `Some(true)`/`Some(false)` force or
+    /// suppress `diff.<d>.textconv` (for both the commit diff and a directly
+    /// shown blob); `None` (default) leaves textconv on for the diff path.
+    textconv: Option<bool>,
     /// `--ignore-blank-lines`.
     ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
@@ -181,6 +187,8 @@ struct ShowContext<'a> {
     format: ObjectFormat,
     config: &'a GitConfig,
     options: &'a ShowOptions,
+    /// Resolves `diff.<d>.textconv` for `git show --textconv <rev>:<path>`.
+    userdiff: &'a commands::userdiff::UserdiffResolver,
     decorations: &'a HashMap<ObjectId, Vec<String>>,
     diff_pathspec: Option<&'a DiffPathspec>,
     mailmap: RefCell<Option<commands::utility::Mailmap>>,
@@ -287,6 +295,8 @@ impl Default for ShowOptions {
             show_root: None,
             ws_ignore: sley_diff_merge::WsIgnore::default(),
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+            anchored: Vec::new(),
+            textconv: None,
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
             word_diff_mode: None,
@@ -479,12 +489,21 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         profile_start,
         &mut profile_last,
     );
+    let show_userdiff_attributes = worktree_root_for_git_dir(git_dir)
+        .ok()
+        .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+        .transpose()?;
+    let show_userdiff = commands::userdiff::UserdiffResolver::with_attributes(
+        show_userdiff_attributes,
+        Some(config.clone()),
+    );
     let context = ShowContext {
         git_dir,
         db,
         format,
         config,
         options: &options,
+        userdiff: &show_userdiff,
         decorations: &decorations,
         diff_pathspec: diff_pathspec.as_ref(),
         mailmap: RefCell::new(None),
@@ -623,6 +642,20 @@ fn show_object(
         }
         ObjectType::Tree => show_tree(stdout, context.format, name, &object.body),
         ObjectType::Blob => {
+            // `git show --textconv <rev>:<path>` runs the path's textconv driver
+            // over the blob (git's `cmd_show` textconv path); the path comes from
+            // the `<rev>:<path>` argument, so a bare-oid blob has none. Without
+            // `--textconv` (or with `--no-textconv`) the blob is emitted verbatim.
+            if context.options.textconv == Some(true)
+                && let Some((_, path)) = name.split_once(':')
+                && let Some(driver) = context.userdiff.driver_for_path(path.as_bytes())?
+                && let Some(command) = driver.textconv.as_deref()
+                && let Some(converted) =
+                    commands::userdiff::run_textconv(command, &object.body)?
+            {
+                stdout.write_all(&converted)?;
+                return Ok(());
+            }
             stdout.write_all(&object.body)?;
             Ok(())
         }
@@ -1223,6 +1256,7 @@ fn write_merge_stat(
                 compact_summary: options.compact_summary,
                 stat_count: options.stat_count,
                 color,
+                quote_path_fully: true,
             },
             stat_widths,
         )?;
@@ -1511,6 +1545,7 @@ fn write_commit_diff_patch(
                         compact_summary: options.compact_summary,
                         stat_count: options.stat_count,
                         color,
+                        quote_path_fully: true,
                     },
                     widths: Some(stat_widths),
                 },
@@ -1521,6 +1556,8 @@ fn write_commit_diff_patch(
             |stdout, entry| {
                 let patch_options = DiffRenderOptions {
                     binary: false,
+                    anchors: &options.anchored,
+                    allow_textconv: options.textconv != Some(false),
                     db,
                     worktree_root: None,
                     use_worktree_new: false,
@@ -1578,6 +1615,7 @@ fn write_commit_diff_patch(
                         compact_summary: options.compact_summary,
                         stat_count: options.stat_count,
                         color,
+                        quote_path_fully: true,
                     },
                     widths: Some(stat_widths),
                 },
@@ -1888,8 +1926,17 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             // These influence rendering details sley does not yet model; accept
             // them so common invocations parse, matching how cmd_log treats them.
             "--minimal" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Minimal,
-            "--patience" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience,
+            "--patience" => {
+                options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience;
+                options.anchored.clear();
+            }
             "--histogram" => options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Histogram,
+            "--textconv" => options.textconv = Some(true),
+            "--no-textconv" => options.textconv = Some(false),
+            value if let Some(text) = value.strip_prefix("--anchored=") => {
+                options.diff_algorithm = sley_diff_merge::DiffAlgorithm::Patience;
+                options.anchored.push(text.as_bytes().to_vec());
+            }
             "--ignore-all-space" | "-w" => options.ws_ignore.all_space = true,
             "--ignore-space-change" | "-b" => options.ws_ignore.space_change = true,
             "--ignore-space-at-eol" => options.ws_ignore.space_at_eol = true,
@@ -1962,8 +2009,6 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             | "-a"
             | "--no-ext-diff"
             | "--ext-diff"
-            | "--no-textconv"
-            | "--textconv"
             | "--color-moved"
             | "--no-color-moved"
             | "--color-moved-ws"

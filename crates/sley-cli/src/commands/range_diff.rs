@@ -554,6 +554,8 @@ fn build_patch_text(
             entry,
             DiffRenderOptions {
                 binary: false,
+                anchors: &[],
+                allow_textconv: false,
                 db,
                 worktree_root: None,
                 use_worktree_new: false,

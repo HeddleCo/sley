@@ -2194,6 +2194,16 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     } else {
         None
     };
+    // Userdiff resolver for the `-p` patch path (textconv / binary / funcname
+    // drivers). Built once for the repo and shared across every rendered commit.
+    let log_userdiff_attributes = worktree_root_for_git_dir(&git_dir)
+        .ok()
+        .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+        .transpose()?;
+    let log_userdiff = commands::userdiff::UserdiffResolver::with_attributes(
+        log_userdiff_attributes,
+        Some(config.clone()),
+    );
     // Per-commit diff rendering context (only consulted when a diff-output
     // option was given).
     let log_diff = if diff_opts.any() || diff_opts.merges_imply_patch {
@@ -2215,6 +2225,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             db: &db,
             format,
             config: &config,
+            userdiff: &log_userdiff,
             opts: &diff_opts,
             merges: diff_opts.merges.unwrap_or(if first_parent {
                 LogDiffMerges::FirstParent
@@ -2797,6 +2808,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 pickaxe_text,
                 pickaxe_detect_renames,
                 pickaxe_pathspec.as_ref(),
+                Some(&log_userdiff),
             )? {
                 kept.push(record);
             }
