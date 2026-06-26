@@ -8,10 +8,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-config = { path = "../sley-config", version = "0.2.0" }
-sley-core = { path = "../sley-core", version = "0.2.0" }
-sley-diff-merge = { path = "../sley-diff-merge", version = "0.2.0" }
-sley-grep = { path = "../sley-grep", version = "0.2.0" }
+sley-config = { path = "../sley-config", version = "0.3.0" }
+sley-core = { path = "../sley-core", version = "0.3.0" }
+sley-diff-merge = { path = "../sley-diff-merge", version = "0.3.0" }
+sley-grep = { path = "../sley-grep", version = "0.3.0" }
 
 [lints]
 workspace = true
