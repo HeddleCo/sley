@@ -18,7 +18,7 @@ use sley_pack::{
     PackStreamIndexBuild, PackWrite, PackWriteOptions, PackWriteSummary,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -154,6 +154,25 @@ pub struct RawPackIndexedObject {
     pub offset: u64,
 }
 
+struct PackInstallTeeReader<'a, R, W> {
+    reader: &'a mut R,
+    writer: &'a mut W,
+}
+
+impl<R, W> Read for PackInstallTeeReader<'_, R, W>
+where
+    R: Read,
+    W: Write,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let len = self.reader.read(buf)?;
+        if len > 0 {
+            self.writer.write_all(&buf[..len])?;
+        }
+        Ok(len)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReachablePackFile {
     pub pack_path: PathBuf,
@@ -179,6 +198,15 @@ pub struct RawPackInstallOptions {
 
 pub trait RawPackInstaller {
     fn install_raw_pack(&self, pack_bytes: &[u8]) -> Result<RawPackInstallResult>;
+
+    fn install_raw_pack_from_reader<R>(&self, reader: &mut R) -> Result<RawPackInstallResult>
+    where
+        R: Read,
+    {
+        let mut pack_bytes = Vec::new();
+        reader.read_to_end(&mut pack_bytes)?;
+        self.install_raw_pack(&pack_bytes)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +225,16 @@ pub struct ObjectStorageInfo {
 impl RawPackInstaller for FileObjectDatabase {
     fn install_raw_pack(&self, pack_bytes: &[u8]) -> Result<RawPackInstallResult> {
         let result = FileObjectDatabase::install_raw_pack(self, pack_bytes)?;
+        Ok(RawPackInstallResult {
+            object_ids: result.object_ids,
+        })
+    }
+
+    fn install_raw_pack_from_reader<R>(&self, reader: &mut R) -> Result<RawPackInstallResult>
+    where
+        R: Read,
+    {
+        let result = FileObjectDatabase::install_raw_pack_from_reader(self, reader)?;
         Ok(RawPackInstallResult {
             object_ids: result.object_ids,
         })
@@ -438,10 +476,10 @@ pub fn index_raw_pack_from_reader<R>(
     format: ObjectFormat,
 ) -> Result<RawPackIndexResult>
 where
-    R: Read + Seek,
+    R: Read,
 {
     Ok(stream_index_build_to_raw_result(
-        PackIndex::write_v2_for_pack_reader(reader, format)?,
+        PackIndex::write_v2_for_pack_reader_to_trailer(reader, format)?,
     ))
 }
 
@@ -849,18 +887,43 @@ where
         return Ok(None);
     }
     let inputs = pack_inputs(&objects);
-    let pack = PackFile::write_packed_with_known_ids(&inputs, format)?;
-    trace_packfile(&pack.pack)?;
-    destination
-        .install_generated_pack_unchecked(&pack, options)
-        .map(Some)
+    let pack_dir = destination.objects_dir.join("pack");
+    fs::create_dir_all(&pack_dir)?;
+    let temp_pack_path = unique_temp_path(&pack_dir);
+    let result = (|| -> Result<PackInstallResult> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_pack_path)?;
+        let summary = PackFile::write_packed_with_known_ids_to_writer(
+            &inputs,
+            format,
+            &PackWriteOptions::new(),
+            &mut file,
+        )?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        trace_packfile_path(&temp_pack_path)?;
+        destination.install_pack_file_from_temp(
+            &temp_pack_path,
+            summary.checksum,
+            &summary.index,
+            summary.entries.iter().map(|entry| entry.oid).collect(),
+            options,
+        )
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_pack_path);
+    }
+    result.map(Some)
 }
 
-fn trace_packfile(pack: &[u8]) -> Result<()> {
+fn trace_packfile_path(pack_path: &Path) -> Result<()> {
     let Some(path) = env::var_os("GIT_TRACE_PACKFILE").filter(|value| !value.is_empty()) else {
         return Ok(());
     };
-    fs::write(path, pack)?;
+    fs::copy(pack_path, path)?;
     Ok(())
 }
 
@@ -5027,8 +5090,46 @@ impl FileObjectDatabase {
         })
     }
 
+    fn install_pack_file_from_temp(
+        &self,
+        temp_pack_path: &Path,
+        pack_checksum: ObjectId,
+        index: &[u8],
+        object_ids: Vec<ObjectId>,
+        options: RawPackInstallOptions,
+    ) -> Result<PackInstallResult> {
+        let pack_dir = self.objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir)?;
+        let pack_name = format!("pack-{}", pack_checksum.to_hex());
+        let pack_path = pack_dir.join(format!("{pack_name}.pack"));
+        let index_path = pack_dir.join(format!("{pack_name}.idx"));
+        match fs::rename(temp_pack_path, &pack_path) {
+            Ok(()) => {}
+            Err(_) if pack_path.exists() => {
+                let _ = fs::remove_file(temp_pack_path);
+            }
+            Err(err) => return Err(GitError::Io(err.to_string())),
+        }
+        write_pack_component(&index_path, index)?;
+        let promisor_path = write_promisor_pack_sidecar(&pack_dir, &pack_name, options.promisor)?;
+        Ok(PackInstallResult {
+            pack_name,
+            pack_path,
+            index_path,
+            promisor_path,
+            object_ids,
+        })
+    }
+
     pub fn install_raw_pack(&self, pack_bytes: &[u8]) -> Result<PackInstallResult> {
         self.install_raw_pack_with_options(pack_bytes, RawPackInstallOptions::default())
+    }
+
+    pub fn install_raw_pack_from_reader<R>(&self, reader: &mut R) -> Result<PackInstallResult>
+    where
+        R: Read,
+    {
+        self.install_raw_pack_from_reader_with_options(reader, RawPackInstallOptions::default())
     }
 
     pub fn begin_raw_pack_install(
@@ -5105,6 +5206,49 @@ impl FileObjectDatabase {
             promisor_path,
             object_ids: built.entries.iter().map(|entry| entry.oid).collect(),
         })
+    }
+
+    pub fn install_raw_pack_from_reader_with_options<R>(
+        &self,
+        reader: &mut R,
+        options: RawPackInstallOptions,
+    ) -> Result<PackInstallResult>
+    where
+        R: Read,
+    {
+        let pack_dir = self.objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir)?;
+        let temp_pack_path = unique_temp_path(&pack_dir);
+        let result = (|| -> Result<PackInstallResult> {
+            // Stage directly in objects/pack so validation, indexing, and the
+            // eventual checksum-named rename use one streamed write.
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_pack_path)?;
+            let built = {
+                let mut tee = PackInstallTeeReader {
+                    reader,
+                    writer: &mut file,
+                };
+                PackIndex::write_v2_for_pack_reader_to_trailer(&mut tee, self.format)?
+            };
+            file.flush()?;
+            file.sync_all()?;
+            drop(file);
+
+            self.install_pack_file_from_temp(
+                &temp_pack_path,
+                built.pack_checksum,
+                &built.index,
+                built.entries.iter().map(|entry| entry.oid).collect(),
+                options,
+            )
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_pack_path);
+        }
+        result
     }
 
     pub fn contains(&self, oid: &ObjectId) -> Result<bool> {
@@ -7285,6 +7429,62 @@ mod tests {
                 .exists()
         );
 
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_database_installs_unknown_length_raw_pack_from_reader() {
+        let root = temp_root("sley-file-odb-install-raw-pack-reader");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let object = EncodedObject::new(ObjectType::Blob, b"reader streamed raw pack\n".to_vec());
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let mut reader = pack.pack.as_slice();
+
+        let result = db
+            .install_raw_pack_from_reader(&mut reader)
+            .expect("test operation should succeed");
+
+        assert_eq!(result.pack_name, format!("pack-{}", pack.checksum.to_hex()));
+        assert_eq!(result.object_ids, vec![oid]);
+        assert_eq!(
+            fs::read(&result.pack_path).expect("test operation should succeed"),
+            pack.pack
+        );
+        assert!(result.index_path.exists());
+        assert!(db.contains(&oid).expect("test operation should succeed"));
+        assert_eq!(read_object_for_assert(&db, &oid), object);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_database_rejects_unknown_length_raw_pack_with_trailing_bytes() {
+        let root = temp_root("sley-file-odb-install-raw-pack-reader-trailing");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let object = EncodedObject::new(ObjectType::Blob, b"trailing streamed raw pack\n".to_vec());
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let mut bytes = pack.pack;
+        bytes.extend_from_slice(b"not part of the pack");
+        let mut reader = bytes.as_slice();
+
+        let err = db
+            .install_raw_pack_from_reader(&mut reader)
+            .expect_err("trailing bytes should be rejected");
+
+        assert!(err.to_string().contains("trailing bytes after checksum"));
+        let pack_dir = git_dir.join("objects").join("pack");
+        let pack_entries = fs::read_dir(&pack_dir)
+            .map(|entries| entries.count())
+            .unwrap_or_default();
+        assert_eq!(pack_entries, 0);
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 

@@ -3374,7 +3374,9 @@ fn register_promisor_remote(git_dir: &Path, name: &str, filter_spec: &str) -> Re
         return Ok(());
     }
     if config.get_bool("remote", Some(name), "promisor") == Some(true)
-        && config.get("remote", Some(name), "partialclonefilter").is_some()
+        && config
+            .get("remote", Some(name), "partialclonefilter")
+            .is_some()
     {
         return Ok(());
     }
@@ -5119,26 +5121,34 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
     let push_options = sley_remote::receive_pack_request_uses_push_options(&commands)
         .then(|| read_receive_pack_push_options(&mut stdin))
         .transpose()?;
-    let mut packfile = Vec::new();
-    stdin.read_to_end(&mut packfile)?;
-    let request = ReceivePackPushRequest {
+    let header = sley_protocol::ReceivePackPushRequestHeader {
         commands,
         push_options,
-        packfile,
     };
-    if !request.packfile.is_empty() {
-        let config = read_repo_config(&git_dir)?;
-        if config
-            .get_bool("transfer", None, "fsckObjects")
-            .unwrap_or(false)
-        {
+    let config = read_repo_config(&git_dir)?;
+    let report = if config
+        .get_bool("transfer", None, "fsckObjects")
+        .unwrap_or(false)
+    {
+        let mut packfile = Vec::new();
+        stdin.read_to_end(&mut packfile)?;
+        let request = ReceivePackPushRequest {
+            commands: header.commands.clone(),
+            push_options: header.push_options.clone(),
+            packfile,
+        };
+        if !request.packfile.is_empty() {
             let exit = super::pack::fsck_pack_objects(&request.packfile, format, &[])?;
             if exit != 0 {
                 return Err(GitError::Exit(exit));
             }
         }
-    }
-    let report = sley_remote::receive_pack_into_local_repository(&git_dir, format, &request)?;
+        sley_remote::receive_pack_into_local_repository(&git_dir, format, &request)?
+    } else {
+        sley_remote::receive_pack_stream_into_local_repository(
+            &git_dir, format, &header, &mut stdin,
+        )?
+    };
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     write_receive_pack_report_status(&mut stdout, &report)?;

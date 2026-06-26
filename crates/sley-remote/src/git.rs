@@ -9,22 +9,25 @@ use std::net::{Shutdown, TcpStream};
 use std::path::Path;
 
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
-use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
+use sley_fetch::{
+    install_upload_pack_raw_promisor_response,
+    install_upload_pack_raw_promisor_response_from_reader, install_upload_pack_raw_response,
+    install_upload_pack_raw_response_from_reader,
+    install_upload_pack_shallow_raw_promisor_response_from_reader,
+    install_upload_pack_shallow_raw_response_from_reader,
+};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
     GitService, ProtocolV2CommandOptions, ProtocolV2FetchRequest, ProtocolV2FetchShallowInfo,
     ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand, ReceivePackFeatures,
     ReceivePackPushRequestOptions, RefAdvertisement, TransportHandshake, UploadPackFeatures,
     UploadPackNegotiationRequest, UploadPackRawPackfileResponse, UploadPackRequest,
-    build_receive_pack_push_request, demux_protocol_v2_fetch_packfile,
-    parse_protocol_v2_fetch_features, parse_receive_pack_features, parse_refspec,
-    parse_upload_pack_features, plan_push_commands,
+    demux_protocol_v2_fetch_packfile, parse_protocol_v2_fetch_features,
+    parse_receive_pack_features, parse_refspec, parse_upload_pack_features, plan_push_commands,
     protocol_v2_ls_refs_records_to_ref_advertisement_set, protocol_v2_object_format,
     read_protocol_v2_advertisement, read_protocol_v2_fetch_response,
     read_protocol_v2_ls_refs_response, read_receive_pack_report_status, read_ref_advertisement_set,
-    read_upload_pack_raw_packfile_response,
-    read_upload_pack_shallow_info_and_raw_packfile_response, write_protocol_v2_command_request,
-    write_protocol_v2_fetch_request, write_receive_pack_push_request,
+    write_protocol_v2_command_request, write_protocol_v2_fetch_request,
     write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::FileRefStore;
@@ -194,95 +197,60 @@ pub fn install_fetch_pack_via_git_upload_pack(
         return Ok(Vec::new());
     }
     let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
-    let (shallow_info, response) = if request.protocol_v2 {
-        git_protocol_v2_fetch_response(&request, haves)?
-    } else {
-        let upload_request = UploadPackRequest {
-            wants: request.wants,
-            capabilities: shallow_request_capabilities(request.deepen),
-            shallow: request.shallow,
-            deepen: request.deepen,
-            ..UploadPackRequest::default()
-        };
-        if request.deepen.is_some() {
-            git_upload_pack_shallow_fetch_response(
-                request.remote,
-                request.format,
-                request.features,
-                upload_request,
-                haves,
-            )?
+    if request.protocol_v2 {
+        let (shallow_info, response) = git_protocol_v2_fetch_response(&request, haves)?;
+        if request.promisor {
+            install_upload_pack_raw_promisor_response(&response, &local_db)?;
         } else {
-            let response = git_upload_pack_fetch_response(
-                request.remote,
-                request.format,
-                request.features,
-                upload_request,
-                haves,
-            )?;
-            (Vec::new(), response)
+            install_upload_pack_raw_response(&response, &local_db)?;
         }
-    };
-    if request.promisor {
-        install_upload_pack_raw_promisor_response(&response, &local_db)?;
-    } else {
-        install_upload_pack_raw_response(&response, &local_db)?;
+        return Ok(shallow_info);
     }
-    Ok(shallow_info)
-}
 
-pub fn git_upload_pack_fetch_response(
-    remote: &RemoteUrl,
-    format: ObjectFormat,
-    _features: &UploadPackFeatures,
-    request: UploadPackRequest,
-    haves: Vec<ObjectId>,
-) -> Result<UploadPackRawPackfileResponse> {
-    let (_shallow, response) =
-        git_upload_pack_fetch_response_inner(remote, format, request, haves, false)?;
-    Ok(response)
-}
-
-pub fn git_upload_pack_shallow_fetch_response(
-    remote: &RemoteUrl,
-    format: ObjectFormat,
-    _features: &UploadPackFeatures,
-    request: UploadPackRequest,
-    haves: Vec<ObjectId>,
-) -> Result<(
-    Vec<ProtocolV2FetchShallowInfo>,
-    UploadPackRawPackfileResponse,
-)> {
-    git_upload_pack_fetch_response_inner(remote, format, request, haves, true)
-}
-
-fn git_upload_pack_fetch_response_inner(
-    remote: &RemoteUrl,
-    format: ObjectFormat,
-    request: UploadPackRequest,
-    haves: Vec<ObjectId>,
-    expect_shallow_info: bool,
-) -> Result<(
-    Vec<ProtocolV2FetchShallowInfo>,
-    UploadPackRawPackfileResponse,
-)> {
-    let mut stream = connect_git_service(remote, GitService::UploadPack, None)?;
-    read_ref_advertisement_set(format, &mut stream)?;
-    write_upload_pack_request(&mut stream, Some(&request))?;
+    let upload_request = UploadPackRequest {
+        wants: request.wants,
+        capabilities: shallow_request_capabilities(request.deepen),
+        shallow: request.shallow,
+        deepen: request.deepen,
+        ..UploadPackRequest::default()
+    };
+    let mut stream = connect_git_service(request.remote, GitService::UploadPack, None)?;
+    read_ref_advertisement_set(request.format, &mut stream)?;
+    write_upload_pack_request(&mut stream, Some(&upload_request))?;
     write_upload_pack_negotiation_request(
         &mut stream,
         &UploadPackNegotiationRequest { haves, done: true },
     )?;
     stream.flush()?;
     let _ = stream.shutdown(Shutdown::Write);
-    if expect_shallow_info {
-        read_upload_pack_shallow_info_and_raw_packfile_response(format, &mut stream)
-    } else {
-        Ok((
-            Vec::new(),
-            read_upload_pack_raw_packfile_response(format, &mut stream)?,
-        ))
+    if request.deepen.is_some() {
+        let shallow_info = if request.promisor {
+            let (shallow_info, _) = install_upload_pack_shallow_raw_promisor_response_from_reader(
+                request.format,
+                &mut stream,
+                &local_db,
+            )?;
+            shallow_info
+        } else {
+            let (shallow_info, _) = install_upload_pack_shallow_raw_response_from_reader(
+                request.format,
+                &mut stream,
+                &local_db,
+            )?;
+            shallow_info
+        };
+        return Ok(shallow_info);
     }
+    if request.promisor {
+        install_upload_pack_raw_promisor_response_from_reader(
+            request.format,
+            &mut stream,
+            &local_db,
+        )?;
+    } else {
+        install_upload_pack_raw_response_from_reader(request.format, &mut stream, &local_db)?;
+    }
+    Ok(Vec::new())
 }
 
 pub(crate) fn plan_push_git(request: GitPushRequest<'_>) -> Result<GitPushPlan> {
@@ -387,35 +355,28 @@ pub(crate) fn execute_push_git_plan(
         .ok_or_else(|| GitError::Command("git:// receive-pack stream was not available".into()))?;
     let commands = plan.commands.clone();
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
-    let packfile = crate::pack::build_push_packfile(&crate::pack::PushPackRequest {
-        local_db: &local_db,
-        format: request.format,
-        commands: &commands,
-        pack_objects: &plan.pack_objects,
-        remote_advertisements: &plan.advertisements,
-        features: &plan.features,
-        options: ReceivePackPushRequestOptions {
-            ofs_delta: plan.features.ofs_delta,
-            ..ReceivePackPushRequestOptions::default()
+    crate::pack::write_receive_pack_body(
+        &crate::pack::PushPackRequest {
+            local_db: &local_db,
+            format: request.format,
+            commands: &commands,
+            pack_objects: &plan.pack_objects,
+            remote_advertisements: &plan.advertisements,
+            features: &plan.features,
+            options: ReceivePackPushRequestOptions {
+                report_status: plan.features.report_status,
+                ofs_delta: plan.features.ofs_delta,
+                quiet: request.options.quiet && plan.features.quiet,
+                object_format: plan
+                    .features
+                    .object_format
+                    .filter(|_| request.format != ObjectFormat::Sha1),
+                ..ReceivePackPushRequestOptions::default()
+            },
+            thin: false,
         },
-        thin: false,
-    })?;
-    let receive_request = build_receive_pack_push_request(
-        &plan.features,
-        commands.clone(),
-        packfile,
-        ReceivePackPushRequestOptions {
-            report_status: plan.features.report_status,
-            ofs_delta: plan.features.ofs_delta,
-            quiet: request.options.quiet && plan.features.quiet,
-            object_format: plan
-                .features
-                .object_format
-                .filter(|_| request.format != ObjectFormat::Sha1),
-            ..ReceivePackPushRequestOptions::default()
-        },
+        &mut stream,
     )?;
-    write_receive_pack_push_request(&mut stream, &receive_request)?;
     stream.flush()?;
     let _ = stream.shutdown(Shutdown::Write);
 

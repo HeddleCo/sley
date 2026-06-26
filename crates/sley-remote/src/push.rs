@@ -769,7 +769,7 @@ fn execute_push_http(
 ) -> Result<PushOutcome> {
     let client = crate::http::new_http_client();
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
-    let body = build_receive_pack_body(&PushPackRequest {
+    let pack_request = PushPackRequest {
         local_db: &local_db,
         format: request.format,
         commands: &commands,
@@ -778,9 +778,10 @@ fn execute_push_http(
         features: &features,
         options: receive_pack_push_options(&features, request.format, request.options.quiet),
         thin: false,
-    })?;
+    };
     let url = http_smart_rpc_url(&remote_url, GitService::ReceivePack)?;
     let content_type = smart_http_rpc_request_content_type(GitService::ReceivePack)?;
+    let body = build_receive_pack_body(&pack_request)?;
     let mut response = crate::http::http_send_with_auth(&remote_url, credentials, |auth| {
         client.post(
             &url,

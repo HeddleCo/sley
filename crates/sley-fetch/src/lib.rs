@@ -2,18 +2,36 @@
 // the only retained `expect`s would be documented compile-time invariants.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+use sley_core::ObjectFormat;
 use sley_core::Result;
 use sley_odb::{FileObjectDatabase, RawPackInstallOptions, RawPackInstallResult, RawPackInstaller};
 use sley_protocol::{
-    ProtocolV2FetchResponseSection, SideBandDemux, UploadPackRawPackfileResponse,
-    demux_protocol_v2_fetch_packfile,
+    ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, SideBandDemux,
+    UploadPackRawPackfileResponse, demux_protocol_v2_fetch_packfile,
+    read_upload_pack_raw_packfile_response_header,
+    read_upload_pack_shallow_info_and_raw_packfile_response_header,
 };
+use std::io::{Cursor, Read};
 
 pub fn install_upload_pack_raw_response<I: RawPackInstaller>(
     response: &UploadPackRawPackfileResponse,
     destination: &I,
 ) -> Result<RawPackInstallResult> {
     destination.install_raw_pack(&response.packfile)
+}
+
+pub fn install_upload_pack_raw_response_from_reader<I, R>(
+    format: ObjectFormat,
+    reader: &mut R,
+    destination: &I,
+) -> Result<RawPackInstallResult>
+where
+    I: RawPackInstaller,
+    R: Read,
+{
+    let header = read_upload_pack_raw_packfile_response_header(format, reader)?;
+    let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
+    destination.install_raw_pack_from_reader(&mut pack_reader)
 }
 
 pub fn install_upload_pack_raw_promisor_response(
@@ -27,6 +45,64 @@ pub fn install_upload_pack_raw_promisor_response(
     Ok(RawPackInstallResult {
         object_ids: result.object_ids,
     })
+}
+
+pub fn install_upload_pack_raw_promisor_response_from_reader<R>(
+    format: ObjectFormat,
+    reader: &mut R,
+    destination: &FileObjectDatabase,
+) -> Result<RawPackInstallResult>
+where
+    R: Read,
+{
+    let header = read_upload_pack_raw_packfile_response_header(format, reader)?;
+    let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
+    let result = destination.install_raw_pack_from_reader_with_options(
+        &mut pack_reader,
+        RawPackInstallOptions { promisor: true },
+    )?;
+    Ok(RawPackInstallResult {
+        object_ids: result.object_ids,
+    })
+}
+
+pub fn install_upload_pack_shallow_raw_response_from_reader<I, R>(
+    format: ObjectFormat,
+    reader: &mut R,
+    destination: &I,
+) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
+where
+    I: RawPackInstaller,
+    R: Read,
+{
+    let (shallow, header) =
+        read_upload_pack_shallow_info_and_raw_packfile_response_header(format, reader)?;
+    let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
+    let result = destination.install_raw_pack_from_reader(&mut pack_reader)?;
+    Ok((shallow, result))
+}
+
+pub fn install_upload_pack_shallow_raw_promisor_response_from_reader<R>(
+    format: ObjectFormat,
+    reader: &mut R,
+    destination: &FileObjectDatabase,
+) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
+where
+    R: Read,
+{
+    let (shallow, header) =
+        read_upload_pack_shallow_info_and_raw_packfile_response_header(format, reader)?;
+    let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
+    let result = destination.install_raw_pack_from_reader_with_options(
+        &mut pack_reader,
+        RawPackInstallOptions { promisor: true },
+    )?;
+    Ok((
+        shallow,
+        RawPackInstallResult {
+            object_ids: result.object_ids,
+        },
+    ))
 }
 
 pub fn install_protocol_v2_fetch_packfile<I: RawPackInstaller>(
@@ -72,7 +148,11 @@ mod tests {
     use sley_object::{EncodedObject, ObjectType};
     use sley_odb::{FileObjectDatabase, ObjectDatabase, ObjectReader};
     use sley_pack::PackFile;
-    use sley_protocol::{SideBandChannel, SideBandPacket, encode_sideband_packet};
+    use sley_protocol::{
+        SideBandChannel, SideBandPacket, UploadPackAcknowledgment, encode_sideband_packet,
+        encode_upload_pack_raw_packfile_response, write_pkt_line_payload,
+        write_upload_pack_raw_packfile_response,
+    };
     use std::fs;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -98,6 +178,74 @@ mod tests {
         let result = install_upload_pack_raw_response(&response, &destination)
             .expect("test operation should succeed");
 
+        assert_eq!(result.object_ids, vec![oid]);
+        assert_pack_install(&root.join("objects"), &destination, &oid, &object);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn raw_upload_pack_response_stream_installs_pack_without_buffering_response() {
+        let root = test_temp_root("sley-fetch-upload-pack-raw-stream-install");
+        let format = ObjectFormat::Sha1;
+        let object = EncodedObject::new(ObjectType::Blob, b"raw streamed upload-pack\n".to_vec());
+        let oid = object
+            .object_id(format)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format)
+            .expect("test operation should succeed");
+        let response = UploadPackRawPackfileResponse {
+            acknowledgments: vec![UploadPackAcknowledgment::Nak],
+            packfile: pack.pack,
+        };
+        let encoded =
+            encode_upload_pack_raw_packfile_response(&response).expect("response should encode");
+        let destination = FileObjectDatabase::new(root.join("objects"), format);
+        let mut reader = encoded.as_slice();
+
+        let result =
+            install_upload_pack_raw_response_from_reader(format, &mut reader, &destination)
+                .expect("test operation should succeed");
+
+        assert_eq!(result.object_ids, vec![oid]);
+        assert_pack_install(&root.join("objects"), &destination, &oid, &object);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shallow_raw_upload_pack_response_stream_installs_pack_without_buffering_response() {
+        let root = test_temp_root("sley-fetch-upload-pack-shallow-raw-stream-install");
+        let format = ObjectFormat::Sha1;
+        let shallow_oid =
+            sley_core::ObjectId::from_hex(format, "1111111111111111111111111111111111111111")
+                .expect("test operation should succeed");
+        let object =
+            EncodedObject::new(ObjectType::Blob, b"shallow streamed upload-pack\n".to_vec());
+        let oid = object
+            .object_id(format)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format)
+            .expect("test operation should succeed");
+        let response = UploadPackRawPackfileResponse {
+            acknowledgments: vec![UploadPackAcknowledgment::Nak],
+            packfile: pack.pack,
+        };
+        let mut encoded = Vec::new();
+        write_pkt_line_payload(&mut encoded, format!("shallow {shallow_oid}\n").as_bytes())
+            .expect("test operation should succeed");
+        encoded.extend_from_slice(b"0000");
+        write_upload_pack_raw_packfile_response(&mut encoded, &response)
+            .expect("test operation should succeed");
+        let destination = FileObjectDatabase::new(root.join("objects"), format);
+        let mut reader = encoded.as_slice();
+
+        let (shallow, result) =
+            install_upload_pack_shallow_raw_response_from_reader(format, &mut reader, &destination)
+                .expect("test operation should succeed");
+
+        assert_eq!(
+            shallow,
+            vec![ProtocolV2FetchShallowInfo::Shallow(shallow_oid)]
+        );
         assert_eq!(result.object_ids, vec![oid]);
         assert_pack_install(&root.join("objects"), &destination, &oid, &object);
         let _ = fs::remove_dir_all(&root);

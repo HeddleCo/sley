@@ -28,18 +28,22 @@ use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, St
 
 use sley_config::GitConfig;
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
-use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
+use sley_fetch::{
+    install_upload_pack_raw_promisor_response_from_reader,
+    install_upload_pack_raw_response_from_reader,
+    install_upload_pack_shallow_raw_promisor_response_from_reader,
+    install_upload_pack_shallow_raw_response_from_reader,
+};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::write_pkt_line_payload;
 use sley_protocol::{
     GitService, ProtocolV2FetchShallowInfo, ReceivePackCommand, ReceivePackFeatures,
     ReceivePackPushRequestOptions, RefAdvertisement, UploadPackFeatures,
     UploadPackNegotiationRequest, UploadPackRawPackfileResponse, UploadPackRequest,
-    build_receive_pack_push_request, parse_receive_pack_features, parse_upload_pack_features,
-    read_receive_pack_report_status, read_ref_advertisement_set,
-    read_upload_pack_raw_packfile_response,
-    read_upload_pack_shallow_info_and_raw_packfile_response, write_receive_pack_push_request,
-    write_upload_pack_negotiation_request, write_upload_pack_request,
+    parse_receive_pack_features, parse_upload_pack_features, read_receive_pack_report_status,
+    read_ref_advertisement_set, read_upload_pack_raw_packfile_response,
+    read_upload_pack_shallow_info_and_raw_packfile_response, write_upload_pack_negotiation_request,
+    write_upload_pack_request,
 };
 use sley_refs::FileRefStore;
 use sley_transport::{
@@ -656,35 +660,28 @@ pub(crate) fn execute_push_ssh_plan(
         .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not available".into()))?;
     let commands = plan.commands.clone();
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
-    let packfile = crate::pack::build_push_packfile(&crate::pack::PushPackRequest {
-        local_db: &local_db,
-        format: request.format,
-        commands: &commands,
-        pack_objects: &plan.pack_objects,
-        remote_advertisements: &plan.advertisements,
-        features: &plan.features,
-        options: ReceivePackPushRequestOptions {
-            ofs_delta: plan.features.ofs_delta,
-            ..ReceivePackPushRequestOptions::default()
+    crate::pack::write_receive_pack_body(
+        &crate::pack::PushPackRequest {
+            local_db: &local_db,
+            format: request.format,
+            commands: &commands,
+            pack_objects: &plan.pack_objects,
+            remote_advertisements: &plan.advertisements,
+            features: &plan.features,
+            options: ReceivePackPushRequestOptions {
+                report_status: plan.features.report_status,
+                ofs_delta: plan.features.ofs_delta,
+                quiet: request.options.quiet && plan.features.quiet,
+                object_format: plan
+                    .features
+                    .object_format
+                    .filter(|_| request.format != ObjectFormat::Sha1),
+                ..ReceivePackPushRequestOptions::default()
+            },
+            thin: false,
         },
-        thin: false,
-    })?;
-    let request = build_receive_pack_push_request(
-        &plan.features,
-        commands.clone(),
-        packfile,
-        ReceivePackPushRequestOptions {
-            report_status: plan.features.report_status,
-            ofs_delta: plan.features.ofs_delta,
-            quiet: request.options.quiet && plan.features.quiet,
-            object_format: plan
-                .features
-                .object_format
-                .filter(|_| request.format != ObjectFormat::Sha1),
-            ..ReceivePackPushRequestOptions::default()
-        },
+        &mut stdin,
     )?;
-    write_receive_pack_push_request(&mut stdin, &request)?;
     drop(stdin);
 
     let report = if plan.features.report_status {
@@ -844,33 +841,58 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
         ..UploadPackRequest::default()
     };
     let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
-    // Only a deepen request gets a leading shallow-info section in the response;
-    // a plain fetch must use the non-shallow reader (the response starts straight
-    // at the NAK/ACK), preserving the existing SSH wire handling exactly.
-    let (shallow_info, response) = if request.deepen.is_some() {
-        ssh_upload_pack_shallow_fetch_response(
-            request.remote,
-            request.format,
-            request.features,
-            upload_request,
-            haves,
-            request.command_options,
-        )?
+    let (child, stdin, mut stdout) = spawn_service_process(
+        request.remote,
+        GitService::UploadPack,
+        true,
+        request.command_options,
+    )?;
+    let mut stdin =
+        stdin.ok_or_else(|| GitError::Command("ssh upload-pack stdin was not piped".into()))?;
+
+    read_ref_advertisement_set(request.format, &mut stdout)?;
+    write_upload_pack_request(&mut stdin, Some(&upload_request))?;
+    write_upload_pack_negotiation_request(
+        &mut stdin,
+        &UploadPackNegotiationRequest { haves, done: true },
+    )?;
+    drop(stdin);
+
+    let shallow_info = if request.deepen.is_some() {
+        if request.promisor {
+            let (shallow_info, _) = install_upload_pack_shallow_raw_promisor_response_from_reader(
+                request.format,
+                &mut stdout,
+                &local_db,
+            )?;
+            shallow_info
+        } else {
+            let (shallow_info, _) = install_upload_pack_shallow_raw_response_from_reader(
+                request.format,
+                &mut stdout,
+                &local_db,
+            )?;
+            shallow_info
+        }
     } else {
-        let response = ssh_upload_pack_fetch_response(
-            request.remote,
-            request.format,
-            request.features,
-            upload_request,
-            haves,
-            request.command_options,
-        )?;
-        (Vec::new(), response)
+        if request.promisor {
+            install_upload_pack_raw_promisor_response_from_reader(
+                request.format,
+                &mut stdout,
+                &local_db,
+            )?;
+        } else {
+            install_upload_pack_raw_response_from_reader(request.format, &mut stdout, &local_db)?;
+        }
+        Vec::new()
     };
-    if request.promisor {
-        install_upload_pack_raw_promisor_response(&response, &local_db)?;
-    } else {
-        install_upload_pack_raw_response(&response, &local_db)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(GitError::Command(format!(
+            "ssh upload-pack failed for {}: {}",
+            ssh_remote_display(request.remote),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
     Ok(shallow_info)
 }

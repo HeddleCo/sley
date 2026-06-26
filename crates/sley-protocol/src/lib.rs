@@ -997,6 +997,21 @@ pub fn build_receive_pack_push_request(
     packfile: Vec<u8>,
     options: ReceivePackPushRequestOptions,
 ) -> Result<ReceivePackPushRequest> {
+    let header = build_receive_pack_push_request_header(features, commands, options)?;
+    let request = ReceivePackPushRequest {
+        commands: header.commands,
+        push_options: header.push_options,
+        packfile,
+    };
+    validate_receive_pack_push_request_features(features, &request)?;
+    Ok(request)
+}
+
+pub fn build_receive_pack_push_request_header(
+    features: &ReceivePackFeatures,
+    commands: Vec<ReceivePackCommand>,
+    options: ReceivePackPushRequestOptions,
+) -> Result<ReceivePackPushRequestHeader> {
     let mut capabilities = Vec::new();
     if options.report_status_v2 {
         require_receive_pack_feature(features.report_status_v2, "report-status-v2")?;
@@ -1077,17 +1092,23 @@ pub fn build_receive_pack_push_request(
         });
         Some(options.push_options)
     };
-    let request = ReceivePackPushRequest {
+    let header = ReceivePackPushRequestHeader {
         commands: ReceivePackRequest {
             commands,
             capabilities,
             shallow: Vec::new(),
         },
         push_options,
-        packfile,
     };
-    validate_receive_pack_push_request_features(features, &request)?;
-    Ok(request)
+    validate_receive_pack_push_request_features(
+        features,
+        &ReceivePackPushRequest {
+            commands: header.commands.clone(),
+            push_options: header.push_options.clone(),
+            packfile: Vec::new(),
+        },
+    )?;
+    Ok(header)
 }
 
 pub fn smart_http_info_refs_path(repository_path: &str, service: GitService) -> Result<String> {
@@ -1616,6 +1637,12 @@ pub struct UploadPackRawPackfileResponse {
     pub packfile: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UploadPackRawPackfileResponseHeader {
+    pub acknowledgments: Vec<UploadPackAcknowledgment>,
+    pub pack_prefix: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceivePackCommand {
     pub old_id: ObjectId,
@@ -1635,6 +1662,12 @@ pub struct ReceivePackPushRequest {
     pub commands: ReceivePackRequest,
     pub push_options: Option<Vec<String>>,
     pub packfile: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReceivePackPushRequestHeader {
+    pub commands: ReceivePackRequest,
+    pub push_options: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -5051,6 +5084,92 @@ pub fn read_upload_pack_raw_packfile_response(
     parse_upload_pack_raw_packfile_response(format, &input)
 }
 
+pub fn read_upload_pack_raw_packfile_response_header(
+    format: ObjectFormat,
+    reader: &mut impl Read,
+) -> Result<UploadPackRawPackfileResponseHeader> {
+    let mut acknowledgments = Vec::new();
+    loop {
+        let mut header = [0u8; 4];
+        reader.read_exact(&mut header)?;
+        if &header == b"PACK" {
+            return Ok(UploadPackRawPackfileResponseHeader {
+                acknowledgments,
+                pack_prefix: header.to_vec(),
+            });
+        }
+        let len = parse_pkt_len(&header)?;
+        let payload = match len {
+            0..=2 => {
+                return Err(GitError::InvalidFormat(
+                    "upload-pack raw packfile response contains a control packet".into(),
+                ));
+            }
+            3 => {
+                return Err(GitError::InvalidFormat(
+                    "reserved pkt-line length 0003".into(),
+                ));
+            }
+            4..=PKT_LINE_MAX_LEN => {
+                let mut payload = vec![0; len - 4];
+                reader.read_exact(&mut payload)?;
+                payload
+            }
+            _ => {
+                return Err(GitError::InvalidFormat(format!(
+                    "pkt-line length exceeds {PKT_LINE_MAX_LEN}: {len}"
+                )));
+            }
+        };
+        trace_packet_read_payload(&payload);
+        let trimmed = trim_trailing_lf(&payload);
+        if trimmed == b"NAK" || trimmed.starts_with(b"ACK ") {
+            acknowledgments.push(parse_upload_pack_acknowledgment(format, &payload)?);
+            continue;
+        }
+        return Err(GitError::InvalidFormat(
+            "upload-pack raw packfile response has non-ack pkt-line before packfile".into(),
+        ));
+    }
+}
+
+pub fn read_upload_pack_shallow_info_section(
+    format: ObjectFormat,
+    reader: &mut impl Read,
+) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
+    let mut entries = Vec::new();
+    loop {
+        let Some(frame) = read_pkt_line_frame(reader)? else {
+            return Err(GitError::InvalidFormat(
+                "upload-pack shallow-info section ended before flush".into(),
+            ));
+        };
+        match frame {
+            PktLineFrame::Data(payload) => {
+                entries.push(parse_fetch_shallow_info(format, &payload)?)
+            }
+            PktLineFrame::Flush => return Ok(entries),
+            PktLineFrame::Delimiter | PktLineFrame::ResponseEnd => {
+                return Err(GitError::InvalidFormat(
+                    "upload-pack shallow-info section contains a non-flush control packet".into(),
+                ));
+            }
+        }
+    }
+}
+
+pub fn read_upload_pack_shallow_info_and_raw_packfile_response_header(
+    format: ObjectFormat,
+    reader: &mut impl Read,
+) -> Result<(
+    Vec<ProtocolV2FetchShallowInfo>,
+    UploadPackRawPackfileResponseHeader,
+)> {
+    let shallow = read_upload_pack_shallow_info_section(format, reader)?;
+    let raw = read_upload_pack_raw_packfile_response_header(format, reader)?;
+    Ok((shallow, raw))
+}
+
 pub fn write_upload_pack_raw_packfile_response(
     writer: &mut impl Write,
     response: &UploadPackRawPackfileResponse,
@@ -5141,9 +5260,17 @@ pub fn read_upload_pack_shallow_info_and_raw_packfile_response(
     Vec<ProtocolV2FetchShallowInfo>,
     UploadPackRawPackfileResponse,
 )> {
-    let mut input = Vec::new();
-    reader.read_to_end(&mut input)?;
-    parse_upload_pack_shallow_info_and_raw_packfile_response(format, &input)
+    let (shallow, header) =
+        read_upload_pack_shallow_info_and_raw_packfile_response_header(format, reader)?;
+    let mut packfile = header.pack_prefix;
+    reader.read_to_end(&mut packfile)?;
+    Ok((
+        shallow,
+        UploadPackRawPackfileResponse {
+            acknowledgments: header.acknowledgments,
+            packfile,
+        },
+    ))
 }
 
 pub fn parse_receive_pack_request(
@@ -5325,18 +5452,30 @@ pub fn read_receive_pack_push_request(
     reader: &mut impl Read,
     has_push_options: bool,
 ) -> Result<ReceivePackPushRequest> {
+    let header = read_receive_pack_push_request_header(format, reader, has_push_options)?;
+    let mut packfile = Vec::new();
+    reader.read_to_end(&mut packfile)?;
+    Ok(ReceivePackPushRequest {
+        commands: header.commands,
+        push_options: header.push_options,
+        packfile,
+    })
+}
+
+pub fn read_receive_pack_push_request_header(
+    format: ObjectFormat,
+    reader: &mut impl Read,
+    has_push_options: bool,
+) -> Result<ReceivePackPushRequestHeader> {
     let commands = read_receive_pack_request(format, reader)?;
     let push_options = if has_push_options {
         Some(read_receive_pack_push_options(reader)?)
     } else {
         None
     };
-    let mut packfile = Vec::new();
-    reader.read_to_end(&mut packfile)?;
-    Ok(ReceivePackPushRequest {
+    Ok(ReceivePackPushRequestHeader {
         commands,
         push_options,
-        packfile,
     })
 }
 
@@ -5344,11 +5483,25 @@ pub fn write_receive_pack_push_request(
     writer: &mut impl Write,
     request: &ReceivePackPushRequest,
 ) -> Result<()> {
-    write_receive_pack_request(writer, &request.commands)?;
-    if let Some(push_options) = &request.push_options {
+    write_receive_pack_push_request_header(
+        writer,
+        &ReceivePackPushRequestHeader {
+            commands: request.commands.clone(),
+            push_options: request.push_options.clone(),
+        },
+    )?;
+    writer.write_all(&request.packfile)?;
+    Ok(())
+}
+
+pub fn write_receive_pack_push_request_header(
+    writer: &mut impl Write,
+    header: &ReceivePackPushRequestHeader,
+) -> Result<()> {
+    write_receive_pack_request(writer, &header.commands)?;
+    if let Some(push_options) = &header.push_options {
         write_receive_pack_push_options(writer, push_options)?;
     }
-    writer.write_all(&request.packfile)?;
     Ok(())
 }
 

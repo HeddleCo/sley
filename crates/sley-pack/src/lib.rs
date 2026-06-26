@@ -1773,6 +1773,22 @@ impl PackIndex {
         index_pack_from_reader(reader, format, pack_len)
     }
 
+    /// Validate and index a pack from the reader's current position, stopping
+    /// after the pack trailer checksum.
+    ///
+    /// This is for transports where the pack length is not known in advance but
+    /// the stream is expected to contain exactly one pack. It avoids forcing the
+    /// caller to first materialize the pack only to learn its length.
+    pub fn write_v2_for_pack_reader_to_trailer<R>(
+        reader: &mut R,
+        format: ObjectFormat,
+    ) -> Result<PackStreamIndexBuild>
+    where
+        R: Read,
+    {
+        index_pack_from_reader_to_trailer(reader, format)
+    }
+
     pub fn write_v2_for_pack_reader_with_len<R>(
         reader: &mut R,
         format: ObjectFormat,
@@ -2165,7 +2181,26 @@ fn index_pack_from_reader<R>(
 where
     R: Read,
 {
-    let mut stream = PackReadStream::new(reader, format, pack_len)?;
+    index_pack_from_stream(PackReadStream::new(reader, format, Some(pack_len))?, format)
+}
+
+fn index_pack_from_reader_to_trailer<R>(
+    reader: &mut R,
+    format: ObjectFormat,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+{
+    index_pack_from_stream(PackReadStream::new(reader, format, None)?, format)
+}
+
+fn index_pack_from_stream<R>(
+    mut stream: PackReadStream<'_, R>,
+    format: ObjectFormat,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+{
     let mut header = [0u8; 12];
     stream.read_pack_bytes(&mut header)?;
     if &header[..4] != b"PACK" {
@@ -2291,8 +2326,8 @@ fn pack_object_kind_to_object_type(kind: PackObjectKind) -> Result<ObjectType> {
 struct PackReadStream<'a, R> {
     reader: &'a mut R,
     position: u64,
-    pack_len: u64,
-    trailer_position: u64,
+    pack_len: Option<u64>,
+    trailer_position: Option<u64>,
     digest: StreamingDigest,
     format: ObjectFormat,
     pending: VecDeque<u8>,
@@ -2302,16 +2337,21 @@ impl<'a, R> PackReadStream<'a, R>
 where
     R: Read,
 {
-    fn new(reader: &'a mut R, format: ObjectFormat, pack_len: u64) -> Result<Self> {
+    fn new(reader: &'a mut R, format: ObjectFormat, pack_len: Option<u64>) -> Result<Self> {
         let trailer_len = format.raw_len() as u64;
-        if pack_len < 12 + trailer_len {
-            return Err(GitError::InvalidFormat("pack file too short".into()));
-        }
+        let trailer_position = pack_len
+            .map(|pack_len| {
+                if pack_len < 12 + trailer_len {
+                    return Err(GitError::InvalidFormat("pack file too short".into()));
+                }
+                Ok(pack_len - trailer_len)
+            })
+            .transpose()?;
         Ok(Self {
             reader,
             position: 0,
             pack_len,
-            trailer_position: pack_len - trailer_len,
+            trailer_position,
             digest: StreamingDigest::new(format),
             format,
             pending: VecDeque::new(),
@@ -2323,7 +2363,7 @@ where
     }
 
     fn trailer_pack_offset(&self) -> u64 {
-        self.trailer_position
+        self.trailer_position.unwrap_or(self.position)
     }
 
     fn read_pack_bytes(&mut self, bytes: &mut [u8]) -> Result<()> {
@@ -2331,7 +2371,10 @@ where
             .position
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
-        if end > self.trailer_position {
+        if self
+            .trailer_position
+            .is_some_and(|trailer_position| end > trailer_position)
+        {
             return Err(GitError::InvalidFormat(
                 "pack entry extends past checksum".into(),
             ));
@@ -2369,12 +2412,16 @@ where
     }
 
     fn read_compressed_chunk(&mut self, bytes: &mut [u8]) -> Result<usize> {
-        if self.position >= self.trailer_position {
-            return Ok(0);
-        }
-        let remaining = self.trailer_position - self.position;
-        let len = if remaining < bytes.len() as u64 {
-            remaining as usize
+        let len = if let Some(trailer_position) = self.trailer_position {
+            if self.position >= trailer_position {
+                return Ok(0);
+            }
+            let remaining = trailer_position - self.position;
+            if remaining < bytes.len() as u64 {
+                remaining as usize
+            } else {
+                bytes.len()
+            }
         } else {
             bytes.len()
         };
@@ -2422,11 +2469,18 @@ where
             .position
             .checked_add(raw.len() as u64)
             .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
-        if self.position != self.pack_len {
+        if let Some(pack_len) = self.pack_len
+            && self.position != pack_len
+        {
             return Err(GitError::InvalidFormat(format!(
                 "pack has {} trailing bytes after checksum",
-                self.pack_len - self.position
+                pack_len - self.position
             )));
+        }
+        if self.pack_len.is_none() && !self.pending.is_empty() {
+            return Err(GitError::InvalidFormat(
+                "pack has trailing bytes after checksum".into(),
+            ));
         }
         ObjectId::from_raw(self.format, &raw)
     }

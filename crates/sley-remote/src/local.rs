@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::{Cursor, ErrorKind, Read};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,8 +28,9 @@ use sley_protocol::{
     PKT_LINE_MAX_PAYLOAD_LEN, ProtocolV2FetchAcknowledgment, ProtocolV2FetchFeatures,
     ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
     ProtocolV2LsRefsFeatures, ProtocolV2LsRefsRecord, ProtocolV2LsRefsRef, ProtocolV2LsRefsRequest,
-    ProtocolVersion, ReceivePackCommand, ReceivePackFeatures, ReceivePackPushRequest,
-    ReceivePackReportStatus, ReceivePackRequest, RefAdvertisement, SideBandChannel, SideBandPacket,
+    ProtocolVersion, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures,
+    ReceivePackPushRequest, ReceivePackPushRequestHeader, ReceivePackReportStatus,
+    ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement, SideBandChannel, SideBandPacket,
     TransportHandshake, UploadPackFeatures, UploadPackNegotiationRequest,
     UploadPackPackfileResponse, UploadPackRawPackfileResponse, UploadPackRequest,
     apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
@@ -36,9 +38,9 @@ use sley_protocol::{
     encode_protocol_v2_ls_refs_capability, encode_receive_pack_features,
     encode_upload_pack_features, read_protocol_v2_command_request,
     read_upload_pack_negotiation_request, read_upload_pack_request,
-    write_protocol_v2_advertisement, write_protocol_v2_fetch_response,
-    write_protocol_v2_ls_refs_response, write_upload_pack_negotiation_request,
-    write_upload_pack_request,
+    validate_receive_pack_push_request_features, write_protocol_v2_advertisement,
+    write_protocol_v2_fetch_response, write_protocol_v2_ls_refs_response,
+    write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::{
     DeleteRef, FileRefStore, Ref, RefDeletePrecondition, RefPrecondition, RefTarget, ReflogEntry,
@@ -251,6 +253,135 @@ pub fn receive_pack_into_local_repository(
                 .map_err(|err| GitError::Transaction(err.to_string()))
         },
     )
+}
+
+/// Apply a receive-pack push while streaming the optional incoming packfile from
+/// `pack_reader` into the object database. This mirrors
+/// [`receive_pack_into_local_repository`] but avoids materializing the pack as a
+/// `Vec<u8>` in stdio/SSH server paths.
+pub fn receive_pack_stream_into_local_repository<R: Read>(
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    header: &ReceivePackPushRequestHeader,
+    pack_reader: &mut R,
+) -> Result<ReceivePackReportStatus> {
+    let remote_store = FileRefStore::new(remote_git_dir, format);
+    let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
+    let pack_prefix = read_optional_pack_prefix(pack_reader)?;
+    let validation_request = ReceivePackPushRequest {
+        commands: header.commands.clone(),
+        push_options: header.push_options.clone(),
+        packfile: pack_prefix.clone().unwrap_or_default(),
+    };
+    validate_receive_pack_push_request_features(
+        &receive_pack_features(format),
+        &validation_request,
+    )?;
+
+    let deletes_applied_with_updates = std::cell::RefCell::new(HashSet::<String>::new());
+    for command in header
+        .commands
+        .commands
+        .iter()
+        .filter(|command| command.new_id.is_null())
+    {
+        let current = match remote_store.read_ref(&command.name)? {
+            Some(RefTarget::Direct(oid)) => Some(oid),
+            Some(RefTarget::Symbolic(_)) | None => None,
+        };
+        if !command.old_id.is_null() && current != Some(command.old_id.clone()) {
+            return Err(GitError::Transaction(format!(
+                "expected ref {} to match",
+                command.name
+            )));
+        }
+    }
+
+    let updates = header
+        .commands
+        .commands
+        .iter()
+        .filter(|command| !command.new_id.is_null())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !updates.is_empty() {
+        if let Some(prefix) = pack_prefix {
+            let mut stream = Cursor::new(prefix).chain(pack_reader);
+            remote_db
+                .install_raw_pack_from_reader(&mut stream)
+                .map(|_| ())?;
+        }
+        for command in &updates {
+            if !remote_db.contains(&command.new_id)? {
+                return Err(GitError::InvalidObject(format!(
+                    "receive-pack packfile did not provide {}",
+                    command.new_id
+                )));
+            }
+        }
+        let applied = apply_receive_pack_ref_transaction(
+            remote_git_dir,
+            format,
+            &remote_store,
+            &updates,
+            &header.commands.commands,
+        )?;
+        deletes_applied_with_updates.borrow_mut().extend(applied);
+    }
+
+    for command in header
+        .commands
+        .commands
+        .iter()
+        .filter(|command| command.new_id.is_null())
+    {
+        if deletes_applied_with_updates
+            .borrow()
+            .contains(command.name.as_str())
+        {
+            continue;
+        }
+        remote_store
+            .delete_ref_checked(DeleteRef {
+                name: command.name.clone(),
+                expected_old: (!command.old_id.is_null()).then_some(command.old_id),
+                reflog: None,
+            })
+            .map(|_| ())
+            .map_err(|err| GitError::Transaction(err.to_string()))?;
+    }
+
+    Ok(ReceivePackReportStatus {
+        unpack: ReceivePackUnpackStatus::Ok,
+        commands: header
+            .commands
+            .commands
+            .iter()
+            .map(|command| ReceivePackCommandStatus::Ok {
+                name: command.name.clone(),
+            })
+            .collect(),
+    })
+}
+
+fn read_optional_pack_prefix(reader: &mut impl Read) -> Result<Option<Vec<u8>>> {
+    let mut prefix = [0u8; 4];
+    loop {
+        match reader.read(&mut prefix[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(1) => break,
+            Ok(_) => unreachable!("one-byte read returned more than one byte"),
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    reader.read_exact(&mut prefix[1..])?;
+    if &prefix != b"PACK" {
+        return Err(GitError::InvalidFormat(
+            "receive-pack packfile must start with PACK".into(),
+        ));
+    }
+    Ok(Some(prefix.to_vec()))
 }
 
 fn receive_pack_log_all_ref_updates(git_dir: &Path) -> bool {

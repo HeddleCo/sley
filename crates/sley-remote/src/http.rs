@@ -20,7 +20,10 @@ use sley_core::{
 use sley_fetch::{
     install_protocol_v2_fetch_response_packfile,
     install_protocol_v2_fetch_response_promisor_packfile,
-    install_upload_pack_raw_promisor_response, install_upload_pack_raw_response,
+    install_upload_pack_raw_promisor_response_from_reader,
+    install_upload_pack_raw_response_from_reader,
+    install_upload_pack_shallow_raw_promisor_response_from_reader,
+    install_upload_pack_shallow_raw_response_from_reader,
 };
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
@@ -523,31 +526,52 @@ pub fn install_fetch_pack_via_http_upload_pack(
         ..UploadPackRequest::default()
     };
     let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
-    let (shallow_info, response) = if request.deepen.is_some() {
-        http_upload_pack_shallow_fetch_response(
+    if request.deepen.is_none() {
+        let mut response = http_upload_pack_post(
             request.client,
             request.remote,
-            request.format,
-            upload_request,
-            haves,
-            credentials,
-        )?
-    } else {
-        let response = http_upload_pack_fetch_response(
-            request.client,
-            request.remote,
-            request.format,
-            upload_request,
+            &upload_request,
             haves,
             credentials,
         )?;
-        (Vec::new(), response)
-    };
-    if request.promisor {
-        install_upload_pack_raw_promisor_response(&response, &local_db)?;
-    } else {
-        install_upload_pack_raw_response(&response, &local_db)?;
+        if request.promisor {
+            install_upload_pack_raw_promisor_response_from_reader(
+                request.format,
+                &mut response.body,
+                &local_db,
+            )?;
+        } else {
+            install_upload_pack_raw_response_from_reader(
+                request.format,
+                &mut response.body,
+                &local_db,
+            )?;
+        }
+        return Ok(Vec::new());
     }
+
+    let mut response = http_upload_pack_post(
+        request.client,
+        request.remote,
+        &upload_request,
+        haves,
+        credentials,
+    )?;
+    let shallow_info = if request.promisor {
+        let (shallow_info, _) = install_upload_pack_shallow_raw_promisor_response_from_reader(
+            request.format,
+            &mut response.body,
+            &local_db,
+        )?;
+        shallow_info
+    } else {
+        let (shallow_info, _) = install_upload_pack_shallow_raw_response_from_reader(
+            request.format,
+            &mut response.body,
+            &local_db,
+        )?;
+        shallow_info
+    };
     Ok(shallow_info)
 }
 
