@@ -1540,7 +1540,9 @@ fn update_server_info_usage<T>() -> Result<T> {
 }
 
 pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
-    let mut message = b"update by sley".to_vec();
+    // git's `update-ref` writes an *empty* reflog message when no -m is given
+    // (builtin/update-ref.c leaves msg NULL); only -m supplies one.
+    let mut message = Vec::new();
     let mut delete = false;
     let mut create_reflog = false;
     let mut deref = true;
