@@ -1619,18 +1619,25 @@ fn branch_get_upstream_refname(
 }
 
 /// `tracking_for_push_dest()`: the local tracking ref for `refname` on `remote`,
-/// produced by applying that remote's fetch refspecs.
+/// produced by applying that remote's fetch refspecs. When no fetch refspec
+/// matches — e.g. a remote configured only via `branch.<name>.{remote,merge}`
+/// with no `[remote]` section, or any remote lacking an explicit `fetch` line —
+/// fall back to the conventional `refs/remotes/<remote>/<short>` mapping, the
+/// same direct construction the `@{upstream}` path uses. This keeps `@{push}`
+/// consistent with `@{u}` and matches git's result for the standard
+/// `+refs/heads/*:refs/remotes/<remote>/*` layout without requiring the refspec
+/// to be spelled out.
 fn tracking_for_push_dest(config: &GitConfig, remote: &str, refname: &str) -> Result<String> {
     let fetch_refspecs: Vec<&str> = config
         .get_all("remote", Some(remote), "fetch")
         .into_iter()
         .flatten()
         .collect();
-    apply_refspecs(&fetch_refspecs, refname).ok_or_else(|| {
-        GitError::not_found(format!(
-            "push destination '{refname}' on remote '{remote}' has no local tracking branch"
-        ))
-    })
+    if let Some(dst) = apply_refspecs(&fetch_refspecs, refname) {
+        return Ok(dst);
+    }
+    let short = refname.strip_prefix("refs/heads/").unwrap_or(refname);
+    Ok(format!("refs/remotes/{remote}/{short}"))
 }
 
 /// Apply a list of refspecs to a single ref, returning the first matching
@@ -7343,10 +7350,16 @@ mod tests {
         );
 
         // With a pushRemote, `@{push}` follows refs/remotes/<pushRemote>/<short>.
+        // git only resolves the triangular push.default ∈ {current, matching}
+        // case to the push remote; under `simple` it refuses because the push
+        // destination (fork/main) differs from the upstream (origin/main).
+        // Verified against git 2.54: `git rev-parse main@{push}` returns
+        // refs/remotes/fork/main with push.default=current and errors under
+        // simple ("cannot resolve 'simple' push to a single destination").
         set_ref(&git_dir, "refs/remotes/fork/main", &pushed);
         fs::write(
             git_dir.join("config"),
-            b"[branch \"main\"]\n\tremote = origin\n\tpushRemote = fork\n\tmerge = refs/heads/main\n",
+            b"[push]\n\tdefault = current\n[branch \"main\"]\n\tremote = origin\n\tpushRemote = fork\n\tmerge = refs/heads/main\n",
         )
         .expect("test operation should succeed");
         assert_eq!(
@@ -7359,6 +7372,20 @@ mod tests {
             resolve_revision(&git_dir, ObjectFormat::Sha1, "@{u}")
                 .expect("test operation should succeed"),
             up
+        );
+
+        // Under the default push.default=simple, a triangular pushRemote that
+        // differs from the upstream remote refuses to resolve, matching git.
+        fs::write(
+            git_dir.join("config"),
+            b"[branch \"main\"]\n\tremote = origin\n\tpushRemote = fork\n\tmerge = refs/heads/main\n",
+        )
+        .expect("test operation should succeed");
+        let err = resolve_revision(&git_dir, ObjectFormat::Sha1, "@{push}")
+            .expect_err("triangular simple push must not resolve");
+        assert!(
+            matches!(&err, GitError::NotFound(kind) if kind.to_string().contains("simple")),
+            "unexpected error: {err:?}"
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
