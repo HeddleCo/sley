@@ -1278,6 +1278,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
             deepen_since: None,
             deepen_not: Vec::new(),
             ssh_options: None,
+            atomic: false,
         },
     )?;
     if let Some(branch) = head_branch {
@@ -1894,6 +1895,7 @@ fn clone_bare_network_repository(
             record_promisor_refs: false,
             refetch: false,
             ssh_options: None,
+            atomic: false,
         },
         &[],
     )
@@ -2296,6 +2298,7 @@ fn clone_bare_or_mirror_local_repository(
             deepen_since: None,
             deepen_not: Vec::new(),
             ssh_options: None,
+            atomic: false,
         },
     );
     env::set_current_dir(previous_cwd)?;
@@ -3496,6 +3499,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         deepen_since: None,
         deepen_not: Vec::new(),
         ssh_options: None,
+        atomic: false,
     };
     let mut unshallow = false;
     let mut filter_option_explicit = false;
@@ -3531,6 +3535,8 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
             "--no-append" => options.append = false,
             "-n" | "--dry-run" => options.dry_run = true,
             "--no-dry-run" => options.dry_run = false,
+            "--atomic" => options.atomic = true,
+            "--no-atomic" => options.atomic = false,
             "--depth" => {
                 let value = iter
                     .next()

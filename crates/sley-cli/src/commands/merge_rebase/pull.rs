@@ -969,6 +969,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         deepen_since: None,
         deepen_not: Vec::new(),
         ssh_options: None,
+        atomic: false,
     };
     let fetch_recurse_submodules = resolve_fetch_recurse_submodules(
         &config,

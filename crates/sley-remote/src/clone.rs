@@ -530,5 +530,6 @@ fn clone_fetch_options(
         deepen_since,
         deepen_not,
         ssh_options,
+        atomic: false,
     }
 }

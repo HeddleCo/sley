@@ -146,6 +146,12 @@ pub struct FetchOptions {
     /// such as clone (`-4`/`-6`). When absent, fetch derives SSH options from
     /// the effective repository config.
     pub ssh_options: Option<crate::ssh::SshTransportOptions>,
+    /// `--atomic`: apply every remote-tracking ref update (and prune deletion)
+    /// in a single reference transaction so a single rejected update aborts the
+    /// whole fetch and leaves `FETCH_HEAD` empty. The default is non-atomic:
+    /// each ref is updated independently and a per-ref failure is reported but
+    /// does not block the others.
+    pub atomic: bool,
 }
 
 /// A remote-tracking ref removed by a prune pass.
@@ -1933,6 +1939,7 @@ mod tests {
             deepen_since: None,
             deepen_not: Vec::new(),
             ssh_options: None,
+            atomic: false,
         }
     }
 

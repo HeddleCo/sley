@@ -282,6 +282,7 @@ mod tests {
             deepen_since: None,
             deepen_not: Vec::new(),
             ssh_options: None,
+            atomic: false,
         }
     }
 
