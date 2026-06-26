@@ -197,16 +197,9 @@ pub struct RawPackInstallOptions {
 }
 
 pub trait RawPackInstaller {
-    fn install_raw_pack(&self, pack_bytes: &[u8]) -> Result<RawPackInstallResult>;
-
     fn install_raw_pack_from_reader<R>(&self, reader: &mut R) -> Result<RawPackInstallResult>
     where
-        R: Read,
-    {
-        let mut pack_bytes = Vec::new();
-        reader.read_to_end(&mut pack_bytes)?;
-        self.install_raw_pack(&pack_bytes)
-    }
+        R: Read;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,13 +216,6 @@ pub struct ObjectStorageInfo {
 }
 
 impl RawPackInstaller for FileObjectDatabase {
-    fn install_raw_pack(&self, pack_bytes: &[u8]) -> Result<RawPackInstallResult> {
-        let result = FileObjectDatabase::install_raw_pack(self, pack_bytes)?;
-        Ok(RawPackInstallResult {
-            object_ids: result.object_ids,
-        })
-    }
-
     fn install_raw_pack_from_reader<R>(&self, reader: &mut R) -> Result<RawPackInstallResult>
     where
         R: Read,
@@ -242,8 +228,13 @@ impl RawPackInstaller for FileObjectDatabase {
 }
 
 impl RawPackInstaller for ObjectDatabase {
-    fn install_raw_pack(&self, pack_bytes: &[u8]) -> Result<RawPackInstallResult> {
-        let result = unpack_packfile_objects(pack_bytes, self.format, self)?;
+    fn install_raw_pack_from_reader<R>(&self, reader: &mut R) -> Result<RawPackInstallResult>
+    where
+        R: Read,
+    {
+        let mut pack_bytes = Vec::new();
+        reader.read_to_end(&mut pack_bytes)?;
+        let result = unpack_packfile_objects(&pack_bytes, self.format, self)?;
         Ok(RawPackInstallResult {
             object_ids: result.written_objects,
         })
@@ -415,7 +406,8 @@ where
     R: ObjectReader,
 {
     verify_bundle_prerequisites(bundle, prerequisite_reader)?;
-    let install = destination.install_raw_pack(&bundle.pack)?;
+    let mut reader = bundle.pack.as_slice();
+    let install = destination.install_raw_pack_from_reader(&mut reader)?;
     Ok(BundleUnbundleResult {
         written_objects: install.object_ids,
         references: bundle.references.clone(),
@@ -665,7 +657,10 @@ where
         Some(pack) => pack,
         None => return Ok(None),
     };
-    destination.install_raw_pack(&pack.pack).map(Some)
+    let mut reader = pack.pack.as_slice();
+    destination
+        .install_raw_pack_from_reader(&mut reader)
+        .map(Some)
 }
 
 pub fn build_reachable_pack<R, I>(
@@ -5121,10 +5116,6 @@ impl FileObjectDatabase {
         })
     }
 
-    pub fn install_raw_pack(&self, pack_bytes: &[u8]) -> Result<PackInstallResult> {
-        self.install_raw_pack_with_options(pack_bytes, RawPackInstallOptions::default())
-    }
-
     pub fn install_raw_pack_from_reader<R>(&self, reader: &mut R) -> Result<PackInstallResult>
     where
         R: Read,
@@ -5180,31 +5171,6 @@ impl FileObjectDatabase {
             file: Some(file),
             written: 0,
             finished: false,
-        })
-    }
-
-    pub fn install_raw_pack_with_options(
-        &self,
-        pack_bytes: &[u8],
-        options: RawPackInstallOptions,
-    ) -> Result<PackInstallResult> {
-        let built = PackIndex::write_v2_for_pack(pack_bytes, self.format)?;
-        let pack_dir = self.objects_dir.join("pack");
-        fs::create_dir_all(&pack_dir)?;
-        let pack_name = format!("pack-{}", built.pack_checksum.to_hex());
-        let pack_path = pack_dir.join(format!("{pack_name}.pack"));
-        let index_path = pack_dir.join(format!("{pack_name}.idx"));
-        if !pack_path.exists() || !index_path.exists() {
-            write_pack_component(&pack_path, pack_bytes)?;
-            write_pack_component(&index_path, &built.index)?;
-        }
-        let promisor_path = write_promisor_pack_sidecar(&pack_dir, &pack_name, options.promisor)?;
-        Ok(PackInstallResult {
-            pack_name,
-            pack_path,
-            index_path,
-            promisor_path,
-            object_ids: built.entries.iter().map(|entry| entry.oid).collect(),
         })
     }
 
@@ -7353,9 +7319,10 @@ mod tests {
         let pack = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha256)
             .expect("test operation should succeed");
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha256);
+        let mut reader = pack.pack.as_slice();
 
         let result = db
-            .install_raw_pack(&pack.pack)
+            .install_raw_pack_from_reader(&mut reader)
             .expect("test operation should succeed");
 
         assert_eq!(result.pack_name, format!("pack-{}", pack.checksum.to_hex()));
@@ -7520,9 +7487,13 @@ mod tests {
         let pack = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha1)
             .expect("test operation should succeed");
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let mut reader = pack.pack.as_slice();
 
         let result = db
-            .install_raw_pack_with_options(&pack.pack, RawPackInstallOptions { promisor: true })
+            .install_raw_pack_from_reader_with_options(
+                &mut reader,
+                RawPackInstallOptions { promisor: true },
+            )
             .expect("test operation should succeed");
 
         let promisor_path = result.promisor_path.expect("promisor sidecar");
@@ -7965,7 +7936,15 @@ mod tests {
         }
 
         impl RawPackInstaller for RecordingInstaller {
-            fn install_raw_pack(&self, pack_bytes: &[u8]) -> Result<RawPackInstallResult> {
+            fn install_raw_pack_from_reader<R>(
+                &self,
+                reader: &mut R,
+            ) -> Result<RawPackInstallResult>
+            where
+                R: Read,
+            {
+                let mut pack_bytes = Vec::new();
+                reader.read_to_end(&mut pack_bytes)?;
                 self.packs.borrow_mut().push(pack_bytes.to_vec());
                 let object_ids = self.installed.borrow().clone();
                 Ok(RawPackInstallResult { object_ids })

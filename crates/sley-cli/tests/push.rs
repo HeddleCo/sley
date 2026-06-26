@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_core::{Capability, ObjectFormat, ObjectId};
-use sley_fetch::install_upload_pack_raw_response;
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
     ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures,
@@ -13,7 +13,7 @@ use sley_protocol::{
     UploadPackNegotiationRequest, UploadPackRequest, build_receive_pack_push_request,
     demux_upload_pack_packfile_response, read_receive_pack_report_status,
     read_ref_advertisement_set, read_upload_pack_packfile_response,
-    read_upload_pack_raw_packfile_response, write_upload_pack_negotiation_request,
+    read_upload_pack_raw_packfile_response_header, write_upload_pack_negotiation_request,
     write_upload_pack_request,
 };
 
@@ -748,15 +748,17 @@ fn upload_pack_service_serves_raw_pack() {
         name: "object-format".into(),
         value: Some("sha1".into()),
     }));
-    let response = read_upload_pack_raw_packfile_response(ObjectFormat::Sha1, &mut stdout)
-        .expect("parse upload-pack response");
+    let response = read_upload_pack_raw_packfile_response_header(ObjectFormat::Sha1, &mut stdout)
+        .expect("parse upload-pack response header");
     assert_eq!(
         response.acknowledgments,
         vec![UploadPackAcknowledgment::Nak]
     );
 
     let receiver_db = FileObjectDatabase::from_git_dir(&receiver, ObjectFormat::Sha1);
-    install_upload_pack_raw_response(&response, &receiver_db)
+    let mut pack_reader = Cursor::new(response.pack_prefix).chain(stdout);
+    receiver_db
+        .install_raw_pack_from_reader(&mut pack_reader)
         .expect("install upload-pack response pack");
     assert!(
         receiver_db
@@ -844,8 +846,9 @@ fn upload_pack_service_serves_sideband_64k_pack() {
     assert!(demuxed.data.starts_with(b"PACK"));
 
     let receiver_db = FileObjectDatabase::from_git_dir(&receiver, ObjectFormat::Sha1);
+    let mut pack_reader = demuxed.data.as_slice();
     receiver_db
-        .install_raw_pack(&demuxed.data)
+        .install_raw_pack_from_reader(&mut pack_reader)
         .expect("install sideband pack");
     assert!(
         receiver_db

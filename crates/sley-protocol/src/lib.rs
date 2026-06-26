@@ -1897,6 +1897,12 @@ pub struct ProtocolV2FetchSidebandAllResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProtocolV2FetchResponseHeader {
+    pub sections: Vec<ProtocolV2FetchResponseSection>,
+    pub has_packfile: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProtocolV2ObjectInfoRequest {
     pub size: bool,
     pub oids: Vec<ObjectId>,
@@ -2950,6 +2956,80 @@ pub fn read_protocol_v2_fetch_response(
 ) -> Result<Vec<ProtocolV2FetchResponseSection>> {
     let frames = read_pkt_line_frames_until_flush(reader)?;
     parse_protocol_v2_fetch_response(format, &frames)
+}
+
+pub fn read_protocol_v2_fetch_response_header(
+    format: ObjectFormat,
+    reader: &mut impl Read,
+    sideband_all: bool,
+) -> Result<ProtocolV2FetchResponseHeader> {
+    let mut sections = Vec::new();
+    let mut current: Option<(String, Vec<Vec<u8>>)> = None;
+    loop {
+        let frame = read_protocol_v2_fetch_metadata_frame(reader, sideband_all)?;
+        match frame {
+            PktLineFrame::Data(payload) => {
+                if let Some((_name, lines)) = &mut current {
+                    lines.push(payload);
+                } else {
+                    let name = parse_fetch_section_header(&payload)?;
+                    if name == "packfile" {
+                        return Ok(ProtocolV2FetchResponseHeader {
+                            sections,
+                            has_packfile: true,
+                        });
+                    }
+                    current = Some((name, Vec::new()));
+                }
+            }
+            PktLineFrame::Delimiter => {
+                let Some((name, lines)) = current.take() else {
+                    return Err(GitError::InvalidFormat(
+                        "fetch response has delimiter before section".into(),
+                    ));
+                };
+                sections.push(parse_fetch_section(format, name, lines)?);
+            }
+            PktLineFrame::Flush => {
+                if let Some((name, lines)) = current.take() {
+                    sections.push(parse_fetch_section(format, name, lines)?);
+                }
+                return Ok(ProtocolV2FetchResponseHeader {
+                    sections,
+                    has_packfile: false,
+                });
+            }
+            PktLineFrame::ResponseEnd => {
+                return Err(GitError::InvalidFormat(
+                    "fetch response contains response-end".into(),
+                ));
+            }
+        }
+    }
+}
+
+fn read_protocol_v2_fetch_metadata_frame(
+    reader: &mut impl Read,
+    sideband_all: bool,
+) -> Result<PktLineFrame> {
+    loop {
+        let frame = read_pkt_line_frame(reader)?
+            .ok_or_else(|| GitError::InvalidFormat("fetch response ended before flush".into()))?;
+        if sideband_all && let PktLineFrame::Data(payload) = frame {
+            let packet = parse_sideband_packet(&payload)?;
+            match packet.channel {
+                SideBandChannel::Data => return Ok(PktLineFrame::Data(packet.data)),
+                SideBandChannel::Progress => continue,
+                SideBandChannel::Fatal => {
+                    let message = String::from_utf8_lossy(&packet.data).into_owned();
+                    return Err(GitError::InvalidFormat(format!(
+                        "sideband fatal: {message}"
+                    )));
+                }
+            }
+        }
+        return Ok(frame);
+    }
 }
 
 pub fn write_protocol_v2_fetch_response(

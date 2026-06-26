@@ -10,25 +10,26 @@ use std::path::Path;
 
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_fetch::{
-    install_upload_pack_raw_promisor_response,
-    install_upload_pack_raw_promisor_response_from_reader, install_upload_pack_raw_response,
+    install_protocol_v2_fetch_promisor_response_from_reader,
+    install_protocol_v2_fetch_response_from_reader,
+    install_upload_pack_raw_promisor_response_from_reader,
     install_upload_pack_raw_response_from_reader,
     install_upload_pack_shallow_raw_promisor_response_from_reader,
     install_upload_pack_shallow_raw_response_from_reader,
+    shallow_info_from_protocol_v2_fetch_header,
 };
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
     GitService, ProtocolV2CommandOptions, ProtocolV2FetchRequest, ProtocolV2FetchShallowInfo,
     ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand, ReceivePackFeatures,
     ReceivePackPushRequestOptions, RefAdvertisement, TransportHandshake, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackRawPackfileResponse, UploadPackRequest,
-    demux_protocol_v2_fetch_packfile, parse_protocol_v2_fetch_features,
+    UploadPackNegotiationRequest, UploadPackRequest, parse_protocol_v2_fetch_features,
     parse_receive_pack_features, parse_refspec, parse_upload_pack_features, plan_push_commands,
     protocol_v2_ls_refs_records_to_ref_advertisement_set, protocol_v2_object_format,
-    read_protocol_v2_advertisement, read_protocol_v2_fetch_response,
-    read_protocol_v2_ls_refs_response, read_receive_pack_report_status, read_ref_advertisement_set,
-    write_protocol_v2_command_request, write_protocol_v2_fetch_request,
-    write_upload_pack_negotiation_request, write_upload_pack_request,
+    read_protocol_v2_advertisement, read_protocol_v2_ls_refs_response,
+    read_receive_pack_report_status, read_ref_advertisement_set, write_protocol_v2_command_request,
+    write_protocol_v2_fetch_request, write_upload_pack_negotiation_request,
+    write_upload_pack_request,
 };
 use sley_refs::FileRefStore;
 use sley_transport::{RemoteTransport, RemoteUrl, ServiceRequest, write_service_request};
@@ -198,13 +199,7 @@ pub fn install_fetch_pack_via_git_upload_pack(
     }
     let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
     if request.protocol_v2 {
-        let (shallow_info, response) = git_protocol_v2_fetch_response(&request, haves)?;
-        if request.promisor {
-            install_upload_pack_raw_promisor_response(&response, &local_db)?;
-        } else {
-            install_upload_pack_raw_response(&response, &local_db)?;
-        }
-        return Ok(shallow_info);
+        return git_protocol_v2_fetch_into_repository(&request, haves, &local_db);
     }
 
     let upload_request = UploadPackRequest {
@@ -514,13 +509,11 @@ fn upload_pack_features_from_v2(
     Ok(features)
 }
 
-fn git_protocol_v2_fetch_response(
+fn git_protocol_v2_fetch_into_repository(
     request: &GitFetchPackRequest<'_>,
     haves: Vec<ObjectId>,
-) -> Result<(
-    Vec<ProtocolV2FetchShallowInfo>,
-    UploadPackRawPackfileResponse,
-)> {
+    local_db: &FileObjectDatabase,
+) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     let mut stream = connect_git_service(
         request.remote,
         GitService::UploadPack,
@@ -544,26 +537,22 @@ fn git_protocol_v2_fetch_response(
     write_protocol_v2_fetch_request(&mut stream, &fetch)?;
     stream.flush()?;
     let _ = stream.shutdown(Shutdown::Write);
-    let sections = read_protocol_v2_fetch_response(request.format, &mut stream)?;
-    let shallow_info = sections
-        .iter()
-        .find_map(|section| match section {
-            sley_protocol::ProtocolV2FetchResponseSection::ShallowInfo(entries) => {
-                Some(entries.clone())
-            }
-            _ => None,
-        })
-        .unwrap_or_default();
-    let packfile = demux_protocol_v2_fetch_packfile(&sections)?
-        .map(|demux| demux.data)
-        .unwrap_or_default();
-    Ok((
-        shallow_info,
-        UploadPackRawPackfileResponse {
-            acknowledgments: Vec::new(),
-            packfile,
-        },
-    ))
+    let (header, _install) = if request.promisor {
+        install_protocol_v2_fetch_promisor_response_from_reader(
+            request.format,
+            &mut stream,
+            false,
+            local_db,
+        )?
+    } else {
+        install_protocol_v2_fetch_response_from_reader(
+            request.format,
+            &mut stream,
+            false,
+            local_db,
+        )?
+    };
+    Ok(shallow_info_from_protocol_v2_fetch_header(&header))
 }
 
 fn git_host_parameter(remote: &RemoteUrl, host: &str, port: u16) -> String {

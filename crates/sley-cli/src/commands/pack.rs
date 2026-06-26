@@ -71,25 +71,32 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
             .as_ref()
             .expect("stdin index-pack requires a repository");
         let common_git_dir = common_git_dir.clone();
-        let mut pack = Vec::new();
-        io::stdin().read_to_end(&mut pack)?;
-        // `index-pack -v` reports two phases on stderr: receiving the pack and
-        // resolving deltas (builtin/index-pack.c start_progress messages). The
-        // object count is the pack header's 32-bit big-endian field at bytes
-        // 8..12.
-        if options.verbose && pack.len() >= 12 {
-            let count = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]);
-            eprintln!("Receiving objects: 100% ({count}/{count}), done.");
-            eprintln!("Resolving deltas: 100% ({count}/{count}), done.");
-        }
-        if options.fsck {
-            let exit = fsck_pack_objects(&pack, format, &options.fsck_overrides)?;
-            if exit != 0 {
-                return Err(GitError::Exit(exit));
-            }
-        }
         let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-        let install = db.install_raw_pack(&pack)?;
+        let install = if options.verbose || options.fsck {
+            let mut pack = Vec::new();
+            io::stdin().read_to_end(&mut pack)?;
+            // `index-pack -v` reports two phases on stderr: receiving the pack and
+            // resolving deltas (builtin/index-pack.c start_progress messages). The
+            // object count is the pack header's 32-bit big-endian field at bytes
+            // 8..12.
+            if options.verbose && pack.len() >= 12 {
+                let count = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]);
+                eprintln!("Receiving objects: 100% ({count}/{count}), done.");
+                eprintln!("Resolving deltas: 100% ({count}/{count}), done.");
+            }
+            if options.fsck {
+                let exit = fsck_pack_objects(&pack, format, &options.fsck_overrides)?;
+                if exit != 0 {
+                    return Err(GitError::Exit(exit));
+                }
+            }
+            let mut reader = pack.as_slice();
+            db.install_raw_pack_from_reader(&mut reader)?
+        } else {
+            let stdin = io::stdin();
+            let mut stdin = stdin.lock();
+            db.install_raw_pack_from_reader(&mut stdin)?
+        };
         if options.keep {
             let keep_path = install.pack_path.with_extension("keep");
             fs::write(keep_path, b"")?;

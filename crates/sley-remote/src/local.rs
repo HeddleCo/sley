@@ -223,7 +223,12 @@ pub fn receive_pack_into_local_repository(
             Some(RefTarget::Direct(oid)) => Ok(Some(oid)),
             Some(RefTarget::Symbolic(_)) | None => Ok(None),
         },
-        |packfile| remote_db.install_raw_pack(packfile).map(|_| ()),
+        |packfile| {
+            let mut reader = packfile;
+            remote_db
+                .install_raw_pack_from_reader(&mut reader)
+                .map(|_| ())
+        },
         |oid| remote_db.contains(oid),
         |commands| {
             let applied = apply_receive_pack_ref_transaction(

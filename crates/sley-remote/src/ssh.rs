@@ -39,11 +39,9 @@ use sley_protocol::write_pkt_line_payload;
 use sley_protocol::{
     GitService, ProtocolV2FetchShallowInfo, ReceivePackCommand, ReceivePackFeatures,
     ReceivePackPushRequestOptions, RefAdvertisement, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackRawPackfileResponse, UploadPackRequest,
-    parse_receive_pack_features, parse_upload_pack_features, read_receive_pack_report_status,
-    read_ref_advertisement_set, read_upload_pack_raw_packfile_response,
-    read_upload_pack_shallow_info_and_raw_packfile_response, write_upload_pack_negotiation_request,
-    write_upload_pack_request,
+    UploadPackNegotiationRequest, UploadPackRequest, parse_receive_pack_features,
+    parse_upload_pack_features, read_receive_pack_report_status, read_ref_advertisement_set,
+    write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::FileRefStore;
 use sley_transport::{
@@ -963,97 +961,6 @@ pub fn ssh_upload_pack_advertisements_with_options(
         .transpose()?
         .unwrap_or_default();
     Ok((set.refs, features))
-}
-
-/// Post an upload-pack `request` + `haves` over SSH and read back the raw packfile
-/// response. The leading re-advertised ref set in the RPC stream is read and
-/// discarded before the request is written. For a plain (non-deepen) request; see
-/// [`ssh_upload_pack_shallow_fetch_response`] for the deepen case.
-pub fn ssh_upload_pack_fetch_response(
-    remote: &RemoteUrl,
-    format: ObjectFormat,
-    _features: &UploadPackFeatures,
-    request: UploadPackRequest,
-    haves: Vec<ObjectId>,
-    options: SshTransportOptions,
-) -> Result<UploadPackRawPackfileResponse> {
-    let (_shallow, response) =
-        ssh_upload_pack_fetch_response_inner(remote, format, request, haves, false, options)?;
-    Ok(response)
-}
-
-/// Post a deepen upload-pack `request` + `haves` over SSH and read back the
-/// shallow-info section plus the raw packfile response. Use this when `request`
-/// carries a `shallow`/`deepen`/`deepen-since`/`deepen-not` argument: the response
-/// is then prefixed with a shallow-info section (possibly empty). The returned
-/// [`ProtocolV2FetchShallowInfo`] entries are the server's shallow-info updates.
-pub fn ssh_upload_pack_shallow_fetch_response(
-    remote: &RemoteUrl,
-    format: ObjectFormat,
-    _features: &UploadPackFeatures,
-    request: UploadPackRequest,
-    haves: Vec<ObjectId>,
-    options: SshTransportOptions,
-) -> Result<(
-    Vec<ProtocolV2FetchShallowInfo>,
-    UploadPackRawPackfileResponse,
-)> {
-    ssh_upload_pack_fetch_response_inner(remote, format, request, haves, true, options)
-}
-
-/// Drive the `ssh` upload-pack subprocess for `request` + `haves`, reading back the
-/// raw packfile response. When `expect_shallow_info` is set (the request is a
-/// deepen request) the response's leading shallow-info section is parsed and
-/// returned; otherwise no shallow-info is expected and the returned vec is empty.
-fn ssh_upload_pack_fetch_response_inner(
-    remote: &RemoteUrl,
-    format: ObjectFormat,
-    request: UploadPackRequest,
-    haves: Vec<ObjectId>,
-    expect_shallow_info: bool,
-    options: SshTransportOptions,
-) -> Result<(
-    Vec<ProtocolV2FetchShallowInfo>,
-    UploadPackRawPackfileResponse,
-)> {
-    if !matches!(
-        remote.transport,
-        RemoteTransport::Ssh | RemoteTransport::Ext
-    ) {
-        return Err(GitError::InvalidFormat(
-            "SSH upload-pack requires an SSH remote".into(),
-        ));
-    }
-    let (child, stdin, mut stdout) =
-        spawn_service_process(remote, GitService::UploadPack, true, options)?;
-    let mut stdin =
-        stdin.ok_or_else(|| GitError::Command("ssh upload-pack stdin was not piped".into()))?;
-
-    read_ref_advertisement_set(format, &mut stdout)?;
-    write_upload_pack_request(&mut stdin, Some(&request))?;
-    write_upload_pack_negotiation_request(
-        &mut stdin,
-        &UploadPackNegotiationRequest { haves, done: true },
-    )?;
-    drop(stdin);
-
-    let result = if expect_shallow_info {
-        read_upload_pack_shallow_info_and_raw_packfile_response(format, &mut stdout)?
-    } else {
-        (
-            Vec::new(),
-            read_upload_pack_raw_packfile_response(format, &mut stdout)?,
-        )
-    };
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(GitError::Command(format!(
-            "ssh upload-pack failed for {}: {}",
-            ssh_remote_display(remote),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(result)
 }
 
 /// A human-readable rendering of an SSH `remote` for error messages. The CLI built

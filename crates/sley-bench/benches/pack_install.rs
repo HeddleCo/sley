@@ -36,8 +36,9 @@ fn install_pack_fresh_repo(c: &mut Criterion) {
         b.iter(|| {
             let target = create_pack_install_target().expect("pack install target");
             let db = FileObjectDatabase::from_git_dir(&target.git_dir, target.format);
+            let mut reader = black_box(pack.pack.as_slice());
             let result = db
-                .install_raw_pack(black_box(&pack.pack))
+                .install_raw_pack_from_reader(&mut reader)
                 .expect("install_raw_pack");
             black_box(result.object_ids.len())
         });

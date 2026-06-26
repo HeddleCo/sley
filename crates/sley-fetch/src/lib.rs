@@ -6,19 +6,13 @@ use sley_core::ObjectFormat;
 use sley_core::Result;
 use sley_odb::{FileObjectDatabase, RawPackInstallOptions, RawPackInstallResult, RawPackInstaller};
 use sley_protocol::{
-    ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, SideBandDemux,
-    UploadPackRawPackfileResponse, demux_protocol_v2_fetch_packfile,
-    read_upload_pack_raw_packfile_response_header,
+    PktLineFrame, ProtocolV2FetchResponseHeader, ProtocolV2FetchResponseSection,
+    ProtocolV2FetchShallowInfo, SideBandChannel, parse_sideband_packet, read_pkt_line_frame,
+    read_protocol_v2_fetch_response_header, read_upload_pack_raw_packfile_response_header,
     read_upload_pack_shallow_info_and_raw_packfile_response_header,
 };
-use std::io::{Cursor, Read};
-
-pub fn install_upload_pack_raw_response<I: RawPackInstaller>(
-    response: &UploadPackRawPackfileResponse,
-    destination: &I,
-) -> Result<RawPackInstallResult> {
-    destination.install_raw_pack(&response.packfile)
-}
+use std::collections::VecDeque;
+use std::io::{Cursor, ErrorKind, Read};
 
 pub fn install_upload_pack_raw_response_from_reader<I, R>(
     format: ObjectFormat,
@@ -32,19 +26,6 @@ where
     let header = read_upload_pack_raw_packfile_response_header(format, reader)?;
     let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
     destination.install_raw_pack_from_reader(&mut pack_reader)
-}
-
-pub fn install_upload_pack_raw_promisor_response(
-    response: &UploadPackRawPackfileResponse,
-    destination: &FileObjectDatabase,
-) -> Result<RawPackInstallResult> {
-    let result = destination.install_raw_pack_with_options(
-        &response.packfile,
-        RawPackInstallOptions { promisor: true },
-    )?;
-    Ok(RawPackInstallResult {
-        object_ids: result.object_ids,
-    })
 }
 
 pub fn install_upload_pack_raw_promisor_response_from_reader<R>(
@@ -105,40 +86,138 @@ where
     ))
 }
 
-pub fn install_protocol_v2_fetch_packfile<I: RawPackInstaller>(
-    packfile: &SideBandDemux,
+pub fn install_protocol_v2_fetch_response_from_reader<I, R>(
+    format: ObjectFormat,
+    reader: &mut R,
+    sideband_all: bool,
     destination: &I,
-) -> Result<RawPackInstallResult> {
-    destination.install_raw_pack(&packfile.data)
+) -> Result<(ProtocolV2FetchResponseHeader, Option<RawPackInstallResult>)>
+where
+    I: RawPackInstaller,
+    R: Read,
+{
+    let header = read_protocol_v2_fetch_response_header(format, reader, sideband_all)?;
+    if !header.has_packfile {
+        return Ok((header, None));
+    }
+    let mut pack_reader = ProtocolV2PackfileReader::new(reader);
+    let result = destination.install_raw_pack_from_reader(&mut pack_reader)?;
+    Ok((header, Some(result)))
 }
 
-pub fn install_protocol_v2_fetch_promisor_packfile(
-    packfile: &SideBandDemux,
+pub fn install_protocol_v2_fetch_promisor_response_from_reader<R>(
+    format: ObjectFormat,
+    reader: &mut R,
+    sideband_all: bool,
     destination: &FileObjectDatabase,
-) -> Result<RawPackInstallResult> {
-    let result = destination
-        .install_raw_pack_with_options(&packfile.data, RawPackInstallOptions { promisor: true })?;
-    Ok(RawPackInstallResult {
-        object_ids: result.object_ids,
-    })
+) -> Result<(ProtocolV2FetchResponseHeader, Option<RawPackInstallResult>)>
+where
+    R: Read,
+{
+    let header = read_protocol_v2_fetch_response_header(format, reader, sideband_all)?;
+    if !header.has_packfile {
+        return Ok((header, None));
+    }
+    let mut pack_reader = ProtocolV2PackfileReader::new(reader);
+    let result = destination.install_raw_pack_from_reader_with_options(
+        &mut pack_reader,
+        RawPackInstallOptions { promisor: true },
+    )?;
+    Ok((
+        header,
+        Some(RawPackInstallResult {
+            object_ids: result.object_ids,
+        }),
+    ))
 }
 
-pub fn install_protocol_v2_fetch_response_packfile<I: RawPackInstaller>(
-    sections: &[ProtocolV2FetchResponseSection],
-    destination: &I,
-) -> Result<Option<RawPackInstallResult>> {
-    demux_protocol_v2_fetch_packfile(sections)?
-        .map(|packfile| install_protocol_v2_fetch_packfile(&packfile, destination))
-        .transpose()
+struct ProtocolV2PackfileReader<'a, R> {
+    reader: &'a mut R,
+    pending: VecDeque<u8>,
+    done: bool,
 }
 
-pub fn install_protocol_v2_fetch_response_promisor_packfile(
-    sections: &[ProtocolV2FetchResponseSection],
-    destination: &FileObjectDatabase,
-) -> Result<Option<RawPackInstallResult>> {
-    demux_protocol_v2_fetch_packfile(sections)?
-        .map(|packfile| install_protocol_v2_fetch_promisor_packfile(&packfile, destination))
-        .transpose()
+impl<'a, R> ProtocolV2PackfileReader<'a, R> {
+    fn new(reader: &'a mut R) -> Self {
+        Self {
+            reader,
+            pending: VecDeque::new(),
+            done: false,
+        }
+    }
+}
+
+impl<R> Read for ProtocolV2PackfileReader<'_, R>
+where
+    R: Read,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        while written < buf.len() {
+            if let Some(byte) = self.pending.pop_front() {
+                buf[written] = byte;
+                written += 1;
+                continue;
+            }
+            if self.done {
+                break;
+            }
+            let frame = read_pkt_line_frame(self.reader)
+                .map_err(git_error_to_io)?
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "protocol v2 packfile ended before flush",
+                    )
+                })?;
+            match frame {
+                PktLineFrame::Data(payload) => {
+                    let packet = parse_sideband_packet(&payload).map_err(git_error_to_io)?;
+                    match packet.channel {
+                        SideBandChannel::Data => self.pending.extend(packet.data),
+                        SideBandChannel::Progress => {}
+                        SideBandChannel::Fatal => {
+                            let message = String::from_utf8_lossy(&packet.data).into_owned();
+                            return Err(std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                format!("sideband fatal: {message}"),
+                            ));
+                        }
+                    }
+                }
+                PktLineFrame::Flush => {
+                    self.done = true;
+                    break;
+                }
+                PktLineFrame::Delimiter | PktLineFrame::ResponseEnd => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "protocol v2 packfile section ended unexpectedly",
+                    ));
+                }
+            }
+        }
+        Ok(written)
+    }
+}
+
+fn git_error_to_io(err: sley_core::GitError) -> std::io::Error {
+    std::io::Error::new(ErrorKind::InvalidData, err.to_string())
+}
+
+pub fn shallow_info_from_protocol_v2_fetch_header(
+    header: &ProtocolV2FetchResponseHeader,
+) -> Vec<ProtocolV2FetchShallowInfo> {
+    let mut shallow_info = Vec::new();
+    for section in &header.sections {
+        if let ProtocolV2FetchResponseSection::ShallowInfo(entries) = section {
+            shallow_info.extend(entries.clone());
+        }
+    }
+    shallow_info
 }
 
 #[cfg(test)]
@@ -149,39 +228,15 @@ mod tests {
     use sley_odb::{FileObjectDatabase, ObjectDatabase, ObjectReader};
     use sley_pack::PackFile;
     use sley_protocol::{
-        SideBandChannel, SideBandPacket, UploadPackAcknowledgment, encode_sideband_packet,
-        encode_upload_pack_raw_packfile_response, write_pkt_line_payload,
-        write_upload_pack_raw_packfile_response,
+        SideBandChannel, SideBandPacket, UploadPackAcknowledgment, UploadPackRawPackfileResponse,
+        encode_sideband_packet, encode_upload_pack_raw_packfile_response, write_pkt_line_payload,
+        write_protocol_v2_fetch_response, write_upload_pack_raw_packfile_response,
     };
     use std::fs;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    #[test]
-    fn raw_upload_pack_response_installs_pack_without_loose_objects() {
-        let root = test_temp_root("sley-fetch-upload-pack-raw-install");
-        let format = ObjectFormat::Sha256;
-        let object = EncodedObject::new(ObjectType::Blob, b"raw upload-pack boundary\n".to_vec());
-        let oid = object
-            .object_id(format)
-            .expect("test operation should succeed");
-        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format)
-            .expect("test operation should succeed");
-        let response = UploadPackRawPackfileResponse {
-            acknowledgments: Vec::new(),
-            packfile: pack.pack,
-        };
-        let destination = FileObjectDatabase::new(root.join("objects"), format);
-
-        let result = install_upload_pack_raw_response(&response, &destination)
-            .expect("test operation should succeed");
-
-        assert_eq!(result.object_ids, vec![oid]);
-        assert_pack_install(&root.join("objects"), &destination, &oid, &object);
-        let _ = fs::remove_dir_all(&root);
-    }
 
     #[test]
     fn raw_upload_pack_response_stream_installs_pack_without_buffering_response() {
@@ -265,41 +320,22 @@ mod tests {
             acknowledgments: Vec::new(),
             packfile: pack.pack,
         };
-        let destination = FileObjectDatabase::new(root.join("objects"), format);
-
-        let result = install_upload_pack_raw_promisor_response(&response, &destination)
+        let mut encoded = Vec::new();
+        write_upload_pack_raw_packfile_response(&mut encoded, &response)
             .expect("test operation should succeed");
+        let destination = FileObjectDatabase::new(root.join("objects"), format);
+        let mut reader = encoded.as_slice();
+
+        let result = install_upload_pack_raw_promisor_response_from_reader(
+            format,
+            &mut reader,
+            &destination,
+        )
+        .expect("test operation should succeed");
 
         assert_eq!(result.object_ids, vec![oid]);
         assert_pack_install(&root.join("objects"), &destination, &oid, &object);
         assert_promisor_sidecar(&root.join("objects"));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn protocol_v2_fetch_packfile_installs_pack_without_loose_objects() {
-        let root = test_temp_root("sley-fetch-v2-packfile-install");
-        let format = ObjectFormat::Sha1;
-        let object = EncodedObject::new(
-            ObjectType::Blob,
-            b"protocol v2 packfile boundary\n".to_vec(),
-        );
-        let oid = object
-            .object_id(format)
-            .expect("test operation should succeed");
-        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format)
-            .expect("test operation should succeed");
-        let packfile = SideBandDemux {
-            data: pack.pack,
-            progress: vec![b"counting objects\n".to_vec()],
-        };
-        let destination = FileObjectDatabase::new(root.join("objects"), format);
-
-        let result = install_protocol_v2_fetch_packfile(&packfile, &destination)
-            .expect("test operation should succeed");
-
-        assert_eq!(result.object_ids, vec![oid]);
-        assert_pack_install(&root.join("objects"), &destination, &oid, &object);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -325,12 +361,23 @@ mod tests {
             })
             .expect("test operation should succeed"),
         ])];
+        let mut encoded = Vec::new();
+        write_protocol_v2_fetch_response(&mut encoded, &sections)
+            .expect("test operation should succeed");
         let destination = FileObjectDatabase::new(root.join("objects"), format);
+        let mut reader = encoded.as_slice();
 
-        let result = install_protocol_v2_fetch_response_packfile(&sections, &destination)
-            .expect("test operation should succeed")
-            .expect("packfile should be installed");
+        let (header, result) = install_protocol_v2_fetch_response_from_reader(
+            format,
+            &mut reader,
+            false,
+            &destination,
+        )
+        .expect("test operation should succeed");
+        let result = result.expect("packfile should be installed");
 
+        assert!(header.has_packfile);
+        assert!(header.sections.is_empty());
         assert_eq!(result.object_ids, vec![oid]);
         assert_pack_install(&root.join("objects"), &destination, &oid, &object);
         let _ = fs::remove_dir_all(&root);
@@ -353,12 +400,22 @@ mod tests {
             })
             .expect("test operation should succeed"),
         ])];
+        let mut encoded = Vec::new();
+        write_protocol_v2_fetch_response(&mut encoded, &sections)
+            .expect("test operation should succeed");
         let destination = FileObjectDatabase::new(root.join("objects"), format);
+        let mut reader = encoded.as_slice();
 
-        let result = install_protocol_v2_fetch_response_promisor_packfile(&sections, &destination)
-            .expect("test operation should succeed")
-            .expect("packfile should be installed");
+        let (header, result) = install_protocol_v2_fetch_promisor_response_from_reader(
+            format,
+            &mut reader,
+            false,
+            &destination,
+        )
+        .expect("test operation should succeed");
+        let result = result.expect("packfile should be installed");
 
+        assert!(header.has_packfile);
         assert_eq!(result.object_ids, vec![oid]);
         assert_pack_install(&root.join("objects"), &destination, &oid, &object);
         assert_promisor_sidecar(&root.join("objects"));
@@ -370,10 +427,20 @@ mod tests {
         let root = test_temp_root("sley-fetch-v2-response-empty");
         let destination = FileObjectDatabase::new(root.join("objects"), ObjectFormat::Sha1);
         let sections = vec![ProtocolV2FetchResponseSection::Acknowledgments(Vec::new())];
-
-        let result = install_protocol_v2_fetch_response_packfile(&sections, &destination)
+        let mut encoded = Vec::new();
+        write_protocol_v2_fetch_response(&mut encoded, &sections)
             .expect("test operation should succeed");
+        let mut reader = encoded.as_slice();
 
+        let (header, result) = install_protocol_v2_fetch_response_from_reader(
+            ObjectFormat::Sha1,
+            &mut reader,
+            false,
+            &destination,
+        )
+        .expect("test operation should succeed");
+
+        assert!(!header.has_packfile);
         assert!(result.is_none());
         assert!(!root.join("objects").join("pack").exists());
         let _ = fs::remove_dir_all(&root);
@@ -387,7 +454,15 @@ mod tests {
         }
 
         impl RawPackInstaller for RecordingInstaller {
-            fn install_raw_pack(&self, pack_bytes: &[u8]) -> Result<RawPackInstallResult> {
+            fn install_raw_pack_from_reader<R>(
+                &self,
+                reader: &mut R,
+            ) -> Result<RawPackInstallResult>
+            where
+                R: Read,
+            {
+                let mut pack_bytes = Vec::new();
+                reader.read_to_end(&mut pack_bytes)?;
                 self.packs.borrow_mut().push(pack_bytes.to_vec());
                 Ok(RawPackInstallResult {
                     object_ids: Vec::new(),
@@ -400,9 +475,16 @@ mod tests {
             acknowledgments: Vec::new(),
             packfile: b"PACKcustom".to_vec(),
         };
+        let encoded =
+            encode_upload_pack_raw_packfile_response(&response).expect("response should encode");
+        let mut reader = encoded.as_slice();
 
-        let result = install_upload_pack_raw_response(&response, &installer)
-            .expect("test operation should succeed");
+        let result = install_upload_pack_raw_response_from_reader(
+            ObjectFormat::Sha1,
+            &mut reader,
+            &installer,
+        )
+        .expect("test operation should succeed");
 
         assert!(result.object_ids.is_empty());
         assert_eq!(installer.packs.into_inner(), vec![b"PACKcustom".to_vec()]);
@@ -421,10 +503,14 @@ mod tests {
             acknowledgments: Vec::new(),
             packfile: pack.pack,
         };
+        let encoded =
+            encode_upload_pack_raw_packfile_response(&response).expect("response should encode");
         let destination = ObjectDatabase::new(format);
+        let mut reader = encoded.as_slice();
 
-        let result = install_upload_pack_raw_response(&response, &destination)
-            .expect("test operation should succeed");
+        let result =
+            install_upload_pack_raw_response_from_reader(format, &mut reader, &destination)
+                .expect("test operation should succeed");
 
         assert_eq!(result.object_ids, vec![oid]);
         assert_eq!(
