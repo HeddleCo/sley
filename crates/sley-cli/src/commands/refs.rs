@@ -2346,6 +2346,7 @@ fn dispatch_ref_stdin_command(
             let current = context.store.read_ref(&name)?;
             if context.batch_updates {
                 return verify_update_ref_stdin_batch(
+                    context.store,
                     context.format,
                     &name,
                     current.as_ref(),
@@ -3395,6 +3396,7 @@ fn print_update_ref_stdin_rejection(
 }
 
 fn update_ref_stdin_expected_rejection(
+    store: &FileRefStore,
     format: ObjectFormat,
     name: &str,
     current: Option<&RefTarget>,
@@ -3415,6 +3417,10 @@ fn update_ref_stdin_expected_rejection(
         return Ok(None);
     }
 
+    // Mirror check_update_ref_stdin_expected_named: a `--no-deref` symref is
+    // resolved one chain to an OID so its dangling target reports
+    // `reference is missing but expected X` (stderr) / `reference does not exist`
+    // (stdout), distinct from a wholly-missing ref's `unable to resolve`.
     match current {
         Some(RefTarget::Direct(actual)) if actual == expected => Ok(None),
         Some(RefTarget::Direct(actual)) => Ok(Some(UpdateRefStdinRejection {
@@ -3424,7 +3430,24 @@ fn update_ref_stdin_expected_rejection(
             stdout_reason: "incorrect old value provided",
             stderr_reason: format!("is at {actual} but expected {expected}"),
         })),
-        Some(RefTarget::Symbolic(_)) | None => Ok(Some(UpdateRefStdinRejection {
+        Some(RefTarget::Symbolic(_)) => match resolve_ref_peeled(store, name)? {
+            Some(actual) if &actual == expected => Ok(None),
+            Some(actual) => Ok(Some(UpdateRefStdinRejection {
+                name: name.to_string(),
+                new_value,
+                old_value: expected.to_string(),
+                stdout_reason: "incorrect old value provided",
+                stderr_reason: format!("is at {actual} but expected {expected}"),
+            })),
+            None => Ok(Some(UpdateRefStdinRejection {
+                name: name.to_string(),
+                new_value,
+                old_value: expected.to_string(),
+                stdout_reason: "reference does not exist",
+                stderr_reason: format!("reference is missing but expected {expected}"),
+            })),
+        },
+        None => Ok(Some(UpdateRefStdinRejection {
             name: name.to_string(),
             new_value,
             old_value: expected.to_string(),
@@ -3502,6 +3525,7 @@ fn update_ref_stdin_write_batch(
     let current = context.store.read_ref(&request.name)?;
     if let Some(expected_oid) = request.expected_oid
         && let Some(rejection) = update_ref_stdin_expected_rejection(
+            context.store,
             context.format,
             &request.name,
             current.as_ref(),
@@ -3530,6 +3554,26 @@ fn update_ref_stdin_write_batch(
         eprintln!("error: cannot update ref '{}': {reason}", request.name);
         return Ok(());
     }
+    // A directory/file refname conflict (e.g. creating `refs/heads/ref` while
+    // `refs/heads/ref/foo` exists) rejects only this update under
+    // --batch-updates rather than aborting the whole batch.
+    if let Some(conflict) = context.store.refname_directory_conflict(&request.name)? {
+        writeln!(
+            stdout,
+            "rejected {} {} {} refname conflict",
+            request.name,
+            request.new_oid,
+            request
+                .expected_oid
+                .map(ObjectId::to_string)
+                .unwrap_or_else(|| "(null)".to_string())
+        )?;
+        eprintln!(
+            "error: cannot lock ref '{}': '{conflict}' exists; cannot create '{}'",
+            request.name, request.name
+        );
+        return Ok(());
+    }
     update_ref_stdin_write(
         context,
         UpdateRefStdinWriteRequest {
@@ -3549,6 +3593,7 @@ fn update_ref_delete_stdin_batch(
     let current = store.read_ref(name)?;
     if let Some(expected) = expected
         && let Some(rejection) = update_ref_stdin_expected_rejection(
+            store,
             format,
             name,
             current.as_ref(),
@@ -3563,15 +3608,21 @@ fn update_ref_delete_stdin_batch(
 }
 
 fn verify_update_ref_stdin_batch(
+    store: &FileRefStore,
     format: ObjectFormat,
     name: &str,
     current: Option<&RefTarget>,
     expected: &ObjectId,
     stdout: &mut dyn Write,
 ) -> Result<()> {
-    if let Some(rejection) =
-        update_ref_stdin_expected_rejection(format, name, current, expected, "(null)".to_string())?
-    {
+    if let Some(rejection) = update_ref_stdin_expected_rejection(
+        store,
+        format,
+        name,
+        current,
+        expected,
+        "(null)".to_string(),
+    )? {
         print_update_ref_stdin_rejection(rejection, stdout)?;
     }
     Ok(())

@@ -2869,25 +2869,37 @@ impl FileRefStore {
     }
 
     fn check_ref_directory_conflict_targeted(&self, name: &str) -> Result<()> {
+        match self.refname_directory_conflict(name)? {
+            Some(conflict) => Err(ref_directory_conflict_error(name, &conflict)),
+            None => Ok(()),
+        }
+    }
+
+    /// Return the existing ref that would directory/file-conflict with creating
+    /// `name` (an ancestor occupying a needed file, or a descendant occupying a
+    /// needed directory), or `None` when `name` is creatable. Checks loose and
+    /// packed refs. Exposed so `update-ref --stdin --batch-updates` can reject a
+    /// single conflicting update without aborting the rest of the batch.
+    pub fn refname_directory_conflict(&self, name: &str) -> Result<Option<String>> {
         let components = name.split('/').collect::<Vec<_>>();
         let mut ancestors = Vec::new();
         for index in 1..components.len() {
             let ancestor = components[..index].join("/");
             if self.loose_ref_file_exists_for_conflict(&ancestor)? {
-                return Err(ref_directory_conflict_error(name, &ancestor));
+                return Ok(Some(ancestor));
             }
             ancestors.push(ancestor);
         }
         let child_prefix = format!("{name}/");
         if let Some(existing) = self.first_loose_ref_name_with_prefix(&child_prefix)? {
-            return Err(ref_directory_conflict_error(name, &existing));
+            return Ok(Some(existing));
         }
         if let Some(existing) =
             self.first_packed_ref_directory_conflict(&ancestors, &child_prefix)?
         {
-            return Err(ref_directory_conflict_error(name, &existing));
+            return Ok(Some(existing));
         }
-        Ok(())
+        Ok(None)
     }
 
     fn loose_ref_file_exists_for_conflict(&self, name: &str) -> Result<bool> {
