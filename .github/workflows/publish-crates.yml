@@ -80,6 +80,8 @@ jobs:
             sley-protocol
             sley-transport
             sley-fetch
+            sley-submodule
+            sley-fsck
             sley-remote
             sley
           )

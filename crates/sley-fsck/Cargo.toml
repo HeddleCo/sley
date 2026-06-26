@@ -1,18 +1,18 @@
 [package]
 name = "sley-fsck"
-publish = false
+description = "Object and connectivity fsck for sley."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core" }
-sley-config = { path = "../sley-config" }
-sley-formats = { path = "../sley-formats" }
-sley-object = { path = "../sley-object" }
-sley-odb = { path = "../sley-odb" }
-sley-submodule = { path = "../sley-submodule" }
+sley-core = { path = "../sley-core", version = "0.3.0" }
+sley-config = { path = "../sley-config", version = "0.3.0" }
+sley-formats = { path = "../sley-formats", version = "0.3.0" }
+sley-object = { path = "../sley-object", version = "0.3.0" }
+sley-odb = { path = "../sley-odb", version = "0.3.0" }
+sley-submodule = { path = "../sley-submodule", version = "0.3.0" }
 
 [lints]
 workspace = true
