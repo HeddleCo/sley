@@ -1504,24 +1504,21 @@ fn resolve_upstream_ref(
             &owned_config
         }
     };
+    // `@{push}` follows git's `branch_get_push()`: pushremote + push refspecs +
+    // `push.default`, which differ materially from `@{upstream}`'s plain
+    // `branch.<name>.{remote,merge}` lookup.
+    if push {
+        return branch_get_push(&branch, config);
+    }
     let merge = config
         .get("branch", Some(&branch), "merge")
         .ok_or_else(|| {
             GitError::not_found(format!("no upstream configured for branch '{branch}'"))
         })?;
     let short = merge.strip_prefix("refs/heads/").unwrap_or(merge);
-
-    // For `@{push}` prefer a push-specific remote, falling back to the upstream
-    // remote (`branch.<name>.remote`) when none is set.
-    let remote = if push {
-        config
-            .get("branch", Some(&branch), "pushRemote")
-            .or_else(|| config.get("remote", None, "pushDefault"))
-            .or_else(|| config.get("branch", Some(&branch), "remote"))
-    } else {
-        config.get("branch", Some(&branch), "remote")
-    }
-    .ok_or_else(|| GitError::not_found(format!("no upstream remote for branch '{branch}'")))?;
+    let remote = config
+        .get("branch", Some(&branch), "remote")
+        .ok_or_else(|| GitError::not_found(format!("no upstream remote for branch '{branch}'")))?;
 
     let refname = if remote == "." {
         merge.to_string()
@@ -1532,6 +1529,129 @@ fn resolve_upstream_ref(
         refname,
         merge: merge.to_string(),
     })
+}
+
+/// `branch_get_push_1()` from remote.c: resolve `<branch>@{push}` to its push
+/// tracking ref. Determines the pushremote, applies explicit push refspecs when
+/// present, and otherwise dispatches on `push.default`.
+fn branch_get_push(branch: &str, config: &GitConfig) -> Result<UpstreamRef> {
+    let merge = config
+        .get("branch", Some(branch), "merge")
+        .map(str::to_string);
+    let pushremote = config
+        .get("branch", Some(branch), "pushRemote")
+        .or_else(|| config.get("remote", None, "pushDefault"))
+        .or_else(|| config.get("branch", Some(branch), "remote"))
+        .ok_or_else(|| {
+            GitError::not_found(format!("branch '{branch}' has no remote for pushing"))
+        })?
+        .to_string();
+    let branch_refname = format!("refs/heads/{branch}");
+
+    let upstream_ref = |refname: String| UpstreamRef {
+        refname,
+        merge: merge.clone().unwrap_or_default(),
+    };
+
+    // Explicit push refspecs win over `push.default`: map the local branch ref
+    // through them, then through the pushremote's fetch refspecs.
+    let push_refspecs: Vec<&str> = config
+        .get_all("remote", Some(&pushremote), "push")
+        .into_iter()
+        .flatten()
+        .collect();
+    if !push_refspecs.is_empty() {
+        let dst = apply_refspecs(&push_refspecs, &branch_refname).ok_or_else(|| {
+            GitError::not_found(format!(
+                "push refspecs for '{pushremote}' do not include '{branch}'"
+            ))
+        })?;
+        return Ok(upstream_ref(tracking_for_push_dest(config, &pushremote, &dst)?));
+    }
+
+    match config.get("push", None, "default").unwrap_or("simple") {
+        "nothing" => Err(GitError::not_found(
+            "push has no destination (push.default is 'nothing')".to_string(),
+        )),
+        "matching" | "current" => Ok(upstream_ref(tracking_for_push_dest(
+            config,
+            &pushremote,
+            &branch_refname,
+        )?)),
+        "upstream" | "tracking" => Ok(upstream_ref(branch_get_upstream_refname(
+            config,
+            branch,
+            merge.as_deref(),
+        )?)),
+        // "simple" and any unrecognised/unspecified value: push to the same-named
+        // branch, but only when that coincides with the upstream destination.
+        _ => {
+            let up = branch_get_upstream_refname(config, branch, merge.as_deref())?;
+            let cur = tracking_for_push_dest(config, &pushremote, &branch_refname)?;
+            if cur != up {
+                return Err(GitError::not_found(
+                    "cannot resolve 'simple' push to a single destination".to_string(),
+                ));
+            }
+            Ok(upstream_ref(cur))
+        }
+    }
+}
+
+/// The upstream tracking ref of `branch` (`branch_get_upstream()` →
+/// `branch->merge[0]->dst`): the `branch.<name>.merge` ref mapped through the
+/// fetch refspecs of `branch.<name>.remote`.
+fn branch_get_upstream_refname(
+    config: &GitConfig,
+    branch: &str,
+    merge: Option<&str>,
+) -> Result<String> {
+    let merge = merge.filter(|merge| !merge.is_empty()).ok_or_else(|| {
+        GitError::not_found(format!("no upstream configured for branch '{branch}'"))
+    })?;
+    let remote = config.get("branch", Some(branch), "remote").ok_or_else(|| {
+        GitError::not_found(format!("no upstream configured for branch '{branch}'"))
+    })?;
+    if remote == "." {
+        return Ok(merge.to_string());
+    }
+    tracking_for_push_dest(config, remote, merge)
+}
+
+/// `tracking_for_push_dest()`: the local tracking ref for `refname` on `remote`,
+/// produced by applying that remote's fetch refspecs.
+fn tracking_for_push_dest(config: &GitConfig, remote: &str, refname: &str) -> Result<String> {
+    let fetch_refspecs: Vec<&str> = config
+        .get_all("remote", Some(remote), "fetch")
+        .into_iter()
+        .flatten()
+        .collect();
+    apply_refspecs(&fetch_refspecs, refname).ok_or_else(|| {
+        GitError::not_found(format!(
+            "push destination '{refname}' on remote '{remote}' has no local tracking branch"
+        ))
+    })
+}
+
+/// Apply a list of refspecs to a single ref, returning the first matching
+/// destination. Handles the exact `<src>:<dst>` and wildcard `<p>*:<q>*` forms
+/// (a trailing `*` matches an arbitrary suffix, slashes included); a leading `+`
+/// is ignored and a colon-less spec maps a ref to itself.
+fn apply_refspecs(refspecs: &[&str], refname: &str) -> Option<String> {
+    for spec in refspecs {
+        let spec = spec.strip_prefix('+').unwrap_or(spec);
+        let (src, dst) = spec.split_once(':').unwrap_or((spec, spec));
+        if let Some(src_prefix) = src.strip_suffix('*') {
+            if let (Some(suffix), Some(dst_prefix)) =
+                (refname.strip_prefix(src_prefix), dst.strip_suffix('*'))
+            {
+                return Some(format!("{dst_prefix}{suffix}"));
+            }
+        } else if src == refname {
+            return Some(dst.to_string());
+        }
+    }
+    None
 }
 
 /// Read the repository config (`<git_dir>/config`), resolving `include`/`includeIf`
