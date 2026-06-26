@@ -505,7 +505,7 @@ declare -A FLOOR=(
     # need a split-chain Bloom reader that walks non-latest graph layers; the
     # hand-tuned filter-count normalize hack covers fewer combinations than 161.
     [t4216-log-bloom.sh]=160
-    [t5318-commit-graph.sh]=95
+    [t5318-commit-graph.sh]=98  # wave-52 graphpack: 96->98 (--stdin-commits tag peel + hash-version warn)
     [t3432-rebase-fast-forward.sh]=219
     # wave-25 (2026-06-21): fetch-push push-caps/status-report 99->111 (banked 110, 1-cell
     # transport-flake margin); diff-whitespace ignore-modes 119->129; add modes 41->50 (NEW floor).
@@ -633,7 +633,7 @@ declare -A FLOOR=(
     [t5303-pack-corruption-resilience.sh]=31
     [t5304-prune.sh]=32
     [t5319-multi-pack-index.sh]=93  # wave-39: 70->95 (midx bitmap/verify/expire/repack; banked 93 margin, 3 hard cells)
-    [t5324-split-commit-graph.sh]=25
+    [t5324-split-commit-graph.sh]=26  # wave-52 graphpack: 25->26 (core.sharedRepository perms)
     [t5329-pack-objects-cruft.sh]=19
     [t5504-fetch-receive-strict.sh]=7
     # codex-wave-10 (remote verbs): add (config forms/mirror/tags/fetch-on-add),
@@ -1206,6 +1206,15 @@ declare -A FLOOR=(
     [t4207-log-decoration-colors.sh]=1
     [t8005-blame-i18n.sh]=1
     [t0410-partial-clone.sh]=23
+    # wave-52 graphpack (commit-graph + pack-objects cluster): pack-objects
+    # --stdin-packs standard mode (t5331 1->13, NEW floor); git pack-redundant
+    # full impl (t5323 4->18 full, NEW floor); commit-graph --stdin-commits tag
+    # peeling + hash-version-mismatch warning (t5318 96->98, raised 95->98);
+    # commit-graph write honors core.sharedRepository (t5324 25->26, raised
+    # 25->26). Guards held: t5300=55 t5302=31 t5304=32 t5310=221 t5319=95
+    # t5326=345 t6012=42 t4202=131. cargo test --workspace green.
+    [t5331-pack-objects-stdin.sh]=13
+    [t5323-pack-redundant.sh]=18
 
 )
 

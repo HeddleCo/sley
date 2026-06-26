@@ -2736,6 +2736,9 @@ fn load_commit_graph_map(
             Ok(bytes) => bytes,
             Err(_) => return HashMap::new(),
         };
+        if commit_graph_hash_version_mismatch(&bytes, format) {
+            return HashMap::new();
+        }
         return match CommitGraph::parse(&bytes, format) {
             Ok(graph) => graph_to_map(&graph).unwrap_or_default(),
             Err(_) => {
@@ -2763,6 +2766,9 @@ fn load_direct_commit_graph(git_dir: &Path, format: sley_core::ObjectFormat) -> 
             Err(_) => return DirectCommitGraph::Invalid,
         },
     };
+    if commit_graph_hash_version_mismatch(bytes.as_ref(), format) {
+        return DirectCommitGraph::Invalid;
+    }
     warn_invalid_commit_graph_bloom_chunks(bytes.as_ref(), &path, format);
     RawCommitGraph::parse_for_lookup(bytes, format)
         .map(Box::new)
@@ -2801,6 +2807,29 @@ fn commit_graph_hash_function_id(format: ObjectFormat) -> u32 {
         ObjectFormat::Sha1 => 1,
         ObjectFormat::Sha256 => 2,
     }
+}
+
+/// Warn (once per process, on stderr) when a commit-graph file's hash-version
+/// byte disagrees with the repository's object format, mirroring git's
+/// `load_commit_graph_one`. Returns true when the graph must be ignored. The
+/// graph is otherwise silently usable, so this never fires in normal operation.
+fn commit_graph_hash_version_mismatch(bytes: &[u8], format: ObjectFormat) -> bool {
+    if bytes.len() <= 5 || &bytes[..4] != b"CGPH" {
+        return false;
+    }
+    let file_version = u32::from(bytes[5]);
+    let repo_version = commit_graph_hash_function_id(format);
+    if file_version == repo_version {
+        return false;
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "error: commit-graph hash version {file_version} does not match version {repo_version}"
+        );
+    }
+    true
 }
 
 fn read_u32_be(bytes: &[u8]) -> u32 {

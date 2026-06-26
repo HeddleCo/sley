@@ -8144,11 +8144,12 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
     )?;
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
+    let shared_read_mode = commit_graph_shared_read_mode(&git_dir);
     if split.mode == CommitGraphSplitMode::Off {
-        write_commit_graph_file(&graph_dir.join("commit-graph"), &graph)?;
+        write_commit_graph_file(&graph_dir.join("commit-graph"), &graph, shared_read_mode)?;
         remove_split_commit_graphs(&object_dir)?;
     } else {
-        write_split_commit_graph_file(&object_dir, format, &graph, split)?;
+        write_split_commit_graph_file(&object_dir, format, &graph, split, shared_read_mode)?;
     }
     Ok(())
 }
@@ -8170,7 +8171,7 @@ fn existing_commit_graph_oids(object_dir: &Path, format: ObjectFormat) -> Result
 /// The umask is derived (without `unsafe`/libc) from the just-created file: the
 /// OS gives it `0666 & ~umask`, so its read bits (`& 0444`) equal `0444 &
 /// ~umask` exactly — which is the mode git lands on.
-fn write_commit_graph_file(path: &Path, bytes: &[u8]) -> Result<()> {
+fn write_commit_graph_file(path: &Path, bytes: &[u8], shared_read_mode: u32) -> Result<()> {
     // A prior graph is written read-only (and a corrupted-graph test may leave
     // it chmod-000); make it writable first so the remove always succeeds, then
     // remove it so the rewrite creates a fresh file with the OS default mode
@@ -8188,11 +8189,48 @@ fn write_commit_graph_file(path: &Path, bytes: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // The graph is read-only; `core.sharedRepository` narrows which classes
+        // keep the read bit (git's adjust_shared_perm). The umask is folded in
+        // via the freshly-created file's mode so the default (no sharedRepository
+        // → 0o444) still tracks it.
         let created_mode = fs::metadata(path)?.permissions().mode();
-        let mode = created_mode & 0o444;
+        let mode = created_mode & shared_read_mode;
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
+    #[cfg(not(unix))]
+    let _ = shared_read_mode;
     Ok(())
+}
+
+/// The read-only file mode a freshly-written commit-graph should carry, after
+/// applying `core.sharedRepository`. Defaults to `0o444` (all-read); a
+/// configured numeric/symbolic mode drops the group/other read bit for any
+/// class the mode grants no access (mirrors git's `adjust_shared_perm`).
+fn commit_graph_shared_read_mode(git_dir: &Path) -> u32 {
+    const BASE: u32 = 0o444;
+    let Ok(config) = read_repo_config(git_dir) else {
+        return BASE;
+    };
+    let Some(value) = config.get("core", None, "sharedRepository") else {
+        return BASE;
+    };
+    let mode: u32 = match value.trim().to_ascii_lowercase().as_str() {
+        "umask" | "false" | "no" | "off" | "0" | "" => return BASE,
+        "group" | "true" | "yes" | "on" | "1" => 0o660,
+        "all" | "world" | "everybody" | "2" => 0o664,
+        other => match u32::from_str_radix(other, 8) {
+            Ok(parsed) if parsed != 0 => parsed,
+            _ => return BASE,
+        },
+    };
+    let mut read = 0o400;
+    if mode & 0o070 != 0 {
+        read |= 0o040;
+    }
+    if mode & 0o007 != 0 {
+        read |= 0o004;
+    }
+    read
 }
 
 fn commit_graph_parse_max_new_filters(value: &str) -> Result<usize> {
@@ -8231,6 +8269,7 @@ fn write_split_commit_graph_file(
     format: ObjectFormat,
     graph: &[u8],
     options: CommitGraphSplitOptions,
+    shared_read_mode: u32,
 ) -> Result<()> {
     let info = object_dir.join("info");
     let graphs = info.join("commit-graphs");
@@ -8248,7 +8287,7 @@ fn write_split_commit_graph_file(
         let hash = graph_file_checksum(&bytes, format)?;
         let path = graphs.join(format!("graph-{hash}.graph"));
         if !path.exists() {
-            write_commit_graph_file(&path, &bytes)?;
+            write_commit_graph_file(&path, &bytes, shared_read_mode)?;
         }
         layers.push(CommitGraphLayer {
             hash,
@@ -8323,7 +8362,7 @@ fn write_split_commit_graph_file(
     )?;
     let hash = graph_file_checksum(&graph, format)?;
     let graph_path = graphs.join(format!("graph-{hash}.graph"));
-    write_commit_graph_file(&graph_path, &graph)?;
+    write_commit_graph_file(&graph_path, &graph, shared_read_mode)?;
 
     let mut chain = base_hashes;
     chain.push(hash);
@@ -8332,7 +8371,7 @@ fn write_split_commit_graph_file(
         chain_text.push_str(&hash.to_hex());
         chain_text.push('\n');
     }
-    write_commit_graph_file(&chain_path, chain_text.as_bytes())?;
+    write_commit_graph_file(&chain_path, chain_text.as_bytes(), shared_read_mode)?;
     if single.exists() {
         #[cfg(unix)]
         {
@@ -8576,11 +8615,12 @@ fn write_reachable_commit_graph(
     )?;
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
+    let shared_read_mode = commit_graph_shared_read_mode(git_dir);
     if split.mode == CommitGraphSplitMode::Off {
-        write_commit_graph_file(&graph_dir.join("commit-graph"), &graph)?;
+        write_commit_graph_file(&graph_dir.join("commit-graph"), &graph, shared_read_mode)?;
         remove_split_commit_graphs(object_dir)?;
     } else {
-        write_split_commit_graph_file(object_dir, format, &graph, split)?;
+        write_split_commit_graph_file(object_dir, format, &graph, split, shared_read_mode)?;
     }
     Ok(())
 }
@@ -8688,14 +8728,18 @@ fn commit_graph_stdin_commits_starts(
             eprintln!("error: unexpected non-hex object ID: {line}");
             return Err(GitError::Exit(1));
         };
-        let Ok(object) = db.read_object(&oid) else {
+        let Ok(_object) = db.read_object(&oid) else {
             eprintln!("error: invalid object {line}");
             return Err(GitError::Exit(1));
         };
-        // Peel tags/commit; non-commit tree-ish (e.g. a tree oid) is silently
-        // skipped, matching git, which only graphs the commit objects.
-        if object.object_type == ObjectType::Commit && seen.insert(oid) {
-            starts.push(oid);
+        // Peel annotated tags down to the commit they reference; non-commit
+        // tree-ish (e.g. a tree oid) is silently skipped, matching git, which
+        // only graphs commit objects. Dedup on the peeled commit so two tags
+        // pointing at the same commit contribute one start.
+        if let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid)
+            && seen.insert(commit)
+        {
+            starts.push(commit);
         }
     }
     Ok(starts)

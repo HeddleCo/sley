@@ -6447,3 +6447,392 @@ fn cmd_multi_pack_index_expire(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
+
+/// A packfile considered by `git pack-redundant`, mirroring its `pack_list`.
+struct RedundantPack {
+    /// Filesystem path of the `.pack` (printed as upstream's `pack_name`).
+    pack_path: PathBuf,
+    /// Filesystem path of the `.idx` (printed as upstream's `idx_name`).
+    idx_path: PathBuf,
+    /// Working object set, reduced by alt-odb and stdin-ignore subtraction.
+    remaining: Vec<ObjectId>,
+    /// Objects only this pack holds among the local packs (filled by the
+    /// pairwise comparison). Empty for single-pack repos, as upstream forces.
+    unique: Vec<ObjectId>,
+    /// Object count before any subtraction (upstream `all_objects_size`).
+    all_objects_size: usize,
+    local: bool,
+}
+
+/// `a := a - b` for two ascending OID lists (upstream
+/// `llist_sorted_difference_inplace`).
+fn oid_sorted_difference(a: &mut Vec<ObjectId>, b: &[ObjectId]) {
+    if b.is_empty() || a.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(a.len());
+    let mut j = 0;
+    for oid in a.iter() {
+        while j < b.len() && b[j].as_bytes() < oid.as_bytes() {
+            j += 1;
+        }
+        if j < b.len() && b[j].as_bytes() == oid.as_bytes() {
+            continue;
+        }
+        out.push(*oid);
+    }
+    *a = out;
+}
+
+/// |a ∩ b| for two ascending OID lists (upstream `sizeof_union`'s shared count).
+fn oid_sorted_intersection_size(a: &[ObjectId], b: &[ObjectId]) -> usize {
+    let (mut i, mut j, mut count) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].as_bytes().cmp(b[j].as_bytes()) {
+            std::cmp::Ordering::Equal => {
+                count += 1;
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    count
+}
+
+/// Read every `.idx`/`.pack` pair in `pack_dir`, returning each pack's
+/// ascending OID list keyed by its filesystem paths.
+fn pack_redundant_scan_dir(
+    pack_dir: &Path,
+    format: ObjectFormat,
+    local: bool,
+    into: &mut Vec<RedundantPack>,
+) -> Result<()> {
+    let Ok(entries) = fs::read_dir(pack_dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let idx_path = entry?.path();
+        if idx_path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+            continue;
+        }
+        let pack_path = idx_path.with_extension("pack");
+        if !pack_path.exists() {
+            continue;
+        }
+        let index = PackIndex::parse(&fs::read(&idx_path)?, format)?;
+        let mut oids: Vec<ObjectId> = index.entries.into_iter().map(|entry| entry.oid).collect();
+        oids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        into.push(RedundantPack {
+            pack_path,
+            idx_path,
+            all_objects_size: oids.len(),
+            remaining: oids,
+            unique: Vec::new(),
+            local,
+        });
+    }
+    Ok(())
+}
+
+/// `git pack-redundant`: report packs every one of whose objects also live in
+/// some other pack (so the pack can be deleted without losing reachability).
+/// Deprecated upstream; gated behind `--i-still-use-this`.
+pub(crate) fn cmd_pack_redundant(args: &[String]) -> Result<()> {
+    let mut load_all_packs = false;
+    let mut verbose = false;
+    let mut alt_odb = false;
+    let mut i_still_use_this = false;
+    let mut filenames: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--" => {
+                filenames.extend(iter.by_ref().cloned());
+                break;
+            }
+            "--all" => load_all_packs = true,
+            "--verbose" => verbose = true,
+            "--alt-odb" => alt_odb = true,
+            "--i-still-use-this" => i_still_use_this = true,
+            other if other.starts_with('-') => {
+                eprintln!(
+                    "usage: git pack-redundant [--verbose] [--alt-odb] (--all | <pack-filename>...)"
+                );
+                return Err(GitError::Exit(129));
+            }
+            other => {
+                filenames.push(other.to_string());
+                filenames.extend(iter.by_ref().cloned());
+                break;
+            }
+        }
+    }
+
+    if !i_still_use_this {
+        eprintln!("'git pack-redundant' is nominated for removal.");
+        eprintln!(
+            "If you still use this command, here's what you can do:\n\n\
+             - read https://git-scm.com/docs/BreakingChanges.html\n\
+             - check if anyone has discussed this on the mailing\n  \
+               list and if they came up with something that can\n  \
+               help you: https://lore.kernel.org/git/?q=git%20pack-redundant\n\
+             - send an email to <git@vger.kernel.org> to let us\n  \
+               know that you still use this command and were unable\n  \
+               to determine a suitable replacement\n"
+        );
+        eprintln!("fatal: refusing to run without --i-still-use-this");
+        return Err(GitError::Exit(128));
+    }
+
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(cwd.clone())?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let objects_dir = repository_objects_dir(&common_git_dir);
+
+    let mut packs: Vec<RedundantPack> = Vec::new();
+    if load_all_packs {
+        pack_redundant_scan_dir(&objects_dir.join("pack"), format, true, &mut packs)?;
+        // Alternate packs are only loaded when they can matter — `--alt-odb`
+        // subtracts them, `--verbose` reports their count (add_pack's veto).
+        if alt_odb || verbose {
+            if let Ok(alternates) = fs::read_to_string(objects_dir.join("info/alternates")) {
+                for raw in alternates.lines() {
+                    let raw = raw.trim();
+                    if raw.is_empty() || raw.starts_with('#') {
+                        continue;
+                    }
+                    let path = PathBuf::from(raw);
+                    let alt = if path.is_absolute() {
+                        path
+                    } else {
+                        objects_dir.join(path)
+                    };
+                    pack_redundant_scan_dir(&alt.join("pack"), format, false, &mut packs)?;
+                }
+            }
+        }
+    } else {
+        // `<pack-filename>...`: match each against the local pack basenames.
+        let mut local = Vec::new();
+        pack_redundant_scan_dir(&objects_dir.join("pack"), format, true, &mut local)?;
+        for filename in &filenames {
+            if filename.len() < 40 {
+                eprintln!("fatal: Bad pack filename: {filename}");
+                return Err(GitError::Exit(128));
+            }
+            let Some(found) = local.iter().position(|pack| {
+                pack.pack_path
+                    .to_string_lossy()
+                    .contains(filename.as_str())
+            }) else {
+                eprintln!("fatal: Filename {filename} not found in packed_git");
+                return Err(GitError::Exit(128));
+            };
+            packs.push(local.remove(found));
+        }
+    }
+
+    if !packs.iter().any(|pack| pack.local) {
+        eprintln!("fatal: Zero packs found!");
+        return Err(GitError::Exit(128));
+    }
+
+    let alt_count = packs.iter().filter(|pack| !pack.local).count();
+
+    // all_objects: union of the local packs' objects, minus the alt-odb packs'.
+    let mut all_objects: Vec<ObjectId> = Vec::new();
+    for pack in packs.iter().filter(|pack| pack.local) {
+        all_objects.extend(pack.remaining.iter().copied());
+    }
+    all_objects.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    all_objects.dedup();
+    for pack in packs.iter().filter(|pack| !pack.local) {
+        oid_sorted_difference(&mut all_objects, &pack.remaining);
+    }
+
+    // --alt-odb: drop objects already in an alternate pack from the local set.
+    if alt_odb {
+        let alt_remaining: Vec<Vec<ObjectId>> = packs
+            .iter()
+            .filter(|pack| !pack.local)
+            .map(|pack| pack.remaining.clone())
+            .collect();
+        for pack in packs.iter_mut().filter(|pack| pack.local) {
+            for alt in &alt_remaining {
+                oid_sorted_difference(&mut pack.remaining, alt);
+            }
+        }
+    }
+
+    // Objects named on stdin are ignored (removed from consideration). Upstream
+    // only reads stdin when it is not a terminal.
+    if !io::stdin().is_terminal() {
+        let mut ignore: Vec<ObjectId> = Vec::new();
+        let mut text = String::new();
+        io::stdin().read_to_string(&mut text)?;
+        for line in text.lines() {
+            let token = line.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let Ok(oid) = ObjectId::from_hex(format, token) else {
+                eprintln!("fatal: Bad object ID on stdin: {line}");
+                return Err(GitError::Exit(128));
+            };
+            ignore.push(oid);
+        }
+        ignore.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        ignore.dedup();
+        oid_sorted_difference(&mut all_objects, &ignore);
+        for pack in packs.iter_mut().filter(|pack| pack.local) {
+            oid_sorted_difference(&mut pack.remaining, &ignore);
+        }
+    }
+
+    // Pairwise comparison fills each local pack's `unique` set: objects in its
+    // remaining set that no other local pack holds. A lone pack has none.
+    let local_indices: Vec<usize> = (0..packs.len()).filter(|&i| packs[i].local).collect();
+    if local_indices.len() > 1 {
+        for &i in &local_indices {
+            let mut unique = packs[i].remaining.clone();
+            for &j in &local_indices {
+                if i != j {
+                    let other = packs[j].remaining.clone();
+                    oid_sorted_difference(&mut unique, &other);
+                }
+            }
+            packs[i].unique = unique;
+        }
+    }
+
+    // minimize(): keep every pack with unique objects, then greedily cover the
+    // rest with the non-unique packs holding the most still-missing objects.
+    let mut min_indices: Vec<usize> = Vec::new();
+    let mut non_unique: Vec<usize> = Vec::new();
+    for &i in &local_indices {
+        if packs[i].unique.is_empty() {
+            non_unique.push(i);
+        } else {
+            min_indices.push(i);
+        }
+    }
+
+    let mut missing = all_objects.clone();
+    for &i in &min_indices {
+        let remaining = packs[i].remaining.clone();
+        oid_sorted_difference(&mut missing, &remaining);
+    }
+
+    if !missing.is_empty() {
+        let mut unique_pack_objects = all_objects.clone();
+        oid_sorted_difference(&mut unique_pack_objects, &missing);
+        for &i in &non_unique {
+            oid_sorted_difference(&mut packs[i].remaining, &unique_pack_objects);
+        }
+
+        loop {
+            // Sort the survivors: most remaining objects first, ties broken by
+            // larger original pack (upstream cmp_remaining_objects).
+            non_unique.sort_by(|&a, &b| {
+                packs[b]
+                    .remaining
+                    .len()
+                    .cmp(&packs[a].remaining.len())
+                    .then_with(|| packs[b].all_objects_size.cmp(&packs[a].all_objects_size))
+            });
+            match non_unique.first() {
+                Some(&head) if !packs[head].remaining.is_empty() => {
+                    let chosen = packs[head].remaining.clone();
+                    non_unique.remove(0);
+                    for &i in &non_unique {
+                        if packs[i].remaining.is_empty() {
+                            break;
+                        }
+                        oid_sorted_difference(&mut packs[i].remaining, &chosen);
+                    }
+                    min_indices.push(head);
+                }
+                _ => break,
+            }
+        }
+    }
+
+    // Redundant = local packs not in the minimal set, in discovery order.
+    let min_set: HashSet<usize> = min_indices.iter().copied().collect();
+    let redundant: Vec<usize> = local_indices
+        .iter()
+        .copied()
+        .filter(|i| !min_set.contains(i))
+        .collect();
+
+    if verbose {
+        eprintln!("There are {alt_count} packs available in alt-odbs.");
+        eprintln!("The smallest (bytewise) set of packs is:");
+        for &i in &min_indices {
+            eprintln!("\t{}", pack_redundant_display_path(&packs[i].pack_path, &cwd));
+        }
+        let mut duplicates = 0usize;
+        for (a, &ia) in min_indices.iter().enumerate() {
+            for &ib in &min_indices[a + 1..] {
+                duplicates += oid_sorted_intersection_size(
+                    &packs[ia].remaining,
+                    &packs[ib].remaining,
+                );
+            }
+        }
+        let min_bytes: u64 = min_indices
+            .iter()
+            .map(|&i| pack_redundant_pack_bytes(&packs[i]))
+            .sum();
+        eprintln!(
+            "containing {duplicates} duplicate objects with a total size of {}kb.",
+            min_bytes / 1024
+        );
+        eprintln!(
+            "A total of {} unique objects were considered.",
+            all_objects.len()
+        );
+        eprintln!("Redundant packs (with indexes):");
+    }
+
+    let mut stdout = io::stdout().lock();
+    for &i in &redundant {
+        writeln!(stdout, "{}", pack_redundant_display_path(&packs[i].idx_path, &cwd))?;
+        writeln!(stdout, "{}", pack_redundant_display_path(&packs[i].pack_path, &cwd))?;
+    }
+    stdout.flush()?;
+
+    if verbose {
+        let red_bytes: u64 = redundant
+            .iter()
+            .map(|&i| pack_redundant_pack_bytes(&packs[i]))
+            .sum();
+        eprintln!(
+            "{}MB of redundant packs in total.",
+            red_bytes / (1024 * 1024)
+        );
+    }
+
+    Ok(())
+}
+
+/// Render a pack path relative to the working directory when possible, matching
+/// git's `pack_name` (relative to the discovered object dir) so the output is
+/// free of the absolute prefix — which, in the test suite, contains a space
+/// that would otherwise split `xargs rm`.
+fn pack_redundant_display_path(path: &Path, cwd: &Path) -> String {
+    path.strip_prefix(cwd)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Combined `.pack` + `.idx` byte size for the verbose redundancy report.
+fn pack_redundant_pack_bytes(pack: &RedundantPack) -> u64 {
+    let pack_size = fs::metadata(&pack.pack_path).map(|m| m.len()).unwrap_or(0);
+    let idx_size = fs::metadata(&pack.idx_path).map(|m| m.len()).unwrap_or(0);
+    pack_size + idx_size
+}
