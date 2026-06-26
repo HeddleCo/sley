@@ -8688,14 +8688,18 @@ fn commit_graph_stdin_commits_starts(
             eprintln!("error: unexpected non-hex object ID: {line}");
             return Err(GitError::Exit(1));
         };
-        let Ok(object) = db.read_object(&oid) else {
+        let Ok(_object) = db.read_object(&oid) else {
             eprintln!("error: invalid object {line}");
             return Err(GitError::Exit(1));
         };
-        // Peel tags/commit; non-commit tree-ish (e.g. a tree oid) is silently
-        // skipped, matching git, which only graphs the commit objects.
-        if object.object_type == ObjectType::Commit && seen.insert(oid) {
-            starts.push(oid);
+        // Peel annotated tags down to the commit they reference; non-commit
+        // tree-ish (e.g. a tree oid) is silently skipped, matching git, which
+        // only graphs commit objects. Dedup on the peeled commit so two tags
+        // pointing at the same commit contribute one start.
+        if let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid)
+            && seen.insert(commit)
+        {
+            starts.push(commit);
         }
     }
     Ok(starts)
