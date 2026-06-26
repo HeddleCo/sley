@@ -222,10 +222,15 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         None,
     )
     .map_err(crate::protocol::transport_policy_git_error)?;
+    // A pack must be installed as a promisor pack when the remote is already a
+    // promisor remote OR this fetch applies an object filter: a filtered fetch
+    // omits objects, so its pack is only valid as a `.promisor` pack (git's
+    // fetch-pack writes `.promisor` whenever the request carries a filter).
     let promisor_remote = request
         .config
         .get_bool("remote", Some(request.remote_name), "promisor")
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || request.options.filter.is_some();
     let configured_refspecs = if request.refspecs.is_empty() {
         remote_config_values(request.config, request.remote_name, "fetch")
     } else {

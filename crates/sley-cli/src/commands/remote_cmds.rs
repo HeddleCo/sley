@@ -3324,6 +3324,31 @@ fn configure_clone_remote(
     write_repo_config(git_dir, &config)
 }
 
+/// Register a configured remote as a promisor remote after a `fetch --filter`,
+/// mirroring git's `partial_clone_register`: upgrade the repo format to 1, set
+/// `remote.<name>.promisor=true`, and record the filter spec under
+/// `remote.<name>.partialclonefilter` (the default for later fetches from it).
+/// A no-op when `name` is not a configured remote (e.g. a bare-URL fetch) or is
+/// already a promisor remote with a recorded filter.
+fn register_promisor_remote(git_dir: &Path, name: &str, filter_spec: &str) -> Result<()> {
+    let mut config = read_repo_config_on_disk(git_dir)?;
+    if config.get("remote", Some(name), "url").is_none() {
+        return Ok(());
+    }
+    if config.get_bool("remote", Some(name), "promisor") == Some(true)
+        && config.get("remote", Some(name), "partialclonefilter").is_some()
+    {
+        return Ok(());
+    }
+    let format_key = parse_config_key("core.repositoryformatversion")?;
+    config_set_value(&mut config, &format_key, "1", false);
+    let promisor_key = parse_config_key(&format!("remote.{name}.promisor"))?;
+    config_set_value(&mut config, &promisor_key, "true", false);
+    let filter_key = parse_config_key(&format!("remote.{name}.partialclonefilter"))?;
+    config_set_value(&mut config, &filter_key, filter_spec, false);
+    write_repo_config(git_dir, &config)
+}
+
 fn configure_clone_branch(git_dir: &Path, branch: &str, remote: &str) -> Result<()> {
     let mut config = read_repo_config_on_disk(git_dir)?;
     let mut entries = vec![
@@ -3426,6 +3451,11 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     };
     let mut unshallow = false;
     let mut filter_option_explicit = false;
+    // The raw `--filter` spec (e.g. "blob:none"), retained so a filtered fetch
+    // of a named remote can register it as a promisor remote afterwards (git's
+    // `partial_clone_register` records the spec under
+    // `remote.<name>.partialclonefilter`).
+    let mut filter_spec = None::<String>;
     let mut prefetch = false;
     let mut recurse_submodules_cli = FetchRecurseSubmodules::Default;
     let mut recurse_submodules_default = FetchRecurseSubmodules::OnDemand;
@@ -3507,6 +3537,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                     .ok_or_else(|| GitError::Command("fetch --filter requires a value".into()))?;
                 validate_clone_filter(value)?;
                 options.filter = fetch_pack_filter_from_spec(value);
+                filter_spec = Some(value.to_string());
                 filter_option_explicit = true;
             }
             value if value.starts_with("--filter=") => {
@@ -3515,10 +3546,12 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                     .ok_or_else(|| GitError::Command("fetch --filter requires a value".into()))?;
                 validate_clone_filter(value)?;
                 options.filter = fetch_pack_filter_from_spec(value);
+                filter_spec = Some(value.to_string());
                 filter_option_explicit = true;
             }
             "--no-filter" => {
                 options.filter = None;
+                filter_spec = None;
                 filter_option_explicit = true;
             }
             "--refetch" => options.refetch = true,
@@ -3779,7 +3812,14 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     } else {
         refspecs.clone()
     };
-    if fetch_raw_oid_refspecs(&git_dir, format, &source, &effective_refspecs, &options)? {
+    if fetch_raw_oid_refspecs(
+        &git_dir,
+        format,
+        &source,
+        &effective_refspecs,
+        &options,
+        filter_spec.as_deref(),
+    )? {
         return Ok(());
     }
     let before_fetch_refs = fetch_ref_snapshot(&git_dir, format)?;
@@ -3806,6 +3846,13 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         trace2_fetch_refetch_maintenance();
     }
     let outcome = result?;
+    // A successful `fetch --filter` against a configured remote registers that
+    // remote as a promisor remote (git's `partial_clone_register`): the partial
+    // pack is only usable once the repo knows the remote can supply the omitted
+    // objects on demand.
+    if let Some(spec) = filter_spec.as_deref() {
+        register_promisor_remote(&git_dir, &source, spec)?;
+    }
     if set_upstream {
         fetch_set_upstream_from_outcome(&git_dir, format, &source, &outcome)?;
     }
@@ -4199,6 +4246,7 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
                 &sub_source,
                 &missing_oids,
                 &sub_options,
+                None,
             )?;
         }
         let nested_changed_gitlinks =
@@ -4311,6 +4359,7 @@ fn fetch_changed_submodule_after_superproject(
             &sub_source,
             &[refspec],
             &sub_options,
+            None,
         )?;
     }
     let mut nested_changed_gitlinks =
@@ -4798,6 +4847,7 @@ fn fetch_raw_oid_refspecs(
     source: &str,
     refspecs: &[String],
     options: &FetchOptions,
+    filter_spec: Option<&str>,
 ) -> Result<bool> {
     if refspecs.is_empty() || refspecs.iter().any(|refspec| refspec.contains(':')) {
         return Ok(false);
@@ -4813,9 +4863,12 @@ fn fetch_raw_oid_refspecs(
         return Ok(false);
     };
     let config = read_repo_config(git_dir)?;
+    // A filtered fetch omits objects, so its pack is only valid as a promisor
+    // pack — exactly as for an already-promisor remote.
     let promisor = config
         .get_bool("remote", Some(source), "promisor")
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || options.filter.is_some();
     sley_remote::install_fetch_pack_via_local_upload_pack(
         git_dir,
         &remote_git_dir,
@@ -4828,6 +4881,12 @@ fn fetch_raw_oid_refspecs(
         false,
         None,
     )?;
+    // `fetch --filter <remote> <oid>` registers the remote as promisor (git's
+    // `partial_clone_register`), so later accesses know it can supply the
+    // omitted objects on demand.
+    if let Some(spec) = filter_spec {
+        register_promisor_remote(git_dir, source, spec)?;
+    }
     Ok(true)
 }
 
