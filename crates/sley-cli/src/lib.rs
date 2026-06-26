@@ -416,6 +416,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "gc" => commands::pack::cmd_gc(&args[1..]),
         "maintenance" => commands::pack::cmd_maintenance(&args[1..]),
         "repack" => commands::pack::cmd_repack(&args[1..]),
+        "pack-redundant" => commands::pack::cmd_pack_redundant(&args[1..]),
         "repo" => commands::utility::cmd_repo(&args[1..]),
         "apply" => commands::plumbing::cmd_apply(&args[1..]),
         "commit" => commands::commit::cmd_commit(&args[1..]),

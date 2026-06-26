@@ -81,6 +81,7 @@ pub(crate) const BUILTIN_COMMANDS: &[&str] = &[
     "name-rev",
     "notes",
     "pack-objects",
+    "pack-redundant",
     "pack-refs",
     "patch-id",
     "prune",
