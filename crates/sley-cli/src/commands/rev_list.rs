@@ -268,6 +268,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             }
             "--pretty=oneline" | "--format=oneline" => preset_oneline = true,
             "--pretty=short" | "--format=short" => pretty = RevListPretty::Short,
+            "--pretty=raw" | "--format=raw" => pretty = RevListPretty::Raw,
             value if value.starts_with("--format=") => {
                 pretty = RevListPretty::Compiled {
                     compiled: CompiledLogFormat::compile(
@@ -372,6 +373,12 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     // `%aN`/… always map; lower-case map only under the flag).
     let mailmap = commands::utility::Mailmap::load_default(&git_dir, format)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    // `.git/info/grafts` rewrites commit parents, which the commit-graph and
+    // pack-bitmap reachability shortcuts cannot see (they read raw parents).
+    // git disables those optimisations whenever grafts are in effect
+    // (`commit_graph_compatible()`); do the same so the graft-aware full walk
+    // runs instead.
+    let has_commit_grafts = !sley_rev::revlist::load_commit_grafts(&db, format).is_empty();
     object_filter = object_filter.resolve(&git_dir, &db, format)?;
     let cwd = env::current_dir()?;
     let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
@@ -583,6 +590,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         let bitmap_eligible = walk_mode == RevListWalkMode::Walk
             && ordering == RevListOrdering::Default
             && !bisect
+            && !has_commit_grafts
             && pathspecs.is_empty()
             && !full_history
             && !first_parent
@@ -710,6 +718,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     if walk_mode == RevListWalkMode::Walk
         && matches!(ordering, RevListOrdering::Default | RevListOrdering::Date)
         && !bisect
+        && !has_commit_grafts
         && (matches!(pretty, RevListPretty::Default) || metadata_format.is_some())
         && matches!(object_filter, RevListObjectFilter::None)
         && pathspecs.is_empty()
@@ -1297,6 +1306,17 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                     timestamp,
                     &output_encoding,
                 )?,
+                RevListPretty::Raw => {
+                    write_rev_list_commit_header_line(
+                        record,
+                        output_prefix,
+                        parents,
+                        abbrev_commit,
+                        abbrev_len,
+                        timestamp,
+                    )?;
+                    write_rev_list_raw_body(record)?;
+                }
                 RevListPretty::Compiled {
                     compiled,
                     commit_header: true,
@@ -1546,6 +1566,10 @@ fn rev_list_emit_bisection(
 enum RevListPretty {
     Default,
     Short,
+    /// `--pretty=raw`: the decoded commit object (tree, parent lines, author,
+    /// committer, indented message) under a `commit <oid>` header that honours
+    /// `--parents`/`--children`.
+    Raw,
     /// `commit_header` is true for `--format=` / `--pretty=format:` (git prints a
     /// leading `commit <oid>` line); false for `--oneline` presets.
     Compiled {
@@ -1609,6 +1633,29 @@ fn write_rev_list_short(
     let message = commit_message_for_commit_encoding(&record.commit, output_encoding);
     stdout.write_all(commit_subject_bytes(&message))?;
     stdout.write_all(b"\n")?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
+/// The body of a `--pretty=raw` commit (everything after the `commit <oid>`
+/// header): the decoded tree/parent/author/committer headers and the message
+/// indented by four spaces, followed by a blank separator line.
+fn write_rev_list_raw_body(record: &sley_rev::CommitRecord) -> Result<()> {
+    let mut stdout = io::stdout();
+    writeln!(stdout, "tree {}", record.commit.tree)?;
+    for parent in &record.parents {
+        writeln!(stdout, "parent {parent}")?;
+    }
+    stdout.write_all(b"author ")?;
+    stdout.write_all(&record.commit.author)?;
+    stdout.write_all(b"\ncommitter ")?;
+    stdout.write_all(&record.commit.committer)?;
+    stdout.write_all(b"\n\n")?;
+    for line in String::from_utf8_lossy(&record.commit.message).lines() {
+        stdout.write_all(b"    ")?;
+        stdout.write_all(line.as_bytes())?;
+        stdout.write_all(b"\n")?;
+    }
     writeln!(stdout)?;
     Ok(())
 }
@@ -1932,6 +1979,17 @@ fn write_rev_list_boundary_record(
             timestamp,
             output_encoding,
         ),
+        RevListPretty::Raw => {
+            write_rev_list_commit_header_line(
+                record,
+                Some('-'),
+                parents,
+                abbrev_commit,
+                abbrev_len,
+                timestamp,
+            )?;
+            write_rev_list_raw_body(record)
+        }
         RevListPretty::Compiled {
             compiled,
             commit_header: true,

@@ -438,6 +438,7 @@ pub fn rev_list_walk_commits_with_missing_details(
     if !first_parent {
         return rev_list_walk_commits_all_parents_with_missing(db, format, starts, missing_action);
     }
+    let grafts = load_commit_grafts(db, format);
     let mut seen = HashSet::new();
     let mut missing_seen = HashSet::new();
     let mut pending = starts.into_iter().collect::<VecDeque<_>>();
@@ -469,7 +470,7 @@ pub fn rev_list_walk_commits_with_missing_details(
             )));
         }
         let commit = Commit::parse(format, &object.body)?;
-        let parents = commit.parents.clone();
+        let parents = graft_overridden_parents(db, &grafts, &oid, commit.parents.clone());
         if let Some(parent) = parents.first() {
             pending.push_back(*parent);
         }
@@ -485,12 +486,59 @@ pub fn rev_list_walk_commits_with_missing_details(
     })
 }
 
+/// Commit grafts from `$GIT_DIR/info/grafts`: each non-comment line
+/// `<commit> <parent>...` overrides that commit's parent list during traversal
+/// (git's `read_graft_line` / `lookup_commit_graft`). `$GIT_DIR` is the parent
+/// of the database's objects directory; a missing/empty file yields no grafts.
+pub fn load_commit_grafts(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> HashMap<ObjectId, Vec<ObjectId>> {
+    let Some(git_dir) = db.objects_dir().parent() else {
+        return HashMap::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(git_dir.join("info").join("grafts")) else {
+        return HashMap::new();
+    };
+    let mut grafts = HashMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut oids = line
+            .split_whitespace()
+            .filter_map(|hex| ObjectId::from_hex(format, hex).ok());
+        let Some(commit) = oids.next() else {
+            continue;
+        };
+        grafts.insert(commit, oids.collect::<Vec<_>>());
+    }
+    grafts
+}
+
+/// Apply a commit-graft override (if any) to a commit's parsed parents before
+/// the shallow-boundary seam runs.
+fn graft_overridden_parents(
+    db: &FileObjectDatabase,
+    grafts: &HashMap<ObjectId, Vec<ObjectId>>,
+    oid: &ObjectId,
+    parents: Vec<ObjectId>,
+) -> Vec<ObjectId> {
+    let overridden = match grafts.get(oid) {
+        Some(graft) => graft.clone(),
+        None => parents,
+    };
+    sley_odb::grafted_parents(db, oid, overridden)
+}
+
 fn rev_list_walk_commits_all_parents_with_missing(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     starts: impl IntoIterator<Item = ObjectId>,
     missing_action: RevListMissingAction,
 ) -> Result<RevListWalkWithMissing> {
+    let grafts = load_commit_grafts(db, format);
     let mut seen = HashSet::new();
     let mut missing_seen = HashSet::new();
     let mut pending: VecDeque<ObjectId> = starts.into_iter().collect();
@@ -522,7 +570,7 @@ fn rev_list_walk_commits_all_parents_with_missing(
             )));
         }
         let commit = Commit::parse(format, &object.body)?;
-        let parents = sley_odb::grafted_parents(db, &oid, commit.parents.clone());
+        let parents = graft_overridden_parents(db, &grafts, &oid, commit.parents.clone());
         pending.extend(parents.iter().cloned());
         out.push(CommitRecord {
             oid,
