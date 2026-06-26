@@ -320,6 +320,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         .collect::<Result<Vec<_>>>()?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     for_each_ref_validate_ahead_behind(&format_spec, &git_dir, format)?;
+    for_each_ref_validate_describe(&format_spec)?;
     // The abbreviation candidate set is only needed by `%(objectname:short...)`;
     // enumerating every object id is otherwise pure overhead.
     let objectname_candidates = if needs.candidates {
@@ -361,7 +362,12 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         HashMap::new()
     };
     let config = if needs.config || needs.short_ref || for_each_ref_sorts_need_config(&sorts) {
-        GitConfig::read(git_dir.join("config")).unwrap_or_default()
+        // git resolves %(upstream)/%(push)/sort keys against the *full* config
+        // layering (system + global + repo + includes + command-line `-c`
+        // overrides), not just the repository file — e.g. `-c push.default=simple`
+        // must win over a repo-level `push.default`. identity_effective_config()
+        // builds exactly that layered view rooted at the current repo.
+        identity_effective_config().unwrap_or_default()
     } else {
         GitConfig::default()
     };
@@ -542,26 +548,44 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             .transpose()?
             .flatten();
         // The peeled tag target is only read when a %(*...) atom references it.
-        let peeled_oid = if needs.peeled {
-            contents.as_ref().and_then(|contents| contents.tag_object)
-        } else {
-            None
-        };
-        let peeled_encoded_object = match peeled_oid {
-            Some(peeled_oid) => Some(db.read_object(&peeled_oid)?),
-            None => None,
-        };
-        let peeled_object = if let (Some(peeled_oid), Some(peeled_encoded_object)) =
-            (peeled_oid, peeled_encoded_object.as_ref())
+        // git's %(*...) atoms expose `peel_object`, which follows the *whole*
+        // tag chain (a tag that points at another tag is peeled all the way to
+        // the underlying non-tag object), so chase nested tags to the bottom.
+        let peeled_chain: Option<(ObjectId, std::sync::Arc<sley_object::EncodedObject>)> =
+            if needs.peeled {
+                if let Some(first_oid) = contents.as_ref().and_then(|contents| contents.tag_object)
+                {
+                    let mut target_oid = first_oid;
+                    let mut target = db.read_object(&target_oid)?;
+                    // Validate the outer tag's recorded pointer type first.
+                    if let Some(contents) = contents.as_ref() {
+                        for_each_ref_validate_tag_pointer(&oid, contents, &target_oid, &target)?;
+                    }
+                    // Then follow each further tag, validating its declared
+                    // target type against what it actually points at.
+                    while target.object_type == ObjectType::Tag {
+                        let (next_oid, declared_type) = {
+                            let tag = sley_object::Tag::parse_ref(format, &target.body)?;
+                            (tag.object, tag.object_type)
+                        };
+                        let next = db.read_object(&next_oid)?;
+                        if declared_type != next.object_type {
+                            eprintln!("error: bad tag pointer to {next_oid} in {target_oid}");
+                            return Err(GitError::Exit(128));
+                        }
+                        target_oid = next_oid;
+                        target = next;
+                    }
+                    Some((target_oid, target))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        let peeled_object = if let Some((peeled_oid, peeled_encoded_object)) = peeled_chain.as_ref()
         {
-            if let Some(contents) = contents.as_ref() {
-                for_each_ref_validate_tag_pointer(
-                    &oid,
-                    contents,
-                    &peeled_oid,
-                    peeled_encoded_object,
-                )?;
-            }
+            let peeled_oid = *peeled_oid;
             let object_disk_size = if needs.peeled_disk {
                 for_each_ref_loose_object_disk_size(&git_dir, &peeled_oid)?
             } else {
@@ -599,6 +623,23 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         };
         let object_disk_size = if needs.object_disk {
             for_each_ref_loose_object_disk_size(&git_dir, &oid)?
+        } else {
+            None
+        };
+        // %(signature[:opt]) / %(*signature[:opt]) verify the embedded GPG/SSH
+        // signature of the ref object (or its peeled target), reusing the same
+        // verification backend as `git verify-commit`.
+        let signature = if needs.signature {
+            object
+                .as_ref()
+                .and_then(|object| for_each_ref_object_signature(&git_dir, &config, object))
+        } else {
+            None
+        };
+        let peeled_signature = if needs.peeled_signature {
+            peeled_chain
+                .as_ref()
+                .and_then(|(_, object)| for_each_ref_object_signature(&git_dir, &config, object))
         } else {
             None
         };
@@ -648,6 +689,8 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             push_track,
             contents,
             peeled_object,
+            signature,
+            peeled_signature,
             mailmap: &mailmap,
             ref_names: &ref_names,
             warn_ambiguous_refs,
@@ -789,6 +832,11 @@ struct ForEachRefNeeds {
     /// `%(refname:short)` / `%(symref:short)` / `%(upstream:short)` /
     /// `%(push:short)` — needs the ref-name universe for shorten_unambiguous_ref.
     short_ref: bool,
+    /// `%(signature*)` — the ref object's GPG/SSH signature must be verified
+    /// (the verification reads the object body and consults the config).
+    signature: bool,
+    /// `%(*signature*)` — the peeled object's signature must be verified.
+    peeled_signature: bool,
 }
 
 /// Map a missing-object read failure to git's `fatal: missing object <oid> for
@@ -805,6 +853,23 @@ fn for_each_ref_missing_object(err: GitError, oid: &ObjectId, refname: &str) -> 
 /// git resolves every `%(ahead-behind:<committish>)` base up front, rejecting a
 /// bare `%(ahead-behind)` and dying on an unresolvable base before any ref is
 /// printed (builtin/for-each-ref.c + ref-filter.c's ahead/behind setup).
+/// git compiles the ref format once, up front, so a malformed `%(describe:...)`
+/// argument is rejected before any ref is matched (builtin/for-each-ref.c's
+/// `verify_ref_format`). Validate the describe options here so a bad argument
+/// fails even when the pattern matches zero refs (the per-ref render path would
+/// otherwise never reach the offending atom).
+fn for_each_ref_validate_describe(format_spec: &ForEachRefFormat) -> Result<()> {
+    for segment in format_spec.segments() {
+        let ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(placeholder)) = segment else {
+            continue;
+        };
+        if let Some((_peeled, opts)) = crate::for_each_ref_describe_atom(placeholder) {
+            crate::for_each_ref_parse_describe_opts(opts)?;
+        }
+    }
+    Ok(())
+}
+
 fn for_each_ref_validate_ahead_behind(
     format_spec: &ForEachRefFormat,
     git_dir: &Path,
@@ -955,6 +1020,18 @@ impl ForEachRefNeeds {
                     // (no body read); the deref form needs the peeled tag target
                     // resolved so `context.peeled_object` is populated.
                     peeled
+                } else if other == "signature" || other.starts_with("signature:") {
+                    // %(signature[:opt]) verifies the (commit) object's embedded
+                    // signature: it reads the object body and consults the config
+                    // (gpg.format, allowedSigners, ...). The deref form verifies
+                    // the peeled tag target instead.
+                    if peeled {
+                        self.peeled_signature = true;
+                    } else {
+                        self.signature = true;
+                    }
+                    self.config = true;
+                    true
                 } else if other.starts_with("authordate:")
                     || other.starts_with("committerdate:")
                     || other.starts_with("taggerdate:")
@@ -1572,6 +1649,32 @@ impl ForEachRefSort {
 
 fn for_each_ref_sorts_need_config(sorts: &[ForEachRefSort]) -> bool {
     sorts.iter().any(|sort| sort.needs_config())
+}
+
+/// Verify the embedded signature of a ref's commit/tag object for the
+/// `%(signature[:opt])` atom family, mirroring git's `check_commit_signature`.
+///
+/// An *unsigned* commit still produces a verification result (git reports grade
+/// `N` with empty key/signer/fingerprints), so a missing signature maps to a
+/// default [`GpgVerification`] rather than `None`. Object types that cannot
+/// carry a signature (trees, blobs) yield `None`, leaving the atoms empty.
+fn for_each_ref_object_signature(
+    git_dir: &Path,
+    config: &GitConfig,
+    object: &sley_object::EncodedObject,
+) -> Option<commands::signing::GpgVerification> {
+    let payload_signature = match object.object_type {
+        ObjectType::Commit => commands::signing::commit_signature_payload(&object.body),
+        ObjectType::Tag => commands::signing::tag_signature_payload(&object.body)
+            .map(|(payload, signature)| (payload.to_vec(), signature.to_vec())),
+        _ => return None,
+    };
+    let Some((payload, signature)) = payload_signature else {
+        // Unsigned: git's check_commit_signature leaves result 'N' with empty
+        // identity fields, which a default verification models exactly.
+        return Some(commands::signing::GpgVerification::default());
+    };
+    commands::signing::verify_payload(git_dir, Some(config), &payload, &signature).ok()
 }
 
 fn for_each_ref_object_header(

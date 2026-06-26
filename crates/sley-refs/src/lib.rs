@@ -1724,6 +1724,15 @@ impl FileRefStore {
             }
         };
         self.delete_loose_ref(name)?;
+        // A loose ref can shadow a packed entry of the same name (e.g. an update
+        // after `pack-refs --all` writes a loose file over the packed copy).
+        // git removes the ref from packed-refs too, so unlinking only the loose
+        // file would leave the stale packed entry resurfacing. Drop any packed
+        // copy as well; its absence is not an error.
+        match self.delete_packed_ref(name, kind, short_name) {
+            Ok(_) | Err(GitError::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
         Ok(oid)
     }
 
@@ -2869,25 +2878,37 @@ impl FileRefStore {
     }
 
     fn check_ref_directory_conflict_targeted(&self, name: &str) -> Result<()> {
+        match self.refname_directory_conflict(name)? {
+            Some(conflict) => Err(ref_directory_conflict_error(name, &conflict)),
+            None => Ok(()),
+        }
+    }
+
+    /// Return the existing ref that would directory/file-conflict with creating
+    /// `name` (an ancestor occupying a needed file, or a descendant occupying a
+    /// needed directory), or `None` when `name` is creatable. Checks loose and
+    /// packed refs. Exposed so `update-ref --stdin --batch-updates` can reject a
+    /// single conflicting update without aborting the rest of the batch.
+    pub fn refname_directory_conflict(&self, name: &str) -> Result<Option<String>> {
         let components = name.split('/').collect::<Vec<_>>();
         let mut ancestors = Vec::new();
         for index in 1..components.len() {
             let ancestor = components[..index].join("/");
             if self.loose_ref_file_exists_for_conflict(&ancestor)? {
-                return Err(ref_directory_conflict_error(name, &ancestor));
+                return Ok(Some(ancestor));
             }
             ancestors.push(ancestor);
         }
         let child_prefix = format!("{name}/");
         if let Some(existing) = self.first_loose_ref_name_with_prefix(&child_prefix)? {
-            return Err(ref_directory_conflict_error(name, &existing));
+            return Ok(Some(existing));
         }
         if let Some(existing) =
             self.first_packed_ref_directory_conflict(&ancestors, &child_prefix)?
         {
-            return Err(ref_directory_conflict_error(name, &existing));
+            return Ok(Some(existing));
         }
-        Ok(())
+        Ok(None)
     }
 
     fn loose_ref_file_exists_for_conflict(&self, name: &str) -> Result<bool> {

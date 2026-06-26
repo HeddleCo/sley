@@ -1540,7 +1540,9 @@ fn update_server_info_usage<T>() -> Result<T> {
 }
 
 pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
-    let mut message = b"update by sley".to_vec();
+    // git's `update-ref` writes an *empty* reflog message when no -m is given
+    // (builtin/update-ref.c leaves msg NULL); only -m supplies one.
+    let mut message = Vec::new();
     let mut delete = false;
     let mut create_reflog = false;
     let mut deref = true;
@@ -1665,7 +1667,15 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             );
             return Err(GitError::Exit(1));
         }
-        return update_ref_delete(&store, format, &effective.effective, expected_oid.as_ref());
+        return update_ref_delete(
+            &store,
+            &git_dir,
+            format,
+            &effective.effective,
+            expected_oid.as_ref(),
+            &message,
+            create_reflog,
+        );
     }
     if positional.len() != 2 && positional.len() != 3 {
         return Err(GitError::Command(
@@ -1706,7 +1716,15 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
         check_update_ref_expected(format, &name, current.as_ref(), expected_oid)?;
     }
     if new_oid == zero_oid(format)? {
-        return update_ref_delete(&store, format, &name, None);
+        return update_ref_delete(
+            &store,
+            &git_dir,
+            format,
+            &name,
+            None,
+            &message,
+            create_reflog,
+        );
     }
     let old_oid = match current {
         Some(RefTarget::Direct(oid)) => oid,
@@ -2297,6 +2315,7 @@ fn dispatch_ref_stdin_command(
                 return update_ref_delete_stdin_batch(
                     context.store,
                     context.format,
+                    &effective.requested,
                     &name,
                     expected.as_ref(),
                     stdout,
@@ -2346,7 +2365,9 @@ fn dispatch_ref_stdin_command(
             let current = context.store.read_ref(&name)?;
             if context.batch_updates {
                 return verify_update_ref_stdin_batch(
+                    context.store,
                     context.format,
+                    &effective.requested,
                     &name,
                     current.as_ref(),
                     &expected,
@@ -2968,6 +2989,22 @@ fn update_ref_stdin_remove_ref(store: &FileRefStore, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The current target of a staged ref, preferring the pre-read `list_refs`
+/// snapshot but falling back to a direct read. `list_refs()` does not enumerate
+/// root-level symrefs (e.g. a `TESTSYMREF` created by `symbolic-ref`), so a
+/// `--no-deref` update/delete of such a ref would otherwise see it as missing
+/// and fail the old-value check with `unable to resolve reference`.
+fn update_ref_stdin_current_target(
+    context: &UpdateRefStdinContext<'_>,
+    current_refs: &HashMap<String, RefTarget>,
+    name: &str,
+) -> Result<Option<RefTarget>> {
+    match current_refs.get(name).cloned() {
+        Some(target) => Ok(Some(target)),
+        None => context.store.read_ref(name),
+    }
+}
+
 fn update_ref_stdin_commit_staged(
     context: &UpdateRefStdinContext<'_>,
     staged: Vec<UpdateRefStdinStagedChange>,
@@ -2986,7 +3023,7 @@ fn update_ref_stdin_commit_staged(
         match change {
             UpdateRefStdinStagedChange::Write(write) => {
                 requested_by_name.insert(write.name.clone(), write.requested.clone());
-                let current = current_refs.get(&write.name).cloned();
+                let current = update_ref_stdin_current_target(context, &current_refs, &write.name)?;
                 if let Some(expected_oid) = write.expected_oid.as_ref() {
                     check_update_ref_stdin_expected_named(
                         context.store,
@@ -3037,7 +3074,8 @@ fn update_ref_stdin_commit_staged(
             }
             UpdateRefStdinStagedChange::Delete(delete) => {
                 requested_by_name.insert(delete.name.clone(), delete.requested.clone());
-                let current = current_refs.get(&delete.name).cloned();
+                let current =
+                    update_ref_stdin_current_target(context, &current_refs, &delete.name)?;
                 if let Some(expected_oid) = delete.expected_oid.as_ref() {
                     check_update_ref_stdin_expected_named(
                         context.store,
@@ -3354,7 +3392,13 @@ fn update_ref_stdin_symref_update_invalid_old_kind(name: &str, kind: &str) -> Re
 
 #[derive(Debug)]
 struct UpdateRefStdinRejection {
+    /// The effective (dereferenced) ref name printed in the `rejected …` stdout
+    /// line.
     name: String,
+    /// The ref name the user typed, printed in the `cannot lock ref '…'` stderr
+    /// line — for a dereferenced symref delete these differ (git reports the
+    /// symref on stderr but its dangling target on stdout).
+    requested: String,
     new_value: String,
     old_value: String,
     stdout_reason: &'static str,
@@ -3372,48 +3416,69 @@ fn print_update_ref_stdin_rejection(
     )?;
     eprintln!(
         "error: cannot lock ref '{}': {}",
-        rejection.name, rejection.stderr_reason
+        rejection.requested, rejection.stderr_reason
     );
     Ok(())
 }
 
 fn update_ref_stdin_expected_rejection(
+    store: &FileRefStore,
     format: ObjectFormat,
+    requested: &str,
     name: &str,
     current: Option<&RefTarget>,
     expected: &ObjectId,
     new_value: String,
 ) -> Result<Option<UpdateRefStdinRejection>> {
+    let make = |stdout_reason, stderr_reason, old_value: String| UpdateRefStdinRejection {
+        name: name.to_string(),
+        requested: requested.to_string(),
+        new_value: new_value.clone(),
+        old_value,
+        stdout_reason,
+        stderr_reason,
+    };
     let zero = zero_oid(format)?;
     if expected == &zero {
         if current.is_some() {
-            return Ok(Some(UpdateRefStdinRejection {
-                name: name.to_string(),
-                new_value,
-                old_value: zero.to_string(),
-                stdout_reason: "reference already exists",
-                stderr_reason: "reference already exists".to_string(),
-            }));
+            return Ok(Some(make(
+                "reference already exists",
+                "reference already exists".to_string(),
+                zero.to_string(),
+            )));
         }
         return Ok(None);
     }
 
+    // Mirror check_update_ref_stdin_expected_named: a `--no-deref` symref is
+    // resolved one chain to an OID so its dangling target reports
+    // `reference is missing but expected X` (stderr) / `reference does not exist`
+    // (stdout), distinct from a wholly-missing ref's `unable to resolve`.
     match current {
         Some(RefTarget::Direct(actual)) if actual == expected => Ok(None),
-        Some(RefTarget::Direct(actual)) => Ok(Some(UpdateRefStdinRejection {
-            name: name.to_string(),
-            new_value,
-            old_value: expected.to_string(),
-            stdout_reason: "incorrect old value provided",
-            stderr_reason: format!("is at {actual} but expected {expected}"),
-        })),
-        Some(RefTarget::Symbolic(_)) | None => Ok(Some(UpdateRefStdinRejection {
-            name: name.to_string(),
-            new_value,
-            old_value: expected.to_string(),
-            stdout_reason: "reference does not exist",
-            stderr_reason: format!("unable to resolve reference '{name}'"),
-        })),
+        Some(RefTarget::Direct(actual)) => Ok(Some(make(
+            "incorrect old value provided",
+            format!("is at {actual} but expected {expected}"),
+            expected.to_string(),
+        ))),
+        Some(RefTarget::Symbolic(_)) => match resolve_ref_peeled(store, name)? {
+            Some(actual) if &actual == expected => Ok(None),
+            Some(actual) => Ok(Some(make(
+                "incorrect old value provided",
+                format!("is at {actual} but expected {expected}"),
+                expected.to_string(),
+            ))),
+            None => Ok(Some(make(
+                "reference does not exist",
+                format!("reference is missing but expected {expected}"),
+                expected.to_string(),
+            ))),
+        },
+        None => Ok(Some(make(
+            "reference does not exist",
+            format!("unable to resolve reference '{name}'"),
+            expected.to_string(),
+        ))),
     }
 }
 
@@ -3485,7 +3550,9 @@ fn update_ref_stdin_write_batch(
     let current = context.store.read_ref(&request.name)?;
     if let Some(expected_oid) = request.expected_oid
         && let Some(rejection) = update_ref_stdin_expected_rejection(
+            context.store,
             context.format,
+            &request.requested,
             &request.name,
             current.as_ref(),
             expected_oid,
@@ -3513,6 +3580,26 @@ fn update_ref_stdin_write_batch(
         eprintln!("error: cannot update ref '{}': {reason}", request.name);
         return Ok(());
     }
+    // A directory/file refname conflict (e.g. creating `refs/heads/ref` while
+    // `refs/heads/ref/foo` exists) rejects only this update under
+    // --batch-updates rather than aborting the whole batch.
+    if let Some(conflict) = context.store.refname_directory_conflict(&request.name)? {
+        writeln!(
+            stdout,
+            "rejected {} {} {} refname conflict",
+            request.name,
+            request.new_oid,
+            request
+                .expected_oid
+                .map(ObjectId::to_string)
+                .unwrap_or_else(|| "(null)".to_string())
+        )?;
+        eprintln!(
+            "error: cannot lock ref '{}': '{conflict}' exists; cannot create '{}'",
+            request.name, request.name
+        );
+        return Ok(());
+    }
     update_ref_stdin_write(
         context,
         UpdateRefStdinWriteRequest {
@@ -3525,6 +3612,7 @@ fn update_ref_stdin_write_batch(
 fn update_ref_delete_stdin_batch(
     store: &FileRefStore,
     format: ObjectFormat,
+    requested: &str,
     name: &str,
     expected: Option<&ObjectId>,
     stdout: &mut dyn Write,
@@ -3532,7 +3620,9 @@ fn update_ref_delete_stdin_batch(
     let current = store.read_ref(name)?;
     if let Some(expected) = expected
         && let Some(rejection) = update_ref_stdin_expected_rejection(
+            store,
             format,
+            requested,
             name,
             current.as_ref(),
             expected,
@@ -3546,15 +3636,23 @@ fn update_ref_delete_stdin_batch(
 }
 
 fn verify_update_ref_stdin_batch(
+    store: &FileRefStore,
     format: ObjectFormat,
+    requested: &str,
     name: &str,
     current: Option<&RefTarget>,
     expected: &ObjectId,
     stdout: &mut dyn Write,
 ) -> Result<()> {
-    if let Some(rejection) =
-        update_ref_stdin_expected_rejection(format, name, current, expected, "(null)".to_string())?
-    {
+    if let Some(rejection) = update_ref_stdin_expected_rejection(
+        store,
+        format,
+        requested,
+        name,
+        current,
+        expected,
+        "(null)".to_string(),
+    )? {
         print_update_ref_stdin_rejection(rejection, stdout)?;
     }
     Ok(())
@@ -3681,9 +3779,12 @@ fn update_ref_effective_ref(
 
 fn update_ref_delete(
     store: &FileRefStore,
+    git_dir: &Path,
     format: ObjectFormat,
     name: &str,
     expected: Option<&ObjectId>,
+    message: &[u8],
+    create_reflog: bool,
 ) -> Result<()> {
     let current = store.read_ref(name)?;
     if let Some(expected) = expected {
@@ -3706,6 +3807,18 @@ fn update_ref_delete(
             }
         }
     }
+    // Capture the deleted branch's tip and HEAD's pre-delete symref target so a
+    // deletion of the branch HEAD points at can be mirrored into HEAD's reflog
+    // (git logs the delete on the symref even though the branch's own reflog is
+    // unlinked).
+    let deleted_oid = match current.as_ref() {
+        Some(RefTarget::Direct(oid)) => Some(*oid),
+        _ => None,
+    };
+    let head_target = match store.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(target)) => Some(target),
+        _ => None,
+    };
     if current.is_some() {
         match current {
             Some(RefTarget::Symbolic(_)) => {
@@ -3715,6 +3828,20 @@ fn update_ref_delete(
                 store.delete_ref(name)?;
             }
         }
+    }
+    if let Some(deleted_oid) = deleted_oid
+        && head_target.as_deref() == Some(name)
+        && update_ref_should_write_reflog(git_dir, "HEAD", create_reflog)?
+    {
+        store.append_reflog(
+            "HEAD",
+            &ReflogEntry {
+                old_oid: deleted_oid,
+                new_oid: zero_oid(format)?,
+                committer: ref_reflog_committer(),
+                message: message.to_vec(),
+            },
+        )?;
     }
     Ok(())
 }
