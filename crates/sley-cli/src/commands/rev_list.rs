@@ -243,10 +243,12 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             "--disk-usage" => disk_usage = Some(false),
             "--disk-usage=human" => disk_usage = Some(true),
             value if value.starts_with("--disk-usage=") => {
-                return Err(GitError::Command(format!(
-                    "invalid rev-list disk-usage format {}",
+                eprintln!(
+                    "fatal: invalid value for '--disk-usage=<format>': '{}', \
+                     the only allowed format is 'human'",
                     &value["--disk-usage=".len()..]
-                )));
+                );
+                return Err(GitError::Exit(128));
             }
             "--object-names" => object_names = true,
             "--no-object-names" => object_names = false,
@@ -1072,6 +1074,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     if let Some(human_readable) = disk_usage {
         let disk_usage = rev_list_disk_usage(
             &git_dir,
+            format,
             &selected,
             &boundary_records,
             &selected_tag_objects,
@@ -2783,12 +2786,18 @@ fn rev_list_quote_missing_path(path: &[u8]) -> Vec<u8> {
 
 fn rev_list_disk_usage(
     git_dir: &Path,
+    format: ObjectFormat,
     records: &[&sley_rev::CommitRecord],
     boundary_records: &[sley_rev::CommitRecord],
     tag_objects: &[RevListObject],
     objects: &[RevListObject],
     human_readable: bool,
 ) -> Result<String> {
+    // `--disk-usage` sums each reachable object's on-disk size (git's
+    // `%(objectsize:disk)`): the loose-file size for loose objects, the packed
+    // entry size (including delta framing) for packed objects. The earlier
+    // loose-only helper undercounted any repacked history to zero.
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut seen = HashSet::new();
     let mut size = 0u64;
     for oid in records
@@ -2799,9 +2808,9 @@ fn rev_list_disk_usage(
         .chain(objects.iter().map(|object| &object.oid))
     {
         if seen.insert(oid)
-            && let Some(object_size) = for_each_ref_loose_object_disk_size(git_dir, oid)?
+            && let Some(info) = db.object_storage_info(oid)?
         {
-            size += object_size;
+            size += info.disk_size;
         }
     }
     if human_readable {
