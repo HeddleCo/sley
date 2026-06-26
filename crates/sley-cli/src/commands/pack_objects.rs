@@ -55,6 +55,11 @@ struct PackObjectsOptions {
     no_delta: bool,
     delta_base_offset: bool,
     stdin_packs: bool,
+    /// `--stdin-packs=follow`: in addition to the standard "objects in the
+    /// included packs minus objects in the excluded packs" set, run a
+    /// reachability walk from the commits of the included (and excluded-open
+    /// `!`) packs to rescue objects that live in packs not named on stdin.
+    stdin_packs_follow: bool,
     path_walk: bool,
     thin: bool,
     write_bitmap_index: bool,
@@ -144,6 +149,15 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             "--stdin-packs" if !saw_dashdash => options.stdin_packs = true,
             value if !saw_dashdash && value.starts_with("--stdin-packs=") => {
                 options.stdin_packs = true;
+                let mode = &value["--stdin-packs=".len()..];
+                if mode.is_empty() {
+                    // bare `--stdin-packs=` is the standard mode
+                } else if mode == "follow" {
+                    options.stdin_packs_follow = true;
+                } else {
+                    eprintln!("fatal: invalid value for 'stdin-packs': '{mode}'");
+                    return Err(GitError::Exit(128));
+                }
             }
             "-q" | "--quiet" if !saw_dashdash => options.progress = Some(false),
             "--no-quiet" if !saw_dashdash => {}
@@ -278,12 +292,12 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             progress,
         );
     }
-    if options.stdin_packs {
-        return read_stdin_packs(format);
-    }
-
     let traversal = options.revs || options.all;
-    let (mut oids, mut objects, reused_packs) = if traversal {
+    let (mut oids, mut objects, reused_packs) = if options.stdin_packs {
+        let (oids, objects) =
+            collect_stdin_packs_objects(&common_git_dir, &database, format, &options)?;
+        (oids, objects, Vec::new())
+    } else if traversal {
         collect_traversal_objects(&git_dir, &common_git_dir, &database, format, &options)?
     } else {
         let oids = read_pack_objects_stdin(format)?;
@@ -639,6 +653,22 @@ struct WrittenPackParts {
 }
 
 fn validate_pack_objects_options(options: &PackObjectsOptions) -> Result<()> {
+    if options.stdin_packs {
+        // `--stdin-packs` selects objects from named packs directly, so an
+        // internal rev list (`--revs`/`--all`) and `--filter` are both
+        // rejected before any work happens (builtin/pack-objects.c
+        // die_for_incompatible_opt2 + "cannot use internal rev list").
+        if options.object_filter != PackObjectFilter::None {
+            eprintln!(
+                "fatal: options '--stdin-packs' and '--filter' cannot be used together"
+            );
+            return Err(GitError::Exit(128));
+        }
+        if options.revs || options.all {
+            eprintln!("fatal: cannot use internal rev list with --stdin-packs");
+            return Err(GitError::Exit(128));
+        }
+    }
     if let Some(version) = options.name_hash_version {
         if version == 0 || version > 2 {
             eprintln!("fatal: invalid --name-hash-version option: {version}");
@@ -651,28 +681,197 @@ fn validate_pack_objects_options(options: &PackObjectsOptions) -> Result<()> {
     Ok(())
 }
 
-fn read_stdin_packs(format: ObjectFormat) -> Result<()> {
-    let hex_len = format.raw_len() * 2;
+/// `kind` bitflags for a pack named on `--stdin-packs` input.
+const STDIN_PACK_INCLUDE: u8 = 1 << 0;
+const STDIN_PACK_EXCLUDE_CLOSED: u8 = 1 << 1;
+const STDIN_PACK_EXCLUDE_OPEN: u8 = 1 << 2;
+
+/// A `.idx`/`.pack` pair discovered while scanning the object stores.
+struct StdinPackFile {
+    oids: Vec<ObjectId>,
+    mtime: std::time::SystemTime,
+}
+
+/// `git pack-objects --stdin-packs`: read pack basenames from standard input
+/// (one per line, `^`-prefixed names excluded; `!`-prefixed names are
+/// excluded-open under `=follow` and literal otherwise), resolve them across
+/// the local and alternate object stores, and return the objects to pack.
+///
+/// The standard set is "the union of objects in the included packs, minus any
+/// object that also appears in an excluded pack". With `--unpacked`, loose
+/// objects that are not present in an excluded pack are appended too
+/// (`add_unreachable_loose_objects`; `add_object_entry` deduplicates, so we add
+/// every loose object once and let the want-veto drop the excluded ones).
+fn collect_stdin_packs_objects(
+    common_git_dir: &Path,
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    options: &PackObjectsOptions,
+) -> Result<(Vec<ObjectId>, Vec<Arc<EncodedObject>>)> {
+    let follow = options.stdin_packs_follow;
+
+    // 1. Parse stdin into per-basename kind bitflags, preserving first-seen
+    //    order so the "could not find pack" diagnostic names the right key.
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut line = Vec::new();
-    let mut packs = Vec::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut requested: HashMap<String, u8> = HashMap::new();
     loop {
         line.clear();
         if input.read_until(b'\n', &mut line)? == 0 {
             break;
         }
-        let Some(oid) = parse_pack_objects_oid(&line, hex_len, format) else {
-            return pack_objects_garbage("expected object ID", &line);
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let (kind, key) = if line.first() == Some(&b'^') {
+            (STDIN_PACK_EXCLUDE_CLOSED, &line[1..])
+        } else if follow && line.first() == Some(&b'!') {
+            (STDIN_PACK_EXCLUDE_OPEN, &line[1..])
+        } else {
+            (STDIN_PACK_INCLUDE, &line[..])
         };
-        packs.push(oid);
+        let key = String::from_utf8_lossy(key).into_owned();
+        let entry = requested.entry(key.clone()).or_insert_with(|| {
+            order.push(key);
+            0
+        });
+        *entry |= kind;
     }
-    packs.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    if let Some(oid) = packs.first() {
-        eprintln!("fatal: could not find pack '{oid}'");
-        return Err(GitError::Exit(128));
+
+    // 2. Scan the local and alternate object stores for every `.idx`/`.pack`
+    //    pair, indexed by the `<basename>.pack` filename git matches against.
+    let objects_dir = sley_odb::repository_objects_dir(common_git_dir);
+    let mut object_dirs: Vec<PathBuf> = vec![objects_dir.clone()];
+    if let Ok(alternates) = fs::read_to_string(objects_dir.join("info/alternates")) {
+        for raw in alternates.lines() {
+            let raw = raw.trim();
+            if raw.is_empty() || raw.starts_with('#') {
+                continue;
+            }
+            let path = PathBuf::from(raw);
+            object_dirs.push(if path.is_absolute() {
+                path
+            } else {
+                objects_dir.join(path)
+            });
+        }
     }
-    Ok(())
+    let mut found: HashMap<String, StdinPackFile> = HashMap::new();
+    for dir in &object_dirs {
+        let pack_dir = dir.join("pack");
+        let Ok(entries) = fs::read_dir(&pack_dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+                continue;
+            }
+            let pack_path = path.with_extension("pack");
+            if !pack_path.exists() {
+                continue;
+            }
+            let Some(basename) = pack_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if found.contains_key(basename) || !requested.contains_key(basename) {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(index) = PackIndex::parse(&bytes, format) else {
+                continue;
+            };
+            let mtime = fs::metadata(&pack_path)
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            found.insert(
+                basename.to_string(),
+                StdinPackFile {
+                    oids: index.entries.into_iter().map(|entry| entry.oid).collect(),
+                    mtime,
+                },
+            );
+        }
+    }
+
+    // 3. Every named pack must resolve, or git dies naming the missing key.
+    for key in &order {
+        if !found.contains_key(key) {
+            eprintln!("fatal: could not find pack '{key}'");
+            return Err(GitError::Exit(128));
+        }
+    }
+
+    // 4. Objects in any excluded pack veto inclusion (closed and open both).
+    let mut excluded: HashSet<ObjectId> = HashSet::new();
+    for (key, &kind) in &requested {
+        if kind & (STDIN_PACK_EXCLUDE_CLOSED | STDIN_PACK_EXCLUDE_OPEN) != 0
+            && let Some(pack) = found.get(key)
+        {
+            excluded.extend(pack.oids.iter().copied());
+        }
+    }
+
+    // 5. Walk the included packs in ascending-mtime order (newest objects laid
+    //    out last, as upstream's pack_mtime_cmp arranges) and collect the
+    //    wanted objects, deduplicating across packs.
+    let mut included_keys: Vec<&String> = order
+        .iter()
+        .filter(|key| requested.get(*key).is_some_and(|kind| kind & STDIN_PACK_INCLUDE != 0))
+        .collect();
+    included_keys.sort_by_key(|key| found.get(*key).map(|pack| pack.mtime));
+
+    let mut oids: Vec<ObjectId> = Vec::new();
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    for key in included_keys {
+        let Some(pack) = found.get(key) else {
+            continue;
+        };
+        for oid in &pack.oids {
+            if excluded.contains(oid) || !seen.insert(*oid) {
+                continue;
+            }
+            oids.push(*oid);
+        }
+    }
+
+    // 6. `--unpacked` appends loose objects not vetoed by an excluded pack.
+    if options.unpacked {
+        let mut loose: HashSet<ObjectId> = HashSet::new();
+        for dir in &object_dirs {
+            collect_loose_oids(dir, format, &mut loose)?;
+        }
+        let mut loose: Vec<ObjectId> = loose.into_iter().collect();
+        loose.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        for oid in loose {
+            if excluded.contains(&oid) || !seen.insert(oid) {
+                continue;
+            }
+            oids.push(oid);
+        }
+    }
+
+    // 7. Materialise the object bodies for the writer.
+    let mut objects = Vec::with_capacity(oids.len());
+    for oid in &oids {
+        match database.read_object(oid) {
+            Ok(object) => objects.push(object),
+            Err(GitError::NotFound(_)) => {
+                eprintln!("fatal: unable to read {oid}");
+                return Err(GitError::Exit(128));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok((oids, objects))
 }
 
 /// The final progress totals line and the trace2 data events upstream emits
