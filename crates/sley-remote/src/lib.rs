@@ -372,6 +372,7 @@ mod tests {
             FetchServices {
                 credentials,
                 progress: &mut progress,
+                ref_hook: None,
             },
         )
         .expect("live fetch should succeed");

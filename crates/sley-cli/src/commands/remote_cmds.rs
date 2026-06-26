@@ -8230,6 +8230,7 @@ fn run_fetch(
     {
         trace_protocol_v2_ls_refs_request(server_options);
     }
+    let ref_hook = crate::commands::refs::ReferenceTransactionHookRunner::new(git_dir);
     let outcome = sley_remote::fetch(
         sley_remote::FetchRequest {
             git_dir,
@@ -8243,6 +8244,7 @@ fn run_fetch(
         sley_remote::FetchServices {
             credentials: &mut credentials,
             progress: &mut progress,
+            ref_hook: Some(&ref_hook),
         },
     )?;
     maybe_set_remote_head_on_fetch(

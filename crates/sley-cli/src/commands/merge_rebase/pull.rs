@@ -668,6 +668,7 @@ fn run_fetch_with_outcome(
         sley_remote::FetchServices {
             credentials: &mut credentials,
             progress: &mut progress,
+            ref_hook: None,
         },
     )
 }

@@ -271,6 +271,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         crate::fetch::FetchServices {
             credentials: services.credentials,
             progress: services.progress,
+            ref_hook: None,
         },
     )?;
 
