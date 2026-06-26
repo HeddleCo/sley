@@ -50,6 +50,7 @@ pub(crate) mod last_modified;
 pub(crate) mod line_log;
 pub(crate) mod log;
 pub(crate) mod merge_file;
+pub(crate) mod merge_index;
 pub(crate) mod merge_rebase;
 pub(crate) mod merge_tree;
 pub(crate) mod mergetool;

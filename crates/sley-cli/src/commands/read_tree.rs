@@ -60,6 +60,10 @@ struct ReadTreeArgs {
     /// harness's `read_tree_*_must_succeed` to prove the dry run leaves index
     /// and worktree untouched before the real run.
     dry_run: bool,
+    /// git's `-i`: don't check that the working tree is up to date and don't
+    /// require one at all (`opts.index_only`). This is what lets `read-tree -i
+    /// -m` run inside a bare repository against `$GIT_INDEX_FILE`.
+    index_only: bool,
     trees: Vec<String>,
 }
 
@@ -177,6 +181,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                 repo.config(),
                 &tree_oids,
                 apply_worktree,
+                parsed.index_only,
                 recurse_submodules,
             )?;
             if !parsed.dry_run {
@@ -253,6 +258,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
     let mut sparse_checkout = true;
     let mut empty = false;
     let mut dry_run = false;
+    let mut index_only = false;
     let mut trees = Vec::new();
     let mut no_more_options = false;
 
@@ -271,7 +277,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
                 set_mode(ReadTreeMode::Merge, &mut mode)?;
                 update_worktree = true;
             }
-            "-i" => {} // "don't check the working tree" — we already skip those checks.
+            "-i" => index_only = true, // "don't check the working tree" (git's index_only).
             "--empty" => empty = true,
             "--no-empty" => empty = false,
             "--recurse-submodules" => recurse_submodules = Some(true),
@@ -320,6 +326,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
             sparse_checkout,
             empty,
             dry_run,
+            index_only,
             trees,
         });
     }
@@ -333,6 +340,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
         sparse_checkout,
         empty,
         dry_run,
+        index_only,
         trees,
     })
 }
@@ -1205,6 +1213,7 @@ fn merge_trees(
     config: &GitConfig,
     tree_oids: &[ObjectId],
     update_worktree: bool,
+    index_only: bool,
     recurse_submodules: bool,
 ) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
     use sley_unpack_trees::{MergeFn, UnpackTreesOptions, check_updates, unpack_trees};
@@ -1248,9 +1257,16 @@ fn merge_trees(
     // up-to-date checks. read-tree's historic behaviour DOES run verify_uptodate
     // even without `-u`, so keep `index_only` false and let `update` gate the
     // verify_absent (clobber) check inside merged_entry.
-    opts.index_only = false;
+    // `-i` (git's `index_only`): skip the worktree verify_uptodate/verify_absent
+    // checks entirely. This is also what makes `read-tree -i -m` usable in a bare
+    // repository, where there is no worktree to require.
+    opts.index_only = index_only;
 
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let worktree_root = if index_only {
+        worktree_root_for_git_dir(git_dir).unwrap_or_else(|_| git_dir.to_path_buf())
+    } else {
+        worktree_root_for_git_dir(git_dir)?
+    };
     let mut wt = ReadTreeWorktree {
         submodules: load_superproject_submodules(&worktree_root),
         repo_config: read_repo_config(git_dir).unwrap_or_default(),

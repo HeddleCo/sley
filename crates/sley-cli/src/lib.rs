@@ -520,6 +520,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "fast-import" => commands::fast_import::cmd_fast_import(&args[1..]),
         "merge-tree" => commands::merge_tree::cmd_merge_tree(&args[1..]),
         "merge-file" => commands::merge_file::cmd_merge_file(&args[1..]),
+        "merge-index" => commands::merge_index::cmd_merge_index(&args[1..]),
         "name-rev" => commands::name_rev::cmd_name_rev(&args[1..]),
         "show-branch" => commands::show_branch::cmd_show_branch(&args[1..]),
         "verify-commit" => commands::verify_commit::cmd_verify_commit(&args[1..]),
