@@ -692,7 +692,7 @@ impl ObjectQuery<'_> {
     fn print_pretty(&self) -> Result<()> {
         let (oid, _) = self.resolve_command_oid()?;
         let read_oid = self.view.replacement_oid(&oid)?;
-        let object = match self.view.db().read_object(&read_oid) {
+        let object = match crate::read_object_maybe_prefetch_promisor(self.view.db(), &read_oid) {
             Ok(object) => object,
             Err(GitError::NotFound(_)) => return cat_file_not_a_valid_object_name(self.name),
             Err(err) => {

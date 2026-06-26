@@ -5289,6 +5289,27 @@ fn read_object_maybe_prefetch_promisor(
     Ok(object)
 }
 
+/// Promisor remotes to consult for a lazy fetch, in git's
+/// `promisor_remote_get_direct` order: the default remote named by
+/// `extensions.partialclone` first, then every other `remote.<name>.promisor`.
+fn promisor_remote_names(config: &GitConfig) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(default) = config
+        .get("extensions", None, "partialclone")
+        .filter(|value| !value.is_empty())
+    {
+        names.push(default.to_string());
+    }
+    for name in remote_names(config) {
+        if config.get_bool("remote", Some(&name), "promisor") == Some(true)
+            && !names.contains(&name)
+        {
+            names.push(name);
+        }
+    }
+    names
+}
+
 fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Result<bool> {
     let Some(git_dir) = database_git_dir(db) else {
         return Ok(false);
@@ -5296,36 +5317,41 @@ fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Re
     let Ok(config) = read_repo_config(&git_dir) else {
         return Ok(false);
     };
-    let Some(remote_name) = config
-        .get("extensions", None, "partialclone")
-        .map(str::to_string)
-        .or_else(|| {
-            remote_names(&config)
-                .into_iter()
-                .find(|name| config.get_bool("remote", Some(name), "promisor") == Some(true))
-        })
-    else {
-        return Ok(false);
-    };
-    let Some(url) = config.get("remote", Some(&remote_name), "url") else {
-        return Ok(false);
-    };
-    let Ok(remote_git_dir) = commands::remote_cmds::ls_remote_git_dir(url) else {
-        return Ok(false);
-    };
-    sley_remote::install_fetch_pack_via_local_upload_pack(
-        &git_dir,
-        &remote_git_dir,
-        db.object_format(),
-        vec![*oid],
-        None,
-        true,
-        false,
-        None,
-        false,
-        None,
-    )?;
-    Ok(true)
+    // Try each configured promisor remote in turn (git's
+    // `promisor_remote_get_direct` does the same): a remote that lacks the
+    // requested oid errors during negotiation, so fall through to the next one.
+    for remote_name in promisor_remote_names(&config) {
+        let Some(url) = config.get("remote", Some(&remote_name), "url") else {
+            continue;
+        };
+        let Ok(remote_git_dir) = commands::remote_cmds::ls_remote_git_dir(url) else {
+            continue;
+        };
+        if sley_remote::install_fetch_pack_via_local_upload_pack(
+            &git_dir,
+            &remote_git_dir,
+            db.object_format(),
+            vec![*oid],
+            None,
+            true,
+            false,
+            None,
+            false,
+            None,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        // A remote can answer the fetch without actually supplying the oid;
+        // confirm it landed before declaring success (and before skipping the
+        // remaining promisor remotes).
+        db.refresh_read_cache();
+        if db.contains(oid).unwrap_or(false) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
