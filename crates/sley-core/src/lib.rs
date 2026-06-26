@@ -1677,6 +1677,66 @@ pub fn digest_bytes(format: ObjectFormat, bytes: &[u8]) -> Result<ObjectId> {
     }
 }
 
+pub struct StreamingDigest {
+    format: ObjectFormat,
+    inner: StreamingDigestInner,
+}
+
+enum StreamingDigestInner {
+    #[cfg(not(feature = "fast-sha1"))]
+    Sha1(Sha1Hasher),
+    #[cfg(feature = "fast-sha1")]
+    Sha1(sha1::Sha1),
+    Sha256(Sha256Hasher),
+}
+
+impl StreamingDigest {
+    pub fn new(format: ObjectFormat) -> Self {
+        let inner = match format {
+            #[cfg(not(feature = "fast-sha1"))]
+            ObjectFormat::Sha1 => StreamingDigestInner::Sha1(Sha1Hasher::new()),
+            #[cfg(feature = "fast-sha1")]
+            ObjectFormat::Sha1 => {
+                use sha1::Digest;
+                StreamingDigestInner::Sha1(sha1::Sha1::new())
+            }
+            ObjectFormat::Sha256 => StreamingDigestInner::Sha256(Sha256Hasher::new()),
+        };
+        Self { format, inner }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        match &mut self.inner {
+            #[cfg(not(feature = "fast-sha1"))]
+            StreamingDigestInner::Sha1(hasher) => hasher.update(data),
+            #[cfg(feature = "fast-sha1")]
+            StreamingDigestInner::Sha1(hasher) => {
+                use sha1::Digest;
+                hasher.update(data);
+            }
+            StreamingDigestInner::Sha256(hasher) => hasher.update(data),
+        }
+    }
+
+    pub fn finalize(self) -> Result<ObjectId> {
+        match self.inner {
+            #[cfg(not(feature = "fast-sha1"))]
+            StreamingDigestInner::Sha1(hasher) => {
+                ObjectId::from_raw(self.format, &hasher.finalize())
+            }
+            #[cfg(feature = "fast-sha1")]
+            StreamingDigestInner::Sha1(hasher) => {
+                use sha1::Digest;
+                let bytes: [u8; 20] = hasher.finalize().into();
+                ObjectId::from_raw(self.format, &bytes)
+            }
+            StreamingDigestInner::Sha256(hasher) => {
+                ObjectId::from_raw(self.format, &hasher.finalize())
+            }
+        }
+    }
+}
+
 pub fn to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     write_hex_bytes(bytes, &mut out).expect("writing hex to a String cannot fail");
@@ -1877,6 +1937,19 @@ fn sha1_compress(state: &mut [u32; 5], block: &[u8]) {
 }
 
 fn sha256(input: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256Hasher::new();
+    hasher.update(input);
+    hasher.finalize()
+}
+
+struct Sha256Hasher {
+    state: [u32; 8],
+    block: [u8; 64],
+    block_len: usize,
+    total_len: u64,
+}
+
+impl Sha256Hasher {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -1890,26 +1963,67 @@ fn sha256(input: &[u8]) -> [u8; 32] {
         0xc67178f2,
     ];
 
-    let mut h = [
-        0x6a09e667u32,
-        0xbb67ae85,
-        0x3c6ef372,
-        0xa54ff53a,
-        0x510e527f,
-        0x9b05688c,
-        0x1f83d9ab,
-        0x5be0cd19,
-    ];
-
-    let bit_len = (input.len() as u64) * 8;
-    let mut msg = input.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
+    fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667u32,
+                0xbb67ae85,
+                0x3c6ef372,
+                0xa54ff53a,
+                0x510e527f,
+                0x9b05688c,
+                0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            block: [0u8; 64],
+            block_len: 0,
+            total_len: 0,
+        }
     }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    fn update(&mut self, mut data: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
+        if self.block_len > 0 {
+            let take = (64 - self.block_len).min(data.len());
+            self.block[self.block_len..self.block_len + take].copy_from_slice(&data[..take]);
+            self.block_len += take;
+            data = &data[take..];
+            if self.block_len == 64 {
+                let block = self.block;
+                self.compress(&block);
+                self.block_len = 0;
+            }
+        }
+        while data.len() >= 64 {
+            self.compress(&data[..64]);
+            data = &data[64..];
+        }
+        if !data.is_empty() {
+            self.block[..data.len()].copy_from_slice(data);
+            self.block_len = data.len();
+        }
+    }
+
+    fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.total_len.wrapping_mul(8);
+        let mut tail = [0u8; 128];
+        tail[..self.block_len].copy_from_slice(&self.block[..self.block_len]);
+        tail[self.block_len] = 0x80;
+        let total = if self.block_len < 56 { 64 } else { 128 };
+        tail[total - 8..total].copy_from_slice(&bit_len.to_be_bytes());
+        self.compress(&tail[..64]);
+        if total == 128 {
+            self.compress(&tail[64..128]);
+        }
+
+        let mut out = [0; 32];
+        for (idx, word) in self.state.iter().enumerate() {
+            out[idx * 4..idx * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    fn compress(&mut self, chunk: &[u8]) {
         let mut w = [0u32; 64];
         for (i, word) in w.iter_mut().take(16).enumerate() {
             let offset = i * 4;
@@ -1929,14 +2043,14 @@ fn sha256(input: &[u8]) -> [u8; 32] {
                 .wrapping_add(s1);
         }
 
-        let mut a = h[0];
-        let mut b = h[1];
-        let mut c = h[2];
-        let mut d = h[3];
-        let mut e = h[4];
-        let mut f = h[5];
-        let mut g = h[6];
-        let mut hh = h[7];
+        let mut a = self.state[0];
+        let mut b = self.state[1];
+        let mut c = self.state[2];
+        let mut d = self.state[3];
+        let mut e = self.state[4];
+        let mut f = self.state[5];
+        let mut g = self.state[6];
+        let mut hh = self.state[7];
 
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
@@ -1944,7 +2058,7 @@ fn sha256(input: &[u8]) -> [u8; 32] {
             let temp1 = hh
                 .wrapping_add(s1)
                 .wrapping_add(ch)
-                .wrapping_add(K[i])
+                .wrapping_add(Self::K[i])
                 .wrapping_add(w[i]);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
@@ -1960,21 +2074,15 @@ fn sha256(input: &[u8]) -> [u8; 32] {
             a = temp1.wrapping_add(temp2);
         }
 
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
+        self.state[0] = self.state[0].wrapping_add(a);
+        self.state[1] = self.state[1].wrapping_add(b);
+        self.state[2] = self.state[2].wrapping_add(c);
+        self.state[3] = self.state[3].wrapping_add(d);
+        self.state[4] = self.state[4].wrapping_add(e);
+        self.state[5] = self.state[5].wrapping_add(f);
+        self.state[6] = self.state[6].wrapping_add(g);
+        self.state[7] = self.state[7].wrapping_add(hh);
     }
-
-    let mut out = [0; 32];
-    for (idx, word) in h.iter().enumerate() {
-        out[idx * 4..idx * 4 + 4].copy_from_slice(&word.to_be_bytes());
-    }
-    out
 }
 
 #[cfg(test)]
