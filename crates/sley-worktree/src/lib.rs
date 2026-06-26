@@ -562,8 +562,13 @@ mod tests {
         let git_dir = root.join(".git");
         fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         fs::write(root.join("f.txt"), b"hello\n").expect("test operation should succeed");
-        add_paths_to_index(&root, &git_dir, ObjectFormat::Sha1, &[PathBuf::from("f.txt")])
-            .expect("test operation should succeed");
+        add_paths_to_index(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &[PathBuf::from("f.txt")],
+        )
+        .expect("test operation should succeed");
         let expected = write_tree_from_index(&git_dir, ObjectFormat::Sha1)
             .expect("test operation should succeed");
 
@@ -610,6 +615,64 @@ mod tests {
                 .map(ShortStatusEntry::line)
                 .collect::<Vec<_>>(),
             vec!["A  hello.txt", "?? extra.txt"]
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn borrowed_untracked_frontier_preserves_directory_ignore_scopes() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(root.join("tracked.txt"), b"tracked\n").expect("test operation should succeed");
+        build_commit(&root, &git_dir, &["tracked.txt"]);
+
+        fs::create_dir_all(root.join("alpha").join("nested"))
+            .expect("test operation should succeed");
+        fs::write(root.join("alpha").join(".gitignore"), b"blocked.txt\n")
+            .expect("test operation should succeed");
+        fs::write(
+            root.join("alpha").join("nested").join("blocked.txt"),
+            b"ignored\n",
+        )
+        .expect("test operation should succeed");
+        fs::write(
+            root.join("alpha").join("nested").join("visible.txt"),
+            b"visible\n",
+        )
+        .expect("test operation should succeed");
+
+        fs::create_dir_all(root.join("beta").join("nested"))
+            .expect("test operation should succeed");
+        fs::write(
+            root.join("beta").join("nested").join("blocked.txt"),
+            b"visible\n",
+        )
+        .expect("test operation should succeed");
+
+        let index_bytes = read_borrowed_index_bytes(&repository_index_path(&git_dir))
+            .expect("test operation should succeed");
+        let borrowed = BorrowedIndex::parse(index_bytes.as_ref(), ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let mut ignores =
+            IgnoreMatcher::from_worktree_base(&root).expect("test operation should succeed");
+        let paths = status_untracked_paths_from_borrowed_index(
+            &root,
+            &git_dir,
+            &borrowed,
+            &mut ignores,
+            StatusUntrackedMode::All,
+            None,
+        )
+        .expect("test operation should succeed");
+
+        assert_eq!(
+            paths,
+            vec![
+                b"alpha/.gitignore".to_vec(),
+                b"alpha/nested/visible.txt".to_vec(),
+                b"beta/nested/blocked.txt".to_vec(),
+            ]
         );
         fs::remove_dir_all(root).expect("test operation should succeed");
     }

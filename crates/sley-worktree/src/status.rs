@@ -8,6 +8,7 @@ use crate::ignore::*;
 use crate::index::*;
 use crate::index_io::*;
 use crate::types_admin::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub fn stream_short_status<F>(
     worktree_root: impl AsRef<Path>,
@@ -94,22 +95,68 @@ pub(crate) struct StatusProfileCounters {
 }
 
 pub(crate) const STATUS_BORROWED_OVERLAP_MIN_STAGE0: usize = 1024;
-pub(crate) const STATUS_WORKER_STACK_SIZE: usize = 32 * 1024;
 
-pub(crate) fn spawn_status_worker<'scope, 'env, F, T>(
-    scope: &'scope std::thread::Scope<'scope, 'env>,
-    name: &str,
-    f: F,
-) -> Result<std::thread::ScopedJoinHandle<'scope, Result<T>>>
-where
-    F: FnOnce() -> Result<T> + Send + 'scope,
-    T: Send + 'scope,
-{
-    std::thread::Builder::new()
-        .name(name.to_string())
-        .stack_size(STATUS_WORKER_STACK_SIZE)
-        .spawn_scoped(scope, f)
-        .map_err(|err| GitError::Command(format!("failed to spawn status worker `{name}`: {err}")))
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StatusExecutor {
+    workers: usize,
+}
+
+impl StatusExecutor {
+    pub(crate) fn new() -> Self {
+        let workers = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .max(1);
+        Self { workers }
+    }
+
+    pub(crate) fn worker_count_for(
+        self,
+        item_count: usize,
+        min_items_per_worker: usize,
+        cap: usize,
+    ) -> usize {
+        if item_count == 0 {
+            return 0;
+        }
+        let requested = item_count.div_ceil(min_items_per_worker.max(1));
+        self.workers.min(cap.max(1)).min(requested).max(1)
+    }
+
+    pub(crate) fn spawn<'scope, 'env, F, T>(
+        self,
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        name: &str,
+        f: F,
+    ) -> Result<StatusTask<'scope, T>>
+    where
+        F: FnOnce() -> Result<T> + Send + 'scope,
+        T: Send + 'scope,
+    {
+        let handle = std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn_scoped(scope, f)
+            .map_err(|err| {
+                GitError::Command(format!("failed to spawn status worker `{name}`: {err}"))
+            })?;
+        Ok(StatusTask {
+            name: name.to_string(),
+            handle,
+        })
+    }
+}
+
+pub(crate) struct StatusTask<'scope, T> {
+    name: String,
+    handle: std::thread::ScopedJoinHandle<'scope, Result<T>>,
+}
+
+impl<T> StatusTask<'_, T> {
+    pub(crate) fn join(self) -> Result<T> {
+        self.handle
+            .join()
+            .map_err(|_| GitError::Command(format!("status worker `{}` panicked", self.name)))?
+    }
 }
 
 pub(crate) enum BorrowedIndexBytes {
@@ -144,7 +191,7 @@ impl StatusProfileCounters {
             .is_some_and(|value| value == "mem" || value == "memory")
     }
 
-    fn merge_untracked(&mut self, other: StatusProfileCounters) {
+    pub(crate) fn merge_untracked(&mut self, other: StatusProfileCounters) {
         self.read_dir_calls += other.read_dir_calls;
         self.dir_entries_seen += other.dir_entries_seen;
         self.file_type_calls += other.file_type_calls;
@@ -667,7 +714,10 @@ pub(crate) fn sparse_checkout_active_for_status(git_dir: &Path, index: &Index) -
         || sparse_checkout_config_enabled(git_dir)
 }
 
-pub(crate) fn sparse_checkout_active_for_borrowed_status(git_dir: &Path, index: &BorrowedIndex<'_>) -> bool {
+pub(crate) fn sparse_checkout_active_for_borrowed_status(
+    git_dir: &Path,
+    index: &BorrowedIndex<'_>,
+) -> bool {
     index
         .entries
         .iter()
@@ -1239,10 +1289,11 @@ pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
     if let Some(profile) = profile.as_mut() {
         profile.overlap_enabled = true;
     }
+    let executor = StatusExecutor::new();
     if profile_enabled {
         let (mut entries, untracked_paths, untracked_profile) =
             std::thread::scope(|scope| -> Result<_> {
-                let tracked = spawn_status_worker(scope, "status-tracked", || {
+                let tracked = executor.spawn(scope, "status-tracked", || {
                     let start = Instant::now();
                     short_status_borrowed_tracked_only_head_matches_index_parallel(
                         worktree_root,
@@ -1255,7 +1306,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
                     )
                     .map(|entries| (entries, start.elapsed().as_micros()))
                 })?;
-                let untracked = spawn_status_worker(
+                let untracked = executor.spawn(
                     scope,
                     "status-untracked",
                     || -> Result<(Vec<Vec<u8>>, StatusProfileCounters)> {
@@ -1275,12 +1326,8 @@ pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
                         Ok((paths, local_profile))
                     },
                 )?;
-                let (entries, tracked_elapsed_us) = tracked
-                    .join()
-                    .map_err(|_| GitError::Command("status worker panicked".into()))??;
-                let (untracked_paths, untracked_profile) = untracked
-                    .join()
-                    .map_err(|_| GitError::Command("status worker panicked".into()))??;
+                let (entries, tracked_elapsed_us) = tracked.join()?;
+                let (untracked_paths, untracked_profile) = untracked.join()?;
                 if let Some(profile) = profile.as_mut() {
                     profile.tracked_elapsed_us = tracked_elapsed_us;
                 }
@@ -1300,7 +1347,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
         return Ok(Some(entries));
     }
     let (mut entries, untracked_paths) = std::thread::scope(|scope| -> Result<_> {
-        let tracked = spawn_status_worker(scope, "status-tracked", || {
+        let tracked = executor.spawn(scope, "status-tracked", || {
             short_status_borrowed_tracked_only_head_matches_index_parallel(
                 worktree_root,
                 git_dir,
@@ -1311,24 +1358,19 @@ pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
                 untracked_mode,
             )
         })?;
-        let untracked =
-            spawn_status_worker(scope, "status-untracked", || -> Result<Vec<Vec<u8>>> {
-                let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-                status_untracked_paths_from_borrowed_index(
-                    worktree_root,
-                    git_dir,
-                    &borrowed,
-                    &mut ignores,
-                    untracked_mode,
-                    None,
-                )
-            })?;
-        let entries = tracked
-            .join()
-            .map_err(|_| GitError::Command("status worker panicked".into()))??;
-        let untracked_paths = untracked
-            .join()
-            .map_err(|_| GitError::Command("status worker panicked".into()))??;
+        let untracked = executor.spawn(scope, "status-untracked", || -> Result<Vec<Vec<u8>>> {
+            let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+            status_untracked_paths_from_borrowed_index(
+                worktree_root,
+                git_dir,
+                &borrowed,
+                &mut ignores,
+                untracked_mode,
+                None,
+            )
+        })?;
+        let entries = tracked.join()?;
+        let untracked_paths = untracked.join()?;
         Ok((entries, untracked_paths))
     })?;
     let render_start = Instant::now();
@@ -1552,9 +1594,10 @@ where
     if let Some(profile) = profile.as_mut() {
         profile.overlap_enabled = true;
     }
+    let executor = StatusExecutor::new();
     let (tracked_control, untracked_paths, untracked_profile) =
         std::thread::scope(|scope| -> Result<_> {
-            let untracked = spawn_status_worker(
+            let untracked = executor.spawn(
                 scope,
                 "status-untracked",
                 || -> Result<(Vec<Vec<u8>>, StatusProfileCounters)> {
@@ -1603,9 +1646,7 @@ where
                     emit,
                 )?;
             let tracked_elapsed_us = tracked_start.elapsed().as_micros();
-            let (untracked_paths, untracked_profile) = untracked
-                .join()
-                .map_err(|_| GitError::Command("status worker panicked".into()))??;
+            let (untracked_paths, untracked_profile) = untracked.join()?;
             if let Some(profile) = profile.as_mut() {
                 profile.tracked_elapsed_us = tracked_elapsed_us;
             }
@@ -1770,9 +1811,10 @@ pub(crate) fn short_status_borrowed_head_matches_index_count_if_possible(
     if let Some(profile) = profile.as_mut() {
         profile.overlap_enabled = true;
     }
+    let executor = StatusExecutor::new();
     let (tracked_count, untracked_count, untracked_profile) =
         std::thread::scope(|scope| -> Result<_> {
-            let tracked = spawn_status_worker(scope, "status-tracked", || {
+            let tracked = executor.spawn(scope, "status-tracked", || {
                 let start = Instant::now();
                 short_status_borrowed_tracked_only_head_matches_index_count_parallel(
                     worktree_root,
@@ -1785,7 +1827,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_count_if_possible(
                 )
                 .map(|count| (count, start.elapsed().as_micros()))
             })?;
-            let untracked = spawn_status_worker(
+            let untracked = executor.spawn(
                 scope,
                 "status-untracked",
                 || -> Result<(usize, StatusProfileCounters)> {
@@ -1805,12 +1847,8 @@ pub(crate) fn short_status_borrowed_head_matches_index_count_if_possible(
                     Ok((count, local_profile))
                 },
             )?;
-            let (tracked_count, tracked_elapsed_us) = tracked
-                .join()
-                .map_err(|_| GitError::Command("status worker panicked".into()))??;
-            let (untracked_count, untracked_profile) = untracked
-                .join()
-                .map_err(|_| GitError::Command("status worker panicked".into()))??;
+            let (tracked_count, tracked_elapsed_us) = tracked.join()?;
+            let (untracked_count, untracked_profile) = untracked.join()?;
             if let Some(profile) = profile.as_mut() {
                 profile.tracked_elapsed_us = tracked_elapsed_us;
             }
@@ -2284,9 +2322,7 @@ pub(crate) fn short_status_tracked_only_with_head_parallel(
         let (worktree_code, worktree_mode, submodule) = match precheck {
             None if entry.is_intent_to_add() => (b' ', None, None),
             None => (b' ', Some(index_entry.mode), None),
-            Some(TrackedOnlyPrecheck::Deleted(_)) if entry.is_intent_to_add() => {
-                (b' ', None, None)
-            }
+            Some(TrackedOnlyPrecheck::Deleted(_)) if entry.is_intent_to_add() => (b' ', None, None),
             Some(TrackedOnlyPrecheck::Deleted(_)) => (b'D', None, None),
             Some(TrackedOnlyPrecheck::Slow(_)) => {
                 let worktree_entry = worktree_entry_for_index_entry_with_attributes(
@@ -2372,7 +2408,10 @@ pub(crate) fn tracked_only_precheck_index(precheck: TrackedOnlyPrecheck) -> usiz
     }
 }
 
-pub(crate) fn stage0_index_entry_count<E>(entries: &[E], mut stage: impl FnMut(&E) -> Stage) -> usize {
+pub(crate) fn stage0_index_entry_count<E>(
+    entries: &[E],
+    mut stage: impl FnMut(&E) -> Stage,
+) -> usize {
     entries
         .iter()
         .filter(|entry| stage(entry) == Stage::Normal)
@@ -2420,11 +2459,8 @@ pub(crate) fn tracked_only_non_clean_prechecks_parallel(
     if normal_count == 0 {
         return Ok(Vec::new());
     }
-    let max_workers = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-        .min(4);
-    let worker_count = max_workers.min(normal_count.div_ceil(512)).max(1);
+    let executor = StatusExecutor::new();
+    let worker_count = executor.worker_count_for(normal_count, 512, 4);
     if worker_count == 1 {
         let mut prechecks = Vec::new();
         let mut absolute = PathBuf::new();
@@ -2452,33 +2488,42 @@ pub(crate) fn tracked_only_non_clean_prechecks_parallel(
     }
     let chunk_size = normal_count.div_ceil(worker_count);
     let chunk_ranges = stage0_index_chunk_ranges(&index.entries, chunk_size, IndexEntry::stage);
+    let next_chunk = AtomicUsize::new(0);
     let mut prechecks = std::thread::scope(|scope| -> Result<Vec<TrackedOnlyPrecheck>> {
         let mut handles = Vec::new();
-        for range in chunk_ranges {
-            handles.push(spawn_status_worker(
+        for _ in 0..worker_count {
+            let chunk_ranges = &chunk_ranges;
+            let next_chunk = &next_chunk;
+            handles.push(executor.spawn(
                 scope,
                 "status-precheck",
                 move || -> Result<Vec<TrackedOnlyPrecheck>> {
                     let mut prechecks = Vec::new();
                     let mut absolute = PathBuf::new();
-                    for idx in range {
-                        let entry = &index.entries[idx];
-                        if entry.stage() != Stage::Normal {
-                            continue;
-                        }
-                        match tracked_only_stat_precheck(
-                            worktree_root,
-                            entry,
-                            stat_cache,
-                            sparse_checkout_active,
-                            &mut absolute,
-                        )? {
-                            TrackedOnlyPrecheckOutcome::Clean => {}
-                            TrackedOnlyPrecheckOutcome::Deleted => {
-                                prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
+                    loop {
+                        let chunk_idx = next_chunk.fetch_add(1, Ordering::Relaxed);
+                        let Some(range) = chunk_ranges.get(chunk_idx) else {
+                            break;
+                        };
+                        for idx in range.clone() {
+                            let entry = &index.entries[idx];
+                            if entry.stage() != Stage::Normal {
+                                continue;
                             }
-                            TrackedOnlyPrecheckOutcome::Slow => {
-                                prechecks.push(TrackedOnlyPrecheck::Slow(idx));
+                            match tracked_only_stat_precheck(
+                                worktree_root,
+                                entry,
+                                stat_cache,
+                                sparse_checkout_active,
+                                &mut absolute,
+                            )? {
+                                TrackedOnlyPrecheckOutcome::Clean => {}
+                                TrackedOnlyPrecheckOutcome::Deleted => {
+                                    prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
+                                }
+                                TrackedOnlyPrecheckOutcome::Slow => {
+                                    prechecks.push(TrackedOnlyPrecheck::Slow(idx));
+                                }
                             }
                         }
                     }
@@ -2488,9 +2533,7 @@ pub(crate) fn tracked_only_non_clean_prechecks_parallel(
         }
         let mut prechecks = Vec::new();
         for handle in handles {
-            let mut chunk = handle
-                .join()
-                .map_err(|_| GitError::Command("status worker panicked".into()))??;
+            let mut chunk = handle.join()?;
             prechecks.append(&mut chunk);
         }
         Ok(prechecks)
@@ -2509,11 +2552,8 @@ pub(crate) fn tracked_only_borrowed_non_clean_prechecks_parallel(
     if normal_count == 0 {
         return Ok(Vec::new());
     }
-    let max_workers = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-        .min(4);
-    let worker_count = max_workers.min(normal_count.div_ceil(512)).max(1);
+    let executor = StatusExecutor::new();
+    let worker_count = executor.worker_count_for(normal_count, 512, 4);
     if worker_count == 1 {
         let mut prechecks = Vec::new();
         let mut absolute = PathBuf::new();
@@ -2541,33 +2581,42 @@ pub(crate) fn tracked_only_borrowed_non_clean_prechecks_parallel(
     }
     let chunk_size = normal_count.div_ceil(worker_count);
     let chunk_ranges = stage0_index_chunk_ranges(&index.entries, chunk_size, IndexEntryRef::stage);
+    let next_chunk = AtomicUsize::new(0);
     let mut prechecks = std::thread::scope(|scope| -> Result<Vec<TrackedOnlyPrecheck>> {
         let mut handles = Vec::new();
-        for range in chunk_ranges {
-            handles.push(spawn_status_worker(
+        for _ in 0..worker_count {
+            let chunk_ranges = &chunk_ranges;
+            let next_chunk = &next_chunk;
+            handles.push(executor.spawn(
                 scope,
                 "status-precheck",
                 move || -> Result<Vec<TrackedOnlyPrecheck>> {
                     let mut prechecks = Vec::new();
                     let mut absolute = PathBuf::new();
-                    for idx in range {
-                        let entry = &index.entries[idx];
-                        if entry.stage() != Stage::Normal {
-                            continue;
-                        }
-                        match tracked_only_borrowed_stat_precheck(
-                            worktree_root,
-                            entry,
-                            stat_cache,
-                            sparse_checkout_active,
-                            &mut absolute,
-                        )? {
-                            TrackedOnlyPrecheckOutcome::Clean => {}
-                            TrackedOnlyPrecheckOutcome::Deleted => {
-                                prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
+                    loop {
+                        let chunk_idx = next_chunk.fetch_add(1, Ordering::Relaxed);
+                        let Some(range) = chunk_ranges.get(chunk_idx) else {
+                            break;
+                        };
+                        for idx in range.clone() {
+                            let entry = &index.entries[idx];
+                            if entry.stage() != Stage::Normal {
+                                continue;
                             }
-                            TrackedOnlyPrecheckOutcome::Slow => {
-                                prechecks.push(TrackedOnlyPrecheck::Slow(idx));
+                            match tracked_only_borrowed_stat_precheck(
+                                worktree_root,
+                                entry,
+                                stat_cache,
+                                sparse_checkout_active,
+                                &mut absolute,
+                            )? {
+                                TrackedOnlyPrecheckOutcome::Clean => {}
+                                TrackedOnlyPrecheckOutcome::Deleted => {
+                                    prechecks.push(TrackedOnlyPrecheck::Deleted(idx));
+                                }
+                                TrackedOnlyPrecheckOutcome::Slow => {
+                                    prechecks.push(TrackedOnlyPrecheck::Slow(idx));
+                                }
                             }
                         }
                     }
@@ -2577,9 +2626,7 @@ pub(crate) fn tracked_only_borrowed_non_clean_prechecks_parallel(
         }
         let mut prechecks = Vec::new();
         for handle in handles {
-            let mut chunk = handle
-                .join()
-                .map_err(|_| GitError::Command("status worker panicked".into()))??;
+            let mut chunk = handle.join()?;
             prechecks.append(&mut chunk);
         }
         Ok(prechecks)
@@ -2748,4 +2795,3 @@ pub(crate) fn status_sort_category(entry: &ShortStatusEntry) -> u8 {
         _ => 0,
     }
 }
-
