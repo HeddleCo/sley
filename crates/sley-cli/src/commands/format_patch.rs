@@ -3725,6 +3725,7 @@ fn format_patch_diff_options<'a>(
     crate::DiffRenderOptions {
         binary: false,
         anchors: &[],
+        allow_textconv: false,
         db,
         worktree_root: None,
         use_worktree_new: false,

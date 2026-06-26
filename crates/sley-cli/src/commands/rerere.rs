@@ -875,6 +875,7 @@ fn rerere_diff(git_dir: &Path, format: ObjectFormat) -> Result<()> {
             DiffRenderOptions {
                 binary: false,
                 anchors: &[],
+                allow_textconv: false,
                 db: &db,
                 worktree_root: None,
                 use_worktree_new: false,

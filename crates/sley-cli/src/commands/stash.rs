@@ -3116,6 +3116,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                     let options = DiffRenderOptions {
                         binary: false,
                         anchors: &[],
+                        allow_textconv: false,
                         db: &db,
                         worktree_root: None,
                         use_worktree_new: false,
@@ -4229,6 +4230,7 @@ fn write_stash_list_patch(
         let options = DiffRenderOptions {
             binary: false,
             anchors: &[],
+            allow_textconv: false,
             db,
             worktree_root: None,
             use_worktree_new: false,

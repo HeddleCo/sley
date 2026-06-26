@@ -167,6 +167,9 @@ pub(super) struct LogDiffContext<'a> {
     pub(super) db: &'a FileObjectDatabase,
     pub(super) format: ObjectFormat,
     pub(super) config: &'a GitConfig,
+    /// Resolves `diff.<driver>.textconv` (and binary/funcname drivers) for the
+    /// `-p` patch path so `git log -p` honors textconv like `git diff` does.
+    pub(super) userdiff: &'a commands::userdiff::UserdiffResolver,
     pub(super) opts: &'a LogDiffOptions,
     pub(super) merges: LogDiffMerges,
     pub(super) show_root: bool,
@@ -394,6 +397,7 @@ impl LogDiffContext<'_> {
                     DiffRenderOptions {
                         binary: false,
                         anchors: &[],
+                        allow_textconv: true,
                         db: self.db,
                         worktree_root: None,
                         use_worktree_new: false,
@@ -402,7 +406,7 @@ impl LogDiffContext<'_> {
                         src_prefix: "a/",
                         dst_prefix: "b/",
                         context: 3,
-                        userdiff: None,
+                        userdiff: Some(self.userdiff),
                         funcname: None,
                         colors: None,
                         word_diff: None,

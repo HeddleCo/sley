@@ -1179,6 +1179,7 @@ fn run_diff_request(
             let patch_options = DiffRenderOptions {
                 binary: context.options.patch_binary,
                 anchors: &[],
+                allow_textconv: false,
                 db: context.db,
                 worktree_root: None,
                 use_worktree_new: false,

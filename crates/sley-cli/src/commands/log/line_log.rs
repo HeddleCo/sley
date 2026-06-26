@@ -425,6 +425,7 @@ fn render_line_log_patch(
             crate::DiffRenderOptions {
                 binary: false,
                 anchors: &[],
+                allow_textconv: false,
                 db,
                 worktree_root: None,
                 use_worktree_new: false,

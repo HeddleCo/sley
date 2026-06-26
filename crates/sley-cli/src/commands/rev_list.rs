@@ -1774,6 +1774,7 @@ fn rev_list_render_tree_to_tree_patch(
             DiffRenderOptions {
                 binary: false,
                 anchors: &[],
+                allow_textconv: false,
                 db,
                 worktree_root: None,
                 use_worktree_new: false,

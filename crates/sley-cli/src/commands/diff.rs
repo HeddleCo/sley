@@ -1944,6 +1944,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         line_ranges: None,
                         indent_heuristic,
                         anchors: &anchored,
+                        allow_textconv: true,
                     };
                     write_diff_patch_entry(stdout, entry, options)
                 },
@@ -2842,6 +2843,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             let options = DiffRenderOptions {
                 binary: false,
                 anchors: params.anchored,
+                allow_textconv: true,
                 db: &db,
                 worktree_root: None,
                 use_worktree_new: false,

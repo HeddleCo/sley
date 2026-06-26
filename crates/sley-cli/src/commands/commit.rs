@@ -2822,6 +2822,7 @@ fn append_commit_diff_index_patch(
             DiffRenderOptions {
                 binary: false,
                 anchors: &[],
+                allow_textconv: true,
                 db: &db,
                 worktree_root: worktree.then_some(worktree_root.as_path()),
                 use_worktree_new: worktree,

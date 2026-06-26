@@ -585,6 +585,7 @@ fn render(
             let options = DiffRenderOptions {
                 binary: false,
                 anchors: &[],
+                allow_textconv: false,
                 db: ctx.db,
                 worktree_root: ctx.worktree_root,
                 use_worktree_new: ctx.use_worktree_new,

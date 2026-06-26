@@ -2568,6 +2568,12 @@ pub(crate) struct DiffRenderOptions<'a> {
     /// `--anchored=<text>` prefixes (git's patience anchors). Only consulted when
     /// `diff_algorithm` is patience; empty (the default) is plain patience.
     pub(crate) anchors: &'a [Vec<u8>],
+    /// git's `DIFF_OPT_ALLOW_TEXTCONV`: when set, a regular-file side whose diff
+    /// driver defines `diff.<d>.textconv` is converted to its text representation
+    /// before binary detection and diffing. Enabled for porcelain patch output
+    /// (`git diff`/`show`/`log -p`/`status -v`); off for plumbing (`diff-tree`,
+    /// `diff-index`, `diff-files`) and patch generation (`format-patch`).
+    pub(crate) allow_textconv: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2947,6 +2953,7 @@ pub(crate) fn render_tree_to_tree_patch(
             DiffRenderOptions {
                 binary: false,
                 anchors: &[],
+                allow_textconv: false,
                 db,
                 worktree_root: None,
                 use_worktree_new: false,
@@ -3070,6 +3077,12 @@ pub(crate) fn compile_ignore_matching_regexes(
     Ok(compiled)
 }
 
+/// Whether a tree/index mode is a regular file (`S_ISREG`). Textconv acts only
+/// on regular-file blobs, never on symlinks (`120000`) or gitlinks (`160000`).
+fn diff_mode_is_regular_file(mode: Option<u32>) -> bool {
+    matches!(mode, Some(m) if (m & 0o170000) == 0o100000)
+}
+
 pub(crate) fn write_diff_patch_entry(
     stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
@@ -3131,7 +3144,7 @@ pub(crate) fn write_diff_patch_entry(
     {
         return write_submodule_patch_entry(stdout, entry, options);
     }
-    let (old_content, mut new_content) = match options.no_index_contents {
+    let (mut old_content, mut new_content) = match options.no_index_contents {
         Some((old, new)) => (old.map(<[u8]>::to_vec), new.map(<[u8]>::to_vec)),
         None => (
             diff_entry_old_content(entry, options.db)?,
@@ -3172,6 +3185,29 @@ pub(crate) fn write_diff_patch_entry(
         ),
         None => (None, None),
     };
+    // Textconv (git's `fill_textconv`): for porcelain `-p` output, replace a
+    // regular-file side's bytes with `diff.<driver>.textconv`'s output before
+    // binary detection and diffing. The recorded blob oids (and thus the `index`
+    // line) are unaffected; symlinks/gitlinks are never converted (not regular
+    // files), and a textconv helper that fails leaves the side unconverted.
+    if options.allow_textconv {
+        if let Some(driver) = old_driver.as_ref()
+            && let Some(command) = driver.textconv.as_deref()
+            && diff_mode_is_regular_file(entry.old_mode)
+            && let Some(content) = old_content.as_deref()
+            && let Some(converted) = commands::userdiff::run_textconv(command, content)?
+        {
+            old_content = Some(converted);
+        }
+        if let Some(driver) = new_driver.as_ref()
+            && let Some(command) = driver.textconv.as_deref()
+            && diff_mode_is_regular_file(entry.new_mode)
+            && let Some(content) = new_content.as_deref()
+            && let Some(converted) = commands::userdiff::run_textconv(command, content)?
+        {
+            new_content = Some(converted);
+        }
+    }
     let binary_override = old_driver
         .as_ref()
         .and_then(|driver| driver.binary)
@@ -4945,6 +4981,7 @@ fn write_submodule_inline_diff(
                 DiffRenderOptions {
                     binary: false,
                     anchors: &[],
+                    allow_textconv: false,
                     db: sub_db,
                     worktree_root: Some(sub_root),
                     use_worktree_new: true,
@@ -4991,6 +5028,7 @@ fn write_submodule_inline_diff(
             DiffRenderOptions {
                 binary: false,
                 anchors: &[],
+                allow_textconv: false,
                 db: sub_db,
                 worktree_root: nested_worktree_root.as_deref(),
                 use_worktree_new: false,
