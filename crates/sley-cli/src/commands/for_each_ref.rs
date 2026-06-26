@@ -319,6 +319,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         .map(|rev| resolve_revision(&git_dir, format, rev))
         .collect::<Result<Vec<_>>>()?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    for_each_ref_validate_ahead_behind(&format_spec, &git_dir, format)?;
     // The abbreviation candidate set is only needed by `%(objectname:short...)`;
     // enumerating every object id is otherwise pure overhead.
     let objectname_candidates = if needs.candidates {
@@ -520,12 +521,18 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         // cheaper header path below, and formats like %(objectname)/%(refname)
         // read nothing here.
         let object = if needs.object {
-            Some(db.read_object(&oid)?)
+            Some(
+                db.read_object(&oid)
+                    .map_err(|err| for_each_ref_missing_object(err, &oid, &reference.name))?,
+            )
         } else {
             None
         };
         let object_header = if object.is_none() && needs.object_header {
-            Some(for_each_ref_object_header(&db, &mut object_headers, &oid)?)
+            Some(
+                for_each_ref_object_header(&db, &mut object_headers, &oid)
+                    .map_err(|err| for_each_ref_missing_object(err, &oid, &reference.name))?,
+            )
         } else {
             None
         };
@@ -782,6 +789,49 @@ struct ForEachRefNeeds {
     /// `%(refname:short)` / `%(symref:short)` / `%(upstream:short)` /
     /// `%(push:short)` — needs the ref-name universe for shorten_unambiguous_ref.
     short_ref: bool,
+}
+
+/// Map a missing-object read failure to git's `fatal: missing object <oid> for
+/// <refname>` (ref-filter.c) when a format atom forces the ref's object to be
+/// read; other errors propagate unchanged.
+fn for_each_ref_missing_object(err: GitError, oid: &ObjectId, refname: &str) -> GitError {
+    if matches!(err, GitError::NotFound(_)) {
+        eprintln!("fatal: missing object {oid} for {refname}");
+        return GitError::Exit(128);
+    }
+    err
+}
+
+/// git resolves every `%(ahead-behind:<committish>)` base up front, rejecting a
+/// bare `%(ahead-behind)` and dying on an unresolvable base before any ref is
+/// printed (builtin/for-each-ref.c + ref-filter.c's ahead/behind setup).
+fn for_each_ref_validate_ahead_behind(
+    format_spec: &ForEachRefFormat,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    for segment in format_spec.segments() {
+        let ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(placeholder)) = segment else {
+            continue;
+        };
+        let placeholder = placeholder.strip_prefix('*').unwrap_or(placeholder);
+        let base = if placeholder == "ahead-behind" {
+            None
+        } else if let Some(base) = placeholder.strip_prefix("ahead-behind:") {
+            Some(base)
+        } else {
+            continue;
+        };
+        let Some(base) = base.filter(|base| !base.is_empty()) else {
+            eprintln!("fatal: expected format: %(ahead-behind:<committish>)");
+            return Err(GitError::Exit(128));
+        };
+        if resolve_revision(git_dir, format, base).is_err() {
+            eprintln!("fatal: failed to find '{base}'");
+            return Err(GitError::Exit(128));
+        }
+    }
+    Ok(())
 }
 
 impl ForEachRefNeeds {

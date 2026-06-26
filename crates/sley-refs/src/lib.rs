@@ -2392,8 +2392,18 @@ impl FileRefStore {
             if path.is_dir() {
                 self.collect_loose_refs(&path, &name, refs)?;
             } else if !name.ends_with(".lock") {
-                let reference = parse_loose_ref(self.format, name.clone(), &fs::read(path)?)?;
-                refs.insert(name, reference);
+                // git marks a loose ref whose content is unparseable, or that
+                // resolves to the null OID, as REF_ISBROKEN and skips it from
+                // iteration with a warning instead of aborting the whole walk.
+                match parse_loose_ref(self.format, name.clone(), &fs::read(path)?) {
+                    Ok(reference) if ref_target_is_broken(&reference.target) => {
+                        warn_broken_ref(&name);
+                    }
+                    Ok(reference) => {
+                        refs.insert(name, reference);
+                    }
+                    Err(_) => warn_broken_ref(&name),
+                }
             }
         }
         Ok(())
@@ -5358,6 +5368,15 @@ fn safe_ref_prefix_for_directory_scan(prefix: &str) -> bool {
 
 fn warn_broken_ref_name(name: &str) {
     eprintln!("warning: ignoring ref with broken name {name}");
+}
+
+fn warn_broken_ref(name: &str) {
+    eprintln!("warning: ignoring broken ref {name}");
+}
+
+/// A direct ref resolving to the null OID is broken (git's `REF_ISBROKEN`).
+fn ref_target_is_broken(target: &RefTarget) -> bool {
+    matches!(target, RefTarget::Direct(oid) if oid.is_null())
 }
 
 fn ref_directory_conflict_error(new_ref: &str, existing_ref: &str) -> GitError {
