@@ -16,7 +16,7 @@
 //! / `FETCH_HEAD` / prune helpers are shared so there is a single implementation.
 
 use crate::local::LocalDeepenPlan;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -979,7 +979,42 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
         updates.sort_by_key(|update| update.not_for_merge);
     }
     append_opportunistic_tracking_updates(&mut updates, tracking_refspecs)?;
+    ref_remove_duplicate_updates(&mut updates)?;
     Ok(updates)
+}
+
+/// Mirror git's `ref_remove_duplicates` (remote.c): two ref-map entries with the
+/// same destination are collapsed when they came from the same source ref (e.g.
+/// a remote that lists `+refs/heads/*:refs/remotes/origin/*` twice), and rejected
+/// when two *different* sources would map to one destination.
+fn ref_remove_duplicate_updates(updates: &mut Vec<FetchRefUpdate>) -> Result<()> {
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    let mut error = None;
+    updates.retain(|update| {
+        let Some(dst) = update.dst.as_deref() else {
+            return true;
+        };
+        match seen.get(dst) {
+            Some(prev_src) if prev_src == &update.src => false,
+            Some(prev_src) => {
+                if error.is_none() {
+                    error = Some(GitError::Command(format!(
+                        "Cannot fetch both {} and {} to {dst}",
+                        prev_src, update.src
+                    )));
+                }
+                true
+            }
+            None => {
+                seen.insert(dst.to_string(), update.src.clone());
+                true
+            }
+        }
+    });
+    match error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 fn configured_refspecs_for_tracking(config: &GitConfig, remote: &str) -> Vec<String> {

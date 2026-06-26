@@ -3569,7 +3569,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 let value = value.strip_prefix("--refmap=").unwrap_or_default();
                 push_fetch_refmap(&mut options, value);
             }
-            "--tags" => {
+            "--tags" | "-t" => {
                 options.auto_follow_tags = true;
                 options.fetch_all_tags = true;
                 options.tag_option_explicit = true;
@@ -3743,7 +3743,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 return Err(GitError::Exit(129));
             }
             _ if source.is_none() => source = Some(arg.clone()),
-            _ => refspecs.push(arg.clone()),
+            _ => refspecs.push(rewrite_empty_source_refspec(arg)),
         }
     }
     let cwd = env::current_dir()?;
@@ -4103,6 +4103,23 @@ fn trace_fetch_maintenance() {
 
 fn fetch_pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
     pack_filter_from_spec(spec)
+}
+
+/// `git fetch <remote> :<dst>` is shorthand for fetching the remote's `HEAD`
+/// into `<dst>` (git resolves an empty refspec source to `HEAD` in
+/// `get_fetch_map`). Rewrite the bare-colon form to an explicit `HEAD:<dst>`
+/// refspec, preserving any leading `+` force marker.
+fn rewrite_empty_source_refspec(arg: &str) -> String {
+    let (force, rest) = match arg.strip_prefix('+') {
+        Some(rest) => ("+", rest),
+        None => ("", arg),
+    };
+    if let Some(dst) = rest.strip_prefix(':')
+        && !dst.is_empty()
+    {
+        return format!("{force}HEAD:{dst}");
+    }
+    arg.to_string()
 }
 
 fn push_fetch_refmap(options: &mut FetchOptions, value: &str) {
