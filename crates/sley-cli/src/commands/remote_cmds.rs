@@ -8428,12 +8428,7 @@ fn maybe_set_remote_head_on_fetch(
 /// stdout that the remote's `HEAD` points somewhere other than the local
 /// `<remote>/HEAD`. `warn-if-not-<branch>` suppresses the warning when the
 /// remote default branch equals `<branch>`.
-fn report_followremotehead_warn(
-    follow: &str,
-    remote: &str,
-    head_name: &str,
-    existing: &RefTarget,
-) {
+fn report_followremotehead_warn(follow: &str, remote: &str, head_name: &str, existing: &RefTarget) {
     let follow_lower = follow.to_ascii_lowercase();
     // `no_warn_branch` is the `<branch>` in `warn-if-not-<branch>`; plain `warn`
     // has none. Anything else is not a warn mode.
@@ -8442,8 +8437,7 @@ fn report_followremotehead_warn(
     } else if let Some(rest) = follow_lower.strip_prefix("warn-if-not-") {
         // Match git's case-sensitive `strcmp` on the branch name; recover the
         // original (non-lowercased) suffix to compare.
-        Some(follow["warn-if-not-".len()..].to_string())
-        .filter(|_| !rest.is_empty())
+        Some(follow["warn-if-not-".len()..].to_string()).filter(|_| !rest.is_empty())
     } else {
         return;
     };
@@ -8456,7 +8450,9 @@ fn report_followremotehead_warn(
             if let Some(prev_head) = target.strip_prefix(&prefix)
                 && prev_head != head_name
             {
-                println!("'HEAD' at '{remote}' is '{head_name}', but we have '{prev_head}' locally.");
+                println!(
+                    "'HEAD' at '{remote}' is '{head_name}', but we have '{prev_head}' locally."
+                );
             }
         }
         RefTarget::Direct(oid) => {

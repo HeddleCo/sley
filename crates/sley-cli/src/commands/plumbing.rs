@@ -1664,7 +1664,15 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     // bit or the sparse-checkout definition put outside the working set, unless
     // `--sparse` is given. This guards every add flavor (regular, -u, -A, -N,
     // --refresh, --dry-run), so run it once up front before dispatching.
-    reject_add_skip_worktree_paths(&cwd, &worktree_root, &git_dir, format, &paths, sparse, refresh)?;
+    reject_add_skip_worktree_paths(
+        &cwd,
+        &worktree_root,
+        &git_dir,
+        format,
+        &paths,
+        sparse,
+        refresh,
+    )?;
     if refresh {
         refresh_index_after_add(&worktree_root, &git_dir, format, &paths)?;
         return Ok(());
@@ -7576,8 +7584,14 @@ pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
     let source_skipped = if ignore_sparse {
         vec![false; sources.len()]
     } else {
-        let (rejected_paths, per_source) =
-            mv_sparse_rejections(&cwd, &worktree_root, &git_dir, format, sources, &destination)?;
+        let (rejected_paths, per_source) = mv_sparse_rejections(
+            &cwd,
+            &worktree_root,
+            &git_dir,
+            format,
+            sources,
+            &destination,
+        )?;
         if !rejected_paths.is_empty() {
             advise_on_updating_sparse_paths(&git_dir, &rejected_paths);
             if !skip_errors {
@@ -7681,9 +7695,12 @@ fn mv_sparse_rejections(
         || mv_git_relative_path(worktree_root, destination).is_some_and(|dest_git| {
             let mut prefix = dest_git;
             prefix.push(b'/');
-            index
-                .as_ref()
-                .is_some_and(|index| index.entries.iter().any(|entry| entry.path.as_bytes().starts_with(&prefix)))
+            index.as_ref().is_some_and(|index| {
+                index
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path.as_bytes().starts_with(&prefix))
+            })
         });
     let mut rejected = Vec::new();
     let mut per_source = vec![false; sources.len()];

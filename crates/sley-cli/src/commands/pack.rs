@@ -6669,11 +6669,10 @@ pub(crate) fn cmd_pack_redundant(args: &[String]) -> Result<()> {
                 eprintln!("fatal: Bad pack filename: {filename}");
                 return Err(GitError::Exit(128));
             }
-            let Some(found) = local.iter().position(|pack| {
-                pack.pack_path
-                    .to_string_lossy()
-                    .contains(filename.as_str())
-            }) else {
+            let Some(found) = local
+                .iter()
+                .position(|pack| pack.pack_path.to_string_lossy().contains(filename.as_str()))
+            else {
                 eprintln!("fatal: Filename {filename} not found in packed_git");
                 return Err(GitError::Exit(128));
             };
@@ -6818,15 +6817,16 @@ pub(crate) fn cmd_pack_redundant(args: &[String]) -> Result<()> {
         eprintln!("There are {alt_count} packs available in alt-odbs.");
         eprintln!("The smallest (bytewise) set of packs is:");
         for &i in &min_indices {
-            eprintln!("\t{}", pack_redundant_display_path(&packs[i].pack_path, &cwd));
+            eprintln!(
+                "\t{}",
+                pack_redundant_display_path(&packs[i].pack_path, &cwd)
+            );
         }
         let mut duplicates = 0usize;
         for (a, &ia) in min_indices.iter().enumerate() {
             for &ib in &min_indices[a + 1..] {
-                duplicates += oid_sorted_intersection_size(
-                    &packs[ia].remaining,
-                    &packs[ib].remaining,
-                );
+                duplicates +=
+                    oid_sorted_intersection_size(&packs[ia].remaining, &packs[ib].remaining);
             }
         }
         let min_bytes: u64 = min_indices
@@ -6846,8 +6846,16 @@ pub(crate) fn cmd_pack_redundant(args: &[String]) -> Result<()> {
 
     let mut stdout = io::stdout().lock();
     for &i in &redundant {
-        writeln!(stdout, "{}", pack_redundant_display_path(&packs[i].idx_path, &cwd))?;
-        writeln!(stdout, "{}", pack_redundant_display_path(&packs[i].pack_path, &cwd))?;
+        writeln!(
+            stdout,
+            "{}",
+            pack_redundant_display_path(&packs[i].idx_path, &cwd)
+        )?;
+        writeln!(
+            stdout,
+            "{}",
+            pack_redundant_display_path(&packs[i].pack_path, &cwd)
+        )?;
     }
     stdout.flush()?;
 

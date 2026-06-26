@@ -1028,8 +1028,8 @@ pub(crate) fn short_status_tracked_only(
         };
         // Honor the skip-worktree bit literally unless sparse-checkout is active
         // and the file is present (git clears the bit then -> changes reported).
-        let skip_worktree = entry.is_skip_worktree()
-            && (!sparse_checkout_active || worktree_entry.is_none());
+        let skip_worktree =
+            entry.is_skip_worktree() && (!sparse_checkout_active || worktree_entry.is_none());
         let worktree_code = match worktree_entry.as_ref() {
             _ if skip_worktree => b' ',
             None if entry.is_intent_to_add() => b' ',

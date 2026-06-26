@@ -1465,22 +1465,19 @@ fn sparse_single_file_move(
     let source_present = fs::symlink_metadata(source_absolute).is_ok();
     // A dirty source moving out-of-cone keeps its worktree file (and stays
     // cached) instead of being discarded; detect that before mutating the index.
-    let source_dirty = source_present
-        && cone_mode
-        && !destination_in_cone
-        && {
-            let index_path = repository_index_path(git_dir);
-            let stat_cache = IndexStatCache::from_index(&index, &index_path);
-            let mut clean_filter = None;
-            mv_source_is_dirty(
-                worktree_root,
-                git_dir,
-                format,
-                &index.entries[position],
-                &stat_cache,
-                &mut clean_filter,
-            )?
-        };
+    let source_dirty = source_present && cone_mode && !destination_in_cone && {
+        let index_path = repository_index_path(git_dir);
+        let stat_cache = IndexStatCache::from_index(&index, &index_path);
+        let mut clean_filter = None;
+        mv_source_is_dirty(
+            worktree_root,
+            git_dir,
+            format,
+            &index.entries[position],
+            &stat_cache,
+            &mut clean_filter,
+        )?
+    };
     let mut dirty_paths = Vec::new();
     let mut destination_entry = index.entries.remove(position);
     destination_entry.path = destination_path.clone().into();
@@ -1589,7 +1586,9 @@ fn mv_source_is_dirty(
         clean_filter,
     )?;
     Ok(match worktree_entry {
-        Some(worktree_entry) => worktree_entry.oid != entry.oid || worktree_entry.mode != entry.mode,
+        Some(worktree_entry) => {
+            worktree_entry.oid != entry.oid || worktree_entry.mode != entry.mode
+        }
         None => false,
     })
 }

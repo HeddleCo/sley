@@ -659,9 +659,7 @@ fn validate_pack_objects_options(options: &PackObjectsOptions) -> Result<()> {
         // rejected before any work happens (builtin/pack-objects.c
         // die_for_incompatible_opt2 + "cannot use internal rev list").
         if options.object_filter != PackObjectFilter::None {
-            eprintln!(
-                "fatal: options '--stdin-packs' and '--filter' cannot be used together"
-            );
+            eprintln!("fatal: options '--stdin-packs' and '--filter' cannot be used together");
             return Err(GitError::Exit(128));
         }
         if options.revs || options.all {
@@ -805,7 +803,10 @@ fn collect_stdin_packs_objects(
     //    several keys are unresolved git reports the one that sorts first — its
     //    strmap iteration tracks the keys' byte order, which for the hash-named
     //    packs of t5300's "--stdin-packs handles garbage" is OID order.
-    let mut missing: Vec<&String> = order.iter().filter(|key| !found.contains_key(*key)).collect();
+    let mut missing: Vec<&String> = order
+        .iter()
+        .filter(|key| !found.contains_key(*key))
+        .collect();
     if !missing.is_empty() {
         missing.sort();
         eprintln!("fatal: could not find pack '{}'", missing[0]);
@@ -827,7 +828,11 @@ fn collect_stdin_packs_objects(
     //    wanted objects, deduplicating across packs.
     let mut included_keys: Vec<&String> = order
         .iter()
-        .filter(|key| requested.get(*key).is_some_and(|kind| kind & STDIN_PACK_INCLUDE != 0))
+        .filter(|key| {
+            requested
+                .get(*key)
+                .is_some_and(|kind| kind & STDIN_PACK_INCLUDE != 0)
+        })
         .collect();
     included_keys.sort_by_key(|key| found.get(*key).map(|pack| pack.mtime));
 

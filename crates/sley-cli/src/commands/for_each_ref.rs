@@ -551,38 +551,38 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         // git's %(*...) atoms expose `peel_object`, which follows the *whole*
         // tag chain (a tag that points at another tag is peeled all the way to
         // the underlying non-tag object), so chase nested tags to the bottom.
-        let peeled_chain: Option<(ObjectId, std::sync::Arc<sley_object::EncodedObject>)> =
-            if needs.peeled {
-                if let Some(first_oid) = contents.as_ref().and_then(|contents| contents.tag_object)
-                {
-                    let mut target_oid = first_oid;
-                    let mut target = db.read_object(&target_oid)?;
-                    // Validate the outer tag's recorded pointer type first.
-                    if let Some(contents) = contents.as_ref() {
-                        for_each_ref_validate_tag_pointer(&oid, contents, &target_oid, &target)?;
-                    }
-                    // Then follow each further tag, validating its declared
-                    // target type against what it actually points at.
-                    while target.object_type == ObjectType::Tag {
-                        let (next_oid, declared_type) = {
-                            let tag = sley_object::Tag::parse_ref(format, &target.body)?;
-                            (tag.object, tag.object_type)
-                        };
-                        let next = db.read_object(&next_oid)?;
-                        if declared_type != next.object_type {
-                            eprintln!("error: bad tag pointer to {next_oid} in {target_oid}");
-                            return Err(GitError::Exit(128));
-                        }
-                        target_oid = next_oid;
-                        target = next;
-                    }
-                    Some((target_oid, target))
-                } else {
-                    None
+        let peeled_chain: Option<(ObjectId, std::sync::Arc<sley_object::EncodedObject>)> = if needs
+            .peeled
+        {
+            if let Some(first_oid) = contents.as_ref().and_then(|contents| contents.tag_object) {
+                let mut target_oid = first_oid;
+                let mut target = db.read_object(&target_oid)?;
+                // Validate the outer tag's recorded pointer type first.
+                if let Some(contents) = contents.as_ref() {
+                    for_each_ref_validate_tag_pointer(&oid, contents, &target_oid, &target)?;
                 }
+                // Then follow each further tag, validating its declared
+                // target type against what it actually points at.
+                while target.object_type == ObjectType::Tag {
+                    let (next_oid, declared_type) = {
+                        let tag = sley_object::Tag::parse_ref(format, &target.body)?;
+                        (tag.object, tag.object_type)
+                    };
+                    let next = db.read_object(&next_oid)?;
+                    if declared_type != next.object_type {
+                        eprintln!("error: bad tag pointer to {next_oid} in {target_oid}");
+                        return Err(GitError::Exit(128));
+                    }
+                    target_oid = next_oid;
+                    target = next;
+                }
+                Some((target_oid, target))
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
         let peeled_object = if let Some((peeled_oid, peeled_encoded_object)) = peeled_chain.as_ref()
         {
             let peeled_oid = *peeled_oid;

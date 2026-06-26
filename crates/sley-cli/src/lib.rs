@@ -6847,9 +6847,7 @@ fn write_for_each_ref_signature(
         "key" => stdout.write_all(verification.key.as_bytes())?,
         "signer" => stdout.write_all(verification.signer.as_bytes())?,
         "fingerprint" => stdout.write_all(verification.fingerprint.as_bytes())?,
-        "primarykeyfingerprint" => {
-            stdout.write_all(verification.primary_fingerprint.as_bytes())?
-        }
+        "primarykeyfingerprint" => stdout.write_all(verification.primary_fingerprint.as_bytes())?,
         "trustlevel" => stdout.write_all(verification.trust.as_bytes())?,
         _ => {}
     }
