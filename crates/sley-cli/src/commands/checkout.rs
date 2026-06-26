@@ -2011,43 +2011,48 @@ fn prefetch_local_promisor_checkout_blobs(
     config: &GitConfig,
     commit_oid: &ObjectId,
 ) -> Result<bool> {
-    let Some(remote_name) = config
-        .get("extensions", None, "partialclone")
-        .map(str::to_string)
-        .or_else(|| {
-            remote_names(config)
-                .into_iter()
-                .find(|name| config.get_bool("remote", Some(name), "promisor") == Some(true))
-        })
-    else {
+    let remotes = crate::promisor_remote_names(config);
+    if remotes.is_empty() {
         return Ok(false);
-    };
-    let Some(url) = config.get("remote", Some(&remote_name), "url") else {
-        return Ok(false);
-    };
-    let Ok(remote_git_dir) = commands::remote_cmds::ls_remote_git_dir(url) else {
-        return Ok(false);
-    };
+    }
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut wants = Vec::new();
     collect_missing_checkout_blob_wants(&db, format, *commit_oid, &mut wants)?;
     if wants.is_empty() {
         return Ok(true);
     }
+    // Try every configured promisor remote in turn (git's
+    // `promisor_remote_get_direct`): a remote that cannot supply the blobs
+    // errors during negotiation, so fall through to the next.
     sley_protocol::set_packet_trace_identity("fetch");
-    sley_remote::install_fetch_pack_via_local_upload_pack(
-        git_dir,
-        &remote_git_dir,
-        format,
-        wants,
-        None,
-        true,
-        false,
-        None,
-        false,
-        None,
-    )?;
+    for remote_name in &remotes {
+        let Some(url) = config.get("remote", Some(remote_name), "url") else {
+            continue;
+        };
+        let Ok(remote_git_dir) = commands::remote_cmds::ls_remote_git_dir(url) else {
+            continue;
+        };
+        let _ = sley_remote::install_fetch_pack_via_local_upload_pack(
+            git_dir,
+            &remote_git_dir,
+            format,
+            wants.clone(),
+            None,
+            true,
+            false,
+            None,
+            false,
+            None,
+        );
+    }
     sley_protocol::set_packet_trace_identity("checkout");
+    // Anything the promisor remotes could not supply stays missing: git's
+    // `promisor_remote_get_direct` dies once every remote has been tried.
+    db.refresh_read_cache();
+    if let Some(missing) = wants.iter().find(|oid| !db.contains(oid).unwrap_or(false)) {
+        eprintln!("fatal: could not fetch {missing} from promisor remote");
+        return Err(GitError::Exit(128));
+    }
     Ok(true)
 }
 
