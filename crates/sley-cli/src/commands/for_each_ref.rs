@@ -361,7 +361,12 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         HashMap::new()
     };
     let config = if needs.config || needs.short_ref || for_each_ref_sorts_need_config(&sorts) {
-        GitConfig::read(git_dir.join("config")).unwrap_or_default()
+        // git resolves %(upstream)/%(push)/sort keys against the *full* config
+        // layering (system + global + repo + includes + command-line `-c`
+        // overrides), not just the repository file — e.g. `-c push.default=simple`
+        // must win over a repo-level `push.default`. identity_effective_config()
+        // builds exactly that layered view rooted at the current repo.
+        identity_effective_config().unwrap_or_default()
     } else {
         GitConfig::default()
     };
@@ -542,26 +547,44 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             .transpose()?
             .flatten();
         // The peeled tag target is only read when a %(*...) atom references it.
-        let peeled_oid = if needs.peeled {
-            contents.as_ref().and_then(|contents| contents.tag_object)
-        } else {
-            None
-        };
-        let peeled_encoded_object = match peeled_oid {
-            Some(peeled_oid) => Some(db.read_object(&peeled_oid)?),
-            None => None,
-        };
-        let peeled_object = if let (Some(peeled_oid), Some(peeled_encoded_object)) =
-            (peeled_oid, peeled_encoded_object.as_ref())
+        // git's %(*...) atoms expose `peel_object`, which follows the *whole*
+        // tag chain (a tag that points at another tag is peeled all the way to
+        // the underlying non-tag object), so chase nested tags to the bottom.
+        let peeled_chain: Option<(ObjectId, std::sync::Arc<sley_object::EncodedObject>)> =
+            if needs.peeled {
+                if let Some(first_oid) = contents.as_ref().and_then(|contents| contents.tag_object)
+                {
+                    let mut target_oid = first_oid;
+                    let mut target = db.read_object(&target_oid)?;
+                    // Validate the outer tag's recorded pointer type first.
+                    if let Some(contents) = contents.as_ref() {
+                        for_each_ref_validate_tag_pointer(&oid, contents, &target_oid, &target)?;
+                    }
+                    // Then follow each further tag, validating its declared
+                    // target type against what it actually points at.
+                    while target.object_type == ObjectType::Tag {
+                        let (next_oid, declared_type) = {
+                            let tag = sley_object::Tag::parse_ref(format, &target.body)?;
+                            (tag.object, tag.object_type)
+                        };
+                        let next = db.read_object(&next_oid)?;
+                        if declared_type != next.object_type {
+                            eprintln!("error: bad tag pointer to {next_oid} in {target_oid}");
+                            return Err(GitError::Exit(128));
+                        }
+                        target_oid = next_oid;
+                        target = next;
+                    }
+                    Some((target_oid, target))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        let peeled_object = if let Some((peeled_oid, peeled_encoded_object)) = peeled_chain.as_ref()
         {
-            if let Some(contents) = contents.as_ref() {
-                for_each_ref_validate_tag_pointer(
-                    &oid,
-                    contents,
-                    &peeled_oid,
-                    peeled_encoded_object,
-                )?;
-            }
+            let peeled_oid = *peeled_oid;
             let object_disk_size = if needs.peeled_disk {
                 for_each_ref_loose_object_disk_size(&git_dir, &peeled_oid)?
             } else {

@@ -6509,45 +6509,61 @@ fn for_each_ref_upstream(config: &GitConfig, refname: &str) -> Option<ForEachRef
 
 fn for_each_ref_push(config: &GitConfig, refname: &str) -> Option<ForEachRefPush> {
     let branch = refname.strip_prefix("refs/heads/")?;
-    let remote = for_each_ref_push_remote(config, branch)?;
-    if remote.name == "." {
+    let push_remote = for_each_ref_push_remote(config, branch)?;
+    let remote_name = push_remote.name.clone();
+    // The display name is exposed by `%(push:remotename)` even when the push
+    // destination itself does not resolve, so compute it up front and keep it
+    // on every return path (git's branch_get_push reports the remote regardless).
+    let display_remote = remote_display_name(push_remote);
+    if remote_name == "." {
         return Some(ForEachRefPush {
             refname: None,
-            remote: remote.name.to_string(),
+            remote: display_remote,
             remote_ref: None,
         });
     }
-    if let Some(push) = config.get("remote", Some(remote.name.as_str()), "push") {
+    // An explicit push refspec (remote.<name>.push) takes precedence over
+    // push.default — mirrors `remote->push.nr` in git's branch_get_push_1.
+    if let Some(push) = config.get("remote", Some(remote_name.as_str()), "push") {
         if let Some(remote_ref) = map_remote_push_refspec(push, refname) {
-            let refname = map_remote_tracking_ref(config, &remote.name, &remote_ref);
-            let remote = remote_display_name(remote);
+            let tracking = map_remote_tracking_ref(config, &remote_name, &remote_ref);
             return Some(ForEachRefPush {
-                refname,
-                remote,
+                refname: tracking,
+                remote: display_remote,
                 remote_ref: Some(remote_ref),
             });
         }
-        let remote = remote_display_name(remote);
         return Some(ForEachRefPush {
             refname: None,
-            remote,
+            remote: display_remote,
             remote_ref: None,
         });
     }
+    // Otherwise resolve the destination through push.default, exactly as
+    // git's branch_get_push_1 switch does.
     let push_default = config.get("push", None, "default").unwrap_or("simple");
-    let merge_owned;
-    let merge = match push_default {
-        "current" => {
-            merge_owned = format!("refs/heads/{branch}");
-            merge_owned.as_str()
+    let tracking = match push_default {
+        "nothing" => None,
+        // matching/current push the branch's own ref through the push remote's
+        // fetch refspec (tracking_for_push_dest on branch->refname).
+        "matching" | "current" => map_remote_tracking_ref(config, &remote_name, refname),
+        // upstream uses the branch's configured upstream destination.
+        "upstream" => for_each_ref_upstream(config, refname).map(|up| up.refname),
+        // simple/unspecified (the default): the push destination must equal the
+        // upstream destination, otherwise there is no single 'simple' target and
+        // %(push) is empty (the remote name is still reported).
+        _ => {
+            let up = for_each_ref_upstream(config, refname).map(|up| up.refname);
+            let cur = map_remote_tracking_ref(config, &remote_name, refname);
+            match (up, cur) {
+                (Some(up), Some(cur)) if up == cur => Some(cur),
+                _ => None,
+            }
         }
-        _ => config.get("branch", Some(branch), "merge")?,
     };
-    let refname = map_remote_tracking_ref(config, &remote.name, merge);
-    let remote = remote_display_name(remote);
     Some(ForEachRefPush {
-        refname,
-        remote,
+        refname: tracking,
+        remote: display_remote,
         remote_ref: None,
     })
 }
