@@ -704,10 +704,12 @@ pub(crate) fn collect_status_entries_head_matches_index(
         let worktree_entry = worktree.get(path);
         let worktree_present =
             worktree_entry.is_some() || tracked_presence.contains(path.as_slice());
-        let skip_worktree = sparse_checkout_active
-            && stat_cache
-                .index_entry(path)
-                .is_some_and(index_entry_skip_worktree);
+        // Honor the skip-worktree bit literally unless sparse-checkout is active
+        // and the file is present (git clears the bit then -> changes reported).
+        let skip_worktree = stat_cache
+            .index_entry(path)
+            .is_some_and(index_entry_skip_worktree)
+            && (!sparse_checkout_active || !worktree_present);
         let submodule = status_submodule_from_entries(
             path,
             index_entry,
@@ -716,8 +718,8 @@ pub(crate) fn collect_status_entries_head_matches_index(
             untracked_mode,
         );
         let worktree_code = match worktree_entry {
+            _ if skip_worktree => b' ',
             None if intent_to_add => b' ',
-            None if !worktree_present && skip_worktree => b' ',
             None if !worktree_present => b'D',
             Some(_) if intent_to_add => b'A',
             Some(worktree_entry) if Some(worktree_entry) != visible_index_entry => {
@@ -801,13 +803,14 @@ pub(crate) fn collect_status_entries_with_head(
             ),
             None => None,
         };
-        let skip_worktree = inputs.sparse_checkout_active
-            && visible_index_entry.is_some_and(|_| {
-                inputs
-                    .stat_cache
-                    .index_entry(&path)
-                    .is_some_and(index_entry_skip_worktree)
-            });
+        // Honor the skip-worktree bit literally unless sparse-checkout is active
+        // and the file is present (git clears the bit then -> changes reported).
+        let skip_worktree = visible_index_entry.is_some_and(|_| {
+            inputs
+                .stat_cache
+                .index_entry(&path)
+                .is_some_and(index_entry_skip_worktree)
+        }) && (!inputs.sparse_checkout_active || !worktree_present);
         let (index_code, worktree_code) =
             if head_entry.is_none() && index_entry.is_none() && worktree_entry.is_some() {
                 (b'?', b'?')
@@ -824,7 +827,7 @@ pub(crate) fn collect_status_entries_with_head(
                     (None, Some(_)) if intent_to_add => b'A',
                     (None, Some(_)) => b'?',
                     (None, None) if intent_to_add => b' ',
-                    (Some(_), None) if !worktree_present && skip_worktree => b' ',
+                    (Some(_), _) if skip_worktree => b' ',
                     (Some(_), None) if !worktree_present => b'D',
                     (Some(left), Some(right)) if left != right => {
                         status_change_code(left.mode, right.mode)
@@ -835,7 +838,7 @@ pub(crate) fn collect_status_entries_with_head(
                 (index_code, worktree_code)
             };
         if index_code != b' ' || worktree_code != b' ' {
-            let worktree_mode = if skip_worktree && !worktree_present && worktree_entry.is_none() {
+            let worktree_mode = if skip_worktree {
                 visible_index_entry.map(|entry| entry.mode)
             } else {
                 status_worktree_mode(visible_index_entry, worktree_entry, worktree_present)
@@ -973,9 +976,13 @@ pub(crate) fn short_status_tracked_only(
             }
             _ => b' ',
         };
+        // Honor the skip-worktree bit literally unless sparse-checkout is active
+        // and the file is present (git clears the bit then -> changes reported).
+        let skip_worktree = entry.is_skip_worktree()
+            && (!sparse_checkout_active || worktree_entry.is_none());
         let worktree_code = match worktree_entry.as_ref() {
+            _ if skip_worktree => b' ',
             None if entry.is_intent_to_add() => b' ',
-            None if sparse_checkout_active && entry.is_skip_worktree() => b' ',
             None => b'D',
             Some(_) if entry.is_intent_to_add() => b'A',
             Some(worktree_entry) if Some(worktree_entry) != visible_index_entry => {
@@ -991,7 +998,11 @@ pub(crate) fn short_status_tracked_only(
                 path: path.to_vec(),
                 head_mode: head_entry.map(|entry| entry.mode),
                 index_mode: visible_index_entry.map(|entry| entry.mode),
-                worktree_mode: worktree_entry.as_ref().map(|entry| entry.mode),
+                worktree_mode: if skip_worktree {
+                    visible_index_entry.map(|entry| entry.mode)
+                } else {
+                    worktree_entry.as_ref().map(|entry| entry.mode)
+                },
                 head_oid: head_entry.map(|entry| entry.oid),
                 index_oid: visible_index_entry.map(|entry| entry.oid),
                 submodule: submodule.filter(|sub| sub.any()),
@@ -2584,6 +2595,15 @@ pub(crate) fn tracked_only_stat_precheck(
     sparse_checkout_active: bool,
     absolute: &mut PathBuf,
 ) -> Result<TrackedOnlyPrecheckOutcome> {
+    // Skip-worktree handling mirrors git's clear_skip_worktree_from_present_files:
+    // when core.sparseCheckout is DISABLED the bit is honored literally, so the
+    // worktree side is always clean regardless of the on-disk file (git's
+    // run_diff_files skips ce_skip_worktree entries). When it is ENABLED, git
+    // clears the bit for entries whose file is present, so a present file's
+    // worktree changes ARE reported; only an absent file stays clean.
+    if index_entry.is_skip_worktree() && !sparse_checkout_active {
+        return Ok(TrackedOnlyPrecheckOutcome::Clean);
+    }
     if sley_index::is_gitlink(index_entry.mode) {
         return Ok(TrackedOnlyPrecheckOutcome::Slow);
     }
@@ -2597,7 +2617,8 @@ pub(crate) fn tracked_only_stat_precheck(
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
             ) =>
         {
-            if sparse_checkout_active && index_entry.is_skip_worktree() {
+            // sparse-active + absent skip-worktree: bit stays set -> clean.
+            if index_entry.is_skip_worktree() {
                 return Ok(TrackedOnlyPrecheckOutcome::Clean);
             }
             return Ok(TrackedOnlyPrecheckOutcome::Deleted);
@@ -2625,6 +2646,13 @@ pub(crate) fn tracked_only_borrowed_stat_precheck(
     sparse_checkout_active: bool,
     absolute: &mut PathBuf,
 ) -> Result<TrackedOnlyPrecheckOutcome> {
+    // See tracked_only_stat_precheck: when core.sparseCheckout is disabled the
+    // skip-worktree bit is honored literally (worktree side always clean); when
+    // enabled, git clears the bit for present files so their changes ARE
+    // reported, and only absent files stay clean.
+    if index_entry.is_skip_worktree() && !sparse_checkout_active {
+        return Ok(TrackedOnlyPrecheckOutcome::Clean);
+    }
     if sley_index::is_gitlink(index_entry.mode) {
         return Ok(TrackedOnlyPrecheckOutcome::Slow);
     }
@@ -2637,7 +2665,8 @@ pub(crate) fn tracked_only_borrowed_stat_precheck(
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
             ) =>
         {
-            if sparse_checkout_active && index_entry.is_skip_worktree() {
+            // sparse-active + absent skip-worktree: bit stays set -> clean.
+            if index_entry.is_skip_worktree() {
                 return Ok(TrackedOnlyPrecheckOutcome::Clean);
             }
             return Ok(TrackedOnlyPrecheckOutcome::Deleted);
