@@ -49,6 +49,12 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
     let mut path_format = RevParsePathFormat::Default;
     let mut end_of_options = false;
     let mut seen_path_arg = false;
+    // `--prefix <p>` makes rev-parse behave as if it were invoked from the <p>
+    // subdirectory: trailing pathspecs (after `--`) and disambiguated filenames
+    // are emitted with the prefix prepended, and `<tree>:./path` / `:./path`
+    // relative object names resolve against the prefix. Mirrors git's
+    // `startup_info->prefix` + `output_prefix` (builtin/rev-parse.c).
+    let mut output_prefix: Option<String> = None;
     let mut default_rev: Option<String> = None;
     let mut verified_output: Option<String> = None;
     let dashdash = args.iter().position(|arg| arg == "--");
@@ -93,9 +99,19 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                 }
                 println!("--");
                 for path in &args[idx + 1..] {
-                    println!("{path}");
+                    match &output_prefix {
+                        Some(prefix) => println!("{}", rev_parse_prefix_filename(prefix, path)),
+                        None => println!("{path}"),
+                    }
                 }
                 break;
+            }
+            "--prefix" => {
+                idx += 1;
+                let prefix = args
+                    .get(idx)
+                    .ok_or_else(|| GitError::Command("--prefix requires an argument".into()))?;
+                output_prefix = Some(prefix.clone());
             }
             "--end-of-options" if !verify => {
                 println!("--end-of-options");
@@ -282,7 +298,12 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                     rev_parse_no_such_worktree_path(rev);
                     return Err(GitError::Exit(128));
                 }
-                let normalized_rev = rev_parse_normalize_revision_arg(&cwd, &git_dir, rev)?;
+                let normalized_rev = rev_parse_normalize_revision_arg(
+                    &cwd,
+                    &git_dir,
+                    rev,
+                    output_prefix.as_deref(),
+                )?;
                 let oid = match rev_parse_resolve_revision_arg(&git_dir, format, &normalized_rev) {
                     Ok(oid) => oid,
                     Err(_) if revs_only => {
@@ -299,14 +320,20 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                         return rev_parse_needed_single_revision(false);
                     }
                     Err(err) => {
-                        if !before_dashdash(dashdash, idx)
-                            && !rev.contains(':')
-                            && rev_parse_path_exists_on_disk(&cwd, &git_dir, rev)?
-                        {
-                            println!("{rev}");
-                            seen_path_arg = true;
-                            idx += 1;
-                            continue;
+                        if !before_dashdash(dashdash, idx) && !rev.contains(':') {
+                            if let Some(prefix) = output_prefix.as_deref() {
+                                if rev_parse_prefixed_path_exists(&git_dir, prefix, rev)? {
+                                    println!("{}", rev_parse_prefix_filename(prefix, rev));
+                                    seen_path_arg = true;
+                                    idx += 1;
+                                    continue;
+                                }
+                            } else if rev_parse_path_exists_on_disk(&cwd, &git_dir, rev)? {
+                                println!("{rev}");
+                                seen_path_arg = true;
+                                idx += 1;
+                                continue;
+                            }
                         }
                         return rev_parse_diagnose_arg_failure(
                             &cwd,
@@ -467,23 +494,92 @@ fn rev_parse_split_range(rev: &str) -> Option<(&str, &str, bool)> {
         .map(|pos| (&rev[..pos], &rev[pos + 2..], false))
 }
 
-fn rev_parse_normalize_revision_arg(cwd: &Path, git_dir: &Path, rev: &str) -> Result<String> {
+fn rev_parse_normalize_revision_arg(
+    cwd: &Path,
+    git_dir: &Path,
+    rev: &str,
+    output_prefix: Option<&str>,
+) -> Result<String> {
     if rev.starts_with(":/") {
         return Ok(rev.to_string());
     }
     if let Some(rest) = rev.strip_prefix(':') {
         let (stage, path) = rev_parse_index_stage_path(rest);
-        let path = rev_parse_normalize_relative_path(cwd, git_dir, path)?;
+        let path = rev_parse_resolve_relative_path(cwd, git_dir, path, output_prefix)?;
         return Ok(match stage {
             Some(stage) => format!(":{stage}:{path}"),
             None => format!(":{path}"),
         });
     }
     if let Some((base, path)) = sley_rev::split_rev_path_spec(rev) {
-        let path = rev_parse_normalize_relative_path(cwd, git_dir, path)?;
+        let path = rev_parse_resolve_relative_path(cwd, git_dir, path, output_prefix)?;
         return Ok(format!("{base}:{path}"));
     }
     Ok(rev.to_string())
+}
+
+/// Resolve a `./` / `../` relative path inside an object name. With an explicit
+/// `--prefix`, git resolves the relative path against the prefix string itself
+/// (pure lexical `prefix_path()` normalisation, no filesystem); otherwise it is
+/// resolved against the current working directory.
+fn rev_parse_resolve_relative_path(
+    cwd: &Path,
+    git_dir: &Path,
+    path: &str,
+    output_prefix: Option<&str>,
+) -> Result<String> {
+    match output_prefix {
+        Some(prefix) => Ok(rev_parse_apply_prefix_path(prefix, path)),
+        None => rev_parse_normalize_relative_path(cwd, git_dir, path),
+    }
+}
+
+/// git's `resolve_relative_path()` only rewrites paths that begin with `./` or
+/// `../`; a bare `<tree>:top` ignores the prefix entirely. When it does apply,
+/// the prefix is prepended and the result is lexically normalised (collapsing
+/// `.` and `..`), matching `prefix_path()` in setup.c.
+fn rev_parse_apply_prefix_path(prefix: &str, path: &str) -> String {
+    if !(path.starts_with("./") || path.starts_with("../")) {
+        return path.to_string();
+    }
+    rev_parse_lexical_normalize(&format!("{prefix}{path}"))
+}
+
+/// Collapse `.` and `..` components of a slash-separated path lexically.
+fn rev_parse_lexical_normalize(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => match out.last() {
+                Some(&"..") | None => out.push(".."),
+                Some(_) => {
+                    out.pop();
+                }
+            },
+            normal => out.push(normal),
+        }
+    }
+    out.join("/")
+}
+
+/// `prefix_filename()` from setup.c: prepend the prefix to a (relative) path
+/// without normalising `..`, leaving absolute paths untouched.
+fn rev_parse_prefix_filename(prefix: &str, arg: &str) -> String {
+    if prefix.is_empty() || Path::new(arg).is_absolute() {
+        return arg.to_string();
+    }
+    format!("{prefix}{arg}")
+}
+
+/// Existence probe for a disambiguated filename relative to an explicit prefix
+/// (`<worktree-root>/<prefix><path>`), mirroring git's `verify_filename()`.
+fn rev_parse_prefixed_path_exists(git_dir: &Path, prefix: &str, path: &str) -> Result<bool> {
+    if path.is_empty() {
+        return Ok(false);
+    }
+    let root = worktree_root_for_git_dir(git_dir)?;
+    Ok(root.join(format!("{prefix}{path}")).exists())
 }
 
 fn rev_parse_index_stage_path(rest: &str) -> (Option<u8>, &str) {
