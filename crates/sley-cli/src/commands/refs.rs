@@ -2968,6 +2968,22 @@ fn update_ref_stdin_remove_ref(store: &FileRefStore, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The current target of a staged ref, preferring the pre-read `list_refs`
+/// snapshot but falling back to a direct read. `list_refs()` does not enumerate
+/// root-level symrefs (e.g. a `TESTSYMREF` created by `symbolic-ref`), so a
+/// `--no-deref` update/delete of such a ref would otherwise see it as missing
+/// and fail the old-value check with `unable to resolve reference`.
+fn update_ref_stdin_current_target(
+    context: &UpdateRefStdinContext<'_>,
+    current_refs: &HashMap<String, RefTarget>,
+    name: &str,
+) -> Result<Option<RefTarget>> {
+    match current_refs.get(name).cloned() {
+        Some(target) => Ok(Some(target)),
+        None => context.store.read_ref(name),
+    }
+}
+
 fn update_ref_stdin_commit_staged(
     context: &UpdateRefStdinContext<'_>,
     staged: Vec<UpdateRefStdinStagedChange>,
@@ -2986,7 +3002,7 @@ fn update_ref_stdin_commit_staged(
         match change {
             UpdateRefStdinStagedChange::Write(write) => {
                 requested_by_name.insert(write.name.clone(), write.requested.clone());
-                let current = current_refs.get(&write.name).cloned();
+                let current = update_ref_stdin_current_target(context, &current_refs, &write.name)?;
                 if let Some(expected_oid) = write.expected_oid.as_ref() {
                     check_update_ref_stdin_expected_named(
                         context.store,
@@ -3037,7 +3053,8 @@ fn update_ref_stdin_commit_staged(
             }
             UpdateRefStdinStagedChange::Delete(delete) => {
                 requested_by_name.insert(delete.name.clone(), delete.requested.clone());
-                let current = current_refs.get(&delete.name).cloned();
+                let current =
+                    update_ref_stdin_current_target(context, &current_refs, &delete.name)?;
                 if let Some(expected_oid) = delete.expected_oid.as_ref() {
                     check_update_ref_stdin_expected_named(
                         context.store,
