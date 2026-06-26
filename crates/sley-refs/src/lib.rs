@@ -1724,6 +1724,15 @@ impl FileRefStore {
             }
         };
         self.delete_loose_ref(name)?;
+        // A loose ref can shadow a packed entry of the same name (e.g. an update
+        // after `pack-refs --all` writes a loose file over the packed copy).
+        // git removes the ref from packed-refs too, so unlinking only the loose
+        // file would leave the stale packed entry resurfacing. Drop any packed
+        // copy as well; its absence is not an error.
+        match self.delete_packed_ref(name, kind, short_name) {
+            Ok(_) | Err(GitError::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
         Ok(oid)
     }
 
