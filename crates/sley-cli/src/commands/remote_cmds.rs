@@ -3324,6 +3324,36 @@ fn configure_clone_remote(
     write_repo_config(git_dir, &config)
 }
 
+/// The first `extensions.<name>` key that git does not recognise (neither a
+/// version-0-honoured extension nor a v1-only one), or `None` when every
+/// extension is known. Mirrors the recognised set in
+/// `rev_parse::verify_repository_format` / git's `handle_extension`.
+fn first_unknown_repository_extension(config: &GitConfig) -> Option<String> {
+    config
+        .sections
+        .iter()
+        .filter(|section| {
+            section.name.eq_ignore_ascii_case("extensions") && section.subsection.is_none()
+        })
+        .flat_map(|section| section.entries.iter())
+        .map(|entry| entry.key.to_ascii_lowercase())
+        .find(|ext| {
+            !matches!(
+                ext.as_str(),
+                "noop"
+                    | "preciousobjects"
+                    | "partialclone"
+                    | "worktreeconfig"
+                    | "noop-v1"
+                    | "objectformat"
+                    | "compatobjectformat"
+                    | "refstorage"
+                    | "relativeworktrees"
+                    | "submodulepathconfig"
+            )
+        })
+}
+
 /// Register a configured remote as a promisor remote after a `fetch --filter`,
 /// mirroring git's `partial_clone_register`: upgrade the repo format to 1, set
 /// `remote.<name>.promisor=true`, and record the filter spec under
@@ -3339,6 +3369,19 @@ fn register_promisor_remote(git_dir: &Path, name: &str, filter_spec: &str) -> Re
         && config.get("remote", Some(name), "partialclonefilter").is_some()
     {
         return Ok(());
+    }
+    // git's `upgrade_repository_format` refuses to bump a version-0 repo that
+    // carries an extension it does not recognise: the unknown extension would
+    // become active (and unsupported) at version 1.
+    let version: i64 = config
+        .get("core", None, "repositoryformatversion")
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0);
+    if version == 0
+        && let Some(unknown) = first_unknown_repository_extension(&config)
+    {
+        eprintln!("error: cannot upgrade repository format: unknown extension {unknown}");
+        return Err(GitError::Exit(128));
     }
     let format_key = parse_config_key("core.repositoryformatversion")?;
     config_set_value(&mut config, &format_key, "1", false);
