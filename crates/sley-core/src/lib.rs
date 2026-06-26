@@ -1120,6 +1120,145 @@ impl Signature {
     }
 }
 
+/// A tolerant parse-view of a git identity line split git's way (ident.c's
+/// `split_ident_line`). Unlike [`Signature::from_ident_line`] — which is a
+/// strict, byte-exact round-trip parser — this mirrors how git's pretty-printer
+/// recovers fields from *broken* idents: the email is the run between the
+/// **first** `<` and the **first** following `>`, while the timestamp is located
+/// by scanning **backwards** from the end of the line for the **last** `>`. That
+/// split lets a corrupt ident like `Name <a@b>-<> 123 +0000` still surrender the
+/// correct name (`Name`), email (`a@b`), and date (`123 +0000`).
+pub struct IdentFields<'a> {
+    /// Everything before the first `<`, with one trailing separator space removed.
+    pub name: &'a [u8],
+    /// The bytes between the first `<` and the first following `>`.
+    pub email: &'a [u8],
+    /// The decimal timestamp digit-run, or `None` when the line has no parseable
+    /// `<digits> <±digits>` date tail (git's "person only" case).
+    pub date: Option<&'a [u8]>,
+    /// The timezone token (`±` plus digits), present iff `date` is.
+    pub tz: Option<&'a [u8]>,
+}
+
+/// True for the whitespace bytes git's `isspace` recognizes (space, tab,
+/// newline, carriage return). This deliberately excludes vertical tab (`0x0b`)
+/// and form feed (`0x0c`), matching git's `sane_ctype` table — the distinction
+/// that makes a vertical-tab-only date a sentinel rather than valid whitespace.
+fn ident_isspace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Split a git identity line the way ident.c's `split_ident_line` does,
+/// returning `None` only when the line has no `<` or no following `>` (git's
+/// `status < 0`). The date/timezone fields are `None` for the "person only"
+/// case where no valid timestamp follows the final `>`.
+pub fn split_ident_line(line: &[u8]) -> Option<IdentFields<'_>> {
+    let len = line.len();
+    // mail_begin: just past the first '<'.
+    let lt = line.iter().position(|&byte| byte == b'<')?;
+    let mail_begin = lt + 1;
+
+    // name_end: the last non-space byte before '<' (git scans down from
+    // mail_begin-2); default to the '<' position when only spaces precede it.
+    let mut name_end = mail_begin - 1;
+    if mail_begin >= 2 {
+        let mut i = mail_begin - 2;
+        loop {
+            if !ident_isspace(line[i]) {
+                name_end = i + 1;
+                break;
+            }
+            if i == 0 {
+                break;
+            }
+            i -= 1;
+        }
+    }
+    let name = &line[..name_end];
+
+    // mail_end: first '>' at or after mail_begin.
+    let gt = line[mail_begin..].iter().position(|&byte| byte == b'>')? + mail_begin;
+    let email = &line[mail_begin..gt];
+
+    let person_only = IdentFields {
+        name,
+        email,
+        date: None,
+        tz: None,
+    };
+
+    // Date: scan from the end of the line for the LAST '>', then parse a
+    // "<digits> <±digits>" tail after it (git assumes the timestamp has no '>').
+    let mut cp = len - 1;
+    while line[cp] != b'>' {
+        if cp == 0 {
+            return Some(person_only);
+        }
+        cp -= 1;
+    }
+    let mut i = cp + 1;
+    while i < len && ident_isspace(line[i]) {
+        i += 1;
+    }
+    let date_begin = i;
+    while i < len && line[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == date_begin {
+        return Some(person_only);
+    }
+    let date = &line[date_begin..i];
+
+    while i < len && ident_isspace(line[i]) {
+        i += 1;
+    }
+    if i >= len || (line[i] != b'+' && line[i] != b'-') {
+        return Some(person_only);
+    }
+    let tz_begin = i;
+    i += 1;
+    let tz_digits = i;
+    while i < len && line[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == tz_digits {
+        return Some(person_only);
+    }
+    Some(IdentFields {
+        name,
+        email,
+        date: Some(date),
+        tz: Some(&line[tz_begin..i]),
+    })
+}
+
+/// True when a timestamp is too large to be a valid `time_t`, mirroring git's
+/// `date_overflows` for a 64-bit signed `time_t`.
+fn ident_date_overflows(seconds: u64) -> bool {
+    seconds >= i64::MAX as u64
+}
+
+/// Render an ident's date the way pretty.c's `show_ident_date` does: parse the
+/// timestamp (git's `parse_timestamp` is unsigned/base-10 and clamps on
+/// overflow), substitute the epoch sentinel (`time = 0`, timezone `+0000`) when
+/// the value overflows what a `time_t` can hold, then format per `mode`. `date`
+/// is the timestamp digit-run and `tz` its timezone token (as returned by
+/// [`split_ident_line`]).
+pub fn ident_render_date(date: &[u8], tz: &[u8], mode: &DateMode) -> String {
+    let parsed = std::str::from_utf8(date)
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok());
+    let (seconds, tz_text) = match parsed {
+        Some(value) if !ident_date_overflows(value) => {
+            (value as i64, std::str::from_utf8(tz).unwrap_or("+0000"))
+        }
+        // Overflow, or a digit-run too long for u64: the epoch sentinel with a
+        // forced `+0000` timezone, exactly like git's show_ident_date.
+        _ => (0, "+0000"),
+    };
+    mode.render(seconds, tz_text).unwrap_or_default()
+}
+
 impl fmt::Display for Signature {
     /// Renders the original ident line (lossy only for bytes that are not valid
     /// UTF-8, which are replaced with `U+FFFD`). Use
@@ -2102,5 +2241,71 @@ mod tests {
         assert_eq!(format!("{path}"), "src/\u{FFFD}.txt");
         assert_eq!(path, b"src/\xFF.txt");
         assert_eq!(path.clone().into_bytes(), b"src/\xFF.txt".to_vec());
+    }
+
+    #[test]
+    fn split_ident_line_parses_well_formed_ident() {
+        let f = split_ident_line(b"A U Thor <author@example.com> 1112911993 -0700").unwrap();
+        assert_eq!(f.name, b"A U Thor");
+        assert_eq!(f.email, b"author@example.com");
+        assert_eq!(f.date, Some(&b"1112911993"[..]));
+        assert_eq!(f.tz, Some(&b"-0700"[..]));
+    }
+
+    #[test]
+    fn split_ident_line_recovers_broken_email() {
+        // git inserts junk after the '>': email stops at the first '>', but the
+        // timestamp is found by scanning back from the end for the last '>'.
+        let f = split_ident_line(b"A U Thor <author@example.com>-<> 1112911993 -0700").unwrap();
+        assert_eq!(f.name, b"A U Thor");
+        assert_eq!(f.email, b"author@example.com");
+        assert_eq!(f.date, Some(&b"1112911993"[..]));
+        assert_eq!(f.tz, Some(&b"-0700"[..]));
+    }
+
+    #[test]
+    fn split_ident_line_non_numeric_date_is_person_only() {
+        let f = split_ident_line(b"A U Thor <author@example.com> totally_bogus -0700").unwrap();
+        assert_eq!(f.email, b"author@example.com");
+        assert_eq!(f.date, None);
+        assert_eq!(f.tz, None);
+    }
+
+    #[test]
+    fn split_ident_line_whitespace_date_is_person_only() {
+        // Trailing spaces after '>' with no timestamp -> no date.
+        let f = split_ident_line(b"A U Thor <author@example.com>    ").unwrap();
+        assert_eq!(f.date, None);
+        // A vertical tab is NOT git-isspace, so it stops the space-skip and the
+        // (non-digit) VT yields no date either.
+        let f = split_ident_line(b"A U Thor <author@example.com>   \x0b").unwrap();
+        assert_eq!(f.date, None);
+    }
+
+    #[test]
+    fn split_ident_line_requires_angle_brackets() {
+        assert!(split_ident_line(b"no brackets here 123 +0000").is_none());
+    }
+
+    #[test]
+    fn ident_render_date_overflow_is_epoch_sentinel() {
+        // 2^64 + 1 (clamps in u64 parse) and 2^64 - 2 (fits u64 but past time_t)
+        // both render the epoch sentinel with a forced +0000 timezone.
+        assert_eq!(
+            ident_render_date(b"18446744073709551617", b"-0700", &DateMode::Default),
+            "Thu Jan 1 00:00:00 1970 +0000"
+        );
+        assert_eq!(
+            ident_render_date(b"18446744073709551614", b"-0700", &DateMode::Default),
+            "Thu Jan 1 00:00:00 1970 +0000"
+        );
+    }
+
+    #[test]
+    fn ident_render_date_valid_value_uses_original_timezone() {
+        assert_eq!(
+            ident_render_date(b"0", b"+0000", &DateMode::Default),
+            "Thu Jan 1 00:00:00 1970 +0000"
+        );
     }
 }

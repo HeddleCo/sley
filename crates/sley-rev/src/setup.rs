@@ -896,11 +896,15 @@ fn parse_date_cutoff(value: &str) -> Result<i64> {
     let (date, time, embedded_tz) = if let Some((date, rest)) = first.split_once('T') {
         let (time, tz) = split_embedded_timezone(rest);
         (date, time, tz)
-    } else {
-        let Some(time) = parts.next() else {
-            return invalid_date_format(value);
-        };
+    } else if let Some(time) = parts.next() {
         (first, time, None)
+    } else if parse_date_ymd(first).is_some() {
+        // A bare `YYYY-MM-DD` with no time of day: git's approxidate fills the
+        // time from "now", but for the since/until window boundaries this feeds
+        // (callers only compare against it), midnight UTC is precise enough.
+        (first, "00:00:00", Some("+0000".to_string()))
+    } else {
+        return invalid_date_format(value);
     };
     let timezone = match embedded_tz {
         Some(tz) => tz,

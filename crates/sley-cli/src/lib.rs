@@ -8977,12 +8977,19 @@ fn print_log_decorations(oid: &ObjectId, decorations: &HashMap<ObjectId, Vec<Str
 }
 
 pub(crate) fn commit_author_identity(raw: &[u8]) -> String {
-    let author = String::from_utf8_lossy(raw);
-    author
-        .rsplit_once(' ')
-        .and_then(|(left, _)| left.rsplit_once(' ').map(|(identity, _)| identity))
-        .unwrap_or(&author)
-        .to_string()
+    // Split the ident git's way (tolerant of broken emails / missing dates) and
+    // re-join as `Name <email>`, exactly as pretty.c's pp_user_info renders the
+    // Author:/Committer: line. A line with no `<…>` pair falls back to the raw
+    // bytes.
+    let Some(fields) = sley_core::split_ident_line(raw) else {
+        return String::from_utf8_lossy(raw).into_owned();
+    };
+    let mut identity = String::new();
+    identity.push_str(&String::from_utf8_lossy(fields.name));
+    identity.push_str(" <");
+    identity.push_str(&String::from_utf8_lossy(fields.email));
+    identity.push('>');
+    identity
 }
 
 /// `commit_author_identity` with an optional mailmap pass — the default/medium/
@@ -11038,11 +11045,15 @@ fn format_log_format_decorations(
 }
 
 fn commit_identity_name_email(raw: &[u8]) -> (String, String) {
-    let identity = commit_author_identity(raw);
-    let Some((name, email)) = identity.rsplit_once(" <") else {
-        return (identity, String::new());
+    // Tolerant git-style split (matches %an/%ae in format_person_part), so a
+    // broken email yields the recovered name and clean address.
+    let Some(fields) = sley_core::split_ident_line(raw) else {
+        return (String::from_utf8_lossy(raw).into_owned(), String::new());
     };
-    (name.to_string(), email.trim_end_matches('>').to_string())
+    (
+        String::from_utf8_lossy(fields.name).into_owned(),
+        String::from_utf8_lossy(fields.email).into_owned(),
+    )
 }
 
 fn commit_encoding(commit: &Commit) -> String {
