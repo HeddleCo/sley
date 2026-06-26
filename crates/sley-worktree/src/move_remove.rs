@@ -1003,7 +1003,12 @@ pub fn move_index_and_worktree_path(
     // it (`dst/basename`). Record that so the trailing-separator check below does
     // not then reject `git mv file dir/` — git only errors on a trailing slash
     // when the named directory does not exist.
-    let destination_was_existing_dir = destination_absolute.is_dir();
+    // A `git mv --sparse` destination may be a directory that is tracked but
+    // sparsified off disk (e.g. `mv x folder1` where folder1/ has skip-worktree
+    // contents). git still treats it as a directory; detect that from the index.
+    let destination_was_existing_dir = destination_absolute.is_dir()
+        || (options.sparse
+            && move_dir_has_tracked_contents(&index, worktree_root, &destination_absolute));
     let mut destination_absolute = if destination_was_existing_dir {
         let Some(file_name) = source_absolute.file_name() else {
             return Err(GitError::InvalidPath(format!(
@@ -1312,6 +1317,25 @@ pub fn move_index_and_worktree_path(
             details: Vec::new(),
         });
     }
+    // `git mv --sparse` of a single file reconciles the worktree with the
+    // destination's cone membership instead of doing a plain rename: a
+    // skip-worktree source has no on-disk file to move, and the destination is
+    // materialized (and the bit cleared) only when it lands inside the cone.
+    if options.sparse {
+        return sparse_single_file_move(
+            worktree_root,
+            git_dir,
+            format,
+            &source_absolute,
+            &destination_absolute,
+            source_path,
+            destination_path,
+            index,
+            position,
+            gitmodules_move,
+            &gitlink_gitdir_moves,
+        );
+    }
     if let Some(parent) = destination_absolute.parent()
         && !parent.exists()
     {
@@ -1338,6 +1362,125 @@ pub fn move_index_and_worktree_path(
     destination_entry.refresh_name_length();
     index.entries.retain(|entry| entry.path != destination_path);
     index.entries.push(destination_entry);
+    if let Some(edited) = gitmodules_move {
+        apply_prepared_gitmodules_move(worktree_root, git_dir, format, &mut index.entries, edited)?;
+    }
+    index
+        .entries
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    index.extensions.clear();
+    write_repository_index_ref(git_dir, format, &index)?;
+    Ok(MoveResult {
+        source: source_path,
+        destination: destination_path,
+        skipped: false,
+        fatal: None,
+        details: Vec::new(),
+    })
+}
+
+/// Whether the index holds any tracked entries under `dir_absolute`. Used to
+/// recognise a directory that `git sparse-checkout` removed from disk but still
+/// tracks as a valid `git mv --sparse` destination directory.
+fn move_dir_has_tracked_contents(index: &Index, worktree_root: &Path, dir_absolute: &Path) -> bool {
+    let Ok(relative) = dir_absolute.strip_prefix(worktree_root) else {
+        return false;
+    };
+    let Ok(git_path) = git_path_bytes(relative) else {
+        return false;
+    };
+    if git_path.is_empty() {
+        return false;
+    }
+    let mut prefix = git_path;
+    prefix.push(b'/');
+    index
+        .entries
+        .iter()
+        .any(|entry| entry.path.as_bytes().starts_with(&prefix))
+}
+
+/// `git mv --sparse` of a single tracked file. Rather than renaming on disk
+/// (the source may be a skip-worktree entry with no worktree file), this moves
+/// the index entry and reconciles the worktree + skip-worktree bit with the
+/// destination's sparse-checkout cone membership: in-cone destinations are
+/// materialized with the bit cleared; out-of-cone destinations keep no worktree
+/// file and gain the skip-worktree bit (git's mv.c SPARSE handling).
+#[allow(clippy::too_many_arguments)]
+fn sparse_single_file_move(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    source_absolute: &Path,
+    destination_absolute: &Path,
+    source_path: Vec<u8>,
+    destination_path: Vec<u8>,
+    mut index: Index,
+    position: usize,
+    gitmodules_move: Option<Vec<u8>>,
+    gitlink_gitdir_moves: &[GitlinkGitdirMove],
+) -> Result<MoveResult> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let (cone_mode, destination_in_cone) = match crate::checkout::active_sparse_checkout(git_dir)? {
+        Some((sparse, mode)) => (
+            matches!(mode, SparseCheckoutMode::Cone),
+            crate::checkout::path_in_sparse_checkout(&destination_path, &sparse, mode),
+        ),
+        None => (false, true),
+    };
+    let source_present = fs::symlink_metadata(source_absolute).is_ok();
+    let mut destination_entry = index.entries.remove(position);
+    destination_entry.path = destination_path.clone().into();
+    destination_entry.refresh_name_length();
+    index.entries.retain(|entry| entry.path != destination_path);
+    // git only re-homes the worktree file and toggles the skip-worktree bit for
+    // cone-mode transitions (builtin/mv.c gates this on
+    // core_sparse_checkout_cone); everything else is a plain rename that
+    // preserves the bit.
+    if source_present {
+        if cone_mode && !destination_in_cone {
+            // Clean in-cone -> out-of-cone: drop the worktree file, keep only the
+            // (now skip-worktree) index entry.
+            crate::checkout::remove_existing_worktree_path(source_absolute)?;
+            if fs::symlink_metadata(destination_absolute).is_ok() {
+                crate::checkout::remove_existing_worktree_path(destination_absolute)?;
+            }
+            crate::checkout::set_skip_worktree(&mut destination_entry);
+        } else {
+            // Plain rename of the present worktree file.
+            if let Some(parent) = destination_absolute.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if fs::symlink_metadata(destination_absolute).is_ok() {
+                crate::checkout::remove_existing_worktree_path(destination_absolute)?;
+            }
+            fs::rename(source_absolute, destination_absolute)?;
+            if destination_in_cone {
+                crate::checkout::clear_skip_worktree(&mut destination_entry);
+            }
+            if let Ok(metadata) = fs::symlink_metadata(destination_absolute) {
+                destination_entry = index_entry_with_refreshed_stat(&destination_entry, &metadata);
+            }
+        }
+    } else if cone_mode && destination_in_cone {
+        // Sparse (skip-worktree) source moving into the cone: materialize it.
+        crate::checkout::clear_skip_worktree(&mut destination_entry);
+        if fs::symlink_metadata(destination_absolute).is_err() {
+            crate::checkout::materialize_index_entry_file(
+                &db,
+                worktree_root,
+                destination_absolute,
+                &destination_entry,
+            )?;
+        }
+        if let Ok(metadata) = fs::symlink_metadata(destination_absolute) {
+            destination_entry = index_entry_with_refreshed_stat(&destination_entry, &metadata);
+        }
+    }
+    // Otherwise (out-of-cone -> out-of-cone, or any non-cone move of an absent
+    // source) the index entry simply moves and keeps its skip-worktree bit.
+    index.entries.push(destination_entry);
+    apply_moved_gitlink_gitdirs(gitlink_gitdir_moves)?;
     if let Some(edited) = gitmodules_move {
         apply_prepared_gitmodules_move(worktree_root, git_dir, format, &mut index.entries, edited)?;
     }

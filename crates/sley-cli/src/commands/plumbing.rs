@@ -7561,6 +7561,7 @@ pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
                 force,
                 dry_run,
                 skip_errors,
+                sparse: ignore_sparse,
             },
         )?;
         let fatal = result.fatal.is_some();
@@ -7627,7 +7628,17 @@ fn mv_sparse_rejections(
         return Ok((Vec::new(), vec![false; sources.len()]));
     };
     let index = sley_worktree::read_repository_index(git_dir, format)?;
-    let dest_is_dir = destination.is_dir();
+    // git treats a destination directory that the sparse-checkout removed from
+    // disk (but still tracks) as a directory; detect that from the index so a
+    // contained file's mapped destination path is computed correctly.
+    let dest_is_dir = destination.is_dir()
+        || mv_git_relative_path(worktree_root, destination).is_some_and(|dest_git| {
+            let mut prefix = dest_git;
+            prefix.push(b'/');
+            index
+                .as_ref()
+                .is_some_and(|index| index.entries.iter().any(|entry| entry.path.as_bytes().starts_with(&prefix)))
+        });
     let mut rejected = Vec::new();
     let mut per_source = vec![false; sources.len()];
     let in_cone = |git_path: &[u8]| {
