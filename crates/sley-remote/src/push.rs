@@ -41,11 +41,11 @@ use sley_protocol::{
 
 use crate::pack::push_pack_roots;
 #[cfg(feature = "http")]
-use crate::pack::{PushPackRequest, build_receive_pack_body};
+use crate::pack::{PushPackRequest, write_receive_pack_body};
 use sley_refs::{FileRefStore, Ref, RefTarget};
 use sley_transport::RemoteUrl;
 #[cfg(feature = "http")]
-use sley_transport::{HttpClient, http_smart_rpc_url};
+use sley_transport::{HttpClient, HttpResponse, http_smart_rpc_url};
 
 use crate::{CredentialProvider, ProgressSink};
 
@@ -781,14 +781,10 @@ fn execute_push_http(
     };
     let url = http_smart_rpc_url(&remote_url, GitService::ReceivePack)?;
     let content_type = smart_http_rpc_request_content_type(GitService::ReceivePack)?;
-    let body = build_receive_pack_body(&pack_request)?;
+    let post_buffer = http_post_buffer(request.config);
     let mut response = crate::http::http_send_with_auth(&remote_url, credentials, |auth| {
-        client.post(
-            &url,
-            &content_type,
-            &crate::http::http_authorization_headers(auth),
-            &body,
-        )
+        let headers = crate::http::http_authorization_headers(auth);
+        send_receive_pack_body(&client, &url, &content_type, &headers, &pack_request, post_buffer)
     })?;
     crate::http::http_check_status(&response, &url)?;
     crate::http::http_validate_content_type(
@@ -806,6 +802,126 @@ fn execute_push_http(
         None
     };
     Ok(PushOutcome { commands, report })
+}
+
+/// git's `http.postBuffer` (default 1 MiB): a receive-pack request body that
+/// fits within this many bytes is sent buffered with `Content-Length`; a larger
+/// body is streamed with chunked transfer-encoding. Matching git here keeps the
+/// common (small) push retry-safe under auth challenges while bounding memory
+/// for large pushes.
+#[cfg(feature = "http")]
+fn http_post_buffer(config: &GitConfig) -> usize {
+    const DEFAULT_POST_BUFFER: usize = 1 << 20;
+    config
+        .get("http", None, "postBuffer")
+        .and_then(parse_post_buffer)
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(DEFAULT_POST_BUFFER)
+}
+
+/// Parse a git size value (`http.postBuffer`): a decimal byte count with an
+/// optional `k`/`m`/`g` binary-unit suffix.
+#[cfg(feature = "http")]
+fn parse_post_buffer(raw: &str) -> Option<usize> {
+    let raw = raw.trim();
+    let (digits, multiplier) = match raw.as_bytes().last() {
+        Some(b'k' | b'K') => (&raw[..raw.len() - 1], 1024usize),
+        Some(b'm' | b'M') => (&raw[..raw.len() - 1], 1024 * 1024),
+        Some(b'g' | b'G') => (&raw[..raw.len() - 1], 1024 * 1024 * 1024),
+        _ => (raw, 1),
+    };
+    digits
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .and_then(|value| value.checked_mul(multiplier))
+}
+
+/// Send the receive-pack request body, choosing buffered (`Content-Length`) vs
+/// streamed (chunked) delivery by `post_buffer`. The body is generated on a
+/// scoped thread that pipes into the HTTP client, so a large pack is never held
+/// fully in memory. A genuine generation failure is surfaced in preference to a
+/// downstream transport error on a truncated body.
+#[cfg(feature = "http")]
+fn send_receive_pack_body(
+    client: &dyn HttpClient,
+    url: &str,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    pack_request: &PushPackRequest<'_>,
+    post_buffer: usize,
+) -> Result<HttpResponse> {
+    std::thread::scope(|scope| {
+        let (mut reader, writer) =
+            std::io::pipe().map_err(|err| GitError::Io(err.to_string()))?;
+        let generator = scope.spawn(move || -> Result<()> {
+            // `writer` is dropped at the end of this closure, signalling EOF to
+            // the reader even on the error path.
+            let mut writer = writer;
+            write_receive_pack_body(pack_request, &mut writer)
+        });
+
+        // Probe up to `post_buffer + 1` bytes to decide buffered vs chunked
+        // without first materialising the whole body.
+        let mut probe = Vec::new();
+        read_up_to(&mut reader, post_buffer.saturating_add(1), &mut probe)?;
+
+        if probe.len() <= post_buffer {
+            // Whole body fits the probe: the generator has reached EOF. Surface
+            // any generation error before sending, then send with Content-Length
+            // (re-runnable under auth retry).
+            join_pack_generator(generator)?;
+            client.post(url, content_type, headers, &probe)
+        } else {
+            // Large body: stream the probe followed by the rest of the pipe with
+            // chunked encoding. Scope `body` so the pipe reader is dropped before
+            // joining — a transport that stops early then unblocks the generator
+            // via a broken pipe instead of deadlocking the join.
+            let response = {
+                let mut body = std::io::Cursor::new(probe).chain(reader);
+                client.post_reader(url, content_type, headers, &mut body)
+            };
+            let generation = join_pack_generator(generator);
+            match response {
+                // An HTTP response (including 401) drives the caller's status and
+                // auth-retry handling; the body was consumed, so prefer it.
+                Ok(response) => Ok(response),
+                Err(transport) => match generation {
+                    Err(generation) => Err(generation),
+                    Ok(()) => Err(transport),
+                },
+            }
+        }
+    })
+}
+
+/// Join the receive-pack body generator thread, flattening a panic into an I/O
+/// error and propagating the generator's own `Result`.
+#[cfg(feature = "http")]
+fn join_pack_generator(handle: std::thread::ScopedJoinHandle<'_, Result<()>>) -> Result<()> {
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(GitError::Io(
+            "receive-pack body generator thread panicked".to_string(),
+        )),
+    }
+}
+
+/// Read from `reader` into `out` until `cap` bytes are buffered or EOF.
+#[cfg(feature = "http")]
+fn read_up_to(reader: &mut impl Read, cap: usize, out: &mut Vec<u8>) -> Result<()> {
+    let mut chunk = [0u8; 8192];
+    while out.len() < cap {
+        let want = (cap - out.len()).min(chunk.len());
+        let read = reader
+            .read(&mut chunk[..want])
+            .map_err(|err| GitError::Io(err.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        out.extend_from_slice(&chunk[..read]);
+    }
+    Ok(())
 }
 
 /// Push to a local repository served in-process: advertise from the remote
@@ -2210,6 +2326,139 @@ mod tests {
             quiet: true,
             force: false,
         }
+    }
+
+    /// Records the last send and which `HttpClient` method delivered it, so the
+    /// streaming-vs-buffered gate can be asserted along with byte-for-byte body
+    /// equality across both paths.
+    #[derive(Default)]
+    struct RecordingClient {
+        last: std::sync::Mutex<Option<(&'static str, Vec<u8>)>>,
+    }
+
+    impl RecordingClient {
+        fn take(&self) -> (&'static str, Vec<u8>) {
+            self.last
+                .lock()
+                .expect("lock")
+                .take()
+                .expect("a send was recorded")
+        }
+
+        fn ok_response() -> Result<HttpResponse> {
+            Ok(HttpResponse {
+                status: 200,
+                content_type: None,
+                body: Box::new(std::io::empty()),
+            })
+        }
+    }
+
+    impl HttpClient for RecordingClient {
+        fn get(&self, _url: &str, _headers: &[(&str, &str)]) -> Result<HttpResponse> {
+            Self::ok_response()
+        }
+
+        fn post(
+            &self,
+            _url: &str,
+            _content_type: &str,
+            _headers: &[(&str, &str)],
+            body: &[u8],
+        ) -> Result<HttpResponse> {
+            *self.last.lock().expect("lock") = Some(("post", body.to_vec()));
+            Self::ok_response()
+        }
+
+        fn post_reader(
+            &self,
+            _url: &str,
+            _content_type: &str,
+            _headers: &[(&str, &str)],
+            body: &mut dyn Read,
+        ) -> Result<HttpResponse> {
+            let mut buffered = Vec::new();
+            body.read_to_end(&mut buffered)
+                .map_err(|err| GitError::Io(err.to_string()))?;
+            *self.last.lock().expect("lock") = Some(("post_reader", buffered));
+            Self::ok_response()
+        }
+    }
+
+    fn receive_pack_request<'a>(
+        db: &'a FileObjectDatabase,
+        commands: &'a [ReceivePackCommand],
+        advertisements: &'a [RefAdvertisement],
+        features: &'a ReceivePackFeatures,
+    ) -> PushPackRequest<'a> {
+        PushPackRequest {
+            local_db: db,
+            format: ObjectFormat::Sha1,
+            commands,
+            pack_objects: &[],
+            remote_advertisements: advertisements,
+            features,
+            options: ReceivePackPushRequestOptions {
+                report_status: true,
+                ofs_delta: true,
+                ..ReceivePackPushRequestOptions::default()
+            },
+            thin: false,
+        }
+    }
+
+    #[test]
+    fn send_receive_pack_body_gates_on_post_buffer_and_preserves_bytes() {
+        let git_dir = temp_repo("send-receive-pack-gate");
+        let commit = write_commit(&git_dir, vec![], "streamed http push");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let commands = [ReceivePackCommand {
+            old_id: ObjectId::null(ObjectFormat::Sha1),
+            new_id: commit,
+            name: "refs/heads/main".into(),
+        }];
+        let features = ReceivePackFeatures {
+            report_status: true,
+            ofs_delta: true,
+            ..ReceivePackFeatures::default()
+        };
+        let req = receive_pack_request(&db, &commands, &[], &features);
+
+        // The canonical body the streaming and buffered paths must both deliver.
+        let mut canonical = Vec::new();
+        write_receive_pack_body(&req, &mut canonical).expect("canonical body");
+        assert!(canonical.len() > 1, "body should be non-trivial");
+
+        // A post_buffer larger than the body → buffered Content-Length send.
+        let buffered_client = RecordingClient::default();
+        send_receive_pack_body(&buffered_client, "http://h/git-receive-pack", "ct", &[], &req, usize::MAX)
+            .expect("buffered send");
+        let (method, body) = buffered_client.take();
+        assert_eq!(method, "post");
+        assert_eq!(body, canonical);
+
+        // A post_buffer smaller than the body → streamed chunked send. The probe
+        // (post_buffer + 1 bytes) plus the rest of the pipe must reproduce the
+        // exact same bytes.
+        let streamed_client = RecordingClient::default();
+        send_receive_pack_body(&streamed_client, "http://h/git-receive-pack", "ct", &[], &req, 8)
+            .expect("streamed send");
+        let (method, body) = streamed_client.take();
+        assert_eq!(method, "post_reader");
+        assert_eq!(body, canonical);
+
+        let _ = fs::remove_dir_all(git_dir.parent().unwrap_or(&git_dir));
+    }
+
+    #[test]
+    fn parse_post_buffer_reads_git_size_values() {
+        assert_eq!(parse_post_buffer("1048576"), Some(1 << 20));
+        assert_eq!(parse_post_buffer("512k"), Some(512 * 1024));
+        assert_eq!(parse_post_buffer("1M"), Some(1024 * 1024));
+        assert_eq!(parse_post_buffer("2g"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_post_buffer("  64k "), Some(64 * 1024));
+        assert_eq!(parse_post_buffer("garbage"), None);
+        assert_eq!(parse_post_buffer(""), None);
     }
 
     #[test]

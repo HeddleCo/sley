@@ -1449,6 +1449,26 @@ pub trait HttpClient {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<HttpResponse>;
+
+    /// Issue a `POST` whose body is streamed from `body` with chunked
+    /// transfer-encoding (no `Content-Length`), so large request bodies never
+    /// have to be held in memory. The default implementation buffers `body` and
+    /// delegates to [`HttpClient::post`]; transports that can stream the request
+    /// (e.g. [`UreqHttpClient`]) override this. Callers that need retry-on-auth
+    /// must be able to regenerate `body` per attempt, since a reader is consumed
+    /// once.
+    fn post_reader(
+        &self,
+        url: &str,
+        content_type: &str,
+        headers: &[(&str, &str)],
+        body: &mut dyn std::io::Read,
+    ) -> Result<HttpResponse> {
+        let mut buffered = Vec::new();
+        body.read_to_end(&mut buffered)
+            .map_err(|err| GitError::Io(err.to_string()))?;
+        self.post(url, content_type, headers, &buffered)
+    }
 }
 
 /// [`HttpClient`] backed by [`ureq`] with rustls + bundled Mozilla roots.
@@ -1540,6 +1560,25 @@ impl HttpClient for UreqHttpClient {
         }
         let response = request
             .send(body)
+            .map_err(|err| http_transport_error(url, &err))?;
+        Ok(http_response_from_ureq(response))
+    }
+
+    fn post_reader(
+        &self,
+        url: &str,
+        content_type: &str,
+        headers: &[(&str, &str)],
+        body: &mut dyn std::io::Read,
+    ) -> Result<HttpResponse> {
+        let mut request = self.agent.post(url).header("Content-Type", content_type);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        // `SendBody::from_reader` carries no known length, so ureq sends the
+        // request with `Transfer-Encoding: chunked` and pulls bytes on demand.
+        let response = request
+            .send(ureq::SendBody::from_reader(body))
             .map_err(|err| http_transport_error(url, &err))?;
         Ok(http_response_from_ureq(response))
     }
