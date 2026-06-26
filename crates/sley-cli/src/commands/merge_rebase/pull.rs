@@ -668,6 +668,7 @@ fn run_fetch_with_outcome(
         sley_remote::FetchServices {
             credentials: &mut credentials,
             progress: &mut progress,
+            ref_hook: None,
         },
     )
 }
@@ -969,6 +970,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         deepen_since: None,
         deepen_not: Vec::new(),
         ssh_options: None,
+        atomic: false,
     };
     let fetch_recurse_submodules = resolve_fetch_recurse_submodules(
         &config,

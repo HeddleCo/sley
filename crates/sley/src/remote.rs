@@ -120,6 +120,7 @@ impl Repository {
             FetchServices {
                 credentials,
                 progress,
+                ref_hook: None,
             },
         )?;
         self.refresh_objects();

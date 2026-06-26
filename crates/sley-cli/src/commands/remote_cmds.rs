@@ -1278,6 +1278,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
             deepen_since: None,
             deepen_not: Vec::new(),
             ssh_options: None,
+            atomic: false,
         },
     )?;
     if let Some(branch) = head_branch {
@@ -1894,6 +1895,7 @@ fn clone_bare_network_repository(
             record_promisor_refs: false,
             refetch: false,
             ssh_options: None,
+            atomic: false,
         },
         &[],
     )
@@ -2296,6 +2298,7 @@ fn clone_bare_or_mirror_local_repository(
             deepen_since: None,
             deepen_not: Vec::new(),
             ssh_options: None,
+            atomic: false,
         },
     );
     env::set_current_dir(previous_cwd)?;
@@ -3496,6 +3499,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         deepen_since: None,
         deepen_not: Vec::new(),
         ssh_options: None,
+        atomic: false,
     };
     let mut unshallow = false;
     let mut filter_option_explicit = false;
@@ -3531,6 +3535,8 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
             "--no-append" => options.append = false,
             "-n" | "--dry-run" => options.dry_run = true,
             "--no-dry-run" => options.dry_run = false,
+            "--atomic" => options.atomic = true,
+            "--no-atomic" => options.atomic = false,
             "--depth" => {
                 let value = iter
                     .next()
@@ -3569,7 +3575,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 let value = value.strip_prefix("--refmap=").unwrap_or_default();
                 push_fetch_refmap(&mut options, value);
             }
-            "--tags" => {
+            "--tags" | "-t" => {
                 options.auto_follow_tags = true;
                 options.fetch_all_tags = true;
                 options.tag_option_explicit = true;
@@ -3743,7 +3749,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 return Err(GitError::Exit(129));
             }
             _ if source.is_none() => source = Some(arg.clone()),
-            _ => refspecs.push(arg.clone()),
+            _ => refspecs.push(rewrite_empty_source_refspec(arg)),
         }
     }
     let cwd = env::current_dir()?;
@@ -4103,6 +4109,23 @@ fn trace_fetch_maintenance() {
 
 fn fetch_pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
     pack_filter_from_spec(spec)
+}
+
+/// `git fetch <remote> :<dst>` is shorthand for fetching the remote's `HEAD`
+/// into `<dst>` (git resolves an empty refspec source to `HEAD` in
+/// `get_fetch_map`). Rewrite the bare-colon form to an explicit `HEAD:<dst>`
+/// refspec, preserving any leading `+` force marker.
+fn rewrite_empty_source_refspec(arg: &str) -> String {
+    let (force, rest) = match arg.strip_prefix('+') {
+        Some(rest) => ("+", rest),
+        None => ("", arg),
+    };
+    if let Some(dst) = rest.strip_prefix(':')
+        && !dst.is_empty()
+    {
+        return format!("{force}HEAD:{dst}");
+    }
+    arg.to_string()
 }
 
 fn push_fetch_refmap(options: &mut FetchOptions, value: &str) {
@@ -8207,6 +8230,7 @@ fn run_fetch(
     {
         trace_protocol_v2_ls_refs_request(server_options);
     }
+    let ref_hook = crate::commands::refs::ReferenceTransactionHookRunner::new(git_dir);
     let outcome = sley_remote::fetch(
         sley_remote::FetchRequest {
             git_dir,
@@ -8220,9 +8244,18 @@ fn run_fetch(
         sley_remote::FetchServices {
             credentials: &mut credentials,
             progress: &mut progress,
+            ref_hook: Some(&ref_hook),
         },
     )?;
-    maybe_set_remote_head_on_fetch(git_dir, format, config, source, refspecs, &outcome)?;
+    maybe_set_remote_head_on_fetch(
+        git_dir,
+        format,
+        config,
+        source,
+        refspecs,
+        options.quiet,
+        &outcome,
+    )?;
     print_fetch_status(
         git_dir,
         format,
@@ -8311,6 +8344,7 @@ fn maybe_set_remote_head_on_fetch(
     config: &GitConfig,
     source: &str,
     refspecs: &[String],
+    quiet: bool,
     outcome: &sley_remote::FetchOutcome,
 ) -> Result<()> {
     // Only for a default fetch (no command-line refspecs) of a configured remote
@@ -8356,7 +8390,14 @@ fn maybe_set_remote_head_on_fetch(
         return Ok(());
     }
     let create_only = !follow.eq_ignore_ascii_case("always");
-    if create_only && store.read_ref(&head_ref)?.is_some() {
+    if create_only && let Some(existing) = store.read_ref(&head_ref)? {
+        // `create` never overwrites an existing `<remote>/HEAD`. For the `warn`
+        // family git additionally reports when the local HEAD disagrees with the
+        // remote's advertised default branch (builtin/fetch.c `report_set_head`).
+        // The message goes to stdout and only when not quiet (`verbosity >= 0`).
+        if !quiet {
+            report_followremotehead_warn(follow, source, head_name, &existing);
+        }
         return Ok(());
     }
     let mut tx = store.transaction();
@@ -8368,6 +8409,50 @@ fn maybe_set_remote_head_on_fetch(
     });
     tx.commit()?;
     Ok(())
+}
+
+/// git's `report_set_head` (builtin/fetch.c): when `remote.<name>.followRemoteHEAD`
+/// is `warn` (or `warn-if-not-<branch>` with a non-matching default), warn on
+/// stdout that the remote's `HEAD` points somewhere other than the local
+/// `<remote>/HEAD`. `warn-if-not-<branch>` suppresses the warning when the
+/// remote default branch equals `<branch>`.
+fn report_followremotehead_warn(
+    follow: &str,
+    remote: &str,
+    head_name: &str,
+    existing: &RefTarget,
+) {
+    let follow_lower = follow.to_ascii_lowercase();
+    // `no_warn_branch` is the `<branch>` in `warn-if-not-<branch>`; plain `warn`
+    // has none. Anything else is not a warn mode.
+    let no_warn_branch = if follow_lower == "warn" {
+        None
+    } else if let Some(rest) = follow_lower.strip_prefix("warn-if-not-") {
+        // Match git's case-sensitive `strcmp` on the branch name; recover the
+        // original (non-lowercased) suffix to compare.
+        Some(follow["warn-if-not-".len()..].to_string())
+        .filter(|_| !rest.is_empty())
+    } else {
+        return;
+    };
+    if no_warn_branch.as_deref() == Some(head_name) {
+        return;
+    }
+    match existing {
+        RefTarget::Symbolic(target) => {
+            let prefix = format!("refs/remotes/{remote}/");
+            if let Some(prev_head) = target.strip_prefix(&prefix)
+                && prev_head != head_name
+            {
+                println!("'HEAD' at '{remote}' is '{head_name}', but we have '{prev_head}' locally.");
+            }
+        }
+        RefTarget::Direct(oid) => {
+            println!(
+                "'HEAD' at '{remote}' is '{head_name}', but we have a detached HEAD pointing to '{oid}' locally."
+            );
+        }
+    }
 }
 
 pub(crate) fn fetch_source_is_ssh(source: &str) -> Result<bool> {

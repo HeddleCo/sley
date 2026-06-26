@@ -1502,7 +1502,7 @@ fn receive_denies_current_branch_delete(
 
 /// Whether `old` is an ancestor of `new` (a fast-forward). A walk from `new`;
 /// `old` reachable ⇒ fast-forward.
-fn is_fast_forward(
+pub(crate) fn is_fast_forward(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     old: &ObjectId,

@@ -282,6 +282,7 @@ mod tests {
             deepen_since: None,
             deepen_not: Vec::new(),
             ssh_options: None,
+            atomic: false,
         }
     }
 
@@ -371,6 +372,7 @@ mod tests {
             FetchServices {
                 credentials,
                 progress: &mut progress,
+                ref_hook: None,
             },
         )
         .expect("live fetch should succeed");

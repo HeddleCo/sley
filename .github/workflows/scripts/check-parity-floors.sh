@@ -1045,7 +1045,13 @@ declare -A FLOOR=(
     # t3700 re-verified on the MERGED+fixed binary. Guards held/gained: t5516=110 t5526=56 t5601=108
     # t5605=23 t5604=31 t5512=40 t2400=215 t2402=27 t7508=119 t1501=39 t3600=81 t2070=15 t5300=57
     # t1450=96 t3700=51. fetchcore disjoint+clean. cargo test --workspace green.
-    [t5510-fetch.sh]=167
+    # wave-52 fetch (2026-06-26, off main 4514354b; sley-remote fetch lane): -t alias,
+    # empty-source refspec, dup-refspec dedup, followRemoteHEAD warn output,
+    # fetch --atomic (single transaction + reference-transaction hook + non-ff abort +
+    # FETCH_HEAD truncate-on-abort), and a latent FETCH_HEAD opportunistic-tracking dup
+    # fix. 167->184. Guards held: t5516=111 t5601=109 t5505=127 t5500=363. cargo test
+    # --workspace green; clippy -p sley-remote -p sley-cli clean.
+    [t5510-fetch.sh]=184
     [t2205-add-worktree-config.sh]=13
     [t1050-large.sh]=29
     # wave-36 (2026-06-21, off main 5dfe861a; t_fetch/worktree): fetch-multiple, unresolve-info,

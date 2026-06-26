@@ -16,7 +16,7 @@
 //! / `FETCH_HEAD` / prune helpers are shared so there is a single implementation.
 
 use crate::local::LocalDeepenPlan;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -146,6 +146,12 @@ pub struct FetchOptions {
     /// such as clone (`-4`/`-6`). When absent, fetch derives SSH options from
     /// the effective repository config.
     pub ssh_options: Option<crate::ssh::SshTransportOptions>,
+    /// `--atomic`: apply every remote-tracking ref update (and prune deletion)
+    /// in a single reference transaction so a single rejected update aborts the
+    /// whole fetch and leaves `FETCH_HEAD` empty. The default is non-atomic:
+    /// each ref is updated independently and a per-ref failure is reported but
+    /// does not block the others.
+    pub atomic: bool,
 }
 
 /// A remote-tracking ref removed by a prune pass.
@@ -199,6 +205,11 @@ pub struct FetchServices<'a> {
     pub credentials: &'a mut dyn CredentialProvider,
     /// Progress sink for prune notices.
     pub progress: &'a mut dyn ProgressSink,
+    /// `reference-transaction` hook handler fired when applying remote-tracking
+    /// ref updates. `None` skips the hook (the historical behavior). The CLI
+    /// supplies a runner so `--atomic` fetches honor a hook that aborts the
+    /// transaction, matching git's `store_updated_refs`.
+    pub ref_hook: Option<&'a dyn sley_refs::ReferenceTransactionHook>,
 }
 
 /// Fetch from a resolved `source` into the repository at `git_dir`.
@@ -213,6 +224,7 @@ pub struct FetchServices<'a> {
 /// Emits prune notices through `progress` and returns the structured
 /// [`FetchOutcome`]; never prints or returns `GitError::Exit`.
 pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<FetchOutcome> {
+    let ref_hook = services.ref_hook;
     let mut options = request.options.clone();
     apply_configured_remote_tag_option(request.config, request.remote_name, &mut options);
     apply_configured_fetch_prune_option(request.config, request.remote_name, &mut options);
@@ -348,7 +360,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 .transpose()?
                 .unwrap_or_default();
             outcome.head_symref = head_symref_from_features(&features.symrefs);
-            let mut updates = plan_and_adjust_updates(FetchPlanInput {
+            let (mut updates, opportunistic_dsts) = plan_and_adjust_updates(FetchPlanInput {
                 advertisements: &advertisements,
                 refspecs: &parsed_refspecs,
                 options: &options,
@@ -407,6 +419,8 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
                     log_all_ref_updates: fetch_log_all_ref_updates(request.config),
+                    ref_hook,
+                    opportunistic_dsts: &opportunistic_dsts,
                 },
                 &mut updates,
                 &mut outcome,
@@ -427,7 +441,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     ssh_options,
                 )?;
             outcome.head_symref = head_symref_from_features(&features.symrefs);
-            let mut updates = plan_and_adjust_updates(FetchPlanInput {
+            let (mut updates, opportunistic_dsts) = plan_and_adjust_updates(FetchPlanInput {
                 advertisements: &advertisements,
                 refspecs: &parsed_refspecs,
                 options: &options,
@@ -478,6 +492,8 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
                     log_all_ref_updates: fetch_log_all_ref_updates(request.config),
+                    ref_hook,
+                    opportunistic_dsts: &opportunistic_dsts,
                 },
                 &mut updates,
                 &mut outcome,
@@ -498,7 +514,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             let advertisements = discovered.refs;
             let features = discovered.features;
             outcome.head_symref = head_symref_from_features(&features.symrefs);
-            let mut updates = plan_and_adjust_updates(FetchPlanInput {
+            let (mut updates, opportunistic_dsts) = plan_and_adjust_updates(FetchPlanInput {
                 advertisements: &advertisements,
                 refspecs: &parsed_refspecs,
                 options: &options,
@@ -539,6 +555,8 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
                     log_all_ref_updates: fetch_log_all_ref_updates(request.config),
+                    ref_hook,
+                    opportunistic_dsts: &opportunistic_dsts,
                 },
                 &mut updates,
                 &mut outcome,
@@ -650,7 +668,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             };
             let mut deepen_plan = plan_deepen(&primary_heads)?;
             let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
-            let mut updates = plan_and_adjust_updates(FetchPlanInput {
+            let (mut updates, opportunistic_dsts) = plan_and_adjust_updates(FetchPlanInput {
                 advertisements: &advertisements,
                 refspecs: &parsed_refspecs,
                 options: &options,
@@ -773,6 +791,8 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
                     log_all_ref_updates: fetch_log_all_ref_updates(request.config),
+                    ref_hook,
+                    opportunistic_dsts: &opportunistic_dsts,
                 },
                 &mut updates,
                 &mut outcome,
@@ -896,7 +916,9 @@ struct FetchPlanInput<'a> {
     tracking_refspecs: &'a [RefSpec],
 }
 
-fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpdate>> {
+fn plan_and_adjust_updates(
+    input: FetchPlanInput<'_>,
+) -> Result<(Vec<FetchRefUpdate>, HashSet<String>)> {
     let FetchPlanInput {
         advertisements,
         refspecs,
@@ -978,8 +1000,44 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
         // stably to reproduce that layout.
         updates.sort_by_key(|update| update.not_for_merge);
     }
-    append_opportunistic_tracking_updates(&mut updates, tracking_refspecs)?;
-    Ok(updates)
+    let opportunistic_dsts =
+        append_opportunistic_tracking_updates(&mut updates, tracking_refspecs)?;
+    ref_remove_duplicate_updates(&mut updates)?;
+    Ok((updates, opportunistic_dsts))
+}
+
+/// Mirror git's `ref_remove_duplicates` (remote.c): two ref-map entries with the
+/// same destination are collapsed when they came from the same source ref (e.g.
+/// a remote that lists `+refs/heads/*:refs/remotes/origin/*` twice), and rejected
+/// when two *different* sources would map to one destination.
+fn ref_remove_duplicate_updates(updates: &mut Vec<FetchRefUpdate>) -> Result<()> {
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    let mut error = None;
+    updates.retain(|update| {
+        let Some(dst) = update.dst.as_deref() else {
+            return true;
+        };
+        match seen.get(dst) {
+            Some(prev_src) if prev_src == &update.src => false,
+            Some(prev_src) => {
+                if error.is_none() {
+                    error = Some(GitError::Command(format!(
+                        "Cannot fetch both {} and {} to {dst}",
+                        prev_src, update.src
+                    )));
+                }
+                true
+            }
+            None => {
+                seen.insert(dst.to_string(), update.src.clone());
+                true
+            }
+        }
+    });
+    match error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 fn configured_refspecs_for_tracking(config: &GitConfig, remote: &str) -> Vec<String> {
@@ -990,12 +1048,17 @@ fn configured_refspecs_for_tracking(config: &GitConfig, remote: &str) -> Vec<Str
     }
 }
 
+/// Append the opportunistic remote-tracking updates for a command-line refspec
+/// fetch (a fetched ref that also matches a configured tracking refspec). Returns
+/// the set of destinations these added — git marks them `FETCH_HEAD_IGNORE`, so
+/// the caller excludes them from `FETCH_HEAD` while still applying them as refs.
 fn append_opportunistic_tracking_updates(
     updates: &mut Vec<FetchRefUpdate>,
     tracking_refspecs: &[RefSpec],
-) -> Result<()> {
+) -> Result<HashSet<String>> {
+    let mut opportunistic_dsts = HashSet::new();
     if tracking_refspecs.is_empty() {
-        return Ok(());
+        return Ok(opportunistic_dsts);
     }
     let mut seen_dsts = updates
         .iter()
@@ -1013,6 +1076,7 @@ fn append_opportunistic_tracking_updates(
             if !seen_dsts.insert(dst.clone()) {
                 continue;
             }
+            opportunistic_dsts.insert(dst.clone());
             additions.push(FetchRefUpdate {
                 src: update.src.clone(),
                 dst: Some(dst),
@@ -1023,7 +1087,7 @@ fn append_opportunistic_tracking_updates(
         }
     }
     updates.extend(additions);
-    Ok(())
+    Ok(opportunistic_dsts)
 }
 
 fn advertisements_without_peeled_refs(
@@ -1080,6 +1144,10 @@ struct FetchFinalize<'a> {
     fetch_head_source: &'a str,
     default_head_fetch: bool,
     log_all_ref_updates: bool,
+    ref_hook: Option<&'a dyn sley_refs::ReferenceTransactionHook>,
+    /// Destinations of opportunistic tracking updates (git's `FETCH_HEAD_IGNORE`):
+    /// applied as refs but excluded from `FETCH_HEAD`.
+    opportunistic_dsts: &'a HashSet<String>,
 }
 
 /// git's `store_updated_refs` (builtin/fetch.c) downgrades any for-merge
@@ -1116,6 +1184,8 @@ fn finalize_fetch(
         fetch_head_source,
         default_head_fetch,
         log_all_ref_updates,
+        ref_hook,
+        opportunistic_dsts,
     } = finalize;
     if options.dry_run {
         outcome.ref_updates = std::mem::take(updates);
@@ -1123,16 +1193,53 @@ fn finalize_fetch(
     }
     downgrade_non_commit_for_merge(git_dir, format, updates);
     validate_fetch_ref_updates(git_dir, format, store, options.update_head_ok, updates)?;
-    if options.write_fetch_head {
-        if default_head_fetch
-            && updates.len() == 1
-            && updates[0].src == "HEAD"
-            && updates[0].dst.is_none()
-        {
-            write_default_fetch_head(git_dir, fetch_head_source, updates[0].oid, options.append)?;
-        } else {
-            write_fetch_head(git_dir, fetch_head_source, updates, options.append)?;
+    if options.atomic {
+        // Atomic fetch (`do_fetch`/`store_updated_refs` with a transaction): a
+        // single rejected update aborts the whole fetch and leaves `FETCH_HEAD`
+        // empty. git truncates `FETCH_HEAD` up front (unless `--append`) and
+        // only re-writes the buffered records once the transaction commits, so
+        // an abort leaves the truncated (empty) file. Reject non-fast-forward
+        // tracking updates first, then apply every update in one transaction
+        // (firing the `reference-transaction` hook, which may itself abort).
+        if options.write_fetch_head && !options.append {
+            fs::write(git_dir.join("FETCH_HEAD"), b"")?;
         }
+        if let Some(reason) = atomic_non_fast_forward_rejection(git_dir, format, store, updates)? {
+            return Err(GitError::Command(reason));
+        }
+        apply_fetch_ref_updates(
+            store,
+            format,
+            fetch_head_source,
+            log_all_ref_updates,
+            updates,
+            ref_hook,
+        )?;
+        if options.write_fetch_head {
+            // Already truncated above when not appending, so always append the
+            // committed records (mirrors git's buffer-then-`commit_fetch_head`).
+            write_finalized_fetch_head(
+                git_dir,
+                fetch_head_source,
+                default_head_fetch,
+                updates,
+                opportunistic_dsts,
+                true,
+            )?;
+            outcome.wrote_fetch_head = true;
+        }
+        outcome.ref_updates = std::mem::take(updates);
+        return Ok(());
+    }
+    if options.write_fetch_head {
+        write_finalized_fetch_head(
+            git_dir,
+            fetch_head_source,
+            default_head_fetch,
+            updates,
+            opportunistic_dsts,
+            options.append,
+        )?;
         outcome.wrote_fetch_head = true;
     }
     apply_fetch_ref_updates(
@@ -1141,9 +1248,77 @@ fn finalize_fetch(
         fetch_head_source,
         log_all_ref_updates,
         updates,
+        ref_hook,
     )?;
     outcome.ref_updates = std::mem::take(updates);
     Ok(())
+}
+
+/// Write `FETCH_HEAD` for the planned `updates`, using the bare-`HEAD` default
+/// record when the fetch was a single default `HEAD` fetch. Opportunistic
+/// tracking updates (git's `FETCH_HEAD_IGNORE`) are dropped — they are applied
+/// as refs but not recorded in `FETCH_HEAD`.
+fn write_finalized_fetch_head(
+    git_dir: &Path,
+    fetch_head_source: &str,
+    default_head_fetch: bool,
+    updates: &[FetchRefUpdate],
+    opportunistic_dsts: &HashSet<String>,
+    append: bool,
+) -> Result<()> {
+    if default_head_fetch
+        && updates.len() == 1
+        && updates[0].src == "HEAD"
+        && updates[0].dst.is_none()
+    {
+        return write_default_fetch_head(git_dir, fetch_head_source, updates[0].oid, append);
+    }
+    let records: Vec<FetchRefUpdate> = updates
+        .iter()
+        .filter(|update| {
+            update
+                .dst
+                .as_deref()
+                .is_none_or(|dst| !opportunistic_dsts.contains(dst))
+        })
+        .cloned()
+        .collect();
+    write_fetch_head(git_dir, fetch_head_source, &records, append)
+}
+
+/// Reject the first non-fast-forward tracking update an `--atomic` fetch would
+/// make (a non-forced refspec whose destination already exists and whose new tip
+/// does not descend from the old). Returns the git-shaped `! [rejected]` line so
+/// the whole atomic transaction can be aborted before any ref is touched.
+fn atomic_non_fast_forward_rejection(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    updates: &[FetchRefUpdate],
+) -> Result<Option<String>> {
+    let mut db: Option<FileObjectDatabase> = None;
+    for update in updates {
+        let Some(dst) = update.dst.as_deref() else {
+            continue;
+        };
+        if update.force {
+            continue;
+        }
+        let Some(RefTarget::Direct(old)) = store.read_ref(dst)? else {
+            continue;
+        };
+        if old == update.oid || dst.starts_with("refs/tags/") {
+            continue;
+        }
+        let db = db.get_or_insert_with(|| FileObjectDatabase::from_git_dir(git_dir, format));
+        if !crate::push::is_fast_forward(db, format, &old, &update.oid)? {
+            return Ok(Some(format!(
+                "! [rejected]        {} -> {}  (non-fast-forward)",
+                update.src, dst
+            )));
+        }
+    }
+    Ok(None)
 }
 
 fn apply_fetch_ref_updates(
@@ -1152,9 +1327,13 @@ fn apply_fetch_ref_updates(
     fetch_head_source: &str,
     log_all_ref_updates: bool,
     updates: &[FetchRefUpdate],
+    ref_hook: Option<&dyn sley_refs::ReferenceTransactionHook>,
 ) -> Result<()> {
     let mut seen = BTreeSet::new();
     let mut tx = store.transaction();
+    if let Some(hook) = ref_hook {
+        tx = tx.with_hook(hook);
+    }
     for update in updates {
         let Some(dst) = update.dst.as_deref() else {
             continue;
@@ -1898,6 +2077,7 @@ mod tests {
             deepen_since: None,
             deepen_not: Vec::new(),
             ssh_options: None,
+            atomic: false,
         }
     }
 
@@ -1928,6 +2108,7 @@ mod tests {
             FetchServices {
                 credentials: &mut credentials,
                 progress: &mut progress,
+                ref_hook: None,
             },
         )
         .expect("fetch should succeed");
@@ -1974,6 +2155,7 @@ mod tests {
             FetchServices {
                 credentials: &mut credentials,
                 progress: &mut progress,
+                ref_hook: None,
             },
         )
         .expect("shallow fetch should succeed");
@@ -2021,6 +2203,7 @@ mod tests {
             FetchServices {
                 credentials: &mut credentials,
                 progress: &mut progress,
+                ref_hook: None,
             },
         )
         .expect("initial shallow fetch should succeed");
@@ -2041,6 +2224,7 @@ mod tests {
             FetchServices {
                 credentials: &mut credentials,
                 progress: &mut progress,
+                ref_hook: None,
             },
         )
         .expect("same-depth shallow fetch should succeed");
@@ -2106,6 +2290,7 @@ mod tests {
             FetchServices {
                 credentials: &mut credentials,
                 progress: &mut progress,
+                ref_hook: None,
             },
         )
         .expect_err("fetch should fail before finalizing refs");
