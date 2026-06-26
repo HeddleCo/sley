@@ -801,12 +801,15 @@ fn collect_stdin_packs_objects(
         }
     }
 
-    // 3. Every named pack must resolve, or git dies naming the missing key.
-    for key in &order {
-        if !found.contains_key(key) {
-            eprintln!("fatal: could not find pack '{key}'");
-            return Err(GitError::Exit(128));
-        }
+    // 3. Every named pack must resolve, or git dies naming a missing key. When
+    //    several keys are unresolved git reports the one that sorts first — its
+    //    strmap iteration tracks the keys' byte order, which for the hash-named
+    //    packs of t5300's "--stdin-packs handles garbage" is OID order.
+    let mut missing: Vec<&String> = order.iter().filter(|key| !found.contains_key(*key)).collect();
+    if !missing.is_empty() {
+        missing.sort();
+        eprintln!("fatal: could not find pack '{}'", missing[0]);
+        return Err(GitError::Exit(128));
     }
 
     // 4. Objects in any excluded pack veto inclusion (closed and open both).
