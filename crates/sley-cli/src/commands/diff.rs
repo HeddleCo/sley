@@ -1055,6 +1055,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     }
     let git_dir = discover_git_dir(&cwd)?;
     let repo_config = read_repo_config(&git_dir).ok();
+    // git's `quote_path_fully` (`core.quotePath`, default true): drives whether
+    // non-ASCII bytes in diffstat names are octal-escaped or shown verbatim.
+    let quote_path_fully = repo_config
+        .as_ref()
+        .and_then(|config| config.get_bool("core", None, "quotepath"))
+        .unwrap_or(true);
     let format = repository_object_format(&git_dir)?;
     if let Ok(config) = read_repo_config(&git_dir) {
         if let Some(value) = config.get("diff", None, "colormoved")
@@ -1843,6 +1849,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                             compact_summary,
                             stat_count,
                             color: color_always,
+                            quote_path_fully,
                         },
                         widths: Some(resolved_stat_widths),
                     },
@@ -1965,6 +1972,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                             compact_summary,
                             stat_count,
                             color: color_always,
+                            quote_path_fully,
                         },
                         widths: Some(resolved_stat_widths),
                     },

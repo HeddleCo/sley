@@ -3093,6 +3093,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                         compact_summary,
                         stat_count: None,
                         color: false,
+                        quote_path_fully: true,
                     },
                 )?;
                 wrote_prefix_output |= !entries.is_empty();

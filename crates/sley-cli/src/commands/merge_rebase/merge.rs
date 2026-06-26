@@ -39,6 +39,7 @@ fn write_merge_result_diffstat(
             compact_summary: compact,
             stat_count: None,
             color: false,
+            quote_path_fully: true,
         },
     )?;
     // The default `--stat` mode appends a `DIFF_FORMAT_SUMMARY` block (the

@@ -1132,6 +1132,32 @@ fn wcwidth(ch: u32) -> i32 {
     1
 }
 
+/// Display width of `s` in terminal columns, mirroring git's `utf8_strwidth`:
+/// each decoded scalar contributes `max(0, git_wcwidth)` (so zero-width marks
+/// count as 0 and control characters are skipped), and any byte that does not
+/// begin a valid UTF-8 sequence falls back to width 1 (matching git's
+/// `pick_one_utf8_char` byte-at-a-time recovery).
+pub fn strwidth(s: &[u8]) -> usize {
+    let mut width = 0usize;
+    let mut idx = 0usize;
+    while idx < s.len() {
+        match pick_utf8(s, idx) {
+            Some((cp, len)) => {
+                let w = wcwidth(cp);
+                if w > 0 {
+                    width += w as usize;
+                }
+                idx += len;
+            }
+            None => {
+                width += 1;
+                idx += 1;
+            }
+        }
+    }
+    width
+}
+
 fn bisearch(needle: u32, ranges: &[(u32, u32)]) -> bool {
     let mut low = 0usize;
     let mut high = ranges.len();

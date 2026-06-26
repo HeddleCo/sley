@@ -560,6 +560,7 @@ fn render(
                 compact_summary: output.compact_summary,
                 stat_count: None,
                 color: false,
+                quote_path_fully: true,
             },
         )?;
     }

@@ -1166,6 +1166,7 @@ fn run_diff_request(
                     compact_summary: output.compact_summary,
                     stat_count: None,
                     color: false,
+                    quote_path_fully: true,
                 },
                 // diff-tree is plumbing: fixed 80 columns, no config caps.
                 widths: Some(DiffStatWidths::plumbing()),
@@ -1306,6 +1307,7 @@ fn run_combined_request(
                     compact_summary: output.compact_summary,
                     stat_count: None,
                     color: false,
+                    quote_path_fully: true,
                 },
                 DiffStatWidths::plumbing(),
             )?;

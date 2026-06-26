@@ -2412,13 +2412,13 @@ fn write_diff_summary_entry(
             if let Some(old_path) = &entry.old_path {
                 // git's `show_rename_copy` compresses a common path prefix/suffix
                 // into `pfx{a => b}sfx` via `pprint_rename`.
-                let pretty = diff_stat_pprint_rename(old_path, &entry.path);
+                let pretty = diff_stat_pprint_rename(old_path, &entry.path, true);
                 writeln!(stdout, " rename {pretty} ({score}%)")?;
             }
         }
         sley_diff_merge::NameStatus::Copied(score) => {
             if let Some(old_path) = &entry.old_path {
-                let pretty = diff_stat_pprint_rename(old_path, &entry.path);
+                let pretty = diff_stat_pprint_rename(old_path, &entry.path, true);
                 writeln!(stdout, " copy {pretty} ({score}%)")?;
             }
         }
@@ -3677,7 +3677,7 @@ fn write_diff_numstat_materialized_entry(
         write_diff_numstat_counts(stdout, stats)?;
         if let Some(old_path) = &entry.old_path {
             // Renames/copies print the brace-collapsed form, like the stat rows.
-            writeln!(stdout, "{}", diff_stat_pprint_rename(old_path, &entry.path))?;
+            writeln!(stdout, "{}", diff_stat_pprint_rename(old_path, &entry.path, true))?;
         } else {
             let path = status_quote_path(&entry.path, false);
             writeln!(stdout, "{path}")?;
@@ -3795,11 +3795,11 @@ fn diff_stat_scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
     1 + (it * (width - 1) / max_change)
 }
 
-/// Display width of a stat row name. git uses `utf8_strwidth`; paths that
-/// need quoting come out of `status_quote_path` as ASCII, so plain char count
-/// matches for everything the t-suite exercises.
+/// Display width of a stat row name. git uses `utf8_strwidth`, so East-Asian
+/// wide characters count as two columns and zero-width marks as none; paths that
+/// need quoting come out of `status_quote_path` as ASCII (width == byte count).
 fn diff_stat_display_width(name: &str) -> i64 {
-    name.chars().count() as i64
+    sley_strbuf_expand::strwidth(name.as_bytes()) as i64
 }
 
 fn write_diff_stat_materialized_with_widths(
@@ -3815,8 +3815,9 @@ fn write_diff_stat_materialized_with_widths(
         compact_summary,
         stat_count,
         color,
+        quote_path_fully,
     } = options;
-    let rows = diff_stat_rows_from_materialized(entries, compact_summary);
+    let rows = diff_stat_rows_from_materialized(entries, compact_summary, quote_path_fully);
 
     let mut count = stat_count.unwrap_or(rows.len()).min(rows.len());
 
@@ -4251,6 +4252,10 @@ struct DiffStatOptions {
     compact_summary: bool,
     stat_count: Option<usize>,
     color: bool,
+    /// git's `quote_path_fully` (`core.quotePath`, default true): when false,
+    /// non-ASCII bytes in the diffstat name are shown verbatim rather than
+    /// octal-escaped.
+    quote_path_fully: bool,
 }
 
 struct DiffStatEntryData<'a> {
@@ -4316,6 +4321,7 @@ fn diff_stat_totals(entries: &[DiffStatEntryData<'_>]) -> (usize, usize) {
 fn diff_stat_rows_from_materialized(
     entries: &[DiffStatEntryData<'_>],
     compact_summary: bool,
+    quote_path_fully: bool,
 ) -> Vec<DiffStatRow> {
     let mut rows = Vec::with_capacity(entries.len());
     for data in entries {
@@ -4332,7 +4338,7 @@ fn diff_stat_rows_from_materialized(
             DiffLineStats::Text { inserted, deleted } => DiffStatStats::Text { inserted, deleted },
         };
         rows.push(DiffStatRow {
-            path: diff_stat_path(data.entry, compact_summary),
+            path: diff_stat_path(data.entry, compact_summary, quote_path_fully),
             stats,
         });
     }
@@ -4358,11 +4364,15 @@ enum DiffStatStats {
     },
 }
 
-fn diff_stat_path(entry: &sley_diff_merge::NameStatusEntry, compact_summary: bool) -> String {
+fn diff_stat_path(
+    entry: &sley_diff_merge::NameStatusEntry,
+    compact_summary: bool,
+    quote_path_fully: bool,
+) -> String {
     let mut path = if let Some(old_path) = &entry.old_path {
-        diff_stat_pprint_rename(old_path, &entry.path)
+        diff_stat_pprint_rename(old_path, &entry.path, quote_path_fully)
     } else {
-        status_quote_path(&entry.path, false)
+        status_quote_path_full(&entry.path, false, quote_path_fully)
     };
     if compact_summary && let Some(summary) = diff_compact_summary_label(entry) {
         path.push(' ');
@@ -4375,9 +4385,9 @@ fn diff_stat_path(entry: &sley_diff_merge::NameStatusEntry, compact_summary: boo
 /// suffix into braces — `dir/{old => new}/file` — falling back to the plain
 /// `old => new` form when either side needs c-style quoting or when nothing
 /// is shared.
-fn diff_stat_pprint_rename(a: &[u8], b: &[u8]) -> String {
-    let quoted_a = status_quote_path(a, false);
-    let quoted_b = status_quote_path(b, false);
+fn diff_stat_pprint_rename(a: &[u8], b: &[u8], quote_path_fully: bool) -> String {
+    let quoted_a = status_quote_path_full(a, false, quote_path_fully);
+    let quoted_b = status_quote_path_full(b, false, quote_path_fully);
     if quoted_a.starts_with('"') || quoted_b.starts_with('"') {
         return format!("{quoted_a} => {quoted_b}");
     }
@@ -11207,22 +11217,36 @@ fn symbolic_ref_cannot_delete(name: &str) -> Result<()> {
 }
 
 pub(crate) fn status_quote_path(path: &[u8], quote_space: bool) -> String {
-    if !status_path_needs_quotes(path, quote_space) {
+    status_quote_path_full(path, quote_space, true)
+}
+
+/// Like [`status_quote_path`] but parameterized by git's `quote_path_fully`
+/// (`core.quotePath`): when `quote_path_fully` is false, bytes `>= 0x80` are
+/// emitted verbatim instead of octal-escaped, so a UTF-8 path with no other
+/// quote-forcing byte comes through raw (matching `quote_c_style` with
+/// `core.quotePath=false`). Control bytes, `0x7f`, `"` and `\` are still quoted.
+pub(crate) fn status_quote_path_full(
+    path: &[u8],
+    quote_space: bool,
+    quote_path_fully: bool,
+) -> String {
+    if !status_path_needs_quotes_full(path, quote_space, quote_path_fully) {
         return String::from_utf8_lossy(path).into_owned();
     }
-    let mut out = String::from("\"");
+    let mut out: Vec<u8> = vec![b'"'];
     for &byte in path {
         match byte {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            b'\n' => out.push_str("\\n"),
-            b'\t' => out.push_str("\\t"),
-            0x20..=0x7e => out.push(byte as char),
-            _ => out.push_str(&format!("\\{byte:03o}")),
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0x20..=0x7e => out.push(byte),
+            0x80..=0xff if !quote_path_fully => out.push(byte),
+            _ => out.extend_from_slice(format!("\\{byte:03o}").as_bytes()),
         }
     }
-    out.push('"');
-    out
+    out.push(b'"');
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub(crate) fn write_status_quoted_path(
@@ -11250,12 +11274,18 @@ pub(crate) fn write_status_quoted_path(
 }
 
 fn status_path_needs_quotes(path: &[u8], quote_space: bool) -> bool {
+    status_path_needs_quotes_full(path, quote_space, true)
+}
+
+fn status_path_needs_quotes_full(path: &[u8], quote_space: bool, quote_path_fully: bool) -> bool {
     path.iter().any(|&byte| {
         byte == b'"'
             || byte == b'\\'
             || byte == b'\n'
             || byte == b'\t'
-            || !(0x20..0x7f).contains(&byte)
+            || byte < 0x20
+            || byte == 0x7f
+            || (quote_path_fully && byte >= 0x80)
             || (quote_space && byte == b' ')
     })
 }

@@ -362,6 +362,7 @@ impl LogDiffContext<'_> {
                     compact_summary: opts.compact_summary,
                     stat_count: opts.stat_count,
                     color: false,
+                    quote_path_fully: true,
                 },
                 widths,
             )?;
@@ -516,6 +517,7 @@ impl LogDiffContext<'_> {
                     compact_summary: opts.compact_summary,
                     stat_count: opts.stat_count,
                     color: false,
+                    quote_path_fully: true,
                 },
                 widths,
             )?;

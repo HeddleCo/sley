@@ -771,6 +771,7 @@ fn render_diff_files_entries(
                     compact_summary: o.compact_summary,
                     stat_count: o.stat_count,
                     color: false,
+                    quote_path_fully: true,
                 },
                 widths: None,
             },

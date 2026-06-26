@@ -3830,6 +3830,7 @@ fn write_patch_diffstat(
             compact_summary: false,
             stat_count: options.stat_count,
             color: false,
+            quote_path_fully: true,
         },
         widths,
     )

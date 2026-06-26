@@ -1223,6 +1223,7 @@ fn write_merge_stat(
                 compact_summary: options.compact_summary,
                 stat_count: options.stat_count,
                 color,
+                quote_path_fully: true,
             },
             stat_widths,
         )?;
@@ -1511,6 +1512,7 @@ fn write_commit_diff_patch(
                         compact_summary: options.compact_summary,
                         stat_count: options.stat_count,
                         color,
+                        quote_path_fully: true,
                     },
                     widths: Some(stat_widths),
                 },
@@ -1578,6 +1580,7 @@ fn write_commit_diff_patch(
                         compact_summary: options.compact_summary,
                         stat_count: options.stat_count,
                         color,
+                        quote_path_fully: true,
                     },
                     widths: Some(stat_widths),
                 },
