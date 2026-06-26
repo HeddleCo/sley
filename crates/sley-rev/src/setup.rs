@@ -496,7 +496,7 @@ where
         match self.add_revision_arg(value) {
             Ok(()) => Ok(()),
             Err(_) if self.setup.options.ignore_missing => Ok(()),
-            Err(_) if path_exists(self.ctx, value) => {
+            Err(_) if path_exists(self.ctx, value) || looks_like_pathspec(value) => {
                 self.setup.pathspecs.push(value.to_string());
                 Ok(())
             }
@@ -815,6 +815,32 @@ pub fn ambiguous_argument_error(value: &str) -> GitError {
 
 fn ambiguous_argument(value: &str) -> Result<()> {
     Err(ambiguous_argument_error(value))
+}
+
+/// git's `looks_like_pathspec()`: an argument that fails to parse as a revision
+/// is still taken as a pathspec when it carries pathspec magic (`:(...)` or a
+/// `:/`, `:!`, `:^` short prefix) or an unescaped glob special (`*`, `?`, `[`),
+/// even if no matching file exists on disk.
+fn looks_like_pathspec(arg: &str) -> bool {
+    if arg.starts_with(":(") {
+        return true;
+    }
+    if let Some(rest) = arg.strip_prefix(':')
+        && matches!(rest.as_bytes().first(), Some(b'/' | b'!' | b'^'))
+    {
+        return true;
+    }
+    let mut bytes = arg.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'\\' => {
+                bytes.next();
+            }
+            b'*' | b'?' | b'[' => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn path_exists<R>(ctx: &RevisionSetupContext<'_, R>, value: &str) -> bool {
