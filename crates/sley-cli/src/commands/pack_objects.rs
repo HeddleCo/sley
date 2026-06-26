@@ -274,8 +274,8 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let database = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    options.object_filter = std::mem::take(&mut options.object_filter)
-        .resolve(&git_dir, &database, format)?;
+    options.object_filter =
+        std::mem::take(&mut options.object_filter).resolve(&git_dir, &database, format)?;
     let progress = options
         .progress
         .unwrap_or_else(|| io::stderr().is_terminal());
@@ -1235,7 +1235,11 @@ impl FilteredPackTraversal<'_> {
         provided: bool,
         state: &mut FilteredPackTraversalState,
     ) -> Result<()> {
-        if provided || self.filter.includes_object(ObjectType::Commit, &[], None, 0) {
+        if provided
+            || self
+                .filter
+                .includes_object(ObjectType::Commit, &[], None, 0)
+        {
             self.include_object(oid, Arc::clone(&object), state);
         } else {
             self.omit_object(oid, state);

@@ -279,7 +279,7 @@ impl LogDiffContext<'_> {
                     detect_inexact: true,
                     rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                     copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-                rename_limit: 0,
+                    rename_limit: 0,
                 },
             )?,
             (Some(parent), false) => sley_diff_merge::diff_name_status_trees_with_options(

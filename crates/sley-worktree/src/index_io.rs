@@ -66,7 +66,10 @@ pub(crate) fn restore_index_entry(
     Ok(Some(index_entry_with_refreshed_stat(entry, &metadata)))
 }
 
-pub(crate) fn index_entry_with_refreshed_stat(entry: &IndexEntry, metadata: &fs::Metadata) -> IndexEntry {
+pub(crate) fn index_entry_with_refreshed_stat(
+    entry: &IndexEntry,
+    metadata: &fs::Metadata,
+) -> IndexEntry {
     let mut refreshed = index_entry_from_metadata(entry.path.clone(), entry.oid, metadata);
     refreshed.mode = entry.mode;
     refreshed.flags = entry.flags;
@@ -196,7 +199,10 @@ pub(crate) fn index_entry_from_metadata_with_filemode(
     entry
 }
 
-pub(crate) fn trust_executable_bit_from_git_dir(git_dir: &Path, config_parameters_env: Option<&str>) -> bool {
+pub(crate) fn trust_executable_bit_from_git_dir(
+    git_dir: &Path,
+    config_parameters_env: Option<&str>,
+) -> bool {
     sley_config::read_repo_config(git_dir, config_parameters_env)
         .ok()
         .as_ref()
@@ -208,7 +214,10 @@ pub(crate) fn trust_executable_bit(config: &GitConfig) -> bool {
     config.get_bool("core", None, "filemode").unwrap_or(true)
 }
 
-pub(crate) fn trust_symlinks_from_git_dir(git_dir: &Path, config_parameters_env: Option<&str>) -> bool {
+pub(crate) fn trust_symlinks_from_git_dir(
+    git_dir: &Path,
+    config_parameters_env: Option<&str>,
+) -> bool {
     sley_config::read_repo_config(git_dir, config_parameters_env)
         .ok()
         .as_ref()
@@ -262,7 +271,11 @@ pub(crate) fn apply_unix_metadata_to_index_entry(entry: &mut IndexEntry, metadat
 }
 
 #[cfg(not(unix))]
-pub(crate) fn apply_unix_metadata_to_index_entry(_entry: &mut IndexEntry, _metadata: &fs::Metadata) {}
+pub(crate) fn apply_unix_metadata_to_index_entry(
+    _entry: &mut IndexEntry,
+    _metadata: &fs::Metadata,
+) {
+}
 
 pub(crate) fn index_size_from_metadata(metadata: &fs::Metadata) -> u32 {
     metadata.len().min(u32::MAX as u64) as u32
@@ -311,7 +324,11 @@ pub(crate) fn missing_kind_for_type(object_type: ObjectType) -> MissingObjectKin
     }
 }
 
-pub(crate) fn read_commit(db: &FileObjectDatabase, format: ObjectFormat, oid: &ObjectId) -> Result<Commit> {
+pub(crate) fn read_commit(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Commit> {
     let object = read_expected_object(db, oid, ObjectType::Commit)?;
     Commit::parse(format, &object.body)
 }
@@ -565,7 +582,10 @@ pub(crate) fn read_index_entries(
     Ok(read_index_entries_with_stat_cache(git_dir, format, &db)?.0)
 }
 
-pub(crate) fn read_all_index_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet<Vec<u8>>> {
+pub(crate) fn read_all_index_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<BTreeSet<Vec<u8>>> {
     let index_path = repository_index_path(git_dir);
     let bytes = match fs::read(index_path) {
         Ok(bytes) => bytes,
@@ -596,7 +616,10 @@ pub(crate) fn resolve_head_tree_oid(
     Ok(Some(commit.tree))
 }
 
-pub(crate) fn resolve_head_commit_oid(git_dir: &Path, format: ObjectFormat) -> Result<Option<ObjectId>> {
+pub(crate) fn resolve_head_commit_oid(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Option<ObjectId>> {
     let refs = FileRefStore::new(git_dir, format);
     sley_refs::resolve_ref_peeled(&refs, "HEAD")
 }
@@ -1226,7 +1249,11 @@ pub(crate) struct TrackedOnlyCleanFilter {
 }
 
 impl TrackedOnlyCleanFilter {
-    pub(crate) fn read_attributes_for_path(&mut self, worktree_root: &Path, git_path: &[u8]) -> Result<()> {
+    pub(crate) fn read_attributes_for_path(
+        &mut self,
+        worktree_root: &Path,
+        git_path: &[u8],
+    ) -> Result<()> {
         self.read_attribute_dir(worktree_root, &[])?;
         let mut prefix = Vec::new();
         let mut parts = git_path.split(|byte| *byte == b'/').peekable();
@@ -1581,7 +1608,10 @@ pub(crate) fn collect_worktree_entries(
     Ok(())
 }
 
-pub(crate) fn tracked_paths_may_contain(tracked_paths: &BTreeSet<Vec<u8>>, directory: &[u8]) -> bool {
+pub(crate) fn tracked_paths_may_contain(
+    tracked_paths: &BTreeSet<Vec<u8>>,
+    directory: &[u8],
+) -> bool {
     if tracked_paths.contains(directory) {
         return true;
     }
@@ -1892,4 +1922,3 @@ pub(crate) fn path_has_trailing_separator(path: &Path) -> bool {
         .to_string_lossy()
         .ends_with(std::path::MAIN_SEPARATOR)
 }
-

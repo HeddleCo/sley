@@ -165,7 +165,10 @@ impl LargeObjectPolicy {
     }
 }
 
-pub(crate) fn effective_worktree_config(git_dir: &Path, parameters_env: Option<&str>) -> Result<GitConfig> {
+pub(crate) fn effective_worktree_config(
+    git_dir: &Path,
+    parameters_env: Option<&str>,
+) -> Result<GitConfig> {
     let common = common_git_dir_for_worktree_config(git_dir);
     let context = sley_config::ConfigIncludeContext::new(
         Some(common.clone()),
@@ -597,8 +600,9 @@ pub(crate) struct CachedRepositoryIndexStatProbes {
     probes: IndexStatProbeCache,
 }
 
-pub(crate) static REPOSITORY_INDEX_STAT_PROBES: OnceLock<Mutex<Option<CachedRepositoryIndexStatProbes>>> =
-    OnceLock::new();
+pub(crate) static REPOSITORY_INDEX_STAT_PROBES: OnceLock<
+    Mutex<Option<CachedRepositoryIndexStatProbes>>,
+> = OnceLock::new();
 
 pub(crate) fn cached_repository_index_stat_probe(
     index_path: &Path,
@@ -1105,4 +1109,3 @@ impl ShortStatusRow<'_> {
         )
     }
 }
-

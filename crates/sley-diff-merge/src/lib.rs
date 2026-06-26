@@ -1197,7 +1197,13 @@ pub fn merge_blobs(
         let base_region = &base_lines[base_idx..seg.base_start];
         let our_region = &ours_lines[our_idx..seg.ours_start];
         let their_region = &theirs_lines[their_idx..seg.theirs_start];
-        emit_region(&mut writer, base_region, our_region, their_region, options.ws_ignore);
+        emit_region(
+            &mut writer,
+            base_region,
+            our_region,
+            their_region,
+            options.ws_ignore,
+        );
 
         // The stable segment matched on both sides. Emit ours' actual bytes
         // (xdl_merge copies common spans from file1): identical to base under an
@@ -3322,8 +3328,14 @@ fn detect_inexact_renames(
     // git only does this for pure rename detection (`!want_copies`); when copies
     // are also wanted it culls differently and skips the basename heuristic.
     if !options.base.detect_copies {
-        let src_paths: Vec<&[u8]> = deleted.iter().map(|(idx, _)| &changes[*idx].path[..]).collect();
-        let dst_paths: Vec<&[u8]> = added.iter().map(|(idx, _)| &changes[*idx].path[..]).collect();
+        let src_paths: Vec<&[u8]> = deleted
+            .iter()
+            .map(|(idx, _)| &changes[*idx].path[..])
+            .collect();
+        let dst_paths: Vec<&[u8]> = added
+            .iter()
+            .map(|(idx, _)| &changes[*idx].path[..])
+            .collect();
         let basename_pairs = basename_rename_matches(
             &src_paths,
             &dst_paths,
@@ -4962,7 +4974,10 @@ pub fn reverse_file_patch(patch: &FilePatch) -> FilePatch {
         is_binary: patch.is_binary,
         binary: patch.binary.as_ref().map(|binary| BinaryPatch {
             // `-R` swaps forward and reverse hunks (git's apply_in_reverse).
-            forward: binary.reverse.clone().unwrap_or_else(|| binary.forward.clone()),
+            forward: binary
+                .reverse
+                .clone()
+                .unwrap_or_else(|| binary.forward.clone()),
             reverse: Some(binary.forward.clone()),
         }),
         is_toplevel_relative: patch.is_toplevel_relative,
@@ -5176,7 +5191,11 @@ fn ws_line_from_bytes(bytes: Vec<u8>, common: bool) -> WsImageLine {
 }
 
 /// Whitespace-aware single-file apply — git's `apply_one_fragment` matching path.
-pub fn apply_file_patch_ws(base: &[u8], patch: &FilePatch, opts: &WsApplyOptions) -> WsApplyOutcome {
+pub fn apply_file_patch_ws(
+    base: &[u8],
+    patch: &FilePatch,
+    opts: &WsApplyOptions,
+) -> WsApplyOutcome {
     if patch.is_delete && patch.hunks.is_empty() {
         return WsApplyOutcome::Applied {
             content: Vec::new(),
@@ -6270,8 +6289,8 @@ impl<'a> PatchParser<'a> {
             if max_byte_length < byte_length || byte_length <= max_byte_length.saturating_sub(4) {
                 return Err(self.corrupt_binary_error());
             }
-            let decoded =
-                decode_base85(&data[1..], byte_length).ok_or_else(|| self.corrupt_binary_error())?;
+            let decoded = decode_base85(&data[1..], byte_length)
+                .ok_or_else(|| self.corrupt_binary_error())?;
             deflated.extend_from_slice(&decoded);
             self.index += 1;
         }
@@ -6312,8 +6331,7 @@ impl<'a> PatchParser<'a> {
         let first_line = self.lines[self.index];
         let first = first_line[b"--- ".len()..].to_vec();
         self.index += 1;
-        let second = if self.index < self.lines.len()
-            && self.lines[self.index].starts_with(b"+++ ")
+        let second = if self.index < self.lines.len() && self.lines[self.index].starts_with(b"+++ ")
         {
             let s = self.lines[self.index][b"+++ ".len()..].to_vec();
             self.index += 1;
@@ -7533,7 +7551,11 @@ pub fn merge_entry_maps(
             match options.favor {
                 MergeFavor::Ours => {
                     leaves.insert(path.clone(), (ours_mode, ours_oid));
-                    paths.push(clean_path_auto(path.clone(), Some((ours_mode, ours_oid)), false));
+                    paths.push(clean_path_auto(
+                        path.clone(),
+                        Some((ours_mode, ours_oid)),
+                        false,
+                    ));
                 }
                 MergeFavor::Theirs => {
                     leaves.insert(path.clone(), (theirs_mode, theirs_oid));
@@ -7546,7 +7568,8 @@ pub fn merge_entry_maps(
                 MergeFavor::None | MergeFavor::Union => {
                     clean = false;
                     leaves.insert(path.clone(), (ours_mode, ours_oid));
-                    let worktree = Some((ours_mode, merge_worktree_bytes(db, ours_mode, &ours_oid)?));
+                    let worktree =
+                        Some((ours_mode, merge_worktree_bytes(db, ours_mode, &ours_oid)?));
                     paths.push(MergedPath {
                         path: path.clone(),
                         stages: stages_for(&base, &ours, &theirs),
@@ -7606,8 +7629,7 @@ pub fn merge_entry_maps(
                 ours_renamed: rename_ours.then(|| ours_path.clone()),
                 theirs_renamed: rename_theirs.then(|| theirs_path.clone()),
             };
-            let ours_worktree =
-                Some((ours_mode, merge_worktree_bytes(db, ours_mode, &ours_oid)?));
+            let ours_worktree = Some((ours_mode, merge_worktree_bytes(db, ours_mode, &ours_oid)?));
             paths.push(MergedPath {
                 path: ours_path,
                 stages: MergeStages {
@@ -7624,8 +7646,10 @@ pub fn merge_entry_maps(
                 }),
                 auto_merged: false,
             });
-            let theirs_worktree =
-                Some((theirs_mode, merge_worktree_bytes(db, theirs_mode, &theirs_oid)?));
+            let theirs_worktree = Some((
+                theirs_mode,
+                merge_worktree_bytes(db, theirs_mode, &theirs_oid)?,
+            ));
             paths.push(MergedPath {
                 path: theirs_path,
                 stages: MergeStages {
@@ -9667,10 +9691,8 @@ fn write_two_sided_dest_conflict(
             } else {
                 0o100644
             };
-            let oid = db.write_object(EncodedObject::new(
-                ObjectType::Blob,
-                merged.content.clone(),
-            ))?;
+            let oid =
+                db.write_object(EncodedObject::new(ObjectType::Blob, merged.content.clone()))?;
             (mode, merged.content, Some((mode, oid)))
         }
         (Some((mode, content)), None) | (None, Some((mode, content))) => {
@@ -10255,7 +10277,10 @@ mod tests {
             ..merge_opts()
         };
         let result = merge_blobs(base, ours, theirs, &options);
-        assert!(!result.conflicted, "whitespace-only divergence is not a conflict");
+        assert!(
+            !result.conflicted,
+            "whitespace-only divergence is not a conflict"
+        );
         assert_eq!(result.content, b"alpha beta\nsecond CHANGED\n".to_vec());
     }
 
@@ -10381,8 +10406,14 @@ index ccccccc..ddddddd 100644
         // The `index <a>..<b> 100644` line carries the unchanged-file mode, which
         // git's gitdiff_index records as old_mode.
         assert_eq!(patches[0].old_mode, Some(0o100644));
-        assert_eq!(patches[0].old_oid_hex.as_deref(), Some(b"aaaaaaa".as_slice()));
-        assert_eq!(patches[0].new_oid_hex.as_deref(), Some(b"bbbbbbb".as_slice()));
+        assert_eq!(
+            patches[0].old_oid_hex.as_deref(),
+            Some(b"aaaaaaa".as_slice())
+        );
+        assert_eq!(
+            patches[0].new_oid_hex.as_deref(),
+            Some(b"bbbbbbb".as_slice())
+        );
         assert_eq!(patches[0].hunks.len(), 1);
         let h = &patches[0].hunks[0];
         assert_eq!(
@@ -10887,7 +10918,7 @@ new mode 100755
             detect_inexact: true,
             rename_threshold: DEFAULT_RENAME_THRESHOLD,
             copy_threshold: DEFAULT_RENAME_THRESHOLD,
-        rename_limit: 0,
+            rename_limit: 0,
         };
         let entries = diff_name_status_trees_with_rename_options(
             &db,
@@ -10937,7 +10968,7 @@ new mode 100755
             detect_inexact: true,
             rename_threshold: 60,
             copy_threshold: 60,
-        rename_limit: 0,
+            rename_limit: 0,
         };
         let entries = diff_name_status_trees_with_rename_options(
             &db,
@@ -11001,7 +11032,7 @@ new mode 100755
                 detect_inexact: inexact,
                 rename_threshold: DEFAULT_RENAME_THRESHOLD,
                 copy_threshold: DEFAULT_RENAME_THRESHOLD,
-            rename_limit: 0,
+                rename_limit: 0,
             };
             let entries = diff_name_status_trees_with_rename_options(
                 &db,
@@ -11051,7 +11082,7 @@ new mode 100755
             detect_inexact: true,
             rename_threshold: DEFAULT_RENAME_THRESHOLD,
             copy_threshold: DEFAULT_RENAME_THRESHOLD,
-        rename_limit: 0,
+            rename_limit: 0,
         };
         let entries = diff_name_status_trees_with_rename_options(
             &db,
@@ -12255,7 +12286,7 @@ new mode 100755
             detect_inexact: true,
             rename_threshold: DEFAULT_RENAME_THRESHOLD,
             copy_threshold: DEFAULT_RENAME_THRESHOLD,
-        rename_limit: 0,
+            rename_limit: 0,
         };
 
         // Reference: full flatten + same detection.

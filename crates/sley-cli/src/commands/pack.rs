@@ -40,19 +40,17 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
     // the surrounding repository. A `<pack-file>` argument (not `--stdin`) can
     // run outside any repo, so only fall back to repo discovery when needed.
     let repo = match discover_git_dir(env::current_dir()?) {
-        Ok(git_dir) => {
-            match common_git_dir_for_git_dir(&git_dir) {
-                Ok(common_git_dir) => {
-                    let format = match options.object_format {
-                        Some(format) => format,
-                        None => repository_object_format(&common_git_dir)?,
-                    };
-                    Some((common_git_dir, format))
-                }
-                Err(err) if !options.stdin && options.object_format.is_some() => None,
-                Err(err) => return Err(err),
+        Ok(git_dir) => match common_git_dir_for_git_dir(&git_dir) {
+            Ok(common_git_dir) => {
+                let format = match options.object_format {
+                    Some(format) => format,
+                    None => repository_object_format(&common_git_dir)?,
+                };
+                Some((common_git_dir, format))
             }
-        }
+            Err(err) if !options.stdin && options.object_format.is_some() => None,
+            Err(err) => return Err(err),
+        },
         Err(err) => {
             // Outside a repo, a file-mode index-pack is still valid: `git`
             // falls back to the built-in hash (SHA-1) when no repository names
@@ -1592,7 +1590,9 @@ fn gc_run_locked(
         if let Some(result) = sley_odb::repack_loose_objects(&common_git_dir, format)? {
             sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
         }
-    } else if prune_expire.as_deref() == Some("now") && !(cruft_packs && options.expire_to.is_some()) {
+    } else if prune_expire.as_deref() == Some("now")
+        && !(cruft_packs && options.expire_to.is_some())
+    {
         // prune_expire=="now" with cruft (no expire-to): immediate drop via -a.
         trace_gc_repack(&["repack", "-d", "-l", "-a"]);
         let repack_options = sley_odb::RepackOptions {
@@ -1626,7 +1626,10 @@ fn gc_run_locked(
             trace_args.push(&cruft_expiration_arg);
         }
         let max_cruft_size_arg;
-        if let Some(size) = options.max_cruft_size.or_else(|| gc_config_u64(config, "maxCruftSize")) {
+        if let Some(size) = options
+            .max_cruft_size
+            .or_else(|| gc_config_u64(config, "maxCruftSize"))
+        {
             max_cruft_size_arg = format!("--max-cruft-size={size}");
             trace_args.push(&max_cruft_size_arg);
         }
@@ -1722,7 +1725,9 @@ fn gc_run_locked(
             gc_prune_expired_loose(&common_git_dir, format, &roots, expire)?;
         } else {
             let expire = parse_prune_expire(
-                config.get("gc", None, "pruneExpire").unwrap_or("2.weeks.ago"),
+                config
+                    .get("gc", None, "pruneExpire")
+                    .unwrap_or("2.weeks.ago"),
                 "gc.pruneExpire",
             )?;
             gc_pack_recent_unreachable_loose(&common_git_dir, format, &roots, expire)?;
@@ -1750,7 +1755,9 @@ fn gc_run_locked(
         ])?;
     }
     if options.auto && gc_too_many_loose_objects(&common_git_dir, format, config)? {
-        eprintln!("warning: There are too many unreachable loose objects; run 'git prune' to remove them.");
+        eprintln!(
+            "warning: There are too many unreachable loose objects; run 'git prune' to remove them."
+        );
     }
 
     Ok(())
@@ -1906,7 +1913,10 @@ fn gc_before_repack(
     config: &GitConfig,
 ) -> Result<()> {
     if gc_pack_refs(config, common_git_dir)? {
-        crate::setup::git_trace_line("builtin/gc.c:0", "trace: built-in: git pack-refs --all --prune");
+        crate::setup::git_trace_line(
+            "builtin/gc.c:0",
+            "trace: built-in: git pack-refs --all --prune",
+        );
         commands::pack::cmd_pack_refs(&["--all".to_string(), "--prune".to_string()])?;
     }
     let reflog_expire_never = is_config_never(config, "gc", "reflogExpire");
@@ -2161,7 +2171,10 @@ fn gc_lock_held(common_git_dir: &Path) -> Result<bool> {
 
 fn gc_write_pid(common_git_dir: &Path) -> Result<()> {
     let host = env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
-    fs::write(common_git_dir.join("gc.pid"), format!("{} {host}", std::process::id()))?;
+    fs::write(
+        common_git_dir.join("gc.pid"),
+        format!("{} {host}", std::process::id()),
+    )?;
     Ok(())
 }
 
@@ -2198,7 +2211,11 @@ fn parse_gc_size(value: &str) -> Result<u64> {
         "k" => 1024,
         "m" => 1024 * 1024,
         "g" => 1024 * 1024 * 1024,
-        _ => return Err(GitError::Command(format!("bad numeric config value '{value}'"))),
+        _ => {
+            return Err(GitError::Command(format!(
+                "bad numeric config value '{value}'"
+            )));
+        }
     };
     size = size.saturating_mul(multiplier);
     Ok(size)
@@ -4558,7 +4575,12 @@ pub(crate) fn cmd_prune(args: &[String]) -> Result<()> {
     let format = repository_object_format(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let mut roots = prune_roots(&git_dir, &common_git_dir, format, &options.heads)?;
-    roots.extend(prune_recent_object_roots(&db, &common_git_dir, format, options.expire)?);
+    roots.extend(prune_recent_object_roots(
+        &db,
+        &common_git_dir,
+        format,
+        options.expire,
+    )?);
     roots.extend(prune_recent_hook_roots(&common_git_dir, format)?);
     roots.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     roots.dedup();
@@ -4588,8 +4610,19 @@ pub(crate) fn cmd_prune(args: &[String]) -> Result<()> {
             }
         }
     }
-    prune_shallow_file(&common_git_dir, format, &reachable, options.dry_run, options.verbose)?;
-    prune_temporary_files(&common_git_dir.join("objects"), options.expire, options.dry_run, options.verbose)?;
+    prune_shallow_file(
+        &common_git_dir,
+        format,
+        &reachable,
+        options.dry_run,
+        options.verbose,
+    )?;
+    prune_temporary_files(
+        &common_git_dir.join("objects"),
+        options.expire,
+        options.dry_run,
+        options.verbose,
+    )?;
     prune_temporary_files(
         &common_git_dir.join("objects").join("pack"),
         options.expire,
@@ -5766,7 +5799,8 @@ fn write_default_midx(object_dir: &Path, format: ObjectFormat) -> Result<()> {
 
     let mut objects = Vec::new();
     for (pack_int_id, pack_name) in pack_names.iter().enumerate() {
-        let index = PackIndex::parse_without_checksum(&fs::read(pack_dir.join(pack_name))?, format)?;
+        let index =
+            PackIndex::parse_without_checksum(&fs::read(pack_dir.join(pack_name))?, format)?;
         for entry in index.entries {
             objects.push(MultiPackIndexEntry {
                 oid: entry.oid,
@@ -5894,7 +5928,8 @@ fn cmd_multi_pack_index_repack(args: &[String]) -> Result<()> {
     let mut pack_size = vec![0u64; num_packs];
     let mut pack_mtime = vec![std::time::UNIX_EPOCH; num_packs];
     for (i, name) in midx.pack_names.iter().enumerate() {
-        if let Ok(index) = PackIndex::parse_without_checksum(&fs::read(pack_dir.join(name))?, format)
+        if let Ok(index) =
+            PackIndex::parse_without_checksum(&fs::read(pack_dir.join(name))?, format)
         {
             pack_objects_total[i] = index.entries.len() as u64;
         }
@@ -6070,7 +6105,11 @@ fn cmd_multi_pack_index_verify(args: &[String]) -> Result<()> {
 /// `die()`/`error()` strings; verify-time corruptions (incorrect checksum,
 /// failed pack load, no oid, oid lookup order, incorrect object offset) are
 /// reported the way upstream's verify pass reports them.
-pub(crate) fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -> Result<()> {
+pub(crate) fn verify_midx_at(
+    object_dir: &Path,
+    format: ObjectFormat,
+    progress: bool,
+) -> Result<()> {
     let pack_dir = object_dir.join("pack");
     let midx_path = pack_dir.join("multi-pack-index");
     let bytes = match fs::read(&midx_path) {

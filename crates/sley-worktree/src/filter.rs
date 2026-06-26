@@ -143,8 +143,7 @@ pub(crate) enum BomProblem {
 /// byte-order-agnostic one (`UTF-16` / `UTF-32`) must.
 pub(crate) fn utf_bom_problem(suffix: &str, data: &[u8]) -> Option<BomProblem> {
     let has16 = data.starts_with(&[0xFF, 0xFE]) || data.starts_with(&[0xFE, 0xFF]);
-    let has32 =
-        data.starts_with(&[0xFF, 0xFE, 0, 0]) || data.starts_with(&[0, 0, 0xFE, 0xFF]);
+    let has32 = data.starts_with(&[0xFF, 0xFE, 0, 0]) || data.starts_with(&[0, 0, 0xFE, 0xFF]);
     match suffix {
         "16LE" | "16BE" => has16.then_some(BomProblem::Prohibited),
         "32LE" | "32BE" => has32.then_some(BomProblem::Prohibited),
@@ -280,7 +279,11 @@ pub(crate) fn encode_utf32(utf8: &[u8], le: bool, bom: bool) -> Option<Vec<u8>> 
     }
     for ch in text.chars() {
         let cp = ch as u32;
-        out.extend_from_slice(&if le { cp.to_le_bytes() } else { cp.to_be_bytes() });
+        out.extend_from_slice(&if le {
+            cp.to_le_bytes()
+        } else {
+            cp.to_be_bytes()
+        });
     }
     Some(out)
 }
@@ -403,7 +406,9 @@ pub(crate) fn report_encode_failure(write_object: bool, message: &str) -> Result
 /// an *unset* one is binary, `=auto` is auto, `=input` forces LF while still
 /// counting as text, and any other value is "undefined" — i.e. no opinion, so
 /// the caller falls through to the next source (the `crlf` alias, then config).
-pub(crate) fn decode_crlf_family_attribute(state: Option<&AttributeState>) -> (TextDecision, EolConversion) {
+pub(crate) fn decode_crlf_family_attribute(
+    state: Option<&AttributeState>,
+) -> (TextDecision, EolConversion) {
     match state {
         Some(AttributeState::Set) => (TextDecision::Text, EolConversion::None),
         Some(AttributeState::Unset) => (TextDecision::Binary, EolConversion::None),
@@ -692,7 +697,11 @@ pub(crate) fn resolve_filter_driver(
     })
 }
 
-pub(crate) fn filter_config_value(config: &GitConfig, subsection: &str, key: &str) -> Option<String> {
+pub(crate) fn filter_config_value(
+    config: &GitConfig,
+    subsection: &str,
+    key: &str,
+) -> Option<String> {
     config
         .get("filter", Some(subsection), key)
         .map(str::to_owned)
@@ -797,7 +806,10 @@ pub(crate) fn ident_to_git_cow(content: Cow<'_, [u8]>) -> Cow<'_, [u8]> {
 
 /// Expand `$Id$` and git-style `$Id: <hex> $` keywords using the blob id of the
 /// unexpanded content, matching convert.c's ident_to_worktree.
-pub(crate) fn ident_to_worktree_cow(format: ObjectFormat, content: Cow<'_, [u8]>) -> Result<Cow<'_, [u8]>> {
+pub(crate) fn ident_to_worktree_cow(
+    format: ObjectFormat,
+    content: Cow<'_, [u8]>,
+) -> Result<Cow<'_, [u8]>> {
     let input = content.as_ref();
     if !has_git_ident(input) {
         return Ok(content);
@@ -930,9 +942,11 @@ pub(crate) const PROCESS_CAP_SMUDGE: u8 = 1 << 1;
 pub(crate) const PROCESS_CAP_DELAY: u8 = 1 << 2;
 pub(crate) const PKT_DATA_MAX: usize = 65_516;
 
-pub(crate) static PROCESS_FILTERS: OnceLock<Mutex<HashMap<String, ProcessFilter>>> = OnceLock::new();
+pub(crate) static PROCESS_FILTERS: OnceLock<Mutex<HashMap<String, ProcessFilter>>> =
+    OnceLock::new();
 pub(crate) type ProcessFilterMetadata = Vec<(String, String)>;
-pub(crate) static PROCESS_FILTER_METADATA: OnceLock<Mutex<Option<ProcessFilterMetadata>>> = OnceLock::new();
+pub(crate) static PROCESS_FILTER_METADATA: OnceLock<Mutex<Option<ProcessFilterMetadata>>> =
+    OnceLock::new();
 
 pub(crate) struct ProcessFilterMetadataGuard {
     previous: Option<ProcessFilterMetadata>,
@@ -1196,7 +1210,9 @@ pub(crate) fn write_pkt_data(
         })
 }
 
-pub(crate) fn write_flush(writer: &mut ChildStdin) -> std::result::Result<(), ProcessFilterFailure> {
+pub(crate) fn write_flush(
+    writer: &mut ChildStdin,
+) -> std::result::Result<(), ProcessFilterFailure> {
     writer
         .write_all(b"0000")
         .and_then(|_| writer.flush())
@@ -1739,7 +1755,10 @@ pub(crate) fn run_driver<'a>(
 
 /// Compute the attributes relevant to content filtering (`text`, `eol`,
 /// `filter`) for `path` from the worktree `.gitattributes` chain.
-pub(crate) fn filter_attribute_checks(worktree_root: &Path, path: &[u8]) -> Result<Vec<AttributeCheck>> {
+pub(crate) fn filter_attribute_checks(
+    worktree_root: &Path,
+    path: &[u8],
+) -> Result<Vec<AttributeCheck>> {
     let requested = filter_attribute_names();
     let mut matcher = AttributeMatcher::default();
     let git_dir = worktree_root.join(".git");
@@ -2260,4 +2279,3 @@ pub fn eol_attribute_checks(
 ) -> Result<Vec<AttributeCheck>> {
     filter_attribute_checks(worktree_root.as_ref(), path)
 }
-

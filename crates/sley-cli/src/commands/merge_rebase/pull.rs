@@ -838,10 +838,24 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             "--no-write-fetch-head" => no_write_fetch_head = true,
             "--tags" => tags = Some(true),
             "--no-tags" => tags = Some(false),
-            "-n" | "--no-stat" | "--stat" | "--summary" | "--no-summary" | "--compact-summary"
-            | "--no-compact-summary" | "--log" | "--no-log" | "--commit" | "--no-commit"
-            | "--squash" | "--no-squash" | "--allow-unrelated-histories"
-            | "--no-allow-unrelated-histories" | "--signoff" | "--no-signoff" | "--no-verify"
+            "-n"
+            | "--no-stat"
+            | "--stat"
+            | "--summary"
+            | "--no-summary"
+            | "--compact-summary"
+            | "--no-compact-summary"
+            | "--log"
+            | "--no-log"
+            | "--commit"
+            | "--no-commit"
+            | "--squash"
+            | "--no-squash"
+            | "--allow-unrelated-histories"
+            | "--no-allow-unrelated-histories"
+            | "--signoff"
+            | "--no-signoff"
+            | "--no-verify"
             | "--verify" => merge_passthrough.push(arg.clone()),
             value if value.starts_with("--log=") || value.starts_with("--cleanup=") => {
                 merge_passthrough.push(value.to_string());

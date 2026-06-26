@@ -675,7 +675,7 @@ fn count_splittable(body: &[String]) -> usize {
 // Prompt strings (PatchMode::Add)
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT: &str ="y - stage this hunk\n\
+const HELP_TEXT: &str = "y - stage this hunk\n\
     n - do not stage this hunk\n\
     q - quit; do not stage this hunk or any of the remaining ones\n\
     a - stage this hunk and all later hunks in the file\n\
@@ -1909,7 +1909,8 @@ fn apply_file_via_patch(fd: &FileDiff, mode: PatchMode, stdin: &mut impl BufRead
     if reverse {
         args.push("-R");
     }
-    let (_out, ok) = run_capture_status(&args, Some(patch)).map_err(|e| GitError::Io(e.to_string()))?;
+    let (_out, ok) =
+        run_capture_status(&args, Some(patch)).map_err(|e| GitError::Io(e.to_string()))?;
     if !ok {
         eprintln!("error: 'git apply' failed");
     }

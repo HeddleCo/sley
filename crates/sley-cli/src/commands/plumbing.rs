@@ -3669,9 +3669,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                         eprintln!("error: {message}");
                         GitError::Exit(1)
                     }
-                    GitError::InvalidFormat(message)
-                        if message.starts_with("binary-corrupt:") =>
-                    {
+                    GitError::InvalidFormat(message) if message.starts_with("binary-corrupt:") => {
                         let line = message.strip_prefix("binary-corrupt:").unwrap_or("");
                         eprintln!("error: corrupt binary patch at {name}:{line}: ");
                         GitError::Exit(128)
@@ -3686,7 +3684,8 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                         );
                         GitError::Exit(128)
                     }
-                    GitError::InvalidFormat(message) if message.starts_with("invalid mode on line") =>
+                    GitError::InvalidFormat(message)
+                        if message.starts_with("invalid mode on line") =>
                     {
                         eprintln!("error: {message}");
                         GitError::Exit(128)
@@ -3699,7 +3698,10 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     // whitespace handling or application (git reverses the parsed patches up
     // front).
     if reverse {
-        patches = patches.iter().map(sley_diff_merge::reverse_file_patch).collect();
+        patches = patches
+            .iter()
+            .map(sley_diff_merge::reverse_file_patch)
+            .collect();
     }
     // git's `prefix_patch` + `use_patch`: prepend the cwd prefix to every
     // non-toplevel-relative (traditional) patch, then drop any patch whose
@@ -3801,8 +3803,13 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             if patch.new_mode.or(patch.old_mode) == Some(0o120000) {
                 rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
             }
-            let base =
-                read_patch_base(&worktree_base, patch, index.as_ref(), &db, verify_worktree_match)?;
+            let base = read_patch_base(
+                &worktree_base,
+                patch,
+                index.as_ref(),
+                &db,
+                verify_worktree_match,
+            )?;
             apply_patch_whitespace(
                 patch,
                 &base,
@@ -3832,7 +3839,11 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 eprintln!("error: {n} {adds} whitespace errors.");
             }
             WsAction::Fix => {
-                let applied = if n == 1 { "line applied" } else { "lines applied" };
+                let applied = if n == 1 {
+                    "line applied"
+                } else {
+                    "lines applied"
+                };
                 eprintln!("warning: {n} {applied} after fixing whitespace errors.");
             }
             _ => {
@@ -3859,7 +3870,13 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     // applies is unchanged; this is what makes the "replace submodule with a
     // directory must fail" / untracked-file-in-the-way cases abort like git.
     if has_gitlink_patch && !check {
-        apply_check_to_create(&worktree_base, &patches, index.as_ref(), touch_index, cached)?;
+        apply_check_to_create(
+            &worktree_base,
+            &patches,
+            index.as_ref(),
+            touch_index,
+            cached,
+        )?;
     }
 
     // `--3way`: reconstruct the recorded pre-image, apply the patch to it to form
@@ -3901,8 +3918,13 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 }
                 continue;
             }
-            let base =
-                read_patch_base(&worktree_base, patch, index.as_ref(), &db, verify_worktree_match)?;
+            let base = read_patch_base(
+                &worktree_base,
+                patch,
+                index.as_ref(),
+                &db,
+                verify_worktree_match,
+            )?;
             let content = match sley_diff_merge::apply_file_patch_with_options(
                 &base,
                 patch,
@@ -3938,8 +3960,13 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             actions.push(ApplyAction::Gitlink { path: target, oid });
             continue;
         }
-        let base =
-            read_patch_base(&worktree_base, patch, index.as_ref(), &db, verify_worktree_match)?;
+        let base = read_patch_base(
+            &worktree_base,
+            patch,
+            index.as_ref(),
+            &db,
+            verify_worktree_match,
+        )?;
         // Binary patches reconstruct the postimage from the recorded blob OIDs
         // (and the `GIT binary patch` payload), not from textual hunks.
         if patch.is_binary {
@@ -3955,8 +3982,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                         return Err(GitError::InvalidFormat("patch missing target path".into()));
                     };
                     let mode = apply_write_mode(&worktree_base, patch, &target)?;
-                    let index_mode =
-                        apply_index_mode_and_warn(patch, &target, mode, &index_modes);
+                    let index_mode = apply_index_mode_and_warn(patch, &target, mode, &index_modes);
                     actions.push(ApplyAction::Write {
                         path: target,
                         mode,
@@ -4106,10 +4132,17 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 content,
             } => {
                 if !cached {
-                    apply_write_worktree_file(&worktree_base, path, content, *mode, umask_complement)?;
+                    apply_write_worktree_file(
+                        &worktree_base,
+                        path,
+                        content,
+                        *mode,
+                        umask_complement,
+                    )?;
                 }
                 if let Some(index) = index.as_mut() {
-                    let oid = db.write_object(EncodedObject::new(ObjectType::Blob, content.clone()))?;
+                    let oid =
+                        db.write_object(EncodedObject::new(ObjectType::Blob, content.clone()))?;
                     apply_index_upsert(index, path, *index_mode, oid);
                 }
             }
@@ -4118,7 +4151,9 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                     merge_remove_worktree_file(&worktree_base, path)?;
                 }
                 if let Some(index) = index.as_mut() {
-                    index.entries.retain(|entry| entry.path.as_bytes() != path.as_slice());
+                    index
+                        .entries
+                        .retain(|entry| entry.path.as_bytes() != path.as_slice());
                 }
             }
             ApplyAction::Gitlink { path, oid } => {
@@ -4130,16 +4165,16 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 }
             }
             ApplyAction::GitlinkRemove { path } => {
-                if !cached
-                    && let Ok(rel) = std::str::from_utf8(path)
-                {
+                if !cached && let Ok(rel) = std::str::from_utf8(path) {
                     // git's `remove_or_warn` rmdir's a gitlink only when empty; a
                     // populated submodule directory is left untouched (ENOTEMPTY
                     // is silent).
                     let _ = fs::remove_dir(worktree_base.join(rel));
                 }
                 if let Some(index) = index.as_mut() {
-                    index.entries.retain(|entry| entry.path.as_bytes() != path.as_slice());
+                    index
+                        .entries
+                        .retain(|entry| entry.path.as_bytes() != path.as_slice());
                 }
             }
         }
@@ -4168,8 +4203,8 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     // `--reject`: write each `<file>.rej` (git opens it `O_CREAT|O_EXCL`, unlinking
     // a stale one first), then exit 1 because the patch did not fully apply.
     for (target, bytes) in &reject_writes {
-        let rel = std::str::from_utf8(target)
-            .map_err(|err| GitError::InvalidPath(err.to_string()))?;
+        let rel =
+            std::str::from_utf8(target).map_err(|err| GitError::InvalidPath(err.to_string()))?;
         let mut rej_path = worktree_base.join(rel).into_os_string();
         rej_path.push(".rej");
         let rej_path = PathBuf::from(rej_path);
@@ -4193,7 +4228,11 @@ fn apply_say_reject(patch: &sley_diff_merge::FilePatch, rejected: &[usize], hunk
             status_quote_path(new, false)
         ),
         _ => status_quote_path(
-            patch.new_path.as_deref().or(patch.old_path.as_deref()).unwrap_or(b""),
+            patch
+                .new_path
+                .as_deref()
+                .or(patch.old_path.as_deref())
+                .unwrap_or(b""),
             false,
         ),
     };
@@ -5215,10 +5254,7 @@ fn apply_write_worktree_file(
         } else {
             umask_complement & 0o666
         };
-        fs::set_permissions(
-            worktree_base.join(rel),
-            fs::Permissions::from_mode(target),
-        )?;
+        fs::set_permissions(worktree_base.join(rel), fs::Permissions::from_mode(target))?;
     }
     let _ = umask_complement;
     Ok(())
@@ -5348,7 +5384,8 @@ fn apply_binary_outcome(
         eprintln!("error: binary patch does not apply to '{name}'");
         GitError::Exit(1)
     };
-    let inflated = inflate_zlib_exact(&frag.deflated, frag.origlen).ok_or_else(binary_apply_failed)?;
+    let inflated =
+        inflate_zlib_exact(&frag.deflated, frag.origlen).ok_or_else(binary_apply_failed)?;
     let post = match frag.method {
         sley_diff_merge::BinaryMethod::Literal => inflated,
         sley_diff_merge::BinaryMethod::Delta => {
@@ -5511,21 +5548,30 @@ fn apply_three_way_path(
         }
     }
 
-    let (results, conflicts, _info) = commands::merge_rebase::three_way_merge_trees_inner_with_info(
-        db,
-        format,
-        &base_map,
-        &ours_map,
-        &theirs_map,
-        "ours",
-        "theirs",
-        "merged common ancestors",
-        favor,
-        style,
-    )?;
+    let (results, conflicts, _info) =
+        commands::merge_rebase::three_way_merge_trees_inner_with_info(
+            db,
+            format,
+            &base_map,
+            &ours_map,
+            &theirs_map,
+            "ours",
+            "theirs",
+            "merged common ancestors",
+            favor,
+            style,
+        )?;
 
     if !check {
-        apply_write_three_way(git_dir, worktree_root, format, db, &ours_map, &results, cached)?;
+        apply_write_three_way(
+            git_dir,
+            worktree_root,
+            format,
+            db,
+            &ours_map,
+            &results,
+            cached,
+        )?;
     }
 
     if conflicts.is_empty() {
@@ -10120,9 +10166,9 @@ fn commit_graph_generation(
             stack.pop();
             continue;
         }
-        let record = records
-            .get(&current)
-            .ok_or_else(|| GitError::InvalidObject(format!("commit {current} missing from walk")))?;
+        let record = records.get(&current).ok_or_else(|| {
+            GitError::InvalidObject(format!("commit {current} missing from walk"))
+        })?;
         let mut max_parent = 0u32;
         let mut ready = true;
         for parent in &record.parents {

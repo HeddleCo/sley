@@ -863,12 +863,7 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
                 if sub_head == Some(merge.oid) {
                     return Ok(());
                 }
-                return self.check_submodule_move_head(
-                    path,
-                    sub_head.as_ref(),
-                    &merge.oid,
-                    reset,
-                );
+                return self.check_submodule_move_head(path, sub_head.as_ref(), &merge.oid, reset);
             }
             return self.verify_clean_subdirectory(path, &file_path);
         }

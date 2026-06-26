@@ -10,11 +10,11 @@
 //! `FileObjectDatabase`, ...);
 //! see `commands::stash` for the rationale.
 
+use crate::*;
 use sley_grep::{
     Expr, ExprToken, GrepCompileConfig, GrepMatcher, PatternKind, PatternTypeOption,
     RegexDiagnosticVerbosity,
 };
-use crate::*;
 use sley_pathspec::{parse_normalized_pathspec_element, pathspec_attrs_match_with};
 use std::borrow::Cow;
 use std::cell::RefCell;

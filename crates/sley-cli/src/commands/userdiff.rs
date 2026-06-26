@@ -10,10 +10,10 @@
 //! `|[^[:space:]]|[\xc0-\xff][\x80-\xbf]+` tail) dumped verbatim, so the byte
 //! content matches upstream exactly.
 
+use crate::*;
 pub(crate) use sley_diff_format::CompiledFuncname;
 #[cfg(test)]
 use sley_grep::{Regex, RegexMode};
-use crate::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;

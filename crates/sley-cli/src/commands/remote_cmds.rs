@@ -523,10 +523,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let repository = positional[0].clone();
     let cwd = env::current_dir()?;
     let bundle_source_path = clone_bundle_path(&cwd, &repository);
-    let destination = positional
-        .get(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default_clone_directory(&repository, bare, bundle_source_path.is_some()));
+    let destination = positional.get(1).map(PathBuf::from).unwrap_or_else(|| {
+        default_clone_directory(&repository, bare, bundle_source_path.is_some())
+    });
     // git reports the destination as it was given on the command line (or as
     // derived from the source) — `dir` in upstream `builtin/clone.c` — not its
     // absolutized form.
@@ -1138,7 +1137,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         checkout,
         depth,
         quiet,
-            &reference_alternates,
+        &reference_alternates,
     )
 }
 
@@ -1168,7 +1167,11 @@ fn clone_bundle_path(cwd: &Path, repository: &str) -> Option<PathBuf> {
         return None;
     }
     let raw = PathBuf::from(parsed.path);
-    let base = if raw.is_absolute() { raw } else { cwd.join(raw) };
+    let base = if raw.is_absolute() {
+        raw
+    } else {
+        cwd.join(raw)
+    };
     if local_repository_git_dir_path(&base).is_ok() {
         return None;
     }
@@ -2305,11 +2308,7 @@ fn clone_bare_or_mirror_local_repository(
     fetch_result?;
     if options.copy_source_alternates {
         let source_git_dir = common_git_dir_for_git_dir(&ls_remote_git_dir(options.repository)?)?;
-        install_local_clone_objects(
-            &source_git_dir,
-            &git_dir,
-            options.local_object_install,
-        )?;
+        install_local_clone_objects(&source_git_dir, &git_dir, options.local_object_install)?;
     }
     if options.dissociate {
         dissociate_clone_alternates(&git_dir, options.format)?;
@@ -2475,11 +2474,7 @@ fn push_unique_alternate(alternates: &mut Vec<PathBuf>, alternate: PathBuf) {
     }
 }
 
-fn apply_clone_alternates(
-    git_dir: &Path,
-    alternates: &[PathBuf],
-    _dissociate: bool,
-) -> Result<()> {
+fn apply_clone_alternates(git_dir: &Path, alternates: &[PathBuf], _dissociate: bool) -> Result<()> {
     if alternates.is_empty() {
         return Ok(());
     }
@@ -2514,7 +2509,9 @@ fn dissociate_repack_roots(git_dir: &Path, format: ObjectFormat) -> Result<Vec<O
     let mut roots = Vec::new();
     let mut seen = HashSet::new();
     for reference in store.list_refs()? {
-        if let Some(oid) = resolve_clone_ref_oid(&store, reference.target)? && seen.insert(oid) {
+        if let Some(oid) = resolve_clone_ref_oid(&store, reference.target)?
+            && seen.insert(oid)
+        {
             roots.push(oid);
         }
     }
@@ -2641,7 +2638,10 @@ fn install_local_clone_objects(
 
     let source_objects = repository_objects_dir(remote_git_dir);
     let destination_objects = repository_objects_dir(git_dir);
-    if fs::symlink_metadata(&source_objects)?.file_type().is_symlink() {
+    if fs::symlink_metadata(&source_objects)?
+        .file_type()
+        .is_symlink()
+    {
         eprintln!(
             "fatal: '{}' is a symlink, refusing to clone with --local",
             source_objects.display()
@@ -4478,8 +4478,12 @@ fn resolve_changed_submodule_fetch_target(
     {
         return Ok(Some((sub_git_dir, submodule_root, changed.path.clone())));
     }
-    let Some(name) =
-        submodule_name_for_path_at_commit(req.git_dir, req.format, &changed.super_oid, &changed.path)?
+    let Some(name) = submodule_name_for_path_at_commit(
+        req.git_dir,
+        req.format,
+        &changed.super_oid,
+        &changed.path,
+    )?
     else {
         return Ok(None);
     };
@@ -4502,10 +4506,7 @@ fn ensure_submodule_object_store(git_dir: &Path) -> Result<()> {
     if git_dir.join("objects").is_dir() {
         return Ok(());
     }
-    eprintln!(
-        "fatal: not a git repository: {}",
-        git_dir.display()
-    );
+    eprintln!("fatal: not a git repository: {}", git_dir.display());
     Err(GitError::Exit(128))
 }
 
@@ -4609,7 +4610,11 @@ pub(crate) fn changed_gitlinks_for_fetch(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut changed = Vec::new();
     for update in &outcome.ref_updates {
-        let old = update.dst.as_deref().and_then(|dst| before.get(dst)).copied();
+        let old = update
+            .dst
+            .as_deref()
+            .and_then(|dst| before.get(dst))
+            .copied();
         if old == Some(update.oid) {
             continue;
         }
@@ -5006,8 +5011,7 @@ fn fetch_one_source_with_outcome(
     options: FetchOptions,
     server_options: &[String],
 ) -> Result<sley_remote::FetchOutcome> {
-    if let Some((bundle_source, bundle)) = fetch_bundle_source(git_dir, format, source)?
-    {
+    if let Some((bundle_source, bundle)) = fetch_bundle_source(git_dir, format, source)? {
         // Bundle fetches have no shallow support, so a `--depth` is warned-and-
         // ignored here, matching the local-clone behavior.
         if options.depth.is_some() {
@@ -8057,9 +8061,7 @@ pub(crate) fn fetch_set_upstream_from_outcome(
     for update in &outcome.ref_updates {
         if update.dst.is_none() {
             if source_ref.is_some() {
-                eprintln!(
-                    "warning: multiple branches detected, incompatible with --set-upstream"
-                );
+                eprintln!("warning: multiple branches detected, incompatible with --set-upstream");
                 return Ok(());
             }
             source_ref = Some(update.src.as_str());
@@ -9345,7 +9347,8 @@ pub(crate) fn ls_remote_git_dir(repository: &str) -> Result<PathBuf> {
     {
         return Ok(git_dir);
     }
-    let local_git_dir = local_git_dir.ok_or_else(|| GitError::repository_not_found("not a git repository"))?;
+    let local_git_dir =
+        local_git_dir.ok_or_else(|| GitError::repository_not_found("not a git repository"))?;
     let config = read_repo_config(&local_git_dir)?;
     let rewritten = rewrite_url_with_config(&config, repository, false);
     if rewritten != repository

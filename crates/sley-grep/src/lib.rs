@@ -464,12 +464,7 @@ pub struct Regex {
 }
 
 impl Regex {
-    pub fn compile(
-        pattern: &str,
-        mode: RegexMode,
-        ignore_case: bool,
-        word: bool,
-    ) -> Result<Self> {
+    pub fn compile(pattern: &str, mode: RegexMode, ignore_case: bool, word: bool) -> Result<Self> {
         Self::compile_bytes(pattern.as_bytes(), mode, ignore_case, word)
     }
 

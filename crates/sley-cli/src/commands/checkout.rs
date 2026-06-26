@@ -236,7 +236,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(128));
         }
         if patch {
-            eprintln!("fatal: options '--pathspec-from-file' and '--patch' cannot be used together");
+            eprintln!(
+                "fatal: options '--pathspec-from-file' and '--patch' cannot be used together"
+            );
             return Err(GitError::Exit(128));
         }
     }
@@ -333,58 +335,66 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             (source, file_pathspecs.as_slice())
         } else {
             match dashdash_index {
-            Some(index) => {
-                let (before, after) = positional.split_at(index);
-                match before {
-                    [] => (None, after),
-                    [rev] => (Some(rev.as_str()), after),
-                    _ => {
-                        return Err(GitError::Command(
-                            "checkout with multiple tree-ish arguments is not supported".into(),
-                        ));
+                Some(index) => {
+                    let (before, after) = positional.split_at(index);
+                    match before {
+                        [] => (None, after),
+                        [rev] => (Some(rev.as_str()), after),
+                        _ => {
+                            return Err(GitError::Command(
+                                "checkout with multiple tree-ish arguments is not supported".into(),
+                            ));
+                        }
                     }
                 }
-            }
-            None if positional.len() > 1 => {
-                // `checkout <rev> <paths>...` — but if the first arg is not a
-                // revision, every positional is a pathspec (git's
-                // disambiguation for `checkout <path> <path>...`).
-                if checkout_resolve_start_oid(&git_dir, format, &positional[0]).is_ok() {
-                    (Some(positional[0].as_str()), &positional[1..])
-                } else {
-                    (None, positional.as_slice())
-                }
-            }
-            None if positional.len() == 1 => {
-                // A single arg that is neither a branch nor a revision but
-                // names an existing file is a path checkout.
-                let value = &positional[0];
-                let store = FileRefStore::new(&git_dir, format);
-                let is_branch = branch_ref_name(value)
-                    .ok()
-                    .and_then(|name| sley_refs::resolve_ref_peeled(&store, &name).ok().flatten())
-                    .is_some();
-                if !is_branch
-                    && checkout_resolve_start_oid(&git_dir, format, value).is_err()
-                    && (cwd.join(value).exists()
-                        || checkout_index_has_path(&git_dir, &worktree_root, &cwd, format, value)?)
-                {
-                    if guess {
-                        let _ = checkout_dwim_remote_branch(
-                            &git_dir,
-                            format,
-                            &store,
-                            &checkout_config,
-                            value,
-                            true,
-                        )?;
+                None if positional.len() > 1 => {
+                    // `checkout <rev> <paths>...` — but if the first arg is not a
+                    // revision, every positional is a pathspec (git's
+                    // disambiguation for `checkout <path> <path>...`).
+                    if checkout_resolve_start_oid(&git_dir, format, &positional[0]).is_ok() {
+                        (Some(positional[0].as_str()), &positional[1..])
+                    } else {
+                        (None, positional.as_slice())
                     }
-                    (None, positional.as_slice())
-                } else {
-                    (None, &[])
                 }
-            }
-            None => (None, &[]),
+                None if positional.len() == 1 => {
+                    // A single arg that is neither a branch nor a revision but
+                    // names an existing file is a path checkout.
+                    let value = &positional[0];
+                    let store = FileRefStore::new(&git_dir, format);
+                    let is_branch = branch_ref_name(value)
+                        .ok()
+                        .and_then(|name| {
+                            sley_refs::resolve_ref_peeled(&store, &name).ok().flatten()
+                        })
+                        .is_some();
+                    if !is_branch
+                        && checkout_resolve_start_oid(&git_dir, format, value).is_err()
+                        && (cwd.join(value).exists()
+                            || checkout_index_has_path(
+                                &git_dir,
+                                &worktree_root,
+                                &cwd,
+                                format,
+                                value,
+                            )?)
+                    {
+                        if guess {
+                            let _ = checkout_dwim_remote_branch(
+                                &git_dir,
+                                format,
+                                &store,
+                                &checkout_config,
+                                value,
+                                true,
+                            )?;
+                        }
+                        (None, positional.as_slice())
+                    } else {
+                        (None, &[])
+                    }
+                }
+                None => (None, &[]),
             }
         };
         if !paths.is_empty() {
@@ -937,7 +947,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             // the downstream switch then no-ops on the worktree but still writes
             // the HEAD reflog and prints the message.
             let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-            let old_tree = commands::merge_rebase::commit_tree_oid(&db, format, &checkout_old_head)?;
+            let old_tree =
+                commands::merge_rebase::commit_tree_oid(&db, format, &checkout_old_head)?;
             let target_tree = commands::merge_rebase::commit_tree_oid(&db, format, &target)?;
             if let Err(err) = commands::read_tree::checkout_two_way_engine(
                 &git_dir,
@@ -1314,10 +1325,7 @@ fn checkout_expand_creation_branch_name(
         let n = inner
             .parse::<usize>()
             .map_err(|_| GitError::InvalidFormat(format!("invalid branch name: '{branch}'")))?;
-        return Ok(
-            sley_rev::nth_prior_checkout_branch_name(git_dir, format, n)?
-                .unwrap_or(branch),
-        );
+        return Ok(sley_rev::nth_prior_checkout_branch_name(git_dir, format, n)?.unwrap_or(branch));
     }
     if branch.contains("@{")
         && let Ok(Some(refname)) =
@@ -1845,7 +1853,14 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         let cwd = env::current_dir()?;
         let git_dir = discover_git_dir(&cwd)?;
         let format = repository_object_format(&git_dir)?;
-        return restore_run_patch(&git_dir, format, &paths, source.as_deref(), staged, worktree);
+        return restore_run_patch(
+            &git_dir,
+            format,
+            &paths,
+            source.as_deref(),
+            staged,
+            worktree,
+        );
     }
     if let Some(pathspec_file) = pathspec_from_file {
         paths.extend(read_pathspecs_from_file(&pathspec_file, pathspec_file_nul)?);
@@ -2350,7 +2365,8 @@ fn checkout_run_patch(
         ),
     };
 
-    let cfg = commands::add_interactive::resolve_patch_config(git_dir, None, None, !no_auto_advance)?;
+    let cfg =
+        commands::add_interactive::resolve_patch_config(git_dir, None, None, !no_auto_advance)?;
     let stdin = io::stdin();
     let mut handle = stdin.lock();
     commands::add_patch::run_add_patch(mode, pathspecs, revision.as_deref(), &mut handle, cfg)
@@ -2372,7 +2388,8 @@ fn restore_run_patch(
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect();
-    let (mode, revision): (commands::add_patch::PatchMode, Option<String>) = if staged && !worktree {
+    let (mode, revision): (commands::add_patch::PatchMode, Option<String>) = if staged && !worktree
+    {
         // `restore --staged -p` unstages selected hunks (ADD_P_RESET).
         (commands::add_patch::PatchMode::Reset, None)
     } else {

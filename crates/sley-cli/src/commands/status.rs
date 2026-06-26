@@ -849,9 +849,13 @@ fn print_status_short_stream(
             )?,
         );
         entries = status_collapse_pathspec_untracked_entries(entries, options, pathspec);
-        for entry in
-            status_entries_with_renames(worktree_root, git_dir, format, entries, &display.rename_config)?
-        {
+        for entry in status_entries_with_renames(
+            worktree_root,
+            git_dir,
+            format,
+            entries,
+            &display.rename_config,
+        )? {
             let mut entry = entry;
             if !display.porcelain_v1 && display.relative_paths {
                 entry.entry.path = pathspec.display(&entry.entry.path);
@@ -1275,11 +1279,21 @@ fn status_apply_inexact_staged_renames(
     // Cache source/target blob bytes once.
     let source_blobs: Vec<Option<Vec<u8>>> = source_indices
         .iter()
-        .map(|&i| output[i].entry.head_oid.and_then(|oid| read_blob(&db, &oid)))
+        .map(|&i| {
+            output[i]
+                .entry
+                .head_oid
+                .and_then(|oid| read_blob(&db, &oid))
+        })
         .collect();
     let target_blobs: Vec<Option<Vec<u8>>> = target_indices
         .iter()
-        .map(|&i| output[i].entry.index_oid.and_then(|oid| read_blob(&db, &oid)))
+        .map(|&i| {
+            output[i]
+                .entry
+                .index_oid
+                .and_then(|oid| read_blob(&db, &oid))
+        })
         .collect();
 
     // Score every (target, source) pair once.
@@ -3258,9 +3272,7 @@ fn build_status_long_sink_inner(
             if !del_mod_conflict {
                 sink.hint("  (use \"git add <file>...\" to mark resolution)");
             } else {
-                sink.hint(
-                    "  (use \"git add/rm <file>...\" as appropriate to mark resolution)",
-                );
+                sink.hint("  (use \"git add/rm <file>...\" as appropriate to mark resolution)");
             }
         } else if !del_mod_conflict && !not_deleted {
             sink.hint("  (use \"git rm <file>...\" to mark resolution)");

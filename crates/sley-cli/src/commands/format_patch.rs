@@ -1653,7 +1653,7 @@ fn cover_diff_entries(
         detect_inexact: true,
         rename_threshold: options.rename_threshold,
         copy_threshold: options.copy_threshold,
-    rename_limit: 0,
+        rename_limit: 0,
     };
     let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
         db,
@@ -3120,7 +3120,7 @@ fn first_parent_diff_entries(
         detect_inexact: true,
         rename_threshold: options.rename_threshold,
         copy_threshold: options.copy_threshold,
-    rename_limit: 0,
+        rename_limit: 0,
     };
     let entries = match commit.parents.first() {
         Some(parent_oid) => {

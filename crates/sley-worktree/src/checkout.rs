@@ -547,7 +547,10 @@ pub(crate) fn checkout_commit_to_index_and_worktree_sparse(
     Ok(target_entries.len())
 }
 
-pub(crate) fn skip_worktree_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet<Vec<u8>>> {
+pub(crate) fn skip_worktree_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<BTreeSet<Vec<u8>>> {
     let index_path = repository_index_path(git_dir);
     if !index_path.exists() {
         return Ok(BTreeSet::new());
@@ -923,7 +926,12 @@ pub(crate) fn checkout_pathspecs_match_git_path(
     Ok(false)
 }
 
-pub(crate) fn resolve_undo_index_entry(path: Vec<u8>, mode: u32, oid: ObjectId, stage: u16) -> IndexEntry {
+pub(crate) fn resolve_undo_index_entry(
+    path: Vec<u8>,
+    mode: u32,
+    oid: ObjectId,
+    stage: u16,
+) -> IndexEntry {
     let name_len = (path
         .len()
         .min(sley_index::INDEX_FLAG_NAME_LENGTH_MASK as usize)) as u16;
@@ -1916,7 +1924,9 @@ pub fn path_in_sparse_checkout(
     SparseMatcher::new(sparse, mode).includes_file(path)
 }
 
-pub(crate) fn active_sparse_checkout(git_dir: &Path) -> Result<Option<(SparseCheckout, SparseCheckoutMode)>> {
+pub(crate) fn active_sparse_checkout(
+    git_dir: &Path,
+) -> Result<Option<(SparseCheckout, SparseCheckoutMode)>> {
     let worktree_config = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();
     let repo_config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
     let sparse_enabled = worktree_config
@@ -2305,7 +2315,10 @@ pub(crate) fn worktree_entry_is_uptodate(entry: &IndexEntry, metadata: &fs::Meta
         && u64::from(entry.mtime_nanoseconds) == mtime_nanoseconds
 }
 
-pub(crate) fn worktree_entry_ref_is_uptodate(entry: &IndexEntryRef<'_>, metadata: &fs::Metadata) -> bool {
+pub(crate) fn worktree_entry_ref_is_uptodate(
+    entry: &IndexEntryRef<'_>,
+    metadata: &fs::Metadata,
+) -> bool {
     if u64::from(entry.size) != metadata.len() {
         return false;
     }
@@ -2588,4 +2601,3 @@ pub(crate) fn restore_worktree_paths_from_entries(
         restored: restored.len(),
     })
 }
-

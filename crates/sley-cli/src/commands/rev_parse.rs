@@ -124,7 +124,10 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                 println!("{}", display_git_common_dir(&cwd, &git_dir, path_format)?);
             }
             "--shared-index-path" => {
-                println!("{}", display_shared_index_path(&cwd, &git_dir, path_format)?);
+                println!(
+                    "{}",
+                    display_shared_index_path(&cwd, &git_dir, path_format)?
+                );
             }
             "--git-path" => {
                 idx += 1;
@@ -410,7 +413,12 @@ fn rev_parse_resolve_revision_arg(
         // `core.disambiguate` narrows a bare prefix to the configured type, but a
         // ref still wins over a same-spelled prefix (git consults refs before
         // get_short_oid). Route through the ref-first resolver.
-        return sley_rev::resolve_revision_with_disambiguation(git_dir, format, rev, disambiguation);
+        return sley_rev::resolve_revision_with_disambiguation(
+            git_dir,
+            format,
+            rev,
+            disambiguation,
+        );
     }
     resolve_revision(git_dir, format, rev)
 }
@@ -1695,21 +1703,14 @@ fn validate_bare_rev_parse_setup(setup: &Option<setup::SetupResult>) -> Result<(
     Ok(())
 }
 
-fn rev_parse_worktree_root(
-    git_dir: &Path,
-    setup: Option<&setup::SetupResult>,
-) -> Result<PathBuf> {
+fn rev_parse_worktree_root(git_dir: &Path, setup: Option<&setup::SetupResult>) -> Result<PathBuf> {
     if let Some(worktree) = setup.and_then(|setup| setup.worktree.as_ref()) {
         return Ok(worktree.clone());
     }
     worktree_root_for_git_dir(git_dir)
 }
 
-fn worktree_cdup(
-    cwd: &Path,
-    git_dir: &Path,
-    setup: Option<&setup::SetupResult>,
-) -> Result<String> {
+fn worktree_cdup(cwd: &Path, git_dir: &Path, setup: Option<&setup::SetupResult>) -> Result<String> {
     let prefix = worktree_prefix(cwd, git_dir, setup)?;
     let depth = prefix.split('/').filter(|part| !part.is_empty()).count();
     Ok("../".repeat(depth))

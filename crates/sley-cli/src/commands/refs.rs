@@ -888,7 +888,9 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
 }
 
 fn is_reflog_selector(value: &str) -> bool {
-    value.strip_suffix('}').is_some_and(|prefix| prefix.contains("@{"))
+    value
+        .strip_suffix('}')
+        .is_some_and(|prefix| prefix.contains("@{"))
 }
 
 fn expire_reflog_entries(

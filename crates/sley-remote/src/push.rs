@@ -944,10 +944,11 @@ fn fsck_pushed_objects(
     if starts.is_empty() {
         return Ok(());
     }
-    let new_objects: Vec<ObjectId> = collect_reachable_object_ids(local_db, format, starts.to_vec())?
-        .into_iter()
-        .filter(|oid| !remote_excluded.contains(oid))
-        .collect();
+    let new_objects: Vec<ObjectId> =
+        collect_reachable_object_ids(local_db, format, starts.to_vec())?
+            .into_iter()
+            .filter(|oid| !remote_excluded.contains(oid))
+            .collect();
     // The reader is the COMPLETE local db so link-walks never spuriously report
     // a "missing object" for something the remote already holds; only genuine
     // content errors (e.g. a disallowed .gitmodules url) in the new objects fail.

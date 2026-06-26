@@ -2159,9 +2159,7 @@ fn apply_merge_results_to_index_and_worktree(
     for (path, result) in results {
         let remove = match result {
             MergePathResult::Resolved(None) => ours_map.contains_key(path),
-            MergePathResult::Conflict {
-                worktree: None, ..
-            } => true,
+            MergePathResult::Conflict { worktree: None, .. } => true,
             _ => false,
         };
         if remove {

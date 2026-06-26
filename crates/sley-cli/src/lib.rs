@@ -892,8 +892,8 @@ pub(crate) fn core_big_file_threshold(git_dir: Option<&Path>) -> Result<u64> {
         }
         None => sley_config::ConfigIncludeContext::new(None, None),
     };
-    let mut config =
-        sley_config::load_pre_dispatch_config(git_dir, &context).map_err(report_config_setup_error)?;
+    let mut config = sley_config::load_pre_dispatch_config(git_dir, &context)
+        .map_err(report_config_setup_error)?;
     let parameters = injected_config_parameters()?;
     let base = match env::current_dir() {
         Ok(path) => path,
@@ -1646,7 +1646,9 @@ fn read_pathspecs_from_file(path: &Path, nul: bool) -> Result<Vec<PathBuf>> {
             if !nul && entry.first() == Some(&b'"') {
                 let mut unquoted = Vec::new();
                 if commands::ref_command_stream::unquote_c_style(entry, &mut unquoted).is_some() {
-                    return Some(PathBuf::from(String::from_utf8_lossy(&unquoted).into_owned()));
+                    return Some(PathBuf::from(
+                        String::from_utf8_lossy(&unquoted).into_owned(),
+                    ));
                 }
             }
             Some(PathBuf::from(String::from_utf8_lossy(entry).into_owned()))
@@ -1850,8 +1852,7 @@ fn resolve_checkout_merge_base_start_oid(
     let right = if right.is_empty() { "HEAD" } else { right };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let left = sley_rev::peel_to_commit(&db, format, &resolve_revision(git_dir, format, left)?)?;
-    let right =
-        sley_rev::peel_to_commit(&db, format, &resolve_revision(git_dir, format, right)?)?;
+    let right = sley_rev::peel_to_commit(&db, format, &resolve_revision(git_dir, format, right)?)?;
     let bases = sley_rev::merge_bases(git_dir, format, &db, &left, &right)?;
     match bases.as_slice() {
         [base] => Ok(Some(*base)),
@@ -3351,8 +3352,8 @@ pub(crate) fn write_diff_patch_entry(
         .as_ref()
         .and_then(|driver| driver.binary)
         .or_else(|| new_driver.as_ref().and_then(|driver| driver.binary));
-    let big_file_threshold =
-        core_big_file_threshold(options.db.objects_dir().parent()).unwrap_or(DEFAULT_BIG_FILE_THRESHOLD);
+    let big_file_threshold = core_big_file_threshold(options.db.objects_dir().parent())
+        .unwrap_or(DEFAULT_BIG_FILE_THRESHOLD);
     let treat_as_binary = match binary_override {
         Some(binary) => binary,
         None => {
@@ -3537,19 +3538,14 @@ pub(crate) fn write_diff_patch_entry(
                 });
             word_regex = spec
                 .map(|spec| {
-                    sley_grep::Regex::compile_bytes(
-                        &spec,
-                        sley_grep::RegexMode::Ere,
-                        false,
-                        false,
-                    )
-                    .map_err(|_| {
-                        eprintln!(
-                            "fatal: invalid regular expression: {}",
-                            String::from_utf8_lossy(&spec)
-                        );
-                        GitError::Exit(128)
-                    })
+                    sley_grep::Regex::compile_bytes(&spec, sley_grep::RegexMode::Ere, false, false)
+                        .map_err(|_| {
+                            eprintln!(
+                                "fatal: invalid regular expression: {}",
+                                String::from_utf8_lossy(&spec)
+                            );
+                            GitError::Exit(128)
+                        })
                 })
                 .transpose()?;
             default_colors = commands::diff_words::DiffColors::default();
@@ -10279,9 +10275,8 @@ fn emit_log_one_token(
             FormatToken::Newline => out.push(b'\n'),
             FormatToken::HexByte(byte) => out.push(*byte),
             FormatToken::Trailers(opts) => {
-                let parsed =
-                    sley_pretty::parse_for_each_ref_trailer_options(opts)
-                        .map_err(|_| GitError::Command("invalid %(trailers) options".into()))?;
+                let parsed = sley_pretty::parse_for_each_ref_trailer_options(opts)
+                    .map_err(|_| GitError::Command("invalid %(trailers) options".into()))?;
                 let rendered =
                     crate::commands::for_each_ref::for_each_ref_format_trailers(message, &parsed);
                 out.extend_from_slice(&rendered);

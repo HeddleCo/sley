@@ -1644,7 +1644,9 @@ fn corrected_commit_dates(entries: &[CommitGraphWriteEntry]) -> Result<Vec<u64>>
         entries
             .binary_search_by(|entry| entry.oid.as_bytes().cmp(parent.as_bytes()))
             .map_err(|_| {
-                GitError::InvalidFormat(format!("commit-graph parent {parent} is missing from graph"))
+                GitError::InvalidFormat(format!(
+                    "commit-graph parent {parent} is missing from graph"
+                ))
             })
     };
 

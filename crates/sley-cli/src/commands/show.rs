@@ -1308,12 +1308,12 @@ fn write_show_combined(
 ) -> Result<()> {
     let options = context.options;
     let db = context.db;
-    let stat_entries = if options.numstat || options.stat || options.compact_summary || options.shortstat
-    {
-        collect_diff_stat_entries(entries, db, None, false)?
-    } else {
-        Vec::new()
-    };
+    let stat_entries =
+        if options.numstat || options.stat || options.compact_summary || options.shortstat {
+            collect_diff_stat_entries(entries, db, None, false)?
+        } else {
+            Vec::new()
+        };
     let format = context.format;
     let dense = matches!(layout.merge_mode, ShowMergeMode::Combined { dense: true });
 
@@ -1409,7 +1409,7 @@ fn commit_diff_entries(
         detect_inexact: true,
         rename_threshold: options.rename_threshold,
         copy_threshold: options.copy_threshold,
-    rename_limit: 0,
+        rename_limit: 0,
     };
     let entries = match commit.parents.first() {
         Some(parent_oid) => {
@@ -1516,11 +1516,12 @@ fn write_commit_diff_patch(
     let color = diff_color_enabled(config);
 
     let show_patch = options.shows_patch_body();
-    let stat_entries = if options.numstat || options.stat || options.compact_summary || options.shortstat {
-        collect_diff_stat_entries(entries, db, None, false)?
-    } else {
-        Vec::new()
-    };
+    let stat_entries =
+        if options.numstat || options.stat || options.compact_summary || options.shortstat {
+            collect_diff_stat_entries(entries, db, None, false)?
+        } else {
+            Vec::new()
+        };
 
     if entries.is_empty() {
         return Ok(());

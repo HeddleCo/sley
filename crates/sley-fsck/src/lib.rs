@@ -370,9 +370,8 @@ where
                 f.msg_id.camel(),
                 f.detail,
             );
-            let masked_tag_ident = object.object_type == ObjectType::Tag
-                && is_tag_ident_msg(f.msg_id)
-                && !f.fatal;
+            let masked_tag_ident =
+                object.object_type == ObjectType::Tag && is_tag_ident_msg(f.msg_id) && !f.fatal;
             let issue = if f.severity == content::Severity::Error
                 && (fail_nonfatal_errors || !masked_tag_ident)
             {
@@ -1055,9 +1054,8 @@ mod tests {
     fn unreachable_tag_referent_is_not_checked_as_a_broken_link() {
         let format = ObjectFormat::Sha1;
         let mut db = ObjectDatabase::new(format);
-        let missing_tag =
-            ObjectId::from_hex(format, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
-                .expect("test operation should succeed");
+        let missing_tag = ObjectId::from_hex(format, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+            .expect("test operation should succeed");
         let tag = db
             .write_object(EncodedObject::new(
                 ObjectType::Tag,

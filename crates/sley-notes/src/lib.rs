@@ -1368,10 +1368,7 @@ fn write_woven_notes_tree(
 /// Build (and write) nested tree objects from full slash-separated paths,
 /// returning the root tree oid. Entries are grouped by first path component;
 /// each level is emitted in git's canonical order via [`TreeBuilder`].
-fn build_nested_tree(
-    db: &mut FileObjectDatabase,
-    entries: &[PathEntry],
-) -> Result<ObjectId> {
+fn build_nested_tree(db: &mut FileObjectDatabase, entries: &[PathEntry]) -> Result<ObjectId> {
     let mut builder = TreeBuilder::new();
     let mut subdirs: BTreeMap<Vec<u8>, Vec<PathEntry>> = BTreeMap::new();
     for (path, mode, oid) in entries {
@@ -1380,7 +1377,10 @@ fn build_nested_tree(
             Some(slash) => {
                 let component = path[..slash].to_vec();
                 let rest = path[slash + 1..].to_vec();
-                subdirs.entry(component).or_default().push((rest, *mode, *oid));
+                subdirs
+                    .entry(component)
+                    .or_default()
+                    .push((rest, *mode, *oid));
             }
         }
     }

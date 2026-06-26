@@ -743,8 +743,7 @@ fn parse_parenthesized_atom(
     if let Some(opts) = inner.strip_prefix("trailers") {
         let opts = opts.strip_prefix(':').unwrap_or("");
         if !(inner == "trailers" || inner.starts_with("trailers:"))
-            || (!opts.is_empty()
-                && parse_for_each_ref_trailer_options(opts).is_err())
+            || (!opts.is_empty() && parse_for_each_ref_trailer_options(opts).is_err())
         {
             return Ok(None);
         }
@@ -1216,11 +1215,7 @@ pub mod presets {
     use super::{CompiledLogFormat, LogFormatDialect, Result};
 
     /// `git log --oneline` / `--pretty=oneline` (%h/%H + optional %d + subject).
-    pub fn log_oneline(
-        decorate: bool,
-        full_oid: bool,
-        parents: bool,
-    ) -> Result<CompiledLogFormat> {
+    pub fn log_oneline(decorate: bool, full_oid: bool, parents: bool) -> Result<CompiledLogFormat> {
         let spec = match (full_oid, decorate) {
             (true, true) => "%H%d %s",
             (true, false) => "%H %s",

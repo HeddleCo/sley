@@ -34,7 +34,10 @@ fn fresh_index_default_version(git_dir: &Path) -> u32 {
         };
     }
     let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
-    let mut version = if config.get_bool("feature", None, "manyFiles").unwrap_or(false) {
+    let mut version = if config
+        .get_bool("feature", None, "manyFiles")
+        .unwrap_or(false)
+    {
         4
     } else {
         INDEX_FORMAT_DEFAULT
@@ -57,7 +60,9 @@ fn fresh_index_default_version(git_dir: &Path) -> u32 {
 /// `feature.manyFiles` defaults skip-hash on, and an explicit `index.skipHash`
 /// (last) overrides it.
 pub fn index_skip_hash_from_config(config: &GitConfig) -> bool {
-    let many_files = config.get_bool("feature", None, "manyFiles").unwrap_or(false);
+    let many_files = config
+        .get_bool("feature", None, "manyFiles")
+        .unwrap_or(false);
     config
         .get_bool("index", None, "skipHash")
         .unwrap_or(many_files)
@@ -914,8 +919,7 @@ pub(crate) fn add_update_tracked_path(
     if is_symlink {
         updated_entry.mode = 0o120000;
     }
-    let changed =
-        is_unmerged || updated_entry.oid != entry.oid || updated_entry.mode != entry.mode;
+    let changed = is_unmerged || updated_entry.oid != entry.oid || updated_entry.mode != entry.mode;
     if updated_entry != entry {
         replace_index_entries_with_entry(&mut index.entries, updated_entry);
         return Ok((
@@ -931,7 +935,10 @@ pub(crate) enum UpdateIndexCleanFilter {
     PathLocal,
 }
 
-pub(crate) fn index_entries_path_range(entries: &[IndexEntry], path: &[u8]) -> std::ops::Range<usize> {
+pub(crate) fn index_entries_path_range(
+    entries: &[IndexEntry],
+    path: &[u8],
+) -> std::ops::Range<usize> {
     let mut start = match entries.binary_search_by(|entry| entry.path.as_bytes().cmp(path)) {
         Ok(index) => index,
         Err(insert) => return insert..insert,
@@ -1812,7 +1819,10 @@ pub fn set_index_assume_unchanged_paths(
     })
 }
 
-pub(crate) fn selected_git_paths(worktree_root: &Path, paths: &[PathBuf]) -> Result<BTreeSet<Vec<u8>>> {
+pub(crate) fn selected_git_paths(
+    worktree_root: &Path,
+    paths: &[PathBuf],
+) -> Result<BTreeSet<Vec<u8>>> {
     paths
         .iter()
         .map(|path| {
@@ -2256,7 +2266,10 @@ pub(crate) fn parse_resolve_undo_records(
     Ok(records)
 }
 
-pub(crate) fn set_resolve_undo_extension(index: &mut Index, records: &[ResolveUndoRecord]) -> Result<()> {
+pub(crate) fn set_resolve_undo_extension(
+    index: &mut Index,
+    records: &[ResolveUndoRecord],
+) -> Result<()> {
     let mut body = Vec::new();
     for record in records {
         body.extend_from_slice(&record.path);
@@ -2307,7 +2320,11 @@ pub fn clear_resolve_undo(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Re
     }
 }
 
-pub(crate) fn append_index_extension(out: &mut Vec<u8>, signature: &[u8; 4], body: &[u8]) -> Result<()> {
+pub(crate) fn append_index_extension(
+    out: &mut Vec<u8>,
+    signature: &[u8; 4],
+    body: &[u8],
+) -> Result<()> {
     let len = u32::try_from(body.len())
         .map_err(|_| GitError::InvalidFormat("index extension body too large".into()))?;
     out.extend_from_slice(signature);
@@ -2478,10 +2495,9 @@ pub(crate) fn write_repository_index_ref_with_split_skip_hash(
         && !split_index_delta_exceeds_threshold(git_dir, index, &base)
     {
         let (entries, link) = split_index_delta_entries(index, &base, &link)?;
-        let extensions =
-            index_extensions_without_split_index_link(&index_extensions_without_cache_tree(
-                &index.extensions,
-            ));
+        let extensions = index_extensions_without_split_index_link(
+            &index_extensions_without_cache_tree(&index.extensions),
+        );
         let mut primary = Index {
             version: index.version,
             entries,
@@ -2664,7 +2680,11 @@ pub(crate) fn read_shared_index_for_link(
     Ok(Some(base))
 }
 
-pub(crate) fn split_index_delta_exceeds_threshold(git_dir: &Path, index: &Index, base: &Index) -> bool {
+pub(crate) fn split_index_delta_exceeds_threshold(
+    git_dir: &Path,
+    index: &Index,
+    base: &Index,
+) -> bool {
     let max_percent = sley_config::read_repo_config(git_dir, None)
         .ok()
         .and_then(|config| {
@@ -2716,8 +2736,10 @@ pub(crate) fn split_index_delta_entries(
                 {
                     delete_positions.push(base_pos as u32);
                     additions.push(index.entries[index_pos].clone());
-                } else if !index_entry_content_eq(&base.entries[base_pos], &index.entries[index_pos])
-                {
+                } else if !index_entry_content_eq(
+                    &base.entries[base_pos],
+                    &index.entries[index_pos],
+                ) {
                     replace_positions.push(base_pos as u32);
                     let mut replacement = index.entries[index_pos].clone();
                     replacement.path = BString::from(Vec::<u8>::new());
@@ -3241,7 +3263,10 @@ pub(crate) fn index_entry_stage(entry: &IndexEntry) -> u16 {
 
 /// The oid of the stage-0 entry in `range` (the path's currently-tracked blob),
 /// if any. Used by the safecrlf check to fetch `has_crlf_in_index`.
-pub(crate) fn stage0_oid_in_range(entries: &[IndexEntry], range: std::ops::Range<usize>) -> Option<ObjectId> {
+pub(crate) fn stage0_oid_in_range(
+    entries: &[IndexEntry],
+    range: std::ops::Range<usize>,
+) -> Option<ObjectId> {
     entries[range]
         .iter()
         .find(|entry| index_entry_stage(entry) == 0)
@@ -3692,7 +3717,10 @@ where
     ))
 }
 
-pub(crate) fn valid_cache_tree_oid(tree: Option<&CacheTree>, entry_count: usize) -> Option<ObjectId> {
+pub(crate) fn valid_cache_tree_oid(
+    tree: Option<&CacheTree>,
+    entry_count: usize,
+) -> Option<ObjectId> {
     let tree = tree?;
     if valid_cache_tree_entry_count(Some(tree))? != entry_count {
         return None;
@@ -3717,4 +3745,3 @@ pub(crate) fn same_tree_component(path: &[u8], prefix: &[u8], name: &[u8]) -> Re
     };
     Ok(remainder.starts_with(name) && remainder.get(name.len()) == Some(&b'/'))
 }
-

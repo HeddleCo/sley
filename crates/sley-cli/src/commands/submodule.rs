@@ -729,7 +729,10 @@ fn populate_submodule_worktree(
         // git's `prepare_possible_alternates`: borrow each submodule's objects
         // from the reference superproject's `modules/<name>` when the super has
         // `submodule.alternateLocation=superproject` (clone --reference --recursive).
-        clone_args.extend(superproject_alternate_reference_args(git_dir, &submodule.name)?);
+        clone_args.extend(superproject_alternate_reference_args(
+            git_dir,
+            &submodule.name,
+        )?);
         clone_args.push("--separate-git-dir".to_string());
         clone_args.push(modules_git_dir.display().to_string());
         clone_args.push(url.to_string());
@@ -791,7 +794,10 @@ fn superproject_alternate_reference_args(git_dir: &Path, name: &str) -> Result<V
 /// `submodule.alternateErrorStrategy` from the superproject into the freshly
 /// cloned submodule's config so its own recursive update borrows for the next
 /// nesting level.
-fn propagate_submodule_alternate_config(super_git_dir: &Path, modules_git_dir: &Path) -> Result<()> {
+fn propagate_submodule_alternate_config(
+    super_git_dir: &Path,
+    modules_git_dir: &Path,
+) -> Result<()> {
     let super_config = read_repo_config(&common_git_dir_for_git_dir(super_git_dir)?)?;
     let location = super_config
         .get("submodule", None, "alternateLocation")
@@ -804,7 +810,13 @@ fn propagate_submodule_alternate_config(super_git_dir: &Path, modules_git_dir: &
     }
     let mut config = read_repo_config(modules_git_dir)?;
     if let Some(location) = location {
-        set_config_value(&mut config, "submodule", None, "alternateLocation", &location);
+        set_config_value(
+            &mut config,
+            "submodule",
+            None,
+            "alternateLocation",
+            &location,
+        );
     }
     if let Some(strategy) = strategy {
         set_config_value(
@@ -1675,7 +1687,13 @@ fn sync_one_submodule(
         sub_format,
         &sub_config,
     )?;
-    set_config_value(&mut sub_config, "remote", Some(&remote), "url", &sub_origin_url);
+    set_config_value(
+        &mut sub_config,
+        "remote",
+        Some(&remote),
+        "url",
+        &sub_origin_url,
+    );
     write_repo_config(&sub_git_dir, &sub_config)?;
 
     if recursive {
@@ -2914,7 +2932,9 @@ fn superproject_remote_base(
             }
         }
     };
-    let base = config.get("remote", Some(&remote), "url").map(str::to_string);
+    let base = config
+        .get("remote", Some(&remote), "url")
+        .map(str::to_string);
     (remote, base)
 }
 

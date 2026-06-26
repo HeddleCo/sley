@@ -545,7 +545,12 @@ impl IgnorePattern {
         self.matches_with_basename(path, basename, is_dir)
     }
 
-    pub(crate) fn glob_literal_prefix_matches(&self, path: &[u8], basename: &[u8], is_dir: bool) -> bool {
+    pub(crate) fn glob_literal_prefix_matches(
+        &self,
+        path: &[u8],
+        basename: &[u8],
+        is_dir: bool,
+    ) -> bool {
         if self.match_kind != MatchKind::Glob {
             return true;
         }
@@ -838,7 +843,11 @@ pub(crate) fn wildcard_double_star_matches(
     false
 }
 
-pub(crate) fn wildcard_class_matches(pattern: &[u8], start: usize, value: u8) -> Option<(bool, usize)> {
+pub(crate) fn wildcard_class_matches(
+    pattern: &[u8],
+    start: usize,
+    value: u8,
+) -> Option<(bool, usize)> {
     let mut index = start + 1;
     let negated = matches!(pattern.get(index), Some(b'!' | b'^'));
     if negated {
@@ -1566,7 +1575,11 @@ impl AttributePattern {
     }
 }
 
-pub(crate) fn strip_attribute_base<'a>(path: &'a [u8], base: &[u8], ignore_case: bool) -> Option<&'a [u8]> {
+pub(crate) fn strip_attribute_base<'a>(
+    path: &'a [u8],
+    base: &[u8],
+    ignore_case: bool,
+) -> Option<&'a [u8]> {
     if path.len() <= base.len() || path.get(base.len()) != Some(&b'/') {
         return None;
     }
@@ -1582,4 +1595,3 @@ pub(crate) fn strip_attribute_base<'a>(path: &'a [u8], base: &[u8], ignore_case:
 pub(crate) fn ascii_lowercase(value: &[u8]) -> Vec<u8> {
     value.iter().map(u8::to_ascii_lowercase).collect()
 }
-

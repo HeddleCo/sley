@@ -145,7 +145,10 @@ pub fn rev_list_author_date_order(records: Vec<&CommitRecord>) -> Result<Vec<&Co
 /// order. Tips are inserted in input order; a parent is inserted when its last
 /// child is emitted (iterating that child's parents in order), exactly mirroring
 /// git's `prio_queue` `ctr` tiebreak.
-fn rev_list_prio_emit<'a>(records: Vec<&'a CommitRecord>, priority: &[i64]) -> Vec<&'a CommitRecord> {
+fn rev_list_prio_emit<'a>(
+    records: Vec<&'a CommitRecord>,
+    priority: &[i64],
+) -> Vec<&'a CommitRecord> {
     let index_by_oid = records
         .iter()
         .enumerate()

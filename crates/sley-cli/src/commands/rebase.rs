@@ -7,10 +7,11 @@
 //! `--skip` / `--quit` / `--edit-todo`, and autostash handling.
 
 use crate::commands::merge_rebase::{
-    MergePathResult, commit_tree_oid, effective_config_with_overrides, head_commit_oid, merge_bases,
-    merge_favor_from_strategy_opts, merge_index_entry, merge_read_blob, merge_remove_worktree_file,
-    merge_write_worktree_file, print_branch_commit_summary, print_commit_shortstat_between_trees,
-    three_way_merge_trees, three_way_merge_trees_inner_with_info, three_way_merge_trees_with_favor,
+    MergePathResult, commit_tree_oid, effective_config_with_overrides, head_commit_oid,
+    merge_bases, merge_favor_from_strategy_opts, merge_index_entry, merge_read_blob,
+    merge_remove_worktree_file, merge_write_worktree_file, print_branch_commit_summary,
+    print_commit_shortstat_between_trees, three_way_merge_trees,
+    three_way_merge_trees_inner_with_info, three_way_merge_trees_with_favor,
 };
 use crate::commands::replay::{comment_char, launch_editor, strip_comment_lines};
 use crate::*;
@@ -541,7 +542,10 @@ fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
         )?;
     }
     match opts.rerere_autoupdate {
-        Some(true) => fs::write(dir.join("allow_rerere_autoupdate"), b"--rerere-autoupdate\n")?,
+        Some(true) => fs::write(
+            dir.join("allow_rerere_autoupdate"),
+            b"--rerere-autoupdate\n",
+        )?,
         Some(false) => fs::write(
             dir.join("allow_rerere_autoupdate"),
             b"--no-rerere-autoupdate\n",
@@ -692,7 +696,11 @@ fn find_unique_abbrev_hex(ctx: &Ctx, db: &FileObjectDatabase, oid: &ObjectId) ->
 /// not yet distinguish the zealous variant.
 fn rebase_merge_conflict_style() -> sley_diff_merge::ConflictStyle {
     effective_config_with_overrides()
-        .and_then(|config| config.get("merge", None, "conflictstyle").map(str::to_string))
+        .and_then(|config| {
+            config
+                .get("merge", None, "conflictstyle")
+                .map(str::to_string)
+        })
         .map(|value| match value.as_str() {
             "diff3" | "zdiff3" => sley_diff_merge::ConflictStyle::Diff3,
             _ => sley_diff_merge::ConflictStyle::Merge,
@@ -1327,8 +1335,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                     // HEAD onto its commit (RESET_HEAD_DETACH path).
                     reset_index_and_worktree_to_commit_for_rebase(ctx, &orig_head)?;
                     let refs = ctx.refs();
-                    let old =
-                        head_commit_oid(&refs)?.unwrap_or_else(|| ObjectId::null(ctx.format));
+                    let old = head_commit_oid(&refs)?.unwrap_or_else(|| ObjectId::null(ctx.format));
                     let committer = commit_identity_from_env("COMMITTER")?;
                     detach_head_with_reflog(
                         ctx,
@@ -2447,7 +2454,9 @@ fn make_script_with_merges(
                         let subject = match records.get(&oid) {
                             Some(rec) => commit_subject(&rec.commit.message),
                             None => commit_subject(
-                                &read_rev_list_commit_record(db, ctx.format, oid)?.commit.message,
+                                &read_rev_list_commit_record(db, ctx.format, oid)?
+                                    .commit
+                                    .message,
                             ),
                         };
                         format!("{t} # {subject}")
@@ -2570,8 +2579,7 @@ impl<'a> LabelState<'a> {
                     buf = format!("rev-{}", find_unique_abbrev_hex(self.ctx, self.db, oid));
                 }
                 let hexsz = oid.to_hex().len();
-                let is_full_hex =
-                    buf.len() == hexsz && buf.bytes().all(|b| b.is_ascii_hexdigit());
+                let is_full_hex = buf.len() == hexsz && buf.bytes().all(|b| b.is_ascii_hexdigit());
                 if is_full_hex || buf == "#" || self.taken(&buf) {
                     let stem = buf.clone();
                     let mut i = 2;
@@ -5600,7 +5608,12 @@ fn copy_notes_for_rewrite(ctx: &Ctx, rewritten: &[(ObjectId, ObjectId)]) -> Resu
         .map(str::to_string)
         .collect();
     if let Ok(env_refs) = env::var("GIT_NOTES_REWRITE_REF") {
-        patterns.extend(env_refs.split(':').filter(|s| !s.is_empty()).map(str::to_string));
+        patterns.extend(
+            env_refs
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
     }
     if patterns.is_empty() {
         return Ok(());
@@ -5640,28 +5653,18 @@ fn copy_notes_for_rewrite(ctx: &Ctx, rewritten: &[(ObjectId, ObjectId)]) -> Resu
             if dest_blob == Some(source_blob) {
                 continue;
             }
-            let source = sley_notes::read_note_bytes(
-                &ctx.git_dir,
-                ctx.format,
-                &store,
-                &notes_ref,
-                old,
-            )?
-            .unwrap_or_default();
+            let source =
+                sley_notes::read_note_bytes(&ctx.git_dir, ctx.format, &store, &notes_ref, old)?
+                    .unwrap_or_default();
             // `overwrite` replaces; concatenate/cat_sort_uniq append to any note
             // already on the replacement commit, separated by a blank line
             // (combine_notes_concatenate).
             let combined = if mode == "overwrite" || dest_blob.is_none() {
                 source
             } else {
-                let mut cur = sley_notes::read_note_bytes(
-                    &ctx.git_dir,
-                    ctx.format,
-                    &store,
-                    &notes_ref,
-                    new,
-                )?
-                .unwrap_or_default();
+                let mut cur =
+                    sley_notes::read_note_bytes(&ctx.git_dir, ctx.format, &store, &notes_ref, new)?
+                        .unwrap_or_default();
                 if cur.last() == Some(&b'\n') {
                     cur.pop();
                 }

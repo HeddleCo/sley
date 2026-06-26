@@ -1758,8 +1758,7 @@ fn rev_list_patchsame_oids(
         if left_first == on_left {
             continue;
         }
-        let Some(id) = rev_list_commit_patch_id(db, format, record, diff_pathspec.as_ref())?
-        else {
+        let Some(id) = rev_list_commit_patch_id(db, format, record, diff_pathspec.as_ref())? else {
             continue;
         };
         let Some(matches) = ids.get(&id) else {
@@ -1793,10 +1792,8 @@ fn rev_list_commit_patch_id(
             &record.commit.tree,
             pathspec,
         )?,
-        None => {
-            render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree)
-                .unwrap_or_default()
-        }
+        None => render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree)
+            .unwrap_or_default(),
     };
     Ok(commands::patch_id::patch_id_for_diff(&diff, format))
 }

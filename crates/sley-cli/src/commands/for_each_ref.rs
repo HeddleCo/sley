@@ -2060,12 +2060,7 @@ fn for_each_ref_sort_peeled_object(
     let tag_oid = resolve_for_each_ref_target(context.store, reference)?
         .map(|(oid, _)| oid)
         .unwrap_or(oid);
-    for_each_ref_validate_tag_pointer(
-        &tag_oid,
-        &contents,
-        &oid,
-        &object,
-    )?;
+    for_each_ref_validate_tag_pointer(&tag_oid, &contents, &oid, &object)?;
     Ok(Some((oid, (*object).clone())))
 }
 

@@ -2375,8 +2375,7 @@ fn populate_tag_sort_metadata(
         };
         let object = db.read_object(&oid)?;
         let contents = for_each_ref_contents(format, &object)?;
-        let peeled_object =
-            tag_format_peeled_object(git_dir, db, format, &oid, contents.as_ref())?;
+        let peeled_object = tag_format_peeled_object(git_dir, db, format, &oid, contents.as_ref())?;
         let peeled_authordate =
             tag_sort_peeled_date_key(peeled_object.as_ref(), ForEachRefDateSortField::Author);
         let peeled_committerdate =

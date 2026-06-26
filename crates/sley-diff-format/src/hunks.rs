@@ -69,4 +69,3 @@ pub fn heading_classifier<'a>(
         None => crate::default_funcname_heading(line),
     }
 }
-

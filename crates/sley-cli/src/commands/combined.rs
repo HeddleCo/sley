@@ -55,7 +55,7 @@ pub(crate) fn combined_paths(
         detect_inexact: false,
         rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
         copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-    rename_limit: 0,
+        rename_limit: 0,
     };
 
     let mut first_parent_entries = sley_diff_merge::diff_name_status_trees_with_rename_options(

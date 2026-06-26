@@ -265,7 +265,14 @@ pub fn resolve_revision_with_reader<R: ObjectReader>(
     reader: &R,
     rev: &str,
 ) -> Result<ObjectId> {
-    resolve_revision_inner(git_dir, format, reader, rev, None, ObjectDisambiguation::Any)
+    resolve_revision_inner(
+        git_dir,
+        format,
+        reader,
+        rev,
+        None,
+        ObjectDisambiguation::Any,
+    )
 }
 
 /// Like [`resolve_revision_with_reader`], but resolves `@{upstream}` / `@{push}`
@@ -1055,7 +1062,10 @@ fn parse_at_count(rev: &str, text: &str) -> Result<usize> {
 }
 
 fn parse_prior_checkout_selector(rev: &str) -> Result<Option<usize>> {
-    let Some(inner) = rev.strip_prefix("@{-").and_then(|rest| rest.strip_suffix('}')) else {
+    let Some(inner) = rev
+        .strip_prefix("@{-")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
         return Ok(None);
     };
     if !inner.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -1395,10 +1405,10 @@ fn resolve_previous_checkout(
             let from = from.to_string();
             return resolve_revision_name(git_dir, format, &from, ObjectDisambiguation::Any)
                 .map_err(|_| {
-                GitError::not_found(format!(
-                    "could not resolve previous branch '{from}' for {rev}"
-                ))
-            });
+                    GitError::not_found(format!(
+                        "could not resolve previous branch '{from}' for {rev}"
+                    ))
+                });
         }
     }
     Err(GitError::not_found(format!(
@@ -5050,8 +5060,14 @@ pub fn resolve_rev_path_entry<R: ObjectReader>(
     // Ref-first resolution with a tree-ish disambiguation: a ref named like a
     // short hex prefix (e.g. `added:path`) resolves to the ref, while a genuine
     // bare prefix is narrowed to its tree-ish candidates.
-    let rev_oid =
-        resolve_revision_inner(git_dir, format, reader, rev, None, ObjectDisambiguation::Treeish)?;
+    let rev_oid = resolve_revision_inner(
+        git_dir,
+        format,
+        reader,
+        rev,
+        None,
+        ObjectDisambiguation::Treeish,
+    )?;
     let tree_oid = peel_to_tree(reader, format, &rev_oid)?;
     resolve_tree_path_entry(reader, format, &tree_oid, path)
         .ok_or_else(|| GitError::not_found(format!("path '{path}' does not exist in '{rev}'")))
@@ -5411,7 +5427,8 @@ fn resolve_index_path<R: ObjectReader>(
         }
     }
     if stage == 0
-        && let Some(oid) = resolve_index_path_in_sparse_dir(&index, reader, format, &normalized_path)
+        && let Some(oid) =
+            resolve_index_path_in_sparse_dir(&index, reader, format, &normalized_path)
     {
         return Ok(oid);
     }
@@ -7484,8 +7501,16 @@ mod tests {
         write_head_reflog(
             &git_dir,
             &[
-                (&old_two, &new_two, "checkout: moving from old-branch to new-branch"),
-                (&new_two, &old_two, "checkout: moving from new-branch to old-branch"),
+                (
+                    &old_two,
+                    &new_two,
+                    "checkout: moving from old-branch to new-branch",
+                ),
+                (
+                    &new_two,
+                    &old_two,
+                    "checkout: moving from new-branch to old-branch",
+                ),
             ],
         );
         assert_eq!(

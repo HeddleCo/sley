@@ -378,8 +378,8 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
     }
     if !request.options.remote_head_branch.is_empty()
         && (!request.options.single_branch
-        || request.options.checkout_branch == request.options.remote_head_branch
-    ) {
+            || request.options.checkout_branch == request.options.remote_head_branch)
+    {
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: format!("refs/remotes/{}/HEAD", request.options.origin),

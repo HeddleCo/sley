@@ -154,7 +154,7 @@ pub(super) fn diff_filter_commit_matches(
                 detect_inexact: true,
                 rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            rename_limit: 0,
+                rename_limit: 0,
             },
         )?,
         (Some(parent), false) => {
@@ -211,7 +211,7 @@ pub(super) fn log_follow_single_path<'a>(
                     detect_inexact: true,
                     rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                     copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-                rename_limit: 0,
+                    rename_limit: 0,
                 },
             )?,
             (Some(parent), false) => sley_diff_merge::diff_name_status_trees_with_options(
@@ -289,7 +289,7 @@ pub(super) fn pickaxe_commit_matches(
                 detect_inexact: true,
                 rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            rename_limit: 0,
+                rename_limit: 0,
             },
         )?,
         (Some(parent), false) => {
@@ -467,20 +467,13 @@ fn pickaxe_diff_grep(old: &[u8], new: &[u8], regex: &sley_grep::Regex) -> bool {
 
 /// Compile a pickaxe regex. git uses POSIX ERE (`REG_EXTENDED | REG_NEWLINE`,
 /// plus `REG_ICASE` under `-i`) for both `-G` and `-S --pickaxe-regex`.
-pub(super) fn compile_pickaxe_regex(
-    pattern: &str,
-    ignore_case: bool,
-) -> Result<sley_grep::Regex> {
-    sley_grep::Regex::compile(
-        pattern,
-        sley_grep::RegexMode::Ere,
-        ignore_case,
-        false,
+pub(super) fn compile_pickaxe_regex(pattern: &str, ignore_case: bool) -> Result<sley_grep::Regex> {
+    sley_grep::Regex::compile(pattern, sley_grep::RegexMode::Ere, ignore_case, false).map_err(
+        |_| {
+            eprintln!("fatal: invalid regex: {pattern}");
+            GitError::Exit(128)
+        },
     )
-    .map_err(|_| {
-        eprintln!("fatal: invalid regex: {pattern}");
-        GitError::Exit(128)
-    })
 }
 
 impl CompiledPickaxe {

@@ -827,7 +827,9 @@ impl FileRefStore {
                 return Ok(Some(target));
             }
             if name != "HEAD" && is_root_ref_syntax(&name) {
-                return Ok(self.read_loose_ref(&name)?.map(|reference| reference.target));
+                return Ok(self
+                    .read_loose_ref(&name)?
+                    .map(|reference| reference.target));
             }
             return Ok(None);
         }
@@ -2073,7 +2075,10 @@ impl FileRefStore {
             ));
         }
         if reftable_current_worktree_ref(name) {
-            return Ok((self.reftable_store_with_storage(self.git_dir.clone()), name.to_string()));
+            return Ok((
+                self.reftable_store_with_storage(self.git_dir.clone()),
+                name.to_string(),
+            ));
         }
         Ok((
             self.reftable_store_with_storage(self.shared_reftable_storage_dir()),

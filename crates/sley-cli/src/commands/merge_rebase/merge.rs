@@ -3162,7 +3162,11 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     // `merge.conflictStyle`: diff3/zdiff3 add the `|||||||` common-ancestor
     // section to conflict markers (git honours this for `git merge`).
     let conflict_style = effective_config_with_overrides()
-        .and_then(|config| config.get("merge", None, "conflictstyle").map(str::to_string))
+        .and_then(|config| {
+            config
+                .get("merge", None, "conflictstyle")
+                .map(str::to_string)
+        })
         .map(|value| match value.as_str() {
             "diff3" | "zdiff3" => sley_diff_merge::ConflictStyle::Diff3,
             _ => sley_diff_merge::ConflictStyle::Merge,
@@ -3683,12 +3687,7 @@ pub(crate) fn cmd_merge_recursive(args: &[String]) -> Result<()> {
                 ws_ignore.cr_at_eol = true;
             } else if matches!(
                 opt,
-                "renormalize"
-                    | "no-renormalize"
-                    | "patience"
-                    | "histogram"
-                    | "minimal"
-                    | "subtree"
+                "renormalize" | "no-renormalize" | "patience" | "histogram" | "minimal" | "subtree"
             ) || opt.starts_with("diff-algorithm=")
                 || opt.starts_with("subtree=")
             {

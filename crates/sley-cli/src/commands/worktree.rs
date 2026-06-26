@@ -450,7 +450,9 @@ fn prune_worktree_admins(
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         match should_prune_worktree_admin(&path, &name, options.expire)? {
-            PruneAdminDecision::Prune(reason) => prune_worktree_admin(&path, &name, &reason, options),
+            PruneAdminDecision::Prune(reason) => {
+                prune_worktree_admin(&path, &name, &reason, options)
+            }
             PruneAdminDecision::Keep { gitdir } => kept.push(PruneKeptWorktree {
                 path: gitdir,
                 admin_name: Some(name),
@@ -508,9 +510,7 @@ fn should_prune_worktree_admin(
         path.pop();
     }
     if path.is_empty() {
-        return Ok(PruneAdminDecision::Prune(
-            "invalid gitdir file".to_string(),
-        ));
+        return Ok(PruneAdminDecision::Prune("invalid gitdir file".to_string()));
     }
     let gitdir = resolve_admin_path_forgiving(admin_dir, &path);
     if !gitdir.exists() {
@@ -2754,7 +2754,11 @@ fn read_common_ref_oid(
     )))
 }
 
-fn print_worktree_list_default(entries: &[WorktreeListEntry], common_git_dir: &Path, verbose: bool) {
+fn print_worktree_list_default(
+    entries: &[WorktreeListEntry],
+    common_git_dir: &Path,
+    verbose: bool,
+) {
     let quote_path = worktree_list_quote_path(common_git_dir);
     let display_paths: Vec<String> = entries
         .iter()
@@ -2887,10 +2891,9 @@ fn print_worktree_list_porcelain(entries: &[WorktreeListEntry], z: bool) -> Resu
 
 fn worktree_list_quote_reason(reason: &str) -> String {
     let bytes = reason.as_bytes();
-    if !bytes
-        .iter()
-        .any(|byte| matches!(byte, b'"' | b'\\' | b'\n' | b'\r' | b'\t') || !(0x20..0x7f).contains(byte))
-    {
+    if !bytes.iter().any(|byte| {
+        matches!(byte, b'"' | b'\\' | b'\n' | b'\r' | b'\t') || !(0x20..0x7f).contains(byte)
+    }) {
         return reason.to_string();
     }
     let mut out = String::from("\"");

@@ -905,7 +905,13 @@ pub(crate) fn cmd_add_patch(
     let cfg = resolve_patch_config(&git_dir, context, interhunk, auto_advance)?;
     let stdin = io::stdin();
     let mut handle = stdin.lock();
-    super::add_patch::run_add_patch(super::add_patch::PatchMode::Add, paths, None, &mut handle, cfg)
+    super::add_patch::run_add_patch(
+        super::add_patch::PatchMode::Add,
+        paths,
+        None,
+        &mut handle,
+        cfg,
+    )
 }
 
 /// Resolve the diff-tuning [`PatchConfig`] the way add-patch.c's

@@ -520,7 +520,14 @@ pub(crate) fn rebase_apply_continue(
     format: ObjectFormat,
 ) -> Result<()> {
     let state_dir = git_dir.join("rebase-apply");
-    am_continue(git_dir, common_git_dir, worktree_root, format, &state_dir, AmResumeOverrides::default())
+    am_continue(
+        git_dir,
+        common_git_dir,
+        worktree_root,
+        format,
+        &state_dir,
+        AmResumeOverrides::default(),
+    )
 }
 
 /// `git rebase --apply --skip`.
@@ -646,7 +653,9 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
                 index += 1;
             }
             value if let Some(action) = value.strip_prefix("--whitespace=") => {
-                options.git_apply_opts.push(format!("--whitespace={action}"));
+                options
+                    .git_apply_opts
+                    .push(format!("--whitespace={action}"));
             }
             "--reject" => options.git_apply_opts.push("--reject".to_string()),
             "--no-reject" => options.git_apply_opts.push("--no-reject".to_string()),
@@ -1278,10 +1287,9 @@ fn parse_message(lines: &[Vec<u8>], cleanup: SubjectCleanup) -> Result<AmPatch> 
                 // apply backend stores the commit's raw git date (`<secs> <tz>` /
                 // `@<secs> <tz>`) directly; accept that too so the round-trip
                 // through the state dir preserves the author date.
-                author_date =
-                    parse_rfc2822_date(value)
-                        .or_else(|| parse_raw_git_date_normalized(value))
-                        .or_else(|| parse_git_default_date(value));
+                author_date = parse_rfc2822_date(value)
+                    .or_else(|| parse_raw_git_date_normalized(value))
+                    .or_else(|| parse_git_default_date(value));
             }
             "subject" => subject = clean_subject(value, cleanup),
             "message-id" if !value.is_empty() => message_id = Some(value.clone()),
@@ -1451,10 +1459,9 @@ fn consume_in_body_headers(
             }
             "date" => {
                 *author_date_raw = Some(value.clone());
-                *author_date =
-                    parse_rfc2822_date(value)
-                        .or_else(|| parse_raw_git_date_normalized(value))
-                        .or_else(|| parse_git_default_date(value));
+                *author_date = parse_rfc2822_date(value)
+                    .or_else(|| parse_raw_git_date_normalized(value))
+                    .or_else(|| parse_git_default_date(value));
             }
             "subject" => *subject = clean_subject(value, cleanup),
             _ => {}
@@ -2466,9 +2473,7 @@ fn run_am_series(
                 if !state_dir.join("head-name").exists() {
                     let refs = FileRefStore::new(git_dir, format);
                     match head_commit_oid(&refs)? {
-                        Some(oid) => {
-                            fs::write(state_dir.join("abort-safety"), format!("{oid}\n"))?
-                        }
+                        Some(oid) => fs::write(state_dir.join("abort-safety"), format!("{oid}\n"))?,
                         None => fs::write(state_dir.join("abort-safety"), b"")?,
                     }
                 }
@@ -3600,24 +3605,29 @@ fn apply_three_way(
     // merge.conflictStyle so `-c merge.conflictstyle=diff3` (and rebase --apply)
     // emit the `|||||||` ancestor section.
     let conflict_style = commands::merge_rebase::effective_config_with_overrides()
-        .and_then(|config| config.get("merge", None, "conflictstyle").map(str::to_string))
+        .and_then(|config| {
+            config
+                .get("merge", None, "conflictstyle")
+                .map(str::to_string)
+        })
         .map(|value| match value.as_str() {
             "diff3" | "zdiff3" => sley_diff_merge::ConflictStyle::Diff3,
             _ => sley_diff_merge::ConflictStyle::Merge,
         })
         .unwrap_or(sley_diff_merge::ConflictStyle::Merge);
-    let (results, conflicts, _info) = commands::merge_rebase::three_way_merge_trees_inner_with_info(
-        &db,
-        format,
-        &base_map,
-        &ours_map,
-        &theirs_map,
-        "HEAD",
-        &patch.subject,
-        "constructed fake ancestor",
-        sley_diff_merge::MergeFavor::None,
-        conflict_style,
-    )?;
+    let (results, conflicts, _info) =
+        commands::merge_rebase::three_way_merge_trees_inner_with_info(
+            &db,
+            format,
+            &base_map,
+            &ours_map,
+            &theirs_map,
+            "HEAD",
+            &patch.subject,
+            "constructed fake ancestor",
+            sley_diff_merge::MergeFavor::None,
+            conflict_style,
+        )?;
 
     // git's merge refuses to clobber untracked working-tree files: a path the
     // merge would create that is absent from "ours" (HEAD) but present in the
@@ -4420,7 +4430,12 @@ fn am_abort(
                 }
             }
             tx.commit()?;
-            sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &oid)?;
+            sley_worktree::reset_index_and_worktree_to_commit(
+                worktree_root,
+                git_dir,
+                format,
+                &oid,
+            )?;
         }
         // Drop state directly: `finish_am` would re-run the rebase finish (which
         // moves to the rebased tip), but on abort we have already restored
@@ -4751,14 +4766,28 @@ fn am_continue_allow_empty(
             .any(|entry| (entry.flags >> 12) & 0x3 != 0)
     });
     if has_unmerged {
-        return am_continue(git_dir, common_git_dir, worktree_root, format, state_dir, AmResumeOverrides::default());
+        return am_continue(
+            git_dir,
+            common_git_dir,
+            worktree_root,
+            format,
+            state_dir,
+            AmResumeOverrides::default(),
+        );
     }
 
     let refs = FileRefStore::new(git_dir, format);
     if let Some(head_oid) = head_commit_oid(&refs)?
         && am_index_is_dirty(git_dir, common_git_dir, format, &head_oid)?
     {
-        return am_continue(git_dir, common_git_dir, worktree_root, format, state_dir, AmResumeOverrides::default());
+        return am_continue(
+            git_dir,
+            common_git_dir,
+            worktree_root,
+            format,
+            state_dir,
+            AmResumeOverrides::default(),
+        );
     }
 
     let commit_opts = read_am_commit_opts(state_dir);

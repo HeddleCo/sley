@@ -859,7 +859,7 @@ fn commit_name_status(
                 detect_inexact: true,
                 rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            rename_limit: 0,
+                rename_limit: 0,
             },
         )?,
         (Some(parent), false) => {

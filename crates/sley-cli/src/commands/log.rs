@@ -414,7 +414,13 @@ pub(crate) fn print_log_custom_format_with_notes(
             git_dir, format, &store, &refs, record, compiled, context, &mut line,
         )?;
     } else {
-        emit_compiled_log_format(record, compiled, context, &mut line, 0..compiled.tokens.len())?;
+        emit_compiled_log_format(
+            record,
+            compiled,
+            context,
+            &mut line,
+            0..compiled.tokens.len(),
+        )?;
     }
     let out = log_reencode_message(&line, "UTF-8", context.output_encoding);
     let emitted = out.len();

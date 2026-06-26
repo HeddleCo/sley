@@ -360,9 +360,9 @@ impl CatFileObjectRequest {
             use_mailmap: self.use_mailmap,
         };
         match self.mode {
-            CatFileObjectMode::Command(mode @ (CatFileCmdMode::Textconv | CatFileCmdMode::Filters)) => {
-                query.print_transform(mode, self.force_path.as_deref())
-            }
+            CatFileObjectMode::Command(
+                mode @ (CatFileCmdMode::Textconv | CatFileCmdMode::Filters),
+            ) => query.print_transform(mode, self.force_path.as_deref()),
             CatFileObjectMode::Command(mode) => query.print_command_mode(mode),
             CatFileObjectMode::Typed(object_type) => query.print_typed_body(object_type),
         }
@@ -522,9 +522,9 @@ impl ObjectQuery<'_> {
             CatFileCmdMode::Pretty => self.print_pretty(),
             // `--textconv`/`--filters` are dispatched to `print_transform` before
             // reaching here (they need the recorded path + mode, not just an oid).
-            CatFileCmdMode::Textconv | CatFileCmdMode::Filters => unreachable!(
-                "--textconv/--filters are handled by print_transform"
-            ),
+            CatFileCmdMode::Textconv | CatFileCmdMode::Filters => {
+                unreachable!("--textconv/--filters are handled by print_transform")
+            }
             // Never reaches execution: `--batch-all-objects` is folded into a batch
             // request or rejected during option validation.
             CatFileCmdMode::BatchAllObjects => unreachable!(

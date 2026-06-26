@@ -362,8 +362,7 @@ pub fn remove_index_and_worktree_paths(
                 is_gitlink,
                 is_stage0_gitlink,
                 options.force,
-            )?
-            {
+            )? {
                 true => removed_any = true,
                 false if !removed_any => {
                     eprintln!(
@@ -1814,4 +1813,3 @@ fn sparse_directory_move(
         details,
     })
 }
-

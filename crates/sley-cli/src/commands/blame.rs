@@ -360,9 +360,15 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         let previous = read_path_blob(db, format, &start_commit, &repo_path)?
             .map(|_| (start_commit, repo_path.clone()));
         let (name, email) = if options.contents_from.is_some() {
-            ("External file (--contents)".to_string(), "external.file".to_string())
+            (
+                "External file (--contents)".to_string(),
+                "external.file".to_string(),
+            )
         } else {
-            ("Not Committed Yet".to_string(), "not.committed.yet".to_string())
+            (
+                "Not Committed Yet".to_string(),
+                "not.committed.yet".to_string(),
+            )
         };
         let source = match &options.contents_from {
             Some(spec) if spec == "-" => "standard input".to_string(),
@@ -720,8 +726,9 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
                 diff_algorithm = Some(parse_blame_diff_algorithm(value)?);
             }
             other if other.starts_with("--diff-algorithm=") => {
-                diff_algorithm =
-                    Some(parse_blame_diff_algorithm(&other["--diff-algorithm=".len()..])?);
+                diff_algorithm = Some(parse_blame_diff_algorithm(
+                    &other["--diff-algorithm=".len()..],
+                )?);
             }
             "--encoding" => {
                 let Some(value) = iter.next() else {
@@ -828,7 +835,9 @@ fn parse_blame_diff_algorithm(value: &str) -> Result<sley_diff_merge::DiffAlgori
         "patience" => DiffAlgorithm::Patience,
         "histogram" => DiffAlgorithm::Histogram,
         other => {
-            eprintln!("fatal: option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\"");
+            eprintln!(
+                "fatal: option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\""
+            );
             let _ = other;
             return Err(GitError::Exit(128));
         }
@@ -878,11 +887,7 @@ fn resolve_positionals(
 fn is_unsupported_blame_option(arg: &str) -> bool {
     if matches!(
         arg,
-        "-n" | "--show-number"
-            | "-w"
-            | "--reverse"
-            | "--show-stats"
-            | "--score-debug"
+        "-n" | "--show-number" | "-w" | "--reverse" | "--show-stats" | "--score-debug"
     ) {
         return true;
     }
@@ -1120,11 +1125,9 @@ fn read_index_blob(
     let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
         return Ok(None);
     };
-    let Some(entry) = index
-        .entries
-        .iter()
-        .find(|entry| entry.stage() == sley_index::Stage::Normal && entry.path.as_bytes() == repo_path.as_bytes())
-    else {
+    let Some(entry) = index.entries.iter().find(|entry| {
+        entry.stage() == sley_index::Stage::Normal && entry.path.as_bytes() == repo_path.as_bytes()
+    }) else {
         return Ok(None);
     };
     let object = read_object_maybe_prefetch_promisor(db, &entry.oid)?;
@@ -1138,10 +1141,7 @@ fn read_index_blob(
 /// commit set, mirroring git's `build_ignorelist`. Files are processed first
 /// (config entries, then CLI ones, in order; an empty filename clears the set so
 /// far), then the explicit `--ignore-rev` revisions.
-fn build_ignore_set(
-    repo: &RepositoryContext,
-    options: &BlameOptions,
-) -> Result<HashSet<ObjectId>> {
+fn build_ignore_set(repo: &RepositoryContext, options: &BlameOptions) -> Result<HashSet<ObjectId>> {
     let db = repo.objects();
     let format = repo.format();
     let mut set: HashSet<ObjectId> = HashSet::new();
@@ -1218,7 +1218,10 @@ fn parse_ignore_revs_file(
         let end = line.iter().rposition(|b| !is_ascii_space(*b)).unwrap() + 1;
         let token = &line[start..end];
         let Ok(text) = std::str::from_utf8(token) else {
-            eprintln!("fatal: invalid object name: {}", String::from_utf8_lossy(token));
+            eprintln!(
+                "fatal: invalid object name: {}",
+                String::from_utf8_lossy(token)
+            );
             return Err(GitError::Exit(128));
         };
         let Ok(oid) = ObjectId::from_hex(format, text) else {
@@ -1252,9 +1255,15 @@ fn read_graft_file(git_dir: &Path, format: ObjectFormat) -> HashMap<ObjectId, Ve
             .split(|b| b.is_ascii_whitespace())
             .filter(|t| !t.is_empty())
             .collect();
-        let Some(first) = tokens.first() else { continue };
-        let Ok(text) = std::str::from_utf8(first) else { continue };
-        let Ok(commit) = ObjectId::from_hex(format, text) else { continue };
+        let Some(first) = tokens.first() else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(first) else {
+            continue;
+        };
+        let Ok(commit) = ObjectId::from_hex(format, text) else {
+            continue;
+        };
         let parents = tokens[1..]
             .iter()
             .filter_map(|t| std::str::from_utf8(t).ok())
@@ -1543,11 +1552,19 @@ fn compute_blame(
     // the parent's committed-blob read and make every line pass through. The
     // virtual origin gets its image from `final_blob` directly instead.
     if !virtual_final {
-        blob_cache.insert((start_key.commit, start_key.path.clone()), Some(final_blob.to_vec()));
+        blob_cache.insert(
+            (start_key.commit, start_key.path.clone()),
+            Some(final_blob.to_vec()),
+        );
     }
     suspects.insert(
         start_key.clone(),
-        vec![BlameEntry { lno: 0, s_lno: 0, num_lines: line_count, ..Default::default() }],
+        vec![BlameEntry {
+            lno: 0,
+            s_lno: 0,
+            num_lines: line_count,
+            ..Default::default()
+        }],
     );
 
     // Commit-date priority queue, newest first (git's
@@ -1583,7 +1600,14 @@ fn compute_blame(
         let child_blob = if origin.virtual_worktree {
             Some(final_blob.to_vec())
         } else {
-            cached_blob(db, format, &commit_oid, &origin.path, &mut blob_cache, textconv)?
+            cached_blob(
+                db,
+                format,
+                &commit_oid,
+                &origin.path,
+                &mut blob_cache,
+                textconv,
+            )?
         };
         let Some(child_blob) = child_blob else {
             // The path is absent at this commit (shouldn't normally happen for a
@@ -1634,8 +1658,14 @@ fn compute_blame(
                     .entry((origin.commit, origin.path.clone()))
                     .or_insert_with(|| (parent_origin.commit, parent_origin.path.clone()));
             }
-            let parent_blob =
-                cached_blob(db, format, parent, &parent_origin.path, &mut blob_cache, textconv)?;
+            let parent_blob = cached_blob(
+                db,
+                format,
+                parent,
+                &parent_origin.path,
+                &mut blob_cache,
+                textconv,
+            )?;
             let Some(parent_blob) = parent_blob else {
                 // Path absent in this parent: it preserves nothing, so all
                 // chunks stay with the current commit for the next parent.
@@ -1678,8 +1708,14 @@ fn compute_blame(
                 else {
                     continue;
                 };
-                let parent_blob =
-                    cached_blob(db, format, parent, &parent_origin.path, &mut blob_cache, textconv)?;
+                let parent_blob = cached_blob(
+                    db,
+                    format,
+                    parent,
+                    &parent_origin.path,
+                    &mut blob_cache,
+                    textconv,
+                )?;
                 let Some(parent_blob) = parent_blob else {
                     continue;
                 };
@@ -2093,7 +2129,7 @@ fn find_parent_origin(
             detect_inexact: true,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-        rename_limit: 0,
+            rename_limit: 0,
         },
     )?;
 
@@ -2103,9 +2139,7 @@ fn find_parent_origin(
         }
         let is_origin = matches!(entry.status, sley_diff_merge::NameStatus::Renamed(_))
             || (allow_whole_copy && matches!(entry.status, sley_diff_merge::NameStatus::Copied(_)));
-        if is_origin
-            && let Some(old_path) = entry.old_path
-        {
+        if is_origin && let Some(old_path) = entry.old_path {
             return Ok(Some(OriginKey {
                 commit: *parent,
                 path: String::from_utf8_lossy(old_path.as_bytes()).into_owned(),
@@ -2277,7 +2311,8 @@ fn split_copy_matches(
         let mut len = 1usize;
         while cursor + len < entry.num_lines
             && source_start + len < source_lines.len()
-            && source_lines[source_start + len].content == final_lines[entry.lno + cursor + len].content
+            && source_lines[source_start + len].content
+                == final_lines[entry.lno + cursor + len].content
             && source_lines[source_start + len].has_newline
                 == final_lines[entry.lno + cursor + len].has_newline
         {
@@ -2375,7 +2410,10 @@ fn get_fingerprint(line: &[u8]) -> Fingerprint {
 
 /// Fingerprints for every line of a blob, in line order.
 fn line_fingerprints(lines: &[sley_diff_merge::DiffLine<'_>]) -> Vec<Fingerprint> {
-    lines.iter().map(|line| get_fingerprint(line.content)).collect()
+    lines
+        .iter()
+        .map(|line| get_fingerprint(line.content))
+        .collect()
 }
 
 /// git's `fingerprint_similarity`: the size of the bigram-multiset intersection
@@ -2511,13 +2549,7 @@ fn find_best_line_matches(state: &mut FuzzyState, start_a: i32, length_a: i32, a
 /// git's `fuzzy_find_matching_lines_recurse`: pick the most confidently matched
 /// line as a partition, subtract its fingerprint, invalidate contradicting
 /// neighbours, then recurse on either side.
-fn fuzzy_recurse(
-    state: &mut FuzzyState,
-    start_a: i32,
-    start_b: i32,
-    length_a: i32,
-    length_b: i32,
-) {
+fn fuzzy_recurse(state: &mut FuzzyState, start_a: i32, start_b: i32, length_a: i32, length_b: i32) {
     let mut most_certain_local_line_b: i32 = -1;
     let mut most_certain_line_certainty: i32 = -1;
     for i in 0..length_b {
@@ -2539,9 +2571,7 @@ fn fuzzy_recurse(
     let most_certain_line_a = state.result[most_certain_b_idx];
 
     // Subtract the chosen B line's fingerprint from its matched A line.
-    let (left, right) = state
-        .parent_fps
-        .split_at_mut(most_certain_line_a as usize);
+    let (left, right) = state.parent_fps.split_at_mut(most_certain_line_a as usize);
     let target_fp = &state.target_fps[most_certain_abs_b as usize];
     fingerprint_subtract(&mut right[0], target_fp);
     let _ = left;
@@ -2644,8 +2674,7 @@ fn fuzzy_find_matching_lines(
     if max_search_distance_a >= length_a {
         max_search_distance_a = if length_a != 0 { length_a - 1 } else { 0 };
     }
-    let max_search_distance_b =
-        ((2 * max_search_distance_a + 1) * length_b - 1) / length_a;
+    let max_search_distance_b = ((2 * max_search_distance_a + 1) * length_b - 1) / length_a;
 
     let similarity_count = (length_b * (max_search_distance_a * 2 + 1)) as usize;
     let mut parent_copy = parent_fps.to_vec();
@@ -2744,9 +2773,15 @@ fn guess_line_blames(
             ),
         };
         if best_idx >= 0 {
-            line_blames.push(LineTracker { is_parent: true, s_lno: best_idx });
+            line_blames.push(LineTracker {
+                is_parent: true,
+                s_lno: best_idx,
+            });
         } else {
-            line_blames.push(LineTracker { is_parent: false, s_lno: target_idx });
+            line_blames.push(LineTracker {
+                is_parent: false,
+                s_lno: target_idx,
+            });
         }
     }
     line_blames
@@ -2769,7 +2804,10 @@ fn ignore_blame_entry(
     while i < n {
         let mut len = 1usize;
         while i + len < n
-            && are_lines_adjacent(&line_blames[base + i + len - 1], &line_blames[base + i + len])
+            && are_lines_adjacent(
+                &line_blames[base + i + len - 1],
+                &line_blames[base + i + len],
+            )
         {
             len += 1;
         }
@@ -2783,7 +2821,11 @@ fn ignore_blame_entry(
             },
             num_lines: len,
             ignored: if head.is_parent { true } else { entry.ignored },
-            unblamable: if head.is_parent { entry.unblamable } else { true },
+            unblamable: if head.is_parent {
+                entry.unblamable
+            } else {
+                true
+            },
         };
         if head.is_parent {
             passed.push(part);
@@ -3207,12 +3249,27 @@ fn render_blame(
 ) -> Result<()> {
     if options.incremental {
         return render_incremental(
-            db, format, lines, selected, fake, previous_map, output_encoding, options.show_root,
+            db,
+            format,
+            lines,
+            selected,
+            fake,
+            previous_map,
+            output_encoding,
+            options.show_root,
         );
     }
     if options.porcelain {
         return render_porcelain(
-            git_dir, format, db, lines, selected, options, fake, previous_map, marks,
+            git_dir,
+            format,
+            db,
+            lines,
+            selected,
+            options,
+            fake,
+            previous_map,
+            marks,
         );
     }
 
@@ -3271,8 +3328,7 @@ fn render_blame(
         // hex column each, after any boundary `^`. Only the marker case needs
         // the alternate renderer; everything else keeps `render_sha` (which also
         // handles the excessive-`--abbrev` boundary widths).
-        let want_mark =
-            (marks.unblamable && blame.unblamable) || (marks.ignored && blame.ignored);
+        let want_mark = (marks.unblamable && blame.unblamable) || (marks.ignored && blame.ignored);
         let sha = if want_mark {
             render_object_name_marked(
                 &blame.commit,
@@ -3306,8 +3362,8 @@ fn render_blame(
                 (determine_line_heat(time, fields), "\x1b[m")
             }
             Some(ColorPlan::Lines { repeated }) => {
-                let repeated_line = display_idx > 0
-                    && lines[selected[display_idx - 1] - 1].commit == blame.commit;
+                let repeated_line =
+                    display_idx > 0 && lines[selected[display_idx - 1] - 1].commit == blame.commit;
                 if repeated_line {
                     (repeated.as_str(), "\x1b[m")
                 } else {
@@ -3472,7 +3528,9 @@ fn render_porcelain(
                 writeln!(handle, "ignored")?;
             }
             handle.write_all(b"\t")?;
-            handle.write_all(strip_trailing_newline(&lines[selected[idx + offset] - 1].content))?;
+            handle.write_all(strip_trailing_newline(
+                &lines[selected[idx + offset] - 1].content,
+            ))?;
             handle.write_all(b"\n")?;
         }
         idx += group_len;
@@ -3496,8 +3554,7 @@ fn emit_porcelain_details(
     shown: &mut HashSet<ObjectId>,
     repeat: bool,
 ) -> Result<()> {
-    let emitted =
-        emit_one_suspect_detail(handle, db, format, blame, options, fake, shown, repeat)?;
+    let emitted = emit_one_suspect_detail(handle, db, format, blame, options, fake, shown, repeat)?;
     if emitted || multi_path.contains(&blame.commit) {
         write_filename_info(handle, blame, fake, previous_map)?;
     }
@@ -3529,7 +3586,10 @@ fn emit_one_suspect_detail(
         };
         let summary = match fake {
             Some(f) => f.summary.clone(),
-            None => format!("Version of {} from {}", blame.origin_path, blame.origin_path),
+            None => format!(
+                "Version of {} from {}",
+                blame.origin_path, blame.origin_path
+            ),
         };
         writeln!(handle, "author {name}")?;
         writeln!(handle, "author-mail <{email}>")?;
@@ -3606,7 +3666,11 @@ fn emit_one_suspect_detail(
             .map(|sig| sig.time.offset_token())
             .unwrap_or_else(|| "+0000".to_string())
     )?;
-    write_field(handle, b"summary ", &commit_summary_bytes(&commit.message, &blame.commit))?;
+    write_field(
+        handle,
+        b"summary ",
+        &commit_summary_bytes(&commit.message, &blame.commit),
+    )?;
     if blame.boundary && !options.show_root {
         writeln!(handle, "boundary")?;
     }
@@ -3676,7 +3740,10 @@ fn render_incremental(
             }
             len += 1;
         }
-        runs.push(Run { first_line: line_no, len });
+        runs.push(Run {
+            first_line: line_no,
+            len,
+        });
         idx += len;
     }
     // Walk order: by charge sequence (newest commit first), then file position.
@@ -3729,7 +3796,10 @@ fn emit_incremental_detail(
         };
         let summary = match fake {
             Some(f) => f.summary.clone(),
-            None => format!("Version of {} from {}", blame.origin_path, blame.origin_path),
+            None => format!(
+                "Version of {} from {}",
+                blame.origin_path, blame.origin_path
+            ),
         };
         writeln!(handle, "author {name}")?;
         writeln!(handle, "author-mail <{email}>")?;
@@ -3752,7 +3822,11 @@ fn emit_incremental_detail(
 
     emit_incremental_ident(handle, "author", &author_bytes)?;
     emit_incremental_ident(handle, "committer", &committer_bytes)?;
-    write_field(handle, b"summary ", &commit_summary_bytes(&message_bytes, &blame.commit))?;
+    write_field(
+        handle,
+        b"summary ",
+        &commit_summary_bytes(&message_bytes, &blame.commit),
+    )?;
     if boundary {
         writeln!(handle, "boundary")?;
     }
@@ -4085,7 +4159,8 @@ mod tests {
             num_lines: 3,
             ..Default::default()
         }];
-        let passed = pass_blame_to_parent(&p, &c, &mut owned, sley_diff_merge::DiffAlgorithm::Myers);
+        let passed =
+            pass_blame_to_parent(&p, &c, &mut owned, sley_diff_merge::DiffAlgorithm::Myers);
         // The inserted line (child s_lno 0) stays with the child; lines 1..3 go
         // to the parent at parent-s_lno 0..2.
         let ours_lines: usize = owned.iter().map(|e| e.num_lines).sum();
@@ -4109,7 +4184,8 @@ mod tests {
             num_lines: 3,
             ..Default::default()
         }];
-        let passed = pass_blame_to_parent(&p, &c, &mut owned, sley_diff_merge::DiffAlgorithm::Myers);
+        let passed =
+            pass_blame_to_parent(&p, &c, &mut owned, sley_diff_merge::DiffAlgorithm::Myers);
         let ours: usize = owned.iter().map(|e| e.num_lines).sum();
         let to_parent: usize = passed.iter().map(|e| e.num_lines).sum();
         assert_eq!(ours, 1, "the changed middle line is charged to the child");

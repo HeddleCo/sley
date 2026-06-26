@@ -644,7 +644,13 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     // git: `--recurse-submodules` rejects worktree-dependent modes and
     // `--with-tree`; `--error-unmatch` is separately unsupported. Both die(128).
     if recurse_submodules
-        && (deleted || others || unmerged || killed || modified || resolve_undo || with_tree.is_some())
+        && (deleted
+            || others
+            || unmerged
+            || killed
+            || modified
+            || resolve_undo
+            || with_tree.is_some())
     {
         eprintln!("fatal: ls-files --recurse-submodules unsupported mode");
         return Err(GitError::Exit(128));
@@ -655,9 +661,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     }
     // git: `--with-tree` cannot combine with stage/unmerged output (die 128).
     if with_tree.is_some() && (stage || unmerged) {
-        eprintln!(
-            "fatal: options 'ls-files --with-tree' and '-s/-u' cannot be used together"
-        );
+        eprintln!("fatal: options 'ls-files --with-tree' and '-s/-u' cannot be used together");
         return Err(GitError::Exit(128));
     }
     let selected = cached || others || deleted || modified || unmerged || resolve_undo;
@@ -833,10 +837,8 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                 let Some(path) = pathspec.display(&entry.path) else {
                     continue;
                 };
-                let is_deleted =
-                    deleted && deleted_entries.iter().any(|e| e.path == entry.path);
-                let is_modified =
-                    modified && modified_entries.iter().any(|e| e.path == entry.path);
+                let is_deleted = deleted && deleted_entries.iter().any(|e| e.path == entry.path);
+                let is_modified = modified && modified_entries.iter().any(|e| e.path == entry.path);
                 // git emits the line once per matching condition, in cache order
                 // (cached, then deleted, then modified).
                 for emit in [want_cached, is_deleted, is_modified] {
@@ -1304,8 +1306,9 @@ fn write_ls_files_format(
                 let atom = &after_open[..end];
                 match atom {
                     "objectmode" => write!(stdout, "{:06o}", entry.mode)?,
-                    "objectname" => stdout
-                        .write_all(ls_files_oid(&entry.oid, ctx.abbrev, ctx.candidates).as_bytes())?,
+                    "objectname" => stdout.write_all(
+                        ls_files_oid(&entry.oid, ctx.abbrev, ctx.candidates).as_bytes(),
+                    )?,
                     "objecttype" => {
                         stdout.write_all(ls_files_object_type(entry.mode).as_str().as_bytes())?
                     }
@@ -1314,11 +1317,14 @@ fn write_ls_files_format(
                         write_ls_files_objectsize(stdout, entry, &ctx.eol, true)?
                     }
                     "stage" => write!(stdout, "{}", index_entry_stage(entry))?,
-                    "eolinfo:index" => stdout.write_all(
-                        eol_info.as_ref().map(|i| i.index).unwrap_or("").as_bytes(),
-                    )?,
+                    "eolinfo:index" => stdout
+                        .write_all(eol_info.as_ref().map(|i| i.index).unwrap_or("").as_bytes())?,
                     "eolinfo:worktree" => stdout.write_all(
-                        eol_info.as_ref().map(|i| i.worktree).unwrap_or("").as_bytes(),
+                        eol_info
+                            .as_ref()
+                            .map(|i| i.worktree)
+                            .unwrap_or("")
+                            .as_bytes(),
                     )?,
                     "eolattr" => stdout
                         .write_all(eol_info.as_ref().map(|i| i.attr).unwrap_or("").as_bytes())?,
@@ -2278,16 +2284,13 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             if unresolve_only {
                 return Ok(());
             }
-            let git_dir = if show_index_version
-                || fsmonitor
-                || split_index.is_some()
-                || clear_resolve_undo
-            {
-                let cwd = env::current_dir()?;
-                Some(discover_git_dir(&cwd)?)
-            } else {
-                None
-            };
+            let git_dir =
+                if show_index_version || fsmonitor || split_index.is_some() || clear_resolve_undo {
+                    let cwd = env::current_dir()?;
+                    Some(discover_git_dir(&cwd)?)
+                } else {
+                    None
+                };
             if clear_resolve_undo && let Some(git_dir) = &git_dir {
                 let format = repository_object_format(git_dir)?;
                 sley_worktree::clear_resolve_undo(git_dir, format)?;
