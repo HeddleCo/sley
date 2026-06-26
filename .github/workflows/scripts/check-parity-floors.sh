@@ -412,6 +412,17 @@ declare -A FLOOR=(
     [t2004-checkout-cache-temp.sh]=23
     [t3070-wildmatch.sh]=1861
     [t6300-for-each-ref.sh]=410
+    # wave-51 revtail (sley-rev): rev-parse --prefix t1513 1->11, <branch>@{push} full
+    # resolution t1514 3->9 (upstream fallback under push.default=simple), rev-list
+    # --disk-usage packed t6115 8->17, grafts+--pretty=raw t6001 5->13, for-each-ref
+    # error reporting t6301 1->6, rev-vs-pathspec dwim t6133 2->6, merge-index t6060 3->7.
+    [t1513-rev-parse-prefix.sh]=11
+    [t1514-rev-parse-push.sh]=9
+    [t6115-rev-list-du.sh]=17
+    [t6001-rev-list-graft.sh]=13
+    [t6301-for-each-ref-errors.sh]=6
+    [t6133-pathspec-rev-dwim.sh]=6
+    [t6060-merge-index.sh]=7
     # codex-wave-10 (branch tracking-info): branch -vv ahead/behind+gone column,
     # status -sb branch header, upstream:track/trackshort atoms, @{u} resolution,
     # left-right ahead/behind count. t6040 9->44 FULL. Auto-merged w/ remote verbs:
