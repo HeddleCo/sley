@@ -2808,6 +2808,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 pickaxe_text,
                 pickaxe_detect_renames,
                 pickaxe_pathspec.as_ref(),
+                Some(&log_userdiff),
             )? {
                 kept.push(record);
             }

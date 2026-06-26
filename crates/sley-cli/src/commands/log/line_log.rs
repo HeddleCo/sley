@@ -231,6 +231,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                 pickaxe_text,
                 pickaxe_detect_renames,
                 None,
+                None,
             )?,
             None => false,
         };
