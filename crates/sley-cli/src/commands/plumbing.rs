@@ -5787,16 +5787,22 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
     // Resolve `fsck.<msgid>` severity overrides from the repo config (folds in
-    // command-line `-c fsck.x=y` via GIT_CONFIG_PARAMETERS).
+    // command-line `-c fsck.x=y` via GIT_CONFIG_PARAMETERS). The same read tells
+    // us whether this is a partial clone: only then may a `.promisor` pack
+    // excuse a missing object from the connectivity walk (git's
+    // `is_promisor_object` is gated on `repo_has_promisor_remote`).
     let mut severity = sley_fsck::SeverityConfig::new(strict);
+    let mut has_promisor_remote = false;
     if let Ok(config) = read_repo_config(&git_dir) {
         for (key, value) in config.fsck_entries() {
             severity.set(&key, &value);
         }
+        has_promisor_remote = repo_has_promisor_remote(&config);
     }
+    let db =
+        FileObjectDatabase::from_git_dir(&git_dir, format).with_promisor_remote_present(has_promisor_remote);
     // The ref-store consistency check shares the same severity table; clone it
     // before the object walk consumes `severity`.
     let refs_severity = severity.clone();
@@ -5859,6 +5865,15 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
                 }
             }
             Err(_) => {
+                // A root that is missing locally but covered by a promisor
+                // remote is still a valid ref/tip in a partial clone: git's
+                // `snapshot_ref` counts it (default_refs++) and returns without
+                // complaint, leaving it OUT of the walk roots (there is nothing
+                // local to walk). Same for an explicit `git fsck <oid>` arg that
+                // names a promised object.
+                if db.is_promised_object(oid) {
+                    continue;
+                }
                 eprintln!("error: {name}: invalid sha1 pointer {oid}");
                 ref_error_bits |= sley_fsck::ERROR_REACHABLE;
             }
@@ -6325,6 +6340,12 @@ fn fsck_index_roots(
                 roots.push(oid);
                 continue;
             }
+            // A missing index blob covered by a promisor remote is fine in a
+            // partial clone: git's `fsck_index` marks it via `mark_object`,
+            // which returns early for promisor objects without reporting.
+            if db.is_promised_object(&oid) {
+                continue;
+            }
             // Missing index blob. git: `missing blob <oid>` (stdout),
             // ERROR_REACHABLE; `--name-objects` appends `(<prefix>:<name>)`.
             if name_objects {
@@ -6413,6 +6434,22 @@ fn fsck_index_display_path(git_dir: &Path, index_path: &Path) -> String {
         return format!("{}/{}", rel.display(), suffix.display());
     }
     index_path.display().to_string()
+}
+
+/// True when the repository has a promisor remote configured, mirroring git's
+/// `repo_has_promisor_remote`: either `extensions.partialclone` names a default
+/// promisor remote, or some `remote.<name>.promisor` is true. Only then does git
+/// treat objects in `.promisor` packs as legitimately-absent "promised" objects.
+fn repo_has_promisor_remote(config: &GitConfig) -> bool {
+    if config
+        .get("extensions", None, "partialclone")
+        .is_some_and(|value| !value.is_empty())
+    {
+        return true;
+    }
+    crate::commands::remote_cmds::remote_names(config)
+        .into_iter()
+        .any(|name| config.get_bool("remote", Some(&name), "promisor") == Some(true))
 }
 
 /// Named root refs for a full fsck: every ref (and HEAD), each as

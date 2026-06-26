@@ -4041,6 +4041,14 @@ pub struct FileObjectDatabase {
     pack_deltas: PackDeltaCaches,
     pack_header_types: PackHeaderTypeCaches,
     promisor_objects: Arc<OnceLock<HashSet<ObjectId>>>,
+    /// Whether the owning repository actually has a promisor remote configured
+    /// (`extensions.partialclone` is set, or some `remote.<name>.promisor` is
+    /// true). Mirrors git's `is_promisor_object`, which only treats objects in
+    /// `.promisor` packs as "promised" when `repo_has_promisor_remote()` holds:
+    /// a stray `.promisor` sidecar in a non-partial repo must NOT excuse missing
+    /// objects from fsck. Defaults to `false`; the fsck driver opts in after
+    /// reading the repo config.
+    promisor_remote_present: bool,
     /// Graft points (`$GIT_DIR/shallow`), loaded lazily on the first
     /// [`ObjectReader::is_shallow_graft`] query. `$GIT_DIR` is taken to be
     /// the parent of `objects_dir`, matching the standard layout.
@@ -4408,6 +4416,7 @@ impl FileObjectDatabase {
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
             pack_header_types: Arc::new(Mutex::new(HashMap::new())),
             promisor_objects: Arc::new(OnceLock::new()),
+            promisor_remote_present: false,
             shallow_grafts: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -4428,12 +4437,26 @@ impl FileObjectDatabase {
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
             pack_header_types: Arc::new(Mutex::new(HashMap::new())),
             promisor_objects: Arc::new(OnceLock::new()),
+            promisor_remote_present: false,
             shallow_grafts: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
     pub fn from_git_dir(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Self {
         Self::new(repository_objects_dir(git_dir), format)
+    }
+
+    /// Declare whether the owning repository has a promisor remote configured.
+    /// Only when this holds does [`ObjectReader::is_promised_object`] treat
+    /// objects in `.promisor` packs (and their transitive references) as
+    /// promised — matching git's `is_promisor_object`, which is gated on
+    /// `repo_has_promisor_remote()`. Callers that know the repo config (e.g. the
+    /// fsck driver) opt in; readers built without config keep the safe default
+    /// of `false`, so a stray `.promisor` sidecar never silently excuses a
+    /// genuinely missing object.
+    pub fn with_promisor_remote_present(mut self, present: bool) -> Self {
+        self.promisor_remote_present = present;
+        self
     }
 
     /// Drop cached pack registries, indexes, and decoded objects so the next read
@@ -5429,7 +5452,12 @@ fn alternate_object_dirs(objects_dir: &Path) -> Vec<PathBuf> {
 
 impl ObjectReader for FileObjectDatabase {
     fn is_promised_object(&self, oid: &ObjectId) -> bool {
-        self.promisor_objects().contains(oid)
+        // Gate on a configured promisor remote, exactly like git's
+        // `is_promisor_object` (which short-circuits when
+        // `repo_has_promisor_remote()` is false). Without this, a `.promisor`
+        // sidecar left in an ordinary repository would wrongly excuse missing
+        // objects from fsck connectivity checks.
+        self.promisor_remote_present && self.promisor_objects().contains(oid)
     }
 
     fn has_shallow_grafts(&self) -> bool {
