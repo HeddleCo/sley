@@ -1464,6 +1464,25 @@ fn sparse_single_file_move(
         return Err(GitError::Exit(128));
     }
     let source_present = fs::symlink_metadata(source_absolute).is_ok();
+    // A dirty source moving out-of-cone keeps its worktree file (and stays
+    // cached) instead of being discarded; detect that before mutating the index.
+    let source_dirty = source_present
+        && cone_mode
+        && !destination_in_cone
+        && {
+            let index_path = repository_index_path(git_dir);
+            let stat_cache = IndexStatCache::from_index(&index, &index_path);
+            let mut clean_filter = None;
+            mv_source_is_dirty(
+                worktree_root,
+                git_dir,
+                format,
+                &index.entries[position],
+                &stat_cache,
+                &mut clean_filter,
+            )?
+        };
+    let mut dirty_paths = Vec::new();
     let mut destination_entry = index.entries.remove(position);
     destination_entry.path = destination_path.clone().into();
     destination_entry.refresh_name_length();
@@ -1474,13 +1493,30 @@ fn sparse_single_file_move(
     // preserves the bit.
     if source_present {
         if cone_mode && !destination_in_cone {
-            // Clean in-cone -> out-of-cone: drop the worktree file, keep only the
-            // (now skip-worktree) index entry.
-            crate::checkout::remove_existing_worktree_path(source_absolute)?;
-            if fs::symlink_metadata(destination_absolute).is_ok() {
-                crate::checkout::remove_existing_worktree_path(destination_absolute)?;
+            if source_dirty {
+                // Dirty in-cone -> out-of-cone: move the file to the destination
+                // and keep it cached (no skip-worktree); warn about the dirty path.
+                if let Some(parent) = destination_absolute.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if fs::symlink_metadata(destination_absolute).is_ok() {
+                    crate::checkout::remove_existing_worktree_path(destination_absolute)?;
+                }
+                fs::rename(source_absolute, destination_absolute)?;
+                if let Ok(metadata) = fs::symlink_metadata(destination_absolute) {
+                    destination_entry =
+                        index_entry_with_refreshed_stat(&destination_entry, &metadata);
+                }
+                dirty_paths.push(destination_path.clone());
+            } else {
+                // Clean in-cone -> out-of-cone: drop the worktree file, keep only
+                // the (now skip-worktree) index entry.
+                crate::checkout::remove_existing_worktree_path(source_absolute)?;
+                if fs::symlink_metadata(destination_absolute).is_ok() {
+                    crate::checkout::remove_existing_worktree_path(destination_absolute)?;
+                }
+                crate::checkout::set_skip_worktree(&mut destination_entry);
             }
-            crate::checkout::set_skip_worktree(&mut destination_entry);
         } else {
             // Plain rename of the present worktree file.
             if let Some(parent) = destination_absolute.parent() {
@@ -1524,6 +1560,7 @@ fn sparse_single_file_move(
         .sort_by(|left, right| left.path.cmp(&right.path));
     index.extensions.clear();
     write_repository_index_ref(git_dir, format, &index)?;
+    advise_on_moving_dirty_paths(git_dir, &dirty_paths);
     Ok(MoveResult {
         source: source_path,
         destination: destination_path,
@@ -1531,6 +1568,58 @@ fn sparse_single_file_move(
         fatal: None,
         details: Vec::new(),
     })
+}
+
+/// Whether a tracked entry's worktree file differs from the index (git's
+/// `ie_modified`), so a `git mv --sparse` out-of-cone move must keep the file
+/// rather than discard it.
+fn mv_source_is_dirty(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    entry: &IndexEntry,
+    stat_cache: &IndexStatCache,
+    clean_filter: &mut Option<TrackedOnlyCleanFilter>,
+) -> Result<bool> {
+    let worktree_entry = worktree_entry_for_index_entry_with_attributes(
+        worktree_root,
+        git_dir,
+        format,
+        entry,
+        stat_cache,
+        clean_filter,
+    )?;
+    Ok(match worktree_entry {
+        Some(worktree_entry) => worktree_entry.oid != entry.oid || worktree_entry.mode != entry.mode,
+        None => false,
+    })
+}
+
+/// git's `advise_on_moving_dirty_path`: the "moved outside the sparse-checkout
+/// definition but are not sparse due to local modifications" header, the dirty
+/// paths, then the hint block (gated by `advice.updateSparsePath`).
+fn advise_on_moving_dirty_paths(git_dir: &Path, paths: &[Vec<u8>]) {
+    if paths.is_empty() {
+        return;
+    }
+    eprintln!("The following paths have been moved outside the");
+    eprintln!("sparse-checkout definition but are not sparse due to local");
+    eprintln!("modifications.");
+    for path in paths {
+        eprintln!("{}", String::from_utf8_lossy(path));
+    }
+    let show_hint = sley_config::read_repo_config(git_dir, None)
+        .ok()
+        .and_then(|config| config.get_bool("advice", None, "updateSparsePath"))
+        .unwrap_or(true);
+    if show_hint {
+        eprintln!("hint: To correct the sparsity of these paths, do the following:");
+        eprintln!("hint: * Use \"git add --sparse <paths>\" to update the index");
+        eprintln!("hint: * Use \"git sparse-checkout reapply\" to apply the sparsity rules");
+        eprintln!(
+            "hint: Disable this message with \"git config set advice.updateSparsePath false\""
+        );
+    }
 }
 
 /// Recursively remove `dir` and its subdirectories when they contain only
@@ -1584,6 +1673,10 @@ fn sparse_directory_move(
         Some((sparse, mode)) => crate::checkout::path_in_sparse_checkout(path, sparse, *mode),
         None => true,
     };
+    let index_path = repository_index_path(git_dir);
+    let stat_cache = IndexStatCache::from_index(&index, &index_path);
+    let mut clean_filter = None;
+    let mut dirty_paths = Vec::new();
     let mut details = Vec::new();
     let mut new_entries = Vec::new();
     let mut source_parents: Vec<PathBuf> = Vec::new();
@@ -1619,11 +1712,35 @@ fn sparse_directory_move(
         let source_present = fs::symlink_metadata(&source_absolute).is_ok();
         if source_present {
             if cone_mode && !destination_in_cone {
-                crate::checkout::remove_existing_worktree_path(&source_absolute)?;
-                if fs::symlink_metadata(&destination_absolute).is_ok() {
-                    crate::checkout::remove_existing_worktree_path(&destination_absolute)?;
+                let dirty = mv_source_is_dirty(
+                    worktree_root,
+                    git_dir,
+                    format,
+                    entry,
+                    &stat_cache,
+                    &mut clean_filter,
+                )?;
+                if dirty {
+                    // Dirty file: keep it at the destination, stay cached.
+                    if let Some(parent) = destination_absolute.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    if fs::symlink_metadata(&destination_absolute).is_ok() {
+                        crate::checkout::remove_existing_worktree_path(&destination_absolute)?;
+                    }
+                    fs::rename(&source_absolute, &destination_absolute)?;
+                    if let Ok(metadata) = fs::symlink_metadata(&destination_absolute) {
+                        destination_entry =
+                            index_entry_with_refreshed_stat(&destination_entry, &metadata);
+                    }
+                    dirty_paths.push(destination.clone());
+                } else {
+                    crate::checkout::remove_existing_worktree_path(&source_absolute)?;
+                    if fs::symlink_metadata(&destination_absolute).is_ok() {
+                        crate::checkout::remove_existing_worktree_path(&destination_absolute)?;
+                    }
+                    crate::checkout::set_skip_worktree(&mut destination_entry);
                 }
-                crate::checkout::set_skip_worktree(&mut destination_entry);
             } else {
                 if let Some(parent) = destination_absolute.parent() {
                     fs::create_dir_all(parent)?;
@@ -1679,6 +1796,7 @@ fn sparse_directory_move(
     for parent in source_parents {
         prune_empty_parents(worktree_root, Some(&parent))?;
     }
+    advise_on_moving_dirty_paths(git_dir, &dirty_paths);
     apply_moved_gitlink_gitdirs(gitlink_gitdir_moves)?;
     if let Some(edited) = gitmodules_move {
         apply_prepared_gitmodules_move(worktree_root, git_dir, format, &mut index.entries, edited)?;
