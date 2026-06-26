@@ -1660,6 +1660,11 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    // git refuses (with advice + exit 1) to update entries that the skip-worktree
+    // bit or the sparse-checkout definition put outside the working set, unless
+    // `--sparse` is given. This guards every add flavor (regular, -u, -A, -N,
+    // --refresh, --dry-run), so run it once up front before dispatching.
+    reject_add_skip_worktree_paths(&cwd, &worktree_root, &git_dir, format, &paths, sparse, refresh)?;
     if refresh {
         refresh_index_after_add(&worktree_root, &git_dir, format, &paths)?;
         return Ok(());
@@ -2385,7 +2390,6 @@ fn resolve_add_regular_actions(
     options: AddRegularOptions,
     reusable_index: Option<Index>,
 ) -> Result<AddRegularResolution> {
-    reject_add_paths_outside_sparse_checkout(cwd, worktree_root, git_dir, &paths, options)?;
     if let Some(exact) = resolve_add_regular_tracked_exact_actions(
         cwd,
         worktree_root,
@@ -2719,7 +2723,6 @@ fn resolve_add_regular_tracked_exact_actions(
     options: AddRegularOptions,
     index: Option<&Index>,
 ) -> Result<Option<TrackedExactResolution>> {
-    reject_add_paths_outside_sparse_checkout(cwd, worktree_root, git_dir, paths, options)?;
     if paths.is_empty() || options.chmod.is_some() || options.force || options.dry_run {
         return Ok(None);
     }
@@ -2804,19 +2807,36 @@ fn resolve_add_regular_tracked_exact_actions(
     }))
 }
 
-fn reject_add_paths_outside_sparse_checkout(
+/// Refuse to update index entries that live outside the sparse-checkout, the
+/// way git's `add` does. A pathspec is rejected when it matches an entry that
+/// either carries the skip-worktree bit or lies outside the sparse-checkout
+/// definition, and matches nothing that *would* legitimately be staged — this
+/// mirrors git's `find_pathspecs_matching_skip_worktree` (`ce_skip_worktree(ce)
+/// || !path_in_sparse_checkout(ce->name)`). Unlike a naive pattern check this
+/// fires even when `core.sparseCheckout` is disabled, because the skip-worktree
+/// bit alone protects an entry (t3705 exercises exactly this with the bit set
+/// but sparse-checkout off).
+///
+/// `--sparse` (`sparse_flag`) opts out entirely. Glob/magic pathspecs are left
+/// to the normal walk (a glob that also matches a dense path must not warn).
+fn reject_add_skip_worktree_paths(
     cwd: &Path,
     worktree_root: &Path,
     git_dir: &Path,
+    format: ObjectFormat,
     paths: &[PathBuf],
-    options: AddRegularOptions,
+    sparse_flag: bool,
+    is_refresh: bool,
 ) -> Result<()> {
-    if options.sparse || paths.is_empty() {
+    if sparse_flag || paths.is_empty() {
         return Ok(());
     }
-    let Some(active) = active_sparse_checkout_for_add(git_dir)? else {
-        return Ok(());
-    };
+    // `active` is `Some` only when core.sparseCheckout is enabled; when it is
+    // `None` every path is "in" the checkout (git's path_in_sparse_checkout
+    // returns 1 when sparse-checkout is off), so only the skip-worktree bit can
+    // reject a path.
+    let active = active_sparse_checkout_for_add(git_dir)?;
+    let index = sley_worktree::read_repository_index(git_dir, format)?;
     let mut rejected = Vec::new();
     for path in paths {
         if add_pathspec_needs_status_walk(path) {
@@ -2832,38 +2852,94 @@ fn reject_add_paths_outside_sparse_checkout(
         {
             continue;
         }
-        let mut git_path = match add_git_path_bytes(relative) {
+        let git_path = match add_git_path_bytes(relative) {
             Ok(path) => path,
             Err(_) => continue,
         };
         if git_path.is_empty() {
             continue;
         }
-        if fs::symlink_metadata(&absolute)
-            .map(|metadata| metadata.is_dir())
-            .unwrap_or(false)
-            && !git_path.ends_with(b"/")
-        {
-            git_path.push(b'/');
+        let metadata = fs::symlink_metadata(&absolute).ok();
+        let present = metadata.is_some();
+        let is_dir = metadata.as_ref().map(fs::Metadata::is_dir).unwrap_or(false);
+        let mut pattern_path = git_path.clone();
+        if is_dir && !pattern_path.ends_with(b"/") {
+            pattern_path.push(b'/');
         }
-        if !sley_worktree::path_in_sparse_checkout(&git_path, &active.sparse, active.mode) {
+        let in_sparse = match active.as_ref() {
+            Some(active) => {
+                sley_worktree::path_in_sparse_checkout(&pattern_path, &active.sparse, active.mode)
+            }
+            None => true,
+        };
+        let index_entry = index.as_ref().and_then(|index| {
+            let range = add_index_entries_path_range(&index.entries, &git_path);
+            index.entries[range]
+                .iter()
+                .find(|entry| entry.stage() == sley_index::Stage::Normal)
+        });
+        let rejected_path = if let Some(entry) = index_entry {
+            // git clears the skip-worktree bit for present files when sparse
+            // checkout is enabled (clear_skip_worktree_from_present_files), so a
+            // present, in-cone file is a legitimate dense match.
+            let effective_skip_worktree =
+                entry.is_skip_worktree() && !(active.is_some() && present);
+            // `--refresh` re-stats whatever refresh_index would touch: a present
+            // out-of-cone entry has had its bit cleared, so it refreshes normally
+            // and only a still-skip-worktree entry is rejected. Regular `add`
+            // additionally rejects anything outside the sparse cone.
+            if is_refresh {
+                effective_skip_worktree
+            } else {
+                effective_skip_worktree || !in_sparse
+            }
+        } else if is_refresh {
+            // refresh only touches tracked entries; an untracked pathspec falls
+            // through to the normal "did not match" handling.
+            false
+        } else {
+            // Untracked: only an existing path outside the cone is rejected; a
+            // missing pathspec falls through to the normal "did not match" error.
+            present && !in_sparse
+        };
+        if rejected_path {
             rejected.push(path.to_string_lossy().replace('\\', "/"));
         }
     }
     if rejected.is_empty() {
         return Ok(());
     }
+    advise_on_updating_sparse_paths(git_dir, &rejected);
+    Err(GitError::Exit(1))
+}
+
+/// git's `advise_on_updating_sparse_paths`: the "outside of your sparse-checkout
+/// definition" header, one line per path, then the hint block (gated by
+/// `advice.updateSparsePath`, default true). Shared by `add` and `mv`.
+fn advise_on_updating_sparse_paths(git_dir: &Path, paths: &[String]) {
     eprintln!("The following paths and/or pathspecs matched paths that exist");
     eprintln!("outside of your sparse-checkout definition, so will not be");
     eprintln!("updated in the index:");
-    for path in rejected {
+    for path in paths {
         eprintln!("{path}");
     }
-    eprintln!("hint: If you intend to update such entries, try one of the following:");
-    eprintln!("hint: * Use the --sparse option.");
-    eprintln!("hint: * Disable or modify the sparsity rules.");
-    eprintln!("hint: Disable this message with \"git config set advice.updateSparsePath false\"");
-    Err(GitError::Exit(1))
+    if add_update_sparse_path_advice_enabled(git_dir) {
+        eprintln!("hint: If you intend to update such entries, try one of the following:");
+        eprintln!("hint: * Use the --sparse option.");
+        eprintln!("hint: * Disable or modify the sparsity rules.");
+        eprintln!(
+            "hint: Disable this message with \"git config set advice.updateSparsePath false\""
+        );
+    }
+}
+
+/// `advice.updateSparsePath` (default true) gates the hint block that follows
+/// the "outside of your sparse-checkout definition" header.
+fn add_update_sparse_path_advice_enabled(git_dir: &Path) -> bool {
+    read_repo_config(git_dir)
+        .ok()
+        .and_then(|config| config.get_bool("advice", None, "updateSparsePath"))
+        .unwrap_or(true)
 }
 
 struct ActiveSparseCheckoutForAdd {
@@ -7380,6 +7456,7 @@ pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
     let mut dry_run = false;
     let mut verbose = false;
     let mut skip_errors = false;
+    let mut ignore_sparse = false;
     let mut parsing_options = true;
     for arg in args {
         if !parsing_options {
@@ -7395,7 +7472,8 @@ pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
             "-v" | "--verbose" => verbose = true,
             "--no-verbose" => verbose = false,
             "-k" => skip_errors = true,
-            "--sparse" | "--no-sparse" => {}
+            "--sparse" => ignore_sparse = true,
+            "--no-sparse" => ignore_sparse = false,
             value if value.starts_with('-') && !value.starts_with("--") && value.len() > 2 => {
                 for flag in value[1..].bytes() {
                     match flag {
@@ -7443,8 +7521,31 @@ pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
         validate_mv_sources_do_not_overlap(&cwd, &worktree_root, &paths[..paths.len() - 1])?;
     }
 
+    // git refuses to move a source or destination that the sparse-checkout
+    // definition places outside the working set (builtin/mv.c's
+    // only_match_skip_worktree handling); `--sparse` opts out. Compute which
+    // source/destination pairs are sparse so they can be skipped, and emit the
+    // shared advice. Without `-k` any sparse match aborts the whole command.
+    let sources = &paths[..paths.len() - 1];
+    let source_skipped = if ignore_sparse {
+        vec![false; sources.len()]
+    } else {
+        let (rejected_paths, per_source) =
+            mv_sparse_rejections(&cwd, &worktree_root, &git_dir, format, sources, &destination)?;
+        if !rejected_paths.is_empty() {
+            advise_on_updating_sparse_paths(&git_dir, &rejected_paths);
+            if !skip_errors {
+                return Err(GitError::Exit(1));
+            }
+        }
+        per_source
+    };
+
     let mut results = Vec::new();
-    for source in &paths[..paths.len() - 1] {
+    for (index, source) in sources.iter().enumerate() {
+        if source_skipped[index] {
+            continue;
+        }
         let source = if source.is_absolute() {
             source.clone()
         } else {
@@ -7460,6 +7561,7 @@ pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
                 force,
                 dry_run,
                 skip_errors,
+                sparse: ignore_sparse,
             },
         )?;
         let fatal = result.fatal.is_some();
@@ -7503,6 +7605,125 @@ pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// For each `git mv` (source, destination) pair, decide whether the source
+/// and/or destination fall outside the sparse-checkout definition, mirroring
+/// builtin/mv.c's `only_match_skip_worktree` collection. Returns the offending
+/// git paths (source before destination, matching git's append order) and a
+/// per-source flag marking which moves must be skipped.
+///
+/// A source is sparse when it lies outside the sparse cone, or when it is an
+/// absent skip-worktree index entry (git's "lstat fails + ce_skip_worktree"
+/// branch). A destination is sparse when it lies outside the cone.
+fn mv_sparse_rejections(
+    cwd: &Path,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    sources: &[PathBuf],
+    destination: &Path,
+) -> Result<(Vec<String>, Vec<bool>)> {
+    let Some(active) = active_sparse_checkout_for_add(git_dir)? else {
+        return Ok((Vec::new(), vec![false; sources.len()]));
+    };
+    let index = sley_worktree::read_repository_index(git_dir, format)?;
+    // git treats a destination directory that the sparse-checkout removed from
+    // disk (but still tracks) as a directory; detect that from the index so a
+    // contained file's mapped destination path is computed correctly.
+    let dest_is_dir = destination.is_dir()
+        || mv_git_relative_path(worktree_root, destination).is_some_and(|dest_git| {
+            let mut prefix = dest_git;
+            prefix.push(b'/');
+            index
+                .as_ref()
+                .is_some_and(|index| index.entries.iter().any(|entry| entry.path.as_bytes().starts_with(&prefix)))
+        });
+    let mut rejected = Vec::new();
+    let mut per_source = vec![false; sources.len()];
+    let in_cone = |git_path: &[u8]| {
+        sley_worktree::path_in_sparse_checkout(git_path, &active.sparse, active.mode)
+    };
+    for (i, source) in sources.iter().enumerate() {
+        let source_abs = normalize_add_absolute_path(cwd, source);
+        let dest_abs = if dest_is_dir {
+            match source_abs.file_name() {
+                Some(name) => destination.join(name),
+                None => destination.to_path_buf(),
+            }
+        } else {
+            destination.to_path_buf()
+        };
+        let Some(src_git) = mv_git_relative_path(worktree_root, &source_abs) else {
+            continue;
+        };
+        let dst_git = mv_git_relative_path(worktree_root, &dest_abs);
+        // A directory source (still tracked under a prefix even after its files
+        // were sparsified off disk) expands to its contained entries: git lists
+        // each contained file's source and mapped destination that is sparse.
+        let mut prefix = src_git.clone();
+        prefix.push(b'/');
+        let contained: Vec<&IndexEntry> = index
+            .as_ref()
+            .map(|index| {
+                index
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.stage() == sley_index::Stage::Normal
+                            && entry.path.as_bytes().starts_with(&prefix)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if source_abs.is_dir() || !contained.is_empty() {
+            for entry in contained {
+                let name = entry.path.as_bytes();
+                if !in_cone(name) {
+                    rejected.push(String::from_utf8_lossy(name).into_owned());
+                    per_source[i] = true;
+                }
+                if let Some(dst_git) = dst_git.as_ref() {
+                    let mut mapped = dst_git.clone();
+                    mapped.extend_from_slice(&name[src_git.len()..]);
+                    if !in_cone(&mapped) {
+                        rejected.push(String::from_utf8_lossy(&mapped).into_owned());
+                        per_source[i] = true;
+                    }
+                }
+            }
+            continue;
+        }
+        let present = fs::symlink_metadata(&source_abs).is_ok();
+        if !in_cone(&src_git)
+            || (!present && mv_index_entry_skip_worktree(index.as_ref(), &src_git))
+        {
+            rejected.push(String::from_utf8_lossy(&src_git).into_owned());
+            per_source[i] = true;
+        }
+        if let Some(dst_git) = dst_git.as_ref()
+            && !in_cone(dst_git)
+        {
+            rejected.push(String::from_utf8_lossy(dst_git).into_owned());
+            per_source[i] = true;
+        }
+    }
+    Ok((rejected, per_source))
+}
+
+fn mv_git_relative_path(worktree_root: &Path, absolute: &Path) -> Option<Vec<u8>> {
+    let relative = absolute.strip_prefix(worktree_root).ok()?;
+    let git_path = add_git_path_bytes(relative).ok()?;
+    (!git_path.is_empty()).then_some(git_path)
+}
+
+fn mv_index_entry_skip_worktree(index: Option<&Index>, git_path: &[u8]) -> bool {
+    index.is_some_and(|index| {
+        let range = add_index_entries_path_range(&index.entries, git_path);
+        index.entries[range]
+            .iter()
+            .any(|entry| entry.stage() == sley_index::Stage::Normal && entry.is_skip_worktree())
+    })
 }
 
 fn validate_mv_sources_do_not_overlap(

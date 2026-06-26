@@ -1050,6 +1050,10 @@ pub struct MoveOptions {
     pub force: bool,
     pub dry_run: bool,
     pub skip_errors: bool,
+    /// `git mv --sparse`: allow moving entries into or out of the
+    /// sparse-checkout, reconciling each moved entry's skip-worktree bit and
+    /// worktree materialization with the destination's cone membership.
+    pub sparse: bool,
 }
 
 impl ShortStatusEntry {
