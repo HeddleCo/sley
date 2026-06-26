@@ -754,9 +754,9 @@ declare -A FLOOR=(
     # wave-52 sparse: honor skip-worktree bit in status/diff (gated on
     # core.sparseCheckout before, now unconditional + clear-skip-worktree-from-
     # present semantics) + git mv/git add sparse-checkout rejection + git mv
-    # --sparse cone in/out-of-cone materialization. t3705 4->17, t7002 3->14.
+    # --sparse cone in/out-of-cone materialization. t3705 4->17, t7002 3->16.
     [t3705-add-sparse-checkout.sh]=17
-    [t7002-mv-sparse-checkout.sh]=14
+    [t7002-mv-sparse-checkout.sh]=16
     # wave-9 engine-completion (2026-06-17): merge porcelain (octopus + --squash/--abort/
     # --continue/--quit state machine), submodule engine (relative_url primitive + summary/
     # foreach/update), mailmap canonicalization engine. Bumps applied above: t7600 38->44,

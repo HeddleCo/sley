@@ -1332,6 +1332,7 @@ pub fn move_index_and_worktree_path(
             destination_path,
             index,
             position,
+            options.force,
             gitmodules_move,
             &gitlink_gitdir_moves,
         );
@@ -1417,6 +1418,7 @@ fn sparse_single_file_move(
     destination_path: Vec<u8>,
     mut index: Index,
     position: usize,
+    force: bool,
     gitmodules_move: Option<Vec<u8>>,
     gitlink_gitdir_moves: &[GitlinkGitdirMove],
 ) -> Result<MoveResult> {
@@ -1428,6 +1430,22 @@ fn sparse_single_file_move(
         ),
         None => (false, true),
     };
+    // git refuses to overwrite a destination that already exists in the index
+    // when it is out-of-cone, unless --force is given (builtin/mv.c's
+    // "destination exists in the index").
+    if !destination_in_cone
+        && !force
+        && index.entries.iter().any(|entry| {
+            entry.path.as_bytes() == destination_path.as_slice() && entry.stage() == Stage::Normal
+        })
+    {
+        eprintln!(
+            "fatal: destination exists in the index, source={}, destination={}",
+            String::from_utf8_lossy(&source_path),
+            String::from_utf8_lossy(&destination_path)
+        );
+        return Err(GitError::Exit(128));
+    }
     let source_present = fs::symlink_metadata(source_absolute).is_ok();
     let mut destination_entry = index.entries.remove(position);
     destination_entry.path = destination_path.clone().into();
