@@ -17,19 +17,19 @@ tls-native-tls = ["sley-transport/tls-native-tls"]
 tls-platform-verifier = ["sley-transport/tls-platform-verifier"]
 
 [dependencies]
-sley-config = { path = "../sley-config", version = "0.3.0" }
-sley-core = { path = "../sley-core", version = "0.3.0" }
-sley-fetch = { path = "../sley-fetch", version = "0.3.0" }
-sley-formats = { path = "../sley-formats", version = "0.3.0" }
-sley-fsck = { path = "../sley-fsck", version = "0.3.0" }
-sley-object = { path = "../sley-object", version = "0.3.0" }
-sley-odb = { path = "../sley-odb", version = "0.3.0" }
-sley-pack = { path = "../sley-pack", version = "0.3.0" }
-sley-protocol = { path = "../sley-protocol", version = "0.3.0" }
-sley-refs = { path = "../sley-refs", version = "0.3.0" }
-sley-rev = { path = "../sley-rev", version = "0.3.0" }
-sley-transport = { path = "../sley-transport", version = "0.3.0", default-features = false }
-sley-worktree = { path = "../sley-worktree", version = "0.3.0" }
+sley-config = { path = "../sley-config", version = "0.3.1" }
+sley-core = { path = "../sley-core", version = "0.3.1" }
+sley-fetch = { path = "../sley-fetch", version = "0.3.1" }
+sley-formats = { path = "../sley-formats", version = "0.3.1" }
+sley-fsck = { path = "../sley-fsck", version = "0.3.1" }
+sley-object = { path = "../sley-object", version = "0.3.1" }
+sley-odb = { path = "../sley-odb", version = "0.3.1" }
+sley-pack = { path = "../sley-pack", version = "0.3.1" }
+sley-protocol = { path = "../sley-protocol", version = "0.3.1" }
+sley-refs = { path = "../sley-refs", version = "0.3.1" }
+sley-rev = { path = "../sley-rev", version = "0.3.1" }
+sley-transport = { path = "../sley-transport", version = "0.3.1", default-features = false }
+sley-worktree = { path = "../sley-worktree", version = "0.3.1" }
 
 [lints]
 workspace = true

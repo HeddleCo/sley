@@ -7,7 +7,7 @@ license.workspace = true
 description = "Git strbuf_expand-style format-string expansion for sley."
 
 [dependencies]
-sley-core = { path = "../sley-core", version = "0.3.0" }
+sley-core = { path = "../sley-core", version = "0.3.1" }
 
 [lints]
 workspace = true

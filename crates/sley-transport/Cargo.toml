@@ -15,8 +15,8 @@ tls-native-tls = ["http-client", "ureq/native-tls"]
 tls-platform-verifier = ["http-client", "ureq/rustls", "ureq/platform-verifier"]
 
 [dependencies]
-sley-core = { path = "../sley-core", version = "0.3.0" }
-sley-protocol = { path = "../sley-protocol", version = "0.3.0" }
+sley-core = { path = "../sley-core", version = "0.3.1" }
+sley-protocol = { path = "../sley-protocol", version = "0.3.1" }
 # gzip is required for smart-HTTP; TLS features are forwarded separately above.
 ureq = { version = "3.3.0", optional = true, default-features = false, features = ["gzip"] }
 

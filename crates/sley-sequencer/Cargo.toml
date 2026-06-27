@@ -8,12 +8,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core", version = "0.3.0" }
-sley-formats = { path = "../sley-formats", version = "0.3.0" }
-sley-object = { path = "../sley-object", version = "0.3.0" }
-sley-odb = { path = "../sley-odb", version = "0.3.0" }
-sley-refs = { path = "../sley-refs", version = "0.3.0" }
-sley-worktree = { path = "../sley-worktree", version = "0.3.0" }
+sley-core = { path = "../sley-core", version = "0.3.1" }
+sley-formats = { path = "../sley-formats", version = "0.3.1" }
+sley-object = { path = "../sley-object", version = "0.3.1" }
+sley-odb = { path = "../sley-odb", version = "0.3.1" }
+sley-refs = { path = "../sley-refs", version = "0.3.1" }
+sley-worktree = { path = "../sley-worktree", version = "0.3.1" }
 
 [dev-dependencies]
 tempfile = "3"
