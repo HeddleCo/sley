@@ -5086,6 +5086,46 @@ fn parse_shallow_since(value: &str) -> Result<i64> {
         .ok_or_else(|| GitError::Command(format!("invalid shallow-since date: {value}")))
 }
 
+/// The effective `receive.maxInputSize` cap, mirroring git's
+/// `git_config_get_ulong` read in receive-pack.c: unset or non-positive means
+/// unlimited (returns `None`); a positive value is the byte cap. Uses the shared
+/// unit-suffix parser so `1g`/`512m`/etc. behave exactly as git's config reader.
+fn receive_max_input_size(config: &GitConfig) -> Option<u64> {
+    let raw = config.get("receive", None, "maxInputSize")?;
+    match sley_config::parse_config_int(raw) {
+        Some(limit) if limit > 0 => Some(limit as u64),
+        _ => None,
+    }
+}
+
+/// Read the receive-pack packfile from `reader` into a buffer, enforcing the
+/// `receive.maxInputSize` cap (used only on the fsck path, which must hold the
+/// whole pack to validate it). With no cap this is a plain `read_to_end`; with a
+/// cap it bounds the read at `limit + 1` and refuses anything larger, mirroring
+/// index-pack's `pack exceeds maximum allowed size` die (exit 128).
+fn read_capped_packfile<R: Read>(reader: &mut R, max_input_size: Option<u64>) -> Result<Vec<u8>> {
+    let mut packfile = Vec::new();
+    match max_input_size {
+        Some(limit) => {
+            // `take(limit + 1)` reads at most one byte past the cap, so a buffer
+            // strictly larger than `limit` is detectable without slurping an
+            // arbitrarily large input into memory.
+            reader.take(limit.saturating_add(1)).read_to_end(&mut packfile)?;
+            if packfile.len() as u64 > limit {
+                eprintln!(
+                    "fatal: pack exceeds maximum allowed size ({})",
+                    super::pack::humanise_byte_count(limit)
+                );
+                return Err(GitError::Exit(128));
+            }
+        }
+        None => {
+            reader.read_to_end(&mut packfile)?;
+        }
+    }
+    Ok(packfile)
+}
+
 pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
     let repository = match args {
         [repository] => repository,
@@ -5130,8 +5170,7 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
         .get_bool("transfer", None, "fsckObjects")
         .unwrap_or(false)
     {
-        let mut packfile = Vec::new();
-        stdin.read_to_end(&mut packfile)?;
+        let packfile = read_capped_packfile(&mut stdin, receive_max_input_size(&config))?;
         let request = ReceivePackPushRequest {
             commands: header.commands.clone(),
             push_options: header.push_options.clone(),
@@ -11709,4 +11748,73 @@ fn validate_remote_branch_name(name: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod receive_max_input_size_tests {
+    use super::*;
+
+    fn config(text: &str) -> GitConfig {
+        GitConfig::parse(text.as_bytes()).expect("config parses")
+    }
+
+    #[test]
+    fn unset_means_unlimited() {
+        let cfg = config("[transfer]\n\tfsckObjects = true\n");
+        assert_eq!(receive_max_input_size(&cfg), None);
+    }
+
+    #[test]
+    fn zero_means_unlimited() {
+        let cfg = config("[receive]\n\tmaxInputSize = 0\n");
+        assert_eq!(receive_max_input_size(&cfg), None);
+    }
+
+    #[test]
+    fn positive_value_is_the_cap() {
+        let cfg = config("[receive]\n\tmaxInputSize = 64\n");
+        assert_eq!(receive_max_input_size(&cfg), Some(64));
+    }
+
+    #[test]
+    fn unit_suffix_is_honoured() {
+        // Shares git's unit parser: `1k` == 1024 bytes.
+        let cfg = config("[receive]\n\tmaxInputSize = 1k\n");
+        assert_eq!(receive_max_input_size(&cfg), Some(1024));
+    }
+
+    #[test]
+    fn no_cap_reads_everything() {
+        let data = vec![0xABu8; 4096];
+        let buf = read_capped_packfile(&mut &data[..], None).expect("reads all bytes");
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn under_cap_succeeds() {
+        let data = vec![0x42u8; 8];
+        let buf = read_capped_packfile(&mut &data[..], Some(16)).expect("under the cap reads fine");
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn at_cap_succeeds() {
+        let data = vec![0x42u8; 16];
+        let buf =
+            read_capped_packfile(&mut &data[..], Some(16)).expect("exactly at the cap is allowed");
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn over_cap_errors_with_exit_128() {
+        // A buffered input one byte past the cap must be refused, not slurped —
+        // this is the B5 hardening: the fsck path no longer buffers unbounded.
+        let data = vec![0x42u8; 17];
+        let err = read_capped_packfile(&mut &data[..], Some(16))
+            .expect_err("over the cap must error rather than buffer it all");
+        match err {
+            GitError::Exit(128) => {}
+            other => panic!("expected GitError::Exit(128), got {other:?}"),
+        }
+    }
 }

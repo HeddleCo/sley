@@ -276,7 +276,7 @@ fn index_pack_add_pack_file(options: &mut IndexPackOptions, value: &str) -> Resu
 
 /// Render `bytes` the way git's `strbuf_humanise_bytes` does: `<n> byte[s]`
 /// under 1 KiB, otherwise `<x>.<yy> KiB/MiB/GiB` with truncating fixed-point.
-fn humanise_byte_count(bytes: u64) -> String {
+pub(crate) fn humanise_byte_count(bytes: u64) -> String {
     if bytes > 1 << 30 {
         let whole = bytes >> 30;
         let frac = (bytes & ((1 << 30) - 1)) / 10_737_419;
