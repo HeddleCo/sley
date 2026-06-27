@@ -13,8 +13,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -96,6 +96,7 @@ struct HttpBackendServer {
     port: u16,
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    requests: Arc<Mutex<Vec<HttpRequestRecord>>>,
 }
 
 impl HttpBackendServer {
@@ -104,6 +105,15 @@ impl HttpBackendServer {
     /// `/<name>` (e.g. `/repo.git`). `http_backend` is the `git-http-backend`
     /// executable located via [`git_http_backend`].
     fn start(project_root: &Path, http_backend: &Path) -> HttpBackendServer {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        Self::start_with_request_log(project_root, http_backend, requests)
+    }
+
+    fn start_with_request_log(
+        project_root: &Path,
+        http_backend: &Path,
+        requests: Arc<Mutex<Vec<HttpRequestRecord>>>,
+    ) -> HttpBackendServer {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral http port");
         listener
             .set_nonblocking(true)
@@ -112,6 +122,7 @@ impl HttpBackendServer {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let thread_shutdown = Arc::clone(&shutdown);
+        let thread_requests = Arc::clone(&requests);
         let project_root = project_root.to_path_buf();
         let http_backend = http_backend.to_path_buf();
         let handle = thread::spawn(move || {
@@ -119,7 +130,12 @@ impl HttpBackendServer {
                 match listener.accept() {
                     Ok((stream, _addr)) => {
                         // One request per accepted connection (Connection: close).
-                        if let Err(err) = handle_connection(stream, &project_root, &http_backend) {
+                        if let Err(err) = handle_connection(
+                            stream,
+                            &project_root,
+                            &http_backend,
+                            &thread_requests,
+                        ) {
                             // Surface unexpected I/O problems but keep serving.
                             eprintln!("http-backend test server error: {err}");
                         }
@@ -139,11 +155,16 @@ impl HttpBackendServer {
             port,
             shutdown,
             handle: Some(handle),
+            requests,
         }
     }
 
     fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{}", self.port, path)
+    }
+
+    fn requests(&self) -> Vec<HttpRequestRecord> {
+        self.requests.lock().expect("request log lock").clone()
     }
 }
 
@@ -160,12 +181,41 @@ impl Drop for HttpBackendServer {
     }
 }
 
+#[derive(Clone, Debug)]
+struct HttpRequestRecord {
+    method: String,
+    target: String,
+    headers: Vec<(String, String)>,
+}
+
+impl HttpRequestRecord {
+    fn header_values(&self, needle: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter_map(|(name, value)| {
+                if name.eq_ignore_ascii_case(needle) {
+                    Some(value.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn has_header(&self, needle: &str) -> bool {
+        self.headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(needle))
+    }
+}
+
 /// Reads and serves a single HTTP request from `stream` by invoking
 /// `git http-backend` as a CGI program.
 fn handle_connection(
     stream: TcpStream,
     project_root: &Path,
     http_backend: &Path,
+    requests: &Arc<Mutex<Vec<HttpRequestRecord>>>,
 ) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -186,8 +236,10 @@ fn handle_connection(
     }
 
     // Request headers until a blank line.
-    let mut content_length = 0usize;
+    let mut headers = Vec::new();
+    let mut content_length: Option<usize> = None;
     let mut content_type: Option<String> = None;
+    let mut chunked = false;
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header)? == 0 {
@@ -198,21 +250,40 @@ fn handle_connection(
             break;
         }
         if let Some((name, value)) = header.split_once(':') {
-            let name = name.trim().to_ascii_lowercase();
+            let raw_name = name.trim().to_string();
             let value = value.trim().to_string();
-            match name.as_str() {
-                "content-length" => content_length = value.parse().unwrap_or(0),
-                "content-type" => content_type = Some(value),
+            match raw_name.to_ascii_lowercase().as_str() {
+                "content-length" => content_length = value.parse().ok(),
+                "content-type" => content_type = Some(value.clone()),
+                "transfer-encoding" => {
+                    chunked = value
+                        .split(',')
+                        .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"));
+                }
                 _ => {}
             }
+            headers.push((raw_name, value));
         }
     }
+    requests
+        .lock()
+        .expect("request log lock")
+        .push(HttpRequestRecord {
+            method: method.clone(),
+            target: target.clone(),
+            headers,
+        });
 
-    // Request body (POST). git smart-HTTP always sends Content-Length.
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body)?;
-    }
+    let body = if chunked {
+        read_chunked_body(&mut reader)?
+    } else {
+        let content_length = content_length.unwrap_or(0);
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body)?;
+        }
+        body
+    };
 
     // Split the request target into PATH_INFO and QUERY_STRING.
     let (path_info, query_string) = match target.split_once('?') {
@@ -228,7 +299,7 @@ fn handle_connection(
         .env("REQUEST_METHOD", &method)
         .env("PATH_INFO", &path_info)
         .env("QUERY_STRING", &query_string)
-        .env("CONTENT_LENGTH", content_length.to_string())
+        .env("CONTENT_LENGTH", body.len().to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -260,6 +331,47 @@ fn handle_connection(
     writer.write_all(&response)?;
     writer.flush()?;
     Ok(())
+}
+
+fn read_chunked_body(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let mut size_line = String::new();
+        reader.read_line(&mut size_line)?;
+        let size_text = size_line
+            .trim_end_matches(['\r', '\n'])
+            .split_once(';')
+            .map(|(size, _)| size)
+            .unwrap_or_else(|| size_line.trim_end_matches(['\r', '\n']));
+        let size = usize::from_str_radix(size_text.trim(), 16).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid chunk size {size_text:?}: {err}"),
+            )
+        })?;
+        if size == 0 {
+            loop {
+                let mut trailer = String::new();
+                reader.read_line(&mut trailer)?;
+                if trailer.trim_end_matches(['\r', '\n']).is_empty() {
+                    break;
+                }
+            }
+            break;
+        }
+        let start = body.len();
+        body.resize(start + size, 0);
+        reader.read_exact(&mut body[start..])?;
+        let mut crlf = [0u8; 2];
+        reader.read_exact(&mut crlf)?;
+        if crlf != *b"\r\n" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunk data was not followed by CRLF",
+            ));
+        }
+    }
+    Ok(body)
 }
 
 /// Splits CGI program output into `(status_line, headers, body)`.
@@ -801,6 +913,129 @@ fn push_http_creates_ref() {
         assert!(
             cat.status.success(),
             "pushed commit object {local_head} missing from upstream\nstderr:\n{}",
+            String::from_utf8_lossy(&cat.stderr)
+        );
+    };
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn push_http_large_body_uses_chunked_transfer_without_content_length() {
+    let Some(http_backend) = git_http_backend() else {
+        return;
+    };
+    let root = unique_temp_dir("http-push-chunked");
+    let project_root = root.join("srv");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+    {
+        let bare = create_upstream_repo(&project_root);
+        run_success(
+            sley_testkit::oracle_git(),
+            &bare,
+            &["config", "http.receivepack", "true"],
+        );
+
+        let server = HttpBackendServer::start(&project_root, &http_backend);
+        let url = server.url("/repo.git");
+        let dst = root.join("clone");
+        let dst_arg = dst.to_string_lossy().to_string();
+
+        let clone = run(git_rs(), &root, &["clone", "-q", &url, &dst_arg]);
+        assert!(
+            clone.status.success(),
+            "sley clone over http failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&clone.stdout),
+            String::from_utf8_lossy(&clone.stderr)
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &dst,
+            &["config", "http.postBuffer", "8"],
+        );
+
+        let payload = vec![b'x'; 64 * 1024];
+        std::fs::write(dst.join("large-payload.bin"), payload).expect("write large payload");
+        run_success(
+            sley_testkit::oracle_git(),
+            &dst,
+            &["add", "large-payload.bin"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &dst,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "large local change",
+                "-q",
+            ],
+        );
+        let local_head = trimmed_utf8(run_success(
+            sley_testkit::oracle_git(),
+            &dst,
+            &["rev-parse", "HEAD"],
+        ));
+
+        let push = run(
+            git_rs(),
+            &dst,
+            &["push", "-q", "origin", "HEAD:refs/heads/chunked"],
+        );
+        assert!(
+            push.status.success(),
+            "sley push over http failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&push.stdout),
+            String::from_utf8_lossy(&push.stderr)
+        );
+
+        let receive_pack_posts: Vec<_> = server
+            .requests()
+            .into_iter()
+            .filter(|request| {
+                request.method == "POST" && request.target == "/repo.git/git-receive-pack"
+            })
+            .collect();
+        assert_eq!(
+            receive_pack_posts.len(),
+            1,
+            "expected one receive-pack POST, got {receive_pack_posts:#?}"
+        );
+        let receive_pack = &receive_pack_posts[0];
+        let transfer_encoding = receive_pack.header_values("Transfer-Encoding");
+        assert!(
+            transfer_encoding.iter().any(|value| {
+                value
+                    .split(',')
+                    .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+            }),
+            "receive-pack POST should use chunked transfer encoding, headers: {receive_pack:#?}"
+        );
+        assert!(
+            !receive_pack.has_header("Content-Length"),
+            "chunked receive-pack POST must not include Content-Length, headers: {receive_pack:#?}"
+        );
+
+        let remote_head = trimmed_utf8(run_success(
+            sley_testkit::oracle_git(),
+            &bare,
+            &["rev-parse", "refs/heads/chunked"],
+        ));
+        assert_eq!(
+            remote_head, local_head,
+            "chunked pushed ref OID on upstream did not match local HEAD"
+        );
+        let cat = run(
+            sley_testkit::oracle_git(),
+            &bare,
+            &["cat-file", "-e", &local_head],
+        );
+        assert!(
+            cat.status.success(),
+            "chunked pushed commit object {local_head} missing from upstream\nstderr:\n{}",
             String::from_utf8_lossy(&cat.stderr)
         );
     };
