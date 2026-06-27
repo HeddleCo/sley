@@ -1058,6 +1058,7 @@ fn pager_basename(pager: &str) -> &str {
 /// Run the resolved `-O` pager over the matched files (git's `run_pager`). The
 /// pager string is executed as a shell command with the (optional `+/` jump and)
 /// file arguments passed positionally, mirroring `run_command(use_shell=1)`.
+#[cfg(unix)]
 fn run_open_pager(pager: &str, opts: &GrepOptions, files: &[Vec<u8>]) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -1091,6 +1092,15 @@ fn run_open_pager(pager: &str, opts: &GrepOptions, files: &[Vec<u8>]) -> Result<
         return Err(GitError::Exit(status.code().unwrap_or(1)));
     }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn run_open_pager(_pager: &str, _opts: &GrepOptions, _files: &[Vec<u8>]) -> Result<()> {
+    // The `-O`/`--open-files-in-pager` path shells out via `sh -c` and maps raw
+    // path bytes through `OsStrExt`; neither is available off Unix.
+    Err(GitError::Unsupported(
+        "grep --open-files-in-pager is only supported on Unix".to_string(),
+    ))
 }
 
 fn grep_no_index(

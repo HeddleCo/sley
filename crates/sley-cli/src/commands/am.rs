@@ -4176,8 +4176,15 @@ fn am_entry_stage(entry: &IndexEntry) -> u8 {
 
 /// Worktree path bytes → a relative `PathBuf`.
 fn am_bytes_to_pathbuf(bytes: &[u8]) -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 /// Path → (mode, oid) leaf map for a commit's tree (empty for an unborn HEAD).

@@ -13,7 +13,6 @@ use crate::commands::merge_rebase::{
     merge_index_entry, merge_read_blob, merge_write_worktree_file, read_worktree_index,
 };
 use crate::*;
-use std::os::unix::ffi::OsStrExt;
 
 /// The repository-relative path bytes of an index entry.
 fn entry_path(entry: &sley_index::IndexEntry) -> &[u8] {
@@ -342,12 +341,19 @@ fn run_external_merge_program(
             .map(|(mode, _)| format!("{mode:o}"))
             .unwrap_or_default()
     };
+    #[cfg(unix)]
+    let path_arg: std::ffi::OsString = {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsStr::from_bytes(path).to_os_string()
+    };
+    #[cfg(not(unix))]
+    let path_arg: std::ffi::OsString = String::from_utf8_lossy(path).into_owned().into();
     let mut command = std::process::Command::new(program);
     command
         .arg(hex(stages.base))
         .arg(hex(stages.ours))
         .arg(hex(stages.theirs))
-        .arg(std::ffi::OsStr::from_bytes(path))
+        .arg(&path_arg)
         .arg(mode(stages.base))
         .arg(mode(stages.ours))
         .arg(mode(stages.theirs));

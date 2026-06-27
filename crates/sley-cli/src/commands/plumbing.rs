@@ -600,8 +600,13 @@ fn archive_disk_extra_file(prefix: &[u8], path: &str) -> Result<ArchiveExtraFile
         .unwrap_or_else(|| path.as_bytes().to_vec());
     let mut output_path = prefix.to_vec();
     output_path.extend_from_slice(&basename);
-    use std::os::unix::fs::PermissionsExt;
-    let raw_mode = metadata.permissions().mode();
+    #[cfg(unix)]
+    let raw_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode()
+    };
+    #[cfg(not(unix))]
+    let raw_mode: u32 = 0;
     let mode = if metadata.file_type().is_symlink() {
         0o120000
     } else if raw_mode & 0o111 != 0 {

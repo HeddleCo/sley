@@ -1329,7 +1329,6 @@ fn read_worktree_image(
     start_commit: &ObjectId,
     repo_path: &str,
 ) -> Result<(Vec<u8>, u32)> {
-    use std::os::unix::ffi::OsStrExt as _;
     // `verify_working_tree_path`: an untracked path (absent from the start
     // commit's tree and from the index in *any* stage) is the "no such path"
     // fatal, even when a file by that name exists on disk. An unmerged path
@@ -1355,7 +1354,18 @@ fn read_worktree_image(
         if let Ok(meta) = std::fs::symlink_metadata(&absolute) {
             if meta.file_type().is_symlink() {
                 if let Ok(target) = std::fs::read_link(&absolute) {
-                    return Ok((target.as_os_str().as_bytes().to_vec(), 0o120000));
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        return Ok((target.as_os_str().as_bytes().to_vec(), 0o120000));
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        return Ok((
+                            target.to_string_lossy().replace('\\', "/").into_bytes(),
+                            0o120000,
+                        ));
+                    }
                 }
             } else if let Ok(bytes) = std::fs::read(&absolute) {
                 // git's `convert_to_git` honors `has_crlf_in_index`: an auto

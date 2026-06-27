@@ -812,9 +812,14 @@ fn worktree_blob_oid(format: ObjectFormat, full: &Path) -> Result<Option<(u32, O
     };
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
-        use std::os::unix::ffi::OsStrExt;
         let target = fs::read_link(full)?;
-        let body = target.as_os_str().as_bytes().to_vec();
+        #[cfg(unix)]
+        let body = {
+            use std::os::unix::ffi::OsStrExt;
+            target.as_os_str().as_bytes().to_vec()
+        };
+        #[cfg(not(unix))]
+        let body = target.to_string_lossy().replace('\\', "/").into_bytes();
         let oid = sley_core::object_id_for_bytes(format, "blob", &body)?;
         return Ok(Some((0o120000, oid)));
     }
@@ -2222,8 +2227,13 @@ fn stash_capture_worktree_entry(
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
         let target = fs::read_link(absolute)?;
-        use std::os::unix::ffi::OsStrExt;
-        let body = target.as_os_str().as_bytes().to_vec();
+        #[cfg(unix)]
+        let body = {
+            use std::os::unix::ffi::OsStrExt;
+            target.as_os_str().as_bytes().to_vec()
+        };
+        #[cfg(not(unix))]
+        let body = target.to_string_lossy().replace('\\', "/").into_bytes();
         let oid = db.write_object(EncodedObject::new(ObjectType::Blob, body))?;
         let mut index_entry = stash_index_entry_from_metadata(path, oid, metadata);
         index_entry.mode = 0o120000;

@@ -1779,9 +1779,19 @@ fn write_blob_to_worktree(
 
     if (mode & 0o170000) == 0o120000 {
         // Symlink: the blob bytes are the link target, opaque to clean/smudge.
-        use std::os::unix::ffi::OsStringExt;
-        let target = std::path::PathBuf::from(std::ffi::OsString::from_vec(object.body.clone()));
-        std::os::unix::fs::symlink(&target, &file_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let target =
+                std::path::PathBuf::from(std::ffi::OsString::from_vec(object.body.clone()));
+            std::os::unix::fs::symlink(&target, &file_path)?;
+        }
+        #[cfg(not(unix))]
+        {
+            // No symlink support: fall back to writing the link text as a regular
+            // file, matching git's behaviour on filesystems without symlinks.
+            fs::write(&file_path, &object.body)?;
+        }
     } else {
         let body = sley_worktree::apply_smudge_filter(
             worktree_root,
@@ -1794,6 +1804,7 @@ fn write_blob_to_worktree(
         fs::write(&file_path, &body)?;
         // Executable bit: 0o100755 → +x, 0o100644 → plain. git only honours the
         // user-execute bit when deciding the index mode, so set/clear it here.
+        #[cfg(unix)]
         if (mode & 0o170000) == 0o100000 {
             use std::os::unix::fs::PermissionsExt;
             let perms = fs::symlink_metadata(&file_path)?.permissions();
@@ -2057,6 +2068,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 /// `size` is the **on-disk** byte length (so it equals `metadata.len()`, which
 /// sley's `worktree_entry_is_uptodate` compares directly), and mtime is the
 /// file's real mtime so the racy-clean shortcut can prove the path unchanged.
+#[cfg(unix)]
 fn stat_info_from_lstat(file_path: &Path) -> Result<sley_unpack_trees::StatInfo> {
     use std::os::unix::fs::MetadataExt;
     let md = fs::symlink_metadata(file_path)?;
@@ -2069,6 +2081,31 @@ fn stat_info_from_lstat(file_path: &Path) -> Result<sley_unpack_trees::StatInfo>
         ino: md.ino() as u32,
         uid: md.uid(),
         gid: md.gid(),
+        size: md.len().min(u32::MAX as u64) as u32,
+    })
+}
+
+#[cfg(not(unix))]
+fn stat_info_from_lstat(file_path: &Path) -> Result<sley_unpack_trees::StatInfo> {
+    // The ctime/dev/ino/uid/gid stat fields are Unix-only; off Unix they are
+    // zeroed (as git does on platforms without them) and only the portable
+    // mtime and size are filled. The racy-clean shortcut degrades gracefully.
+    let md = fs::symlink_metadata(file_path)?;
+    let (mtime_seconds, mtime_nanoseconds) = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| (d.as_secs().min(u32::MAX as u64) as u32, d.subsec_nanos()))
+        .unwrap_or((0, 0));
+    Ok(sley_unpack_trees::StatInfo {
+        ctime_seconds: 0,
+        ctime_nanoseconds: 0,
+        mtime_seconds,
+        mtime_nanoseconds,
+        dev: 0,
+        ino: 0,
+        uid: 0,
+        gid: 0,
         size: md.len().min(u32::MAX as u64) as u32,
     })
 }

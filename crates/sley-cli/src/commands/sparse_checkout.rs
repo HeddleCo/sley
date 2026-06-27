@@ -25,6 +25,34 @@ use sley_worktree::{
     SparseCheckout, SparseCheckoutMode, apply_sparse_checkout_with_mode, path_in_sparse_checkout,
 };
 
+/// Interpret raw path bytes as a (relative) [`PathBuf`]. On Unix the bytes are
+/// the OS-native path encoding; off Unix they are decoded lossily as UTF-8.
+fn bytes_to_os_path(bytes: &[u8]) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        std::path::PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// Path/`OsStr` → its byte encoding. On Unix this is the native bytes; off Unix
+/// it is the lossy UTF-8 form with `\` normalised to `/`.
+fn os_str_to_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        value.as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        value.to_string_lossy().replace('\\', "/").into_bytes()
+    }
+}
+
 const SPARSE_USAGE: &str = "usage: git sparse-checkout (init | list | set | add | reapply | disable | check-rules | clean) [<options>]";
 
 // The exact usage + option-help blocks upstream prints when it rejects an
@@ -471,7 +499,6 @@ const CLEAN_HELP: &str = "usage: git sparse-checkout clean [-n|--dry-run]\n\n   
 /// index: an out-of-cone directory that still has stray files on disk is
 /// removed wholesale.
 fn cmd_sparse_clean(args: &[String]) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
     let ctx = sparse_context()?;
     if !sparse_checkout_enabled(&ctx)? {
         eprintln!("fatal: must be in a sparse-checkout to clean directories");
@@ -507,7 +534,7 @@ fn cmd_sparse_clean(args: &[String]) -> Result<()> {
     let msg_prefix = if dry_run { "Would remove" } else { "Removing" };
     let mut out = io::stdout();
     for dir in &sparse_dirs {
-        let abs = ctx.worktree_root.join(std::ffi::OsStr::from_bytes(dir));
+        let abs = ctx.worktree_root.join(bytes_to_os_path(dir));
         if !abs.is_dir() {
             continue;
         }
@@ -611,7 +638,6 @@ fn sparse_directories(ctx: &SparseContext, patterns: &[Vec<u8>]) -> Result<Vec<V
 /// Lists every file beneath `root`, returned as paths relative to `root` (with a
 /// leading component, no leading slash). Used for `clean --verbose`.
 fn list_files_recursive(root: &Path) -> Result<Vec<Vec<u8>>> {
-    use std::os::unix::ffi::OsStrExt;
     let mut files = Vec::new();
     let mut stack = vec![(root.to_path_buf(), Vec::<u8>::new())];
     while let Some((dir, prefix)) = stack.pop() {
@@ -620,7 +646,7 @@ fn list_files_recursive(root: &Path) -> Result<Vec<Vec<u8>>> {
         for entry in entries {
             let name = entry.file_name();
             let mut rel = prefix.clone();
-            rel.extend_from_slice(name.as_bytes());
+            rel.extend_from_slice(&os_str_to_bytes(&name));
             let metadata = entry.metadata()?;
             if metadata.is_dir() {
                 let mut child_prefix = rel.clone();
@@ -1193,18 +1219,16 @@ fn sparse_context() -> Result<SparseContext> {
 /// the current directory, with a trailing `/` (empty at the top). Used to
 /// resolve cone-mode directory arguments supplied from a subdirectory.
 fn sparse_prefix(worktree_root: &Path) -> Result<Vec<u8>> {
-    use std::os::unix::ffi::OsStrExt;
     let cwd = env::current_dir()?;
     let canonical_root = fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.into());
     let canonical_cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
     let Ok(rel) = canonical_cwd.strip_prefix(&canonical_root) else {
         return Ok(Vec::new());
     };
-    let bytes = rel.as_os_str().as_bytes();
-    if bytes.is_empty() {
+    let mut prefix = os_str_to_bytes(rel.as_os_str());
+    if prefix.is_empty() {
         return Ok(Vec::new());
     }
-    let mut prefix = bytes.to_vec();
     prefix.push(b'/');
     Ok(prefix)
 }
