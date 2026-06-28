@@ -88,7 +88,7 @@ mod push;
 pub use push::{
     PushAction, PushActionPlan, PushActionRequest, PushCommand, PushDestination, PushOptions,
     PushOutcome, PushPlan, PushRefStatus, PushReportRef, PushReportRequest, PushRequest,
-    PushServices, PushStatusReport, execute_push_action_plan, execute_push_plan,
+    PushServices, PushStatusReport, PushThinMode, execute_push_action_plan, execute_push_plan,
     local_push_source_refs, normalize_push_refname, normalize_push_refspec, plan_push,
     plan_push_actions, push, push_actions, push_local_with_report, reject_non_fast_forward_pushes,
     validate_receive_pack_report,
@@ -406,6 +406,7 @@ mod tests {
         let options = PushOptions {
             quiet: true,
             force: false,
+            thin: PushThinMode::Auto,
         };
         let mut progress = SilentProgress;
 

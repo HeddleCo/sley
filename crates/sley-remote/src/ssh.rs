@@ -676,7 +676,7 @@ pub(crate) fn execute_push_ssh_plan(
                     .filter(|_| request.format != ObjectFormat::Sha1),
                 ..ReceivePackPushRequestOptions::default()
             },
-            thin: false,
+            thin: request.options.thin.wants_thin(),
         },
         &mut stdin,
     )?;

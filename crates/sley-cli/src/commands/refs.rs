@@ -2456,6 +2456,16 @@ fn dispatch_ref_stdin_command(
 
             let effective = update_ref_effective_ref(context.store, &raw_name, *deref)?;
             let name = effective.effective.clone();
+            if context.batch_updates {
+                return update_ref_stdin_symref_update_batch(
+                    context,
+                    &effective.requested,
+                    &name,
+                    &target,
+                    expected,
+                    stdout,
+                );
+            }
             if transaction.capture(context.store, &effective.requested, &name)? {
                 return Ok(());
             }
@@ -3266,6 +3276,37 @@ fn update_ref_stdin_symref_update(
     Ok(())
 }
 
+fn update_ref_stdin_symref_update_batch(
+    context: &UpdateRefStdinContext<'_>,
+    requested: &str,
+    name: &str,
+    target: &str,
+    expected: Option<UpdateRefStdinSymrefExpected>,
+    stdout: &mut dyn Write,
+) -> Result<()> {
+    validate_ref_name(name)?;
+    if let Some(UpdateRefStdinSymrefExpected::Target(expected_target)) = expected.as_ref()
+        && matches!(context.store.read_ref(name)?, Some(RefTarget::Direct(_)))
+    {
+        let zero = zero_oid(context.format)?.to_string();
+        print_update_ref_stdin_rejection(
+            UpdateRefStdinRejection {
+                name: name.to_string(),
+                requested: requested.to_string(),
+                new_value: zero.clone(),
+                old_value: zero,
+                stdout_reason: "expected symref but found regular ref",
+                stderr_reason: format!(
+                    "expected symref with target '{expected_target}': but is a regular ref"
+                ),
+            },
+            stdout,
+        )?;
+        return Ok(());
+    }
+    update_ref_stdin_symref_update(context, requested, name, target, expected)
+}
+
 fn update_ref_stdin_symref_reflog(
     context: &UpdateRefStdinContext<'_>,
     name: &str,
@@ -3423,6 +3464,34 @@ fn print_update_ref_stdin_rejection(
     Ok(())
 }
 
+fn print_update_ref_stdin_case_conflict_rejection(
+    context: &UpdateRefStdinContext<'_>,
+    name: &str,
+    new_value: String,
+    old_value: String,
+    stdout: &mut dyn Write,
+) -> Result<()> {
+    writeln!(
+        stdout,
+        "rejected {name} {new_value} {old_value} reference conflict due to case-insensitive filesystem"
+    )?;
+    let lock_path = lock_path_for_loose_ref_path(&loose_ref_path_for_ref(context.git_dir, name)?)?;
+    eprintln!(
+        "error: cannot lock ref '{name}': Unable to create '{}': File exists",
+        lock_path.display()
+    );
+    Ok(())
+}
+
+fn find_case_insensitive_ref_conflict(store: &FileRefStore, name: &str) -> Result<Option<String>> {
+    for reference in store.list_refs()? {
+        if reference.name != name && reference.name.eq_ignore_ascii_case(name) {
+            return Ok(Some(reference.name));
+        }
+    }
+    Ok(None)
+}
+
 fn update_ref_stdin_expected_rejection(
     store: &FileRefStore,
     format: ObjectFormat,
@@ -3550,6 +3619,19 @@ fn update_ref_stdin_write_batch(
     stdout: &mut dyn Write,
 ) -> Result<()> {
     let current = context.store.read_ref(&request.name)?;
+    let zero = zero_oid(context.format)?;
+    if request.expected_oid == Some(&zero)
+        && current.is_some()
+        && find_case_insensitive_ref_conflict(context.store, &request.name)?.is_some()
+    {
+        return print_update_ref_stdin_case_conflict_rejection(
+            context,
+            &request.name,
+            request.new_oid.to_string(),
+            zero.to_string(),
+            stdout,
+        );
+    }
     if let Some(expected_oid) = request.expected_oid
         && let Some(rejection) = update_ref_stdin_expected_rejection(
             context.store,
@@ -3564,7 +3646,7 @@ fn update_ref_stdin_write_batch(
         print_update_ref_stdin_rejection(rejection, stdout)?;
         return Ok(());
     }
-    if request.new_oid == zero_oid(context.format)? {
+    if request.new_oid == zero {
         return update_ref_delete_stdin(context.store, context.format, &request.name, None);
     }
     if let Err(reason) = check_update_ref_new_value_cached(context, &request.name, &request.new_oid)

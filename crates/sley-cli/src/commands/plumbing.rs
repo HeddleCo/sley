@@ -1141,6 +1141,16 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
         other => other,
     })?;
 
+    if !layout.reinitialized
+        && init_config_bool(
+            "init.defaultSubmodulePathConfig",
+            global_config,
+            init_config_git_dir.as_deref(),
+        )? == Some(true)
+    {
+        crate::enable_submodule_path_config_extension(&layout.git_dir)?;
+    }
+
     if branch_defaulted && !quiet && !layout.reinitialized {
         emit_default_branch_advice(
             &initial_branch,

@@ -94,7 +94,7 @@ pub(crate) struct StatusProfileCounters {
     pub(crate) overlap_enabled: bool,
 }
 
-pub(crate) const STATUS_BORROWED_OVERLAP_MIN_STAGE0: usize = 1024;
+pub(crate) const STATUS_BORROWED_OVERLAP_MIN_STAGE0: usize = 8192;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StatusExecutor {
@@ -255,7 +255,7 @@ impl StatusProfileCounters {
             self.tracked_exact_hits,
             self.tracked_dir_prefix_hits,
             self.tracked_skip_worktree_prefix_hits,
-            std::mem::size_of::<fs::DirEntry>(),
+            std::mem::size_of::<StatusDirEntry>(),
             self.read_dir_entry_vec_cap_bytes,
             self.read_dir_entry_vec_max_len,
             self.read_dir_entry_vec_max_cap,
