@@ -1,0 +1,1634 @@
+{
+  "timestamp": "20260628T002700Z",
+  "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+  "python": "3.14.6 (main, Jun 10 2026, 10:03:53) [Clang 21.0.0 (clang-2100.0.123.102)]",
+  "workspace": "/Users/lukethorne/.codex/worktrees/ccac/sley",
+  "git_bin": "/opt/homebrew/bin/git",
+  "git_version": "git version 2.54.0",
+  "sley_bin": "/Users/lukethorne/.codex/worktrees/ccac/sley/target/release/sley",
+  "sley_harness_bin": "/Users/lukethorne/.codex/worktrees/ccac/sley/target/release/sley-human-harness",
+  "repeat": 8,
+  "warmup": 2,
+  "memory_runs": 2,
+  "repos": [
+    {
+      "size": "lg",
+      "name": "git",
+      "url": "https://github.com/git/git.git",
+      "path": "/private/tmp/sley-human-common-repos/lg-git",
+      "head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "branch": "master",
+      "commit_count": 81316,
+      "tracked_files": 4765,
+      "has_parent": true
+    }
+  ],
+  "commands": [
+    {
+      "name": "status_short",
+      "kind": "read",
+      "args": [
+        "status",
+        "--short"
+      ]
+    },
+    {
+      "name": "log_oneline_100",
+      "kind": "read",
+      "args": [
+        "log",
+        "--oneline",
+        "-100"
+      ]
+    },
+    {
+      "name": "branch_list",
+      "kind": "read",
+      "args": [
+        "branch",
+        "--list"
+      ]
+    },
+    {
+      "name": "tag_list",
+      "kind": "read",
+      "args": [
+        "tag",
+        "--list"
+      ]
+    },
+    {
+      "name": "rev_parse_short_head",
+      "kind": "read",
+      "args": [
+        "rev-parse",
+        "--short",
+        "HEAD"
+      ]
+    },
+    {
+      "name": "branch_force_write",
+      "kind": "write",
+      "args": [
+        "branch",
+        "-f",
+        "sley-bench-write",
+        "HEAD"
+      ]
+    },
+    {
+      "name": "tag_force_write",
+      "kind": "write",
+      "args": [
+        "tag",
+        "-f",
+        "sley-bench-write",
+        "HEAD"
+      ]
+    }
+  ],
+  "timing": [
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "status_short",
+      "command_kind": "read",
+      "command": "status --short",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 19641042
+        },
+        {
+          "index": 1,
+          "ns": 20156708
+        },
+        {
+          "index": 2,
+          "ns": 21178167
+        },
+        {
+          "index": 3,
+          "ns": 20216750
+        },
+        {
+          "index": 4,
+          "ns": 20305917
+        },
+        {
+          "index": 5,
+          "ns": 20329292
+        },
+        {
+          "index": 6,
+          "ns": 19820000
+        },
+        {
+          "index": 7,
+          "ns": 19670667
+        }
+      ],
+      "min_ms": 19.641042,
+      "max_ms": 21.178167,
+      "mean_ms": 20.164817875,
+      "median_ms": 20.186729,
+      "stdev_ms": 0.49483409732135347,
+      "speedup_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "status_short",
+      "command_kind": "read",
+      "command": "status --short",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 19782750
+        },
+        {
+          "index": 1,
+          "ns": 19410291
+        },
+        {
+          "index": 2,
+          "ns": 19574250
+        },
+        {
+          "index": 3,
+          "ns": 20011667
+        },
+        {
+          "index": 4,
+          "ns": 19248334
+        },
+        {
+          "index": 5,
+          "ns": 19680791
+        },
+        {
+          "index": 6,
+          "ns": 19511459
+        },
+        {
+          "index": 7,
+          "ns": 19160917
+        }
+      ],
+      "min_ms": 19.160917,
+      "max_ms": 20.011667,
+      "mean_ms": 19.547557375,
+      "median_ms": 19.542854499999997,
+      "stdev_ms": 0.27988455988697325,
+      "speedup_vs_git": 1.0315773724644204
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "status_short",
+      "command_kind": "read",
+      "command": "status --short",
+      "mode": "sley_harness",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 15321167
+        },
+        {
+          "index": 1,
+          "ns": 13279542
+        },
+        {
+          "index": 2,
+          "ns": 13416209
+        },
+        {
+          "index": 3,
+          "ns": 11143083
+        },
+        {
+          "index": 4,
+          "ns": 12300292
+        },
+        {
+          "index": 5,
+          "ns": 11151917
+        },
+        {
+          "index": 6,
+          "ns": 12867709
+        },
+        {
+          "index": 7,
+          "ns": 12510500
+        }
+      ],
+      "detail_file": "/Users/lukethorne/.codex/worktrees/ccac/sley/bench-results/human-common/20260627T-status-log-threshold8192/harness-details/harness-lg-git-status_short.json",
+      "min_ms": 11.143083,
+      "max_ms": 15.321167,
+      "mean_ms": 12.748802375,
+      "median_ms": 12.6891045,
+      "stdev_ms": 1.3493195053492641,
+      "speedup_vs_git": 1.581702914662994
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "log_oneline_100",
+      "command_kind": "read",
+      "command": "log --oneline -100",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 9643000
+        },
+        {
+          "index": 1,
+          "ns": 9778666
+        },
+        {
+          "index": 2,
+          "ns": 9159167
+        },
+        {
+          "index": 3,
+          "ns": 9360166
+        },
+        {
+          "index": 4,
+          "ns": 9010917
+        },
+        {
+          "index": 5,
+          "ns": 8891917
+        },
+        {
+          "index": 6,
+          "ns": 8927542
+        },
+        {
+          "index": 7,
+          "ns": 9525917
+        }
+      ],
+      "min_ms": 8.891917,
+      "max_ms": 9.778666,
+      "mean_ms": 9.2871615,
+      "median_ms": 9.2596665,
+      "stdev_ms": 0.3399095620842193,
+      "speedup_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "log_oneline_100",
+      "command_kind": "read",
+      "command": "log --oneline -100",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 6468667
+        },
+        {
+          "index": 1,
+          "ns": 6270334
+        },
+        {
+          "index": 2,
+          "ns": 6126416
+        },
+        {
+          "index": 3,
+          "ns": 6236917
+        },
+        {
+          "index": 4,
+          "ns": 6210750
+        },
+        {
+          "index": 5,
+          "ns": 6325958
+        },
+        {
+          "index": 6,
+          "ns": 6345542
+        },
+        {
+          "index": 7,
+          "ns": 6233875
+        }
+      ],
+      "min_ms": 6.126416,
+      "max_ms": 6.468667,
+      "mean_ms": 6.277307375,
+      "median_ms": 6.2536255,
+      "stdev_ms": 0.10309899972348006,
+      "speedup_vs_git": 1.4794817180670556
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "log_oneline_100",
+      "command_kind": "read",
+      "command": "log --oneline -100",
+      "mode": "sley_harness",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 1685959
+        },
+        {
+          "index": 1,
+          "ns": 1665209
+        },
+        {
+          "index": 2,
+          "ns": 1742083
+        },
+        {
+          "index": 3,
+          "ns": 1735333
+        },
+        {
+          "index": 4,
+          "ns": 1683416
+        },
+        {
+          "index": 5,
+          "ns": 1661333
+        },
+        {
+          "index": 6,
+          "ns": 1665583
+        },
+        {
+          "index": 7,
+          "ns": 1668833
+        }
+      ],
+      "detail_file": "/Users/lukethorne/.codex/worktrees/ccac/sley/bench-results/human-common/20260627T-status-log-threshold8192/harness-details/harness-lg-git-log_oneline_100.json",
+      "min_ms": 1.661333,
+      "max_ms": 1.742083,
+      "mean_ms": 1.688468625,
+      "median_ms": 1.6761245,
+      "stdev_ms": 0.03226953447775031,
+      "speedup_vs_git": 5.500345912557303
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_list",
+      "command_kind": "read",
+      "command": "branch --list",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 7530042
+        },
+        {
+          "index": 1,
+          "ns": 7044750
+        },
+        {
+          "index": 2,
+          "ns": 7030333
+        },
+        {
+          "index": 3,
+          "ns": 6911625
+        },
+        {
+          "index": 4,
+          "ns": 7591292
+        },
+        {
+          "index": 5,
+          "ns": 7128709
+        },
+        {
+          "index": 6,
+          "ns": 7160291
+        },
+        {
+          "index": 7,
+          "ns": 7164625
+        }
+      ],
+      "min_ms": 6.911625,
+      "max_ms": 7.591292,
+      "mean_ms": 7.195208375,
+      "median_ms": 7.1445,
+      "stdev_ms": 0.24077662133422556,
+      "speedup_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_list",
+      "command_kind": "read",
+      "command": "branch --list",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 4422542
+        },
+        {
+          "index": 1,
+          "ns": 4439292
+        },
+        {
+          "index": 2,
+          "ns": 4333750
+        },
+        {
+          "index": 3,
+          "ns": 4351875
+        },
+        {
+          "index": 4,
+          "ns": 4329292
+        },
+        {
+          "index": 5,
+          "ns": 4383542
+        },
+        {
+          "index": 6,
+          "ns": 4373833
+        },
+        {
+          "index": 7,
+          "ns": 4577625
+        }
+      ],
+      "min_ms": 4.329292,
+      "max_ms": 4.577625,
+      "mean_ms": 4.401468875,
+      "median_ms": 4.3786875,
+      "stdev_ms": 0.08128051949432824,
+      "speedup_vs_git": 1.6347289005877612
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_list",
+      "command_kind": "read",
+      "command": "branch --list",
+      "mode": "sley_harness",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 277375
+        },
+        {
+          "index": 1,
+          "ns": 274125
+        },
+        {
+          "index": 2,
+          "ns": 271208
+        },
+        {
+          "index": 3,
+          "ns": 266167
+        },
+        {
+          "index": 4,
+          "ns": 264291
+        },
+        {
+          "index": 5,
+          "ns": 265708
+        },
+        {
+          "index": 6,
+          "ns": 269083
+        },
+        {
+          "index": 7,
+          "ns": 264375
+        }
+      ],
+      "detail_file": "/Users/lukethorne/.codex/worktrees/ccac/sley/bench-results/human-common/20260627T-status-log-threshold8192/harness-details/harness-lg-git-branch_list.json",
+      "min_ms": 0.264291,
+      "max_ms": 0.277375,
+      "mean_ms": 0.2690415,
+      "median_ms": 0.267625,
+      "stdev_ms": 0.004835923371719491,
+      "speedup_vs_git": 26.743860612582075
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_list",
+      "command_kind": "read",
+      "command": "tag --list",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 7672542
+        },
+        {
+          "index": 1,
+          "ns": 7374417
+        },
+        {
+          "index": 2,
+          "ns": 7606416
+        },
+        {
+          "index": 3,
+          "ns": 7584750
+        },
+        {
+          "index": 4,
+          "ns": 7378125
+        },
+        {
+          "index": 5,
+          "ns": 7354417
+        },
+        {
+          "index": 6,
+          "ns": 7715333
+        },
+        {
+          "index": 7,
+          "ns": 7451500
+        }
+      ],
+      "min_ms": 7.354417,
+      "max_ms": 7.715333,
+      "mean_ms": 7.5171875,
+      "median_ms": 7.5181249999999995,
+      "stdev_ms": 0.14464436898920652,
+      "speedup_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_list",
+      "command_kind": "read",
+      "command": "tag --list",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 5458125
+        },
+        {
+          "index": 1,
+          "ns": 5544334
+        },
+        {
+          "index": 2,
+          "ns": 5516666
+        },
+        {
+          "index": 3,
+          "ns": 5731041
+        },
+        {
+          "index": 4,
+          "ns": 5298916
+        },
+        {
+          "index": 5,
+          "ns": 5242833
+        },
+        {
+          "index": 6,
+          "ns": 5351041
+        },
+        {
+          "index": 7,
+          "ns": 5512875
+        }
+      ],
+      "min_ms": 5.242833,
+      "max_ms": 5.731041,
+      "mean_ms": 5.456978875,
+      "median_ms": 5.4855,
+      "stdev_ms": 0.15652218970889673,
+      "speedup_vs_git": 1.3775364853322802
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_list",
+      "command_kind": "read",
+      "command": "tag --list",
+      "mode": "sley_harness",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 285125
+        },
+        {
+          "index": 1,
+          "ns": 286375
+        },
+        {
+          "index": 2,
+          "ns": 286583
+        },
+        {
+          "index": 3,
+          "ns": 280666
+        },
+        {
+          "index": 4,
+          "ns": 281625
+        },
+        {
+          "index": 5,
+          "ns": 277667
+        },
+        {
+          "index": 6,
+          "ns": 283541
+        },
+        {
+          "index": 7,
+          "ns": 278875
+        }
+      ],
+      "detail_file": "/Users/lukethorne/.codex/worktrees/ccac/sley/bench-results/human-common/20260627T-status-log-threshold8192/harness-details/harness-lg-git-tag_list.json",
+      "min_ms": 0.277667,
+      "max_ms": 0.286583,
+      "mean_ms": 0.282557125,
+      "median_ms": 0.28258300000000003,
+      "stdev_ms": 0.0033861568792237402,
+      "speedup_vs_git": 26.604133588915868
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "rev_parse_short_head",
+      "command_kind": "read",
+      "command": "rev-parse --short HEAD",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 7040375
+        },
+        {
+          "index": 1,
+          "ns": 7027208
+        },
+        {
+          "index": 2,
+          "ns": 6760583
+        },
+        {
+          "index": 3,
+          "ns": 7046541
+        },
+        {
+          "index": 4,
+          "ns": 7543291
+        },
+        {
+          "index": 5,
+          "ns": 7489958
+        },
+        {
+          "index": 6,
+          "ns": 7160209
+        },
+        {
+          "index": 7,
+          "ns": 6869750
+        }
+      ],
+      "min_ms": 6.760583,
+      "max_ms": 7.543291,
+      "mean_ms": 7.117239375,
+      "median_ms": 7.043458,
+      "stdev_ms": 0.2750979957038362,
+      "speedup_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "rev_parse_short_head",
+      "command_kind": "read",
+      "command": "rev-parse --short HEAD",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 4549542
+        },
+        {
+          "index": 1,
+          "ns": 4479667
+        },
+        {
+          "index": 2,
+          "ns": 4354125
+        },
+        {
+          "index": 3,
+          "ns": 4353833
+        },
+        {
+          "index": 4,
+          "ns": 4476083
+        },
+        {
+          "index": 5,
+          "ns": 4760041
+        },
+        {
+          "index": 6,
+          "ns": 4834708
+        },
+        {
+          "index": 7,
+          "ns": 4612500
+        }
+      ],
+      "min_ms": 4.353833,
+      "max_ms": 4.834708,
+      "mean_ms": 4.552562375,
+      "median_ms": 4.5146045,
+      "stdev_ms": 0.17577939172069193,
+      "speedup_vs_git": 1.5633480200257552
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "rev_parse_short_head",
+      "command_kind": "read",
+      "command": "rev-parse --short HEAD",
+      "mode": "sley_harness",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 145250
+        },
+        {
+          "index": 1,
+          "ns": 121375
+        },
+        {
+          "index": 2,
+          "ns": 134875
+        },
+        {
+          "index": 3,
+          "ns": 124709
+        },
+        {
+          "index": 4,
+          "ns": 121750
+        },
+        {
+          "index": 5,
+          "ns": 126709
+        },
+        {
+          "index": 6,
+          "ns": 129333
+        },
+        {
+          "index": 7,
+          "ns": 123833
+        }
+      ],
+      "detail_file": "/Users/lukethorne/.codex/worktrees/ccac/sley/bench-results/human-common/20260627T-status-log-threshold8192/harness-details/harness-lg-git-rev_parse_short_head.json",
+      "min_ms": 0.121375,
+      "max_ms": 0.14525,
+      "mean_ms": 0.12847925,
+      "median_ms": 0.125709,
+      "stdev_ms": 0.008085100454363125,
+      "speedup_vs_git": 55.39602212030348
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_force_write",
+      "command_kind": "write",
+      "command": "branch -f sley-bench-write HEAD",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 7363334
+        },
+        {
+          "index": 1,
+          "ns": 7513750
+        },
+        {
+          "index": 2,
+          "ns": 7805584
+        },
+        {
+          "index": 3,
+          "ns": 7464583
+        },
+        {
+          "index": 4,
+          "ns": 7341000
+        },
+        {
+          "index": 5,
+          "ns": 7457584
+        },
+        {
+          "index": 6,
+          "ns": 8484709
+        },
+        {
+          "index": 7,
+          "ns": 8062166
+        }
+      ],
+      "min_ms": 7.341,
+      "max_ms": 8.484709,
+      "mean_ms": 7.68658875,
+      "median_ms": 7.4891665,
+      "stdev_ms": 0.40492367063462015,
+      "speedup_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_force_write",
+      "command_kind": "write",
+      "command": "branch -f sley-bench-write HEAD",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 5556375
+        },
+        {
+          "index": 1,
+          "ns": 5601542
+        },
+        {
+          "index": 2,
+          "ns": 5665375
+        },
+        {
+          "index": 3,
+          "ns": 5625166
+        },
+        {
+          "index": 4,
+          "ns": 5511875
+        },
+        {
+          "index": 5,
+          "ns": 5485375
+        },
+        {
+          "index": 6,
+          "ns": 5551250
+        },
+        {
+          "index": 7,
+          "ns": 5507667
+        }
+      ],
+      "min_ms": 5.485375,
+      "max_ms": 5.665375,
+      "mean_ms": 5.563078125,
+      "median_ms": 5.553812499999999,
+      "stdev_ms": 0.06292148097984056,
+      "speedup_vs_git": 1.3817150464698895
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_force_write",
+      "command_kind": "write",
+      "command": "branch -f sley-bench-write HEAD",
+      "mode": "sley_harness",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 1012875
+        },
+        {
+          "index": 1,
+          "ns": 1064459
+        },
+        {
+          "index": 2,
+          "ns": 1015375
+        },
+        {
+          "index": 3,
+          "ns": 975667
+        },
+        {
+          "index": 4,
+          "ns": 990125
+        },
+        {
+          "index": 5,
+          "ns": 1079375
+        },
+        {
+          "index": 6,
+          "ns": 1103500
+        },
+        {
+          "index": 7,
+          "ns": 1026500
+        }
+      ],
+      "detail_file": "/Users/lukethorne/.codex/worktrees/ccac/sley/bench-results/human-common/20260627T-status-log-threshold8192/harness-details/harness-timing-lg-git-sley_harness-branch_force_write-branch_force_write.json",
+      "min_ms": 0.975667,
+      "max_ms": 1.1035,
+      "mean_ms": 1.0334845,
+      "median_ms": 1.0209375,
+      "stdev_ms": 0.044708462203160465,
+      "speedup_vs_git": 7.437546233155892
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_force_write",
+      "command_kind": "write",
+      "command": "tag -f sley-bench-write HEAD",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 8040375
+        },
+        {
+          "index": 1,
+          "ns": 8000875
+        },
+        {
+          "index": 2,
+          "ns": 8315875
+        },
+        {
+          "index": 3,
+          "ns": 8179250
+        },
+        {
+          "index": 4,
+          "ns": 8087208
+        },
+        {
+          "index": 5,
+          "ns": 7257625
+        },
+        {
+          "index": 6,
+          "ns": 7184375
+        },
+        {
+          "index": 7,
+          "ns": 7126708
+        }
+      ],
+      "min_ms": 7.126708,
+      "max_ms": 8.315875,
+      "mean_ms": 7.774036375,
+      "median_ms": 8.020624999999999,
+      "stdev_ms": 0.4944941050591684,
+      "speedup_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_force_write",
+      "command_kind": "write",
+      "command": "tag -f sley-bench-write HEAD",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 7696458
+        },
+        {
+          "index": 1,
+          "ns": 8182833
+        },
+        {
+          "index": 2,
+          "ns": 8929083
+        },
+        {
+          "index": 3,
+          "ns": 5933958
+        },
+        {
+          "index": 4,
+          "ns": 8202166
+        },
+        {
+          "index": 5,
+          "ns": 5970500
+        },
+        {
+          "index": 6,
+          "ns": 5981791
+        },
+        {
+          "index": 7,
+          "ns": 7982209
+        }
+      ],
+      "min_ms": 5.933958,
+      "max_ms": 8.929083,
+      "mean_ms": 7.35987475,
+      "median_ms": 7.8393335,
+      "stdev_ms": 1.2078572031094392,
+      "speedup_vs_git": 1.0562729175520276
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_force_write",
+      "command_kind": "write",
+      "command": "tag -f sley-bench-write HEAD",
+      "mode": "sley_harness",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 1073250
+        },
+        {
+          "index": 1,
+          "ns": 1022708
+        },
+        {
+          "index": 2,
+          "ns": 1014208
+        },
+        {
+          "index": 3,
+          "ns": 1010916
+        },
+        {
+          "index": 4,
+          "ns": 1004208
+        },
+        {
+          "index": 5,
+          "ns": 1270417
+        },
+        {
+          "index": 6,
+          "ns": 1102833
+        },
+        {
+          "index": 7,
+          "ns": 1017667
+        }
+      ],
+      "detail_file": "/Users/lukethorne/.codex/worktrees/ccac/sley/bench-results/human-common/20260627T-status-log-threshold8192/harness-details/harness-timing-lg-git-sley_harness-tag_force_write-tag_force_write.json",
+      "min_ms": 1.004208,
+      "max_ms": 1.270417,
+      "mean_ms": 1.064525875,
+      "median_ms": 1.0201875,
+      "stdev_ms": 0.0901770826595213,
+      "speedup_vs_git": 7.302815795811445
+    }
+  ],
+  "memory": [
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "status_short",
+      "command_kind": "read",
+      "command": "status --short",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 10584064
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 10584064
+        }
+      ],
+      "min_rss_bytes": 10584064,
+      "max_rss_bytes": 10584064,
+      "mean_rss_bytes": 10584064.0,
+      "median_rss_bytes": 10584064.0,
+      "rss_ratio_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "status_short",
+      "command_kind": "read",
+      "command": "status --short",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 8863744
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 8814592
+        }
+      ],
+      "min_rss_bytes": 8814592,
+      "max_rss_bytes": 8863744,
+      "mean_rss_bytes": 8839168.0,
+      "median_rss_bytes": 8839168.0,
+      "rss_ratio_vs_git": 0.8351393188854489
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "status_short",
+      "command_kind": "read",
+      "command": "status --short",
+      "mode": "sley_harness",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 6537216
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 6455296
+        }
+      ],
+      "min_rss_bytes": 6455296,
+      "max_rss_bytes": 6537216,
+      "mean_rss_bytes": 6496256.0,
+      "median_rss_bytes": 6496256.0,
+      "rss_ratio_vs_git": 0.6137770897832817
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "log_oneline_100",
+      "command_kind": "read",
+      "command": "log --oneline -100",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 13598720
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 13549568
+        }
+      ],
+      "min_rss_bytes": 13549568,
+      "max_rss_bytes": 13598720,
+      "mean_rss_bytes": 13574144.0,
+      "median_rss_bytes": 13574144.0,
+      "rss_ratio_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "log_oneline_100",
+      "command_kind": "read",
+      "command": "log --oneline -100",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 11452416
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 11436032
+        }
+      ],
+      "min_rss_bytes": 11436032,
+      "max_rss_bytes": 11452416,
+      "mean_rss_bytes": 11444224.0,
+      "median_rss_bytes": 11444224.0,
+      "rss_ratio_vs_git": 0.8430899215449608
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "log_oneline_100",
+      "command_kind": "read",
+      "command": "log --oneline -100",
+      "mode": "sley_harness",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 9666560
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 9682944
+        }
+      ],
+      "min_rss_bytes": 9666560,
+      "max_rss_bytes": 9682944,
+      "mean_rss_bytes": 9674752.0,
+      "median_rss_bytes": 9674752.0,
+      "rss_ratio_vs_git": 0.7127338563669282
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_list",
+      "command_kind": "read",
+      "command": "branch --list",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 7634944
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 7634944
+        }
+      ],
+      "min_rss_bytes": 7634944,
+      "max_rss_bytes": 7634944,
+      "mean_rss_bytes": 7634944.0,
+      "median_rss_bytes": 7634944.0,
+      "rss_ratio_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_list",
+      "command_kind": "read",
+      "command": "branch --list",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 3588096
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 3588096
+        }
+      ],
+      "min_rss_bytes": 3588096,
+      "max_rss_bytes": 3588096,
+      "mean_rss_bytes": 3588096.0,
+      "median_rss_bytes": 3588096.0,
+      "rss_ratio_vs_git": 0.4699570815450644
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_list",
+      "command_kind": "read",
+      "command": "branch --list",
+      "mode": "sley_harness",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 2293760
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 2293760
+        }
+      ],
+      "min_rss_bytes": 2293760,
+      "max_rss_bytes": 2293760,
+      "mean_rss_bytes": 2293760.0,
+      "median_rss_bytes": 2293760.0,
+      "rss_ratio_vs_git": 0.30042918454935624
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_list",
+      "command_kind": "read",
+      "command": "tag --list",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 7716864
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 7684096
+        }
+      ],
+      "min_rss_bytes": 7684096,
+      "max_rss_bytes": 7716864,
+      "mean_rss_bytes": 7700480.0,
+      "median_rss_bytes": 7700480.0,
+      "rss_ratio_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_list",
+      "command_kind": "read",
+      "command": "tag --list",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 4456448
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 4489216
+        }
+      ],
+      "min_rss_bytes": 4456448,
+      "max_rss_bytes": 4489216,
+      "mean_rss_bytes": 4472832.0,
+      "median_rss_bytes": 4472832.0,
+      "rss_ratio_vs_git": 0.5808510638297872
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_list",
+      "command_kind": "read",
+      "command": "tag --list",
+      "mode": "sley_harness",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 2326528
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 2326528
+        }
+      ],
+      "min_rss_bytes": 2326528,
+      "max_rss_bytes": 2326528,
+      "mean_rss_bytes": 2326528.0,
+      "median_rss_bytes": 2326528.0,
+      "rss_ratio_vs_git": 0.3021276595744681
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "rev_parse_short_head",
+      "command_kind": "read",
+      "command": "rev-parse --short HEAD",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 7667712
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 7667712
+        }
+      ],
+      "min_rss_bytes": 7667712,
+      "max_rss_bytes": 7667712,
+      "mean_rss_bytes": 7667712.0,
+      "median_rss_bytes": 7667712.0,
+      "rss_ratio_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "rev_parse_short_head",
+      "command_kind": "read",
+      "command": "rev-parse --short HEAD",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 3457024
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 3457024
+        }
+      ],
+      "min_rss_bytes": 3457024,
+      "max_rss_bytes": 3457024,
+      "mean_rss_bytes": 3457024.0,
+      "median_rss_bytes": 3457024.0,
+      "rss_ratio_vs_git": 0.45085470085470086
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "rev_parse_short_head",
+      "command_kind": "read",
+      "command": "rev-parse --short HEAD",
+      "mode": "sley_harness",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 2228224
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 2244608
+        }
+      ],
+      "min_rss_bytes": 2228224,
+      "max_rss_bytes": 2244608,
+      "mean_rss_bytes": 2236416.0,
+      "median_rss_bytes": 2236416.0,
+      "rss_ratio_vs_git": 0.2916666666666667
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_force_write",
+      "command_kind": "write",
+      "command": "branch -f sley-bench-write HEAD",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 8126464
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 8093696
+        }
+      ],
+      "min_rss_bytes": 8093696,
+      "max_rss_bytes": 8126464,
+      "mean_rss_bytes": 8110080.0,
+      "median_rss_bytes": 8110080.0,
+      "rss_ratio_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_force_write",
+      "command_kind": "write",
+      "command": "branch -f sley-bench-write HEAD",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 4571136
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 4734976
+        }
+      ],
+      "min_rss_bytes": 4571136,
+      "max_rss_bytes": 4734976,
+      "mean_rss_bytes": 4653056.0,
+      "median_rss_bytes": 4653056.0,
+      "rss_ratio_vs_git": 0.5737373737373738
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_force_write",
+      "command_kind": "write",
+      "command": "branch -f sley-bench-write HEAD",
+      "mode": "sley_harness",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 2965504
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 2998272
+        }
+      ],
+      "min_rss_bytes": 2965504,
+      "max_rss_bytes": 2998272,
+      "mean_rss_bytes": 2981888.0,
+      "median_rss_bytes": 2981888.0,
+      "rss_ratio_vs_git": 0.36767676767676766
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_force_write",
+      "command_kind": "write",
+      "command": "tag -f sley-bench-write HEAD",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 8372224
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 8372224
+        }
+      ],
+      "min_rss_bytes": 8372224,
+      "max_rss_bytes": 8372224,
+      "mean_rss_bytes": 8372224.0,
+      "median_rss_bytes": 8372224.0,
+      "rss_ratio_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_force_write",
+      "command_kind": "write",
+      "command": "tag -f sley-bench-write HEAD",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 4112384
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 4112384
+        }
+      ],
+      "min_rss_bytes": 4112384,
+      "max_rss_bytes": 4112384,
+      "mean_rss_bytes": 4112384.0,
+      "median_rss_bytes": 4112384.0,
+      "rss_ratio_vs_git": 0.4911937377690802
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_force_write",
+      "command_kind": "write",
+      "command": "tag -f sley-bench-write HEAD",
+      "mode": "sley_harness",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 2932736
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 2932736
+        }
+      ],
+      "min_rss_bytes": 2932736,
+      "max_rss_bytes": 2932736,
+      "mean_rss_bytes": 2932736.0,
+      "median_rss_bytes": 2932736.0,
+      "rss_ratio_vs_git": 0.350293542074364
+    }
+  ]
+}

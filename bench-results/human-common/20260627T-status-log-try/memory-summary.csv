@@ -1,0 +1,22 @@
+repo_size,repo_name,command_name,command_kind,command,mode,mean_rss_bytes,median_rss_bytes,min_rss_bytes,max_rss_bytes,rss_ratio_vs_git
+lg,git,status_short,read,status --short,git,10551296.0,10551296.0,10551296,10551296,1.0
+lg,git,status_short,read,status --short,sley_cli,23822336.0,23822336.0,23642112,24002560,2.2577639751552794
+lg,git,status_short,read,status --short,sley_harness,,,,,
+lg,git,log_oneline_100,read,log --oneline -100,git,13557760.0,13557760.0,13516800,13598720,1.0
+lg,git,log_oneline_100,read,log --oneline -100,sley_cli,11493376.0,11493376.0,11468800,11517952,0.8477341389728097
+lg,git,log_oneline_100,read,log --oneline -100,sley_harness,,,,,
+lg,git,branch_list,read,branch --list,git,7667712.0,7667712.0,7667712,7667712,1.0
+lg,git,branch_list,read,branch --list,sley_cli,3563520.0,3563520.0,3555328,3571712,0.46474358974358976
+lg,git,branch_list,read,branch --list,sley_harness,,,,,
+lg,git,tag_list,read,tag --list,git,7684096.0,7684096.0,7667712,7700480,1.0
+lg,git,tag_list,read,tag --list,sley_cli,4489216.0,4489216.0,4472832,4505600,0.5842217484008528
+lg,git,tag_list,read,tag --list,sley_harness,,,,,
+lg,git,rev_parse_short_head,read,rev-parse --short HEAD,git,7667712.0,7667712.0,7667712,7667712,1.0
+lg,git,rev_parse_short_head,read,rev-parse --short HEAD,sley_cli,3432448.0,3432448.0,3424256,3440640,0.44764957264957267
+lg,git,rev_parse_short_head,read,rev-parse --short HEAD,sley_harness,,,,,
+lg,git,branch_force_write,write,branch -f sley-bench-write HEAD,git,8118272.0,8118272.0,8110080,8126464,1.0
+lg,git,branch_force_write,write,branch -f sley-bench-write HEAD,sley_cli,4562944.0,4562944.0,4538368,4587520,0.562058526740666
+lg,git,branch_force_write,write,branch -f sley-bench-write HEAD,sley_harness,,,,,
+lg,git,tag_force_write,write,tag -f sley-bench-write HEAD,git,8331264.0,8331264.0,8323072,8339456,1.0
+lg,git,tag_force_write,write,tag -f sley-bench-write HEAD,sley_cli,4112384.0,4112384.0,4112384,4112384,0.4936086529006883
+lg,git,tag_force_write,write,tag -f sley-bench-write HEAD,sley_harness,,,,,

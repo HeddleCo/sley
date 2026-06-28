@@ -961,6 +961,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 partial_clone_filter.as_deref(),
             )?;
             apply_clone_config_overrides(git_dir, &config_overrides)?;
+            apply_clone_default_submodule_path_config(git_dir)?;
             apply_clone_submodule_active(git_dir, &submodule_active)?;
             read_repo_config(git_dir)
         };
@@ -2811,6 +2812,17 @@ fn apply_clone_submodule_active(git_dir: &Path, active: &[String]) -> Result<()>
         config_set_value(&mut config, &key, value, true);
     }
     write_repo_config(git_dir, &config)
+}
+
+fn apply_clone_default_submodule_path_config(git_dir: &Path) -> Result<()> {
+    if !crate::clone_init_default_submodule_path_config()? {
+        return Ok(());
+    }
+    let config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
+    if config.get_bool("extensions", None, "submodulePathConfig") == Some(false) {
+        return Ok(());
+    }
+    crate::enable_submodule_path_config_extension(git_dir)
 }
 
 /// After a `--recurse-submodules` clone, populate the submodules — git's
@@ -5037,23 +5049,50 @@ fn fetch_one_source_with_outcome(
             &bundle_source,
             bundle_refspecs,
             &bundle,
-            options,
+            options.clone(),
         )?;
+        maybe_write_fetch_commit_graph(git_dir, &options)?;
         return Ok(sley_remote::FetchOutcome::default());
     }
     let config = transport_policy_config_for_cwd()?;
     let resolved = ls_remote_resolved_url(source)?;
     check_transport_allowed_url(&resolved, Some(&config))?;
-    if fetch_source_is_http(source)? {
-        return fetch_http_repository_with_outcome(git_dir, format, source, refspecs, options);
+    let outcome = if fetch_source_is_http(source)? {
+        fetch_http_repository_with_outcome(git_dir, format, source, refspecs, options.clone())?
+    } else if fetch_source_is_ssh(source)? {
+        fetch_ssh_repository_with_outcome(git_dir, format, source, refspecs, options.clone())?
+    } else if fetch_source_is_git(source)? {
+        fetch_git_repository_with_outcome(git_dir, format, source, refspecs, options.clone())?
+    } else {
+        fetch_local_repository_with_outcome(
+            git_dir,
+            format,
+            source,
+            refspecs,
+            options.clone(),
+            server_options,
+        )?
+    };
+    maybe_write_fetch_commit_graph(git_dir, &options)?;
+    Ok(outcome)
+}
+
+fn maybe_write_fetch_commit_graph(git_dir: &Path, options: &FetchOptions) -> Result<()> {
+    if options.dry_run {
+        return Ok(());
     }
-    if fetch_source_is_ssh(source)? {
-        return fetch_ssh_repository_with_outcome(git_dir, format, source, refspecs, options);
+    let config = read_repo_config(git_dir)?;
+    if !config
+        .get_bool("fetch", None, "writecommitgraph")
+        .unwrap_or(false)
+    {
+        return Ok(());
     }
-    if fetch_source_is_git(source)? {
-        return fetch_git_repository_with_outcome(git_dir, format, source, refspecs, options);
-    }
-    fetch_local_repository_with_outcome(git_dir, format, source, refspecs, options, server_options)
+    crate::commands::plumbing::cmd_commit_graph(&[
+        "write".to_string(),
+        "--reachable".to_string(),
+        "--split".to_string(),
+    ])
 }
 
 fn fetch_bundle_source(
@@ -5110,7 +5149,9 @@ fn read_capped_packfile<R: Read>(reader: &mut R, max_input_size: Option<u64>) ->
             // `take(limit + 1)` reads at most one byte past the cap, so a buffer
             // strictly larger than `limit` is detectable without slurping an
             // arbitrarily large input into memory.
-            reader.take(limit.saturating_add(1)).read_to_end(&mut packfile)?;
+            reader
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut packfile)?;
             if packfile.len() as u64 > limit {
                 eprintln!(
                     "fatal: pack exceeds maximum allowed size ({})",
@@ -5334,6 +5375,7 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
     let mut mirror = false;
     let mut all_refs = false;
     let mut quiet = false;
+    let mut thin = sley_remote::PushThinMode::Auto;
     let mut from_stdin = false;
     let mut force_with_lease_specs: Vec<String> = Vec::new();
     let mut receive_pack_command: Option<String> = None;
@@ -5352,8 +5394,10 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
             "--all" => all_refs = true,
             "--stdin" => from_stdin = true,
             "-q" | "--quiet" => quiet = true,
-            "-v" | "--verbose" | "--progress" | "--no-progress" | "--thin" | "--no-thin"
-            | "--stateless-rpc" | "--helper-status" => {}
+            "-v" | "--verbose" | "--progress" | "--no-progress" | "--stateless-rpc"
+            | "--helper-status" => {}
+            "--thin" => thin = sley_remote::PushThinMode::Always,
+            "--no-thin" => thin = sley_remote::PushThinMode::Never,
             "--signed" | "--no-signed" => {}
             value if value.starts_with("--signed=") => {}
             "--force-if-includes" => {}
@@ -5492,6 +5536,7 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
         no_verify: true,
         dry_run,
         progress: false,
+        thin,
     };
     run_push_local_report(RunPushLocalReport {
         git_dir: &git_dir,
@@ -5548,6 +5593,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let mut tags = false;
     let mut follow_tags = false;
     let mut prune = false;
+    let mut thin = sley_remote::PushThinMode::Auto;
     let mut receive_pack_command: Option<String> = None;
     let mut push_options_cmdline: Option<Vec<String>> = None;
     // `--force-with-lease` requests: an explicit `ref:expect` lease, or the
@@ -5625,7 +5671,8 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             value if value.starts_with("--repo=") => {}
             "--progress" => progress = true,
             "--no-progress" => progress = false,
-            "--thin" | "--no-thin" => {}
+            "--thin" => thin = sley_remote::PushThinMode::Always,
+            "--no-thin" => thin = sley_remote::PushThinMode::Never,
             value if value.starts_with("--recurse-submodules=") => {}
             // `OPT_IPVERSION` in builtin/push.c: accepted but a no-op for the
             // file:// transport (the `--no-` forms are not defined and fall
@@ -5725,6 +5772,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         no_verify,
         dry_run,
         progress,
+        thin,
     };
     let config = transport_policy_config_for_cwd()?;
     let resolved_remote = push_resolved_url(&remote)?;
@@ -6433,6 +6481,7 @@ struct PushOptions {
     no_verify: bool,
     dry_run: bool,
     progress: bool,
+    thin: sley_remote::PushThinMode,
 }
 
 /// Drive [`sley_remote::push`] for an already-resolved `destination` (HTTP or
@@ -6457,6 +6506,7 @@ fn run_push(
     let remote_options = sley_remote::PushOptions {
         quiet: options.quiet,
         force: options.force,
+        thin: options.thin,
     };
     if matches!(destination, sley_remote::PushDestination::Ssh(_)) {
         trace_configured_local_protocol_version(Some(&config));
@@ -8313,6 +8363,8 @@ fn run_fetch(
         config,
         source,
         options.quiet,
+        options.dry_run,
+        options.write_fetch_head,
         &before_refs,
         &outcome,
     )?;
@@ -8325,6 +8377,8 @@ fn print_fetch_status(
     config: &GitConfig,
     source: &str,
     quiet: bool,
+    dry_run: bool,
+    write_fetch_head: bool,
     before_refs: &std::collections::BTreeMap<String, ObjectId>,
     outcome: &sley_remote::FetchOutcome,
 ) -> Result<()> {
@@ -8334,11 +8388,17 @@ fn print_fetch_status(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut rows = Vec::new();
     for update in &outcome.ref_updates {
-        let Some(dst) = update.dst.as_deref() else {
-            continue;
+        let dst = match update.dst.as_deref() {
+            Some(dst) => dst,
+            None if dry_run && write_fetch_head => "FETCH_HEAD",
+            None => continue,
         };
-        let old = before_refs.get(dst).copied();
-        if old == Some(update.oid) {
+        let old = update
+            .dst
+            .as_deref()
+            .and_then(|dst| before_refs.get(dst))
+            .copied();
+        if update.dst.is_some() && old == Some(update.oid) {
             continue;
         }
         let src = prettify_refname(&update.src);

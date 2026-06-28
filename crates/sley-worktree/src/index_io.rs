@@ -109,37 +109,6 @@ pub(crate) fn restored_head_index_entry(
     })
 }
 
-pub(crate) fn restore_head_entry_to_worktree(
-    worktree_root: &Path,
-    db: &FileObjectDatabase,
-    path: &[u8],
-    entry: &TrackedEntry,
-) -> Result<()> {
-    // Route through the single gitlink-aware materializer: a gitlink has no blob
-    // here, so `write_worktree_blob_entry` would fail reading the commit-oid as
-    // a blob. `materialize_tree_entry` owns the gitlink-vs-blob decision (mkdir
-    // the submodule dir) in ONE place. The returned index entry is unused on
-    // this worktree-only restore path.
-    materialize_tree_entry(db, worktree_root, path, entry)?;
-    Ok(())
-}
-
-pub(crate) fn restore_head_entry_to_worktree_and_index(
-    worktree_root: &Path,
-    db: &FileObjectDatabase,
-    path: &[u8],
-    entry: &TrackedEntry,
-) -> Result<IndexEntry> {
-    // Route through the single gitlink-aware materializer rather than calling
-    // `write_worktree_blob_entry` directly: a gitlink (mode 160000) has no blob
-    // in this object store, so the blob read would fail with "not found: blob
-    // object <commit-oid>". `materialize_tree_entry` owns the
-    // gitlink-vs-blob/symlink decision (mkdir the submodule dir, never read an
-    // object) in ONE place, so `checkout <tree> -- <gitlink-path>` /
-    // `restore --source` inherit the same gitlink correctness as `reset --hard`.
-    materialize_tree_entry(db, worktree_root, path, entry)
-}
-
 pub(crate) fn index_has_entry_under(entries: &[IndexEntry], directory: &[u8]) -> bool {
     entries
         .iter()

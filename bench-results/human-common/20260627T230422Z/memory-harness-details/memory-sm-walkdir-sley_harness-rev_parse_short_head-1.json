@@ -1,0 +1,9 @@
+{
+  "repo": "/private/tmp/sley-human-common-repos/sm-walkdir",
+  "repeat": 1,
+  "warmup": 0,
+  "command": ["rev-parse", "--short", "HEAD"],
+  "runs": [
+    {"index": 0, "ns": 221333}
+  ]
+}

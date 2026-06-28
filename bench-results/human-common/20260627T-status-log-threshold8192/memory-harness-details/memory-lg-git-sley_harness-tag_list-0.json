@@ -1,0 +1,9 @@
+{
+  "repo": "/private/tmp/sley-human-common-repos/lg-git",
+  "repeat": 1,
+  "warmup": 0,
+  "command": ["tag", "--list"],
+  "runs": [
+    {"index": 0, "ns": 391167}
+  ]
+}

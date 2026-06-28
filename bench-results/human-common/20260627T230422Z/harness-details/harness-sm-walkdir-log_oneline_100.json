@@ -1,0 +1,16 @@
+{
+  "repo": "/private/tmp/sley-human-common-repos/sm-walkdir",
+  "repeat": 8,
+  "warmup": 2,
+  "command": ["log", "--oneline", "-100"],
+  "runs": [
+    {"index": 0, "ns": 940375},
+    {"index": 1, "ns": 928125},
+    {"index": 2, "ns": 922292},
+    {"index": 3, "ns": 921292},
+    {"index": 4, "ns": 916333},
+    {"index": 5, "ns": 909542},
+    {"index": 6, "ns": 941292},
+    {"index": 7, "ns": 908375}
+  ]
+}

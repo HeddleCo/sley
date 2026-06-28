@@ -1,0 +1,1368 @@
+{
+  "timestamp": "20260628T001754Z",
+  "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+  "python": "3.14.6 (main, Jun 10 2026, 10:03:53) [Clang 21.0.0 (clang-2100.0.123.102)]",
+  "workspace": "/Users/lukethorne/.codex/worktrees/ccac/sley",
+  "git_bin": "/opt/homebrew/bin/git",
+  "git_version": "git version 2.54.0",
+  "sley_bin": "/Users/lukethorne/.codex/worktrees/ccac/sley/target/release/sley",
+  "sley_harness_bin": "/Users/lukethorne/.codex/worktrees/ccac/sley/target/release/sley-human-harness",
+  "repeat": 8,
+  "warmup": 2,
+  "memory_runs": 2,
+  "repos": [
+    {
+      "size": "lg",
+      "name": "git",
+      "url": "https://github.com/git/git.git",
+      "path": "/private/tmp/sley-human-common-repos/lg-git",
+      "head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "branch": "master",
+      "commit_count": 81316,
+      "tracked_files": 4765,
+      "has_parent": true
+    }
+  ],
+  "commands": [
+    {
+      "name": "status_short",
+      "kind": "read",
+      "args": [
+        "status",
+        "--short"
+      ]
+    },
+    {
+      "name": "log_oneline_100",
+      "kind": "read",
+      "args": [
+        "log",
+        "--oneline",
+        "-100"
+      ]
+    },
+    {
+      "name": "branch_list",
+      "kind": "read",
+      "args": [
+        "branch",
+        "--list"
+      ]
+    },
+    {
+      "name": "tag_list",
+      "kind": "read",
+      "args": [
+        "tag",
+        "--list"
+      ]
+    },
+    {
+      "name": "rev_parse_short_head",
+      "kind": "read",
+      "args": [
+        "rev-parse",
+        "--short",
+        "HEAD"
+      ]
+    },
+    {
+      "name": "branch_force_write",
+      "kind": "write",
+      "args": [
+        "branch",
+        "-f",
+        "sley-bench-write",
+        "HEAD"
+      ]
+    },
+    {
+      "name": "tag_force_write",
+      "kind": "write",
+      "args": [
+        "tag",
+        "-f",
+        "sley-bench-write",
+        "HEAD"
+      ]
+    }
+  ],
+  "timing": [
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "status_short",
+      "command_kind": "read",
+      "command": "status --short",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 21287375
+        },
+        {
+          "index": 1,
+          "ns": 21822875
+        },
+        {
+          "index": 2,
+          "ns": 21837167
+        },
+        {
+          "index": 3,
+          "ns": 21399291
+        },
+        {
+          "index": 4,
+          "ns": 21265333
+        },
+        {
+          "index": 5,
+          "ns": 21371708
+        },
+        {
+          "index": 6,
+          "ns": 21068375
+        },
+        {
+          "index": 7,
+          "ns": 21292500
+        }
+      ],
+      "min_ms": 21.068375,
+      "max_ms": 21.837167,
+      "mean_ms": 21.418078,
+      "median_ms": 21.332104,
+      "stdev_ms": 0.2726786860878047,
+      "speedup_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "status_short",
+      "command_kind": "read",
+      "command": "status --short",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 23800625
+        },
+        {
+          "index": 1,
+          "ns": 23306041
+        },
+        {
+          "index": 2,
+          "ns": 24859208
+        },
+        {
+          "index": 3,
+          "ns": 23170250
+        },
+        {
+          "index": 4,
+          "ns": 24036333
+        },
+        {
+          "index": 5,
+          "ns": 24109875
+        },
+        {
+          "index": 6,
+          "ns": 24105375
+        },
+        {
+          "index": 7,
+          "ns": 23479125
+        }
+      ],
+      "min_ms": 23.17025,
+      "max_ms": 24.859208,
+      "mean_ms": 23.858354,
+      "median_ms": 23.918478999999998,
+      "stdev_ms": 0.5455471013193999,
+      "speedup_vs_git": 0.8977181745228527
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "status_short",
+      "command_kind": "read",
+      "command": "status --short",
+      "mode": "sley_harness",
+      "error": {
+        "returncode": 1,
+        "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n",
+        "stdout": ""
+      }
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "log_oneline_100",
+      "command_kind": "read",
+      "command": "log --oneline -100",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 10249958
+        },
+        {
+          "index": 1,
+          "ns": 9604584
+        },
+        {
+          "index": 2,
+          "ns": 9763542
+        },
+        {
+          "index": 3,
+          "ns": 10164292
+        },
+        {
+          "index": 4,
+          "ns": 9897500
+        },
+        {
+          "index": 5,
+          "ns": 10323125
+        },
+        {
+          "index": 6,
+          "ns": 9621375
+        },
+        {
+          "index": 7,
+          "ns": 10030500
+        }
+      ],
+      "min_ms": 9.604584,
+      "max_ms": 10.323125,
+      "mean_ms": 9.9568595,
+      "median_ms": 9.964,
+      "stdev_ms": 0.27929794541109154,
+      "speedup_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "log_oneline_100",
+      "command_kind": "read",
+      "command": "log --oneline -100",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 5587875
+        },
+        {
+          "index": 1,
+          "ns": 5769625
+        },
+        {
+          "index": 2,
+          "ns": 5577666
+        },
+        {
+          "index": 3,
+          "ns": 5907709
+        },
+        {
+          "index": 4,
+          "ns": 6572125
+        },
+        {
+          "index": 5,
+          "ns": 6574458
+        },
+        {
+          "index": 6,
+          "ns": 5755833
+        },
+        {
+          "index": 7,
+          "ns": 5987375
+        }
+      ],
+      "min_ms": 5.577666,
+      "max_ms": 6.574458,
+      "mean_ms": 5.96658325,
+      "median_ms": 5.838666999999999,
+      "stdev_ms": 0.39963836919779283,
+      "speedup_vs_git": 1.668770732395295
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "log_oneline_100",
+      "command_kind": "read",
+      "command": "log --oneline -100",
+      "mode": "sley_harness",
+      "error": {
+        "returncode": 1,
+        "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n",
+        "stdout": ""
+      }
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_list",
+      "command_kind": "read",
+      "command": "branch --list",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 7126209
+        },
+        {
+          "index": 1,
+          "ns": 6968083
+        },
+        {
+          "index": 2,
+          "ns": 6802541
+        },
+        {
+          "index": 3,
+          "ns": 7205750
+        },
+        {
+          "index": 4,
+          "ns": 6619625
+        },
+        {
+          "index": 5,
+          "ns": 7412750
+        },
+        {
+          "index": 6,
+          "ns": 6875083
+        },
+        {
+          "index": 7,
+          "ns": 6815750
+        }
+      ],
+      "min_ms": 6.619625,
+      "max_ms": 7.41275,
+      "mean_ms": 6.978223875,
+      "median_ms": 6.921583,
+      "stdev_ms": 0.25609065116669555,
+      "speedup_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_list",
+      "command_kind": "read",
+      "command": "branch --list",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 4416875
+        },
+        {
+          "index": 1,
+          "ns": 4184125
+        },
+        {
+          "index": 2,
+          "ns": 4041542
+        },
+        {
+          "index": 3,
+          "ns": 4279750
+        },
+        {
+          "index": 4,
+          "ns": 4753042
+        },
+        {
+          "index": 5,
+          "ns": 4392416
+        },
+        {
+          "index": 6,
+          "ns": 4156917
+        },
+        {
+          "index": 7,
+          "ns": 4037000
+        }
+      ],
+      "min_ms": 4.037,
+      "max_ms": 4.753042,
+      "mean_ms": 4.282708375,
+      "median_ms": 4.2319375,
+      "stdev_ms": 0.2376476668341106,
+      "speedup_vs_git": 1.6293950612502304
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_list",
+      "command_kind": "read",
+      "command": "branch --list",
+      "mode": "sley_harness",
+      "error": {
+        "returncode": 1,
+        "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n",
+        "stdout": ""
+      }
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_list",
+      "command_kind": "read",
+      "command": "tag --list",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 6863500
+        },
+        {
+          "index": 1,
+          "ns": 7151083
+        },
+        {
+          "index": 2,
+          "ns": 7425792
+        },
+        {
+          "index": 3,
+          "ns": 6901583
+        },
+        {
+          "index": 4,
+          "ns": 6927042
+        },
+        {
+          "index": 5,
+          "ns": 7007000
+        },
+        {
+          "index": 6,
+          "ns": 7460125
+        },
+        {
+          "index": 7,
+          "ns": 7410917
+        }
+      ],
+      "min_ms": 6.8635,
+      "max_ms": 7.460125,
+      "mean_ms": 7.14338025,
+      "median_ms": 7.0790415,
+      "stdev_ms": 0.25464809151889267,
+      "speedup_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_list",
+      "command_kind": "read",
+      "command": "tag --list",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 5589959
+        },
+        {
+          "index": 1,
+          "ns": 5310083
+        },
+        {
+          "index": 2,
+          "ns": 5045084
+        },
+        {
+          "index": 3,
+          "ns": 5027333
+        },
+        {
+          "index": 4,
+          "ns": 4972459
+        },
+        {
+          "index": 5,
+          "ns": 5114958
+        },
+        {
+          "index": 6,
+          "ns": 5082875
+        },
+        {
+          "index": 7,
+          "ns": 5038333
+        }
+      ],
+      "min_ms": 4.972459,
+      "max_ms": 5.589959,
+      "mean_ms": 5.1476355,
+      "median_ms": 5.0639795,
+      "stdev_ms": 0.20526093309736285,
+      "speedup_vs_git": 1.3877012562369655
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_list",
+      "command_kind": "read",
+      "command": "tag --list",
+      "mode": "sley_harness",
+      "error": {
+        "returncode": 1,
+        "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n",
+        "stdout": ""
+      }
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "rev_parse_short_head",
+      "command_kind": "read",
+      "command": "rev-parse --short HEAD",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 6307875
+        },
+        {
+          "index": 1,
+          "ns": 6362917
+        },
+        {
+          "index": 2,
+          "ns": 6385250
+        },
+        {
+          "index": 3,
+          "ns": 6473792
+        },
+        {
+          "index": 4,
+          "ns": 6281333
+        },
+        {
+          "index": 5,
+          "ns": 7264167
+        },
+        {
+          "index": 6,
+          "ns": 6859834
+        },
+        {
+          "index": 7,
+          "ns": 7246500
+        }
+      ],
+      "min_ms": 6.281333,
+      "max_ms": 7.264167,
+      "mean_ms": 6.6477085,
+      "median_ms": 6.429521,
+      "stdev_ms": 0.41636608151172505,
+      "speedup_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "rev_parse_short_head",
+      "command_kind": "read",
+      "command": "rev-parse --short HEAD",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 3905541
+        },
+        {
+          "index": 1,
+          "ns": 3821000
+        },
+        {
+          "index": 2,
+          "ns": 4046583
+        },
+        {
+          "index": 3,
+          "ns": 3885208
+        },
+        {
+          "index": 4,
+          "ns": 3901375
+        },
+        {
+          "index": 5,
+          "ns": 3965291
+        },
+        {
+          "index": 6,
+          "ns": 3829084
+        },
+        {
+          "index": 7,
+          "ns": 3813500
+        }
+      ],
+      "min_ms": 3.8135,
+      "max_ms": 4.046583,
+      "mean_ms": 3.89594775,
+      "median_ms": 3.8932915,
+      "stdev_ms": 0.07984077937235907,
+      "speedup_vs_git": 1.7063135664486262
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "rev_parse_short_head",
+      "command_kind": "read",
+      "command": "rev-parse --short HEAD",
+      "mode": "sley_harness",
+      "error": {
+        "returncode": 1,
+        "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n",
+        "stdout": ""
+      }
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_force_write",
+      "command_kind": "write",
+      "command": "branch -f sley-bench-write HEAD",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 8580500
+        },
+        {
+          "index": 1,
+          "ns": 9065375
+        },
+        {
+          "index": 2,
+          "ns": 8440291
+        },
+        {
+          "index": 3,
+          "ns": 8134292
+        },
+        {
+          "index": 4,
+          "ns": 7838834
+        },
+        {
+          "index": 5,
+          "ns": 8146917
+        },
+        {
+          "index": 6,
+          "ns": 8545292
+        },
+        {
+          "index": 7,
+          "ns": 7857375
+        }
+      ],
+      "min_ms": 7.838834,
+      "max_ms": 9.065375,
+      "mean_ms": 8.3261095,
+      "median_ms": 8.293604,
+      "stdev_ms": 0.4137562669325987,
+      "speedup_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_force_write",
+      "command_kind": "write",
+      "command": "branch -f sley-bench-write HEAD",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 5188792
+        },
+        {
+          "index": 1,
+          "ns": 5178375
+        },
+        {
+          "index": 2,
+          "ns": 5077500
+        },
+        {
+          "index": 3,
+          "ns": 5114667
+        },
+        {
+          "index": 4,
+          "ns": 4930125
+        },
+        {
+          "index": 5,
+          "ns": 4952875
+        },
+        {
+          "index": 6,
+          "ns": 5019041
+        },
+        {
+          "index": 7,
+          "ns": 5519042
+        }
+      ],
+      "min_ms": 4.930125,
+      "max_ms": 5.519042,
+      "mean_ms": 5.122552125,
+      "median_ms": 5.0960835,
+      "stdev_ms": 0.18644535114185795,
+      "speedup_vs_git": 1.6253830701625118
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_force_write",
+      "command_kind": "write",
+      "command": "branch -f sley-bench-write HEAD",
+      "mode": "sley_harness",
+      "error": {
+        "returncode": 1,
+        "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n",
+        "stdout": ""
+      }
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_force_write",
+      "command_kind": "write",
+      "command": "tag -f sley-bench-write HEAD",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 8477917
+        },
+        {
+          "index": 1,
+          "ns": 8333958
+        },
+        {
+          "index": 2,
+          "ns": 8036417
+        },
+        {
+          "index": 3,
+          "ns": 7881458
+        },
+        {
+          "index": 4,
+          "ns": 8691416
+        },
+        {
+          "index": 5,
+          "ns": 8436000
+        },
+        {
+          "index": 6,
+          "ns": 8243375
+        },
+        {
+          "index": 7,
+          "ns": 8002208
+        }
+      ],
+      "min_ms": 7.881458,
+      "max_ms": 8.691416,
+      "mean_ms": 8.262843625,
+      "median_ms": 8.288666500000001,
+      "stdev_ms": 0.27516363693157336,
+      "speedup_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_force_write",
+      "command_kind": "write",
+      "command": "tag -f sley-bench-write HEAD",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "ns": 4918708
+        },
+        {
+          "index": 1,
+          "ns": 4869417
+        },
+        {
+          "index": 2,
+          "ns": 4861875
+        },
+        {
+          "index": 3,
+          "ns": 4808000
+        },
+        {
+          "index": 4,
+          "ns": 5319166
+        },
+        {
+          "index": 5,
+          "ns": 5600542
+        },
+        {
+          "index": 6,
+          "ns": 5045416
+        },
+        {
+          "index": 7,
+          "ns": 4950959
+        }
+      ],
+      "min_ms": 4.808,
+      "max_ms": 5.600542,
+      "mean_ms": 5.046760375,
+      "median_ms": 4.9348335,
+      "stdev_ms": 0.2749274775733398,
+      "speedup_vs_git": 1.6372569749757537
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_force_write",
+      "command_kind": "write",
+      "command": "tag -f sley-bench-write HEAD",
+      "mode": "sley_harness",
+      "error": {
+        "returncode": 1,
+        "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n",
+        "stdout": ""
+      }
+    }
+  ],
+  "memory": [
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "status_short",
+      "command_kind": "read",
+      "command": "status --short",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 10551296
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 10551296
+        }
+      ],
+      "min_rss_bytes": 10551296,
+      "max_rss_bytes": 10551296,
+      "mean_rss_bytes": 10551296.0,
+      "median_rss_bytes": 10551296.0,
+      "rss_ratio_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "status_short",
+      "command_kind": "read",
+      "command": "status --short",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 24002560
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 23642112
+        }
+      ],
+      "min_rss_bytes": 23642112,
+      "max_rss_bytes": 24002560,
+      "mean_rss_bytes": 23822336.0,
+      "median_rss_bytes": 23822336.0,
+      "rss_ratio_vs_git": 2.2577639751552794
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "status_short",
+      "command_kind": "read",
+      "command": "status --short",
+      "mode": "sley_harness",
+      "runs": [],
+      "errors": [
+        {
+          "index": 0,
+          "returncode": 1,
+          "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n        0.02 real         0.03 user         0.03 sys\n            21905408  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1614  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  79  involuntary context switches\n           477794340  instructions retired\n           214140004  cycles elapsed\n            18055600  peak memory footprint\n"
+        },
+        {
+          "index": 1,
+          "returncode": 1,
+          "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n        0.02 real         0.03 user         0.03 sys\n            21807104  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1608  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  83  involuntary context switches\n           474159141  instructions retired\n           208482383  cycles elapsed\n            17973704  peak memory footprint\n"
+        }
+      ]
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "log_oneline_100",
+      "command_kind": "read",
+      "command": "log --oneline -100",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 13516800
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 13598720
+        }
+      ],
+      "min_rss_bytes": 13516800,
+      "max_rss_bytes": 13598720,
+      "mean_rss_bytes": 13557760.0,
+      "median_rss_bytes": 13557760.0,
+      "rss_ratio_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "log_oneline_100",
+      "command_kind": "read",
+      "command": "log --oneline -100",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 11517952
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 11468800
+        }
+      ],
+      "min_rss_bytes": 11468800,
+      "max_rss_bytes": 11517952,
+      "mean_rss_bytes": 11493376.0,
+      "median_rss_bytes": 11493376.0,
+      "rss_ratio_vs_git": 0.8477341389728097
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "log_oneline_100",
+      "command_kind": "read",
+      "command": "log --oneline -100",
+      "mode": "sley_harness",
+      "runs": [],
+      "errors": [
+        {
+          "index": 0,
+          "returncode": 1,
+          "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n        0.00 real         0.00 user         0.00 sys\n             9650176  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 761  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   4  involuntary context switches\n            35466633  instructions retired\n            13454549  cycles elapsed\n             1655168  peak memory footprint\n"
+        },
+        {
+          "index": 1,
+          "returncode": 1,
+          "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n        0.00 real         0.00 user         0.00 sys\n             9732096  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 766  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  14  involuntary context switches\n            35736534  instructions retired\n            14235655  cycles elapsed\n             1737088  peak memory footprint\n"
+        }
+      ]
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_list",
+      "command_kind": "read",
+      "command": "branch --list",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 7667712
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 7667712
+        }
+      ],
+      "min_rss_bytes": 7667712,
+      "max_rss_bytes": 7667712,
+      "mean_rss_bytes": 7667712.0,
+      "median_rss_bytes": 7667712.0,
+      "rss_ratio_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_list",
+      "command_kind": "read",
+      "command": "branch --list",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 3555328
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 3571712
+        }
+      ],
+      "min_rss_bytes": 3555328,
+      "max_rss_bytes": 3571712,
+      "mean_rss_bytes": 3563520.0,
+      "median_rss_bytes": 3563520.0,
+      "rss_ratio_vs_git": 0.46474358974358976
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_list",
+      "command_kind": "read",
+      "command": "branch --list",
+      "mode": "sley_harness",
+      "runs": [],
+      "errors": [
+        {
+          "index": 0,
+          "returncode": 1,
+          "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n        0.00 real         0.00 user         0.00 sys\n             2359296  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 313  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n            20844674  instructions retired\n             8522834  cycles elapsed\n             1179960  peak memory footprint\n"
+        },
+        {
+          "index": 1,
+          "returncode": 1,
+          "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n        0.00 real         0.00 user         0.00 sys\n             2359296  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 313  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   4  involuntary context switches\n            20912246  instructions retired\n             7621021  cycles elapsed\n             1179960  peak memory footprint\n"
+        }
+      ]
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_list",
+      "command_kind": "read",
+      "command": "tag --list",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 7700480
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 7667712
+        }
+      ],
+      "min_rss_bytes": 7667712,
+      "max_rss_bytes": 7700480,
+      "mean_rss_bytes": 7684096.0,
+      "median_rss_bytes": 7684096.0,
+      "rss_ratio_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_list",
+      "command_kind": "read",
+      "command": "tag --list",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 4472832
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 4505600
+        }
+      ],
+      "min_rss_bytes": 4472832,
+      "max_rss_bytes": 4505600,
+      "mean_rss_bytes": 4489216.0,
+      "median_rss_bytes": 4489216.0,
+      "rss_ratio_vs_git": 0.5842217484008528
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_list",
+      "command_kind": "read",
+      "command": "tag --list",
+      "mode": "sley_harness",
+      "runs": [],
+      "errors": [
+        {
+          "index": 0,
+          "returncode": 1,
+          "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n        0.00 real         0.00 user         0.00 sys\n             2392064  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 315  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   3  involuntary context switches\n            21064960  instructions retired\n             7705550  cycles elapsed\n             1229112  peak memory footprint\n"
+        },
+        {
+          "index": 1,
+          "returncode": 1,
+          "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n        0.00 real         0.00 user         0.00 sys\n             2408448  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 316  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   4  involuntary context switches\n            21088525  instructions retired\n             7322921  cycles elapsed\n             1245496  peak memory footprint\n"
+        }
+      ]
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "rev_parse_short_head",
+      "command_kind": "read",
+      "command": "rev-parse --short HEAD",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 7667712
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 7667712
+        }
+      ],
+      "min_rss_bytes": 7667712,
+      "max_rss_bytes": 7667712,
+      "mean_rss_bytes": 7667712.0,
+      "median_rss_bytes": 7667712.0,
+      "rss_ratio_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "rev_parse_short_head",
+      "command_kind": "read",
+      "command": "rev-parse --short HEAD",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 3440640
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 3424256
+        }
+      ],
+      "min_rss_bytes": 3424256,
+      "max_rss_bytes": 3440640,
+      "mean_rss_bytes": 3432448.0,
+      "median_rss_bytes": 3432448.0,
+      "rss_ratio_vs_git": 0.44764957264957267
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "rev_parse_short_head",
+      "command_kind": "read",
+      "command": "rev-parse --short HEAD",
+      "mode": "sley_harness",
+      "runs": [],
+      "errors": [
+        {
+          "index": 0,
+          "returncode": 1,
+          "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n        0.00 real         0.00 user         0.00 sys\n             2277376  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 308  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   3  involuntary context switches\n            18743844  instructions retired\n             6515167  cycles elapsed\n             1065272  peak memory footprint\n"
+        },
+        {
+          "index": 1,
+          "returncode": 1,
+          "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n        0.00 real         0.00 user         0.00 sys\n             2277376  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 308  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   3  involuntary context switches\n            18718224  instructions retired\n             7672090  cycles elapsed\n             1065272  peak memory footprint\n"
+        }
+      ]
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_force_write",
+      "command_kind": "write",
+      "command": "branch -f sley-bench-write HEAD",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 8126464
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 8110080
+        }
+      ],
+      "min_rss_bytes": 8110080,
+      "max_rss_bytes": 8126464,
+      "mean_rss_bytes": 8118272.0,
+      "median_rss_bytes": 8118272.0,
+      "rss_ratio_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_force_write",
+      "command_kind": "write",
+      "command": "branch -f sley-bench-write HEAD",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 4538368
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 4587520
+        }
+      ],
+      "min_rss_bytes": 4538368,
+      "max_rss_bytes": 4587520,
+      "mean_rss_bytes": 4562944.0,
+      "median_rss_bytes": 4562944.0,
+      "rss_ratio_vs_git": 0.562058526740666
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "branch_force_write",
+      "command_kind": "write",
+      "command": "branch -f sley-bench-write HEAD",
+      "mode": "sley_harness",
+      "runs": [],
+      "errors": [
+        {
+          "index": 0,
+          "returncode": 1,
+          "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n        0.00 real         0.00 user         0.00 sys\n             2965504  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 350  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   3  involuntary context switches\n            32206053  instructions retired\n            11702039  cycles elapsed\n             1704272  peak memory footprint\n"
+        },
+        {
+          "index": 1,
+          "returncode": 1,
+          "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n        0.00 real         0.00 user         0.00 sys\n             2981888  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 351  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   3  involuntary context switches\n            32271740  instructions retired\n            11617087  cycles elapsed\n             1720656  peak memory footprint\n"
+        }
+      ]
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_force_write",
+      "command_kind": "write",
+      "command": "tag -f sley-bench-write HEAD",
+      "mode": "git",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 8339456
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 8323072
+        }
+      ],
+      "min_rss_bytes": 8323072,
+      "max_rss_bytes": 8339456,
+      "mean_rss_bytes": 8331264.0,
+      "median_rss_bytes": 8331264.0,
+      "rss_ratio_vs_git": 1.0
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_force_write",
+      "command_kind": "write",
+      "command": "tag -f sley-bench-write HEAD",
+      "mode": "sley_cli",
+      "runs": [
+        {
+          "index": 0,
+          "max_rss_bytes": 4112384
+        },
+        {
+          "index": 1,
+          "max_rss_bytes": 4112384
+        }
+      ],
+      "min_rss_bytes": 4112384,
+      "max_rss_bytes": 4112384,
+      "mean_rss_bytes": 4112384.0,
+      "median_rss_bytes": 4112384.0,
+      "rss_ratio_vs_git": 0.4936086529006883
+    },
+    {
+      "repo_size": "lg",
+      "repo_name": "git",
+      "repo_head": "6c3d7b73556db708feb3b16232fab1efc4353428",
+      "command_name": "tag_force_write",
+      "command_kind": "write",
+      "command": "tag -f sley-bench-write HEAD",
+      "mode": "sley_harness",
+      "runs": [],
+      "errors": [
+        {
+          "index": 0,
+          "returncode": 1,
+          "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n        0.00 real         0.00 user         0.00 sys\n             2949120  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 349  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   3  involuntary context switches\n            26938669  instructions retired\n            10337189  cycles elapsed\n             1687888  peak memory footprint\n"
+        },
+        {
+          "index": 1,
+          "returncode": 1,
+          "stderr": "sley-human-harness: io error: No such file or directory (os error 2)\n        0.00 real         0.00 user         0.00 sys\n             2949120  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 351  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   3  involuntary context switches\n            26964690  instructions retired\n            11103662  cycles elapsed\n             1687888  peak memory footprint\n"
+        }
+      ]
+    }
+  ]
+}

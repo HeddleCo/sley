@@ -48,6 +48,11 @@ const PACK_PARALLEL_COMPRESSION_MIN_OBJECTS: usize = 64;
 /// planning and inflate peak memory on large packs.
 const PACK_PARALLEL_COMPRESSION_MAX_THREADS: usize = 4;
 
+/// Streaming pack writes pre-compress only this many ordered entries at a time.
+/// This restores CPU parallelism without holding every compressed payload for a
+/// large pack in memory at once.
+const PACK_STREAM_COMPRESSION_WINDOW_OBJECTS: usize = 256;
+
 /// Options controlling sliding-window delta selection during pack generation.
 ///
 /// Construct with [`PackWriteOptions::new`] (sensible defaults) and adjust with
@@ -1097,56 +1102,290 @@ impl PackFile {
         let mut delta_count = 0u32;
         let mut written_offsets: Vec<Option<u64>> = vec![None; objects.len()];
 
-        for &idx in &order {
-            let offset = output.position();
-            let mut entry_header = Vec::new();
-            match &plan[idx].base {
-                PlannedBase::None => {
-                    write_entry_header(
-                        &mut entry_header,
-                        objects[idx].object_type,
-                        objects[idx].body.len() as u64,
-                    );
-                }
-                PlannedBase::InPack { base_idx, delta } => {
-                    delta_count += 1;
-                    let base_offset = written_offsets[*base_idx].ok_or_else(|| {
-                        GitError::InvalidFormat(
-                            "in-pack delta base emitted after dependent object".into(),
-                        )
-                    })?;
-                    if options.prefer_ofs_delta {
-                        write_pack_entry_header_kind(&mut entry_header, 6, delta.len() as u64);
-                        let relative = offset.checked_sub(base_offset).ok_or_else(|| {
-                            GitError::InvalidFormat("ofs-delta base offset is after delta".into())
-                        })?;
-                        write_ofs_delta_offset(&mut entry_header, relative)?;
-                    } else {
-                        write_pack_entry_header_kind(&mut entry_header, 7, delta.len() as u64);
-                        entry_header.extend_from_slice(object_ids[*base_idx].as_bytes());
-                    }
-                }
-                PlannedBase::External { base_oid, delta } => {
-                    delta_count += 1;
-                    write_pack_entry_header_kind(&mut entry_header, 7, delta.len() as u64);
-                    entry_header.extend_from_slice(base_oid.as_bytes());
-                }
-            }
-            let compressed_payload = compressed_payload(
-                planned_payload(&objects, &plan, idx),
+        for order_window in order.chunks(PACK_STREAM_COMPRESSION_WINDOW_OBJECTS) {
+            let compressed_payloads = compress_planned_payloads(
+                &objects,
+                &plan,
+                order_window,
                 options.compression_level,
             )?;
-            let mut crc32 = crc32fast::Hasher::new();
-            crc32.update(&entry_header);
-            crc32.update(&compressed_payload);
-            output.write_pack_bytes(&entry_header)?;
-            output.write_pack_bytes(&compressed_payload)?;
-            written_offsets[idx] = Some(offset);
-            index_entries.push(PackIndexEntry {
-                oid: object_ids[idx],
-                crc32: crc32.finalize(),
-                offset,
-            });
+            for (&idx, compressed_payload) in order_window.iter().zip(&compressed_payloads) {
+                let offset = output.position();
+                let mut entry_header = Vec::new();
+                match &plan[idx].base {
+                    PlannedBase::None => {
+                        write_entry_header(
+                            &mut entry_header,
+                            objects[idx].object_type,
+                            objects[idx].body.len() as u64,
+                        );
+                    }
+                    PlannedBase::InPack { base_idx, delta } => {
+                        delta_count += 1;
+                        let base_offset = written_offsets[*base_idx].ok_or_else(|| {
+                            GitError::InvalidFormat(
+                                "in-pack delta base emitted after dependent object".into(),
+                            )
+                        })?;
+                        if options.prefer_ofs_delta {
+                            write_pack_entry_header_kind(&mut entry_header, 6, delta.len() as u64);
+                            let relative = offset.checked_sub(base_offset).ok_or_else(|| {
+                                GitError::InvalidFormat(
+                                    "ofs-delta base offset is after delta".into(),
+                                )
+                            })?;
+                            write_ofs_delta_offset(&mut entry_header, relative)?;
+                        } else {
+                            write_pack_entry_header_kind(&mut entry_header, 7, delta.len() as u64);
+                            entry_header.extend_from_slice(object_ids[*base_idx].as_bytes());
+                        }
+                    }
+                    PlannedBase::External { base_oid, delta } => {
+                        delta_count += 1;
+                        write_pack_entry_header_kind(&mut entry_header, 7, delta.len() as u64);
+                        entry_header.extend_from_slice(base_oid.as_bytes());
+                    }
+                }
+                let mut crc32 = crc32fast::Hasher::new();
+                crc32.update(&entry_header);
+                crc32.update(compressed_payload);
+                output.write_pack_bytes(&entry_header)?;
+                output.write_pack_bytes(compressed_payload)?;
+                written_offsets[idx] = Some(offset);
+                index_entries.push(PackIndexEntry {
+                    oid: object_ids[idx],
+                    crc32: crc32.finalize(),
+                    offset,
+                });
+            }
+        }
+
+        let (checksum, pack_size) = output.finish()?;
+        let index = PackIndex::write_v2(format, &index_entries, &checksum)?;
+        Ok(PackWriteSummary {
+            index,
+            checksum,
+            entries: index_entries,
+            delta_count,
+            pack_size,
+        })
+    }
+
+    pub fn write_undeltified_from_source_to_writer<W, F>(
+        object_ids: &[ObjectId],
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+        mut read_object: F,
+        writer: &mut W,
+    ) -> Result<PackWriteSummary>
+    where
+        W: Write,
+        F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
+    {
+        let mut seen = HashSet::with_capacity(object_ids.len());
+        for oid in object_ids {
+            if oid.format() != format {
+                return Err(GitError::InvalidObjectId(
+                    "pack object id format does not match pack format".into(),
+                ));
+            }
+            if !seen.insert(oid) {
+                return Err(GitError::InvalidFormat(format!(
+                    "pack contains duplicate object id {oid}"
+                )));
+            }
+        }
+
+        let mut output = PackDigestWriter::new(writer, format);
+        output.write_pack_bytes(b"PACK")?;
+        output.write_pack_bytes(&2u32.to_be_bytes())?;
+        output.write_pack_bytes(&(object_ids.len() as u32).to_be_bytes())?;
+
+        let mut index_entries = Vec::with_capacity(object_ids.len());
+        for oid_window in object_ids.chunks(PACK_STREAM_COMPRESSION_WINDOW_OBJECTS) {
+            let mut objects = Vec::with_capacity(oid_window.len());
+            for oid in oid_window {
+                objects.push(read_object(oid)?);
+            }
+            let compressed_payloads =
+                compress_undeltified_payloads(&objects, options.compression_level)?;
+            for ((oid, object), compressed_payload) in
+                oid_window.iter().zip(&objects).zip(&compressed_payloads)
+            {
+                let offset = output.position();
+                let mut entry_header = Vec::new();
+                write_entry_header(
+                    &mut entry_header,
+                    object.object_type,
+                    object.body.len() as u64,
+                );
+                let mut crc32 = crc32fast::Hasher::new();
+                crc32.update(&entry_header);
+                crc32.update(compressed_payload);
+                output.write_pack_bytes(&entry_header)?;
+                output.write_pack_bytes(compressed_payload)?;
+                index_entries.push(PackIndexEntry {
+                    oid: *oid,
+                    crc32: crc32.finalize(),
+                    offset,
+                });
+            }
+        }
+
+        let (checksum, pack_size) = output.finish()?;
+        let index = PackIndex::write_v2(format, &index_entries, &checksum)?;
+        Ok(PackWriteSummary {
+            index,
+            checksum,
+            entries: index_entries,
+            delta_count: 0,
+            pack_size,
+        })
+    }
+
+    pub fn write_packed_from_source_to_writer<W, F>(
+        object_ids: &[ObjectId],
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+        mut read_object: F,
+        writer: &mut W,
+    ) -> Result<PackWriteSummary>
+    where
+        W: Write,
+        F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
+    {
+        if object_ids.len() > u32::MAX as usize {
+            return Err(GitError::InvalidFormat("too many pack objects".into()));
+        }
+
+        let mut seen = HashSet::with_capacity(object_ids.len());
+        for oid in object_ids {
+            if oid.format() != format {
+                return Err(GitError::InvalidObjectId(
+                    "pack object id format does not match pack format".into(),
+                ));
+            }
+            if !seen.insert(*oid) {
+                return Err(GitError::InvalidFormat(format!(
+                    "pack contains duplicate object id {oid}"
+                )));
+            }
+        }
+
+        for oid in options.thin_bases.keys() {
+            if oid.format() != format {
+                return Err(GitError::InvalidObjectId(
+                    "thin pack base object id format does not match pack format".into(),
+                ));
+            }
+        }
+
+        let mut output = PackDigestWriter::new(writer, format);
+        output.write_pack_bytes(b"PACK")?;
+        output.write_pack_bytes(&2u32.to_be_bytes())?;
+        output.write_pack_bytes(&(object_ids.len() as u32).to_be_bytes())?;
+
+        let mut index_entries = Vec::with_capacity(object_ids.len());
+        let mut delta_count = 0u32;
+        let mut base_horizon: VecDeque<StreamingDeltaBase> = VecDeque::new();
+
+        for oid_window in object_ids.chunks(PACK_STREAM_COMPRESSION_WINDOW_OBJECTS) {
+            let mut objects = Vec::with_capacity(oid_window.len());
+            for oid in oid_window {
+                objects.push(read_object(oid)?);
+            }
+
+            let (plan, order) =
+                plan_streaming_window_deltas(&objects, oid_window, &base_horizon, options);
+            let compressed_payloads = compress_streaming_planned_payloads(
+                &objects,
+                &plan,
+                &order,
+                options.compression_level,
+            )?;
+            let mut written_offsets: Vec<Option<u64>> = vec![None; objects.len()];
+
+            for (&idx, compressed_payload) in order.iter().zip(&compressed_payloads) {
+                let offset = output.position();
+                let mut entry_header = Vec::new();
+                match &plan[idx].base {
+                    StreamingPlannedBase::None => {
+                        write_entry_header(
+                            &mut entry_header,
+                            objects[idx].object_type,
+                            objects[idx].body.len() as u64,
+                        );
+                    }
+                    StreamingPlannedBase::Current { base_idx, delta } => {
+                        delta_count += 1;
+                        let base_offset = written_offsets[*base_idx].ok_or_else(|| {
+                            GitError::InvalidFormat(
+                                "in-pack delta base emitted after dependent object".into(),
+                            )
+                        })?;
+                        if options.prefer_ofs_delta {
+                            write_pack_entry_header_kind(&mut entry_header, 6, delta.len() as u64);
+                            let relative = offset.checked_sub(base_offset).ok_or_else(|| {
+                                GitError::InvalidFormat(
+                                    "ofs-delta base offset is after delta".into(),
+                                )
+                            })?;
+                            write_ofs_delta_offset(&mut entry_header, relative)?;
+                        } else {
+                            write_pack_entry_header_kind(&mut entry_header, 7, delta.len() as u64);
+                            entry_header.extend_from_slice(oid_window[*base_idx].as_bytes());
+                        }
+                    }
+                    StreamingPlannedBase::Previous {
+                        base_oid,
+                        base_offset,
+                        delta,
+                    } => {
+                        delta_count += 1;
+                        if options.prefer_ofs_delta {
+                            write_pack_entry_header_kind(&mut entry_header, 6, delta.len() as u64);
+                            let relative = offset.checked_sub(*base_offset).ok_or_else(|| {
+                                GitError::InvalidFormat(
+                                    "ofs-delta base offset is after delta".into(),
+                                )
+                            })?;
+                            write_ofs_delta_offset(&mut entry_header, relative)?;
+                        } else {
+                            write_pack_entry_header_kind(&mut entry_header, 7, delta.len() as u64);
+                            entry_header.extend_from_slice(base_oid.as_bytes());
+                        }
+                    }
+                    StreamingPlannedBase::External { base_oid, delta } => {
+                        delta_count += 1;
+                        write_pack_entry_header_kind(&mut entry_header, 7, delta.len() as u64);
+                        entry_header.extend_from_slice(base_oid.as_bytes());
+                    }
+                }
+
+                let mut crc32 = crc32fast::Hasher::new();
+                crc32.update(&entry_header);
+                crc32.update(compressed_payload);
+                output.write_pack_bytes(&entry_header)?;
+                output.write_pack_bytes(compressed_payload)?;
+                written_offsets[idx] = Some(offset);
+                index_entries.push(PackIndexEntry {
+                    oid: oid_window[idx],
+                    crc32: crc32.finalize(),
+                    offset,
+                });
+
+                if options.depth > 0 && options.window > 0 {
+                    base_horizon.push_back(StreamingDeltaBase {
+                        oid: oid_window[idx],
+                        object: Arc::clone(&objects[idx]),
+                        offset,
+                        depth: plan[idx].depth,
+                    });
+                    while base_horizon.len() > options.window {
+                        base_horizon.pop_front();
+                    }
+                }
+            }
         }
 
         let (checksum, pack_size) = output.finish()?;
@@ -4668,6 +4907,57 @@ struct PlannedEntry {
     base: PlannedBase,
 }
 
+#[derive(Debug, Clone)]
+struct StreamingDeltaBase {
+    oid: ObjectId,
+    object: Arc<EncodedObject>,
+    offset: u64,
+    depth: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamingPlannedBase {
+    None,
+    Current {
+        base_idx: usize,
+        delta: Vec<u8>,
+    },
+    Previous {
+        base_oid: ObjectId,
+        base_offset: u64,
+        delta: Vec<u8>,
+    },
+    External {
+        base_oid: ObjectId,
+        delta: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamingPlannedEntry {
+    base: StreamingPlannedBase,
+    depth: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamingCandidateBase {
+    Previous {
+        oid: ObjectId,
+        offset: u64,
+        depth: usize,
+    },
+    Current {
+        idx: usize,
+        depth: usize,
+    },
+}
+
+struct StreamingDeltaWindowEntry<'a> {
+    base: StreamingCandidateBase,
+    object_type: ObjectType,
+    index: DeltaIndex<'a>,
+}
+
 fn compress_planned_payloads(
     objects: &[&EncodedObject],
     plan: &[PlannedEntry],
@@ -4741,6 +5031,165 @@ fn compress_planned_payloads(
     Ok(payloads)
 }
 
+fn compress_streaming_planned_payloads(
+    objects: &[Arc<EncodedObject>],
+    plan: &[StreamingPlannedEntry],
+    order: &[usize],
+    compression_level: u32,
+) -> Result<Vec<Vec<u8>>> {
+    if order.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1)
+        .min(PACK_PARALLEL_COMPRESSION_MAX_THREADS)
+        .min(order.len());
+    if worker_count <= 1 || order.len() < PACK_PARALLEL_COMPRESSION_MIN_OBJECTS {
+        let mut payloads = Vec::with_capacity(order.len());
+        for &idx in order {
+            payloads.push(compressed_payload(
+                streaming_planned_payload(objects, plan, idx),
+                compression_level,
+            )?);
+        }
+        return Ok(payloads);
+    }
+
+    let chunk_len = order.len().div_ceil(worker_count);
+    let mut payloads: Vec<Vec<u8>> = std::iter::repeat_with(Vec::new).take(order.len()).collect();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (chunk_idx, chunk) in order.chunks(chunk_len).enumerate() {
+            let chunk_start = chunk_idx * chunk_len;
+            handles.push(scope.spawn(move || -> Result<Vec<(usize, Vec<u8>)>> {
+                let mut chunk_payloads = Vec::with_capacity(chunk.len());
+                for (offset, &idx) in chunk.iter().enumerate() {
+                    chunk_payloads.push((
+                        chunk_start + offset,
+                        compressed_payload(
+                            streaming_planned_payload(objects, plan, idx),
+                            compression_level,
+                        )?,
+                    ));
+                }
+                Ok(chunk_payloads)
+            }));
+        }
+
+        let mut first_error = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(chunk_payloads)) => {
+                    if first_error.is_none() {
+                        for (pos, payload) in chunk_payloads {
+                            payloads[pos] = payload;
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    first_error.get_or_insert(err);
+                }
+                Err(_) => {
+                    first_error.get_or_insert_with(|| {
+                        GitError::InvalidObject("pack compression worker panicked".into())
+                    });
+                }
+            }
+        }
+
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    })?;
+    Ok(payloads)
+}
+
+fn compress_undeltified_payloads(
+    objects: &[Arc<EncodedObject>],
+    compression_level: u32,
+) -> Result<Vec<Vec<u8>>> {
+    if objects.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1)
+        .min(PACK_PARALLEL_COMPRESSION_MAX_THREADS)
+        .min(objects.len());
+    if worker_count <= 1 || objects.len() < PACK_PARALLEL_COMPRESSION_MIN_OBJECTS {
+        let mut payloads = Vec::with_capacity(objects.len());
+        for object in objects {
+            payloads.push(compressed_payload(&object.body, compression_level)?);
+        }
+        return Ok(payloads);
+    }
+
+    let chunk_len = objects.len().div_ceil(worker_count);
+    let mut payloads: Vec<Vec<u8>> = std::iter::repeat_with(Vec::new)
+        .take(objects.len())
+        .collect();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (chunk_idx, chunk) in objects.chunks(chunk_len).enumerate() {
+            let chunk_start = chunk_idx * chunk_len;
+            handles.push(scope.spawn(move || -> Result<Vec<(usize, Vec<u8>)>> {
+                let mut chunk_payloads = Vec::with_capacity(chunk.len());
+                for (offset, object) in chunk.iter().enumerate() {
+                    chunk_payloads.push((
+                        chunk_start + offset,
+                        compressed_payload(&object.body, compression_level)?,
+                    ));
+                }
+                Ok(chunk_payloads)
+            }));
+        }
+
+        let mut first_error = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(chunk_payloads)) => {
+                    if first_error.is_none() {
+                        for (pos, payload) in chunk_payloads {
+                            payloads[pos] = payload;
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    first_error.get_or_insert(err);
+                }
+                Err(_) => {
+                    first_error.get_or_insert_with(|| {
+                        GitError::InvalidObject("pack compression worker panicked".into())
+                    });
+                }
+            }
+        }
+
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    })?;
+    Ok(payloads)
+}
+
+fn streaming_planned_payload<'a>(
+    objects: &'a [Arc<EncodedObject>],
+    plan: &'a [StreamingPlannedEntry],
+    idx: usize,
+) -> &'a [u8] {
+    match &plan[idx].base {
+        StreamingPlannedBase::None => &objects[idx].body,
+        StreamingPlannedBase::Current { delta, .. }
+        | StreamingPlannedBase::Previous { delta, .. }
+        | StreamingPlannedBase::External { delta, .. } => delta,
+    }
+}
+
 fn planned_payload<'a>(
     objects: &'a [&'a EncodedObject],
     plan: &'a [PlannedEntry],
@@ -4776,6 +5225,176 @@ fn delta_type_rank(object_type: ObjectType) -> u8 {
         ObjectType::Blob => 2,
         ObjectType::Tag => 3,
     }
+}
+
+fn plan_streaming_window_deltas(
+    objects: &[Arc<EncodedObject>],
+    object_ids: &[ObjectId],
+    base_horizon: &VecDeque<StreamingDeltaBase>,
+    options: &PackWriteOptions,
+) -> (Vec<StreamingPlannedEntry>, Vec<usize>) {
+    let count = objects.len();
+    let mut plan: Vec<StreamingPlannedEntry> = (0..count)
+        .map(|_| StreamingPlannedEntry {
+            base: StreamingPlannedBase::None,
+            depth: 0,
+        })
+        .collect();
+
+    let mut order: Vec<usize> = (0..count).collect();
+    if options.reorder && options.depth > 0 {
+        order.sort_by(|&left, &right| {
+            delta_type_rank(objects[left].object_type)
+                .cmp(&delta_type_rank(objects[right].object_type))
+                .then_with(|| objects[right].body.len().cmp(&objects[left].body.len()))
+                .then_with(|| {
+                    object_ids[left]
+                        .as_bytes()
+                        .cmp(object_ids[right].as_bytes())
+                })
+        });
+    }
+
+    if options.depth == 0 || options.window == 0 {
+        return (plan, order);
+    }
+
+    let mut external_indexes: Vec<(ObjectId, ObjectType, DeltaIndex<'_>)> =
+        Vec::with_capacity(options.thin_bases.len());
+    let mut external_bases = options.thin_bases.iter().collect::<Vec<_>>();
+    external_bases
+        .sort_by(|(left_oid, _), (right_oid, _)| left_oid.as_bytes().cmp(right_oid.as_bytes()));
+    for (oid, object) in external_bases {
+        external_indexes.push((*oid, object.object_type, DeltaIndex::new(&object.body)));
+    }
+
+    let mut window: VecDeque<StreamingDeltaWindowEntry<'_>> =
+        VecDeque::with_capacity(options.window.min(base_horizon.len() + count));
+    for base in base_horizon {
+        window.push_back(StreamingDeltaWindowEntry {
+            base: StreamingCandidateBase::Previous {
+                oid: base.oid,
+                offset: base.offset,
+                depth: base.depth,
+            },
+            object_type: base.object.object_type,
+            index: DeltaIndex::new(&base.object.body),
+        });
+    }
+    while window.len() > options.window {
+        window.pop_front();
+    }
+
+    for &idx in &order {
+        let target = &objects[idx].body;
+        let target_type = objects[idx].object_type;
+
+        let mut best_delta: Option<Vec<u8>> = None;
+        let mut best_base = StreamingPlannedBase::None;
+        let mut best_base_depth = 0usize;
+
+        for base_entry in window.iter().rev() {
+            if base_entry.object_type != target_type {
+                continue;
+            }
+            let base_depth = match &base_entry.base {
+                StreamingCandidateBase::Previous { depth, .. }
+                | StreamingCandidateBase::Current { depth, .. } => *depth,
+            };
+            if base_depth + 1 > options.depth {
+                continue;
+            }
+            let Some(delta) = base_entry.index.delta(target) else {
+                continue;
+            };
+            if !delta_is_acceptable(&delta, target.len()) {
+                continue;
+            }
+            if best_delta
+                .as_ref()
+                .is_none_or(|current| delta.len() < current.len())
+            {
+                best_delta = Some(delta);
+                best_base_depth = base_depth;
+                best_base = match &base_entry.base {
+                    StreamingCandidateBase::Previous { oid, offset, .. } => {
+                        StreamingPlannedBase::Previous {
+                            base_oid: *oid,
+                            base_offset: *offset,
+                            delta: Vec::new(),
+                        }
+                    }
+                    StreamingCandidateBase::Current { idx: base_idx, .. } => {
+                        StreamingPlannedBase::Current {
+                            base_idx: *base_idx,
+                            delta: Vec::new(),
+                        }
+                    }
+                };
+            }
+        }
+
+        for (base_oid, base_type, base_index) in
+            external_indexes.iter().take(DELTA_MAX_EXTERNAL_BASES)
+        {
+            if *base_type != target_type {
+                continue;
+            }
+            let Some(delta) = base_index.delta(target) else {
+                continue;
+            };
+            if !delta_is_acceptable(&delta, target.len()) {
+                continue;
+            }
+            if best_delta
+                .as_ref()
+                .is_none_or(|current| delta.len() < current.len())
+            {
+                best_delta = Some(delta);
+                best_base_depth = 0;
+                best_base = StreamingPlannedBase::External {
+                    base_oid: *base_oid,
+                    delta: Vec::new(),
+                };
+            }
+        }
+
+        if let Some(delta) = best_delta {
+            plan[idx].depth = best_base_depth + 1;
+            plan[idx].base = match best_base {
+                StreamingPlannedBase::Current { base_idx, .. } => {
+                    StreamingPlannedBase::Current { base_idx, delta }
+                }
+                StreamingPlannedBase::Previous {
+                    base_oid,
+                    base_offset,
+                    ..
+                } => StreamingPlannedBase::Previous {
+                    base_oid,
+                    base_offset,
+                    delta,
+                },
+                StreamingPlannedBase::External { base_oid, .. } => {
+                    StreamingPlannedBase::External { base_oid, delta }
+                }
+                StreamingPlannedBase::None => StreamingPlannedBase::None,
+            };
+        }
+
+        window.push_back(StreamingDeltaWindowEntry {
+            base: StreamingCandidateBase::Current {
+                idx,
+                depth: plan[idx].depth,
+            },
+            object_type: objects[idx].object_type,
+            index: DeltaIndex::new(&objects[idx].body),
+        });
+        while window.len() > options.window {
+            window.pop_front();
+        }
+    }
+
+    (plan, order)
 }
 
 /// Decide how each object is stored (undeltified or deltified) and the order in
@@ -7959,6 +8578,68 @@ mod tests {
         assert_eq!(streamed.entries, in_memory.entries);
         assert_eq!(streamed.delta_count, in_memory.delta_count);
         assert_eq!(streamed.pack_size, in_memory.pack.len() as u64);
+    }
+
+    #[test]
+    fn write_packed_from_source_to_writer_deltifies_across_windows() {
+        let format = ObjectFormat::Sha1;
+        let mut objects = Vec::new();
+        for idx in 0..PACK_STREAM_COMPRESSION_WINDOW_OBJECTS - 1 {
+            objects.push(EncodedObject::new(
+                ObjectType::Blob,
+                format!("unrelated streamed source object {idx:04}\n").into_bytes(),
+            ));
+        }
+        let base_body = b"cross-window base payload with enough shared anchors\nbase\n".to_vec();
+        let target_body =
+            b"cross-window base payload with enough shared anchors\ntarget\n".to_vec();
+        objects.push(EncodedObject::new(ObjectType::Blob, base_body));
+        objects.push(EncodedObject::new(ObjectType::Blob, target_body));
+
+        let object_ids = objects
+            .iter()
+            .map(|object| {
+                object
+                    .object_id(format)
+                    .expect("test operation should succeed")
+            })
+            .collect::<Vec<_>>();
+        let base_oid = object_ids[PACK_STREAM_COMPRESSION_WINDOW_OBJECTS - 1];
+        let target_oid = object_ids[PACK_STREAM_COMPRESSION_WINDOW_OBJECTS];
+        let object_map = object_ids
+            .iter()
+            .copied()
+            .zip(objects.into_iter().map(Arc::new))
+            .collect::<HashMap<_, _>>();
+
+        let options = PackWriteOptions::new().with_reorder(false).with_window(10);
+        let mut written = Vec::new();
+        let summary = PackFile::write_packed_from_source_to_writer(
+            &object_ids,
+            format,
+            &options,
+            |oid| {
+                object_map
+                    .get(oid)
+                    .cloned()
+                    .ok_or_else(|| GitError::not_found(format!("missing test object {oid}")))
+            },
+            &mut written,
+        )
+        .expect("test operation should succeed");
+
+        assert!(
+            summary.delta_count > 0,
+            "expected source-backed streaming writer to find deltas"
+        );
+        let stats =
+            PackFile::verify_pack_stats(&written, format).expect("test operation should succeed");
+        let target = stats
+            .objects
+            .iter()
+            .find(|entry| entry.oid == target_oid)
+            .expect("target object should be present");
+        assert_eq!(target.base_oid, Some(base_oid));
     }
 
     fn write_packed_deltifies_similar_blobs_and_round_trips(format: ObjectFormat) {

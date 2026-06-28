@@ -1,0 +1,16 @@
+{
+  "repo": "/private/tmp/sley-human-common-write-f18jjwgq/timing-sm-walkdir-sley_harness-tag_force_write",
+  "repeat": 8,
+  "warmup": 2,
+  "command": ["tag", "-f", "sley-bench-write", "HEAD"],
+  "runs": [
+    {"index": 0, "ns": 378959},
+    {"index": 1, "ns": 359875},
+    {"index": 2, "ns": 362416},
+    {"index": 3, "ns": 351750},
+    {"index": 4, "ns": 345083},
+    {"index": 5, "ns": 342000},
+    {"index": 6, "ns": 349000},
+    {"index": 7, "ns": 352541}
+  ]
+}

@@ -3648,7 +3648,7 @@ fn update_launchctl(enable: bool) -> Result<()> {
 fn update_schtasks(common_git_dir: &Path, enable: bool) -> Result<()> {
     if enable {
         for frequency in ["hourly", "daily", "weekly"] {
-            let xml = common_git_dir.join(format!("schedule_{frequency}.xml"));
+            let xml = common_git_dir.join(format!("schedule_{frequency}"));
             fs::write(&xml, "<Task></Task>\n")?;
             let xml = xml.display().to_string();
             run_scheduler_command(

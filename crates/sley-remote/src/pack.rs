@@ -9,13 +9,20 @@ use std::io::Write;
 
 use sley_core::{ObjectFormat, ObjectId, Result};
 use sley_odb::{
-    FileObjectDatabase, ObjectReader, collect_reachable_object_ids, write_reachable_pack_to_writer,
+    FileObjectDatabase, ObjectReader, collect_reachable_object_ids, write_object_id_pack_to_writer,
+    write_reachable_pack_to_writer,
 };
 use sley_pack::{PackFile, PackInput, PackWriteOptions};
 use sley_protocol::{
     ReceivePackCommand, ReceivePackFeatures, ReceivePackPushRequestOptions, RefAdvertisement,
     build_receive_pack_push_request_header, write_receive_pack_push_request_header,
 };
+
+const THIN_PUSH_EXTERNAL_BASE_LIMIT: usize = 64;
+#[cfg(test)]
+const THIN_PUSH_STREAMING_MIN_OBJECTS: usize = 32;
+#[cfg(not(test))]
+const THIN_PUSH_STREAMING_MIN_OBJECTS: usize = 4096;
 
 /// The advertised tips the local repository already has, deduplicated and
 /// excluding the all-zero sentinel — the safe negotiation base for the push pack.
@@ -138,18 +145,30 @@ where
     W: Write,
 {
     let reachable = collect_reachable_object_ids(req.local_db, req.format, starts)?;
-    let to_send = reachable
+    let mut to_send = reachable
         .into_iter()
         .filter(|oid| !remote_excluded.contains(oid))
         .collect::<Vec<_>>();
+    to_send.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     if to_send.is_empty() {
+        return write_empty_packfile(req.format, writer);
+    }
+    if to_send.len() >= THIN_PUSH_STREAMING_MIN_OBJECTS {
+        write_object_id_pack_to_writer(req.local_db, req.format, &to_send, writer)?;
         return Ok(());
     }
 
-    let mut thin_bases = HashMap::with_capacity(remote_excluded.len());
-    for oid in remote_excluded {
-        let object = req.local_db.read_object(oid)?;
-        thin_bases.insert(*oid, (*object).clone());
+    let mut remote_base_oids = remote_excluded.iter().copied().collect::<Vec<_>>();
+    remote_base_oids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+    let mut thin_bases =
+        HashMap::with_capacity(remote_base_oids.len().min(THIN_PUSH_EXTERNAL_BASE_LIMIT));
+    for oid in remote_base_oids
+        .into_iter()
+        .take(THIN_PUSH_EXTERNAL_BASE_LIMIT)
+    {
+        let object = req.local_db.read_object(&oid)?;
+        thin_bases.insert(oid, (*object).clone());
     }
 
     let mut oids = Vec::with_capacity(to_send.len());
@@ -430,6 +449,61 @@ mod tests {
         ))
         .expect("full pack");
         assert_eq!(thin_pack, full_pack);
+
+        let _ = fs::remove_dir_all(git_dir);
+    }
+
+    #[test]
+    fn push_writes_empty_pack_when_remote_already_has_target_object() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+        let existing_oid = write_blob(&mut db, b"already on the remote\n");
+        let commands = [push_command(&ObjectId::null(format), &existing_oid)];
+        let remote_advertisements = [advertisement(&existing_oid, "refs/heads/main")];
+        let no_thin_features = ReceivePackFeatures {
+            no_thin: true,
+            ..default_features()
+        };
+
+        let no_thin_pack = build_push_packfile(&pack_request(
+            &db,
+            format,
+            &commands,
+            &remote_advertisements,
+            &no_thin_features,
+            false,
+        ))
+        .expect("no-thin no-op object pack");
+        assert!(no_thin_pack.starts_with(b"PACK"));
+        let parsed = PackFile::parse(&no_thin_pack, format).expect("parse empty pack");
+        assert!(parsed.entries.is_empty());
+
+        let thin_pack = build_push_packfile(&pack_request(
+            &db,
+            format,
+            &commands,
+            &remote_advertisements,
+            &default_features(),
+            true,
+        ))
+        .expect("thin empty pack");
+        assert_eq!(thin_pack, no_thin_pack);
+
+        let body = build_receive_pack_body(&pack_request(
+            &db,
+            format,
+            &commands,
+            &remote_advertisements,
+            &no_thin_features,
+            true,
+        ))
+        .expect("no-thin receive-pack body");
+        let parsed =
+            parse_receive_pack_push_request(format, &body, false).expect("parse receive-pack body");
+        assert_eq!(parsed.commands.commands, commands);
+        assert_eq!(parsed.packfile, no_thin_pack);
 
         let _ = fs::remove_dir_all(git_dir);
     }

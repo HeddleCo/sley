@@ -1203,6 +1203,35 @@ pub(crate) fn clone_init_default_branch_config() -> Result<Option<String>> {
     init_config_value("init.defaultBranch", &[], None)
 }
 
+pub(crate) fn clone_init_default_submodule_path_config() -> Result<bool> {
+    Ok(
+        init_config_value("init.defaultSubmodulePathConfig", &[], None)?
+            .as_deref()
+            .and_then(parse_config_bool)
+            .unwrap_or(false),
+    )
+}
+
+pub(crate) fn enable_submodule_path_config_extension(git_dir: &Path) -> Result<()> {
+    let mut config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
+    set_config_value(&mut config, "core", None, "repositoryformatversion", "1");
+    set_config_value(
+        &mut config,
+        "extensions",
+        None,
+        "submodulePathConfig",
+        "true",
+    );
+    commands::remote_cmds::write_repo_config(git_dir, &config)
+}
+
+pub(crate) fn submodule_path_config_enabled(git_dir: &Path) -> bool {
+    GitConfig::read(git_dir.join("config"))
+        .ok()
+        .and_then(|config| config.get_bool("extensions", None, "submodulePathConfig"))
+        .unwrap_or(false)
+}
+
 pub(crate) fn report_config_setup_error(err: GitError) -> GitError {
     match err {
         GitError::InvalidFormat(message) => {
@@ -8794,11 +8823,10 @@ fn log_inter_hunk_context_requires_number_error() -> Result<()> {
 }
 
 fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
-    // git's diff_opt_char (diff.c) accepts the value only when it is exactly one
-    // byte long: it errors via `if (arg[1])` and the empty string is rejected too,
-    // so the contract is a single byte. A multibyte single Unicode scalar (len 2+)
-    // is therefore rejected, matching git 2.54.
-    if value.len() == 1 {
+    // git's diff_opt_char (diff.c) accepts the value when it is at most one
+    // byte long. A multibyte single Unicode scalar (len 2+) is therefore
+    // rejected, matching git 2.54.
+    if value.len() <= 1 {
         return Ok(());
     }
     eprintln!("error: {option} expects a character, got '{value}'");

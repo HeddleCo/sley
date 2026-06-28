@@ -1,0 +1,16 @@
+{
+  "repo": "/private/tmp/sley-human-common-write-o38h52cd/timing-lg-git-sley_harness-tag_force_write",
+  "repeat": 8,
+  "warmup": 2,
+  "command": ["tag", "-f", "sley-bench-write", "HEAD"],
+  "runs": [
+    {"index": 0, "ns": 1132916},
+    {"index": 1, "ns": 1103833},
+    {"index": 2, "ns": 1083875},
+    {"index": 3, "ns": 1061916},
+    {"index": 4, "ns": 1640875},
+    {"index": 5, "ns": 1105792},
+    {"index": 6, "ns": 1069042},
+    {"index": 7, "ns": 1313708}
+  ]
+}

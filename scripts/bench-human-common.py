@@ -3,12 +3,12 @@
 
 The matrix compares:
 
-* git: system git as the baseline
+* git: Homebrew/system git as the baseline
 * sley_cli: release `sley` process, including process startup
-* sley_harness: `sley_cli::run` invoked repeatedly inside one process
+* sley_harness: direct in-process harness calls for matching Sley APIs
 
 By default repositories are cached under /private/tmp/sley-human-common-repos and
-results are written under /private/tmp/sley-human-common-results-<timestamp>.
+results are persisted under bench-results/human-common/<timestamp>.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -46,50 +47,50 @@ REPOS = [
     },
 ]
 
-COMMANDS = [
+READ_COMMANDS = [
     {
         "name": "status_short",
+        "kind": "read",
         "args": ["status", "--short"],
     },
     {
-        "name": "status_branch_porcelain",
-        "args": ["status", "--porcelain=v1", "--branch"],
-    },
-    {
         "name": "log_oneline_100",
+        "kind": "read",
         "args": ["log", "--oneline", "-100"],
     },
     {
-        "name": "log_stat_20",
-        "args": ["log", "--stat", "--oneline", "-20"],
-    },
-    {
-        "name": "show_stat_head",
-        "args": ["show", "--stat", "--oneline", "--no-renames", "HEAD"],
-    },
-    {
-        "name": "diff_name_status_prev",
-        "args": ["diff", "--name-status", "HEAD~1", "HEAD"],
-        "requires": "parent",
-    },
-    {
-        "name": "diff_stat_prev",
-        "args": ["diff", "--stat", "HEAD~1", "HEAD"],
-        "requires": "parent",
-    },
-    {
         "name": "branch_list",
+        "kind": "read",
         "args": ["branch", "--list"],
     },
     {
         "name": "tag_list",
+        "kind": "read",
         "args": ["tag", "--list"],
     },
     {
         "name": "rev_parse_short_head",
+        "kind": "read",
         "args": ["rev-parse", "--short", "HEAD"],
     },
 ]
+
+WRITE_COMMANDS = [
+    {
+        "name": "branch_force_write",
+        "kind": "write",
+        "args": ["branch", "-f", "sley-bench-write", "HEAD"],
+    },
+    {
+        "name": "tag_force_write",
+        "kind": "write",
+        "args": ["tag", "-f", "sley-bench-write", "HEAD"],
+    },
+]
+
+# Keep this matrix to commands implemented by git, sley_cli, and sley_harness so
+# every row has timing and memory numbers for all three modes.
+COMMANDS = READ_COMMANDS + WRITE_COMMANDS
 
 BENCH_ENV = {
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -99,11 +100,19 @@ BENCH_ENV = {
     "LC_ALL": "C",
     "LANG": "C",
     "NO_COLOR": "1",
+    "GIT_COMMITTER_NAME": "Sley Bench",
+    "GIT_COMMITTER_EMAIL": "sley-bench@example.invalid",
+    "GIT_COMMITTER_DATE": "@1700000000 +0000",
 }
 
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def default_git_bin() -> Path:
+    configured = os.environ.get("SLEY_TEST_GIT") or os.environ.get("SLEY_BENCH_GIT")
+    return Path(configured or shutil.which("git") or "git")
 
 
 def run(
@@ -165,6 +174,7 @@ def ensure_repos(
     cache_dir: Path,
     update: bool,
     sizes: set[str] | None,
+    git_bin: Path,
 ) -> list[dict[str, Any]]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     repos = []
@@ -172,24 +182,33 @@ def ensure_repos(
         if sizes and spec["size"] not in sizes:
             continue
         path = cache_dir / f"{spec['size']}-{spec['name']}"
-        if not (path / ".git").exists():
-            run(["git", "clone", spec["url"], str(path)], stdout=None, stderr=None)
+        if path.exists() and not is_git_repo(path, git_bin):
+            shutil.rmtree(path)
+        if not path.exists():
+            run([str(git_bin), "clone", spec["url"], str(path)], stdout=None, stderr=None)
         elif update:
-            run(["git", "fetch", "--tags", "--prune"], cwd=path, stdout=None, stderr=None)
+            run(
+                [str(git_bin), "fetch", "--tags", "--prune"],
+                cwd=path,
+                stdout=None,
+                stderr=None,
+            )
 
-        head = decode(run(["git", "rev-parse", "HEAD"], cwd=path).stdout).strip()
+        head = decode(run([str(git_bin), "rev-parse", "HEAD"], cwd=path).stdout).strip()
         branch = decode(
-            run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=path).stdout
+            run([str(git_bin), "rev-parse", "--abbrev-ref", "HEAD"], cwd=path).stdout
         ).strip()
         commit_count = int(
-            decode(run(["git", "rev-list", "--count", "HEAD"], cwd=path).stdout).strip()
+            decode(
+                run([str(git_bin), "rev-list", "--count", "HEAD"], cwd=path).stdout
+            ).strip()
         )
         tracked_files = int(
-            decode(run(["git", "ls-files"], cwd=path).stdout).count("\n")
+            decode(run([str(git_bin), "ls-files"], cwd=path).stdout).count("\n")
         )
         has_parent = (
             run(
-                ["git", "rev-parse", "--verify", "--quiet", "HEAD~1"],
+                [str(git_bin), "rev-parse", "--verify", "--quiet", "HEAD~1"],
                 cwd=path,
                 check=False,
             ).returncode
@@ -209,12 +228,104 @@ def ensure_repos(
     return repos
 
 
+def is_git_repo(path: Path, git_bin: Path) -> bool:
+    return (
+        run(
+            [str(git_bin), "-C", str(path), "rev-parse", "--git-dir"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
 def command_available(repo: dict[str, Any], command: dict[str, Any]) -> bool:
     return command.get("requires") != "parent" or bool(repo["has_parent"])
 
 
 def command_label(command: dict[str, Any]) -> str:
     return " ".join(command["args"])
+
+
+def command_kind(command: dict[str, Any]) -> str:
+    return str(command.get("kind", "read"))
+
+
+def is_write_command(command: dict[str, Any]) -> bool:
+    return command_kind(command) == "write"
+
+
+def process_argv(
+    mode: str,
+    command: dict[str, Any],
+    repo_path: Path,
+    sley_bin: Path,
+    git_bin: Path,
+) -> list[str]:
+    if mode == "git":
+        return [str(git_bin), *command["args"]]
+    if mode == "sley_cli":
+        return [str(sley_bin), "-C", str(repo_path), *command["args"]]
+    raise ValueError(f"unsupported process mode {mode}")
+
+
+def case_repo_path(
+    source_repo: Path,
+    repo: dict[str, Any],
+    command: dict[str, Any],
+    mode: str,
+    phase: str,
+    scratch_root: Path,
+    git_bin: Path,
+    index: int | None = None,
+) -> Path:
+    if not is_write_command(command):
+        return source_repo
+    return prepare_write_repo(
+        source_repo,
+        repo,
+        command,
+        mode,
+        phase,
+        scratch_root,
+        git_bin,
+        index,
+    )
+
+
+def prepare_write_repo(
+    source_repo: Path,
+    repo: dict[str, Any],
+    command: dict[str, Any],
+    mode: str,
+    phase: str,
+    scratch_root: Path,
+    git_bin: Path,
+    index: int | None,
+) -> Path:
+    parts = [phase, repo["size"], repo["name"], mode, command["name"]]
+    if index is not None:
+        parts.append(str(index))
+    dest = scratch_root / "-".join(safe_component(str(part)) for part in parts)
+    run(
+        [
+            str(git_bin),
+            "clone",
+            "--local",
+            "--no-checkout",
+            "--quiet",
+            str(source_repo),
+            str(dest),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    return dest
+
+
+def safe_component(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in value)
 
 
 def timed_process(
@@ -318,7 +429,9 @@ def run_timing_matrix(
     repos: list[dict[str, Any]],
     sley_bin: Path,
     harness_bin: Path,
+    git_bin: Path,
     out_dir: Path,
+    scratch_root: Path,
     warmup: int,
     repeat: int,
 ) -> list[dict[str, Any]]:
@@ -332,18 +445,27 @@ def run_timing_matrix(
             if not command_available(repo, command):
                 records.append(skip_record(repo, command, "missing HEAD~1"))
                 continue
-            modes = {
-                "git": ["git", *command["args"]],
-                "sley_cli": [str(sley_bin), "-C", str(repo_path), *command["args"]],
-            }
-            for mode, argv in modes.items():
+            for mode in ["git", "sley_cli"]:
+                bench_repo = case_repo_path(
+                    repo_path, repo, command, mode, "timing", scratch_root, git_bin
+                )
+                argv = process_argv(mode, command, bench_repo, sley_bin, git_bin)
                 print(f"timing {repo['size']} {repo['name']} {mode} {command['name']}")
-                result = timed_process(argv, repo_path, warmup, repeat, env)
+                result = timed_process(argv, bench_repo, warmup, repeat, env)
                 records.append(make_timing_record(repo, command, mode, result))
 
             print(f"timing {repo['size']} {repo['name']} sley_harness {command['name']}")
+            bench_repo = case_repo_path(
+                repo_path,
+                repo,
+                command,
+                "sley_harness",
+                "timing",
+                scratch_root,
+                git_bin,
+            )
             result = timed_harness(
-                harness_bin, repo_path, command, warmup, repeat, timing_dir, env
+                harness_bin, bench_repo, command, warmup, repeat, timing_dir, env
             )
             records.append(make_timing_record(repo, command, "sley_harness", result))
     add_speedups(records)
@@ -356,6 +478,7 @@ def skip_record(repo: dict[str, Any], command: dict[str, Any], reason: str) -> d
         "repo_name": repo["name"],
         "repo_head": repo["head"],
         "command_name": command["name"],
+        "command_kind": command_kind(command),
         "command": command_label(command),
         "mode": "all",
         "skipped": reason,
@@ -373,6 +496,7 @@ def make_timing_record(
         "repo_name": repo["name"],
         "repo_head": repo["head"],
         "command_name": command["name"],
+        "command_kind": command_kind(command),
         "command": command_label(command),
         "mode": mode,
     }
@@ -398,7 +522,9 @@ def run_memory_matrix(
     repos: list[dict[str, Any]],
     sley_bin: Path,
     harness_bin: Path,
+    git_bin: Path,
     out_dir: Path,
+    scratch_root: Path,
     runs_per_case: int,
 ) -> list[dict[str, Any]]:
     time_bin = shutil.which("time")
@@ -416,31 +542,46 @@ def run_memory_matrix(
         for command in COMMANDS:
             if not command_available(repo, command):
                 continue
-            modes = {
-                "git": ["git", *command["args"]],
-                "sley_cli": [str(sley_bin), "-C", str(repo_path), *command["args"]],
-                "sley_harness": [
-                    str(harness_bin),
-                    "--repo",
-                    str(repo_path),
-                    "--warmup",
-                    "0",
-                    "--repeat",
-                    "1",
-                    "--out",
-                    str(mem_dir / f"memory-{repo_path.name}-{command['name']}.json"),
-                    "--",
-                    *command["args"],
-                ],
-            }
-            for mode, argv in modes.items():
+            for mode in ["git", "sley_cli", "sley_harness"]:
                 print(f"memory {repo['size']} {repo['name']} {mode} {command['name']}")
                 rss_runs = []
                 errors = []
                 for index in range(runs_per_case):
+                    bench_repo = case_repo_path(
+                        repo_path,
+                        repo,
+                        command,
+                        mode,
+                        "memory",
+                        scratch_root,
+                        git_bin,
+                        index,
+                    )
+                    if mode == "sley_harness":
+                        argv = [
+                            str(harness_bin),
+                            "--repo",
+                            str(bench_repo),
+                            "--warmup",
+                            "0",
+                            "--repeat",
+                            "1",
+                            "--out",
+                            str(
+                                mem_dir
+                                / (
+                                    f"memory-{repo['size']}-{repo['name']}-{mode}-"
+                                    f"{command['name']}-{index}.json"
+                                )
+                            ),
+                            "--",
+                            *command["args"],
+                        ]
+                    else:
+                        argv = process_argv(mode, command, bench_repo, sley_bin, git_bin)
                     proc = run(
                         [time_cmd, "-l", *argv],
-                        cwd=repo_path,
+                        cwd=bench_repo,
                         env=env,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.PIPE,
@@ -495,6 +636,7 @@ def make_memory_record(
         "repo_name": repo["name"],
         "repo_head": repo["head"],
         "command_name": command["name"],
+        "command_kind": command_kind(command),
         "command": command_label(command),
         "mode": mode,
         "runs": rss_runs,
@@ -541,9 +683,17 @@ def write_markdown(
     repos: list[dict[str, Any]],
     timing: list[dict[str, Any]],
     memory: list[dict[str, Any]],
+    metadata: dict[str, Any],
 ) -> None:
     with path.open("w", encoding="utf-8") as handle:
         handle.write("# Sley Human Common Command Bench\n\n")
+        handle.write("## Environment\n\n")
+        handle.write(f"- Timestamp: `{metadata['timestamp']}`\n")
+        handle.write(f"- Git: `{metadata['git_version']}` at `{metadata['git_bin']}`\n")
+        handle.write(f"- Sley CLI: `{metadata['sley_bin']}`\n")
+        handle.write(f"- Sley harness: `{metadata['sley_harness_bin']}`\n")
+        handle.write(f"- Platform: `{metadata['platform']}`\n")
+
         handle.write("## Repositories\n\n")
         handle.write("| size | repo | head | commits | tracked files |\n")
         handle.write("|---|---|---:|---:|---:|\n")
@@ -554,21 +704,23 @@ def write_markdown(
             )
 
         handle.write("\n## Timing Mean ms\n\n")
-        handle.write("| repo | command | git | sley_cli | sley_harness |\n")
-        handle.write("|---|---|---:|---:|---:|\n")
+        handle.write("| repo | kind | command | git | sley_cli | sley_harness |\n")
+        handle.write("|---|---|---|---:|---:|---:|\n")
         for row in grouped_rows(timing, "mean_ms"):
             handle.write(
-                f"| {row['repo']} | `{row['command']}` | {fmt(row.get('git'))} | "
+                f"| {row['repo']} | {row['kind']} | `{row['command']}` | "
+                f"{fmt(row.get('git'))} | "
                 f"{fmt(row.get('sley_cli'))} | {fmt(row.get('sley_harness'))} |\n"
             )
 
         if memory:
             handle.write("\n## Memory Mean RSS MiB\n\n")
-            handle.write("| repo | command | git | sley_cli | sley_harness |\n")
-            handle.write("|---|---|---:|---:|---:|\n")
+            handle.write("| repo | kind | command | git | sley_cli | sley_harness |\n")
+            handle.write("|---|---|---|---:|---:|---:|\n")
             for row in grouped_rows(memory, "mean_rss_bytes", mib=True):
                 handle.write(
-                    f"| {row['repo']} | `{row['command']}` | {fmt(row.get('git'))} | "
+                    f"| {row['repo']} | {row['kind']} | `{row['command']}` | "
+                    f"{fmt(row.get('git'))} | "
                     f"{fmt(row.get('sley_cli'))} | {fmt(row.get('sley_harness'))} |\n"
                 )
 
@@ -586,7 +738,11 @@ def grouped_rows(
         key = (record["repo_name"], record["command_name"])
         row = grouped.setdefault(
             key,
-            {"repo": record["repo_name"], "command": record["command"]},
+            {
+                "repo": f"{record['repo_size']}/{record['repo_name']}",
+                "kind": record.get("command_kind", "read"),
+                "command": record["command"],
+            },
         )
         value = record[value_key]
         row[record["mode"]] = value / (1024 * 1024) if mib else value
@@ -607,6 +763,12 @@ def main() -> int:
         default=Path("/private/tmp/sley-human-common-repos"),
     )
     parser.add_argument("--out-dir", type=Path)
+    parser.add_argument(
+        "--git-bin",
+        type=Path,
+        default=default_git_bin(),
+        help="git binary to use for the oracle/baseline; defaults to SLEY_TEST_GIT, then SLEY_BENCH_GIT, then PATH",
+    )
     parser.add_argument("--repeat", type=int, default=12)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--memory-runs", type=int, default=3)
@@ -622,8 +784,12 @@ def main() -> int:
 
     root = repo_root()
     timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
-    out_dir = args.out_dir or Path(f"/private/tmp/sley-human-common-results-{timestamp}")
+    out_dir = args.out_dir or root / "bench-results" / "human-common" / timestamp
+    if not out_dir.is_absolute():
+        out_dir = root / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+    latest_marker = root / "bench-results" / "human-common" / "LATEST"
+    latest_marker.parent.mkdir(parents=True, exist_ok=True)
 
     if args.skip_build:
         sley_bin = root / "target/release/sley"
@@ -636,26 +802,42 @@ def main() -> int:
     if unknown_sizes:
         raise RuntimeError(f"unknown repo sizes: {', '.join(unknown_sizes)}")
 
-    repos = ensure_repos(args.cache_dir, args.update_repos, sizes)
-    timing = run_timing_matrix(
-        repos,
-        sley_bin,
-        harness_bin,
-        out_dir,
-        args.warmup,
-        args.repeat,
-    )
-    memory = []
-    if not args.skip_memory:
-        memory = run_memory_matrix(
-            repos, sley_bin, harness_bin, out_dir, args.memory_runs
+    git_bin = args.git_bin
+    git_version = decode(run([str(git_bin), "--version"]).stdout).strip()
+    repos = ensure_repos(args.cache_dir, args.update_repos, sizes, git_bin)
+    with tempfile.TemporaryDirectory(
+        prefix="sley-human-common-write-", dir="/private/tmp"
+    ) as scratch:
+        scratch_root = Path(scratch)
+        timing = run_timing_matrix(
+            repos,
+            sley_bin,
+            harness_bin,
+            git_bin,
+            out_dir,
+            scratch_root,
+            args.warmup,
+            args.repeat,
         )
+        memory = []
+        if not args.skip_memory:
+            memory = run_memory_matrix(
+                repos,
+                sley_bin,
+                harness_bin,
+                git_bin,
+                out_dir,
+                scratch_root,
+                args.memory_runs,
+            )
 
     payload = {
         "timestamp": timestamp,
         "platform": platform.platform(),
         "python": sys.version,
         "workspace": str(root),
+        "git_bin": str(git_bin),
+        "git_version": git_version,
         "sley_bin": str(sley_bin),
         "sley_harness_bin": str(harness_bin),
         "repeat": args.repeat,
@@ -677,6 +859,7 @@ def main() -> int:
             "repo_size",
             "repo_name",
             "command_name",
+            "command_kind",
             "command",
             "mode",
             "mean_ms",
@@ -695,6 +878,7 @@ def main() -> int:
             "repo_size",
             "repo_name",
             "command_name",
+            "command_kind",
             "command",
             "mode",
             "mean_rss_bytes",
@@ -704,7 +888,8 @@ def main() -> int:
             "rss_ratio_vs_git",
         ],
     )
-    write_markdown(out_dir / "README.md", repos, timing, memory)
+    write_markdown(out_dir / "README.md", repos, timing, memory, payload)
+    latest_marker.write_text(f"{out_dir}\n", encoding="utf-8")
     print(out_dir)
     return 0
 

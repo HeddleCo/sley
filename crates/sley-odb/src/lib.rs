@@ -202,6 +202,11 @@ pub trait RawPackInstaller {
         R: Read;
 }
 
+#[cfg(test)]
+const REACHABLE_PACK_STREAMING_MIN_OBJECTS: usize = 32;
+#[cfg(not(test))]
+const REACHABLE_PACK_STREAMING_MIN_OBJECTS: usize = 4096;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectPrefixResolution {
     Missing,
@@ -601,6 +606,18 @@ struct ReachablePackObject {
     object: Arc<EncodedObject>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReachablePackObjectMeta {
+    oid: ObjectId,
+    object_type: ObjectType,
+    size: u64,
+}
+
+enum ReachablePackObjectsForWrite {
+    Buffered(Vec<ReachablePackObject>),
+    Streaming(Vec<ReachablePackObjectMeta>),
+}
+
 fn collect_reachable_pack_objects<R, I>(
     reader: &R,
     format: ObjectFormat,
@@ -619,6 +636,65 @@ where
         });
     })?;
     Ok(objects)
+}
+
+fn collect_reachable_pack_objects_for_write<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+) -> Result<ReachablePackObjectsForWrite>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    let mut buffered = Some(Vec::new());
+    let mut metadata = Vec::new();
+    walk_reachable_objects(reader, format, starts, excluded, |oid, object| {
+        metadata.push(ReachablePackObjectMeta {
+            oid: *oid,
+            object_type: object.object_type,
+            size: object.body.len() as u64,
+        });
+        let should_stream = buffered
+            .as_ref()
+            .is_some_and(|objects| objects.len() + 1 >= REACHABLE_PACK_STREAMING_MIN_OBJECTS);
+        if should_stream {
+            buffered = None;
+        }
+        if let Some(objects) = buffered.as_mut() {
+            objects.push(ReachablePackObject {
+                oid: *oid,
+                object: Arc::clone(object),
+            });
+        }
+    })?;
+
+    match buffered {
+        Some(objects) => Ok(ReachablePackObjectsForWrite::Buffered(objects)),
+        None => {
+            sort_reachable_pack_metadata(&mut metadata);
+            Ok(ReachablePackObjectsForWrite::Streaming(metadata))
+        }
+    }
+}
+
+fn sort_reachable_pack_metadata(metadata: &mut [ReachablePackObjectMeta]) {
+    metadata.sort_by(|left, right| {
+        reachable_pack_type_rank(left.object_type)
+            .cmp(&reachable_pack_type_rank(right.object_type))
+            .then_with(|| right.size.cmp(&left.size))
+            .then_with(|| left.oid.as_bytes().cmp(right.oid.as_bytes()))
+    });
+}
+
+fn reachable_pack_type_rank(object_type: ObjectType) -> u8 {
+    match object_type {
+        ObjectType::Commit => 0,
+        ObjectType::Tree => 1,
+        ObjectType::Blob => 2,
+        ObjectType::Tag => 3,
+    }
 }
 
 fn pack_inputs(objects: &[ReachablePackObject]) -> Vec<PackInput<'_>> {
@@ -732,18 +808,48 @@ where
     I: IntoIterator<Item = ObjectId>,
     W: Write,
 {
-    let objects = collect_reachable_pack_objects(reader, format, starts, excluded)?;
-    if objects.is_empty() {
-        return Ok(None);
+    match collect_reachable_pack_objects_for_write(reader, format, starts, excluded)? {
+        ReachablePackObjectsForWrite::Buffered(objects) => {
+            if objects.is_empty() {
+                return Ok(None);
+            }
+            let inputs = pack_inputs(&objects);
+            let summary = PackFile::write_packed_with_known_ids_to_writer(
+                &inputs,
+                format,
+                &PackWriteOptions::new(),
+                writer,
+            )?;
+            Ok(Some(reachable_pack_write_summary(summary)))
+        }
+        ReachablePackObjectsForWrite::Streaming(metadata) => {
+            if metadata.is_empty() {
+                return Ok(None);
+            }
+            let object_ids = metadata.iter().map(|meta| meta.oid).collect::<Vec<_>>();
+            write_object_id_pack_to_writer(reader, format, &object_ids, writer).map(Some)
+        }
     }
-    let inputs = pack_inputs(&objects);
-    let summary = PackFile::write_packed_with_known_ids_to_writer(
-        &inputs,
+}
+
+pub fn write_object_id_pack_to_writer<R, W>(
+    reader: &R,
+    format: ObjectFormat,
+    object_ids: &[ObjectId],
+    writer: &mut W,
+) -> Result<ReachablePackWriteSummary>
+where
+    R: ObjectReader,
+    W: Write,
+{
+    let summary = PackFile::write_packed_from_source_to_writer(
+        object_ids,
         format,
         &PackWriteOptions::new(),
+        |oid| reader.read_object(oid),
         writer,
     )?;
-    Ok(Some(reachable_pack_write_summary(summary)))
+    Ok(reachable_pack_write_summary(summary))
 }
 
 fn reachable_pack_file_result(path: &Path, summary: PackWriteSummary) -> ReachablePackFile {
@@ -7748,6 +7854,56 @@ mod tests {
             .expect("test operation should succeed")
             .is_none()
         );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn large_reachable_pack_streams_objects_by_id_windows() {
+        let root = temp_root("sley-reachable-pack-streamed-large");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+        let mut roots = Vec::new();
+        for idx in 0..(REACHABLE_PACK_STREAMING_MIN_OBJECTS + 5) {
+            let object = EncodedObject::new(
+                ObjectType::Blob,
+                format!("streamed reachable blob {idx:04}\n").into_bytes(),
+            );
+            roots.push(
+                db.write_object(object)
+                    .expect("test operation should succeed"),
+            );
+        }
+
+        let mut pack_bytes = Vec::new();
+        let summary = write_reachable_pack_to_writer(
+            &db,
+            format,
+            roots.iter().copied(),
+            &HashSet::new(),
+            &mut pack_bytes,
+        )
+        .expect("test operation should succeed")
+        .expect("reachable pack should be streamed");
+        assert_eq!(summary.object_count, roots.len());
+        assert!(
+            summary.delta_count > 0,
+            "streamed large packs should still find deltas"
+        );
+        assert_eq!(summary.pack_size, pack_bytes.len() as u64);
+
+        let parsed = PackFile::parse(&pack_bytes, format).expect("test operation should succeed");
+        let expected_oids = roots.iter().copied().collect::<HashSet<_>>();
+        let parsed_oids = parsed
+            .entries
+            .iter()
+            .map(|entry| entry.entry.oid)
+            .collect::<HashSet<_>>();
+        assert_eq!(parsed.checksum, summary.checksum);
+        assert_eq!(parsed_oids, expected_oids);
+
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 

@@ -1,0 +1,9 @@
+{
+  "repo": "/private/tmp/sley-human-common-write-o38h52cd/memory-sm-walkdir-sley_harness-tag_force_write-0",
+  "repeat": 1,
+  "warmup": 0,
+  "command": ["tag", "-f", "sley-bench-write", "HEAD"],
+  "runs": [
+    {"index": 0, "ns": 702833}
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "repo": "/private/tmp/sley-human-common-repos/md-ripgrep",
+  "repeat": 8,
+  "warmup": 2,
+  "command": ["tag", "--list"],
+  "runs": [
+    {"index": 0, "ns": 619416},
+    {"index": 1, "ns": 392666},
+    {"index": 2, "ns": 704791},
+    {"index": 3, "ns": 581833},
+    {"index": 4, "ns": 189958},
+    {"index": 5, "ns": 164375},
+    {"index": 6, "ns": 167958},
+    {"index": 7, "ns": 194875}
+  ]
+}

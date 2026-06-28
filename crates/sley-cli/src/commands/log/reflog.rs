@@ -202,7 +202,7 @@ pub(super) fn compile_log_filter_matcher(
             ignore_case,
             word: false,
             line_regexp: false,
-            diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity::Default,
+            diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity::Verbose,
         },
         error_context,
     )

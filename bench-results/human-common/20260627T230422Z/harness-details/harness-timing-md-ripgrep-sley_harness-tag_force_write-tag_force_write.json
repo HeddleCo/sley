@@ -1,0 +1,16 @@
+{
+  "repo": "/private/tmp/sley-human-common-write-xtgoqggz/timing-md-ripgrep-sley_harness-tag_force_write",
+  "repeat": 8,
+  "warmup": 2,
+  "command": ["tag", "-f", "sley-bench-write", "HEAD"],
+  "runs": [
+    {"index": 0, "ns": 515083},
+    {"index": 1, "ns": 498750},
+    {"index": 2, "ns": 513750},
+    {"index": 3, "ns": 588167},
+    {"index": 4, "ns": 559459},
+    {"index": 5, "ns": 569500},
+    {"index": 6, "ns": 579458},
+    {"index": 7, "ns": 592083}
+  ]
+}

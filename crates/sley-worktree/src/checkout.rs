@@ -328,8 +328,24 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
         }
     }
 
+    let ignore_case = checkout_should_detect_case_collisions(worktree_root, git_dir);
+    let mut materialized_paths: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut collided_paths: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut index_entries = Vec::new();
     for (path, entry) in &target_entries {
+        if ignore_case {
+            let folded = checkout_collision_key(path);
+            if let Some((_, existing_path)) = materialized_paths
+                .iter()
+                .find(|(existing, _)| checkout_paths_collide(existing, &folded))
+            {
+                collided_paths.insert(existing_path.clone());
+                collided_paths.insert(path.clone());
+                index_entries.push(unmaterialized_index_entry(path, entry));
+                continue;
+            }
+            materialized_paths.push((folded, path.clone()));
+        }
         // Single type-by-mode materializer: gitlinks become a directory (mkdir,
         // no blob read), symlinks (mode 120000) a real symlink to the raw blob
         // bytes, and regular files the smudge-filtered content. Inlining the blob
@@ -345,6 +361,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
             attributes.as_ref(),
         )?);
     }
+    warn_checkout_collisions(&collided_paths);
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let extensions = preserved_index_extensions(git_dir, format)?;
     fs::write(
@@ -358,6 +375,71 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
         .write(format)?,
     )?;
     Ok(target_entries.len())
+}
+
+fn checkout_should_detect_case_collisions(worktree_root: &Path, git_dir: &Path) -> bool {
+    GitConfig::read(git_dir.join("config"))
+        .ok()
+        .and_then(|config| config.get_bool("core", None, "ignorecase"))
+        .unwrap_or(false)
+        || filesystem_is_case_insensitive(worktree_root)
+}
+
+fn filesystem_is_case_insensitive(root: &Path) -> bool {
+    let probe = root.join(format!(".sley-case-probe-{}", std::process::id()));
+    let upper = root.join(format!(".SLEY-CASE-PROBE-{}", std::process::id()));
+    let result = (|| -> std::io::Result<bool> {
+        fs::write(&probe, b"lower")?;
+        Ok(upper.exists())
+    })();
+    let _ = fs::remove_file(&probe);
+    if upper != probe {
+        let _ = fs::remove_file(&upper);
+    }
+    result.unwrap_or(false)
+}
+
+fn checkout_collision_key(path: &[u8]) -> Vec<u8> {
+    path.iter().map(u8::to_ascii_lowercase).collect()
+}
+
+fn checkout_paths_collide(left: &[u8], right: &[u8]) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with(b"/"))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with(b"/"))
+}
+
+fn unmaterialized_index_entry(path: &[u8], entry: &TrackedEntry) -> IndexEntry {
+    IndexEntry {
+        ctime_seconds: 0,
+        ctime_nanoseconds: 0,
+        mtime_seconds: 0,
+        mtime_nanoseconds: 0,
+        dev: 0,
+        ino: 0,
+        mode: entry.mode,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        oid: entry.oid,
+        flags: path.len().min(0x0fff) as u16,
+        flags_extended: 0,
+        path: BString::from(path),
+    }
+}
+
+fn warn_checkout_collisions(collided_paths: &BTreeSet<Vec<u8>>) {
+    if collided_paths.is_empty() {
+        return;
+    }
+    eprintln!("warning: the following paths have collided:");
+    for path in collided_paths {
+        eprintln!("{}", String::from_utf8_lossy(path));
+    }
 }
 
 /// Build an [`AttributeMatcher`] from the `.gitattributes` files contained in a
@@ -1335,6 +1417,7 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
 ) -> Result<RestoreResult> {
     let index_version = index.version;
     let extensions = index_extensions_without_cache_tree(&index.extensions);
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
     let mut index_entries = index
         .entries
         .into_iter()
@@ -1379,7 +1462,15 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
             if let Some(entry) = source_entries.get(&path) {
                 index_entries.insert(
                     path.clone(),
-                    restore_head_entry_to_worktree_and_index(worktree_root, db, &path, entry)?,
+                    materialize_path_restore_entry_filtered(
+                        db,
+                        format,
+                        worktree_root,
+                        git_dir,
+                        &path,
+                        entry,
+                        &config,
+                    )?,
                 );
             } else if overlay {
                 // Overlay mode (git checkout default): a path that matches the
@@ -1551,6 +1642,38 @@ pub(crate) fn materialize_tree_entry_filtered(
     }
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let checks = attributes.attributes_for_path(path, &filter_attribute_names(), false);
+    let body = apply_smudge_filter_with_attributes_cow_format(
+        config,
+        &checks,
+        path,
+        &object.body,
+        format,
+    )?;
+    let file_path = worktree_path(worktree_root, path)?;
+    prepare_blob_parent_dirs(worktree_root, &file_path)?;
+    remove_existing_worktree_path(&file_path)?;
+    fs::write(&file_path, &body)?;
+    set_worktree_file_mode(&file_path, entry.mode)?;
+    let metadata = fs::symlink_metadata(&file_path)?;
+    let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
+    index_entry.mode = entry.mode;
+    Ok(index_entry)
+}
+
+pub(crate) fn materialize_path_restore_entry_filtered(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    worktree_root: &Path,
+    git_dir: &Path,
+    path: &[u8],
+    entry: &TrackedEntry,
+    config: &GitConfig,
+) -> Result<IndexEntry> {
+    if sley_index::is_gitlink(entry.mode) || (entry.mode & 0o170000) == 0o120000 {
+        return materialize_tree_entry(db, worktree_root, path, entry);
+    }
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
+    let checks = smudge_attribute_checks_from_index(worktree_root, git_dir, format, path)?;
     let body = apply_smudge_filter_with_attributes_cow_format(
         config,
         &checks,
@@ -2513,7 +2636,15 @@ pub fn restore_worktree_paths_from_head(
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head_entries = head_tree_entries(git_dir, format, &db)?;
-    restore_worktree_paths_from_entries(worktree_root, &db, index, &head_entries, paths)
+    restore_worktree_paths_from_entries(
+        worktree_root,
+        git_dir,
+        format,
+        &db,
+        index,
+        &head_entries,
+        paths,
+    )
 }
 
 pub fn restore_worktree_paths_from_tree(
@@ -2538,11 +2669,21 @@ pub fn restore_worktree_paths_from_tree(
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let source_entries = tree_entries(&db, format, tree_oid)?;
-    restore_worktree_paths_from_entries(worktree_root, &db, index, &source_entries, paths)
+    restore_worktree_paths_from_entries(
+        worktree_root,
+        git_dir,
+        format,
+        &db,
+        index,
+        &source_entries,
+        paths,
+    )
 }
 
 pub(crate) fn restore_worktree_paths_from_entries(
     worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
     db: &FileObjectDatabase,
     index: Index,
     source_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
@@ -2553,6 +2694,7 @@ pub(crate) fn restore_worktree_paths_from_entries(
         .into_iter()
         .map(|entry| entry.path.into_bytes())
         .collect::<BTreeSet<_>>();
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
     let mut restored = BTreeSet::new();
     for path in paths {
         let absolute = if path.is_absolute() {
@@ -2590,7 +2732,15 @@ pub(crate) fn restore_worktree_paths_from_entries(
         }
         for path in matched_paths {
             if let Some(entry) = source_entries.get(&path) {
-                restore_head_entry_to_worktree(worktree_root, db, &path, entry)?;
+                materialize_path_restore_entry_filtered(
+                    db,
+                    format,
+                    worktree_root,
+                    git_dir,
+                    &path,
+                    entry,
+                    &config,
+                )?;
             } else {
                 remove_worktree_file(worktree_root, &path)?;
             }

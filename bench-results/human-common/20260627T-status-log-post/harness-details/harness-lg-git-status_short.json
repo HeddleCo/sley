@@ -1,0 +1,16 @@
+{
+  "repo": "/private/tmp/sley-human-common-repos/lg-git",
+  "repeat": 8,
+  "warmup": 2,
+  "command": ["status", "--short"],
+  "runs": [
+    {"index": 0, "ns": 15435750},
+    {"index": 1, "ns": 16278708},
+    {"index": 2, "ns": 16650334},
+    {"index": 3, "ns": 15577750},
+    {"index": 4, "ns": 15853917},
+    {"index": 5, "ns": 15922583},
+    {"index": 6, "ns": 15508750},
+    {"index": 7, "ns": 16222417}
+  ]
+}

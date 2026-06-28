@@ -1,0 +1,9 @@
+{
+  "repo": "/private/tmp/sley-human-common-write-qtxi1dvf/memory-lg-git-sley_harness-branch_force_write-0",
+  "repeat": 1,
+  "warmup": 0,
+  "command": ["branch", "-f", "sley-bench-write", "HEAD"],
+  "runs": [
+    {"index": 0, "ns": 1805791}
+  ]
+}

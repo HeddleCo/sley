@@ -11,7 +11,6 @@ use sley_protocol::{
     read_protocol_v2_fetch_response_header, read_upload_pack_raw_packfile_response_header,
     read_upload_pack_shallow_info_and_raw_packfile_response_header,
 };
-use std::collections::VecDeque;
 use std::io::{Cursor, ErrorKind, Read};
 
 pub fn install_upload_pack_raw_response_from_reader<I, R>(
@@ -133,7 +132,8 @@ where
 
 struct ProtocolV2PackfileReader<'a, R> {
     reader: &'a mut R,
-    pending: VecDeque<u8>,
+    pending: Vec<u8>,
+    pending_offset: usize,
     done: bool,
 }
 
@@ -141,9 +141,30 @@ impl<'a, R> ProtocolV2PackfileReader<'a, R> {
     fn new(reader: &'a mut R) -> Self {
         Self {
             reader,
-            pending: VecDeque::new(),
+            pending: Vec::new(),
+            pending_offset: 0,
             done: false,
         }
+    }
+
+    fn drain_pending(&mut self, buf: &mut [u8]) -> usize {
+        let available = self.pending.len().saturating_sub(self.pending_offset);
+        let to_copy = available.min(buf.len());
+        if to_copy == 0 {
+            if self.pending_offset >= self.pending.len() {
+                self.pending.clear();
+                self.pending_offset = 0;
+            }
+            return 0;
+        }
+        let end = self.pending_offset + to_copy;
+        buf[..to_copy].copy_from_slice(&self.pending[self.pending_offset..end]);
+        self.pending_offset = end;
+        if self.pending_offset == self.pending.len() {
+            self.pending.clear();
+            self.pending_offset = 0;
+        }
+        to_copy
     }
 }
 
@@ -157,9 +178,9 @@ where
         }
         let mut written = 0usize;
         while written < buf.len() {
-            if let Some(byte) = self.pending.pop_front() {
-                buf[written] = byte;
-                written += 1;
+            let copied = self.drain_pending(&mut buf[written..]);
+            if copied > 0 {
+                written += copied;
                 continue;
             }
             if self.done {
@@ -177,7 +198,10 @@ where
                 PktLineFrame::Data(payload) => {
                     let packet = parse_sideband_packet(&payload).map_err(git_error_to_io)?;
                     match packet.channel {
-                        SideBandChannel::Data => self.pending.extend(packet.data),
+                        SideBandChannel::Data => {
+                            self.pending = packet.data;
+                            self.pending_offset = 0;
+                        }
                         SideBandChannel::Progress => {}
                         SideBandChannel::Fatal => {
                             let message = String::from_utf8_lossy(&packet.data).into_owned();

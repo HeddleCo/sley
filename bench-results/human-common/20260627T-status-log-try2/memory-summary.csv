@@ -1,0 +1,22 @@
+repo_size,repo_name,command_name,command_kind,command,mode,mean_rss_bytes,median_rss_bytes,min_rss_bytes,max_rss_bytes,rss_ratio_vs_git
+lg,git,status_short,read,status --short,git,10551296.0,10551296.0,10518528,10584064,1.0
+lg,git,status_short,read,status --short,sley_cli,23969792.0,23969792.0,23969792,23969792,2.2717391304347827
+lg,git,status_short,read,status --short,sley_harness,21954560.0,21954560.0,21807104,22102016,2.080745341614907
+lg,git,log_oneline_100,read,log --oneline -100,git,13541376.0,13541376.0,13516800,13565952,1.0
+lg,git,log_oneline_100,read,log --oneline -100,sley_cli,11493376.0,11493376.0,11468800,11517952,0.8487598306110102
+lg,git,log_oneline_100,read,log --oneline -100,sley_harness,9666560.0,9666560.0,9666560,9666560,0.7138535995160314
+lg,git,branch_list,read,branch --list,git,7651328.0,7651328.0,7651328,7651328,1.0
+lg,git,branch_list,read,branch --list,sley_cli,3563520.0,3563520.0,3555328,3571712,0.4657387580299786
+lg,git,branch_list,read,branch --list,sley_harness,2310144.0,2310144.0,2310144,2310144,0.3019271948608137
+lg,git,tag_list,read,tag --list,git,7692288.0,7692288.0,7684096,7700480,1.0
+lg,git,tag_list,read,tag --list,sley_cli,4489216.0,4489216.0,4472832,4505600,0.5835995740149095
+lg,git,tag_list,read,tag --list,sley_harness,2342912.0,2342912.0,2342912,2342912,0.3045793397231097
+lg,git,rev_parse_short_head,read,rev-parse --short HEAD,git,7667712.0,7667712.0,7667712,7667712,1.0
+lg,git,rev_parse_short_head,read,rev-parse --short HEAD,sley_cli,3440640.0,3440640.0,3440640,3440640,0.44871794871794873
+lg,git,rev_parse_short_head,read,rev-parse --short HEAD,sley_harness,2244608.0,2244608.0,2244608,2244608,0.29273504273504275
+lg,git,branch_force_write,write,branch -f sley-bench-write HEAD,git,8126464.0,8126464.0,8110080,8142848,1.0
+lg,git,branch_force_write,write,branch -f sley-bench-write HEAD,sley_cli,4538368.0,4538368.0,4538368,4538368,0.5584677419354839
+lg,git,branch_force_write,write,branch -f sley-bench-write HEAD,sley_harness,2965504.0,2965504.0,2949120,2981888,0.3649193548387097
+lg,git,tag_force_write,write,tag -f sley-bench-write HEAD,git,8347648.0,8347648.0,8323072,8372224,1.0
+lg,git,tag_force_write,write,tag -f sley-bench-write HEAD,sley_cli,4096000.0,4096000.0,4096000,4096000,0.49067713444553485
+lg,git,tag_force_write,write,tag -f sley-bench-write HEAD,sley_harness,2924544.0,2924544.0,2916352,2932736,0.35034347399411186

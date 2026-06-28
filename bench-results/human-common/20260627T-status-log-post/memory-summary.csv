@@ -1,0 +1,64 @@
+repo_size,repo_name,command_name,command_kind,command,mode,mean_rss_bytes,median_rss_bytes,min_rss_bytes,max_rss_bytes,rss_ratio_vs_git
+sm,walkdir,status_short,read,status --short,git,8585216.0,8585216.0,8552448,8617984,1.0
+sm,walkdir,status_short,read,status --short,sley_cli,4587520.0,4587520.0,4571136,4603904,0.5343511450381679
+sm,walkdir,status_short,read,status --short,sley_harness,2899968.0,2899968.0,2899968,2899968,0.3377862595419847
+sm,walkdir,log_oneline_100,read,log --oneline -100,git,8282112.0,8282112.0,8273920,8290304,1.0
+sm,walkdir,log_oneline_100,read,log --oneline -100,sley_cli,4636672.0,4636672.0,4620288,4653056,0.559841740850643
+sm,walkdir,log_oneline_100,read,log --oneline -100,sley_harness,2850816.0,2850816.0,2834432,2867200,0.34421364985163205
+sm,walkdir,branch_list,read,branch --list,git,7585792.0,7585792.0,7569408,7602176,1.0
+sm,walkdir,branch_list,read,branch --list,sley_cli,3432448.0,3432448.0,3424256,3440640,0.4524838012958963
+sm,walkdir,branch_list,read,branch --list,sley_harness,2179072.0,2179072.0,2179072,2179072,0.28725701943844495
+sm,walkdir,tag_list,read,tag --list,git,7585792.0,7585792.0,7569408,7602176,1.0
+sm,walkdir,tag_list,read,tag --list,sley_cli,3244032.0,3244032.0,3244032,3244032,0.42764578833693306
+sm,walkdir,tag_list,read,tag --list,sley_harness,2113536.0,2113536.0,2113536,2113536,0.2786177105831533
+sm,walkdir,rev_parse_short_head,read,rev-parse --short HEAD,git,7602176.0,7602176.0,7585792,7618560,1.0
+sm,walkdir,rev_parse_short_head,read,rev-parse --short HEAD,sley_cli,3448832.0,3448832.0,3440640,3457024,0.4536637931034483
+sm,walkdir,rev_parse_short_head,read,rev-parse --short HEAD,sley_harness,2244608.0,2244608.0,2244608,2244608,0.2952586206896552
+sm,walkdir,branch_force_write,write,branch -f sley-bench-write HEAD,git,8019968.0,8019968.0,8011776,8028160,1.0
+sm,walkdir,branch_force_write,write,branch -f sley-bench-write HEAD,sley_cli,3989504.0,3989504.0,3981312,3997696,0.4974463738508682
+sm,walkdir,branch_force_write,write,branch -f sley-bench-write HEAD,sley_harness,2408448.0,2408448.0,2408448,2408448,0.3003064351378958
+sm,walkdir,tag_force_write,write,tag -f sley-bench-write HEAD,git,8241152.0,8241152.0,8224768,8257536,1.0
+sm,walkdir,tag_force_write,write,tag -f sley-bench-write HEAD,sley_cli,3579904.0,3579904.0,3571712,3588096,0.43439363817097415
+sm,walkdir,tag_force_write,write,tag -f sley-bench-write HEAD,sley_harness,2367488.0,2367488.0,2359296,2375680,0.28727634194831014
+md,ripgrep,status_short,read,status --short,git,8880128.0,8880128.0,8880128,8880128,1.0
+md,ripgrep,status_short,read,status --short,sley_cli,4874240.0,4874240.0,4866048,4882432,0.5488929889298892
+md,ripgrep,status_short,read,status --short,sley_harness,3268608.0,3268608.0,3244032,3293184,0.36808118081180813
+md,ripgrep,log_oneline_100,read,log --oneline -100,git,8626176.0,8626176.0,8617984,8634368,1.0
+md,ripgrep,log_oneline_100,read,log --oneline -100,sley_cli,5062656.0,5062656.0,5046272,5079040,0.5868945868945868
+md,ripgrep,log_oneline_100,read,log --oneline -100,sley_harness,3235840.0,3235840.0,3227648,3244032,0.37511870845204176
+md,ripgrep,branch_list,read,branch --list,git,7643136.0,7643136.0,7634944,7651328,1.0
+md,ripgrep,branch_list,read,branch --list,sley_cli,3473408.0,3473408.0,3473408,3473408,0.45444801714898175
+md,ripgrep,branch_list,read,branch --list,sley_harness,2211840.0,2211840.0,2211840,2211840,0.28938906752411575
+md,ripgrep,tag_list,read,tag --list,git,7610368.0,7610368.0,7602176,7618560,1.0
+md,ripgrep,tag_list,read,tag --list,sley_cli,3612672.0,3612672.0,3588096,3637248,0.4747039827771798
+md,ripgrep,tag_list,read,tag --list,sley_harness,2195456.0,2195456.0,2195456,2195456,0.2884822389666308
+md,ripgrep,rev_parse_short_head,read,rev-parse --short HEAD,git,7618560.0,7618560.0,7618560,7618560,1.0
+md,ripgrep,rev_parse_short_head,read,rev-parse --short HEAD,sley_cli,3432448.0,3432448.0,3424256,3440640,0.4505376344086022
+md,ripgrep,rev_parse_short_head,read,rev-parse --short HEAD,sley_harness,2244608.0,2244608.0,2244608,2244608,0.2946236559139785
+md,ripgrep,branch_force_write,write,branch -f sley-bench-write HEAD,git,8118272.0,8118272.0,8110080,8126464,1.0
+md,ripgrep,branch_force_write,write,branch -f sley-bench-write HEAD,sley_cli,4243456.0,4243456.0,4243456,4243456,0.5227043390514632
+md,ripgrep,branch_force_write,write,branch -f sley-bench-write HEAD,sley_harness,2629632.0,2629632.0,2621440,2637824,0.3239152371342079
+md,ripgrep,tag_force_write,write,tag -f sley-bench-write HEAD,git,8314880.0,8314880.0,8290304,8339456,1.0
+md,ripgrep,tag_force_write,write,tag -f sley-bench-write HEAD,sley_cli,3801088.0,3801088.0,3801088,3801088,0.45714285714285713
+md,ripgrep,tag_force_write,write,tag -f sley-bench-write HEAD,sley_harness,2621440.0,2621440.0,2621440,2621440,0.31527093596059114
+lg,git,status_short,read,status --short,git,10518528.0,10518528.0,10518528,10518528,1.0
+lg,git,status_short,read,status --short,sley_cli,23674880.0,23674880.0,23543808,23805952,2.250778816199377
+lg,git,status_short,read,status --short,sley_harness,21864448.0,21864448.0,21856256,21872640,2.0786604361370715
+lg,git,log_oneline_100,read,log --oneline -100,git,13541376.0,13541376.0,13533184,13549568,1.0
+lg,git,log_oneline_100,read,log --oneline -100,sley_cli,11444224.0,11444224.0,11436032,11452416,0.8451300665456746
+lg,git,log_oneline_100,read,log --oneline -100,sley_harness,9682944.0,9682944.0,9666560,9699328,0.7150635208711433
+lg,git,branch_list,read,branch --list,git,7667712.0,7667712.0,7634944,7700480,1.0
+lg,git,branch_list,read,branch --list,sley_cli,3571712.0,3571712.0,3555328,3588096,0.4658119658119658
+lg,git,branch_list,read,branch --list,sley_harness,2310144.0,2310144.0,2310144,2310144,0.30128205128205127
+lg,git,tag_list,read,tag --list,git,7700480.0,7700480.0,7700480,7700480,1.0
+lg,git,tag_list,read,tag --list,sley_cli,4505600.0,4505600.0,4489216,4521984,0.5851063829787234
+lg,git,tag_list,read,tag --list,sley_harness,2342912.0,2342912.0,2342912,2342912,0.30425531914893617
+lg,git,rev_parse_short_head,read,rev-parse --short HEAD,git,7667712.0,7667712.0,7667712,7667712,1.0
+lg,git,rev_parse_short_head,read,rev-parse --short HEAD,sley_cli,3440640.0,3440640.0,3440640,3440640,0.44871794871794873
+lg,git,rev_parse_short_head,read,rev-parse --short HEAD,sley_harness,2244608.0,2244608.0,2244608,2244608,0.29273504273504275
+lg,git,branch_force_write,write,branch -f sley-bench-write HEAD,git,8093696.0,8093696.0,8093696,8093696,1.0
+lg,git,branch_force_write,write,branch -f sley-bench-write HEAD,sley_cli,4538368.0,4538368.0,4521984,4554752,0.5607287449392713
+lg,git,branch_force_write,write,branch -f sley-bench-write HEAD,sley_harness,2973696.0,2973696.0,2965504,2981888,0.3674089068825911
+lg,git,tag_force_write,write,tag -f sley-bench-write HEAD,git,8355840.0,8355840.0,8339456,8372224,1.0
+lg,git,tag_force_write,write,tag -f sley-bench-write HEAD,sley_cli,4096000.0,4096000.0,4096000,4096000,0.49019607843137253
+lg,git,tag_force_write,write,tag -f sley-bench-write HEAD,sley_harness,2924544.0,2924544.0,2916352,2932736,0.35

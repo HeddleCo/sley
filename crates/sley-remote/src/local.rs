@@ -163,7 +163,8 @@ pub fn upload_pack_from_local_repository(
 }
 
 /// The receive-pack capabilities advertised for a local repository: report
-/// status, ref deletion, ofs-delta, push-options, quiet, and the object format.
+/// status, ref deletion, ofs-delta, push-options, quiet, no-thin, and the object
+/// format.
 pub fn receive_pack_features(format: ObjectFormat) -> ReceivePackFeatures {
     ReceivePackFeatures {
         report_status: true,
@@ -171,6 +172,7 @@ pub fn receive_pack_features(format: ObjectFormat) -> ReceivePackFeatures {
         ofs_delta: true,
         push_options: true,
         quiet: true,
+        no_thin: true,
         object_format: Some(format),
         ..ReceivePackFeatures::default()
     }
@@ -1594,4 +1596,23 @@ pub fn serve_upload_pack_v2_with_config(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receive_pack_advertises_no_thin_until_server_fixes_thin_packs() {
+        let features = receive_pack_features(ObjectFormat::Sha1);
+        assert!(features.no_thin);
+
+        let capabilities =
+            encode_receive_pack_features(&features).expect("test operation should succeed");
+        assert!(
+            capabilities
+                .iter()
+                .any(|capability| capability.name == "no-thin")
+        );
+    }
 }

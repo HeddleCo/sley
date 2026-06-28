@@ -71,15 +71,33 @@ pub enum PushDestination {
     },
 }
 
+/// Whether push pack generation may use thin-pack deltas against remote objects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PushThinMode {
+    /// Git's default: request/use thin packs unless the remote advertises
+    /// `no-thin`.
+    #[default]
+    Auto,
+    /// Explicit `--thin`; still respects a remote `no-thin` advertisement.
+    Always,
+    /// Explicit `--no-thin`.
+    Never,
+}
+
+impl PushThinMode {
+    pub(crate) fn wants_thin(self) -> bool {
+        !matches!(self, Self::Never)
+    }
+}
+
 /// Controls for a [`push`] run, mirroring the `git push` flags the CLI parses
 /// that affect the wire/planning behavior the library owns.
 ///
 /// `set-upstream` (`-u`) is intentionally absent: it only writes
 /// `branch.<name>.remote`/`merge` config, which is a caller concern (the library
 /// returns the executed commands in [`PushOutcome::commands`] so the caller can
-/// drive that write). Atomic / push-options / thin are likewise absent because
-/// the CLI's HTTP and local push paths accept but do not act on them today; this
-/// stays a faithful refactor of the existing behavior.
+/// drive that write). Atomic / push-options are likewise absent because the
+/// CLI's HTTP and local push paths accept but do not act on them today.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PushOptions {
     /// Suppress the per-command side-effect of negotiating the `quiet`
@@ -89,6 +107,8 @@ pub struct PushOptions {
     /// Force every update, bypassing the non-fast-forward check. Per-refspec `+`
     /// forces are honored independently of this flag.
     pub force: bool,
+    /// Thin-pack behavior for transports that send a real receive-pack body.
+    pub thin: PushThinMode,
 }
 
 /// One caller-authored receive-pack command.
@@ -777,7 +797,7 @@ fn execute_push_http(
         remote_advertisements: &advertisements,
         features: &features,
         options: receive_pack_push_options(&features, request.format, request.options.quiet),
-        thin: false,
+        thin: request.options.thin.wants_thin(),
     };
     let url = http_smart_rpc_url(&remote_url, GitService::ReceivePack)?;
     let content_type = smart_http_rpc_request_content_type(GitService::ReceivePack)?;
@@ -2331,6 +2351,7 @@ mod tests {
         PushOptions {
             quiet: true,
             force: false,
+            thin: PushThinMode::Auto,
         }
     }
 

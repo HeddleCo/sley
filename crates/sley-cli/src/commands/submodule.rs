@@ -289,10 +289,10 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
         return Err(GitError::Exit(1));
     }
 
+    let modules_git_dir = git_dir.join("modules").join(&add_name);
     if existing_repo {
         println!("Adding existing repo at '{normalized_path}' to the index");
     } else {
-        let modules_git_dir = git_dir.join("modules").join(&add_name);
         let mut clone_args = Vec::new();
         if options.quiet {
             clone_args.push("-q".to_string());
@@ -336,6 +336,12 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
         &real_repo,
         options.branch.as_deref(),
         Some(&add_name),
+    )?;
+    record_submodule_gitdir_config_if_enabled(
+        &git_dir,
+        &worktree_root,
+        &add_name,
+        &modules_git_dir,
     )?;
     stage_submodule_paths(&git_dir, format, &worktree_root, &normalized_path, head_oid)?;
     Ok(())
@@ -744,6 +750,13 @@ fn populate_submodule_worktree(
         rewrite_submodule_gitdir_file(path, &modules_git_dir)?;
         set_submodule_core_worktree(path, &modules_git_dir)?;
     }
+    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    record_submodule_gitdir_config_if_enabled(
+        git_dir,
+        &worktree_root,
+        &submodule.name,
+        &modules_git_dir,
+    )?;
     Ok(())
 }
 
@@ -1389,6 +1402,21 @@ fn write_submodule_mapping(
     set_submodule_config_value(&mut config, &name, "active", "true");
     write_repo_config(git_dir, &config)?;
     Ok(())
+}
+
+fn record_submodule_gitdir_config_if_enabled(
+    git_dir: &Path,
+    worktree_root: &Path,
+    name: &str,
+    modules_git_dir: &Path,
+) -> Result<()> {
+    if !crate::submodule_path_config_enabled(git_dir) {
+        return Ok(());
+    }
+    let gitdir = relative_path_from_absolute_components(worktree_root, modules_git_dir)?;
+    let mut config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
+    set_config_value(&mut config, "submodule", Some(name), "gitdir", &gitdir);
+    write_repo_config(git_dir, &config)
 }
 
 fn stage_submodule_paths(
@@ -3489,12 +3517,16 @@ fn summary_tip_commit(
 }
 
 fn submodule_index_oid(index: &Option<Index>, path: &str) -> Option<ObjectId> {
+    use sley_index::Stage;
+
     let path = path.as_bytes();
     index
         .as_ref()?
         .entries
         .iter()
-        .find(|entry| entry.mode == 0o160000 && entry.path == path)
+        .find(|entry| {
+            entry.mode == 0o160000 && entry.path == path && entry.stage() == Stage::Normal
+        })
         .map(|entry| entry.oid)
 }
 
