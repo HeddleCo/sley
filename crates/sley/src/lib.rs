@@ -46,8 +46,10 @@ mod diff;
 mod index_io;
 mod notes_repo;
 mod objects;
+mod pack_plan;
 mod refs;
 mod remote_edit;
+mod rev_graph;
 mod status_plan;
 
 #[cfg(feature = "remote")]
@@ -82,6 +84,7 @@ pub mod plumbing {
     pub use sley_notes;
     pub use sley_object;
     pub use sley_odb;
+    pub use sley_pack;
     pub use sley_pretty;
     pub use sley_refs;
     #[cfg(feature = "remote")]
@@ -107,6 +110,7 @@ pub use sley_object::{
 };
 pub use sley_object::{EntryKind, TreeBuilder as TreeEditor};
 pub use sley_odb::FileObjectDatabase as ObjectDatabase;
+pub use sley_pack::PackWriteOptions;
 pub use sley_pretty as pretty;
 pub use sley_refs::{
     FileRefStore as RefStore, RefDeleteError, RefPrecondition, RefTarget as ReferenceTarget,
@@ -114,8 +118,8 @@ pub use sley_refs::{
 pub use sley_sequencer::TagCreate;
 pub use sley_worktree::{
     AtomicMetadataWriteOptions, AtomicMetadataWriteResult, IndexStatProbe, IndexStatProbeCache,
-    ShortStatusEntry, ShortStatusOptions, ShortStatusRow, StatusUntrackedMode, StreamControl,
-    WorktreeEntryState, write_metadata_file_atomic,
+    ShortStatusEntry, ShortStatusOptions, ShortStatusRow, StatusIgnoredMode, StatusUntrackedMode,
+    StreamControl, SubmoduleStatus, WorktreeEntryState, write_metadata_file_atomic,
 };
 
 pub use capabilities::RepositoryCapabilities;
@@ -127,11 +131,18 @@ pub use config_edit::{
 };
 pub use index_io::{IndexError, IndexWriteError, IndexWriteOptions, IndexWriteResult};
 pub use objects::{BlobFetchOptions, BlobStore, LoadedObject};
-pub use refs::{
-    DeleteRef, RefBatchChange, RefChange, RefChangeResult, RefConflict, RefDeleteExpected,
-    RefUpdateOptions, ReflogMessage,
+pub use pack_plan::{
+    PreparedReachablePack, PreparedReachablePackFile, ReachablePackPlan, ReachablePackPlanBuilder,
+    ReachablePackSummary,
 };
-pub use status_plan::{StatusCacheKey, StatusPlan, StatusPlanBuilder};
+pub use refs::{
+    DeleteRef, HeadUpdateOptions, RefBatchChange, RefChange, RefChangeResult, RefConflict,
+    RefDeleteExpected, RefUpdateOptions, ReflogMessage,
+};
+pub use rev_graph::{ReachableCommit, ReachableCommitOptions, RevGraph};
+pub use status_plan::{
+    OwnedStatusRow, StatusCacheKey, StatusCode, StatusPlan, StatusPlanBuilder, StatusRow,
+};
 
 /// A resolved reference: its full name plus the target it points at.
 ///
@@ -210,6 +221,84 @@ impl Head {
             .as_ref()
             .map(FullName::as_str)
             .and_then(|name| name.strip_prefix("refs/heads/"))
+    }
+}
+
+/// Typed, immediate state of `HEAD`.
+///
+/// Unlike [`Head`], this preserves the raw on-disk target separately from the
+/// resolved commit id. That lets embedders distinguish an unborn attached HEAD
+/// from a detached HEAD and from malformed/missing state without parsing
+/// `.git/HEAD` themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadState {
+    /// `HEAD` is missing.
+    Missing,
+    /// `HEAD` points at `target`, but that ref does not yet exist.
+    Unborn {
+        target: FullName,
+        raw_target: String,
+    },
+    /// `HEAD` points symbolically at `target`, which resolves to `oid`.
+    Attached {
+        target: FullName,
+        raw_target: String,
+        oid: ObjectId,
+    },
+    /// `HEAD` directly names an object id.
+    Detached { oid: ObjectId },
+}
+
+impl HeadState {
+    /// The immediate target stored in `HEAD`.
+    pub fn immediate_target(&self) -> Option<RefTarget> {
+        match self {
+            Self::Missing => None,
+            Self::Unborn { raw_target, .. } | Self::Attached { raw_target, .. } => {
+                Some(RefTarget::Symbolic(raw_target.clone()))
+            }
+            Self::Detached { oid } => Some(RefTarget::Direct(*oid)),
+        }
+    }
+
+    /// The symbolic target when `HEAD` is attached or unborn.
+    pub fn symbolic_target(&self) -> Option<&FullName> {
+        match self {
+            Self::Unborn { target, .. } | Self::Attached { target, .. } => Some(target),
+            Self::Missing | Self::Detached { .. } => None,
+        }
+    }
+
+    /// The resolved commit id when `HEAD` is attached to an existing branch or
+    /// detached.
+    pub fn oid(&self) -> Option<ObjectId> {
+        match self {
+            Self::Attached { oid, .. } | Self::Detached { oid } => Some(*oid),
+            Self::Missing | Self::Unborn { .. } => None,
+        }
+    }
+
+    pub fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    pub fn is_unborn(&self) -> bool {
+        matches!(self, Self::Unborn { .. })
+    }
+
+    pub fn is_attached(&self) -> bool {
+        matches!(self, Self::Attached { .. })
+    }
+
+    pub fn is_detached(&self) -> bool {
+        matches!(self, Self::Detached { .. })
+    }
+
+    /// Short branch name (`refs/heads/<name>` stripped to `<name>`), if any.
+    pub fn branch_name(&self) -> Option<&str> {
+        self.symbolic_target()
+            .map(FullName::as_str)
+            .and_then(|target| target.strip_prefix("refs/heads/"))
     }
 }
 
@@ -597,20 +686,42 @@ impl Repository {
     /// Resolve `HEAD`: its symbolic branch target (if any) and the commit it
     /// points at (if the branch exists).
     pub fn head(&self) -> Result<Head> {
-        let refs = self.references();
-        match refs.read_ref("HEAD")? {
-            None => Err(GitError::reference_not_found("HEAD is missing")),
-            Some(RefTarget::Direct(oid)) => Ok(Head {
+        match self.head_state()? {
+            HeadState::Missing => Err(GitError::reference_not_found("HEAD is missing")),
+            HeadState::Detached { oid } => Ok(Head {
                 symbolic_target: None,
                 oid: Some(oid),
             }),
+            HeadState::Unborn { target, .. } => Ok(Head {
+                symbolic_target: Some(target),
+                oid: None,
+            }),
+            HeadState::Attached { target, oid, .. } => Ok(Head {
+                symbolic_target: Some(target),
+                oid: Some(oid),
+            }),
+        }
+    }
+
+    /// Inspect `HEAD` without collapsing attached, detached, unborn, and missing
+    /// states into `Option` fields.
+    pub fn head_state(&self) -> Result<HeadState> {
+        match self.references().read_ref("HEAD")? {
+            None => Ok(HeadState::Missing),
+            Some(RefTarget::Direct(oid)) => Ok(HeadState::Detached { oid }),
             Some(RefTarget::Symbolic(name)) => {
-                let symbolic_target = FullName::new(&name)?;
-                let oid = self.resolve_symbolic(&name)?;
-                Ok(Head {
-                    symbolic_target: Some(symbolic_target),
-                    oid,
-                })
+                let target = FullName::new(&name)?;
+                match self.resolve_symbolic(&name)? {
+                    Some(oid) => Ok(HeadState::Attached {
+                        target,
+                        raw_target: name,
+                        oid,
+                    }),
+                    None => Ok(HeadState::Unborn {
+                        target,
+                        raw_target: name,
+                    }),
+                }
             }
         }
     }
@@ -1091,6 +1202,36 @@ mod tests {
             .expect("write empty tree commit")
     }
 
+    fn seed_child_commit(repo: &Repository, parent: ObjectId, message: &[u8]) -> ObjectId {
+        let db = repo.objects_mut();
+        let blob_oid = db
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                [message, b"\n"].concat(),
+            ))
+            .expect("write child blob");
+        let tree = Tree {
+            entries: vec![sley_object::TreeEntry {
+                mode: 0o100644,
+                name: BString::from(b"child.txt"),
+                oid: blob_oid,
+            }],
+        };
+        let tree_oid = db
+            .write_object(EncodedObject::new(ObjectType::Tree, tree.write()))
+            .expect("write child tree");
+        let commit = Commit {
+            tree: tree_oid,
+            parents: vec![parent],
+            author: b"Tester <test@example.com> 1700000001 +0000".to_vec(),
+            committer: b"Tester <test@example.com> 1700000001 +0000".to_vec(),
+            encoding: None,
+            message: message.to_vec(),
+        };
+        db.write_object(EncodedObject::new(ObjectType::Commit, commit.write()))
+            .expect("write child commit")
+    }
+
     #[test]
     fn init_creates_repo_and_open_reads_it_back() {
         let temp = TempDir::new();
@@ -1148,6 +1289,57 @@ mod tests {
         assert!(head.is_unborn());
         assert!(!head.is_detached());
         assert_eq!(head.branch_name(), Some("main"));
+
+        let state = repo.head_state().expect("head state");
+        assert!(state.is_unborn());
+        assert_eq!(
+            state.symbolic_target().map(FullName::as_str),
+            Some("refs/heads/main")
+        );
+        assert_eq!(
+            state.immediate_target(),
+            Some(RefTarget::Symbolic("refs/heads/main".into()))
+        );
+    }
+
+    #[test]
+    fn set_head_symref_attaches_head_and_writes_reflog() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        let main = seed_commit(&repo);
+        let topic = seed_child_commit(&repo, main, b"topic\n");
+        repo.apply_ref_changes(&[
+            RefChange::new("refs/heads/topic", RefTarget::Direct(topic)).expect("valid ref")
+        ])
+        .expect("create topic");
+        let committer = b"Tester <test@example.com> 1700000002 +0000".to_vec();
+
+        repo.set_head_symref(
+            "refs/heads/topic",
+            HeadUpdateOptions::new()
+                .expect_current(RefTarget::Symbolic("refs/heads/main".into()))
+                .reflog(b"checkout: moving from main to topic".to_vec())
+                .reflog_committer(committer.clone()),
+        )
+        .expect("set HEAD symref");
+
+        match repo.head_state().expect("head state") {
+            HeadState::Attached { target, oid, .. } => {
+                assert_eq!(target.as_str(), "refs/heads/topic");
+                assert_eq!(oid, topic);
+            }
+            other => panic!("expected attached HEAD, got {other:?}"),
+        }
+        assert_eq!(
+            repo.references().read_ref("HEAD").expect("read HEAD"),
+            Some(RefTarget::Symbolic("refs/heads/topic".into()))
+        );
+        let head_log = repo.references().read_reflog("HEAD").expect("HEAD log");
+        let last = head_log.last().expect("HEAD reflog entry");
+        assert_eq!(last.old_oid, main);
+        assert_eq!(last.new_oid, topic);
+        assert_eq!(last.committer, committer);
+        assert_eq!(last.message, b"checkout: moving from main to topic");
     }
 
     #[test]
@@ -1225,7 +1417,28 @@ mod tests {
             status.cache_key().map(StatusCacheKey::as_str),
             Some("health")
         );
+        assert_eq!(status.count().expect("count status"), 0);
         assert!(status.collect().expect("collect status").is_empty());
+
+        fs::write(temp.path().join("untracked.txt"), b"new\n").expect("write untracked");
+        let status = repo
+            .status_plan()
+            .include_untracked(true)
+            .build()
+            .expect("status plan");
+        let mut streamed = Vec::new();
+        status
+            .stream(|row| {
+                streamed.push(row.to_owned());
+                Ok(StreamControl::Stop)
+            })
+            .expect("stream one row");
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(streamed[0].worktree, StatusCode::Untracked);
+        assert_eq!(streamed[0].path, b"untracked.txt");
+        let collected = status.collect_rows().expect("collect typed rows");
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].path, b"untracked.txt");
     }
 
     #[test]
@@ -1698,6 +1911,80 @@ mod tests {
                 .entries
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn rev_graph_streams_and_counts_ancestry() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        let base = seed_commit(&repo);
+        let tip = seed_child_commit(&repo, base, b"second\n");
+        repo.apply_ref_changes(&[
+            RefChange::new("refs/heads/main", RefTarget::Direct(tip)).expect("valid ref")
+        ])
+        .expect("advance main");
+
+        let graph = repo.rev_graph();
+        assert!(graph.is_ancestor(base, tip).expect("ancestor check"));
+        assert!(!graph.is_ancestor(tip, base).expect("reverse check"));
+        assert_eq!(graph.ahead_behind(tip, base).expect("ahead behind"), (1, 0));
+
+        let mut streamed = Vec::new();
+        graph
+            .stream_reachable_commits([tip], ReachableCommitOptions::new(), |commit| {
+                streamed.push(commit.oid);
+                Ok(StreamControl::Stop)
+            })
+            .expect("stream one commit");
+        assert_eq!(streamed, vec![tip]);
+
+        let collected = graph
+            .collect_reachable_commits([tip], ReachableCommitOptions::new())
+            .expect("collect commits");
+        assert_eq!(collected.len(), 2);
+        assert_eq!(collected[0].oid, tip);
+        assert_eq!(collected[1].oid, base);
+    }
+
+    #[test]
+    fn reachable_pack_plan_freezes_selection_and_prepares_once() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        let commit_oid = seed_commit(&repo);
+
+        let plan = repo
+            .reachable_pack_plan()
+            .root(commit_oid)
+            .build()
+            .expect("build pack plan")
+            .expect("reachable objects");
+        assert!(plan.object_count() >= 3);
+        assert_eq!(plan.object_format(), repo.object_format());
+        assert!(plan.object_ids().contains(&commit_oid));
+
+        let prepared = plan.prepare_to_memory().expect("prepare memory");
+        assert!(prepared.pack.starts_with(b"PACK"));
+        assert_eq!(prepared.summary.object_count, plan.object_count());
+        assert_eq!(prepared.summary.pack_size, prepared.pack.len() as u64);
+        assert!(!prepared.index.is_empty());
+
+        let mut streamed = Vec::new();
+        let streamed_summary = plan.stream_to(&mut streamed).expect("stream pack");
+        assert_eq!(streamed, prepared.pack);
+        assert_eq!(streamed_summary, prepared.summary);
+
+        let pack_path = temp.path().join("planned.pack");
+        let prepared_file = plan.prepare_to_file(&pack_path).expect("prepare file");
+        assert_eq!(prepared_file.summary, prepared.summary);
+        assert_eq!(fs::read(pack_path).expect("read pack file"), prepared.pack);
+
+        let none = repo
+            .reachable_pack_plan()
+            .root(commit_oid)
+            .exclude(commit_oid)
+            .build()
+            .expect("excluded root plan");
+        assert!(none.is_none());
     }
 
     #[test]

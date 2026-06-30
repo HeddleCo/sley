@@ -57,6 +57,40 @@ impl ReflogMessage {
     }
 }
 
+/// Options for writing `HEAD` as a symbolic reference.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HeadUpdateOptions {
+    expected_old: Option<RefTarget>,
+    reflog: Option<Vec<u8>>,
+    reflog_committer: Option<Vec<u8>>,
+}
+
+impl HeadUpdateOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Require `HEAD` to still have this immediate on-disk target.
+    pub fn expect_current(mut self, target: RefTarget) -> Self {
+        self.expected_old = Some(target);
+        self
+    }
+
+    /// Reflog message to write to `HEAD` if old and new sides can be rendered
+    /// as object ids. Unborn sides are rendered as the null object id, matching
+    /// git's reflog line shape.
+    pub fn reflog(mut self, message: impl Into<Vec<u8>>) -> Self {
+        self.reflog = Some(message.into());
+        self
+    }
+
+    /// Override the reflog committer ident (`Name <email> seconds +0000`).
+    pub fn reflog_committer(mut self, committer: impl Into<Vec<u8>>) -> Self {
+        self.reflog_committer = Some(committer.into());
+        self
+    }
+}
+
 /// Options for porcelain-style checked ref updates.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RefUpdateOptions {
@@ -199,6 +233,53 @@ fn extract_ref_name_from_transaction(message: &str) -> Option<String> {
 }
 
 impl Repository {
+    /// Attach `HEAD` to `target` through the ref backend.
+    ///
+    /// `target` must be a valid symbolic ref target (for example
+    /// `refs/heads/main`). Linked worktrees are handled by
+    /// [`Repository::references`], so a linked worktree's own `HEAD` is updated
+    /// while shared branch refs remain in the common directory.
+    pub fn set_head_symref(
+        &self,
+        target: impl AsRef<str>,
+        options: HeadUpdateOptions,
+    ) -> RefChangeResult<()> {
+        let target = FullName::new(target.as_ref()).map_err(RefConflict::from_git_error)?;
+        let refs = self.references();
+        let reflog = match options.reflog {
+            Some(message) => {
+                let current = refs.read_ref("HEAD").map_err(RefConflict::from_git_error)?;
+                let old_oid = self
+                    .resolve_ref_target_oid(current.as_ref())
+                    .map_err(RefConflict::from_git_error)?
+                    .unwrap_or_else(|| ObjectId::null(self.object_format()));
+                let new_oid = self
+                    .resolve_symbolic(target.as_str())
+                    .map_err(RefConflict::from_git_error)?
+                    .unwrap_or_else(|| ObjectId::null(self.object_format()));
+                let committer = options.reflog_committer.unwrap_or_else(|| {
+                    self.default_reflog_committer()
+                        .unwrap_or_else(|_| b"sley <sley@example.invalid> 0 +0000".to_vec())
+                });
+                Some(ReflogEntry {
+                    old_oid,
+                    new_oid,
+                    committer,
+                    message,
+                })
+            }
+            None => None,
+        };
+        let mut tx = refs.transaction();
+        tx.update(RefUpdate {
+            name: "HEAD".to_string(),
+            expected: options.expected_old,
+            new: RefTarget::Symbolic(target.into()),
+            reflog,
+        });
+        tx.commit().map_err(RefConflict::from_git_error)
+    }
+
     /// Delete a direct ref only if the optional old-oid precondition still holds.
     ///
     /// The ref is locked before its current value is read, stale expected values
@@ -374,18 +455,20 @@ impl Repository {
 
         let mut tx = refs.transaction();
         tx.update(RefUpdate {
-            name: branch_name.clone(),
+            name: branch_name,
             expected: Some(RefTarget::Direct(old_oid)),
             new: RefTarget::Direct(new_oid),
-            reflog: reflog.clone(),
-        });
-        tx.update(RefUpdate {
-            name: "HEAD".to_string(),
-            expected: Some(RefTarget::Symbolic(branch_name.clone())),
-            new: RefTarget::Symbolic(branch_name),
             reflog,
         });
         tx.commit().map_err(RefConflict::from_git_error)
+    }
+
+    fn resolve_ref_target_oid(&self, target: Option<&RefTarget>) -> Result<Option<ObjectId>> {
+        match target {
+            None => Ok(None),
+            Some(RefTarget::Direct(oid)) => Ok(Some(*oid)),
+            Some(RefTarget::Symbolic(name)) => self.resolve_symbolic(name),
+        }
     }
 
     fn verify_delete_expected(

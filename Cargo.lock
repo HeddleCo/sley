@@ -1106,6 +1106,7 @@ dependencies = [
  "sley-notes",
  "sley-object",
  "sley-odb",
+ "sley-pack",
  "sley-pretty",
  "sley-refs",
  "sley-remote",

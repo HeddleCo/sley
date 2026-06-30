@@ -7199,10 +7199,16 @@ mod tests {
         let written = PackFile::write_undeltified_sha1(std::slice::from_ref(&object))
             .expect("test operation should succeed");
         let pack_name = written.checksum.to_hex();
-        fs::write(pack_dir.join(format!("pack-{pack_name}.pack")), written.pack)
-            .expect("test operation should succeed");
-        fs::write(pack_dir.join(format!("pack-{pack_name}.idx")), written.index)
-            .expect("test operation should succeed");
+        fs::write(
+            pack_dir.join(format!("pack-{pack_name}.pack")),
+            written.pack,
+        )
+        .expect("test operation should succeed");
+        fs::write(
+            pack_dir.join(format!("pack-{pack_name}.idx")),
+            written.index,
+        )
+        .expect("test operation should succeed");
 
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         // Header read takes the loose-first path; it must still resolve from the pack
@@ -7269,10 +7275,16 @@ mod tests {
         let written = PackFile::write_undeltified_sha1(std::slice::from_ref(&packed))
             .expect("test operation should succeed");
         let pack_name = written.checksum.to_hex();
-        fs::write(pack_dir.join(format!("pack-{pack_name}.pack")), written.pack)
-            .expect("test operation should succeed");
-        fs::write(pack_dir.join(format!("pack-{pack_name}.idx")), written.index)
-            .expect("test operation should succeed");
+        fs::write(
+            pack_dir.join(format!("pack-{pack_name}.pack")),
+            written.pack,
+        )
+        .expect("test operation should succeed");
+        fs::write(
+            pack_dir.join(format!("pack-{pack_name}.idx")),
+            written.index,
+        )
+        .expect("test operation should succeed");
         let packed_oid = packed
             .object_id(ObjectFormat::Sha1)
             .expect("test operation should succeed");
@@ -7321,8 +7333,11 @@ mod tests {
         let pack_name = written.checksum.to_hex();
         let pack_path = pack_dir.join(format!("pack-{pack_name}.pack"));
         fs::write(&pack_path, written.pack).expect("test operation should succeed");
-        fs::write(pack_dir.join(format!("pack-{pack_name}.idx")), written.index)
-            .expect("test operation should succeed");
+        fs::write(
+            pack_dir.join(format!("pack-{pack_name}.idx")),
+            written.index,
+        )
+        .expect("test operation should succeed");
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         db.loose()
             .write_object(object.clone())
