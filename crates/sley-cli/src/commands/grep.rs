@@ -538,6 +538,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         let any = grep_no_index(
             &opts,
             color_config,
+            repo.as_ref(),
             &positionals,
             DASHDASH,
             pager_collector.as_ref(),
@@ -1106,6 +1107,7 @@ fn run_open_pager(_pager: &str, _opts: &GrepOptions, _files: &[Vec<u8>]) -> Resu
 fn grep_no_index(
     opts: &GrepOptions,
     color_config: Option<&GitConfig>,
+    repo: Option<&RepositoryContext>,
     positionals: &[String],
     dashdash: &str,
     pager: Option<&RefCell<Vec<Vec<u8>>>>,
@@ -1113,6 +1115,18 @@ fn grep_no_index(
     let cwd = env::current_dir()?;
     let cwd_canon = fs::canonicalize(&cwd)?;
     let raw_paths = no_index_paths(positionals, dashdash)?;
+    let worktree_root = if opts.untracked {
+        repo.and_then(|repo| worktree_root_for_git_dir(repo.git_dir()).ok())
+    } else {
+        None
+    };
+    let pathspec_args: &[String] = if opts.untracked { &raw_paths } else { &[] };
+    let pathspec = GrepPathspec::new(
+        worktree_root.as_deref(),
+        &cwd,
+        opts.full_name,
+        pathspec_args,
+    )?;
     let matcher = GrepMatcher::compile(GrepCompileConfig {
         patterns: &opts.patterns,
         kind: opts.kind,
@@ -1122,12 +1136,11 @@ fn grep_no_index(
         diagnostic_verbosity: RegexDiagnosticVerbosity::from_env(),
     })?;
     let expr = build_expr(&opts.tokens);
-    let empty_pathspec = GrepPathspec::new(None, &cwd, opts.full_name, &[])?;
     let plan = GrepPlan {
         matcher: &matcher,
         expr: expr.as_ref(),
         opts,
-        pathspec: &empty_pathspec,
+        pathspec: &pathspec,
         colors: color_config
             .map(|config| GrepColors::from_config(config, opts.color))
             .unwrap_or_else(GrepColors::none),
@@ -1139,8 +1152,26 @@ fn grep_no_index(
         NoIndexIgnore::default()
     };
     let mut files = Vec::new();
-    for raw in raw_paths {
-        collect_no_index_path(&cwd, &cwd_canon, &raw, &ignore, &mut files)?;
+    if opts.untracked {
+        collect_no_index_path(
+            &cwd,
+            &cwd_canon,
+            ".",
+            &ignore,
+            worktree_root.as_deref(),
+            &mut files,
+        )?;
+    } else {
+        for raw in raw_paths {
+            collect_no_index_path(
+                &cwd,
+                &cwd_canon,
+                &raw,
+                &ignore,
+                worktree_root.as_deref(),
+                &mut files,
+            )?;
+        }
     }
     files.sort_by(|a, b| a.display.cmp(&b.display));
 
@@ -1148,18 +1179,22 @@ fn grep_no_index(
     let mut printed_file = false;
     let mut out = io::stdout();
     for file in files {
+        if opts.untracked && !pathspec.matches(&file.match_path) {
+            continue;
+        }
         let Ok(content) = fs::read(&file.absolute) else {
             continue;
         };
-        let matched = grep_buffer(
-            &content,
-            &file.display,
-            None,
-            &plan,
-            &mut out,
-            &mut printed_file,
-        )?;
+        let display = if opts.untracked {
+            plan.pathspec.display(&file.match_path)
+        } else {
+            file.display.clone()
+        };
+        let matched = grep_buffer(&content, &display, None, &plan, &mut out, &mut printed_file)?;
         any_match = any_match || matched;
+    }
+    if opts.untracked {
+        pathspec.report_unmatched()?;
     }
     Ok(any_match)
 }
@@ -1228,6 +1263,7 @@ impl NoIndexIgnore {
 struct NoIndexFile {
     absolute: PathBuf,
     display: Vec<u8>,
+    match_path: Vec<u8>,
 }
 
 fn collect_no_index_path(
@@ -1235,6 +1271,7 @@ fn collect_no_index_path(
     cwd_canon: &Path,
     raw: &str,
     ignore: &NoIndexIgnore,
+    match_root: Option<&Path>,
     out: &mut Vec<NoIndexFile>,
 ) -> Result<()> {
     let path = cwd.join(raw);
@@ -1248,9 +1285,9 @@ fn collect_no_index_path(
         return Err(GitError::Exit(128));
     }
     if path.is_dir() {
-        collect_no_index_dir(cwd, &path, ignore, out)?;
+        collect_no_index_dir(cwd, &path, ignore, match_root, out)?;
     } else if path.is_file() {
-        push_no_index_file(cwd, &path, ignore, out)?;
+        push_no_index_file(cwd, &path, ignore, match_root, out)?;
     }
     Ok(())
 }
@@ -1259,6 +1296,7 @@ fn collect_no_index_dir(
     cwd: &Path,
     dir: &Path,
     ignore: &NoIndexIgnore,
+    match_root: Option<&Path>,
     out: &mut Vec<NoIndexFile>,
 ) -> Result<()> {
     let mut entries = Vec::new();
@@ -1273,9 +1311,9 @@ fn collect_no_index_dir(
             continue;
         }
         if path.is_dir() {
-            collect_no_index_dir(cwd, &path, ignore, out)?;
+            collect_no_index_dir(cwd, &path, ignore, match_root, out)?;
         } else if path.is_file() {
-            push_no_index_file(cwd, &path, ignore, out)?;
+            push_no_index_file(cwd, &path, ignore, match_root, out)?;
         }
     }
     Ok(())
@@ -1285,6 +1323,7 @@ fn push_no_index_file(
     cwd: &Path,
     path: &Path,
     ignore: &NoIndexIgnore,
+    match_root: Option<&Path>,
     out: &mut Vec<NoIndexFile>,
 ) -> Result<()> {
     let display_path = path.strip_prefix(cwd).unwrap_or(path);
@@ -1292,9 +1331,14 @@ fn push_no_index_file(
     if display.is_empty() || ignore.ignores(&display) {
         return Ok(());
     }
+    let match_path = match_root
+        .and_then(|root| path.strip_prefix(root).ok())
+        .map(path_to_bytes)
+        .unwrap_or_else(|| display.clone());
     out.push(NoIndexFile {
         absolute: path.to_path_buf(),
         display,
+        match_path,
     });
     Ok(())
 }

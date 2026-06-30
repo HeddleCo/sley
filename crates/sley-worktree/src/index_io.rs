@@ -109,12 +109,6 @@ pub(crate) fn restored_head_index_entry(
     })
 }
 
-pub(crate) fn index_has_entry_under(entries: &[IndexEntry], directory: &[u8]) -> bool {
-    entries
-        .iter()
-        .any(|entry| index_entry_is_under_path(entry.path.as_bytes(), directory))
-}
-
 pub(crate) fn index_entry_is_under_path(entry_path: &[u8], directory: &[u8]) -> bool {
     if directory.is_empty() {
         return true;

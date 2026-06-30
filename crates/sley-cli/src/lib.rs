@@ -77,6 +77,7 @@ static GLOBAL_PATHSPEC_FLAGS: Mutex<PathspecFlags> = Mutex::new(PathspecFlags {
     literal: false,
     glob: false,
     icase: false,
+    literal_pathspecs: false,
 });
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -87,6 +88,8 @@ pub(crate) struct PathspecFlags {
     pub glob: bool,
     /// `--icase-pathspecs`: case-insensitive matching (`WM_CASEFOLD`).
     pub icase: bool,
+    /// `--literal-pathspecs`: even `:(...)` magic syntax is treated as bytes.
+    pub literal_pathspecs: bool,
 }
 
 pub(crate) fn collect_short_status(
@@ -633,6 +636,7 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
             }
             "--literal-pathspecs" => {
                 pathspec_flags.literal = true;
+                pathspec_flags.literal_pathspecs = true;
                 index += 1;
             }
             "--glob-pathspecs" => {
@@ -880,16 +884,10 @@ pub(crate) const DEFAULT_BIG_FILE_THRESHOLD: u64 = 512 * 1024 * 1024;
 
 pub(crate) fn core_big_file_threshold(git_dir: Option<&Path>) -> Result<u64> {
     let context = match git_dir {
-        Some(git_dir) => {
-            let git_dir_abs = match fs::canonicalize(git_dir) {
-                Ok(path) => path,
-                Err(_) => git_dir.to_path_buf(),
-            };
-            sley_config::ConfigIncludeContext::new(
-                Some(git_dir_abs),
-                sley_config::repo_current_branch_name(git_dir),
-            )
-        }
+        Some(git_dir) => sley_config::ConfigIncludeContext::new(
+            Some(sley_config::git_dir_for_include_context(git_dir)),
+            sley_config::repo_current_branch_name(git_dir),
+        ),
         None => sley_config::ConfigIncludeContext::new(None, None),
     };
     let mut config = sley_config::load_pre_dispatch_config(git_dir, &context)
@@ -976,6 +974,7 @@ pub(crate) fn effective_pathspec_flags() -> sley_worktree::PathspecMatchMagic {
         .unwrap_or_default();
     if git_env_bool("GIT_LITERAL_PATHSPECS") {
         flags.literal = true;
+        flags.literal_pathspecs = true;
     }
     if git_env_bool("GIT_NOGLOB_PATHSPECS") {
         flags.literal = true;
@@ -988,8 +987,9 @@ pub(crate) fn effective_pathspec_flags() -> sley_worktree::PathspecMatchMagic {
     }
     sley_worktree::PathspecMatchMagic {
         literal: flags.literal,
-        glob: flags.glob && !flags.literal,
+        glob: flags.glob && !flags.literal && !flags.literal_pathspecs,
         icase: flags.icase,
+        literal_pathspecs: flags.literal_pathspecs,
     }
 }
 
@@ -1163,16 +1163,10 @@ fn init_config_value(
         return Ok(Some(value));
     }
     let context = match config_git_dir {
-        Some(git_dir) => {
-            let git_dir_abs = match fs::canonicalize(git_dir) {
-                Ok(path) => path,
-                Err(_) => git_dir.to_path_buf(),
-            };
-            sley_config::ConfigIncludeContext::new(
-                Some(git_dir_abs),
-                sley_config::repo_current_branch_name(git_dir),
-            )
-        }
+        Some(git_dir) => sley_config::ConfigIncludeContext::new(
+            Some(sley_config::git_dir_for_include_context(git_dir)),
+            sley_config::repo_current_branch_name(git_dir),
+        ),
         None => sley_config::ConfigIncludeContext::new(None, None),
     };
     let mut config = sley_config::load_pre_dispatch_config(config_git_dir, &context)
@@ -1235,6 +1229,12 @@ pub(crate) fn submodule_path_config_enabled(git_dir: &Path) -> bool {
 pub(crate) fn report_config_setup_error(err: GitError) -> GitError {
     match err {
         GitError::InvalidFormat(message) => {
+            if message == "relative config includes must come from files"
+                || message.starts_with("exceeded maximum include depth")
+            {
+                eprintln!("fatal: {message}");
+                return GitError::Exit(128);
+            }
             if message
                 == "remote URLs cannot be configured in file directly or indirectly included by includeIf.hasconfig:remote.*.url"
             {
@@ -8823,10 +8823,9 @@ fn log_inter_hunk_context_requires_number_error() -> Result<()> {
 }
 
 fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
-    // git's diff_opt_char (diff.c) requires exactly one byte: an empty value is
-    // rejected (exit 129) and a multibyte single Unicode scalar (len 2+) is
-    // rejected, matching git 2.54.
-    if value.len() == 1 {
+    // git's diff_opt_char (diff.c) accepts an empty string (suppress the marker)
+    // or exactly one byte; multibyte Unicode scalars are rejected.
+    if value.len() <= 1 {
         return Ok(());
     }
     eprintln!("error: {option} expects a character, got '{value}'");
@@ -9398,7 +9397,7 @@ fn parse_log_filter_patterns(
     parse_log_filter_patterns_with_diagnostic_verbosity(
         patterns,
         mode,
-        sley_grep::RegexDiagnosticVerbosity::from_env(),
+        sley_grep::RegexDiagnosticVerbosity::Verbose,
     )
 }
 
@@ -9456,7 +9455,7 @@ fn compile_log_message_grep_matcher(
             ignore_case,
             word: false,
             line_regexp: false,
-            diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity::from_env(),
+            diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity::Verbose,
         },
         "command line",
     )

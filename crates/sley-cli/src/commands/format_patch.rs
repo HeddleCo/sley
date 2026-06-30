@@ -2193,9 +2193,9 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         subject_prefix_label(resolved, seq, last_number, numbered)
     };
     let subject_bytes = if options.keep_subject {
-        // -k/--keep-subject emits the bare first line verbatim (no encoding,
-        // no paragraph collapse, no 822-atom quoting).
-        commit_subject(&commit.message).into_bytes()
+        // -k/--keep-subject preserves the title paragraph's embedded newlines;
+        // the header writer RFC 2047-encodes those newlines just like git.
+        format_patch_preserved_subject(&commit.message)
     } else {
         format_patch_subject(&commit.message)
     };
@@ -2448,6 +2448,16 @@ fn subject_prefix_label(
 /// whitespace and joined by one space, stopping at the first blank line. This is
 /// what turns a three-line `one\ntwo\nthree` subject into `one two three`.
 fn format_patch_subject(message: &[u8]) -> Vec<u8> {
+    format_patch_subject_with_separator(message, b" ")
+}
+
+/// Preserve the leading subject paragraph (git's `format_subject` with a
+/// newline separator), used by `format-patch -k`.
+fn format_patch_preserved_subject(message: &[u8]) -> Vec<u8> {
+    format_patch_subject_with_separator(message, b"\n")
+}
+
+fn format_patch_subject_with_separator(message: &[u8], separator: &[u8]) -> Vec<u8> {
     let text = message;
     let mut out: Vec<u8> = Vec::new();
     let mut first = true;
@@ -2471,13 +2481,40 @@ fn format_patch_subject(message: &[u8]) -> Vec<u8> {
             break;
         }
         if !first {
-            out.push(b' ');
+            out.extend_from_slice(separator);
         }
         out.extend_from_slice(line);
         first = false;
         idx = nl + 1;
     }
     out
+}
+
+/// Byte offset immediately after the title paragraph and its first separating
+/// blank line, matching the message pointer returned by git's `format_subject`.
+fn format_patch_body_start(message: &[u8]) -> usize {
+    let mut idx = 0;
+    while idx < message.len() {
+        let nl = message[idx..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| idx + p)
+            .unwrap_or(message.len());
+        let mut line = &message[idx..nl];
+        while let Some(&last) = line.last() {
+            if last == b' ' || last == b'\t' || last == b'\r' {
+                line = &line[..line.len() - 1];
+            } else {
+                break;
+            }
+        }
+        let next = if nl < message.len() { nl + 1 } else { nl };
+        if line.is_empty() {
+            return next;
+        }
+        idx = next;
+    }
+    idx
 }
 
 /// Append the `Subject:` header for one mail. Mirrors git's `pp_email_subject`
@@ -2757,7 +2794,7 @@ fn build_thread_plan(
 /// the subject framing back off — this is what makes the subject-only case emit
 /// exactly one blank line before the sign-off (no spurious extra blanks).
 fn format_patch_body(message: &[u8], subject: &[u8], signoff_line: Option<&[u8]>) -> Vec<u8> {
-    let mut body = commit_body(message).to_vec();
+    let mut body = message[format_patch_body_start(message)..].to_vec();
     // Strip any trailing newlines, then re-add a single one (when non-empty) so
     // the body always ends "...text\n" before the sign-off / separator.
     while body.last() == Some(&b'\n') {

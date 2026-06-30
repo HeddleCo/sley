@@ -576,6 +576,10 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     if no_explicit_paths {
         paths.push(worktree_root.clone());
     }
+    let paths = paths
+        .into_iter()
+        .map(|path| reset_pathspec_path_for_worktree(&cwd, &worktree_root, path))
+        .collect::<Result<Vec<_>>>()?;
     if !saw_separator && source_tree.is_none() {
         for path in &paths {
             let absolute = if path.is_absolute() {
@@ -633,6 +637,69 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         print_reset_unstaged_changes(&worktree_root, &git_dir, format)?;
     }
     Ok(())
+}
+
+fn reset_pathspec_path_for_worktree(
+    cwd: &Path,
+    worktree_root: &Path,
+    path: PathBuf,
+) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    let raw = path.to_string_lossy().replace('\\', "/");
+    let Some(normalized) = normalize_magic_pathspec_from_cwd(cwd, worktree_root, &raw)? else {
+        return Ok(path);
+    };
+    Ok(worktree_root.join(normalized))
+}
+
+fn normalize_magic_pathspec_from_cwd(
+    cwd: &Path,
+    worktree_root: &Path,
+    raw: &str,
+) -> Result<Option<String>> {
+    if !raw.starts_with(':') {
+        return Ok(None);
+    }
+    let prefix = {
+        let root = fs::canonicalize(worktree_root)?;
+        let cwd = fs::canonicalize(cwd)?;
+        cwd.strip_prefix(&root)
+            .map(|relative| relative.to_string_lossy().replace('\\', "/").into_bytes())
+            .unwrap_or_default()
+    };
+    let (magic, pattern, top) = split_pathspec_magic_prefix(raw);
+    let base = if top { b"".as_slice() } else { &prefix };
+    let normalized = sley_pathspec::normalize_ls_files_pathspec(base, pattern)?;
+    let normalized = String::from_utf8_lossy(&normalized);
+    Ok(Some(format!("{magic}{normalized}")))
+}
+
+fn split_pathspec_magic_prefix(raw: &str) -> (&str, &str, bool) {
+    if let Some(after_open) = raw.strip_prefix(":(")
+        && let Some(close) = after_open.find(')')
+    {
+        let magic_end = 2 + close + 1;
+        let magic = &raw[..magic_end];
+        let body = &after_open[..close];
+        let top = body.split(',').any(|word| word == "top");
+        return (magic, &raw[magic_end..], top);
+    }
+    let bytes = raw.as_bytes();
+    let mut idx = 1;
+    let mut top = false;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'!' | b'^' => idx += 1,
+            b'/' => {
+                top = true;
+                idx += 1;
+            }
+            _ => break,
+        }
+    }
+    (&raw[..idx], &raw[idx..], top)
 }
 
 fn reset_process_filter_metadata(

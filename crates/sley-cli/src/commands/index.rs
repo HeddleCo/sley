@@ -201,34 +201,55 @@ fn print_tree_pathspecs(
     recursive: bool,
     options: TreePrintOptions<'_>,
 ) -> Result<()> {
-    for pathspec in pathspecs {
-        let expand_tree = pathspec.ends_with('/');
-        let normalized = path_context.normalize_pathspec(pathspec)?;
-        let display_path = path_context.display_path(&normalized);
-        if normalized.is_empty() {
-            if recursive {
-                print_tree_recursive(db, format, root_body, b"", options)?;
-            } else {
-                print_tree(Some(db), format, root_body, options)?;
-            }
-            continue;
-        }
-        let components = normalized.split('/').collect::<Vec<_>>();
-        let Some(entry) = find_tree_entry(db, format, root_body, &components)? else {
-            continue;
+    let filter = LsTreePathspecFilter::new(pathspecs, path_context)?;
+    if filter.matches_root_scope() {
+        return if recursive {
+            print_tree_recursive(db, format, root_body, b"", options)
+        } else {
+            print_tree(Some(db), format, root_body, options)
         };
-        if entry.mode == 0o040000 && (recursive || expand_tree) {
-            if options.show_trees || (options.tree_only && recursive) {
-                let mut stdout = io::stdout();
-                print_tree_entry_to_writer(
-                    &mut stdout,
-                    Some(db),
-                    &entry,
-                    display_path.as_bytes(),
-                    options,
-                )?;
-                stdout.flush()?;
-            }
+    }
+    let stdout = io::stdout();
+    let mut stdout = BufWriter::with_capacity(128 * 1024, stdout.lock());
+    let mut path = Vec::new();
+    print_tree_pathspecs_to_writer(
+        &mut stdout,
+        db,
+        format,
+        root_body,
+        &mut path,
+        path_context,
+        &filter,
+        recursive,
+        options,
+    )?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn print_tree_pathspecs_to_writer(
+    writer: &mut impl Write,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    body: &[u8],
+    path: &mut Vec<u8>,
+    path_context: &LsTreePathContext,
+    filter: &LsTreePathspecFilter,
+    recursive: bool,
+    options: TreePrintOptions<'_>,
+) -> Result<()> {
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
+        let path_len = path.len();
+        path.extend_from_slice(entry.name);
+        let is_tree = entry.mode == 0o040000;
+
+        if filter.should_print(path, is_tree, recursive, options) {
+            let display_path = path_context.display_path_bytes(path);
+            print_tree_entry_to_writer(writer, Some(db), &entry, &display_path, options)?;
+        }
+
+        if is_tree && filter.should_descend(path, recursive) {
             let object = db.read_object(&entry.oid)?;
             if object.object_type != ObjectType::Tree {
                 return Err(GitError::InvalidObject(format!(
@@ -237,29 +258,21 @@ fn print_tree_pathspecs(
                     object.object_type.as_str()
                 )));
             }
-            let prefix = if display_path.is_empty() {
-                Vec::new()
-            } else {
-                let mut prefix = display_path.as_bytes().to_vec();
-                prefix.push(b'/');
-                prefix
-            };
-            if recursive {
-                print_tree_recursive(db, format, &object.body, &prefix, options)?;
-            } else {
-                print_tree_with_prefix(Some(db), format, &object.body, &prefix, options)?;
-            }
-        } else {
-            let mut stdout = io::stdout();
-            print_tree_entry_to_writer(
-                &mut stdout,
-                Some(db),
-                &entry,
-                display_path.as_bytes(),
+            path.push(b'/');
+            print_tree_pathspecs_to_writer(
+                writer,
+                db,
+                format,
+                &object.body,
+                path,
+                path_context,
+                filter,
+                recursive,
                 options,
             )?;
-            stdout.flush()?;
         }
+
+        path.truncate(path_len);
     }
     Ok(())
 }
@@ -369,6 +382,190 @@ impl LsTreePathContext {
         }
         display.push_str(normalized);
         display
+    }
+
+    fn display_path_bytes(&self, normalized: &[u8]) -> Vec<u8> {
+        if self.full_name || self.prefix.is_empty() {
+            return normalized.to_vec();
+        }
+        let prefix = self.prefix.as_bytes();
+        if normalized == prefix {
+            return Vec::new();
+        }
+        if normalized.len() > prefix.len()
+            && normalized.starts_with(prefix)
+            && normalized[prefix.len()] == b'/'
+        {
+            return normalized[prefix.len() + 1..].to_vec();
+        }
+        let mut display = Vec::new();
+        for _ in 0..self.cwd_depth {
+            display.extend_from_slice(b"../");
+        }
+        display.extend_from_slice(normalized);
+        display
+    }
+}
+
+#[derive(Debug)]
+struct LsTreePathspecFilter {
+    specs: Vec<LsTreePathspec>,
+    root_scope: bool,
+}
+
+#[derive(Debug)]
+struct LsTreePathspec {
+    path: Vec<u8>,
+    trailing_slash: bool,
+}
+
+impl LsTreePathspecFilter {
+    fn new(pathspecs: &[String], path_context: &LsTreePathContext) -> Result<Self> {
+        let mut specs = Vec::new();
+        let mut root_scope = false;
+        for pathspec in pathspecs {
+            let trailing_slash = pathspec.ends_with('/');
+            let normalized = path_context.normalize_pathspec(pathspec)?;
+            if normalized.is_empty() {
+                root_scope = true;
+                continue;
+            }
+            specs.push(LsTreePathspec {
+                path: normalized.into_bytes(),
+                trailing_slash,
+            });
+        }
+        Ok(Self { specs, root_scope })
+    }
+
+    fn matches_root_scope(&self) -> bool {
+        self.root_scope
+    }
+
+    fn should_print(
+        &self,
+        path: &[u8],
+        is_tree: bool,
+        recursive: bool,
+        options: TreePrintOptions<'_>,
+    ) -> bool {
+        let exact = self.has_exact(path);
+        let contents = self.matches_contents(path, recursive);
+        let recursive_exact = recursive && self.matches_recursive_exact_descendant(path);
+        let traversal_tree = is_tree
+            && options.show_trees
+            && (self.has_contents(path)
+                || self.has_descendant_spec(path)
+                || (recursive && (exact || self.is_under_exact_prefix(path)))
+                || (recursive && self.is_under_contents_prefix(path)));
+
+        let mut print = false;
+        if exact && !self.exact_tree_is_redundant(path, is_tree, recursive) {
+            print |= if recursive && is_tree {
+                output_allowed_recursive(is_tree, options)
+            } else {
+                output_allowed_nonrecursive(is_tree, options)
+            };
+        }
+        if contents {
+            print |= if recursive {
+                output_allowed_recursive(is_tree, options)
+            } else {
+                output_allowed_nonrecursive(is_tree, options)
+            };
+        }
+        if recursive_exact {
+            print |= output_allowed_recursive(is_tree, options);
+        }
+        print || traversal_tree
+    }
+
+    fn should_descend(&self, path: &[u8], recursive: bool) -> bool {
+        self.has_descendant_spec(path)
+            || self.has_contents(path)
+            || (recursive
+                && (self.has_exact(path)
+                    || self.is_under_exact_prefix(path)
+                    || self.is_under_contents_prefix(path)))
+    }
+
+    fn has_exact(&self, path: &[u8]) -> bool {
+        self.specs
+            .iter()
+            .any(|spec| !spec.trailing_slash && spec.path == path)
+    }
+
+    fn has_contents(&self, path: &[u8]) -> bool {
+        self.specs
+            .iter()
+            .any(|spec| spec.trailing_slash && spec.path == path)
+    }
+
+    fn has_descendant_spec(&self, path: &[u8]) -> bool {
+        self.specs
+            .iter()
+            .any(|spec| path_is_descendant(&spec.path, path))
+    }
+
+    fn matches_contents(&self, path: &[u8], recursive: bool) -> bool {
+        self.specs
+            .iter()
+            .filter(|spec| spec.trailing_slash)
+            .any(|spec| {
+                if recursive {
+                    path_is_descendant(path, &spec.path)
+                } else {
+                    path_parent_eq(path, &spec.path)
+                }
+            })
+    }
+
+    fn matches_recursive_exact_descendant(&self, path: &[u8]) -> bool {
+        self.specs
+            .iter()
+            .filter(|spec| !spec.trailing_slash)
+            .any(|spec| path_is_descendant(path, &spec.path))
+    }
+
+    fn is_under_exact_prefix(&self, path: &[u8]) -> bool {
+        self.matches_recursive_exact_descendant(path)
+    }
+
+    fn is_under_contents_prefix(&self, path: &[u8]) -> bool {
+        self.specs
+            .iter()
+            .filter(|spec| spec.trailing_slash)
+            .any(|spec| path_is_descendant(path, &spec.path))
+    }
+
+    fn exact_tree_is_redundant(&self, path: &[u8], is_tree: bool, recursive: bool) -> bool {
+        is_tree && !recursive && (self.has_contents(path) || self.has_descendant_spec(path))
+    }
+}
+
+fn output_allowed_nonrecursive(is_tree: bool, options: TreePrintOptions<'_>) -> bool {
+    is_tree || !options.tree_only
+}
+
+fn output_allowed_recursive(is_tree: bool, options: TreePrintOptions<'_>) -> bool {
+    if is_tree {
+        options.show_trees || options.tree_only
+    } else {
+        !options.tree_only
+    }
+}
+
+fn path_is_descendant(path: &[u8], base: &[u8]) -> bool {
+    if base.is_empty() {
+        return !path.is_empty();
+    }
+    path.len() > base.len() && path.starts_with(base) && path[base.len()] == b'/'
+}
+
+fn path_parent_eq(path: &[u8], parent: &[u8]) -> bool {
+    match path.iter().rposition(|byte| *byte == b'/') {
+        Some(index) => &path[..index] == parent,
+        None => parent.is_empty(),
     }
 }
 

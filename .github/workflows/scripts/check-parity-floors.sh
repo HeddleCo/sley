@@ -497,7 +497,7 @@ declare -A FLOOR=(
     # All guards neutral incl t1450-fsck=96 t1400=275 t7700=29.
     [t6006-rev-list-format.sh]=77
     [t6007-rev-list-cherry-pick-file.sh]=23
-    [t6112-rev-list-filters-objects.sh]=48
+    [t6112-rev-list-filters-objects.sh]=54
     [t6113-rev-list-bitmap-filters.sh]=13
     [t1800-hook.sh]=55
     # wave-27 (2026-06-21, core): pack-object option/split 46->55 (+bonus t5303 21->31); restore modes
@@ -527,6 +527,11 @@ declare -A FLOOR=(
     [t4201-shortlog.sh]=28
     [t1014-read-tree-confusing.sh]=28
     [t3000-ls-files-others.sh]=15
+    # wave-54 ls-tree pathspec traversal: stream one filtered tree walk in
+    # canonical order, preserve trailing-slash directory semantics, collapse
+    # duplicate/redundant pathspecs, and show traversed trees for -t.
+    [t3100-ls-tree-restrict.sh]=14
+    [t3101-ls-tree-dirname.sh]=19
     [t3103-ls-tree-misc.sh]=10
     # codex-wave-9 (ls-tree output): gitlink mode 160000 classified as commit
     # object type; -d shows gitlinks (skip only blobs); subdir ../ pathspec norm
@@ -566,6 +571,9 @@ declare -A FLOOR=(
     # codex-wave-3 (2026-06-17): am --empty=stop/drop/keep + --allow-empty resume + -3 -q quiet 54->56.
     # wave-40 (am state machine): t4150 84->85 (am -3 + rerere).
     [t4150-am.sh]=85
+    # wave-54 am subjects: format-patch/am preserve and round-trip multiline
+    # title paragraphs, including `-k` RFC 2047 folded Subject headers.
+    [t4152-am-subjects.sh]=13
     # codex-wave-6 (2026-06-17): diff function-context t4051@32 / submodule-format t4060@7; t4015 101->102.
     # wave-2 submodule (2026-06-18, integ/submodule): t4060 7->15 (diff porcelain options).
     [t4051-diff-function-context.sh]=38
@@ -583,6 +591,10 @@ declare -A FLOOR=(
     [t4018-diff-funcname.sh]=287
     [t4124-apply-ws-rule.sh]=84
     [t4019-diff-wserror.sh]=19
+    # wave-54 diff retval: diff-tree `-S` pickaxe filtering participates in
+    # --exit-code, and diff --check reports leftover conflict markers with
+    # conflict-marker-size attributes.
+    [t4017-diff-retval.sh]=38
     [t4034-diff-words.sh]=64
     [t5407-post-rewrite-hook.sh]=17
     [t5500-fetch-pack.sh]=353
@@ -808,7 +820,7 @@ declare -A FLOOR=(
     # tip against the same binary; floor-guards (t4013=191 t7810=235) held.
     [t4020-diff-external.sh]=72
     [t4072-diff-max-depth.sh]=76
-    [t6132-pathspec-exclude.sh]=23
+    [t6132-pathspec-exclude.sh]=31
     [t6135-pathspec-with-attrs.sh]=27
     [t6022-rev-list-missing.sh]=40
     [t1013-read-tree-submodule.sh]=58
@@ -1151,6 +1163,10 @@ declare -A FLOOR=(
     [t6412-merge-large-rename.sh]=9
     [t7525-status-rename.sh]=15
     [t4001-diff-rename.sh]=22
+    # wave-54 diff basic: non-recursive raw file/tree replacements, reverse
+    # same-path add/delete ordering, diff-files ENOTDIR handling, and
+    # --no-index stdin side support.
+    [t4002-diff-basic.sh]=63
     [t4007-rename-3.sh]=11
     [t4003-diff-rename-1.sh]=4
     [t4023-diff-rename-typechange.sh]=1
@@ -1175,7 +1191,7 @@ declare -A FLOOR=(
     [t2026-checkout-pathspec-file.sh]=11
     [t2017-checkout-orphan.sh]=12
     [t2021-checkout-overwrite.sh]=4
-    [t2025-checkout-no-overlay.sh]=4
+    [t2025-checkout-no-overlay.sh]=6
     [t2022-checkout-paths.sh]=3
     [t7425-submodule-gitdir-path-extension.sh]=7
     [t7403-submodule-sync.sh]=18
@@ -1227,7 +1243,43 @@ declare -A FLOOR=(
     # commit-graph write honors core.sharedRepository (t5324 25->26, raised
     # 25->26). Guards held: t5300=55 t5302=31 t5304=32 t5310=221 t5319=95
     # t5326=345 t6012=42 t4202=131. cargo test --workspace green.
-    [t5331-pack-objects-stdin.sh]=13
+    # wave-53 focused facade/parity hardening: config include, archive attrs,
+    # rev-list stdin/count/parents/filter edges, merge-base, partial-clone
+    # materialization for stdin-packs, checkout no-overlay stage removal, and
+    # pathspec glob/literal/exclude all full-pass in a 14-script wave.
+    [t1305-config-include.sh]=37
+    [t5001-archive-attr.sh]=44
+    [t5002-archive-attr-pattern.sh]=19
+    [t5331-pack-objects-stdin.sh]=18
+    [t6005-rev-list-count.sh]=6
+    [t6010-merge-base.sh]=12
+    [t6017-rev-list-stdin.sh]=37
+    [t6101-rev-parse-parents.sh]=38
+    [t6130-pathspec-noglob.sh]=21
+    [t6137-pathspec-wildcards-literal.sh]=25
+    # wave-53 outside-scope promotion: small adjacent scripts verified locally.
+    # t3305-notes-fanout stayed out because it timed out after four assertions
+    # under the 120s candidate-wave ceiling; do not enroll it until bounded.
+    [t1100-commit-tree-options.sh]=5
+    [t1303-wacky-config.sh]=11
+    [t3102-ls-tree-wildcards.sh]=3
+    [t3104-ls-tree-format.sh]=19
+    [t3304-notes-mixed.sh]=6
+    [t3307-notes-man.sh]=3
+    [t3601-rm-pathspec-file.sh]=5
+    [t4006-diff-mode.sh]=7
+    [t4016-diff-quote.sh]=5
+    [t4101-apply-nonl.sh]=12
+    [t7513-interpret-trailers.sh]=99
+    # wave-54 outside-scope promotion: focused candidate fixes for embeddable
+    # facade parity neighbors. Git-var/config path variables, configurable
+    # stripspace comments, add pathspec-file option errors, no-op apply --check,
+    # and update-server-info no-op mtime preservation are now full-pass.
+    [t0007-git-var.sh]=27
+    [t0030-stripspace.sh]=30
+    [t3704-add-pathspec-file.sh]=11
+    [t4136-apply-check.sh]=6
+    [t5200-update-server-info.sh]=8
     [t5323-pack-redundant.sh]=18
 
 )

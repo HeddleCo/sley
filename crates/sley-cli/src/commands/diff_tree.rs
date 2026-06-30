@@ -133,6 +133,10 @@ struct DiffTreeOptions {
     dst_prefix: String,
     /// `--check`: emit a whitespace-error report instead of the diff body.
     check: bool,
+    /// `-S<string>`: keep filepairs whose old/new occurrence count differs.
+    pickaxe: Option<String>,
+    /// `--pickaxe-all`: if any filepair matches `-S`, show the whole changeset.
+    pickaxe_all: bool,
     /// `--exit-code` / `--quiet`: exit with status 1 when any difference is
     /// found (0 otherwise). `--quiet` additionally suppresses the diff output.
     exit_code: bool,
@@ -186,6 +190,8 @@ impl Default for DiffTreeOptions {
             src_prefix: "a/".to_string(),
             dst_prefix: "b/".to_string(),
             check: false,
+            pickaxe: None,
+            pickaxe_all: false,
             exit_code: false,
             ws_ignore: sley_diff_merge::WsIgnore::default(),
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
@@ -312,6 +318,24 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
                     ..DiffTreeOutput::default()
                 };
             }
+            "-S" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(commands::diff_options::diff_pickaxe_requires_non_empty_error)?;
+                if value.is_empty() {
+                    return Err(commands::diff_options::diff_pickaxe_requires_non_empty_error());
+                }
+                options.pickaxe = Some(value.clone());
+            }
+            value if value.starts_with("-S") => {
+                let value = &value[2..];
+                if value.is_empty() {
+                    return Err(commands::diff_options::diff_pickaxe_requires_non_empty_error());
+                }
+                options.pickaxe = Some(value.to_string());
+            }
+            "--pickaxe-all" => options.pickaxe_all = true,
             "-a" | "--text" | "--no-ext-diff" | "--no-textconv" => {}
             // Rename / copy detection. diff-tree leaves these off unless asked.
             "-M" | "--find-renames" => options.detect_renames = true,
@@ -1077,6 +1101,18 @@ fn run_diff_request(
         Some(pathspec) => apply_diff_pathspec(entries, pathspec),
         None => entries,
     };
+    let entries = if let Some(needle) = context.options.pickaxe.as_deref() {
+        commands::diff::apply_diff_pickaxe(
+            entries,
+            needle.as_bytes(),
+            context.options.pickaxe_all,
+            context.db,
+            None,
+            false,
+        )?
+    } else {
+        entries
+    };
     let has_differences = !entries.is_empty();
 
     // `--check`: report whitespace errors in place of the normal diff body.
@@ -1414,7 +1450,7 @@ fn compute_entries(
         }
         sort_entries_by_path(&mut entries);
         if options.reverse {
-            entries = reverse_diff_entries(entries);
+            entries = reverse_top_level_entries(entries);
         }
         Ok(entries)
     }
@@ -1767,8 +1803,9 @@ fn top_level_entries(
 }
 
 /// Compute add/delete/modify entries between two single-level entry maps. A name
-/// present on both sides with a different (mode, oid) is `Modified`; this covers
-/// both blob edits and changed subtrees (reported as `040000` modifications).
+/// present on both sides with a different (mode, oid) is `Modified`, except
+/// file/tree replacements: non-recursive diff-tree reports those as a delete and
+/// an add at the same path rather than as a single typechange.
 fn top_level_changes(
     left: &BTreeMap<Vec<u8>, TopEntry>,
     right: &BTreeMap<Vec<u8>, TopEntry>,
@@ -1780,6 +1817,19 @@ fn top_level_changes(
     for name in names {
         let l = left.get(&name);
         let r = right.get(&name);
+        if let (Some(l), Some(r)) = (l, r)
+            && l != r
+            && ((l.mode == 0o040000) != (r.mode == 0o040000))
+        {
+            if l.mode == 0o040000 {
+                changes.push(top_level_added_entry(name.clone(), r));
+                changes.push(top_level_deleted_entry(name, l));
+            } else {
+                changes.push(top_level_deleted_entry(name.clone(), l));
+                changes.push(top_level_added_entry(name, r));
+            }
+            continue;
+        }
         let status = match (l, r) {
             (None, Some(_)) => sley_diff_merge::NameStatus::Added,
             (Some(_), None) => sley_diff_merge::NameStatus::Deleted,
@@ -1797,6 +1847,30 @@ fn top_level_changes(
         });
     }
     changes
+}
+
+fn top_level_added_entry(path: Vec<u8>, entry: &TopEntry) -> sley_diff_merge::NameStatusEntry {
+    sley_diff_merge::NameStatusEntry {
+        status: sley_diff_merge::NameStatus::Added,
+        path: BString::from(path),
+        old_path: None,
+        old_mode: None,
+        new_mode: Some(entry.mode),
+        old_oid: None,
+        new_oid: Some(entry.oid),
+    }
+}
+
+fn top_level_deleted_entry(path: Vec<u8>, entry: &TopEntry) -> sley_diff_merge::NameStatusEntry {
+    sley_diff_merge::NameStatusEntry {
+        status: sley_diff_merge::NameStatus::Deleted,
+        path: BString::from(path),
+        old_path: None,
+        old_mode: Some(entry.mode),
+        new_mode: None,
+        old_oid: Some(entry.oid),
+        new_oid: None,
+    }
 }
 
 /// Top-level rename/copy detection over an already-computed change list.
@@ -2141,6 +2215,17 @@ fn is_empty_blob_oid(oid: &ObjectId) -> bool {
 /// involve a rename whose old path would sort differently).
 fn sort_entries_by_path(entries: &mut [sley_diff_merge::NameStatusEntry]) {
     entries.sort_by(|a, b| a.path.cmp(&b.path));
+}
+
+fn reverse_top_level_entries(
+    entries: Vec<sley_diff_merge::NameStatusEntry>,
+) -> Vec<sley_diff_merge::NameStatusEntry> {
+    let mut reversed = entries
+        .into_iter()
+        .map(reverse_diff_entry)
+        .collect::<Vec<_>>();
+    reversed.sort_by(|left, right| left.path.cmp(&right.path));
+    reversed
 }
 
 /// Collect the intermediate-tree (`040000`) change entries for `-t`, recursing

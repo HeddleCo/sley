@@ -22,6 +22,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
     let mut pathspecs = Vec::new();
     let mut list = false;
     let mut verbose = false;
+    let mut worktree_attributes = false;
     let mut mtime_option: Option<String> = None;
     let mut compression_level: Option<u32> = None;
     let mut extra_files: Vec<ArchiveExtraFile> = Vec::new();
@@ -41,6 +42,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             "--end-of-options" => positional_only = true,
             "-l" | "--list" => list = true,
             "-v" | "--verbose" => verbose = true,
+            "--worktree-attributes" => worktree_attributes = true,
             "--format" => {
                 format_name = Some(
                     iter.next()
@@ -226,8 +228,9 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
     // `.gitattributes`, matching `git archive`'s `convert_to_working_tree`, plus
     // `export-subst` keyword substitution against the archived commit. The
     // attribute root is the worktree (when non-bare) or the git dir (bare); the
-    // git dir locates `info/attributes`. TODO(convert): `--worktree-attributes`
-    // (read live `.gitattributes`) and the `ident` filter are not wired yet.
+    // git dir locates `info/attributes`. `--worktree-attributes` switches this
+    // to live worktree attributes, or `attr.tree` for bare repositories. The
+    // remaining conversion gap is the lower-level `ident` filter.
     // Format resolution: explicit `--format`, else inferred from the `--output`
     // filename extension, else `tar` (upstream `archive_format_from_filename`).
     let format_name = match format_name {
@@ -253,26 +256,74 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             )));
         }
     };
-    let attr_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?
+    let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?;
+    let attr_root = worktree_root
+        .clone()
         .unwrap_or_else(|| git_dir.to_path_buf());
     let archive_process_filter_metadata =
         archive_process_filter_metadata(&git_dir, format, &treeish, &oid);
-    let mut convert = sley_archive::ArchiveConvert::from_tree(
-        &attr_root, &git_dir, &config, &db, format, &tree_oid,
-    )?;
+    let archive_attr_tree_oid = if worktree_attributes && worktree_root.is_none() {
+        archive_attr_tree_oid(&git_dir, &db, format, &config)?
+    } else {
+        None
+    };
+    let mut convert = if worktree_attributes {
+        if let Some(worktree_root) = &worktree_root {
+            sley_archive::ArchiveConvert::from_worktree(worktree_root, &config)?
+        } else if let Some(attr_tree_oid) = &archive_attr_tree_oid {
+            sley_archive::ArchiveConvert::from_tree(
+                &attr_root,
+                &git_dir,
+                &config,
+                &db,
+                format,
+                attr_tree_oid,
+            )?
+        } else {
+            sley_archive::ArchiveConvert::from_tree(
+                &attr_root, &git_dir, &config, &db, format, &tree_oid,
+            )?
+        }
+    } else {
+        sley_archive::ArchiveConvert::from_tree(
+            &attr_root, &git_dir, &config, &db, format, &tree_oid,
+        )?
+    };
     convert = convert.with_process_filter_metadata(archive_process_filter_metadata);
     // export-subst only runs when archiving a commit (git sets `args->convert`
     // only when a commit is available).
     if let Some(record) = &commit_record {
-        convert = convert.with_subst(move |fmt| format_subst_for_commit(record, fmt));
+        let describe_available = std::cell::Cell::new(true);
+        let git_dir_ref = &git_dir;
+        let db_ref = &db;
+        let record_ref = record;
+        convert = convert.with_subst(move |fmt| {
+            archive_format_subst_for_commit(
+                git_dir_ref,
+                db_ref,
+                format,
+                record_ref,
+                &describe_available,
+                fmt,
+            )
+        });
     }
     // Text/binary classification for the zip backend, driven by the tree's
     // `diff` userdiff attribute (the same `entry_is_binary` upstream uses). Read
     // attributes from the archived *tree* (not the worktree). The
     // `UserdiffResolver` resolves `diff=<name>` ⇒ `diff.<name>.binary` config and
     // builtin driver flags.
-    let diff_attributes =
-        sley_worktree::TreeAttributes::from_tree(&attr_root, &git_dir, &db, format, &tree_oid)?;
+    let diff_attributes = archive_diff_attributes(
+        &attr_root,
+        &git_dir,
+        &db,
+        format,
+        &tree_oid,
+        worktree_attributes
+            .then_some(worktree_root.as_deref())
+            .flatten(),
+        archive_attr_tree_oid.as_ref(),
+    )?;
     let userdiff =
         commands::userdiff::UserdiffResolver::with_attributes(None, Some(config.clone()));
     convert = convert
@@ -388,6 +439,49 @@ fn archive_process_filter_metadata(
     }
     metadata.push(("treeish".to_string(), oid.to_hex()));
     metadata
+}
+
+fn archive_attr_tree_oid(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    config: &GitConfig,
+) -> Result<Option<ObjectId>> {
+    let Some(attr_tree) = config.get("attr", None, "tree") else {
+        return Ok(None);
+    };
+    let oid = resolve_revision(git_dir, format, attr_tree)?;
+    Ok(Some(sley_rev::peel_to_tree(db, format, &oid)?))
+}
+
+enum ArchiveDiffAttributes {
+    Tree(sley_worktree::TreeAttributes),
+    Worktree(sley_worktree::StandardAttributeMatcher),
+}
+
+fn archive_diff_attributes(
+    attr_root: &Path,
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    worktree_root: Option<&Path>,
+    attr_tree_oid: Option<&ObjectId>,
+) -> Result<ArchiveDiffAttributes> {
+    if let Some(worktree_root) = worktree_root {
+        return Ok(ArchiveDiffAttributes::Worktree(
+            sley_worktree::StandardAttributeMatcher::from_worktree_root(worktree_root)?,
+        ));
+    }
+    Ok(ArchiveDiffAttributes::Tree(
+        sley_worktree::TreeAttributes::from_tree(
+            attr_root,
+            git_dir,
+            db,
+            format,
+            attr_tree_oid.unwrap_or(tree_oid),
+        )?,
+    ))
 }
 
 /// Run `body` with a writer that is either the `--output` file or stdout.
@@ -683,11 +777,11 @@ fn archive_virtual_extra_file(spec: &str) -> Result<ArchiveExtraFile> {
 /// (`Some(true)` = binary, `Some(false)` = text, `None` = auto-detect via
 /// content). Mirrors `userdiff_find_by_path(...)->binary`.
 fn archive_diff_binary(
-    attributes: &sley_worktree::TreeAttributes,
+    attributes: &ArchiveDiffAttributes,
     userdiff: &commands::userdiff::UserdiffResolver,
     path: &[u8],
 ) -> Option<bool> {
-    match attributes.diff_attribute_for_path(path) {
+    match archive_diff_attribute_for_path(attributes, path) {
         // `diff` set ⇒ driver_true ⇒ text.
         Some(sley_worktree::AttributeState::Set) => Some(false),
         // `-diff` ⇒ driver_false ⇒ binary.
@@ -701,6 +795,118 @@ fn archive_diff_binary(
         // unspecified ⇒ no driver override; auto-detect via content.
         None => None,
     }
+}
+
+fn archive_diff_attribute_for_path(
+    attributes: &ArchiveDiffAttributes,
+    path: &[u8],
+) -> Option<sley_worktree::AttributeState> {
+    match attributes {
+        ArchiveDiffAttributes::Tree(attributes) => attributes.diff_attribute_for_path(path),
+        ArchiveDiffAttributes::Worktree(attributes) => attributes
+            .attributes_for_path(path, &[b"diff".to_vec()], false)
+            .into_iter()
+            .next()
+            .and_then(|check| check.state),
+    }
+}
+
+fn archive_format_subst_for_commit(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    record: &sley_rev::CommitRecord,
+    describe_available: &std::cell::Cell<bool>,
+    fmt: &[u8],
+) -> Result<Vec<u8>> {
+    let describe = LogDescribeContext {
+        git_dir,
+        db,
+        format,
+    };
+    let Some(first) = archive_find_describe_atom(fmt, 0) else {
+        return archive_render_commit_format(record, fmt, None);
+    };
+    let mut out = Vec::with_capacity(fmt.len());
+    let mut cursor = 0;
+    let mut next = Some(first);
+    while let Some((start, end)) = next {
+        out.extend(archive_render_commit_format(
+            record,
+            &fmt[cursor..start],
+            None,
+        )?);
+        if describe_available.replace(false) {
+            out.extend(archive_render_commit_format(
+                record,
+                &fmt[start..end],
+                Some(&describe),
+            )?);
+        } else {
+            out.extend_from_slice(&fmt[start..end]);
+        }
+        cursor = end;
+        next = archive_find_describe_atom(fmt, cursor);
+    }
+    out.extend(archive_render_commit_format(record, &fmt[cursor..], None)?);
+    Ok(out)
+}
+
+fn archive_render_commit_format(
+    record: &sley_rev::CommitRecord,
+    fmt: &[u8],
+    describe: Option<&LogDescribeContext<'_>>,
+) -> Result<Vec<u8>> {
+    let fmt = String::from_utf8_lossy(fmt);
+    let compiled = CompiledLogFormat::compile(&fmt, LogFormatDialect::Log)?;
+    let decorations = std::collections::HashMap::new();
+    let date_mode = DateMode::Default;
+    let mailmap = commands::utility::Mailmap::default();
+    let context = LogFormatContext {
+        abbrev_len: Some(7),
+        decorations: &decorations,
+        marker: '>',
+        dialect: LogFormatDialect::Log,
+        source: None,
+        date_mode: &date_mode,
+        source_oid: None,
+        describe,
+        signature: None,
+        color: false,
+        output_encoding: "UTF-8",
+        mailmap: &mailmap,
+        use_mailmap: false,
+    };
+    let mut out = Vec::with_capacity(compiled.estimated_line_capacity());
+    emit_compiled_log_format(
+        record,
+        &compiled,
+        &context,
+        &mut out,
+        0..compiled.tokens.len(),
+    )?;
+    Ok(out)
+}
+
+fn archive_find_describe_atom(fmt: &[u8], mut offset: usize) -> Option<(usize, usize)> {
+    let marker = b"%(describe";
+    while offset < fmt.len() {
+        let relative = fmt[offset..]
+            .windows(marker.len())
+            .position(|window| window == marker)?;
+        let start = offset + relative;
+        let after_marker = start + marker.len();
+        match fmt.get(after_marker).copied() {
+            Some(b')') => return Some((start, after_marker + 1)),
+            Some(b':') => {
+                let rest = &fmt[after_marker + 1..];
+                let close = rest.iter().position(|byte| *byte == b')')?;
+                return Some((start, after_marker + 1 + close + 1));
+            }
+            _ => offset = after_marker,
+        }
+    }
+    None
 }
 
 fn handle_archive_result(result: Result<()>) -> Result<()> {
@@ -736,11 +942,19 @@ fn archive_pathspecs_for_current_prefix(
         ]);
     }
     let current_components = archive_path_components(current_prefix);
-    pathspecs
+    let mut have_include = false;
+    let mut normalized = pathspecs
         .into_iter()
         .map(|pathspec| {
             if pathspec.starts_with(b":") {
-                return Ok(pathspec);
+                let normalized = archive_normalize_magic_pathspec(current_prefix, &pathspec)?;
+                let element =
+                    sley_pathspec::PathspecElement::parse(&normalized, effective_pathspec_flags())
+                        .map_err(|err| {
+                            GitError::InvalidPath(format!("invalid archive pathspec: {err}"))
+                        })?;
+                have_include |= !element.is_exclude();
+                return Ok(normalized);
             }
             let mut components = current_components.clone();
             for component in pathspec.split(|byte| *byte == b'/') {
@@ -761,9 +975,56 @@ fn archive_pathspecs_for_current_prefix(
                     "pathspec is outside the current directory".into(),
                 ));
             }
+            have_include = true;
             Ok(components.join(&b'/'))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    if !have_include && normalized.iter().all(|pathspec| pathspec.starts_with(b":")) {
+        normalized.insert(
+            0,
+            current_prefix
+                .strip_suffix(b"/")
+                .unwrap_or(current_prefix)
+                .to_vec(),
+        );
+    }
+    Ok(normalized)
+}
+
+fn archive_normalize_magic_pathspec(current_prefix: &[u8], pathspec: &[u8]) -> Result<Vec<u8>> {
+    let raw = String::from_utf8_lossy(pathspec);
+    let (magic, pattern, top) = split_archive_pathspec_magic_prefix(&raw);
+    let base = if top { b"".as_slice() } else { current_prefix };
+    let normalized = sley_pathspec::normalize_ls_files_pathspec(base, pattern)?;
+    let mut out = magic.as_bytes().to_vec();
+    out.extend_from_slice(&normalized);
+    Ok(out)
+}
+
+fn split_archive_pathspec_magic_prefix(raw: &str) -> (&str, &str, bool) {
+    if let Some(after_open) = raw.strip_prefix(":(")
+        && let Some(close) = after_open.find(')')
+    {
+        let magic_end = 2 + close + 1;
+        let magic = &raw[..magic_end];
+        let body = &after_open[..close];
+        let top = body.split(',').any(|word| word == "top");
+        return (magic, &raw[magic_end..], top);
+    }
+    let bytes = raw.as_bytes();
+    let mut idx = 1;
+    let mut top = false;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'!' | b'^' => idx += 1,
+            b'/' => {
+                top = true;
+                idx += 1;
+            }
+            _ => break,
+        }
+    }
+    (&raw[..idx], &raw[idx..], top)
 }
 
 fn archive_path_components(path: &[u8]) -> Vec<Vec<u8>> {
@@ -1453,6 +1714,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         let mut interactive = false;
         let mut patch = false;
         let mut dry_run = false;
+        let mut pathspec_from_file = false;
         let mut spec: Vec<String> = Vec::new();
         // Explicit `-U<n>` / `--inter-hunk-context=<n>` from add's own argv. `None`
         // means "fall back to diff.context / diff.interHunkContext config".
@@ -1474,6 +1736,13 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                 "--no-dry-run" => dry_run = false,
                 "-i" | "--interactive" => interactive = true,
                 "-p" | "--patch" => patch = true,
+                "--pathspec-from-file" => {
+                    pathspec_from_file = true;
+                    iter.next();
+                }
+                value if value.starts_with("--pathspec-from-file=") => {
+                    pathspec_from_file = true;
+                }
                 "--auto-advance" => auto_advance = Some(true),
                 "--no-auto-advance" => auto_advance = Some(false),
                 "-U" | "--unified" => {
@@ -1534,6 +1803,12 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             );
             return Err(GitError::Exit(128));
         }
+        if (patch || interactive) && pathspec_from_file {
+            eprintln!(
+                "fatal: options '--pathspec-from-file' and '--interactive/--patch' cannot be used together"
+            );
+            return Err(GitError::Exit(128));
+        }
         if patch {
             return super::add_interactive::cmd_add_patch(
                 &spec,
@@ -1561,6 +1836,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let mut chmod = None;
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
+    let mut edit_option = false;
     let mut parsing_options = true;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -1617,7 +1893,23 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             "--no-sparse" => sparse = false,
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
+            "--edit" | "-e" => {
+                if pathspec_from_file.is_some() {
+                    eprintln!(
+                        "fatal: options '--pathspec-from-file' and '--edit' cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                edit_option = true;
+                paths.push(PathBuf::from(arg));
+            }
             "--pathspec-from-file" => {
+                if edit_option {
+                    eprintln!(
+                        "fatal: options '--pathspec-from-file' and '--edit' cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
                 if !paths.is_empty() {
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
@@ -1631,6 +1923,12 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             }
             "--no-pathspec-from-file" => {}
             value if value.starts_with("--pathspec-from-file=") => {
+                if edit_option {
+                    eprintln!(
+                        "fatal: options '--pathspec-from-file' and '--edit' cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
                 if !paths.is_empty() {
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
@@ -2413,6 +2711,123 @@ struct AddRegularResolution {
     ignored_paths: Vec<Vec<u8>>,
 }
 
+struct AddCompiledPathspec {
+    display: String,
+    element: sley_pathspec::PathspecElement,
+    matched: bool,
+}
+
+struct AddCompiledPathspecs {
+    specs: Vec<AddCompiledPathspec>,
+    have_include: bool,
+    last_matched_includes: Vec<usize>,
+}
+
+impl AddCompiledPathspecs {
+    fn parse(cwd: &Path, worktree_root: &Path, paths: &[PathBuf]) -> Result<Self> {
+        let root = fs::canonicalize(worktree_root)?;
+        let cwd_prefix = fs::canonicalize(cwd)
+            .ok()
+            .and_then(|cwd| cwd.strip_prefix(&root).ok().map(Path::to_path_buf))
+            .map(|relative| relative.to_string_lossy().replace('\\', "/").into_bytes())
+            .unwrap_or_default();
+        let mut specs = Vec::with_capacity(paths.len());
+        let mut have_include = false;
+        for path in paths {
+            let arg = add_pathspec_arg_for_matcher(worktree_root, path)?;
+            let element = sley_pathspec::parse_normalized_pathspec_element(
+                &cwd_prefix,
+                &arg,
+                effective_pathspec_flags(),
+            )?;
+            have_include |= !element.is_exclude();
+            specs.push(AddCompiledPathspec {
+                display: path.to_string_lossy().into_owned(),
+                element,
+                matched: false,
+            });
+        }
+        Ok(Self {
+            specs,
+            have_include,
+            last_matched_includes: Vec::new(),
+        })
+    }
+
+    fn have_include(&self) -> bool {
+        self.have_include
+    }
+
+    fn mark_matched(&mut self, idx: usize) {
+        if let Some(spec) = self.specs.get_mut(idx) {
+            spec.matched = true;
+        }
+    }
+
+    fn matched_include_indexes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.last_matched_includes.iter().copied()
+    }
+
+    fn matches(&mut self, path: &[u8]) -> bool {
+        if self.specs.is_empty() {
+            return true;
+        }
+        self.last_matched_includes.clear();
+        let mut included = false;
+        let mut excluded = false;
+        for (idx, spec) in self.specs.iter_mut().enumerate() {
+            if spec.element.matches_path(path) {
+                spec.matched = true;
+                if spec.element.is_exclude() {
+                    excluded = true;
+                } else {
+                    included = true;
+                    self.last_matched_includes.push(idx);
+                }
+            }
+        }
+        !excluded && (!self.have_include || included)
+    }
+
+    fn unmatched_includes(&self) -> impl Iterator<Item = &AddCompiledPathspec> {
+        self.specs
+            .iter()
+            .filter(|spec| !spec.element.is_exclude() && !spec.matched)
+    }
+}
+
+fn add_pathspec_arg_for_matcher(worktree_root: &Path, path: &Path) -> Result<String> {
+    if !path.is_absolute() {
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    let absolute = normalize_add_pathspec_absolute_path_lexically(path);
+    let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+        GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+    })?;
+    let git_path = add_git_path_bytes(relative)?;
+    if git_path.is_empty() {
+        Ok(":/".to_string())
+    } else {
+        Ok(format!(":/{}", String::from_utf8_lossy(&git_path)))
+    }
+}
+
+fn normalize_add_pathspec_absolute_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(_)
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 struct ExactTrackedAdd {
     git_path: Vec<u8>,
     needs_index_update: bool,
@@ -2447,6 +2862,7 @@ fn resolve_add_regular_actions(
             ignored_paths: Vec::new(),
         });
     }
+    let mut compiled_pathspecs = AddCompiledPathspecs::parse(cwd, worktree_root, &paths)?;
     let pathspecs = paths
         .into_iter()
         .map(|path| {
@@ -2459,6 +2875,11 @@ fn resolve_add_regular_actions(
         .iter()
         .map(|(_, _, matched)| *matched)
         .collect::<Vec<_>>();
+    for (idx, matched) in matched.iter().copied().enumerate() {
+        if matched {
+            compiled_pathspecs.mark_matched(idx);
+        }
+    }
     let mut actions = Vec::new();
     let mut seen = BTreeSet::new();
     let mut ignored_paths = BTreeSet::new();
@@ -2473,6 +2894,7 @@ fn resolve_add_regular_actions(
             &indexed_paths,
         )? {
             matched[idx] = true;
+            compiled_pathspecs.mark_matched(idx);
             ignored_paths.insert(ignored_path);
         }
     }
@@ -2488,11 +2910,21 @@ fn resolve_add_regular_actions(
             std::str::from_utf8(entry.path)
                 .map_err(|err| GitError::InvalidPath(err.to_string()))?,
         );
-        let mut path_matches = false;
-        for (idx, (_, pathspec, _)) in pathspecs.iter().enumerate() {
-            if add_path_matches(&path, pathspec) {
-                matched[idx] = true;
-                path_matches = true;
+        let path_matches = compiled_pathspecs.matches(entry.path);
+        if path_matches {
+            for (idx, (_, pathspec, _)) in pathspecs.iter().enumerate() {
+                if add_path_matches(&path, pathspec) {
+                    matched[idx] = true;
+                }
+            }
+            if !compiled_pathspecs.have_include() {
+                for matched in &mut matched {
+                    *matched = true;
+                }
+            } else {
+                for idx in compiled_pathspecs.matched_include_indexes() {
+                    matched[idx] = true;
+                }
             }
         }
         if !path_matches {
@@ -2522,6 +2954,7 @@ fn resolve_add_regular_actions(
                     continue;
                 }
                 matched[idx] = true;
+                compiled_pathspecs.mark_matched(idx);
                 if seen.insert(path.clone()) {
                     actions.push(AddAction::Add(path));
                 }
@@ -2537,16 +2970,14 @@ fn resolve_add_regular_actions(
                 ignored_missing_add_pathspec(worktree_root, display, pathspec)?
             {
                 matched[idx] = true;
+                compiled_pathspecs.mark_matched(idx);
                 ignored_paths.insert(ignored_path);
             }
         }
     }
-    for ((display, _, _), matched) in pathspecs.iter().zip(matched) {
-        if !matched && !options.ignore_missing {
-            eprintln!(
-                "fatal: pathspec '{}' did not match any files",
-                display.to_string_lossy()
-            );
+    for spec in compiled_pathspecs.unmatched_includes() {
+        if !options.ignore_missing {
+            eprintln!("fatal: pathspec '{}' did not match any files", spec.display);
             return Err(GitError::Exit(128));
         }
     }
@@ -3735,6 +4166,9 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                     other => other,
                 })?,
         );
+    }
+    if !recount && patches.iter().any(apply_patch_is_noop) {
+        return Err(GitError::Exit(1));
     }
     // `-R`/`--reverse`: undo the patch by reversing each file patch before any
     // whitespace handling or application (git reverses the parsed patches up
@@ -5089,6 +5523,26 @@ fn apply_check_to_create(
 /// the working tree gains only an (empty) directory.
 fn apply_patch_is_gitlink(patch: &sley_diff_merge::FilePatch) -> bool {
     patch.old_mode == Some(0o160000) || patch.new_mode == Some(0o160000)
+}
+
+fn apply_patch_is_noop(patch: &sley_diff_merge::FilePatch) -> bool {
+    if patch.is_new
+        || patch.is_delete
+        || patch.is_rename
+        || patch.is_copy
+        || patch.is_binary
+        || patch.old_mode != patch.new_mode
+    {
+        return false;
+    }
+    !patch.hunks.iter().any(|hunk| {
+        hunk.lines.iter().any(|line| {
+            matches!(
+                line,
+                sley_diff_merge::HunkLine::Insert(_) | sley_diff_merge::HunkLine::Delete(_)
+            )
+        })
+    })
 }
 
 /// Reconstruct a gitlink patch's preimage (`Subproject commit <old>\n`) from its
@@ -7892,6 +8346,10 @@ fn mv_git_path_bytes(path: &Path) -> Result<Vec<u8>> {
         .collect::<Vec<_>>()
         .join("/")
         .into_bytes())
+}
+
+fn normalize_absolute_path_lexically(path: &Path) -> PathBuf {
+    normalize_mv_absolute_path_lexically(path)
 }
 
 fn normalize_mv_absolute_path_lexically(path: &Path) -> PathBuf {

@@ -205,14 +205,20 @@ where
 
     fn parse(&mut self, args: &[String]) -> Result<()> {
         let mut positional_only = false;
+        let mut end_of_options = false;
         let mut iter = args.iter().peekable();
         while let Some(arg) = iter.next() {
             if positional_only {
                 self.setup.pathspecs.push(arg.clone());
                 continue;
             }
+            if end_of_options {
+                self.add_positional(arg)?;
+                continue;
+            }
             match arg.as_str() {
                 "--" => positional_only = true,
+                "--end-of-options" => end_of_options = true,
                 "--not" => self.not = !self.not,
                 "--default" => {
                     self.default_revision = Some(
@@ -339,7 +345,10 @@ where
                 }
                 value
                     if value.starts_with('-')
-                        && value[1..].bytes().all(|byte| byte.is_ascii_digit()) =>
+                        && value
+                            .as_bytes()
+                            .get(1)
+                            .is_some_and(|byte| byte.is_ascii_digit()) =>
                 {
                     self.setup.options.max_count = Some(parse_max_count(&value[1..])?);
                 }
@@ -858,15 +867,17 @@ fn path_exists<R>(ctx: &RevisionSetupContext<'_, R>, value: &str) -> bool {
 }
 
 fn parse_max_count(value: &str) -> Result<usize> {
-    value
-        .parse::<usize>()
-        .map_err(|_| GitError::Command(format!("invalid max-count {value}")))
+    match value.parse::<isize>() {
+        Ok(value) if value < 0 => Ok(usize::MAX),
+        Ok(value) => Ok(value as usize),
+        Err(_) => Err(GitError::Command(format!("{value} is not an integer"))),
+    }
 }
 
 fn parse_skip(value: &str) -> Result<usize> {
     value
         .parse::<usize>()
-        .map_err(|_| GitError::Command(format!("invalid skip count {value}")))
+        .map_err(|_| GitError::Command(format!("{value} is not an integer")))
 }
 
 fn parse_timestamp(value: &str) -> Result<i64> {

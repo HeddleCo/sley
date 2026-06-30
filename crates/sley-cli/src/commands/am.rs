@@ -1527,36 +1527,88 @@ fn clean_subject(value: &str, cleanup: SubjectCleanup) -> String {
             _ => break,
         }
     }
-    String::from_utf8_lossy(&bytes).trim().to_string()
+    let cleaned = cleanup_space_bytes(&bytes);
+    String::from_utf8_lossy(&cleaned).trim().to_string()
 }
 
-/// Best-effort decode of a single RFC 2047 encoded-word for UTF-8/Q or B
-/// encodings. Anything we cannot decode is returned unchanged.
+fn cleanup_space_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx].is_ascii_whitespace() {
+            out.push(b' ');
+            idx += 1;
+            while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+        } else {
+            out.push(bytes[idx]);
+            idx += 1;
+        }
+    }
+    out
+}
+
+/// Best-effort decode of RFC 2047 encoded-words for UTF-8/Q or B encodings.
+/// Adjacent encoded words separated only by folded whitespace are concatenated,
+/// which is what `format-patch -k` uses for multiline subjects.
 fn decode_mime_word(value: &str) -> String {
-    let trimmed = value.trim();
-    let Some(rest) = trimmed.strip_prefix("=?") else {
-        return value.to_string();
-    };
-    let Some(end) = rest.rfind("?=") else {
-        return value.to_string();
-    };
-    let inner = &rest[..end];
-    let parts: Vec<&str> = inner.splitn(3, '?').collect();
-    if parts.len() != 3 {
-        return value.to_string();
+    let mut out = String::with_capacity(value.len());
+    let mut idx = 0;
+    let mut previous_encoded = false;
+    while idx < value.len() {
+        if let Some((decoded, consumed)) = decode_mime_word_at(&value[idx..]) {
+            out.push_str(&decoded);
+            idx += consumed;
+            previous_encoded = true;
+            continue;
+        }
+
+        let byte = value.as_bytes()[idx];
+        if previous_encoded && byte.is_ascii_whitespace() {
+            let whitespace_start = idx;
+            while idx < value.len() && value.as_bytes()[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+            if decode_mime_word_at(&value[idx..]).is_some() {
+                continue;
+            }
+            out.push_str(&value[whitespace_start..idx]);
+            previous_encoded = false;
+            continue;
+        }
+
+        let ch = value[idx..].chars().next().unwrap();
+        out.push(ch);
+        idx += ch.len_utf8();
+        previous_encoded = false;
     }
-    let charset = parts[0].to_ascii_lowercase();
+    out
+}
+
+fn decode_mime_word_at(value: &str) -> Option<(String, usize)> {
+    let rest = value.strip_prefix("=?")?;
+    let charset_end = rest.find('?')?;
+    let charset = rest[..charset_end].to_ascii_lowercase();
     if charset != "utf-8" && charset != "us-ascii" {
-        return value.to_string();
+        return None;
     }
-    let decoded = match parts[1].to_ascii_uppercase().as_str() {
-        "Q" => decode_quoted_printable_word(parts[2]),
-        "B" => decode_base64(parts[2]),
-        _ => return value.to_string(),
+    let after_charset = &rest[charset_end + 1..];
+    let encoding_end = after_charset.find('?')?;
+    let encoding = &after_charset[..encoding_end];
+    let payload = &after_charset[encoding_end + 1..];
+    let end = payload.find("?=")?;
+    let encoded = &payload[..end];
+    let consumed = 2 + charset_end + 1 + encoding_end + 1 + end + 2;
+
+    let decoded = match encoding.to_ascii_uppercase().as_str() {
+        "Q" => decode_quoted_printable_word(encoded),
+        "B" => decode_base64(encoded),
+        _ => return None,
     };
     match decoded {
-        Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        None => value.to_string(),
+        Some(bytes) => Some((String::from_utf8_lossy(&bytes).into_owned(), consumed)),
+        None => None,
     }
 }
 
@@ -1900,20 +1952,54 @@ fn encode_patch_file(patch: &AmPatch) -> Vec<u8> {
     // had mailinfo cleanup applied once at parse time, so `read_patch_file`
     // re-parses with `keep_subject` to keep it byte-identical across the
     // store/resume round-trip.
-    out.extend_from_slice(b"Subject: ");
-    out.extend_from_slice(patch.subject.as_bytes());
-    out.extend_from_slice(b"\n\n");
-    // Body (message minus the subject's first line).
-    let body = commit_message_body_after_subject(&patch.message);
+    write_stored_subject_header(&mut out, &patch.subject);
+    out.push(b'\n');
+    // Body (message minus the full stored subject).
+    let body = commit_message_body_after_subject(&patch.message, &patch.subject);
     out.extend_from_slice(&body);
     out.extend_from_slice(b"---\n\n");
     out.extend_from_slice(&patch.diff);
     out
 }
 
+fn write_stored_subject_header(out: &mut Vec<u8>, subject: &str) {
+    out.extend_from_slice(b"Subject: ");
+    if subject.bytes().any(stored_subject_needs_rfc2047) {
+        out.extend_from_slice(b"=?UTF-8?Q?");
+        for byte in subject.bytes() {
+            if stored_subject_q_safe(byte) {
+                out.push(byte);
+            } else {
+                out.extend_from_slice(format!("={byte:02X}").as_bytes());
+            }
+        }
+        out.extend_from_slice(b"?=");
+    } else {
+        out.extend_from_slice(subject.as_bytes());
+    }
+    out.push(b'\n');
+}
+
+fn stored_subject_needs_rfc2047(byte: u8) -> bool {
+    byte == b'\n' || byte == b'\r' || byte >= 0x80 || byte == b'='
+}
+
+fn stored_subject_q_safe(byte: u8) -> bool {
+    byte.is_ascii_graphic() && byte != b'=' && byte != b'?' && byte != b'_' && byte < 0x80
+}
+
 /// Return the commit body (everything after the subject line and its trailing
 /// blank line). Empty when the message is subject-only.
-fn commit_message_body_after_subject(message: &[u8]) -> Vec<u8> {
+fn commit_message_body_after_subject(message: &[u8], subject: &str) -> Vec<u8> {
+    let subject = subject.as_bytes();
+    if message.starts_with(subject) && message.get(subject.len()) == Some(&b'\n') {
+        let mut start = subject.len() + 1;
+        if message.get(start) == Some(&b'\n') {
+            start += 1;
+        }
+        return message[start..].to_vec();
+    }
+
     let Some(first_lf) = message.iter().position(|byte| *byte == b'\n') else {
         return Vec::new();
     };
@@ -4353,6 +4439,7 @@ fn am_clean_index(
             sley_worktree::CheckoutIndexPathOptions {
                 force: true,
                 merge: false,
+                overlay: true,
                 stage: None,
                 conflict_style: sley_worktree::CheckoutConflictStyle::Merge,
                 smudge_config: Some(&config),

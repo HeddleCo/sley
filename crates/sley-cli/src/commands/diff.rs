@@ -341,6 +341,13 @@ pub(crate) struct WhitespaceRuleResolver {
     matcher: Option<sley_worktree::StandardAttributeMatcher>,
 }
 
+const DEFAULT_CONFLICT_MARKER_SIZE: usize = 7;
+
+struct DiffCheckRules {
+    whitespace: sley_diff_merge::ws::WsRule,
+    conflict_marker_size: usize,
+}
+
 impl WhitespaceRuleResolver {
     /// Build a resolver from a git dir: reads `core.whitespace` and opens the
     /// worktree attribute matcher (best-effort — a bare repo has no worktree).
@@ -396,12 +403,56 @@ impl WhitespaceRuleResolver {
         };
         resolve_whitespace_rule(self.config_rule, attr).ok_or_else(whitespace_conflict_error)
     }
+
+    fn check_rules_for_path(&self, path: &[u8]) -> Result<DiffCheckRules> {
+        use sley_diff_merge::ws::{WsAttr, resolve_whitespace_rule};
+        let Some(matcher) = &self.matcher else {
+            return Ok(DiffCheckRules {
+                whitespace: self.config_rule,
+                conflict_marker_size: DEFAULT_CONFLICT_MARKER_SIZE,
+            });
+        };
+        let requested = vec![b"whitespace".to_vec(), b"conflict-marker-size".to_vec()];
+        let checks = matcher.attributes_for_path(path, &requested, false);
+        let mut value_storage = String::new();
+        let whitespace_attr = match checks.first().and_then(|check| check.state.as_ref()) {
+            Some(sley_worktree::AttributeState::Set) => WsAttr::True,
+            Some(sley_worktree::AttributeState::Unset) => WsAttr::False,
+            Some(sley_worktree::AttributeState::Value(value)) => {
+                value_storage = String::from_utf8_lossy(value).into_owned();
+                WsAttr::Value(&value_storage)
+            }
+            None => WsAttr::Unset,
+        };
+        let whitespace = resolve_whitespace_rule(self.config_rule, whitespace_attr)
+            .ok_or_else(whitespace_conflict_error)?;
+        let conflict_marker_size =
+            conflict_marker_size_from_attr(checks.get(1).and_then(|check| check.state.as_ref()));
+        Ok(DiffCheckRules {
+            whitespace,
+            conflict_marker_size,
+        })
+    }
 }
 
 /// git's fatal error for an unenforceable whitespace rule pair.
 fn whitespace_conflict_error() -> GitError {
     eprintln!("fatal: cannot enforce both tab-in-indent and indent-with-non-tab");
     GitError::Exit(128)
+}
+
+fn conflict_marker_size_from_attr(state: Option<&sley_worktree::AttributeState>) -> usize {
+    let Some(sley_worktree::AttributeState::Value(value)) = state else {
+        return DEFAULT_CONFLICT_MARKER_SIZE;
+    };
+    let raw = String::from_utf8_lossy(value);
+    match raw.parse::<isize>() {
+        Ok(size) if size > 0 => size as usize,
+        _ => {
+            eprintln!("warning: invalid marker-size '{raw}', expecting an integer");
+            DEFAULT_CONFLICT_MARKER_SIZE
+        }
+    }
 }
 
 /// Run `git diff --check` over the computed diff entries. For each entry it
@@ -438,11 +489,19 @@ pub(crate) fn run_diff_check(
         // WS_INCOMPLETE_LINE for symlinks). We don't track symlink mode here in
         // a way that distinguishes, so leave the rule intact — the t-suite does
         // exercise a symlink incomplete-line case in t4015.
-        let mut rule = resolver.rule_for_path(&entry.path)?;
+        let rules = resolver.check_rules_for_path(&entry.path)?;
+        let mut rule = rules.whitespace;
         if entry.new_mode == Some(0o120000) {
             rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
         }
-        if check_one_diff(&mut stdout, &old_content, &new_content, &path, rule)? {
+        if check_one_diff(
+            &mut stdout,
+            &old_content,
+            &new_content,
+            &path,
+            rule,
+            rules.conflict_marker_size,
+        )? {
             status = true;
         }
     }
@@ -503,6 +562,7 @@ fn check_one_diff(
     new_content: &[u8],
     path: &str,
     rule: sley_diff_merge::ws::WsRule,
+    conflict_marker_size: usize,
 ) -> Result<bool> {
     use sley_diff_merge::ws;
     let old = sley_diff_merge::split_lines(old_content);
@@ -532,6 +592,10 @@ fn check_one_diff(
                     new_idx += 1;
                     last_kind = b'+';
                     // git strips the `+` prefix; our `line` is already prefix-free.
+                    if is_conflict_marker(line, conflict_marker_size) {
+                        status = true;
+                        writeln!(out, "{path}:{new_lineno}: leftover conflict marker")?;
+                    }
                     let bad = ws::ws_check(line, rule);
                     if bad != 0 {
                         status = true;
@@ -564,6 +628,20 @@ fn check_one_diff(
         }
     }
     Ok(status)
+}
+
+fn is_conflict_marker(line: &[u8], marker_size: usize) -> bool {
+    if line.len() < marker_size + 1 {
+        return false;
+    }
+    let first = line[0];
+    if !matches!(first, b'=' | b'>' | b'<' | b'|') {
+        return false;
+    }
+    if !line[..marker_size].iter().all(|byte| *byte == first) {
+        return false;
+    }
+    line[marker_size].is_ascii_whitespace()
 }
 
 #[derive(Clone)]
@@ -2340,7 +2418,7 @@ fn parse_ws_error_highlight_kinds(value: Option<&str>) -> Option<WsErrorHighligh
     (kinds.old || kinds.new || kinds.context || kinds.plain).then_some(kinds)
 }
 
-fn apply_diff_pickaxe(
+pub(crate) fn apply_diff_pickaxe(
     entries: Vec<sley_diff_merge::NameStatusEntry>,
     needle: &[u8],
     pickaxe_all: bool,
@@ -2695,6 +2773,7 @@ struct NoIndexSide {
     path: Vec<u8>,
     content: Vec<u8>,
     mode: u32,
+    oid: Option<ObjectId>,
 }
 
 struct NoIndexEntry {
@@ -2888,6 +2967,10 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
 }
 
 fn no_index_entries(old_spec: &str, new_spec: &str) -> Result<Vec<NoIndexEntry>> {
+    if old_spec == "-" && new_spec == "-" {
+        let _ = no_index_read_stdin_side()?;
+        return Ok(Vec::new());
+    }
     let old_path = Path::new(old_spec);
     let new_path = Path::new(new_spec);
     let old_is_dir = old_path.is_dir();
@@ -2966,6 +3049,9 @@ fn no_index_collect_dir(
 }
 
 fn no_index_read_file(spec: &str, path: &Path) -> Result<NoIndexSide> {
+    if spec == "-" {
+        return no_index_read_stdin_side();
+    }
     let content = fs::read(path).map_err(|_| no_index_access_error(spec))?;
     let mode = {
         #[cfg(unix)]
@@ -2987,6 +3073,18 @@ fn no_index_read_file(spec: &str, path: &Path) -> Result<NoIndexSide> {
         path: spec.as_bytes().to_vec(),
         content,
         mode,
+        oid: None,
+    })
+}
+
+fn no_index_read_stdin_side() -> Result<NoIndexSide> {
+    let mut content = Vec::new();
+    io::stdin().read_to_end(&mut content)?;
+    Ok(NoIndexSide {
+        path: b"-".to_vec(),
+        content,
+        mode: 0o100644,
+        oid: Some(ObjectId::null(ObjectFormat::Sha1)),
     })
 }
 
@@ -3018,8 +3116,8 @@ fn no_index_entry_from_sides(old: Option<&NoIndexSide>, new: Option<&NoIndexSide
             },
             old_mode: old.map(|side| side.mode),
             new_mode: new.map(|side| side.mode),
-            old_oid: None,
-            new_oid: None,
+            old_oid: old.and_then(|side| side.oid),
+            new_oid: new.and_then(|side| side.oid),
         },
         old_content: old.map(|side| side.content.clone()),
         new_content: new.map(|side| side.content.clone()),

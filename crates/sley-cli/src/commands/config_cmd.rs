@@ -884,7 +884,14 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     if matches!(source, ConfigSource::Repository(_)) {
         let parameters = crate::injected_config_parameters()?;
         let mut stack = sley_config::ConfigStack { entries };
-        stack.push_parameters(&parameters);
+        if respect_includes_opt == Some(false) {
+            stack.push_parameters(&parameters);
+        } else {
+            let context = config_include_context();
+            stack
+                .push_parameters_with_includes(&parameters, &context)
+                .map_err(|err| report_config_parse_error(err, None))?;
+        }
         entries = stack.entries;
     }
     let entries = entries;
@@ -1231,13 +1238,14 @@ fn load_read_entries(
     respect_includes_opt: Option<bool>,
 ) -> Result<LoadedEntries> {
     let context = config_include_context();
+    let respect_repository_includes = respect_includes_opt.unwrap_or(true);
     let mut stack = sley_config::ConfigStack::new();
     let mut tail_error = None;
     match source {
         ConfigSource::Repository(git_dir) => {
             for (path, scope) in sley_config::default_config_layer_paths() {
                 stack
-                    .push_file(&path, scope, true, &context)
+                    .push_file(&path, scope, respect_repository_includes, &context)
                     .map_err(|err| report_config_parse_error(err, Some(&path)))?;
             }
             // An explicit-but-missing git dir (e.g. `--git-dir=nonexistent`)
@@ -1248,7 +1256,12 @@ fn load_read_entries(
             };
             let local_path = config_display_path(common.join("config"));
             stack
-                .push_file(&local_path, sley_config::ConfigScope::Local, true, &context)
+                .push_file(
+                    &local_path,
+                    sley_config::ConfigScope::Local,
+                    respect_repository_includes,
+                    &context,
+                )
                 .map_err(|err| report_config_parse_error(err, Some(&local_path)))?;
             if worktree_config_extension_enabled(&common) {
                 let worktree_path = config_display_path(git_dir.join("config.worktree"));
@@ -1256,7 +1269,7 @@ fn load_read_entries(
                     .push_file(
                         &worktree_path,
                         sley_config::ConfigScope::Worktree,
-                        true,
+                        respect_repository_includes,
                         &context,
                     )
                     .map_err(|err| report_config_parse_error(err, Some(&worktree_path)))?;
@@ -1661,15 +1674,26 @@ fn config_include_context() -> sley_config::ConfigIncludeContext {
     let Ok(cwd) = env::current_dir() else {
         return sley_config::ConfigIncludeContext::default();
     };
-    match discover_git_dir(&cwd) {
-        Ok(git_dir) => {
-            let git_dir_abs = fs::canonicalize(&git_dir).unwrap_or_else(|_| git_dir.clone());
-            sley_config::ConfigIncludeContext::new(
-                Some(git_dir_abs),
-                repo_current_branch_name(&git_dir),
-            )
-        }
+    let start = logical_cwd_for_include_context(&cwd);
+    match discover_git_dir(&start) {
+        Ok(git_dir) => sley_config::ConfigIncludeContext::new(
+            Some(sley_config::git_dir_for_include_context(&git_dir)),
+            repo_current_branch_name(&git_dir),
+        ),
         Err(_) => sley_config::ConfigIncludeContext::default(),
+    }
+}
+
+fn logical_cwd_for_include_context(cwd: &Path) -> PathBuf {
+    let Some(pwd) = env::var_os("PWD").map(PathBuf::from) else {
+        return cwd.to_path_buf();
+    };
+    if !pwd.is_absolute() {
+        return cwd.to_path_buf();
+    }
+    match (fs::canonicalize(&pwd), fs::canonicalize(cwd)) {
+        (Ok(pwd_real), Ok(cwd_real)) if pwd_real == cwd_real => pwd,
+        _ => cwd.to_path_buf(),
     }
 }
 
@@ -1777,6 +1801,14 @@ fn config_blob_resolve_error<T>(spec: &str) -> Result<T> {
 fn report_config_parse_error(err: GitError, path: Option<&Path>) -> GitError {
     match err {
         GitError::InvalidFormat(message) => {
+            if message == "relative config includes must come from files"
+                || message.starts_with("exceeded maximum include depth")
+                || message
+                    == "remote URLs cannot be configured in file directly or indirectly included by includeIf.hasconfig:remote.*.url"
+            {
+                eprintln!("fatal: {message}");
+                return GitError::Exit(128);
+            }
             if let Some((line, message_path)) = parse_bad_config_line_with_path(&message) {
                 eprintln!("fatal: bad config line {line} in file {message_path}");
                 return GitError::Exit(128);

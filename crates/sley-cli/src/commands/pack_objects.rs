@@ -60,6 +60,11 @@ struct PackObjectsOptions {
     /// reachability walk from the commits of the included (and excluded-open
     /// `!`) packs to rescue objects that live in packs not named on stdin.
     stdin_packs_follow: bool,
+    /// `--exclude-promisor-objects`: with `--stdin-packs`, included promisor
+    /// packs are rejected up front and follow-mode traversal treats objects in
+    /// promisor packs as a missing-object boundary instead of attempting any
+    /// lazy backfill.
+    exclude_promisor_objects: bool,
     path_walk: bool,
     thin: bool,
     write_bitmap_index: bool,
@@ -158,6 +163,12 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
                     eprintln!("fatal: invalid value for 'stdin-packs': '{mode}'");
                     return Err(GitError::Exit(128));
                 }
+            }
+            "--exclude-promisor-objects" if !saw_dashdash => {
+                options.exclude_promisor_objects = true;
+            }
+            "--no-exclude-promisor-objects" if !saw_dashdash => {
+                options.exclude_promisor_objects = false;
             }
             "-q" | "--quiet" if !saw_dashdash => options.progress = Some(false),
             "--no-quiet" if !saw_dashdash => {}
@@ -688,6 +699,8 @@ const STDIN_PACK_EXCLUDE_OPEN: u8 = 1 << 2;
 struct StdinPackFile {
     oids: Vec<ObjectId>,
     mtime: std::time::SystemTime,
+    pack_path: PathBuf,
+    is_promisor: bool,
 }
 
 /// `git pack-objects --stdin-packs`: read pack basenames from standard input
@@ -794,6 +807,8 @@ fn collect_stdin_packs_objects(
                 StdinPackFile {
                     oids: index.entries.into_iter().map(|entry| entry.oid).collect(),
                     mtime,
+                    pack_path: pack_path.clone(),
+                    is_promisor: pack_path.with_extension("promisor").exists(),
                 },
             );
         }
@@ -813,14 +828,54 @@ fn collect_stdin_packs_objects(
         return Err(GitError::Exit(128));
     }
 
-    // 4. Objects in any excluded pack veto inclusion (closed and open both).
-    let mut excluded: HashSet<ObjectId> = HashSet::new();
-    for (key, &kind) in &requested {
-        if kind & (STDIN_PACK_EXCLUDE_CLOSED | STDIN_PACK_EXCLUDE_OPEN) != 0
-            && let Some(pack) = found.get(key)
-        {
-            excluded.extend(pack.oids.iter().copied());
+    if options.exclude_promisor_objects {
+        for key in &order {
+            let Some(pack) = found.get(key) else {
+                continue;
+            };
+            if requested
+                .get(key)
+                .is_some_and(|kind| kind & STDIN_PACK_INCLUDE != 0)
+                && pack.is_promisor
+            {
+                eprintln!(
+                    "fatal: packfile {} is a promisor but --exclude-promisor-objects was given",
+                    pack.pack_path.display()
+                );
+                return Err(GitError::Exit(128));
+            }
         }
+    }
+
+    // 4. Objects in any excluded pack veto inclusion (closed and open both).
+    let mut closed_excluded: HashSet<ObjectId> = HashSet::new();
+    let mut open_excluded: HashSet<ObjectId> = HashSet::new();
+    for (key, &kind) in &requested {
+        if let Some(pack) = found.get(key) {
+            if kind & STDIN_PACK_EXCLUDE_CLOSED != 0 {
+                closed_excluded.extend(pack.oids.iter().copied());
+            }
+            if kind & STDIN_PACK_EXCLUDE_OPEN != 0 {
+                open_excluded.extend(pack.oids.iter().copied());
+            }
+        }
+    }
+    let promisor_excluded = if options.exclude_promisor_objects {
+        collect_promisor_pack_oids(&object_dirs, format)?
+    } else {
+        HashSet::new()
+    };
+    let mut omitted = closed_excluded.clone();
+    omitted.extend(open_excluded.iter().copied());
+    omitted.extend(promisor_excluded.iter().copied());
+
+    // Git only treats closed-excluded packs as traversal boundaries when an
+    // open-excluded pack is also present. Without a `!pack`, follow mode may
+    // walk through `^pack` objects to rescue older objects from unnamed packs.
+    // Promisor objects are always a boundary under `--exclude-promisor-objects`.
+    let mut traversal_stop = promisor_excluded;
+    if !open_excluded.is_empty() {
+        traversal_stop.extend(closed_excluded.iter().copied());
     }
 
     // 5. Walk the included packs in ascending-mtime order (newest objects laid
@@ -838,15 +893,43 @@ fn collect_stdin_packs_objects(
 
     let mut oids: Vec<ObjectId> = Vec::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut object_cache: HashMap<ObjectId, Arc<EncodedObject>> = HashMap::new();
+    let mut follow_starts: Vec<ObjectId> = Vec::new();
     for key in included_keys {
         let Some(pack) = found.get(key) else {
             continue;
         };
         for oid in &pack.oids {
-            if excluded.contains(oid) || !seen.insert(*oid) {
+            if follow
+                && let Some(object) =
+                    read_stdin_pack_object_tolerant(database, oid, &mut object_cache)?
+                && object.object_type == ObjectType::Commit
+            {
+                follow_starts.push(*oid);
+            }
+            if omitted.contains(oid) || !seen.insert(*oid) {
                 continue;
             }
             oids.push(*oid);
+        }
+    }
+
+    if follow {
+        for (key, &kind) in &requested {
+            if kind & STDIN_PACK_EXCLUDE_OPEN == 0 {
+                continue;
+            }
+            let Some(pack) = found.get(key) else {
+                continue;
+            };
+            for oid in &pack.oids {
+                if let Some(object) =
+                    read_stdin_pack_object_tolerant(database, oid, &mut object_cache)?
+                    && object.object_type == ObjectType::Commit
+                {
+                    follow_starts.push(*oid);
+                }
+            }
         }
     }
 
@@ -859,17 +942,47 @@ fn collect_stdin_packs_objects(
         let mut loose: Vec<ObjectId> = loose.into_iter().collect();
         loose.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         for oid in loose {
-            if excluded.contains(&oid) || !seen.insert(oid) {
+            let object = if follow {
+                read_stdin_pack_object_tolerant(database, &oid, &mut object_cache)?
+            } else {
+                None
+            };
+            if follow
+                && let Some(object) = &object
+                && object.object_type == ObjectType::Commit
+            {
+                follow_starts.push(oid);
+            }
+            if omitted.contains(&oid) || !seen.insert(oid) {
                 continue;
             }
             oids.push(oid);
         }
     }
 
+    if follow {
+        let mut state = StdinPackFollowState {
+            oids: &mut oids,
+            seen: &mut seen,
+            expanded: HashSet::new(),
+            omitted: &omitted,
+            stop: &traversal_stop,
+            object_cache: &mut object_cache,
+        };
+        for oid in follow_starts {
+            walk_stdin_pack_follow_object(database, format, oid, &mut state)?;
+        }
+    }
+
     // 7. Materialise the object bodies for the writer.
     let mut objects = Vec::with_capacity(oids.len());
     for oid in &oids {
-        match database.read_object(oid) {
+        match object_cache
+            .get(oid)
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| database.read_object(oid))
+        {
             Ok(object) => objects.push(object),
             Err(GitError::NotFound(_)) => {
                 eprintln!("fatal: unable to read {oid}");
@@ -880,6 +993,105 @@ fn collect_stdin_packs_objects(
     }
 
     Ok((oids, objects))
+}
+
+struct StdinPackFollowState<'a> {
+    oids: &'a mut Vec<ObjectId>,
+    seen: &'a mut HashSet<ObjectId>,
+    expanded: HashSet<ObjectId>,
+    omitted: &'a HashSet<ObjectId>,
+    stop: &'a HashSet<ObjectId>,
+    object_cache: &'a mut HashMap<ObjectId, Arc<EncodedObject>>,
+}
+
+fn read_stdin_pack_object_tolerant(
+    database: &FileObjectDatabase,
+    oid: &ObjectId,
+    cache: &mut HashMap<ObjectId, Arc<EncodedObject>>,
+) -> Result<Option<Arc<EncodedObject>>> {
+    if let Some(object) = cache.get(oid) {
+        return Ok(Some(Arc::clone(object)));
+    }
+    match database.read_object(oid) {
+        Ok(object) => {
+            cache.insert(*oid, Arc::clone(&object));
+            Ok(Some(object))
+        }
+        Err(GitError::NotFound(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn walk_stdin_pack_follow_object(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: ObjectId,
+    state: &mut StdinPackFollowState<'_>,
+) -> Result<()> {
+    if state.stop.contains(&oid) {
+        return Ok(());
+    }
+    let Some(object) = read_stdin_pack_object_tolerant(database, &oid, state.object_cache)? else {
+        return Ok(());
+    };
+    if !state.omitted.contains(&oid) && state.seen.insert(oid) {
+        state.oids.push(oid);
+    }
+    if !state.expanded.insert(oid) {
+        return Ok(());
+    }
+    match object.object_type {
+        ObjectType::Commit => {
+            let commit = Commit::parse_ref(format, &object.body)?;
+            walk_stdin_pack_follow_object(database, format, commit.tree, state)?;
+            for parent in commit.parents {
+                walk_stdin_pack_follow_object(database, format, parent, state)?;
+            }
+        }
+        ObjectType::Tree => {
+            for entry in TreeEntries::new(format, &object.body) {
+                let entry = entry?;
+                if !entry.is_gitlink() {
+                    walk_stdin_pack_follow_object(database, format, entry.oid, state)?;
+                }
+            }
+        }
+        ObjectType::Tag => {
+            let tag = Tag::parse_ref(format, &object.body)?;
+            walk_stdin_pack_follow_object(database, format, tag.object, state)?;
+        }
+        ObjectType::Blob => {}
+    }
+    Ok(())
+}
+
+fn collect_promisor_pack_oids(
+    object_dirs: &[PathBuf],
+    format: ObjectFormat,
+) -> Result<HashSet<ObjectId>> {
+    let mut oids = HashSet::new();
+    for dir in object_dirs {
+        let pack_dir = dir.join("pack");
+        let Ok(entries) = fs::read_dir(&pack_dir) else {
+            continue;
+        };
+        for entry in entries {
+            let idx_path = entry?.path();
+            if idx_path.extension().and_then(|ext| ext.to_str()) != Some("idx")
+                || !idx_path.with_extension("promisor").exists()
+            {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&idx_path) else {
+                continue;
+            };
+            let Ok(index) = PackIndex::parse(&bytes, format) else {
+                continue;
+            };
+            oids.extend(index.entries.into_iter().map(|entry| entry.oid));
+        }
+    }
+    Ok(oids)
 }
 
 /// The final progress totals line and the trace2 data events upstream emits
@@ -953,6 +1165,33 @@ fn collect_traversal_objects(
             // read_revisions_from_stdin: `if (!sb.len) break;`).
             if rev.is_empty() {
                 break;
+            }
+            if let Some(range) = sley_rev::parse_revision_range(rev) {
+                match range {
+                    sley_rev::RevisionRange::Asymmetric { start, end } => {
+                        let start_oid = match resolve_revision(git_dir, format, &start) {
+                            Ok(oid) => oid,
+                            Err(_) => {
+                                eprintln!("fatal: bad revision '{start}'");
+                                return Err(GitError::Exit(128));
+                            }
+                        };
+                        let end_oid = match resolve_revision(git_dir, format, &end) {
+                            Ok(oid) => oid,
+                            Err(_) => {
+                                eprintln!("fatal: bad revision '{end}'");
+                                return Err(GitError::Exit(128));
+                            }
+                        };
+                        haves.push(start_oid);
+                        wants.push(end_oid);
+                    }
+                    sley_rev::RevisionRange::Symmetric { .. } => {
+                        eprintln!("fatal: bad revision '{rev}'");
+                        return Err(GitError::Exit(128));
+                    }
+                }
+                continue;
             }
             let (negative, rev) = match rev.strip_prefix('^') {
                 Some(rest) => (true, rest),
@@ -1287,6 +1526,9 @@ impl FilteredPackTraversal<'_> {
         provided: bool,
         state: &mut FilteredPackTraversalState,
     ) -> Result<()> {
+        if self.excluded.contains(&oid) {
+            return Ok(());
+        }
         let object = match self.database.read_object(&oid) {
             Ok(object) => object,
             Err(GitError::NotFound(_)) => {
@@ -1348,6 +1590,9 @@ impl FilteredPackTraversal<'_> {
         object: Option<Arc<EncodedObject>>,
         state: &mut FilteredPackTraversalState,
     ) -> Result<()> {
+        if self.excluded.contains(&oid) {
+            return Ok(());
+        }
         if state.want_set.contains(&oid) {
             return Ok(());
         }

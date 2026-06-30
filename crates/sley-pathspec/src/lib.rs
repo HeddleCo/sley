@@ -77,8 +77,12 @@ impl PathspecElement {
         let mut top = false;
         let mut attrs: Vec<Vec<u8>> = Vec::new();
         let mut attr_requirements: Vec<PathspecAttrRequirement> = Vec::new();
+        let mut explicit_literal = false;
+        let mut explicit_glob = false;
 
-        let rest = if let Some(after) = arg.strip_prefix(b":(") {
+        let rest = if defaults.literal_pathspecs {
+            arg
+        } else if let Some(after) = arg.strip_prefix(b":(") {
             // Long form: :(magic[,magic...])pattern
             let close = after
                 .iter()
@@ -89,8 +93,16 @@ impl PathspecElement {
                 match word.as_slice() {
                     b"exclude" => exclude = true,
                     b"icase" => icase = true,
-                    b"literal" => literal = true,
-                    b"glob" => glob = true,
+                    b"literal" => {
+                        explicit_literal = true;
+                        literal = true;
+                        glob = false;
+                    }
+                    b"glob" => {
+                        explicit_glob = true;
+                        glob = true;
+                        literal = false;
+                    }
                     b"top" => top = true,
                     other => {
                         if let Some(attr) = other.strip_prefix(b"attr:") {
@@ -126,7 +138,7 @@ impl PathspecElement {
         };
 
         // `:(glob)` and `:(literal)` are mutually exclusive in git.
-        if glob && literal {
+        if (glob && literal) || (explicit_glob && explicit_literal) {
             return Err(PathspecParseError::GlobLiteralConflict);
         }
 
@@ -182,6 +194,7 @@ impl PathspecElement {
             literal: self.literal,
             glob: self.glob,
             icase: self.icase,
+            literal_pathspecs: false,
         }
     }
 
@@ -613,6 +626,9 @@ pub struct PathspecMatchMagic {
     pub literal: bool,
     pub glob: bool,
     pub icase: bool,
+    /// `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS`: the entire pathspec is
+    /// literal, including leading `:(...)` magic syntax.
+    pub literal_pathspecs: bool,
 }
 
 /// git `is_glob_special`: characters that make a pathspec a wildcard.
@@ -1153,6 +1169,17 @@ mod tests {
         // ** spans directories under glob magic.
         let pp = ps(&[":(glob)**/*.rs"]);
         assert!(pp.matches(b"src/lib.rs"));
+    }
+
+    #[test]
+    fn default_wildcard_can_cross_directory_separator() {
+        let p = ps(&["*file3"]);
+        assert!(p.matches(b"file3"));
+        assert!(p.matches(b"subdir/file3"));
+
+        let glob = ps(&[":(glob)*file3"]);
+        assert!(glob.matches(b"file3"));
+        assert!(!glob.matches(b"subdir/file3"));
     }
 
     #[test]

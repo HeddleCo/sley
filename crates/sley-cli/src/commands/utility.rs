@@ -385,8 +385,9 @@ pub(crate) fn cmd_var(args: &[String]) -> Result<()> {
             Ok(())
         }
         [name] => {
-            let value = var_value(name)?;
-            println!("{value}");
+            for value in var_values(name)? {
+                println!("{value}");
+            }
             Ok(())
         }
         _ => var_usage(),
@@ -414,9 +415,15 @@ fn var_list() -> Result<()> {
         "GIT_PAGER",
         "GIT_DEFAULT_BRANCH",
         "GIT_SHELL_PATH",
+        "GIT_ATTR_SYSTEM",
+        "GIT_ATTR_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_GLOBAL",
     ] {
-        if let Ok(value) = var_value(name) {
-            println!("{name}={value}");
+        if let Ok(values) = var_values(name) {
+            for value in values {
+                println!("{name}={value}");
+            }
         }
     }
     Ok(())
@@ -436,15 +443,19 @@ fn var_print_config(config: &GitConfig) -> Result<()> {
     Ok(())
 }
 
-fn var_value(name: &str) -> Result<String> {
+fn var_values(name: &str) -> Result<Vec<String>> {
     match name {
-        "GIT_AUTHOR_IDENT" => var_identity("AUTHOR"),
-        "GIT_COMMITTER_IDENT" => var_identity("COMMITTER"),
-        "GIT_EDITOR" => var_editor(None),
-        "GIT_SEQUENCE_EDITOR" => var_editor(Some("sequence.editor")),
-        "GIT_PAGER" => Ok(var_pager()),
-        "GIT_DEFAULT_BRANCH" => Ok(var_default_branch()),
-        "GIT_SHELL_PATH" => Ok("/bin/sh".into()),
+        "GIT_AUTHOR_IDENT" => Ok(vec![var_identity("AUTHOR")?]),
+        "GIT_COMMITTER_IDENT" => Ok(vec![var_identity("COMMITTER")?]),
+        "GIT_EDITOR" => Ok(vec![var_editor(None)?]),
+        "GIT_SEQUENCE_EDITOR" => Ok(vec![var_editor(Some("sequence.editor"))?]),
+        "GIT_PAGER" => Ok(vec![var_pager()]),
+        "GIT_DEFAULT_BRANCH" => Ok(vec![var_default_branch()]),
+        "GIT_SHELL_PATH" => Ok(vec!["/bin/sh".into()]),
+        "GIT_ATTR_SYSTEM" => var_path_values(var_attr_system_path()),
+        "GIT_ATTR_GLOBAL" => var_path_values(var_attr_global_paths()),
+        "GIT_CONFIG_SYSTEM" => var_path_values(var_config_paths(sley_config::ConfigScope::System)),
+        "GIT_CONFIG_GLOBAL" => var_path_values(var_config_paths(sley_config::ConfigScope::Global)),
         _ => var_usage(),
     }
 }
@@ -515,6 +526,63 @@ fn var_effective_config_value(key: &str) -> Option<String> {
     }
     let (section, key) = key.split_once('.')?;
     identity_effective_config().and_then(|config| config.get(section, None, key).map(str::to_owned))
+}
+
+fn var_path_values(paths: Vec<PathBuf>) -> Result<Vec<String>> {
+    if paths.is_empty() {
+        return Err(GitError::Exit(1));
+    }
+    Ok(paths
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect())
+}
+
+fn var_config_paths(scope: sley_config::ConfigScope) -> Vec<PathBuf> {
+    sley_config::default_config_layer_paths()
+        .into_iter()
+        .filter_map(|(path, layer_scope)| (layer_scope == scope).then_some(path))
+        .collect()
+}
+
+fn var_attr_system_path() -> Vec<PathBuf> {
+    if var_env_bool("GIT_ATTR_NOSYSTEM") {
+        return Vec::new();
+    }
+    let path = env::var_os("GIT_ATTR_SYSTEM")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/gitattributes"));
+    vec![path]
+}
+
+fn var_attr_global_paths() -> Vec<PathBuf> {
+    if let Some(config_home) = env::var_os("XDG_CONFIG_HOME")
+        && !config_home.is_empty()
+    {
+        return vec![PathBuf::from(config_home).join("git").join("attributes")];
+    }
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(|home| {
+            vec![
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("git")
+                    .join("attributes"),
+            ]
+        })
+        .unwrap_or_default()
+}
+
+fn var_env_bool(name: &str) -> bool {
+    match env::var(name) {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "" | "0" | "false" | "no" | "off")
+        }
+        Err(_) => false,
+    }
 }
 
 fn var_usage<T>() -> Result<T> {
@@ -1184,10 +1252,13 @@ pub(crate) fn cmd_stripspace(args: &[String]) -> Result<()> {
         );
         return Err(GitError::Exit(129));
     }
+    let comment = stripspace_comment_string()?;
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
     let output = if comment_lines {
-        stripspace_comment_lines(&input)
+        stripspace_comment_lines(&input, &comment)
+    } else if strip_comments {
+        stripspace_message(&input, Some(&comment))
     } else {
         tag_stripspace_message(&input, strip_comments)
     };
@@ -1195,13 +1266,74 @@ pub(crate) fn cmd_stripspace(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn stripspace_comment_lines(input: &[u8]) -> Vec<u8> {
+fn stripspace_comment_string() -> Result<Vec<u8>> {
+    let mut comment = None;
+    if let Ok(cwd) = env::current_dir()
+        && let Ok(git_dir) = discover_git_dir(cwd)
+        && let Ok(config) = read_repo_config(&git_dir)
+        && let Some(value) = config.get("core", None, "commentchar")
+        && value != "auto"
+    {
+        comment = Some(value.as_bytes().to_vec());
+    }
+    let comment = comment.unwrap_or_else(|| b"#".to_vec());
+    if comment.is_empty() {
+        eprintln!("error: core.commentchar must have at least one character");
+        return Err(GitError::Exit(128));
+    }
+    if comment.iter().any(|byte| matches!(byte, b'\n' | b'\r')) {
+        eprintln!("error: core.commentchar cannot contain newline");
+        return Err(GitError::Exit(128));
+    }
+    Ok(comment)
+}
+
+fn stripspace_message(input: &[u8], comment: Option<&[u8]>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pending_blank = false;
+    for raw_line in input.split(|byte| *byte == b'\n') {
+        let line = stripspace_trim_trailing_space(raw_line);
+        if let Some(prefix) = comment
+            && line.starts_with(prefix)
+        {
+            continue;
+        }
+        if line.is_empty() {
+            if !out.is_empty() {
+                pending_blank = true;
+            }
+            continue;
+        }
+        if pending_blank {
+            out.push(b'\n');
+            pending_blank = false;
+        }
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
+    out
+}
+
+fn stripspace_trim_trailing_space(line: &[u8]) -> &[u8] {
+    let end = line
+        .iter()
+        .rposition(|byte| !matches!(byte, b' ' | b'\t' | b'\r'))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    &line[..end]
+}
+
+fn stripspace_comment_lines(input: &[u8], comment: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     for line in input.split_inclusive(|byte| *byte == b'\n') {
-        if matches!(line, b"\n" | b"\r\n") {
-            out.extend_from_slice(b"#");
-        } else {
-            out.extend_from_slice(b"# ");
+        let content = line
+            .strip_suffix(b"\n")
+            .unwrap_or(line)
+            .strip_suffix(b"\r")
+            .unwrap_or_else(|| line.strip_suffix(b"\n").unwrap_or(line));
+        out.extend_from_slice(comment);
+        if !content.is_empty() && content.first() != Some(&b'\t') {
+            out.push(b' ');
         }
         out.extend_from_slice(line);
     }

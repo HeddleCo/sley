@@ -1999,17 +1999,18 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     if read_stdin {
         let mut input = String::new();
         io::stdin().read_to_string(&mut input)?;
-        if setup_not {
-            setup_args.push("--not".to_string());
-        }
         if ignored_missing_input && input.lines().any(|line| !line.is_empty()) {
             revision_input_with_ignore_missing = true;
         }
-        setup_args.extend(
-            input
-                .lines()
-                .filter(|line| !line.is_empty())
-                .map(str::to_string),
+        let stdin_args = input
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        crate::commands::rev_list::merge_setup_args_from_stdin(
+            &mut setup_args,
+            stdin_args,
+            setup_not,
         );
     }
     if show_parents && show_children {

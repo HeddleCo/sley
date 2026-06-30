@@ -1856,51 +1856,49 @@ fn stage_partial_commit_paths(
         .chain(head_tree_map.keys().cloned())
         .collect();
 
-    // Expand the pathspecs over the tracked entries (directories and `.`
-    // cover everything beneath them).
+    let prefix = {
+        let root = fs::canonicalize(&worktree_root)?;
+        let cwd = fs::canonicalize(&cwd)?;
+        cwd.strip_prefix(&root)
+            .map(|relative| relative.to_string_lossy().replace('\\', "/").into_bytes())
+            .unwrap_or_default()
+    };
+    let mut pathspecs = Vec::with_capacity(paths.len());
+    let mut have_include = false;
+    for path in paths {
+        let element = sley_pathspec::parse_normalized_pathspec_element(
+            &prefix,
+            path,
+            effective_pathspec_flags(),
+        )?;
+        have_include |= !element.is_exclude();
+        pathspecs.push((path.as_str(), element, false));
+    }
+
+    // Expand the pathspecs over the tracked entries using git pathspec
+    // semantics. With only negative pathspecs, commit's implicit include is the
+    // whole tree, while the negative patterns themselves are still cwd-relative.
     let mut rel_paths: Vec<Vec<u8>> = Vec::new();
     let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for path in paths {
-        let absolute = if Path::new(path).is_absolute() {
-            PathBuf::from(path)
-        } else {
-            cwd.join(path)
-        };
-        let rel: Vec<u8> = match absolute.strip_prefix(&worktree_root) {
-            Ok(stripped) => stripped.to_string_lossy().into_owned().into_bytes(),
-            Err(_) => {
-                return Err(GitError::InvalidPath(format!(
-                    "pathspec outside repository: {path}"
-                )));
-            }
-        };
-        let mut matched = false;
-        if rel.is_empty() {
-            // `.` at the worktree root: every tracked entry.
-            for tracked in &known {
-                if seen.insert(tracked.clone()) {
-                    rel_paths.push(tracked.clone());
-                }
-                matched = true;
-            }
-        } else if known.contains(&rel) {
-            if seen.insert(rel.clone()) {
-                rel_paths.push(rel.clone());
-            }
-            matched = true;
-        } else {
-            let mut prefix = rel.clone();
-            prefix.push(b'/');
-            for tracked in &known {
-                if tracked.starts_with(&prefix) {
-                    if seen.insert(tracked.clone()) {
-                        rel_paths.push(tracked.clone());
-                    }
-                    matched = true;
+    for tracked in &known {
+        let mut included = false;
+        let mut excluded = false;
+        for (_, element, matched) in &mut pathspecs {
+            if element.matches_path(tracked) {
+                *matched = true;
+                if element.is_exclude() {
+                    excluded = true;
+                } else {
+                    included = true;
                 }
             }
         }
-        if !matched {
+        if !excluded && (!have_include || included) && seen.insert(tracked.clone()) {
+            rel_paths.push(tracked.clone());
+        }
+    }
+    for (path, element, matched) in &pathspecs {
+        if !element.is_exclude() && !matched {
             eprintln!("error: pathspec '{path}' did not match any file(s) known to git");
             return Err(GitError::Exit(128));
         }

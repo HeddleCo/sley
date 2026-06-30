@@ -1836,9 +1836,9 @@ fn apply_revision_suffix<R: ObjectReader>(
             // reads the object, so skip it when the graph already covers the base
             // (a commit) to preserve the graph-only navigation fast path.
             let mut graph = CommitGraphContext::load(git_dir, format);
+            let grafts = revlist::load_commit_grafts_from_git_dir(git_dir, format);
             let base = peel_base_to_commit_if_needed(reader, format, &mut graph, base)?;
-            graph
-                .commit_parents(reader, &base)?
+            revision_suffix_commit_parents(&mut graph, reader, format, &base, &grafts)?
                 .get(parent - 1)
                 .cloned()
                 .ok_or_else(|| GitError::not_found(format!("parent {parent} of {base}")))
@@ -1847,11 +1847,14 @@ fn apply_revision_suffix<R: ObjectReader>(
             // Likewise `<annotated-tag>~N` peels to the commit before walking
             // first parents (skipping the read when the graph covers the base).
             let mut graph = CommitGraphContext::load(git_dir, format);
+            let grafts = revlist::load_commit_grafts_from_git_dir(git_dir, format);
             let mut current = peel_base_to_commit_if_needed(reader, format, &mut graph, base)?;
             for _ in 0..count {
-                current = graph
-                    .commit_first_parent(reader, &current)?
-                    .ok_or_else(|| GitError::not_found(format!("first parent of {current}")))?;
+                current =
+                    revision_suffix_commit_parents(&mut graph, reader, format, &current, &grafts)?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| GitError::not_found(format!("first parent of {current}")))?;
             }
             Ok(current)
         }
@@ -1860,6 +1863,22 @@ fn apply_revision_suffix<R: ObjectReader>(
             search_commit_message_first_parent(git_dir, reader, format, base, text)
         }
     }
+}
+
+fn revision_suffix_commit_parents<R: ObjectReader>(
+    graph: &mut CommitGraphContext,
+    reader: &R,
+    format: sley_core::ObjectFormat,
+    oid: &ObjectId,
+    grafts: &HashMap<ObjectId, Vec<ObjectId>>,
+) -> Result<Vec<ObjectId>> {
+    if let Some(parents) = grafts.get(oid) {
+        return Ok(sley_odb::grafted_parents(reader, oid, parents.clone()));
+    }
+    if grafts.is_empty() {
+        return graph.commit_parents(reader, oid);
+    }
+    commit_parents(reader, format, oid)
 }
 
 // ---------------------------------------------------------------------------
@@ -5655,14 +5674,18 @@ pub enum RevisionRange {
     Symmetric { left: String, right: String },
 }
 
-/// Parse `A..B` / `A...B` range syntax.
+/// Parse `A..B` / `A...B` / `A^-N` range syntax.
 ///
 /// Returns `None` when `spec` is not a range. An omitted side defaults to
 /// `HEAD` (so `..B`, `A..`, `...B`, etc. behave like git). `...` is checked
 /// before `..` so the symmetric form is not misread as an asymmetric one. A
 /// trailing `..`/`...` with the wrong number of dots (more than two/three) is
-/// rejected as a malformed range.
+/// rejected as a malformed range. `A^-` expands to `A^1..A`, and `A^-N`
+/// expands to `A^N..A`.
 pub fn parse_revision_range(spec: &str) -> Option<RevisionRange> {
+    if let Some(range) = parse_parent_revision_range(spec) {
+        return Some(range);
+    }
     if let Some((left, right)) = spec.split_once("...") {
         if left.contains("..") || right.contains("..") {
             return None;
@@ -5682,6 +5705,27 @@ pub fn parse_revision_range(spec: &str) -> Option<RevisionRange> {
         });
     }
     None
+}
+
+fn parse_parent_revision_range(spec: &str) -> Option<RevisionRange> {
+    let (base, parent) = spec.rsplit_once("^-")?;
+    if base.is_empty() {
+        return None;
+    }
+    let parent = if parent.is_empty() {
+        1
+    } else if parent.bytes().all(|byte| byte.is_ascii_digit()) {
+        parent.parse::<usize>().ok()?
+    } else {
+        return None;
+    };
+    if parent == 0 {
+        return None;
+    }
+    Some(RevisionRange::Asymmetric {
+        start: format!("{base}^{parent}"),
+        end: base.to_string(),
+    })
 }
 
 fn default_range_side(side: &str) -> &str {
@@ -6110,29 +6154,24 @@ pub fn merge_bases<R: ObjectReader>(
         .filter(|oid| right_depths.contains_key(*oid))
         .cloned()
         .collect();
-    // Keep only the lowest common ancestors: drop any candidate that has another
-    // candidate strictly closer to *both* endpoints (i.e. a descendant common
-    // ancestor).
+    // Keep only maximal common ancestors. Because every parent of a common
+    // ancestor is also common, a candidate is dominated exactly when it is the
+    // direct parent of another common candidate.
+    let candidate_set: HashSet<ObjectId> = candidates.iter().copied().collect();
+    let mut dominated = HashSet::new();
+    for candidate in &candidates {
+        for parent in graph.commit_parents(reader, candidate)? {
+            if candidate_set.contains(&parent) {
+                dominated.insert(parent);
+            }
+        }
+    }
     let mut bases: Vec<ObjectId> = candidates
-        .iter()
-        .filter(|candidate| {
-            !candidates.iter().any(|other| {
-                other != *candidate
-                    && depth_lt(&left_depths, other, candidate)
-                    && depth_lt(&right_depths, other, candidate)
-            })
-        })
-        .cloned()
+        .into_iter()
+        .filter(|candidate| !dominated.contains(candidate))
         .collect();
     bases.sort_by_key(|oid| oid.to_hex());
     Ok(bases)
-}
-
-fn depth_lt(depths: &HashMap<ObjectId, usize>, a: &ObjectId, b: &ObjectId) -> bool {
-    match (depths.get(a), depths.get(b)) {
-        (Some(a_depth), Some(b_depth)) => a_depth < b_depth,
-        _ => false,
-    }
 }
 
 /// BFS the ancestry of `start`, recording the shortest distance to each commit,
@@ -6210,6 +6249,46 @@ mod tests {
                 negated: false,
             }]
         );
+    }
+
+    #[test]
+    fn setup_revisions_parses_parent_shorthand_range() {
+        let git_dir = temp_git_dir();
+        let worktree = git_dir.with_extension("worktree");
+        fs::create_dir_all(&worktree).expect("test operation should succeed");
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let tree = write_tree(&mut db, &[]);
+        let base = write_test_commit(&mut db, tree, Vec::new(), b"base\n");
+        let first = write_test_commit(&mut db, tree, vec![base], b"first\n");
+        let second = write_test_commit(&mut db, tree, vec![base], b"second\n");
+        let merge = write_test_commit(&mut db, tree, vec![first, second], b"merge\n");
+        set_branch(&git_dir, "merge", &merge);
+
+        let args = ["merge^-2".to_string()];
+        let setup = setup_revisions(
+            &args,
+            &RevisionSetupContext {
+                git_dir: &git_dir,
+                worktree_root: Some(&worktree),
+                cwd: &worktree,
+                format: ObjectFormat::Sha1,
+                reader: &db,
+                config: None,
+            },
+        )
+        .expect("setup should parse parent shorthand range");
+        assert_eq!(
+            setup
+                .options
+                .positives
+                .iter()
+                .map(|tip| tip.oid)
+                .collect::<Vec<_>>(),
+            vec![merge]
+        );
+        assert_eq!(setup.options.negatives, vec![second]);
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+        fs::remove_dir_all(worktree).expect("test operation should succeed");
     }
 
     #[test]
@@ -6343,6 +6422,34 @@ mod tests {
             resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, &format!("{merge}~2"))
                 .expect("test operation should succeed"),
             base
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn resolve_revision_parent_suffix_honors_commit_grafts() {
+        let git_dir = temp_git_dir();
+        fs::create_dir_all(git_dir.join("info")).expect("test operation should succeed");
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let tree = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        )
+        .expect("test operation should succeed");
+        let root = write_test_commit(&mut db, tree, Vec::new(), b"root\n");
+        let first = write_test_commit(&mut db, tree, vec![root], b"first\n");
+        let second = write_test_commit(&mut db, tree, vec![root], b"second\n");
+        let third = write_test_commit(&mut db, tree, vec![root], b"third\n");
+        fs::write(
+            git_dir.join("info").join("grafts"),
+            format!("{first} {second} {third}\n"),
+        )
+        .expect("test operation should succeed");
+
+        assert_eq!(
+            resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, &format!("{first}^2"))
+                .expect("test operation should succeed"),
+            third
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
@@ -7025,6 +7132,22 @@ mod tests {
                 end: "HEAD".into(),
             })
         );
+        assert_eq!(
+            parse_revision_range("merge^-"),
+            Some(RevisionRange::Asymmetric {
+                start: "merge^1".into(),
+                end: "merge".into(),
+            })
+        );
+        assert_eq!(
+            parse_revision_range("merge^-2"),
+            Some(RevisionRange::Asymmetric {
+                start: "merge^2".into(),
+                end: "merge".into(),
+            })
+        );
+        assert_eq!(parse_revision_range("merge^-0"), None);
+        assert_eq!(parse_revision_range("merge^-2x"), None);
         assert_eq!(parse_revision_range("plain"), None);
     }
 
@@ -7252,6 +7375,37 @@ mod tests {
             merge_bases(&git_dir, ObjectFormat::Sha1, &db, &left, &right)
                 .expect("test operation should succeed"),
             vec![base]
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn merge_bases_drop_common_ancestors_of_better_common_ancestors() {
+        let git_dir = temp_git_dir();
+        let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
+        let tree = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        )
+        .expect("test operation should succeed");
+
+        // E---D---C---B---A
+        // |           \   \
+        // |            G   \
+        // F----------------H
+        let e = write_test_commit(&mut db, tree, Vec::new(), b"E\n");
+        let d = write_test_commit(&mut db, tree, vec![e], b"D\n");
+        let f = write_test_commit(&mut db, tree, vec![e], b"F\n");
+        let c = write_test_commit(&mut db, tree, vec![d], b"C\n");
+        let b = write_test_commit(&mut db, tree, vec![c], b"B\n");
+        let a = write_test_commit(&mut db, tree, vec![b], b"A\n");
+        let g = write_test_commit(&mut db, tree, vec![b, e], b"G\n");
+        let h = write_test_commit(&mut db, tree, vec![a, f], b"H\n");
+
+        assert_eq!(
+            merge_bases(&git_dir, ObjectFormat::Sha1, &db, &g, &h)
+                .expect("test operation should succeed"),
+            vec![b]
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }

@@ -260,15 +260,15 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command("clone --filter requires a value".into()))?;
-                validate_clone_filter(value)?;
-                add_clone_filter(&mut partial_clone_filter, value);
+                let value = normalize_clone_filter(value)?;
+                add_clone_filter(&mut partial_clone_filter, &value);
             }
             value if value.starts_with("--filter=") => {
                 let value = value
                     .strip_prefix("--filter=")
                     .ok_or_else(|| GitError::Command("clone --filter requires a value".into()))?;
-                validate_clone_filter(value)?;
-                add_clone_filter(&mut partial_clone_filter, value);
+                let value = normalize_clone_filter(value)?;
+                add_clone_filter(&mut partial_clone_filter, &value);
             }
             "--no-filter" => partial_clone_filter = None,
             "--template" => {
@@ -2000,23 +2000,30 @@ fn validate_clone_jobs(value: &str) -> Result<()> {
 }
 
 fn validate_clone_filter(value: &str) -> Result<()> {
+    normalize_clone_filter(value).map(|_| ())
+}
+
+fn normalize_clone_filter(value: &str) -> Result<String> {
     if value == "blob:none" {
-        return Ok(());
+        return Ok(value.to_string());
     }
     if let Some(depth) = value.strip_prefix("tree:") {
-        parse_rev_list_tree_depth(depth)?;
-        return Ok(());
+        let depth = parse_rev_list_tree_depth(depth)?;
+        return Ok(format!("tree:{depth}"));
     }
     if let Some(limit) = value.strip_prefix("blob:limit=") {
-        parse_rev_list_blob_limit(limit)?;
-        return Ok(());
+        let limit = git_parse_blob_limit(limit).ok_or_else(|| {
+            eprintln!("fatal: invalid filter-spec 'blob:limit={limit}'");
+            GitError::Exit(128)
+        })?;
+        return Ok(format!("blob:limit={limit}"));
     }
     if let Some(object_type) = value.strip_prefix("object:type=") {
         parse_rev_list_object_type_filter(object_type)?;
-        return Ok(());
+        return Ok(value.to_string());
     }
     if value.starts_with("sparse:oid=") {
-        return Ok(());
+        return Ok(value.to_string());
     }
     eprintln!("fatal: invalid filter-spec '{value}'");
     Err(GitError::Exit(128))
@@ -3603,18 +3610,18 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command("fetch --filter requires a value".into()))?;
-                validate_clone_filter(value)?;
-                options.filter = fetch_pack_filter_from_spec(value);
-                filter_spec = Some(value.to_string());
+                let normalized = normalize_clone_filter(value)?;
+                options.filter = fetch_pack_filter_from_spec(&normalized);
+                filter_spec = Some(normalized);
                 filter_option_explicit = true;
             }
             value if value.starts_with("--filter=") => {
                 let value = value
                     .strip_prefix("--filter=")
                     .ok_or_else(|| GitError::Command("fetch --filter requires a value".into()))?;
-                validate_clone_filter(value)?;
-                options.filter = fetch_pack_filter_from_spec(value);
-                filter_spec = Some(value.to_string());
+                let normalized = normalize_clone_filter(value)?;
+                options.filter = fetch_pack_filter_from_spec(&normalized);
+                filter_spec = Some(normalized);
                 filter_option_explicit = true;
             }
             "--no-filter" => {

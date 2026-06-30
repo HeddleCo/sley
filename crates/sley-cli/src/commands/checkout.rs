@@ -449,6 +449,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         sley_worktree::CheckoutIndexPathOptions {
                             force,
                             merge: path_merge || conflict_implies_merge,
+                            overlay: overlay_mode.unwrap_or(true),
                             stage: checkout_stage,
                             conflict_style,
                             smudge_config: Some(&config),
@@ -1952,6 +1953,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
             sley_worktree::CheckoutIndexPathOptions {
                 force: ignore_unmerged,
                 merge: path_merge || conflict_implies_merge,
+                overlay: false,
                 stage: checkout_stage,
                 conflict_style,
                 smudge_config: Some(&config),

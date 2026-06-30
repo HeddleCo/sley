@@ -1408,7 +1408,7 @@ fn reflog_show_pathspecs_match(cwd: &Path, pathspecs: &[String]) -> bool {
 }
 
 pub(crate) fn cmd_update_server_info(args: &[String]) -> Result<()> {
-    parse_update_server_info_options(args)?;
+    let force = parse_update_server_info_options(args)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
@@ -1417,31 +1417,35 @@ pub(crate) fn cmd_update_server_info(args: &[String]) -> Result<()> {
 
     let info_dir = common_git_dir.join("info");
     fs::create_dir_all(&info_dir)?;
-    fs::write(
-        info_dir.join("refs"),
-        update_server_info_refs(&store, &db, format)?,
+    update_server_info_file(
+        &info_dir.join("refs"),
+        &update_server_info_refs(&store, &db, format)?,
+        force,
     )?;
 
     let objects_info_dir = repository_objects_dir(&common_git_dir).join("info");
     fs::create_dir_all(&objects_info_dir)?;
-    fs::write(
-        objects_info_dir.join("packs"),
-        update_server_info_packs(
+    update_server_info_file(
+        &objects_info_dir.join("packs"),
+        &update_server_info_packs(
             &repository_objects_dir(&common_git_dir).join("pack"),
             format,
         )?,
+        force,
     )?;
     Ok(())
 }
 
-fn parse_update_server_info_options(args: &[String]) -> Result<()> {
+fn parse_update_server_info_options(args: &[String]) -> Result<bool> {
     let mut after_delimiter = false;
+    let mut force = false;
     for arg in args {
         if after_delimiter {
             return update_server_info_usage();
         }
         match arg.as_str() {
-            "-f" | "--force" | "--no-force" => {}
+            "-f" | "--force" => force = true,
+            "--no-force" => force = false,
             "--" => after_delimiter = true,
             value if value.starts_with("--force=") => {
                 eprintln!("error: option `force' takes no value");
@@ -1461,11 +1465,23 @@ fn parse_update_server_info_options(args: &[String]) -> Result<()> {
                         eprintln!("error: unknown switch `{option}'");
                         return update_server_info_usage();
                     }
+                    force = true;
                 }
             }
             _ => return update_server_info_usage(),
         }
     }
+    Ok(force)
+}
+
+fn update_server_info_file(path: &Path, content: &[u8], force: bool) -> Result<()> {
+    if !force
+        && let Ok(existing) = fs::read(path)
+        && existing == content
+    {
+        return Ok(());
+    }
+    fs::write(path, content)?;
     Ok(())
 }
 

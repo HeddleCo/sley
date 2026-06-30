@@ -1066,6 +1066,42 @@ mod tests {
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
+    #[test]
+    fn restore_from_tree_default_wildcard_matches_subdirectory_file() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("subdir")).expect("test operation should succeed");
+        fs::write(root.join("subdir").join("file3"), b"file3-1\n")
+            .expect("test operation should succeed");
+        let old_commit = build_commit(&root, &git_dir, &["subdir/file3"]);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let old_tree = read_commit(&db, ObjectFormat::Sha1, &old_commit)
+            .expect("test operation should succeed")
+            .tree;
+
+        fs::write(root.join("subdir").join("file3"), b"file3-2\n")
+            .expect("test operation should succeed");
+        build_commit(&root, &git_dir, &["subdir/file3"]);
+
+        let result = restore_index_and_worktree_paths_from_tree(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &old_tree,
+            &[PathBuf::from("*file3")],
+            false,
+        )
+        .expect("wildcard pathspec should select subdir/file3");
+
+        assert_eq!(result.restored, 1);
+        assert_eq!(
+            fs::read(root.join("subdir").join("file3")).expect("test operation should succeed"),
+            b"file3-1\n"
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
     // ----- content filtering: EOL / autocrlf + clean/smudge drivers -----
 
     /// Build a [`GitConfig`] from raw config text.

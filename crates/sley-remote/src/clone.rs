@@ -436,9 +436,18 @@ fn fetch_local_partial_clone_checkout_blobs(
         return Ok(());
     };
 
+    let local_db = FileObjectDatabase::from_git_dir(git_dir, request.format);
     let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, request.format);
     let mut wants = Vec::new();
-    collect_checkout_blob_wants(&remote_db, request.format, commit_oid, &mut wants)?;
+    let mut seen = std::collections::HashSet::new();
+    collect_checkout_materialization_wants(
+        &remote_db,
+        &local_db,
+        request.format,
+        commit_oid,
+        &mut seen,
+        &mut wants,
+    )?;
     crate::local::install_fetch_pack_via_local_upload_pack(
         git_dir,
         remote_git_dir,
@@ -447,20 +456,22 @@ fn fetch_local_partial_clone_checkout_blobs(
         None,
         true,
         false,
-        Some(sley_odb::PackObjectFilter::BlobNone),
+        None,
         false,
         None,
     )?;
     Ok(())
 }
 
-fn collect_checkout_blob_wants(
-    db: &FileObjectDatabase,
+fn collect_checkout_materialization_wants(
+    remote_db: &FileObjectDatabase,
+    local_db: &FileObjectDatabase,
     format: ObjectFormat,
     commit_oid: ObjectId,
+    seen: &mut std::collections::HashSet<ObjectId>,
     wants: &mut Vec<ObjectId>,
 ) -> Result<()> {
-    let commit_object = db.read_object(&commit_oid)?;
+    let commit_object = remote_db.read_object(&commit_oid)?;
     if commit_object.object_type != ObjectType::Commit {
         return Err(GitError::InvalidObject(format!(
             "expected commit {commit_oid}, found {}",
@@ -468,16 +479,24 @@ fn collect_checkout_blob_wants(
         )));
     }
     let commit = Commit::parse_ref(format, &commit_object.body)?;
-    collect_tree_blob_wants(db, format, commit.tree, wants)
+    collect_tree_materialization_wants(remote_db, local_db, format, commit.tree, seen, wants)
 }
 
-fn collect_tree_blob_wants(
-    db: &FileObjectDatabase,
+fn collect_tree_materialization_wants(
+    remote_db: &FileObjectDatabase,
+    local_db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: ObjectId,
+    seen: &mut std::collections::HashSet<ObjectId>,
     wants: &mut Vec<ObjectId>,
 ) -> Result<()> {
-    let tree_object = db.read_object(&tree_oid)?;
+    if !seen.insert(tree_oid) {
+        return Ok(());
+    }
+    if !local_db.contains(&tree_oid)? {
+        wants.push(tree_oid);
+    }
+    let tree_object = remote_db.read_object(&tree_oid)?;
     if tree_object.object_type != ObjectType::Tree {
         return Err(GitError::InvalidObject(format!(
             "expected tree {tree_oid}, found {}",
@@ -486,9 +505,13 @@ fn collect_tree_blob_wants(
     }
     for entry in Tree::parse(format, &tree_object.body)?.entries {
         if entry.is_tree() {
-            collect_tree_blob_wants(db, format, entry.oid, wants)?;
+            collect_tree_materialization_wants(
+                remote_db, local_db, format, entry.oid, seen, wants,
+            )?;
         } else if !entry.is_gitlink() {
-            wants.push(entry.oid);
+            if seen.insert(entry.oid) && !local_db.contains(&entry.oid)? {
+                wants.push(entry.oid);
+            }
         }
     }
     Ok(())

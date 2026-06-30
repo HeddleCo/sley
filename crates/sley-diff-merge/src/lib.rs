@@ -4426,12 +4426,10 @@ fn index_worktree_change_for_entry(
     let git_path = index_entry.git_path();
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(err)
-            if err.kind() == std::io::ErrorKind::NotFound && index_entry.is_skip_worktree() =>
-        {
+        Err(err) if is_missing_worktree_path_error(&err) && index_entry.is_skip_worktree() => {
             return Ok(None);
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        Err(err) if is_missing_worktree_path_error(&err) => {
             return Ok(Some(index_worktree_deleted_entry(index_entry)));
         }
         Err(err) => return Err(GitError::Io(err.to_string())),
@@ -4486,6 +4484,13 @@ fn index_worktree_deleted_entry(index_entry: &impl WorktreeIndexEntry) -> NameSt
         old_oid: Some(index_entry.oid()),
         new_oid: None,
     }
+}
+
+fn is_missing_worktree_path_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 fn worktree_blob_cache_for_path_set(

@@ -67,13 +67,22 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut bisect_inject_refs = false;
     let mut bisect_vars = false;
     let mut bisect_all = false;
+    let mut end_of_options = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
+        if end_of_options {
+            setup_args.push(arg.clone());
+            continue;
+        }
         match arg.as_str() {
             "--" => {
                 setup_args.push(arg.clone());
                 setup_args.extend(iter.cloned());
                 break;
+            }
+            "--end-of-options" => {
+                setup_args.push(arg.clone());
+                end_of_options = true;
             }
             "--not" => {
                 setup_not = !setup_not;
@@ -127,7 +136,10 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                     || (value.starts_with("-n") && value.len() > 2)
                     || (value.starts_with('-')
                         && value.len() > 1
-                        && value[1..].bytes().all(|byte| byte.is_ascii_digit())) =>
+                        && value
+                            .as_bytes()
+                            .get(1)
+                            .is_some_and(|byte| byte.is_ascii_digit())) =>
             {
                 setup_args.push(arg.clone());
             }
@@ -233,6 +245,10 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             "--filter-provided-objects" => filter_provided_objects = true,
             value if value.starts_with("--filter=") => {
                 let parsed = RevListObjectFilter::parse(&value["--filter=".len()..])?;
+                if object_filter != RevListObjectFilter::None {
+                    trace_rev_list_combine_filter_additions(&object_filter);
+                    trace_rev_list_combine_filter_additions(&parsed);
+                }
                 object_filter = object_filter.combine_with(parsed);
             }
             "--missing=print" => missing_action = RevListMissingAction::Print,
@@ -327,15 +343,13 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     if read_stdin {
         let mut input = String::new();
         io::stdin().read_to_string(&mut input)?;
-        if setup_not {
-            setup_args.push("--not".to_string());
-        }
-        setup_args.extend(
-            input
-                .lines()
-                .filter(|line| !line.is_empty())
-                .map(str::to_string),
-        );
+        let stdin_args = input
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        validate_rev_list_stdin_args(&stdin_args)?;
+        merge_setup_args_from_stdin(&mut setup_args, stdin_args, setup_not);
     }
     if parents && children {
         return Err(GitError::Command(
@@ -2066,6 +2080,115 @@ fn rev_list_missing_tip_candidates(args: &[String]) -> Vec<String> {
     out
 }
 
+pub(crate) fn merge_setup_args_from_stdin(
+    setup_args: &mut Vec<String>,
+    stdin_args: Vec<String>,
+    setup_not: bool,
+) {
+    let cli_delim = setup_args.iter().position(|arg| arg == "--");
+    let stdin_delim = stdin_args.iter().position(|arg| arg == "--");
+    if cli_delim.is_none() && stdin_delim.is_none() {
+        if setup_not && !stdin_args.is_empty() {
+            setup_args.push("--not".to_string());
+        }
+        setup_args.extend(stdin_args);
+        return;
+    }
+
+    let (cli_revs, cli_paths) = split_setup_args_at_delimiter(setup_args, cli_delim);
+    let (stdin_revs, stdin_paths) = split_setup_args_at_delimiter(&stdin_args, stdin_delim);
+    let mut merged = Vec::with_capacity(setup_args.len() + stdin_args.len() + 2);
+    merged.extend(cli_revs.iter().cloned());
+    if setup_not && !stdin_revs.is_empty() {
+        merged.push("--not".to_string());
+    }
+    merged.extend(stdin_revs.iter().cloned());
+    merged.push("--".to_string());
+    merged.extend(cli_paths.iter().cloned());
+    merged.extend(stdin_paths.iter().cloned());
+    *setup_args = merged;
+}
+
+fn split_setup_args_at_delimiter(
+    args: &[String],
+    delimiter: Option<usize>,
+) -> (&[String], &[String]) {
+    match delimiter {
+        Some(index) => (&args[..index], &args[index + 1..]),
+        None => (args, &[]),
+    }
+}
+
+fn validate_rev_list_stdin_args(args: &[String]) -> Result<()> {
+    let mut end_of_options = false;
+    for arg in args {
+        if end_of_options {
+            continue;
+        }
+        match arg.as_str() {
+            "--" => break,
+            "--end-of-options" => end_of_options = true,
+            "--glob" | "--exclude" | "--exclude-hidden" => {
+                eprintln!("fatal: Option '{arg}' requires a value");
+                return Err(GitError::Exit(128));
+            }
+            value if value.starts_with("--no-walk=") => {
+                eprintln!("error: invalid argument to --no-walk");
+                eprintln!("fatal: invalid option '{value}' in --stdin mode");
+                return Err(GitError::Exit(128));
+            }
+            "--all"
+            | "--no-all"
+            | "--not"
+            | "--branches"
+            | "--tags"
+            | "--remotes"
+            | "--ignore-missing"
+            | "--no-ignore-missing"
+            | "--reflog"
+            | "--no-reflog"
+            | "--no-walk"
+            | "--no-walk=sorted"
+            | "--no-walk=unsorted"
+            | "--do-walk"
+            | "--reverse"
+            | "--topo-order"
+            | "--date-order"
+            | "--author-date-order"
+            | "--first-parent"
+            | "--no-first-parent"
+            | "--full-history"
+            | "--sparse"
+            | "--dense"
+            | "--remove-empty"
+            | "--simplify-merges"
+            | "--show-pulls"
+            | "--ancestry-path" => {}
+            value
+                if value.starts_with("--glob=")
+                    || value.starts_with("--exclude=")
+                    || value.starts_with("--exclude-hidden=")
+                    || value.starts_with("--branches=")
+                    || value.starts_with("--tags=")
+                    || value.starts_with("--remotes=")
+                    || value.starts_with("--max-count=")
+                    || value.starts_with("--skip=")
+                    || value.starts_with("--max-age=")
+                    || value.starts_with("--min-age=")
+                    || value.starts_with("--since=")
+                    || value.starts_with("--after=")
+                    || value.starts_with("--until=")
+                    || value.starts_with("--before=") => {}
+            value if value.starts_with('-') => {
+                eprintln!("fatal: invalid option '{value}' in --stdin mode");
+                return Err(GitError::Exit(128));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn rev_list_extract_non_commit_excludes(
     args: &mut Vec<String>,
     git_dir: &Path,
@@ -2278,8 +2401,16 @@ impl RevListObjectFilter {
         match self {
             Self::TreeDepth(depth) => Some(*depth),
             Self::ObjectType(ObjectType::Commit | ObjectType::Tag) => Some(0),
-            Self::Combine(filters) => filters.iter().filter_map(Self::tree_depth_limit).max(),
+            Self::Combine(filters) => filters.iter().filter_map(Self::tree_depth_limit).min(),
             _ => None,
+        }
+    }
+
+    fn path_sensitive(&self) -> bool {
+        match self {
+            Self::Sparse(_) | Self::SparseOid(_) => true,
+            Self::Combine(filters) => filters.iter().any(Self::path_sensitive),
+            _ => false,
         }
     }
 
@@ -2322,6 +2453,56 @@ impl RevListObjectFilter {
             Self::SparseOid(_) => unreachable!("sparse:oid filter must be resolved before use"),
         }
     }
+}
+
+fn trace_rev_list_combine_filter_additions(filter: &RevListObjectFilter) {
+    match filter {
+        RevListObjectFilter::None => {}
+        RevListObjectFilter::Combine(filters) => {
+            for filter in filters {
+                trace_rev_list_combine_filter_additions(filter);
+            }
+        }
+        filter => {
+            crate::setup::git_trace_line(
+                "list-objects-filter-options.c:216",
+                &format!(
+                    "Add to combine filter-spec: {}",
+                    rev_list_trace_sub_filter_spec(filter)
+                ),
+            );
+        }
+    }
+}
+
+fn rev_list_trace_sub_filter_spec(filter: &RevListObjectFilter) -> String {
+    match filter {
+        RevListObjectFilter::BlobNone => "blob:none".to_string(),
+        RevListObjectFilter::BlobLimit(limit) => format!("blob:limit={limit}"),
+        RevListObjectFilter::ObjectType(object_type) => {
+            format!("object:type={}", object_type.as_str())
+        }
+        RevListObjectFilter::TreeDepth(depth) => format!("tree:{depth}"),
+        RevListObjectFilter::SparseOid(value) => {
+            format!("sparse:oid={}", rev_list_encode_sub_filter(value))
+        }
+        RevListObjectFilter::Sparse(_) => "sparse:oid".to_string(),
+        RevListObjectFilter::None | RevListObjectFilter::Combine(_) => String::new(),
+    }
+}
+
+fn rev_list_encode_sub_filter(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'=' | b'/' | b'.' | b'_' | b'-') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+            out.push(char::from_digit((byte & 0xf) as u32, 16).unwrap());
+        }
+    }
+    out
 }
 
 fn rev_list_should_print_commit(
@@ -2420,25 +2601,22 @@ fn rev_list_objects(
     collect_omitted: bool,
     missing_action: RevListMissingAction,
 ) -> Result<(Vec<RevListObject>, Vec<RevListObject>, Vec<RevListObject>)> {
-    if !collect_omitted && filter.tree_depth_limit() == Some(0) {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
-    }
-    let mut seen = HashSet::new();
+    let mut hidden = HashSet::new();
     for oid in excluded {
         let object = db.read_object(oid)?;
         if object.object_type != ObjectType::Commit {
             continue;
         }
         let commit = Commit::parse_ref(format, &object.body)?;
-        rev_list_mark_tree_objects(db, format, &commit.tree, &mut seen)?;
+        rev_list_mark_tree_objects(db, format, &commit.tree, &mut hidden)?;
     }
     for object in exclude_objects {
         match object.object_type {
             Some(ObjectType::Tree) => {
-                rev_list_mark_tree_objects(db, format, &object.oid, &mut seen)?
+                rev_list_mark_tree_objects(db, format, &object.oid, &mut hidden)?
             }
             _ => {
-                seen.insert(object.oid);
+                hidden.insert(object.oid);
             }
         }
     }
@@ -2455,7 +2633,7 @@ fn rev_list_objects(
             &walk,
             &record.commit.tree,
             Vec::new(),
-            &mut seen,
+            &hidden,
             &mut state,
             filter.tree_depth_limit(),
             0,
@@ -2480,6 +2658,8 @@ struct RevListObjectState {
     emitted_oids: HashSet<ObjectId>,
     omitted_oids: HashSet<ObjectId>,
     missing_oids: HashSet<ObjectId>,
+    visited_tree_depths: HashMap<ObjectId, usize>,
+    omitted_tree_contents: HashSet<ObjectId>,
 }
 
 fn rev_list_mark_tree_objects(
@@ -2513,13 +2693,49 @@ fn rev_list_collect_tree_objects(
     walk: &RevListObjectWalk<'_>,
     tree_oid: &ObjectId,
     path: Vec<u8>,
-    seen: &mut HashSet<ObjectId>,
+    hidden: &HashSet<ObjectId>,
     state: &mut RevListObjectState,
-    tree_depth: Option<usize>,
+    tree_depth_limit: Option<usize>,
     depth: usize,
 ) -> Result<()> {
-    if seen.contains(tree_oid) {
+    if hidden.contains(tree_oid) {
         return Ok(());
+    }
+    if tree_depth_limit.is_some_and(|limit| depth >= limit) {
+        if !walk.collect_omitted
+            && !walk.filter.path_sensitive()
+            && let Some(seen_depth) = state.visited_tree_depths.get(tree_oid)
+            && *seen_depth <= depth
+        {
+            return Ok(());
+        }
+        if walk.collect_omitted {
+            return rev_list_collect_omitted_tree_contents(
+                walk, tree_oid, &path, hidden, state, depth,
+            );
+        }
+        rev_list_trace_skipping_tree(&path);
+        if !walk.filter.path_sensitive() {
+            state
+                .visited_tree_depths
+                .entry(*tree_oid)
+                .and_modify(|seen_depth| *seen_depth = (*seen_depth).min(depth))
+                .or_insert(depth);
+        }
+        return Ok(());
+    }
+    if !walk.filter.path_sensitive()
+        && let Some(seen_depth) = state.visited_tree_depths.get(tree_oid)
+        && *seen_depth <= depth
+    {
+        return Ok(());
+    }
+    if !walk.filter.path_sensitive() {
+        state
+            .visited_tree_depths
+            .entry(*tree_oid)
+            .and_modify(|seen_depth| *seen_depth = (*seen_depth).min(depth))
+            .or_insert(depth);
     }
     let object = match walk.db.read_object(tree_oid) {
         Ok(object) => object,
@@ -2534,7 +2750,6 @@ fn rev_list_collect_tree_objects(
             );
         }
     };
-    seen.insert(*tree_oid);
     if object.object_type != ObjectType::Tree {
         return Err(GitError::InvalidObject(format!(
             "expected tree {tree_oid}, found {}",
@@ -2542,19 +2757,11 @@ fn rev_list_collect_tree_objects(
         )));
     }
     rev_list_record_filter_decision(walk, ObjectType::Tree, tree_oid, &path, None, depth, state)?;
-    if tree_depth == Some(1) {
-        if walk.collect_omitted {
-            rev_list_collect_omitted_tree_contents(walk, tree_oid, &path, state)?;
-        } else if env::var_os("GIT_TRACE").is_some() {
-            eprintln!(
-                "Skipping contents of tree {}...",
-                String::from_utf8_lossy(&path)
-            );
-        }
-        return Ok(());
-    }
     for entry in TreeEntries::new(walk.format, &object.body) {
         let entry = entry?;
+        if hidden.contains(&entry.oid) {
+            continue;
+        }
         let entry_path = rev_list_join_object_path(&path, entry.name);
         let entry_type = tree_entry_object_type(entry.mode);
         if entry_type == ObjectType::Tree {
@@ -2562,13 +2769,13 @@ fn rev_list_collect_tree_objects(
                 walk,
                 &entry.oid,
                 entry_path,
-                seen,
+                hidden,
                 state,
-                tree_depth.map(|depth| depth.saturating_sub(1)),
+                tree_depth_limit,
                 depth + 1,
             )?;
         } else {
-            if !seen.insert(entry.oid) {
+            if state.emitted_oids.contains(&entry.oid) {
                 continue;
             }
             let size = if entry_type == ObjectType::Blob
@@ -2674,8 +2881,17 @@ fn rev_list_collect_omitted_tree_contents(
     walk: &RevListObjectWalk<'_>,
     tree_oid: &ObjectId,
     path: &[u8],
+    hidden: &HashSet<ObjectId>,
     state: &mut RevListObjectState,
+    depth: usize,
 ) -> Result<()> {
+    if hidden.contains(tree_oid) {
+        return Ok(());
+    }
+    if !walk.filter.path_sensitive() && !state.omitted_tree_contents.insert(*tree_oid) {
+        rev_list_trace_skipping_tree(path);
+        return Ok(());
+    }
     let object = match walk.db.read_object(tree_oid) {
         Ok(object) => object,
         Err(err) => {
@@ -2692,24 +2908,50 @@ fn rev_list_collect_omitted_tree_contents(
     if object.object_type != ObjectType::Tree {
         return Ok(());
     }
+    rev_list_record_filter_decision(walk, ObjectType::Tree, tree_oid, path, None, depth, state)?;
     for entry in TreeEntries::new(walk.format, &object.body) {
         let entry = entry?;
+        if hidden.contains(&entry.oid) {
+            continue;
+        }
         let entry_path = rev_list_join_object_path(path, entry.name);
         let entry_type = tree_entry_object_type(entry.mode);
-        rev_list_record_filter_decision(
-            walk,
-            entry_type,
-            &entry.oid,
-            &entry_path,
-            None,
-            usize::MAX,
-            state,
-        )?;
         if entry_type == ObjectType::Tree {
-            rev_list_collect_omitted_tree_contents(walk, &entry.oid, &entry_path, state)?;
+            rev_list_collect_omitted_tree_contents(
+                walk,
+                &entry.oid,
+                &entry_path,
+                hidden,
+                state,
+                depth + 1,
+            )?;
+        } else {
+            rev_list_record_filter_decision(
+                walk,
+                entry_type,
+                &entry.oid,
+                &entry_path,
+                None,
+                depth + 1,
+                state,
+            )?;
         }
     }
     Ok(())
+}
+
+fn rev_list_trace_skipping_tree(path: &[u8]) {
+    if env::var_os("GIT_TRACE").is_none() {
+        return;
+    }
+    if path.is_empty() {
+        eprintln!("Skipping contents of tree ...");
+    } else {
+        eprintln!(
+            "Skipping contents of tree {}/...",
+            String::from_utf8_lossy(path)
+        );
+    }
 }
 
 fn rev_list_handle_missing_object(

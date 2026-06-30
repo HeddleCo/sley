@@ -9,7 +9,7 @@ use crate::index::*;
 use crate::index_io::*;
 use crate::status::*;
 use crate::types_admin::*;
-use sley_pathspec::{PathspecMatchMagic, pathspec_item_matches};
+use sley_pathspec::{PathspecElement, PathspecMatchMagic};
 
 pub fn deleted_index_entries(
     worktree_root: impl AsRef<Path>,
@@ -695,80 +695,29 @@ pub(crate) fn restore_worktree_paths_inner(
     let stat_cache = IndexStatCache::from_index(&index, &index_path);
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut restored = BTreeSet::new();
-    for path in paths {
-        let absolute = if path.is_absolute() {
-            path.clone()
-        } else {
-            worktree_root.join(path)
-        };
-        let absolute = normalize_absolute_path_lexically(&absolute);
-        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
-            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
-        })?;
-        let git_path = git_path_bytes(relative)?;
-        let recursive = path == Path::new(".")
-            || path.to_string_lossy().ends_with('/')
-            || absolute.is_dir()
-            || index_has_entry_under(&index.entries, &git_path);
-        let mut matched = false;
-        let mut matched_positions = index
+    let selected = checkout_selected_positions(
+        worktree_root,
+        paths,
+        index
             .entries
             .iter()
             .enumerate()
-            .filter_map(|(position, entry)| {
-                (entry.path.as_bytes() == git_path.as_slice()
-                    || (recursive && index_entry_is_under_path(entry.path.as_bytes(), &git_path)))
-                .then_some(position)
-            })
-            .collect::<Vec<_>>();
-        if matched_positions.is_empty() && checkout_pathspec_has_wildcard(&git_path) {
-            matched_positions = index
-                .entries
-                .iter()
-                .enumerate()
-                .filter_map(|(position, entry)| {
-                    pathspec_item_matches(
-                        &git_path,
-                        entry.path.as_bytes(),
-                        PathspecMatchMagic::default(),
-                    )
-                    .then_some(position)
-                })
-                .collect::<Vec<_>>();
-        }
-        if matched_positions.is_empty() && checkout_pathspec_has_wildcard(&git_path) {
-            matched_positions = index
-                .entries
-                .iter()
-                .enumerate()
-                .filter_map(|(position, entry)| {
-                    checkout_simple_wildcard_match(&git_path, entry.path.as_bytes())
-                        .then_some(position)
-                })
-                .collect::<Vec<_>>();
-        }
-        for position in matched_positions {
-            let refreshed = restore_index_entry(
-                worktree_root,
-                git_dir,
-                format,
-                &db,
-                &index.entries[position],
-                smudge_config,
-                Some(&stat_cache),
-            )?;
-            restored.insert(index.entries[position].path.clone());
-            matched = true;
-            if let Some(refreshed) = refreshed {
-                index.entries[position] = refreshed;
-            }
-        }
-        if !matched {
-            eprintln!(
-                "error: pathspec '{}' did not match any file(s) known to git",
-                path.display()
-            );
-            return Err(GitError::Exit(1));
+            .map(|(position, entry)| (position, entry.path.as_bytes())),
+        false,
+    )?;
+    for position in selected {
+        let refreshed = restore_index_entry(
+            worktree_root,
+            git_dir,
+            format,
+            &db,
+            &index.entries[position],
+            smudge_config,
+            Some(&stat_cache),
+        )?;
+        restored.insert(index.entries[position].path.clone());
+        if let Some(refreshed) = refreshed {
+            index.entries[position] = refreshed;
         }
     }
     write_repository_index_ref(git_dir, format, &index)?;
@@ -838,6 +787,11 @@ pub fn checkout_index_paths(
                     .copied()
                     .find(|position| index.entries[*position].stage() == wanted)
                 else {
+                    if !options.overlay {
+                        remove_worktree_file(worktree_root, &path)?;
+                        restored.insert(path);
+                        continue;
+                    }
                     eprintln!(
                         "error: path '{}' does not have {} version",
                         String::from_utf8_lossy(&path),
@@ -930,63 +884,150 @@ pub(crate) fn checkout_selected_index_paths(
         .iter()
         .map(|entry| entry.path.as_bytes().to_vec())
         .collect::<BTreeSet<_>>();
-    let mut selected = BTreeSet::new();
-    for path in paths {
-        let absolute = if path.is_absolute() {
-            path.clone()
-        } else {
-            worktree_root.join(path)
-        };
-        let absolute = normalize_absolute_path_lexically(&absolute);
-        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
-            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
-        })?;
-        let git_path = git_path_bytes(relative)?;
-        let recursive = path == Path::new(".")
-            || path.to_string_lossy().ends_with('/')
-            || absolute.is_dir()
-            || index_paths
-                .iter()
-                .any(|entry| index_entry_is_under_path(entry, &git_path));
-        let mut matched = index_paths
+    checkout_selected_paths(
+        worktree_root,
+        paths,
+        index_paths.iter().map(Vec::as_slice),
+        false,
+    )
+}
+
+#[derive(Debug)]
+struct CheckoutPathspec {
+    display: String,
+    element: PathspecElement,
+    matched: bool,
+}
+
+#[derive(Debug)]
+struct CheckoutPathspecs {
+    specs: Vec<CheckoutPathspec>,
+    have_include: bool,
+}
+
+impl CheckoutPathspecs {
+    fn parse(worktree_root: &Path, paths: &[PathBuf]) -> Result<Self> {
+        let mut specs = Vec::with_capacity(paths.len());
+        let mut have_include = false;
+        for path in paths {
+            let git_path = checkout_pathspec_pattern(worktree_root, path)?;
+            let element = PathspecElement::parse(&git_path, PathspecMatchMagic::default())
+                .map_err(|err| GitError::Command(format!("bad pathspec: {err}")))?;
+            have_include |= !element.is_exclude();
+            specs.push(CheckoutPathspec {
+                display: path.display().to_string(),
+                element,
+                matched: false,
+            });
+        }
+        Ok(Self {
+            specs,
+            have_include,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.specs.is_empty()
+    }
+
+    fn matches(&mut self, candidate: &[u8]) -> bool {
+        if self.specs.is_empty() {
+            return true;
+        }
+
+        let mut included = false;
+        let mut excluded = false;
+        for spec in &mut self.specs {
+            if spec.element.matches_path(candidate) {
+                spec.matched = true;
+                if spec.element.is_exclude() {
+                    excluded = true;
+                } else {
+                    included = true;
+                }
+            }
+        }
+
+        !excluded && (!self.have_include || included)
+    }
+
+    fn require_matched_includes(&self, allow_unmatched: bool) -> Result<()> {
+        if allow_unmatched {
+            return Ok(());
+        }
+        if let Some(spec) = self
+            .specs
             .iter()
-            .filter(|entry| {
-                entry.as_slice() == git_path.as_slice()
-                    || (recursive && index_entry_is_under_path(entry, &git_path))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if matched.is_empty() && checkout_pathspec_has_wildcard(&git_path) {
-            matched.extend(
-                index_paths
-                    .iter()
-                    .filter(|entry| {
-                        pathspec_item_matches(
-                            &git_path,
-                            entry.as_slice(),
-                            PathspecMatchMagic::default(),
-                        )
-                    })
-                    .cloned(),
-            );
-        }
-        if matched.is_empty() && checkout_pathspec_has_wildcard(&git_path) {
-            matched.extend(
-                index_paths
-                    .iter()
-                    .filter(|entry| checkout_simple_wildcard_match(&git_path, entry.as_slice()))
-                    .cloned(),
-            );
-        }
-        if matched.is_empty() {
+            .find(|spec| !spec.element.is_exclude() && !spec.matched)
+        {
             eprintln!(
                 "error: pathspec '{}' did not match any file(s) known to git",
-                path.display()
+                spec.display
             );
             return Err(GitError::Exit(1));
         }
-        selected.extend(matched);
+        Ok(())
     }
+}
+
+fn checkout_pathspec_pattern(worktree_root: &Path, path: &Path) -> Result<Vec<u8>> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        worktree_root.join(path)
+    };
+    let absolute = normalize_absolute_path_lexically(&absolute);
+    let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+        GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+    })?;
+    git_path_bytes(relative)
+}
+
+fn checkout_selected_paths<'a, I>(
+    worktree_root: &Path,
+    paths: &[PathBuf],
+    candidates: I,
+    allow_unmatched: bool,
+) -> Result<BTreeSet<Vec<u8>>>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut pathspecs = CheckoutPathspecs::parse(worktree_root, paths)?;
+    if pathspecs.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let mut selected = BTreeSet::new();
+    for candidate in candidates {
+        if pathspecs.matches(candidate) {
+            selected.insert(candidate.to_vec());
+        }
+    }
+    pathspecs.require_matched_includes(allow_unmatched)?;
+    Ok(selected)
+}
+
+fn checkout_selected_positions<'a, I>(
+    worktree_root: &Path,
+    paths: &[PathBuf],
+    candidates: I,
+    allow_unmatched: bool,
+) -> Result<BTreeSet<usize>>
+where
+    I: IntoIterator<Item = (usize, &'a [u8])>,
+{
+    let mut pathspecs = CheckoutPathspecs::parse(worktree_root, paths)?;
+    if pathspecs.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let mut selected = BTreeSet::new();
+    for (position, candidate) in candidates {
+        if pathspecs.matches(candidate) {
+            selected.insert(position);
+        }
+    }
+    pathspecs.require_matched_includes(allow_unmatched)?;
     Ok(selected)
 }
 
@@ -1000,10 +1041,11 @@ pub(crate) fn checkout_unmerge_resolve_undo_paths(
     if records.is_empty() {
         return Ok(());
     }
+    let mut pathspecs = CheckoutPathspecs::parse(worktree_root, paths)?;
     let mut remaining = Vec::new();
     let mut unmerged_any = false;
     for record in records {
-        if checkout_pathspecs_match_git_path(worktree_root, paths, &record.path)? {
+        if pathspecs.matches(&record.path) {
             remove_index_entries_with_path(&mut index.entries, &record.path);
             for (idx, stage) in record.stages.into_iter().enumerate() {
                 let Some((mode, oid)) = stage else {
@@ -1027,55 +1069,6 @@ pub(crate) fn checkout_unmerge_resolve_undo_paths(
         set_resolve_undo_extension(index, &remaining)?;
     }
     Ok(())
-}
-
-pub(crate) fn checkout_pathspecs_match_git_path(
-    worktree_root: &Path,
-    paths: &[PathBuf],
-    candidate: &[u8],
-) -> Result<bool> {
-    for path in paths {
-        let absolute = if path.is_absolute() {
-            path.clone()
-        } else {
-            worktree_root.join(path)
-        };
-        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
-            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
-        })?;
-        let git_path = git_path_bytes(relative)?;
-        let recursive = path == Path::new(".")
-            || path.to_string_lossy().ends_with('/')
-            || absolute.is_dir()
-            || index_entry_is_under_path(candidate, &git_path);
-        if candidate == git_path.as_slice()
-            || (recursive && index_entry_is_under_path(candidate, &git_path))
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn checkout_pathspec_has_wildcard(pathspec: &[u8]) -> bool {
-    pathspec
-        .iter()
-        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
-}
-
-fn checkout_simple_wildcard_match(pattern: &[u8], path: &[u8]) -> bool {
-    let Some(star) = pattern.iter().position(|byte| *byte == b'*') else {
-        return false;
-    };
-    if pattern[star + 1..]
-        .iter()
-        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
-    {
-        return false;
-    }
-    let prefix = &pattern[..star];
-    let suffix = &pattern[star + 1..];
-    path.len() >= prefix.len() + suffix.len() && path.starts_with(prefix) && path.ends_with(suffix)
 }
 
 pub(crate) fn resolve_undo_index_entry(
@@ -1321,68 +1314,39 @@ pub(crate) fn restore_index_paths_from_entries(
         .map(|(path, _)| path.clone())
         .collect::<BTreeSet<_>>();
     let mut restored = BTreeSet::new();
-    for path in paths {
-        let absolute = if path.is_absolute() {
-            path.clone()
-        } else {
-            worktree_root.join(path)
-        };
-        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
-            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
-        })?;
-        let git_path = git_path_bytes(relative)?;
-        let recursive = path == Path::new(".")
-            || path.to_string_lossy().ends_with('/')
-            || absolute.is_dir()
-            || index_entries
-                .keys()
-                .any(|entry| index_entry_is_under_path(entry, &git_path))
-            || source_entries
-                .keys()
-                .any(|entry| index_entry_is_under_path(entry, &git_path));
-        let mut matched_paths = BTreeSet::new();
-        for path in index_entries.keys().chain(source_entries.keys()) {
-            if path.as_slice() == git_path.as_slice()
-                || (recursive && index_entry_is_under_path(path, &git_path))
-            {
-                matched_paths.insert(path.clone());
-            }
-        }
-        if matched_paths.is_empty() {
-            if allow_unmatched {
-                continue;
-            }
-            eprintln!(
-                "error: pathspec '{}' did not match any file(s) known to git",
-                path.display()
-            );
-            return Err(GitError::Exit(1));
-        }
-        for path in matched_paths {
-            if let Some(entry) = source_entries.get(&path) {
-                // git's pathspec reset (`reset_index` → diff against the source
-                // tree) only rewrites entries that actually CHANGE: an entry whose
-                // oid and mode already equal the source is left untouched, so its
-                // cached stat is preserved and `git diff-files` stays clean (t7102
-                // "resetting an unmodified path is a no-op"). Only when the entry
-                // genuinely changes does git write a fresh, stat-zeroed entry.
-                let unchanged = index_entries.get(&path).is_some_and(|existing| {
-                    existing.oid == entry.oid
-                        && existing.mode == entry.mode
-                        && !existing.is_intent_to_add()
-                });
-                if !unchanged {
-                    let mut restored = restored_head_index_entry(worktree_root, db, &path, entry)?;
-                    if prior_skip_worktree.contains(&path) {
-                        restored.set_skip_worktree(true);
-                    }
-                    index_entries.insert(path.clone(), restored);
+    let matched_paths = checkout_selected_paths(
+        worktree_root,
+        paths,
+        index_entries
+            .keys()
+            .chain(source_entries.keys())
+            .map(Vec::as_slice),
+        allow_unmatched,
+    )?;
+    for path in matched_paths {
+        if let Some(entry) = source_entries.get(&path) {
+            // git's pathspec reset (`reset_index` → diff against the source
+            // tree) only rewrites entries that actually CHANGE: an entry whose
+            // oid and mode already equal the source is left untouched, so its
+            // cached stat is preserved and `git diff-files` stays clean (t7102
+            // "resetting an unmodified path is a no-op"). Only when the entry
+            // genuinely changes does git write a fresh, stat-zeroed entry.
+            let unchanged = index_entries.get(&path).is_some_and(|existing| {
+                existing.oid == entry.oid
+                    && existing.mode == entry.mode
+                    && !existing.is_intent_to_add()
+            });
+            if !unchanged {
+                let mut restored = restored_head_index_entry(worktree_root, db, &path, entry)?;
+                if prior_skip_worktree.contains(&path) {
+                    restored.set_skip_worktree(true);
                 }
-            } else {
-                index_entries.remove(&path);
+                index_entries.insert(path.clone(), restored);
             }
-            restored.insert(path);
+        } else {
+            index_entries.remove(&path);
         }
+        restored.insert(path);
     }
     let mut entries = index_entries.into_values().collect::<Vec<_>>();
     entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1494,67 +1458,41 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
         .map(|entry| (entry.path.as_bytes().to_vec(), entry))
         .collect::<BTreeMap<_, _>>();
     let mut restored = BTreeSet::new();
-    for path in paths {
-        let absolute = if path.is_absolute() {
-            path.clone()
-        } else {
-            worktree_root.join(path)
-        };
-        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
-            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
-        })?;
-        let git_path = git_path_bytes(relative)?;
-        let recursive = path == Path::new(".")
-            || path.to_string_lossy().ends_with('/')
-            || absolute.is_dir()
-            || index_entries
-                .keys()
-                .any(|entry| index_entry_is_under_path(entry, &git_path))
-            || source_entries
-                .keys()
-                .any(|entry| index_entry_is_under_path(entry, &git_path));
-        let mut matched_paths = BTreeSet::new();
-        for path in index_entries.keys().chain(source_entries.keys()) {
-            if path.as_slice() == git_path.as_slice()
-                || (recursive && index_entry_is_under_path(path, &git_path))
-            {
-                matched_paths.insert(path.clone());
-            }
-        }
-        if matched_paths.is_empty() {
-            eprintln!(
-                "error: pathspec '{}' did not match any file(s) known to git",
-                path.display()
+    let matched_paths = checkout_selected_paths(
+        worktree_root,
+        paths,
+        index_entries
+            .keys()
+            .chain(source_entries.keys())
+            .map(Vec::as_slice),
+        false,
+    )?;
+    for path in matched_paths {
+        if let Some(entry) = source_entries.get(&path) {
+            index_entries.insert(
+                path.clone(),
+                materialize_path_restore_entry_filtered(
+                    db,
+                    format,
+                    worktree_root,
+                    git_dir,
+                    &path,
+                    entry,
+                    &config,
+                )?,
             );
-            return Err(GitError::Exit(1));
+        } else if overlay {
+            // Overlay mode (git checkout default): a path that matches the
+            // pathspec but is absent from the source tree is left untouched
+            // in both the index and the working tree.
+            continue;
+        } else {
+            // No-overlay mode (git restore default, checkout --no-overlay):
+            // drop the path from the index and the working tree.
+            index_entries.remove(&path);
+            remove_worktree_file(worktree_root, &path)?;
         }
-        for path in matched_paths {
-            if let Some(entry) = source_entries.get(&path) {
-                index_entries.insert(
-                    path.clone(),
-                    materialize_path_restore_entry_filtered(
-                        db,
-                        format,
-                        worktree_root,
-                        git_dir,
-                        &path,
-                        entry,
-                        &config,
-                    )?,
-                );
-            } else if overlay {
-                // Overlay mode (git checkout default): a path that matches the
-                // pathspec but is absent from the source tree is left untouched
-                // in both the index and the working tree.
-                continue;
-            } else {
-                // No-overlay mode (git restore default, checkout --no-overlay):
-                // drop the path from the index and the working tree.
-                index_entries.remove(&path);
-                remove_worktree_file(worktree_root, &path)?;
-            }
-            restored.insert(path);
-        }
+        restored.insert(path);
     }
     let mut entries = index_entries.into_values().collect::<Vec<_>>();
     entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -2777,56 +2715,30 @@ pub(crate) fn restore_worktree_paths_from_entries(
         .collect::<BTreeSet<_>>();
     let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
     let mut restored = BTreeSet::new();
-    for path in paths {
-        let absolute = if path.is_absolute() {
-            path.clone()
+    let matched_paths = checkout_selected_paths(
+        worktree_root,
+        paths,
+        index_entries
+            .iter()
+            .chain(source_entries.keys())
+            .map(Vec::as_slice),
+        false,
+    )?;
+    for path in matched_paths {
+        if let Some(entry) = source_entries.get(&path) {
+            materialize_path_restore_entry_filtered(
+                db,
+                format,
+                worktree_root,
+                git_dir,
+                &path,
+                entry,
+                &config,
+            )?;
         } else {
-            worktree_root.join(path)
-        };
-        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
-            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
-        })?;
-        let git_path = git_path_bytes(relative)?;
-        let recursive = path == Path::new(".")
-            || path.to_string_lossy().ends_with('/')
-            || absolute.is_dir()
-            || index_entries
-                .iter()
-                .any(|entry| index_entry_is_under_path(entry, &git_path))
-            || source_entries
-                .keys()
-                .any(|entry| index_entry_is_under_path(entry, &git_path));
-        let mut matched_paths = BTreeSet::new();
-        for path in index_entries.iter().chain(source_entries.keys()) {
-            if path.as_slice() == git_path.as_slice()
-                || (recursive && index_entry_is_under_path(path, &git_path))
-            {
-                matched_paths.insert(path.clone());
-            }
+            remove_worktree_file(worktree_root, &path)?;
         }
-        if matched_paths.is_empty() {
-            eprintln!(
-                "error: pathspec '{}' did not match any file(s) known to git",
-                path.display()
-            );
-            return Err(GitError::Exit(1));
-        }
-        for path in matched_paths {
-            if let Some(entry) = source_entries.get(&path) {
-                materialize_path_restore_entry_filtered(
-                    db,
-                    format,
-                    worktree_root,
-                    git_dir,
-                    &path,
-                    entry,
-                    &config,
-                )?;
-            } else {
-                remove_worktree_file(worktree_root, &path)?;
-            }
-            restored.insert(path);
-        }
+        restored.insert(path);
     }
     Ok(RestoreResult {
         restored: restored.len(),

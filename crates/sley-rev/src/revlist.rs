@@ -500,6 +500,13 @@ pub fn load_commit_grafts(
     let Some(git_dir) = db.objects_dir().parent() else {
         return HashMap::new();
     };
+    load_commit_grafts_from_git_dir(git_dir, format)
+}
+
+pub fn load_commit_grafts_from_git_dir(
+    git_dir: &std::path::Path,
+    format: ObjectFormat,
+) -> HashMap<ObjectId, Vec<ObjectId>> {
     let Ok(contents) = std::fs::read_to_string(git_dir.join("info").join("grafts")) else {
         return HashMap::new();
     };

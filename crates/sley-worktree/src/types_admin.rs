@@ -710,6 +710,7 @@ pub enum CheckoutConflictStyle {
 pub struct CheckoutIndexPathOptions<'a> {
     pub force: bool,
     pub merge: bool,
+    pub overlay: bool,
     pub stage: Option<CheckoutStage>,
     pub conflict_style: CheckoutConflictStyle,
     pub smudge_config: Option<&'a GitConfig>,

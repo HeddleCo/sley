@@ -260,6 +260,22 @@ fn merge_base_fork_point_matches_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_same_output(actual, expected, &args);
         }
+
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &[
+                "-c",
+                "core.logallrefupdates=false",
+                "branch",
+                "no-reflog",
+                "main",
+            ],
+        );
+        let args = ["merge-base", "--fork-point", "no-reflog", &topic];
+        let expected = git(&root, &args);
+        let actual = git_rs(&root, &args);
+        assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
 }

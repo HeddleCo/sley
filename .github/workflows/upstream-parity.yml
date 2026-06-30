@@ -39,7 +39,7 @@ jobs:
   upstream-parity:
     name: Upstream parity (expanded subset)
     runs-on: ubuntu-latest
-    # 538 selected t-files: 371 floor-gated scripts plus 167 measurement-only
+    # 559 selected t-files: 401 floor-gated scripts plus 158 measurement-only
     # facade/graph/pack/status scripts. Keep enough room for the oracle-git
     # build on a cache miss and the known long-running upstream scripts.
     timeout-minutes: 180
@@ -100,15 +100,19 @@ jobs:
           # (overrides the runner's default subset).
           SLEY_TESTS: >-
             t0001-init.sh
+            t0007-git-var.sh
             t0008-ignores.sh
             t0012-help.sh
             t0020-crlf.sh
             t0021-conversion.sh
             t0027-auto-crlf.sh
+            t0030-stripspace.sh
             t1006-cat-file.sh
             t1007-hash-object.sh
+            t1100-commit-tree-options.sh
             t1014-read-tree-confusing.sh
             t1300-config.sh
+            t1303-wacky-config.sh
             t1400-update-ref.sh
             t1401-symbolic-ref.sh
             t1430-bad-ref-name.sh
@@ -132,10 +136,16 @@ jobs:
             t2406-worktree-repair.sh
             t3000-ls-files-others.sh
             t3070-wildmatch.sh
+            t3100-ls-tree-restrict.sh
+            t3101-ls-tree-dirname.sh
+            t3102-ls-tree-wildcards.sh
             t3103-ls-tree-misc.sh
+            t3104-ls-tree-format.sh
             t3105-ls-tree-output.sh
             t3200-branch.sh
             t3301-notes.sh
+            t3304-notes-mixed.sh
+            t3307-notes-man.sh
             t3309-notes-merge-auto-resolve.sh
             t3311-notes-merge-fanout.sh
             t4301-merge-tree-write-tree.sh
@@ -191,6 +201,7 @@ jobs:
             t1701-racy-split-index.sh
             t6200-fmt-merge-msg.sh
             t7512-status-help.sh
+            t7513-interpret-trailers.sh
             t7509-commit-authorship.sh
             t0003-attributes.sh
             t7064-wtstatus-pv2.sh
@@ -212,13 +223,19 @@ jobs:
             t3507-cherry-pick-conflict.sh
             t3510-cherry-pick-sequence.sh
             t3600-rm.sh
+            t3601-rm-pathspec-file.sh
             t3700-add.sh
+            t3704-add-pathspec-file.sh
             t3903-stash.sh
             t3900-i18n-commit.sh
             t3920-crlf-messages.sh
+            t4006-diff-mode.sh
             t4013-diff-various.sh
             t4014-format-patch.sh
+            t4016-diff-quote.sh
+            t4017-diff-retval.sh
             t4100-apply-stat.sh
+            t4101-apply-nonl.sh
             t4015-diff-whitespace.sh
             t4018-diff-funcname.sh
             t4019-diff-wserror.sh
@@ -231,7 +248,9 @@ jobs:
             t4041-diff-submodule-option.sh
             t4052-stat-output.sh
             t4124-apply-ws-rule.sh
+            t4136-apply-check.sh
             t4150-am.sh
+            t4152-am-subjects.sh
             t4201-shortlog.sh
             t4202-log.sh
             t4205-log-pretty-formats.sh
@@ -512,6 +531,7 @@ jobs:
             t3513-revert-submodule.sh
             t3705-add-sparse-checkout.sh
             t4001-diff-rename.sh
+            t4002-diff-basic.sh
             t4003-diff-rename-1.sh
             t4007-rename-3.sh
             t4012-diff-binary.sh
@@ -536,6 +556,7 @@ jobs:
             t5002-archive-attr-pattern.sh
             t5003-archive-zip.sh
             t5004-archive-corner-cases.sh
+            t5200-update-server-info.sh
             t5301-sliding-window.sh
             t5305-include-tag.sh
             t5306-pack-nobase.sh

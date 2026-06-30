@@ -44,6 +44,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
     let mut verified_revs = 0usize;
     let mut quiet = false;
     let mut abbrev_ref = false;
+    let mut symbolic = false;
     let mut symbolic_full_name = false;
     let mut revs_only = false;
     let mut path_format = RevParsePathFormat::Default;
@@ -217,6 +218,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
             "--quiet" | "-q" => quiet = true,
             "--revs-only" => revs_only = true,
             "--abbrev-ref" | "--abbrev-ref=strict" | "--abbrev-ref=loose" => abbrev_ref = true,
+            "--symbolic" => symbolic = true,
             "--symbolic-full-name" => symbolic_full_name = true,
             "--bisect" => rev_parse_bisect(&git_dir, format, symbolic_full_name)?,
             value if value.starts_with('-') && !end_of_options => {
@@ -276,6 +278,27 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
                     Some(rest) => (rest, true),
                     None => (rev, false),
                 };
+                if !verify
+                    && let Some(rendered) =
+                        rev_parse_render_parent_expansion(&git_dir, format, rev, negate, symbolic)?
+                {
+                    for line in rendered {
+                        println!("{line}");
+                    }
+                    idx += 1;
+                    continue;
+                }
+                if symbolic && !verify {
+                    if let Some(rendered) = rev_parse_render_symbolic_range(rev, negate) {
+                        for line in rendered {
+                            println!("{line}");
+                        }
+                    } else {
+                        rev_parse_print_positional(rev, negate);
+                    }
+                    idx += 1;
+                    continue;
+                }
                 if let Some(rendered) = rev_parse_render_range(&git_dir, format, rev, negate)? {
                     for line in rendered {
                         println!("{line}");
@@ -442,39 +465,131 @@ fn rev_parse_render_range(
     rev: &str,
     negate: bool,
 ) -> Result<Option<Vec<String>>> {
-    let Some((left, right, symmetric)) = rev_parse_split_range(rev) else {
+    let Some(range) = sley_rev::parse_revision_range(rev) else {
         return Ok(None);
     };
-    if left.is_empty() && right.is_empty() {
-        return Ok(Some(vec![rev.to_string()]));
-    }
-    let left = if left.is_empty() { "HEAD" } else { left };
-    let right = if right.is_empty() { "HEAD" } else { right };
-    let left_oid = rev_parse_resolve_commitish(git_dir, format, left)?;
-    let right_oid = rev_parse_resolve_commitish(git_dir, format, right)?;
     let mut out = Vec::new();
-    if symmetric {
-        let db = FileObjectDatabase::from_git_dir(git_dir, format);
-        let left_commit = sley_rev::peel_to_commit(&db, format, &left_oid)?;
-        let right_commit = sley_rev::peel_to_commit(&db, format, &right_oid)?;
-        let bases = sley_rev::merge_bases(git_dir, format, &db, &left_commit, &right_commit)?;
-        if negate {
-            out.push(format!("^{}", left_oid.to_hex()));
-            out.push(format!("^{}", right_oid.to_hex()));
-            out.extend(bases.into_iter().map(|oid| oid.to_hex()));
-        } else {
-            out.push(left_oid.to_hex());
-            out.push(right_oid.to_hex());
-            out.extend(bases.into_iter().map(|oid| format!("^{}", oid.to_hex())));
+    match range {
+        sley_rev::RevisionRange::Asymmetric { start, end } => {
+            let start_oid = rev_parse_resolve_commitish(git_dir, format, &start)?;
+            let end_oid = rev_parse_resolve_commitish(git_dir, format, &end)?;
+            if negate {
+                out.push(format!("^{}", end_oid.to_hex()));
+                out.push(start_oid.to_hex());
+            } else {
+                out.push(end_oid.to_hex());
+                out.push(format!("^{}", start_oid.to_hex()));
+            }
         }
-    } else if negate {
-        out.push(format!("^{}", right_oid.to_hex()));
-        out.push(left_oid.to_hex());
-    } else {
-        out.push(right_oid.to_hex());
-        out.push(format!("^{}", left_oid.to_hex()));
+        sley_rev::RevisionRange::Symmetric { left, right } => {
+            let left_oid = rev_parse_resolve_commitish(git_dir, format, &left)?;
+            let right_oid = rev_parse_resolve_commitish(git_dir, format, &right)?;
+            let db = FileObjectDatabase::from_git_dir(git_dir, format);
+            let left_commit = sley_rev::peel_to_commit(&db, format, &left_oid)?;
+            let right_commit = sley_rev::peel_to_commit(&db, format, &right_oid)?;
+            let bases = sley_rev::merge_bases(git_dir, format, &db, &left_commit, &right_commit)?;
+            if negate {
+                out.push(format!("^{}", left_oid.to_hex()));
+                out.push(format!("^{}", right_oid.to_hex()));
+                out.extend(bases.into_iter().map(|oid| oid.to_hex()));
+            } else {
+                out.push(left_oid.to_hex());
+                out.push(right_oid.to_hex());
+                out.extend(bases.into_iter().map(|oid| format!("^{}", oid.to_hex())));
+            }
+        }
     }
     Ok(Some(out))
+}
+
+fn rev_parse_render_symbolic_range(rev: &str, negate: bool) -> Option<Vec<String>> {
+    let range = sley_rev::parse_revision_range(rev)?;
+    let mut out = Vec::new();
+    match range {
+        sley_rev::RevisionRange::Asymmetric { start, end } => {
+            if negate {
+                out.push(format!("^{end}"));
+                out.push(start);
+            } else {
+                out.push(end);
+                out.push(format!("^{start}"));
+            }
+        }
+        sley_rev::RevisionRange::Symmetric { left, right } => {
+            if negate {
+                out.push(format!("^{left}"));
+                out.push(format!("^{right}"));
+            } else {
+                out.push(left);
+                out.push(right);
+            }
+        }
+    }
+    Some(out)
+}
+
+fn rev_parse_render_parent_expansion(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+    negate: bool,
+    symbolic: bool,
+) -> Result<Option<Vec<String>>> {
+    if let Some(base) = rev.strip_suffix("^@") {
+        let parents = rev_parse_parent_oids(git_dir, format, base)?;
+        let mut out = Vec::with_capacity(parents.len());
+        for (idx, oid) in parents.into_iter().enumerate() {
+            let rendered = if symbolic {
+                format!("{base}^{}", idx + 1)
+            } else {
+                oid.to_hex()
+            };
+            out.push(if negate {
+                format!("^{rendered}")
+            } else {
+                rendered
+            });
+        }
+        return Ok(Some(out));
+    }
+    if let Some(base) = rev.strip_suffix("^!") {
+        let parents = rev_parse_parent_oids(git_dir, format, base)?;
+        let base_oid = rev_parse_resolve_commitish(git_dir, format, base)?;
+        let mut out = Vec::with_capacity(parents.len() + 1);
+        let rendered_base = if symbolic {
+            base.to_string()
+        } else {
+            base_oid.to_hex()
+        };
+        out.push(if negate {
+            format!("^{rendered_base}")
+        } else {
+            rendered_base
+        });
+        for (idx, oid) in parents.into_iter().enumerate() {
+            let rendered = if symbolic {
+                format!("{base}^{}", idx + 1)
+            } else {
+                oid.to_hex()
+            };
+            out.push(if negate {
+                rendered
+            } else {
+                format!("^{rendered}")
+            });
+        }
+        return Ok(Some(out));
+    }
+    Ok(None)
+}
+
+fn rev_parse_parent_oids(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<Vec<ObjectId>> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let base = rev_parse_resolve_commitish(git_dir, format, rev)?;
+    let commit_oid = sley_rev::peel_to_commit(&db, format, &base)?;
+    let object = db.read_object(&commit_oid)?;
+    let commit = Commit::parse(format, &object.body)?;
+    Ok(sley_odb::grafted_parents(&db, &commit_oid, commit.parents))
 }
 
 fn rev_parse_resolve_commitish(
