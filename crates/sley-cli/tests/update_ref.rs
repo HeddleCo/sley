@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -532,6 +533,61 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
             expected.join(".git").join("refs/tags/zero-new").exists()
         );
     };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn update_ref_stdin_bulk_existing_refs_avoids_quadratic_df_scan() {
+    let root = unique_temp_dir("update-ref-stdin-bulk-existing");
+    fs::create_dir_all(&root).expect("create repo dir");
+    run_success(sley_testkit::oracle_git(), &root, &["init"]);
+
+    let first = empty_commit(&root);
+    let second = empty_commit(&root);
+    let count = 768;
+    let mut input = Vec::new();
+    for n in 1..=count {
+        input.extend_from_slice(format!("create refs/heads/ref-{n} {first}\n").as_bytes());
+    }
+    let output = run_with_stdin(
+        env!("CARGO_BIN_EXE_sley"),
+        &root,
+        &["update-ref", "--stdin"],
+        &input,
+    );
+    assert!(
+        output.status.success(),
+        "bulk create failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    input.clear();
+    for n in 1..=count {
+        input.extend_from_slice(format!("update refs/heads/ref-{n} {second}\n").as_bytes());
+    }
+    let start = Instant::now();
+    let output = run_with_stdin(
+        env!("CARGO_BIN_EXE_sley"),
+        &root,
+        &["update-ref", "--stdin"],
+        &input,
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        output.status.success(),
+        "bulk update failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read_ref(&root, "refs/heads/ref-768"),
+        format!("{second}\n").into_bytes()
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "bulk update of {count} existing refs took {elapsed:?}; this usually means the stdin D/F conflict scan regressed"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 

@@ -2172,7 +2172,7 @@ fn dispatch_ref_stdin_command(
                     &v,
                 )?),
             };
-            let effective = update_ref_stdin_effective_ref(context.store, &raw_name, *deref)?;
+            let effective = transaction.effective_ref(context.store, &raw_name, *deref)?;
             let name = effective.effective.clone();
             if context.batch_updates {
                 return update_ref_stdin_write_batch(
@@ -2240,7 +2240,7 @@ fn dispatch_ref_stdin_command(
             if new_oid == zero_oid(context.format)? {
                 return update_ref_stdin_create_zero(&raw_name);
             }
-            let effective = update_ref_stdin_effective_ref(context.store, &raw_name, *deref)?;
+            let effective = transaction.effective_ref(context.store, &raw_name, *deref)?;
             let name = effective.effective.clone();
             let zero = zero_oid(context.format)?;
             if context.batch_updates {
@@ -2311,7 +2311,7 @@ fn dispatch_ref_stdin_command(
                     Some(oid)
                 }
             };
-            let effective = update_ref_stdin_effective_ref(context.store, &raw_name, *deref)?;
+            let effective = transaction.effective_ref(context.store, &raw_name, *deref)?;
             let name = effective.effective.clone();
             if context.batch_updates {
                 return update_ref_delete_stdin_batch(
@@ -2362,7 +2362,7 @@ fn dispatch_ref_stdin_command(
                 Some(v) => resolve_stdin_oid(context, "verify", &raw_name, "<old-oid>", &v)?,
                 None => zero_oid(context.format)?,
             };
-            let effective = update_ref_stdin_effective_ref(context.store, &raw_name, *deref)?;
+            let effective = transaction.effective_ref(context.store, &raw_name, *deref)?;
             let name = effective.effective.clone();
             let current = context.store.read_ref(&name)?;
             if context.batch_updates {
@@ -2602,7 +2602,8 @@ impl UpdateRefStdinTransaction {
             .originals
             .range(child_prefix.clone()..)
             .map(|(other, _)| other.as_str())
-            .find(|other| other.starts_with(&child_prefix))
+            .next()
+            .filter(|other| other.starts_with(&child_prefix))
         {
             return Some(self.batch_df_conflict_error(requested, name, other));
         }
@@ -2629,6 +2630,65 @@ impl UpdateRefStdinTransaction {
             );
         }
         GitError::Exit(128)
+    }
+
+    fn effective_ref(
+        &mut self,
+        store: &FileRefStore,
+        name: &str,
+        deref: bool,
+    ) -> Result<EffectiveRefName> {
+        let requested = name.to_string();
+        if !deref {
+            return Ok(EffectiveRefName {
+                effective: requested.clone(),
+                requested,
+            });
+        }
+        let mut current = requested.clone();
+        for _ in 0..16 {
+            match self.read_ref_for_deref(store, &current) {
+                Ok(Some(RefTarget::Symbolic(target))) => current = target,
+                Ok(_) => break,
+                Err(GitError::InvalidPath(_)) => {
+                    if sley_refs::validate_ref_name_for_update(&current).is_ok() {
+                        break;
+                    }
+                    return update_ref_stdin_invalid_ref_format(name);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if sley_refs::validate_ref_name_for_update(&current).is_err() {
+            return update_ref_stdin_invalid_ref_format(name);
+        }
+        Ok(EffectiveRefName {
+            requested,
+            effective: current,
+        })
+    }
+
+    fn read_ref_for_deref(
+        &mut self,
+        store: &FileRefStore,
+        name: &str,
+    ) -> Result<Option<RefTarget>> {
+        if name == "HEAD" || !name.starts_with("refs/") {
+            return store.read_ref(name);
+        }
+        if self.ref_snapshot.is_none() {
+            self.ref_snapshot = Some(
+                store
+                    .list_refs()?
+                    .into_iter()
+                    .map(|reference| (reference.name, reference.target))
+                    .collect(),
+            );
+        }
+        Ok(self
+            .ref_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get(name).cloned()))
     }
 
     /// Reshape a backend D/F-conflict error into the git-shaped `fatal:` exit-128
@@ -3800,22 +3860,6 @@ fn update_ref_stdin_write(
 
 fn update_ref_effective_name(store: &FileRefStore, name: &str, deref: bool) -> Result<String> {
     Ok(update_ref_effective_ref(store, name, deref)?.effective)
-}
-
-fn update_ref_stdin_effective_ref(
-    store: &FileRefStore,
-    name: &str,
-    deref: bool,
-) -> Result<EffectiveRefName> {
-    let effective = match update_ref_effective_ref(store, name, deref) {
-        Ok(effective) => effective,
-        Err(GitError::InvalidPath(_)) => return update_ref_stdin_invalid_ref_format(name),
-        Err(err) => return Err(err),
-    };
-    if sley_refs::validate_ref_name_for_update(&effective.effective).is_err() {
-        return update_ref_stdin_invalid_ref_format(name);
-    }
-    Ok(effective)
 }
 
 /// The result of dereferencing a (possibly symbolic) ref for an update: the

@@ -35,6 +35,10 @@ waves=${SLEY_UPSTREAM_WAVES:-${SLEY_TEST_WAVES:-${GIT_RS_UPSTREAM_WAVES:-4}}}
 case $waves in
     *[!0-9]* | 0 | "") die "SLEY_UPSTREAM_WAVES must be a positive integer" ;;
 esac
+timeout_secs=${SLEY_TEST_TIMEOUT:-${GIT_RS_TEST_TIMEOUT:-240}}
+case $timeout_secs in
+    *[!0-9]* | "") die "SLEY_TEST_TIMEOUT must be a non-negative integer" ;;
+esac
 
 selection=$*
 if [ -z "$selection" ]; then
@@ -91,6 +95,7 @@ done
     printf 'run label: %s\n' "$run_label"
     printf 'waves: %s\n' "$waves"
     printf 'selected scripts: %s\n' "$selected_count"
+    printf 'per-script timeout: %ss\n' "$timeout_secs"
     printf 'serial runner: %s\n' "$runner"
     printf '\n'
 } > "$report"
@@ -112,6 +117,7 @@ while [ "$i" -le "$waves" ]; do
             SLEY_SUMMARY="$tmp_root/wave-$i/summary.csv" \
             SLEY_HISTORY="$tmp_root/wave-$i/history.csv" \
             SLEY_RUN_LABEL="$run_label-wave-$i" \
+            SLEY_TEST_TIMEOUT="$timeout_secs" \
             sh "$runner"
         ) > "$tmp_root/wave-$i/stdout.txt" 2> "$tmp_root/wave-$i/stderr.txt" &
         printf '%s\n' "$!" > "$tmp_root/wave-$i/pid"
