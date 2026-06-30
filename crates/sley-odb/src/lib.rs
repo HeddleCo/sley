@@ -4828,10 +4828,56 @@ fn collect_loose_fanout_object_ids(
     Ok(())
 }
 
+/// The set of `objects/XX/` fanout directories that actually exist on disk,
+/// learned from a single `read_dir(objects/)`. A freshly cloned or repacked
+/// repository has zero loose-object fanout dirs (everything is packed), so this
+/// lets a loose-presence probe skip the per-fanout `opendir(objects/XX)` that
+/// would otherwise miss with ENOENT on every distinct id prefix — the
+/// constant-factor loose-probe floor on packed-repo reads. Returns the present
+/// fanout bytes (`0x00..=0xff`); a missing `objects/` dir yields the empty set.
+fn present_loose_fanouts(objects_dir: &Path) -> Result<HashSet<u8>> {
+    let mut present = HashSet::new();
+    let entries = match fs::read_dir(objects_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(present),
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.len() != 2 {
+            continue;
+        }
+        let mut bytes = name.bytes();
+        let (Some(hi), Some(lo)) = (bytes.next(), bytes.next()) else {
+            continue;
+        };
+        let (Some(hi), Some(lo)) = ((hi as char).to_digit(16), (lo as char).to_digit(16)) else {
+            continue;
+        };
+        // Only count it as a fanout dir if it really is a directory; `git` keeps
+        // non-fanout entries (`pack`, `info`) under `objects/` that happen to be
+        // dirs too, but those never collide with a two-hex-char name.
+        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            present.insert(((hi << 4) | lo) as u8);
+        }
+    }
+    Ok(present)
+}
+
 #[derive(Debug, Default)]
 struct LoosePresenceCache {
+    /// Fanout bytes whose `objects/XX/` listing has been folded into `objects`.
     loaded_fanouts: HashSet<u8>,
     objects: HashSet<ObjectId>,
+    /// Which of the 256 `objects/XX/` fanout dirs exist on disk, learned from a
+    /// single `read_dir(objects/)`. `None` until first queried. A fanout absent
+    /// from this set cannot hold a loose object, so its per-fanout `read_dir`
+    /// (which would miss with ENOENT) is skipped entirely.
+    present_fanouts: Option<HashSet<u8>>,
 }
 
 /// Every object id resolvable through a pack (any `.idx` or the
@@ -6399,13 +6445,34 @@ impl LooseObjectStore {
         let mut guard = self.loose_cache.lock().ok()?;
         let fanout = oid.as_bytes()[0];
         if !guard.loaded_fanouts.contains(&fanout) {
-            collect_loose_fanout_object_ids(
-                &self.objects_dir,
-                self.format,
-                fanout,
-                &mut guard.objects,
-            )
-            .ok()?;
+            // Learn (once) which `objects/XX/` dirs exist via a single
+            // `read_dir(objects/)`. If this id's fanout dir is absent, no loose
+            // object can live there — skip the per-fanout `read_dir` that would
+            // otherwise miss with ENOENT. For an all-packed repo (every fanout
+            // absent) this collapses the whole loose-probe cost to one
+            // `read_dir(objects/)`.
+            if guard.present_fanouts.is_none() {
+                guard.present_fanouts = Some(present_loose_fanouts(&self.objects_dir).ok()?);
+            }
+            let fanout_present = guard
+                .present_fanouts
+                .as_ref()
+                .is_some_and(|present| present.contains(&fanout));
+            if fanout_present {
+                collect_loose_fanout_object_ids(
+                    &self.objects_dir,
+                    self.format,
+                    fanout,
+                    &mut guard.objects,
+                )
+                .ok()?;
+            }
+            // Mark the fanout loaded regardless: an absent fanout contributes no
+            // ids, and the `present_fanouts` set already proved it empty, so we
+            // never need to rescan it (a later loose write into a previously
+            // absent fanout goes through `note_loose_write`, which records the
+            // id directly, or `invalidate_cache`, which clears `present_fanouts`
+            // so the next probe re-learns the dir set).
             guard.loaded_fanouts.insert(fanout);
         }
         Some(guard.objects.contains(oid))
@@ -6430,6 +6497,14 @@ impl LooseObjectStore {
     /// eventual lazy scan will pick the object up) or the lock is poisoned.
     fn note_loose_write(&self, oid: ObjectId) {
         if let Ok(mut guard) = self.loose_cache.lock() {
+            // Keep the present-fanout set coherent: writing this object created
+            // (or kept) its `objects/XX/` dir, so a sibling id in the same fanout
+            // must be scannable on its next probe rather than short-circuited as
+            // an absent fanout.
+            let fanout = oid.as_bytes()[0];
+            if let Some(present) = guard.present_fanouts.as_mut() {
+                present.insert(fanout);
+            }
             guard.objects.insert(oid);
         }
     }
@@ -7070,6 +7145,202 @@ mod tests {
             .expect("test operation should succeed");
 
         assert_eq!(read_object_for_assert(&db, &oid), object);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn present_loose_fanouts_lists_only_existing_two_hex_dirs() {
+        let root = temp_root("sley-present-fanouts");
+        let objects = root.join("objects");
+        fs::create_dir_all(objects.join("ab")).expect("test operation should succeed");
+        fs::create_dir_all(objects.join("0f")).expect("test operation should succeed");
+        // Non-fanout siblings git keeps under objects/ must be ignored.
+        fs::create_dir_all(objects.join("pack")).expect("test operation should succeed");
+        fs::create_dir_all(objects.join("info")).expect("test operation should succeed");
+        // A 2-char-but-non-hex dir, and a regular file with a 2-hex name, are not
+        // fanouts.
+        fs::create_dir_all(objects.join("zz")).expect("test operation should succeed");
+        fs::write(objects.join("ff"), b"not a dir").expect("test operation should succeed");
+
+        let present = present_loose_fanouts(&objects).expect("test operation should succeed");
+        assert_eq!(
+            present,
+            HashSet::from([0xab, 0x0f]),
+            "only the genuine two-hex fanout directories should be reported"
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn present_loose_fanouts_empty_when_objects_dir_absent() {
+        let root = temp_root("sley-present-fanouts-absent");
+        fs::create_dir_all(&root).expect("test operation should succeed");
+        // No objects dir at all (e.g. an all-packed bare layout before any loose
+        // write): the helper reports an empty set rather than erroring.
+        let present =
+            present_loose_fanouts(&root.join("objects")).expect("test operation should succeed");
+        assert!(present.is_empty());
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn packed_only_repo_read_does_not_probe_loose_fanout_dirs() {
+        // Regression for the loose-first statx floor: an all-packed repo must read
+        // objects without ever opendir()-ing a per-id `objects/XX/` fanout, because
+        // none exist. The present-fanout set is learned from one `read_dir(objects/)`.
+        let root = temp_root("sley-packed-no-loose-probe");
+        let git_dir = root.join(".git");
+        let pack_dir = git_dir.join("objects").join("pack");
+        fs::create_dir_all(&pack_dir).expect("test operation should succeed");
+        let object = EncodedObject::new(ObjectType::Blob, b"packed only\n".to_vec());
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let written = PackFile::write_undeltified_sha1(std::slice::from_ref(&object))
+            .expect("test operation should succeed");
+        let pack_name = written.checksum.to_hex();
+        fs::write(pack_dir.join(format!("pack-{pack_name}.pack")), written.pack)
+            .expect("test operation should succeed");
+        fs::write(pack_dir.join(format!("pack-{pack_name}.idx")), written.index)
+            .expect("test operation should succeed");
+
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        // Header read takes the loose-first path; it must still resolve from the pack
+        // and learn that the object's fanout dir is absent.
+        assert_eq!(
+            db.read_object_header(&oid)
+                .expect("test operation should succeed"),
+            Some((ObjectType::Blob, object.body.len() as u64))
+        );
+        assert_eq!(read_object_for_assert(&db, &oid), object);
+
+        // No fanout dir was created by the read (we never wrote loose), and the
+        // cached present-fanout set is the empty set — so further probes short-circuit.
+        let fanout_hex = format!("{:02x}", oid.as_bytes()[0]);
+        assert!(
+            !git_dir.join("objects").join(&fanout_hex).exists(),
+            "reading a packed object must not create its loose fanout dir"
+        );
+        if let Ok(guard) = db.loose().loose_cache.lock() {
+            assert_eq!(
+                guard.present_fanouts.as_ref(),
+                Some(&HashSet::new()),
+                "an all-packed repo must learn zero present fanouts"
+            );
+        }
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn loose_object_in_existing_fanout_still_resolves_through_cache() {
+        // The optimization must not hide a real loose object: when its fanout dir
+        // exists, the per-fanout scan still runs and the read succeeds.
+        let root = temp_root("sley-loose-resolves");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let object = EncodedObject::new(ObjectType::Blob, b"a genuine loose object\n".to_vec());
+        let oid = db
+            .write_object(object.clone())
+            .expect("test operation should succeed");
+        // Drop all in-memory state so the read must re-learn fanouts from disk.
+        db.refresh_read_cache();
+        assert_eq!(
+            db.read_object_header(&oid)
+                .expect("test operation should succeed"),
+            Some((ObjectType::Blob, object.body.len() as u64))
+        );
+        assert_eq!(read_object_for_assert(&db, &oid), object);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn loose_write_into_previously_absent_fanout_is_found_after_cache_built() {
+        // Cache-coherence gate: a packed-only read first learns "all fanouts
+        // absent". A subsequent loose write must NOT be permanently masked by that
+        // negative present-fanout set — the just-written object reads back.
+        let root = temp_root("sley-new-loose-after-cache");
+        let git_dir = root.join(".git");
+        let pack_dir = git_dir.join("objects").join("pack");
+        fs::create_dir_all(&pack_dir).expect("test operation should succeed");
+        // Seed one packed object and read it, which warms the present-fanout set to
+        // empty (no loose dirs exist yet).
+        let packed = EncodedObject::new(ObjectType::Blob, b"seed packed\n".to_vec());
+        let written = PackFile::write_undeltified_sha1(std::slice::from_ref(&packed))
+            .expect("test operation should succeed");
+        let pack_name = written.checksum.to_hex();
+        fs::write(pack_dir.join(format!("pack-{pack_name}.pack")), written.pack)
+            .expect("test operation should succeed");
+        fs::write(pack_dir.join(format!("pack-{pack_name}.idx")), written.index)
+            .expect("test operation should succeed");
+        let packed_oid = packed
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        // Read the packed object so the loose cache learns "zero present fanouts".
+        assert_eq!(read_object_for_assert(&db, &packed_oid), packed);
+
+        // Now write a NEW loose object through the same handle. Its fanout dir did
+        // not exist when the cache learned the present set, but `note_loose_write`
+        // must keep the read path coherent.
+        let loose = EncodedObject::new(ObjectType::Blob, b"new loose into empty fanout\n".to_vec());
+        let loose_oid = db
+            .write_object(loose.clone())
+            .expect("test operation should succeed");
+        assert_eq!(
+            db.read_object_header(&loose_oid)
+                .expect("test operation should succeed"),
+            Some((ObjectType::Blob, loose.body.len() as u64)),
+            "a loose object written after the present-fanout cache was built must be found"
+        );
+        assert_eq!(read_object_for_assert(&db, &loose_oid), loose);
+        // And the original packed object still resolves.
+        assert_eq!(read_object_for_assert(&db, &packed_oid), packed);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn loose_copy_is_consulted_when_packed_copy_is_corrupt() {
+        // Loose-shadows-packed precedence: git's `oid_object_info_extended` keeps a
+        // good loose copy authoritative when the packed copy is unreadable. The
+        // present-fanout optimization must not change this — the loose fanout dir
+        // exists (we wrote it), so it is scanned and consulted.
+        let root = temp_root("sley-loose-shadows-corrupt-pack");
+        let git_dir = root.join(".git");
+        let pack_dir = git_dir.join("objects").join("pack");
+        fs::create_dir_all(&pack_dir).expect("test operation should succeed");
+        let object = EncodedObject::new(ObjectType::Blob, b"shadow me\n".to_vec());
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+
+        // Write the object both packed and loose (content-addressed: same oid).
+        let written = PackFile::write_undeltified_sha1(std::slice::from_ref(&object))
+            .expect("test operation should succeed");
+        let pack_name = written.checksum.to_hex();
+        let pack_path = pack_dir.join(format!("pack-{pack_name}.pack"));
+        fs::write(&pack_path, written.pack).expect("test operation should succeed");
+        fs::write(pack_dir.join(format!("pack-{pack_name}.idx")), written.index)
+            .expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        db.loose()
+            .write_object(object.clone())
+            .expect("test operation should succeed");
+
+        // Corrupt the pack body so the packed read fails; the good loose copy must
+        // still satisfy the read.
+        let mut pack_bytes = fs::read(&pack_path).expect("test operation should succeed");
+        let mid = pack_bytes.len() / 2;
+        pack_bytes[mid] ^= 0xff;
+        fs::write(&pack_path, &pack_bytes).expect("test operation should succeed");
+        db.refresh_read_cache();
+
+        assert_eq!(
+            read_object_for_assert(&db, &oid),
+            object,
+            "a good loose copy must shadow a corrupt packed copy"
+        );
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
