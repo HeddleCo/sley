@@ -944,11 +944,15 @@ pub(crate) const PKT_DATA_MAX: usize = 65_516;
 
 pub(crate) static PROCESS_FILTERS: OnceLock<Mutex<HashMap<String, ProcessFilter>>> =
     OnceLock::new();
-pub(crate) type ProcessFilterMetadata = Vec<(String, String)>;
+pub(crate) static PROCESS_FILTER_ABORTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// Extra protocol metadata sent on smudge requests when the caller knows the
+/// tree-ish/ref context of the materialization.
+pub type ProcessFilterMetadata = Vec<(String, String)>;
 pub(crate) static PROCESS_FILTER_METADATA: OnceLock<Mutex<Option<ProcessFilterMetadata>>> =
     OnceLock::new();
 
-pub(crate) struct ProcessFilterMetadataGuard {
+/// Restores the previous process-filter metadata when dropped.
+pub struct ProcessFilterMetadataGuard {
     previous: Option<ProcessFilterMetadata>,
 }
 
@@ -963,7 +967,7 @@ impl Drop for ProcessFilterMetadataGuard {
     }
 }
 
-pub(crate) fn set_process_filter_metadata(
+pub fn set_process_filter_metadata(
     metadata: Option<ProcessFilterMetadata>,
 ) -> ProcessFilterMetadataGuard {
     let mutex = PROCESS_FILTER_METADATA.get_or_init(|| Mutex::new(None));
@@ -984,9 +988,10 @@ pub(crate) fn current_process_filter_metadata() -> Option<ProcessFilterMetadata>
 
 pub(crate) struct ProcessFilter {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: ChildStdout,
     capabilities: u8,
+    closed: bool,
 }
 
 pub(crate) enum ProcessFilterOutcome {
@@ -1016,6 +1021,14 @@ pub(crate) fn run_process_filter(
     content: &[u8],
     blob: Option<ObjectId>,
 ) -> std::result::Result<ProcessFilterOutcome, ProcessFilterFailure> {
+    if PROCESS_FILTER_ABORTED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|aborted| aborted.contains(command))
+        .unwrap_or(false)
+    {
+        return Ok(ProcessFilterOutcome::Status("abort".to_string()));
+    }
     let filters = PROCESS_FILTERS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut filters = filters
         .lock()
@@ -1028,6 +1041,17 @@ pub(crate) fn run_process_filter(
         .get_mut(command)
         .expect("process filter was inserted")
         .apply(direction, path, content, blob);
+    if matches!(result, Ok(ProcessFilterOutcome::Status(ref status)) if status == "abort") {
+        if let Some(mut filter) = filters.remove(command) {
+            filter.finish_gracefully();
+        }
+        if let Ok(mut aborted) = PROCESS_FILTER_ABORTED
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+        {
+            aborted.insert(command.to_string());
+        }
+    }
     if result.as_ref().is_err_and(|err| err.protocol) {
         filters.remove(command);
     }
@@ -1107,9 +1131,10 @@ impl ProcessFilter {
 
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout,
             capabilities,
+            closed: false,
         })
     }
 
@@ -1129,24 +1154,30 @@ impl ProcessFilter {
             return Ok(ProcessFilterOutcome::Unsupported);
         }
 
-        write_pkt_text(&mut self.stdin, &format!("command={direction}\n"))?;
-        write_pkt_text(
-            &mut self.stdin,
-            &format!("pathname={}\n", String::from_utf8_lossy(path)),
-        )?;
-        if direction == "smudge"
-            && let Some(blob) = blob
         {
-            if let Some(metadata) = current_process_filter_metadata() {
-                for (key, value) in metadata {
-                    write_pkt_text(&mut self.stdin, &format!("{key}={value}\n"))?;
+            let stdin = self
+                .stdin
+                .as_mut()
+                .ok_or_else(|| ProcessFilterFailure::protocol("process filter stdin closed"))?;
+            write_pkt_text(stdin, &format!("command={direction}\n"))?;
+            write_pkt_text(
+                stdin,
+                &format!("pathname={}\n", String::from_utf8_lossy(path)),
+            )?;
+            if direction == "smudge"
+                && let Some(blob) = blob
+            {
+                if let Some(metadata) = current_process_filter_metadata() {
+                    for (key, value) in metadata {
+                        write_pkt_text(stdin, &format!("{key}={value}\n"))?;
+                    }
                 }
+                write_pkt_text(stdin, &format!("blob={}\n", blob.to_hex()))?;
             }
-            write_pkt_text(&mut self.stdin, &format!("blob={}\n", blob.to_hex()))?;
+            write_flush(stdin)?;
+            write_pkt_content(stdin, content)?;
+            write_flush(stdin)?;
         }
-        write_flush(&mut self.stdin)?;
-        write_pkt_content(&mut self.stdin, content)?;
-        write_flush(&mut self.stdin)?;
 
         let mut status = read_process_status(&mut self.stdout)?.unwrap_or_default();
         match status.as_str() {
@@ -1171,11 +1202,36 @@ impl ProcessFilter {
             ))),
         }
     }
+
+    fn finish_gracefully(&mut self) {
+        self.stdin.take();
+        for _ in 0..10 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.closed = true;
+                    return;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(_) => {
+                    self.closed = true;
+                    return;
+                }
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.closed = true;
+    }
 }
 
 impl Drop for ProcessFilter {
     fn drop(&mut self) {
-        let _ = self.stdin.flush();
+        if self.closed {
+            return;
+        }
+        if let Some(stdin) = self.stdin.as_mut() {
+            let _ = stdin.flush();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

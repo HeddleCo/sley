@@ -9,6 +9,7 @@ use crate::index::*;
 use crate::index_io::*;
 use crate::status::*;
 use crate::types_admin::*;
+use sley_pathspec::{PathspecMatchMagic, pathspec_item_matches};
 
 pub fn deleted_index_entries(
     worktree_root: impl AsRef<Path>,
@@ -710,7 +711,7 @@ pub(crate) fn restore_worktree_paths_inner(
             || absolute.is_dir()
             || index_has_entry_under(&index.entries, &git_path);
         let mut matched = false;
-        let matched_positions = index
+        let mut matched_positions = index
             .entries
             .iter()
             .enumerate()
@@ -720,6 +721,32 @@ pub(crate) fn restore_worktree_paths_inner(
                 .then_some(position)
             })
             .collect::<Vec<_>>();
+        if matched_positions.is_empty() && checkout_pathspec_has_wildcard(&git_path) {
+            matched_positions = index
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(position, entry)| {
+                    pathspec_item_matches(
+                        &git_path,
+                        entry.path.as_bytes(),
+                        PathspecMatchMagic::default(),
+                    )
+                    .then_some(position)
+                })
+                .collect::<Vec<_>>();
+        }
+        if matched_positions.is_empty() && checkout_pathspec_has_wildcard(&git_path) {
+            matched_positions = index
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(position, entry)| {
+                    checkout_simple_wildcard_match(&git_path, entry.path.as_bytes())
+                        .then_some(position)
+                })
+                .collect::<Vec<_>>();
+        }
         for position in matched_positions {
             let refreshed = restore_index_entry(
                 worktree_root,
@@ -921,7 +948,7 @@ pub(crate) fn checkout_selected_index_paths(
             || index_paths
                 .iter()
                 .any(|entry| index_entry_is_under_path(entry, &git_path));
-        let matched = index_paths
+        let mut matched = index_paths
             .iter()
             .filter(|entry| {
                 entry.as_slice() == git_path.as_slice()
@@ -929,6 +956,28 @@ pub(crate) fn checkout_selected_index_paths(
             })
             .cloned()
             .collect::<Vec<_>>();
+        if matched.is_empty() && checkout_pathspec_has_wildcard(&git_path) {
+            matched.extend(
+                index_paths
+                    .iter()
+                    .filter(|entry| {
+                        pathspec_item_matches(
+                            &git_path,
+                            entry.as_slice(),
+                            PathspecMatchMagic::default(),
+                        )
+                    })
+                    .cloned(),
+            );
+        }
+        if matched.is_empty() && checkout_pathspec_has_wildcard(&git_path) {
+            matched.extend(
+                index_paths
+                    .iter()
+                    .filter(|entry| checkout_simple_wildcard_match(&git_path, entry.as_slice()))
+                    .cloned(),
+            );
+        }
         if matched.is_empty() {
             eprintln!(
                 "error: pathspec '{}' did not match any file(s) known to git",
@@ -1006,6 +1055,27 @@ pub(crate) fn checkout_pathspecs_match_git_path(
         }
     }
     Ok(false)
+}
+
+fn checkout_pathspec_has_wildcard(pathspec: &[u8]) -> bool {
+    pathspec
+        .iter()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+}
+
+fn checkout_simple_wildcard_match(pattern: &[u8], path: &[u8]) -> bool {
+    let Some(star) = pattern.iter().position(|byte| *byte == b'*') else {
+        return false;
+    };
+    if pattern[star + 1..]
+        .iter()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+    {
+        return false;
+    }
+    let prefix = &pattern[..star];
+    let suffix = &pattern[star + 1..];
+    path.len() >= prefix.len() + suffix.len() && path.starts_with(prefix) && path.ends_with(suffix)
 }
 
 pub(crate) fn resolve_undo_index_entry(
@@ -1557,6 +1627,17 @@ pub fn reset_index_and_worktree_to_commit(
     Ok(RestoreResult {
         restored: target_entries.len(),
     })
+}
+
+pub fn reset_index_and_worktree_to_commit_with_process_filter_metadata(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+    process_metadata: Option<ProcessFilterMetadata>,
+) -> Result<RestoreResult> {
+    let _process_filter_metadata = set_process_filter_metadata(process_metadata);
+    reset_index_and_worktree_to_commit(worktree_root, git_dir, format, commit_oid)
 }
 
 /// All paths the current index references, deduped across stages (a conflicted

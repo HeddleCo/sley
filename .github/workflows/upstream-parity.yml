@@ -4,8 +4,8 @@ name: Upstream Git Parity Tests
 # parity oracle. This workflow:
 #   1. Builds git 2.54.0 from source (cached) so test-lib.sh has a real built
 #      checkout (GIT-BUILD-OPTIONS + t/).
-#   2. Builds the sley binary and runs the foundational t-file subset through
-#      crates/sley-testkit/scripts/run-upstream-tests.sh.
+#   2. Builds the sley binary and runs the expanded t-file subset through
+#      crates/sley-testkit/scripts/run-upstream-tests-waves.sh.
 #   3. Gates on a per-file PASS FLOOR: each tracked t-file must not drop below
 #      its recorded ok-assertion count. A net gain never fails the gate; only a
 #      regression below floor does.
@@ -37,12 +37,12 @@ env:
 
 jobs:
   upstream-parity:
-    name: Upstream parity (floor-gated subset)
+    name: Upstream parity (expanded subset)
     runs-on: ubuntu-latest
-    # 53 tracked t-files (round-4a added 5: fetch-pack/shallow + userdiff,
-    # incl. the 377-assertion t5500 fetch suite) + oracle-git build on cache
-    # miss; 60 min was sized for the 48-file list.
-    timeout-minutes: 90
+    # 538 selected t-files: 371 floor-gated scripts plus 167 measurement-only
+    # facade/graph/pack/status scripts. Keep enough room for the oracle-git
+    # build on a cache miss and the known long-running upstream scripts.
+    timeout-minutes: 180
 
     steps:
       - uses: actions/checkout@v4
@@ -377,6 +377,268 @@ jobs:
             t4114-apply-typechange.sh
             t4129-apply-samemode.sh
             t4111-apply-subdir.sh
+            t0002-gitfile.sh
+            t0009-git-dir-validation.sh
+            t0014-alias.sh
+            t0022-crlf-rename.sh
+            t0028-working-tree-encoding.sh
+            t0033-safe-directory.sh
+            t0034-root-safe-directory.sh
+            t0035-safe-bare-repository.sh
+            t0056-git-C.sh
+            t0062-revision-walking.sh
+            t0068-for-each-repo.sh
+            t0092-diagnose.sh
+            t0101-at-syntax.sh
+            t0410-partial-clone.sh
+            t0411-clone-from-partial.sh
+            t0600-reffiles-backend.sh
+            t0602-reffiles-fsck.sh
+            t0613-reftable-write-options.sh
+            t0614-reftable-fsck.sh
+            t1000-read-tree-m-3way.sh
+            t1001-read-tree-m-2way.sh
+            t1003-read-tree-prefix.sh
+            t1004-read-tree-m-u-wf.sh
+            t1005-read-tree-reset.sh
+            t1008-read-tree-overlay.sh
+            t1009-read-tree-new-index.sh
+            t1010-mktree.sh
+            t1011-read-tree-sparse-checkout.sh
+            t1012-read-tree-df.sh
+            t1015-read-index-unmerged.sh
+            t1020-subdirectory.sh
+            t1022-read-tree-partial-clone.sh
+            t1051-large-conversion.sh
+            t1090-sparse-checkout-scope.sh
+            t1305-config-include.sh
+            t1306-xdg-files.sh
+            t1307-config-blob.sh
+            t1308-config-set.sh
+            t1309-early-config.sh
+            t1310-config-default.sh
+            t1311-config-optional.sh
+            t1350-config-hooks-path.sh
+            t1402-check-ref-format.sh
+            t1403-show-ref.sh
+            t1405-main-ref-store.sh
+            t1407-worktree-ref-store.sh
+            t1408-packed-refs.sh
+            t1409-avoid-packing-refs.sh
+            t1411-reflog-show.sh
+            t1413-reflog-detach.sh
+            t1414-reflog-walk.sh
+            t1415-worktree-refs.sh
+            t1418-reflog-exists.sh
+            t1421-reflog-write.sh
+            t1422-show-ref-exists.sh
+            t1503-rev-parse-verify.sh
+            t1504-ceiling-dirs.sh
+            t1505-rev-parse-last.sh
+            t1509-root-work-tree.sh
+            t1511-rev-parse-caret.sh
+            t1513-rev-parse-prefix.sh
+            t1514-rev-parse-push.sh
+            t1515-rev-parse-outside-repo.sh
+            t1517-outside-repo.sh
+            t1600-index.sh
+            t1601-index-bogus.sh
+            t2000-conflict-when-checking-files-out.sh
+            t2002-checkout-cache-u.sh
+            t2003-checkout-cache-mkdir.sh
+            t2005-checkout-index-symlinks.sh
+            t2006-checkout-index-basic.sh
+            t2007-checkout-symlink.sh
+            t2008-checkout-subdir.sh
+            t2009-checkout-statinfo.sh
+            t2010-checkout-ambiguous.sh
+            t2011-checkout-invalid-head.sh
+            t2014-checkout-switch.sh
+            t2015-checkout-unborn.sh
+            t2017-checkout-orphan.sh
+            t2019-checkout-ambiguous-ref.sh
+            t2021-checkout-overwrite.sh
+            t2022-checkout-paths.sh
+            t2023-checkout-m.sh
+            t2025-checkout-no-overlay.sh
+            t2026-checkout-pathspec-file.sh
+            t2027-checkout-track.sh
+            t2050-git-dir-relative.sh
+            t2060-switch.sh
+            t2071-restore-patch.sh
+            t2072-restore-pathspec-file.sh
+            t2080-parallel-checkout-basics.sh
+            t2081-parallel-checkout-collisions.sh
+            t2082-parallel-checkout-attributes.sh
+            t2100-update-cache-badpath.sh
+            t2101-update-index-reupdate.sh
+            t2102-update-index-symlinks.sh
+            t2103-update-index-ignore-missing.sh
+            t2104-update-index-skip-worktree.sh
+            t2105-update-index-gitfile.sh
+            t2106-update-index-assume-unchanged.sh
+            t2108-update-index-refresh-racy.sh
+            t2200-add-update.sh
+            t2201-add-update-typechange.sh
+            t2202-add-addremove.sh
+            t2206-add-submodule-ignored.sh
+            t2300-cd-to-toplevel.sh
+            t2403-worktree-move.sh
+            t2404-worktree-config.sh
+            t2405-worktree-submodule.sh
+            t2500-untracked-overwriting.sh
+            t3001-ls-files-others-exclude.sh
+            t3002-ls-files-dashpath.sh
+            t3003-ls-files-exclude.sh
+            t3004-ls-files-basic.sh
+            t3005-ls-files-relative.sh
+            t3006-ls-files-long.sh
+            t3007-ls-files-recurse-submodules.sh
+            t3008-ls-files-lazy-init-name-hash.sh
+            t3009-ls-files-others-nonsubmodule.sh
+            t3010-ls-files-killed-modified.sh
+            t3011-common-prefixes-and-directory-traversal.sh
+            t3012-ls-files-dedup.sh
+            t3013-ls-files-format.sh
+            t3020-ls-files-error-unmatch.sh
+            t3060-ls-files-with-tree.sh
+            t3201-branch-contains.sh
+            t3211-peel-ref.sh
+            t3306-notes-prune.sh
+            t3308-notes-merge.sh
+            t3310-notes-merge-manual-resolve.sh
+            t3426-rebase-submodule.sh
+            t3512-cherry-pick-submodule.sh
+            t3513-revert-submodule.sh
+            t3705-add-sparse-checkout.sh
+            t4001-diff-rename.sh
+            t4003-diff-rename-1.sh
+            t4007-rename-3.sh
+            t4012-diff-binary.sh
+            t4022-diff-rewrite.sh
+            t4023-diff-rename-typechange.sh
+            t4030-diff-textconv.sh
+            t4031-diff-rewrite-binary.sh
+            t4042-diff-textconv-caching.sh
+            t4046-diff-unmerged.sh
+            t4048-diff-combined-binary.sh
+            t4056-diff-order.sh
+            t4063-diff-blobs.sh
+            t4065-diff-anchored.sh
+            t4069-remerge-diff.sh
+            t4070-diff-pairs.sh
+            t4073-diff-stat-name-width.sh
+            t4137-apply-submodule.sh
+            t4207-log-decoration-colors.sh
+            t4212-log-corrupt.sh
+            t4213-log-tabexpand.sh
+            t5001-archive-attr.sh
+            t5002-archive-attr-pattern.sh
+            t5003-archive-zip.sh
+            t5004-archive-corner-cases.sh
+            t5301-sliding-window.sh
+            t5305-include-tag.sh
+            t5306-pack-nobase.sh
+            t5307-pack-missing-commit.sh
+            t5308-pack-detect-duplicates.sh
+            t5309-pack-delta-cycles.sh
+            t5311-pack-bitmaps-shallow.sh
+            t5312-prune-corruption.sh
+            t5313-pack-bounds-checks.sh
+            t5314-pack-cycle-detection.sh
+            t5315-pack-objects-compression.sh
+            t5316-pack-delta-depth.sh
+            t5320-delta-islands.sh
+            t5321-pack-large-objects.sh
+            t5322-pack-objects-sparse.sh
+            t5323-pack-redundant.sh
+            t5325-reverse-index.sh
+            t5328-commit-graph-64bit-time.sh
+            t5330-no-lazy-fetch-with-commit-graph.sh
+            t5331-pack-objects-stdin.sh
+            t5333-pseudo-merge-bitmaps.sh
+            t5334-incremental-multi-pack-index.sh
+            t5335-compact-multi-pack-index.sh
+            t5351-unpack-large-objects.sh
+            t5553-set-upstream.sh
+            t6000-rev-list-misc.sh
+            t6001-rev-list-graft.sh
+            t6004-rev-list-path-optim.sh
+            t6005-rev-list-count.sh
+            t6008-rev-list-submodule.sh
+            t6009-rev-list-parent.sh
+            t6010-merge-base.sh
+            t6011-rev-list-with-bad-commit.sh
+            t6013-rev-list-reverse-parents.sh
+            t6014-rev-list-all.sh
+            t6016-rev-list-graph-simplify-history.sh
+            t6017-rev-list-stdin.sh
+            t6018-rev-list-glob.sh
+            t6019-rev-list-ancestry-path.sh
+            t6021-rev-list-exclude-hidden.sh
+            t6041-bisect-submodule.sh
+            t6050-replace.sh
+            t6060-merge-index.sh
+            t6100-rev-list-in-order.sh
+            t6101-rev-parse-parents.sh
+            t6102-rev-list-unexpected-objects.sh
+            t6110-rev-list-sparse.sh
+            t6111-rev-list-treesame.sh
+            t6114-keep-packs.sh
+            t6115-rev-list-du.sh
+            t6130-pathspec-noglob.sh
+            t6131-pathspec-icase.sh
+            t6133-pathspec-rev-dwim.sh
+            t6134-pathspec-in-submodule.sh
+            t6136-pathspec-in-bare.sh
+            t6137-pathspec-wildcards-literal.sh
+            t6301-for-each-ref-errors.sh
+            t6406-merge-attr.sh
+            t6412-merge-large-rename.sh
+            t6415-merge-dir-to-symlink.sh
+            t6417-merge-ours-theirs.sh
+            t6418-merge-text-auto.sh
+            t6427-diff3-conflict-markers.sh
+            t6432-merge-recursive-space-options.sh
+            t6434-merge-recursive-rename-options.sh
+            t6439-merge-co-error-msgs.sh
+            t6501-freshen-objects.sh
+            t6600-test-reach.sh
+            t6601-path-walk.sh
+            t6700-tree-depth.sh
+            t7002-mv-sparse-checkout.sh
+            t7062-wtstatus-ignorecase.sh
+            t7101-reset-empty-subdirs.sh
+            t7104-reset-hard.sh
+            t7105-reset-patch.sh
+            t7106-reset-unborn-branch.sh
+            t7107-reset-pathspec-file.sh
+            t7403-submodule-sync.sh
+            t7408-submodule-reference.sh
+            t7412-submodule-absorbgitdirs.sh
+            t7416-submodule-dash-url.sh
+            t7424-submodule-mixed-ref-formats.sh
+            t7425-submodule-gitdir-path-extension.sh
+            t7426-submodule-get-default-remote.sh
+            t7511-status-index.sh
+            t7515-status-symlinks.sh
+            t7519-status-fsmonitor.sh
+            t7525-status-rename.sh
+            t7701-repack-unpack-unreachable.sh
+            t7702-repack-cyclic-alternate.sh
+            t7811-grep-open.sh
+            t7814-grep-recurse-submodules.sh
+            t7817-grep-sparse-checkout.sh
+            t8004-blame-with-conflicts.sh
+            t8005-blame-i18n.sh
+            t8006-blame-textconv.sh
+            t8007-cat-file-textconv.sh
+            t8008-blame-formats.sh
+            t8010-cat-file-filters.sh
+            t8011-blame-split-file.sh
+            t8013-blame-ignore-revs.sh
+            t8014-blame-ignore-fuzzy.sh
+            t8015-blame-diff-algorithm.sh
           # t5310/t5326 overrun the runner's 120s default per-script timeout
           # under load (a TIMEOUT row truncates the ok count and would falsely
           # trip the floor gate). Give every script the same generous ceiling.
@@ -385,6 +647,7 @@ jobs:
           # (the job burns the full ceiling on that one script — the job
           # timeout-minutes accounts for it).
           SLEY_TEST_TIMEOUT: "900"
+          SLEY_UPSTREAM_WAVES: "4"
           SLEY_RUN_LABEL: ${{ github.sha }}
         run: |
           export SLEY_BIN="$GITHUB_WORKSPACE/target/release/sley"
@@ -392,7 +655,7 @@ jobs:
           # NOT gate on its exit code — these t-files are partially-passing by
           # design. The floor-check below is the real gate. `|| true` keeps the
           # step from short-circuiting before the floor-check runs.
-          crates/sley-testkit/scripts/run-upstream-tests.sh || true
+          crates/sley-testkit/scripts/run-upstream-tests-waves.sh || true
 
       # Floor gate: each tracked t-file must keep at least its recorded ok
       # count. Reads the per-script summary CSV the runner writes

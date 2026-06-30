@@ -313,6 +313,7 @@ fn sign_ssh_payload(
     };
     let temp = GpgTempFiles::new(Path::new(".git"))?;
     let (key_path, use_agent) = ssh_signing_key_file(&temp, key)?;
+    fs::write(&temp.payload, payload)?;
     let mut command = ProcessCommand::new(ssh_program(config));
     command
         .arg("-Y")
@@ -324,14 +325,29 @@ fn sign_ssh_payload(
     if use_agent {
         command.arg("-U");
     }
-    let output = command_with_stdin(command, payload)
+    let output = command
+        .arg(&temp.payload)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
         .map_err(|err| GitError::Command(format!("could not run ssh-keygen: {err}")))?;
-    if !output.status.success() || !signature_has_marker(&output.stdout) {
+    if !output.status.success() {
         io::stderr().write_all(&output.stderr)?;
         eprintln!("error: ssh-keygen failed to sign the data");
         return Err(GitError::Exit(128));
     }
-    Ok(strip_cr(output.stdout))
+    let signature = fs::read(&temp.ssh_signature).map_err(|err| {
+        GitError::Command(format!(
+            "failed reading ssh signing data buffer from '{}': {err}",
+            temp.ssh_signature.display()
+        ))
+    })?;
+    if !signature_has_marker(&signature) {
+        io::stderr().write_all(&output.stderr)?;
+        eprintln!("error: ssh-keygen failed to sign the data");
+        return Err(GitError::Exit(128));
+    }
+    Ok(strip_cr(signature))
 }
 
 fn ssh_signing_key_file<'a>(temp: &'a GpgTempFiles, key: &'a str) -> Result<(&'a Path, bool)> {
@@ -752,6 +768,7 @@ fn header_value<'a>(line: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
 struct GpgTempFiles {
     payload: PathBuf,
     signature: PathBuf,
+    ssh_signature: PathBuf,
     key: PathBuf,
 }
 
@@ -767,9 +784,14 @@ impl GpgTempFiles {
         );
         let dir = git_dir.join("sley-gpg");
         fs::create_dir_all(&dir)?;
+        let payload = dir.join(format!("{id}.payload"));
+        let mut ssh_signature = payload.as_os_str().to_os_string();
+        ssh_signature.push(".sig");
+        let ssh_signature = PathBuf::from(ssh_signature);
         Ok(Self {
-            payload: dir.join(format!("{id}.payload")),
+            payload,
             signature: dir.join(format!("{id}.sig")),
+            ssh_signature,
             key: dir.join(format!("{id}.key")),
         })
     }
@@ -779,6 +801,7 @@ impl Drop for GpgTempFiles {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.payload);
         let _ = fs::remove_file(&self.signature);
+        let _ = fs::remove_file(&self.ssh_signature);
         let _ = fs::remove_file(&self.key);
     }
 }

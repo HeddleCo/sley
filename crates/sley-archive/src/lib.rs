@@ -53,6 +53,7 @@ pub struct ArchiveConvert<'a> {
     /// `Some(false)` = forced text, `None` = auto-detect via content. Drives the
     /// zip "is text" flag. `None` closure ⇒ always auto-detect.
     diff_binary: Option<Box<dyn Fn(&[u8]) -> Option<bool> + 'a>>,
+    process_filter_metadata: Option<sley_worktree::ProcessFilterMetadata>,
 }
 
 impl<'a> ArchiveConvert<'a> {
@@ -74,6 +75,7 @@ impl<'a> ArchiveConvert<'a> {
             attributes: TreeAttributes::from_tree(attr_root, git_dir, db, format, tree_oid)?,
             subst: None,
             diff_binary: None,
+            process_filter_metadata: None,
         })
     }
 
@@ -91,6 +93,16 @@ impl<'a> ArchiveConvert<'a> {
     /// the path's `diff` driver `binary` flag.
     pub fn with_diff_binary(mut self, resolver: impl Fn(&[u8]) -> Option<bool> + 'a) -> Self {
         self.diff_binary = Some(Box::new(resolver));
+        self
+    }
+
+    /// Attach process-filter metadata to every smudge request emitted while
+    /// archiving this tree.
+    pub fn with_process_filter_metadata(
+        mut self,
+        metadata: sley_worktree::ProcessFilterMetadata,
+    ) -> Self {
+        self.process_filter_metadata = Some(metadata);
         self
     }
 
@@ -116,6 +128,10 @@ impl<'a> ArchiveConvert<'a> {
     /// `export-subst` attribute. Returns the original bytes (borrowed) when
     /// nothing converts.
     fn smudge<'b>(&self, path: &[u8], body: &'b [u8]) -> Result<Cow<'b, [u8]>> {
+        let _process_filter_metadata = self
+            .process_filter_metadata
+            .as_ref()
+            .map(|metadata| sley_worktree::set_process_filter_metadata(Some(metadata.clone())));
         let converted = self
             .attributes
             .apply_smudge_filter(self.config, path, body)?;

@@ -645,7 +645,13 @@ fn merge_octopus(
         }),
     });
     tx.commit()?;
-    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &merged_oid)?;
+    sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
+        worktree_root,
+        git_dir,
+        format,
+        &merged_oid,
+        Some(vec![("treeish".to_string(), merged_oid.to_hex())]),
+    )?;
     Ok(())
 }
 
@@ -4392,7 +4398,13 @@ fn reset_index_and_worktree_to_commit_for_merge(
             true,
         )
     } else {
-        sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, commit)?;
+        sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
+            worktree_root,
+            git_dir,
+            format,
+            commit,
+            Some(vec![("treeish".to_string(), commit.to_hex())]),
+        )?;
         Ok(())
     }
 }

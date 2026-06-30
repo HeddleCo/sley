@@ -456,6 +456,10 @@ run_one() {
         export SLEY_BIN="$sley_bin"
         export GIT_RS_BIN="$sley_bin"
         export GIT_TEST_DEFAULT_HASH="$default_hash"
+        # Daemon-capable scripts should fail loudly when the environment cannot
+        # bind a loopback listener; otherwise upstream marks them SKIP and the
+        # floor checker sees a misleading PASS with zero assertions.
+        export GIT_TEST_GIT_DAEMON=true
         run_with_timeout sh "$upstream_t/$script" \
             --no-bin-wrappers \
             --root="$workdir" \

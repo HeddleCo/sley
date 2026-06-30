@@ -255,9 +255,12 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
     };
     let attr_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?
         .unwrap_or_else(|| git_dir.to_path_buf());
+    let archive_process_filter_metadata =
+        archive_process_filter_metadata(&git_dir, format, &treeish, &oid);
     let mut convert = sley_archive::ArchiveConvert::from_tree(
         &attr_root, &git_dir, &config, &db, format, &tree_oid,
     )?;
+    convert = convert.with_process_filter_metadata(archive_process_filter_metadata);
     // export-subst only runs when archiving a commit (git sets `args->convert`
     // only when a commit is available).
     if let Some(record) = &commit_record {
@@ -369,6 +372,22 @@ enum ArchiveFormatKind {
     TarGz,
     TarFilter,
     Zip,
+}
+
+fn archive_process_filter_metadata(
+    git_dir: &Path,
+    format: ObjectFormat,
+    treeish: &str,
+    oid: &ObjectId,
+) -> Vec<(String, String)> {
+    let mut metadata = Vec::new();
+    if let Ok(Some(refname)) =
+        sley_rev::resolve_revision_symbolic_full_name(git_dir, format, treeish)
+    {
+        metadata.push(("ref".to_string(), refname));
+    }
+    metadata.push(("treeish".to_string(), oid.to_hex()));
+    metadata
 }
 
 /// Run `body` with a writer that is either the `--output` file or stdout.

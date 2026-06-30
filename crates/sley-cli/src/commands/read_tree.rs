@@ -785,10 +785,16 @@ struct ReadTreeWorktree<'a> {
     /// Whether tree application should run the submodule move-head mutation path
     /// rather than only creating/removing the gitlink directory placeholder.
     recurse_submodules: bool,
+    /// Force checkout/reset mode: tracked worktree modifications may be
+    /// overwritten, so `verify_uptodate` must not reject them.
+    force_overwrite_tracked: bool,
 }
 
 impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
     fn verify_uptodate(&self, path: &[u8], ce: &sley_unpack_trees::CacheEntry) -> Result<()> {
+        if self.force_overwrite_tracked {
+            return Ok(());
+        }
         // git's `verify_uptodate_1` short-circuits a gitlink (submodule):
         // `if (S_ISGITLINK(ce->ce_mode)) return 0;` — a submodule is never
         // "dirty" via a worktree blob hash (its working tree is a *directory*,
@@ -803,7 +809,9 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         // treated as up to date, matching git's re-materialization allowance).
         verify_uptodate_path(
             &self.worktree_root,
+            &self.git_dir,
             self.format,
+            &self.repo_config,
             path,
             Some(&(ce.mode, ce.oid)),
             self.porcelain,
@@ -1132,6 +1140,7 @@ pub(crate) fn checkout_two_way_engine(
         original_paths: original_index_paths(git_dir, format)?,
         porcelain,
         recurse_submodules,
+        force_overwrite_tracked: overwrite_untracked,
     };
 
     // git's `merge_working_tree` runs the merge to *populate the result* with
@@ -1272,6 +1281,7 @@ fn merge_trees(
         original_paths: original_index_paths(git_dir, format)?,
         porcelain: UnpackPorcelain::ReadTree,
         recurse_submodules,
+        force_overwrite_tracked: false,
     };
 
     let mut result = unpack_trees(&index, &trees, merge_fn, &opts, &wt)?;
@@ -1435,7 +1445,9 @@ fn stage0(mode: u32, oid: ObjectId) -> StagedEntry {
 /// `verify_uptodate_1`).
 fn verify_uptodate_path(
     worktree_root: &Path,
+    git_dir: &Path,
     format: ObjectFormat,
+    config: &GitConfig,
     path: &[u8],
     expected: Option<&(u32, ObjectId)>,
     porcelain: UnpackPorcelain,
@@ -1452,6 +1464,7 @@ fn verify_uptodate_path(
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err.into()),
     };
+    let body = sley_worktree::apply_clean_filter(worktree_root, git_dir, config, path, &body)?;
     let actual = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
     if &actual != expected_oid {
         match porcelain {

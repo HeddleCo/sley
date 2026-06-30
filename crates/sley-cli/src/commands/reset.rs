@@ -392,11 +392,12 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
                     true,
                 )?;
             } else {
-                sley_worktree::reset_index_and_worktree_to_commit(
+                sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
                     worktree_root.clone(),
                     git_dir.clone(),
                     format,
                     &target_commit,
+                    reset_process_filter_metadata(&git_dir, format, target, &target_commit),
                 )?;
             }
             apply_reset_sparse_checkout(&worktree_root, &git_dir, format)?;
@@ -632,6 +633,22 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         print_reset_unstaged_changes(&worktree_root, &git_dir, format)?;
     }
     Ok(())
+}
+
+fn reset_process_filter_metadata(
+    git_dir: &Path,
+    format: ObjectFormat,
+    target: &str,
+    commit: &ObjectId,
+) -> Option<sley_worktree::ProcessFilterMetadata> {
+    let mut metadata = Vec::new();
+    if let Ok(Some(refname)) =
+        sley_rev::resolve_revision_symbolic_full_name(git_dir, format, target)
+    {
+        metadata.push(("ref".to_string(), refname));
+    }
+    metadata.push(("treeish".to_string(), commit.to_hex()));
+    Some(metadata)
 }
 
 /// Refresh the index stat-cache after a whole-tree `--mixed` reset (git's default

@@ -448,14 +448,32 @@ fn reset_index_and_worktree_to_commit_for_rebase(ctx: &Ctx, commit: &ObjectId) -
             true,
         )
     } else {
-        sley_worktree::reset_index_and_worktree_to_commit(
+        sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
             &ctx.worktree_root,
             &ctx.git_dir,
             ctx.format,
             commit,
+            rebase_process_filter_metadata(ctx, commit),
         )?;
         Ok(())
     }
+}
+
+fn rebase_process_filter_metadata(
+    ctx: &Ctx,
+    commit: &ObjectId,
+) -> Option<sley_worktree::ProcessFilterMetadata> {
+    let mut metadata = Vec::new();
+    let head_name = seq::read_state_line(&ctx.git_dir, "head-name")
+        .map(|name| name.trim().to_string())
+        .or_else(|| ctx.refs().current_branch_ref().ok().flatten());
+    if let Some(head_name) = head_name
+        && head_name.starts_with("refs/")
+    {
+        metadata.push(("ref".to_string(), head_name));
+    }
+    metadata.push(("treeish".to_string(), commit.to_hex()));
+    Some(metadata)
 }
 
 /// Machine flags persisted in the state dir (`write_basic_state` +
@@ -1858,7 +1876,16 @@ fn checkout_up_to_date(
         eprintln!("error: could not switch to branch '{branch}'");
         return Err(GitError::Exit(1));
     }
-    reset_index_and_worktree_to_commit_for_rebase(ctx, oid)?;
+    sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
+        &ctx.worktree_root,
+        &ctx.git_dir,
+        ctx.format,
+        oid,
+        Some(vec![
+            ("ref".to_string(), format!("refs/heads/{branch}")),
+            ("treeish".to_string(), oid.to_hex()),
+        ]),
+    )?;
     let refs = ctx.refs();
     let committer = commit_identity_from_env("COMMITTER")?;
     let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
