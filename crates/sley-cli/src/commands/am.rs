@@ -3432,7 +3432,7 @@ fn create_am_commit(
     // just-applied paths read back clean, while leaving every OTHER worktree
     // file untouched (so a local edit to an unrelated file survives the series,
     // t4151 "am --skip continue after failed am").
-    sley_worktree::refresh_index_paths(
+    sley_worktree::refresh_index_paths_with_options(
         worktree_root,
         git_dir,
         format,

@@ -2623,7 +2623,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         }
     }
     if refresh {
-        sley_worktree::refresh_index_paths(
+        sley_worktree::refresh_index_paths_with_options(
             &worktree_root,
             git_dir.clone(),
             format,

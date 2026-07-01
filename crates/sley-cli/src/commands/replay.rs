@@ -2791,7 +2791,7 @@ pub(crate) fn reset_merge_in(
     for path in &deletions {
         crate::commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)?;
     }
-    sley_worktree::refresh_index_paths(
+    sley_worktree::refresh_index_paths_with_options(
         worktree_root,
         git_dir,
         format,

@@ -49,6 +49,7 @@ fi
 report=${SLEY_REPORT:-${GIT_RS_REPORT:-$repo_root/crates/sley-testkit/upstream-report.txt}}
 summary=${SLEY_SUMMARY:-${GIT_RS_SUMMARY:-${report%.txt}-summary.csv}}
 history=${SLEY_HISTORY:-${GIT_RS_HISTORY:-$repo_root/crates/sley-testkit/upstream-history.csv}}
+timings=${SLEY_TIMINGS:-${GIT_RS_TIMINGS:-${summary%.csv}-timings.csv}}
 run_label=${SLEY_RUN_LABEL:-${GIT_RS_RUN_LABEL:-}}
 if [ -z "$run_label" ]; then
     run_label=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date 2>/dev/null || printf 'unknown')
@@ -104,6 +105,7 @@ printf 'script,command,result,ok,notok,total,plan_total\n' > "$summary"
 if [ ! -f "$history" ]; then
     printf 'label,script,command,result,ok,notok,total\n' > "$history"
 fi
+printf 'label,script,command,result,elapsed_ms,ok,notok,total,plan_total\n' > "$timings"
 
 active_waves=""
 i=1
@@ -116,6 +118,7 @@ while [ "$i" -le "$waves" ]; do
             SLEY_REPORT="$tmp_root/wave-$i/report.txt" \
             SLEY_SUMMARY="$tmp_root/wave-$i/summary.csv" \
             SLEY_HISTORY="$tmp_root/wave-$i/history.csv" \
+            SLEY_TIMINGS="$tmp_root/wave-$i/timings.csv" \
             SLEY_RUN_LABEL="$run_label-wave-$i" \
             SLEY_TEST_TIMEOUT="$timeout_secs" \
             sh "$runner"
@@ -159,6 +162,9 @@ for i in $active_waves; do
     if [ -f "$tmp_root/wave-$i/history.csv" ]; then
         tail -n +2 "$tmp_root/wave-$i/history.csv" >> "$history"
     fi
+    if [ -f "$tmp_root/wave-$i/timings.csv" ]; then
+        tail -n +2 "$tmp_root/wave-$i/timings.csv" >> "$timings"
+    fi
 done
 
 {
@@ -191,6 +197,7 @@ log ""
 log "Full merged report written to: $report"
 log "Merged machine-readable summary: $summary"
 log "Pass-rate history (appended): $history"
+log "Merged per-script timings: $timings"
 
 if awk -F, 'NR > 1 && $3 != "PASS" { exit 1 }' "$summary"; then
     exit 0

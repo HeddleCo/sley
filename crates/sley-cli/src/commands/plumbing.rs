@@ -2448,7 +2448,7 @@ fn refresh_index_after_add(
                 .unwrap_or(false)
         });
     let selected: &[PathBuf] = if only_files { refresh_paths } else { &[] };
-    sley_worktree::refresh_index_paths(
+    sley_worktree::refresh_index_paths_with_options(
         worktree_root,
         git_dir,
         format,

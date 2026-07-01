@@ -755,7 +755,7 @@ fn reset_process_filter_metadata(
 /// content mismatches are not an error — they are genuine worktree changes) and
 /// tolerant of missing files (those are deletions, reported elsewhere).
 fn refresh_reset_index(worktree_root: &Path, git_dir: &Path, format: ObjectFormat) -> Result<()> {
-    sley_worktree::refresh_index_paths(
+    sley_worktree::refresh_index_paths_with_options(
         worktree_root,
         git_dir,
         format,

@@ -63,6 +63,11 @@
 #                       (default: crates/sley-testkit/upstream-history.csv).
 #                       Columns: label,script,command,result,ok,notok,total.
 #                       GIT_RS_HISTORY is accepted as a legacy alias.
+#   SLEY_TIMINGS        per-run script timing CSV (default:
+#                       <summary-base>-timings.csv). Columns:
+#                       label,script,command,result,elapsed_ms,ok,notok,total,
+#                       plan_total. GIT_RS_TIMINGS is accepted as a legacy
+#                       alias.
 #   SLEY_RUN_LABEL      label recorded in the report/history for this run (e.g.
 #                       a git short-SHA or tag). Defaults to a UTC timestamp.
 #                       The library never reads a clock; pass this to make runs
@@ -375,6 +380,10 @@ summary=${SLEY_SUMMARY:-${GIT_RS_SUMMARY:-${report%.txt}-summary.csv}}
 # when unset we fall back to a UTC timestamp from date(1) at the shell layer
 # (still outside any library code).
 history=${SLEY_HISTORY:-${GIT_RS_HISTORY:-$repo_root/crates/sley-testkit/upstream-history.csv}}
+
+# Per-run script timings. This stays separate from the pass/fail summary so
+# floor checks can continue to consume the stable seven-column CSV shape.
+timings=${SLEY_TIMINGS:-${GIT_RS_TIMINGS:-${summary%.csv}-timings.csv}}
 run_label=${SLEY_RUN_LABEL:-${GIT_RS_RUN_LABEL:-}}
 if [ -z "$run_label" ]; then
     run_label=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date 2>/dev/null || printf 'unknown')
@@ -426,15 +435,27 @@ if [ ! -f "$history" ]; then
     printf 'label,script,command,result,ok,notok,total\n' > "$history"
 fi
 
+printf 'label,script,command,result,elapsed_ms,ok,notok,total,plan_total\n' > "$timings"
+
 total=0
 passed=0
 failed=0
 errored=0
 
+now_millis() {
+    if command -v perl >/dev/null 2>&1; then
+        perl -MTime::HiRes=time -e 'printf "%.0f\n", time() * 1000'
+    else
+        seconds=$(date +%s 2>/dev/null || printf 0)
+        printf '%s000\n' "$seconds"
+    fi
+}
+
 run_one() {
     script=$1
     workdir=$(mktemp -d "${TMPDIR:-/tmp}/sley-upstream-run.XXXXXX")
     out_file="$workdir/output.txt"
+    start_ms=$(now_millis)
 
     # Run the script from inside upstream_t so it can source test-lib.sh, with
     # GIT_TEST_INSTALLED pointed at our shim bindir. --no-bin-wrappers because an
@@ -459,6 +480,11 @@ run_one() {
             $extra_opts
     ) > "$out_file" 2>&1
     rc=$?
+    end_ms=$(now_millis)
+    elapsed_ms=$((end_ms - start_ms))
+    if [ "$elapsed_ms" -lt 0 ] 2>/dev/null; then
+        elapsed_ms=0
+    fi
 
     # Parse TAP "ok"/"not ok" counts from the captured output.
     ok_count=$(grep -cE '^ok [0-9]' "$out_file" 2>/dev/null || true)
@@ -498,6 +524,9 @@ run_one() {
     printf '%s,%s,%s,%s,%s,%s,%s\n' \
         "$run_label" "$script" "$command_name" "$result" "$ok_count" \
         "$notok_count" "$run_total" >> "$history"
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$run_label" "$script" "$command_name" "$result" "$elapsed_ms" \
+        "$ok_count" "$notok_count" "$run_total" "${plan_total:-}" >> "$timings"
 
     if [ -n "${SLEY_KEEP_TRASH:-}" ]; then
         printf '  trash=%s\n' "$workdir" >> "$report"
@@ -566,6 +595,7 @@ log ""
 log "Full report written to: $report"
 log "Machine-readable summary: $summary"
 log "Pass-rate history (appended): $history"
+log "Per-script timings: $timings"
 
 # Non-zero exit if anything did not pass, so CI/wrappers can gate on it.
 if [ "$passed" -eq "$total" ]; then
