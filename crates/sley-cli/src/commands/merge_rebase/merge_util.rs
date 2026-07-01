@@ -5,7 +5,7 @@ use super::*;
 pub(crate) type MergeTreeMap = BTreeMap<Vec<u8>, (u32, ObjectId)>;
 
 pub(crate) fn merge_read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
-    let object = db.read_object(oid)?;
+    let object = crate::read_object_maybe_prefetch_promisor(db, oid)?;
     if object.object_type != ObjectType::Blob {
         return Err(GitError::InvalidObject(format!(
             "expected blob {oid}, found {}",
@@ -25,6 +25,40 @@ pub(crate) fn merge_worktree_content(
     } else {
         merge_read_blob(db, oid)
     }
+}
+
+fn prefetch_content_merge_blobs(
+    db: &FileObjectDatabase,
+    base: &MergeTreeMap,
+    ours: &MergeTreeMap,
+    theirs: &MergeTreeMap,
+) -> Result<()> {
+    let mut paths = BTreeSet::new();
+    paths.extend(base.keys().cloned());
+    paths.extend(ours.keys().cloned());
+    paths.extend(theirs.keys().cloned());
+
+    for path in paths {
+        let base_entry = base.get(&path);
+        let ours_entry = ours.get(&path);
+        let theirs_entry = theirs.get(&path);
+        if ours_entry == theirs_entry || ours_entry == base_entry || theirs_entry == base_entry {
+            continue;
+        }
+        let content_mergeable = ours_entry
+            .is_some_and(|(mode, _)| sley_diff_merge::is_mergeable_file_mode(*mode))
+            && theirs_entry.is_some_and(|(mode, _)| sley_diff_merge::is_mergeable_file_mode(*mode))
+            && base_entry
+                .map(|(mode, _)| sley_diff_merge::is_mergeable_file_mode(*mode))
+                .unwrap_or(true);
+        if !content_mergeable {
+            continue;
+        }
+        for (_, oid) in [base_entry, ours_entry, theirs_entry].into_iter().flatten() {
+            let _ = merge_read_blob(db, oid)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn merge_index_entry(path: &[u8], mode: u32, oid: ObjectId, stage: u16) -> IndexEntry {
@@ -349,6 +383,7 @@ pub(crate) enum MergePathResult {
 pub(crate) type MergePathResults = BTreeMap<Vec<u8>, MergePathResult>;
 pub(crate) type MergeConflictPaths = Vec<Vec<u8>>;
 pub(crate) type MergeInfoMessages = Vec<sley_diff_merge::MergeInfoMessage>;
+pub(crate) type MergePathFavorResolver<'a> = dyn Fn(&[u8]) -> sley_diff_merge::MergeFavor + 'a;
 
 /// 3-way merge of three flattened trees. Writes any cleanly-merged blob content
 /// to the ODB and returns per-path results plus the sorted list of conflicted
@@ -482,7 +517,13 @@ pub(crate) fn virtual_ancestor_entry_map(
                 } => {
                     // Keep the conflicted content in the virtual tree, mirroring
                     // merge-recursive (it writes the marker blob at stage 0).
-                    if let Some((mode, bytes)) = worktree {
+                    if let Some((mode, _)) = worktree
+                        && sley_index::is_gitlink(mode)
+                    {
+                        if let Some(entry) = theirs.or(ours) {
+                            next.insert(path, entry);
+                        }
+                    } else if let Some((mode, bytes)) = worktree {
                         let oid = db.write_object(EncodedObject::new(ObjectType::Blob, bytes))?;
                         next.insert(path, (mode, oid));
                     } else if let Some(entry) = ours.or(theirs) {
@@ -635,6 +676,44 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts(
     ws_ignore: sley_diff_merge::WsIgnore,
     renames: RenameMergeConfig,
 ) -> Result<(MergePathResults, MergeConflictPaths, MergeInfoMessages)> {
+    three_way_merge_trees_inner_with_info_opts_and_path_favor(
+        db,
+        format,
+        base,
+        ours,
+        theirs,
+        ours_label,
+        theirs_label,
+        ancestor_label,
+        favor,
+        style,
+        ws_ignore,
+        renames,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_way_merge_trees_inner_with_info_opts_and_path_favor(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    base: &MergeTreeMap,
+    ours: &MergeTreeMap,
+    theirs: &MergeTreeMap,
+    ours_label: &str,
+    theirs_label: &str,
+    ancestor_label: &str,
+    favor: sley_diff_merge::MergeFavor,
+    style: sley_diff_merge::ConflictStyle,
+    ws_ignore: sley_diff_merge::WsIgnore,
+    renames: RenameMergeConfig,
+    path_favor: Option<&MergePathFavorResolver<'_>>,
+) -> Result<(MergePathResults, MergeConflictPaths, MergeInfoMessages)> {
+    // The shared merge engine only sees an object database, while the CLI knows
+    // how to hydrate promised blobs. Fetch just the blobs a non-trivial textual
+    // merge will inspect, preserving partial-clone laziness for unrelated blobs.
+    prefetch_content_merge_blobs(db, base, ours, theirs)?;
+
     let merge = sley_diff_merge::merge_entry_maps(
         db,
         format,
@@ -646,6 +725,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts(
             theirs_label,
             ancestor_label,
             favor,
+            path_favor,
             detect_renames: renames.detect_renames,
             rename_threshold: renames.rename_threshold,
             rename_limit: renames.rename_limit,

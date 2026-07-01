@@ -88,6 +88,13 @@ fn prepare_identity(root: &Path) {
     git(root, &["config", "user.email", "example@example.invalid"]);
 }
 
+fn rev_parse(program: &str, root: &Path, rev: &str) -> String {
+    String::from_utf8(run_output(program, root, &["rev-parse", rev]).stdout)
+        .expect("rev-parse output utf8")
+        .trim()
+        .to_string()
+}
+
 fn prepare_conflict_repos(upstream: &Path, rust: &Path) {
     for root in [upstream, rust] {
         git(root, &["init", "-q", "-b", "master"]);
@@ -111,6 +118,86 @@ fn prepare_conflict_repos(upstream: &Path, rust: &Path) {
         git_with_identity(root, &["commit", "-m", "main", "-q"]);
         git(root, &["checkout", "topic", "-q"]);
     }
+}
+
+fn prepare_tag_target_rebase_abort_repo(root: &Path) {
+    git(root, &["init", "-q", "-b", "main"]);
+    prepare_identity(root);
+    fs::write(root.join("a"), b"a\n").expect("write a");
+    git(root, &["add", "a"]);
+    git_with_identity(root, &["commit", "-m", "a", "-q"]);
+    git(root, &["tag", "a"]);
+    git(root, &["branch", "to-rebase"]);
+
+    fs::write(root.join("a"), b"b\n").expect("write b");
+    git(root, &["add", "a"]);
+    git_with_identity(root, &["commit", "-m", "b", "-q"]);
+    git(root, &["tag", "b"]);
+    fs::write(root.join("a"), b"c\n").expect("write c");
+    git(root, &["add", "a"]);
+    git_with_identity(root, &["commit", "-m", "c", "-q"]);
+    git(root, &["tag", "c"]);
+
+    git(root, &["checkout", "to-rebase", "-q"]);
+    fs::write(root.join("a"), b"d\n").expect("write d");
+    git(root, &["add", "a"]);
+    git_with_identity(root, &["commit", "-m", "merge should fail on this", "-q"]);
+    fs::write(root.join("a"), b"e\n").expect("write e");
+    git(root, &["add", "a"]);
+    git_with_identity(
+        root,
+        &["commit", "-m", "merge should fail on this, too", "-q"],
+    );
+    git(root, &["tag", "pre-rebase"]);
+}
+
+#[test]
+fn rebase_abort_after_non_branch_target_stays_detached() {
+    let root = unique_temp_dir("rebase-abort-tag-target");
+    for backend in ["--apply", "--merge"] {
+        let repo = root.join(backend.trim_start_matches("--"));
+        fs::create_dir_all(&repo).expect("create repo");
+        prepare_tag_target_rebase_abort_repo(&repo);
+
+        let pre_rebase = rev_parse(sley_testkit::oracle_git(), &repo, "pre-rebase^{commit}");
+        let onto = rev_parse(sley_testkit::oracle_git(), &repo, "b^{commit}");
+        let start = run_output_with_identity(
+            env!("CARGO_BIN_EXE_sley"),
+            &repo,
+            &["rebase", backend, "--onto", "b", "c", "pre-rebase"],
+        );
+        assert!(
+            !start.status.success(),
+            "expected rebase {backend} to stop with a conflict\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&start.stdout),
+            String::from_utf8_lossy(&start.stderr)
+        );
+        assert_eq!(
+            rev_parse(sley_testkit::oracle_git(), &repo, "HEAD"),
+            onto,
+            "rebase {backend} should stop on the onto commit"
+        );
+
+        let abort =
+            run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &repo, &["rebase", "--abort"]);
+        assert!(
+            abort.status.success(),
+            "rebase --abort failed for {backend}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&abort.stdout),
+            String::from_utf8_lossy(&abort.stderr)
+        );
+        assert_eq!(
+            rev_parse(sley_testkit::oracle_git(), &repo, "HEAD"),
+            pre_rebase,
+            "rebase --abort should restore the tag target commit for {backend}"
+        );
+        let symbolic = run_output(sley_testkit::oracle_git(), &repo, &["symbolic-ref", "HEAD"]);
+        assert!(
+            !symbolic.status.success(),
+            "rebase --abort should leave HEAD detached for {backend}"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
 }
 
 fn topic_head(program: &str, root: &Path) -> String {

@@ -2872,7 +2872,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             || !log_age_filters_match(record, max_age, min_age)?
             || !log_author_matcher_matches(record, author_filters.as_ref(), filter_mailmap)
             || !log_committer_matcher_matches(record, committer_filters.as_ref(), filter_mailmap)
-            || !log_grep_matcher_matches(record, grep_filters.as_ref(), grep_all_match, invert_grep)
+            || !log_grep_matcher_matches(
+                record,
+                grep_filters.as_ref(),
+                grep_all_match,
+                invert_grep,
+                &output_encoding,
+            )
         {
             continue;
         }
@@ -3168,10 +3174,25 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         db: &db,
         format,
     };
+    let source_tag_signatures = if matches!(
+        &output,
+        LogOutput::Compiled { compiled, .. } if compiled.uses_signature()
+    ) {
+        source_tag_signatures_for_revision_tips(
+            &git_dir,
+            &db,
+            format,
+            &config,
+            &revision_options.positives,
+        )?
+    } else {
+        HashMap::new()
+    };
     let signature_ctx = LogSignatureContext {
         git_dir: &git_dir,
         db: &db,
         config: &config,
+        source_tag_signatures: &source_tag_signatures,
     };
     // `%S` source labels: each commit is tagged with the start ref from which it
     // is reachable; when several starts reach it, the last one (command-line

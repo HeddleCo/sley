@@ -1153,6 +1153,7 @@ dependencies = [
  "encoding_rs",
  "filetime",
  "flate2",
+ "regex",
  "sley-archive",
  "sley-config",
  "sley-core",
@@ -1162,6 +1163,7 @@ dependencies = [
  "sley-formats",
  "sley-fsck",
  "sley-grep",
+ "sley-i18n",
  "sley-index",
  "sley-notes",
  "sley-object",
@@ -1170,6 +1172,7 @@ dependencies = [
  "sley-pack",
  "sley-pathspec",
  "sley-pretty",
+ "sley-procinfo",
  "sley-protocol",
  "sley-ref-filter",
  "sley-refs",
@@ -1212,6 +1215,7 @@ dependencies = [
 name = "sley-diff-merge"
 version = "0.3.0"
 dependencies = [
+ "sley-config",
  "sley-core",
  "sley-formats",
  "sley-index",
@@ -1262,6 +1266,10 @@ version = "0.3.0"
 dependencies = [
  "sley-core",
 ]
+
+[[package]]
+name = "sley-i18n"
+version = "0.3.0"
 
 [[package]]
 name = "sley-index"
@@ -1336,6 +1344,13 @@ version = "0.3.0"
 dependencies = [
  "sley-core",
  "sley-strbuf-expand",
+]
+
+[[package]]
+name = "sley-procinfo"
+version = "0.3.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

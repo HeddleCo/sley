@@ -1084,7 +1084,13 @@ pub fn install_fetch_pack_via_local_upload_pack(
     let decoded_request = read_upload_pack_request(format, &mut encoded_request.as_slice())?
         .ok_or_else(|| GitError::InvalidFormat("encoded upload-pack request was empty".into()))?;
 
-    let haves = if refetch {
+    // Lazy promisor hydration asks for exact missing objects; negotiating local
+    // haves would walk the partial client's intentionally-missing blobs.
+    let direct_promisor_object_fetch = promisor && deepen.is_none() && !record_promisor_refs;
+    if direct_promisor_object_fetch && local_upload_pack_client_wants_v2(git_dir) {
+        trace_local_upload_pack_v2_capabilities(remote_git_dir, format);
+    }
+    let haves = if refetch || direct_promisor_object_fetch {
         Vec::new()
     } else {
         local_have_oids(git_dir, format)?
@@ -1134,7 +1140,13 @@ pub fn install_fetch_pack_via_local_upload_pack(
             let cut: HashSet<ObjectId> = plan.client_shallow.iter().copied().collect();
             sley_odb::collect_reachable_object_ids_with_cut(&remote_db, format, known_haves, &cut)?
         }
-        None => collect_reachable_object_ids(&remote_db, format, known_haves)?,
+        None => {
+            // The negotiated haves describe the client's object graph. A local
+            // remote may be intentionally incomplete while the client has the
+            // missing bases already, so walk the exclusion closure locally and
+            // keep the actual pack source pinned to the remote below.
+            collect_reachable_object_ids(&local_db, format, known_haves)?
+        }
     };
     let mut starts = decoded_request.wants;
     let promisor_ref_wants = starts.iter().copied().collect::<HashSet<_>>();
@@ -1167,6 +1179,43 @@ pub fn install_fetch_pack_via_local_upload_pack(
     Ok(deepen
         .map(|plan| plan.shallow_info.clone())
         .unwrap_or_default())
+}
+
+fn local_upload_pack_client_wants_v2(git_dir: &Path) -> bool {
+    sley_config::read_repo_config(git_dir, None)
+        .ok()
+        .and_then(|config| config.get("protocol", None, "version").map(str::to_string))
+        .as_deref()
+        == Some("2")
+}
+
+fn trace_local_upload_pack_v2_capabilities(remote_git_dir: &Path, format: ObjectFormat) {
+    sley_protocol::set_packet_trace_identity("fetch");
+    let config = sley_config::read_repo_config(remote_git_dir, None).unwrap_or_default();
+    sley_protocol::trace_packet_read_payload(b"version 2\n");
+    sley_protocol::trace_packet_read_payload(
+        format!("agent={UPSTREAM_GIT_COMPAT_VERSION}\n").as_bytes(),
+    );
+    sley_protocol::trace_packet_read_payload(b"ls-refs=unborn\n");
+    let mut fetch = "fetch=shallow wait-for-done".to_string();
+    if config
+        .get_bool("uploadpack", None, "allowfilter")
+        .unwrap_or(false)
+    {
+        fetch.push_str(" filter");
+    }
+    if config
+        .get_bool("uploadpack", None, "allowrefinwant")
+        .unwrap_or(false)
+    {
+        fetch.push_str(" ref-in-want");
+    }
+    fetch.push('\n');
+    sley_protocol::trace_packet_read_payload(fetch.as_bytes());
+    sley_protocol::trace_packet_read_payload(
+        format!("object-format={}\n", format.name()).as_bytes(),
+    );
+    sley_protocol::trace_packet_read_payload(b"0000");
 }
 
 fn local_upload_pack_filter_protocol_spec(filter: &sley_odb::PackObjectFilter) -> Option<String> {
@@ -1316,6 +1365,9 @@ fn upload_pack_v2_capabilities(
             wait_for_done: true,
             filter: config
                 .get_bool("uploadpack", None, "allowfilter")
+                .unwrap_or(false),
+            ref_in_want: config
+                .get_bool("uploadpack", None, "allowrefinwant")
                 .unwrap_or(false),
             packfile_uris: upload_pack_blob_packfile_uri_configured(config),
             ..ProtocolV2FetchFeatures::default()
@@ -1613,6 +1665,8 @@ pub fn serve_upload_pack_v2_with_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sley_object::{BString, EncodedObject, Tree, TreeEntry};
+    use sley_odb::ObjectWriter;
 
     #[test]
     fn receive_pack_advertises_no_thin_until_server_fixes_thin_packs() {
@@ -1626,5 +1680,236 @@ mod tests {
                 .iter()
                 .any(|capability| capability.name == "no-thin")
         );
+    }
+
+    #[test]
+    fn local_fetch_from_incomplete_remote_excludes_client_have_closure() {
+        let root = unique_local_test_dir("incomplete-local-fetch");
+        let base_git = root.join("base.git");
+        let patch_git = root.join("patch.git");
+        let user_git = root.join("user.git");
+        let direct_git = root.join("direct.git");
+        for git_dir in [&base_git, &patch_git, &user_git, &direct_git] {
+            fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+            fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+                .expect("test operation should succeed");
+        }
+
+        let format = ObjectFormat::Sha1;
+        let base_db = FileObjectDatabase::from_git_dir(&base_git, format);
+        let patch_db = FileObjectDatabase::from_git_dir(&patch_git, format);
+
+        let text_a = EncodedObject::new(ObjectType::Blob, b"a\nb\nc\nd\ne\nf\ng\nh\ni\n".to_vec());
+        let text_a_oid = write_test_object(&base_db, &text_a);
+        let side = EncodedObject::new(ObjectType::Blob, b"side\n".to_vec());
+        let side_oid = write_test_object(&base_db, &side);
+        let tree_a = test_tree(&[
+            (0o100644, b"side", side_oid),
+            (0o100644, b"text", text_a_oid),
+        ]);
+        let tree_a_oid = write_test_object(&base_db, &tree_a);
+        let commit_a = test_commit(tree_a_oid, &[], b"A\n");
+        let commit_a_oid = write_test_object(&base_db, &commit_a);
+
+        let text_b =
+            EncodedObject::new(ObjectType::Blob, b"a\nb\nc\nd\ne\nf\ng\nh\ni\nm\n".to_vec());
+        let text_b_oid = write_test_object(&base_db, &text_b);
+        let tree_b = test_tree(&[
+            (0o100644, b"side", side_oid),
+            (0o100644, b"text", text_b_oid),
+        ]);
+        let tree_b_oid = write_test_object(&base_db, &tree_b);
+        let commit_b = test_commit(tree_b_oid, &[commit_a_oid], b"B\n");
+        let commit_b_oid = write_test_object(&base_db, &commit_b);
+
+        let text_c = EncodedObject::new(
+            ObjectType::Blob,
+            b"a\nb\nc\nd\ne\nf\ng\nh\ni\nm\nq\n".to_vec(),
+        );
+        let text_c_oid = write_test_object(&patch_db, &text_c);
+        let tree_c = test_tree(&[
+            (0o100644, b"side", side_oid),
+            (0o100644, b"text", text_c_oid),
+        ]);
+        let tree_c_oid = write_test_object(&patch_db, &tree_c);
+        let commit_c = test_commit(tree_c_oid, &[commit_b_oid], b"C\n");
+        let commit_c_oid = write_test_object(&patch_db, &commit_c);
+        write_test_object(&patch_db, &tree_b);
+        write_test_object(&patch_db, &commit_b);
+        assert!(
+            !patch_db
+                .contains(&text_b_oid)
+                .expect("test operation should succeed"),
+            "patch repo must be missing the best delta base"
+        );
+
+        install_fetch_pack_via_local_upload_pack(
+            &user_git,
+            &base_git,
+            format,
+            vec![commit_b_oid],
+            None,
+            false,
+            false,
+            None,
+            false,
+            None,
+        )
+        .expect("base fetch should succeed");
+        assert!(
+            FileObjectDatabase::from_git_dir(&user_git, format)
+                .contains(&text_b_oid)
+                .expect("test operation should succeed"),
+            "user clone should have the missing base before fetching C"
+        );
+
+        install_fetch_pack_via_local_upload_pack(
+            &user_git,
+            &patch_git,
+            format,
+            vec![commit_c_oid],
+            None,
+            false,
+            false,
+            None,
+            false,
+            None,
+        )
+        .expect("fetch from incomplete remote should succeed when client has the base");
+        assert!(
+            FileObjectDatabase::from_git_dir(&user_git, format)
+                .contains(&commit_c_oid)
+                .expect("test operation should succeed")
+        );
+
+        let direct = install_fetch_pack_via_local_upload_pack(
+            &direct_git,
+            &patch_git,
+            format,
+            vec![commit_c_oid],
+            None,
+            false,
+            false,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            direct.is_err(),
+            "direct fetch from the incomplete patch repo must still fail"
+        );
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn direct_promisor_object_fetch_does_not_walk_missing_local_blobs() {
+        let root = unique_local_test_dir("direct-promisor-object-fetch");
+        let remote_git = root.join("remote.git");
+        let client_git = root.join("client.git");
+        for git_dir in [&remote_git, &client_git] {
+            fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+            fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+                .expect("test operation should succeed");
+        }
+
+        let format = ObjectFormat::Sha1;
+        let remote_db = FileObjectDatabase::from_git_dir(&remote_git, format);
+        let client_db = FileObjectDatabase::from_git_dir(&client_git, format);
+
+        let blob = EncodedObject::new(ObjectType::Blob, b"promised\n".to_vec());
+        let blob_oid = write_test_object(&remote_db, &blob);
+        let tree = test_tree(&[(0o100644, b"file.txt", blob_oid)]);
+        let tree_oid = write_test_object(&remote_db, &tree);
+        let commit = test_commit(tree_oid, &[], b"main\n");
+        let commit_oid = write_test_object(&remote_db, &commit);
+
+        write_test_object(&client_db, &tree);
+        write_test_object(&client_db, &commit);
+        assert!(
+            !client_db
+                .contains(&blob_oid)
+                .expect("test operation should succeed"),
+            "client starts with the promised blob missing"
+        );
+
+        install_fetch_pack_via_local_upload_pack(
+            &client_git,
+            &remote_git,
+            format,
+            vec![blob_oid],
+            None,
+            true,
+            false,
+            None,
+            false,
+            None,
+        )
+        .expect("direct promisor blob fetch should not traverse missing local blobs");
+
+        assert!(
+            FileObjectDatabase::from_git_dir(&client_git, format)
+                .contains(&blob_oid)
+                .expect("test operation should succeed"),
+            "directly wanted promised blob should be installed"
+        );
+        assert_eq!(
+            FileObjectDatabase::from_git_dir(&client_git, format)
+                .read_object(&commit_oid)
+                .expect("test operation should succeed")
+                .object_type,
+            ObjectType::Commit
+        );
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    fn unique_local_test_dir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test operation should succeed")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("sley-remote-{name}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&root).expect("test operation should succeed");
+        root
+    }
+
+    fn write_test_object(db: &FileObjectDatabase, object: &EncodedObject) -> ObjectId {
+        db.write_object(object.clone())
+            .expect("test operation should succeed")
+    }
+
+    fn test_tree(entries: &[(u32, &[u8], ObjectId)]) -> EncodedObject {
+        EncodedObject::new(
+            ObjectType::Tree,
+            Tree {
+                entries: entries
+                    .iter()
+                    .map(|(mode, name, oid)| TreeEntry {
+                        mode: *mode,
+                        name: BString::from(*name),
+                        oid: *oid,
+                    })
+                    .collect(),
+            }
+            .write(),
+        )
+    }
+
+    fn test_commit(tree: ObjectId, parents: &[ObjectId], message: &[u8]) -> EncodedObject {
+        let identity = b"Example <example@example.invalid> 0 +0000".to_vec();
+        EncodedObject::new(
+            ObjectType::Commit,
+            Commit {
+                tree,
+                parents: parents.to_vec(),
+                author: identity.clone(),
+                committer: identity,
+                encoding: None,
+                message: message.to_vec(),
+            }
+            .write(),
+        )
     }
 }

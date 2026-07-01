@@ -45,8 +45,6 @@ use sley_transport::RemoteUrl;
 use crate::fetch::{FetchOptions, FetchSource, fetch};
 use crate::{CredentialProvider, ProgressSink};
 
-/// The unborn placeholder branch the destination is initialized on, replaced by
-/// the real checked-out branch; mirrors the CLI's previous clone init.
 const CLONE_UNBORN_BRANCH: &str = "__git_rs_clone_unborn__";
 
 /// How [`clone`] reaches the remote it is cloning from.
@@ -536,6 +534,7 @@ fn clone_fetch_options(
         prune: false,
         prune_tags: false,
         dry_run: false,
+        force: false,
         append: false,
         write_fetch_head: true,
         tag_option_explicit: false,

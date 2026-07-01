@@ -24,9 +24,10 @@ pub(crate) fn cmd_submodule(args: &[String]) -> Result<()> {
                 return submodule_usage();
             }
             Some("-h") => {
-                // `git submodule -h` prints the usage to stdout and succeeds.
+                // `git submodule -h` uses parse-options help semantics: usage
+                // goes to stdout, but the process exits 129.
                 println!("{}", submodule_usage_text());
-                return Ok(());
+                return Err(GitError::Exit(129));
             }
             // A bare `--` / `--end-of-options` (or any other unknown leading
             // option) is a usage error.
@@ -160,10 +161,13 @@ fn cmd_submodule_status(args: &[String], quiet: bool) -> Result<()> {
     if quiet || options.quiet {
         return Ok(());
     }
+    let mut stdout = io::stdout().lock();
     for submodule in selected {
         print_submodule_status_tree(
+            &mut stdout,
             &cwd,
             &worktree_root,
+            format,
             &index,
             &submodule,
             options.cached,
@@ -289,6 +293,8 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
         return Err(GitError::Exit(1));
     }
 
+    ensure_writing_gitmodules_ok(&git_dir, format, &worktree_root)?;
+
     let modules_git_dir = git_dir.join("modules").join(&add_name);
     if existing_repo {
         println!("Adding existing repo at '{normalized_path}' to the index");
@@ -312,7 +318,7 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
         clone_args.push(modules_git_dir.display().to_string());
         clone_args.push(real_repo.clone());
         clone_args.push(destination.display().to_string());
-        super::remote_cmds::cmd_clone(&clone_args)?;
+        with_local_repo_env_hidden(|| super::remote_cmds::cmd_clone(&clone_args))?;
         if options.progress && !options.quiet {
             eprintln!("Receiving objects: 100% (done)");
         }
@@ -610,6 +616,11 @@ fn update_one_submodule(
         return Err(GitError::Exit(128));
     };
 
+    if submodule_path_contains_symlink(worktree_root, &submodule.path)? {
+        eprintln!("fatal: refusing to update submodule path '{display}' through a symlink");
+        return Err(GitError::Exit(128));
+    }
+
     let just_populated = submodule_head(&path).is_err();
     if just_populated {
         populate_submodule_worktree(git_dir, submodule, &path, &url, options)?;
@@ -743,7 +754,7 @@ fn populate_submodule_worktree(
         clone_args.push(modules_git_dir.display().to_string());
         clone_args.push(url.to_string());
         clone_args.push(path.display().to_string());
-        super::remote_cmds::cmd_clone(&clone_args)?;
+        with_local_repo_env_hidden(|| super::remote_cmds::cmd_clone(&clone_args))?;
         // Propagate the alternate config into the just-cloned submodule so its
         // OWN recursive update borrows for the next level down (nested case).
         propagate_submodule_alternate_config(git_dir, &modules_git_dir)?;
@@ -887,6 +898,7 @@ fn remote_target_oid(
 fn self_sley_fetch(path: &Path, remote: &str) -> Result<std::process::ExitStatus> {
     let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
     let mut command = ProcessCommand::new(exe);
+    clear_submodule_child_repo_env(&mut command);
     command.arg("fetch").arg(remote);
     command
         .current_dir(path)
@@ -931,7 +943,7 @@ fn submodule_gitmodules_branch(submodule: &SubmoduleConfigEntry) -> Option<Strin
     let cwd = env::current_dir().ok()?;
     let git_dir = discover_git_dir(&cwd).ok()?;
     let worktree_root = worktree_root_for_git_dir(&git_dir).ok()?;
-    let gitmodules = GitConfig::read(worktree_root.join(".gitmodules")).ok()?;
+    let gitmodules = read_gitmodules_config(&worktree_root).ok().flatten()?;
     gitmodules
         .get("submodule", Some(&submodule.name), "branch")
         .map(str::to_string)
@@ -1027,6 +1039,7 @@ fn run_submodule_update_command(
             return Ok(UpdateOutcome::Done);
         }
     }
+    clear_submodule_child_repo_env(&mut command);
 
     io::stdout().flush()?;
     let status = command
@@ -1098,6 +1111,7 @@ fn recurse_submodule_update(
 ) -> Result<UpdateOutcome> {
     let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
     let mut command = ProcessCommand::new(exe);
+    clear_submodule_child_repo_env(&mut command);
     command.arg("submodule");
     if options.quiet {
         command.arg("--quiet");
@@ -1128,6 +1142,36 @@ fn recurse_submodule_update(
     } else {
         Ok(UpdateOutcome::NonFatalCheckoutError(GitError::Exit(code)))
     }
+}
+
+fn clear_submodule_child_repo_env(command: &mut ProcessCommand) {
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE");
+}
+
+fn submodule_path_contains_symlink(worktree_root: &Path, path: &str) -> Result<bool> {
+    let mut current = worktree_root.to_path_buf();
+    for component in Path::new(path).components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(err)
+                if err.kind() == io::ErrorKind::NotFound
+                    || err.kind() == io::ErrorKind::NotADirectory =>
+            {
+                return Ok(false);
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(false)
 }
 
 fn parse_submodule_update_options(
@@ -1398,8 +1442,11 @@ fn write_submodule_mapping(
     fs::write(&gitmodules_path, gitmodules.to_canonical_bytes())?;
 
     let mut config = read_repo_config(git_dir)?;
+    let needs_active_entry = submodule_add_needs_active_entry(&config, &name, path);
     set_submodule_config_value(&mut config, &name, "url", config_url);
-    set_submodule_config_value(&mut config, &name, "active", "true");
+    if needs_active_entry {
+        set_submodule_config_value(&mut config, &name, "active", "true");
+    }
     write_repo_config(git_dir, &config)?;
     Ok(())
 }
@@ -2195,15 +2242,20 @@ fn compute_summary_diff_index(
         // the blob on disk, and a missing path is a deletion. This matters for
         // typechanges where the index still records a blob but the worktree has
         // already been replaced by a submodule (or the reverse).
-        let mut removed = Vec::new();
         for (path, slot) in new.iter_mut() {
             match summary_worktree_side(worktree_root, format, path)? {
                 Some(side) => *slot = side,
-                None => removed.push(path.clone()),
+                // A deinitialized-but-still-indexed submodule has no worktree
+                // path, but diff-index keeps the gitlink side. That lets
+                // prepare_submodule_summary later skip the plain modification
+                // because the submodule repository is not available, instead
+                // of misreporting it as a deletion.
+                None if slot.0 == 0o160000 => {}
+                None => {
+                    slot.0 = 0;
+                    slot.1 = ObjectId::null(format);
+                }
             }
-        }
-        for path in removed {
-            new.remove(&path);
         }
     }
     Ok(diff_gitlink_sides(format, old, &new))
@@ -2392,12 +2444,41 @@ fn cmd_submodule_set_url(args: &[String], quiet: bool) -> Result<()> {
     fs::write(&gitmodules_path, gitmodules.to_canonical_bytes())?;
 
     let mut config = read_repo_config(&git_dir)?;
+    let up_path = submodule_up_path(path);
+    let (super_config_url, sub_origin_url) =
+        if new_url.starts_with("../") || new_url.starts_with("./") {
+            resolve_sync_urls(&worktree_root, &config, new_url, &up_path)
+        } else {
+            (new_url.to_string(), new_url.to_string())
+        };
     if config.get("submodule", Some(&name), "url").is_some() {
-        set_submodule_config_value(&mut config, &name, "url", new_url);
+        set_submodule_config_value(&mut config, &name, "url", &super_config_url);
         write_repo_config(&git_dir, &config)?;
         if !quiet {
             println!("Synchronizing submodule url for '{path}'");
         }
+    }
+    let submodule_root = worktree_root.join(path);
+    if let Some(sub_git_dir) = resolve_submodule_repo_gitdir(&submodule_root) {
+        let sub_format = repository_object_format(&sub_git_dir)?;
+        let mut sub_config = read_repo_config(&sub_git_dir)?;
+        let abs_path = normalize_lexical_path(&submodule_root);
+        let remote = submodule_default_remote_name(
+            &worktree_root,
+            &git_dir,
+            &abs_path,
+            &sub_git_dir,
+            sub_format,
+            &sub_config,
+        )?;
+        set_config_value(
+            &mut sub_config,
+            "remote",
+            Some(&remote),
+            "url",
+            &sub_origin_url,
+        );
+        write_repo_config(&sub_git_dir, &sub_config)?;
     }
     Ok(())
 }
@@ -3039,6 +3120,21 @@ fn submodule_is_active(config: &GitConfig, submodule: &SubmoduleConfigEntry) -> 
         .is_some()
 }
 
+fn submodule_add_needs_active_entry(config: &GitConfig, name: &str, path: &str) -> bool {
+    if config
+        .get_bool("submodule", Some(name), "active")
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let active_specs = config
+        .get_all("submodule", None, "active")
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    active_specs.is_empty() || !submodule_active_specs_match(&active_specs, path)
+}
+
 fn submodule_active_specs_match(specs: &[&str], path: &str) -> bool {
     let mut matched = false;
     for spec in specs {
@@ -3575,8 +3671,7 @@ pub(crate) fn read_submodule_configs(worktree_root: &Path) -> Result<Vec<Submodu
     // (set-url / set-branch / sync / add via `submodule_name_for_exact_path`,
     // and the scattered reads in sley-cli/{branch,workspace,remote_cmds}.rs,
     // sley-worktree, sley-remote/clone.rs) onto `SubmoduleConfigSet`.
-    let path = worktree_root.join(".gitmodules");
-    let Ok(config) = GitConfig::read(path) else {
+    let Some(config) = read_gitmodules_config(worktree_root)? else {
         return Ok(Vec::new());
     };
     let set = sley_submodule::SubmoduleConfigSet::parse(&config);
@@ -3619,6 +3714,91 @@ pub(crate) fn read_submodule_configs(worktree_root: &Path) -> Result<Vec<Submodu
         });
     }
     Ok(submodules)
+}
+
+/// Read `.gitmodules` the way git's `repo_read_gitmodules` does: prefer the
+/// working tree file, then fall back to `:.gitmodules` from the index, then to
+/// `HEAD:.gitmodules`. Sparse checkouts rely on the index fallback when the file
+/// is tracked but intentionally absent from the working tree.
+fn read_gitmodules_config(worktree_root: &Path) -> Result<Option<GitConfig>> {
+    let path = worktree_root.join(".gitmodules");
+    match fs::read(&path) {
+        Ok(bytes) => return Ok(GitConfig::parse(&bytes).ok()),
+        Err(err) if err.kind() != io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {}
+    }
+
+    let Ok(git_dir) = discover_git_dir(worktree_root) else {
+        return Ok(None);
+    };
+    let Ok(format) = repository_object_format(&git_dir) else {
+        return Ok(None);
+    };
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+    if let Some(oid) = gitmodules_oid_from_index(&git_dir, format)? {
+        return gitmodules_config_from_oid(&db, &oid);
+    }
+    if let Some(oid) = gitmodules_oid_from_head(&git_dir, format, &db)? {
+        return gitmodules_config_from_oid(&db, &oid);
+    }
+    Ok(None)
+}
+
+fn gitmodules_config_from_oid(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+) -> Result<Option<GitConfig>> {
+    let object = db.read_object(oid)?;
+    if object.object_type != ObjectType::Blob {
+        return Ok(None);
+    }
+    Ok(GitConfig::parse(&object.body).ok())
+}
+
+fn gitmodules_oid_from_index(git_dir: &Path, format: ObjectFormat) -> Result<Option<ObjectId>> {
+    let Some(index) = read_repository_index(git_dir, format)? else {
+        return Ok(None);
+    };
+    Ok(index
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.stage() == sley_index::Stage::Normal && entry.path.as_bytes() == b".gitmodules"
+        })
+        .map(|entry| entry.oid))
+}
+
+fn gitmodules_oid_from_head(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+) -> Result<Option<ObjectId>> {
+    let Ok(head) = resolve_revision(git_dir, format, "HEAD") else {
+        return Ok(None);
+    };
+    let tree = commit_tree_oid(db, format, &head)?;
+    Ok(sley_diff_merge::flatten_tree(db, format, &tree)?
+        .get(b".gitmodules".as_slice())
+        .map(|(_, oid)| *oid))
+}
+
+fn ensure_writing_gitmodules_ok(
+    git_dir: &Path,
+    format: ObjectFormat,
+    worktree_root: &Path,
+) -> Result<()> {
+    if worktree_root.join(".gitmodules").exists() {
+        return Ok(());
+    }
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let tracked = gitmodules_oid_from_index(git_dir, format)?.is_some()
+        || gitmodules_oid_from_head(git_dir, format, &db)?.is_some();
+    if tracked {
+        eprintln!("fatal: please make sure that the .gitmodules file is in the working tree");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
 }
 
 pub(crate) fn index_gitlink_submodule_configs(
@@ -3772,11 +3952,14 @@ fn filter_submodules(
 }
 
 pub(crate) fn submodule_path_matches_pathspec(path: &str, pathspec: &str) -> bool {
-    pathspec.is_empty()
-        || path == pathspec
-        || path
-            .strip_prefix(pathspec)
-            .is_some_and(|rest| rest.starts_with('/'))
+    if pathspec.is_empty() || pathspec == "." {
+        return true;
+    }
+    sley_pathspec::pathspec_item_matches(
+        pathspec.as_bytes(),
+        path.as_bytes(),
+        sley_pathspec::PathspecMatchMagic::default(),
+    )
 }
 
 pub(crate) fn normalize_submodule_pathspec(cwd: &Path, worktree_root: &Path, path: &str) -> String {
@@ -3848,15 +4031,17 @@ fn lexical_relative_path(root: &Path, target: &Path) -> Option<String> {
     )
 }
 
-fn print_submodule_status_tree(
+fn print_submodule_status_tree<W: Write>(
+    stdout: &mut W,
     cwd: &Path,
     worktree_root: &Path,
+    format: ObjectFormat,
     index: &Option<Index>,
     submodule: &SubmoduleStatusEntry,
     cached: bool,
     recursive: bool,
 ) -> Result<()> {
-    print_submodule_status(worktree_root, index, submodule, cached)?;
+    print_submodule_status(stdout, worktree_root, format, index, submodule, cached)?;
     if !recursive {
         return Ok(());
     }
@@ -3870,8 +4055,10 @@ fn print_submodule_status_tree(
     let nested_index = read_repository_index(&git_dir, nested_format)?;
     for nested_submodule in nested {
         print_submodule_status_tree(
+            stdout,
             cwd,
             &submodule_root,
+            nested_format,
             &nested_index,
             &nested_submodule,
             cached,
@@ -3881,12 +4068,25 @@ fn print_submodule_status_tree(
     Ok(())
 }
 
-fn print_submodule_status(
+fn print_submodule_status<W: Write>(
+    stdout: &mut W,
     worktree_root: &Path,
+    format: ObjectFormat,
     index: &Option<Index>,
     submodule: &SubmoduleStatusEntry,
     cached: bool,
 ) -> Result<()> {
+    if submodule_index_is_unmerged(index, &submodule.path) {
+        let null = ObjectId::null(format);
+        if let Err(err) = writeln!(stdout, "U{null} {}", submodule.display_path) {
+            if err.kind() == io::ErrorKind::BrokenPipe {
+                std::process::exit(141);
+            }
+            return Err(err.into());
+        }
+        return Ok(());
+    }
+
     let path_bytes = submodule.path.as_bytes();
     let cached_oid = index
         .as_ref()
@@ -3927,7 +4127,16 @@ fn print_submodule_status(
             .map(|(git_dir, _)| git_dir.as_path()),
         &output_oid,
     )?;
-    println!("{prefix}{output_oid} {}{suffix}", submodule.display_path);
+    if let Err(err) = writeln!(
+        stdout,
+        "{prefix}{output_oid} {}{suffix}",
+        submodule.display_path
+    ) {
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(141);
+        }
+        return Err(err.into());
+    }
     Ok(())
 }
 

@@ -119,6 +119,19 @@ pub(crate) fn run_hook_l(hook_name: &str, args: &[&str]) -> Result<bool> {
     )
 }
 
+pub(crate) fn run_post_index_change_hook(
+    updated_workdir: bool,
+    updated_skipworktree: bool,
+) -> Result<bool> {
+    run_hook_l(
+        "post-index-change",
+        &[
+            if updated_workdir { "1" } else { "0" },
+            if updated_skipworktree { "1" } else { "0" },
+        ],
+    )
+}
+
 pub(crate) fn hook_exists(hook_name: &str) -> Result<bool> {
     Ok(list_hook_commands(hook_name)?
         .into_iter()
@@ -557,6 +570,21 @@ fn hook_cwd_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
     }
 }
 
+fn hook_git_prefix(git_dir: &Path) -> Option<String> {
+    let root = worktree_root_for_git_dir(git_dir).ok()?;
+    let root = fs::canonicalize(root).ok()?;
+    let cwd = fs::canonicalize(env::current_dir().ok()?).ok()?;
+    let relative = cwd.strip_prefix(&root).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    let mut prefix = relative.to_string_lossy().replace('\\', "/");
+    if !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    Some(prefix)
+}
+
 fn spawn_hook(hook: &HookCommand, options: &HookRun) -> Result<std::process::ExitStatus> {
     let mut command = match hook {
         HookCommand::Traditional(path) => Command::new(path),
@@ -571,6 +599,9 @@ fn spawn_hook(hook: &HookCommand, options: &HookRun) -> Result<std::process::Exi
     }
     if let Some(git_dir) = &options.git_dir {
         command.env("GIT_DIR", git_dir);
+        if let Some(prefix) = hook_git_prefix(git_dir) {
+            command.env("GIT_PREFIX", prefix);
+        }
     }
     command.args(&options.args);
     for (key, value) in &options.env {

@@ -22,6 +22,7 @@ use std::cell::RefCell;
 /// Parsed command-line options for `git grep`.
 struct GrepOptions {
     patterns: Vec<String>,
+    nul_pattern_from_file: bool,
     /// `-f`/`-e`/positional patterns recorded in argv order with boolean glue, so
     /// the expression tree can be reconstructed.
     tokens: Vec<ExprToken>,
@@ -78,6 +79,7 @@ impl GrepOptions {
     fn new() -> Self {
         Self {
             patterns: Vec::new(),
+            nul_pattern_from_file: false,
             tokens: Vec::new(),
             kind: PatternKind::Basic,
             ignore_case: false,
@@ -534,6 +536,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             PatternTypeOption::Pcre => PatternKind::Perl,
             _ => PatternKind::Basic,
         };
+        reject_nul_pattern_without_pcre(&opts)?;
         let color_config = repo.as_ref().map(|repo| repo.config());
         let any = grep_no_index(
             &opts,
@@ -580,6 +583,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         PatternTypeOption::Pcre => PatternKind::Perl,
         _ => PatternKind::Basic,
     };
+    reject_nul_pattern_without_pcre(&opts)?;
     // `grep.*` config sets the default; an explicit CLI flag (tracked by the
     // `_set` markers) overrides it. git applies config first, then CLI overrides.
     if let Some(v) = cfg_linenumber
@@ -812,11 +816,24 @@ fn load_pattern_file(file: &str, opts: &mut GrepOptions) -> Result<()> {
             }
         }
     };
+    if raw.contains(&0) {
+        opts.nul_pattern_from_file = true;
+    }
     for line in raw.split(|&b| b == b'\n') {
         if line.is_empty() {
             continue;
         }
         opts.push_pattern(String::from_utf8_lossy(line).into_owned());
+    }
+    Ok(())
+}
+
+fn reject_nul_pattern_without_pcre(opts: &GrepOptions) -> Result<()> {
+    if opts.nul_pattern_from_file && opts.kind != PatternKind::Perl {
+        eprintln!(
+            "fatal: given pattern contains NULL byte (This is only supported with -P under PCRE v2)"
+        );
+        return Err(GitError::Exit(128));
     }
     Ok(())
 }
@@ -1156,7 +1173,7 @@ fn grep_no_index(
         collect_no_index_path(
             &cwd,
             &cwd_canon,
-            ".",
+            "",
             &ignore,
             worktree_root.as_deref(),
             &mut files,

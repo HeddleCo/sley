@@ -246,6 +246,113 @@ pub fn untracked_paths_with_options(
     ))
 }
 
+pub fn killed_paths(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<Vec<Vec<u8>>> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let bytes = match fs::read(index_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let index = Index::parse(&bytes, format)?;
+    let mut exact = BTreeMap::new();
+    let mut directories = BTreeSet::new();
+    for entry in index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == Stage::Normal)
+    {
+        let path = entry.path.as_bytes();
+        exact.insert(path.to_vec(), entry.mode);
+        for (idx, byte) in path.iter().enumerate() {
+            if *byte == b'/' && idx > 0 {
+                directories.insert(path[..idx].to_vec());
+            }
+        }
+    }
+    let mut paths = BTreeSet::new();
+    collect_killed_paths(
+        worktree_root,
+        git_dir,
+        worktree_root,
+        &[],
+        &exact,
+        &directories,
+        &mut paths,
+    )?;
+    Ok(paths.into_iter().collect())
+}
+
+fn collect_killed_paths(
+    root: &Path,
+    git_dir: &Path,
+    dir: &Path,
+    dir_git_path: &[u8],
+    exact: &BTreeMap<Vec<u8>, u32>,
+    directories: &BTreeSet<Vec<u8>>,
+    paths: &mut BTreeSet<Vec<u8>>,
+) -> Result<()> {
+    if is_same_path(dir, git_dir) {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if is_dot_git_entry(&path) || is_same_path(&path, git_dir) {
+            continue;
+        }
+        let git_path = git_path_append_component(dir_git_path, &entry.file_name());
+        let file_type = entry.file_type()?;
+        if let Some(mode) = exact.get(&git_path) {
+            if file_type.is_dir() && !sley_index::is_gitlink(*mode) && *mode != SPARSE_DIR_MODE {
+                collect_killed_leaves(git_dir, &path, &git_path, paths)?;
+            }
+            continue;
+        }
+        if directories.contains(&git_path) {
+            if file_type.is_dir() {
+                collect_killed_paths(root, git_dir, &path, &git_path, exact, directories, paths)?;
+            } else if file_type.is_file() || file_type.is_symlink() {
+                paths.insert(git_path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_killed_leaves(
+    git_dir: &Path,
+    dir: &Path,
+    dir_git_path: &[u8],
+    paths: &mut BTreeSet<Vec<u8>>,
+) -> Result<()> {
+    if is_same_path(dir, git_dir) {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if is_dot_git_entry(&path) || is_same_path(&path, git_dir) {
+            continue;
+        }
+        let git_path = git_path_append_component(dir_git_path, &entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_killed_leaves(git_dir, &path, &git_path, paths)?;
+        } else if file_type.is_file() || file_type.is_symlink() {
+            paths.insert(git_path);
+        }
+    }
+    Ok(())
+}
+
 /// Untracked paths for `ls-files --others` (without `--directory`): every
 /// untracked file is listed individually, except embedded-repository boundaries
 /// which are emitted as `dir/` to match git's non-submodule `.git` handling.

@@ -976,6 +976,35 @@ mod tests {
     }
 
     #[test]
+    fn full_sparse_checkout_later_ancestor_exclusion_wins() {
+        let sparse = SparseCheckout {
+            patterns: vec![
+                b"a".to_vec(),
+                b"!/x".to_vec(),
+                b"y/".to_vec(),
+                b"!x/y/z".to_vec(),
+            ],
+            sparse_index: false,
+        };
+
+        assert!(path_in_sparse_checkout(
+            b"a",
+            &sparse,
+            SparseCheckoutMode::Full
+        ));
+        assert!(path_in_sparse_checkout(
+            b"x/y/keep",
+            &sparse,
+            SparseCheckoutMode::Full
+        ));
+        assert!(!path_in_sparse_checkout(
+            b"x/y/z/new-a",
+            &sparse,
+            SparseCheckoutMode::Full
+        ));
+    }
+
+    #[test]
     fn apply_sparse_checkout_honors_preexisting_skip_worktree_via_idempotence() {
         let root = temp_root();
         let git_dir = root.join(".git");

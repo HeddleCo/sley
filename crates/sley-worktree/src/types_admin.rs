@@ -764,6 +764,12 @@ pub fn read_repository_index(
     if !index_path.exists() {
         return Ok(None);
     }
+    if fs::metadata(&index_path)
+        .map(|metadata| metadata.len() == 0)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
     Ok(Some(sley_index::read_repository_index(git_dir, format)?))
 }
 

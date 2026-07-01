@@ -897,6 +897,28 @@ impl FileRefStore {
         parse_reflog(self.format, &fs::read(path)?)
     }
 
+    pub fn should_write_reflog_for_update(&self, name: &str, create_reflog: bool) -> Result<bool> {
+        validate_ref_name_for_read(name)?;
+        let reflog_exists = if self.uses_reftable()? {
+            !self.read_reftable_logs(name)?.is_empty()
+        } else {
+            self.reflog_path(name).exists()
+        };
+        if create_reflog || reflog_exists {
+            return Ok(true);
+        }
+        let Ok(config) = GitConfig::read(self.common_dir.join("config")) else {
+            return Ok(false);
+        };
+        if let Some(value) = config.get("core", None, "logAllRefUpdates") {
+            return Ok(log_all_ref_updates_matches(name, value));
+        }
+        if config.get_bool("core", None, "bare").unwrap_or(false) {
+            return Ok(false);
+        }
+        Ok(log_all_ref_updates_matches(name, "true"))
+    }
+
     pub fn write_reflog(&self, name: &str, entries: &[ReflogEntry]) -> Result<()> {
         validate_ref_name_for_read(name)?;
         if self.uses_reftable()? {
@@ -3191,6 +3213,19 @@ fn repository_common_dir(git_dir: &Path) -> PathBuf {
     git_dir.to_path_buf()
 }
 
+fn log_all_ref_updates_matches(name: &str, value: &str) -> bool {
+    if value.eq_ignore_ascii_case("always") {
+        return true;
+    }
+    if !sley_config::parse_config_bool(value).unwrap_or(false) {
+        return false;
+    }
+    name == "HEAD"
+        || name.starts_with("refs/heads/")
+        || name.starts_with("refs/remotes/")
+        || name.starts_with("refs/notes/")
+}
+
 /// The phase a [`ReferenceTransactionHook`] is invoked for, mirroring the
 /// `state` argument git passes to the `reference-transaction` hook
 /// (`refs.c:run_transaction_hook`).
@@ -3380,6 +3415,11 @@ impl<'a> FileRefTransaction<'a> {
     /// and all outstanding lock files are deleted. Reflog entries are appended
     /// only after every ref change has landed.
     pub fn commit(self) -> Result<()> {
+        if env::var_os("GIT_QUARANTINE_PATH").is_some() {
+            return Err(GitError::Transaction(
+                "ref updates forbidden inside quarantine environment".into(),
+            ));
+        }
         let FileRefTransaction {
             store,
             changes,

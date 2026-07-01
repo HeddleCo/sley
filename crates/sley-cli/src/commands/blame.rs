@@ -1017,6 +1017,15 @@ fn parse_abbrev_value(value: &str) -> Result<usize> {
 /// Convert the user-supplied (cwd-relative) path into a repository-root
 /// relative path. Outside-of-worktree paths are reported the way git does.
 fn blame_repo_relative_path(cwd: &Path, git_dir: &Path, path: &str) -> Result<String> {
+    let input = Path::new(path);
+    if input.is_absolute() {
+        let root = fs::canonicalize(worktree_root_for_git_dir(git_dir)?)?;
+        let absolute = fs::canonicalize(input)?;
+        let relative = absolute
+            .strip_prefix(&root)
+            .map_err(|_| GitError::InvalidPath(format!("{path} is outside the repository")))?;
+        return normalize_repo_path(&relative.to_string_lossy());
+    }
     let prefix = worktree_prefix(cwd, git_dir)?;
     // Join the prefix and the argument, then normalize `.`/`..`/duplicate
     // separators so the result is a clean repo-relative path with forward
@@ -2769,11 +2778,19 @@ fn guess_line_blames(
     let fuzzy_matches =
         fuzzy_find_matching_lines(parent_fps, target_fps, tlno, parent_slno, same, parent_len);
     let count = (same - tlno) as usize;
+    let validate_tiny_parent_match = parent_len <= 1 && count > parent_len.max(0) as usize;
     let mut line_blames = Vec::with_capacity(count);
     for i in 0..count {
         let target_idx = tlno + i as i32;
         let best_idx = match &fuzzy_matches {
-            Some(m) if m[i] >= 0 => m[i],
+            Some(m) if m[i] >= 0 => {
+                let fuzzy_idx = m[i];
+                if validate_tiny_parent_match {
+                    prefer_whole_parent_match(parent_fps, target_fps, target_idx, fuzzy_idx)
+                } else {
+                    fuzzy_idx
+                }
+            }
             _ => scan_parent_range(
                 parent_fps,
                 target_fps,
@@ -2795,6 +2812,33 @@ fn guess_line_blames(
         }
     }
     line_blames
+}
+
+fn prefer_whole_parent_match(
+    parent_fps: &[Fingerprint],
+    target_fps: &[Fingerprint],
+    target_idx: i32,
+    fuzzy_idx: i32,
+) -> i32 {
+    let scan_idx = scan_parent_range(
+        parent_fps,
+        target_fps,
+        target_idx as usize,
+        0,
+        parent_fps.len(),
+    );
+    if scan_idx < 0 {
+        return fuzzy_idx;
+    }
+
+    let target = &target_fps[target_idx as usize];
+    let fuzzy_score = fingerprint_similarity(target, &parent_fps[fuzzy_idx as usize]);
+    let scan_score = fingerprint_similarity(target, &parent_fps[scan_idx as usize]);
+    if scan_score > fuzzy_score {
+        scan_idx
+    } else {
+        fuzzy_idx
+    }
 }
 
 /// git's `ignore_blame_entry`: split a blame entry over the changed region into
@@ -4200,6 +4244,24 @@ mod tests {
         let to_parent: usize = passed.iter().map(|e| e.num_lines).sum();
         assert_eq!(ours, 1, "the changed middle line is charged to the child");
         assert_eq!(to_parent, 2, "the unchanged a/c lines pass to the parent");
+    }
+
+    #[test]
+    fn blame_ignore_tiny_parent_hunk_prefers_whole_parent_exact_match() {
+        let parent = lines(b"#include \"c.h\"\n#include \"b.h\"\n#include \"a.h\"\n#include \"e.h\"\n#include \"d.h\"\n");
+        let target = lines(b"#include \"a.h\"\n#include \"b.h\"\n#include \"c.h\"\n#include \"d.h\"\n#include \"e.h\"\n");
+        let parent_fps = line_fingerprints(&parent);
+        let target_fps = line_fingerprints(&target);
+
+        // Sley's Myers op stream splits this reorder so the middle target
+        // region (`b.h`, `c.h`) is compared with only the old `e.h` line. Git's
+        // ignore pass still recovers the exact whole-parent matches.
+        let line_blames = guess_line_blames(&parent_fps, &target_fps, 1, 2, 3, 1);
+
+        assert_eq!(line_blames.len(), 2);
+        assert!(line_blames.iter().all(|line| line.is_parent));
+        assert_eq!(line_blames[0].s_lno, 1);
+        assert_eq!(line_blames[1].s_lno, 0);
     }
 
     #[test]

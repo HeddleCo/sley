@@ -452,6 +452,8 @@ impl LsTreePathspecFilter {
         let exact = self.has_exact(path);
         let contents = self.matches_contents(path, recursive);
         let recursive_exact = recursive && self.matches_recursive_exact_descendant(path);
+        let recursive_tree_only_contents_root =
+            recursive && options.tree_only && is_tree && self.has_contents(path);
         let traversal_tree = is_tree
             && options.show_trees
             && (self.has_contents(path)
@@ -476,6 +478,9 @@ impl LsTreePathspecFilter {
         }
         if recursive_exact {
             print |= output_allowed_recursive(is_tree, options);
+        }
+        if recursive_tree_only_contents_root {
+            print = true;
         }
         print || traversal_tree
     }
@@ -861,7 +866,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         eprintln!("fatal: options 'ls-files --with-tree' and '-s/-u' cannot be used together");
         return Err(GitError::Exit(128));
     }
-    let selected = cached || others || deleted || modified || unmerged || resolve_undo;
+    let selected = cached || others || deleted || modified || unmerged || resolve_undo || killed;
     let output_stage = stage || unmerged;
     if ignored && !others && !cached {
         eprintln!("fatal: ls-files -i must be used with either -o or -c");
@@ -996,6 +1001,14 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                     // Untracked files have no index blob: `i/` is empty.
                     eol.write_prefix(&mut stdout, &path, None)?;
                 }
+                write_ls_files_path(&mut stdout, &display, terminator)?;
+                stdout.write_all(&[terminator])?;
+            }
+        }
+    }
+    if killed {
+        for path in sley_worktree::killed_paths(&worktree_root, &git_dir, format)? {
+            if let Some(display) = pathspec.display(&path) {
                 write_ls_files_path(&mut stdout, &display, terminator)?;
                 stdout.write_all(&[terminator])?;
             }
@@ -2155,6 +2168,8 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     let mut refresh = false;
     let mut really_refresh = false;
     let mut refresh_ignore_missing = false;
+    let mut refresh_ignore_submodules = false;
+    let mut refresh_unmerged = false;
     // Upstream git parses `--refresh`/`--really-refresh` as a callback that
     // fires the moment the flag is seen, so only a `-q` placed *before* the
     // refresh flag sets REFRESH_QUIET; a `-q` that comes after does not quiet
@@ -2163,6 +2178,8 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     let mut refresh_quiet = false;
     let mut quiet = false;
     let mut ignore_missing = false;
+    let mut ignore_submodules = false;
+    let mut allow_unmerged_refresh = false;
     let mut assume_unchanged = None;
     let mut skip_worktree = None;
     let mut fsmonitor_valid = None;
@@ -2243,6 +2260,8 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                 refresh = true;
                 really_refresh = false;
                 refresh_ignore_missing = ignore_missing;
+                refresh_ignore_submodules = ignore_submodules;
+                refresh_unmerged = allow_unmerged_refresh;
                 refresh_quiet = quiet;
                 allow_no_input = true;
             }
@@ -2250,6 +2269,8 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                 refresh = true;
                 really_refresh = true;
                 refresh_ignore_missing = ignore_missing;
+                refresh_ignore_submodules = ignore_submodules;
+                refresh_unmerged = allow_unmerged_refresh;
                 refresh_quiet = quiet;
                 allow_no_input = true;
             }
@@ -2285,13 +2306,23 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                 return Err(GitError::Exit(129));
             }
             "-q" => quiet = true,
-            "--ignore-submodules"
-            | "--no-ignore-submodules"
-            | "--replace"
-            | "--no-replace"
-            | "--unmerged"
-            | "--no-unmerged"
-            | "--no-force-untracked-cache" => allow_no_input = true,
+            "--ignore-submodules" => {
+                ignore_submodules = true;
+                allow_no_input = true;
+            }
+            "--no-ignore-submodules" => {
+                ignore_submodules = false;
+                allow_no_input = true;
+            }
+            "--unmerged" => {
+                allow_unmerged_refresh = true;
+                allow_no_input = true;
+            }
+            "--no-unmerged" => {
+                allow_unmerged_refresh = false;
+                allow_no_input = true;
+            }
+            "--replace" | "--no-replace" | "--no-force-untracked-cache" => allow_no_input = true,
             "--split-index" => {
                 split_index = Some(true);
                 allow_no_input = true;
@@ -2599,11 +2630,13 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             &resolved_paths,
             refresh_quiet,
             refresh_ignore_missing,
+            refresh_ignore_submodules,
+            refresh_unmerged,
             really_refresh,
         )?;
         // Unmerged entries make the refresh fail (`<path>: needs merge`).
         let index_path = sley_worktree::repository_index_path(&git_dir);
-        if index_path.exists() {
+        if !refresh_unmerged && index_path.exists() {
             let index = Index::parse(&fs::read(&index_path)?, format)?;
             let mut unmerged: Vec<String> = index
                 .entries
@@ -2721,10 +2754,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     if fsmonitor && !suppress_after_unresolve {
         print_update_index_fsmonitor_unset_warning();
     }
-    crate::commands::hooks::run_hook(
-        "post-index-change",
-        crate::commands::hooks::HookRun::default(),
-    )?;
+    crate::commands::hooks::run_post_index_change_hook(false, true)?;
     Ok(())
 }
 
@@ -2960,12 +2990,18 @@ fn parse_update_index_index_info(input: &[u8]) -> Result<Vec<CliIndexInfoRecord>
             });
             continue;
         }
-        let stage = if let Some(stage) = fields.get(2) {
-            stage.parse::<u16>().map_err(|_| {
-                GitError::Command(format!("invalid update-index --index-info stage {stage}"))
-            })?
-        } else {
-            0
+        let (oid, stage) = match fields.as_slice() {
+            [_, oid] => (*oid, 0),
+            [_, object_type, oid] if update_index_index_info_type(*object_type).is_some() => {
+                (*oid, 0)
+            }
+            [_, oid, stage] => {
+                let stage = stage.parse::<u16>().map_err(|_| {
+                    GitError::Command(format!("invalid update-index --index-info stage {stage}"))
+                })?;
+                (*oid, stage)
+            }
+            _ => unreachable!("field count checked above"),
         };
         if stage > 3 {
             return Err(GitError::Command(format!(
@@ -2974,12 +3010,22 @@ fn parse_update_index_index_info(input: &[u8]) -> Result<Vec<CliIndexInfoRecord>
         }
         records.push(CliIndexInfoRecord::Add {
             mode,
-            oid: fields[1].to_string(),
+            oid: oid.to_string(),
             stage,
             path: path.to_vec(),
         });
     }
     Ok(records)
+}
+
+fn update_index_index_info_type(value: &str) -> Option<ObjectType> {
+    match value {
+        "blob" => Some(ObjectType::Blob),
+        "tree" => Some(ObjectType::Tree),
+        "commit" => Some(ObjectType::Commit),
+        "tag" => Some(ObjectType::Tag),
+        _ => None,
+    }
 }
 
 fn update_index_stdin_paths(input: &[u8], nul: bool) -> Vec<PathBuf> {

@@ -459,6 +459,12 @@ fn status_ignored_directory_rollup_and_negation_match_upstream_git() {
             vec!["status", "--short", "--ignored"],
             vec!["status", "--short", "--ignored=matching"],
             vec!["status", "--porcelain=v2", "--ignored"],
+            vec![
+                "status",
+                "--porcelain=v2",
+                "--ignored=matching",
+                "--untracked-files=all",
+            ],
         ] {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);

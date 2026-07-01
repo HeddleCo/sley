@@ -14,6 +14,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut unified_context = false;
     let mut inter_hunk_context = false;
     let mut guess = None::<bool>;
+    let mut create_reflog = false;
     let mut path_merge = false;
     let mut conflict_implies_merge = false;
     let mut conflict_style = None::<sley_worktree::CheckoutConflictStyle>;
@@ -102,10 +103,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 inter_hunk_context = true;
             }
             "--progress" | "--no-progress" => {}
-            // `-l`/`--log` forces a reflog for the newly created branch. sley
-            // always materializes a reflog on the first commit, so this only
-            // needs to be recognized (and not mistaken for a start-point arg).
-            "-l" | "--log" => {}
+            // `-l`/`--log` forces a reflog for the newly created branch.
+            "-l" | "--log" => create_reflog = true,
             "--overlay" => overlay_mode = Some(true),
             "--no-overlay" => overlay_mode = Some(false),
             "--overwrite-ignore" => overwrite_ignore = true,
@@ -441,7 +440,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                             _ => sley_worktree::CheckoutConflictStyle::Merge,
                         }
                     });
-                    sley_worktree::checkout_index_paths(
+                    let result = sley_worktree::checkout_index_paths(
                         worktree_root,
                         &git_dir,
                         format,
@@ -455,8 +454,13 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                             smudge_config: Some(&config),
                         },
                     )?;
+                    if !quiet && dashdash_index.is_none() && result.restored > 0 {
+                        let suffix = if result.restored == 1 { "" } else { "s" };
+                        eprintln!("Updated {} path{} from the index", result.restored, suffix);
+                    }
                 }
             }
+            commands::hooks::run_post_index_change_hook(false, false)?;
             run_post_checkout_hook(&checkout_old_head, &checkout_old_head, false)?;
             return Ok(());
         }
@@ -489,12 +493,22 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     )
                 });
             if !switches_to_other_branch {
-                sley_worktree::reset_index_and_worktree_to_commit(
-                    &worktree_root,
-                    &git_dir,
-                    format,
-                    &target_oid,
-                )?;
+                if recurse_submodules {
+                    commands::read_tree::reset_index_and_worktree_to_commit(
+                        &worktree_root,
+                        &git_dir,
+                        format,
+                        &target_oid,
+                        true,
+                    )?;
+                } else {
+                    sley_worktree::reset_index_and_worktree_to_commit(
+                        &worktree_root,
+                        &git_dir,
+                        format,
+                        &target_oid,
+                    )?;
+                }
                 sley_sequencer::replay::remove_branch_state(&git_dir);
                 return Ok(());
             }
@@ -507,12 +521,22 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     if force {
         let store = FileRefStore::new(&git_dir, format);
         if let Ok(Some(head_oid)) = resolve_ref_peeled(&store, "HEAD") {
-            sley_worktree::reset_index_and_worktree_to_commit(
-                &worktree_root,
-                &git_dir,
-                format,
-                &head_oid,
-            )?;
+            if recurse_submodules {
+                commands::read_tree::reset_index_and_worktree_to_commit(
+                    &worktree_root,
+                    &git_dir,
+                    format,
+                    &head_oid,
+                    true,
+                )?;
+            } else {
+                sley_worktree::reset_index_and_worktree_to_commit(
+                    &worktree_root,
+                    &git_dir,
+                    format,
+                    &head_oid,
+                )?;
+            }
         } else {
             // Unborn HEAD: discard the staged state entirely.
             let index_path = sley_worktree::repository_index_path(&git_dir);
@@ -573,7 +597,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     &git_dir,
                     format,
                     &target_oid,
-                    commit_identity_from_env("COMMITTER")?,
+                    committer_identity_for_reflog()?,
                     message.clone(),
                     &config,
                 ) {
@@ -592,6 +616,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     Err(err) => return Err(err),
                 }
             }
+            commands::hooks::run_post_index_change_hook(true, false)?;
             sley_sequencer::replay::remove_branch_state(&git_dir);
             if !quiet {
                 checkout_print_previous_detached_head(
@@ -698,7 +723,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         &git_dir,
                         format,
                         &target_oid,
-                        commit_identity_from_env("COMMITTER")?,
+                        committer_identity_for_reflog()?,
                         message.clone(),
                         &config,
                     ) {
@@ -737,6 +762,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         subject
                     );
                 }
+                commands::hooks::run_post_index_change_hook(true, false)?;
                 run_post_checkout_hook(&checkout_old_head, &target_oid, true)?;
                 commands::hooks::run_hook(
                     "reference-transaction",
@@ -766,7 +792,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         &branch_name,
                         &dwim.remote_ref,
                         false,
-                        commit_identity_from_env("COMMITTER")?,
+                        create_reflog,
+                        committer_identity_for_reflog()?,
                     )?;
                     let tracking_start = Some(dwim.remote_ref);
                     crate::commands::branch::branch_create_set_tracking(
@@ -812,7 +839,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 }
                 // --orphan cannot reuse an existing branch name (there is no
                 // force variant); reject before touching the index or HEAD.
-                if store.read_ref(&branch_ref_name(&branch)?)?.is_some() {
+                let branch_ref = branch_ref_name(&branch)?;
+                if store.read_ref(&branch_ref)?.is_some() {
                     eprintln!("fatal: a branch named '{branch}' already exists");
                     return Err(GitError::Exit(128));
                 }
@@ -838,6 +866,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     )?;
                 }
                 checkout_switch_to_unborn_branch(&git_dir, &branch)?;
+                if create_reflog {
+                    store.write_reflog(&branch_ref, &[])?;
+                }
                 sley_sequencer::replay::remove_branch_state(&git_dir);
                 if !quiet {
                     eprintln!("Switched to a new branch '{branch}'");
@@ -876,7 +907,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 &branch,
                 start,
                 force,
-                commit_identity_from_env("COMMITTER")?,
+                create_reflog,
+                committer_identity_for_reflog()?,
             )?;
             let tracking_start = positional.first().map(|start| {
                 if start.contains("@{") {
@@ -999,7 +1031,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             git_dir.clone(),
             format,
             branch,
-            commit_identity_from_env("COMMITTER")?,
+            committer_identity_for_reflog()?,
             &config,
         ) {
             Ok(_) => {}
@@ -1035,6 +1067,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     sley_sequencer::replay::remove_branch_state(&git_dir);
     let checkout_new_head = resolve_ref_peeled(&FileRefStore::new(&git_dir, format), "HEAD")?
         .unwrap_or(checkout_old_head);
+    commands::hooks::run_post_index_change_hook(true, false)?;
     run_post_checkout_hook(&checkout_old_head, &checkout_new_head, true)?;
     commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
     if !quiet {
@@ -1850,6 +1883,10 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         );
         return Err(GitError::Exit(128));
     }
+    if pathspec_from_file.is_some() && patch {
+        eprintln!("fatal: options '--pathspec-from-file' and '--patch' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
     if patch {
         let cwd = env::current_dir()?;
         let git_dir = discover_git_dir(&cwd)?;
@@ -1867,9 +1904,8 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         paths.extend(read_pathspecs_from_file(&pathspec_file, pathspec_file_nul)?);
     }
     if paths.is_empty() {
-        return Err(GitError::Command(
-            "restore requires at least one path".into(),
-        ));
+        eprintln!("fatal: you must specify path(s) to restore");
+        return Err(GitError::Exit(128));
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
@@ -2210,7 +2246,7 @@ fn detach_head_with_reflog(
         reflog: Some(ReflogEntry {
             old_oid: ObjectId::null(format),
             new_oid: *target,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: committer_identity_for_reflog()?,
             message,
         }),
     });
@@ -2233,7 +2269,7 @@ fn switch_head_symbolic_with_reflog(
         reflog: Some(ReflogEntry {
             old_oid: *target,
             new_oid: *target,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: committer_identity_for_reflog()?,
             message: format!("checkout: moving from {from} to {branch}").into_bytes(),
         }),
     });

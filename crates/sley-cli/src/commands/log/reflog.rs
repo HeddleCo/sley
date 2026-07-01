@@ -334,14 +334,21 @@ pub(super) fn log_grep_matcher_matches(
     filter: Option<&sley_grep::GrepMatcher>,
     all_match: bool,
     invert: bool,
+    output_encoding: &str,
 ) -> bool {
     let Some(filter) = filter else {
         return true;
     };
-    let matched = if all_match {
-        filter.matches_all(&record.commit.message)
+    let message = commit_message_for_commit_encoding(&record.commit, output_encoding);
+    let search_message = if encoding_is_utf8(output_encoding) {
+        Cow::Borrowed(message.as_ref())
     } else {
-        filter.matches_any(&record.commit.message)
+        Cow::Owned(argv_string_from_bytes(message.as_ref()).into_bytes())
+    };
+    let matched = if all_match {
+        filter.matches_all(&search_message)
+    } else {
+        filter.matches_any(&search_message)
     };
     matched != invert
 }

@@ -11,6 +11,7 @@ members = [
     "crates/sley-refs",
     "crates/sley-pathspec",
     "crates/sley-grep",
+    "crates/sley-i18n",
     "crates/sley-pretty",
     "crates/sley-diff-format",
     "crates/sley-rev",
@@ -21,6 +22,7 @@ members = [
     "crates/sley-submodule",
     "crates/sley-pack",
     "crates/sley-mmap",
+    "crates/sley-procinfo",
     "crates/sley-transport",
     "crates/sley-fetch",
     "crates/sley-options",
@@ -40,7 +42,7 @@ resolver = "3"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.96"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/HeddleCo/sley"
 
 [workspace.lints.rust]

@@ -64,11 +64,12 @@ enrolled in the main floor gate:
   t7006-pager.sh
   t7527-builtin-fsmonitor.sh
 
-Two additional target scripts produced rows but timed out even in isolated
-900-second retries, so they are also held out of the main floor gate until the
-underlying timeout is understood:
-  t4053-diff-no-index.sh
-  t9300-fast-import.sh
+The former timeout holdouts `t4053-diff-no-index.sh` and
+`t9300-fast-import.sh` were diagnosed and enrolled on 2026-07-01 after their
+blocking FIFO/progress cases were fixed to fail or complete normally. `t9300`
+is now full-parity at 256/256 after native fast-import pack flushing and edge
+list support landed.
+
 
 --------------------------------------------------------------------------------
 SCOREBOARD (sha1)

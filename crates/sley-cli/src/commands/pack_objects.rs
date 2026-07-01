@@ -314,7 +314,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
         let oids = read_pack_objects_stdin(format)?;
         let mut objects = Vec::with_capacity(oids.len());
         for oid in &oids {
-            match database.read_object(oid) {
+            match crate::read_object_maybe_prefetch_promisor(&database, oid) {
                 Ok(object) => objects.push(object),
                 Err(GitError::NotFound(_)) => {
                     eprintln!("fatal: unable to read {oid}");
@@ -1463,7 +1463,7 @@ impl FilteredPackTraversal<'_> {
         if self.excluded.contains(&oid) {
             return Ok(());
         }
-        let object = self.database.read_object(&oid)?;
+        let object = crate::read_object_maybe_prefetch_promisor(self.database, &oid)?;
         match object.object_type {
             ObjectType::Commit => self.visit_commit(oid, object, provided, state),
             ObjectType::Tree => self.visit_tree(oid, object, path, depth, provided, state),
@@ -1529,7 +1529,7 @@ impl FilteredPackTraversal<'_> {
         if self.excluded.contains(&oid) {
             return Ok(());
         }
-        let object = match self.database.read_object(&oid) {
+        let object = match crate::read_object_maybe_prefetch_promisor(self.database, &oid) {
             Ok(object) => object,
             Err(GitError::NotFound(_)) => {
                 eprintln!("fatal: bad tree object {oid}");
@@ -1600,7 +1600,7 @@ impl FilteredPackTraversal<'_> {
         let size = if self.filter.needs_blob_size() {
             match object {
                 Some(ref object) => Some(object.body.len()),
-                None => match self.database.read_object(&oid) {
+                None => match crate::read_object_maybe_prefetch_promisor(self.database, &oid) {
                     Ok(read) => {
                         let len = read.body.len();
                         object = Some(read);
@@ -1624,7 +1624,7 @@ impl FilteredPackTraversal<'_> {
         if include {
             let object = match object {
                 Some(object) => object,
-                None => match self.database.read_object(&oid) {
+                None => match crate::read_object_maybe_prefetch_promisor(self.database, &oid) {
                     Ok(object) => object,
                     Err(GitError::NotFound(_))
                         if self.missing_action == PackObjectsMissingAction::AllowAny =>

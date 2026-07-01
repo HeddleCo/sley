@@ -1449,10 +1449,13 @@ fn do_pick_commit(
         return Ok(PickFlow::Done);
     }
 
+    let target_encoding = commit_encoding_config(&ctx.git_dir);
+
     // Replay message.
     let mut message: Vec<u8> = match action {
         ReplayAction::Pick => {
-            let mut msg = commit.message.clone();
+            let mut msg =
+                commit_message_for_commit_encoding(&commit, &target_encoding).into_owned();
             if opts.record_origin {
                 if !msg.ends_with(b"\n") {
                     msg.push(b'\n');
@@ -1652,7 +1655,9 @@ fn do_pick_commit(
 
     // Create the commit and advance HEAD.
     let author = match action {
-        ReplayAction::Pick => commit.author.clone(),
+        ReplayAction::Pick => {
+            commit_author_for_commit_encoding(&commit, &target_encoding).into_owned()
+        }
         ReplayAction::Revert => commit_identity_from_env("AUTHOR").map_err(print_fatal_error)?,
     };
     let committer = commit_identity_from_env("COMMITTER").map_err(print_fatal_error)?;
@@ -1665,6 +1670,7 @@ fn do_pick_commit(
         committer,
         &message,
         reflog_message,
+        commit_encoding_header_from_config(&ctx.git_dir),
     )
     .map_err(print_fatal_error)?;
     let _ = fs::remove_file(ctx.git_dir.join("CHERRY_PICK_HEAD"));
@@ -1768,7 +1774,12 @@ pub(crate) fn launch_editor(git_dir: &Path, path: &Path) -> Result<()> {
     let editor = env::var("GIT_EDITOR")
         .ok()
         .or_else(|| config_value(git_dir, "core", "editor"))
-        .or_else(|| env::var("VISUAL").ok())
+        .or_else(|| {
+            env::var("VISUAL")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .filter(|_| env::var("TERM").is_ok_and(|term| term != "dumb"))
+        })
         .or_else(|| env::var("EDITOR").ok())
         .unwrap_or_else(|| "vi".to_string());
     if editor == ":" {
@@ -2310,6 +2321,7 @@ fn commit_and_advance_head(
     committer: Vec<u8>,
     message: &[u8],
     reflog_message: Vec<u8>,
+    encoding: Option<Vec<u8>>,
 ) -> Result<ObjectId> {
     let mut db = ctx.db();
     let new_oid = sley_sequencer::create_commit(
@@ -2320,7 +2332,7 @@ fn commit_and_advance_head(
             author,
             committer: committer.clone(),
             message: message.to_vec(),
-            encoding: None,
+            encoding,
             signature: None,
         },
     )?;
@@ -2497,11 +2509,13 @@ fn continue_single_pick(ctx: &ReplayCtx, opts: &ReplayOpts) -> Result<()> {
         message = strip_comment_lines(&fs::read(&path)?, comment_char(&ctx.git_dir));
     }
     // Author: the picked commit's author for cherry-picks; env for reverts.
+    let target_encoding = commit_encoding_config(&ctx.git_dir);
     let author = if cph.exists() {
         let text = fs::read_to_string(&cph)?;
         let oid = ObjectId::from_hex(ctx.format, text.trim())?;
         let object = db.read_object(&oid)?;
-        Commit::parse(ctx.format, &object.body)?.author
+        let commit = Commit::parse(ctx.format, &object.body)?;
+        commit_author_for_commit_encoding(&commit, &target_encoding).into_owned()
     } else {
         commit_identity_from_env("AUTHOR")?
     };
@@ -2515,6 +2529,7 @@ fn continue_single_pick(ctx: &ReplayCtx, opts: &ReplayOpts) -> Result<()> {
         committer,
         &message,
         format!("commit: {subject}").into_bytes(),
+        commit_encoding_header_from_config(&ctx.git_dir),
     )?;
     let _ = fs::remove_file(&cph);
     let _ = fs::remove_file(&rvh);
@@ -2783,6 +2798,8 @@ pub(crate) fn reset_merge_in(
         &[],
         /* quiet */ true,
         /* ignore_missing */ true,
+        /* ignore_submodules */ false,
+        /* allow_unmerged */ false,
         /* really_refresh */ false,
     )?;
 

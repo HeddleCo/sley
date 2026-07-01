@@ -61,6 +61,9 @@ struct AmOptions {
     ignore_whitespace: bool,
     /// Cut message text at a scissors line before mailinfo header/body parsing.
     scissors: bool,
+    /// Recode mail content to the target commit encoding (default; disabled by
+    /// `--no-utf8`).
+    utf8: bool,
     /// Prompt before applying each patch (`-i`/`--interactive`).
     interactive: bool,
     /// Prepend this directory to every path in each patch (`--directory=<dir>`,
@@ -133,6 +136,7 @@ struct AmCommitOpts {
     ignore_date: bool,
     /// Skip the `applypatch-msg` and `pre-applypatch` hooks (`-n`/`--no-verify`).
     no_verify: bool,
+    utf8: bool,
     /// When set, the per-commit reflog uses the rebase apply-backend format
     /// `<action> (pick): <subject>` (git runs am under the rebase backend with
     /// `GIT_REFLOG_ACTION="<action> (pick)"`, builtin/rebase.c run_am), instead
@@ -143,9 +147,11 @@ struct AmCommitOpts {
 /// A single message extracted from an mbox: identity, message, and raw diff.
 struct AmPatch {
     /// Author name from the `From:` header.
-    author_name: String,
+    author_name: Vec<u8>,
     /// Author email from the `From:` header.
-    author_email: String,
+    author_email: Vec<u8>,
+    /// Charset of `author_name` / `author_email`.
+    author_encoding: String,
     /// Author date from the `Date:` header, already normalised to
     /// `"<seconds> <±HHMM>"`. `None` when the header was absent or unparsable
     /// (the committer/env date is then used).
@@ -156,6 +162,8 @@ struct AmPatch {
     subject: String,
     /// Full commit message (subject + blank line + body), newline-terminated.
     message: Vec<u8>,
+    /// Charset declared by the mail message for the commit message body.
+    message_encoding: String,
     /// The raw `Message-ID:` header value (including the surrounding angle
     /// brackets, e.g. `<...@example.com>`), if the message carried one. Appended
     /// to the commit message when `--message-id`/`am.messageid` is set.
@@ -360,8 +368,8 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
 
 /// One commit to replay through the apply backend.
 pub(crate) struct RebaseApplyCommit {
-    pub author_name: String,
-    pub author_email: String,
+    pub author_name: Vec<u8>,
+    pub author_email: Vec<u8>,
     /// Raw author date as `<seconds> <±HHMM>` (or any `Date:` form the patch
     /// would carry); `None` falls back to the env author date.
     pub author_date: Option<String>,
@@ -410,16 +418,19 @@ pub(crate) fn start_rebase_apply(
     params: RebaseApplyParams,
 ) -> Result<()> {
     let state_dir = git_dir.join("rebase-apply");
+    let target_encoding = commit_encoding_config(git_dir);
     let patches: Vec<AmPatch> = params
         .commits
         .iter()
         .map(|commit| AmPatch {
             author_name: commit.author_name.clone(),
             author_email: commit.author_email.clone(),
+            author_encoding: target_encoding.clone(),
             author_date: commit.author_date.clone(),
             author_date_raw: commit.author_date.clone(),
             subject: subject_of_message(&commit.message),
             message: commit.message.clone(),
+            message_encoding: target_encoding.clone(),
             message_id: None,
             diff: commit.diff.clone(),
         })
@@ -441,6 +452,7 @@ pub(crate) fn start_rebase_apply(
         keep_cr: false,
         ignore_whitespace: params.ignore_whitespace,
         scissors: false,
+        utf8: true,
         interactive: false,
         directory: None,
         patch_format: AmPatchFormat::Mbox,
@@ -569,6 +581,7 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         keep_cr: false,
         ignore_whitespace: false,
         scissors: false,
+        utf8: true,
         interactive: false,
         directory: None,
         patch_format: AmPatchFormat::Auto,
@@ -638,12 +651,9 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             // `git format-patch` produces.
             "-c" | "--scissors" => options.scissors = true,
             "--no-scissors" => options.scissors = false,
-            "-u"
-            | "--utf8"
-            | "--no-utf8"
-            | "--rerere-autoupdate"
-            | "--no-rerere-autoupdate"
-            | "--allow-empty" => {}
+            "-u" | "--utf8" => options.utf8 = true,
+            "--no-utf8" => options.utf8 = false,
+            "--rerere-autoupdate" | "--no-rerere-autoupdate" | "--allow-empty" => {}
             // Forwarded `git apply` options: collected into git_apply_opts in git's
             // recreate-opt form (`--whitespace=fix`, `-C1`, `-p2`, `--reject`, …),
             // persisted to apply-opt, and re-applied for every patch + on resume.
@@ -1227,6 +1237,7 @@ fn parse_message(lines: &[Vec<u8>], cleanup: SubjectCleanup) -> Result<AmPatch> 
     let mut author_date_raw = None;
     let mut subject = String::new();
     let mut message_id = None;
+    let mut message_encoding = "UTF-8".to_string();
 
     // Skip any leading all-whitespace lines before the headers (git's mailinfo
     // ignores blank/whitespace lines preceding the first header; the t4150
@@ -1293,6 +1304,11 @@ fn parse_message(lines: &[Vec<u8>], cleanup: SubjectCleanup) -> Result<AmPatch> 
             }
             "subject" => subject = clean_subject(value, cleanup),
             "message-id" if !value.is_empty() => message_id = Some(value.clone()),
+            "content-type" => {
+                if let Some(charset) = content_type_charset(value) {
+                    message_encoding = charset;
+                }
+            }
             _ => {}
         }
     }
@@ -1373,12 +1389,14 @@ fn parse_message(lines: &[Vec<u8>], cleanup: SubjectCleanup) -> Result<AmPatch> 
     };
 
     Ok(AmPatch {
-        author_name,
-        author_email,
+        author_name: author_name.into_bytes(),
+        author_email: author_email.into_bytes(),
+        author_encoding: "UTF-8".to_string(),
         author_date,
         author_date_raw,
         subject,
         message,
+        message_encoding,
         message_id,
         diff,
     })
@@ -1398,6 +1416,20 @@ fn parse_from_header(value: &str) -> (String, String) {
     // Bare address: use it for both, matching git's fallback for name.
     let addr = value.trim().to_string();
     (addr.clone(), addr)
+}
+
+fn content_type_charset(value: &str) -> Option<String> {
+    for part in value.split(';').skip(1) {
+        if let Some((key, raw_value)) = part.trim().split_once('=')
+            && key.trim().eq_ignore_ascii_case("charset")
+        {
+            let charset = raw_value.trim().trim_matches('"');
+            if !charset.is_empty() {
+                return Some(charset.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1549,7 +1581,7 @@ fn cleanup_space_bytes(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Best-effort decode of RFC 2047 encoded-words for UTF-8/Q or B encodings.
+/// Best-effort decode of RFC 2047 encoded-words for Q or B encodings.
 /// Adjacent encoded words separated only by folded whitespace are concatenated,
 /// which is what `format-patch -k` uses for multiline subjects.
 fn decode_mime_word(value: &str) -> String {
@@ -1589,10 +1621,7 @@ fn decode_mime_word(value: &str) -> String {
 fn decode_mime_word_at(value: &str) -> Option<(String, usize)> {
     let rest = value.strip_prefix("=?")?;
     let charset_end = rest.find('?')?;
-    let charset = rest[..charset_end].to_ascii_lowercase();
-    if charset != "utf-8" && charset != "us-ascii" {
-        return None;
-    }
+    let charset = &rest[..charset_end];
     let after_charset = &rest[charset_end + 1..];
     let encoding_end = after_charset.find('?')?;
     let encoding = &after_charset[..encoding_end];
@@ -1607,7 +1636,11 @@ fn decode_mime_word_at(value: &str) -> Option<(String, usize)> {
         _ => return None,
     };
     match decoded {
-        Some(bytes) => Some((String::from_utf8_lossy(&bytes).into_owned(), consumed)),
+        Some(bytes) => {
+            let encoding = encoding_for_name(charset).unwrap_or(encoding_rs::UTF_8);
+            let (decoded, _, _) = encoding.decode(&bytes);
+            Some((decoded.into_owned(), consumed))
+        }
         None => None,
     }
 }
@@ -1895,7 +1928,7 @@ fn write_am_state_dir(
         bool_flag(options.ignore_date),
     )?;
     fs::write(state_dir.join("no-verify"), bool_flag(options.no_verify))?;
-    fs::write(state_dir.join("utf8"), b"t\n")?;
+    fs::write(state_dir.join("utf8"), bool_flag(options.utf8))?;
     fs::write(
         state_dir.join("interactive"),
         bool_flag(options.interactive),
@@ -1934,9 +1967,9 @@ fn bool_flag(value: bool) -> &'static [u8] {
 fn encode_patch_file(patch: &AmPatch) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"From: ");
-    out.extend_from_slice(patch.author_name.as_bytes());
+    out.extend_from_slice(&patch.author_name);
     out.extend_from_slice(b" <");
-    out.extend_from_slice(patch.author_email.as_bytes());
+    out.extend_from_slice(&patch.author_email);
     out.extend_from_slice(b">\n");
     if let Some(date) = &patch.author_date_raw {
         out.extend_from_slice(b"Date: ");
@@ -1948,6 +1981,9 @@ fn encode_patch_file(patch: &AmPatch) -> Vec<u8> {
         out.extend_from_slice(message_id.as_bytes());
         out.push(b'\n');
     }
+    out.extend_from_slice(b"Content-Type: text/plain; charset=");
+    out.extend_from_slice(patch.message_encoding.as_bytes());
+    out.push(b'\n');
     // Store the already-cleaned subject verbatim (no `[PATCH]` re-prefix): it has
     // had mailinfo cleanup applied once at parse time, so `read_patch_file`
     // re-parses with `keep_subject` to keep it byte-identical across the
@@ -2017,17 +2053,20 @@ fn write_current_patch_state(state_dir: &Path, patch: &AmPatch) -> Result<()> {
         .author_date_raw
         .clone()
         .unwrap_or_else(default_author_date);
-    let author_script = format!(
-        "GIT_AUTHOR_NAME={}\nGIT_AUTHOR_EMAIL={}\nGIT_AUTHOR_DATE={}\n",
-        shell_quote(&patch.author_name),
-        shell_quote(&patch.author_email),
-        shell_quote(&author_date),
-    );
+    let mut author_script = b"GIT_AUTHOR_NAME=".to_vec();
+    author_script.extend_from_slice(&shell_quote_bytes(&patch.author_name));
+    author_script.extend_from_slice(b"\nGIT_AUTHOR_EMAIL=");
+    author_script.extend_from_slice(&shell_quote_bytes(&patch.author_email));
+    author_script.extend_from_slice(b"\nGIT_AUTHOR_DATE=");
+    author_script.extend_from_slice(shell_quote(&author_date).as_bytes());
+    author_script.push(b'\n');
     fs::write(state_dir.join("author-script"), author_script)?;
 
+    let author_name = String::from_utf8_lossy(&patch.author_name);
+    let author_email = String::from_utf8_lossy(&patch.author_email);
     let info = format!(
         "Author: {}\nEmail: {}\nSubject: {}\nDate: {}\n\n",
-        patch.author_name, patch.author_email, patch.subject, author_date,
+        author_name, author_email, patch.subject, author_date,
     );
     fs::write(state_dir.join("info"), info)?;
 
@@ -2054,6 +2093,20 @@ fn shell_quote(value: &str) -> String {
         }
     }
     out.push('\'');
+    out
+}
+
+fn shell_quote_bytes(value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len() + 2);
+    out.push(b'\'');
+    for byte in value {
+        if *byte == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(*byte);
+        }
+    }
+    out.push(b'\'');
     out
 }
 
@@ -2117,6 +2170,7 @@ fn read_am_commit_opts(state_dir: &Path) -> AmCommitOpts {
         committer_date_is_author_date: read_state_bool(state_dir, "committer-date-is-author-date"),
         ignore_date: read_state_bool(state_dir, "ignore-date"),
         no_verify: read_state_bool(state_dir, "no-verify"),
+        utf8: !state_dir.join("utf8").exists() || read_state_bool(state_dir, "utf8"),
         // The `head-name` marker is written only by the rebase apply backend
         // (start_rebase_apply); a bare `git am` never writes it. Its presence
         // selects the rebase per-pick reflog format.
@@ -3303,14 +3357,22 @@ fn create_am_commit(
     let head_oid = head_commit_oid(&refs)?;
     let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
 
-    let (author, committer) = am_commit_identities(patch, commit_opts)?;
+    let target_encoding = commit_encoding_config(git_dir);
+    let (author, committer) = am_commit_identities(patch, commit_opts, &target_encoding)?;
     // The message has already been finalised (Message-ID appended + the
     // applypatch-msg hook run) in `prepare_am_commit_message`, BEFORE the patch
     // was applied — git's ordering. Here we only append the sign-off, which git
     // does on `state->msg` just before writing the commit object.
-    let mut message = patch.message.clone();
+    let mut message = if commit_opts.utf8 {
+        log_reencode_message(&patch.message, &patch.message_encoding, &target_encoding).into_owned()
+    } else {
+        patch.message.clone()
+    };
     if commit_opts.signoff {
         message = am_append_signoff(message, &commit_signoff_from_env()?);
+    }
+    if encoding_is_utf8(&target_encoding) && commit_message_has_invalid_utf8(&message) {
+        eprintln!("Warning: commit message did not conform to UTF-8.");
     }
     // pre-applypatch runs after staging, before the commit; a failure aborts the
     // run (git exits 1). `--no-verify` skips it.
@@ -3322,6 +3384,7 @@ fn create_am_commit(
 
     let mut db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let parents: Vec<ObjectId> = head_oid.into_iter().collect();
+    let encoding = commit_encoding_header_from_config(git_dir);
     let new_oid = sley_sequencer::create_commit(
         &mut db,
         sley_sequencer::CommitCreate {
@@ -3330,7 +3393,7 @@ fn create_am_commit(
             author,
             committer: committer.clone(),
             message,
-            encoding: None,
+            encoding,
             signature: None,
         },
     )?;
@@ -3376,6 +3439,8 @@ fn create_am_commit(
         &[],
         /* quiet */ true,
         /* ignore_missing */ true,
+        /* ignore_submodules */ false,
+        /* allow_unmerged */ false,
         /* really_refresh */ false,
     )?;
     // git runs post-applypatch but ignores its exit status — it is purely
@@ -3395,7 +3460,11 @@ fn create_am_commit(
 ///     way `git commit` resolves them). With `--committer-date-is-author-date`,
 ///     the committer *date* is set to the author date (or "now" under
 ///     `--ignore-date`), keeping the committer name/email from the environment.
-fn am_commit_identities(patch: &AmPatch, opts: AmCommitOpts) -> Result<(Vec<u8>, Vec<u8>)> {
+fn am_commit_identities(
+    patch: &AmPatch,
+    opts: AmCommitOpts,
+    target_encoding: &str,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     // The author date: the patch's Date:, the env author date, or "now".
     let author_date = if opts.ignore_date {
         am_now_date()
@@ -3405,11 +3474,14 @@ fn am_commit_identities(patch: &AmPatch, opts: AmCommitOpts) -> Result<(Vec<u8>,
             .clone()
             .unwrap_or_else(|| env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| am_now_date()))
     };
-    let author = sley_sequencer::format_commit_identity(
-        &patch.author_name,
-        &patch.author_email,
-        &author_date,
-    )?;
+    let author_name =
+        log_reencode_message(&patch.author_name, &patch.author_encoding, target_encoding)
+            .into_owned();
+    let author_email =
+        log_reencode_message(&patch.author_email, &patch.author_encoding, target_encoding)
+            .into_owned();
+    let author =
+        sley_sequencer::format_commit_identity_bytes(&author_name, &author_email, &author_date)?;
 
     let committer = if opts.committer_date_is_author_date {
         commit_identity_from_env_with_date("COMMITTER", &author_date)?

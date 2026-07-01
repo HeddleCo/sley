@@ -247,6 +247,8 @@ fn grep_pathspec_limiting_match_git() {
     assert_same(&sub, &["grep", "--full-name", "-l", "hello"]);
     assert_same(&sub, &["grep", "hello", "HEAD"]);
     assert_same(&sub, &["grep", "--full-name", "hello", "HEAD"]);
+    fs::write(sub.join("file2"), "world\n").expect("test operation should succeed");
+    assert_same(&sub, &["grep", "--untracked", "o"]);
 
     fs::remove_dir_all(&root).ok();
 }

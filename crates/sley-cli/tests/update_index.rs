@@ -1557,6 +1557,139 @@ fn update_index_show_index_version_matches_upstream_git() {
 }
 
 #[test]
+fn update_index_refresh_unmerged_matches_upstream_git() {
+    let root = unique_temp_dir("update-index-refresh-unmerged");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo dir");
+    fs::create_dir_all(&actual).expect("create actual repo dir");
+    {
+        for repo in [&expected, &actual] {
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["init", "-q", "-b", "main"],
+            );
+            fs::write(repo.join("one"), b"one\n").expect("write one");
+            fs::write(repo.join("two"), b"two\n").expect("write two");
+            fs::write(repo.join("three"), b"three\n").expect("write three");
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["add", "one", "two", "three"],
+            );
+            let info = run_success(sley_testkit::oracle_git(), repo, &["ls-files", "-s", "one"]);
+            let info = String::from_utf8(info)
+                .expect("stage output utf8")
+                .replace(" 0\t", " 1\t");
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["rm", "--cached", "-q", "one"],
+            );
+            let output = run_with_stdin(
+                sley_testkit::oracle_git(),
+                repo,
+                &["update-index", "--index-info"],
+                info.as_bytes(),
+            );
+            assert!(
+                output.status.success(),
+                "git update-index --index-info failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        for args in [
+            vec!["update-index", "--refresh"],
+            vec!["update-index", "--unmerged", "--refresh"],
+        ] {
+            let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
+            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let expected_success = expected_output.status.success();
+            assert_same_output(actual_output, expected_output, &args);
+            if expected_success {
+                assert_index_matches(&expected, &actual, &args);
+            }
+        }
+
+        fs::write(expected.join("two"), b"changed\n").expect("modify expected two");
+        fs::write(actual.join("two"), b"changed\n").expect("modify actual two");
+        let args = ["update-index", "--unmerged", "--refresh"];
+        let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
+        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        assert_same_output(actual_output, expected_output, &args);
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn update_index_refresh_ignore_submodules_matches_upstream_git() {
+    let root = unique_temp_dir("update-index-refresh-ignore-submodules");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo dir");
+    fs::create_dir_all(&actual).expect("create actual repo dir");
+    {
+        for repo in [&expected, &actual] {
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["init", "-q", "-b", "main"],
+            );
+            let sub = repo.join("sub");
+            fs::create_dir_all(&sub).expect("create submodule dir");
+            run_success(
+                sley_testkit::oracle_git(),
+                &sub,
+                &["init", "-q", "-b", "main"],
+            );
+            run_success(
+                sley_testkit::oracle_git(),
+                &sub,
+                &[
+                    "-c",
+                    "user.name=Example User",
+                    "-c",
+                    "user.email=example@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ],
+            );
+            run_success(sley_testkit::oracle_git(), repo, &["add", "sub"]);
+            run_success(
+                sley_testkit::oracle_git(),
+                &sub,
+                &[
+                    "-c",
+                    "user.name=Example User",
+                    "-c",
+                    "user.email=example@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "updated",
+                ],
+            );
+        }
+
+        for args in [
+            vec!["update-index", "--refresh"],
+            vec!["update-index", "--ignore-missing", "--refresh"],
+            vec!["update-index", "--ignore-submodules", "--refresh"],
+        ] {
+            let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
+            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            assert_same_output(actual_output, expected_output, &args);
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn update_index_index_version_matches_upstream_git() {
     let root = unique_temp_dir("update-index-index-version");
     let expected = root.join("expected");
@@ -1800,11 +1933,14 @@ fn update_index_index_info_matches_upstream_git() {
         let staged = format!(
             "0 0000000000000000000000000000000000000000\tconflict\n100644 {one} 1\tconflict\n100644 {two} 2\tconflict\n"
         );
+        let ls_tree_style =
+            format!("100644 blob {one}\tls-tree/file\n120000 blob {two}\tls-tree/link\n");
 
         for (label, stdin) in [
             ("simple", simple.as_bytes()),
             ("remove", remove.as_bytes()),
             ("staged", staged.as_bytes()),
+            ("ls-tree-style", ls_tree_style.as_bytes()),
         ] {
             let args = ["update-index", "--index-info"];
             let expected_output =

@@ -84,8 +84,7 @@ fn resolve_pull_remote_and_refspecs(
                 }
                 let merge_srcs = branch_merge_values(config, &current);
                 if merge_srcs.is_empty() {
-                    print_pull_no_tracking(&current, false);
-                    return Err(GitError::Exit(1));
+                    return Ok((remote, vec!["HEAD".to_string()], Vec::new()));
                 }
                 merge_srcs
             } else {
@@ -98,23 +97,36 @@ fn resolve_pull_remote_and_refspecs(
                 print_pull_no_merge_candidates_detached(false);
                 return Err(GitError::Exit(1));
             };
-            let Some(remote) = config.get("branch", Some(&current), "remote") else {
-                print_pull_no_tracking(&current, false);
-                return Err(GitError::Exit(1));
+            let remote = match config.get("branch", Some(&current), "remote") {
+                Some(remote) => remote.to_string(),
+                None => match pull_default_remote_without_tracking(config) {
+                    Some(remote) => {
+                        return Ok((remote, vec!["HEAD".to_string()], Vec::new()));
+                    }
+                    None => {
+                        print_pull_no_tracking(&current, false);
+                        return Err(GitError::Exit(1));
+                    }
+                },
             };
             if config.get("branch", Some(&current), "merge").is_none() {
-                print_pull_no_tracking(&current, false);
-                return Err(GitError::Exit(1));
+                return Ok((remote, vec!["HEAD".to_string()], Vec::new()));
             };
-            Ok((
-                remote.to_string(),
-                Vec::new(),
-                branch_merge_values(config, &current),
-            ))
+            Ok((remote, Vec::new(), branch_merge_values(config, &current)))
         }
         (None, false) => Err(GitError::Command(
             "pull currently requires a remote when a branch is specified".into(),
         )),
+    }
+}
+
+fn pull_default_remote_without_tracking(config: &GitConfig) -> Option<String> {
+    let remotes = crate::commands::remote_cmds::remote_names(config);
+    match remotes.as_slice() {
+        [] => None,
+        [only] => Some(only.clone()),
+        _ if remotes.iter().any(|remote| remote == "origin") => Some("origin".to_string()),
+        _ => None,
     }
 }
 
@@ -966,6 +978,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         prune: false,
         prune_tags: false,
         dry_run,
+        force: false,
         append: false,
         write_fetch_head: !dry_run,
         tag_option_explicit: tags.is_some(),

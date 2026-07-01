@@ -175,6 +175,72 @@ fn commit_pathspec_pre_commit_sees_selected_worktree_content() {
     }
 }
 
+#[test]
+fn pre_commit_hook_sees_prefix_and_command_line_author() {
+    let root = unique_temp_dir("commit-hook-prefix-author");
+    let result = std::panic::catch_unwind(|| {
+        fs::create_dir_all(&root).expect("create repo dir");
+        let sley = env!("CARGO_BIN_EXE_sley");
+        run_success(sley, &root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("tracked.txt"), b"tracked\n").expect("write tracked file");
+        run_success(sley, &root, &["add", "tracked.txt"]);
+        let initial = run_output_with_identity(sley, &root, &["commit", "-m", "initial"]);
+        assert!(
+            initial.status.success(),
+            "initial commit failed: {}",
+            String::from_utf8_lossy(&initial.stderr)
+        );
+
+        let hooks = root.join(".git/hooks");
+        fs::create_dir_all(&hooks).expect("create hooks dir");
+        let hook = hooks.join("pre-commit");
+        fs::write(
+            &hook,
+            b"#!/bin/sh\n\
+              echo ok >>actual_hooks\n\
+              test \"$GIT_PREFIX\" = success/ &&\n\
+              test \"$GIT_AUTHOR_NAME\" = \"New Author\" &&\n\
+              test \"$GIT_AUTHOR_EMAIL\" = newauthor@example.com\n",
+        )
+        .expect("write pre-commit hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&hook).expect("hook metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&hook, permissions).expect("chmod hook");
+        }
+
+        fs::write(root.join("tracked.txt"), b"updated\n").expect("write tracked file");
+        run_success(sley, &root, &["add", "tracked.txt"]);
+        fs::create_dir(root.join("success")).expect("create subdir");
+        let committed = run_output_with_identity(
+            sley,
+            &root.join("success"),
+            &[
+                "commit",
+                "--author=New Author <newauthor@example.com>",
+                "-m",
+                "hook author",
+            ],
+        );
+        assert!(
+            committed.status.success(),
+            "commit failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&committed.stdout),
+            String::from_utf8_lossy(&committed.stderr)
+        );
+        assert_eq!(
+            fs::read(root.join("actual_hooks")).expect("read actual hooks"),
+            b"ok\n"
+        );
+    });
+    let _ = fs::remove_dir_all(&root);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 fn remove_message_fixtures(root: &Path) {
     for name in [
         "message-empty.txt",
@@ -409,6 +475,27 @@ fn commit_message_option_errors_match_upstream_git() {
                 "commit",
                 "--pathspec-from-file=missing",
                 "--no-pathspec-from-file",
+                "-m",
+                "subject",
+            ],
+            vec![
+                "commit",
+                "--pathspec-from-file=pathspecs",
+                "--interactive",
+                "-m",
+                "subject",
+            ],
+            vec![
+                "commit",
+                "--pathspec-from-file=pathspecs",
+                "--patch",
+                "-m",
+                "subject",
+            ],
+            vec![
+                "commit",
+                "--pathspec-from-file=pathspecs",
+                "--all",
                 "-m",
                 "subject",
             ],

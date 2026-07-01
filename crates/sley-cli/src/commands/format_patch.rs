@@ -245,6 +245,10 @@ struct FormatPatchOptions {
     /// defers to config (default true). Only consulted by the cover subject;
     /// the per-patch subject path is unchanged.
     encode_email_headers: Option<bool>,
+    /// `--encoding=<enc>`: output encoding for log-message and mail headers.
+    /// `None` follows `i18n.logOutputEncoding`, then `i18n.commitEncoding`,
+    /// then UTF-8.
+    output_encoding: Option<String>,
     /// `--thread[=<style>]` / `--no-thread`: message-threading level. `None`
     /// defers to `format.thread`; `Unset` is `--no-thread`.
     thread: Option<ThreadLevel>,
@@ -376,6 +380,7 @@ impl Default for FormatPatchOptions {
             cover_from_description: None,
             description_file: None,
             encode_email_headers: None,
+            output_encoding: None,
             thread: None,
             in_reply_to: None,
             notes: FormatPatchNotes::default(),
@@ -588,6 +593,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
             .unwrap_or(&empty_thread)
     };
     let encode_headers = encode_email_headers_on(&options, config);
+    let output_encoding = format_patch_output_encoding(&options, config);
 
     // Resolve the cover-letter content once: its synthetic header identity, the
     // subject/blurb (from the branch description / --description-file under the
@@ -638,6 +644,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
                 abbrev,
                 thread: patch_thread(idx),
                 encode_headers,
+                output_encoding: &output_encoding,
                 config,
                 git_dir,
                 notes_refs: &notes_refs,
@@ -674,6 +681,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
                 abbrev,
                 thread: patch_thread(idx),
                 encode_headers,
+                output_encoding: &output_encoding,
                 config,
                 git_dir,
                 notes_refs: &notes_refs,
@@ -743,6 +751,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
             abbrev,
             thread: patch_thread(idx),
             encode_headers,
+            output_encoding: &output_encoding,
             config,
             git_dir,
             notes_refs: &notes_refs,
@@ -842,7 +851,13 @@ fn build_cover_letter(
         }
     };
     let encode = encode_email_headers_on(options, config);
-    write_from_header(&mut out, &from_name, &from_email, encode);
+    write_from_header(
+        &mut out,
+        from_name.as_bytes(),
+        from_email.as_bytes(),
+        encode,
+        "UTF-8",
+    );
     writeln_fmt_buf(&mut out, format_args!("Date: {}", cover_letter_date()));
 
     // Resolve the cover subject + blurb body from the branch description /
@@ -852,7 +867,13 @@ fn build_cover_letter(
     // Subject: [PATCH 0/m] <subject>, RFC 2047-encoded when it carries non-ASCII
     // and header encoding is on. The cover is patch 0, so it is always numbered.
     let prefix = subject_prefix_label(resolved, 0, last_number, true);
-    write_email_subject(&mut out, prefix.as_deref(), subject.as_bytes(), encode);
+    write_email_subject(
+        &mut out,
+        prefix.as_deref(),
+        subject.as_bytes(),
+        encode,
+        "UTF-8",
+    );
 
     // Extra headers (custom / To: / Cc:) sit between Subject and the blank line.
     out.extend_from_slice(&resolved.header_block);
@@ -1144,6 +1165,13 @@ fn encode_email_headers_on(options: &FormatPatchOptions, config: &GitConfig) -> 
         .unwrap_or(true)
 }
 
+fn format_patch_output_encoding(options: &FormatPatchOptions, config: &GitConfig) -> String {
+    options
+        .output_encoding
+        .clone()
+        .unwrap_or_else(|| log_output_encoding(config))
+}
+
 /// Which RFC 2047 character class governs the special-byte check: `Subject` is
 /// the loose set (git's `RFC2047_SUBJECT`); `Address` is the tighter phrase set
 /// (git's `RFC2047_ADDRESS`, used for `From:`/`To:` display names).
@@ -1230,12 +1258,11 @@ fn utf8_seq_len(bytes: &[u8]) -> usize {
 /// hold the header text up to the insertion point (e.g. `Subject: [PATCH] `),
 /// since the first encoded word's budget is measured from the current last-line
 /// length. Multi-byte UTF-8 characters are never split across encoded words.
-fn add_rfc2047(out: &mut Vec<u8>, line: &[u8], kind: Rfc2047Type) {
-    const ENCODING: &str = "UTF-8";
+fn add_rfc2047(out: &mut Vec<u8>, line: &[u8], kind: Rfc2047Type, encoding: &str) {
     const MAX_ENCODED_LENGTH: usize = 76;
     let mut line_len = last_line_length(out);
-    out.extend_from_slice(format!("=?{ENCODING}?q?").as_bytes());
-    line_len += ENCODING.len() + 5; // 5 for "=??q?"
+    out.extend_from_slice(format!("=?{encoding}?q?").as_bytes());
+    line_len += encoding.len() + 5; // 5 for "=??q?"
 
     let mut rest = line;
     while !rest.is_empty() {
@@ -1246,8 +1273,8 @@ fn add_rfc2047(out: &mut Vec<u8>, line: &[u8], kind: Rfc2047Type) {
 
         if line_len + encoded_len + 2 > MAX_ENCODED_LENGTH {
             // It won't fit with the trailing "?=" — break the line.
-            out.extend_from_slice(format!("?=\n =?{ENCODING}?q?").as_bytes());
-            line_len = ENCODING.len() + 5 + 1; // "=??q?" plus the leading SP
+            out.extend_from_slice(format!("?=\n =?{encoding}?q?").as_bytes());
+            line_len = encoding.len() + 5 + 1; // "=??q?" plus the leading SP
         }
 
         if is_special {
@@ -1953,7 +1980,13 @@ fn write_recipient_block(out: &mut Vec<u8>, label: &str, recipients: &[String], 
             out.extend_from_slice(b"    ");
         }
         match parse_from_ident(recipient) {
-            Ok(ident) => write_address_name_and_email(out, &ident.name, &ident.email, encode),
+            Ok(ident) => write_address_name_and_email(
+                out,
+                ident.name.as_bytes(),
+                ident.email.as_bytes(),
+                encode,
+                "UTF-8",
+            ),
             Err(_) => out.extend_from_slice(recipient.as_bytes()),
         }
         if idx + 1 < recipients.len() {
@@ -2107,6 +2140,8 @@ struct RenderContext<'a> {
     thread: &'a MailThreadHeaders,
     /// Whether `--encode-email-headers`/`format.encodeEmailHeaders` is on.
     encode_headers: bool,
+    /// Effective log/mail output encoding.
+    output_encoding: &'a str,
     /// Repo config (for the `--signoff` committer-ident 8-bit CTE check).
     config: &'a GitConfig,
     /// Repository gitdir, used to resolve notes.
@@ -2135,6 +2170,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         abbrev,
         thread,
         encode_headers,
+        output_encoding,
         config,
         git_dir,
         notes_refs,
@@ -2143,6 +2179,8 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     } = ctx;
 
     let commit = &record.commit;
+    let message = commit_message_for_commit_encoding(commit, output_encoding);
+    let author_identity = commit_identity_for_output(commit, output_encoding);
     let mut out = Vec::new();
 
     // mbox `From ` separator: the commit oid (or the all-zero oid under
@@ -2163,19 +2201,32 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     // identity and the real author moves to an in-body `From:`; otherwise the
     // author identity is used directly. The display name is RFC 2047-encoded /
     // RFC 822-quoted / wrapped exactly like git's pp_user_info.
-    let (author_name, author_email) = commit_identity_name_email(&commit.author);
+    let (author_name, author_email) = commit_identity_name_email_bytes(&author_identity);
     let in_body_from = match &resolved.from_ident {
         Some(from) => {
-            write_from_header(&mut out, &from.name, &from.email, encode_headers);
+            write_from_header(
+                &mut out,
+                from.name.as_bytes(),
+                from.email.as_bytes(),
+                encode_headers,
+                output_encoding,
+            );
             // git keeps the in-body From: only when it differs from the header
             // From: (i.e. the author differs from the rewrite ident), unless
             // --force-in-body-from is set.
-            let redundant = from.name == author_name && from.email == author_email;
+            let redundant =
+                from.name.as_bytes() == author_name && from.email.as_bytes() == author_email;
             (!redundant || resolved.force_in_body_from)
-                .then(|| format!("From: {author_name} <{author_email}>\n"))
+                .then(|| format_in_body_from_header(author_name, author_email))
         }
         None => {
-            write_from_header(&mut out, &author_name, &author_email, encode_headers);
+            write_from_header(
+                &mut out,
+                author_name,
+                author_email,
+                encode_headers,
+                output_encoding,
+            );
             None
         }
     };
@@ -2195,11 +2246,17 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     let subject_bytes = if options.keep_subject {
         // -k/--keep-subject preserves the title paragraph's embedded newlines;
         // the header writer RFC 2047-encodes those newlines just like git.
-        format_patch_preserved_subject(&commit.message)
+        format_patch_preserved_subject(&message)
     } else {
-        format_patch_subject(&commit.message)
+        format_patch_subject(&message)
     };
-    write_email_subject(&mut out, prefix.as_deref(), &subject_bytes, encode_headers);
+    write_email_subject(
+        &mut out,
+        prefix.as_deref(),
+        &subject_bytes,
+        encode_headers,
+        output_encoding,
+    );
 
     // Content-Transfer-Encoding: a non-ASCII commit body, a non-ASCII in-body
     // header, or `--signoff` with a non-ASCII committer ident forces the 8-bit
@@ -2210,14 +2267,17 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     // text/plain CTE block is replaced by the multipart preamble below.
     let need_8bit_cte = options.mime.is_none()
         && (signoff_non_ascii
-            || message_body_has_non_ascii(&commit.message)
+            || message_body_has_non_ascii(&message)
             || in_body_from
                 .as_deref()
-                .map(|h| h.bytes().any(|b| b >= 0x80))
+                .map(|h| h.iter().any(|b| *b >= 0x80))
                 .unwrap_or(false));
     if need_8bit_cte {
-        out.extend_from_slice(
-            b"MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n",
+        write_fmt_buf(
+            &mut out,
+            format_args!(
+                "MIME-Version: 1.0\nContent-Type: text/plain; charset={output_encoding}\nContent-Transfer-Encoding: 8bit\n"
+            ),
         );
     }
 
@@ -2230,7 +2290,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     // normalized to end in exactly one newline. With --signoff the trailer is
     // appended to the body. Under `--attach`/`--inline` the blank line is
     // supplied by the multipart preamble's trailing `\n\n` instead.
-    let body = format_patch_body(&commit.message, &subject_bytes, signoff_line);
+    let body = format_patch_body(&message, &subject_bytes, signoff_line);
     if let Some(mime) = &options.mime {
         write_mime_preamble(&mut out, mime);
         // git renders the text/plain part's body (the in-body From + commit
@@ -2244,7 +2304,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         out.push(b'\n');
     }
     if let Some(in_body) = in_body_from {
-        out.extend_from_slice(in_body.as_bytes());
+        out.extend_from_slice(&in_body);
         out.push(b'\n');
     }
     if options.mboxrd {
@@ -2316,6 +2376,30 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         out.extend_from_slice(b"\n\n");
     }
     Ok(out)
+}
+
+fn commit_identity_for_output<'a>(
+    commit: &'a Commit,
+    output_encoding: &str,
+) -> std::borrow::Cow<'a, [u8]> {
+    let from = commit_encoding(commit);
+    log_reencode_message(&commit.author, &from, output_encoding)
+}
+
+fn commit_identity_name_email_bytes(raw: &[u8]) -> (&[u8], &[u8]) {
+    let Some(fields) = sley_core::split_ident_line(raw) else {
+        return (raw, b"");
+    };
+    (fields.name, fields.email)
+}
+
+fn format_in_body_from_header(name: &[u8], email: &[u8]) -> Vec<u8> {
+    let mut out = b"From: ".to_vec();
+    out.extend_from_slice(name);
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(email);
+    out.extend_from_slice(b">\n");
+    out
 }
 
 /// git's 12-dash `mime_boundary_leader` (diff.c). The actual delimiter lines are
@@ -2523,7 +2607,13 @@ fn format_patch_body_start(message: &[u8]) -> usize {
 /// needs it) or an ASCII word-wrap at 78 columns (continuations indented one
 /// space). The encoded path folds *inside* the encoded word at 76 columns; the
 /// ASCII path measures its first-line budget from the prefix already written.
-fn write_email_subject(out: &mut Vec<u8>, prefix: Option<&str>, subject: &[u8], encode: bool) {
+fn write_email_subject(
+    out: &mut Vec<u8>,
+    prefix: Option<&str>,
+    subject: &[u8],
+    encode: bool,
+    output_encoding: &str,
+) {
     const MAX_LENGTH: isize = 78;
     let header_start = out.len();
     match prefix {
@@ -2531,7 +2621,7 @@ fn write_email_subject(out: &mut Vec<u8>, prefix: Option<&str>, subject: &[u8], 
         None => out.extend_from_slice(b"Subject: "),
     }
     if encode && needs_rfc2047_encoding(subject) {
-        add_rfc2047(out, subject, Rfc2047Type::Subject);
+        add_rfc2047(out, subject, Rfc2047Type::Subject, output_encoding);
     } else {
         let prefix_cols = (out.len() - header_start) as isize;
         add_wrapped_text(out, subject, -prefix_cols, 1, MAX_LENGTH);
@@ -2544,19 +2634,30 @@ fn write_email_subject(out: &mut Vec<u8>, prefix: Option<&str>, subject: &[u8], 
 /// it carries non-ASCII), else RFC 822-quoted if it has specials, else wrapped at
 /// `max_length` columns; the ` <email>` is folded onto its own line when it would
 /// overflow that last line.
-fn write_from_header(out: &mut Vec<u8>, name: &str, email: &str, encode: bool) {
+fn write_from_header(
+    out: &mut Vec<u8>,
+    name: &[u8],
+    email: &[u8],
+    encode: bool,
+    output_encoding: &str,
+) {
     out.extend_from_slice(b"From: ");
-    write_address_name_and_email(out, name, email, encode);
+    write_address_name_and_email(out, name, email, encode, output_encoding);
     out.push(b'\n');
 }
 
-fn write_address_name_and_email(out: &mut Vec<u8>, name: &str, email: &str, encode: bool) {
-    let name_bytes = name.as_bytes();
+fn write_address_name_and_email(
+    out: &mut Vec<u8>,
+    name_bytes: &[u8],
+    email: &[u8],
+    encode: bool,
+    output_encoding: &str,
+) {
     // git: max_length starts at 78, narrows to 76 once the name is rfc2047-encoded.
     let mut max_length: isize = 78;
 
     if encode && needs_rfc2047_encoding(name_bytes) {
-        add_rfc2047(out, name_bytes, Rfc2047Type::Address);
+        add_rfc2047(out, name_bytes, Rfc2047Type::Address, output_encoding);
         max_length = 76;
     } else if needs_rfc822_quoting(name_bytes) {
         let quoted = add_rfc822_quoted(name_bytes);
@@ -2572,7 +2673,9 @@ fn write_address_name_and_email(out: &mut Vec<u8>, name: &str, email: &str, enco
     if max_length < needed {
         out.push(b'\n');
     }
-    write_fmt_buf(out, format_args!(" <{email}>"));
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(email);
+    out.push(b'>');
 }
 
 /// Per-mail threading headers: the `Message-ID`, the `In-Reply-To` target, and
@@ -4301,6 +4404,15 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             }
             "--encode-email-headers" => options.encode_email_headers = Some(true),
             "--no-encode-email-headers" => options.encode_email_headers = Some(false),
+            "--encoding" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--encoding requires a value".into()))?;
+                options.output_encoding = Some(value.clone());
+            }
+            value if let Some(encoding) = value.strip_prefix("--encoding=") => {
+                options.output_encoding = Some(encoding.to_string());
+            }
             "--root" => options.root = true,
             // `-<n>`: limit to the last n commits.
             value

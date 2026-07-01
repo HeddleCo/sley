@@ -3,9 +3,13 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
+use regex::Regex;
 use sley_object::EncodedObject;
 use sley_odb::ObjectReader;
-use sley_pack::{PackInput, PackReverseIndex, PackWriteOptions, pack_order_index_positions};
+use sley_pack::{
+    PackBitmapWriter, PackInput, PackReverseIndex, PackWriteOptions, pack_order_index_positions,
+};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -820,6 +824,257 @@ fn repack_preferred_bitmap_tips(
     Ok(tips)
 }
 
+#[derive(Clone)]
+struct PseudoMergeCandidate {
+    oid: ObjectId,
+    date: i64,
+}
+
+#[derive(Default)]
+struct PseudoMergeMatches {
+    stable: Vec<PseudoMergeCandidate>,
+    unstable: Vec<PseudoMergeCandidate>,
+}
+
+struct PseudoMergeConfigBuilder {
+    pattern: Option<String>,
+    decay: f64,
+    max_merges: usize,
+    sample_rate: f64,
+    threshold: i64,
+    stable_threshold: i64,
+    stable_size: usize,
+}
+
+struct PseudoMergeConfig {
+    name: String,
+    pattern: Regex,
+    capture_count: usize,
+    decay: f64,
+    max_merges: usize,
+    sample_rate: f64,
+    threshold: i64,
+    stable_threshold: i64,
+    stable_size: usize,
+}
+
+impl PseudoMergeConfigBuilder {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            pattern: None,
+            decay: 1.0,
+            max_merges: 64,
+            sample_rate: 1.0,
+            threshold: parse_pseudo_merge_expiry("1.week.ago")?,
+            stable_threshold: parse_pseudo_merge_expiry("1.month.ago")?,
+            stable_size: 512,
+        })
+    }
+}
+
+fn parse_pseudo_merge_expiry(value: &str) -> Result<i64> {
+    let timestamp = crate::commands::approxidate::parse_expiry_date(value)
+        .ok_or_else(|| GitError::Command(format!("invalid timestamp '{value}'")))?;
+    let unsigned = timestamp as u64;
+    Ok(if unsigned >= i64::MAX as u64 {
+        i64::MAX
+    } else {
+        unsigned as i64
+    })
+}
+
+fn load_pseudo_merge_configs(git_dir: &Path) -> Result<Vec<PseudoMergeConfig>> {
+    let config = read_repo_config(git_dir)?;
+    let mut builders: BTreeMap<String, PseudoMergeConfigBuilder> = BTreeMap::new();
+    for section in &config.sections {
+        if !section.name.eq_ignore_ascii_case("bitmapPseudoMerge") {
+            continue;
+        }
+        let Some(name) = section.subsection.as_ref() else {
+            continue;
+        };
+        for entry in &section.entries {
+            let builder = match builders.entry(name.clone()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(PseudoMergeConfigBuilder::new()?)
+                }
+            };
+            let value = entry.value.as_deref().unwrap_or("");
+            if entry.key.eq_ignore_ascii_case("pattern") {
+                builder.pattern = Some(value.to_string());
+            } else if entry.key.eq_ignore_ascii_case("decay") {
+                if let Ok(decay) = value.trim().parse::<f64>()
+                    && decay >= 0.0
+                {
+                    builder.decay = decay;
+                }
+            } else if entry.key.eq_ignore_ascii_case("sampleRate") {
+                if let Ok(sample_rate) = value.trim().parse::<f64>()
+                    && (0.0..=1.0).contains(&sample_rate)
+                {
+                    builder.sample_rate = sample_rate;
+                }
+            } else if entry.key.eq_ignore_ascii_case("threshold") {
+                builder.threshold = parse_pseudo_merge_expiry(value)?;
+            } else if entry.key.eq_ignore_ascii_case("maxMerges") {
+                if let Some(max_merges) = sley_config::parse_config_int(value)
+                    && max_merges >= 0
+                {
+                    builder.max_merges = max_merges as usize;
+                }
+            } else if entry.key.eq_ignore_ascii_case("stableThreshold") {
+                builder.stable_threshold = parse_pseudo_merge_expiry(value)?;
+            } else if entry.key.eq_ignore_ascii_case("stableSize")
+                && let Some(stable_size) = sley_config::parse_config_int(value)
+                && stable_size > 0
+            {
+                builder.stable_size = stable_size as usize;
+            }
+        }
+    }
+
+    let mut groups = Vec::new();
+    for (name, builder) in builders {
+        if builder.threshold < builder.stable_threshold {
+            eprintln!(
+                "fatal: pseudo-merge group '{name}' has unstable threshold before stable one"
+            );
+            return Err(GitError::Exit(128));
+        }
+        let Some(pattern) = builder.pattern else {
+            eprintln!("fatal: pseudo-merge group '{name}' missing required pattern");
+            return Err(GitError::Exit(128));
+        };
+        let anchored = if pattern.starts_with('^') {
+            pattern
+        } else {
+            format!("^{pattern}")
+        };
+        let regex = Regex::new(&anchored).map_err(|_| {
+            GitError::Command(format!(
+                "failed to load pseudo-merge regex for {name}: '{anchored}'"
+            ))
+        })?;
+        groups.push(PseudoMergeConfig {
+            name,
+            capture_count: regex.captures_len().saturating_sub(1),
+            pattern: regex,
+            decay: builder.decay,
+            max_merges: builder.max_merges,
+            sample_rate: builder.sample_rate,
+            threshold: builder.threshold,
+            stable_threshold: builder.stable_threshold,
+            stable_size: builder.stable_size,
+        });
+    }
+    Ok(groups)
+}
+
+fn pseudo_merge_match_key(config: &PseudoMergeConfig, refname: &str) -> Option<String> {
+    let captures = config.pattern.captures(refname)?;
+    let mut parts = Vec::new();
+    if config.capture_count == 0 {
+        if let Some(full) = captures.get(0) {
+            parts.push(full.as_str());
+        }
+    } else {
+        for index in 1..=config.capture_count {
+            if let Some(capture) = captures.get(index) {
+                parts.push(capture.as_str());
+            }
+        }
+    }
+    Some(parts.join("-"))
+}
+
+fn push_pseudo_merge_candidate_groups(
+    out: &mut Vec<sley_odb::BitmapPseudoMergeGroup>,
+    commits: &[PseudoMergeCandidate],
+    exclude_selected: bool,
+    partition: Option<sley_odb::BitmapPseudoMergePartition>,
+) {
+    if commits.is_empty() {
+        return;
+    }
+    out.push(sley_odb::BitmapPseudoMergeGroup {
+        commits: commits.iter().map(|candidate| candidate.oid).collect(),
+        exclude_selected,
+        partition,
+    });
+}
+
+fn repack_pseudo_merge_groups(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<Vec<sley_odb::BitmapPseudoMergeGroup>> {
+    let configs = load_pseudo_merge_configs(git_dir)?;
+    if configs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut matches: Vec<BTreeMap<String, PseudoMergeMatches>> =
+        configs.iter().map(|_| BTreeMap::new()).collect();
+    let store = FileRefStore::new(git_dir, format);
+    for reference in store.list_refs()? {
+        let RefTarget::Direct(oid) = reference.target else {
+            continue;
+        };
+        let Ok(commit_oid) = sley_rev::peel_to_commit(db, format, &oid) else {
+            continue;
+        };
+        let Ok(object) = db.read_object(&commit_oid) else {
+            continue;
+        };
+        let Ok(commit) = sley_object::Commit::parse_ref(format, &object.body) else {
+            continue;
+        };
+        let date = sley_rev::revlist::commit_identity_timestamp_i64(commit.committer).unwrap_or(0);
+        for (index, config) in configs.iter().enumerate() {
+            let Some(key) = pseudo_merge_match_key(config, &reference.name) else {
+                continue;
+            };
+            let entry = matches[index].entry(key).or_default();
+            let candidate = PseudoMergeCandidate {
+                oid: commit_oid,
+                date,
+            };
+            if date <= config.stable_threshold {
+                entry.stable.push(candidate);
+            } else if date <= config.threshold {
+                entry.unstable.push(candidate);
+            }
+        }
+    }
+
+    let mut groups = Vec::new();
+    for (config, group_matches) in configs.iter().zip(matches.iter_mut()) {
+        let _ = &config.name;
+        for entry in group_matches.values_mut() {
+            entry.stable.sort_by_key(|candidate| candidate.date);
+            entry.unstable.sort_by_key(|candidate| candidate.date);
+
+            for chunk in entry.stable.chunks(config.stable_size) {
+                push_pseudo_merge_candidate_groups(&mut groups, chunk, false, None);
+            }
+
+            if !entry.unstable.is_empty() && config.max_merges > 0 {
+                push_pseudo_merge_candidate_groups(
+                    &mut groups,
+                    &entry.unstable,
+                    true,
+                    Some(sley_odb::BitmapPseudoMergePartition {
+                        max_merges: config.max_merges,
+                        decay: config.decay,
+                        sample_rate: config.sample_rate,
+                    }),
+                );
+            }
+        }
+    }
+    Ok(groups)
+}
+
 /// The traversal roots `repack -a` packs from, mirroring upstream's
 /// `pack-objects --all --reflog --indexed-objects` invocation: every direct
 /// ref target, `HEAD`, both sides of every reflog entry, and the blobs in the
@@ -1006,6 +1261,10 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
         eprintln!("warning: disabling bitmap writing, as some objects are not being packed");
         write_bitmaps = false;
     }
+    if write_bitmaps && all && pack_dir_has_promisor_packs(&common_git_dir)? {
+        eprintln!("fatal: cannot write bitmap index for a repack with promisor packs");
+        return Err(GitError::Exit(128));
+    }
 
     if let Some(split_factor) = geometric {
         // `--geometric` and `-a`/`-A` are mutually exclusive (builtin/repack.c).
@@ -1067,11 +1326,14 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
         sley_odb::repack_loose_objects(&common_git_dir, format)?
     };
     if let Some(result) = result {
-        let bitmap_tips = if write_bitmaps {
+        let (bitmap_tips, bitmap_pseudo_merge_groups) = if write_bitmaps {
             let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-            Some(repack_preferred_bitmap_tips(&common_git_dir, &db, format)?)
+            (
+                Some(repack_preferred_bitmap_tips(&common_git_dir, &db, format)?),
+                Some(repack_pseudo_merge_groups(&common_git_dir, &db, format)?),
+            )
         } else {
-            None
+            (None, None)
         };
         sley_odb::install_repack_result_with_bitmap(
             &common_git_dir,
@@ -1079,6 +1341,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             &result,
             prune,
             bitmap_tips.as_ref(),
+            bitmap_pseudo_merge_groups.as_deref(),
         )?;
     }
     if all && (!write_bitmaps || write_midx) {
@@ -1411,6 +1674,20 @@ fn pack_dir_has_kept_packs(common_git_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
+fn pack_dir_has_promisor_packs(common_git_dir: &Path) -> Result<bool> {
+    let pack_dir = repository_objects_dir(common_git_dir).join("pack");
+    let Ok(entries) = fs::read_dir(&pack_dir) else {
+        return Ok(false);
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("promisor") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn remove_pack_bitmap_sidecars(common_git_dir: &Path) -> Result<()> {
     let pack_dir = repository_objects_dir(common_git_dir).join("pack");
     let Ok(entries) = fs::read_dir(&pack_dir) else {
@@ -1715,10 +1992,23 @@ fn gc_run_locked(
                 pack_kept_objects: false,
                 keep_pack_stems,
             };
+            let mut repack_roots = roots.clone();
+            if let Some(spec) = prune_expire.as_deref() {
+                let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
+                repack_roots.extend(prune_recent_object_roots(
+                    &FileObjectDatabase::from_git_dir(&common_git_dir, format),
+                    &common_git_dir,
+                    format,
+                    expire,
+                )?);
+                repack_roots.extend(prune_recent_hook_roots(&common_git_dir, format)?);
+                repack_roots.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+                repack_roots.dedup();
+            }
             if let Some(result) = sley_odb::repack_reachable_objects_with_options(
                 &common_git_dir,
                 format,
-                &roots,
+                &repack_roots,
                 &repack_options,
             )? {
                 sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
@@ -1745,6 +2035,9 @@ fn gc_run_locked(
         .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?);
     if options.auto && store.uses_reftable()? && store.reftable_table_count()? > 2 {
         store.compact_reftable_stack()?;
+    }
+    if let Some(result) = sley_odb::repack_promisor_objects(&common_git_dir, format)? {
+        sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
     }
     gc_clean_pack_garbage(&repository_objects_dir(&common_git_dir).join("pack"))?;
     crate::commands::refs::cmd_update_server_info(&[])?;
@@ -2119,6 +2412,9 @@ fn gc_non_cruft_pack_stems(common_git_dir: &Path) -> Result<Vec<(String, u64)>> 
 }
 
 fn gc_write_commit_graph(config: &GitConfig) -> bool {
+    if env::var("GIT_TEST_COMMIT_GRAPH").ok().as_deref() == Some("0") {
+        return false;
+    }
     config
         .get_bool("gc", None, "writeCommitGraph")
         .or_else(|| config.get_bool("core", None, "commitGraph"))
@@ -4863,8 +5159,12 @@ fn prune_recent_object_roots(
         return Ok(Vec::new());
     }
     let mut roots = Vec::new();
-    for oid in sley_odb::repository_object_ids(common_git_dir, format)? {
-        if prune_object_is_expired(db, &oid, expire)? {
+    let object_mtimes = sley_odb::object_mtimes_on_disk_pub(
+        &sley_odb::repository_objects_dir(common_git_dir),
+        format,
+    )?;
+    for (oid, mtime) in object_mtimes {
+        if i64::from(mtime) <= expire {
             continue;
         }
         if db.read_object(&oid).is_ok() {
@@ -4922,7 +5222,12 @@ fn gc_prune_expired_loose(
     prune_roots.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     prune_roots.dedup();
 
-    for oid in prune_unreachable_loose(common_git_dir, format, prune_roots, false)? {
+    for oid in sley_odb::prune_unreachable_loose_tolerating_missing(
+        common_git_dir,
+        format,
+        prune_roots,
+        false,
+    )? {
         if !prune_object_is_expired(&db, &oid, expire)? {
             continue;
         }
@@ -4949,7 +5254,12 @@ fn gc_pack_recent_unreachable_loose(
     }
     let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let mut objects = Vec::new();
-    for oid in prune_unreachable_loose(common_git_dir, format, roots.to_vec(), false)? {
+    for oid in sley_odb::prune_unreachable_loose_tolerating_missing(
+        common_git_dir,
+        format,
+        roots.to_vec(),
+        false,
+    )? {
         if prune_object_is_expired(&db, &oid, expire)? {
             continue;
         }
@@ -5367,6 +5677,7 @@ pub(crate) fn cmd_multi_pack_index(args: &[String]) -> Result<()> {
     let rest: Vec<String> = iter.cloned().collect();
     let combined: Vec<String> = global.into_iter().chain(rest).collect();
     match subcommand.as_str() {
+        "compact" => cmd_multi_pack_index_compact(&combined),
         "expire" => cmd_multi_pack_index_expire(&combined),
         "repack" => cmd_multi_pack_index_repack(&combined),
         "write" => cmd_multi_pack_index_write(&combined),
@@ -5386,6 +5697,7 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     let mut object_dir: Option<PathBuf> = None;
     let mut stdin_packs = false;
     let mut write_bitmap = false;
+    let mut incremental = false;
     let mut preferred_pack_name: Option<String> = None;
     let mut refs_snapshot: Option<PathBuf> = None;
     let mut progress = false;
@@ -5410,6 +5722,8 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
             "--no-stdin-packs" => stdin_packs = false,
             "--bitmap" => write_bitmap = true,
             "--no-bitmap" => write_bitmap = false,
+            "--incremental" => incremental = true,
+            "--no-incremental" => incremental = false,
             "--preferred-pack" => {
                 let value = iter
                     .next()
@@ -5438,6 +5752,19 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(&git_dir));
     let pack_dir = object_dir.join("pack");
     fs::create_dir_all(&pack_dir)?;
+    if incremental {
+        return cmd_multi_pack_index_write_incremental(MidxWriteIncremental {
+            git_dir: &git_dir,
+            object_dir: &object_dir,
+            pack_dir: &pack_dir,
+            format,
+            stdin_packs,
+            write_bitmap,
+            preferred_pack_name: preferred_pack_name.as_deref(),
+            refs_snapshot: refs_snapshot.as_deref(),
+            progress,
+        });
+    }
     if progress {
         // Upstream shows a delayed progress meter labelled this way; with
         // GIT_PROGRESS_DELAY=0 it appears immediately. We emit a single line so
@@ -5519,6 +5846,11 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     let mut objects = Vec::new();
     let mut pack_object_counts = vec![0usize; pack_names.len()];
     for (pack_int_id, pack_name) in pack_names.iter().enumerate() {
+        let pack_path = pack_dir.join(pack_name).with_extension("pack");
+        if !pack_path.exists() {
+            eprintln!("error: could not load pack");
+            return Err(GitError::Exit(1));
+        }
         let index_bytes = fs::read(pack_dir.join(pack_name))?;
         let force_large_offset = pack_index_has_large_offset_area(&index_bytes, format);
         let index = PackIndex::parse_without_checksum(&index_bytes, format)?;
@@ -5624,6 +5956,7 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     let bitmap = if write_bitmap {
         let db = FileObjectDatabase::new(object_dir.clone(), format);
         let mut tips = repack_preferred_bitmap_tips(&git_dir, &db, format)?;
+        let pseudo_merge_groups = repack_pseudo_merge_groups(&git_dir, &db, format)?;
         if let Some(snapshot) = &refs_snapshot {
             // Snapshot lines are "<oid>" (plain tip) or "+<oid>" (preferred
             // tip, upstream's NEEDS_BITMAP). Only the preferred ones
@@ -5645,6 +5978,7 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
             &midx_checksum,
             preferred_pack,
             &tips,
+            &pseudo_merge_groups,
         )? {
             Some(bitmap) => Some(bitmap),
             None => {
@@ -5657,6 +5991,7 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     };
 
     fs::write(pack_dir.join("multi-pack-index"), &midx)?;
+    remove_incremental_midx_dir(&pack_dir)?;
 
     // GIT_TEST_MIDX_WRITE_REV=1 (t5327): additionally write the bit-order
     // permutation as a separate `multi-pack-index-<checksum>.rev` file, the
@@ -5705,6 +6040,645 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+struct MidxWriteIncremental<'a> {
+    git_dir: &'a Path,
+    object_dir: &'a Path,
+    pack_dir: &'a Path,
+    format: ObjectFormat,
+    stdin_packs: bool,
+    write_bitmap: bool,
+    preferred_pack_name: Option<&'a str>,
+    refs_snapshot: Option<&'a Path>,
+    progress: bool,
+}
+
+#[derive(Clone)]
+struct IncrementalMidxLayer {
+    checksum: String,
+    midx: MultiPackIndex,
+}
+
+fn cmd_multi_pack_index_write_incremental(options: MidxWriteIncremental<'_>) -> Result<()> {
+    if options.progress {
+        eprintln!("Adding packfiles to multi-pack-index");
+    }
+
+    let mut chain = read_midx_chain(options.pack_dir)?;
+    if let Some(checksum) = migrate_single_midx_to_incremental(options.pack_dir, options.format)?
+        && !chain.iter().any(|existing| existing == &checksum)
+    {
+        chain.push(checksum);
+    }
+
+    let layers = read_incremental_midx_layers(options.pack_dir, options.format, &chain)?;
+    let mut chained_pack_names = HashSet::new();
+    let mut chained_oids = HashSet::new();
+    for layer in &layers {
+        chained_pack_names.extend(layer.midx.pack_names.iter().cloned());
+        chained_oids.extend(layer.midx.objects.iter().map(|entry| entry.oid));
+    }
+
+    let mut pack_names = collect_midx_pack_names(options.pack_dir, options.stdin_packs)?;
+    pack_names.retain(|name| !chained_pack_names.contains(name));
+
+    if pack_names.is_empty() {
+        if chain.is_empty() {
+            if let Some(name) = options.preferred_pack_name {
+                eprintln!("warning: unknown preferred pack: '{name}'");
+            }
+            eprintln!("error: no pack files to index.");
+            return Err(GitError::Exit(1));
+        }
+        write_midx_chain(options.pack_dir, &chain)?;
+        return Ok(());
+    }
+
+    let layer = build_midx_layer_from_packs(
+        options.git_dir,
+        options.object_dir,
+        options.pack_dir,
+        options.format,
+        pack_names,
+        &chained_oids,
+        options.write_bitmap,
+        options.preferred_pack_name,
+        options.refs_snapshot,
+        1,
+    )?;
+    install_incremental_midx_layer(options.pack_dir, options.format, &layer)?;
+    chain.push(layer.checksum);
+    write_midx_chain(options.pack_dir, &chain)?;
+    clear_incremental_midx_sidecars(options.pack_dir, options.format)?;
+    Ok(())
+}
+
+struct BuiltMidxLayer {
+    checksum: String,
+    midx: Vec<u8>,
+    bitmap: Option<Vec<u8>>,
+    rev: Option<Vec<u8>>,
+}
+
+fn build_midx_layer_from_packs(
+    git_dir: &Path,
+    object_dir: &Path,
+    pack_dir: &Path,
+    format: ObjectFormat,
+    pack_names: Vec<String>,
+    excluded_oids: &HashSet<ObjectId>,
+    mut write_bitmap: bool,
+    preferred_pack_name: Option<&str>,
+    refs_snapshot: Option<&Path>,
+    version: u8,
+) -> Result<BuiltMidxLayer> {
+    let pack_mtimes: Vec<std::time::SystemTime> = pack_names
+        .iter()
+        .map(|name| {
+            fs::metadata(pack_dir.join(name).with_extension("pack"))
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::UNIX_EPOCH)
+        })
+        .collect();
+    let pack_mtime = |pack_int_id: u32| -> std::time::SystemTime {
+        pack_mtimes
+            .get(pack_int_id as usize)
+            .copied()
+            .unwrap_or(std::time::UNIX_EPOCH)
+    };
+
+    let mut objects = Vec::new();
+    let mut pack_object_counts = vec![0usize; pack_names.len()];
+    for (pack_int_id, pack_name) in pack_names.iter().enumerate() {
+        let pack_path = pack_dir.join(pack_name).with_extension("pack");
+        if !pack_path.exists() {
+            eprintln!("error: could not load pack");
+            return Err(GitError::Exit(1));
+        }
+        let index_bytes = fs::read(pack_dir.join(pack_name))?;
+        let force_large_offset = pack_index_has_large_offset_area(&index_bytes, format);
+        let index = PackIndex::parse_without_checksum(&index_bytes, format)?;
+        pack_object_counts[pack_int_id] = index.entries.len();
+        for entry in index.entries {
+            if excluded_oids.contains(&entry.oid) {
+                continue;
+            }
+            objects.push(MultiPackIndexEntry {
+                oid: entry.oid,
+                pack_int_id: pack_int_id as u32,
+                offset: entry.offset,
+                force_large_offset,
+            });
+        }
+    }
+
+    if write_bitmap && objects.is_empty() {
+        eprintln!("warning: refusing to write multi-pack .bitmap without any objects");
+        write_bitmap = false;
+    }
+
+    let preferred_pack = match preferred_pack_name {
+        Some(name) => {
+            let normalized = name.strip_suffix(".pack").map(|stem| format!("{stem}.idx"));
+            match pack_names.iter().position(|pack_name| {
+                pack_name == name || Some(pack_name.as_str()) == normalized.as_deref()
+            }) {
+                Some(position) => {
+                    if pack_object_counts.get(position).copied().unwrap_or(0) == 0 {
+                        let pack_path = pack_dir.join(&pack_names[position]).with_extension("pack");
+                        eprintln!(
+                            "error: cannot select preferred pack {} with no objects",
+                            pack_path.display()
+                        );
+                        return Err(GitError::Exit(255));
+                    }
+                    Some(position as u32)
+                }
+                None => {
+                    eprintln!("warning: unknown preferred pack: '{name}'");
+                    write_bitmap.then_some(0)
+                }
+            }
+        }
+        None if write_bitmap => {
+            let mut preferred = 0u32;
+            let mut oldest: Option<std::time::SystemTime> = None;
+            for pack_int_id in 0..pack_names.len() as u32 {
+                let mtime = pack_mtime(pack_int_id);
+                if oldest.is_none_or(|current| mtime < current) {
+                    oldest = Some(mtime);
+                    preferred = pack_int_id;
+                }
+            }
+            Some(preferred)
+        }
+        None => None,
+    };
+
+    objects.sort_by(|left, right| {
+        left.oid
+            .as_bytes()
+            .cmp(right.oid.as_bytes())
+            .then_with(|| {
+                let left_preferred = Some(left.pack_int_id) == preferred_pack;
+                let right_preferred = Some(right.pack_int_id) == preferred_pack;
+                right_preferred.cmp(&left_preferred)
+            })
+            .then_with(|| pack_mtime(right.pack_int_id).cmp(&pack_mtime(left.pack_int_id)))
+            .then_with(|| left.pack_int_id.cmp(&right.pack_int_id))
+    });
+    objects.dedup_by(|next, kept| next.oid == kept.oid);
+
+    write_midx_layer_bytes(
+        git_dir,
+        object_dir,
+        format,
+        version,
+        pack_names,
+        objects,
+        write_bitmap,
+        preferred_pack,
+        refs_snapshot,
+    )
+}
+
+fn write_midx_layer_bytes(
+    git_dir: &Path,
+    object_dir: &Path,
+    format: ObjectFormat,
+    version: u8,
+    pack_names: Vec<String>,
+    objects: Vec<MultiPackIndexEntry>,
+    write_bitmap: bool,
+    preferred_pack: Option<u32>,
+    refs_snapshot: Option<&Path>,
+) -> Result<BuiltMidxLayer> {
+    let bitmapped_packs = write_bitmap.then(|| {
+        if version == 2 {
+            incremental_compact_bitmapped_pack_ranges(pack_names.len(), &objects)
+        } else {
+            midx_bitmapped_pack_ranges(pack_names.len(), &objects, preferred_pack.unwrap_or(0))
+        }
+    });
+    let midx = MultiPackIndex::write_with_bitmap_packs(
+        format,
+        version,
+        &pack_names,
+        &objects,
+        write_bitmap.then(|| preferred_pack.unwrap_or(0)),
+        bitmapped_packs.as_deref(),
+    )?;
+    let checksum = ObjectId::from_raw(format, &midx[midx.len() - format.raw_len()..])?;
+
+    let bitmap = if write_bitmap {
+        let db = FileObjectDatabase::new(object_dir.to_path_buf(), format);
+        let mut tips = repack_preferred_bitmap_tips(git_dir, &db, format)?;
+        let pseudo_merge_groups = repack_pseudo_merge_groups(git_dir, &db, format)?;
+        if let Some(snapshot) = refs_snapshot {
+            for line in fs::read_to_string(snapshot)?.lines() {
+                if let Some(hex) = line.strip_prefix('+')
+                    && let Ok(oid) = ObjectId::from_hex(format, hex)
+                    && let Ok(commit) = sley_rev::peel_to_commit(&db, format, &oid)
+                {
+                    tips.insert(commit);
+                }
+            }
+        }
+        match sley_odb::build_midx_bitmap(
+            &db,
+            format,
+            &objects,
+            &checksum,
+            preferred_pack.unwrap_or(0),
+            &tips,
+            &pseudo_merge_groups,
+        )? {
+            Some(bitmap) => Some(bitmap),
+            None => Some(write_empty_midx_bitmap(
+                &db,
+                format,
+                &objects,
+                &checksum,
+                preferred_pack,
+            )?),
+        }
+    } else {
+        None
+    };
+
+    let rev = if write_bitmap
+        && env::var("GIT_TEST_MIDX_WRITE_REV").is_ok_and(|value| value == "1" || value == "true")
+    {
+        let mut pseudo: Vec<u32> = (0..objects.len() as u32).collect();
+        let preferred = preferred_pack.unwrap_or(0);
+        pseudo.sort_by_key(|&midx_pos| {
+            let object = &objects[midx_pos as usize];
+            (
+                object.pack_int_id != preferred,
+                object.pack_int_id,
+                object.offset,
+            )
+        });
+        Some(PackReverseIndex::write(format, &pseudo, &checksum)?)
+    } else {
+        None
+    };
+
+    Ok(BuiltMidxLayer {
+        checksum: checksum.to_hex(),
+        midx,
+        bitmap,
+        rev,
+    })
+}
+
+fn write_empty_midx_bitmap(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    objects: &[MultiPackIndexEntry],
+    checksum: &ObjectId,
+    preferred_pack: Option<u32>,
+) -> Result<Vec<u8>> {
+    let preferred = preferred_pack.unwrap_or(0);
+    let mut pseudo: Vec<usize> = (0..objects.len()).collect();
+    pseudo.sort_by_key(|&midx_pos| {
+        let object = &objects[midx_pos];
+        (
+            object.pack_int_id != preferred,
+            object.pack_int_id,
+            object.offset,
+        )
+    });
+    let mut object_types = Vec::with_capacity(objects.len());
+    for midx_pos in pseudo {
+        let oid = objects[midx_pos].oid;
+        let (object_type, _size) = db.read_object_header(&oid)?.ok_or_else(|| {
+            GitError::InvalidFormat(format!("object {oid} missing while writing bitmap"))
+        })?;
+        object_types.push(object_type);
+    }
+    PackBitmapWriter::new(format, *checksum, &object_types)?.write()
+}
+
+fn install_incremental_midx_layer(
+    pack_dir: &Path,
+    _format: ObjectFormat,
+    layer: &BuiltMidxLayer,
+) -> Result<()> {
+    let midx_dir = incremental_midx_dir(pack_dir);
+    fs::create_dir_all(&midx_dir)?;
+    let midx_path = midx_dir.join(format!("multi-pack-index-{}.midx", layer.checksum));
+    fs::write(&midx_path, &layer.midx)?;
+    if let Some(bitmap) = &layer.bitmap {
+        fs::write(
+            midx_dir.join(format!("multi-pack-index-{}.bitmap", layer.checksum)),
+            bitmap,
+        )?;
+    }
+    if let Some(rev) = &layer.rev {
+        fs::write(
+            midx_dir.join(format!("multi-pack-index-{}.rev", layer.checksum)),
+            rev,
+        )?;
+    }
+    Ok(())
+}
+
+fn collect_midx_pack_names(pack_dir: &Path, stdin_packs: bool) -> Result<Vec<String>> {
+    let mut pack_names = if stdin_packs {
+        let mut input = String::new();
+        io::stdin().read_to_string(&mut input)?;
+        input
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    } else {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(pack_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            names.push(name.to_string());
+        }
+        names
+    };
+    pack_names.sort();
+    Ok(pack_names)
+}
+
+fn incremental_midx_dir(pack_dir: &Path) -> PathBuf {
+    pack_dir.join("multi-pack-index.d")
+}
+
+fn midx_chain_path(pack_dir: &Path) -> PathBuf {
+    incremental_midx_dir(pack_dir).join("multi-pack-index-chain")
+}
+
+fn read_midx_chain(pack_dir: &Path) -> Result<Vec<String>> {
+    let path = midx_chain_path(pack_dir);
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Ok(Vec::new());
+    };
+    Ok(contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn write_midx_chain(pack_dir: &Path, chain: &[String]) -> Result<()> {
+    let midx_dir = incremental_midx_dir(pack_dir);
+    fs::create_dir_all(&midx_dir)?;
+    let mut contents = String::new();
+    for checksum in chain {
+        contents.push_str(checksum);
+        contents.push('\n');
+    }
+    fs::write(midx_chain_path(pack_dir), contents)?;
+    Ok(())
+}
+
+fn read_incremental_midx_layers(
+    pack_dir: &Path,
+    format: ObjectFormat,
+    chain: &[String],
+) -> Result<Vec<IncrementalMidxLayer>> {
+    let midx_dir = incremental_midx_dir(pack_dir);
+    let mut layers = Vec::with_capacity(chain.len());
+    for checksum in chain {
+        let path = midx_dir.join(format!("multi-pack-index-{checksum}.midx"));
+        let midx = MultiPackIndex::parse(&fs::read(path)?, format)?;
+        layers.push(IncrementalMidxLayer {
+            checksum: checksum.clone(),
+            midx,
+        });
+    }
+    Ok(layers)
+}
+
+fn migrate_single_midx_to_incremental(
+    pack_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Option<String>> {
+    let midx_path = pack_dir.join("multi-pack-index");
+    let Ok(bytes) = fs::read(&midx_path) else {
+        return Ok(None);
+    };
+    if bytes.len() < format.raw_len() {
+        return Ok(None);
+    }
+    let checksum = ObjectId::from_raw(format, &bytes[bytes.len() - format.raw_len()..])?.to_hex();
+    let midx_dir = incremental_midx_dir(pack_dir);
+    fs::create_dir_all(&midx_dir)?;
+    let layer_path = midx_dir.join(format!("multi-pack-index-{checksum}.midx"));
+    fs::write(&layer_path, &bytes)?;
+    let _ = fs::remove_file(&midx_path);
+    for ext in ["bitmap", "rev"] {
+        let from = pack_dir.join(format!("multi-pack-index-{checksum}.{ext}"));
+        if from.exists() {
+            let to = midx_dir.join(format!("multi-pack-index-{checksum}.{ext}"));
+            match fs::rename(&from, &to) {
+                Ok(()) => {}
+                Err(_) => {
+                    fs::copy(&from, &to)?;
+                    let _ = fs::remove_file(&from);
+                }
+            }
+        }
+    }
+    Ok(Some(checksum))
+}
+
+fn remove_incremental_midx_dir(pack_dir: &Path) -> Result<()> {
+    let midx_dir = incremental_midx_dir(pack_dir);
+    match fs::remove_dir_all(&midx_dir) {
+        Ok(()) => fs::create_dir_all(&midx_dir).map_err(|err| GitError::Io(err.to_string())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(&midx_dir).map_err(|err| GitError::Io(err.to_string()))
+        }
+        Err(err) => Err(GitError::Io(err.to_string())),
+    }
+}
+
+fn clear_incremental_midx_sidecars(pack_dir: &Path, format: ObjectFormat) -> Result<()> {
+    let chain = read_midx_chain(pack_dir)?;
+    let keep: HashSet<String> = chain.into_iter().collect();
+    let midx_dir = incremental_midx_dir(pack_dir);
+    let Ok(entries) = fs::read_dir(&midx_dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("multi-pack-index-") {
+            continue;
+        }
+        let Some((checksum, ext)) = name
+            .strip_prefix("multi-pack-index-")
+            .and_then(|rest| rest.rsplit_once('.'))
+        else {
+            continue;
+        };
+        if checksum.len() != format.hex_len() || !matches!(ext, "midx" | "bitmap" | "rev") {
+            continue;
+        }
+        if !keep.contains(checksum) {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_multi_pack_index_compact(args: &[String]) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let mut object_dir: Option<PathBuf> = None;
+    let mut write_bitmap = false;
+    let mut incremental = false;
+    let mut endpoints = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--object-dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
+                object_dir = Some(resolve_cli_path(&cwd, value));
+            }
+            value if value.starts_with("--object-dir=") => {
+                object_dir = Some(resolve_cli_path(&cwd, &value["--object-dir=".len()..]));
+            }
+            "--bitmap" => write_bitmap = true,
+            "--no-bitmap" => write_bitmap = false,
+            "--incremental" => incremental = true,
+            "--no-incremental" => incremental = false,
+            "--progress" | "--no-progress" => {}
+            other if other.starts_with('-') => {
+                return Err(GitError::Unsupported(format!(
+                    "multi-pack-index compact option {other}"
+                )));
+            }
+            other => endpoints.push(other.to_string()),
+        }
+    }
+    if endpoints.len() != 2 {
+        eprint!("{MULTI_PACK_INDEX_USAGE}");
+        return Err(GitError::Exit(129));
+    }
+    let config = read_repo_config(&git_dir)?;
+    if config
+        .get_entry("midx", None, "version")
+        .flatten()
+        .is_some_and(|value| value.trim() == "1")
+    {
+        eprintln!("fatal: cannot perform MIDX compaction with v1 format");
+        return Err(GitError::Exit(128));
+    }
+    if !incremental {
+        incremental = true;
+    }
+    if !incremental {
+        return Ok(());
+    }
+
+    let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(&git_dir));
+    let pack_dir = object_dir.join("pack");
+    let mut chain = read_midx_chain(&pack_dir)?;
+    let layers = read_incremental_midx_layers(&pack_dir, format, &chain)?;
+    let Some(from_idx) = chain.iter().position(|checksum| checksum == &endpoints[0]) else {
+        eprintln!("fatal: could not find MIDX: {}", endpoints[0]);
+        return Err(GitError::Exit(128));
+    };
+    let Some(to_idx) = chain.iter().position(|checksum| checksum == &endpoints[1]) else {
+        eprintln!("fatal: could not find MIDX: {}", endpoints[1]);
+        return Err(GitError::Exit(128));
+    };
+    if from_idx == to_idx {
+        eprintln!("fatal: MIDX compaction endpoints must be unique");
+        return Err(GitError::Exit(128));
+    }
+    if from_idx > to_idx {
+        eprintln!(
+            "fatal: MIDX {} must be an ancestor of {}",
+            endpoints[0], endpoints[1]
+        );
+        return Err(GitError::Exit(128));
+    }
+
+    let mut pack_names = Vec::new();
+    let mut objects = Vec::new();
+    let mut pack_name_to_id = HashMap::new();
+    for layer in &layers[from_idx..=to_idx] {
+        for name in &layer.midx.pack_names {
+            if !pack_name_to_id.contains_key(name) {
+                let id = pack_names.len() as u32;
+                pack_name_to_id.insert(name.clone(), id);
+                pack_names.push(name.clone());
+            }
+        }
+        for entry in &layer.midx.objects {
+            let Some(old_name) = layer.midx.pack_names.get(entry.pack_int_id as usize) else {
+                return Err(GitError::InvalidFormat(
+                    "multi-pack-index object points past pack table".into(),
+                ));
+            };
+            let new_pack = *pack_name_to_id.get(old_name).ok_or_else(|| {
+                GitError::InvalidFormat("compacted MIDX pack missing from table".into())
+            })?;
+            objects.push(MultiPackIndexEntry {
+                oid: entry.oid,
+                pack_int_id: new_pack,
+                offset: entry.offset,
+                force_large_offset: entry.force_large_offset,
+            });
+        }
+    }
+    objects.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
+    objects.dedup_by(|next, kept| next.oid == kept.oid);
+
+    let compacted = write_midx_layer_bytes(
+        &git_dir,
+        &object_dir,
+        format,
+        2,
+        pack_names,
+        objects,
+        write_bitmap,
+        write_bitmap.then_some(0),
+        None,
+    )?;
+    install_incremental_midx_layer(&pack_dir, format, &compacted)?;
+
+    let old: HashSet<String> = chain[from_idx..=to_idx].iter().cloned().collect();
+    chain.splice(
+        from_idx..=to_idx,
+        std::iter::once(compacted.checksum.clone()),
+    );
+    write_midx_chain(&pack_dir, &chain)?;
+
+    let retained: HashSet<String> = chain.iter().cloned().collect();
+    for checksum in old {
+        if retained.contains(&checksum) {
+            continue;
+        }
+        for ext in ["midx", "bitmap", "rev"] {
+            let _ = fs::remove_file(
+                incremental_midx_dir(&pack_dir).join(format!("multi-pack-index-{checksum}.{ext}")),
+            );
+        }
+    }
+    clear_incremental_midx_sidecars(&pack_dir, format)?;
+    Ok(())
+}
+
 fn midx_bitmapped_pack_ranges(
     pack_count: usize,
     objects: &[MultiPackIndexEntry],
@@ -5732,6 +6706,25 @@ fn midx_bitmapped_pack_ranges(
             pack.bitmap_pos = bitmap_pos as u32;
         }
         pack.bitmap_nr += 1;
+    }
+    ranges
+}
+
+fn incremental_compact_bitmapped_pack_ranges(
+    pack_count: usize,
+    objects: &[MultiPackIndexEntry],
+) -> Vec<sley_pack::MultiPackBitmapPack> {
+    let mut ranges = vec![
+        sley_pack::MultiPackBitmapPack {
+            bitmap_pos: 0,
+            bitmap_nr: 0,
+        };
+        pack_count
+    ];
+    for object in objects {
+        if let Some(pack) = ranges.get_mut(object.pack_int_id as usize) {
+            pack.bitmap_nr += 1;
+        }
     }
     ranges
 }

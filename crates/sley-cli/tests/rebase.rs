@@ -29,6 +29,8 @@ fn run_output_with_identity(program: &str, cwd: &Path, args: &[&str]) -> Output 
         .env("GIT_COMMITTER_NAME", "Example User")
         .env("GIT_COMMITTER_EMAIL", "example@example.invalid")
         .env("GIT_COMMITTER_DATE", "@0 +0000")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true")
         .output()
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
@@ -86,6 +88,13 @@ fn prepare_identity(root: &Path) {
     git(root, &["config", "user.email", "example@example.invalid"]);
 }
 
+fn rev_parse(program: &str, root: &Path, rev: &str) -> String {
+    String::from_utf8(run_output(program, root, &["rev-parse", rev]).stdout)
+        .expect("rev-parse output utf8")
+        .trim()
+        .to_string()
+}
+
 fn prepare_diverged_repos(upstream: &Path, rust: &Path) {
     for root in [upstream, rust] {
         git(root, &["init", "-q", "-b", "master"]);
@@ -126,6 +135,70 @@ fn prepare_up_to_date_repos(upstream: &Path, rust: &Path) {
         git(root, &["merge", "topic", "-q"]);
         git(root, &["checkout", "topic", "-q"]);
     }
+}
+
+#[test]
+fn rebase_keep_base_root_is_rejected() {
+    let root = unique_temp_dir("rebase-keep-base-root");
+    fs::create_dir_all(&root).expect("create repo");
+    git(&root, &["init", "-q", "-b", "main"]);
+    prepare_identity(&root);
+    fs::write(root.join("file"), b"base\n").expect("write file");
+    git(&root, &["add", "file"]);
+    git_with_identity(&root, &["commit", "-m", "base", "-q"]);
+
+    let args = ["rebase", "--keep-base", "--root"];
+    let output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &root, &args);
+    assert_eq!(output.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("fatal: options '--keep-base' and '--root' cannot be used together"),
+        "stderr differed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!root.join(".git/rebase-merge").exists());
+    assert!(!root.join(".git/rebase-apply").exists());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rebase_keep_base_reapplies_cherry_picks_by_default() {
+    let root = unique_temp_dir("rebase-keep-base-reapply");
+    fs::create_dir_all(&root).expect("create repo");
+    git(&root, &["init", "-q", "-b", "main"]);
+    prepare_identity(&root);
+
+    fs::write(root.join("base"), b"base\n").expect("write base");
+    git(&root, &["add", "base"]);
+    git_with_identity(&root, &["commit", "-m", "base", "-q"]);
+    git(&root, &["checkout", "-b", "topic", "-q"]);
+    fs::write(root.join("f"), b"f\n").expect("write f");
+    git(&root, &["add", "f"]);
+    git_with_identity(&root, &["commit", "-m", "F", "-q"]);
+    let f_oid = rev_parse(sley_testkit::oracle_git(), &root, "HEAD");
+    fs::write(root.join("g"), b"g\n").expect("write g");
+    git(&root, &["add", "g"]);
+    git_with_identity(&root, &["commit", "-m", "G", "-q"]);
+    let topic_oid = rev_parse(sley_testkit::oracle_git(), &root, "HEAD");
+
+    git(&root, &["checkout", "main", "-q"]);
+    git_with_identity(&root, &["cherry-pick", &f_oid]);
+
+    let args = ["rebase", "-i", "--keep-base", "HEAD", &topic_oid];
+    let output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &root, &args);
+    assert!(
+        output.status.success(),
+        "sley rebase failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        rev_parse(sley_testkit::oracle_git(), &root, "HEAD"),
+        topic_oid,
+        "--keep-base should reapply clean cherry-picks unless explicitly disabled"
+    );
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

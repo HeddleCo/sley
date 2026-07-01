@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -2494,6 +2495,69 @@ fn diff_stat_matches_upstream_git() {
 }
 
 #[test]
+fn diff_stat_excludes_unmerged_rows_from_totals() {
+    let root = unique_temp_dir("diff-stat-unmerged-total");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        for path in ["a", "b", "c", "d"] {
+            fs::write(root.join(path), b"").expect("write empty fixture");
+        }
+        git(&root, &["add", "a", "b", "c", "d"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+
+        fs::write(root.join("a"), b"a\n").expect("modify a");
+        fs::write(root.join("b"), b"b\n").expect("modify b");
+        let stage0 =
+            String::from_utf8(git(&root, &["ls-files", "-s", "a"])).expect("stage output is utf8");
+        git(&root, &["rm", "-f", "d"]);
+        let mut index_info = String::new();
+        for stage in 1..=3 {
+            index_info.push_str(&stage0.replace(" 0\ta", &format!(" {stage}\td")));
+        }
+        let mut child = Command::new(sley_testkit::oracle_git())
+            .current_dir(&root)
+            .args(["update-index", "--index-info"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn update-index");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin is piped")
+            .write_all(index_info.as_bytes())
+            .expect("write index-info");
+        let status = child.wait().expect("wait for update-index");
+        assert!(status.success(), "update-index failed with {status:?}");
+        fs::write(root.join("d"), b"d\n").expect("write unmerged worktree file");
+
+        for args in [
+            vec!["diff", "--stat"],
+            vec!["diff", "--stat", "--stat-count=2"],
+            vec!["diff", "--numstat"],
+            vec!["diff", "--shortstat"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "sley output differed for {args:?}");
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn diff_compact_summary_matches_upstream_git() {
     let root = unique_temp_dir("diff-compact-summary");
     fs::create_dir_all(&root).expect("create temp repo");
@@ -2779,5 +2843,55 @@ fn diff_two_tree_uses_committed_content_not_dirty_worktree() {
             "sley diff diverged from git for {args:?} (dirty worktree)",
         );
     }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn diff_no_index_rejects_stdin_directory_without_reading_stdin() {
+    let root = unique_temp_dir("diff-no-index-stdin-directory");
+    fs::create_dir_all(root.join("a")).expect("create directory side");
+    let output = Command::new(env!("CARGO_BIN_EXE_sley"))
+        .current_dir(&root)
+        .args(["diff", "--no-index", "--", "-", "a"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run sley diff --no-index");
+    assert!(
+        !output.status.success(),
+        "diff --no-index unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fatal: cannot compare stdin to a directory"),
+        "unexpected stderr: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn diff_no_index_rejects_fifo_directory_without_reading_fifo() {
+    let root = unique_temp_dir("diff-no-index-fifo-directory");
+    fs::create_dir_all(root.join("a")).expect("create directory side");
+    let status = Command::new("mkfifo")
+        .arg(root.join("pipe"))
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "mkfifo failed with {status:?}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sley"))
+        .current_dir(&root)
+        .args(["diff", "--no-index", "--", "pipe", "a"])
+        .output()
+        .expect("run sley diff --no-index");
+    assert!(
+        !output.status.success(),
+        "diff --no-index unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fatal: cannot compare a named pipe to a directory"),
+        "unexpected stderr: {stderr}"
+    );
     let _ = fs::remove_dir_all(&root);
 }

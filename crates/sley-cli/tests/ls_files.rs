@@ -395,6 +395,55 @@ fn ls_files_unmerged_matches_upstream_git() {
 }
 
 #[test]
+fn ls_files_killed_matches_upstream_git() {
+    let root = unique_temp_dir("ls-files-killed");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo");
+    fs::create_dir_all(&actual).expect("create actual repo");
+    {
+        for repo in [&expected, &actual] {
+            git(repo, &["init", "-q", "-b", "main"]);
+            fs::write(repo.join("path0"), b"path0\n").expect("write tracked file");
+            fs::create_dir_all(repo.join("path2")).expect("create tracked dir");
+            fs::write(repo.join("path2").join("file2"), b"path2\n")
+                .expect("write tracked file below dir");
+            fs::create_dir_all(repo.join("pathx")).expect("create pathx dir");
+            fs::write(repo.join("pathx").join("ju"), b"ju\n").expect("write tracked file");
+            git(repo, &["add", "path0", "path2/file2", "pathx/ju"]);
+
+            fs::remove_file(repo.join("path0")).expect("remove tracked file");
+            fs::remove_dir_all(repo.join("path2")).expect("remove tracked dir");
+            fs::remove_file(repo.join("pathx").join("ju")).expect("remove tracked file");
+
+            fs::create_dir_all(repo.join("path0")).expect("create blocker dir");
+            fs::write(repo.join("path0").join("file0"), b"killed\n").expect("write killed leaf");
+            fs::write(repo.join("path2"), b"killed\n").expect("write killed file");
+            fs::create_dir_all(repo.join("pathx").join("ju")).expect("create blocker dir");
+            fs::write(repo.join("pathx").join("ju").join("nk"), b"killed\n")
+                .expect("write killed leaf");
+            fs::create_dir_all(repo.join("unrelated")).expect("create unrelated dir");
+            fs::write(repo.join("unrelated").join("file"), b"untracked\n")
+                .expect("write unrelated file");
+        }
+
+        for args in [
+            vec!["ls-files", "-k"],
+            vec!["ls-files", "--killed"],
+            vec!["-c", "core.ignorecase=true", "ls-files", "-k"],
+        ] {
+            let expected_output = git(&expected, &args);
+            let actual_output = git_rs(&actual, &args);
+            assert_eq!(
+                actual_output, expected_output,
+                "sley output differed for {args:?}"
+            );
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn ls_files_directory_matches_upstream_git() {
     let root = unique_temp_dir("ls-files-directory");
     let expected = root.join("expected");

@@ -278,6 +278,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             }
             "-R" => options.reverse = true,
             "--root" => options.root = true,
+            "--always" => {}
             "--merge-base" => options.merge_base = true,
             "--check" => options.check = true,
             "--no-commit-id" => options.no_commit_id = true,
@@ -1109,6 +1110,7 @@ fn run_diff_request(
             context.db,
             None,
             false,
+            None,
         )?
     } else {
         entries
@@ -1118,8 +1120,9 @@ fn run_diff_request(
     // `--check`: report whitespace errors in place of the normal diff body.
     if context.options.check {
         if let Some(resolver) = &context.ws_resolver {
-            let failed =
-                commands::diff::run_diff_check(&entries, context.db, None, false, false, resolver)?;
+            let failed = commands::diff::run_diff_check(
+                &entries, context.db, None, false, false, None, resolver,
+            )?;
             if failed {
                 context.check_failed.set(true);
             }
@@ -2214,7 +2217,17 @@ fn is_empty_blob_oid(oid: &ObjectId) -> bool {
 /// non-rename entries we produce here (raw/name modes and `-t` tree nodes never
 /// involve a rename whose old path would sort differently).
 fn sort_entries_by_path(entries: &mut [sley_diff_merge::NameStatusEntry]) {
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries.sort_by(|a, b| {
+        sley_object::tree_entry_cmp(
+            a.path.as_bytes(),
+            diff_tree_entry_sort_mode(a),
+            b.path.as_bytes(),
+            diff_tree_entry_sort_mode(b),
+        )
+        .then_with(|| a.path.len().cmp(&b.path.len()))
+        .then_with(|| diff_tree_entry_tree_rank(a).cmp(&diff_tree_entry_tree_rank(b)))
+        .then_with(|| a.status.code().cmp(&b.status.code()))
+    });
 }
 
 fn reverse_top_level_entries(
@@ -2224,8 +2237,28 @@ fn reverse_top_level_entries(
         .into_iter()
         .map(reverse_diff_entry)
         .collect::<Vec<_>>();
-    reversed.sort_by(|left, right| left.path.cmp(&right.path));
+    sort_entries_by_path(&mut reversed);
     reversed
+}
+
+fn diff_tree_entry_sort_mode(entry: &sley_diff_merge::NameStatusEntry) -> u32 {
+    entry.new_mode.or(entry.old_mode).unwrap_or(0)
+}
+
+fn diff_tree_entry_tree_rank(entry: &sley_diff_merge::NameStatusEntry) -> u8 {
+    match diff_tree_entry_primary_mode(entry) {
+        0o040000 => 1,
+        _ => 0,
+    }
+}
+
+fn diff_tree_entry_primary_mode(entry: &sley_diff_merge::NameStatusEntry) -> u32 {
+    match entry.status {
+        sley_diff_merge::NameStatus::Added => entry.new_mode.or(entry.old_mode),
+        sley_diff_merge::NameStatus::Deleted => entry.old_mode.or(entry.new_mode),
+        _ => entry.new_mode.or(entry.old_mode),
+    }
+    .unwrap_or(0)
 }
 
 /// Collect the intermediate-tree (`040000`) change entries for `-t`, recursing

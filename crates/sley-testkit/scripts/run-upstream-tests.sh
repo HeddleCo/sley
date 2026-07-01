@@ -76,6 +76,9 @@
 #                       (e.g. "--verbose" or "-x"). --no-bin-wrappers is always
 #                       supplied because GIT_TEST_INSTALLED has no bin-wrappers.
 #                       GIT_RS_TEST_OPTS is accepted as a legacy alias.
+#   SLEY_KEEP_TRASH     when non-empty, preserve each temporary --root directory
+#                       and record it in the report. Useful for byte-level
+#                       parity debugging after a failing upstream script.
 #
 # Each SCRIPT argument may be a command name ("config", "cat-file", "ls-tree"),
 # a bare basename ("t0001-init.sh"), a numeric prefix ("t0001"), or a glob
@@ -218,9 +221,10 @@ log "sley binary: $sley_bin"
 # --- Build the shim bindir ------------------------------------------------
 #
 # test-lib.sh runs `$GIT_TEST_INSTALLED/git --exec-path` early and aborts if it
-# fails, so the shim must answer the introspection flags itself; everything else
-# is delegated to sley. We also export SLEY_BIN inside the shim so its value
-# is visible regardless of how the shim is invoked.
+# fails. Delegate that probe to sley too: feature-enabled builds can return a
+# Git-compatible helper dir (git-sh-i18n, git-sh-i18n--envsubst), while lean
+# builds still return their binary directory. We also export SLEY_BIN inside the
+# shim so its value is visible regardless of how the shim is invoked.
 bindir=$(mktemp -d "${TMPDIR:-/tmp}/sley-upstream-bindir.XXXXXX") \
     || die "could not create temp bindir"
 cleanup() { rm -rf "$bindir"; }
@@ -232,17 +236,6 @@ cat > "$bindir/git" <<SHIM
 SLEY_BIN='$sley_bin'
 GIT_RS_BIN='$sley_bin'
 SHIM_DIR='$bindir'
-case "\${1:-}" in
-    --exec-path)
-        # test-lib.sh: GIT_EXEC_PATH=\$(\$GIT_TEST_INSTALLED/git --exec-path)
-        printf '%s\n' "\$SHIM_DIR"
-        exit 0
-        ;;
-    --man-path|--html-path|--info-path)
-        printf '%s\n' "\$SHIM_DIR"
-        exit 0
-        ;;
-esac
 exec "\$SLEY_BIN" "\$@"
 SHIM
 chmod +x "$bindir/git"
@@ -506,6 +499,10 @@ run_one() {
         "$run_label" "$script" "$command_name" "$result" "$ok_count" \
         "$notok_count" "$run_total" >> "$history"
 
+    if [ -n "${SLEY_KEEP_TRASH:-}" ]; then
+        printf '  trash=%s\n' "$workdir" >> "$report"
+    fi
+
     # On anything but a clean pass, append the concrete failing TAP assertion
     # titles (the text after "not ok N - ...") plus a short tail. These titles
     # are the actionable gap map: each names a specific upstream behaviour
@@ -525,7 +522,9 @@ run_one() {
         } >> "$report"
     fi
 
-    rm -rf "$workdir"
+    if [ -z "${SLEY_KEEP_TRASH:-}" ]; then
+        rm -rf "$workdir"
+    fi
 }
 
 log ""

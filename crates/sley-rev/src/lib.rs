@@ -187,7 +187,7 @@ pub fn commit_graph_tree_oid(
     let mut graph = CommitGraphContext::load(git_dir, format);
     match graph.direct_graph() {
         DirectCommitGraph::Raw(graph) => graph.tree_oid(oid).or(Ok(None)),
-        DirectCommitGraph::Missing | DirectCommitGraph::Invalid => Ok(None),
+        DirectCommitGraph::Missing | DirectCommitGraph::Invalid(_) => Ok(None),
     }
 }
 
@@ -1194,11 +1194,6 @@ fn resolve_reflog_nth(
     let display_name = reflog_display_name_for_ref(base, &ref_name);
     let entries = refs.read_reflog(&ref_name)?;
     if entries.is_empty() {
-        if n == 0
-            && let Some(oid) = resolve_revision_ref(&refs, &ref_name)?
-        {
-            return Ok(oid);
-        }
         return Err(GitError::not_found(format!(
             "no reflog for '{}' to resolve {rev}",
             display_name
@@ -1807,7 +1802,7 @@ fn peel_base_to_commit_if_needed<R: ObjectReader>(
     graph: &mut CommitGraphContext<'_>,
     base: &ObjectId,
 ) -> Result<ObjectId> {
-    if graph.lookup(base).is_some() {
+    if graph.lookup(base)?.is_some() {
         return Ok(*base);
     }
     peel_to_commit(reader, format, base)
@@ -2094,14 +2089,15 @@ struct CommitGraphContext<'a> {
     /// materializing every graph entry into a `HashMap` when callers only need a
     /// handful of commits (for example `log -50`).
     direct_graph: Option<DirectCommitGraph>,
-    /// `None` until the first lookup forces a load; afterwards `Some(map)` where
-    /// the map is empty iff no usable graph exists.
-    commits: Option<HashMap<ObjectId, GraphCommit>>,
+    /// `None` until the first lookup forces a load. Missing graphs cache as an
+    /// empty map; corrupt graphs cache their parse error so callers fail instead
+    /// of silently walking stale object data.
+    commits: Option<std::result::Result<HashMap<ObjectId, GraphCommit>, String>>,
 }
 
 enum DirectCommitGraph {
     Missing,
-    Invalid,
+    Invalid(String),
     Raw(Box<RawCommitGraph>),
 }
 
@@ -2302,6 +2298,7 @@ impl RawCommitGraph {
                 "commit-graph EDGE chunk has invalid length".into(),
             ));
         }
+        raw_commit_graph_validate_generation_data(data, &chunks, commit_count)?;
 
         Ok(Self {
             bytes,
@@ -2616,41 +2613,51 @@ impl<'a> CommitGraphContext<'a> {
 
     /// Resolve `oid`'s graph metadata, loading and parsing the graph on first
     /// use. Returns `None` when the commit is not in the graph.
-    fn lookup(&mut self, oid: &ObjectId) -> Option<&GraphCommit> {
+    fn lookup(&mut self, oid: &ObjectId) -> Result<Option<&GraphCommit>> {
         if self.commits.is_none() {
-            self.commits = Some(load_commit_graph_map(self.git_dir, self.format));
+            self.commits = Some(
+                load_commit_graph_map(self.git_dir, self.format).map_err(|err| err.to_string()),
+            );
         }
-        self.commits.as_ref().and_then(|map| map.get(oid))
+        match self
+            .commits
+            .as_ref()
+            .expect("commit graph map load state initialized")
+        {
+            Ok(map) => Ok(map.get(oid)),
+            Err(message) => Err(GitError::InvalidFormat(message.clone())),
+        }
     }
 
     /// Parents of `oid` from the graph, or `None` when it is not present.
-    fn parents(&mut self, oid: &ObjectId) -> Option<&GraphParents> {
-        self.lookup(oid).map(|commit| &commit.parents)
+    fn parents(&mut self, oid: &ObjectId) -> Result<Option<&GraphParents>> {
+        Ok(self.lookup(oid)?.map(|commit| &commit.parents))
     }
 
     /// First parent of `oid` from the graph. The outer `None` means the commit is
     /// not present in the graph; the inner `None` means the commit is present but
     /// root/unborn with no parents.
-    fn first_parent(&mut self, oid: &ObjectId) -> Option<Option<ObjectId>> {
-        self.lookup(oid).map(|commit| commit.parents.first())
+    fn first_parent(&mut self, oid: &ObjectId) -> Result<Option<Option<ObjectId>>> {
+        Ok(self.lookup(oid)?.map(|commit| commit.parents.first()))
     }
 
     /// Generation number of `oid`, or `None` when it is not present in the graph
     /// or the graph carries no generation numbers (generation 0). A `None`
     /// result disables generation-based pruning for that commit.
-    fn generation(&mut self, oid: &ObjectId) -> Option<u32> {
-        match self.lookup(oid) {
+    fn generation(&mut self, oid: &ObjectId) -> Result<Option<u32>> {
+        Ok(match self.lookup(oid)? {
             Some(commit) if commit.generation != GENERATION_NUMBER_ZERO => Some(commit.generation),
             _ => None,
-        }
+        })
     }
 
     /// Committer date (seconds since the epoch) recorded for `oid` in the graph,
     /// or `None` when the commit is not present. Used to order candidates
     /// without re-parsing the commit object's committer line.
-    fn commit_time(&mut self, oid: &ObjectId) -> Option<i64> {
-        self.lookup(oid)
-            .map(|commit| i64::try_from(commit.commit_time).unwrap_or(i64::MAX))
+    fn commit_time(&mut self, oid: &ObjectId) -> Result<Option<i64>> {
+        Ok(self
+            .lookup(oid)?
+            .map(|commit| i64::try_from(commit.commit_time).unwrap_or(i64::MAX)))
     }
 
     /// Parents of `oid`: from the graph when present, otherwise read+parsed from
@@ -2666,7 +2673,7 @@ impl<'a> CommitGraphContext<'a> {
             return Ok(Vec::new());
         }
         let format = self.format;
-        if let Some(parents) = self.parents(oid) {
+        if let Some(parents) = self.parents(oid)? {
             return Ok(parents.to_vec());
         }
         commit_parents(reader, format, oid)
@@ -2684,7 +2691,7 @@ impl<'a> CommitGraphContext<'a> {
             return Ok(CommitParentIds::Empty);
         }
         let format = self.format;
-        if let Some(parents) = self.parents(oid) {
+        if let Some(parents) = self.parents(oid)? {
             return Ok(CommitParentIds::borrowed(parents));
         }
         Ok(CommitParentIds::owned(commit_parents(reader, format, oid)?))
@@ -2701,7 +2708,7 @@ impl<'a> CommitGraphContext<'a> {
             return Ok(None);
         }
         let format = self.format;
-        if let Some(parent) = self.first_parent(oid) {
+        if let Some(parent) = self.first_parent(oid)? {
             return Ok(parent);
         }
         Ok(commit_parents(reader, format, oid)?.into_iter().next())
@@ -2709,11 +2716,11 @@ impl<'a> CommitGraphContext<'a> {
 
     /// `oid`'s parents and committer time from the graph in one lookup, or `None`
     /// when the commit is not represented (the caller then reads the object).
-    fn metadata(&mut self, oid: &ObjectId) -> Option<GraphCommitMetadata<'_>> {
-        self.lookup(oid).map(|commit| GraphCommitMetadata {
+    fn metadata(&mut self, oid: &ObjectId) -> Result<Option<GraphCommitMetadata<'_>>> {
+        Ok(self.lookup(oid)?.map(|commit| GraphCommitMetadata {
             parents: &commit.parents,
             commit_time: i64::try_from(commit.commit_time).unwrap_or(i64::MAX),
-        })
+        }))
     }
 
     fn metadata_owned<R: ObjectReader>(
@@ -2731,10 +2738,12 @@ impl<'a> CommitGraphContext<'a> {
                 }
                 return Ok(Some(metadata));
             }
-            DirectCommitGraph::Invalid => return Ok(None),
+            DirectCommitGraph::Invalid(message) => {
+                return Err(GitError::InvalidFormat(message.clone()));
+            }
             DirectCommitGraph::Missing => {}
         }
-        Ok(self.metadata(oid).map(|metadata| CommitMetadata {
+        Ok(self.metadata(oid)?.map(|metadata| CommitMetadata {
             oid: *oid,
             parents: metadata.parents.grafted_vec(reader, oid),
             commit_time: metadata.commit_time,
@@ -2759,30 +2768,31 @@ impl<'a> CommitGraphContext<'a> {
 fn load_commit_graph_map(
     git_dir: &Path,
     format: sley_core::ObjectFormat,
-) -> HashMap<ObjectId, GraphCommit> {
+) -> Result<HashMap<ObjectId, GraphCommit>> {
     let info = repository_objects_dir(git_dir).join("info");
     let single = info.join("commit-graph");
     if single.exists() {
-        // A read/parse failure degrades to "no graph" (empty map) so callers
-        // fall back to object reads; correctness never depends on the graph.
         let bytes = match fs::read(&single) {
             Ok(bytes) => bytes,
-            Err(_) => return HashMap::new(),
+            Err(err) => return Err(GitError::Io(err.to_string())),
         };
         if commit_graph_hash_version_mismatch(&bytes, format) {
-            return HashMap::new();
+            return Err(GitError::InvalidFormat(
+                "commit-graph hash version mismatch".into(),
+            ));
         }
         return match CommitGraph::parse(&bytes, format) {
-            Ok(graph) => graph_to_map(&graph).unwrap_or_default(),
+            Ok(graph) => graph_to_map(&graph),
             Err(_) => {
                 warn_invalid_commit_graph_bloom_chunks(&bytes, &single, format);
-                HashMap::new()
+                RawCommitGraph::parse_for_lookup(RawCommitGraphBytes::Owned(bytes), format)?;
+                Ok(HashMap::new())
             }
         };
     }
 
     let chain = info.join("commit-graphs").join("commit-graph-chain");
-    load_commit_graph_chain(&info, &chain, format).unwrap_or_default()
+    load_commit_graph_chain(&info, &chain, format)
 }
 
 fn load_direct_commit_graph(git_dir: &Path, format: sley_core::ObjectFormat) -> DirectCommitGraph {
@@ -2796,17 +2806,18 @@ fn load_direct_commit_graph(git_dir: &Path, format: sley_core::ObjectFormat) -> 
         Ok(mapped) => RawCommitGraphBytes::Mapped(mapped),
         Err(_) => match fs::read(&path) {
             Ok(bytes) => RawCommitGraphBytes::Owned(bytes),
-            Err(_) => return DirectCommitGraph::Invalid,
+            Err(err) => return DirectCommitGraph::Invalid(err.to_string()),
         },
     };
     if commit_graph_hash_version_mismatch(bytes.as_ref(), format) {
-        return DirectCommitGraph::Invalid;
+        return DirectCommitGraph::Invalid("commit-graph hash version mismatch".into());
     }
     warn_invalid_commit_graph_bloom_chunks(bytes.as_ref(), &path, format);
-    RawCommitGraph::parse_for_lookup(bytes, format)
-        .map(Box::new)
-        .map(DirectCommitGraph::Raw)
-        .unwrap_or(DirectCommitGraph::Invalid)
+    match RawCommitGraph::parse_for_lookup(bytes, format) {
+        Ok(graph) => DirectCommitGraph::Raw(Box::new(graph)),
+        Err(GitError::InvalidFormat(message)) => DirectCommitGraph::Invalid(message),
+        Err(err) => DirectCommitGraph::Invalid(err.to_string()),
+    }
 }
 
 const RAW_COMMIT_GRAPH_PARENT_NONE: u32 = 0x7000_0000;
@@ -2817,6 +2828,56 @@ fn raw_commit_graph_chunk(chunks: &[([u8; 4], Range<usize>)], id: [u8; 4]) -> Op
     chunks
         .iter()
         .find_map(|(chunk_id, range)| (*chunk_id == id).then(|| range.clone()))
+}
+
+fn raw_commit_graph_validate_generation_data(
+    data: &[u8],
+    chunks: &[([u8; 4], Range<usize>)],
+    commit_count: usize,
+) -> Result<()> {
+    let Some(gda2) = raw_commit_graph_chunk(chunks, *b"GDA2") else {
+        return Ok(());
+    };
+    let expected_gda2_len = commit_count
+        .checked_mul(4)
+        .ok_or_else(|| GitError::InvalidFormat("commit-graph generation data overflow".into()))?;
+    if gda2.len() != expected_gda2_len {
+        return Err(GitError::InvalidFormat(
+            "commit-graph generation data is the wrong size".into(),
+        ));
+    }
+    let gdo2 = raw_commit_graph_chunk(chunks, *b"GDO2");
+    if let Some(gdo2) = &gdo2
+        && gdo2.len() % 8 != 0
+    {
+        return Err(GitError::InvalidFormat(
+            "commit-graph overflow generation data is corrupt".into(),
+        ));
+    }
+    for offset in (gda2.start..gda2.end).step_by(4) {
+        let raw = read_u32_be(&data[offset..offset + 4]);
+        if raw & 0x8000_0000 == 0 {
+            continue;
+        }
+        let Some(gdo2) = &gdo2 else {
+            return Err(GitError::InvalidFormat(
+                "commit-graph overflow generation data is missing".into(),
+            ));
+        };
+        let overflow_idx = (raw & 0x7fff_ffff) as usize;
+        let overflow_start = overflow_idx.checked_mul(8).ok_or_else(|| {
+            GitError::InvalidFormat("commit-graph overflow generation index overflow".into())
+        })?;
+        let overflow_end = overflow_start.checked_add(8).ok_or_else(|| {
+            GitError::InvalidFormat("commit-graph overflow generation index overflow".into())
+        })?;
+        if overflow_end > gdo2.len() {
+            return Err(GitError::InvalidFormat(
+                "commit-graph overflow generation data is too small".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn raw_commit_graph_entry_len(format: ObjectFormat) -> Result<usize> {
@@ -5553,7 +5614,7 @@ fn search_commit_message_all<R: ObjectReader>(
         pending.extend(commit.parents.iter().cloned());
         if commit_message_contains(commit.message, text) {
             let when = graph
-                .commit_time(&oid)
+                .commit_time(&oid)?
                 .or_else(|| commit_committer_time(commit.committer))
                 .unwrap_or(i64::MIN);
             if best
@@ -5602,7 +5663,7 @@ fn search_commit_message_first_parent<R: ObjectReader>(
         current = if reader.is_shallow_graft(&oid) {
             None
         } else {
-            match graph.first_parent(&oid) {
+            match graph.first_parent(&oid)? {
                 Some(parent) => parent,
                 None => commit.parents.into_iter().next(),
             }
@@ -5683,10 +5744,16 @@ pub enum RevisionRange {
 /// rejected as a malformed range. `A^-` expands to `A^1..A`, and `A^-N`
 /// expands to `A^N..A`.
 pub fn parse_revision_range(spec: &str) -> Option<RevisionRange> {
+    if spec.starts_with(':') {
+        return None;
+    }
     if let Some(range) = parse_parent_revision_range(spec) {
         return Some(range);
     }
     if let Some((left, right)) = spec.split_once("...") {
+        if range_operator_is_inside_tree_path(spec, left.len()) {
+            return None;
+        }
         if left.contains("..") || right.contains("..") {
             return None;
         }
@@ -5696,6 +5763,12 @@ pub fn parse_revision_range(spec: &str) -> Option<RevisionRange> {
         });
     }
     if let Some((left, right)) = spec.split_once("..") {
+        if left.is_empty() && right.is_empty() {
+            return None;
+        }
+        if range_operator_is_inside_tree_path(spec, left.len()) {
+            return None;
+        }
         if left.contains("..") || right.contains("..") {
             return None;
         }
@@ -5709,6 +5782,9 @@ pub fn parse_revision_range(spec: &str) -> Option<RevisionRange> {
 
 fn parse_parent_revision_range(spec: &str) -> Option<RevisionRange> {
     let (base, parent) = spec.rsplit_once("^-")?;
+    if range_operator_is_inside_tree_path(spec, base.len()) {
+        return None;
+    }
     if base.is_empty() {
         return None;
     }
@@ -5726,6 +5802,28 @@ fn parse_parent_revision_range(spec: &str) -> Option<RevisionRange> {
         start: format!("{base}^{parent}"),
         end: base.to_string(),
     })
+}
+
+fn range_operator_is_inside_tree_path(spec: &str, operator_pos: usize) -> bool {
+    top_level_tree_path_colon(spec).is_some_and(|colon| colon < operator_pos)
+}
+
+fn top_level_tree_path_colon(spec: &str) -> Option<usize> {
+    let bytes = spec.as_bytes();
+    let mut braced_selector_depth = 0usize;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        match byte {
+            b'{' if index > 0 && matches!(bytes[index - 1], b'^' | b'@') => {
+                braced_selector_depth = braced_selector_depth.saturating_add(1);
+            }
+            b'}' if braced_selector_depth > 0 => {
+                braced_selector_depth -= 1;
+            }
+            b':' if braced_selector_depth == 0 && index > 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn default_range_side(side: &str) -> &str {
@@ -6098,8 +6196,8 @@ pub fn is_ancestor<R: ObjectReader>(
     // the generation order it cannot be a (proper) ancestor of it. This only
     // fires when both generations are known; otherwise we fall through to the
     // walk. (`min_generation` doubles as the pruning floor below.)
-    let min_generation = graph.generation(ancestor);
-    if let (Some(anc_gen), Some(desc_gen)) = (min_generation, graph.generation(descendant))
+    let min_generation = graph.generation(ancestor)?;
+    if let (Some(anc_gen), Some(desc_gen)) = (min_generation, graph.generation(descendant)?)
         && anc_gen >= desc_gen
     {
         return Ok(false);
@@ -6115,7 +6213,7 @@ pub fn is_ancestor<R: ObjectReader>(
         // of its own ancestors have a generation strictly smaller than
         // `ancestor`'s, so none of them can be `ancestor`. Stop descending here.
         // Only applies when both generations are known.
-        if let (Some(floor), Some(here)) = (min_generation, graph.generation(&oid))
+        if let (Some(floor), Some(here)) = (min_generation, graph.generation(&oid)?)
             && here < floor
         {
             continue;
@@ -7149,6 +7247,13 @@ mod tests {
         assert_eq!(parse_revision_range("merge^-0"), None);
         assert_eq!(parse_revision_range("merge^-2x"), None);
         assert_eq!(parse_revision_range("plain"), None);
+        assert_eq!(parse_revision_range(".."), None);
+        assert_eq!(parse_revision_range(":../file.txt"), None);
+        assert_eq!(parse_revision_range(":/message..text"), None);
+        assert_eq!(parse_revision_range("HEAD:../top"), None);
+        assert_eq!(parse_revision_range("HEAD:path..with-dots"), None);
+        assert_eq!(parse_revision_range("HEAD:path...with-dots"), None);
+        assert_eq!(parse_revision_range("HEAD:path^-"), None);
     }
 
     #[test]
@@ -7685,15 +7790,14 @@ mod tests {
     }
 
     #[test]
-    fn reflog_nth_uses_git_empty_and_oldest_fallbacks() {
+    fn reflog_nth_requires_reflog_but_uses_oldest_fallback() {
         let git_dir = temp_git_dir();
         let base = test_oid(0x55);
         let tip = test_oid(0x56);
         set_branch(&git_dir, "newbranch", &tip);
-        assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "newbranch@{0}")
-                .expect("test operation should succeed"),
-            tip
+        assert!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "newbranch@{0}").is_err(),
+            "branch without reflog must not resolve @{{0}}"
         );
         write_branch_reflog(&git_dir, "newbranch", &[(&base, &tip, "commit: tip")]);
         assert_eq!(

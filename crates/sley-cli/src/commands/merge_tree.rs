@@ -417,6 +417,7 @@ fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
             theirs_label: branch2,
             ancestor_label: "merged common ancestors",
             favor: strategy,
+            path_favor: None,
             detect_renames,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             rename_limit: 0,

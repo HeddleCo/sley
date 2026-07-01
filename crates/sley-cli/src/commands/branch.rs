@@ -5997,6 +5997,7 @@ struct BranchVerboseListOptions {
     ignore_case: bool,
     verbosity: usize,
     abbrev: Option<Option<usize>>,
+    color: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6488,6 +6489,7 @@ fn parse_branch_verbose_list_options(args: &[String]) -> Result<Option<BranchVer
     let mut mode = BranchListMode::Local;
     let mut ignore_case = false;
     let mut abbrev = None;
+    let mut color = false;
     let mut saw_verbose = false;
     let mut saw_column = false;
     let specs = branch_verbose_list_option_specs();
@@ -6518,6 +6520,8 @@ fn parse_branch_verbose_list_options(args: &[String]) -> Result<Option<BranchVer
     }
     for arg in args {
         match arg.as_str() {
+            "--color" | "--color=always" => color = true,
+            "--no-color" | "--color=never" | "--color=auto" => color = false,
             "--abbrev" => abbrev = None,
             "--no-abbrev" => abbrev = Some(None),
             value if value.starts_with("--abbrev=") => {
@@ -6555,6 +6559,7 @@ fn parse_branch_verbose_list_options(args: &[String]) -> Result<Option<BranchVer
         ignore_case,
         verbosity,
         abbrev,
+        color,
     }))
 }
 
@@ -6565,12 +6570,11 @@ fn run_branch_verbose_list_options(
     options: BranchVerboseListOptions,
 ) -> Result<()> {
     if options.verbosity == 0 {
-        return print_branch_list_matching(
-            store,
-            options.mode,
-            &options.patterns,
-            options.ignore_case,
-        );
+        return if options.color {
+            print_branch_list_matching_colored(store, options.mode, &options.patterns)
+        } else {
+            print_branch_list_matching(store, options.mode, &options.patterns, options.ignore_case)
+        };
     }
     print_branch_list_verbose(git_dir, format, store, options)
 }
@@ -9840,13 +9844,18 @@ fn print_branch_refs(
     worktree_paths: Option<&HashMap<String, String>>,
     mut include: impl FnMut(&sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
+    let colors = if color {
+        Some(branch_list_colors_from_current_repo()?)
+    } else {
+        None
+    };
     if matches!(mode, BranchListMode::Local | BranchListMode::All)
         && current.is_none()
         && show_detached
         && let Some(line) = detached_head_branch_line()
     {
-        if color {
-            println!("* \x1b[32m{line}\x1b[m");
+        if let Some(colors) = &colors {
+            println!("* {}", colors.paint(BranchColorSlot::Current, &line));
         } else {
             println!("* {line}");
         }
@@ -9874,20 +9883,13 @@ fn print_branch_refs(
                 ' '
             };
             let target = local_symbolic_branch_target(&reference);
-            if color && marker == '*' {
-                print!("{marker} \x1b[32m{name}\x1b[m");
-                if let Some(target) = target {
-                    print!(" -> {target}");
-                }
-                println!();
-            } else if color && marker == '+' {
-                print!("{marker} \x1b[36m{name}\x1b[m");
-                if let Some(target) = target {
-                    print!(" -> {target}");
-                }
-                println!();
-            } else if color {
-                print!("{marker} {name}\x1b[m");
+            if let Some(colors) = &colors {
+                let slot = match marker {
+                    '*' => BranchColorSlot::Current,
+                    '+' => BranchColorSlot::Worktree,
+                    _ => BranchColorSlot::Local,
+                };
+                print!("{marker} {}", colors.paint(slot, name));
                 if let Some(target) = target {
                     print!(" -> {target}");
                 }
@@ -9912,8 +9914,8 @@ fn print_branch_refs(
             if !include(&reference, name) {
                 continue;
             }
-            if color {
-                println!("  \x1b[31m{display}\x1b[m");
+            if let Some(colors) = &colors {
+                println!("  {}", colors.paint(BranchColorSlot::Remote, &display));
             } else {
                 println!("  {display}");
             }
@@ -9931,13 +9933,21 @@ fn collect_branch_rows(
     mut include: impl FnMut(&sley_refs::Ref, &str) -> bool,
 ) -> Result<Vec<String>> {
     let mut rows = Vec::new();
+    let colors = if color {
+        Some(branch_list_colors_from_current_repo()?)
+    } else {
+        None
+    };
     if matches!(mode, BranchListMode::Local | BranchListMode::All)
         && current.is_none()
         && show_detached
         && let Some(line) = detached_head_branch_line()
     {
-        if color {
-            rows.push(format!("* \x1b[32m{line}\x1b[m"));
+        if let Some(colors) = &colors {
+            rows.push(format!(
+                "* {}",
+                colors.paint(BranchColorSlot::Current, &line)
+            ));
         } else {
             rows.push(format!("* {line}"));
         }
@@ -9960,14 +9970,13 @@ fn collect_branch_rows(
                 ' '
             };
             let target = local_symbolic_branch_target(&reference);
-            if color && marker == '*' {
-                let mut row = format!("{marker} \x1b[32m{name}\x1b[m");
-                if let Some(target) = target {
-                    row.push_str(&format!(" -> {target}"));
-                }
-                rows.push(row);
-            } else if color {
-                let mut row = format!("{marker} {name}\x1b[m");
+            if let Some(colors) = &colors {
+                let slot = if marker == '*' {
+                    BranchColorSlot::Current
+                } else {
+                    BranchColorSlot::Local
+                };
+                let mut row = format!("{marker} {}", colors.paint(slot, name));
                 if let Some(target) = target {
                     row.push_str(&format!(" -> {target}"));
                 }
@@ -9992,8 +10001,11 @@ fn collect_branch_rows(
             if !include(&reference, name) {
                 continue;
             }
-            if color {
-                rows.push(format!("  \x1b[31m{display}\x1b[m"));
+            if let Some(colors) = &colors {
+                rows.push(format!(
+                    "  {}",
+                    colors.paint(BranchColorSlot::Remote, &display)
+                ));
             } else {
                 rows.push(format!("  {display}"));
             }
@@ -10035,6 +10047,57 @@ fn remote_branch_display(reference: &sley_refs::Ref, name: &str, mode: BranchLis
         return display;
     };
     format!("{display} -> {target_name}")
+}
+
+#[derive(Clone, Copy)]
+enum BranchColorSlot {
+    Current,
+    Local,
+    Remote,
+    Worktree,
+}
+
+struct BranchListColors {
+    current: String,
+    local: String,
+    remote: String,
+    worktree: String,
+    reset: String,
+}
+
+impl BranchListColors {
+    fn from_config(config: &GitConfig) -> Self {
+        Self {
+            current: branch_color(config, "current", "green"),
+            local: branch_color(config, "local", "normal"),
+            remote: branch_color(config, "remote", "red"),
+            worktree: branch_color(config, "worktree", "cyan"),
+            reset: git_color_spec_to_ansi("reset", true),
+        }
+    }
+
+    fn paint(&self, slot: BranchColorSlot, text: &str) -> String {
+        let color = match slot {
+            BranchColorSlot::Current => &self.current,
+            BranchColorSlot::Local => &self.local,
+            BranchColorSlot::Remote => &self.remote,
+            BranchColorSlot::Worktree => &self.worktree,
+        };
+        format!("{color}{text}{}", self.reset)
+    }
+}
+
+fn branch_list_colors_from_current_repo() -> Result<BranchListColors> {
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let config = read_repo_config(&git_dir)?;
+    Ok(BranchListColors::from_config(&config))
+}
+
+fn branch_color(config: &GitConfig, key: &str, default: &str) -> String {
+    git_color_spec_to_ansi(
+        config.get("color", Some("branch"), key).unwrap_or(default),
+        true,
+    )
 }
 
 fn print_branch_columns(rows: &[String], style: BranchColumnStyle) -> Result<()> {
@@ -10160,6 +10223,11 @@ fn print_branch_list_verbose(
         });
     }
     let width = rows.iter().map(|row| row.display.len()).max().unwrap_or(0);
+    let colors = if options.color {
+        Some(branch_list_colors_from_current_repo()?)
+    } else {
+        None
+    };
     for row in rows {
         let marker = if row.is_head {
             '*'
@@ -10176,14 +10244,22 @@ fn print_branch_list_verbose(
         {
             tracking.push_str(&format!(" ({worktree_path})"));
         }
-        println!(
-            "{marker} {:width$} {}{} {}",
-            row.display,
-            row.oid,
-            tracking,
-            row.subject,
-            width = width
-        );
+        let display = format!("{:<width$}", row.display, width = width);
+        let display = if let Some(colors) = &colors {
+            let slot = if row.is_head {
+                BranchColorSlot::Current
+            } else if row.worktree_path.is_some() {
+                BranchColorSlot::Worktree
+            } else if row.display.starts_with("remotes/") {
+                BranchColorSlot::Remote
+            } else {
+                BranchColorSlot::Local
+            };
+            colors.paint(slot, &display)
+        } else {
+            display
+        };
+        println!("{marker} {display} {}{} {}", row.oid, tracking, row.subject);
     }
     Ok(())
 }

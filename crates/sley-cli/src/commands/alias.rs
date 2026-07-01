@@ -211,6 +211,10 @@ pub(crate) fn run_shell_alias(command: &str, extra_args: &[String]) -> Result<()
 
     let mut process = ProcessCommand::new(&prepared[0]);
     process.args(&prepared[1..]);
+    process.env(
+        "SLEY_TRACE2_DEPTH",
+        (sley_core::trace2::depth() + 1).to_string(),
+    );
     configure_shell_alias_worktree_env(&mut process)?;
     // Propagate the effective config-injection parameters (`-c` / `--config-env`
     // folded onto any inherited `GIT_CONFIG_PARAMETERS`) to the subprocess git,

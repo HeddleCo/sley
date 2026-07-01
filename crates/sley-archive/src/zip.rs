@@ -26,6 +26,9 @@ const ZIP_UTF8: u16 = 1 << 11;
 /// (`flags` + 4-byte little-endian mtime), flag bit 1 = "mtime present".
 const ZIP_EXTRA_MTIME_SIZE: u16 = 9;
 const ZIP_EXTRA_MTIME_PAYLOAD_SIZE: u16 = 5;
+const ZIP_MAX_16: u64 = 0xffff;
+const ZIP_MAX_32: u64 = 0xffff_ffff;
+const ZIP64_END_OF_CENTRAL_DIRECTORY_RECORD_SIZE: u64 = 44;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZipArchiveOptions {
@@ -324,16 +327,27 @@ impl<W: Write + ?Sized> ZipSink<'_, W> {
     /// present, becomes the archive comment (the hex object id).
     fn write_trailer(&mut self, commit_id: Option<&ObjectId>, format: ObjectFormat) -> Result<()> {
         self.writer.write_all(&self.central_dir)?;
+        let central_dir_size = self.central_dir.len() as u64;
+        let central_dir_offset = self.offset;
         let comment = commit_id.map(|oid| oid.to_string().into_bytes());
         let comment_len = comment.as_ref().map_or(0, |c| c.len());
+        let mut clamped = false;
+        let entries = clamp_u16(self.entries, &mut clamped);
+        let central_dir_size_32 = clamp_u32(central_dir_size, &mut clamped);
+        let central_dir_offset_32 = clamp_u32(central_dir_offset, &mut clamped);
+
+        if clamped {
+            self.write_zip64_trailer(central_dir_size, central_dir_offset)?;
+        }
+
         let mut trailer = Vec::with_capacity(22);
         trailer.extend_from_slice(&0x06054b50u32.to_le_bytes());
         trailer.extend_from_slice(&0u16.to_le_bytes()); // disk
         trailer.extend_from_slice(&0u16.to_le_bytes()); // dir start disk
-        trailer.extend_from_slice(&(self.entries as u16).to_le_bytes());
-        trailer.extend_from_slice(&(self.entries as u16).to_le_bytes());
-        trailer.extend_from_slice(&(self.central_dir.len() as u32).to_le_bytes());
-        trailer.extend_from_slice(&(self.offset as u32).to_le_bytes());
+        trailer.extend_from_slice(&entries.to_le_bytes());
+        trailer.extend_from_slice(&entries.to_le_bytes());
+        trailer.extend_from_slice(&central_dir_size_32.to_le_bytes());
+        trailer.extend_from_slice(&central_dir_offset_32.to_le_bytes());
         trailer.extend_from_slice(&(comment_len as u16).to_le_bytes());
         self.writer.write_all(&trailer)?;
         if let Some(comment) = comment {
@@ -341,6 +355,53 @@ impl<W: Write + ?Sized> ZipSink<'_, W> {
         }
         let _ = format;
         Ok(())
+    }
+
+    fn write_zip64_trailer(
+        &mut self,
+        central_dir_size: u64,
+        central_dir_offset: u64,
+    ) -> Result<()> {
+        let zip64_offset = central_dir_offset + central_dir_size;
+
+        let mut trailer = Vec::with_capacity(56);
+        trailer.extend_from_slice(&0x06064b50u32.to_le_bytes());
+        trailer.extend_from_slice(&ZIP64_END_OF_CENTRAL_DIRECTORY_RECORD_SIZE.to_le_bytes());
+        trailer.extend_from_slice(&self.max_creator_version.to_le_bytes());
+        trailer.extend_from_slice(&45u16.to_le_bytes());
+        trailer.extend_from_slice(&0u32.to_le_bytes()); // disk
+        trailer.extend_from_slice(&0u32.to_le_bytes()); // dir start disk
+        trailer.extend_from_slice(&self.entries.to_le_bytes());
+        trailer.extend_from_slice(&self.entries.to_le_bytes());
+        trailer.extend_from_slice(&central_dir_size.to_le_bytes());
+        trailer.extend_from_slice(&central_dir_offset.to_le_bytes());
+        self.writer.write_all(&trailer)?;
+
+        let mut locator = Vec::with_capacity(20);
+        locator.extend_from_slice(&0x07064b50u32.to_le_bytes());
+        locator.extend_from_slice(&0u32.to_le_bytes()); // zip64 trailer disk
+        locator.extend_from_slice(&zip64_offset.to_le_bytes());
+        locator.extend_from_slice(&1u32.to_le_bytes()); // number of disks
+        self.writer.write_all(&locator)?;
+        Ok(())
+    }
+}
+
+fn clamp_u16(value: u64, clamped: &mut bool) -> u16 {
+    if value > ZIP_MAX_16 {
+        *clamped = true;
+        u16::MAX
+    } else {
+        value as u16
+    }
+}
+
+fn clamp_u32(value: u64, clamped: &mut bool) -> u32 {
+    if value > ZIP_MAX_32 {
+        *clamped = true;
+        u32::MAX
+    } else {
+        value as u32
     }
 }
 
@@ -417,4 +478,66 @@ fn has_only_ascii(s: &[u8]) -> bool {
 /// Minimal UTF-8 validity check (git's `is_utf8`).
 fn is_utf8(s: &[u8]) -> bool {
     std::str::from_utf8(s).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_u16(data: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(data[offset..offset + 2].try_into().expect("u16 bytes"))
+    }
+
+    fn read_u32(data: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(data[offset..offset + 4].try_into().expect("u32 bytes"))
+    }
+
+    fn read_u64(data: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(data[offset..offset + 8].try_into().expect("u64 bytes"))
+    }
+
+    #[test]
+    fn trailer_uses_zip64_when_entry_count_overflows_classic_eocd() {
+        let mut archive = Vec::new();
+        let central_dir = b"central".to_vec();
+        let mut sink = ZipSink {
+            writer: &mut archive,
+            central_dir,
+            offset: 123,
+            entries: 65_792,
+            max_creator_version: 0,
+            mtime: 0,
+            zip_date: 0,
+            zip_time: 0,
+            compression_level: 0,
+        };
+
+        sink.write_trailer(None, ObjectFormat::Sha1)
+            .expect("trailer should be written");
+
+        assert_eq!(&archive[..7], b"central");
+
+        let zip64 = 7;
+        assert_eq!(read_u32(&archive, zip64), 0x06064b50);
+        assert_eq!(
+            read_u64(&archive, zip64 + 4),
+            ZIP64_END_OF_CENTRAL_DIRECTORY_RECORD_SIZE
+        );
+        assert_eq!(read_u16(&archive, zip64 + 14), 45);
+        assert_eq!(read_u64(&archive, zip64 + 24), 65_792);
+        assert_eq!(read_u64(&archive, zip64 + 32), 65_792);
+        assert_eq!(read_u64(&archive, zip64 + 40), 7);
+        assert_eq!(read_u64(&archive, zip64 + 48), 123);
+
+        let locator = zip64 + 56;
+        assert_eq!(read_u32(&archive, locator), 0x07064b50);
+        assert_eq!(read_u64(&archive, locator + 8), 130);
+
+        let eocd = locator + 20;
+        assert_eq!(read_u32(&archive, eocd), 0x06054b50);
+        assert_eq!(read_u16(&archive, eocd + 8), u16::MAX);
+        assert_eq!(read_u16(&archive, eocd + 10), u16::MAX);
+        assert_eq!(read_u32(&archive, eocd + 12), 7);
+        assert_eq!(read_u32(&archive, eocd + 16), 123);
+    }
 }

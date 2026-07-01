@@ -295,6 +295,21 @@ fn rev_list_linear_history_matches_upstream_git() {
             vec!["rev-list", "--objects", "--filter=tree:2", "HEAD"],
             vec!["rev-list", "--objects", "--filter=object:type=blob", "HEAD"],
             vec!["rev-list", "--filter=object:type=blob", "--objects", "HEAD"],
+            vec![
+                "rev-list",
+                "--objects",
+                "--filter=blob:limit=1000",
+                "--filter=object:type=blob",
+                "HEAD",
+            ],
+            vec![
+                "rev-list",
+                "--objects",
+                "--filter-provided-objects",
+                "--filter=blob:limit=1000",
+                "--filter=object:type=blob",
+                "HEAD",
+            ],
             vec!["rev-list", "--objects", "--filter=object:type=tree", "HEAD"],
             vec![
                 "rev-list",

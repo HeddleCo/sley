@@ -81,6 +81,9 @@ pub struct FetchOptions {
     pub prune_tags: bool,
     /// Plan and report the fetch without installing objects or updating refs.
     pub dry_run: bool,
+    /// Force ref updates (`git fetch --force`), equivalent to applying `+` to
+    /// each effective refspec.
+    pub force: bool,
     /// Append to `FETCH_HEAD` instead of truncating it.
     pub append: bool,
     /// Write `FETCH_HEAD` (the CLI's `--write-fetch-head`).
@@ -303,10 +306,15 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             }
         }
     }
-    let parsed_refspecs = effective_refspecs
+    let mut parsed_refspecs = effective_refspecs
         .iter()
         .map(|refspec| parse_refspec(refspec))
         .collect::<Result<Vec<_>>>()?;
+    if options.force {
+        for refspec in &mut parsed_refspecs {
+            refspec.force = true;
+        }
+    }
     if options.refmap.is_some() && request.refspecs.is_empty() {
         return Err(GitError::Command(
             "--refmap option is only meaningful with command-line refspec(s)".into(),
@@ -2062,6 +2070,7 @@ mod tests {
             prune: false,
             prune_tags: false,
             dry_run: false,
+            force: false,
             append: false,
             write_fetch_head: true,
             tag_option_explicit: true,

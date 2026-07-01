@@ -8,7 +8,7 @@ use sley_formats::Bundle;
 use sley_object::{EncodedObject, ObjectType};
 use std::borrow::Borrow;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -349,6 +349,7 @@ pub struct PackBitmapIndex {
     pub index_checksum: ObjectId,
     pub type_bitmaps: PackBitmapTypeBitmaps,
     pub entries: Vec<PackBitmapEntry>,
+    pub pseudo_merges: Vec<PackBitmapPseudoMerge>,
     pub name_hash_cache: Option<Vec<u32>>,
 }
 
@@ -371,6 +372,16 @@ pub struct PackBitmapEntry {
     pub flags: u8,
     /// Reachability bitmap; bit `i` refers to the `i`-th object in *pack
     /// order* (offset order), as mapped by the pack's reverse index.
+    pub bitmap: EwahBitmap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackBitmapPseudoMerge {
+    /// Commit bits, in the bitmap's bit-numbering order, covered by this
+    /// pseudo-merge.
+    pub commits: EwahBitmap,
+    /// Object reachability closure for the pseudo-merge's commits, in the same
+    /// bit-numbering order.
     pub bitmap: EwahBitmap,
 }
 
@@ -3057,6 +3068,7 @@ impl PackMtimes {
 impl PackBitmapIndex {
     pub const OPTION_FULL_DAG: u16 = 0x0001;
     pub const OPTION_HASH_CACHE: u16 = 0x0004;
+    pub const OPTION_PSEUDO_MERGES: u16 = 0x0020;
 
     pub fn parse(bytes: &[u8], format: ObjectFormat, object_count: usize) -> Result<Self> {
         let hash_len = format.raw_len();
@@ -3078,7 +3090,8 @@ impl PackBitmapIndex {
             )));
         }
         let options = u16_be(&bytes[6..8]);
-        let known_options = Self::OPTION_FULL_DAG | Self::OPTION_HASH_CACHE;
+        let known_options =
+            Self::OPTION_FULL_DAG | Self::OPTION_HASH_CACHE | Self::OPTION_PSEUDO_MERGES;
         if options & !known_options != 0 {
             return Err(GitError::Unsupported(format!(
                 "bitmap index options {:#06x}",
@@ -3094,20 +3107,56 @@ impl PackBitmapIndex {
                 "bitmap index checksum mismatch: expected {index_checksum}, got {actual_index_checksum}"
             )));
         }
+        let mut extras_end = checksum_offset;
+        let hash_cache_range = if options & Self::OPTION_HASH_CACHE != 0 {
+            let cache_len = object_count
+                .checked_mul(4)
+                .ok_or_else(|| GitError::InvalidFormat("bitmap hash cache overflow".into()))?;
+            if cache_len > extras_end {
+                return Err(GitError::InvalidFormat(
+                    "truncated bitmap hash cache".into(),
+                ));
+            }
+            extras_end -= cache_len;
+            Some(extras_end..extras_end + cache_len)
+        } else {
+            None
+        };
+        let pseudo_merge_range = if options & Self::OPTION_PSEUDO_MERGES != 0 {
+            if extras_end < 24 {
+                return Err(GitError::InvalidFormat(
+                    "truncated bitmap pseudo-merge extension".into(),
+                ));
+            }
+            let extension_size = u64_be(&bytes[extras_end - 8..extras_end]) as usize;
+            if extension_size > extras_end {
+                return Err(GitError::InvalidFormat(
+                    "bitmap pseudo-merge extension points before file start".into(),
+                ));
+            }
+            let start = extras_end - extension_size;
+            Some(start..extras_end)
+        } else {
+            None
+        };
+        let entries_end = pseudo_merge_range
+            .as_ref()
+            .map(|range| range.start)
+            .unwrap_or(extras_end);
 
         let pack_checksum_end = 12usize
             .checked_add(hash_len)
             .ok_or_else(|| GitError::InvalidFormat("bitmap index length overflow".into()))?;
         let pack_checksum = ObjectId::from_raw(format, &bytes[12..pack_checksum_end])?;
         let mut offset = pack_checksum_end;
-        let commits = parse_bitmap_ewah(bytes, &mut offset, checksum_offset, object_count)?;
-        let trees = parse_bitmap_ewah(bytes, &mut offset, checksum_offset, object_count)?;
-        let blobs = parse_bitmap_ewah(bytes, &mut offset, checksum_offset, object_count)?;
-        let tags = parse_bitmap_ewah(bytes, &mut offset, checksum_offset, object_count)?;
+        let commits = parse_bitmap_ewah(bytes, &mut offset, entries_end, object_count)?;
+        let trees = parse_bitmap_ewah(bytes, &mut offset, entries_end, object_count)?;
+        let blobs = parse_bitmap_ewah(bytes, &mut offset, entries_end, object_count)?;
+        let tags = parse_bitmap_ewah(bytes, &mut offset, entries_end, object_count)?;
 
         let mut entries = Vec::with_capacity(entry_count);
         for idx in 0..entry_count {
-            if checksum_offset.saturating_sub(offset) < 6 {
+            if entries_end.saturating_sub(offset) < 6 {
                 return Err(GitError::InvalidFormat(
                     "truncated bitmap index entry".into(),
                 ));
@@ -3128,7 +3177,7 @@ impl PackBitmapIndex {
             }
             let flags = bytes[offset];
             offset += 1;
-            let bitmap = parse_bitmap_ewah(bytes, &mut offset, checksum_offset, object_count)?;
+            let bitmap = parse_bitmap_ewah(bytes, &mut offset, entries_end, object_count)?;
             entries.push(PackBitmapEntry {
                 object_position,
                 xor_offset,
@@ -3137,16 +3186,22 @@ impl PackBitmapIndex {
             });
         }
 
-        let name_hash_cache = if options & Self::OPTION_HASH_CACHE != 0 {
-            let cache_len = object_count
-                .checked_mul(4)
-                .ok_or_else(|| GitError::InvalidFormat("bitmap hash cache overflow".into()))?;
-            if checksum_offset.saturating_sub(offset) < cache_len {
-                return Err(GitError::InvalidFormat(
-                    "truncated bitmap hash cache".into(),
-                ));
-            }
+        if offset != entries_end {
+            return Err(GitError::InvalidFormat(format!(
+                "bitmap index has {} trailing entry bytes",
+                entries_end - offset
+            )));
+        }
+
+        let pseudo_merges = if let Some(range) = pseudo_merge_range {
+            parse_bitmap_pseudo_merges(bytes, range, object_count)?
+        } else {
+            Vec::new()
+        };
+
+        let name_hash_cache = if let Some(range) = hash_cache_range {
             let mut cache = Vec::with_capacity(object_count);
+            let mut offset = range.start;
             for _ in 0..object_count {
                 cache.push(u32_be(&bytes[offset..offset + 4]));
                 offset += 4;
@@ -3155,13 +3210,6 @@ impl PackBitmapIndex {
         } else {
             None
         };
-
-        if offset != checksum_offset {
-            return Err(GitError::InvalidFormat(format!(
-                "bitmap index has {} trailing bytes",
-                checksum_offset - offset
-            )));
-        }
 
         Ok(Self {
             version,
@@ -3176,6 +3224,7 @@ impl PackBitmapIndex {
                 tags,
             },
             entries,
+            pseudo_merges,
             name_hash_cache,
         })
     }
@@ -3187,6 +3236,74 @@ impl PackBitmapIndex {
             .iter()
             .find(|entry| entry.object_position == position)
     }
+}
+
+fn parse_bitmap_pseudo_merges(
+    bytes: &[u8],
+    range: std::ops::Range<usize>,
+    object_count: usize,
+) -> Result<Vec<PackBitmapPseudoMerge>> {
+    if range.end < range.start || range.end > bytes.len() || range.end - range.start < 24 {
+        return Err(GitError::InvalidFormat(
+            "truncated bitmap pseudo-merge extension".into(),
+        ));
+    }
+    let trailer_start = range.end - 24;
+    let pseudo_merge_count = u32_be(&bytes[trailer_start..trailer_start + 4]) as usize;
+    let commit_count = u32_be(&bytes[trailer_start + 4..trailer_start + 8]) as usize;
+    let lookup_offset = u64_be(&bytes[trailer_start + 8..trailer_start + 16]) as usize;
+    let extension_size = u64_be(&bytes[trailer_start + 16..trailer_start + 24]) as usize;
+    if extension_size != range.end - range.start {
+        return Err(GitError::InvalidFormat(
+            "bitmap pseudo-merge extension size mismatch".into(),
+        ));
+    }
+    let lookup_start = range
+        .start
+        .checked_add(lookup_offset)
+        .ok_or_else(|| GitError::InvalidFormat("bitmap pseudo-merge lookup overflow".into()))?;
+    if lookup_start > trailer_start {
+        return Err(GitError::InvalidFormat(
+            "bitmap pseudo-merge lookup points past extension".into(),
+        ));
+    }
+    let lookup_len = commit_count
+        .checked_mul(12)
+        .ok_or_else(|| GitError::InvalidFormat("bitmap pseudo-merge lookup overflow".into()))?;
+    if lookup_start
+        .checked_add(lookup_len)
+        .is_none_or(|end| end > trailer_start)
+    {
+        return Err(GitError::InvalidFormat(
+            "truncated bitmap pseudo-merge lookup".into(),
+        ));
+    }
+    let position_table_len = pseudo_merge_count.checked_mul(8).ok_or_else(|| {
+        GitError::InvalidFormat("bitmap pseudo-merge position table overflow".into())
+    })?;
+    let position_table_start = trailer_start
+        .checked_sub(position_table_len)
+        .filter(|start| *start >= range.start)
+        .ok_or_else(|| {
+            GitError::InvalidFormat("truncated bitmap pseudo-merge position table".into())
+        })?;
+
+    let mut pseudo_merges = Vec::with_capacity(pseudo_merge_count);
+    let mut cursor = position_table_start;
+    for _ in 0..pseudo_merge_count {
+        let pseudo_offset = u64_be(&bytes[cursor..cursor + 8]) as usize;
+        cursor += 8;
+        if pseudo_offset < range.start || pseudo_offset >= position_table_start {
+            return Err(GitError::InvalidFormat(
+                "bitmap pseudo-merge offset out of range".into(),
+            ));
+        }
+        let mut offset = pseudo_offset;
+        let commits = parse_bitmap_ewah(bytes, &mut offset, range.end, object_count)?;
+        let bitmap = parse_bitmap_ewah(bytes, &mut offset, range.end, object_count)?;
+        pseudo_merges.push(PackBitmapPseudoMerge { commits, bitmap });
+    }
+    Ok(pseudo_merges)
 }
 
 fn parse_bitmap_ewah(
@@ -6442,6 +6559,7 @@ pub struct PackBitmapWriter {
     tag_positions: Vec<u32>,
     name_hash_cache: Option<Vec<u32>>,
     selected: Vec<SelectedCommit>,
+    pseudo_merges: Vec<PackBitmapPseudoMerge>,
 }
 
 #[derive(Debug, Clone)]
@@ -6505,6 +6623,7 @@ impl PackBitmapWriter {
             tag_positions,
             name_hash_cache: None,
             selected: Vec::new(),
+            pseudo_merges: Vec::new(),
         })
     }
 
@@ -6577,6 +6696,44 @@ impl PackBitmapWriter {
         Ok(())
     }
 
+    /// Registers a pseudo-merge bitmap. Both `commits` and `reachable` are
+    /// positions in the bitmap's bit-numbering order (pack order for a single
+    /// pack, pseudo-pack order for a MIDX). Every commit position must refer to
+    /// a commit object; every reachable position must be in range.
+    pub fn add_pseudo_merge(&mut self, commits: &[u32], reachable: &[u32]) -> Result<()> {
+        if commits.is_empty() {
+            return Err(GitError::InvalidFormat(
+                "pseudo-merge must contain at least one commit".into(),
+            ));
+        }
+        for &position in commits {
+            if position >= self.object_count {
+                return Err(GitError::InvalidFormat(format!(
+                    "pseudo-merge commit position {position} out of range for {} objects",
+                    self.object_count
+                )));
+            }
+            if !self.commit_positions.contains(&position) {
+                return Err(GitError::InvalidFormat(format!(
+                    "pseudo-merge commit position {position} is not a commit object"
+                )));
+            }
+        }
+        for &position in reachable {
+            if position >= self.object_count {
+                return Err(GitError::InvalidFormat(format!(
+                    "pseudo-merge reachable position {position} out of range for {} objects",
+                    self.object_count
+                )));
+            }
+        }
+        self.pseudo_merges.push(PackBitmapPseudoMerge {
+            commits: EwahBitmap::from_positions(self.object_count, commits)?,
+            bitmap: EwahBitmap::from_positions(self.object_count, reachable)?,
+        });
+        Ok(())
+    }
+
     /// Builds the in-memory [`PackBitmapIndex`] without serialising it.
     ///
     /// The resulting index always advertises
@@ -6604,6 +6761,9 @@ impl PackBitmapWriter {
         if self.name_hash_cache.is_some() {
             options |= PackBitmapIndex::OPTION_HASH_CACHE;
         }
+        if !self.pseudo_merges.is_empty() {
+            options |= PackBitmapIndex::OPTION_PSEUDO_MERGES;
+        }
 
         // The index checksum is only known once the body is serialised; the
         // dedicated `write` path fills it in. `build` reports a placeholder of
@@ -6623,6 +6783,7 @@ impl PackBitmapWriter {
                 tags,
             },
             entries,
+            pseudo_merges: self.pseudo_merges.clone(),
             name_hash_cache: self.name_hash_cache.clone(),
         })
     }
@@ -6641,8 +6802,8 @@ impl PackBitmapIndex {
     /// `BITM`, version (u16 BE), options (u16 BE), entry count (u32 BE), the
     /// pack checksum, the four type bitmaps (commits, trees, blobs, tags), each
     /// commit entry (object position, XOR offset, flags, EWAH bitmap), the
-    /// optional name-hash cache, and finally the trailing index checksum over
-    /// everything written so far.
+    /// optional pseudo-merge extension, the optional name-hash cache, and
+    /// finally the trailing index checksum over everything written so far.
     ///
     /// The `index_checksum` field of `self` is ignored and recomputed from the
     /// serialised body. Returns an error for unsupported versions, mismatched
@@ -6655,11 +6816,16 @@ impl PackBitmapIndex {
                 self.version
             )));
         }
-        let known_options = Self::OPTION_FULL_DAG | Self::OPTION_HASH_CACHE;
-        if self.options & !known_options != 0 {
+        let mut options = self.options;
+        if !self.pseudo_merges.is_empty() {
+            options |= Self::OPTION_PSEUDO_MERGES;
+        }
+        let known_options =
+            Self::OPTION_FULL_DAG | Self::OPTION_HASH_CACHE | Self::OPTION_PSEUDO_MERGES;
+        if options & !known_options != 0 {
             return Err(GitError::Unsupported(format!(
                 "bitmap index options {:#06x}",
-                self.options & !known_options
+                options & !known_options
             )));
         }
         if self.pack_checksum.format() != self.format {
@@ -6672,7 +6838,12 @@ impl PackBitmapIndex {
                 "too many bitmap index entries".into(),
             ));
         }
-        let want_cache = self.options & Self::OPTION_HASH_CACHE != 0;
+        if options & Self::OPTION_PSEUDO_MERGES != 0 && self.pseudo_merges.is_empty() {
+            return Err(GitError::InvalidFormat(
+                "OPTION_PSEUDO_MERGES set without pseudo-merge records".into(),
+            ));
+        }
+        let want_cache = options & Self::OPTION_HASH_CACHE != 0;
         match (&self.name_hash_cache, want_cache) {
             (Some(_), false) => {
                 return Err(GitError::InvalidFormat(
@@ -6690,7 +6861,7 @@ impl PackBitmapIndex {
         let mut out = Vec::new();
         out.extend_from_slice(b"BITM");
         out.extend_from_slice(&self.version.to_be_bytes());
-        out.extend_from_slice(&self.options.to_be_bytes());
+        out.extend_from_slice(&options.to_be_bytes());
         out.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
         out.extend_from_slice(self.pack_checksum.as_bytes());
 
@@ -6711,6 +6882,10 @@ impl PackBitmapIndex {
             entry.bitmap.append_bytes(&mut out);
         }
 
+        if !self.pseudo_merges.is_empty() {
+            append_bitmap_pseudo_merges(&mut out, &self.pseudo_merges)?;
+        }
+
         if let Some(cache) = &self.name_hash_cache {
             for value in cache {
                 out.extend_from_slice(&value.to_be_bytes());
@@ -6721,6 +6896,112 @@ impl PackBitmapIndex {
         out.extend_from_slice(checksum.as_bytes());
         Ok(out)
     }
+}
+
+fn append_bitmap_pseudo_merges(
+    out: &mut Vec<u8>,
+    pseudo_merges: &[PackBitmapPseudoMerge],
+) -> Result<()> {
+    if pseudo_merges.len() > u32::MAX as usize {
+        return Err(GitError::InvalidFormat(
+            "too many pseudo-merge bitmap records".into(),
+        ));
+    }
+    let start = out.len();
+    let mut pseudo_offsets = Vec::with_capacity(pseudo_merges.len());
+    let mut commit_to_offsets: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
+    for merge in pseudo_merges {
+        let offset = u64::try_from(out.len())
+            .map_err(|_| GitError::InvalidFormat("bitmap file offset overflow".into()))?;
+        pseudo_offsets.push(offset);
+        for commit_pos in merge.commits.to_positions()? {
+            commit_to_offsets
+                .entry(commit_pos)
+                .or_default()
+                .push(offset);
+        }
+        merge.commits.append_bytes(out);
+        merge.bitmap.append_bytes(out);
+    }
+    if commit_to_offsets.len() > u32::MAX as usize {
+        return Err(GitError::InvalidFormat(
+            "too many pseudo-merge commits".into(),
+        ));
+    }
+
+    let lookup_start = out.len();
+    let lookup_len = commit_to_offsets
+        .len()
+        .checked_mul(12)
+        .ok_or_else(|| GitError::InvalidFormat("pseudo-merge lookup overflow".into()))?;
+    let mut next_extended = u64::try_from(
+        lookup_start
+            .checked_add(lookup_len)
+            .ok_or_else(|| GitError::InvalidFormat("pseudo-merge lookup overflow".into()))?,
+    )
+    .map_err(|_| GitError::InvalidFormat("bitmap file offset overflow".into()))?;
+    let mut rows = Vec::with_capacity(commit_to_offsets.len());
+    for (commit_pos, offsets) in commit_to_offsets {
+        let extended_offset = if offsets.len() > 1 {
+            if next_extended & (1u64 << 63) != 0 {
+                return Err(GitError::InvalidFormat(
+                    "pseudo-merge extended offset overflow".into(),
+                ));
+            }
+            let offset = next_extended;
+            let ext_len = offsets
+                .len()
+                .checked_mul(8)
+                .and_then(|len| len.checked_add(4))
+                .ok_or_else(|| {
+                    GitError::InvalidFormat("pseudo-merge extended lookup overflow".into())
+                })?;
+            next_extended = next_extended.checked_add(ext_len as u64).ok_or_else(|| {
+                GitError::InvalidFormat("pseudo-merge extended lookup overflow".into())
+            })?;
+            Some(offset)
+        } else {
+            None
+        };
+        rows.push((commit_pos, offsets, extended_offset));
+    }
+
+    for (commit_pos, offsets, extended_offset) in &rows {
+        out.extend_from_slice(&commit_pos.to_be_bytes());
+        match extended_offset {
+            Some(offset) => out.extend_from_slice(&(offset | (1u64 << 63)).to_be_bytes()),
+            None => out.extend_from_slice(&offsets[0].to_be_bytes()),
+        }
+    }
+
+    for (_commit_pos, offsets, extended_offset) in &rows {
+        if extended_offset.is_none() {
+            continue;
+        }
+        let count = u32::try_from(offsets.len())
+            .map_err(|_| GitError::InvalidFormat("pseudo-merge extended lookup overflow".into()))?;
+        out.extend_from_slice(&count.to_be_bytes());
+        for offset in offsets {
+            out.extend_from_slice(&offset.to_be_bytes());
+        }
+    }
+
+    for offset in &pseudo_offsets {
+        out.extend_from_slice(&offset.to_be_bytes());
+    }
+    out.extend_from_slice(&(pseudo_merges.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+    let lookup_relative = lookup_start
+        .checked_sub(start)
+        .ok_or_else(|| GitError::InvalidFormat("pseudo-merge lookup underflow".into()))?;
+    out.extend_from_slice(&(lookup_relative as u64).to_be_bytes());
+    let extension_size = out
+        .len()
+        .checked_sub(start)
+        .and_then(|len| len.checked_add(8))
+        .ok_or_else(|| GitError::InvalidFormat("pseudo-merge extension overflow".into()))?;
+    out.extend_from_slice(&(extension_size as u64).to_be_bytes());
+    Ok(())
 }
 
 /// Convenience wrapper that builds a `.bitmap` file in one call.

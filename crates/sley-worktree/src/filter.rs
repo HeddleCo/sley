@@ -950,6 +950,7 @@ pub(crate) static PROCESS_FILTER_ABORTED: OnceLock<Mutex<HashSet<String>>> = Onc
 pub type ProcessFilterMetadata = Vec<(String, String)>;
 pub(crate) static PROCESS_FILTER_METADATA: OnceLock<Mutex<Option<ProcessFilterMetadata>>> =
     OnceLock::new();
+pub(crate) static PROCESS_FILTER_CWD: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
 /// Restores the previous process-filter metadata when dropped.
 pub struct ProcessFilterMetadataGuard {
@@ -978,8 +979,38 @@ pub fn set_process_filter_metadata(
     ProcessFilterMetadataGuard { previous }
 }
 
+/// Restores the previous process-filter working directory when dropped.
+pub struct ProcessFilterCwdGuard {
+    previous: Option<PathBuf>,
+}
+
+impl Drop for ProcessFilterCwdGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = PROCESS_FILTER_CWD.get_or_init(|| Mutex::new(None)).lock() {
+            *guard = self.previous.take();
+        }
+    }
+}
+
+pub fn set_process_filter_cwd(cwd: Option<PathBuf>) -> ProcessFilterCwdGuard {
+    let mutex = PROCESS_FILTER_CWD.get_or_init(|| Mutex::new(None));
+    let previous = mutex
+        .lock()
+        .map(|mut guard| std::mem::replace(&mut *guard, cwd))
+        .unwrap_or(None);
+    ProcessFilterCwdGuard { previous }
+}
+
 pub(crate) fn current_process_filter_metadata() -> Option<ProcessFilterMetadata> {
     PROCESS_FILTER_METADATA
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+pub(crate) fn current_process_filter_cwd() -> Option<PathBuf> {
+    PROCESS_FILTER_CWD
         .get_or_init(|| Mutex::new(None))
         .lock()
         .ok()
@@ -1000,9 +1031,19 @@ pub(crate) enum ProcessFilterOutcome {
     Status(String),
 }
 
+pub(crate) enum DriverFilterResult<'a> {
+    Content(Cow<'a, [u8]>),
+    Delayed { process: String },
+}
+
+pub(crate) enum SmudgeFilterResult<'a> {
+    Content(Cow<'a, [u8]>),
+    Delayed { process: String },
+}
+
 pub(crate) struct ProcessFilterFailure {
-    message: String,
-    protocol: bool,
+    pub(crate) message: String,
+    pub(crate) protocol: bool,
 }
 
 impl ProcessFilterFailure {
@@ -1020,6 +1061,7 @@ pub(crate) fn run_process_filter(
     path: &[u8],
     content: &[u8],
     blob: Option<ObjectId>,
+    can_delay: bool,
 ) -> std::result::Result<ProcessFilterOutcome, ProcessFilterFailure> {
     if PROCESS_FILTER_ABORTED
         .get_or_init(|| Mutex::new(HashSet::new()))
@@ -1040,7 +1082,7 @@ pub(crate) fn run_process_filter(
     let result = filters
         .get_mut(command)
         .expect("process filter was inserted")
-        .apply(direction, path, content, blob);
+        .apply(direction, path, content, blob, can_delay);
     if matches!(result, Ok(ProcessFilterOutcome::Status(ref status)) if status == "abort") {
         if let Some(mut filter) = filters.remove(command) {
             filter.finish_gracefully();
@@ -1058,6 +1100,25 @@ pub(crate) fn run_process_filter(
     result
 }
 
+pub(crate) fn list_available_process_filter_blobs(
+    command: &str,
+) -> std::result::Result<Vec<Vec<u8>>, ProcessFilterFailure> {
+    let filters = PROCESS_FILTERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut filters = filters
+        .lock()
+        .map_err(|_| ProcessFilterFailure::protocol("process filter cache poisoned"))?;
+    let Some(filter) = filters.get_mut(command) else {
+        return Err(ProcessFilterFailure::protocol(format!(
+            "external filter '{command}' is not available anymore although not all paths have been filtered"
+        )));
+    };
+    let result = filter.list_available_blobs();
+    if result.as_ref().is_err_and(|err| err.protocol) {
+        filters.remove(command);
+    }
+    result
+}
+
 impl ProcessFilter {
     fn start(command: &str) -> std::result::Result<Self, ProcessFilterFailure> {
         let (shell, flag) = if cfg!(windows) {
@@ -1065,18 +1126,21 @@ impl ProcessFilter {
         } else {
             ("/bin/sh", "-c")
         };
-        let mut child = Command::new(shell)
+        let mut process = Command::new(shell);
+        process
             .arg(flag)
             .arg(command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|err| {
-                ProcessFilterFailure::protocol(format!(
-                    "cannot fork to run subprocess '{command}': {err}"
-                ))
-            })?;
+            .stderr(Stdio::inherit());
+        if let Some(cwd) = current_process_filter_cwd() {
+            process.current_dir(cwd);
+        }
+        let mut child = process.spawn().map_err(|err| {
+            ProcessFilterFailure::protocol(format!(
+                "cannot fork to run subprocess '{command}': {err}"
+            ))
+        })?;
         let mut stdin = child
             .stdin
             .take()
@@ -1144,6 +1208,7 @@ impl ProcessFilter {
         path: &[u8],
         content: &[u8],
         blob: Option<ObjectId>,
+        can_delay: bool,
     ) -> std::result::Result<ProcessFilterOutcome, ProcessFilterFailure> {
         let wanted = match direction {
             "clean" => PROCESS_CAP_CLEAN,
@@ -1153,6 +1218,9 @@ impl ProcessFilter {
         if self.capabilities & wanted == 0 {
             return Ok(ProcessFilterOutcome::Unsupported);
         }
+
+        let can_delay =
+            can_delay && direction == "smudge" && self.capabilities & PROCESS_CAP_DELAY != 0;
 
         {
             let stdin = self
@@ -1173,6 +1241,9 @@ impl ProcessFilter {
                     }
                 }
                 write_pkt_text(stdin, &format!("blob={}\n", blob.to_hex()))?;
+            }
+            if can_delay {
+                write_pkt_text(stdin, "can-delay=1\n")?;
             }
             write_flush(stdin)?;
             write_pkt_content(stdin, content)?;
@@ -1197,6 +1268,34 @@ impl ProcessFilter {
         match status.as_str() {
             "" | "success" => Ok(ProcessFilterOutcome::Filtered(output)),
             "error" | "abort" | "delayed" => Ok(ProcessFilterOutcome::Status(status)),
+            other => Err(ProcessFilterFailure::protocol(format!(
+                "external filter returned unsupported status '{other}'"
+            ))),
+        }
+    }
+
+    fn list_available_blobs(&mut self) -> std::result::Result<Vec<Vec<u8>>, ProcessFilterFailure> {
+        if self.capabilities & PROCESS_CAP_DELAY == 0 {
+            return Ok(Vec::new());
+        }
+        {
+            let stdin = self
+                .stdin
+                .as_mut()
+                .ok_or_else(|| ProcessFilterFailure::protocol("process filter stdin closed"))?;
+            write_pkt_text(stdin, "command=list_available_blobs\n")?;
+            write_flush(stdin)?;
+        }
+
+        let mut paths = Vec::new();
+        while let Some(line) = read_pkt_text(&mut self.stdout)? {
+            if let Some(path) = line.strip_prefix("pathname=") {
+                paths.push(path.as_bytes().to_vec());
+            }
+        }
+        let status = read_process_status(&mut self.stdout)?.unwrap_or_default();
+        match status.as_str() {
+            "" | "success" => Ok(paths),
             other => Err(ProcessFilterFailure::protocol(format!(
                 "external filter returned unsupported status '{other}'"
             ))),
@@ -1708,6 +1807,22 @@ pub(crate) fn apply_smudge_filter_with_attributes_cow_format<'a>(
     content: &'a [u8],
     format: ObjectFormat,
 ) -> Result<Cow<'a, [u8]>> {
+    match apply_smudge_filter_with_attributes_maybe_delayed(
+        config, attributes, path, content, format, false,
+    )? {
+        SmudgeFilterResult::Content(data) => Ok(data),
+        SmudgeFilterResult::Delayed { .. } => unreachable!("delay was not enabled"),
+    }
+}
+
+pub(crate) fn apply_smudge_filter_with_attributes_maybe_delayed<'a>(
+    config: &GitConfig,
+    attributes: &[AttributeCheck],
+    path: &[u8],
+    content: &'a [u8],
+    format: ObjectFormat,
+    allow_delay: bool,
+) -> Result<SmudgeFilterResult<'a>> {
     let plan = ContentFilterPlan::resolve(config, attributes);
     check_wt_encoding_valid(&plan.encoding)?;
     let mut data = Cow::Borrowed(content);
@@ -1725,16 +1840,20 @@ pub(crate) fn apply_smudge_filter_with_attributes_cow_format<'a>(
     // line-ending-converted, then reencoded into the worktree charset.
     data = encode_to_worktree(&plan.encoding, path, data)?;
     if let Some(driver) = &plan.driver {
-        data = run_driver(
+        return match run_driver_maybe_delayed(
             driver,
             driver.smudge.as_deref(),
             "smudge",
             Some(format),
             path,
             data,
-        )?;
+            allow_delay,
+        )? {
+            DriverFilterResult::Content(data) => Ok(SmudgeFilterResult::Content(data)),
+            DriverFilterResult::Delayed { process } => Ok(SmudgeFilterResult::Delayed { process }),
+        };
     }
-    Ok(data)
+    Ok(SmudgeFilterResult::Content(data))
 }
 
 /// Execute one direction of a driver filter, honouring the `required` flag.
@@ -1746,6 +1865,21 @@ pub(crate) fn run_driver<'a>(
     path: &[u8],
     content: Cow<'a, [u8]>,
 ) -> Result<Cow<'a, [u8]>> {
+    match run_driver_maybe_delayed(driver, command, direction, format, path, content, false)? {
+        DriverFilterResult::Content(data) => Ok(data),
+        DriverFilterResult::Delayed { .. } => unreachable!("delay was not enabled"),
+    }
+}
+
+pub(crate) fn run_driver_maybe_delayed<'a>(
+    driver: &FilterDriver,
+    command: Option<&str>,
+    direction: &str,
+    format: Option<ObjectFormat>,
+    path: &[u8],
+    content: Cow<'a, [u8]>,
+    allow_delay: bool,
+) -> Result<DriverFilterResult<'a>> {
     if let Some(process) = &driver.process {
         let blob = if direction == "smudge" {
             match format {
@@ -1757,17 +1891,24 @@ pub(crate) fn run_driver<'a>(
         } else {
             None
         };
-        match run_process_filter(process, direction, path, &content, blob) {
-            Ok(ProcessFilterOutcome::Filtered(output)) => return Ok(Cow::Owned(output)),
+        match run_process_filter(process, direction, path, &content, blob, allow_delay) {
+            Ok(ProcessFilterOutcome::Filtered(output)) => {
+                return Ok(DriverFilterResult::Content(Cow::Owned(output)));
+            }
             Ok(ProcessFilterOutcome::Unsupported) => {}
             Ok(ProcessFilterOutcome::Status(status)) => {
+                if allow_delay && status == "delayed" {
+                    return Ok(DriverFilterResult::Delayed {
+                        process: process.clone(),
+                    });
+                }
                 if driver.required {
                     return Err(GitError::Command(format!(
                         "external filter '{}' returned status {status}",
                         process
                     )));
                 }
-                return Ok(content);
+                return Ok(DriverFilterResult::Content(content));
             }
             Err(err) => {
                 if err.protocol {
@@ -1776,7 +1917,7 @@ pub(crate) fn run_driver<'a>(
                 if driver.required {
                     return Err(GitError::Command(err.message));
                 }
-                return Ok(content);
+                return Ok(DriverFilterResult::Content(content));
             }
         }
     }
@@ -1793,17 +1934,17 @@ pub(crate) fn run_driver<'a>(
             }
             return Err(GitError::Exit(128));
         }
-        return Ok(content);
+        return Ok(DriverFilterResult::Content(content));
     };
     match run_filter_command(command, path, &content) {
-        Ok(output) => Ok(Cow::Owned(output)),
+        Ok(output) => Ok(DriverFilterResult::Content(Cow::Owned(output))),
         Err(err) => {
             if driver.required {
                 Err(err)
             } else {
                 // Non-required filter failure: fall back to the unfiltered
                 // content, matching git's behaviour.
-                Ok(content)
+                Ok(DriverFilterResult::Content(content))
             }
         }
     }

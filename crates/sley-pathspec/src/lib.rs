@@ -418,20 +418,51 @@ pub fn normalized_revwalk_pathspec(
     pathspecs: &[String],
     magic: PathspecMatchMagic,
 ) -> sley_core::Result<Pathspec> {
-    let prefix = if let Some(root) = worktree_root {
+    let (prefix, root_and_cwd) = if let Some(root) = worktree_root {
         let root = fs::canonicalize(root)?;
         let cwd = fs::canonicalize(cwd)?;
-        cwd.strip_prefix(&root)
+        let prefix = cwd
+            .strip_prefix(&root)
             .map(|relative| relative.to_string_lossy().replace('\\', "/").into_bytes())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (prefix, Some((root, cwd)))
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
     let elements = pathspecs
         .iter()
-        .map(|spec| parse_normalized_pathspec_element(&prefix, spec, magic))
+        .map(|spec| {
+            let parse_spec = match root_and_cwd.as_ref() {
+                Some((root, cwd)) => normalize_absolute_pathspec_arg(root, cwd, spec)?,
+                None => spec.to_string(),
+            };
+            parse_normalized_pathspec_element(&prefix, &parse_spec, magic)
+        })
         .collect::<sley_core::Result<Vec<_>>>()?;
     Ok(Pathspec::from_elements(elements))
+}
+
+fn normalize_absolute_pathspec_arg(
+    root: &Path,
+    cwd: &Path,
+    arg: &str,
+) -> sley_core::Result<String> {
+    let path = Path::new(arg);
+    if !path.is_absolute() {
+        return Ok(arg.to_string());
+    }
+    let absolute = fs::canonicalize(path)?;
+    let relative = absolute
+        .strip_prefix(root)
+        .map_err(|_| GitError::InvalidPath(format!("pathspec {arg} is outside worktree")))?;
+    let repo_path = relative.to_string_lossy().replace('\\', "/");
+    if repo_path.is_empty() {
+        return Ok(":/".to_string());
+    }
+    if cwd == root {
+        return Ok(repo_path);
+    }
+    Ok(format!(":(top){repo_path}"))
 }
 
 pub fn normalize_ls_files_pathspec(prefix: &[u8], arg: &str) -> sley_core::Result<Vec<u8>> {

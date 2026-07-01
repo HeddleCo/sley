@@ -1406,7 +1406,12 @@ pub(crate) fn update_index_paths_impl(
         updated.push(oid);
     }
     normalize_index_version_for_extended_flags(&mut index);
-    index.extensions = index_extensions_without_cache_tree(&index.extensions);
+    update_cache_tree_for_git_paths(
+        &mut index,
+        format,
+        &odb,
+        &untracked_cache_invalidation_paths,
+    )?;
     invalidate_untracked_cache_for_git_paths(
         &mut index,
         format,
@@ -1445,6 +1450,30 @@ pub fn refresh_index_paths(
     paths: &[PathBuf],
     quiet: bool,
     ignore_missing: bool,
+    really_refresh: bool,
+) -> Result<UpdateIndexResult> {
+    refresh_index_paths_with_options(
+        worktree_root,
+        git_dir,
+        format,
+        paths,
+        quiet,
+        ignore_missing,
+        /* ignore_submodules */ false,
+        /* allow_unmerged */ false,
+        really_refresh,
+    )
+}
+
+pub fn refresh_index_paths_with_options(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    quiet: bool,
+    ignore_missing: bool,
+    ignore_submodules: bool,
+    allow_unmerged: bool,
     really_refresh: bool,
 ) -> Result<UpdateIndexResult> {
     let worktree_root = worktree_root.as_ref();
@@ -1499,6 +1528,8 @@ pub fn refresh_index_paths(
             stat_cache,
             quiet,
             ignore_missing,
+            ignore_submodules,
+            allow_unmerged,
             trust_filemode,
         );
     }
@@ -1537,7 +1568,20 @@ pub fn refresh_index_paths(
         // status/diff (the unpopulated default is clean).
         if sley_index::is_gitlink(entry.mode) {
             match sley_index::gitlink_stat_verdict(&metadata) {
-                sley_index::GitlinkStatVerdict::Populated => continue,
+                sley_index::GitlinkStatVerdict::Populated => {
+                    if ignore_submodules {
+                        continue;
+                    }
+                    if let Some(oid) = sley_diff_merge::gitlink_head_oid(&absolute, format)
+                        && oid != entry.oid
+                    {
+                        if !quiet {
+                            print_update_index_needs_update(entry.path.as_bytes());
+                        }
+                        needs_update = true;
+                    }
+                    continue;
+                }
                 sley_index::GitlinkStatVerdict::TypeChanged => {
                     if !quiet {
                         print_update_index_needs_update(entry.path.as_bytes());
@@ -1619,6 +1663,8 @@ pub(crate) fn refresh_all_index_paths_parallel(
     stat_cache: IndexStatCache,
     quiet: bool,
     ignore_missing: bool,
+    ignore_submodules: bool,
+    _allow_unmerged: bool,
     trust_filemode: bool,
 ) -> Result<UpdateIndexResult> {
     let prechecks =
@@ -1655,7 +1701,20 @@ pub(crate) fn refresh_all_index_paths_parallel(
                 // serial path above). Only a type-changed gitlink needs update.
                 if sley_index::is_gitlink(entry.mode) {
                     match sley_index::gitlink_stat_verdict(&metadata) {
-                        sley_index::GitlinkStatVerdict::Populated => continue,
+                        sley_index::GitlinkStatVerdict::Populated => {
+                            if ignore_submodules {
+                                continue;
+                            }
+                            if let Some(oid) = sley_diff_merge::gitlink_head_oid(&absolute, format)
+                                && oid != entry.oid
+                            {
+                                if !quiet {
+                                    print_update_index_needs_update(&path);
+                                }
+                                needs_update = true;
+                            }
+                            continue;
+                        }
                         sley_index::GitlinkStatVerdict::TypeChanged => {
                             if !quiet {
                                 print_update_index_needs_update(&path);
@@ -2168,6 +2227,221 @@ pub(crate) fn index_extensions_without_cache_tree(extensions: &[u8]) -> Vec<u8> 
     filtered
 }
 
+pub(crate) fn update_cache_tree_for_git_paths(
+    index: &mut Index,
+    format: ObjectFormat,
+    odb: &FileObjectDatabase,
+    paths: &[Vec<u8>],
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    match index.cache_tree(format) {
+        Ok(Some(mut cache_tree)) if !cache_tree_has_invalid_untouched(&cache_tree, b"", paths) => {
+            for path in paths {
+                invalidate_cache_tree_path(&mut cache_tree, path);
+            }
+            index.set_cache_tree(Some(&cache_tree))?;
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(_) => {
+            index.extensions = index_extensions_without_cache_tree(&index.extensions);
+            return Ok(());
+        }
+    }
+    let cache_tree = match build_cache_tree_for_index_update(&index.entries, b"", paths, odb) {
+        Ok(cache_tree) => cache_tree,
+        Err(_) => {
+            index.extensions = index_extensions_without_cache_tree(&index.extensions);
+            return Ok(());
+        }
+    };
+    index.set_cache_tree(Some(&cache_tree))?;
+    Ok(())
+}
+
+fn invalidate_cache_tree_path(tree: &mut CacheTree, path: &[u8]) {
+    tree.entry_count = -1;
+    tree.oid = None;
+
+    let mut rest = path;
+    while rest.first() == Some(&b'/') {
+        rest = &rest[1..];
+    }
+    if rest.is_empty() {
+        return;
+    }
+    let split = rest
+        .iter()
+        .position(|byte| *byte == b'/')
+        .unwrap_or(rest.len());
+    let component = &rest[..split];
+    let remaining = if split == rest.len() {
+        &[][..]
+    } else {
+        &rest[split + 1..]
+    };
+    if let Some(child) = tree
+        .subtrees
+        .iter_mut()
+        .find(|child| child.name.as_slice() == component)
+    {
+        invalidate_cache_tree_path(&mut child.tree, remaining);
+    }
+}
+
+fn cache_tree_has_invalid_untouched(tree: &CacheTree, prefix: &[u8], paths: &[Vec<u8>]) -> bool {
+    if !cache_tree_prefix_touched(prefix, paths) && (tree.entry_count < 0 || tree.oid.is_none()) {
+        return true;
+    }
+    tree.subtrees.iter().any(|child| {
+        let mut child_prefix = Vec::with_capacity(prefix.len() + child.name.len() + 1);
+        child_prefix.extend_from_slice(prefix);
+        child_prefix.extend_from_slice(&child.name);
+        child_prefix.push(b'/');
+        cache_tree_has_invalid_untouched(&child.tree, &child_prefix, paths)
+    })
+}
+
+fn build_cache_tree_for_index_update(
+    entries: &[IndexEntry],
+    prefix: &[u8],
+    invalid_paths: &[Vec<u8>],
+    odb: &FileObjectDatabase,
+) -> Result<CacheTree> {
+    let mut invalid = cache_tree_prefix_touched(prefix, invalid_paths);
+    let mut subtrees = Vec::new();
+    let mut tree_entries = Vec::new();
+    let mut index = 0usize;
+    while index < entries.len() {
+        let entry = &entries[index];
+        if entry.stage() != Stage::Normal || entry.is_intent_to_add() {
+            invalid = true;
+            index += 1;
+            continue;
+        }
+        let path = entry.path.as_bytes();
+        let Some(remainder) = path.strip_prefix(prefix) else {
+            return Err(GitError::InvalidPath(format!(
+                "invalid index path {}",
+                String::from_utf8_lossy(path)
+            )));
+        };
+        if remainder.is_empty() || remainder[0] == b'/' {
+            return Err(GitError::InvalidPath(format!(
+                "invalid index path {}",
+                String::from_utf8_lossy(path)
+            )));
+        }
+        if entry.mode == SPARSE_DIR_MODE
+            && let Some(name) = remainder.strip_suffix(b"/")
+            && !name.is_empty()
+            && !name.contains(&b'/')
+        {
+            if !invalid {
+                tree_entries.push(TreeEntry {
+                    mode: SPARSE_DIR_MODE,
+                    name: BString::from(name),
+                    oid: entry.oid,
+                });
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(slash) = remainder.iter().position(|byte| *byte == b'/') {
+            let name = &remainder[..slash];
+            if name.is_empty() {
+                return Err(GitError::InvalidPath(format!(
+                    "invalid index path {}",
+                    String::from_utf8_lossy(path)
+                )));
+            }
+            let start = index;
+            index += 1;
+            while index < entries.len()
+                && same_tree_component(entries[index].path.as_bytes(), prefix, name)?
+            {
+                index += 1;
+            }
+            let mut child_prefix = Vec::with_capacity(prefix.len() + name.len() + 1);
+            child_prefix.extend_from_slice(prefix);
+            child_prefix.extend_from_slice(name);
+            child_prefix.push(b'/');
+            let child_tree = build_cache_tree_for_index_update(
+                &entries[start..index],
+                &child_prefix,
+                invalid_paths,
+                odb,
+            )?;
+            if !invalid {
+                if let Some(oid) = child_tree.oid {
+                    tree_entries.push(TreeEntry {
+                        mode: 0o040000,
+                        name: BString::from(name),
+                        oid,
+                    });
+                } else {
+                    invalid = true;
+                }
+            }
+            subtrees.push(sley_index::CacheTreeChild {
+                name: name.to_vec(),
+                tree: child_tree,
+            });
+            continue;
+        }
+        if !invalid {
+            tree_entries.push(TreeEntry {
+                mode: entry.mode,
+                name: BString::from(remainder),
+                oid: entry.oid,
+            });
+        }
+        index += 1;
+    }
+
+    if invalid {
+        return Ok(CacheTree {
+            entry_count: -1,
+            oid: None,
+            subtrees,
+        });
+    }
+    tree_entries.sort_by(|left, right| {
+        git_tree_entry_cmp(
+            left.name.as_bytes(),
+            left.mode,
+            right.name.as_bytes(),
+            right.mode,
+        )
+    });
+    let oid = odb.write_object(EncodedObject::new(
+        ObjectType::Tree,
+        Tree {
+            entries: tree_entries,
+        }
+        .write(),
+    ))?;
+    let entry_count = i32::try_from(entries.len())
+        .map_err(|_| GitError::InvalidFormat("cache-tree entry count overflow".into()))?;
+    Ok(CacheTree {
+        entry_count,
+        oid: Some(oid),
+        subtrees,
+    })
+}
+
+fn cache_tree_prefix_touched(prefix: &[u8], paths: &[Vec<u8>]) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    let dir = prefix.strip_suffix(b"/").unwrap_or(prefix);
+    paths
+        .iter()
+        .any(|path| path.as_slice() == dir || path.starts_with(prefix))
+}
+
 #[derive(Clone)]
 pub(crate) struct ResolveUndoRecord {
     pub(crate) path: Vec<u8>,
@@ -2364,6 +2638,7 @@ pub(crate) fn index_extensions_without_split_index_link(extensions: &[u8]) -> Ve
 pub(crate) fn preserved_index_extensions(git_dir: &Path, format: ObjectFormat) -> Result<Vec<u8>> {
     let index_path = repository_index_path(git_dir);
     match fs::read(&index_path) {
+        Ok(bytes) if bytes.is_empty() => Ok(Vec::new()),
         Ok(bytes) => {
             let index = Index::parse(&bytes, format)?;
             Ok(index_extensions_without_cache_tree_or_resolve_undo(
@@ -2402,6 +2677,7 @@ pub(crate) fn index_extensions_without_cache_tree_or_resolve_undo(extensions: &[
 pub(crate) fn repository_index_is_split(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
     let index_path = repository_index_path(git_dir);
     match fs::read(index_path) {
+        Ok(bytes) if bytes.is_empty() => Ok(false),
         Ok(bytes) => Ok(Index::parse(&bytes, format)?
             .split_index_link(format)?
             .is_some()),

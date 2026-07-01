@@ -207,7 +207,6 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     if matches!(mode, ResetMode::Hard | ResetMode::Merge | ResetMode::Keep) {
         require_work_tree(&git_dir)?;
     }
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let reset_config = read_repo_config(&git_dir)?;
     let recurse_submodules = recurse_submodules.unwrap_or_else(|| {
@@ -216,8 +215,50 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             .unwrap_or(false)
     });
     let pathspec_from_file_provided = pathspec_from_file.is_some();
+    let has_separator_paths = separator_index.is_some_and(|index| index < positionals.len());
+    if mode == ResetMode::Soft {
+        if pathspec_from_file_provided {
+            eprintln!("fatal: Cannot do soft reset with paths.");
+            return Err(GitError::Exit(128));
+        }
+        if has_separator_paths {
+            eprintln!("fatal: Cannot do soft reset with paths.");
+            return Err(GitError::Exit(128));
+        }
+        let target = match positionals.as_slice() {
+            [] => "HEAD",
+            [target] => target.as_str(),
+            _ => {
+                eprintln!("fatal: Cannot do soft reset with paths.");
+                return Err(GitError::Exit(128));
+            }
+        };
+        if reset_soft_blocked_by_merge(&git_dir, format)? {
+            eprintln!("fatal: Cannot do a soft reset in the middle of a merge.");
+            return Err(GitError::Exit(128));
+        }
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let old_head = match resolve_revision(&git_dir, format, "HEAD") {
+            Ok(oid) => oid,
+            Err(_) => zero_oid(format)?,
+        };
+        let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
+        let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
+        write_reset_orig_head(&git_dir, &old_head, format)?;
+        update_reset_head_ref(
+            &git_dir,
+            format,
+            old_head,
+            target_commit,
+            target,
+            commit_identity_from_env("COMMITTER")?,
+        )?;
+        sley_sequencer::replay::remove_branch_state(&git_dir);
+        return Ok(());
+    }
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     if mode == ResetMode::Merge {
-        if pathspec_from_file_provided || (saw_separator && !positionals.is_empty()) {
+        if pathspec_from_file_provided || has_separator_paths {
             eprintln!("fatal: Cannot do merge reset with paths.");
             return Err(GitError::Exit(128));
         }
@@ -252,7 +293,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         // modifications where safe and refusing the reset (with the read-tree
         // "not uptodate. Cannot merge." porcelain) when a touched file has
         // local changes. It never accepts paths.
-        if pathspec_from_file_provided || (saw_separator && !positionals.is_empty()) {
+        if pathspec_from_file_provided || has_separator_paths {
             eprintln!("fatal: Cannot do keep reset with paths.");
             return Err(GitError::Exit(128));
         }
@@ -319,12 +360,12 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         sley_sequencer::replay::remove_branch_state(&git_dir);
         return Ok(());
     }
-    if matches!(mode, ResetMode::Soft | ResetMode::Hard) {
+    if mode == ResetMode::Hard {
         if pathspec_from_file_provided {
             eprintln!("fatal: Cannot do {} reset with paths.", mode.as_str());
             return Err(GitError::Exit(128));
         }
-        if saw_separator && !positionals.is_empty() {
+        if has_separator_paths {
             eprintln!("fatal: Cannot do {} reset with paths.", mode.as_str());
             return Err(GitError::Exit(128));
         }
@@ -336,24 +377,12 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
                 return Err(GitError::Exit(128));
             }
         };
-        // git refuses a `--soft` reset while a merge is in progress or the index
-        // carries unmerged entries: a soft reset only moves HEAD, so leaving the
-        // half-merged index behind would silently strand the conflict state.
-        // builtin/reset.c: `reset_type == SOFT && (merge in progress || unmerged)`
-        // → "Cannot do a soft reset in the middle of a merge." (exit 128).
-        if mode == ResetMode::Soft && reset_soft_blocked_by_merge(&git_dir, format)? {
-            eprintln!("fatal: Cannot do a soft reset in the middle of a merge.");
-            return Err(GitError::Exit(128));
-        }
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let old_head = match resolve_revision(&git_dir, format, "HEAD") {
             Ok(oid) => oid,
             Err(_) => zero_oid(format)?,
         };
-        if mode == ResetMode::Hard
-            && target == "HEAD"
-            && resolve_revision(&git_dir, format, "HEAD").is_err()
-        {
+        if target == "HEAD" && resolve_revision(&git_dir, format, "HEAD").is_err() {
             // `git reset --hard` on an unborn branch: empty the index and
             // remove the (previously tracked) worktree files.
             let index_path = sley_worktree::repository_index_path(&git_dir);
@@ -382,26 +411,25 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         write_reset_orig_head(&git_dir, &old_head, format)?;
-        if mode == ResetMode::Hard {
-            if recurse_submodules {
-                commands::read_tree::reset_index_and_worktree_to_commit(
-                    &worktree_root,
-                    &git_dir,
-                    format,
-                    &target_commit,
-                    true,
-                )?;
-            } else {
-                sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
-                    worktree_root.clone(),
-                    git_dir.clone(),
-                    format,
-                    &target_commit,
-                    reset_process_filter_metadata(&git_dir, format, target, &target_commit),
-                )?;
-            }
-            apply_reset_sparse_checkout(&worktree_root, &git_dir, format)?;
+        if recurse_submodules {
+            commands::read_tree::reset_index_and_worktree_to_commit(
+                &worktree_root,
+                &git_dir,
+                format,
+                &target_commit,
+                true,
+            )?;
+        } else {
+            sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
+                worktree_root.clone(),
+                git_dir.clone(),
+                format,
+                &target_commit,
+                reset_process_filter_metadata(&git_dir, format, target, &target_commit),
+            )?;
         }
+        apply_reset_sparse_checkout(&worktree_root, &git_dir, format)?;
+        commands::hooks::run_post_index_change_hook(true, false)?;
         update_reset_head_ref(
             &git_dir,
             format,
@@ -410,12 +438,10 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             target,
             commit_identity_from_env("COMMITTER")?,
         )?;
-        if mode == ResetMode::Hard && !quiet {
+        if !quiet {
             print_reset_hard_head(&git_dir, format, &target_commit)?;
         }
-        if mode == ResetMode::Hard {
-            commands::merge_rebase::save_merge_autostash(&git_dir, format);
-        }
+        commands::merge_rebase::save_merge_autostash(&git_dir, format);
         sley_sequencer::replay::remove_branch_state(&git_dir);
         return Ok(());
     }
@@ -456,6 +482,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         if refresh {
             refresh_reset_index(&worktree_root, &git_dir, format)?;
         }
+        commands::hooks::run_post_index_change_hook(false, true)?;
         update_reset_head_ref(
             &git_dir,
             format,
@@ -528,6 +555,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         if refresh {
             refresh_reset_index(&worktree_root, &git_dir, format)?;
         }
+        commands::hooks::run_post_index_change_hook(false, true)?;
         sley_sequencer::replay::remove_branch_state(&git_dir);
         if !quiet {
             print_reset_unstaged_changes(&worktree_root, &git_dir, format)?;
@@ -631,6 +659,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         if refresh {
             refresh_reset_index(&worktree_root, &git_dir, format)?;
         }
+        commands::hooks::run_post_index_change_hook(false, true)?;
         sley_sequencer::replay::remove_branch_state(&git_dir);
     }
     if !quiet {
@@ -733,6 +762,8 @@ fn refresh_reset_index(worktree_root: &Path, git_dir: &Path, format: ObjectForma
         &[],
         /* quiet */ true,
         /* ignore_missing */ true,
+        /* ignore_submodules */ false,
+        /* allow_unmerged */ false,
         /* really_refresh */ false,
     )?;
     Ok(())

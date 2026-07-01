@@ -1833,6 +1833,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let mut intent_to_add = false;
     let mut sparse = false;
     let mut refresh = false;
+    let mut warn_embedded_repos = true;
     let mut chmod = None;
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
@@ -1891,6 +1892,8 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             "--no-ignore-errors" => ignore_errors = false,
             "--sparse" => sparse = true,
             "--no-sparse" => sparse = false,
+            "--warn-embedded-repo" => warn_embedded_repos = true,
+            "--no-warn-embedded-repo" => warn_embedded_repos = false,
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             "--edit" | "-e" => {
@@ -2201,7 +2204,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         .collect::<Vec<_>>();
     if !action_paths.is_empty() {
         let config = read_repo_config(&git_dir)?;
-        let warn_embedded = actions_may_add_embedded_repo(&actions);
+        let warn_embedded = warn_embedded_repos && actions_may_add_embedded_repo(&actions);
         // Snapshot the tracked paths before staging only when the warning can
         // actually fire. Ordinary file adds never need this second index pass.
         let previously_tracked: BTreeSet<Vec<u8>> = if warn_embedded {
@@ -2268,6 +2271,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         print_add_ignored_paths(&git_dir, &ignored_paths);
         return Err(GitError::Exit(1));
     }
+    commands::hooks::run_post_index_change_hook(false, false)?;
     Ok(())
 }
 
@@ -2451,6 +2455,8 @@ fn refresh_index_after_add(
         selected,
         /* quiet */ true,
         /* ignore_missing */ true,
+        /* ignore_submodules */ false,
+        /* allow_unmerged */ false,
         /* really_refresh */ false,
     )?;
     Ok(())
@@ -4103,11 +4109,15 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     } else {
         worktree_root.clone()
     };
+    let repo_config = read_repo_config(&git_dir)?;
+    let trust_filemode = repo_config
+        .get_bool("core", None, "fileMode")
+        .unwrap_or(true);
     let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(&git_dir)?;
     // `apply.whitespace` config supplies the default whitespace action when the
     // command line did not give an explicit `--whitespace=`.
     if !ws_action_explicit
-        && let Some(value) = read_repo_config(&git_dir)?.get("apply", None, "whitespace")
+        && let Some(value) = repo_config.get("apply", None, "whitespace")
         && let Ok(action) = parse_ws_action(value)
     {
         ws_action = action;
@@ -4457,7 +4467,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                     else {
                         return Err(GitError::InvalidFormat("patch missing target path".into()));
                     };
-                    let mode = apply_write_mode(&worktree_base, patch, &target)?;
+                    let mode = apply_write_mode(&worktree_base, patch, &target, trust_filemode)?;
                     let index_mode = apply_index_mode_and_warn(patch, &target, mode, &index_modes);
                     actions.push(ApplyAction::Write {
                         path: target,
@@ -4558,7 +4568,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone()) else {
                 return Err(GitError::InvalidFormat("patch missing target path".into()));
             };
-            let mode = apply_write_mode(&worktree_base, patch, &target)?;
+            let mode = apply_write_mode(&worktree_base, patch, &target, trust_filemode)?;
             let index_mode = apply_index_mode_and_warn(patch, &target, mode, &index_modes);
             actions.push(ApplyAction::Write {
                 path: target,
@@ -5390,12 +5400,16 @@ fn apply_write_mode(
     worktree_root: &Path,
     patch: &sley_diff_merge::FilePatch,
     target: &[u8],
+    trust_filemode: bool,
 ) -> Result<u32> {
     if let Some(mode) = patch.new_mode {
         return Ok(mode);
     }
     if patch.is_new {
         return Ok(0o100644);
+    }
+    if !trust_filemode && let Some(mode) = patch.old_mode {
+        return Ok(mode);
     }
     let path = std::str::from_utf8(target)
         .map_err(|err| GitError::InvalidPath(err.to_string()))
@@ -6499,6 +6513,7 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     }
 
     if explicit_oids.is_empty() && !only_tags {
+        ref_error_bits |= fsck_reflog_roots(&db, format, &git_dir)?;
         ref_error_bits |= fsck_worktree_head_refs(
             &db,
             format,
@@ -6888,6 +6903,36 @@ fn fsck_worktree_head_refs(
     Ok(bits)
 }
 
+fn fsck_reflog_roots(db: &FileObjectDatabase, format: ObjectFormat, git_dir: &Path) -> Result<i32> {
+    let store = FileRefStore::new(git_dir, format);
+    let mut bits = 0i32;
+    let mut seen = HashSet::new();
+    for name in store.list_reflog_names()? {
+        let entries = match store.read_reflog(&name) {
+            Ok(entries) => entries,
+            Err(GitError::NotFound(_)) => continue,
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            for oid in [entry.old_oid, entry.new_oid] {
+                if oid.is_null() || !seen.insert(oid) {
+                    continue;
+                }
+                match db.read_object(&oid) {
+                    Ok(_) => {}
+                    Err(GitError::NotFound(_)) if db.is_promised_object(&oid) => {}
+                    Err(GitError::NotFound(_)) => {
+                        eprintln!("error: {name}: invalid reflog entry {oid}");
+                        bits |= sley_fsck::ERROR_REACHABLE;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+    }
+    Ok(bits)
+}
+
 /// git's `fsck_index` for every worktree index: mark each entry's blob
 /// reachable (appending existing ones to `roots`), report a missing blob with
 /// git's `missing blob <oid>` line (annotated `(<index>:<name>)` under
@@ -7058,7 +7103,7 @@ fn fsck_index_display_path(git_dir: &Path, index_path: &Path) -> String {
 /// `repo_has_promisor_remote`: either `extensions.partialclone` names a default
 /// promisor remote, or some `remote.<name>.promisor` is true. Only then does git
 /// treat objects in `.promisor` packs as legitimately-absent "promised" objects.
-fn repo_has_promisor_remote(config: &GitConfig) -> bool {
+pub(crate) fn repo_has_promisor_remote(config: &GitConfig) -> bool {
     if config
         .get("extensions", None, "partialclone")
         .is_some_and(|value| !value.is_empty())

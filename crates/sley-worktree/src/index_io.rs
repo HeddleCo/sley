@@ -19,6 +19,28 @@ pub(crate) fn restore_index_entry(
     smudge_config: Option<&GitConfig>,
     stat_cache: Option<&IndexStatCache>,
 ) -> Result<Option<IndexEntry>> {
+    restore_index_entry_maybe_delayed(
+        worktree_root,
+        git_dir,
+        format,
+        db,
+        entry,
+        smudge_config,
+        stat_cache,
+        None,
+    )
+}
+
+pub(crate) fn restore_index_entry_maybe_delayed(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    entry: &IndexEntry,
+    smudge_config: Option<&GitConfig>,
+    stat_cache: Option<&IndexStatCache>,
+    mut delayed: Option<&mut DelayedCheckoutQueue>,
+) -> Result<Option<IndexEntry>> {
     // A gitlink (mode 160000) names a commit in the submodule's repository, not
     // a blob here — reading it as a blob fails ("not found: blob object"). git's
     // `checkout_entry` S_IFGITLINK arm just ensures the submodule directory
@@ -49,13 +71,30 @@ pub(crate) fn restore_index_entry(
                 format,
                 entry.path.as_bytes(),
             )?;
-            apply_smudge_filter_with_attributes_cow_format(
+            match apply_smudge_filter_with_attributes_maybe_delayed(
                 config,
                 &checks,
                 entry.path.as_bytes(),
                 &object.body,
                 format,
-            )?
+                delayed.is_some() && (entry.mode & 0o170000) != 0o120000,
+            )? {
+                SmudgeFilterResult::Content(body) => body,
+                SmudgeFilterResult::Delayed { process } => {
+                    let queue = delayed
+                        .as_deref_mut()
+                        .expect("delay is only reported when a queue is available");
+                    queue.enqueue(
+                        process,
+                        entry.path.as_bytes(),
+                        &TrackedEntry {
+                            mode: entry.mode,
+                            oid: entry.oid,
+                        },
+                    );
+                    return Ok(Some(unmaterialized_index_entry_from_index(entry)));
+                }
+            }
         }
         None => Cow::Borrowed(&object.body),
     };

@@ -130,12 +130,24 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             let mut entries = read_tree_overlay(db, format, repo.config(), &tree_oids)?;
             if apply_worktree {
                 let worktree_root = worktree_root_for_git_dir(git_dir)?;
+                let tree_attributes = if tree_oids.len() == 1 {
+                    Some(sley_worktree::TreeAttributes::from_tree(
+                        &worktree_root,
+                        git_dir,
+                        db,
+                        format,
+                        &tree_oids[0],
+                    )?)
+                } else {
+                    None
+                };
                 reset_worktree_to_entries(
                     &worktree_root,
                     git_dir,
                     format,
                     db,
                     repo.config(),
+                    tree_attributes.as_ref(),
                     &mut entries,
                     recurse_submodules,
                 )?;
@@ -158,6 +170,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                     format,
                     db,
                     repo.config(),
+                    None,
                     &mut entries,
                     recurse_submodules,
                 )?;
@@ -287,7 +300,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
                     eprintln!("error: option `prefix' requires a value");
                     GitError::Exit(129)
                 })?;
-                set_mode(ReadTreeMode::Prefix(normalize_prefix(value)), &mut mode)?;
+                set_mode(ReadTreeMode::Prefix(parse_prefix(value)?), &mut mode)?;
             }
             // Accepted no-op switches that don't change our deterministic output.
             "-v" | "--verbose" | "--no-verbose" | "-q" | "--quiet" | "--no-quiet" | "--trivial"
@@ -299,7 +312,7 @@ fn parse_read_tree_args(args: &[String]) -> Result<ReadTreeArgs> {
             "--no-dry-run" => dry_run = false,
             value => {
                 if let Some(prefix) = value.strip_prefix("--prefix=") {
-                    set_mode(ReadTreeMode::Prefix(normalize_prefix(prefix)), &mut mode)?;
+                    set_mode(ReadTreeMode::Prefix(parse_prefix(prefix)?), &mut mode)?;
                 } else if value.starts_with('-') && value != "-" {
                     // Unknown option: git's parse-options prints usage and exits
                     // 129. We surface the same exit code with a focused message.
@@ -390,8 +403,11 @@ fn validate_read_tree_arity(
                 eprintln!("fatal: you must specify at least one tree to merge");
                 return Err(GitError::Exit(128));
             }
-            if trees.len() > 3 {
-                eprintln!("fatal: too many trees given for read-tree");
+            if trees.len() > sley_unpack_trees::MAX_UNPACK_TREES {
+                eprintln!(
+                    "fatal: I cannot read more than {} trees",
+                    sley_unpack_trees::MAX_UNPACK_TREES
+                );
                 return Err(GitError::Exit(128));
             }
         }
@@ -401,6 +417,14 @@ fn validate_read_tree_arity(
 
 /// Normalize a `--prefix` value to git's canonical form: a non-empty path that
 /// ends in a single `/` (an empty prefix becomes the root sentinel `/`).
+fn parse_prefix(value: &str) -> Result<Vec<u8>> {
+    if value.starts_with('/') {
+        eprintln!("fatal: Invalid prefix, prefix cannot start with '/'");
+        return Err(GitError::Exit(128));
+    }
+    Ok(normalize_prefix(value))
+}
+
 fn normalize_prefix(value: &str) -> Vec<u8> {
     let trimmed = value.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -1039,6 +1063,7 @@ impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
             self.format,
             self.db,
             &self.repo_config,
+            None,
             path,
             mode,
             oid,
@@ -1187,12 +1212,15 @@ pub(crate) fn reset_index_and_worktree_to_commit(
     let config = read_repo_config(git_dir).unwrap_or_default();
     let tree = commands::merge_rebase::commit_tree_oid(&db, format, commit)?;
     let mut entries = read_tree_overlay(&db, format, &config, &[tree])?;
+    let tree_attributes =
+        sley_worktree::TreeAttributes::from_tree(worktree_root, git_dir, &db, format, &tree)?;
     reset_worktree_to_entries(
         worktree_root,
         git_dir,
         format,
         &db,
         &config,
+        Some(&tree_attributes),
         &mut entries,
         recurse_submodules,
     )?;
@@ -1208,8 +1236,8 @@ pub(crate) fn reset_index_and_worktree_to_commit(
 /// The number of trees selects the merge function:
 /// * 1 tree  — `oneway_merge`: fast-forward, take the tree wholesale.
 /// * 2 trees — `twoway_merge`: switch `old` → `new`, carry forward local adds.
-/// * 3 trees — `threeway_merge`: trivial 3-way, recording stage 1/2/3 on a
-///   non-trivial path.
+/// * 3+ trees — `threeway_merge`: trivial 3-way, recording stage 1/2/3 on a
+///   non-trivial path. Extra leading trees are additional merge bases.
 fn merge_trees(
     git_dir: &Path,
     format: ObjectFormat,
@@ -1225,9 +1253,16 @@ fn merge_trees(
     let merge_fn = match tree_oids.len() {
         1 => MergeFn::OneWay,
         2 => MergeFn::TwoWay,
-        3 => MergeFn::ThreeWay,
-        _ => {
+        3..=sley_unpack_trees::MAX_UNPACK_TREES => MergeFn::ThreeWay,
+        0 => {
             eprintln!("fatal: you must specify at least one tree to merge");
+            return Err(GitError::Exit(128));
+        }
+        _ => {
+            eprintln!(
+                "fatal: I cannot read more than {} trees",
+                sley_unpack_trees::MAX_UNPACK_TREES
+            );
             return Err(GitError::Exit(128));
         }
     };
@@ -1601,6 +1636,7 @@ fn update_worktree_for_entries(
     format: ObjectFormat,
     db: &FileObjectDatabase,
     config: &GitConfig,
+    tree_attributes: Option<&sley_worktree::TreeAttributes>,
     entries: &mut [(Vec<u8>, StagedEntry)],
     recurse_submodules: bool,
 ) -> Result<()> {
@@ -1620,6 +1656,7 @@ fn update_worktree_for_entries(
             format,
             db,
             config,
+            tree_attributes,
             &path,
             mode,
             &oid,
@@ -1646,6 +1683,7 @@ fn reset_worktree_to_entries(
     format: ObjectFormat,
     db: &FileObjectDatabase,
     config: &GitConfig,
+    tree_attributes: Option<&sley_worktree::TreeAttributes>,
     entries: &mut [(Vec<u8>, StagedEntry)],
     recurse_submodules: bool,
 ) -> Result<()> {
@@ -1674,6 +1712,7 @@ fn reset_worktree_to_entries(
             format,
             db,
             config,
+            tree_attributes,
             &path,
             mode,
             &oid,
@@ -1747,6 +1786,7 @@ fn write_blob_to_worktree(
     format: ObjectFormat,
     db: &FileObjectDatabase,
     config: &GitConfig,
+    tree_attributes: Option<&sley_worktree::TreeAttributes>,
     path: &[u8],
     mode: u32,
     oid: &ObjectId,
@@ -1806,14 +1846,17 @@ fn write_blob_to_worktree(
             fs::write(&file_path, &object.body)?;
         }
     } else {
-        let body = sley_worktree::apply_smudge_filter(
-            worktree_root,
-            git_dir,
-            format,
-            config,
-            path,
-            &object.body,
-        )?;
+        let body = match tree_attributes {
+            Some(attributes) => attributes.apply_smudge_filter(config, path, &object.body)?,
+            None => sley_worktree::apply_smudge_filter(
+                worktree_root,
+                git_dir,
+                format,
+                config,
+                path,
+                &object.body,
+            )?,
+        };
         fs::write(&file_path, &body)?;
         // Executable bit: 0o100755 → +x, 0o100644 → plain. git only honours the
         // user-execute bit when deciding the index mode, so set/clear it here.
@@ -1841,6 +1884,7 @@ fn write_tree_entry_to_worktree(
     format: ObjectFormat,
     db: &FileObjectDatabase,
     config: &GitConfig,
+    tree_attributes: Option<&sley_worktree::TreeAttributes>,
     path: &[u8],
     mode: u32,
     oid: &ObjectId,
@@ -1853,7 +1897,17 @@ fn write_tree_entry_to_worktree(
         checkout_submodule_to_commit(worktree_root, git_dir, format, path, oid)?;
         return Ok(None);
     }
-    write_blob_to_worktree(worktree_root, git_dir, format, db, config, path, mode, oid)
+    write_blob_to_worktree(
+        worktree_root,
+        git_dir,
+        format,
+        db,
+        config,
+        tree_attributes,
+        path,
+        mode,
+        oid,
+    )
 }
 
 fn gitlink_should_recurse(worktree_root: &Path, repo_config: &GitConfig, path: &[u8]) -> bool {
@@ -1880,6 +1934,10 @@ fn checkout_submodule_to_commit(
         return Ok(());
     };
     let path_str = String::from_utf8_lossy(path);
+    if submodule_path_contains_symlink(worktree_root, path)? {
+        eprintln!("fatal: refusing to checkout submodule path '{path_str}' through a symlink");
+        return Err(GitError::Exit(128));
+    }
     let (submodule_name, submodule_url) = submodule_name_and_url_for_path(worktree_root, &path_str)
         .unwrap_or_else(|| (path_str.to_string(), None));
     let sub_git_dir = submodule_admin_git_dir(git_dir, &submodule_name);
@@ -1974,6 +2032,10 @@ fn remove_submodule_worktree(worktree_root: &Path, git_dir: &Path, path: &[u8]) 
         return Ok(());
     };
     let path_str = String::from_utf8_lossy(path);
+    if submodule_path_contains_symlink(worktree_root, path)? {
+        eprintln!("fatal: refusing to remove submodule path '{path_str}' through a symlink");
+        return Err(GitError::Exit(128));
+    }
     let sub_git_dir = submodule_admin_git_dir(git_dir, &path_str);
     if sub_root.join(".git").is_dir() && !sub_git_dir.is_dir() {
         copy_dir_recursive(&sub_root.join(".git"), &sub_git_dir)?;
@@ -1994,6 +2056,31 @@ fn submodule_admin_git_dir(super_git_dir: &Path, name: &str) -> PathBuf {
         }
     }
     path
+}
+
+fn submodule_path_contains_symlink(worktree_root: &Path, path: &[u8]) -> Result<bool> {
+    let Ok(path) = std::str::from_utf8(path) else {
+        return Ok(false);
+    };
+    let mut current = worktree_root.to_path_buf();
+    for component in Path::new(path).components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(err)
+                if err.kind() == io::ErrorKind::NotFound
+                    || err.kind() == io::ErrorKind::NotADirectory =>
+            {
+                return Ok(false);
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(false)
 }
 
 fn connect_submodule_worktree(sub_root: &Path, sub_git_dir: &Path) -> Result<()> {

@@ -39,7 +39,7 @@ jobs:
   upstream-parity:
     name: Upstream parity (expanded subset)
     runs-on: ubuntu-latest
-    # 889 selected t-files: 889 floor-gated scripts plus 0 measurement-only
+    # 891 selected t-files: 891 floor-gated scripts plus 0 measurement-only
     # facade/graph/pack/status scripts. Keep enough room for the oracle-git
     # build on a cache miss and the known long-running upstream scripts.
     timeout-minutes: 180
@@ -87,7 +87,7 @@ jobs:
           make -j"$(nproc)" prefix=/tmp/git-prefix USE_LIBPCRE2=1 install 2>&1 | tail -20
 
       - name: Build sley
-        run: cargo build -p sley-cli --bin sley --release
+        run: cargo build -p sley-cli --bin sley --release --features git-compat-i18n
 
       - name: Run upstream parity subset
         env:
@@ -781,6 +781,7 @@ jobs:
             t4044-diff-index-unique-abbrev.sh
             t4049-diff-stat-count.sh
             t4050-diff-histogram.sh
+            t4053-diff-no-index.sh
             t4055-diff-context.sh
             t4058-diff-duplicates.sh
             t4059-diff-submodule-not-initialized.sh
@@ -860,8 +861,7 @@ jobs:
             t7606-merge-custom.sh
             t7816-grep-binary-pattern.sh
             # wave-61 (2026-06-30): remaining non-risk target coverage
-            # enrollment. t4053 and t9300 timed out and stay in the holdout
-            # note unless their isolated long retries complete.
+            # enrollment.
             t0000-basic.sh
             t0004-unwritable.sh
             t0005-signals.sh
@@ -991,6 +991,7 @@ jobs:
             t9003-help-autocorrect.sh
             t9210-scalar.sh
             t9211-scalar-clone.sh
+            t9300-fast-import.sh
             t9301-fast-import-notes.sh
             t9302-fast-import-unpack-limit.sh
             t9303-fast-import-compression.sh

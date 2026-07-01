@@ -29,6 +29,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut filter_print_omitted = false;
     let mut filter_provided_objects = false;
     let mut missing_action = RevListMissingAction::Error;
+    let mut exclude_promisor_objects = false;
     let mut boundary = false;
     let mut disk_usage = None;
     let mut object_names = true;
@@ -56,6 +57,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut use_bitmap_index = false;
     let mut test_bitmap = false;
     let mut unpacked = false;
+    let mut no_kept_objects = false;
     let mut setup_not = false;
     // Bisection plumbing (`--bisect[-vars|-all]`): `bisect` selects the
     // weighted-midpoint output mode, `bisect_vars` prints the `bisect_*=`
@@ -155,10 +157,14 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             "--simplify-merges" | "--show-pulls" | "--ancestry-path" => {
                 setup_args.push(arg.clone())
             }
-            "--sparse" | "--dense" | "--remove-empty" | "--exclude-promisor-objects" => {}
+            "--sparse" | "--dense" | "--remove-empty" => {}
+            "--exclude-promisor-objects" => exclude_promisor_objects = true,
+            "--no-exclude-promisor-objects" => exclude_promisor_objects = false,
             // No effect on the regular walk yet (pre-existing behaviour); the
             // bitmap path filters packed objects out of its result.
             "--unpacked" => unpacked = true,
+            "--no-kept-objects" => no_kept_objects = true,
+            "--kept-objects" => no_kept_objects = false,
             // Bisection modes. `--bisect` additionally injects the default
             // `refs/bisect/{bad,good-*}` refs as revisions when none are given,
             // matching git's setup_revisions; `--bisect-all` turns on
@@ -386,7 +392,19 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     // Mailmap engine for `--use-mailmap` custom-format atoms (the upper-case
     // `%aN`/… always map; lower-case map only under the flag).
     let mailmap = commands::utility::Mailmap::load_default(&git_dir, format)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let has_promisor_remote = crate::commands::plumbing::repo_has_promisor_remote(&config);
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format)
+        .with_promisor_remote_present(has_promisor_remote);
+    let traversal_missing_action = if exclude_promisor_objects {
+        RevListMissingAction::ExcludePromisor
+    } else {
+        missing_action
+    };
+    let kept_object_oids = if no_kept_objects {
+        sley_odb::kept_pack_object_ids(sley_odb::repository_objects_dir(&git_dir), format)?
+    } else {
+        HashSet::new()
+    };
     // `.git/info/grafts` rewrites commit parents, which the commit-graph and
     // pack-bitmap reachability shortcuts cannot see (they read raw parents).
     // git disables those optimisations whenever grafts are in effect
@@ -479,12 +497,15 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let full_history = revision_options.full_history;
     let mut include_commits = Vec::new();
     let mut start_tag_objects = Vec::new();
+    let pretty_uses_signature =
+        matches!(&pretty, RevListPretty::Compiled { compiled, .. } if compiled.uses_signature());
     // Tips that resolve to non-commit objects (git's pending-object model):
     // a provided blob is emitted directly in --objects mode (exempt from
     // filters unless --filter-provided-objects), silently dropped otherwise;
     // any other non-commit tip is additionally accepted under
     // --use-bitmap-index, where the bitmap traversal can start from it.
     let mut provided_objects: Vec<RevListObject> = Vec::new();
+    let mut provided_tree_roots: Vec<RevListObject> = Vec::new();
     let mut bitmap_object_tips: Vec<ObjectId> = Vec::new();
     for tip in &revision_options.positives {
         let start = match rev_list_start_from_oid(&db, format, tip.oid, ignore_missing) {
@@ -507,6 +528,18 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                             object_type: Some(ObjectType::Blob),
                         });
                     }
+                    ObjectType::Tree if objects => {
+                        let name = tip
+                            .rev
+                            .split_once(':')
+                            .map(|(_, path)| path.as_bytes().to_vec())
+                            .unwrap_or_default();
+                        provided_tree_roots.push(RevListObject {
+                            oid: tip.oid,
+                            name,
+                            object_type: Some(ObjectType::Tree),
+                        });
+                    }
                     ObjectType::Blob | ObjectType::Tree if !use_bitmap_index => {
                         // Without --objects, git silently ignores non-commit
                         // pending objects.
@@ -525,8 +558,48 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                     object: tag_object,
                 });
             }
+        } else if objects && let Ok(object) = db.read_object(&tip.oid) {
+            match object.object_type {
+                ObjectType::Blob => {
+                    let name = tip
+                        .rev
+                        .split_once(':')
+                        .map(|(_, path)| path.as_bytes().to_vec())
+                        .unwrap_or_default();
+                    provided_objects.push(RevListObject {
+                        oid: tip.oid,
+                        name,
+                        object_type: Some(ObjectType::Blob),
+                    });
+                }
+                ObjectType::Tree => {
+                    let name = tip
+                        .rev
+                        .split_once(':')
+                        .map(|(_, path)| path.as_bytes().to_vec())
+                        .unwrap_or_default();
+                    provided_tree_roots.push(RevListObject {
+                        oid: tip.oid,
+                        name,
+                        object_type: Some(ObjectType::Tree),
+                    });
+                }
+                _ if use_bitmap_index => bitmap_object_tips.push(tip.oid),
+                _ => {}
+            }
         }
     }
+    let source_tag_signatures = if pretty_uses_signature {
+        rev_list_source_tag_signatures(&git_dir, &db, &config, &start_tag_objects)?
+    } else {
+        HashMap::new()
+    };
+    let signature_ctx = LogSignatureContext {
+        git_dir: &git_dir,
+        db: &db,
+        config: &config,
+        source_tag_signatures: &source_tag_signatures,
+    };
     let mut left_right_sides = HashMap::new();
     for range in &revision_options.symmetric_ranges {
         if (left_right || side_filter.is_some() || cherry_mode != RevListCherryMode::None)
@@ -537,7 +610,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 format,
                 [range.left],
                 first_parent,
-                missing_action,
+                traversal_missing_action,
             )? {
                 left_right_sides.entry(record.oid).or_insert('<');
             }
@@ -546,24 +619,28 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 format,
                 [range.right],
                 first_parent,
-                missing_action,
+                traversal_missing_action,
             )? {
                 left_right_sides.entry(record.oid).or_insert('>');
             }
         }
     }
-    let object_filter_tip_oids = if !filter_provided_objects
-        && matches!(
-            object_filter,
-            RevListObjectFilter::ObjectType(ObjectType::Blob | ObjectType::Tree | ObjectType::Tag)
-        ) {
-        // Without `--filter-provided-objects`, a directly-provided commit tip is emitted even
-        // when an `object:type` filter would otherwise exclude it; with the flag it is filtered
-        // like any other object (an empty exemption set).
-        include_commits.iter().cloned().collect::<HashSet<_>>()
-    } else {
-        HashSet::new()
-    };
+    let object_filter_tip_oids =
+        if !filter_provided_objects && object_filter != RevListObjectFilter::None {
+            // Without `--filter-provided-objects`, directly-provided commit tips are emitted even
+            // when the object filter would otherwise exclude them (including combined filters).
+            include_commits
+                .iter()
+                .copied()
+                .filter(|oid| {
+                    !object_filter
+                        .includes_object(ObjectType::Commit, oid, &[], None, 0)
+                        .unwrap_or(true)
+                })
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
     let exclude_tip_oids: Vec<ObjectId> = revision_options.negatives.clone();
 
     if verify_objects {
@@ -571,6 +648,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         verify_roots.extend(include_commits.iter().copied());
         verify_roots.extend(start_tag_objects.iter().map(|tag| tag.object.oid));
         verify_roots.extend(provided_objects.iter().map(|object| object.oid));
+        verify_roots.extend(provided_tree_roots.iter().map(|object| object.oid));
         verify_roots.extend(bitmap_object_tips.iter().copied());
         if rev_list_verify_objects(&db, format, verify_roots) {
             return Err(GitError::Exit(1));
@@ -597,6 +675,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         }
         want_roots.extend(bitmap_object_tips.iter().copied());
         want_roots.extend(provided_objects.iter().map(|object| object.oid));
+        want_roots.extend(provided_tree_roots.iter().map(|object| object.oid));
         // Allowlist: anything the bitmap result cannot answer (traversal
         // order, pathspec pruning, per-commit predicates, output shaping)
         // falls back to the regular walk, like upstream's try_bitmap_*
@@ -695,9 +774,13 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
 
     let mut excluded = HashSet::new();
     for oid in &exclude_tip_oids {
-        for record in
-            rev_list_walk_commits_with_missing(&db, format, [*oid], first_parent, missing_action)?
-        {
+        for record in rev_list_walk_commits_with_missing(
+            &db,
+            format,
+            [*oid],
+            first_parent,
+            traversal_missing_action,
+        )? {
             excluded.insert(record.oid);
         }
     }
@@ -796,6 +879,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         let mut selected = metadata
             .into_iter()
             .filter(|record| !excluded.contains(&record.oid))
+            .filter(|record| !kept_object_oids.contains(&record.oid))
             .filter(|record| {
                 !(min_parents.is_some_and(|min| record.parents.len() < min)
                     || max_parents.is_some_and(|max| record.parents.len() > max))
@@ -885,7 +969,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 format,
                 include_commits,
                 first_parent,
-                missing_action,
+                traversal_missing_action,
             )?;
             missing_commit_objects = walk
                 .missing
@@ -911,6 +995,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         .map(|tag| tag.object.oid)
         .collect::<HashSet<_>>();
     known_direct_object_oids.extend(provided_objects.iter().map(|object| object.oid));
+    known_direct_object_oids.extend(provided_tree_roots.iter().map(|object| object.oid));
     let mut recovered_missing_tips = rev_list_missing_tip_objects(
         &git_dir,
         &db,
@@ -919,7 +1004,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         &selected_commit_oids,
         &known_direct_object_oids,
         objects,
-        missing_action,
+        traversal_missing_action,
     )?;
     provided_objects.append(&mut recovered_missing_tips.provided);
     let mut missing_tip_objects = recovered_missing_tips.missing;
@@ -1069,7 +1154,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     } else {
         Vec::new()
     };
-    let selected_tag_objects = if objects {
+    let mut selected_tag_objects = if objects {
         rev_list_selected_tag_objects(&selected, &start_tag_objects)
     } else {
         Vec::new()
@@ -1079,11 +1164,12 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             &db,
             format,
             &selected,
+            &provided_tree_roots,
             &excluded,
             &exclude_object_tips,
             &object_filter,
             filter_print_omitted,
-            missing_action,
+            traversal_missing_action,
         )?
     } else {
         (Vec::new(), Vec::new(), Vec::new())
@@ -1093,6 +1179,11 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         let provided_oids: HashSet<ObjectId> =
             provided_objects.iter().map(|object| object.oid).collect();
         selected_objects.retain(|object| !provided_oids.contains(&object.oid));
+    }
+    if no_kept_objects {
+        selected_tag_objects.retain(|object| !kept_object_oids.contains(&object.oid));
+        provided_objects.retain(|object| !kept_object_oids.contains(&object.oid));
+        selected_objects.retain(|object| !kept_object_oids.contains(&object.oid));
     }
     if let Some(human_readable) = disk_usage {
         let disk_usage = rev_list_disk_usage(
@@ -1126,6 +1217,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 .iter()
                 .filter(|record| {
                     rev_list_should_print_commit(record, &object_filter, &object_filter_tip_oids)
+                        && !kept_object_oids.contains(&record.oid)
                 })
                 .filter(|record| left_right_sides.get(&record.oid).copied().unwrap_or('>') == '<')
                 .filter(|record| !patchsame_oids.contains(&record.oid))
@@ -1134,6 +1226,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 .iter()
                 .filter(|record| {
                     rev_list_should_print_commit(record, &object_filter, &object_filter_tip_oids)
+                        && !kept_object_oids.contains(&record.oid)
                         && left_right_sides.get(&record.oid).copied().unwrap_or('>') != '<'
                 })
                 .filter(|record| !patchsame_oids.contains(&record.oid))
@@ -1146,7 +1239,8 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                             record,
                             &object_filter,
                             &object_filter_tip_oids,
-                        ) && patchsame_oids.contains(&record.oid)
+                        ) && !kept_object_oids.contains(&record.oid)
+                            && patchsame_oids.contains(&record.oid)
                     })
                     .count();
                 println!("{left_count}\t{right_count}\t{same_count}");
@@ -1160,6 +1254,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 .iter()
                 .filter(|record| {
                     rev_list_should_print_commit(record, &object_filter, &object_filter_tip_oids)
+                        && !kept_object_oids.contains(&record.oid)
                         && patchsame_oids.contains(&record.oid)
                 })
                 .count();
@@ -1167,6 +1262,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 .iter()
                 .filter(|record| {
                     rev_list_should_print_commit(record, &object_filter, &object_filter_tip_oids)
+                        && !kept_object_oids.contains(&record.oid)
                         && !patchsame_oids.contains(&record.oid)
                 })
                 .count();
@@ -1177,11 +1273,10 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             "{}",
             selected
                 .iter()
-                .filter(|record| rev_list_should_print_commit(
-                    record,
-                    &object_filter,
-                    &object_filter_tip_oids
-                ))
+                .filter(|record| {
+                    rev_list_should_print_commit(record, &object_filter, &object_filter_tip_oids)
+                        && !kept_object_oids.contains(&record.oid)
+                })
                 .count()
                 + boundary_records.len()
                 + selected_tag_objects.len()
@@ -1217,6 +1312,9 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     if !quiet {
         for record in selected {
             if !rev_list_should_print_commit(record, &object_filter, &object_filter_tip_oids) {
+                continue;
+            }
+            if kept_object_oids.contains(&record.oid) {
                 continue;
             }
             let left_right_prefix = left_right_sides.get(&record.oid).copied().unwrap_or('>');
@@ -1261,7 +1359,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                             date_mode: &date_mode,
                             source_oid: None,
                             describe: None,
-                            signature: None,
+                            signature: Some(&signature_ctx),
                             color: want_color,
                             output_encoding: &output_encoding,
                             mailmap: &mailmap,
@@ -1355,7 +1453,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                             date_mode: &date_mode,
                             source_oid: None,
                             describe: None,
-                            signature: None,
+                            signature: Some(&signature_ctx),
                             color: want_color,
                             output_encoding: &output_encoding,
                             mailmap: &mailmap,
@@ -2057,6 +2155,26 @@ struct RevListTagObject {
     object: RevListObject,
 }
 
+fn rev_list_source_tag_signatures(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    config: &GitConfig,
+    tags: &[RevListTagObject],
+) -> Result<HashMap<ObjectId, commands::signing::GpgVerification>> {
+    let mut signatures = HashMap::new();
+    for tag in tags {
+        let object = db.read_object(&tag.object.oid)?;
+        let Some((payload, signature)) = commands::signing::tag_signature_payload(&object.body)
+        else {
+            continue;
+        };
+        let verification =
+            commands::signing::verify_payload(git_dir, Some(config), payload, signature)?;
+        signatures.insert(tag.commit, verification);
+    }
+    Ok(signatures)
+}
+
 struct RevListRecoveredMissingTips {
     provided: Vec<RevListObject>,
     missing: Vec<RevListObject>,
@@ -2595,6 +2713,7 @@ fn rev_list_objects(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     records: &[&sley_rev::CommitRecord],
+    tree_roots: &[RevListObject],
     excluded: &HashSet<ObjectId>,
     exclude_objects: &[RevListObject],
     filter: &RevListObjectFilter,
@@ -2633,6 +2752,17 @@ fn rev_list_objects(
             &walk,
             &record.commit.tree,
             Vec::new(),
+            &hidden,
+            &mut state,
+            filter.tree_depth_limit(),
+            0,
+        )?;
+    }
+    for root in tree_roots {
+        rev_list_collect_tree_objects(
+            &walk,
+            &root.oid,
+            root.name.clone(),
             &hidden,
             &mut state,
             filter.tree_depth_limit(),
@@ -2701,6 +2831,9 @@ fn rev_list_collect_tree_objects(
     if hidden.contains(tree_oid) {
         return Ok(());
     }
+    if rev_list_excludes_promisor(walk) && walk.db.is_promised_object(tree_oid) {
+        return Ok(());
+    }
     if tree_depth_limit.is_some_and(|limit| depth >= limit) {
         if !walk.collect_omitted
             && !walk.filter.path_sensitive()
@@ -2760,6 +2893,9 @@ fn rev_list_collect_tree_objects(
     for entry in TreeEntries::new(walk.format, &object.body) {
         let entry = entry?;
         if hidden.contains(&entry.oid) {
+            continue;
+        }
+        if rev_list_excludes_promisor(walk) && walk.db.is_promised_object(&entry.oid) {
             continue;
         }
         let entry_path = rev_list_join_object_path(&path, entry.name);
@@ -2888,6 +3024,9 @@ fn rev_list_collect_omitted_tree_contents(
     if hidden.contains(tree_oid) {
         return Ok(());
     }
+    if rev_list_excludes_promisor(walk) && walk.db.is_promised_object(tree_oid) {
+        return Ok(());
+    }
     if !walk.filter.path_sensitive() && !state.omitted_tree_contents.insert(*tree_oid) {
         rev_list_trace_skipping_tree(path);
         return Ok(());
@@ -2912,6 +3051,9 @@ fn rev_list_collect_omitted_tree_contents(
     for entry in TreeEntries::new(walk.format, &object.body) {
         let entry = entry?;
         if hidden.contains(&entry.oid) {
+            continue;
+        }
+        if rev_list_excludes_promisor(walk) && walk.db.is_promised_object(&entry.oid) {
             continue;
         }
         let entry_path = rev_list_join_object_path(path, entry.name);
@@ -2964,7 +3106,13 @@ fn rev_list_handle_missing_object(
 ) -> Result<()> {
     match walk.missing_action {
         RevListMissingAction::Error => Err(err),
-        RevListMissingAction::AllowAny | RevListMissingAction::AllowPromisor => Ok(()),
+        RevListMissingAction::AllowAny => Ok(()),
+        RevListMissingAction::AllowPromisor | RevListMissingAction::ExcludePromisor
+            if walk.db.is_promised_object(oid) =>
+        {
+            Ok(())
+        }
+        RevListMissingAction::AllowPromisor | RevListMissingAction::ExcludePromisor => Err(err),
         RevListMissingAction::Print | RevListMissingAction::PrintInfo => {
             if state.missing_oids.insert(*oid) {
                 state.missing.push(RevListObject {
@@ -2976,6 +3124,10 @@ fn rev_list_handle_missing_object(
             Ok(())
         }
     }
+}
+
+fn rev_list_excludes_promisor(walk: &RevListObjectWalk<'_>) -> bool {
+    walk.missing_action == RevListMissingAction::ExcludePromisor
 }
 
 fn rev_list_join_object_path(prefix: &[u8], name: &[u8]) -> Vec<u8> {
@@ -3257,6 +3409,11 @@ fn rev_list_try_bitmap(
         result.extended.retain(|(oid, _)| !packed.contains(oid));
     }
 
+    rev_list_trace_bitmap_pseudo_merges(
+        result.pseudo_merges_satisfied,
+        result.pseudo_merges_cascades,
+    );
+
     let commit_mask = bitmap.type_words(ObjectType::Commit);
     if query.count {
         let mut commit_count = rev_list_bitmap_and_count(&result.words, commit_mask)
@@ -3311,6 +3468,11 @@ fn rev_list_try_bitmap(
     }
     stdout.flush()?;
     Ok(true)
+}
+
+fn rev_list_trace_bitmap_pseudo_merges(satisfied: usize, cascades: usize) {
+    sley_core::trace2::data("bitmap", "pseudo_merges_satisfied", satisfied);
+    sley_core::trace2::data("bitmap", "pseudo_merges_cascades", cascades);
 }
 
 /// Applies the object filter to a bitmap walk result, mirroring upstream's

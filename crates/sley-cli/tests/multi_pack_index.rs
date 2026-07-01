@@ -418,6 +418,97 @@ fn multi_pack_index_verify_matches_upstream_git() {
 }
 
 #[test]
+fn cat_file_objectsize_disk_uses_midx_when_pack_side_is_missing() {
+    let root = unique_temp_dir("midx-objectsize-disk");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["config", "core.multiPackIndex", "true"],
+        );
+        fs::write(root.join("base.t"), "base\n").expect("write fixture");
+        run_success(sley_testkit::oracle_git(), &root, &["add", "base.t"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &[
+                "-c",
+                "user.name=A U Thor",
+                "-c",
+                "user.email=author@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+        );
+        run_success(sley_testkit::oracle_git(), &root, &["repack", "-ad"]);
+        run_success(
+            env!("CARGO_BIN_EXE_sley"),
+            &root,
+            &["multi-pack-index", "write"],
+        );
+
+        let tip = String::from_utf8(run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["rev-parse", "HEAD"],
+        ))
+        .expect("tip is utf8");
+        let pack_dir = root.join(".git").join("objects").join("pack");
+        let idx = fs::read_dir(&pack_dir)
+            .expect("read pack dir")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("idx"))
+            .expect("pack index exists");
+        let pack = idx.with_extension("pack");
+        let idx_backup = idx.with_extension("idx.bak");
+        let pack_backup = pack.with_extension("pack.bak");
+        let args = ["cat-file", "--batch-check=%(objectsize:disk)"];
+
+        fs::rename(&idx, &idx_backup).expect("hide pack index");
+        let output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, tip.as_bytes());
+        assert_success(env!("CARGO_BIN_EXE_sley"), &args, &output);
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u64>()
+                .is_ok(),
+            "objectsize:disk should be numeric, got {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        fs::rename(&idx_backup, &idx).expect("restore pack index");
+
+        fs::rename(&pack, &pack_backup).expect("hide pack data");
+        let output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, tip.as_bytes());
+        assert_success(env!("CARGO_BIN_EXE_sley"), &args, &output);
+
+        let rewrite = run(
+            env!("CARGO_BIN_EXE_sley"),
+            &root,
+            &["multi-pack-index", "write"],
+        );
+        assert!(
+            !rewrite.status.success(),
+            "midx rewrite should fail when a named pack is missing"
+        );
+        assert!(
+            String::from_utf8_lossy(&rewrite.stderr).contains("could not load pack"),
+            "stderr did not mention missing pack:\n{}",
+            String::from_utf8_lossy(&rewrite.stderr)
+        );
+        fs::rename(&pack_backup, &pack).expect("restore pack data");
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn multi_pack_index_expire_quiet_baseline_matches_upstream_git() {
     let root = unique_temp_dir("midx-expire");
     fs::create_dir_all(&root).expect("create temp repo");

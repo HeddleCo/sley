@@ -46,6 +46,7 @@ pub fn modified_index_entries(
         return Ok(Vec::new());
     }
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    let sparse_checkout_active = sparse_checkout_active_for_status(git_dir, &index);
     if index.entries.iter().any(IndexEntry::is_sparse_dir) {
         let db = FileObjectDatabase::from_git_dir(git_dir, format);
         expand_sparse_index(&mut index, &db, format)?;
@@ -57,6 +58,9 @@ pub fn modified_index_entries(
     let stat_cache = IndexStatCache::from_index(&index, &index_path);
     let mut modified = Vec::new();
     for entry in index.entries {
+        if index_entry_skip_worktree(&entry) && !sparse_checkout_active {
+            continue;
+        }
         let worktree_entry = worktree_entry_for_git_path(
             worktree_root,
             git_dir,
@@ -296,6 +300,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
         );
     }
     let _process_filter_metadata = set_process_filter_metadata(process_metadata);
+    let _process_filter_cwd = set_process_filter_cwd(Some(worktree_root.to_path_buf()));
     let mut dirty = false;
     if smudge_config.is_some() {
         dirty = !modified_index_entries(worktree_root, git_dir, format)?.is_empty();
@@ -323,9 +328,10 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
         .map(|_| build_tree_attribute_matcher(worktree_root, &db, format, &commit.tree))
         .transpose()?;
 
-    for path in read_index_entries(git_dir, format)?.keys() {
+    let old_index_entries = read_index_entries(git_dir, format)?;
+    for (path, old_entry) in &old_index_entries {
         if !target_entries.contains_key(path) {
-            remove_worktree_file(worktree_root, path)?;
+            remove_checkout_tracked_path(worktree_root, path, old_entry)?;
         }
     }
 
@@ -333,6 +339,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
     let mut materialized_paths: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut collided_paths: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut index_entries = Vec::new();
+    let mut delayed_checkout = DelayedCheckoutQueue::default();
     for (path, entry) in &target_entries {
         if ignore_case {
             let folded = checkout_collision_key(path);
@@ -360,7 +367,14 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
             entry,
             smudge_config,
             attributes.as_ref(),
+            Some(&mut delayed_checkout),
         )?);
+    }
+    let mut delayed_updates = finish_delayed_checkout(worktree_root, delayed_checkout)?;
+    for entry in &mut index_entries {
+        if let Some(updated) = delayed_updates.remove(entry.path.as_bytes()) {
+            *entry = updated;
+        }
     }
     warn_checkout_collisions(&collided_paths);
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -376,6 +390,34 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
         .write(format)?,
     )?;
     Ok(target_entries.len())
+}
+
+fn remove_checkout_tracked_path(
+    worktree_root: &Path,
+    path: &[u8],
+    entry: &TrackedEntry,
+) -> Result<()> {
+    if !sley_index::is_gitlink(entry.mode) {
+        return remove_worktree_file(worktree_root, path);
+    }
+    let file = worktree_path(worktree_root, path)?;
+    if !file.exists() {
+        return Ok(());
+    }
+    if !file.is_dir() {
+        return remove_worktree_file(worktree_root, path);
+    }
+    match fs::remove_dir(&file) {
+        Ok(()) => prune_empty_parents(worktree_root, file.parent())?,
+        Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+            eprintln!(
+                "warning: unable to rmdir '{}': Directory not empty",
+                String::from_utf8_lossy(path)
+            );
+        }
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
 }
 
 fn checkout_should_detect_case_collisions(worktree_root: &Path, git_dir: &Path) -> bool {
@@ -433,6 +475,207 @@ fn unmaterialized_index_entry(path: &[u8], entry: &TrackedEntry) -> IndexEntry {
     }
 }
 
+pub(crate) fn unmaterialized_index_entry_from_index(entry: &IndexEntry) -> IndexEntry {
+    let mut unmaterialized = entry.clone();
+    unmaterialized.ctime_seconds = 0;
+    unmaterialized.ctime_nanoseconds = 0;
+    unmaterialized.mtime_seconds = 0;
+    unmaterialized.mtime_nanoseconds = 0;
+    unmaterialized.dev = 0;
+    unmaterialized.ino = 0;
+    unmaterialized.uid = 0;
+    unmaterialized.gid = 0;
+    unmaterialized.size = 0;
+    unmaterialized
+}
+
+#[derive(Default)]
+pub(crate) struct DelayedCheckoutQueue {
+    filters: BTreeSet<String>,
+    pending: BTreeMap<Vec<u8>, DelayedCheckoutEntry>,
+}
+
+struct DelayedCheckoutEntry {
+    process: String,
+    entry: TrackedEntry,
+}
+
+impl DelayedCheckoutQueue {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    pub(crate) fn enqueue(&mut self, process: String, path: &[u8], entry: &TrackedEntry) {
+        self.filters.insert(process.clone());
+        self.pending.insert(
+            path.to_vec(),
+            DelayedCheckoutEntry {
+                process,
+                entry: entry.clone(),
+            },
+        );
+    }
+}
+
+pub(crate) fn finish_delayed_checkout(
+    worktree_root: &Path,
+    mut delayed: DelayedCheckoutQueue,
+) -> Result<BTreeMap<Vec<u8>, IndexEntry>> {
+    if delayed.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut updates = BTreeMap::new();
+    let mut had_error = false;
+    let mut active_filters = delayed.filters.iter().cloned().collect::<Vec<_>>();
+    while !active_filters.is_empty() {
+        let mut next_filters = Vec::new();
+        for process in active_filters {
+            let mut available = match list_available_process_filter_blobs(&process) {
+                Ok(paths) => paths,
+                Err(err) => {
+                    if err.protocol {
+                        eprintln!("error: external filter '{}' failed", process);
+                    }
+                    had_error = true;
+                    continue;
+                }
+            };
+            if available.is_empty() {
+                continue;
+            }
+            available.sort();
+            available.dedup();
+
+            let mut keep_filter = true;
+            for path in available {
+                let Some(delayed_entry) = delayed.pending.remove(path.as_slice()) else {
+                    eprintln!(
+                        "error: external filter '{}' signaled that '{}' is now available although it has not been delayed earlier",
+                        process,
+                        String::from_utf8_lossy(&path)
+                    );
+                    had_error = true;
+                    keep_filter = false;
+                    continue;
+                };
+                if delayed_entry.process != process {
+                    eprintln!(
+                        "error: external filter '{}' signaled that '{}' is now available although it has not been delayed earlier",
+                        process,
+                        String::from_utf8_lossy(&path)
+                    );
+                    had_error = true;
+                    keep_filter = false;
+                    continue;
+                }
+
+                match run_process_filter(
+                    &process,
+                    "smudge",
+                    &path,
+                    &[],
+                    Some(delayed_entry.entry.oid),
+                    false,
+                ) {
+                    Ok(ProcessFilterOutcome::Filtered(output)) => {
+                        let index_entry = write_delayed_checkout_output(
+                            worktree_root,
+                            &path,
+                            &delayed_entry.entry,
+                            &output,
+                        )?;
+                        if let Some(index_entry) = index_entry {
+                            updates.insert(path, index_entry);
+                        }
+                    }
+                    Ok(ProcessFilterOutcome::Unsupported) => {
+                        eprintln!("error: external filter '{}' failed", process);
+                        had_error = true;
+                        keep_filter = false;
+                    }
+                    Ok(ProcessFilterOutcome::Status(status)) => {
+                        eprintln!(
+                            "error: external filter '{}' returned status {status}",
+                            process
+                        );
+                        had_error = true;
+                        keep_filter = false;
+                    }
+                    Err(err) => {
+                        if err.protocol {
+                            eprintln!("error: external filter '{}' failed", process);
+                        }
+                        had_error = true;
+                        keep_filter = false;
+                    }
+                }
+            }
+
+            if keep_filter {
+                next_filters.push(process);
+            }
+        }
+        active_filters = next_filters;
+    }
+
+    for path in delayed.pending.keys() {
+        eprintln!(
+            "error: '{}' was not filtered properly",
+            String::from_utf8_lossy(path)
+        );
+        had_error = true;
+    }
+
+    if had_error {
+        return Err(GitError::Exit(1));
+    }
+    Ok(updates)
+}
+
+fn write_delayed_checkout_output(
+    worktree_root: &Path,
+    path: &[u8],
+    entry: &TrackedEntry,
+    body: &[u8],
+) -> Result<Option<IndexEntry>> {
+    if checkout_path_has_symlink_parent(worktree_root, path)? {
+        return Ok(None);
+    }
+    let file_path = worktree_path(worktree_root, path)?;
+    prepare_blob_parent_dirs(worktree_root, &file_path)?;
+    remove_existing_worktree_path(&file_path)?;
+    fs::write(&file_path, body)?;
+    set_worktree_file_mode(&file_path, entry.mode)?;
+    let metadata = fs::metadata(&file_path)?;
+    let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
+    index_entry.mode = entry.mode;
+    Ok(Some(index_entry))
+}
+
+fn checkout_path_has_symlink_parent(worktree_root: &Path, path: &[u8]) -> Result<bool> {
+    let rel = std::str::from_utf8(path)
+        .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
+    let mut current = worktree_root.to_path_buf();
+    let mut components = Path::new(rel).components().peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(false)
+}
+
 fn warn_checkout_collisions(collided_paths: &BTreeSet<Vec<u8>>) {
     if collided_paths.is_empty() {
         return;
@@ -477,6 +720,7 @@ pub(crate) fn materialize_tree_entry_with_optional_smudge(
     entry: &TrackedEntry,
     smudge_config: Option<&GitConfig>,
     attributes: Option<&AttributeMatcher>,
+    mut delayed: Option<&mut DelayedCheckoutQueue>,
 ) -> Result<IndexEntry> {
     // A symlink (mode 120000) is written as a *symlink* whose target is the raw,
     // unfiltered blob bytes — git treats symlink content as an opaque path, so no
@@ -494,13 +738,23 @@ pub(crate) fn materialize_tree_entry_with_optional_smudge(
     let matcher = attributes.expect("attributes are built when smudge_config is set");
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
-    let body = apply_smudge_filter_with_attributes_cow_format(
+    let body = match apply_smudge_filter_with_attributes_maybe_delayed(
         config,
         &checks,
         path,
         &object.body,
         format,
-    )?;
+        delayed.is_some(),
+    )? {
+        SmudgeFilterResult::Content(body) => body,
+        SmudgeFilterResult::Delayed { process } => {
+            let queue = delayed
+                .as_deref_mut()
+                .expect("delay is only reported when a queue is available");
+            queue.enqueue(process, path, entry);
+            return Ok(unmaterialized_index_entry(path, entry));
+        }
+    };
     let file_path = worktree_path(worktree_root, path)?;
     prepare_blob_parent_dirs(worktree_root, &file_path)?;
     remove_existing_worktree_path(&file_path)?;
@@ -532,6 +786,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree_sparse(
     process_metadata: Option<Vec<(String, String)>>,
 ) -> Result<usize> {
     let _process_filter_metadata = set_process_filter_metadata(process_metadata);
+    let _process_filter_cwd = set_process_filter_cwd(Some(worktree_root.to_path_buf()));
     let previously_skipped = skip_worktree_paths(git_dir, format)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let commit = read_commit(&db, format, target)?;
@@ -592,6 +847,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree_sparse(
     }
 
     let mut index_entries = Vec::new();
+    let mut delayed_checkout = DelayedCheckoutQueue::default();
     for (path, entry) in &target_entries {
         let in_cone = matcher.as_ref().map_or_else(
             || !previously_skipped.contains(path),
@@ -606,6 +862,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree_sparse(
                 entry,
                 smudge_config,
                 attributes.as_ref(),
+                Some(&mut delayed_checkout),
             )?
         } else {
             // Out of cone: ensure no stale worktree file remains and synthesize
@@ -617,6 +874,12 @@ pub(crate) fn checkout_commit_to_index_and_worktree_sparse(
             index_entry
         };
         index_entries.push(index_entry);
+    }
+    let mut delayed_updates = finish_delayed_checkout(worktree_root, delayed_checkout)?;
+    for entry in &mut index_entries {
+        if let Some(updated) = delayed_updates.remove(entry.path.as_bytes()) {
+            *entry = updated;
+        }
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let mut index = Index {
@@ -761,6 +1024,7 @@ pub fn checkout_index_paths(
 
     let mut refreshed = BTreeMap::new();
     let mut restored = BTreeSet::new();
+    let mut delayed_checkout = DelayedCheckoutQueue::default();
     for path in selected {
         let positions = index
             .entries
@@ -802,7 +1066,7 @@ pub fn checkout_index_paths(
                     );
                     return Err(GitError::Exit(1));
                 };
-                checkout_write_index_entry_to_worktree(
+                if restore_index_entry_maybe_delayed(
                     worktree_root,
                     git_dir,
                     format,
@@ -810,8 +1074,12 @@ pub fn checkout_index_paths(
                     &index.entries[position],
                     options.smudge_config,
                     Some(&stat_cache),
-                )?;
-                restored.insert(path);
+                    Some(&mut delayed_checkout),
+                )?
+                .is_some()
+                {
+                    restored.insert(path);
+                }
                 continue;
             }
             if options.merge {
@@ -831,7 +1099,7 @@ pub fn checkout_index_paths(
         }
 
         if let Some(position) = stage0 {
-            if let Some(updated) = checkout_write_index_entry_to_worktree(
+            if let Some(updated) = restore_index_entry_maybe_delayed(
                 worktree_root,
                 git_dir,
                 format,
@@ -839,10 +1107,18 @@ pub fn checkout_index_paths(
                 &index.entries[position],
                 options.smudge_config,
                 Some(&stat_cache),
+                Some(&mut delayed_checkout),
             )? {
                 refreshed.insert(position, updated);
+                restored.insert(path);
             }
-            restored.insert(path);
+        }
+    }
+
+    let mut delayed_updates = finish_delayed_checkout(worktree_root, delayed_checkout)?;
+    for (position, entry) in index.entries.iter().enumerate() {
+        if let Some(updated) = delayed_updates.remove(entry.path.as_bytes()) {
+            refreshed.insert(position, updated);
         }
     }
 
@@ -1103,26 +1379,6 @@ pub(crate) fn checkout_path_is_unmerged(index: &Index, path: &[u8]) -> bool {
         .entries
         .iter()
         .any(|entry| entry.path.as_bytes() == path && entry.stage() != Stage::Normal)
-}
-
-pub(crate) fn checkout_write_index_entry_to_worktree(
-    worktree_root: &Path,
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
-    entry: &IndexEntry,
-    smudge_config: Option<&GitConfig>,
-    stat_cache: Option<&IndexStatCache>,
-) -> Result<Option<IndexEntry>> {
-    restore_index_entry(
-        worktree_root,
-        git_dir,
-        format,
-        db,
-        entry,
-        smudge_config,
-        stat_cache,
-    )
 }
 
 pub(crate) fn checkout_merge_unmerged_path(
@@ -1518,6 +1774,7 @@ pub fn reset_index_and_worktree_to_commit(
 ) -> Result<RestoreResult> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
+    let _process_filter_cwd = set_process_filter_cwd(Some(worktree_root.to_path_buf()));
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let commit = read_commit(&db, format, commit_oid)?;
     let mut target_entries = BTreeMap::new();
@@ -1539,16 +1796,24 @@ pub fn reset_index_and_worktree_to_commit(
     }
 
     let mut index_entries = Vec::new();
+    let mut delayed_checkout = DelayedCheckoutQueue::default();
     for (path, entry) in &target_entries {
-        index_entries.push(materialize_tree_entry_filtered(
+        index_entries.push(materialize_tree_entry_with_optional_smudge(
             &db,
             format,
             worktree_root,
             path,
             entry,
-            &config,
-            &attributes,
+            Some(&config),
+            Some(&attributes),
+            Some(&mut delayed_checkout),
         )?);
+    }
+    let mut delayed_updates = finish_delayed_checkout(worktree_root, delayed_checkout)?;
+    for entry in &mut index_entries {
+        if let Some(updated) = delayed_updates.remove(entry.path.as_bytes()) {
+            *entry = updated;
+        }
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let extensions = preserved_index_extensions(git_dir, format)?;
@@ -1645,38 +1910,6 @@ pub(crate) fn materialize_gitlink_dir(worktree_root: &Path, dir_path: &Path) -> 
     }
     fs::create_dir_all(dir_path)?;
     Ok(())
-}
-
-pub(crate) fn materialize_tree_entry_filtered(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    worktree_root: &Path,
-    path: &[u8],
-    entry: &TrackedEntry,
-    config: &GitConfig,
-    attributes: &AttributeMatcher,
-) -> Result<IndexEntry> {
-    if sley_index::is_gitlink(entry.mode) || (entry.mode & 0o170000) == 0o120000 {
-        return materialize_tree_entry(db, worktree_root, path, entry);
-    }
-    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
-    let checks = attributes.attributes_for_path(path, &filter_attribute_names(), false);
-    let body = apply_smudge_filter_with_attributes_cow_format(
-        config,
-        &checks,
-        path,
-        &object.body,
-        format,
-    )?;
-    let file_path = worktree_path(worktree_root, path)?;
-    prepare_blob_parent_dirs(worktree_root, &file_path)?;
-    remove_existing_worktree_path(&file_path)?;
-    fs::write(&file_path, &body)?;
-    set_worktree_file_mode(&file_path, entry.mode)?;
-    let metadata = fs::symlink_metadata(&file_path)?;
-    let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
-    index_entry.mode = entry.mode;
-    Ok(index_entry)
 }
 
 pub(crate) fn materialize_path_restore_entry_filtered(

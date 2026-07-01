@@ -4,6 +4,14 @@
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
 
+fn warn_diff_rename_limit(diagnostics: sley_diff_merge::RenameLimitDiagnostics) {
+    if diagnostics.inexact_copies_degraded {
+        eprintln!("warning: only found copies from modified paths due to too many files.");
+    } else if diagnostics.any_skipped() {
+        eprintln!("warning: exhaustive rename detection was skipped due to too many files.");
+    }
+}
+
 /// Peel a single revision string to the tree it names (commit/tag/tree all work).
 fn diff_peel_rev_tree(
     git_dir: &Path,
@@ -466,6 +474,7 @@ pub(crate) fn run_diff_check(
     worktree_root: Option<&Path>,
     use_worktree_old: bool,
     use_worktree_new: bool,
+    worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
     resolver: &WhitespaceRuleResolver,
 ) -> Result<bool> {
     let mut stdout = io::stdout();
@@ -477,13 +486,19 @@ pub(crate) fn run_diff_check(
         if entry.new_mode == Some(0o160000) {
             continue;
         }
-        let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+        let new_content =
+            diff_entry_new_content(entry, db, worktree_root, use_worktree_new, worktree_clean)?;
         let Some(new_content) = new_content else {
             continue;
         };
-        let old_content =
-            diff_entry_old_content_for_diff(entry, db, worktree_root, use_worktree_old)?
-                .unwrap_or_default();
+        let old_content = diff_entry_old_content_for_diff(
+            entry,
+            db,
+            worktree_root,
+            use_worktree_old,
+            worktree_clean,
+        )?
+        .unwrap_or_default();
         let path = status_quote_path(&entry.path, false);
         // A symlink target being an incomplete line is not news (git clears
         // WS_INCOMPLETE_LINE for symlinks). We don't track symlink mode here in
@@ -513,6 +528,7 @@ fn diff_entry_old_content_for_diff(
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_old: bool,
+    worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
 ) -> Result<Option<Vec<u8>>> {
     if !use_worktree_old {
         return diff_entry_old_content(entry, db);
@@ -536,7 +552,15 @@ fn diff_entry_old_content_for_diff(
         return read_symlink_bytes_for_diff(&path).map(Some);
     }
     if path.exists() {
-        return Ok(Some(fs::read(path)?));
+        let content = fs::read(path)?;
+        let attr_path = entry.old_path.as_deref().unwrap_or(&entry.path);
+        return match worktree_clean {
+            Some(clean) => clean
+                .attributes
+                .apply_clean_filter(clean.config, attr_path, &content)
+                .map(Some),
+            None => Ok(Some(content)),
+        };
     }
     Ok(None)
 }
@@ -692,6 +716,7 @@ fn run_external_diff_entries(
 ) -> Result<Option<i32>> {
     let mut handled = false;
     let mut found_changes = false;
+    let git_prefix = external_diff_git_prefix(worktree_root);
     let mut output_file = match options.output {
         Some(path) if !options.quiet => Some(
             fs::OpenOptions::new()
@@ -716,6 +741,7 @@ fn run_external_diff_entries(
         let mut context = ExternalDiffProcessContext {
             db,
             worktree_root,
+            git_prefix: git_prefix.clone(),
             use_worktree_new,
             autocrlf: options.autocrlf,
             quiet: options.quiet,
@@ -765,6 +791,7 @@ fn external_diff_for_entry(
 struct ExternalDiffProcessContext<'a> {
     db: &'a FileObjectDatabase,
     worktree_root: Option<&'a Path>,
+    git_prefix: Option<String>,
     use_worktree_new: bool,
     autocrlf: bool,
     quiet: bool,
@@ -821,6 +848,14 @@ fn run_one_external_diff(
         .args(args)
         .env("GIT_DIFF_PATH_COUNTER", counter.to_string())
         .env("GIT_DIFF_PATH_TOTAL", total.to_string());
+    if let Some(root) = context.worktree_root {
+        child.current_dir(root);
+    }
+    if let Some(prefix) = &context.git_prefix {
+        child.env("GIT_PREFIX", prefix);
+    } else {
+        child.env_remove("GIT_PREFIX");
+    }
     if context.quiet {
         child.stdout(std::process::Stdio::null());
     } else if let Some(file) = context.output_file.as_mut() {
@@ -828,6 +863,19 @@ fn run_one_external_diff(
     }
     let status = child.status()?;
     Ok(status.code().unwrap_or(128))
+}
+
+fn external_diff_git_prefix(worktree_root: Option<&Path>) -> Option<String> {
+    let root = worktree_root?;
+    let cwd = env::current_dir().ok()?;
+    let relative = cwd.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}/",
+        relative.to_string_lossy().replace('\\', "/")
+    ))
 }
 
 fn external_diff_oid(oid: Option<&ObjectId>, format: ObjectFormat, zero: bool) -> String {
@@ -879,7 +927,7 @@ fn prepare_external_diff_file(
         }
     }
     let content = if new_side {
-        diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?
+        diff_entry_new_content(entry, db, worktree_root, use_worktree_new, None)?
     } else {
         diff_entry_old_content(entry, db)?
     };
@@ -952,6 +1000,26 @@ fn unique_external_diff_temp_dir() -> Result<PathBuf> {
     ))
 }
 
+fn diff_should_use_implicit_no_index(path_args: &[String], explicit_paths: &[String]) -> bool {
+    let total = path_args.len() + explicit_paths.len();
+    if total != 2 {
+        return false;
+    }
+    path_args
+        .iter()
+        .chain(explicit_paths)
+        .any(|path| diff_arg_looks_outside_worktree(path))
+}
+
+fn diff_arg_looks_outside_worktree(path: &str) -> bool {
+    if path == "-" || Path::new(path).is_absolute() {
+        return true;
+    }
+    Path::new(path)
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
 pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let commands::diff_options::DiffOptions {
         output_format,
@@ -1018,6 +1086,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         renames_explicit,
         rename_threshold,
         copy_threshold,
+        rename_limit,
         diff_filter,
         ignore_submodules_cli,
         merge_base,
@@ -1069,7 +1138,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff patch output controls are not supported for this output mode".into(),
         ));
     }
-    if diff_rewrite_control && !name_status && !name_only {
+    let stat_family = stat || compact_summary || numstat || shortstat;
+    if diff_rewrite_control && !name_status && !name_only && !stat_family {
         return Err(GitError::Unsupported(
             "diff rewrite controls are not supported for this output mode".into(),
         ));
@@ -1078,6 +1148,10 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         return Err(GitError::Unsupported(
             "diff pickaxe controls are not supported for this output mode".into(),
         ));
+    }
+    if !find_object_values.is_empty() && discover_git_dir(&env::current_dir()?).is_err() {
+        eprintln!("fatal: --find-object requires a git repository");
+        return Err(GitError::Exit(128));
     }
     if !find_object_values.is_empty() && !name_status && !name_only {
         return Err(GitError::Unsupported(
@@ -1098,7 +1172,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         ));
     }
     let cwd = env::current_dir()?;
-    if no_index {
+    let implicit_no_index =
+        !no_index && diff_should_use_implicit_no_index(&path_args, &explicit_paths);
+    if no_index || implicit_no_index {
         let mut paths = path_args;
         if head {
             paths.insert(0, "HEAD".to_string());
@@ -1114,11 +1190,21 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 color_moved_ws_cli: color_moved_ws,
                 output_format,
                 raw_abbrev,
+                patch_abbrev,
+                patch_full_index,
+                allow_external,
+                exit_code,
+                output: output.as_deref(),
+                reverse,
                 z,
                 word_diff_mode,
                 word_diff_regex: word_diff_regex.as_deref(),
                 src_prefix: &src_prefix,
                 dst_prefix: &dst_prefix,
+                cli_no_prefix,
+                cli_default_prefix,
+                cli_src_prefix: cli_src_prefix.as_deref(),
+                cli_dst_prefix: cli_dst_prefix.as_deref(),
                 quiet,
                 interhunk: interhunk.unwrap_or(0),
                 ws_ignore,
@@ -1471,21 +1557,25 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         detect_inexact: true,
         rename_threshold,
         copy_threshold,
-        rename_limit: 0,
+        rename_limit,
     };
     let mut precomputed_staged_gitlinks = None;
+    let mut rename_limit_diagnostics = sley_diff_merge::RenameLimitDiagnostics::default();
     let entries = if !diff_trees.is_empty() {
         match diff_trees.as_slice() {
             // `diff <rev>`: that tree vs the worktree (or the index with --cached).
             [tree] => {
                 if cached {
                     if inexact_renames {
-                        sley_diff_merge::diff_name_status_tree_index_with_rename_options(
+                        let diff =
+                            sley_diff_merge::diff_name_status_tree_index_with_rename_options_and_diagnostics(
                             &git_dir,
                             format,
                             tree,
                             rename_options,
-                        )?
+                        )?;
+                        rename_limit_diagnostics = diff.rename_limit;
+                        diff.entries
                     } else {
                         sley_diff_merge::diff_name_status_tree_index_with_options(
                             &git_dir,
@@ -1520,13 +1610,16 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             // `diff <rev> <rev>` / `<rev>..<rev>` / `<rev>...<rev>`: tree vs tree.
             [left, right] => {
                 if inexact_renames {
-                    sley_diff_merge::diff_name_status_trees_with_rename_options(
+                    let diff =
+                        sley_diff_merge::diff_name_status_trees_with_rename_options_and_diagnostics(
                         &db,
                         format,
                         left,
                         right,
                         rename_options,
-                    )?
+                    )?;
+                    rename_limit_diagnostics = diff.rename_limit;
+                    diff.entries
                 } else {
                     sley_diff_merge::diff_name_status_trees_with_options(
                         &db,
@@ -1545,11 +1638,14 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
     } else if cached {
         if inexact_renames {
-            sley_diff_merge::diff_name_status_head_index_with_rename_options(
-                &git_dir,
-                format,
-                rename_options,
-            )?
+            let diff =
+                sley_diff_merge::diff_name_status_head_index_with_rename_options_and_diagnostics(
+                    &git_dir,
+                    format,
+                    rename_options,
+                )?;
+            rename_limit_diagnostics = diff.rename_limit;
+            diff.entries
         } else {
             sley_diff_merge::diff_name_status_head_index_with_options(
                 &git_dir,
@@ -1622,6 +1718,20 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     };
     let entries = apply_diff_pathspec(entries, &pathspec);
     let entries = if let Some(needle) = pickaxe.as_deref() {
+        let worktree_clean_attributes = if use_worktree_new {
+            worktree_root
+                .as_deref()
+                .map(sley_worktree::WorktreeAttributes::from_worktree_root)
+                .transpose()?
+        } else {
+            None
+        };
+        let worktree_clean = match (repo_config.as_ref(), worktree_clean_attributes.as_ref()) {
+            (Some(config), Some(attributes)) => {
+                Some(DiffWorktreeCleanContext { config, attributes })
+            }
+            _ => None,
+        };
         apply_diff_pickaxe(
             entries,
             needle.as_bytes(),
@@ -1629,6 +1739,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             &db,
             worktree_root.as_deref(),
             use_worktree_new,
+            worktree_clean.as_ref(),
         )?
     } else if pickaxe_all || pickaxe_regex {
         sort_diff_entries_by_path(entries)
@@ -1657,6 +1768,18 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             root.push(repo_path_to_path(&prefix));
         }
         apply_diff_relative(entries, &prefix)
+    };
+    let worktree_clean_attributes = if use_worktree_new || use_worktree_old {
+        worktree_root
+            .as_deref()
+            .map(sley_worktree::WorktreeAttributes::from_worktree_root)
+            .transpose()?
+    } else {
+        None
+    };
+    let worktree_clean = match (repo_config.as_ref(), worktree_clean_attributes.as_ref()) {
+        (Some(config), Some(attributes)) => Some(DiffWorktreeCleanContext { config, attributes }),
+        _ => None,
     };
     if reverse {
         std::mem::swap(&mut src_prefix, &mut dst_prefix);
@@ -1690,6 +1813,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 &db,
                 worktree_root.as_deref(),
                 use_worktree_new,
+                worktree_clean.as_ref(),
                 interhunk.unwrap_or(0),
                 patch_context,
                 ws_ignore,
@@ -1720,6 +1844,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         commands::diff_order::rotate_entries(&mut entries, target.as_bytes(), rotate_skip, true)?;
     }
     let has_differences = !entries.is_empty();
+    warn_diff_rename_limit(rename_limit_diagnostics);
     // `--check`: report whitespace errors introduced by the new side, in place
     // of the normal patch body (git's DIFF_FORMAT_CHECKDIFF). It exits 2 on a
     // whitespace error; combined with `--exit-code`/`--quiet` (not exclusive)
@@ -1733,6 +1858,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             worktree_root.as_deref(),
             use_worktree_old,
             use_worktree_new,
+            worktree_clean.as_ref(),
             &resolver,
         )?;
         let mut code = 0;
@@ -1790,12 +1916,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         let show_patch = !name_only && !name_status && (patch || no_output_mode);
         let show_summary = summary && !name_only && !name_status;
         let stat_entries = if show_numstat || show_stat || show_shortstat {
-            Some(if ignore_active {
+            let mut stat_entries = if ignore_active {
                 collect_diff_stat_entries_with_ignore(
                     &entries,
                     &db,
                     worktree_root.as_deref(),
                     use_worktree_new,
+                    worktree_clean.as_ref(),
                     DiffStatIgnoreOptions {
                         ws_ignore,
                         ignore_blank_lines,
@@ -1805,13 +1932,24 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     },
                 )?
             } else {
-                collect_diff_stat_entries(
+                collect_diff_stat_entries_with_worktree_clean(
                     &entries,
                     &db,
                     worktree_root.as_deref(),
                     use_worktree_new,
+                    worktree_clean.as_ref(),
                 )?
-            })
+            };
+            if diff_rewrite_control {
+                apply_diff_break_rewrite_stats(
+                    &mut stat_entries,
+                    &db,
+                    worktree_root.as_deref(),
+                    use_worktree_new,
+                    worktree_clean.as_ref(),
+                )?;
+            }
+            Some(stat_entries)
         } else {
             None
         };
@@ -1860,6 +1998,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     &db,
                     worktree_root.as_deref(),
                     use_worktree_new,
+                    worktree_clean.as_ref(),
                     dirstat_options,
                 )?;
             }
@@ -1969,19 +2108,21 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         }
                         _ => None,
                     };
-                    let materialized_contents = if use_worktree_old {
+                    let materialized_contents = if use_worktree_old || worktree_clean.is_some() {
                         Some((
                             diff_entry_old_content_for_diff(
                                 entry,
                                 &db,
                                 worktree_root.as_deref(),
-                                true,
+                                use_worktree_old,
+                                worktree_clean.as_ref(),
                             )?,
                             diff_entry_new_content(
                                 entry,
                                 &db,
                                 worktree_root.as_deref(),
                                 use_worktree_new,
+                                worktree_clean.as_ref(),
                             )?,
                         ))
                     } else {
@@ -2425,13 +2566,21 @@ pub(crate) fn apply_diff_pickaxe(
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
+    worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
     if needle.is_empty() {
         return Ok(Vec::new());
     }
     if pickaxe_all {
         for entry in &entries {
-            if diff_entry_matches_pickaxe(entry, needle, db, worktree_root, use_worktree_new)? {
+            if diff_entry_matches_pickaxe(
+                entry,
+                needle,
+                db,
+                worktree_root,
+                use_worktree_new,
+                worktree_clean,
+            )? {
                 return Ok(sort_diff_entries_by_path(entries));
             }
         }
@@ -2440,7 +2589,14 @@ pub(crate) fn apply_diff_pickaxe(
 
     let mut matches = Vec::new();
     for entry in &entries {
-        if diff_entry_matches_pickaxe(entry, needle, db, worktree_root, use_worktree_new)? {
+        if diff_entry_matches_pickaxe(
+            entry,
+            needle,
+            db,
+            worktree_root,
+            use_worktree_new,
+            worktree_clean,
+        )? {
             matches.push(entry.clone());
         }
     }
@@ -2453,9 +2609,11 @@ fn diff_entry_matches_pickaxe(
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
+    worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
 ) -> Result<bool> {
     let old_content = diff_entry_old_content(entry, db)?;
-    let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+    let new_content =
+        diff_entry_new_content(entry, db, worktree_root, use_worktree_new, worktree_clean)?;
     Ok(
         count_non_overlapping_occurrences(old_content.as_deref().unwrap_or_default(), needle)
             != count_non_overlapping_occurrences(
@@ -2672,12 +2830,14 @@ fn collect_diff_stat_entries_with_ignore<'a>(
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
+    worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
     ignore: DiffStatIgnoreOptions<'_>,
 ) -> Result<Vec<DiffStatEntryData<'a>>> {
     let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         let old_content = diff_entry_old_content(entry, db)?;
-        let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+        let new_content =
+            diff_entry_new_content(entry, db, worktree_root, use_worktree_new, worktree_clean)?;
         let stats = if old_content.as_deref().is_some_and(is_binary_content)
             || new_content.as_deref().is_some_and(is_binary_content)
         {
@@ -2696,6 +2856,42 @@ fn collect_diff_stat_entries_with_ignore<'a>(
         stat_entries.push(DiffStatEntryData { entry, stats });
     }
     Ok(stat_entries)
+}
+
+fn apply_diff_break_rewrite_stats(
+    entries: &mut [DiffStatEntryData<'_>],
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+    worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+) -> Result<()> {
+    for data in entries {
+        if !matches!(data.entry.status, sley_diff_merge::NameStatus::Modified) {
+            continue;
+        }
+        let old_content = diff_entry_old_content(data.entry, db)?;
+        let new_content = diff_entry_new_content(
+            data.entry,
+            db,
+            worktree_root,
+            use_worktree_new,
+            worktree_clean,
+        )?;
+        let (Some(old), Some(new)) = (old_content.as_deref(), new_content.as_deref()) else {
+            continue;
+        };
+        if sley_diff_merge::blob_similarity(old, new) >= 50 {
+            continue;
+        }
+        let deletes = diff_line_stats(Some(old), None);
+        let inserts = diff_line_stats(None, Some(new));
+        if let (DiffLineStats::Text { deleted, .. }, DiffLineStats::Text { inserted, .. }) =
+            (deletes, inserts)
+        {
+            data.stats = DiffLineStats::Text { inserted, deleted };
+        }
+    }
+    Ok(())
 }
 
 fn diff_line_stats_from_ignored_hunks(
@@ -2754,11 +2950,21 @@ struct DiffNoIndexParams<'a> {
     color_moved_ws_cli: Option<sley_diff_merge::render::ColorMovedWs>,
     output_format: commands::diff_options::DiffOutputFormat,
     raw_abbrev: Option<Option<usize>>,
+    patch_abbrev: Option<usize>,
+    patch_full_index: bool,
+    allow_external: bool,
+    exit_code: bool,
+    output: Option<&'a str>,
+    reverse: bool,
     z: bool,
     word_diff_mode: Option<commands::diff_words::WordDiffMode>,
     word_diff_regex: Option<&'a str>,
     src_prefix: &'a str,
     dst_prefix: &'a str,
+    cli_no_prefix: bool,
+    cli_default_prefix: bool,
+    cli_src_prefix: Option<&'a str>,
+    cli_dst_prefix: Option<&'a str>,
     quiet: bool,
     interhunk: usize,
     ws_ignore: sley_diff_merge::WsIgnore,
@@ -2782,24 +2988,46 @@ struct NoIndexEntry {
     new_content: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoIndexPathKind {
+    Stdin,
+    Null,
+    Directory,
+    File,
+    Fifo,
+    Other,
+}
+
 /// `git diff --no-index <path> <path>`: compare two files outside (or beside)
 /// the object database. Attributes and `diff.*` config still apply when the
 /// command runs inside a repository. Exits 1 when the files differ.
 fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>) -> Result<()> {
-    if paths.len() != 2 {
+    if paths.len() < 2 {
         eprintln!("usage: git diff --no-index [<options>] <path> <path>");
         return Err(GitError::Exit(129));
     }
-    let entries = no_index_entries(&paths[0], &paths[1])?;
+    let git_dir = discover_git_dir(cwd).ok();
+    let format = git_dir
+        .as_deref()
+        .map(repository_object_format)
+        .transpose()?
+        .unwrap_or(ObjectFormat::Sha1);
+    let mut entries = no_index_entries(&paths[0], &paths[1], &paths[2..], format)?;
+    if params.reverse {
+        entries = reverse_no_index_entries(entries);
+    }
     if entries.is_empty() {
         return Ok(());
     }
     // Repository context is optional: when present, .gitattributes drivers,
     // diff.<name>.* config, and color overrides all apply.
-    let git_dir = discover_git_dir(cwd).ok();
     let config = git_dir
         .as_deref()
         .and_then(|dir| read_repo_config(dir).ok());
+    let (mut src_prefix, mut dst_prefix) = no_index_resolve_prefixes(config.as_ref(), &params);
+    if params.reverse {
+        std::mem::swap(&mut src_prefix, &mut dst_prefix);
+    }
     let worktree_root = git_dir
         .as_deref()
         .and_then(|dir| worktree_root_for_git_dir(dir).ok());
@@ -2837,27 +3065,76 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
     // A throwaway object database handle: content reads are overridden, so it
     // is never consulted.
     let scratch_git_dir = git_dir.clone().unwrap_or_else(|| cwd.to_path_buf());
-    let db = FileObjectDatabase::from_git_dir(&scratch_git_dir, ObjectFormat::Sha1);
+    let db = FileObjectDatabase::from_git_dir(&scratch_git_dir, format);
+    let raw = params
+        .output_format
+        .contains(commands::diff_options::DiffOutputFormat::RAW);
+    let name_status = params
+        .output_format
+        .contains(commands::diff_options::DiffOutputFormat::NAME_STATUS);
+    let name_only = params
+        .output_format
+        .contains(commands::diff_options::DiffOutputFormat::NAME_ONLY);
+    let numstat = params
+        .output_format
+        .contains(commands::diff_options::DiffOutputFormat::NUMSTAT);
+    let patch = params
+        .output_format
+        .contains(commands::diff_options::DiffOutputFormat::PATCH);
+    let no_output = params
+        .output_format
+        .contains(commands::diff_options::DiffOutputFormat::NO_OUTPUT);
+    let userdiff_attributes = worktree_root
+        .as_ref()
+        .map(|root| sley_worktree::StandardAttributeMatcher::from_worktree_root(root))
+        .transpose()?;
+    let userdiff =
+        commands::userdiff::UserdiffResolver::with_attributes(userdiff_attributes, config.clone());
+    let show_patch_for_external = !name_only && !name_status && (patch || (!raw && !no_output));
+    if params.allow_external && show_patch_for_external && !no_output {
+        let global_external = global_external_diff_command(config.as_ref());
+        if let Some(code) = run_external_diff_no_index_entries(
+            &entries,
+            &userdiff,
+            global_external.as_ref(),
+            ExternalDiffRunOptions {
+                quiet: params.quiet,
+                // `diff --no-index` reports differences with status 1 even
+                // without an explicit `--exit-code`.
+                exit_code: true,
+                output: params.output,
+                autocrlf: config
+                    .as_ref()
+                    .and_then(|config| config.get_bool("core", None, "autocrlf"))
+                    .unwrap_or(false),
+            },
+        )? {
+            if code != 0 {
+                return Err(GitError::Exit(code));
+            }
+            return Ok(());
+        }
+    }
     if !params.quiet {
         let mut stdout = io::stdout();
-        let raw = params
-            .output_format
-            .contains(commands::diff_options::DiffOutputFormat::RAW);
-        let name_status = params
-            .output_format
-            .contains(commands::diff_options::DiffOutputFormat::NAME_STATUS);
-        let name_only = params
-            .output_format
-            .contains(commands::diff_options::DiffOutputFormat::NAME_ONLY);
-        let patch = params
-            .output_format
-            .contains(commands::diff_options::DiffOutputFormat::PATCH);
-        let no_output = params
-            .output_format
-            .contains(commands::diff_options::DiffOutputFormat::NO_OUTPUT);
         let raw_abbrev = match params.raw_abbrev {
-            Some(width) => width.map(|width| width.min(ObjectFormat::Sha1.hex_len())),
+            Some(width) => width.map(|width| width.min(format.hex_len())),
             None => Some(7),
+        };
+        let repository_abbrev = git_dir
+            .as_deref()
+            .map(|dir| repository_abbrev(dir, format))
+            .transpose()?;
+        let patch_abbrev = if params.patch_full_index {
+            format.hex_len()
+        } else if let Some(width) = params.patch_abbrev {
+            width.min(format.hex_len())
+        } else {
+            match repository_abbrev {
+                Some(Some(width)) => width.min(format.hex_len()),
+                Some(None) => format.hex_len(),
+                None => 7.min(format.hex_len()),
+            }
         };
         if raw && !name_status && !name_only {
             for entry in &entries {
@@ -2867,7 +3144,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                     params.z,
                     true,
                     raw_abbrev,
-                    ObjectFormat::Sha1,
+                    format,
                 )?;
             }
         }
@@ -2898,7 +3175,14 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                 }
             }
         }
-        if raw || name_status || name_only || no_output {
+        if numstat {
+            for entry in &entries {
+                let stats =
+                    diff_line_stats(entry.old_content.as_deref(), entry.new_content.as_deref());
+                write_diff_numstat_materialized_entry(&mut stdout, &entry.entry, stats, params.z)?;
+            }
+        }
+        if raw || name_status || name_only || numstat || no_output {
             return Err(GitError::Exit(1));
         }
         let show_patch =
@@ -2906,13 +3190,6 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
         if !show_patch {
             return Err(GitError::Exit(1));
         }
-        let userdiff_attributes = worktree_root
-            .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
-            .transpose()?;
-        let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
-            userdiff_attributes,
-            config.clone(),
-        );
         for entry in &entries {
             let options = DiffRenderOptions {
                 binary: false,
@@ -2921,10 +3198,10 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                 db: &db,
                 worktree_root: None,
                 use_worktree_new: false,
-                format: ObjectFormat::Sha1,
-                abbrev: 7,
-                src_prefix: params.src_prefix,
-                dst_prefix: params.dst_prefix,
+                format,
+                abbrev: patch_abbrev,
+                src_prefix: &src_prefix,
+                dst_prefix: &dst_prefix,
                 context: params.context,
                 userdiff: Some(&userdiff),
                 funcname: None,
@@ -2966,27 +3243,66 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
     Err(GitError::Exit(1))
 }
 
-fn no_index_entries(old_spec: &str, new_spec: &str) -> Result<Vec<NoIndexEntry>> {
+fn no_index_entries(
+    old_spec: &str,
+    new_spec: &str,
+    pathspecs: &[String],
+    format: ObjectFormat,
+) -> Result<Vec<NoIndexEntry>> {
     if old_spec == "-" && new_spec == "-" {
-        let _ = no_index_read_stdin_side()?;
+        let _ = no_index_read_stdin_side(format)?;
         return Ok(Vec::new());
     }
     let old_path = Path::new(old_spec);
     let new_path = Path::new(new_spec);
-    let old_is_dir = old_path.is_dir();
-    let new_is_dir = new_path.is_dir();
-    if old_is_dir || new_is_dir {
-        let old_files = no_index_collect_path(old_spec, old_path, old_is_dir)?;
-        let new_files = no_index_collect_path(new_spec, new_path, new_is_dir)?;
-        let mut keys = old_files.keys().cloned().collect::<Vec<_>>();
-        for key in new_files.keys() {
-            if !old_files.contains_key(key) {
-                keys.push(key.clone());
-            }
+    let old_kind = no_index_path_kind(old_spec, old_path)?;
+    let new_kind = no_index_path_kind(new_spec, new_path)?;
+    no_index_reject_stream_directory_pair(old_kind, new_kind)?;
+    if old_kind == NoIndexPathKind::Null && new_kind == NoIndexPathKind::Null {
+        return Ok(Vec::new());
+    }
+    if old_kind == NoIndexPathKind::Null {
+        let new = no_index_read_file(new_spec, new_path, format)?;
+        return Ok(vec![no_index_entry_from_sides(None, Some(&new))]);
+    }
+    if new_kind == NoIndexPathKind::Null {
+        let old = no_index_read_file(old_spec, old_path, format)?;
+        return Ok(vec![no_index_entry_from_sides(Some(&old), None)]);
+    }
+    let old_is_dir = old_kind == NoIndexPathKind::Directory;
+    let new_is_dir = new_kind == NoIndexPathKind::Directory;
+    if !pathspecs.is_empty() {
+        if pathspecs
+            .iter()
+            .any(|spec| no_index_pathspec_is_absolute(spec))
+            || !(old_is_dir && new_is_dir)
+        {
+            eprintln!("usage: git diff --no-index [<options>] <path> <path>");
+            return Err(GitError::Exit(129));
         }
+    }
+    if old_is_dir || new_is_dir {
+        let old_files = no_index_collect_path(old_spec, old_path, old_is_dir, format)?;
+        let new_files = no_index_collect_path(new_spec, new_path, new_is_dir, format)?;
+        let mut keys = if old_is_dir == new_is_dir {
+            let mut keys = old_files.keys().cloned().collect::<Vec<_>>();
+            for key in new_files.keys() {
+                if !old_files.contains_key(key) {
+                    keys.push(key.clone());
+                }
+            }
+            keys
+        } else if old_is_dir {
+            new_files.keys().cloned().collect()
+        } else {
+            old_files.keys().cloned().collect()
+        };
         keys.sort();
         let mut entries = Vec::new();
         for key in keys {
+            if !no_index_pathspec_matches(&key, pathspecs) {
+                continue;
+            }
             let old = old_files.get(&key);
             let new = new_files.get(&key);
             if old.map(|side| (&side.content, side.mode))
@@ -2998,24 +3314,123 @@ fn no_index_entries(old_spec: &str, new_spec: &str) -> Result<Vec<NoIndexEntry>>
         }
         return Ok(entries);
     }
-    let old = no_index_read_file(old_spec, old_path)?;
-    let new = no_index_read_file(new_spec, new_path)?;
+    let old = no_index_read_file(old_spec, old_path, format)?;
+    let new = no_index_read_file(new_spec, new_path, format)?;
     if old.content == new.content && old.mode == new.mode {
         return Ok(Vec::new());
     }
     Ok(vec![no_index_entry_from_sides(Some(&old), Some(&new))])
 }
 
+fn no_index_path_kind(spec: &str, path: &Path) -> Result<NoIndexPathKind> {
+    if spec == "-" {
+        return Ok(NoIndexPathKind::Stdin);
+    }
+    if spec == "/dev/null" {
+        return Ok(NoIndexPathKind::Null);
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| no_index_access_error(spec))?;
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        return Ok(NoIndexPathKind::Directory);
+    }
+    if file_type.is_file() {
+        return Ok(NoIndexPathKind::File);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+
+        if file_type.is_fifo() {
+            return Ok(NoIndexPathKind::Fifo);
+        }
+    }
+    if file_type.is_symlink() {
+        let metadata = fs::metadata(path).map_err(|_| no_index_access_error(spec))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+
+            if metadata.file_type().is_fifo() {
+                return Ok(NoIndexPathKind::Fifo);
+            }
+        }
+        if metadata.is_dir() {
+            return Ok(NoIndexPathKind::Directory);
+        }
+        if metadata.is_file() {
+            return Ok(NoIndexPathKind::File);
+        }
+    }
+    Ok(NoIndexPathKind::Other)
+}
+
+fn no_index_reject_stream_directory_pair(
+    old_kind: NoIndexPathKind,
+    new_kind: NoIndexPathKind,
+) -> Result<()> {
+    if (old_kind == NoIndexPathKind::Stdin && new_kind == NoIndexPathKind::Directory)
+        || (old_kind == NoIndexPathKind::Directory && new_kind == NoIndexPathKind::Stdin)
+    {
+        eprintln!("fatal: cannot compare stdin to a directory");
+        return Err(GitError::Exit(1));
+    }
+    if (old_kind == NoIndexPathKind::Fifo && new_kind == NoIndexPathKind::Directory)
+        || (old_kind == NoIndexPathKind::Directory && new_kind == NoIndexPathKind::Fifo)
+    {
+        eprintln!("fatal: cannot compare a named pipe to a directory");
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
+}
+
+fn reverse_no_index_entries(entries: Vec<NoIndexEntry>) -> Vec<NoIndexEntry> {
+    let mut reversed = entries
+        .into_iter()
+        .map(reverse_no_index_entry)
+        .collect::<Vec<_>>();
+    reversed.sort_by(|left, right| {
+        left.entry
+            .path
+            .cmp(&right.entry.path)
+            .then_with(|| left.entry.old_path.cmp(&right.entry.old_path))
+            .then_with(|| left.entry.status.code().cmp(&right.entry.status.code()))
+    });
+    reversed
+}
+
+fn reverse_no_index_entry(entry: NoIndexEntry) -> NoIndexEntry {
+    let mut reversed_entry = reverse_diff_entry(entry.entry);
+    if matches!(
+        reversed_entry.status,
+        sley_diff_merge::NameStatus::Modified | sley_diff_merge::NameStatus::TypeChanged
+    ) && let Some(old_path) = reversed_entry.old_path.take()
+    {
+        let new_path = reversed_entry.path;
+        reversed_entry.path = old_path;
+        reversed_entry.old_path = Some(new_path);
+    }
+    NoIndexEntry {
+        entry: reversed_entry,
+        old_content: entry.new_content,
+        new_content: entry.old_content,
+    }
+}
+
 fn no_index_collect_path(
     spec: &str,
     path: &Path,
     is_dir: bool,
+    format: ObjectFormat,
 ) -> Result<std::collections::BTreeMap<Vec<u8>, NoIndexSide>> {
     let mut files = std::collections::BTreeMap::new();
     if is_dir {
-        no_index_collect_dir(spec, path, path, &mut files)?;
+        no_index_collect_dir(spec, path, path, &mut files, format)?;
     } else {
-        files.insert(Vec::new(), no_index_read_file(spec, path)?);
+        files.insert(
+            no_index_file_key(spec, path),
+            no_index_read_file(spec, path, format)?,
+        );
     }
     Ok(files)
 }
@@ -3025,6 +3440,7 @@ fn no_index_collect_dir(
     root: &Path,
     dir: &Path,
     files: &mut std::collections::BTreeMap<Vec<u8>, NoIndexSide>,
+    format: ObjectFormat,
 ) -> Result<()> {
     let mut children = fs::read_dir(dir)
         .map_err(|_| no_index_access_error(spec))?
@@ -3033,7 +3449,7 @@ fn no_index_collect_dir(
     for child in children {
         let path = child.path();
         if path.is_dir() {
-            no_index_collect_dir(spec, root, &path, files)?;
+            no_index_collect_dir(spec, root, &path, files, format)?;
         } else if path.is_file() {
             let rel = path
                 .strip_prefix(root)
@@ -3041,50 +3457,390 @@ fn no_index_collect_dir(
                 .to_string_lossy()
                 .replace('\\', "/")
                 .into_bytes();
-            let display = format!("{spec}/{}", String::from_utf8_lossy(&rel));
-            files.insert(rel, no_index_read_file(&display, &path)?);
+            let display = no_index_join_display_path(spec, &rel);
+            files.insert(rel, no_index_read_file(&display, &path, format)?);
         }
     }
     Ok(())
 }
 
-fn no_index_read_file(spec: &str, path: &Path) -> Result<NoIndexSide> {
+fn no_index_read_file(spec: &str, path: &Path, format: ObjectFormat) -> Result<NoIndexSide> {
     if spec == "-" {
-        return no_index_read_stdin_side();
+        return no_index_read_stdin_side(format);
     }
-    let content = fs::read(path).map_err(|_| no_index_access_error(spec))?;
-    let mode = {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = fs::metadata(path).map(|meta| meta.permissions().mode());
-            if permissions.is_ok_and(|bits| bits & 0o111 != 0) {
-                0o100755
-            } else {
+    let symlink = fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    let symlink_to_fifo = symlink && no_index_path_is_fifo_target(path);
+    let fifo = !symlink && no_index_path_is_fifo(path);
+    let (content, mode) = if symlink && !symlink_to_fifo {
+        (read_symlink_bytes_for_diff(path)?, 0o120000)
+    } else {
+        let content = fs::read(path).map_err(|_| no_index_access_error(spec))?;
+        let mode = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let permissions = fs::metadata(path).map(|meta| meta.permissions().mode());
+                if permissions.is_ok_and(|bits| bits & 0o111 != 0) {
+                    0o100755
+                } else {
+                    0o100644
+                }
+            }
+            #[cfg(not(unix))]
+            {
                 0o100644
             }
-        }
-        #[cfg(not(unix))]
-        {
-            0o100644
-        }
+        };
+        (content, mode)
     };
     Ok(NoIndexSide {
         path: spec.as_bytes().to_vec(),
         content,
         mode,
-        oid: None,
+        oid: (fifo || symlink_to_fifo).then(|| ObjectId::null(format)),
     })
 }
 
-fn no_index_read_stdin_side() -> Result<NoIndexSide> {
+#[cfg(unix)]
+fn no_index_path_is_fifo(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_fifo())
+}
+
+#[cfg(not(unix))]
+fn no_index_path_is_fifo(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn no_index_path_is_fifo_target(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    fs::metadata(path).is_ok_and(|meta| meta.file_type().is_fifo())
+}
+
+#[cfg(not(unix))]
+fn no_index_path_is_fifo_target(_path: &Path) -> bool {
+    false
+}
+
+fn no_index_file_key(spec: &str, path: &Path) -> Vec<u8> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().replace('\\', "/").into_bytes())
+        .unwrap_or_else(|| spec.as_bytes().to_vec())
+}
+
+fn no_index_join_display_path(spec: &str, rel: &[u8]) -> String {
+    let rel = String::from_utf8_lossy(rel);
+    if spec.ends_with('/') {
+        format!("{spec}{rel}")
+    } else {
+        format!("{spec}/{rel}")
+    }
+}
+
+fn no_index_pathspec_is_absolute(spec: &str) -> bool {
+    no_index_pathspec_pattern(spec)
+        .map(|(_, _, pattern)| pattern.starts_with('/'))
+        .unwrap_or_else(|| spec.starts_with('/'))
+}
+
+fn no_index_pathspec_matches(key: &[u8], pathspecs: &[String]) -> bool {
+    if pathspecs.is_empty() {
+        return true;
+    }
+    let key = String::from_utf8_lossy(key);
+    let mut saw_positive = false;
+    let mut included = false;
+    for spec in pathspecs {
+        let Some((exclude, glob, pattern)) = no_index_pathspec_pattern(spec) else {
+            continue;
+        };
+        if exclude {
+            continue;
+        }
+        saw_positive = true;
+        if no_index_pathspec_pattern_matches(&key, pattern, glob) {
+            included = true;
+        }
+    }
+    if !saw_positive {
+        included = true;
+    }
+    for spec in pathspecs {
+        let Some((exclude, glob, pattern)) = no_index_pathspec_pattern(spec) else {
+            continue;
+        };
+        if exclude && no_index_pathspec_pattern_matches(&key, pattern, glob) {
+            included = false;
+        }
+    }
+    included
+}
+
+fn no_index_pathspec_pattern(spec: &str) -> Option<(bool, bool, &str)> {
+    if let Some(pattern) = spec.strip_prefix(":!") {
+        return Some((true, false, pattern));
+    }
+    if let Some(rest) = spec.strip_prefix(":(") {
+        let (magic, pattern) = rest.split_once(')')?;
+        let mut exclude = false;
+        let mut glob = false;
+        for token in magic.split(',') {
+            match token {
+                "exclude" | "!" => exclude = true,
+                "glob" => glob = true,
+                _ => {}
+            }
+        }
+        return Some((exclude, glob, pattern));
+    }
+    Some((false, false, spec))
+}
+
+fn no_index_pathspec_pattern_matches(key: &str, pattern: &str, glob: bool) -> bool {
+    if glob {
+        return no_index_glob_matches(key.as_bytes(), pattern.as_bytes());
+    }
+    key == pattern
+        || key
+            .strip_prefix(pattern)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn no_index_glob_matches(key: &[u8], pattern: &[u8]) -> bool {
+    if let Some(rest) = pattern.strip_prefix(b"**/") {
+        return key == rest || key.ends_with(&[b"/".as_slice(), rest].concat());
+    }
+    no_index_glob_matches_inner(key, pattern)
+}
+
+fn no_index_glob_matches_inner(mut key: &[u8], mut pattern: &[u8]) -> bool {
+    while let Some((&head, tail)) = pattern.split_first() {
+        if head == b'*' {
+            while pattern.first() == Some(&b'*') {
+                pattern = &pattern[1..];
+            }
+            if pattern.is_empty() {
+                return true;
+            }
+            for idx in 0..=key.len() {
+                if no_index_glob_matches_inner(&key[idx..], pattern) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        let Some((&key_head, key_tail)) = key.split_first() else {
+            return false;
+        };
+        if head != key_head {
+            return false;
+        }
+        key = key_tail;
+        pattern = tail;
+    }
+    key.is_empty()
+}
+
+fn no_index_resolve_prefixes(
+    config: Option<&GitConfig>,
+    params: &DiffNoIndexParams<'_>,
+) -> (String, String) {
+    let mut src_prefix = params.src_prefix.to_string();
+    let mut dst_prefix = params.dst_prefix.to_string();
+    if let Some(config) = config {
+        let cfg_no_prefix = config.get_bool("diff", None, "noprefix").unwrap_or(false);
+        let cfg_mnemonic = config
+            .get_bool("diff", None, "mnemonicprefix")
+            .unwrap_or(false);
+        if cfg_no_prefix {
+            src_prefix.clear();
+            dst_prefix.clear();
+        } else if cfg_mnemonic {
+            src_prefix = "1/".to_string();
+            dst_prefix = "2/".to_string();
+        } else {
+            src_prefix = config
+                .get("diff", None, "srcprefix")
+                .map(str::to_owned)
+                .unwrap_or_else(|| "a/".to_string());
+            dst_prefix = config
+                .get("diff", None, "dstprefix")
+                .map(str::to_owned)
+                .unwrap_or_else(|| "b/".to_string());
+        }
+        if params.cli_default_prefix {
+            src_prefix = "a/".to_string();
+            dst_prefix = "b/".to_string();
+        }
+        if params.cli_no_prefix {
+            src_prefix.clear();
+            dst_prefix.clear();
+        }
+        if let Some(prefix) = params.cli_src_prefix {
+            src_prefix = prefix.to_string();
+        }
+        if let Some(prefix) = params.cli_dst_prefix {
+            dst_prefix = prefix.to_string();
+        }
+    }
+    (src_prefix, dst_prefix)
+}
+
+fn run_external_diff_no_index_entries(
+    entries: &[NoIndexEntry],
+    userdiff: &commands::userdiff::UserdiffResolver,
+    global: Option<&ExternalDiffCommand>,
+    options: ExternalDiffRunOptions<'_>,
+) -> Result<Option<i32>> {
+    let mut handled = false;
+    let mut found_changes = false;
+    let mut output_file = match options.output {
+        Some(path) if !options.quiet => Some(
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)?,
+        ),
+        _ => None,
+    };
+
+    for (idx, entry) in entries.iter().enumerate() {
+        let command = external_diff_for_entry(&entry.entry, userdiff, global)?;
+        let Some(command) = command else {
+            continue;
+        };
+        handled = true;
+        if options.quiet && !command.trust_exit_code {
+            found_changes = true;
+            continue;
+        }
+        let rc = run_one_external_diff_no_index(
+            entry,
+            &command,
+            idx + 1,
+            entries.len(),
+            options.autocrlf,
+            options.quiet,
+            output_file.as_mut(),
+        )?;
+        match (command.trust_exit_code, rc) {
+            (false, 0) => found_changes = true,
+            (true, 0) => {}
+            (true, 1) => found_changes = true,
+            _ => {
+                let path = String::from_utf8_lossy(&entry.entry.path);
+                eprintln!("fatal: external diff died, stopping at {path}");
+                return Err(GitError::Exit(128));
+            }
+        }
+    }
+
+    if !handled {
+        return Ok(None);
+    }
+    let code = if (options.quiet || options.exit_code) && found_changes {
+        1
+    } else {
+        0
+    };
+    Ok(Some(code))
+}
+
+fn run_one_external_diff_no_index(
+    entry: &NoIndexEntry,
+    command: &ExternalDiffCommand,
+    counter: usize,
+    total: usize,
+    autocrlf: bool,
+    quiet: bool,
+    output_file: Option<&mut fs::File>,
+) -> Result<i32> {
+    let old_path = entry.entry.old_path.as_ref().unwrap_or(&entry.entry.path);
+    let old_path = String::from_utf8_lossy(old_path).into_owned();
+    let new_path = String::from_utf8_lossy(&entry.entry.path).into_owned();
+    let old_file = external_no_index_file(&old_path, entry.old_content.as_deref(), autocrlf)?;
+    let new_file = external_no_index_file(&new_path, entry.new_content.as_deref(), autocrlf)?;
+    let old_hex = ObjectId::null(ObjectFormat::Sha1).to_hex();
+    let new_hex = ObjectId::null(ObjectFormat::Sha1).to_hex();
+    let old_mode = external_diff_mode(entry.entry.old_mode);
+    let new_mode = external_diff_mode(entry.entry.new_mode);
+    let args = [
+        old_path.clone(),
+        old_file.path.to_string_lossy().into_owned(),
+        old_hex,
+        old_mode,
+        new_file.path.to_string_lossy().into_owned(),
+        new_hex,
+        new_mode,
+        new_path,
+    ];
+    let shell_command = format!("{} \"$@\"", command.command);
+    let mut child = ProcessCommand::new("sh");
+    child
+        .arg("-c")
+        .arg(shell_command)
+        .arg(&command.command)
+        .args(args)
+        .env("GIT_DIFF_PATH_COUNTER", counter.to_string())
+        .env("GIT_DIFF_PATH_TOTAL", total.to_string());
+    if quiet {
+        child.stdout(std::process::Stdio::null());
+    } else if let Some(file) = output_file {
+        child.stdout(file.try_clone()?);
+    }
+    let status = child.status()?;
+    Ok(status.code().unwrap_or(128))
+}
+
+fn external_no_index_file(
+    display_path: &str,
+    content: Option<&[u8]>,
+    autocrlf: bool,
+) -> Result<ExternalDiffFile> {
+    let Some(content) = content else {
+        return Ok(ExternalDiffFile {
+            path: PathBuf::from("/dev/null"),
+            temp_dir: None,
+        });
+    };
+    let path = PathBuf::from(display_path);
+    if path.exists() {
+        return Ok(ExternalDiffFile {
+            path,
+            temp_dir: None,
+        });
+    }
+    let temp_dir = unique_external_diff_temp_dir()?;
+    let path = temp_dir.join(repo_path_to_path(display_path.as_bytes()));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = if autocrlf && !content.contains(&0) {
+        lf_to_crlf(content)
+    } else {
+        content.to_vec()
+    };
+    fs::write(&path, content)?;
+    Ok(ExternalDiffFile {
+        path,
+        temp_dir: Some(temp_dir),
+    })
+}
+
+fn no_index_read_stdin_side(format: ObjectFormat) -> Result<NoIndexSide> {
     let mut content = Vec::new();
     io::stdin().read_to_end(&mut content)?;
     Ok(NoIndexSide {
         path: b"-".to_vec(),
         content,
         mode: 0o100644,
-        oid: Some(ObjectId::null(ObjectFormat::Sha1)),
+        oid: Some(ObjectId::null(format)),
     })
 }
 

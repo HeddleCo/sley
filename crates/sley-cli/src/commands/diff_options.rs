@@ -132,6 +132,7 @@ pub(crate) struct DiffOptions {
     pub(crate) renames_explicit: bool,
     pub(crate) rename_threshold: u8,
     pub(crate) copy_threshold: u8,
+    pub(crate) rename_limit: usize,
     pub(crate) diff_filter: DiffFilter,
     pub(crate) ignore_submodules_cli: Option<SubmoduleIgnoreMode>,
     pub(crate) merge_base: bool,
@@ -217,6 +218,7 @@ impl Default for DiffOptions {
             renames_explicit: false,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_limit: 0,
             diff_filter: DiffFilter::default(),
             ignore_submodules_cli: None,
             merge_base: false,
@@ -1322,7 +1324,11 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
             options.renames_explicit = true;
         }
         (_, Some("rename-empty")) => options.rename_empty = bool_value(option),
-        (Some('l'), None) => validate_diff_rename_limit(str_value(option))?,
+        (Some('l'), None) => {
+            let value = str_value(option);
+            validate_diff_rename_limit(value)?;
+            options.rename_limit = parse_diff_rename_limit(value);
+        }
         (_, Some("diff-filter")) => options.diff_filter = parse_diff_filter(str_value(option))?,
         _ => {}
     }

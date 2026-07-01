@@ -1101,6 +1101,15 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         eprintln!("fatal: apply options and merge options cannot be used together");
         return Err(GitError::Exit(128));
     }
+    if args.keep_base && args.onto_name.is_some() {
+        eprintln!("fatal: options '--keep-base' and '--onto' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if args.keep_base && args.root {
+        eprintln!("fatal: options '--keep-base' and '--root' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    let reapply_cherry_picks = args.reapply_cherry_picks.unwrap_or(args.keep_base);
 
     // Resolve upstream.
     // With --root there is no upstream argument: the lone positional (if any) is
@@ -1263,13 +1272,23 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                 match bases.first() {
                     Some(base) if bases.len() == 1 => *base,
                     _ => {
-                        eprintln!("fatal: '{onto_name}': need exactly one merge base");
+                        if args.keep_base {
+                            eprintln!(
+                                "fatal: '{upstream_name}': need exactly one merge base with branch"
+                            );
+                        } else {
+                            eprintln!("fatal: '{onto_name}': need exactly one merge base");
+                        }
                         return Err(GitError::Exit(128));
                     }
                 }
             }
             _ => {
-                eprintln!("fatal: '{onto_name}': need exactly one merge base");
+                if args.keep_base {
+                    eprintln!("fatal: '{upstream_name}': need exactly one merge base with branch");
+                } else {
+                    eprintln!("fatal: '{onto_name}': need exactly one merge base");
+                }
                 return Err(GitError::Exit(128));
             }
         }
@@ -1354,7 +1373,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                     reset_index_and_worktree_to_commit_for_rebase(ctx, &orig_head)?;
                     let refs = ctx.refs();
                     let old = head_commit_oid(&refs)?.unwrap_or_else(|| ObjectId::null(ctx.format));
-                    let committer = commit_identity_from_env("COMMITTER")?;
+                    let committer = committer_identity_for_reflog()?;
                     detach_head_with_reflog(
                         ctx,
                         old,
@@ -1403,7 +1422,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     if allow_preemptive_ff && !force && branch_base.as_ref() == Some(&orig_head) {
         // onto is a descendant of orig_head: fast-forward.
         reset_index_and_worktree_to_commit_for_rebase(&ctx, &onto)?;
-        let committer = commit_identity_from_env("COMMITTER")?;
+        let committer = committer_identity_for_reflog()?;
         detach_head_with_reflog(
             ctx,
             orig_head,
@@ -1467,7 +1486,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             upstream.as_ref(),
             &orig_head,
             keep_empty,
-            args.reapply_cherry_picks.unwrap_or(false),
+            reapply_cherry_picks,
             mode,
             args.root && args.onto_name.is_some(),
         )?
@@ -1487,7 +1506,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             cherry_base,
             &orig_head,
             keep_empty,
-            args.reapply_cherry_picks.unwrap_or(false),
+            reapply_cherry_picks,
         )?;
         records
             .iter()
@@ -1568,19 +1587,18 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
 /// Split a raw committer/author identity (`Name <email> <seconds> <tz>`) into
 /// `(name, email, "<seconds> <tz>")`. The date piece is `None` when the line has
 /// no `< … >` email delimiters.
-fn split_identity(identity: &[u8]) -> Option<(String, String, Option<String>)> {
-    let text = String::from_utf8_lossy(identity);
-    let open = text.find('<')?;
-    let close = text[open..].find('>')? + open;
-    let name = text[..open].trim_end().to_string();
-    let email = text[open + 1..close].to_string();
-    let date = text[close + 1..].trim();
-    let date = if date.is_empty() {
-        None
-    } else {
-        Some(date.to_string())
+fn split_identity(identity: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Option<String>)> {
+    let fields = sley_core::split_ident_line(identity)?;
+    let date = match (fields.date, fields.tz) {
+        (Some(date), Some(tz)) => {
+            let date = std::str::from_utf8(date).ok()?;
+            let tz = std::str::from_utf8(tz).ok()?;
+            format!("{date} {tz}")
+        }
+        _ => String::new(),
     };
-    Some((name, email, date))
+    let date = if date.is_empty() { None } else { Some(date) };
+    Some((fields.name.to_vec(), fields.email.to_vec(), date))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1604,6 +1622,7 @@ fn run_apply_backend(
     } else {
         upstream
     };
+    let reapply_cherry_picks = args.reapply_cherry_picks.unwrap_or(args.keep_base);
     let records = make_script_commits(
         ctx,
         db,
@@ -1613,7 +1632,7 @@ fn run_apply_backend(
         // The apply backend drops begin-empty commits by default (git am skips
         // empty patches); `--keep-empty` would have forced the merge backend.
         args.keep_empty.unwrap_or(false),
-        args.reapply_cherry_picks.unwrap_or(false),
+        reapply_cherry_picks,
     )?;
 
     if records.is_empty() {
@@ -1623,7 +1642,7 @@ fn run_apply_backend(
         if let Some(head_name) = head_name
             && head_name.starts_with("refs/heads/")
         {
-            let committer = commit_identity_from_env("COMMITTER")?;
+            let committer = committer_identity_for_reflog()?;
             move_to_original_branch(ctx, head_name, *orig_head, *onto, committer)?;
         }
         // A noop rebase still finishes, so restore any autostash now.
@@ -1639,6 +1658,7 @@ fn run_apply_backend(
         return Ok(());
     }
 
+    let target_encoding = commit_encoding_config(&ctx.git_dir);
     let mut commits = Vec::with_capacity(records.len());
     for record in &records {
         let parent_tree = match record.parents.first() {
@@ -1646,9 +1666,13 @@ fn run_apply_backend(
             None => ObjectId::empty_tree(ctx.format),
         };
         let diff = render_tree_to_tree_patch(db, ctx.format, &parent_tree, &record.commit.tree)?;
-        let (name, email, date) = split_identity(&record.commit.author)
+        let source_encoding = commit_encoding(&record.commit);
+        let author =
+            log_reencode_message(&record.commit.author, &source_encoding, &target_encoding);
+        let (name, email, date) = split_identity(&author)
             .ok_or_else(|| GitError::InvalidObject("commit author has no identity".into()))?;
-        let mut message = record.commit.message.clone();
+        let mut message =
+            commit_message_for_commit_encoding(&record.commit, &target_encoding).into_owned();
         if !message.ends_with(b"\n") {
             message.push(b'\n');
         }
@@ -1739,7 +1763,7 @@ fn checkout_onto_for_apply(
         return Err(GitError::Exit(1));
     }
     reset_index_and_worktree_to_commit_for_rebase(ctx, base)?;
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let committer = committer_identity_for_reflog()?;
     detach_head_with_reflog(
         ctx,
         old,
@@ -1887,7 +1911,7 @@ fn checkout_up_to_date(
         ]),
     )?;
     let refs = ctx.refs();
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let committer = committer_identity_for_reflog()?;
     let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
@@ -3078,7 +3102,7 @@ fn do_update_refs(ctx: &Ctx, quiet: bool) -> Result<()> {
     }
     records.sort_by(|a, b| a.refname.cmp(&b.refname));
     let refs = FileRefStore::new(&ctx.common_git_dir, ctx.format);
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let committer = committer_identity_for_reflog()?;
     let zero = ObjectId::null(ctx.format);
     let mut updated = Vec::new();
     let mut failed = Vec::new();
@@ -3542,7 +3566,7 @@ fn checkout_onto_base(
         let _ = err;
         return Err(GitError::Exit(1));
     }
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let committer = committer_identity_for_reflog()?;
     detach_head_with_reflog(
         ctx,
         old,
@@ -3779,7 +3803,7 @@ fn do_label(ctx: &Ctx, name: &str) -> Result<()> {
     let head =
         head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("could not read HEAD".into()))?;
     let refname = format!("refs/rewritten/{name}");
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let committer = committer_identity_for_reflog()?;
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
         name: refname.clone(),
@@ -3840,7 +3864,7 @@ fn do_reset(ctx: &Ctx, db: &FileObjectDatabase, opts: &MachineOpts, name: &str) 
     reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
     let refs = ctx.refs();
     let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let committer = committer_identity_for_reflog()?;
     detach_head_with_reflog(ctx, old, target, ctx.reflog("reset", Some(name)), committer)
 }
 
@@ -3898,7 +3922,7 @@ fn do_merge(
         }
         let target = merge_heads[0].1;
         reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
-        let committer = commit_identity_from_env("COMMITTER")?;
+        let committer = committer_identity_for_reflog()?;
         detach_head_with_reflog(ctx, head, target, ctx.reflog("merge", None), committer)?;
         return Ok(PickOutcome::Continue);
     }
@@ -3912,7 +3936,7 @@ fn do_merge(
             .eq(merge_heads.iter().map(|(_, oid)| *oid))
     {
         reset_index_and_worktree_to_commit_for_rebase(ctx, &record.oid)?;
-        let committer = commit_identity_from_env("COMMITTER")?;
+        let committer = committer_identity_for_reflog()?;
         detach_head_with_reflog(
             ctx,
             head,
@@ -4024,8 +4048,28 @@ fn do_merge(
         fs::write(ctx.git_dir.join("AUTO_MERGE"), format!("{merged_tree}\n"))?;
         for path in &conflicts {
             let display = String::from_utf8_lossy(path);
-            println!("Auto-merging {display}");
-            println!("CONFLICT (content): Merge conflict in {display}");
+            if let Some(advice) = rebase_submodule_conflict_advice(&results, path) {
+                eprintln!("Failed to merge submodule {display}");
+                eprintln!("CONFLICT (submodule): Merge conflict in {display}");
+                eprintln!(
+                    "Recursive merging with submodules currently only supports trivial cases."
+                );
+                eprintln!("Please manually handle the merging of each conflicted submodule.");
+                eprintln!("This can be accomplished with the following steps:");
+                eprintln!(
+                    " - go to submodule ({display}), and either merge commit {}",
+                    advice.theirs
+                );
+                eprintln!("   or update to an existing commit which has merged those changes");
+                eprintln!(" - come back to superproject and run:");
+                eprintln!("      git add {display}");
+                eprintln!("   to record the above merge or update");
+                eprintln!(" - resolve any other conflicts in the superproject");
+                eprintln!(" - commit the resulting index in the superproject");
+            } else {
+                println!("Auto-merging {display}");
+                println!("CONFLICT (content): Merge conflict in {display}");
+            }
         }
         let _ = commands::rerere::repo_rerere(&ctx.git_dir, ctx.format, opts.rerere_autoupdate);
         print_conflict_hints();
@@ -4203,10 +4247,14 @@ fn merge_todo_message(
     oneline: Option<&str>,
 ) -> Result<Vec<u8>> {
     if let Some(record) = original {
-        if let Some(script) = seq::format_author_script(&record.commit.author) {
+        let target_encoding = commit_encoding_config(&ctx.git_dir);
+        let author = commit_author_for_commit_encoding(&record.commit, &target_encoding);
+        if let Some(script) = seq::format_author_script(&author) {
             fs::write(ctx.state_path("author-script"), script)?;
         }
-        return Ok(record.commit.message.clone());
+        return Ok(
+            commit_message_for_commit_encoding(&record.commit, &target_encoding).into_owned(),
+        );
     }
     if let Some(oneline) = oneline {
         let mut message = oneline.as_bytes().to_vec();
@@ -4232,14 +4280,18 @@ fn create_merge_commit_from_index(
     let refs = ctx.refs();
     let head =
         head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+    let target_encoding = commit_encoding_config(&ctx.git_dir);
     let author = match read_author_script_identity(ctx)? {
         Some(identity) => identity,
         None => match original {
-            Some(record) => record.commit.author.clone(),
+            Some(record) => {
+                commit_author_for_commit_encoding(&record.commit, &target_encoding).into_owned()
+            }
             None => commit_identity_from_env("AUTHOR")?,
         },
     };
     let committer = commit_identity_from_env("COMMITTER")?;
+    let encoding = commit_encoding_header_from_config(&ctx.git_dir);
     let mut writer = ctx.db();
     let new_oid = sley_sequencer::create_commit(
         &mut writer,
@@ -4249,7 +4301,7 @@ fn create_merge_commit_from_index(
             author,
             committer: committer.clone(),
             message: strip_comment_lines(message, comment_char(&ctx.git_dir)),
-            encoding: None,
+            encoding,
             signature: None,
         },
     )?;
@@ -4358,8 +4410,11 @@ fn pick_one_commit(
         return Ok(PickOutcome::Fail(1));
     }
 
+    let target_encoding = commit_encoding_config(&ctx.git_dir);
+
     // Write the author script for --continue / commit amending.
-    if let Some(script) = seq::format_author_script(&record.commit.author) {
+    let author = commit_author_for_commit_encoding(&record.commit, &target_encoding);
+    if let Some(script) = seq::format_author_script(&author) {
         fs::write(ctx.state_path("author-script"), script)?;
     }
 
@@ -4381,7 +4436,7 @@ fn pick_one_commit(
             return Ok(PickOutcome::Fail(1));
         }
         reset_index_and_worktree_to_commit_for_rebase(ctx, &oid)?;
-        let committer = commit_identity_from_env("COMMITTER")?;
+        let committer = committer_identity_for_reflog()?;
         detach_head_with_reflog(
             ctx,
             head,
@@ -4472,7 +4527,6 @@ fn pick_one_commit(
     )?;
 
     // Compose the message (fixup/squash machinery).
-    let target_encoding = commit_encoding_config(&ctx.git_dir);
     let mut message =
         commit_message_for_commit_encoding(&record.commit, &target_encoding).into_owned();
     if opts.signoff && !is_fixup {
@@ -4512,8 +4566,28 @@ fn pick_one_commit(
         }
         for path in &conflicts {
             let display = String::from_utf8_lossy(path);
-            println!("Auto-merging {display}");
-            println!("CONFLICT (content): Merge conflict in {display}");
+            if let Some(advice) = rebase_submodule_conflict_advice(&results, path) {
+                eprintln!("Failed to merge submodule {display}");
+                eprintln!("CONFLICT (submodule): Merge conflict in {display}");
+                eprintln!(
+                    "Recursive merging with submodules currently only supports trivial cases."
+                );
+                eprintln!("Please manually handle the merging of each conflicted submodule.");
+                eprintln!("This can be accomplished with the following steps:");
+                eprintln!(
+                    " - go to submodule ({display}), and either merge commit {}",
+                    advice.theirs
+                );
+                eprintln!("   or update to an existing commit which has merged those changes");
+                eprintln!(" - come back to superproject and run:");
+                eprintln!("      git add {display}");
+                eprintln!("   to record the above merge or update");
+                eprintln!(" - resolve any other conflicts in the superproject");
+                eprintln!(" - commit the resulting index in the superproject");
+            } else {
+                println!("Auto-merging {display}");
+                println!("CONFLICT (content): Merge conflict in {display}");
+            }
         }
 
         // MERGE_MSG with the conflicts comment block.
@@ -4705,6 +4779,37 @@ fn pick_one_commit(
         reread_todo_if_changed(ctx, db, todo)?;
     }
     Ok(PickOutcome::Continue)
+}
+
+struct RebaseSubmoduleConflictAdvice {
+    theirs: String,
+}
+
+fn rebase_submodule_conflict_advice(
+    results: &BTreeMap<Vec<u8>, MergePathResult>,
+    path: &[u8],
+) -> Option<RebaseSubmoduleConflictAdvice> {
+    let MergePathResult::Conflict {
+        base, ours, theirs, ..
+    } = results.get(path)?
+    else {
+        return None;
+    };
+    if ![base, ours, theirs]
+        .into_iter()
+        .flatten()
+        .any(|(mode, _)| sley_index::is_gitlink(*mode))
+    {
+        return None;
+    }
+    let (_, theirs_oid) = theirs.as_ref()?;
+    Some(RebaseSubmoduleConflictAdvice {
+        theirs: short_oid(theirs_oid),
+    })
+}
+
+fn short_oid(oid: &ObjectId) -> String {
+    oid.to_hex()[..oid.abbrev_hex_len(7)].to_string()
 }
 
 fn command_reflog_name(command: TodoCommand) -> &'static str {
@@ -5267,6 +5372,8 @@ fn machine_commit(
         );
         fs::write(&path, template)?;
         launch_editor(&ctx.git_dir, &path)?;
+        let path_arg = path.to_string_lossy().into_owned();
+        commands::hooks::run_hook_l("commit-msg", &[path_arg.as_str()])?;
         message = fs::read(&path)?;
     }
     if commit.edit {
@@ -5291,11 +5398,14 @@ fn machine_commit(
     } else {
         None
     };
+    let target_encoding = commit_encoding_config(&ctx.git_dir);
     let (parents, author) = if commit.create_root {
         let author = match read_author_script_identity(ctx)? {
             Some(identity) => identity,
             None => match commit.original {
-                Some(record) => record.commit.author.clone(),
+                Some(record) => {
+                    commit_author_for_commit_encoding(&record.commit, &target_encoding).into_owned()
+                }
                 None => commit_identity_from_env("AUTHOR")?,
             },
         };
@@ -5307,7 +5417,9 @@ fn machine_commit(
         let author = match read_author_script_identity(ctx)? {
             Some(identity) => identity,
             None => match commit.original {
-                Some(record) => record.commit.author.clone(),
+                Some(record) => {
+                    commit_author_for_commit_encoding(&record.commit, &target_encoding).into_owned()
+                }
                 None => commit_identity_from_env("AUTHOR")?,
             },
         };
@@ -5436,13 +5548,13 @@ fn reset_identity_date(identity: &[u8], new_date: &str) -> Vec<u8> {
 }
 
 fn read_author_script_identity(ctx: &Ctx) -> Result<Option<Vec<u8>>> {
-    let Ok(text) = fs::read_to_string(ctx.state_path("author-script")) else {
+    let Ok(text) = fs::read(ctx.state_path("author-script")) else {
         return Ok(None);
     };
-    let Some((name, email, date)) = seq::parse_author_script(&text) else {
+    let Some((name, email, date)) = seq::parse_author_script_bytes(&text) else {
         return Ok(None);
     };
-    let identity = sley_sequencer::format_commit_identity(&name, &email, &date)?;
+    let identity = sley_sequencer::format_commit_identity_bytes(&name, &email, &date)?;
     Ok(Some(identity))
 }
 
@@ -5456,7 +5568,7 @@ fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
         head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     let head_name_display;
     if let Some(head_name) = &opts.head_name {
-        let committer = commit_identity_from_env("COMMITTER")?;
+        let committer = committer_identity_for_reflog()?;
         let mut tx = refs.transaction();
         let branch_already_at_head = matches!(refs.read_ref(head_name)?, Some(RefTarget::Direct(current)) if current == head);
         if !branch_already_at_head {
@@ -5948,7 +6060,7 @@ fn rebase_abort(ctx: &Ctx) -> Result<()> {
     let target = sley_rev::peel_to_commit(&db, ctx.format, &opts.orig_head)?;
     reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
     let refs = ctx.refs();
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let committer = committer_identity_for_reflog()?;
     let old_head = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
     let returning_to = match &opts.head_name {
         Some(head_name) => head_name.clone(),

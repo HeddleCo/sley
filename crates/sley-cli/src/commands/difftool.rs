@@ -313,7 +313,14 @@ fn materialize_difftool_entry(
     )?;
     write_materialized(
         &remote,
-        diff_entry_new_content(entry, db, Some(worktree_root), entry.new_oid.is_none())?.as_deref(),
+        diff_entry_new_content(
+            entry,
+            db,
+            Some(worktree_root),
+            entry.new_oid.is_none(),
+            None,
+        )?
+        .as_deref(),
         entry.new_mode,
     )?;
     Ok(ToolEnvironment {
@@ -499,6 +506,7 @@ fn dir_diff_new_content(
         repo.objects(),
         Some(repo.worktree_root()?),
         entry.new_oid.is_none(),
+        None,
     )
 }
 

@@ -20,6 +20,7 @@ filetime = "0.2"
 # Binary patch payloads (`git apply` of a `GIT binary patch`) are zlib-deflated;
 # the backend is unified to zlib-rs by the transitive sley-odb default feature.
 flate2 = { version = "1", default-features = false }
+regex = "1"
 sley-archive = { path = "../sley-archive" }
 sley-config = { path = "../sley-config" }
 sley-core = { path = "../sley-core" }
@@ -28,6 +29,7 @@ sley-diff-merge = { path = "../sley-diff-merge" }
 sley-fetch = { path = "../sley-fetch" }
 sley-formats = { path = "../sley-formats" }
 sley-grep = { path = "../sley-grep" }
+sley-i18n = { path = "../sley-i18n", optional = true }
 sley-fsck = { path = "../sley-fsck" }
 sley-index = { path = "../sley-index" }
 sley-notes = { path = "../sley-notes" }
@@ -37,6 +39,7 @@ sley-options = { path = "../sley-options" }
 sley-pack = { path = "../sley-pack" }
 sley-pathspec = { path = "../sley-pathspec" }
 sley-pretty = { path = "../sley-pretty" }
+sley-procinfo = { path = "../sley-procinfo" }
 sley-protocol = { path = "../sley-protocol" }
 sley-ref-filter = { path = "../sley-ref-filter" }
 sley-refs = { path = "../sley-refs" }
@@ -70,6 +73,7 @@ mmap = ["sley-odb/mmap"]
 tls-rustls = ["sley-transport/tls-rustls"]
 tls-native-tls = ["sley-transport/tls-native-tls"]
 tls-platform-verifier = ["sley-transport/tls-platform-verifier"]
+git-compat-i18n = ["dep:sley-i18n"]
 
 [lints]
 workspace = true
