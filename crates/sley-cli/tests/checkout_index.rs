@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const GIT_RS: &str = env!("CARGO_BIN_EXE_sley");
+const SLEY: &str = sley_testkit::sley_bin!();
 
 /// Fixed identity + dates so commit object ids are byte-identical across repos.
 const IDENTITY_ENV: &[(&str, &str)] = &[
@@ -169,7 +169,7 @@ fn checkout_index_all_matches_upstream_git() {
         }
         let args = ["checkout-index", "-a"];
         let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run(GIT_RS, &rust, &args);
+        let actual = run(SLEY, &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -202,7 +202,7 @@ fn checkout_index_existing_without_force_matches_upstream_git() {
         // Leave the worktree populated so each entry already exists on disk.
         let args = ["checkout-index", "-a"];
         let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run(GIT_RS, &rust, &args);
+        let actual = run(SLEY, &rust, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -221,7 +221,7 @@ fn checkout_index_force_overwrites_match_upstream_git() {
         }
         let args = ["checkout-index", "-a", "-f"];
         let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run(GIT_RS, &rust, &args);
+        let actual = run(SLEY, &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -251,7 +251,7 @@ fn checkout_index_explicit_paths_match_upstream_git() {
         }
         let args = ["checkout-index", "file.txt", "dir/nested.txt"];
         let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run(GIT_RS, &rust, &args);
+        let actual = run(SLEY, &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -278,13 +278,13 @@ fn checkout_index_missing_path_matches_upstream_git() {
     {
         let args = ["checkout-index", "absent.txt"];
         let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run(GIT_RS, &rust, &args);
+        let actual = run(SLEY, &rust, &args);
         assert_same_output(actual, expected, &args);
 
         // Quiet form suppresses the warning but keeps the nonzero exit.
         let quiet_args = ["checkout-index", "-q", "absent.txt"];
         let expected = run(sley_testkit::oracle_git(), &upstream, &quiet_args);
-        let actual = run(GIT_RS, &rust, &quiet_args);
+        let actual = run(SLEY, &rust, &quiet_args);
         assert_same_output(actual, expected, &quiet_args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -308,7 +308,7 @@ fn checkout_index_prefix_matches_upstream_git() {
             "dir/nested.txt",
         ];
         let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run(GIT_RS, &rust, &args);
+        let actual = run(SLEY, &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -339,7 +339,7 @@ fn checkout_index_stdin_matches_upstream_git() {
         let args = ["checkout-index", "--stdin"];
         let stdin = b"file.txt\ndir/nested.txt\n";
         let expected = run_with_stdin(sley_testkit::oracle_git(), &upstream, &args, stdin);
-        let actual = run_with_stdin(GIT_RS, &rust, &args, stdin);
+        let actual = run_with_stdin(SLEY, &rust, &args, stdin);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -365,7 +365,7 @@ fn checkout_index_stdin_nul_matches_upstream_git() {
         let args = ["checkout-index", "--stdin", "-z"];
         let stdin = b"file.txt\0dir/nested.txt\0";
         let expected = run_with_stdin(sley_testkit::oracle_git(), &upstream, &args, stdin);
-        let actual = run_with_stdin(GIT_RS, &rust, &args, stdin);
+        let actual = run_with_stdin(SLEY, &rust, &args, stdin);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -392,7 +392,7 @@ fn checkout_index_update_stat_matches_upstream_git() {
         }
         let args = ["checkout-index", "-u", "-f", "file.txt"];
         let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run(GIT_RS, &rust, &args);
+        let actual = run(SLEY, &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -424,7 +424,7 @@ fn checkout_index_mix_all_and_paths_matches_upstream_git() {
     {
         let args = ["checkout-index", "-a", "file.txt"];
         let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run(GIT_RS, &rust, &args);
+        let actual = run(SLEY, &rust, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -440,7 +440,7 @@ fn checkout_index_mix_stdin_and_paths_matches_upstream_git() {
     {
         let args = ["checkout-index", "--stdin", "file.txt"];
         let expected = run_with_stdin(sley_testkit::oracle_git(), &upstream, &args, b"");
-        let actual = run_with_stdin(GIT_RS, &rust, &args, b"");
+        let actual = run_with_stdin(SLEY, &rust, &args, b"");
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -486,7 +486,7 @@ fn checkout_index_executable_and_symlink_modes_match_upstream_git() {
         }
         let args = ["checkout-index", "-a"];
         let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run(GIT_RS, &rust, &args);
+        let actual = run(SLEY, &rust, &args);
         assert_same_output(actual, expected, &args);
 
         // Symlink stays a symlink with the same target.
@@ -532,7 +532,7 @@ fn checkout_index_subdir_all_matches_upstream_git() {
         let upstream_sub = upstream.join("dir");
         let rust_sub = rust.join("dir");
         let expected = run(sley_testkit::oracle_git(), &upstream_sub, &args);
-        let actual = run(GIT_RS, &rust_sub, &args);
+        let actual = run(SLEY, &rust_sub, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(

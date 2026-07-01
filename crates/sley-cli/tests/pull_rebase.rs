@@ -111,7 +111,7 @@ fn pull_rebase_clean_matches_upstream_git() {
     prepare_pull_rebase_clone(&upstream, &actual, Some("true"));
     let args = ["pull", "origin", "master"];
     let expected_output = run_output_with_identity(sley_testkit::oracle_git(), &expected, &args);
-    let actual_output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+    let actual_output = run_output_with_identity(sley_testkit::sley_bin!(), &actual, &args);
     assert_eq!(
         actual_output.status.code(),
         expected_output.status.code(),
@@ -129,12 +129,12 @@ fn pull_rebase_clean_matches_upstream_git() {
             &["rev-parse", "HEAD"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &actual, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after pull rebase"
     );
     assert_eq!(
         run_output(sley_testkit::oracle_git(), &expected, &["log", "--oneline"]).stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["log", "--oneline"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &actual, &["log", "--oneline"]).stdout,
         "log order differed after pull rebase"
     );
     let _ = fs::remove_dir_all(&root);
@@ -154,7 +154,7 @@ fn pull_rebase_flag_matches_upstream_git() {
     prepare_pull_rebase_clone(&upstream, &actual, Some("false"));
     let args = ["pull", "--rebase", "origin", "master"];
     let expected_output = run_output_with_identity(sley_testkit::oracle_git(), &expected, &args);
-    let actual_output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+    let actual_output = run_output_with_identity(sley_testkit::sley_bin!(), &actual, &args);
     assert_eq!(
         actual_output.status.code(),
         expected_output.status.code(),
@@ -172,12 +172,12 @@ fn pull_rebase_flag_matches_upstream_git() {
             &["rev-parse", "HEAD"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &actual, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after pull --rebase"
     );
     assert_eq!(
         run_output(sley_testkit::oracle_git(), &expected, &["log", "--oneline"]).stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["log", "--oneline"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &actual, &["log", "--oneline"]).stdout,
         "log order differed after pull --rebase"
     );
     let _ = fs::remove_dir_all(&root);

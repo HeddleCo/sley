@@ -87,8 +87,8 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
     run_ok(sley_testkit::oracle_git(), cwd, args)
 }
 
-fn git_rs_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_sley")
+fn sley_bin() -> &'static str {
+    sley_testkit::sley_bin!()
 }
 
 fn assert_same_output(actual: &Output, expected: &Output, args: &[&str]) {
@@ -146,7 +146,7 @@ fn make_repo_pair(root: &Path, label: &str, commits: usize) -> (PathBuf, PathBuf
 /// repo, so each tool mutates its own copy.
 fn assert_notes_match(expected_root: &Path, actual_root: &Path, args: &[&str]) {
     let expected = run_output(sley_testkit::oracle_git(), expected_root, args);
-    let actual = run_output(git_rs_bin(), actual_root, args);
+    let actual = run_output(sley_bin(), actual_root, args);
     assert_same_output(&actual, &expected, args);
 }
 
@@ -158,7 +158,7 @@ fn assert_notes_object_match(expected_root: &Path, actual_root: &Path, notes_ref
         expected_root,
         &["rev-parse", notes_ref],
     );
-    let actual = run_output(git_rs_bin(), actual_root, &["rev-parse", notes_ref]);
+    let actual = run_output(sley_bin(), actual_root, &["rev-parse", notes_ref]);
     assert_same_output(&actual, &expected, &["rev-parse", notes_ref]);
     if !expected.status.success() {
         return;
@@ -360,13 +360,9 @@ fn notes_remove_matches_git() {
         let (expected, actual) = make_repo_pair(&root, "rm", 3);
 
         git(&expected, &["notes", "add", "-m", "a", "HEAD"]);
-        run_ok(git_rs_bin(), &actual, &["notes", "add", "-m", "a", "HEAD"]);
+        run_ok(sley_bin(), &actual, &["notes", "add", "-m", "a", "HEAD"]);
         git(&expected, &["notes", "add", "-m", "b", "HEAD~1"]);
-        run_ok(
-            git_rs_bin(),
-            &actual,
-            &["notes", "add", "-m", "b", "HEAD~1"],
-        );
+        run_ok(sley_bin(), &actual, &["notes", "add", "-m", "b", "HEAD~1"]);
 
         // remove a present note (echoes the literal spec), then a missing one.
         assert_notes_match(&expected, &actual, &["notes", "remove", "HEAD"]);
@@ -401,7 +397,7 @@ fn notes_copy_matches_git() {
 
         git(&expected, &["notes", "add", "-m", "source note", "HEAD"]);
         run_ok(
-            git_rs_bin(),
+            sley_bin(),
             &actual,
             &["notes", "add", "-m", "source note", "HEAD"],
         );
@@ -414,7 +410,7 @@ fn notes_copy_matches_git() {
         // copy onto an object that already has a note: error without -f, ok with.
         git(&expected, &["notes", "add", "-m", "dest note", "HEAD~1"]);
         run_ok(
-            git_rs_bin(),
+            sley_bin(),
             &actual,
             &["notes", "add", "-m", "dest note", "HEAD~1"],
         );
@@ -482,7 +478,7 @@ fn notes_custom_ref_matches_git() {
             &["notes", "get-ref"],
             &env,
         );
-        let actual_out = run_output_env(git_rs_bin(), &actual, &["notes", "get-ref"], &env);
+        let actual_out = run_output_env(sley_bin(), &actual, &["notes", "get-ref"], &env);
         assert_same_output(&actual_out, &expected_out, &["notes", "get-ref"]);
     });
     let _ = std::fs::remove_dir_all(&root);

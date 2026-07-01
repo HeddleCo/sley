@@ -148,7 +148,7 @@ fn rebase_keep_base_root_is_rejected() {
     git_with_identity(&root, &["commit", "-m", "base", "-q"]);
 
     let args = ["rebase", "--keep-base", "--root"];
-    let output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &root, &args);
+    let output = run_output_with_identity(sley_testkit::sley_bin!(), &root, &args);
     assert_eq!(output.status.code(), Some(128));
     assert!(
         String::from_utf8_lossy(&output.stderr)
@@ -185,7 +185,7 @@ fn rebase_keep_base_reapplies_cherry_picks_by_default() {
     git_with_identity(&root, &["cherry-pick", &f_oid]);
 
     let args = ["rebase", "-i", "--keep-base", "HEAD", &topic_oid];
-    let output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &root, &args);
+    let output = run_output_with_identity(sley_testkit::sley_bin!(), &root, &args);
     assert!(
         output.status.success(),
         "sley rebase failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -211,7 +211,7 @@ fn rebase_clean_matches_upstream_git() {
     prepare_diverged_repos(&upstream, &rust);
     let args = ["rebase", "master"];
     let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
-    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),
@@ -229,12 +229,12 @@ fn rebase_clean_matches_upstream_git() {
             &["rev-parse", "HEAD"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after clean rebase"
     );
     assert_eq!(
         run_output(sley_testkit::oracle_git(), &upstream, &["log", "--oneline"]).stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "--oneline"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["log", "--oneline"]).stdout,
         "log order differed after clean rebase"
     );
     let _ = fs::remove_dir_all(&root);
@@ -250,7 +250,7 @@ fn rebase_already_up_to_date_matches_upstream_git() {
     prepare_up_to_date_repos(&upstream, &rust);
     let args = ["rebase", "master"];
     let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
-    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
     assert_same_output(actual, expected, &args);
     assert_eq!(
         run_output(
@@ -259,7 +259,7 @@ fn rebase_already_up_to_date_matches_upstream_git() {
             &["rev-parse", "HEAD"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after up-to-date rebase"
     );
     let _ = fs::remove_dir_all(&root);
@@ -302,18 +302,18 @@ fn checkout_can_leave_gitlink_branch_with_dirty_populated_submodule() {
 
     fs::write(superproject.join("sub/file0"), b"changed\n").expect("dirty submodule");
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &superproject,
         &["reset", "--hard"],
     );
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &superproject,
         &["checkout", "main"],
     );
     assert_eq!(
         run_output(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &superproject,
             &["rev-parse", "--abbrev-ref", "HEAD"]
         )

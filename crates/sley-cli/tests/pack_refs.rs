@@ -123,7 +123,7 @@ fn pack_refs_modes_match_upstream_git() {
         prepare_pack_refs_repo(&actual);
 
         let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected, &args);
         assert_eq!(
             read_packed_refs(&actual),
@@ -143,7 +143,7 @@ fn pack_refs_modes_match_upstream_git() {
             );
         }
         assert_eq!(
-            run(env!("CARGO_BIN_EXE_sley"), &actual, &["show-ref"]).stdout,
+            run(sley_testkit::sley_bin!(), &actual, &["show-ref"]).stdout,
             run(sley_testkit::oracle_git(), &upstream, &["show-ref"]).stdout,
             "show-ref differed after {args:?}"
         );

@@ -2738,9 +2738,7 @@ impl<'a> CommitGraphContext<'a> {
                 }
                 return Ok(Some(metadata));
             }
-            DirectCommitGraph::Invalid(message) => {
-                return Err(GitError::InvalidFormat(message.clone()));
-            }
+            DirectCommitGraph::Invalid(_) => return Ok(None),
             DirectCommitGraph::Missing => {}
         }
         Ok(self.metadata(oid)?.map(|metadata| CommitMetadata {
@@ -2785,7 +2783,11 @@ fn load_commit_graph_map(
             Ok(graph) => graph_to_map(&graph),
             Err(_) => {
                 warn_invalid_commit_graph_bloom_chunks(&bytes, &single, format);
-                RawCommitGraph::parse_for_lookup(RawCommitGraphBytes::Owned(bytes), format)?;
+                if RawCommitGraph::parse_for_lookup(RawCommitGraphBytes::Owned(bytes), format)
+                    .is_err()
+                {
+                    return Ok(HashMap::new());
+                }
                 Ok(HashMap::new())
             }
         };
@@ -3918,6 +3920,131 @@ pub fn walk_commit_metadata_date_ordered_limited<R: ObjectReader>(
         .first_parent(first_parent)
         .max_count(Some(limit))
         .collect_all()
+}
+
+/// Result of testing a candidate tip's reachable commits against include and
+/// exclude target sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReachabilityTargetMatch {
+    /// True when the walk reached at least one required target, or when no
+    /// required targets were requested.
+    pub reached_required: bool,
+    /// True when the walk reached an excluded target.
+    pub reached_excluded: bool,
+}
+
+/// Reusable graph-backed reachability helper for porcelain ref filters.
+///
+/// `branch --contains`, `tag --merged`, and `for-each-ref --contains` all ask
+/// the same ancestry questions for many refs. Keeping one helper alive lets
+/// those queries share the lazily-loaded commit-graph context and reuse the
+/// metadata-only parent walk used by [`walk_commit_metadata`], instead of
+/// materializing full [`CommitRecord`] histories for every candidate ref.
+pub struct CommitReachability<'a, R: ObjectReader> {
+    graph: CommitGraphContext<'a>,
+    reader: &'a R,
+}
+
+impl<'a, R: ObjectReader> CommitReachability<'a, R> {
+    pub fn new(git_dir: &'a Path, format: ObjectFormat, reader: &'a R) -> Self {
+        Self {
+            graph: CommitGraphContext::load(git_dir, format),
+            reader,
+        }
+    }
+
+    /// Return the union of commits reachable from `starts`.
+    pub fn reachable_oids(
+        &mut self,
+        starts: impl IntoIterator<Item = ObjectId>,
+        first_parent: bool,
+    ) -> Result<HashSet<ObjectId>> {
+        let mut seen = HashSet::new();
+        let mut pending: VecDeque<ObjectId> = starts.into_iter().collect();
+        while let Some(oid) = pending.pop_front() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            self.enqueue_parents(&oid, first_parent, &mut pending)?;
+        }
+        Ok(seen)
+    }
+
+    /// Test a single candidate tip against required/excluded target sets.
+    ///
+    /// The walk stops as soon as an excluded target is found, or as soon as a
+    /// required target is found when there are no excluded targets to disprove
+    /// the match. Otherwise it walks only as far as needed to answer the filter.
+    pub fn target_match(
+        &mut self,
+        start: &ObjectId,
+        required_targets: &HashSet<ObjectId>,
+        excluded_targets: &HashSet<ObjectId>,
+        first_parent: bool,
+    ) -> Result<ReachabilityTargetMatch> {
+        let mut reached_required = required_targets.is_empty();
+        if reached_required && excluded_targets.is_empty() {
+            return Ok(ReachabilityTargetMatch {
+                reached_required,
+                reached_excluded: false,
+            });
+        }
+
+        let mut seen = HashSet::new();
+        let mut pending = VecDeque::from([*start]);
+        while let Some(oid) = pending.pop_front() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            if excluded_targets.contains(&oid) {
+                return Ok(ReachabilityTargetMatch {
+                    reached_required,
+                    reached_excluded: true,
+                });
+            }
+            if !reached_required && required_targets.contains(&oid) {
+                reached_required = true;
+                if excluded_targets.is_empty() {
+                    return Ok(ReachabilityTargetMatch {
+                        reached_required,
+                        reached_excluded: false,
+                    });
+                }
+            }
+            self.enqueue_parents(&oid, first_parent, &mut pending)?;
+        }
+        Ok(ReachabilityTargetMatch {
+            reached_required,
+            reached_excluded: false,
+        })
+    }
+
+    fn enqueue_parents(
+        &mut self,
+        oid: &ObjectId,
+        first_parent: bool,
+        pending: &mut VecDeque<ObjectId>,
+    ) -> Result<()> {
+        if first_parent {
+            pending.extend(self.graph.commit_first_parent(self.reader, oid)?);
+        } else {
+            for parent in self.graph.commit_parent_ids(self.reader, oid)? {
+                pending.push_back(parent);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Return the union of commits reachable from `starts`.
+pub fn reachable_commit_oids<R: ObjectReader>(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    reader: &R,
+    starts: impl IntoIterator<Item = ObjectId>,
+    first_parent: bool,
+) -> Result<HashSet<ObjectId>> {
+    CommitReachability::new(git_dir, format, reader).reachable_oids(starts, first_parent)
 }
 
 fn commit_metadata_lookup<R: ObjectReader>(
@@ -7896,6 +8023,14 @@ mod tests {
         set_branch(&git_dir, "main", &child);
         write_head_reflog(
             &git_dir,
+            &[
+                (&zero_oid(), &parent, "commit (initial): parent"),
+                (&parent, &child, "commit: child"),
+            ],
+        );
+        write_branch_reflog(
+            &git_dir,
+            "main",
             &[
                 (&zero_oid(), &parent, "commit (initial): parent"),
                 (&parent, &child, "commit: child"),

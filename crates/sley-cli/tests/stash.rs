@@ -65,8 +65,8 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
     run_success(sley_testkit::oracle_git(), cwd, args)
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run_success(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run_success(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git_stash_push_with_identity(
@@ -575,7 +575,7 @@ fn stash_list_matches_upstream_git() {
             vec!["stash", "list", "--left-right"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley stash output differed for {args:?}");
         }
         for args in [
@@ -763,7 +763,7 @@ fn stash_list_matches_upstream_git() {
             ["stash", "list", "--no-before=value"].as_slice(),
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, args);
             assert_same_output(actual, expected, args);
         }
 
@@ -806,7 +806,7 @@ fn stash_list_matches_upstream_git() {
             vec!["stash", "list", "--committer=Missing"],
         ] {
             let expected = git(&identity, &args);
-            let actual = git_rs(&identity, &args);
+            let actual = sley(&identity, &args);
             assert_eq!(
                 actual, expected,
                 "sley stash identity filter output differed for {args:?}"
@@ -843,7 +843,7 @@ fn stash_list_matches_upstream_git() {
             vec!["stash", "list", "--date=raw", "--format=%gd|%gD"],
         ] {
             let expected = git(&ages, &args);
-            let actual = git_rs(&ages, &args);
+            let actual = sley(&ages, &args);
             assert_eq!(
                 actual, expected,
                 "sley stash age filter output differed for {args:?}"
@@ -868,7 +868,7 @@ fn stash_create_matches_upstream_git() {
             &clean_args,
         );
         let actual_output =
-            run_output_with_fixed_identity(env!("CARGO_BIN_EXE_sley"), &clean_actual, &clean_args);
+            run_output_with_fixed_identity(sley_testkit::sley_bin!(), &clean_actual, &clean_args);
         assert_same_output(actual_output, expected, &clean_args);
 
         for (name, setup, args) in [
@@ -899,7 +899,7 @@ fn stash_create_matches_upstream_git() {
             let expected =
                 run_output_with_fixed_identity(sley_testkit::oracle_git(), &upstream, &args);
             let actual_output =
-                run_output_with_fixed_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+                run_output_with_fixed_identity(sley_testkit::sley_bin!(), &actual, &args);
             assert_eq!(
                 actual_output.status.code(),
                 expected.status.code(),
@@ -923,7 +923,7 @@ fn stash_create_matches_upstream_git() {
                 vec!["show-ref", "--exists", "refs/stash"],
             ] {
                 let expected = run_output(sley_testkit::oracle_git(), &upstream, &check_args);
-                let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &check_args);
+                let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &check_args);
                 assert_same_output(actual_output, expected, &check_args);
             }
 
@@ -942,7 +942,7 @@ fn stash_create_matches_upstream_git() {
                 vec!["stash", "show", "--stat", "-p"],
             ] {
                 let expected = run_output(sley_testkit::oracle_git(), &upstream, &check_args);
-                let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &check_args);
+                let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &check_args);
                 assert_same_output(actual_output, expected, &check_args);
             }
         }
@@ -1286,7 +1286,7 @@ fn stash_push_matches_upstream_git() {
 
         let expected = run_output_with_fixed_identity(sley_testkit::oracle_git(), &upstream, &args);
         let actual_output =
-            run_output_with_fixed_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            run_output_with_fixed_identity(sley_testkit::sley_bin!(), &actual, &args);
         assert_eq!(
             actual_output.status.code(),
             expected.status.code(),
@@ -1311,7 +1311,7 @@ fn stash_push_matches_upstream_git() {
             vec!["stash", "list", "--format=%gs"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &upstream, &check_args);
-            let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &check_args);
+            let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &check_args);
             assert_eq!(
                 actual_output.status.code(),
                 expected.status.code(),
@@ -1342,7 +1342,7 @@ fn stash_push_matches_upstream_git() {
                 vec!["stash", "show", "--only-untracked", "--name-only"],
             ] {
                 let expected = run_output(sley_testkit::oracle_git(), &upstream, &check_args);
-                let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &check_args);
+                let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &check_args);
                 assert_same_output(actual_output, expected, &check_args);
             }
         }
@@ -1387,7 +1387,7 @@ fn stash_push_sha256_tracked_changes_match_upstream_git() {
         let args = ["stash", "push", "-m", "sha256 tracked"];
         let expected = run_output_with_fixed_identity(sley_testkit::oracle_git(), &upstream, &args);
         let actual_output =
-            run_output_with_fixed_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            run_output_with_fixed_identity(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected, &args);
 
         for check_args in [
@@ -1397,7 +1397,7 @@ fn stash_push_sha256_tracked_changes_match_upstream_git() {
             vec!["status", "--short"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &upstream, &check_args);
-            let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &check_args);
+            let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &check_args);
             assert_same_output(actual_output, expected, &check_args);
         }
     };
@@ -1596,7 +1596,7 @@ fn stash_save_matches_upstream_git() {
 
         let expected = run_output_with_fixed_identity(sley_testkit::oracle_git(), &upstream, &args);
         let actual_output =
-            run_output_with_fixed_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            run_output_with_fixed_identity(sley_testkit::sley_bin!(), &actual, &args);
         assert_eq!(
             actual_output.status.code(),
             expected.status.code(),
@@ -1621,7 +1621,7 @@ fn stash_save_matches_upstream_git() {
             vec!["stash", "list", "--format=%gs"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &upstream, &check_args);
-            let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &check_args);
+            let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &check_args);
             assert_same_output(actual_output, expected, &check_args);
         }
         let stash_exists = run_output(
@@ -1640,7 +1640,7 @@ fn stash_save_matches_upstream_git() {
                 vec!["stash", "show", "--only-untracked", "--name-only"],
             ] {
                 let expected = run_output(sley_testkit::oracle_git(), &upstream, &check_args);
-                let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &check_args);
+                let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &check_args);
                 assert_same_output(actual_output, expected, &check_args);
             }
         }
@@ -1771,7 +1771,7 @@ fn stash_apply_matches_upstream_git_for_clean_head() {
         run_output_with_fixed_identity(sley_testkit::oracle_git(), &actual, &push_args);
 
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &apply_args);
-        let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &apply_args);
+        let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &apply_args);
         assert_eq!(
             actual_output.status.code(),
             expected.status.code(),
@@ -1796,7 +1796,7 @@ fn stash_apply_matches_upstream_git_for_clean_head() {
             vec!["show-ref", "--exists", "refs/stash"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &upstream, &check_args);
-            let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &check_args);
+            let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &check_args);
             assert_same_output(actual_output, expected, &check_args);
         }
     }
@@ -1890,7 +1890,7 @@ fn stash_pop_matches_upstream_git_for_clean_head() {
         run_output_with_fixed_identity(sley_testkit::oracle_git(), &actual, &push_args);
 
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &pop_args);
-        let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &pop_args);
+        let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &pop_args);
         assert_eq!(
             actual_output.status.code(),
             expected.status.code(),
@@ -1915,7 +1915,7 @@ fn stash_pop_matches_upstream_git_for_clean_head() {
             vec!["show-ref", "--exists", "refs/stash"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &upstream, &check_args);
-            let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &check_args);
+            let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &check_args);
             assert_same_output(actual_output, expected, &check_args);
         }
     }
@@ -1939,7 +1939,7 @@ fn stash_apply_pop_matches_upstream_git_for_moved_head_unchanged_paths() {
         copy_dir(&template, &actual);
 
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &apply_args);
-        let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &apply_args);
+        let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &apply_args);
         assert_same_output(actual_output, expected, &apply_args);
 
         for check_args in [
@@ -1948,7 +1948,7 @@ fn stash_apply_pop_matches_upstream_git_for_moved_head_unchanged_paths() {
             vec!["show-ref", "--exists", "refs/stash"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &upstream, &check_args);
-            let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &check_args);
+            let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &check_args);
             assert_same_output(actual_output, expected, &check_args);
         }
         assert_eq!(
@@ -2053,7 +2053,7 @@ fn stash_apply_pop_empty_and_errors_match_upstream_git() {
         copy_dir(&template, &actual);
 
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected, &args);
     }
     let _ = fs::remove_dir_all(&root);
@@ -2115,7 +2115,7 @@ fn stash_branch_matches_upstream_git_for_clean_head() {
         }
 
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &branch_args);
-        let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &branch_args);
+        let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &branch_args);
         assert_eq!(
             actual_output.status.code(),
             expected.status.code(),
@@ -2185,7 +2185,7 @@ fn stash_store_matches_upstream_git() {
             copy_dir(&template, &actual);
 
             let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-            let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected, &args);
 
             for check_args in [
@@ -2194,7 +2194,7 @@ fn stash_store_matches_upstream_git() {
                 vec!["rev-parse", "refs/stash"],
             ] {
                 let expected = run_output(sley_testkit::oracle_git(), &upstream, &check_args);
-                let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &check_args);
+                let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &check_args);
                 assert_same_output(actual_output, expected, &check_args);
             }
         }
@@ -2255,17 +2255,17 @@ fn stash_store_appends_and_errors_match_upstream_git() {
 
             if matches!(name, "append" | "same-oid-noop") {
                 git(&upstream, &["stash", "store", stash_oid.as_str()]);
-                git_rs(&actual, &["stash", "store", stash_oid.as_str()]);
+                sley(&actual, &["stash", "store", stash_oid.as_str()]);
             }
 
             let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-            let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected, &args);
 
             if matches!(name, "append" | "same-oid-noop") {
                 let check_args = ["stash", "list"];
                 let expected = run_output(sley_testkit::oracle_git(), &upstream, &check_args);
-                let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &check_args);
+                let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &check_args);
                 assert_same_output(actual_output, expected, &check_args);
             }
         }
@@ -2287,7 +2287,7 @@ fn stash_list_empty_matches_upstream_git() {
             vec!["stash", "list", "-1"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(
                 actual, expected,
                 "sley empty stash output differed for {args:?}"
@@ -2310,7 +2310,7 @@ fn stash_clear_matches_upstream_git() {
 
         let args = ["stash", "clear"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected, &args);
 
         for args in [
@@ -2319,7 +2319,7 @@ fn stash_clear_matches_upstream_git() {
             vec!["show-ref", "--exists", "refs/stash"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-            let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected, &args);
         }
     };
@@ -2339,7 +2339,7 @@ fn stash_clear_empty_and_errors_match_upstream_git() {
             vec!["stash", "clear", "--bogus"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -2366,7 +2366,7 @@ fn stash_drop_matches_upstream_git() {
             copy_dir(&template, &actual);
 
             let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-            let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected, &args);
 
             for check_args in [
@@ -2375,7 +2375,7 @@ fn stash_drop_matches_upstream_git() {
                 vec!["show-ref", "--exists", "refs/stash"],
             ] {
                 let expected = run_output(sley_testkit::oracle_git(), &upstream, &check_args);
-                let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &check_args);
+                let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &check_args);
                 assert_same_output(actual_output, expected, &check_args);
             }
         }
@@ -2403,7 +2403,7 @@ fn stash_drop_last_and_errors_match_upstream_git() {
             copy_dir(&template, &actual);
 
             let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-            let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected, &args);
 
             if name == "last" {
@@ -2413,8 +2413,7 @@ fn stash_drop_last_and_errors_match_upstream_git() {
                     vec!["show-ref", "--exists", "refs/stash"],
                 ] {
                     let expected = run_output(sley_testkit::oracle_git(), &upstream, &check_args);
-                    let actual_output =
-                        run_output(env!("CARGO_BIN_EXE_sley"), &actual, &check_args);
+                    let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &check_args);
                     assert_same_output(actual_output, expected, &check_args);
                 }
             }
@@ -2498,7 +2497,7 @@ fn stash_show_matches_upstream_git() {
             vec!["stash", "show", "refs/stash@{0}"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(
                 actual, expected,
                 "sley stash show output differed for {args:?}"
@@ -2506,11 +2505,11 @@ fn stash_show_matches_upstream_git() {
         }
         let args = ["stash", "show", "--quiet"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         let args = ["stash", "show", "--exit-code"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         for args in [
             ["stash", "show", "--quiet=false"].as_slice(),
@@ -2545,7 +2544,7 @@ fn stash_show_matches_upstream_git() {
             ["stash", "show", "--no-textconv=false"].as_slice(),
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, args);
             assert_same_output(actual, expected, args);
         }
     };
@@ -2637,7 +2636,7 @@ fn stash_show_untracked_flags_match_upstream_git() {
             vec!["stash", "show", "-p", "--only-untracked"],
         ] {
             let expected = git(&untracked, &args);
-            let actual = git_rs(&untracked, &args);
+            let actual = sley(&untracked, &args);
             assert_eq!(
                 actual, expected,
                 "sley stash show untracked output differed for {args:?}"
@@ -2678,7 +2677,7 @@ fn stash_show_untracked_flags_match_upstream_git() {
             .as_slice(),
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &untracked, args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &untracked, args);
+            let actual = run_output(sley_testkit::sley_bin!(), &untracked, args);
             assert_same_output(actual, expected, args);
         }
 
@@ -2688,7 +2687,7 @@ fn stash_show_untracked_flags_match_upstream_git() {
             vec!["stash", "show", "--name-only", "--only-untracked"],
         ] {
             let expected = git(&tracked_only, &args);
-            let actual = git_rs(&tracked_only, &args);
+            let actual = sley(&tracked_only, &args);
             assert_eq!(
                 actual, expected,
                 "sley tracked-only stash output differed for {args:?}"
@@ -2696,7 +2695,7 @@ fn stash_show_untracked_flags_match_upstream_git() {
         }
         let args = ["stash", "show", "--quiet", "--only-untracked"];
         let expected = run_output(sley_testkit::oracle_git(), &tracked_only, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &tracked_only, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &tracked_only, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -2729,7 +2728,7 @@ fn stash_show_empty_and_errors_match_upstream_git() {
             copy_dir(&template, &actual);
 
             let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -2738,7 +2737,7 @@ fn stash_show_empty_and_errors_match_upstream_git() {
         git(&empty, &["init", "-q", "-b", "main"]);
         let args = ["stash", "show"];
         let expected = run_output(sley_testkit::oracle_git(), &empty, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &empty, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &empty, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);

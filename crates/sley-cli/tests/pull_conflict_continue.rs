@@ -161,7 +161,7 @@ fn pull_conflict_then_continue_matches_upstream_git() {
     prepare_conflict_clone(&origin, &rust);
 
     let upstream_pre_pull = start_conflict_pull(sley_testkit::oracle_git(), &upstream);
-    let rust_pre_pull = start_conflict_pull(env!("CARGO_BIN_EXE_sley"), &rust);
+    let rust_pre_pull = start_conflict_pull(sley_testkit::sley_bin!(), &rust);
     assert_eq!(upstream_pre_pull, rust_pre_pull, "pre-pull HEAD differed");
 
     resolve_conflict(&upstream);
@@ -169,7 +169,7 @@ fn pull_conflict_then_continue_matches_upstream_git() {
 
     let args = ["merge", "--continue"];
     let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
-    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
     assert_same_output(actual, expected, &args);
 
     assert!(
@@ -178,7 +178,7 @@ fn pull_conflict_then_continue_matches_upstream_git() {
     );
     assert!(
         !rust.join(".git/MERGE_HEAD").is_file(),
-        "git-rs MERGE_HEAD should be removed"
+        "Sley MERGE_HEAD should be removed"
     );
     assert!(
         !upstream.join(".git/MERGE_MSG").is_file(),
@@ -186,7 +186,7 @@ fn pull_conflict_then_continue_matches_upstream_git() {
     );
     assert!(
         !rust.join(".git/MERGE_MSG").is_file(),
-        "git-rs MERGE_MSG should be removed"
+        "Sley MERGE_MSG should be removed"
     );
     assert_eq!(
         run_output(
@@ -195,7 +195,7 @@ fn pull_conflict_then_continue_matches_upstream_git() {
             &["rev-parse", "HEAD"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after merge --continue"
     );
     assert_eq!(
@@ -206,7 +206,7 @@ fn pull_conflict_then_continue_matches_upstream_git() {
         )
         .stdout,
         run_output(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &rust,
             &["log", "-1", "--format=%P"]
         )
@@ -221,7 +221,7 @@ fn pull_conflict_then_continue_matches_upstream_git() {
         )
         .stdout,
         run_output(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &rust,
             &["log", "-1", "--format=%s"]
         )

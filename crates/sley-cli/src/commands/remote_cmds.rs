@@ -12,6 +12,10 @@ use sley_odb::ObjectReader;
 use sley_remote::{FetchOptions, LsRemoteRecord};
 use std::process::Command as Proc;
 
+/// Internal placeholder branch used while clone initializes before it knows
+/// which branch, detached commit, or unborn remote state will own `HEAD`.
+const CLONE_UNBORN_BRANCH: &str = "__sley_clone_unborn__";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FetchRecurseSubmodules {
     Default,
@@ -1033,7 +1037,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             object_format: format,
             object_format_explicit: false,
             bare: false,
-            initial_branch: "__git_rs_clone_unborn__".into(),
+            initial_branch: CLONE_UNBORN_BRANCH.into(),
             template_dir: None,
             copy_template_config: false,
             separate_git_dir: None,
@@ -2324,7 +2328,7 @@ fn clone_bare_or_mirror_local_repository(
     // empty `head_branch` does not form an invalid `refs/heads/` symref. The
     // destination HEAD is repointed at the detached commit after the fetch.
     let initial_branch = if options.detached_head.is_some() {
-        "__git_rs_clone_unborn__"
+        CLONE_UNBORN_BRANCH
     } else {
         options.head_branch
     };

@@ -183,7 +183,7 @@ fn commit_graph_verify_matches_upstream_git() {
             vec!["commit-graph", "verify", "--no-progress"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -218,7 +218,7 @@ fn commit_graph_verify_split_chain_matches_upstream_git() {
             vec!["commit-graph", "verify", "--no-progress"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -239,7 +239,7 @@ fn commit_graph_write_reachable_writes_upstream_verifiable_graph() {
         fs::remove_file(&graph_path).expect("remove upstream commit-graph");
 
         let args = ["commit-graph", "write", "--reachable"];
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run(sley_testkit::sley_bin!(), &root, &args);
         assert!(
             actual.status.success(),
             "sley {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -259,7 +259,7 @@ fn commit_graph_write_reachable_writes_upstream_verifiable_graph() {
         let expected = run(sley_testkit::oracle_git(), &root, &args);
         fs::remove_file(&graph_path).expect("remove upstream commit-graph");
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &[
                 "commit-graph",
@@ -297,7 +297,7 @@ fn commit_graph_write_honors_changed_paths_version_config() {
             );
 
             let args = ["commit-graph", "write", "--reachable", "--changed-paths"];
-            let output = run(env!("CARGO_BIN_EXE_sley"), &repo, &args);
+            let output = run(sley_testkit::sley_bin!(), &repo, &args);
             assert!(
                 output.status.success(),
                 "sley {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -328,7 +328,7 @@ fn commit_graph_write_autodetect_preserves_existing_changed_paths_version() {
             &["config", "commitGraph.changedPathsVersion", "2"],
         );
         run_success(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["commit-graph", "write", "--reachable", "--changed-paths"],
         );
@@ -340,7 +340,7 @@ fn commit_graph_write_autodetect_preserves_existing_changed_paths_version() {
             &["config", "commitGraph.changedPathsVersion", "-1"],
         );
         run_success(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["commit-graph", "write", "--reachable"],
         );
@@ -366,7 +366,7 @@ fn commit_graph_write_unsupported_changed_paths_version_is_warning_noop() {
             );
 
             let args = ["commit-graph", "write", "--reachable", "--changed-paths"];
-            let output = run(env!("CARGO_BIN_EXE_sley"), &repo, &args);
+            let output = run(sley_testkit::sley_bin!(), &repo, &args);
             assert!(
                 output.status.success(),
                 "unsupported changedPathsVersion should be a warning/no-op"
@@ -420,7 +420,7 @@ fn commit_graph_write_without_selector_matches_upstream_noop() {
 
         let args = ["commit-graph", "write"];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         for repo in [&expected, &actual] {
             assert!(
@@ -449,7 +449,7 @@ fn commit_graph_write_without_selector_matches_upstream_noop() {
             &["init", "-q", "-b", "main"],
         );
         let expected_output = run(sley_testkit::oracle_git(), &empty_expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &empty_actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &empty_actual, &args);
         assert_same_output(actual_output, expected_output, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -471,7 +471,7 @@ fn commit_graph_git_object_directory_default_matches_upstream_git() {
 
         let args = ["commit-graph", "write", "--reachable"];
         let expected_output = run_with_env(sley_testkit::oracle_git(), &expected, &args, &envs);
-        let actual_output = run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &args, &envs);
+        let actual_output = run_with_env(sley_testkit::sley_bin!(), &actual, &args, &envs);
         assert_same_output(actual_output, expected_output, &args);
 
         for repo in [&expected, &actual] {
@@ -496,7 +496,7 @@ fn commit_graph_git_object_directory_default_matches_upstream_git() {
         let verify_args = ["commit-graph", "verify"];
         let expected_verify =
             run_with_env(sley_testkit::oracle_git(), &expected, &verify_args, &envs);
-        let actual_verify = run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &verify_args, &envs);
+        let actual_verify = run_with_env(sley_testkit::sley_bin!(), &actual, &verify_args, &envs);
         assert_same_output(actual_verify, expected_verify, &verify_args);
         run_success_with_env(sley_testkit::oracle_git(), &actual, &verify_args, &envs);
     };

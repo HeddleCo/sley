@@ -1234,18 +1234,25 @@ impl FileRefStore {
     pub fn list_reflog_names(&self) -> Result<Vec<String>> {
         let mut names = BTreeSet::new();
         if self.uses_reftable()? {
+            let null = ObjectId::null(self.format);
+            let mut logs_by_index = BTreeMap::<(String, u64), bool>::new();
             for table in self.reftables()? {
                 for record in table.logs {
-                    names.insert(record.refname);
+                    let has_visible_entry = match record.value {
+                        ReftableLogValue::Deletion => false,
+                        ReftableLogValue::Update(update) => {
+                            !reftable_log_update_is_empty_marker(&update, null)
+                        }
+                    };
+                    logs_by_index.insert((record.refname, record.update_index), has_visible_entry);
                 }
             }
-            let mut live = Vec::new();
-            for name in names {
-                if !self.read_reftable_logs(&name)?.is_empty() {
-                    live.push(name);
+            for ((name, _), has_visible_entry) in logs_by_index {
+                if has_visible_entry {
+                    names.insert(name);
                 }
             }
-            return Ok(live);
+            return Ok(names.into_iter().collect());
         }
         self.collect_reflog_names(&self.storage_dir.join("logs"), "logs", &mut names)?;
         let worktree_logs = self.git_dir.join("logs");
@@ -2407,7 +2414,7 @@ impl FileRefStore {
         let mut entries = Vec::new();
         for update in by_index.into_values().flatten() {
             // Drop the existence marker (old==new==null): it is not a real entry.
-            if update.old_oid == null && update.new_oid == null {
+            if reftable_log_update_is_empty_marker(&update, null) {
                 continue;
             }
             entries.push(reflog_entry_from_reftable(update));
@@ -3059,6 +3066,10 @@ fn reflog_entry_from_reftable(update: ReftableLogUpdate) -> ReflogEntry {
         committer: committer.into_bytes(),
         message,
     }
+}
+
+fn reftable_log_update_is_empty_marker(update: &ReftableLogUpdate, null: ObjectId) -> bool {
+    update.old_oid == null && update.new_oid == null
 }
 
 /// Split a flat reflog committer line (`Name <email> <seconds> <±HHMM>`) plus the
@@ -6977,6 +6988,44 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         let null = ObjectId::null(ObjectFormat::Sha1);
         assert_eq!(update.old_oid, null);
         assert_eq!(update.new_oid, null);
+
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_store_lists_only_visible_reftable_reflog_names() {
+        let git_dir = temp_git_dir();
+        write_reftable_config(&git_dir);
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+
+        store
+            .write_reflog("refs/heads/empty", &[])
+            .expect("test operation should succeed");
+        store
+            .append_reflog("refs/heads/main", &reflog_entry(&oid, 1, "create main"))
+            .expect("test operation should succeed");
+
+        assert_eq!(
+            store
+                .list_reflog_names()
+                .expect("test operation should succeed"),
+            vec!["refs/heads/main".to_string()]
+        );
+
+        store
+            .write_reflog("refs/heads/main", &[])
+            .expect("test operation should succeed");
+        assert!(
+            store
+                .list_reflog_names()
+                .expect("test operation should succeed")
+                .is_empty()
+        );
 
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }

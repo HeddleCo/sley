@@ -40,6 +40,18 @@ pub const TEST_GIT_IDENT_DATE: &str = "@0 +0000";
 
 const HERMETIC_GIT_ENV_REMOVE: &[&str] = &["GIT_CONFIG", "GIT_CONFIG_PARAMETERS"];
 
+/// Return the path Cargo built for the `sley` CLI in integration tests.
+///
+/// This is a macro, not a function, so `env!("CARGO_BIN_EXE_sley")` expands in
+/// the integration-test crate that depends on `sley-testkit`. Use this in tests
+/// instead of local helpers named after the old project.
+#[macro_export]
+macro_rules! sley_bin {
+    () => {
+        env!("CARGO_BIN_EXE_sley")
+    };
+}
+
 /// Return a `Command` for an oracle-git-like program with host config sealed
 /// off.
 ///
@@ -5556,7 +5568,6 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 /// of these environment variables:
 ///
 /// * `SLEY_UPSTREAM_T` — absolute path to the upstream git `t/` directory.
-/// * `GIT_RS_UPSTREAM_T` — legacy alias for `SLEY_UPSTREAM_T`.
 /// * `GIT_SRC_DIR` — absolute path to a git source root (we use `$GIT_SRC_DIR/t`).
 ///
 /// The `t/` directory must come from a *built* checkout: `test-lib.sh` sources
@@ -5656,9 +5667,9 @@ pub mod upstream {
     /// Outcome of attempting to run the upstream suite.
     #[derive(Debug, Clone)]
     pub enum UpstreamRunOutcome {
-        /// No upstream `t/` directory was configured (neither `SLEY_UPSTREAM_T`,
-        /// its legacy `GIT_RS_UPSTREAM_T` alias, nor `GIT_SRC_DIR` is set). Holds
-        /// a human-readable reason. This is a clean skip, not a failure.
+        /// No upstream `t/` directory was configured (neither `SLEY_UPSTREAM_T`
+        /// nor `GIT_SRC_DIR` is set). Holds a human-readable reason. This is a
+        /// clean skip, not a failure.
         Skipped(String),
         /// The runner executed. Holds the parsed per-script results and the path
         /// to the full text report, plus whether every script passed.
@@ -5674,11 +5685,6 @@ pub mod upstream {
     /// skip cleanly.
     pub fn upstream_t_dir() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var("SLEY_UPSTREAM_T")
-            && !dir.is_empty()
-        {
-            return Some(PathBuf::from(dir));
-        }
-        if let Ok(dir) = std::env::var("GIT_RS_UPSTREAM_T")
             && !dir.is_empty()
         {
             return Some(PathBuf::from(dir));

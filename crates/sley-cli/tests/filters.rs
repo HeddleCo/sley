@@ -47,7 +47,7 @@ fn git_available() -> bool {
         .unwrap_or(false)
 }
 
-const GIT_RS: &str = env!("CARGO_BIN_EXE_sley");
+const SLEY: &str = sley_testkit::sley_bin!();
 
 /// The blob bytes stored for `path` at HEAD (`cat-file -p HEAD:path`).
 fn blob_at_head(program: &str, cwd: &Path, path: &str) -> Vec<u8> {
@@ -71,7 +71,7 @@ fn autocrlf_true_round_trip_matches_git() {
     let crlf: &[u8] = b"line one\r\nline two\r\nline three\r\n";
     let lf: &[u8] = b"line one\nline two\nline three\n";
 
-    for program in [GIT_RS, sley_testkit::oracle_git()] {
+    for program in [SLEY, sley_testkit::oracle_git()] {
         let repo = root.join(if program == sley_testkit::oracle_git() {
             "ref"
         } else {
@@ -128,7 +128,7 @@ fn autocrlf_true_round_trip_matches_git() {
             &["rev-parse", "HEAD:f.txt"]
         )
         .stdout,
-        run_env(GIT_RS, &root.join("cand"), &["rev-parse", "HEAD:f.txt"]).stdout,
+        run_env(SLEY, &root.join("cand"), &["rev-parse", "HEAD:f.txt"]).stdout,
         "blob OID differs between git and sley under autocrlf"
     );
 
@@ -145,7 +145,7 @@ fn gitattributes_eol_crlf_matches_git() {
     }
     let root = unique_temp_dir("attr-eol");
 
-    for program in [GIT_RS, sley_testkit::oracle_git()] {
+    for program in [SLEY, sley_testkit::oracle_git()] {
         let repo = root.join(if program == sley_testkit::oracle_git() {
             "ref"
         } else {
@@ -204,7 +204,7 @@ fn no_filter_default_is_passthrough() {
 
     let cand = root.join("cand");
     let reference = root.join("ref");
-    for (program, repo) in [(GIT_RS, &cand), (sley_testkit::oracle_git(), &reference)] {
+    for (program, repo) in [(SLEY, &cand), (sley_testkit::oracle_git(), &reference)] {
         ok(
             program,
             &root,
@@ -229,7 +229,7 @@ fn no_filter_default_is_passthrough() {
             &["rev-parse", "HEAD:m.bin"]
         )
         .stdout,
-        run_env(GIT_RS, &cand, &["rev-parse", "HEAD:m.bin"]).stdout,
+        run_env(SLEY, &cand, &["rev-parse", "HEAD:m.bin"]).stdout,
     );
 
     fs::remove_dir_all(&root).ok();

@@ -97,8 +97,8 @@ fn run_status(program: &str, cwd: &Path, args: &[&str]) -> (i32, Vec<u8>, Vec<u8
     )
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -323,7 +323,7 @@ fn ls_files_short_option_aliases_match_upstream_git() {
             vec!["ls-files", "-z", "--", "--dash.txt"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -356,7 +356,7 @@ fn ls_files_sha256_stage_cached_and_modified_match_upstream_git() {
             vec!["ls-files", "--stage", "--modified"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -384,7 +384,7 @@ fn ls_files_unmerged_matches_upstream_git() {
             vec!["ls-files", "-u", "normal"],
         ] {
             let expected_output = git(&expected, &args);
-            let actual_output = git_rs(&actual, &args);
+            let actual_output = sley(&actual, &args);
             assert_eq!(
                 actual_output, expected_output,
                 "sley output differed for {args:?}"
@@ -433,7 +433,7 @@ fn ls_files_killed_matches_upstream_git() {
             vec!["-c", "core.ignorecase=true", "ls-files", "-k"],
         ] {
             let expected_output = git(&expected, &args);
-            let actual_output = git_rs(&actual, &args);
+            let actual_output = sley(&actual, &args);
             assert_eq!(
                 actual_output, expected_output,
                 "sley output differed for {args:?}"
@@ -487,7 +487,7 @@ fn ls_files_directory_matches_upstream_git() {
             vec!["ls-files", "--others", "--directory", "tracked-dir"],
         ] {
             let expected_output = git(&expected, &args);
-            let actual_output = git_rs(&actual, &args);
+            let actual_output = sley(&actual, &args);
             assert_eq!(
                 actual_output, expected_output,
                 "sley output differed for {args:?}"
@@ -551,13 +551,13 @@ fn ls_files_ignored_and_exclude_standard_match_upstream_git() {
             vec!["ls-files", "--cached", "--ignored", "--exclude=*.log"],
         ] {
             let expected = git(&upstream, &args);
-            let actual = git_rs(&rust, &args);
+            let actual = sley(&rust, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
 
         let args = ["ls-files", "--others", "--exclude-from=missing.txt"];
         let expected = run_status(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_status(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_status(sley_testkit::sley_bin!(), &rust, &args);
         assert_eq!(actual, expected, "sley status/output differed for {args:?}");
     };
     let _ = fs::remove_dir_all(&root);
@@ -605,7 +605,7 @@ fn ls_files_default_global_excludes_match_upstream_git() {
                 Some(&xdg),
             );
             let actual_output =
-                run_with_global_env(env!("CARGO_BIN_EXE_sley"), &rust, &args, &home, Some(&xdg));
+                run_with_global_env(sley_testkit::sley_bin!(), &rust, &args, &home, Some(&xdg));
             assert_eq!(
                 actual_output, expected_output,
                 "sley XDG global excludes output differed for {args:?}"
@@ -625,7 +625,7 @@ fn ls_files_default_global_excludes_match_upstream_git() {
             Some(&xdg),
         );
         let actual_output =
-            run_with_global_env(env!("CARGO_BIN_EXE_sley"), &rust, &args, &home, Some(&xdg));
+            run_with_global_env(sley_testkit::sley_bin!(), &rust, &args, &home, Some(&xdg));
         assert_eq!(
             actual_output, expected_output,
             "sley core.excludesFile override differed"
@@ -647,7 +647,7 @@ fn ls_files_default_global_excludes_match_upstream_git() {
             None,
         );
         let actual_output = run_with_global_env(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &fallback_rust,
             &args,
             &home,
@@ -710,7 +710,7 @@ fn ls_files_exclude_per_directory_matches_upstream_git() {
             ],
         ] {
             let expected = git(&upstream, &args);
-            let actual = git_rs(&rust, &args);
+            let actual = sley(&rust, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -765,7 +765,7 @@ fn ls_files_quoted_paths_match_upstream_git() {
             vec!["ls-files", "--others", "-z"],
         ] {
             let expected = git(&repo, &args);
-            let actual = git_rs(&repo, &args);
+            let actual = sley(&repo, &args);
             assert_eq!(
                 actual, expected,
                 "sley output differed for {args:?} path {path:?}"
@@ -794,7 +794,7 @@ fn ls_files_others_symlink_matches_upstream_git() {
 
         for args in [vec!["ls-files", "--others"], vec!["ls-files", "-o", "-z"]] {
             let expected = git(&upstream, &args);
-            let actual = git_rs(&rust, &args);
+            let actual = sley(&rust, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
         let _ = fs::remove_dir_all(&root);
@@ -822,7 +822,7 @@ fn ls_files_others_nested_git_matches_upstream_git() {
         vec!["ls-files", "-o", "-z", "not-a-submodule"],
     ] {
         let expected = git(&upstream, &args);
-        let actual = git_rs(&rust, &args);
+        let actual = sley(&rust, &args);
         assert_eq!(actual, expected, "sley output differed for {args:?}");
     }
     let _ = fs::remove_dir_all(&root);
@@ -887,7 +887,7 @@ fn ls_files_others_basic_matches_upstream_git() {
         ],
     ] {
         let expected = git(&upstream, &args);
-        let actual = git_rs(&rust, &args);
+        let actual = sley(&rust, &args);
         assert_eq!(actual, expected, "sley output differed for {args:?}");
     }
     let _ = fs::remove_dir_all(&root);
@@ -911,7 +911,7 @@ fn ls_files_others_non_submodule_git_file_matches_upstream_git() {
 
     let args = ["ls-files", "--others"];
     let expected = git(&upstream, &args);
-    let actual = git_rs(&rust, &args);
+    let actual = sley(&rust, &args);
     assert_eq!(actual, expected, "sley output differed for {args:?}");
     let _ = fs::remove_dir_all(&root);
 }
@@ -961,7 +961,7 @@ fn ls_files_others_directory_pathspec_matches_upstream_git() {
         vec!["ls-files", "--others", "untracked/*.c"],
     ] {
         let expected = git(&upstream, &args);
-        let actual = git_rs(&rust, &args);
+        let actual = sley(&rust, &args);
         assert_eq!(actual, expected, "sley output differed for {args:?}");
     }
 
@@ -973,7 +973,7 @@ fn ls_files_others_directory_pathspec_matches_upstream_git() {
     git(&nested_empty_rust, &["init", "-q", "-b", "main"]);
     let args = ["ls-files", "--others", "untracked/*.c"];
     let expected = git(&upstream, &args);
-    let actual = git_rs(&rust, &args);
+    let actual = sley(&rust, &args);
     assert_eq!(
         actual, expected,
         "sley output differed for nested gitdir case"
@@ -989,7 +989,7 @@ fn checkout_b_on_fresh_init_matches_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
     git(&upstream, &["init", "-q", "-b", "main"]);
-    git_rs(&rust, &["init", "-q", "-b", "main"]);
+    sley(&rust, &["init", "-q", "-b", "main"]);
 
     for args in [
         vec!["checkout", "-B", "main"],
@@ -997,7 +997,7 @@ fn checkout_b_on_fresh_init_matches_upstream_git() {
         vec!["checkout", "-q", "--orphan", "orphan"],
     ] {
         let expected = run_status(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_status(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_status(sley_testkit::sley_bin!(), &rust, &args);
         assert_eq!(
             actual, expected,
             "sley status/stdout/stderr differed for {args:?}"
@@ -1051,7 +1051,7 @@ fn ls_files_error_unmatch_matches_upstream_git() {
             vec!["ls-files", "--error-unmatch", "--", "--dash.txt"],
         ] {
             let expected = run_status(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_status(sley_testkit::sley_bin!(), &root, &args);
             assert_eq!(
                 actual, expected,
                 "sley status/stdout/stderr differed for {args:?}"

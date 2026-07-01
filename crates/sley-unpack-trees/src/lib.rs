@@ -36,11 +36,13 @@
 //!
 //! The merge functions are line-for-line ports of the corresponding functions
 //! in `unpack-trees.c` (`oneway_merge`, `twoway_merge`, `threeway_merge`,
-//! `bind_merge`). The cases that depend on machinery sley does not model yet —
-//! sparse-checkout / sparse directories, the directory/file (D/F) conflict
-//! entry, submodule move-head hooks — are flagged with precise
-//! `// TODO(unpack-trees):` markers at the exact spot upstream invokes them, so
-//! a later wave can wire them in without re-deriving the control flow.
+//! `bind_merge`). D/F conflict markers, stat writeback for updated entries, and
+//! the submodule move-head probe hook are modeled here now. The remaining
+//! upstream machinery that still needs follow-up — sparse-checkout / sparse
+//! directories, full apply-phase D/F and ignored-file handling, and real
+//! submodule worktree mutation — is flagged with precise
+//! `// TODO(unpack-trees):` markers at the exact spot upstream invokes it, so a
+//! later wave can wire it in without re-deriving the control flow.
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use std::collections::BTreeMap;

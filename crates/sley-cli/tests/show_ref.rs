@@ -81,7 +81,7 @@ fn show_ref_exists_matches_upstream_git() {
             vec!["show-ref", "--exists", "--", "HEAD"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -117,7 +117,7 @@ fn show_ref_exists_matches_upstream_git() {
             vec!["show-ref", "--exists", "refs/heads/foo..bar"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -263,7 +263,7 @@ fn show_ref_head_matches_upstream_git() {
             vec!["show-ref", "--verify", "--head", "HEAD", "refs/heads/main"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -303,7 +303,7 @@ fn show_ref_exclude_existing_matches_upstream_git() {
             vec!["show-ref", "--exclude-existing=refs/heads/"],
         ] {
             let expected = run_with_stdin(sley_testkit::oracle_git(), &root, &args, input);
-            let actual = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, input);
+            let actual = run_with_stdin(sley_testkit::sley_bin!(), &root, &args, input);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -348,7 +348,7 @@ fn show_ref_reftable_repository_matches_upstream_git() {
             vec!["show-ref", "--exists", "refs/tags/v1.0"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };

@@ -56,8 +56,8 @@ fn run_with_env(program: &str, cwd: &Path, args: &[&str], env: &[(&str, &str)]) 
     output.stdout
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -95,7 +95,7 @@ fn archive_tar_matches_upstream_git_for_commit_tree() {
         );
 
         let expected = git(&root, &["archive", "--format=tar", "--prefix=pfx/", "HEAD"]);
-        let actual = git_rs(&root, &["archive", "--format=tar", "--prefix=pfx/", "HEAD"]);
+        let actual = sley(&root, &["archive", "--format=tar", "--prefix=pfx/", "HEAD"]);
         assert_eq!(actual, expected);
     };
     let _ = fs::remove_dir_all(&root);
@@ -122,7 +122,7 @@ fn archive_output_option_writes_tar_file() {
         );
 
         let archive = root.join("out.tar");
-        git_rs(
+        sley(
             &root,
             &[
                 "archive",
@@ -185,7 +185,7 @@ fn archive_tar_pathspecs_match_upstream_git() {
             vec!["archive", "--format=tar", "HEAD", "a.txt", "other/o.txt"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "archive output differed for {args:?}");
         }
     };
@@ -228,7 +228,7 @@ fn archive_tar_cwd_relative_pathspecs_match_upstream_git() {
             ],
         ] {
             let expected = git(&cwd, &args);
-            let actual = git_rs(&cwd, &args);
+            let actual = sley(&cwd, &args);
             assert_eq!(actual, expected, "archive output differed for {args:?}");
         }
     };
@@ -257,7 +257,7 @@ fn archive_missing_pathspec_errors_match_upstream_git() {
 
         let args = ["archive", "--format=tar", "HEAD", "missing"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_eq!(actual.status.code(), expected.status.code());
         assert!(
             actual.stdout.is_empty(),
@@ -305,7 +305,7 @@ fn archive_tar_applies_autocrlf_smudge_like_upstream() {
         );
 
         let expected = git(&root, &["archive", "--format=tar", "HEAD"]);
-        let actual = git_rs(&root, &["archive", "--format=tar", "HEAD"]);
+        let actual = sley(&root, &["archive", "--format=tar", "HEAD"]);
         assert_eq!(actual, expected);
     };
     let _ = fs::remove_dir_all(&root);
@@ -339,7 +339,7 @@ fn archive_tar_applies_gitattributes_eol_from_tree() {
         );
 
         let expected = git(&root, &["archive", "--format=tar", "HEAD"]);
-        let actual = git_rs(&root, &["archive", "--format=tar", "HEAD"]);
+        let actual = sley(&root, &["archive", "--format=tar", "HEAD"]);
         assert_eq!(actual, expected);
     };
     let _ = fs::remove_dir_all(&root);

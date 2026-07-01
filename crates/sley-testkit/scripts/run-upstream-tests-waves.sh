@@ -31,26 +31,26 @@ t3103-ls-tree-misc.sh
 t1401-symbolic-ref.sh
 "
 
-waves=${SLEY_UPSTREAM_WAVES:-${SLEY_TEST_WAVES:-${GIT_RS_UPSTREAM_WAVES:-4}}}
+waves=${SLEY_UPSTREAM_WAVES:-${SLEY_TEST_WAVES:-4}}
 case $waves in
     *[!0-9]* | 0 | "") die "SLEY_UPSTREAM_WAVES must be a positive integer" ;;
 esac
-timeout_secs=${SLEY_TEST_TIMEOUT:-${GIT_RS_TEST_TIMEOUT:-240}}
+timeout_secs=${SLEY_TEST_TIMEOUT:-240}
 case $timeout_secs in
     *[!0-9]* | "") die "SLEY_TEST_TIMEOUT must be a non-negative integer" ;;
 esac
 
 selection=$*
 if [ -z "$selection" ]; then
-    selection=${SLEY_TESTS:-${GIT_RS_TESTS:-$DEFAULT_TESTS}}
+    selection=${SLEY_TESTS:-$DEFAULT_TESTS}
 fi
 [ -n "$selection" ] || die "no upstream scripts selected"
 
-report=${SLEY_REPORT:-${GIT_RS_REPORT:-$repo_root/crates/sley-testkit/upstream-report.txt}}
-summary=${SLEY_SUMMARY:-${GIT_RS_SUMMARY:-${report%.txt}-summary.csv}}
-history=${SLEY_HISTORY:-${GIT_RS_HISTORY:-$repo_root/crates/sley-testkit/upstream-history.csv}}
-timings=${SLEY_TIMINGS:-${GIT_RS_TIMINGS:-${summary%.csv}-timings.csv}}
-run_label=${SLEY_RUN_LABEL:-${GIT_RS_RUN_LABEL:-}}
+report=${SLEY_REPORT:-$repo_root/crates/sley-testkit/upstream-report.txt}
+summary=${SLEY_SUMMARY:-${report%.txt}-summary.csv}
+history=${SLEY_HISTORY:-$repo_root/crates/sley-testkit/upstream-history.csv}
+timings=${SLEY_TIMINGS:-${summary%.csv}-timings.csv}
+run_label=${SLEY_RUN_LABEL:-}
 if [ -z "$run_label" ]; then
     run_label=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date 2>/dev/null || printf 'unknown')
 fi

@@ -1676,23 +1676,10 @@ fn resolve_init_template_dir(
                     Ok(Some(resolve_cli_path(cwd, &path)))
                 }
             } else {
-                Ok(default_init_template_dir())
+                Ok(None)
             }
         }
     }
-}
-
-fn default_init_template_dir() -> Option<PathBuf> {
-    let output = ProcessCommand::new("git")
-        .arg("--exec-path")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let exec_path = String::from_utf8_lossy(&output.stdout);
-    let candidate = PathBuf::from(exec_path.trim()).join("../share/git-core/templates");
-    candidate.canonicalize().ok().filter(|path| path.is_dir())
 }
 
 fn init_config_bool(

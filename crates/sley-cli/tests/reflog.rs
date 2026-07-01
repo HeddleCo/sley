@@ -266,7 +266,7 @@ fn reflog_show_default_and_formats_match_upstream_git() {
             vec!["reflog", "show", "HEAD"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -288,7 +288,7 @@ fn reflog_exists_status_matches_upstream_git() {
             vec!["reflog", "exists", "HEAD", "extra"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -314,7 +314,7 @@ fn reflog_list_matches_upstream_git() {
             vec!["reflog", "list", "--", "HEAD"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -339,7 +339,7 @@ fn reflog_delete_matches_upstream_git() {
         prepare_linear_reflog_repo(&actual);
 
         let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected, &args);
         assert_eq!(
             fs::read(actual.join(".git/logs/HEAD")).expect("actual HEAD reflog"),
@@ -371,7 +371,7 @@ fn reflog_delete_updateref_matches_upstream_git() {
         prepare_linear_reflog_repo(&actual);
 
         let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected, &args);
         assert_eq!(
             fs::read(actual.join(".git/logs/HEAD")).expect("actual HEAD reflog"),
@@ -384,7 +384,7 @@ fn reflog_delete_updateref_matches_upstream_git() {
             "main reflog differed after {args:?}"
         );
         assert_eq!(
-            run(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "main"]).stdout,
+            run(sley_testkit::sley_bin!(), &actual, &["rev-parse", "main"]).stdout,
             run(
                 sley_testkit::oracle_git(),
                 &upstream,
@@ -424,7 +424,7 @@ fn reflog_drop_matches_upstream_git() {
             copy_dir_all(&actual_template, &actual);
 
             let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected, &args);
             assert_eq!(
                 reflog_files(&actual),
@@ -506,7 +506,7 @@ fn reflog_write_matches_upstream_git() {
             copy_dir_all(&actual_template, &actual);
 
             let expected = run_with_committer(sley_testkit::oracle_git(), &upstream, &args);
-            let actual_output = run_with_committer(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run_with_committer(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected, &args);
             assert_eq!(
                 reflog_files(&actual),
@@ -548,8 +548,7 @@ fn branch_force_reflog_matches_upstream_git() {
             vec!["branch", "-f", "sley-bench-write", "HEAD~1"],
         ] {
             let expected = run_with_bench_committer(sley_testkit::oracle_git(), &upstream, &args);
-            let actual_output =
-                run_with_bench_committer(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run_with_bench_committer(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected, &args);
             assert_eq!(
                 reflog_files(&actual),
@@ -625,7 +624,7 @@ fn reflog_expire_matches_upstream_git() {
         prepare_linear_reflog_repo(&actual);
 
         let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected, &args);
         assert_eq!(
             fs::read(actual.join(".git/logs/HEAD")).expect("actual HEAD reflog"),
@@ -638,7 +637,7 @@ fn reflog_expire_matches_upstream_git() {
             "main reflog differed after {args:?}"
         );
         assert_eq!(
-            run(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "main"]).stdout,
+            run(sley_testkit::sley_bin!(), &actual, &["rev-parse", "main"]).stdout,
             run(
                 sley_testkit::oracle_git(),
                 &upstream,
@@ -691,7 +690,7 @@ fn reflog_expire_unreachable_matches_upstream_git() {
         prepare_reflog_repo_with_unreachable_entry(&actual);
 
         let expected = run(sley_testkit::oracle_git(), &upstream, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected, &args);
         assert_eq!(
             fs::read(actual.join(".git/logs/HEAD")).expect("actual HEAD reflog"),

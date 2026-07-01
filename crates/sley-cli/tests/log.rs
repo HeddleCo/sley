@@ -47,8 +47,8 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
     );
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -81,8 +81,8 @@ fn run_with_stdin(program: &str, cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec
     output.stdout
 }
 
-fn git_rs_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
-    run_with_stdin(env!("CARGO_BIN_EXE_sley"), cwd, args, stdin)
+fn sley_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
+    run_with_stdin(sley_testkit::sley_bin!(), cwd, args, stdin)
 }
 
 fn git_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
@@ -175,7 +175,7 @@ fn log_minimal_format_matches_upstream_git() {
             // Author / Date / blank / message, with a blank line between
             // entries), so compare it against real `git log` medium.
             let expected = expected_log_medium(&root, rev);
-            let actual = git_rs(&root, &["log", rev]);
+            let actual = sley(&root, &["log", rev]);
             assert_eq!(actual, expected, "sley log output differed for {rev}");
         }
         for args in [
@@ -408,9 +408,9 @@ fn log_minimal_format_matches_upstream_git() {
             // date modes), not the medium layout — so pin both sides to the same
             // explicit `--format=` that omits the medium-only `Date:` line and
             // commit-line coloring, keeping the comparison layout-agnostic.
-            let mut git_rs_args = vec!["log", "--format=commit %H%nAuthor: %an <%ae>%n%n    %s"];
-            git_rs_args.extend_from_slice(&args);
-            let actual = git_rs(&root, &git_rs_args);
+            let mut sley_args = vec!["log", "--format=commit %H%nAuthor: %an <%ae>%n%n    %s"];
+            sley_args.extend_from_slice(&args);
+            let actual = sley(&root, &sley_args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
         for (args, stdin) in [
@@ -433,7 +433,7 @@ fn log_minimal_format_matches_upstream_git() {
             ),
         ] {
             assert_eq!(
-                git_rs_with_stdin(&root, &args, &stdin),
+                sley_with_stdin(&root, &args, &stdin),
                 git_with_stdin(&root, &args, &stdin),
                 "sley log output differed for {args:?} with stdin {:?}",
                 String::from_utf8_lossy(&stdin)
@@ -584,7 +584,7 @@ fn log_minimal_format_matches_upstream_git() {
             vec!["log", "--decorate-refs-exclude"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -661,7 +661,7 @@ fn log_oneline_matches_upstream_git() {
             vec!["log", "--decorate", "--format=%H", "-1", "HEAD"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
     };
@@ -754,7 +754,7 @@ fn log_pretty_oneline_aliases_match_upstream_git() {
             vec!["log", "--format=short", "-1", "HEAD"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
     };
@@ -916,7 +916,7 @@ fn log_first_parent_matches_upstream_git() {
             ],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
     };
@@ -962,7 +962,7 @@ fn log_author_filter_matches_upstream_git() {
             vec!["log", "--author", "--format=%s"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
 
@@ -972,7 +972,7 @@ fn log_author_filter_matches_upstream_git() {
             vec!["log", "--no-author"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -1036,7 +1036,7 @@ fn log_committer_filter_matches_upstream_git() {
             ],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
 
@@ -1046,7 +1046,7 @@ fn log_committer_filter_matches_upstream_git() {
             vec!["log", "--no-committer"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -1108,7 +1108,7 @@ fn log_epoch_age_filters_match_upstream_git() {
             vec!["log", "--grep=two", "--max-age=2000", "--format=%s"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
 
@@ -1125,7 +1125,7 @@ fn log_epoch_age_filters_match_upstream_git() {
             vec!["log", "--no-before", "--format=%s"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -1195,7 +1195,7 @@ fn log_regexp_ignore_case_filters_match_upstream_git() {
             vec!["log", "-i", "--format=%s"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
 
@@ -1205,7 +1205,7 @@ fn log_regexp_ignore_case_filters_match_upstream_git() {
             vec!["log", "--no-regexp-ignore-case=yes", "--format=%s"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -1308,7 +1308,7 @@ fn log_fixed_string_filters_match_upstream_git() {
             ],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
 
@@ -1321,7 +1321,7 @@ fn log_fixed_string_filters_match_upstream_git() {
             vec!["log", "--no-extended-regexp", "--format=%s"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -1412,7 +1412,7 @@ fn log_grep_filter_matches_upstream_git() {
             vec!["log", "--all-match", "--format=%s"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
 
@@ -1425,7 +1425,7 @@ fn log_grep_filter_matches_upstream_git() {
             vec!["log", "--no-all-match"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -1585,7 +1585,7 @@ fn log_custom_format_placeholders_match_upstream_git() {
             vec!["log", "--pretty=format:%H %s", "-2", "HEAD"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
     };
@@ -1634,7 +1634,7 @@ fn log_limited_subject_formats_match_upstream_git() {
             vec!["log", "--format=%H %s", "-50", "HEAD"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
     };
@@ -1676,7 +1676,7 @@ fn log_reverse_matches_upstream_git() {
             vec!["log", "--reverse", "--pretty=format:%H %s", "-2", "HEAD"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
     };

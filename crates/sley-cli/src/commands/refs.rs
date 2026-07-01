@@ -4909,14 +4909,13 @@ fn cmd_refs_migrate(args: &[String]) -> Result<()> {
     let source = FileRefStore::new(&git_dir, format);
     let refs = source.list_all_refs()?;
     let reflogs = if include_reflogs {
-        let mut names = source.list_reflog_names()?;
+        let mut names = source
+            .list_reflog_names()?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         for reference in &refs {
-            if !names.iter().any(|name| name == &reference.name) {
-                names.push(reference.name.clone());
-            }
+            names.insert(reference.name.clone());
         }
-        names.sort();
-        names.dedup();
         let mut reflogs = Vec::new();
         for name in names {
             let entries = source.read_reflog(&name)?;

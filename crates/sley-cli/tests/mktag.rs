@@ -87,8 +87,8 @@ fn git_ok(cwd: &Path, args: &[&str]) {
     );
 }
 
-fn git_rs() -> &'static str {
-    env!("CARGO_BIN_EXE_sley")
+fn sley() -> &'static str {
+    sley_testkit::sley_bin!()
 }
 
 fn git_available() -> bool {
@@ -122,7 +122,7 @@ fn assert_same_mktag(repo: &Path, args: &[&str], stdin: &[u8]) {
     let mut full = vec!["mktag"];
     full.extend_from_slice(args);
     let g = run_env_stdin(sley_testkit::oracle_git(), repo, &full, stdin);
-    let r = run_env_stdin(git_rs(), repo, &full, stdin);
+    let r = run_env_stdin(sley(), repo, &full, stdin);
     let label = format!("args={args:?} stdin={:?}", String::from_utf8_lossy(stdin));
     assert_eq!(
         String::from_utf8_lossy(&r.stdout),

@@ -117,7 +117,7 @@ fn write_tree_missing_ok_matches_upstream_git() {
         prepare_repo(&expected);
         prepare_repo(&actual);
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
     }
     let _ = fs::remove_dir_all(&root);
@@ -141,7 +141,7 @@ fn write_tree_prefix_matches_upstream_git() {
             vec!["write-tree", "--prefix=missing/"],
         ] {
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
     };

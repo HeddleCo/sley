@@ -71,8 +71,8 @@ fn git(cwd: &Path, args: &[&str]) -> Output {
     run_env(sley_testkit::oracle_git(), cwd, args)
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git_available() -> bool {
@@ -127,7 +127,7 @@ impl RepoPair {
     /// agree. Returns the shared stdout for further inspection.
     fn assert_same(&self, args: &[&str]) -> String {
         let g = git(&self.git_repo, args);
-        let r = git_rs(&self.rs_repo, args);
+        let r = sley(&self.rs_repo, args);
         let g_out = String::from_utf8_lossy(&g.stdout).into_owned();
         let r_out = String::from_utf8_lossy(&r.stdout).into_owned();
         assert_eq!(

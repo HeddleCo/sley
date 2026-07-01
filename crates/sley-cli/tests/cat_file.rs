@@ -103,7 +103,7 @@ fn cat_file_usage_and_option_errors_exit_like_upstream_git() {
             vec!["cat-file", "--textconv=value", "HEAD"],
         ] {
             let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, b"");
-            let actual = run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, b"");
+            let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, b"");
             assert_eq!(
                 actual.status.code(),
                 expected.status.code(),
@@ -162,7 +162,7 @@ fn cat_file_reads_alternate_object_directories_like_upstream_git() {
 
         let args = ["cat-file", "-p", oid.as_str()];
         assert_same_output(
-            run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, &[]),
+            run_output_with_stdin(sley_testkit::sley_bin!(), &actual, &args, &[]),
             run_output_with_stdin(sley_testkit::oracle_git(), &expected, &args, &[]),
             &args,
         );
@@ -196,7 +196,7 @@ fn cat_file_reads_alternate_object_directories_like_upstream_git() {
             actual_alt_objects.as_str(),
         )];
         assert_same_output(
-            run_output_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &args, &actual_env),
+            run_output_with_env(sley_testkit::sley_bin!(), &actual, &args, &actual_env),
             run_output_with_env(sley_testkit::oracle_git(), &expected, &args, &expected_env),
             &args,
         );
@@ -238,7 +238,7 @@ fn cat_file_batch_all_objects_git_object_directory_matches_upstream_git() {
             vec!["cat-file", "--batch", "--batch-all-objects"],
         ] {
             assert_same_output(
-                run_output_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &args, &envs),
+                run_output_with_env(sley_testkit::sley_bin!(), &actual, &args, &envs),
                 run_output_with_env(sley_testkit::oracle_git(), &expected, &args, &envs),
                 &args,
             );
@@ -279,7 +279,7 @@ fn cat_file_storage_atoms_git_object_directory_match_upstream_git() {
             "--batch-all-objects",
         ];
         assert_same_output(
-            run_output_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &args, &envs),
+            run_output_with_env(sley_testkit::sley_bin!(), &actual, &args, &envs),
             run_output_with_env(sley_testkit::oracle_git(), &expected, &args, &envs),
             &args,
         );
@@ -292,8 +292,8 @@ fn remove_loose_object(root: &Path, oid: &str) {
     let _ = fs::remove_file(root.join(".git").join("objects").join(fanout).join(file));
 }
 
-fn git_rs(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
-    run_with_stdin(env!("CARGO_BIN_EXE_sley"), cwd, args, stdin)
+fn sley(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
+    run_with_stdin(sley_testkit::sley_bin!(), cwd, args, stdin)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -362,7 +362,7 @@ fn cat_file_batch_modes_match_upstream_git() {
             vec!["cat-file", "-e", "--mailmap", "HEAD"],
         ] {
             let expected = git_stdin(&root, &args, b"");
-            let actual = git_rs(&root, &args, b"");
+            let actual = sley(&root, &args, b"");
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
         for args in [
@@ -372,13 +372,13 @@ fn cat_file_batch_modes_match_upstream_git() {
             vec!["cat-file", "--no-mailmap=value", "-p", "HEAD"],
         ] {
             let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, b"");
-            let actual = run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, b"");
+            let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, b"");
             assert_same_output(actual, expected, &args);
         }
         let input = format!("HEAD\n{head}\n{tree}\nrefs/tags/v1.0\nmissing\n\n");
         for mode in ["--batch-check", "--batch"] {
             let expected = git_stdin(&root, &["cat-file", mode], input.as_bytes());
-            let actual = git_rs(&root, &["cat-file", mode], input.as_bytes());
+            let actual = sley(&root, &["cat-file", mode], input.as_bytes());
             assert_eq!(actual, expected, "sley {mode} output differed");
         }
         for args in [
@@ -397,7 +397,7 @@ fn cat_file_batch_modes_match_upstream_git() {
             vec!["cat-file", "--no-mailmap", "--batch"],
         ] {
             let expected = git_stdin(&root, &args, input.as_bytes());
-            let actual = git_rs(&root, &args, input.as_bytes());
+            let actual = sley(&root, &args, input.as_bytes());
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
         let nul_input = format!("HEAD\0{head}\0{tree}\0refs/tags/v1.0\0missing\0");
@@ -420,7 +420,7 @@ fn cat_file_batch_modes_match_upstream_git() {
             ],
         ] {
             let expected = git_stdin(&root, &args, nul_input.as_bytes());
-            let actual = git_rs(&root, &args, nul_input.as_bytes());
+            let actual = sley(&root, &args, nul_input.as_bytes());
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
         let nul_rest_input = format!("HEAD trailing tokens\0{head} raw\0missing extra\0");
@@ -437,7 +437,7 @@ fn cat_file_batch_modes_match_upstream_git() {
             ],
         ] {
             let expected = git_stdin(&root, &args, nul_rest_input.as_bytes());
-            let actual = git_rs(&root, &args, nul_rest_input.as_bytes());
+            let actual = sley(&root, &args, nul_rest_input.as_bytes());
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
         for (args, input) in [
@@ -468,7 +468,7 @@ fn cat_file_batch_modes_match_upstream_git() {
             ),
         ] {
             let expected = git_stdin(&root, &args, &input);
-            let actual = git_rs(&root, &args, &input);
+            let actual = sley(&root, &args, &input);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
         for (args, input) in [
@@ -497,7 +497,7 @@ fn cat_file_batch_modes_match_upstream_git() {
             ),
         ] {
             let expected = git_stdin(&root, &args, &input);
-            let actual = git_rs(&root, &args, &input);
+            let actual = sley(&root, &args, &input);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
         for args in [
@@ -511,7 +511,7 @@ fn cat_file_batch_modes_match_upstream_git() {
             vec!["cat-file", "--batch-check", "--batch-all-objects", "-Z"],
         ] {
             let expected = git_stdin(&root, &args, b"ignored\n");
-            let actual = git_rs(&root, &args, b"ignored\n");
+            let actual = sley(&root, &args, b"ignored\n");
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
         for (args, input) in [
@@ -552,7 +552,7 @@ fn cat_file_batch_modes_match_upstream_git() {
             ),
         ] {
             let expected = git_stdin(&root, &args, &input);
-            let actual = git_rs(&root, &args, &input);
+            let actual = sley(&root, &args, &input);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
         git(&root, &["gc", "--quiet"]);
@@ -575,7 +575,7 @@ fn cat_file_batch_modes_match_upstream_git() {
             ),
         ] {
             let expected = git_stdin(&root, &args, &input);
-            let actual = git_rs(&root, &args, &input);
+            let actual = sley(&root, &args, &input);
             assert_eq!(actual, expected, "sley packed output differed for {args:?}");
         }
         for args in [
@@ -592,7 +592,7 @@ fn cat_file_batch_modes_match_upstream_git() {
             ],
         ] {
             let expected = git_stdin(&root, &args, b"ignored\n");
-            let actual = git_rs(&root, &args, b"ignored\n");
+            let actual = sley(&root, &args, b"ignored\n");
             assert_eq!(actual, expected, "sley packed output differed for {args:?}");
         }
     };
@@ -651,7 +651,7 @@ fn cat_file_batch_storage_atoms_match_upstream_for_delta_pack() {
                 .any(|line| !line.ends_with(zero)),
             "fixture did not produce a packed delta object"
         );
-        let actual = git_rs(&root, &args, input.as_bytes());
+        let actual = sley(&root, &args, input.as_bytes());
         assert_eq!(actual, expected, "sley delta storage atom output differed");
     };
     let _ = fs::remove_dir_all(&root);
@@ -719,7 +719,7 @@ fn cat_file_broken_loose_headers_match_upstream_git() {
             for flag in ["-s", "-t", "-p", "-e"] {
                 let args = vec!["cat-file", flag, oid];
                 let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, b"");
-                let actual = run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, b"");
+                let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, b"");
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -737,7 +737,7 @@ fn cat_file_broken_loose_headers_match_upstream_git() {
                     input.as_bytes(),
                 );
                 let actual = run_output_with_stdin(
-                    env!("CARGO_BIN_EXE_sley"),
+                    sley_testkit::sley_bin!(),
                     &root,
                     &args,
                     input.as_bytes(),

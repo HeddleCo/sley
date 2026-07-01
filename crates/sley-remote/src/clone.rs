@@ -45,7 +45,9 @@ use sley_transport::RemoteUrl;
 use crate::fetch::{FetchOptions, FetchSource, fetch};
 use crate::{CredentialProvider, ProgressSink};
 
-const CLONE_UNBORN_BRANCH: &str = "__git_rs_clone_unborn__";
+/// Internal placeholder branch used while clone initializes before it knows
+/// which branch, detached commit, or unborn remote state will own `HEAD`.
+const CLONE_UNBORN_BRANCH: &str = "__sley_clone_unborn__";
 
 /// How [`clone`] reaches the remote it is cloning from.
 ///

@@ -161,7 +161,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
         delete_ref(&actual, "refs/tags/default-log");
         let args = ["update-ref", "refs/tags/default-log", oid.as_str(), zero];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             reflog_exists(&actual, "refs/tags/default-log"),
@@ -178,7 +178,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
             zero,
         ];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             reflog_exists(&actual, "refs/tags/explicit-log"),
@@ -196,7 +196,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
         let expected_args = ["update-ref", "refs/heads/logged", expected_commit.as_str()];
         let actual_args = ["update-ref", "refs/heads/logged", actual_commit.as_str()];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &expected_args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &actual_args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &actual_args);
         assert_same_output(actual_output, expected_output, &expected_args);
         assert_eq!(
             reflog_exists(&actual, "refs/heads/logged"),
@@ -223,7 +223,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
         );
         let args = ["update-ref", "refs/alias/default", wrong_oid.as_str()];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/alias/default"),
@@ -259,7 +259,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
             oid.as_str(),
         ];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/alias/no-deref"),
@@ -288,7 +288,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
         set_ref(&actual, "refs/tags/delete-target", &oid);
         let args = ["update-ref", "-d", "refs/alias/delete-default"];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/alias/delete-default"),
@@ -324,7 +324,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
             "refs/alias/delete-no-deref",
         ];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             reflog_exists(&actual, "refs/alias/delete-no-deref"),
@@ -336,7 +336,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
         let expected_args = ["update-ref", "HEAD", expected_head_commit.as_str()];
         let actual_args = ["update-ref", "HEAD", actual_head_commit.as_str()];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &expected_args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &actual_args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &actual_args);
         assert_same_output(actual_output, expected_output, &expected_args);
         assert_eq!(read_ref(&actual, "HEAD"), read_ref(&expected, "HEAD"));
         assert_eq!(
@@ -354,7 +354,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
             zero,
         ];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/separated"),
@@ -369,33 +369,33 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
             oid.as_str(),
         ];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         delete_ref(&expected, "refs/tags/delete-zero");
         delete_ref(&actual, "refs/tags/delete-zero");
         let args = ["update-ref", "refs/tags/delete-zero", oid.as_str()];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         let args = ["update-ref", "-d", "refs/tags/delete-zero", zero];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         let args = ["update-ref", "-d", "refs/tags/missing-delete"];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         let args = ["update-ref", "-d", "refs/tags/missing-delete", oid.as_str()];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         let args = ["update-ref", "refs/tags/delete-mismatch", oid.as_str()];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         let args = [
             "update-ref",
@@ -404,7 +404,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
             wrong_oid.as_str(),
         ];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         delete_ref(&expected, "refs/tags/message");
@@ -417,7 +417,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
             oid.as_str(),
         ];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/message"),
@@ -434,7 +434,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
             zero,
         ];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/new"),
@@ -451,7 +451,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
             oid.as_str(),
         ];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/topic"),
@@ -462,7 +462,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
         set_ref(&actual, "refs/tags/topic", &oid);
         let args = ["update-ref", "refs/tags/topic", oid.as_str(), zero];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         delete_ref(&expected, "refs/tags/missing");
@@ -474,7 +474,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
             oid.as_str(),
         ];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         set_ref(&expected, "refs/tags/topic", &oid);
@@ -486,27 +486,27 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
             wrong_oid.as_str(),
         ];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         let args = ["update-ref", "refs/heads/blob", oid.as_str()];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         let args = ["update-ref", "HEAD", oid.as_str()];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         let args = ["update-ref", "--no-deref", "HEAD", oid.as_str()];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         let args = ["update-ref", "--no-deref", "-d", "HEAD"];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(ref_exists(&actual, "HEAD"), ref_exists(&expected, "HEAD"));
         fs::write(
@@ -519,14 +519,14 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
 
         let args = ["update-ref", "refs/tags/missing-object", missing_oid];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         set_ref(&expected, "refs/tags/zero-new", &oid);
         set_ref(&actual, "refs/tags/zero-new", &oid);
         let args = ["update-ref", "refs/tags/zero-new", zero];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual.join(".git").join("refs/tags/zero-new").exists(),
@@ -550,7 +550,7 @@ fn update_ref_stdin_bulk_existing_refs_avoids_quadratic_df_scan() {
         input.extend_from_slice(format!("create refs/heads/ref-{n} {first}\n").as_bytes());
     }
     let output = run_with_stdin(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["update-ref", "--stdin"],
         &input,
@@ -568,7 +568,7 @@ fn update_ref_stdin_bulk_existing_refs_avoids_quadratic_df_scan() {
     }
     let start = Instant::now();
     let output = run_with_stdin(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["update-ref", "--stdin"],
         &input,
@@ -621,7 +621,7 @@ fn update_ref_reftable_repository_matches_upstream_git() {
             vec!["show-ref", "refs/tags/rust"],
         ] {
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
     };
@@ -665,7 +665,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin"),
@@ -674,7 +674,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = b"delete refs/tags/stdin\n";
         let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input);
         assert_same_output(actual_output, expected_output, &args);
 
         let input = format!("create refs/tags/stdin-create {oid}\n");
@@ -685,7 +685,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-create"),
@@ -700,7 +700,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
 
         let input = format!("verify refs/tags/stdin-create {wrong_oid}\n");
@@ -711,7 +711,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
 
         for input in [
@@ -726,7 +726,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
                 input.as_bytes(),
             );
             let actual_output =
-                run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+                run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
             assert_same_output(actual_output, expected_output, &args);
         }
 
@@ -738,7 +738,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
 
         let input = format!("update refs/tags/stdin-missing-object {missing_oid}\n");
@@ -749,7 +749,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
 
         set_ref(&expected, "refs/tags/stdin-zero-new", &oid);
@@ -762,7 +762,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -783,7 +783,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
 
         let input = format!(
@@ -796,7 +796,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -819,7 +819,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -840,7 +840,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-transaction"),
@@ -873,7 +873,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/alias/stdin-no-deref"),
@@ -882,12 +882,12 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = b"option create-reflog\n";
         let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input);
         assert_same_output(actual_output, expected_output, &args);
 
         let input = b"start\nabort\n";
         let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input);
         assert_same_output(actual_output, expected_output, &args);
 
         let input = format!("start\nupdate refs/tags/stdin-aborted {oid}\nabort\n");
@@ -898,7 +898,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual.join(".git").join("refs/tags/stdin-aborted").exists(),
@@ -918,7 +918,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-aborted-restore"),
@@ -938,7 +938,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             &expected_input,
         );
         let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &head_no_deref_args,
             &actual_input,
@@ -961,7 +961,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             &expected_input,
         );
         let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &head_no_deref_args,
             &actual_input,
@@ -977,7 +977,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -998,7 +998,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -1021,7 +1021,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -1036,7 +1036,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = b"start\nstart\n";
         let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input);
         assert_same_output(actual_output, expected_output, &args);
 
         let input = format!("update refs/tags/stdin-prepare-eof {oid}\nprepare\n");
@@ -1047,7 +1047,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -1068,7 +1068,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-prepare-commit"),
@@ -1083,7 +1083,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -1106,7 +1106,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-closed-kept"),
@@ -1133,7 +1133,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -1148,7 +1148,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = b"start\ncommit\nstart\n";
         let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input);
         assert_same_output(actual_output, expected_output, &args);
 
         let input = format!(
@@ -1161,7 +1161,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -1178,7 +1178,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let input = format!("update refs/tags/stdin-z\0{oid}\0\0").into_bytes();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-z"),
@@ -1188,7 +1188,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let input = format!("create refs/tags/stdin-z-create\0{oid}\0").into_bytes();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-z-create"),
@@ -1198,13 +1198,13 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let input = format!("verify refs/tags/stdin-z-create\0{oid}\0").into_bytes();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
 
         let input = format!("delete refs/tags/stdin-z-create\0{oid}\0").into_bytes();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
 
         set_ref(&expected, "refs/tags/stdin-z-zero-new", &oid);
@@ -1212,7 +1212,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let input = format!("update refs/tags/stdin-z-zero-new\0{zero}\0\0").into_bytes();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
         assert_eq!(
             actual
@@ -1228,13 +1228,13 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let input = format!("create refs/tags/stdin-z-create-zero\0{zero}\0").into_bytes();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
 
         let input = b"verify refs/tags/stdin-z-create\0\0".to_vec();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
 
         let input = format!(
@@ -1243,7 +1243,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         .into_bytes();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
         assert_eq!(
             actual
@@ -1261,7 +1261,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
                 .into_bytes();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-z-transaction"),
@@ -1271,14 +1271,14 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let input = b"start\0abort\0".to_vec();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
 
         let input =
             format!("start\0update refs/tags/stdin-z-aborted\0{oid}\0\0abort\0").into_bytes();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
         assert_eq!(
             actual
@@ -1297,7 +1297,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         .into_bytes();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
         assert_eq!(
             actual
@@ -1316,7 +1316,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         .into_bytes();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
         assert_eq!(
             actual
@@ -1332,7 +1332,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let input = b"start\0start\0".to_vec();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
 
         let input = format!(
@@ -1341,7 +1341,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         .into_bytes();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-z-closed-kept"),
@@ -1380,7 +1380,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             format!("option no-deref\0update refs/alias/stdin-z-no-deref\0{oid}\0\0").into_bytes();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
         assert_eq!(
             read_ref(&actual, "refs/alias/stdin-z-no-deref"),
@@ -1389,7 +1389,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = b"symref-create refs/alias/stdin-sym refs/heads/main\n";
         let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input);
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/alias/stdin-sym"),
@@ -1401,19 +1401,19 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &no_deref_args, input);
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &no_deref_args, input);
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &no_deref_args, input);
         assert_same_output(actual_output, expected_output, &no_deref_args);
 
         let input = b"option no-deref\nsymref-verify refs/alias/stdin-sym refs/heads/main\n";
         let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input);
         assert_same_output(actual_output, expected_output, &args);
 
         let input = b"symref-create refs/alias/stdin-sym-implicit-duplicate refs/heads/main\nsymref-update refs/alias/stdin-sym-implicit-duplicate refs/heads/next\n";
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &no_deref_args, input);
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &no_deref_args, input);
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &no_deref_args, input);
         assert_same_output(actual_output, expected_output, &no_deref_args);
         assert_eq!(
             actual
@@ -1434,27 +1434,27 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             let expected_output =
                 run_with_stdin(sley_testkit::oracle_git(), &expected, &no_deref_args, input);
             let actual_output =
-                run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &no_deref_args, input);
+                run_with_stdin(sley_testkit::sley_bin!(), &actual, &no_deref_args, input);
             assert_same_output(actual_output, expected_output, &no_deref_args);
         }
 
         let input = b"symref-verify refs/alias/stdin-sym refs/heads/main\n";
         let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input);
         assert_same_output(actual_output, expected_output, &args);
 
         let input = b"symref-verify refs/alias/missing\n";
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &no_deref_args, input);
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &no_deref_args, input);
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &no_deref_args, input);
         assert_same_output(actual_output, expected_output, &no_deref_args);
 
         let input = b"symref-update refs/alias/stdin-sym-update refs/heads/main\n";
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &no_deref_args, input);
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &no_deref_args, input);
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &no_deref_args, input);
         assert_same_output(actual_output, expected_output, &no_deref_args);
         assert_eq!(
             read_ref(&actual, "refs/alias/stdin-sym-update"),
@@ -1466,7 +1466,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &no_deref_args, input);
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &no_deref_args, input);
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &no_deref_args, input);
         assert_same_output(actual_output, expected_output, &no_deref_args);
         assert_eq!(
             read_ref(&actual, "refs/alias/stdin-sym-update"),
@@ -1478,7 +1478,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &no_deref_args, input);
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &no_deref_args, input);
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &no_deref_args, input);
         assert_same_output(actual_output, expected_output, &no_deref_args);
 
         set_ref(&expected, "refs/tags/stdin-sym-oid-direct", &oid);
@@ -1492,7 +1492,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &no_deref_args,
             input.as_bytes(),
@@ -1513,7 +1513,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &no_deref_args,
             input.as_bytes(),
@@ -1540,7 +1540,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         );
         let input = b"symref-update refs/alias/stdin-sym-deref refs/heads/main\n";
         let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input);
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/heads/stdin-sym-deref-target"),
@@ -1569,7 +1569,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &no_deref_args, input);
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &no_deref_args, input);
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &no_deref_args, input);
         assert_same_output(actual_output, expected_output, &no_deref_args);
         assert!(
             !actual
@@ -1583,7 +1583,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &no_deref_args, input);
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &no_deref_args, input);
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &no_deref_args, input);
         assert_same_output(actual_output, expected_output, &no_deref_args);
 
         run_success(
@@ -1608,18 +1608,18 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &no_deref_args, input);
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &no_deref_args, input);
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &no_deref_args, input);
         assert_same_output(actual_output, expected_output, &no_deref_args);
 
         let input = b"symref-delete refs/alias/stdin-sym-delete-mismatch refs/heads/main\n";
         let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, input);
         assert_same_output(actual_output, expected_output, &args);
 
         let input = b"symref-create refs/alias/stdin-z-sym\0refs/heads/main\0".to_vec();
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &z_args, &input);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &z_args, &input);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_args, &input);
         assert_same_output(actual_output, expected_output, &z_args);
         assert_eq!(
             read_ref(&actual, "refs/alias/stdin-z-sym"),
@@ -1634,12 +1634,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             &z_no_deref_args,
             &input,
         );
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &z_no_deref_args,
-            &input,
-        );
+        let actual_output =
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_no_deref_args, &input);
         assert_same_output(actual_output, expected_output, &z_no_deref_args);
 
         let input =
@@ -1651,12 +1647,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             &z_no_deref_args,
             &input,
         );
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &z_no_deref_args,
-            &input,
-        );
+        let actual_output =
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_no_deref_args, &input);
         assert_same_output(actual_output, expected_output, &z_no_deref_args);
         assert_eq!(
             read_ref(&actual, "refs/alias/stdin-z-sym"),
@@ -1688,12 +1680,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             &z_no_deref_args,
             &input,
         );
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &z_no_deref_args,
-            &input,
-        );
+        let actual_output =
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &z_no_deref_args, &input);
         assert_same_output(actual_output, expected_output, &z_no_deref_args);
 
         let batch_args = ["update-ref", "--stdin", "--batch-updates"];
@@ -1705,7 +1693,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &batch_args,
             input.as_bytes(),
@@ -1726,7 +1714,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &batch_args,
             input.as_bytes(),
@@ -1751,7 +1739,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &batch_args,
             input.as_bytes(),
@@ -1766,7 +1754,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &batch_args,
             input.as_bytes(),
@@ -1781,7 +1769,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &batch_args,
             input.as_bytes(),
@@ -1797,7 +1785,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &batch_alias_args,
             input.as_bytes(),
@@ -1813,7 +1801,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &batch_z_args, &input);
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &batch_z_args, &input);
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &batch_z_args, &input);
         assert_same_output(actual_output, expected_output, &batch_z_args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-batch-z"),
@@ -1832,7 +1820,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &batch_args,
             input.as_bytes(),
@@ -1870,7 +1858,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             input.as_bytes(),
         );
         let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &batch_args,
             input.as_bytes(),
@@ -1889,7 +1877,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &batch_z_args, &input);
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &batch_z_args, &input);
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &batch_z_args, &input);
         assert_same_output(actual_output, expected_output, &batch_z_args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-batch-z-ok-after"),
@@ -1906,17 +1894,17 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let expected_output =
             run_with_stdin(sley_testkit::oracle_git(), &expected, &no_batch_args, input);
         let actual_output =
-            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &no_batch_args, input);
+            run_with_stdin(sley_testkit::sley_bin!(), &actual, &no_batch_args, input);
         assert_same_output(actual_output, expected_output, &no_batch_args);
 
         let args = ["update-ref", "--batch-updates"];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         let args = ["update-ref", "-z", "--batch-updates"];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
     };
     let _ = fs::remove_dir_all(&root);

@@ -41,8 +41,8 @@ fn git(cwd: &Path, args: &[&str]) -> Output {
     run_env(sley_testkit::oracle_git(), cwd, args)
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) {
@@ -127,7 +127,7 @@ fn read_sparse_file(root: &Path) -> Option<Vec<u8>> {
 /// contents.
 fn assert_parity(git_repo: &Path, rs_repo: &Path, args: &[&str]) {
     let expected = git(git_repo, args);
-    let actual = git_rs(rs_repo, args);
+    let actual = sley(rs_repo, args);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),

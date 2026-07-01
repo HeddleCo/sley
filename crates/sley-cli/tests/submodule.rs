@@ -146,7 +146,7 @@ fn submodule_status_sha256_superproject_matches_upstream_git() {
             vec!["submodule", "foreach", "printf \"%s\\n\" \"$sha1\""],
         ] {
             let expected = run(sley_testkit::oracle_git(), &upstream_super, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_super, &args);
+            let actual = run(sley_testkit::sley_bin!(), &actual_super, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -216,7 +216,7 @@ fn submodule_status_matches_upstream_git() {
             vec!["submodule", "--quiet", "status"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
         for args in [
@@ -225,7 +225,7 @@ fn submodule_status_matches_upstream_git() {
             vec!["submodule", "status", "sub"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &nested, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &nested, &args);
+            let actual = run(sley_testkit::sley_bin!(), &nested, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -272,7 +272,7 @@ fn submodule_status_matches_upstream_git() {
             vec!["submodule", "status", "--cached"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -287,7 +287,7 @@ fn submodule_status_matches_upstream_git() {
             vec!["submodule", "status", "sub"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -381,12 +381,12 @@ fn submodule_status_sorts_multiple_submodules_like_upstream_git() {
             vec!["submodule", "status", "alpha", "zed"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
         let args = ["submodule", "status", "../zed", "../alpha"];
         let expected = run(sley_testkit::oracle_git(), &nested, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &nested, &args);
+        let actual = run(sley_testkit::sley_bin!(), &nested, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -470,7 +470,7 @@ fn submodule_status_prefers_exact_tag_suffix_like_upstream_git() {
 
         let args = ["submodule", "status"];
         let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
         assert_same_output(actual, expected, &args);
 
         run_success(
@@ -479,7 +479,7 @@ fn submodule_status_prefers_exact_tag_suffix_like_upstream_git() {
             &["checkout", "-q", "v1"],
         );
         let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -560,7 +560,7 @@ fn submodule_status_directory_pathspecs_match_upstream_git() {
             vec!["submodule", "status", "deps/other"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
         for args in [
@@ -568,7 +568,7 @@ fn submodule_status_directory_pathspecs_match_upstream_git() {
             vec!["submodule", "status", "."],
         ] {
             let expected = run(sley_testkit::oracle_git(), &nested, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &nested, &args);
+            let actual = run(sley_testkit::sley_bin!(), &nested, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -660,7 +660,7 @@ fn submodule_status_recursive_matches_upstream_git() {
             vec!["submodule", "status", "--recursive", "deps/child"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -669,7 +669,7 @@ fn submodule_status_recursive_matches_upstream_git() {
             vec!["submodule", "status", "--recursive", "--no-recursive"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -752,7 +752,7 @@ fn submodule_init_registers_local_config_like_upstream_git() {
             &superproject,
             &["config", "--remove-section", "submodule.deps/child"],
         );
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
         let actual_config = run_success(
             sley_testkit::oracle_git(),
             &superproject,
@@ -773,7 +773,7 @@ fn submodule_init_registers_local_config_like_upstream_git() {
             &superproject,
             &["config", "--remove-section", "submodule.deps/child"],
         );
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &quiet_args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &quiet_args);
         assert_same_output(actual, expected, &quiet_args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -864,7 +864,7 @@ fn submodule_sync_updates_registered_urls_like_upstream_git() {
             &superproject,
             &["config", "submodule.deps/a.url", "old-url"],
         );
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
         let actual_config = run_success(
             sley_testkit::oracle_git(),
             &superproject,
@@ -885,12 +885,12 @@ fn submodule_sync_updates_registered_urls_like_upstream_git() {
             &superproject,
             &["config", "submodule.deps/a.url", "old-url"],
         );
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &quiet_args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &quiet_args);
         assert_same_output(actual, expected, &quiet_args);
 
         let bad_args = ["submodule", "sync", "--no-recursive"];
         let expected = run(sley_testkit::oracle_git(), &superproject, &bad_args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &bad_args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &bad_args);
         assert_same_output(actual, expected, &bad_args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -977,7 +977,7 @@ fn submodule_set_url_updates_gitmodules_and_local_config_like_upstream_git() {
             &superproject,
             &["config", "--local", "submodule.deps/child.url", &child_url],
         );
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
         let actual_gitmodules = run_success(
             sley_testkit::oracle_git(),
             &superproject,
@@ -1015,17 +1015,17 @@ fn submodule_set_url_updates_gitmodules_and_local_config_like_upstream_git() {
             &superproject,
             &["config", "--local", "submodule.deps/child.url", "new-url"],
         );
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &quiet_args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &quiet_args);
         assert_same_output(actual, expected, &quiet_args);
 
         let missing_args = ["submodule", "set-url", "missing", "new-url"];
         let expected = run(sley_testkit::oracle_git(), &superproject, &missing_args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &missing_args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &missing_args);
         assert_same_output(actual, expected, &missing_args);
 
         let usage_args = ["submodule", "set-url"];
         let expected = run(sley_testkit::oracle_git(), &superproject, &usage_args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &usage_args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &usage_args);
         assert_same_output(actual, expected, &usage_args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -1102,7 +1102,7 @@ fn submodule_set_branch_updates_gitmodules_like_upstream_git() {
                 "submodule.deps/child.branch",
             ],
         );
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
         let actual_branch = run_success(
             sley_testkit::oracle_git(),
             &superproject,
@@ -1140,7 +1140,7 @@ fn submodule_set_branch_updates_gitmodules_like_upstream_git() {
                 "main",
             ],
         );
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &default_args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &default_args);
         let actual_branch = run(
             sley_testkit::oracle_git(),
             &superproject,
@@ -1169,7 +1169,7 @@ fn submodule_set_branch_updates_gitmodules_like_upstream_git() {
             vec!["submodule", "set-branch", "--branch", "main", "missing"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -1237,7 +1237,7 @@ fn submodule_foreach_runs_commands_like_upstream_git() {
             vec!["submodule", "foreach", "--no-recursive", "pwd"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -1346,7 +1346,7 @@ fn submodule_foreach_recursive_matches_upstream_git() {
             "printf 'name=%s sm=%s display=%s top=%s pwd=%s\\n' \"$name\" \"$sm_path\" \"$displaypath\" \"$toplevel\" \"$PWD\"",
         ];
         let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -1435,7 +1435,7 @@ fn submodule_summary_clean_cases_match_upstream_git() {
             vec!["submodule", "summary", "--summary-limit=x"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
         run_success(
@@ -1448,7 +1448,7 @@ fn submodule_summary_clean_cases_match_upstream_git() {
             vec!["submodule", "summary", "--files"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
         run_success(
@@ -1491,7 +1491,7 @@ fn submodule_summary_clean_cases_match_upstream_git() {
             vec!["submodule", "summary", "--summary-limit", "0"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -1506,7 +1506,7 @@ fn submodule_summary_clean_cases_match_upstream_git() {
             vec!["submodule", "summary", "--summary-limit", "1"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -1540,7 +1540,7 @@ fn submodule_summary_clean_cases_match_upstream_git() {
             vec!["submodule", "summary", "--summary-limit=2"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -1597,7 +1597,7 @@ fn submodule_absorbgitdirs_migrates_embedded_gitdir_like_upstream_git() {
 
         let noop_args = ["submodule", "absorbgitdirs"];
         let expected = run(sley_testkit::oracle_git(), &superproject, &noop_args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &noop_args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &noop_args);
         assert_same_output(actual, expected, &noop_args);
 
         embed_submodule_git_dir(&superproject, "deps/child");
@@ -1617,7 +1617,7 @@ fn submodule_absorbgitdirs_migrates_embedded_gitdir_like_upstream_git() {
         );
 
         embed_submodule_git_dir(&superproject, "deps/child");
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
         let actual_gitfile =
             fs::read(superproject.join("deps/child/.git")).expect("read actual gitfile");
         let actual_worktree = run_success(
@@ -1639,7 +1639,7 @@ fn submodule_absorbgitdirs_migrates_embedded_gitdir_like_upstream_git() {
             vec!["submodule", "absorbgitdirs", "missing"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -1723,7 +1723,7 @@ fn submodule_deinit_unregisters_local_config_like_upstream_git() {
             &superproject,
             &["submodule", "update", "--init", "-q"],
         );
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
         let actual_config = run(
             sley_testkit::oracle_git(),
             &superproject,
@@ -1748,7 +1748,7 @@ fn submodule_deinit_unregisters_local_config_like_upstream_git() {
             &superproject,
             &["submodule", "update", "--init", "-q"],
         );
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &quiet_args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &quiet_args);
         assert_same_output(actual, expected, &quiet_args);
 
         run_success(
@@ -1760,7 +1760,7 @@ fn submodule_deinit_unregisters_local_config_like_upstream_git() {
             .expect("write dirty submodule file");
         let dirty_args = ["submodule", "deinit", "deps/child"];
         let expected = run(sley_testkit::oracle_git(), &superproject, &dirty_args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &dirty_args);
+        let actual = run(sley_testkit::sley_bin!(), &superproject, &dirty_args);
         assert_same_output(actual, expected, &dirty_args);
         let _ = fs::remove_file(superproject.join("deps/child/dirty"));
 
@@ -1769,7 +1769,7 @@ fn submodule_deinit_unregisters_local_config_like_upstream_git() {
             vec!["submodule", "deinit", "missing"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &superproject, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
+            let actual = run(sley_testkit::sley_bin!(), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
     };

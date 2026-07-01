@@ -367,7 +367,7 @@ fn receive_pack_service_updates_bare_repo_with_raw_pack() {
         .expect("encode receive-pack request");
 
     let output = run_with_stdin(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["receive-pack", &remote_arg],
         &encoded_request,
@@ -507,7 +507,7 @@ fn receive_pack_service_accepts_push_options() {
         .expect("encode receive-pack request");
 
     let output = run_with_stdin(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["receive-pack", &remote_arg],
         &encoded_request,
@@ -639,7 +639,7 @@ fn receive_pack_service_accepts_empty_push_options_section() {
         .expect("encode receive-pack request");
 
     let output = run_with_stdin(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["receive-pack", &remote_arg],
         &encoded_request,
@@ -723,7 +723,7 @@ fn upload_pack_service_serves_raw_pack() {
 
     let source_arg = source.to_string_lossy();
     let output = run_with_stdin(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["upload-pack", &source_arg],
         &encoded_request,
@@ -816,7 +816,7 @@ fn upload_pack_service_serves_sideband_64k_pack() {
 
     let source_arg = source.to_string_lossy();
     let output = run_with_stdin(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["upload-pack", &source_arg],
         &encoded_request,
@@ -876,7 +876,7 @@ fn push_local_branch_to_bare_repo_matches_upstream_ref_and_objects() {
 
     let remote_arg = remote.to_string_lossy();
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, "main"],
     );
@@ -913,7 +913,7 @@ fn failing_pre_push_hook_leaves_remote_ref_unchanged_and_runs_at_worktree_root()
 
     let remote_arg = remote.to_string_lossy();
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, "main"],
     );
@@ -955,7 +955,7 @@ fn failing_pre_push_hook_leaves_remote_ref_unchanged_and_runs_at_worktree_root()
     let subdir = work.join("subdir");
     fs::create_dir_all(&subdir).expect("create subdir");
     let output = run(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &subdir,
         &["push", "-q", &remote_arg, "main"],
     );
@@ -1027,7 +1027,7 @@ fn push_ssh_branch_to_bare_repo_matches_upstream_git_protocol_v0() {
             &[("GIT_SSH", fake_ssh)],
         );
         let actual = run_with_env(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_work,
             &actual_args,
             &[("GIT_SSH", fake_ssh)],
@@ -1108,7 +1108,7 @@ fn push_configured_percent_encoded_ssh_remote_matches_upstream_git_protocol_v0()
             &[("GIT_SSH", fake_ssh)],
         );
         let actual = run_with_env(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_work,
             &actual_args,
             &[("GIT_SSH", fake_ssh)],
@@ -1166,7 +1166,7 @@ fn push_configured_percent_encoded_file_remote_updates_bare_repo() {
         );
 
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &work,
             &["push", "-q", "origin", "main"],
         );
@@ -1267,7 +1267,7 @@ fn push_rejects_non_fast_forward_without_force() {
         );
 
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &work,
             &["push", "-q", &remote_arg, "main"],
         );
@@ -1364,7 +1364,7 @@ fn push_force_refspec_updates_non_fast_forward_branch() {
         );
 
         run_success(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &work,
             &["push", "-q", &remote_arg, "+main"],
         );
@@ -1394,7 +1394,7 @@ fn push_update_pack_excludes_objects_reachable_from_remote_refs() {
 
     let remote_arg = remote.to_string_lossy();
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, "main"],
     );
@@ -1450,7 +1450,7 @@ fn push_update_pack_excludes_objects_reachable_from_remote_refs() {
     .trim()
     .to_string();
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, "main"],
     );
@@ -1494,7 +1494,7 @@ fn push_delete_refspec_removes_remote_branch() {
 
     let remote_arg = remote.to_string_lossy();
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, "main"],
     );
@@ -1505,7 +1505,7 @@ fn push_delete_refspec_removes_remote_branch() {
     );
 
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, ":old"],
     );
@@ -1526,7 +1526,7 @@ fn push_delete_option_removes_remote_branch() {
 
     let remote_arg = remote.to_string_lossy();
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, "main"],
     );
@@ -1537,7 +1537,7 @@ fn push_delete_option_removes_remote_branch() {
     );
 
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", "--delete", &remote_arg, "old"],
     );
@@ -1558,7 +1558,7 @@ fn push_delete_missing_remote_branch_fails() {
 
     let remote_arg = remote.to_string_lossy();
     let output = run(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, ":missing"],
     );
@@ -1582,7 +1582,7 @@ fn push_sha256_branch_to_file_remote_sets_upstream() {
 
     let remote_url = format!("file://{}", remote.display());
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", "-u", &remote_url, "main"],
     );
@@ -1635,7 +1635,7 @@ fn push_delete_sha256_remote_branch() {
 
     let remote_url = format!("file://{}", remote.display());
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_url, "main"],
     );
@@ -1646,7 +1646,7 @@ fn push_delete_sha256_remote_branch() {
     );
 
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", "--delete", &remote_url, "old"],
     );

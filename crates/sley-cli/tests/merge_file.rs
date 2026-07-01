@@ -42,8 +42,8 @@ fn git(cwd: &Path, args: &[&str]) -> Output {
     run_env(sley_testkit::oracle_git(), cwd, args)
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git_available() -> bool {
@@ -71,7 +71,7 @@ fn write_inputs(dir: &Path, cur: &[u8], base: &[u8], other: &[u8]) -> (String, S
 /// the fixture files referenced by `args`.
 fn assert_stdout_merge(dir: &Path, args: &[&str]) {
     let g = git(dir, args);
-    let r = git_rs(dir, args);
+    let r = sley(dir, args);
     assert_eq!(
         String::from_utf8_lossy(&r.stdout),
         String::from_utf8_lossy(&g.stdout),
@@ -102,7 +102,7 @@ fn assert_inplace_merge(cur: &[u8], base: &[u8], other: &[u8], extra: &[&str]) {
     args.extend_from_slice(&[cur_name.as_str(), base_name.as_str(), other_name.as_str()]);
 
     let g = git(&git_dir, &args);
-    let r = git_rs(&rs_dir, &args);
+    let r = sley(&rs_dir, &args);
 
     let g_file = fs::read(git_dir.join("cur.txt")).expect("git cur");
     let r_file = fs::read(rs_dir.join("cur.txt")).expect("rs cur");
@@ -362,7 +362,7 @@ fn missing_file_matches_git() {
         ["merge-file", "-p", &c, &b, "nope.txt"],
     ] {
         let g = git(&root, &args);
-        let r = git_rs(&root, &args);
+        let r = sley(&root, &args);
         assert_eq!(
             String::from_utf8_lossy(&r.stderr),
             String::from_utf8_lossy(&g.stderr),
@@ -391,7 +391,7 @@ fn binary_input_matches_git() {
     let (c, b, o) = write_inputs(&root, b"a\x00b\nOURS\n", b"a\nb\n", b"a\nTHEIRS\n");
     let args = ["merge-file", "-p", &c, &b, &o];
     let g = git(&root, &args);
-    let r = git_rs(&root, &args);
+    let r = sley(&root, &args);
     assert_eq!(
         String::from_utf8_lossy(&r.stderr),
         String::from_utf8_lossy(&g.stderr),
@@ -402,7 +402,7 @@ fn binary_input_matches_git() {
     // Only the other file is binary -> git names it.
     write_inputs(&root, b"a\nOURS\n", b"a\nb\n", b"a\x00b\nTHEIRS\n");
     let g = git(&root, &args);
-    let r = git_rs(&root, &args);
+    let r = sley(&root, &args);
     assert_eq!(
         String::from_utf8_lossy(&r.stderr),
         String::from_utf8_lossy(&g.stderr),
@@ -427,7 +427,7 @@ fn binary_input_quiet_matches_git() {
     let (c, b, o) = write_inputs(&root, b"a\x00b\nOURS\n", b"a\nb\n", b"a\nTHEIRS\n");
     let args = ["merge-file", "-p", "-q", &c, &b, &o];
     let g = git(&root, &args);
-    let r = git_rs(&root, &args);
+    let r = sley(&root, &args);
     assert_eq!(
         String::from_utf8_lossy(&r.stderr),
         String::from_utf8_lossy(&g.stderr),
@@ -480,7 +480,7 @@ fn usage_errors_match_git() {
 
     for args in cases {
         let g = git(&root, &args);
-        let r = git_rs(&root, &args);
+        let r = sley(&root, &args);
         assert_eq!(
             String::from_utf8_lossy(&r.stderr),
             String::from_utf8_lossy(&g.stderr),
@@ -529,7 +529,7 @@ fn object_id_mode_matches_git() {
     // print the same id (and write the same object) and share the exit status.
     let args = ["merge-file", "--object-id", &ours, &base, &theirs];
     let g = git(&repo, &args);
-    let r = git_rs(&repo, &args);
+    let r = sley(&repo, &args);
     assert_eq!(
         String::from_utf8_lossy(&r.stdout),
         String::from_utf8_lossy(&g.stdout),

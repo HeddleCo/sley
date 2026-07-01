@@ -51,8 +51,8 @@ fn git_ok(cwd: &Path, args: &[&str]) {
     );
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git_available() -> bool {
@@ -161,7 +161,7 @@ fn merge_branch_mergeoptions_malformed_on_main_fails_like_git() {
     copy_dir_all(&reference, &candidate);
 
     let ref_out = git(&reference, &["merge", "main"]);
-    let rs_out = git_rs(&candidate, &["merge", "main"]);
+    let rs_out = sley(&candidate, &["merge", "main"]);
 
     assert_eq!(ref_out.status.code(), Some(128));
     assert_eq!(rs_out.status.code(), Some(128));
@@ -192,7 +192,7 @@ fn merge_branch_mergeoptions_are_prepended_before_cli_args() {
 
     let args = ["merge", "side", "--no-ff", "-m", "manual merge"];
     let ref_out = git(&reference, &args);
-    let rs_out = git_rs(&candidate, &args);
+    let rs_out = sley(&candidate, &args);
 
     assert!(
         ref_out.status.success(),
@@ -233,7 +233,7 @@ fn merge_clean_threeway_matches_git() {
         &reference,
         &["merge", "-m", "Merge branch 'feature'", "feature"],
     );
-    let rs_out = git_rs(
+    let rs_out = sley(
         &candidate,
         &["merge", "-m", "Merge branch 'feature'", "feature"],
     );
@@ -297,7 +297,7 @@ fn merge_fast_forward_matches_git() {
     copy_dir_all(&reference, &candidate);
 
     let ref_out = git(&reference, &["merge", "feature"]);
-    let rs_out = git_rs(&candidate, &["merge", "feature"]);
+    let rs_out = sley(&candidate, &["merge", "feature"]);
     assert!(ref_out.status.success());
     assert!(
         rs_out.status.success(),
@@ -348,7 +348,7 @@ fn merge_already_up_to_date_matches_git() {
     git_ok(&repo, &["commit", "-qm", "c2"]);
 
     // Merging an ancestor ("old") is a no-op.
-    let rs_out = git_rs(&repo, &["merge", "old"]);
+    let rs_out = sley(&repo, &["merge", "old"]);
     assert!(rs_out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&rs_out.stdout).trim(),
@@ -389,7 +389,7 @@ fn merge_conflict_matches_git() {
     copy_dir_all(&reference, &candidate);
 
     let ref_out = git(&reference, &["merge", "-m", "M", "feature"]);
-    let rs_out = git_rs(&candidate, &["merge", "-m", "M", "feature"]);
+    let rs_out = sley(&candidate, &["merge", "-m", "M", "feature"]);
 
     // Both fail with the same conflict exit code.
     assert_eq!(ref_out.status.code(), Some(1));
@@ -451,10 +451,10 @@ fn merge_abort_restores_pre_merge_state() {
     git_ok(&repo, &["commit", "-qm", "mainwork"]);
     let pre_head = head(&repo);
 
-    let conflict = git_rs(&repo, &["merge", "-m", "M", "feature"]);
+    let conflict = sley(&repo, &["merge", "-m", "M", "feature"]);
     assert_eq!(conflict.status.code(), Some(1));
 
-    let abort = git_rs(&repo, &["merge", "--abort"]);
+    let abort = sley(&repo, &["merge", "--abort"]);
     assert!(
         abort.status.success(),
         "sley merge --abort failed: {}",
@@ -527,7 +527,7 @@ fn merge_rename_clean_matches_git() {
         &reference,
         &["merge", "-m", "Merge branch 'feature'", "feature"],
     );
-    let rs_out = git_rs(
+    let rs_out = sley(
         &candidate,
         &["merge", "-m", "Merge branch 'feature'", "feature"],
     );
@@ -573,7 +573,7 @@ fn merge_rename_conflict_matches_git() {
         &reference,
         &["merge", "-m", "Merge branch 'feature'", "feature"],
     );
-    let rs_out = git_rs(
+    let rs_out = sley(
         &candidate,
         &["merge", "-m", "Merge branch 'feature'", "feature"],
     );

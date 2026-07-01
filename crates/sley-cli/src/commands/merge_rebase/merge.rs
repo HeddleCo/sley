@@ -1509,7 +1509,7 @@ pub(crate) fn cmd_fmt_merge_msg(args: &[String]) -> Result<()> {
         .clone()
         .or_else(|| current_branch_short_name(&refs).ok().flatten())
         .unwrap_or_else(|| "HEAD".to_string());
-    let origins = parse_fmt_merge_fetch_head(&input, &db, format, &head_oid)?;
+    let origins = parse_fmt_merge_fetch_head(&input, &common_git_dir, &db, format, &head_oid)?;
 
     let mut out = String::new();
     if let Some(message) = options.message {
@@ -1644,6 +1644,7 @@ fn fmt_merge_msg_config_log_len() -> Option<usize> {
 
 fn parse_fmt_merge_fetch_head(
     input: &[u8],
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     head_oid: &ObjectId,
@@ -1674,7 +1675,7 @@ fn parse_fmt_merge_fetch_head(
             candidates.push(origin);
         }
     }
-    reduce_fmt_merge_origins(db, format, head_oid, candidates)
+    reduce_fmt_merge_origins(git_dir, db, format, head_oid, candidates)
 }
 
 fn fmt_merge_origin_from_desc(
@@ -1757,6 +1758,7 @@ fn unquote_fetch_name(value: &str) -> &str {
 }
 
 fn reduce_fmt_merge_origins(
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     head_oid: &ObjectId,
@@ -1765,18 +1767,13 @@ fn reduce_fmt_merge_origins(
     if origins.is_empty() {
         return Ok(origins);
     }
+    let mut reachability = sley_rev::CommitReachability::new(git_dir, format, db);
     let mut reachables: Vec<(ObjectId, HashSet<ObjectId>)> = Vec::new();
     for origin in &origins {
-        let reachable = sley_rev::walk_commits(db, format, [origin.commit_oid])?
-            .into_iter()
-            .map(|record| record.oid)
-            .collect();
+        let reachable = reachability.reachable_oids([origin.commit_oid], false)?;
         reachables.push((origin.commit_oid, reachable));
     }
-    let head_reachable: HashSet<ObjectId> = sley_rev::walk_commits(db, format, [*head_oid])?
-        .into_iter()
-        .map(|record| record.oid)
-        .collect();
+    let head_reachable = reachability.reachable_oids([*head_oid], false)?;
     let mut reduced = Vec::new();
     for (idx, origin) in origins.into_iter().enumerate() {
         if head_reachable.contains(&origin.commit_oid) {

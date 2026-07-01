@@ -43,8 +43,8 @@ fn run_output_with_env(program: &str, cwd: &Path, args: &[&str], envs: &[(&str, 
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_output(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_output(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
@@ -110,7 +110,7 @@ fn count_objects_git_object_directory_matches_upstream_git() {
             let expected_output =
                 run_output_with_env(sley_testkit::oracle_git(), &expected, &args, &envs);
             let actual_output =
-                run_output_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &args, &envs);
+                run_output_with_env(sley_testkit::sley_bin!(), &actual, &args, &envs);
             assert_same_output(actual_output, expected_output, &args);
         }
     };
@@ -155,7 +155,7 @@ fn count_objects_matches_upstream_git_for_loose_objects() {
             vec!["count-objects", "-vH", "--no-verbose"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -200,7 +200,7 @@ fn count_objects_matches_upstream_git_for_packed_objects() {
             vec!["count-objects", "-vH", "--no-verbose"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -251,7 +251,7 @@ fn count_objects_prune_packable_and_garbage_match_upstream_git() {
 
         for args in [vec!["count-objects", "-v"], vec!["count-objects", "-vH"]] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -294,7 +294,7 @@ fn count_objects_verbose_lists_alternates_like_upstream_git() {
 
         for args in [vec!["count-objects", "-v"], vec!["count-objects", "-vH"]] {
             let expected = git(&repo, &args);
-            let actual = git_rs(&repo, &args);
+            let actual = sley(&repo, &args);
             assert_same_output(actual, expected, &args);
         }
     };

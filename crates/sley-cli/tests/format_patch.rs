@@ -61,8 +61,8 @@ fn git_ok(cwd: &Path, args: &[&str]) {
     );
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
 /// The suite runs only when the system `git` is present and its version matches
@@ -80,7 +80,7 @@ fn interop_enabled() -> bool {
     }
     let git_version = String::from_utf8_lossy(&git_version.stdout);
     // `git --version` prints "git version X.Y.Z"; sley mirrors that.
-    let Ok(rs_version) = Command::new(env!("CARGO_BIN_EXE_sley"))
+    let Ok(rs_version) = Command::new(sley_testkit::sley_bin!())
         .arg("version")
         .output()
     else {
@@ -97,7 +97,7 @@ fn interop_enabled() -> bool {
 /// stdout, stderr, and exit code.
 fn assert_same_stdout(cwd: &Path, args: &[&str]) {
     let g = git(cwd, args);
-    let r = git_rs(cwd, args);
+    let r = sley(cwd, args);
     assert_eq!(
         String::from_utf8_lossy(&r.stdout),
         String::from_utf8_lossy(&g.stdout),
@@ -147,7 +147,7 @@ fn assert_same_files(repo: &Path, extra: &[&str]) {
     rs_args.extend_from_slice(extra);
 
     let g = git(repo, &git_args);
-    let r = git_rs(repo, &rs_args);
+    let r = sley(repo, &rs_args);
     assert!(
         g.status.success(),
         "git {git_args:?} failed: {}",

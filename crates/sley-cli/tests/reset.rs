@@ -112,7 +112,7 @@ fn reset_path_unstages_modified_file_like_upstream_git() {
 
         let args = ["reset", "file.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -148,12 +148,12 @@ fn reset_sha256_mixed_and_hard_match_upstream_git() {
     {
         let args = ["reset", "--mixed", "HEAD~1"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream_mixed, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust_mixed, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust_mixed, &args);
         assert_same_output(actual, expected, &args);
 
         let args = ["reset", "--hard", "HEAD~1"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream_hard, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust_hard, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust_hard, &args);
         assert_same_output(actual, expected, &args);
 
         for (upstream, rust) in [(&upstream_mixed, &rust_mixed), (&upstream_hard, &rust_hard)] {
@@ -189,7 +189,7 @@ fn reset_path_unstages_added_file_like_upstream_git() {
 
         let args = ["reset", "new.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -224,7 +224,7 @@ fn reset_quiet_suppresses_unstaged_summary_like_upstream_git() {
 
         let args = ["reset", "-q", "file.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -248,7 +248,7 @@ fn reset_no_quiet_restores_unstaged_summary_like_upstream_git() {
 
         let args = ["reset", "-q", "--no-quiet", "file.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -274,7 +274,7 @@ fn reset_pathspec_from_file_matches_upstream_git() {
 
         let args = ["reset", "--pathspec-from-file=pathspecs"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -311,7 +311,7 @@ fn reset_pathspec_file_nul_matches_upstream_git() {
             "pathspecs",
         ];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -350,7 +350,7 @@ fn reset_pathspec_file_option_errors_match_upstream_git() {
             ["reset", "--hard", "--pathspec-from-file=pathspecs"].as_slice(),
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &upstream, args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
+            let actual = run_output(sley_testkit::sley_bin!(), &rust, args);
             assert_same_output(actual, expected, args);
         }
     };
@@ -385,7 +385,7 @@ fn reset_source_path_updates_index_without_moving_head_like_upstream_git() {
             .to_string();
         let args = ["reset", target.as_str(), "--", "file.txt", "new.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -443,7 +443,7 @@ fn reset_source_path_without_separator_matches_upstream_git() {
             .to_string();
         let args = ["reset", target.as_str(), "file.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -489,7 +489,7 @@ fn reset_hard_restores_index_and_worktree_like_upstream_git() {
 
         let args = ["reset", "--hard"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -532,7 +532,7 @@ fn reset_hard_quiet_suppresses_head_summary_like_upstream_git() {
 
         let args = ["reset", "--hard", "-q"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -561,7 +561,7 @@ fn reset_hard_to_commit_moves_head_like_upstream_git() {
             .to_string();
         let args = ["reset", "--hard", target.as_str()];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -611,7 +611,7 @@ fn reset_soft_to_commit_moves_head_only_like_upstream_git() {
             .to_string();
         let args = ["reset", "--soft", target.as_str()];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -651,7 +651,7 @@ fn reset_soft_rejects_paths_like_upstream_git() {
 
         let args = ["reset", "--soft", "HEAD", "--", "file.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -680,7 +680,7 @@ fn reset_mixed_to_commit_moves_head_and_index_like_upstream_git() {
             .to_string();
         let args = ["reset", "--mixed", target.as_str()];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -730,7 +730,7 @@ fn reset_mixed_quiet_to_commit_suppresses_summary_like_upstream_git() {
             .to_string();
         let args = ["reset", "--mixed", "-q", target.as_str()];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);

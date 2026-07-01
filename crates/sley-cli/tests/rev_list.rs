@@ -27,8 +27,8 @@ fn run(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -61,8 +61,8 @@ fn run_with_stdin(program: &str, cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec
     output.stdout
 }
 
-fn git_rs_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
-    run_with_stdin(env!("CARGO_BIN_EXE_sley"), cwd, args, stdin)
+fn sley_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
+    run_with_stdin(sley_testkit::sley_bin!(), cwd, args, stdin)
 }
 
 fn git_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
@@ -638,7 +638,7 @@ fn rev_list_linear_history_matches_upstream_git() {
         ];
         for args in cases {
             assert_eq!(
-                git_rs(&root, &args),
+                sley(&root, &args),
                 git(&root, &args),
                 "rev-list output differed for {args:?}"
             );
@@ -686,7 +686,7 @@ fn rev_list_linear_history_matches_upstream_git() {
             ),
         ] {
             assert_eq!(
-                git_rs_with_stdin(&root, &args, &stdin),
+                sley_with_stdin(&root, &args, &stdin),
                 git_with_stdin(&root, &args, &stdin),
                 "rev-list output differed for {args:?} with stdin {:?}",
                 String::from_utf8_lossy(&stdin)
@@ -739,7 +739,7 @@ fn rev_list_epoch_age_filters_match_upstream_git() {
             vec!["rev-list", "--no-walk", "--do-walk", "--count", "HEAD"],
         ] {
             assert_eq!(
-                git_rs(&root, &args),
+                sley(&root, &args),
                 git(&root, &args),
                 "rev-list output differed for {args:?}"
             );
@@ -863,7 +863,7 @@ fn rev_list_identity_and_message_filters_match_upstream_git() {
             ],
         ] {
             assert_eq!(
-                git_rs(&root, &args),
+                sley(&root, &args),
                 git(&root, &args),
                 "rev-list output differed for {args:?}"
             );
@@ -912,7 +912,7 @@ fn rev_list_annotated_tag_start_matches_upstream_git() {
             vec!["rev-list", "--objects", "--all"],
         ] {
             assert_eq!(
-                git_rs(&root, &args),
+                sley(&root, &args),
                 git(&root, &args),
                 "rev-list output differed for {args:?}"
             );
@@ -1095,7 +1095,7 @@ fn rev_list_ref_selector_modes_match_upstream_git() {
             ],
         ] {
             assert_eq!(
-                git_rs(&root, &args),
+                sley(&root, &args),
                 git(&root, &args),
                 "rev-list output differed for {args:?}"
             );
@@ -1207,7 +1207,7 @@ fn rev_list_symmetric_branch_range_count_matches_upstream_git() {
             ],
         ] {
             assert_eq!(
-                git_rs(&root, &args),
+                sley(&root, &args),
                 git(&root, &args),
                 "rev-list output differed for {args:?}"
             );
@@ -1280,7 +1280,7 @@ fn rev_list_first_parent_merge_history_matches_upstream_git() {
             ],
         ] {
             assert_eq!(
-                git_rs(&root, &args),
+                sley(&root, &args),
                 git(&root, &args),
                 "rev-list output differed for {args:?}"
             );
@@ -1329,7 +1329,7 @@ fn assert_rev_list_date_order_merge_case(name: &str, side_timestamp: i64, main_t
             vec!["rev-list", "--date-order", "--topo-order", "HEAD"],
         ] {
             assert_eq!(
-                git_rs(&root, &args),
+                sley(&root, &args),
                 git(&root, &args),
                 "rev-list output differed for {args:?}"
             );

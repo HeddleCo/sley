@@ -45,8 +45,8 @@ fn git(cwd: &Path, args: &[&str]) -> Output {
     run_env(sley_testkit::oracle_git(), cwd, args)
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
 /// Run a git command and assert success, returning trimmed stdout. Used for
@@ -185,7 +185,7 @@ fn am_clean_series_matches_git() {
     let mut g_args = vec!["am"];
     g_args.extend_from_slice(&patch_args);
     let g = git(&git_target, &g_args);
-    let r = git_rs(&rs_target, &g_args);
+    let r = sley(&rs_target, &g_args);
 
     assert_outputs_equal("am clean series", &g, &r);
     assert_repos_equal(&git_target, &rs_target);
@@ -239,7 +239,7 @@ fn am_conflict_matches_git() {
     let mut args = vec!["am"];
     args.extend_from_slice(&patch_args);
     let g = git(&git_target, &args);
-    let r = git_rs(&rs_target, &args);
+    let r = sley(&rs_target, &args);
 
     assert_outputs_equal("am conflict", &g, &r);
     // HEAD must be unchanged (the failing patch was not committed) and equal.
@@ -295,10 +295,10 @@ fn am_abort_matches_git() {
     start.extend_from_slice(&patch_args);
     // Drive into the conflict state first (output already covered elsewhere).
     let _ = git(&git_target, &start);
-    let _ = git_rs(&rs_target, &start);
+    let _ = sley(&rs_target, &start);
 
     let g_abort = git(&git_target, &["am", "--abort"]);
-    let r_abort = git_rs(&rs_target, &["am", "--abort"]);
+    let r_abort = sley(&rs_target, &["am", "--abort"]);
     assert_outputs_equal("am --abort", &g_abort, &r_abort);
     assert_repos_equal(&git_target, &rs_target);
     assert!(!git_target.join(".git/rebase-apply").exists());
@@ -349,7 +349,7 @@ fn am_continue_matches_git() {
     let mut start = vec!["am"];
     start.extend_from_slice(&patch_args);
     let _ = git(&git_target, &start);
-    let _ = git_rs(&rs_target, &start);
+    let _ = sley(&rs_target, &start);
 
     // Resolve identically in both worktrees, then continue.
     for target in [&git_target, &rs_target] {
@@ -357,7 +357,7 @@ fn am_continue_matches_git() {
         git_ok(target, &["add", "file.txt"]);
     }
     let g_cont = git(&git_target, &["am", "--continue"]);
-    let r_cont = git_rs(&rs_target, &["am", "--continue"]);
+    let r_cont = sley(&rs_target, &["am", "--continue"]);
 
     assert_outputs_equal("am --continue", &g_cont, &r_cont);
     assert_repos_equal(&git_target, &rs_target);
@@ -408,10 +408,10 @@ fn am_skip_matches_git() {
     let mut start = vec!["am"];
     start.extend_from_slice(&patch_args);
     let _ = git(&git_target, &start);
-    let _ = git_rs(&rs_target, &start);
+    let _ = sley(&rs_target, &start);
 
     let g_skip = git(&git_target, &["am", "--skip"]);
-    let r_skip = git_rs(&rs_target, &["am", "--skip"]);
+    let r_skip = sley(&rs_target, &["am", "--skip"]);
     assert_outputs_equal("am --skip", &g_skip, &r_skip);
     assert_repos_equal(&git_target, &rs_target);
     assert!(!git_target.join(".git/rebase-apply").exists());
@@ -464,7 +464,7 @@ fn am_three_way_success_matches_git() {
     let mut args = vec!["am", "-3"];
     args.extend_from_slice(&patch_args);
     let g = git(&git_target, &args);
-    let r = git_rs(&rs_target, &args);
+    let r = sley(&rs_target, &args);
 
     assert_outputs_equal("am -3 success", &g, &r);
     assert_repos_equal(&git_target, &rs_target);
@@ -514,7 +514,7 @@ fn am_three_way_conflict_matches_git() {
     let mut args = vec!["am", "-3"];
     args.extend_from_slice(&patch_args);
     let g = git(&git_target, &args);
-    let r = git_rs(&rs_target, &args);
+    let r = sley(&rs_target, &args);
 
     assert_outputs_equal("am -3 conflict", &g, &r);
     // The conflicted worktree file (with markers) and the index state match.
@@ -546,7 +546,7 @@ fn am_resume_without_progress_matches_git() {
 
     for sub in ["--abort", "--continue", "--skip", "--resolved", "--quit"] {
         let g = git(&git_target, &["am", sub]);
-        let r = git_rs(&rs_target, &["am", sub]);
+        let r = sley(&rs_target, &["am", sub]);
         assert_outputs_equal(&format!("am {sub} (no progress)"), &g, &r);
     }
 
@@ -571,20 +571,20 @@ fn am_empty_and_in_progress_match_git() {
     let empty = root.join("empty.mbox");
     fs::write(&empty, b"").expect("write empty mbox");
     let g = git(&git_target, &["am", empty.to_string_lossy().as_ref()]);
-    let r = git_rs(&rs_target, &["am", empty.to_string_lossy().as_ref()]);
+    let r = sley(&rs_target, &["am", empty.to_string_lossy().as_ref()]);
     assert_outputs_equal("am empty mbox", &g, &r);
 
     // Non-empty, non-patch input -> "Patch is empty." + hints, exit 128.
     let garbage = root.join("garbage.mbox");
     fs::write(&garbage, b"this is not a patch\n").expect("write garbage");
     let g = git(&git_target, &["am", garbage.to_string_lossy().as_ref()]);
-    let r = git_rs(&rs_target, &["am", garbage.to_string_lossy().as_ref()]);
+    let r = sley(&rs_target, &["am", garbage.to_string_lossy().as_ref()]);
     assert_outputs_equal("am garbage mbox", &g, &r);
 
     // With a series now in progress (from the garbage case), starting another am
     // is rejected with the relative ".git/rebase-apply" path in the message.
     let g = git(&git_target, &["am", garbage.to_string_lossy().as_ref()]);
-    let r = git_rs(&rs_target, &["am", garbage.to_string_lossy().as_ref()]);
+    let r = sley(&rs_target, &["am", garbage.to_string_lossy().as_ref()]);
     assert_outputs_equal("am while in progress", &g, &r);
 
     fs::remove_dir_all(&root).ok();

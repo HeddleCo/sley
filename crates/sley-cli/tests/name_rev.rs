@@ -64,8 +64,8 @@ fn git(cwd: &Path, args: &[&str]) -> Output {
     run_env(sley_testkit::oracle_git(), cwd, args)
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) {
@@ -88,7 +88,7 @@ fn git_available() -> bool {
 /// Assert byte-identical stdout/stderr and matching exit code.
 fn assert_same(cwd: &Path, args: &[&str]) {
     let expected = git(cwd, args);
-    let actual = git_rs(cwd, args);
+    let actual = sley(cwd, args);
     assert_eq!(
         String::from_utf8_lossy(&actual.stdout),
         String::from_utf8_lossy(&expected.stdout),
@@ -110,7 +110,7 @@ fn assert_same(cwd: &Path, args: &[&str]) {
 /// Like [`assert_same`] but with bytes fed on stdin.
 fn assert_same_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) {
     let expected = run_env_stdin(sley_testkit::oracle_git(), cwd, args, stdin);
-    let actual = run_env_stdin(env!("CARGO_BIN_EXE_sley"), cwd, args, stdin);
+    let actual = run_env_stdin(sley_testkit::sley_bin!(), cwd, args, stdin);
     assert_eq!(
         String::from_utf8_lossy(&actual.stdout),
         String::from_utf8_lossy(&expected.stdout),
@@ -132,7 +132,7 @@ fn assert_same_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) {
 /// `--all` lists commits in an unspecified order; compare the sorted line set.
 fn assert_same_sorted(cwd: &Path, args: &[&str]) {
     let expected = git(cwd, args);
-    let actual = git_rs(cwd, args);
+    let actual = sley(cwd, args);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),

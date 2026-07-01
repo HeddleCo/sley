@@ -46,8 +46,8 @@ fn git_ok(cwd: &Path, args: &[&str]) {
     );
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git_available() -> bool {
@@ -122,7 +122,7 @@ fn cherry_pick_clean_matches_git() {
     copy_dir_all(&reference, &candidate);
 
     let ref_out = git(&reference, &["cherry-pick", "topic"]);
-    let rs_out = git_rs(&candidate, &["cherry-pick", "topic"]);
+    let rs_out = sley(&candidate, &["cherry-pick", "topic"]);
     assert!(ref_out.status.success(), "git cherry-pick failed");
     assert!(
         rs_out.status.success(),
@@ -171,7 +171,7 @@ fn cherry_pick_conflict_matches_git() {
     copy_dir_all(&reference, &candidate);
 
     let ref_out = git(&reference, &["cherry-pick", "topic"]);
-    let rs_out = git_rs(&candidate, &["cherry-pick", "topic"]);
+    let rs_out = sley(&candidate, &["cherry-pick", "topic"]);
     assert_eq!(ref_out.status.code(), Some(1));
     assert_eq!(
         rs_out.status.code(),
@@ -230,10 +230,10 @@ fn cherry_pick_abort_restores_state() {
     let pre = head(&repo);
 
     assert_eq!(
-        git_rs(&repo, &["cherry-pick", "topic"]).status.code(),
+        sley(&repo, &["cherry-pick", "topic"]).status.code(),
         Some(1)
     );
-    let abort = git_rs(&repo, &["cherry-pick", "--abort"]);
+    let abort = sley(&repo, &["cherry-pick", "--abort"]);
     assert!(
         abort.status.success(),
         "cherry-pick --abort failed: {}",
@@ -279,7 +279,7 @@ fn revert_clean_matches_git() {
     copy_dir_all(&reference, &candidate);
 
     let ref_out = git(&reference, &["revert", "--no-edit", "HEAD"]);
-    let rs_out = git_rs(&candidate, &["revert", "--no-edit", "HEAD"]);
+    let rs_out = sley(&candidate, &["revert", "--no-edit", "HEAD"]);
     assert!(ref_out.status.success(), "git revert failed");
     assert!(
         rs_out.status.success(),
@@ -325,7 +325,7 @@ fn revert_conflict_matches_git() {
 
     // Reverting the middle commit conflicts with the current content.
     let ref_out = git(&reference, &["revert", "--no-edit", "HEAD~1"]);
-    let rs_out = git_rs(&candidate, &["revert", "--no-edit", "HEAD~1"]);
+    let rs_out = sley(&candidate, &["revert", "--no-edit", "HEAD~1"]);
     assert_eq!(ref_out.status.code(), Some(1));
     assert_eq!(
         rs_out.status.code(),

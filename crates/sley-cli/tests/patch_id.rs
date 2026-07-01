@@ -118,8 +118,8 @@ fn git_at(cwd: &Path, args: &[&str], date: &str) {
     );
 }
 
-fn git_rs_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_sley")
+fn sley_bin() -> &'static str {
+    sley_testkit::sley_bin!()
 }
 
 fn git_available() -> bool {
@@ -164,7 +164,7 @@ fn git_capture_bytes(cwd: &Path, args: &[&str]) -> Vec<u8> {
 /// code for `patch-id args` fed `stdin`.
 fn assert_same_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) {
     let g = run_env_with_stdin(sley_testkit::oracle_git(), cwd, args, stdin);
-    let r = run_env_with_stdin(git_rs_bin(), cwd, args, stdin);
+    let r = run_env_with_stdin(sley_bin(), cwd, args, stdin);
     assert_eq!(
         String::from_utf8_lossy(&r.stdout),
         String::from_utf8_lossy(&g.stdout),

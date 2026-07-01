@@ -1847,8 +1847,8 @@ fn pack_reuse_mode(git_dir: &Path) -> Result<PackReuseMode> {
     Ok(mode)
 }
 
-/// Find local bitmapped packs whose every object is in `want_set`: each such
-/// pack can be spliced into the output verbatim.
+/// Find local bitmapped pack entries that can be spliced into the output
+/// verbatim for the requested `want_set`.
 fn find_verbatim_reusable_packs(
     common_git_dir: &Path,
     format: ObjectFormat,
@@ -1895,16 +1895,34 @@ fn find_verbatim_reusable_packs(
         let Ok(pack_bytes) = fs::read(&pack_path) else {
             continue;
         };
-        let wanted: HashSet<ObjectId> = index.entries.iter().map(|entry| entry.oid).collect();
-        let Some(entry_bytes) =
-            raw_pack_entries_for_oids(format, &pack_bytes, &index.entries, &wanted, false)?
-        else {
-            continue;
-        };
-        return Ok(Some(vec![ReusablePackCandidate {
-            entry_bytes,
-            oids: index.entries.into_iter().map(|entry| entry.oid).collect(),
-        }]));
+        let all_pack_oids: HashSet<ObjectId> =
+            index.entries.iter().map(|entry| entry.oid).collect();
+        let wanted_count = index
+            .entries
+            .iter()
+            .filter(|entry| want_set.contains(&entry.oid))
+            .count();
+        let whole_pack = wanted_count == index.entries.len();
+        if whole_pack {
+            let Some(entry_bytes) = raw_pack_entries_for_oids(
+                format,
+                &pack_bytes,
+                &index.entries,
+                &all_pack_oids,
+                false,
+            )?
+            else {
+                continue;
+            };
+            return Ok(Some(vec![ReusablePackCandidate {
+                entry_bytes,
+                oids: all_pack_oids,
+            }]));
+        } else if let Some((oids, entry_bytes)) =
+            raw_partial_pack_entries_for_wanted_oids(format, &pack_bytes, &index.entries, want_set)?
+        {
+            return Ok(Some(vec![ReusablePackCandidate { entry_bytes, oids }]));
+        }
     }
     Ok(None)
 }

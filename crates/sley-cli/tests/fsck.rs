@@ -75,7 +75,7 @@ fn fsck_clean_repository_no_progress_matches_upstream_git() {
         create_single_commit_repo(&root);
         let args = ["fsck", "--no-progress"];
         let expected = run(sley_testkit::oracle_git(), &root, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run(sley_testkit::sley_bin!(), &root, &args);
         assert_eq!(actual.status.code(), expected.status.code());
         assert_eq!(actual.stdout, expected.stdout);
         assert_eq!(actual.stderr, expected.stderr);
@@ -92,7 +92,7 @@ fn fsck_missing_tree_reports_broken_link_like_upstream_git() {
         fs::remove_file(loose_object_path(&root.join(".git"), &tree)).expect("remove tree object");
         let args = ["fsck", "--no-progress"];
         let expected = run(sley_testkit::oracle_git(), &root, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run(sley_testkit::sley_bin!(), &root, &args);
         assert_eq!(actual.status.code(), expected.status.code());
         let stdout = String::from_utf8(actual.stdout).expect("stdout is utf8");
         assert!(
@@ -120,14 +120,14 @@ fn fsck_dangling_blob_matches_upstream_git() {
         );
         let args = ["fsck", "--no-progress"];
         let expected = run(sley_testkit::oracle_git(), &root, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run(sley_testkit::sley_bin!(), &root, &args);
         assert_eq!(actual.status.code(), expected.status.code());
         assert_eq!(actual.stdout, expected.stdout);
         assert_eq!(actual.stderr, expected.stderr);
 
         let args = ["fsck", "--no-progress", "--no-dangling"];
         let expected = run(sley_testkit::oracle_git(), &root, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run(sley_testkit::sley_bin!(), &root, &args);
         assert_eq!(actual.status.code(), expected.status.code());
         assert_eq!(actual.stdout, expected.stdout);
         assert_eq!(actual.stderr, expected.stderr);
@@ -165,7 +165,7 @@ fn fsck_unreachable_commit_matches_upstream_git() {
 
         let args = ["fsck", "--no-progress", "--unreachable", "--no-dangling"];
         let expected = run(sley_testkit::oracle_git(), &root, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run(sley_testkit::sley_bin!(), &root, &args);
         assert_eq!(actual.status.code(), expected.status.code());
         assert_eq!(actual.stdout, expected.stdout);
         assert_eq!(actual.stderr, expected.stderr);

@@ -43,8 +43,8 @@ fn git_ok(cwd: &Path, args: &[&str]) {
     );
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git_available() -> bool {
@@ -103,7 +103,7 @@ fn apply_modifies_worktree_like_git() {
     copy_dir_all(&repo, &candidate);
     copy_dir_all(&repo, &reference);
 
-    let rs = git_rs(&candidate, &["apply", patch_arg]);
+    let rs = sley(&candidate, &["apply", patch_arg]);
     assert!(
         rs.status.success(),
         "sley apply failed: {}",
@@ -148,7 +148,7 @@ fn apply_check_succeeds_for_clean_patch() {
     fs::write(&patch_path, &patch).expect("write patch");
 
     // --check must not modify the worktree and must succeed for an applicable patch.
-    let out = git_rs(
+    let out = sley(
         &repo,
         &[
             "apply",
@@ -195,7 +195,7 @@ fn apply_creates_new_file_like_git() {
     let patch_path = root.join("new.patch");
     fs::write(&patch_path, &patch).expect("write patch");
 
-    let out = git_rs(
+    let out = sley(
         &repo,
         &[
             "apply",
@@ -237,7 +237,7 @@ fn gc_consolidates_loose_objects_and_stays_valid() {
     }
     let head_before = git(&repo, &["rev-parse", "HEAD"]).stdout;
 
-    let out = git_rs(&repo, &["gc"]);
+    let out = sley(&repo, &["gc"]);
     assert!(
         out.status.success(),
         "sley gc failed: {}",
@@ -306,7 +306,7 @@ fn maintenance_run_matches_git_gc_behavior() {
     copy_dir_all(&repo, &candidate);
     copy_dir_all(&repo, &reference);
 
-    let rs = git_rs(&candidate, &["maintenance", "run"]);
+    let rs = sley(&candidate, &["maintenance", "run"]);
     assert!(
         rs.status.success(),
         "sley maintenance run failed: {}",
@@ -364,7 +364,7 @@ fn maintenance_run_aborts_when_lock_exists() {
     );
     fs::write(repo.join(".git/objects/maintenance.lock"), b"in use\n").expect("write lock");
 
-    let out = git_rs(&repo, &["maintenance", "run"]);
+    let out = sley(&repo, &["maintenance", "run"]);
     assert!(
         !out.status.success(),
         "maintenance run unexpectedly succeeded"
@@ -397,7 +397,7 @@ fn maintenance_run_quiet_accepted() {
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
 
-    let out = git_rs(&repo, &["maintenance", "run", "--quiet"]);
+    let out = sley(&repo, &["maintenance", "run", "--quiet"]);
     assert!(
         out.status.success(),
         "sley maintenance run --quiet failed: {}",
@@ -427,7 +427,7 @@ fn repack_d_keeps_repository_complete() {
         git_ok(&repo, &["add", "."]);
         git_ok(&repo, &["commit", "-qm", &format!("c{i}")]);
     }
-    let out = git_rs(&repo, &["repack", "-d"]);
+    let out = sley(&repo, &["repack", "-d"]);
     assert!(
         out.status.success(),
         "sley repack -d failed: {}",

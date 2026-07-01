@@ -86,8 +86,8 @@ fn prepare_repo(root: &Path) {
     );
 }
 
-fn git_rs() -> &'static str {
-    env!("CARGO_BIN_EXE_sley")
+fn sley() -> &'static str {
+    sley_testkit::sley_bin!()
 }
 
 fn hash_blob(root: &Path, body: &[u8]) -> String {
@@ -124,7 +124,7 @@ fn mktree_basic_and_z_modes_match_upstream_git() {
             &["mktree"],
             input.as_bytes(),
         );
-        let actual_output = run_with_stdin(git_rs(), &actual, &["mktree"], input.as_bytes());
+        let actual_output = run_with_stdin(sley(), &actual, &["mktree"], input.as_bytes());
         let actual_tree = String::from_utf8(actual_output.stdout.clone())
             .expect("mktree output is utf8")
             .trim()
@@ -152,7 +152,7 @@ fn mktree_basic_and_z_modes_match_upstream_git() {
             &["mktree", "-z"],
             &nul_input,
         );
-        let actual_output = run_with_stdin(git_rs(), &actual, &["mktree", "-z"], &nul_input);
+        let actual_output = run_with_stdin(sley(), &actual, &["mktree", "-z"], &nul_input);
         assert_same_output(actual_output, expected_output, &["mktree", "-z"]);
     };
     let _ = fs::remove_dir_all(&root);
@@ -174,7 +174,7 @@ fn mktree_missing_commit_and_batch_modes_match_upstream_git() {
             &["mktree"],
             missing_blob.as_bytes(),
         );
-        let actual_output = run_with_stdin(git_rs(), &actual, &["mktree"], missing_blob.as_bytes());
+        let actual_output = run_with_stdin(sley(), &actual, &["mktree"], missing_blob.as_bytes());
         assert_same_output(actual_output, expected_output, &["mktree"]);
 
         let expected_output = run_with_stdin(
@@ -184,7 +184,7 @@ fn mktree_missing_commit_and_batch_modes_match_upstream_git() {
             missing_blob.as_bytes(),
         );
         let actual_output = run_with_stdin(
-            git_rs(),
+            sley(),
             &actual,
             &["mktree", "--missing"],
             missing_blob.as_bytes(),
@@ -198,7 +198,7 @@ fn mktree_missing_commit_and_batch_modes_match_upstream_git() {
             &["mktree"],
             commit_entry.as_bytes(),
         );
-        let actual_output = run_with_stdin(git_rs(), &actual, &["mktree"], commit_entry.as_bytes());
+        let actual_output = run_with_stdin(sley(), &actual, &["mktree"], commit_entry.as_bytes());
         assert_same_output(actual_output, expected_output, &["mktree"]);
 
         let a = hash_blob(&expected, b"a");
@@ -213,7 +213,7 @@ fn mktree_missing_commit_and_batch_modes_match_upstream_git() {
             batch.as_bytes(),
         );
         let actual_output =
-            run_with_stdin(git_rs(), &actual, &["mktree", "--batch"], batch.as_bytes());
+            run_with_stdin(sley(), &actual, &["mktree", "--batch"], batch.as_bytes());
         assert_same_output(actual_output, expected_output, &["mktree", "--batch"]);
     };
     let _ = fs::remove_dir_all(&root);

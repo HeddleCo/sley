@@ -363,7 +363,7 @@ fn bundle_list_heads_matches_upstream_git() {
             vec!["bundle", "list-heads", bundle, "feature/topic"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -383,7 +383,7 @@ fn bundle_list_heads_matches_upstream_git_sha256() {
             vec!["bundle", "list-heads", bundle, "feature/topic"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -403,7 +403,7 @@ fn bundle_verify_matches_upstream_git() {
             vec!["bundle", "verify", "--quiet", bundle],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -424,7 +424,7 @@ fn bundle_verify_prerequisites_match_upstream_git() {
         let bundle = bundle.to_str().expect("bundle path is utf8");
         let args = ["bundle", "verify", bundle];
         let expected = run(sley_testkit::oracle_git(), &source, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &source, &args);
+        let actual = run(sley_testkit::sley_bin!(), &source, &args);
         assert_same_output(actual, expected, &args);
 
         run_success(
@@ -438,7 +438,7 @@ fn bundle_verify_prerequisites_match_upstream_git() {
             &["init", "-q", "-b", "main"],
         );
         let expected = run(sley_testkit::oracle_git(), &expected_empty, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_empty, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_empty, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -453,7 +453,7 @@ fn bundle_create_all_writes_upstream_readable_bundle() {
         let actual_bundle = root.join("actual.bundle");
         let actual_bundle_arg = actual_bundle.to_str().expect("bundle path is utf8");
         run_success(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["bundle", "create", actual_bundle_arg, "--all"],
         );
@@ -510,7 +510,7 @@ fn bundle_create_all_writes_upstream_readable_sha256_bundle() {
         let actual_bundle = root.join("actual.bundle");
         let actual_bundle_arg = actual_bundle.to_str().expect("bundle path is utf8");
         run_success(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["bundle", "create", actual_bundle_arg, "--all"],
         );
@@ -580,7 +580,7 @@ fn bundle_create_all_with_explicit_revisions_matches_upstream() {
         let args = ["bundle", "create", expected_bundle_arg, "--all", "HEAD"];
         let expected = run(sley_testkit::oracle_git(), &root, &args);
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["bundle", "create", actual_bundle_arg, "--all", "HEAD"],
         );
@@ -640,7 +640,7 @@ fn bundle_create_all_with_explicit_revisions_matches_upstream() {
             &["bundle", "create", expected_empty_arg, "--all", "^HEAD"],
         );
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["bundle", "create", actual_empty_arg, "--all", "^HEAD"],
         );
@@ -743,7 +743,7 @@ fn bundle_create_incremental_writes_upstream_readable_bundle() {
             ],
         );
         run_success(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &source,
             &[
                 "bundle",
@@ -842,7 +842,7 @@ fn fetch_bundle_refspec_matches_upstream_git() {
         ];
 
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
 
         let expected_ref = run_success(
@@ -902,7 +902,7 @@ fn fetch_bundle_no_tags_disables_auto_follow_like_upstream_git() {
         ];
 
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -973,7 +973,7 @@ fn fetch_bundle_tags_fetches_unfollowed_tags_like_upstream_git() {
         ];
 
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -1028,7 +1028,7 @@ fn fetch_bundle_source_ref_writes_fetch_head_without_ref_update() {
         let args = ["fetch", "-q", bundle, "refs/heads/feature/topic"];
 
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -1076,7 +1076,7 @@ fn fetch_bundle_default_head_writes_fetch_head_without_ref_update() {
         let args = ["fetch", "-q", bundle];
 
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -1129,7 +1129,7 @@ fn fetch_local_repository_refspec_matches_upstream_git() {
         ];
 
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
 
         let expected_ref = run_success(
@@ -1206,7 +1206,7 @@ fn fetch_ssh_repository_refspec_matches_upstream_git_protocol_v0() {
             &[("GIT_SSH", fake_ssh)],
         );
         let actual = run_with_env(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_repo,
             &args,
             &[("GIT_SSH", fake_ssh)],
@@ -1294,7 +1294,7 @@ fn fetch_configured_percent_encoded_ssh_remote_matches_upstream_git_protocol_v0(
             &[("GIT_SSH", fake_ssh)],
         );
         let actual = run_with_env(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_repo,
             &args,
             &[("GIT_SSH", fake_ssh)],
@@ -1376,7 +1376,7 @@ fn fetch_configured_ssh_remote_prune_matches_upstream_git_protocol_v0() {
             &[("GIT_SSH", fake_ssh)],
         );
         run_success_with_env(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_repo,
             &initial_args,
             &[("GIT_SSH", fake_ssh)],
@@ -1404,7 +1404,7 @@ fn fetch_configured_ssh_remote_prune_matches_upstream_git_protocol_v0() {
             &[("GIT_SSH", fake_ssh)],
         );
         let actual = run_with_env(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_repo,
             &args,
             &[("GIT_SSH", fake_ssh)],
@@ -1473,7 +1473,7 @@ fn fetch_local_repository_no_tags_disables_auto_follow_like_upstream_git() {
         ];
 
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -1533,7 +1533,7 @@ fn fetch_local_repository_tags_fetches_unfollowed_tags_like_upstream_git() {
         ];
 
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -1588,7 +1588,7 @@ fn fetch_local_repository_default_head_writes_fetch_head_without_ref_update() {
         let args = ["fetch", "-q", source];
 
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -1658,7 +1658,7 @@ fn fetch_configured_local_remote_matches_upstream_git() {
             );
 
             let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+            let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
                 fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -1743,7 +1743,7 @@ fn fetch_configured_local_remote_tagopt_matches_upstream_git() {
             run_success(sley_testkit::oracle_git(), &actual_repo, &remote_args);
 
             let expected = run(sley_testkit::oracle_git(), &expected_repo, &fetch_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &fetch_args);
+            let actual = run(sley_testkit::sley_bin!(), &actual_repo, &fetch_args);
             assert_same_output(actual, expected, &fetch_args);
             assert_eq!(
                 fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -1841,7 +1841,7 @@ fn fetch_configured_local_remote_prune_matches_upstream_git() {
             &["fetch", "-q", "origin"],
         );
         run_success(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_repo,
             &["fetch", "-q", "origin"],
         );
@@ -1853,7 +1853,7 @@ fn fetch_configured_local_remote_prune_matches_upstream_git() {
 
         let dry_run_args = ["fetch", "-q", "--dry-run", "--prune", "origin"];
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &dry_run_args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &dry_run_args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &dry_run_args);
         assert_same_output(actual, expected, &dry_run_args);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -1876,7 +1876,7 @@ fn fetch_configured_local_remote_prune_matches_upstream_git() {
 
         let args = ["fetch", "-q", "--prune", "origin"];
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -1958,7 +1958,7 @@ fn fetch_configured_local_remote_prune_config_matches_upstream_git() {
                     &["fetch", "-q", "origin"],
                 );
                 run_success(
-                    env!("CARGO_BIN_EXE_sley"),
+                    sley_testkit::sley_bin!(),
                     &actual_repo,
                     &["fetch", "-q", "origin"],
                 );
@@ -1973,7 +1973,7 @@ fn fetch_configured_local_remote_prune_config_matches_upstream_git() {
                 }
 
                 let expected = run(sley_testkit::oracle_git(), &expected_repo, &fetch_args);
-                let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &fetch_args);
+                let actual = run(sley_testkit::sley_bin!(), &actual_repo, &fetch_args);
                 assert_same_output(actual, expected, &fetch_args);
                 assert_eq!(
                     fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -2084,7 +2084,7 @@ fn fetch_configured_local_remote_dry_run_matches_upstream_git() {
 
         let dry_run_args = ["fetch", "-q", "--dry-run", "origin"];
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &dry_run_args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &dry_run_args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &dry_run_args);
         assert_same_output(actual, expected, &dry_run_args);
         assert_eq!(
             read_optional(&expected_repo.join(".git").join("FETCH_HEAD")),
@@ -2102,7 +2102,7 @@ fn fetch_configured_local_remote_dry_run_matches_upstream_git() {
 
         let fetch_args = ["fetch", "-q", "--dry-run", "--no-dry-run", "origin"];
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &fetch_args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &fetch_args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &fetch_args);
         assert_same_output(actual, expected, &fetch_args);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -2174,7 +2174,7 @@ fn fetch_configured_local_remote_append_matches_upstream_git() {
             vec!["fetch", "-q", "--append", "--no-append", "origin"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+            let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
                 fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -2238,7 +2238,7 @@ fn fetch_configured_local_remote_no_write_fetch_head_matches_upstream_git() {
 
         let args = ["fetch", "-q", "--no-write-fetch-head", "origin"];
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             read_optional(&expected_repo.join(".git").join("FETCH_HEAD")),
@@ -2276,7 +2276,7 @@ fn fetch_configured_local_remote_no_write_fetch_head_matches_upstream_git() {
             "origin",
         ];
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -2380,7 +2380,7 @@ fn fetch_local_repository_linked_worktree_head_matches_upstream_git() {
 
         let args = ["fetch", "-q", linked_arg];
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -2455,7 +2455,7 @@ fn fetch_file_url_and_rewritten_url_match_upstream_git() {
 
             let args = args.iter().map(String::as_str).collect::<Vec<_>>();
             let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+            let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
                 fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -2516,7 +2516,7 @@ fn fetch_file_url_percent_encoded_path_matches_upstream_git() {
         ];
 
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -2572,7 +2572,7 @@ fn fetch_configured_file_url_percent_encoded_path_matches_upstream_git() {
             &["remote", "add", "origin", source_file_url.as_str()],
         );
         run_success(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_repo,
             &["remote", "add", "origin", source_file_url.as_str()],
         );
@@ -2584,7 +2584,7 @@ fn fetch_configured_file_url_percent_encoded_path_matches_upstream_git() {
         ];
 
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -2641,7 +2641,7 @@ fn fetch_sha256_file_url_imports_objects_like_upstream_git() {
             "refs/heads/feature/topic:refs/remotes/file/feature/topic",
         ];
         let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+        let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         let actual_git_dir = actual_repo.join(".git");
         let (_pack_path, index_path) = repository_pack_pair(&actual_git_dir);
@@ -2701,7 +2701,7 @@ fn fetch_local_repository_protocol_pack_excludes_existing_haves() {
         );
         let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
         run_success(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_repo,
             &["fetch", "-q", source_arg, &refspec],
         );
@@ -2735,7 +2735,7 @@ fn fetch_local_repository_protocol_pack_excludes_existing_haves() {
         .trim()
         .to_string();
         run_success(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_repo,
             &["fetch", "-q", source_arg, &refspec],
         );
@@ -2799,7 +2799,7 @@ fn bundle_unbundle_matches_upstream_git_and_imports_objects() {
             vec!["bundle", "unbundle", bundle, "refs/heads/feature/topic"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
+            let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
 

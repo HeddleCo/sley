@@ -141,7 +141,7 @@ fn pull_fast_forward_matches_upstream_git() {
     prepare_fast_forward_clone(&upstream, &actual);
     let args = ["pull"];
     let expected_output = run_output_with_identity(sley_testkit::oracle_git(), &expected, &args);
-    let actual_output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+    let actual_output = run_output_with_identity(sley_testkit::sley_bin!(), &actual, &args);
     assert_eq!(
         actual_output.status.code(),
         expected_output.status.code(),
@@ -164,7 +164,7 @@ fn pull_fast_forward_matches_upstream_git() {
             &["rev-parse", "HEAD"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &actual, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after fast-forward pull"
     );
     let _ = fs::remove_dir_all(&root);
@@ -184,7 +184,7 @@ fn pull_three_way_clean_matches_upstream_git() {
     prepare_three_way_clone(&upstream, &actual);
     let args = ["pull"];
     let expected_output = run_output_with_identity(sley_testkit::oracle_git(), &expected, &args);
-    let actual_output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+    let actual_output = run_output_with_identity(sley_testkit::sley_bin!(), &actual, &args);
     assert_eq!(
         actual_output.status.code(),
         expected_output.status.code(),
@@ -206,7 +206,7 @@ fn pull_three_way_clean_matches_upstream_git() {
             &["rev-parse", "HEAD"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &actual, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after three-way pull"
     );
     let _ = fs::remove_dir_all(&root);

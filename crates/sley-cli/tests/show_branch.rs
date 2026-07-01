@@ -74,8 +74,8 @@ fn git_ok(cwd: &Path, args: &[&str]) {
     );
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env_dated(env!("CARGO_BIN_EXE_sley"), cwd, args, &base_date())
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env_dated(sley_testkit::sley_bin!(), cwd, args, &base_date())
 }
 
 fn git_available() -> bool {
@@ -165,7 +165,7 @@ impl RepoBuilder {
 /// stdout, stderr, and exit code.
 fn assert_same(repo: &Path, args: &[&str]) {
     let g = git(repo, args);
-    let r = git_rs(repo, args);
+    let r = sley(repo, args);
     assert_eq!(
         String::from_utf8_lossy(&r.stdout),
         String::from_utf8_lossy(&g.stdout),

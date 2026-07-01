@@ -50,8 +50,8 @@ fn git_ok(cwd: &Path, args: &[&str]) {
     );
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git_available() -> bool {
@@ -66,7 +66,7 @@ fn git_available() -> bool {
 /// given argument vector run in `cwd`.
 fn assert_same(cwd: &Path, args: &[&str]) {
     let g = git(cwd, args);
-    let r = git_rs(cwd, args);
+    let r = sley(cwd, args);
     assert_eq!(
         String::from_utf8_lossy(&r.stdout),
         String::from_utf8_lossy(&g.stdout),
@@ -87,7 +87,7 @@ fn assert_same(cwd: &Path, args: &[&str]) {
 }
 
 fn assert_sley_stdout(cwd: &Path, args: &[&str], expected: &str) {
-    let r = git_rs(cwd, args);
+    let r = sley(cwd, args);
     assert_eq!(
         String::from_utf8_lossy(&r.stdout),
         expected,

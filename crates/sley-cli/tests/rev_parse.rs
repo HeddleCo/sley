@@ -42,8 +42,8 @@ fn run(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -92,17 +92,17 @@ fn rev_parse_is_shallow_repository_matches_upstream_git() {
         git(&root, &["init", "-q", "-b", "main"]);
         let args = ["rev-parse", "--is-shallow-repository"];
 
-        assert_eq!(git_rs(&root, &args), git(&root, &args));
+        assert_eq!(sley(&root, &args), git(&root, &args));
         let superproject = ["rev-parse", "--show-superproject-working-tree"];
-        assert_eq!(git_rs(&root, &superproject), git(&root, &superproject));
+        assert_eq!(sley(&root, &superproject), git(&root, &superproject));
 
         fs::write(root.join(".git").join("shallow"), b"").expect("write shallow marker");
-        assert_eq!(git_rs(&root, &args), git(&root, &args));
+        assert_eq!(sley(&root, &args), git(&root, &args));
 
         let bare = root.join("bare.git");
         git(&root, &["init", "-q", "--bare", "bare.git", "-b", "main"]);
         fs::write(bare.join("shallow"), b"").expect("write bare shallow marker");
-        assert_eq!(git_rs(&bare, &args), git(&bare, &args));
+        assert_eq!(sley(&bare, &args), git(&bare, &args));
     };
     let _ = fs::remove_dir_all(&root);
 }
@@ -123,7 +123,7 @@ fn rev_parse_git_common_dir_matches_upstream_git() {
                 ["rev-parse", "--git-common-dir"],
             ] {
                 assert_eq!(
-                    git_rs(cwd, &args),
+                    sley(cwd, &args),
                     git(cwd, &args),
                     "sley result differed for {args:?} in {}",
                     cwd.display()
@@ -143,7 +143,7 @@ fn rev_parse_git_common_dir_matches_upstream_git() {
                 ["rev-parse", "--git-common-dir"],
             ] {
                 assert_eq!(
-                    git_rs(cwd, &args),
+                    sley(cwd, &args),
                     git(cwd, &args),
                     "sley result differed for {args:?} in {}",
                     cwd.display()
@@ -178,7 +178,7 @@ fn rev_parse_inside_repository_flags_match_upstream_git() {
                 ["rev-parse", "--is-bare-repository"],
             ] {
                 assert_eq!(
-                    git_rs(cwd, &args),
+                    sley(cwd, &args),
                     git(cwd, &args),
                     "sley result differed for {args:?} in {}",
                     cwd.display()
@@ -256,12 +256,12 @@ fn rev_parse_core_bare_config_matches_upstream_git() {
                         let envs = [("GIT_DIR", git_dir)];
                         (
                             run_status_with_env(sley_testkit::oracle_git(), cwd, args, &envs),
-                            run_status_with_env(env!("CARGO_BIN_EXE_sley"), cwd, args, &envs),
+                            run_status_with_env(sley_testkit::sley_bin!(), cwd, args, &envs),
                         )
                     }
                     None => (
                         run_status(sley_testkit::oracle_git(), cwd, args),
-                        run_status(env!("CARGO_BIN_EXE_sley"), cwd, args),
+                        run_status(sley_testkit::sley_bin!(), cwd, args),
                     ),
                 };
                 assert_eq!(
@@ -314,7 +314,7 @@ fn rev_parse_worktree_path_options_match_upstream_git() {
                 ["rev-parse", "--show-cdup"],
             ] {
                 let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
-                let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
+                let actual = run_status(sley_testkit::sley_bin!(), cwd, &args);
                 assert_eq!(
                     actual,
                     expected,
@@ -344,7 +344,7 @@ fn rev_parse_show_ref_format_matches_upstream_git() {
         let args = ["rev-parse", "--show-ref-format"];
         for cwd in [&root, &nested, &bare, &bare_nested] {
             assert_eq!(
-                git_rs(cwd, &args),
+                sley(cwd, &args),
                 git(cwd, &args),
                 "sley result differed for {args:?} in {}",
                 cwd.display()
@@ -411,7 +411,7 @@ fn rev_parse_submodule_gitfile_matches_upstream_git() {
                 vec!["rev-parse", "--git-path", "index"],
             ] {
                 let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
-                let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
+                let actual = run_status(sley_testkit::sley_bin!(), cwd, &args);
                 assert_eq!(
                     actual,
                     expected,
@@ -460,7 +460,7 @@ fn rev_parse_path_format_matches_upstream_git() {
                 ],
             ] {
                 let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
-                let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
+                let actual = run_status(sley_testkit::sley_bin!(), cwd, &args);
                 assert_eq!(
                     actual,
                     expected,
@@ -510,7 +510,7 @@ fn rev_parse_git_path_matches_upstream_git() {
                 vec!["rev-parse", "--git-path", "--git-dir"],
             ] {
                 let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
-                let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
+                let actual = run_status(sley_testkit::sley_bin!(), cwd, &args);
                 assert_eq!(
                     actual,
                     expected,
@@ -565,7 +565,7 @@ fn rev_parse_git_path_matches_upstream_git() {
             ),
         ] {
             let expected = run_status_with_env(sley_testkit::oracle_git(), &root, &args, &envs);
-            let actual = run_status_with_env(env!("CARGO_BIN_EXE_sley"), &root, &args, &envs);
+            let actual = run_status_with_env(sley_testkit::sley_bin!(), &root, &args, &envs);
             assert_eq!(
                 actual, expected,
                 "sley result differed for {args:?} with env {envs:?}"
@@ -610,7 +610,7 @@ fn rev_parse_resolve_git_dir_matches_upstream_git() {
                 ],
             ] {
                 let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
-                let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
+                let actual = run_status(sley_testkit::sley_bin!(), cwd, &args);
                 assert_eq!(
                     actual,
                     expected,
@@ -643,7 +643,7 @@ fn rev_parse_local_env_vars_and_path_format_errors_match_upstream_git() {
                 vec!["rev-parse", "--path-format=bogus", "--git-dir"],
             ] {
                 let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
-                let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
+                let actual = run_status(sley_testkit::sley_bin!(), cwd, &args);
                 assert_eq!(
                     actual,
                     expected,
@@ -674,7 +674,7 @@ fn rev_parse_sq_quote_matches_upstream_git() {
                 vec!["rev-parse", "--sq-quote", "--", "--flag"],
             ] {
                 let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
-                let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
+                let actual = run_status(sley_testkit::sley_bin!(), cwd, &args);
                 assert_eq!(
                     actual,
                     expected,
@@ -714,7 +714,7 @@ fn rev_parse_object_format_modes_match_upstream_git() {
                 vec!["rev-parse", "--show-object-format="],
             ] {
                 let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
-                let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
+                let actual = run_status(sley_testkit::sley_bin!(), cwd, &args);
                 assert_eq!(
                     actual,
                     expected,
@@ -760,7 +760,7 @@ fn rev_parse_verify_quiet_missing_matches_upstream_git() {
             vec!["rev-parse", "--verify", "--end-of-options", "HEAD"],
         ] {
             let expected = run_status(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_status(sley_testkit::sley_bin!(), &root, &args);
             assert_eq!(actual, expected, "sley result differed for {args:?}");
         }
     };
@@ -794,14 +794,14 @@ fn rev_parse_abbreviated_object_ids_match_upstream_git() {
             .to_string();
         let loose_prefix = &head[..8];
         assert_eq!(
-            git_rs(&root, &["rev-parse", loose_prefix]),
+            sley(&root, &["rev-parse", loose_prefix]),
             git(&root, &["rev-parse", loose_prefix])
         );
 
         git(&root, &["gc", "--quiet"]);
         let packed_prefix = &head[..10];
         assert_eq!(
-            git_rs(&root, &["rev-parse", packed_prefix]),
+            sley(&root, &["rev-parse", packed_prefix]),
             git(&root, &["rev-parse", packed_prefix])
         );
     };
@@ -853,7 +853,7 @@ fn rev_parse_hex_refname_prefers_ref_and_warns_like_upstream_git() {
 
         let args = ["rev-parse", hex_ref];
         let expected = run_status(sley_testkit::oracle_git(), &root, &args);
-        let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_status(sley_testkit::sley_bin!(), &root, &args);
         assert_eq!(actual, expected);
     };
     let _ = fs::remove_dir_all(&root);
@@ -916,7 +916,7 @@ fn rev_parse_parent_suffixes_use_upstream_commit_graph() {
             vec!["rev-parse", "HEAD^2~1"],
         ] {
             assert_eq!(
-                git_rs(&root, &args),
+                sley(&root, &args),
                 git(&root, &args),
                 "sley result differed for {args:?}"
             );
@@ -926,7 +926,7 @@ fn rev_parse_parent_suffixes_use_upstream_commit_graph() {
 }
 
 fn rev_parse_terminates(cwd: &Path, args: &[&str]) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sley"))
+    let mut child = Command::new(sley_testkit::sley_bin!())
         .current_dir(cwd)
         .args(args)
         .stdout(std::process::Stdio::piped())

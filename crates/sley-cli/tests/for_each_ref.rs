@@ -49,24 +49,24 @@ fn run(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
     run(sley_testkit::oracle_git(), cwd, args)
 }
 
-fn git_rs_raw(cwd: &Path, args: &[&str]) -> Output {
-    run_raw(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley_raw(cwd: &Path, args: &[&str]) -> Output {
+    run_raw(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git_raw(cwd: &Path, args: &[&str]) -> Output {
     run_raw(sley_testkit::oracle_git(), cwd, args)
 }
 
-fn git_rs_raw_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Output {
-    run_raw_with_stdin(env!("CARGO_BIN_EXE_sley"), cwd, args, stdin)
+fn sley_raw_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Output {
+    run_raw_with_stdin(sley_testkit::sley_bin!(), cwd, args, stdin)
 }
 
 fn git_raw_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Output {
@@ -1122,7 +1122,7 @@ fn for_each_ref_minimal_formats_match_upstream_git() {
             vec!["for-each-ref", "--format=%% %(refname)%n%(objecttype)"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
 
@@ -1150,7 +1150,7 @@ fn for_each_ref_minimal_formats_match_upstream_git() {
             ),
         ] {
             let expected = git_raw_with_stdin(&root, &args, stdin);
-            let actual = git_rs_raw_with_stdin(&root, &args, stdin);
+            let actual = sley_raw_with_stdin(&root, &args, stdin);
             assert_eq!(
                 actual.status.code(),
                 expected.status.code(),
@@ -1169,7 +1169,7 @@ fn for_each_ref_minimal_formats_match_upstream_git() {
         git(&root, &["config", "core.abbrev", "12"]);
         let args = ["for-each-ref", "--format=%(objectname:short)"];
         let expected = git(&root, &args);
-        let actual = git_rs(&root, &args);
+        let actual = sley(&root, &args);
         assert_eq!(
             actual, expected,
             "sley output differed for core.abbrev-driven objectname:short"
@@ -1184,7 +1184,7 @@ fn for_each_ref_minimal_formats_match_upstream_git() {
             ["for-each-ref", "--format=%(*objectname:short=abc)"],
         ] {
             let expected = git_raw(&root, &args);
-            let actual = git_rs_raw(&root, &args);
+            let actual = sley_raw(&root, &args);
             assert!(
                 !expected.status.success(),
                 "upstream git unexpectedly accepted {args:?}"
@@ -1254,7 +1254,7 @@ fn for_each_ref_direct_remote_refspecs_match_upstream_git() {
             ],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -1303,7 +1303,7 @@ fn for_each_ref_name_only_format_skips_missing_object() {
         .expect("write dangling loose ref");
 
         // Sanity: the object really is missing (so any read would fail).
-        let missing = git_rs_raw(&root, &["cat-file", "-e", dangling]);
+        let missing = sley_raw(&root, &["cat-file", "-e", dangling]);
         assert!(
             !missing.status.success(),
             "fixture invalid: object {dangling} unexpectedly present"
@@ -1311,7 +1311,7 @@ fn for_each_ref_name_only_format_skips_missing_object() {
 
         let args = ["for-each-ref", "--format=%(objectname) %(refname)"];
         let expected = git(&root, &args);
-        let actual = git_rs(&root, &args);
+        let actual = sley(&root, &args);
         assert_eq!(
             actual, expected,
             "name-only for-each-ref must match git without reading the object"

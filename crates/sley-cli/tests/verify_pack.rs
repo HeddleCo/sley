@@ -21,7 +21,7 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
 
 fn assert_status_stdout_stderr_match(cwd: &Path, args: &[&str]) {
     let expected = run_output(sley_testkit::oracle_git(), cwd, args);
-    let actual = run_output(env!("CARGO_BIN_EXE_sley"), cwd, args);
+    let actual = run_output(sley_testkit::sley_bin!(), cwd, args);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),

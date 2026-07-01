@@ -8172,14 +8172,7 @@ fn delete_merged_branches(
     let head_reachable = resolve_revision(git_dir, format, "HEAD")
         .ok()
         .and_then(|head| sley_rev::peel_to_commit(&db, format, &head).ok())
-        .map(|head| {
-            sley_rev::walk_commits(&db, format, [head]).map(|records| {
-                records
-                    .into_iter()
-                    .map(|record| record.oid)
-                    .collect::<HashSet<_>>()
-            })
-        })
+        .map(|head| sley_rev::reachable_commit_oids(git_dir, format, &db, [head], false))
         .transpose()?;
 
     let mut failed = false;
@@ -8216,6 +8209,7 @@ fn delete_merged_branches(
         };
         let reachable = branch_delete_reachable_base(
             store,
+            git_dir,
             &db,
             format,
             &config,
@@ -8257,6 +8251,7 @@ fn branch_delete_display(branch: &str, refname: &str, oid: &ObjectId) -> String 
 
 fn branch_delete_reachable_base<'a>(
     store: &FileRefStore,
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     config: &GitConfig,
@@ -8273,10 +8268,7 @@ fn branch_delete_reachable_base<'a>(
         if let Some((oid, _)) = resolve_for_each_ref_target(store, &upstream_ref)?
             && let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid)
         {
-            let reachable = sley_rev::walk_commits(db, format, [commit])?
-                .into_iter()
-                .map(|record| record.oid)
-                .collect::<HashSet<_>>();
+            let reachable = sley_rev::reachable_commit_oids(git_dir, format, db, [commit], false)?;
             return Ok(Some(Cow::Owned(reachable)));
         }
     }
@@ -8725,6 +8717,9 @@ fn print_branch_list_contains_filters_matching(
         .iter()
         .map(|oid| sley_rev::peel_to_commit(&db, format, oid))
         .collect::<Result<Vec<_>>>()?;
+    let contains_target_set = contains_targets.iter().copied().collect::<HashSet<_>>();
+    let no_contains_target_set = no_contains_targets.iter().copied().collect::<HashSet<_>>();
+    let mut reachability = sley_rev::CommitReachability::new(git_dir, format, &db);
     let mut included = HashSet::new();
     for reference in branch_refs_for_mode(store, mode)? {
         let RefTarget::Direct(tip) = &reference.target else {
@@ -8733,18 +8728,13 @@ fn print_branch_list_contains_filters_matching(
         let Ok(tip) = sley_rev::peel_to_commit(&db, format, tip) else {
             continue;
         };
-        let reachable = sley_rev::walk_commits(&db, format, [tip])?
-            .into_iter()
-            .map(|record| record.oid)
-            .collect::<HashSet<_>>();
-        let contains_match = contains_targets.is_empty()
-            || contains_targets
-                .iter()
-                .any(|target| reachable.contains(target));
-        let no_contains_match = no_contains_targets
-            .iter()
-            .any(|target| reachable.contains(target));
-        if contains_match && !no_contains_match {
+        let target_match = reachability.target_match(
+            &tip,
+            &contains_target_set,
+            &no_contains_target_set,
+            false,
+        )?;
+        if target_match.reached_required && !target_match.reached_excluded {
             included.insert(reference.name.clone());
         }
     }
@@ -8811,30 +8801,17 @@ fn print_branch_list_merged_filters_matching(
     patterns: &[String],
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let merged_reachable = merged_oids
+    let merged_targets = merged_oids
         .iter()
-        .map(|oid| {
-            let target = sley_rev::peel_to_commit(&db, format, oid)?;
-            sley_rev::walk_commits(&db, format, [target]).map(|records| {
-                records
-                    .into_iter()
-                    .map(|record| record.oid)
-                    .collect::<HashSet<_>>()
-            })
-        })
+        .map(|oid| sley_rev::peel_to_commit(&db, format, oid))
         .collect::<Result<Vec<_>>>()?;
-    let no_merged_reachable = no_merged_oids
+    let no_merged_targets = no_merged_oids
         .iter()
-        .map(|oid| {
-            let target = sley_rev::peel_to_commit(&db, format, oid)?;
-            sley_rev::walk_commits(&db, format, [target]).map(|records| {
-                records
-                    .into_iter()
-                    .map(|record| record.oid)
-                    .collect::<HashSet<_>>()
-            })
-        })
+        .map(|oid| sley_rev::peel_to_commit(&db, format, oid))
         .collect::<Result<Vec<_>>>()?;
+    let mut reachability = sley_rev::CommitReachability::new(git_dir, format, &db);
+    let merged_reachable = reachability.reachable_oids(merged_targets, false)?;
+    let no_merged_reachable = reachability.reachable_oids(no_merged_targets, false)?;
     let mut included = HashSet::new();
     for reference in branch_refs_for_mode(store, mode)? {
         let RefTarget::Direct(tip) = &reference.target else {
@@ -8843,9 +8820,8 @@ fn print_branch_list_merged_filters_matching(
         let Ok(tip) = sley_rev::peel_to_commit(&db, format, tip) else {
             continue;
         };
-        let merged_match =
-            merged_reachable.is_empty() || merged_reachable.iter().any(|set| set.contains(&tip));
-        let no_merged_match = no_merged_reachable.iter().any(|set| set.contains(&tip));
+        let merged_match = merged_oids.is_empty() || merged_reachable.contains(&tip);
+        let no_merged_match = no_merged_reachable.contains(&tip);
         if merged_match && !no_merged_match {
             included.insert(reference.name.clone());
         }

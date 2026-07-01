@@ -21,7 +21,7 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
 
 fn assert_status_stderr_match(cwd: &Path, args: &[&str]) {
     let expected = run_output(sley_testkit::oracle_git(), cwd, args);
-    let actual = run_output(env!("CARGO_BIN_EXE_sley"), cwd, args);
+    let actual = run_output(sley_testkit::sley_bin!(), cwd, args);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),
@@ -101,7 +101,7 @@ fn unpack_file_matches_upstream_git() {
         let blob = String::from_utf8(blob.stdout).expect("utf8 oid");
         let blob = blob.trim();
         let (_git_path, git_contents) = unpack_file(sley_testkit::oracle_git(), &root, blob);
-        let (_sley_path, sley_contents) = unpack_file(env!("CARGO_BIN_EXE_sley"), &root, blob);
+        let (_sley_path, sley_contents) = unpack_file(sley_testkit::sley_bin!(), &root, blob);
         assert_eq!(
             sley_contents, git_contents,
             "unpacked blob contents differed"
@@ -110,7 +110,7 @@ fn unpack_file_matches_upstream_git() {
         let (_git_path, git_contents) =
             unpack_file(sley_testkit::oracle_git(), &root, "HEAD:file.txt");
         let (_sley_path, sley_contents) =
-            unpack_file(env!("CARGO_BIN_EXE_sley"), &root, "HEAD:file.txt");
+            unpack_file(sley_testkit::sley_bin!(), &root, "HEAD:file.txt");
         assert_eq!(
             sley_contents, git_contents,
             "revision path unpacked contents differed"

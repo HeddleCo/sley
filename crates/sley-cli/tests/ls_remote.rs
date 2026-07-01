@@ -216,7 +216,7 @@ fn ls_remote_local_repository_matches_upstream_git() {
             vec!["ls-remote", "--get-url", remote_file_url.as_str()],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -253,7 +253,7 @@ fn ls_remote_local_repository_matches_upstream_git() {
             vec!["ls-remote", "--sort=creatordate", remote_file_url.as_str()],
         ] {
             let expected = run(sley_testkit::oracle_git(), &remote, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &remote, &args);
+            let actual = run(sley_testkit::sley_bin!(), &remote, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -289,7 +289,7 @@ fn ls_remote_local_repository_matches_upstream_git() {
             vec!["ls-remote", "--heads", "alias/remote"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &client, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &client, &args);
+            let actual = run(sley_testkit::sley_bin!(), &client, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -326,7 +326,7 @@ fn ls_remote_ssh_repository_matches_upstream_git_protocol_v0() {
                 &[("GIT_SSH", fake_ssh)],
             );
             let actual = run_with_env(
-                env!("CARGO_BIN_EXE_sley"),
+                sley_testkit::sley_bin!(),
                 &root,
                 &args,
                 &[("GIT_SSH", fake_ssh)],
@@ -375,7 +375,7 @@ fn ls_remote_configured_percent_encoded_ssh_remote_matches_upstream_git() {
                 &[("GIT_SSH", fake_ssh)],
             );
             let actual = run_with_env(
-                env!("CARGO_BIN_EXE_sley"),
+                sley_testkit::sley_bin!(),
                 &client,
                 &args,
                 &[("GIT_SSH", fake_ssh)],
@@ -452,7 +452,7 @@ fn ls_remote_configured_local_remote_matches_upstream_git() {
             vec!["ls-remote", "--get-url", "alias-origin"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &client, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &client, &args);
+            let actual = run(sley_testkit::sley_bin!(), &client, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -509,7 +509,7 @@ fn ls_remote_configured_percent_encoded_file_remote_matches_upstream_git() {
             vec!["ls-remote", "--symref", "origin", "HEAD"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &client, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &client, &args);
+            let actual = run(sley_testkit::sley_bin!(), &client, &args);
             assert_same_output(actual, expected, &args);
         }
     };

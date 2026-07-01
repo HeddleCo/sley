@@ -1,13 +1,15 @@
 ================================================================================
-git-rs UPSTREAM GAP MAP (foundational subset)
+SLEY UPSTREAM GAP MAP (foundational subset)
 ================================================================================
 
-Source oracle : upstream git v2.54.0 t/*.sh suite, run against the git-rs binary
-                via crates/git-testkit/scripts/run-upstream-tests.sh.
+Source oracle : upstream git v2.54.0 t/*.sh suite, run against the Sley binary
+                via crates/sley-testkit/scripts/run-upstream-tests.sh.
 Hash algo     : sha1 (GIT_TEST_DEFAULT_HASH=sha1 — REQUIRED, see "Harness note").
 Pass/total    : counts are TAP assertions actually executed (ok / ok+not-ok).
                 The TAP plan total is noted separately where the script aborts
                 or hangs before finishing.
+
+Harness env   : use the SLEY_* environment variables documented by the runner.
 
 This is the curated, themed companion to the auto-generated upstream-report.txt
 (which lists every failing "not ok N - <title>" verbatim). Use this file to
@@ -15,14 +17,14 @@ decide which command-hardening agents to spawn; use upstream-report.txt for the
 raw per-assertion detail of a specific run.
 
 Classification legend:
-  [CLI]    git-cli layer: flag/option parsing, output formatting, error text,
+  [CLI]    sley-cli layer: flag/option parsing, output formatting, error text,
            process exit codes, alias/-c handling, repo discovery.
-  [REV]    git-rev layer: revision/object-name resolution (<rev>:<path>, ^{},
+  [REV]    sley-rev layer: revision/object-name resolution (<rev>:<path>, ^{},
            :/search, --short abbreviation, --since pass-through).
-  [FMT]    git-formats / git-odb: config file parser/writer, object structure
+  [FMT]    sley-formats / sley-odb: config file parser/writer, object structure
            validation, attribute/filter application.
-  [REFS]   git-refs: ref name validation, d/f conflicts, reflog.
-  [WT]     git-worktree: working-tree walk (ls-files), checkout, worktree add.
+  [REFS]   sley-refs: ref name validation, d/f conflicts, reflog.
+  [WT]     sley-worktree: working-tree walk (ls-files), checkout, worktree add.
   [AUX]    unimplemented auxiliary command surfaced as a dependency
            (fast-import, clone/fetch, submodule, repack, rev-list filters).
 
@@ -104,7 +106,7 @@ CROSS-CUTTING THEMES (fix once, many scripts improve)
 --------------------------------------------------------------------------------
 
 T1. Usage errors must exit 129, not 1.  [CLI]
-    git-rs detects bad option combos and prints good messages, but exits 1.
+    Sley detects bad option combos and prints good messages, but exits 1.
     Upstream uses exit code 129 for usage errors; tests assert
     `test_expect_code 129`. This is the dominant ls-tree failure (8 of 9) and a
     large share of cat-file's ~56 "usage:" failures.
@@ -195,7 +197,7 @@ PER-COMMAND DETAIL
 === config  (t1300-config.sh)  131/498 ===
   NOTE: this script runs the WHOLE body twice: once "legacy" (--list/--get/
   --get-all/--get-regexp/--unset/...) and once "subcommands" (git config list/
-  get/set/unset/...). git-rs supports neither fully, hence ~2x duplicated titles.
+  get/set/unset/...). Sley supports neither fully, hence ~2x duplicated titles.
   * [CLI] Modern `git config <subcommand>` syntax unimplemented (BIG: this is
       roughly half the failures). `git config list/get/set/unset` ->
       "config requires <key> ..." or "--list does not accept positional
@@ -221,7 +223,7 @@ PER-COMMAND DETAIL
 === rev-parse  (t1500-rev-parse.sh)  68/82 ===
   * [REV] CRITICAL --short=N hang for N>=hashlen (see top). Test 81.
   * [CLI] core.bare not honored for --is-inside-work-tree / --is-bare-repository:
-      with core.bare=true git-rs returns "true" (in work tree); git says "false"
+      with core.bare=true Sley returns "true" (in work tree); git says "false"
       (~5 tests across GIT_DIR variants). Repo discovery doesn't read core.bare.
   * [CLI] Revision-limiting options not passed through: --since=/--until=/
       --max-age. "unsupported rev-parse option --since=...". "rev-parse --since=
@@ -248,7 +250,7 @@ PER-COMMAND DETAIL
       "ls-files -o --directory with single deep dir pathspec".
 
 === ls-tree  (t3103-ls-tree-misc.sh)  1/10 ===
-  * [T1] 8 of 9 failures are the exit-129 issue: git-rs correctly rejects
+  * [T1] 8 of 9 failures are the exit-129 issue: Sley correctly rejects
       incompatible option pairs (--long/--name-only, --name-status/--format,
       --object-only/--long, etc.) and prints good text, but exits 1 not 129.
       "usage: incompatible options: --long --name-only".
@@ -264,8 +266,8 @@ PER-COMMAND DETAIL
       git allows one-level all-caps names and pseudo-refs. ~5 tests.
       "symbolic-ref can be deleted", "allows top-level target for non-HEAD".
   * [CLI] Error text mismatch: delete of a non-symref prints
-      "git-rs: invalid path: invalid ref name FOO"; git prints
-      "fatal: Cannot delete FOO, not a symbolic ref". "fails to delete missing".
+      Sley's invalid-ref diagnostic; git prints "fatal: Cannot delete FOO,
+      not a symbolic ref". "fails to delete missing".
   * [REFS] d/f conflict handling: writing refs/heads/df/conflict over refs/
       heads/df, and resolving a d/f symref, raise raw io errors
       ("Is a directory (os error 21)") instead of graceful ref errors.
@@ -282,7 +284,7 @@ test-lib's test_detect_hash then leaves $test_hash_algo empty, so EVERY
 `test_oid` lookup aborts the script with "BUG: undefined key '...'", poisoning
 otherwise-passing assertions (e.g. hash-object jumped 13->21 ok, cat-file
 95->115, config 110->131 once a hash was set). The runner now defaults
-GIT_TEST_DEFAULT_HASH=sha1 (override with GIT_RS_DEFAULT_HASH=sha256). Always
+GIT_TEST_DEFAULT_HASH=sha1 (override with SLEY_DEFAULT_HASH=sha256). Always
 keep this set when interpreting results.
 
 Suggested agent order (impact-first):

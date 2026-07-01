@@ -591,8 +591,8 @@ Every optimization must preserve compatibility tests.
   parity plus performance parity.
 - 2026-06-07: Attempted Phase 0 upstream harness inspection. The runner exists
   at `crates/sley-testkit/scripts/run-upstream-tests.sh`, but this environment
-  has no `SLEY_UPSTREAM_T`, `GIT_RS_UPSTREAM_T`, or `GIT_SRC_DIR` configured, so
-  a real upstream refresh cannot run here yet.
+  has no `SLEY_UPSTREAM_T` or `GIT_SRC_DIR` configured, so a real upstream
+  refresh cannot run here yet.
 - 2026-06-07: Started Phase 1 with `ls-tree` usage parity. `cmd_ls_tree` now
   exits `129` for covered usage errors, and
   `crates/sley-cli/tests/ls_tree.rs` compares those exit statuses against

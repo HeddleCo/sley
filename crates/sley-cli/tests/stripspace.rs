@@ -30,7 +30,7 @@ fn run_output_with_input(program: &str, cwd: &Path, args: &[&str], stdin: &[u8])
 
 fn assert_status_stdout_stderr_match(cwd: &Path, args: &[&str], stdin: &[u8]) {
     let expected = run_output_with_input(sley_testkit::oracle_git(), cwd, args, stdin);
-    let actual = run_output_with_input(env!("CARGO_BIN_EXE_sley"), cwd, args, stdin);
+    let actual = run_output_with_input(sley_testkit::sley_bin!(), cwd, args, stdin);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),

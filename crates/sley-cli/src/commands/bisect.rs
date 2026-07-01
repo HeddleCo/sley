@@ -662,10 +662,13 @@ fn cmd_bisect_skip(args: &[String]) -> Result<()> {
                 eprintln!("fatal: Bad rev input: {arg}");
                 return Err(GitError::Exit(128));
             };
-            let mut excluded: HashSet<ObjectId> = HashSet::new();
-            for record in sley_rev::walk_commits(&db, repo.format, [left_oid])? {
-                excluded.insert(record.oid);
-            }
+            let excluded = sley_rev::reachable_commit_oids(
+                &repo.git_dir,
+                repo.format,
+                &db,
+                [left_oid],
+                false,
+            )?;
             for record in sley_rev::walk_commits(&db, repo.format, [right_oid])? {
                 if !excluded.contains(&record.oid) {
                     argv_state.push(record.oid.to_hex());
@@ -1436,12 +1439,13 @@ fn bisect_candidate_records(
     first_parent: bool,
 ) -> Result<Vec<sley_rev::CommitRecord>> {
     let db = repo.db();
-    let mut excluded: HashSet<ObjectId> = HashSet::new();
-    for good in goods {
-        for record in sley_rev::walk_commits(&db, repo.format, [*good])? {
-            excluded.insert(record.oid);
-        }
-    }
+    let excluded = sley_rev::reachable_commit_oids(
+        &repo.git_dir,
+        repo.format,
+        &db,
+        goods.iter().copied(),
+        false,
+    )?;
     let records = rev_list_walk_commits(&db, repo.format, [*bad], first_parent)?;
     let kept: Vec<sley_rev::CommitRecord> = records
         .into_iter()

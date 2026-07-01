@@ -7199,11 +7199,7 @@ pub(crate) fn verify_midx_at(
             // A pack that failed to load was already reported above.
             continue;
         };
-        let pack_offset = index
-            .entries
-            .iter()
-            .find(|e| e.oid == entry.oid)
-            .map(|e| e.offset);
+        let pack_offset = index.find(&entry.oid).map(|e| e.offset);
         match pack_offset {
             Some(offset) if offset == entry.offset => {}
             Some(offset) => report(format!(

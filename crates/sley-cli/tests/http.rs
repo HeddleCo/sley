@@ -46,8 +46,8 @@ fn run_success(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
-fn git_rs() -> &'static str {
-    env!("CARGO_BIN_EXE_sley")
+fn sley() -> &'static str {
+    sley_testkit::sley_bin!()
 }
 
 fn trimmed_utf8(bytes: Vec<u8>) -> String {
@@ -667,7 +667,7 @@ fn ls_remote_http_matches_upstream() {
             String::from_utf8_lossy(&expected.stdout),
             String::from_utf8_lossy(&expected.stderr)
         );
-        let actual = run(git_rs(), &root, &["ls-remote", &url]);
+        let actual = run(sley(), &root, &["ls-remote", &url]);
         assert!(
             actual.status.success(),
             "sley ls-remote over http failed\nstdout:\n{}\nstderr:\n{}",
@@ -698,7 +698,7 @@ fn clone_http_smoke() {
         let dst = root.join("clone");
         let dst_arg = dst.to_string_lossy().to_string();
 
-        let output = run(git_rs(), &root, &["clone", "-q", &url, &dst_arg]);
+        let output = run(sley(), &root, &["clone", "-q", &url, &dst_arg]);
         assert!(
             output.status.success(),
             "sley clone over http failed\nstdout:\n{}\nstderr:\n{}",
@@ -766,7 +766,7 @@ fn fetch_http_incremental() {
         let dst = root.join("clone");
         let dst_arg = dst.to_string_lossy().to_string();
 
-        let clone = run(git_rs(), &root, &["clone", "-q", &url, &dst_arg]);
+        let clone = run(sley(), &root, &["clone", "-q", &url, &dst_arg]);
         assert!(
             clone.status.success(),
             "sley clone over http failed\nstdout:\n{}\nstderr:\n{}",
@@ -795,7 +795,7 @@ fn fetch_http_incremental() {
         );
 
         // Incremental fetch over HTTP.
-        let fetch = run(git_rs(), &dst, &["fetch", "-q", "origin"]);
+        let fetch = run(sley(), &dst, &["fetch", "-q", "origin"]);
         assert!(
             fetch.status.success(),
             "sley fetch over http failed\nstdout:\n{}\nstderr:\n{}",
@@ -850,7 +850,7 @@ fn push_http_creates_ref() {
         let dst = root.join("clone");
         let dst_arg = dst.to_string_lossy().to_string();
 
-        let clone = run(git_rs(), &root, &["clone", "-q", &url, &dst_arg]);
+        let clone = run(sley(), &root, &["clone", "-q", &url, &dst_arg]);
         assert!(
             clone.status.success(),
             "sley clone over http failed\nstdout:\n{}\nstderr:\n{}",
@@ -883,7 +883,7 @@ fn push_http_creates_ref() {
 
         // Push the local commit to a brand-new branch on the upstream over HTTP.
         let push = run(
-            git_rs(),
+            sley(),
             &dst,
             &["push", "-q", "origin", "HEAD:refs/heads/pushed"],
         );
@@ -940,7 +940,7 @@ fn push_http_large_body_uses_chunked_transfer_without_content_length() {
         let dst = root.join("clone");
         let dst_arg = dst.to_string_lossy().to_string();
 
-        let clone = run(git_rs(), &root, &["clone", "-q", &url, &dst_arg]);
+        let clone = run(sley(), &root, &["clone", "-q", &url, &dst_arg]);
         assert!(
             clone.status.success(),
             "sley clone over http failed\nstdout:\n{}\nstderr:\n{}",
@@ -981,7 +981,7 @@ fn push_http_large_body_uses_chunked_transfer_without_content_length() {
         ));
 
         let push = run(
-            git_rs(),
+            sley(),
             &dst,
             &["push", "-q", "origin", "HEAD:refs/heads/chunked"],
         );
@@ -1101,7 +1101,7 @@ fn clone_http_shallow_matches_upstream() {
 
             // sley's shallow clone over the same server.
             let output = run(
-                git_rs(),
+                sley(),
                 &root,
                 &["clone", "-q", &depth_arg, &url, &actual_arg],
             );

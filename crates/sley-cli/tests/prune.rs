@@ -53,7 +53,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 fn assert_status_stdout_stderr_match(upstream: &Path, actual: &Path, args: &[&str]) {
     let expected = run_output(sley_testkit::oracle_git(), upstream, args);
-    let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), actual, args);
+    let actual_output = run_output(sley_testkit::sley_bin!(), actual, args);
     assert_eq!(
         actual_output.status.code(),
         expected.status.code(),

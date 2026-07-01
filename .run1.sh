@@ -25,7 +25,7 @@ WORKDIR=$(mktemp -d /tmp/sley-run1-work.XXXXXX)
 OUT=${OUTFILE:-/tmp/run1-out.txt}
 
 export GIT_TEST_INSTALLED="$BINDIR"
-export SLEY_BIN GIT_RS_BIN="$SLEY_BIN"
+export SLEY_BIN
 export GIT_TEST_DEFAULT_HASH=sha1
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 export GIT_AUTHOR_NAME=A GIT_AUTHOR_EMAIL=a@example.com
