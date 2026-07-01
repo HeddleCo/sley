@@ -27,6 +27,50 @@ Classification legend:
            (fast-import, clone/fetch, submodule, repack, rev-list filters).
 
 --------------------------------------------------------------------------------
+NON-EMAIL / NON-LEGACY COVERAGE RISK HOLDOUTS (2026-06-30)
+--------------------------------------------------------------------------------
+The expanded upstream parity goal is all numeric upstream `t[0-9]*.sh` scripts
+except broad email/mailbox flows and legacy VCS integrations:
+  * email/mailbox: `am`, `mailinfo`, `send-email`, `format-patch`
+  * legacy VCS: git-svn/SVK, CVS, p4, gitweb
+
+The following 25 scripts remain tracked as a separate pre-identified risk bucket
+because they are known or likely to need harness work, external daemons,
+unusually large fixtures, or per-script timeout tuning before they can be safely
+enrolled in the main floor gate:
+  t3305-notes-fanout.sh
+  t4141-apply-too-large.sh
+  t5539-fetch-http-shallow.sh
+  t5540-http-push-webdav.sh
+  t5541-http-push-smart.sh
+  t5542-push-http-shallow.sh
+  t5549-fetch-push-http.sh
+  t5550-http-fetch-dumb.sh
+  t5551-http-fetch-smart.sh
+  t5555-http-smart-common.sh
+  t5557-http-get.sh
+  t5558-clone-bundle-uri.sh
+  t5559-http-fetch-smart-http2.sh
+  t5560-http-backend-noserver.sh
+  t5561-http-backend.sh
+  t5562-http-backend-content-length.sh
+  t5563-simple-http-auth.sh
+  t5564-http-proxy.sh
+  t5570-git-daemon.sh
+  t5581-http-curl-verbose.sh
+  t5584-http-429-retry.sh
+  t5608-clone-2gb.sh
+  t5732-protocol-v2-bundle-uri-http.sh
+  t7006-pager.sh
+  t7527-builtin-fsmonitor.sh
+
+Two additional target scripts produced rows but timed out even in isolated
+900-second retries, so they are also held out of the main floor gate until the
+underlying timeout is understood:
+  t4053-diff-no-index.sh
+  t9300-fast-import.sh
+
+--------------------------------------------------------------------------------
 SCOREBOARD (sha1)
 --------------------------------------------------------------------------------
   command       pass / run     plan   pass%   notes
