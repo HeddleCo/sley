@@ -15,12 +15,20 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "lock") {
+            continue;
+        }
         let file_type = entry.file_type()?;
         let target = dst.join(entry.file_name());
         if file_type.is_dir() {
-            copy_dir_recursive(&entry.path(), &target)?;
+            copy_dir_recursive(&path, &target)?;
         } else {
-            fs::copy(entry.path(), &target)?;
+            match fs::copy(&path, &target) {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
         }
     }
     Ok(())
