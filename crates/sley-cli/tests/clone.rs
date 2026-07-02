@@ -973,6 +973,7 @@ fn clone_local_repository_branch_option_matches_upstream_git() {
             ("long-space", vec!["--branch", "feature/topic"]),
             ("long-equals", vec!["--branch=feature/topic"]),
             ("short-compact", vec!["-bfeature/topic"]),
+            ("tag", vec!["--branch", "v1.0"]),
             ("reset", vec!["--branch", "feature/topic", "--no-branch"]),
         ] {
             let expected_repo = root.join(format!("{label}-expected"));
@@ -993,6 +994,7 @@ fn clone_local_repository_branch_option_matches_upstream_git() {
             for args in [
                 vec!["show-ref"],
                 vec!["rev-parse", "--abbrev-ref", "HEAD"],
+                vec!["config", "--get", "remote.origin.fetch"],
                 vec!["config", "--get", "branch.main.remote"],
                 vec!["config", "--get", "branch.main.merge"],
                 vec!["config", "--get", "branch.feature/topic.remote"],

@@ -79,6 +79,8 @@ pub(super) struct LogDiffOptions {
     pub(super) ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
     pub(super) ignore_regexes: Vec<sley_grep::Regex>,
+    /// Unified diff context (`-U<n>` / `diff.context`), resolved before render.
+    pub(super) context: Option<usize>,
     /// `-a`/`--text`: treat all files as text (affects `-G` binary skipping).
     pub(super) text: bool,
     /// `-O<file>`: reorder diff entries according to an orderfile.
@@ -116,6 +118,7 @@ impl Default for LogDiffOptions {
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
+            context: None,
             text: false,
             order_file: None,
             rotate_to: None,
@@ -405,7 +408,7 @@ impl LogDiffContext<'_> {
                         abbrev: self.patch_abbrev,
                         src_prefix: "a/",
                         dst_prefix: "b/",
-                        context: 3,
+                        context: self.opts.context.unwrap_or(3),
                         userdiff: Some(self.userdiff),
                         funcname: None,
                         colors: None,
@@ -554,7 +557,7 @@ impl LogDiffContext<'_> {
             format: self.format,
             dense,
             all_paths: false,
-            context: 3,
+            context: self.opts.context.unwrap_or(3),
             ws_ignore: self.opts.ws_ignore,
             diff_algorithm: self.opts.diff_algorithm,
             src_prefix: "a/",

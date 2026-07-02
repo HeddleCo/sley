@@ -3144,6 +3144,12 @@ fn format_default_config_value(value: &str, value_type: ConfigValueType) -> Resu
         return Ok(None);
     }
     if value_type != ConfigValueType::Raw && !value_canonicalizes_as(value, value_type) {
+        if matches!(
+            value_type,
+            ConfigValueType::Bool | ConfigValueType::Int | ConfigValueType::BoolOrInt
+        ) {
+            return format_config_value_with(value, value_type, None, None).map(Some);
+        }
         eprintln!("fatal: failed to format default config value: {value}");
         return Err(GitError::Exit(128));
     }

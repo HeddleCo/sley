@@ -6127,6 +6127,8 @@ fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Re
             .get("remote", Some(&remote_name), "partialclonefilter")
             .and_then(commands::remote_cmds::pack_filter_from_spec)
             .or(Some(sley_odb::PackObjectFilter::BlobNone));
+        let quiet = config.get_bool("promisor", None, "quiet").unwrap_or(false);
+        trace2_promisor_fetch_child_start(&remote_name, quiet);
         if let Some(command) = config.get("remote", Some(&remote_name), "uploadpack") {
             let _ = prefetch_via_configured_upload_pack(command, url)?;
             db.refresh_read_cache();
@@ -6163,6 +6165,52 @@ fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Re
         }
     }
     Ok(false)
+}
+
+fn trace2_promisor_fetch_child_start(remote_name: &str, quiet: bool) {
+    let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let mut argv = vec![
+        "git",
+        "-c",
+        "fetch.negotiationAlgorithm=noop",
+        "fetch",
+        remote_name,
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--recurse-submodules=no",
+        "--stdin",
+    ];
+    if quiet {
+        argv.push("--quiet");
+    }
+    let argv = argv
+        .iter()
+        .map(|arg| format!("\"{}\"", trace2_json_escape(arg)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let line = format!(
+        "{{\"event\":\"child_start\",\"sid\":\"sley\",\"child_id\":0,\"argv\":[{argv}]}}\n"
+    );
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn trace2_json_escape(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn prefetch_via_configured_upload_pack(command: &str, repository: &str) -> Result<bool> {
@@ -9433,14 +9481,14 @@ fn log_validate_inter_hunk_context(value: &str) -> Result<()> {
         _ => value,
     };
     let digits = match number.as_bytes().first() {
-        Some(b'+' | b'-') if number.len() > 1 => &number[1..],
+        Some(b'+') if number.len() > 1 => &number[1..],
         _ => number,
     };
     if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return Ok(());
     }
     eprintln!(
-        "error: option `inter-hunk-context' expects an integer value with an optional k/m/g suffix"
+        "error: option `inter-hunk-context' expects a non-negative integer value with an optional k/m/g suffix"
     );
     Err(GitError::Exit(129))
 }

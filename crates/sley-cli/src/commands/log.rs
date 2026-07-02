@@ -999,6 +999,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--remotes"
             | "--no-ignore-missing" => setup_args.push(arg.clone()),
             "--boundary" => boundary = true,
+            "-t" => {}
             "--ignore-missing" => {
                 ignored_missing_input = true;
                 setup_args.push(arg.clone());
@@ -1852,6 +1853,28 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 diff_opts.patch = true;
                 diff_format_explicit = true;
             }
+            "-U" | "--unified" => {
+                diff_opts.context = Some(3);
+                diff_opts.patch = true;
+                diff_format_explicit = true;
+            }
+            value if value.starts_with("-U") && value.len() > 2 => {
+                let raw = &value[2..];
+                patch_validate_unified_context(raw, true)?;
+                diff_opts.context = Some(commands::diff_options::parse_unified_count(raw));
+                diff_opts.patch = true;
+                diff_format_explicit = true;
+            }
+            "--unified=" => {
+                return commit_unified_expects_numerical_value_error(false);
+            }
+            value if value.starts_with("--unified=") => {
+                let raw = &value["--unified=".len()..];
+                patch_validate_unified_context(raw, false)?;
+                diff_opts.context = Some(commands::diff_options::parse_unified_count(raw));
+                diff_opts.patch = true;
+                diff_format_explicit = true;
+            }
             "-s" | "--no-patch" => {
                 diff_opts = LogDiffOptions::default();
                 diff_format_explicit = true;
@@ -2201,6 +2224,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // Compile any `-I<regex>` patterns now (a malformed regex fails like git's
     // diff_opt_ignore_regex, exit 129).
     diff_opts.ignore_regexes = crate::compile_ignore_matching_regexes(&ignore_regex_patterns)?;
+    if diff_opts.any() || diff_opts.merges_imply_patch {
+        diff_opts.context = Some(commands::diff_options::resolve_diff_context(
+            diff_opts.context,
+            Some(&config),
+        )?);
+    }
     // Resolve and validate pickaxe (`-S`/`-G`/`--find-object`). git OR-s the
     // kind bits and rejects any combination of the three kinds; `-G` cannot be
     // combined with `--pickaxe-regex`; `--pickaxe-all` cannot be combined with

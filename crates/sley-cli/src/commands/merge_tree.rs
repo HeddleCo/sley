@@ -418,6 +418,7 @@ fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
             ancestor_label: "merged common ancestors",
             favor: strategy,
             path_favor: None,
+            path_marker_size: None,
             detect_renames,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             rename_limit: 0,
@@ -1214,6 +1215,7 @@ fn trivial_content_merge(
             style: sley_diff_merge::ConflictStyle::Merge,
             favor: sley_diff_merge::MergeFavor::None,
             ws_ignore: sley_diff_merge::WsIgnore::EMPTY,
+            marker_size: 7,
         },
     );
     Ok(result.content)

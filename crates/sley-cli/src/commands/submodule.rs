@@ -2236,6 +2236,10 @@ fn compute_summary_diff_index(
 ) -> Result<Vec<SubmoduleSummaryEntry>> {
     let mut new = index_relevant_paths(index, old);
     if !cached {
+        let configured_paths: BTreeSet<String> = read_submodule_configs(worktree_root)?
+            .into_iter()
+            .map(|submodule| submodule.path)
+            .collect();
         // Default mode: run_diff_index(0) compares against the WORKTREE.
         // For each relevant path, the dst side is the actual worktree entry:
         // a checked-out embedded repository is a gitlink at its HEAD, a file is
@@ -2246,11 +2250,11 @@ fn compute_summary_diff_index(
             match summary_worktree_side(worktree_root, format, path)? {
                 Some(side) => *slot = side,
                 // A deinitialized-but-still-indexed submodule has no worktree
-                // path, but diff-index keeps the gitlink side. That lets
-                // prepare_submodule_summary later skip the plain modification
-                // because the submodule repository is not available, instead
-                // of misreporting it as a deletion.
-                None if slot.0 == 0o160000 => {}
+                // path, but summary keeps the gitlink side only when the path is
+                // a configured submodule. A bare embedded repo added with
+                // `git add` (t7401) has no .gitmodules mapping and is reported as
+                // deleted when its worktree path vanishes.
+                None if slot.0 == 0o160000 && configured_paths.contains(path) => {}
                 None => {
                     slot.0 = 0;
                     slot.1 = ObjectId::null(format);

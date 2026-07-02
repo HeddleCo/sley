@@ -4280,18 +4280,77 @@ where
     F: FnMut(&ObjectId) -> Result<Option<Arc<EncodedObject>>>,
     C: PackDeltaCache + ?Sized,
 {
-    read_object_at_inner(pack_bytes, offset, format, &mut resolve_ref_base, cache)
+    read_object_at_with_cache_and_ofs_base_arc(
+        pack_bytes,
+        offset,
+        format,
+        &mut resolve_ref_base,
+        |_offset| Ok(None),
+        cache,
+    )
 }
 
-fn read_object_at_inner<F, C>(
+/// Like [`read_object_at_with_cache_arc`], but lets an object-database caller
+/// recover an ofs-delta base from another storage copy when the in-pack base
+/// offset cannot be decoded. Direct pack verification should keep using the
+/// strict APIs; this hook mirrors normal object lookup, where a corrupt packed
+/// copy does not hide a good loose or redundant packed copy.
+pub fn read_object_at_with_cache_and_ofs_base_arc<F, G, C>(
     pack_bytes: &[u8],
     offset: u64,
     format: ObjectFormat,
-    resolve_ref_base: &mut F,
+    mut resolve_ref_base: F,
+    mut resolve_ofs_base: G,
     cache: &C,
 ) -> Result<Arc<EncodedObject>>
 where
     F: FnMut(&ObjectId) -> Result<Option<Arc<EncodedObject>>>,
+    G: FnMut(u64) -> Result<Option<Arc<EncodedObject>>>,
+    C: PackDeltaCache + ?Sized,
+{
+    read_object_at_inner(
+        pack_bytes,
+        offset,
+        format,
+        &mut resolve_ref_base,
+        &mut resolve_ofs_base,
+        cache,
+    )
+}
+
+/// Like [`read_object_at_with_cache_and_ofs_base_arc`], without an offset-cache.
+pub fn read_object_at_with_ofs_base_arc<F, G>(
+    pack_bytes: &[u8],
+    offset: u64,
+    format: ObjectFormat,
+    resolve_ref_base: F,
+    resolve_ofs_base: G,
+) -> Result<Arc<EncodedObject>>
+where
+    F: FnMut(&ObjectId) -> Result<Option<Arc<EncodedObject>>>,
+    G: FnMut(u64) -> Result<Option<Arc<EncodedObject>>>,
+{
+    read_object_at_with_cache_and_ofs_base_arc(
+        pack_bytes,
+        offset,
+        format,
+        resolve_ref_base,
+        resolve_ofs_base,
+        &NoopDeltaCache,
+    )
+}
+
+fn read_object_at_inner<F, G, C>(
+    pack_bytes: &[u8],
+    offset: u64,
+    format: ObjectFormat,
+    resolve_ref_base: &mut F,
+    resolve_ofs_base: &mut G,
+    cache: &C,
+) -> Result<Arc<EncodedObject>>
+where
+    F: FnMut(&ObjectId) -> Result<Option<Arc<EncodedObject>>>,
+    G: FnMut(u64) -> Result<Option<Arc<EncodedObject>>>,
     C: PackDeltaCache + ?Sized,
 {
     // A warm cache entry for this exact offset is already the fully resolved
@@ -4356,8 +4415,20 @@ where
             Arc::new(EncodedObject::new(object_type, body))
         }
         Some(DeltaBase::Offset(base_offset)) => {
-            let base =
-                read_object_at_inner(pack_bytes, base_offset, format, resolve_ref_base, cache)?;
+            let base = match read_object_at_inner(
+                pack_bytes,
+                base_offset,
+                format,
+                resolve_ref_base,
+                resolve_ofs_base,
+                cache,
+            ) {
+                Ok(base) => base,
+                Err(pack_err) => match resolve_ofs_base(base_offset)? {
+                    Some(base) => base,
+                    None => return Err(pack_err),
+                },
+            };
             let resolved = apply_pack_delta(&base.body, &body)?;
             Arc::new(EncodedObject::new(base.object_type, resolved))
         }

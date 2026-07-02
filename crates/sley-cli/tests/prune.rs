@@ -41,12 +41,21 @@ fn copy_dir(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("create destination");
     for entry in fs::read_dir(src).expect("read source dir") {
         let entry = entry.expect("read source entry");
+        if entry.file_name().to_string_lossy().ends_with(".lock") {
+            continue;
+        }
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
         if entry.file_type().expect("entry type").is_dir() {
             copy_dir(&src_path, &dst_path);
         } else {
-            fs::copy(&src_path, &dst_path).expect("copy file");
+            fs::copy(&src_path, &dst_path).unwrap_or_else(|err| {
+                panic!(
+                    "copy file {} -> {}: {err}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            });
         }
     }
 }

@@ -110,7 +110,8 @@ fn resolve_pull_remote_and_refspecs(
                 },
             };
             if config.get("branch", Some(&current), "merge").is_none() {
-                return Ok((remote, vec!["HEAD".to_string()], Vec::new()));
+                print_pull_no_tracking(&current, false);
+                return Err(GitError::Exit(1));
             };
             Ok((remote, Vec::new(), branch_merge_values(config, &current)))
         }

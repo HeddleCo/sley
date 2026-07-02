@@ -7,11 +7,12 @@
 //! `--skip` / `--quit` / `--edit-todo`, and autostash handling.
 
 use crate::commands::merge_rebase::{
-    MergePathResult, commit_tree_oid, effective_config_with_overrides, head_commit_oid,
-    merge_bases, merge_favor_from_strategy_opts, merge_index_entry, merge_read_blob,
-    merge_remove_worktree_file, merge_write_worktree_file, print_branch_commit_summary,
+    MergePathResult, RenameMergeConfig, commit_tree_oid, directory_renames_config,
+    effective_config_with_overrides, head_commit_oid, merge_base_fork_point, merge_bases,
+    merge_favor_from_strategy_opts, merge_index_entry, merge_read_blob, merge_remove_worktree_file,
+    merge_rename_limit_config, merge_write_worktree_file, print_branch_commit_summary,
     print_commit_shortstat_between_trees, three_way_merge_trees,
-    three_way_merge_trees_inner_with_info, three_way_merge_trees_with_favor,
+    three_way_merge_trees_inner_with_info_opts_and_path_favor, three_way_merge_trees_with_favor,
 };
 use crate::commands::replay::{comment_char, launch_editor, strip_comment_lines};
 use crate::*;
@@ -300,7 +301,11 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
                 out.ignore_whitespace = true;
                 out.strategy_opts.push("ignore-space-change".to_string());
             }
-            "--no-ignore-whitespace" => out.ignore_whitespace = false,
+            "--no-ignore-whitespace" => {
+                out.ignore_whitespace = false;
+                out.strategy_opts
+                    .retain(|opt| opt.as_str() != "ignore-space-change");
+            }
             _ if arg.starts_with("-C") => {
                 let value = &arg[2..];
                 if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
@@ -371,6 +376,20 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
         }
     }
     Ok(out)
+}
+
+fn rebase_apply_opts(args: &RebaseArgs) -> Vec<String> {
+    let mut opts = Vec::new();
+    if args.ignore_whitespace {
+        opts.push("--ignore-whitespace".to_string());
+    }
+    if let Some(whitespace) = &args.whitespace {
+        opts.push(format!("--whitespace={whitespace}"));
+    }
+    if let Some(context) = args.context_lines {
+        opts.push(format!("-C{context}"));
+    }
+    opts
 }
 
 fn print_rebase_usage() {
@@ -556,7 +575,7 @@ fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
     if !opts.strategy_opts.is_empty() {
         fs::write(
             dir.join("strategy_opts"),
-            opts.strategy_opts.join("\n") + "\n",
+            rebase_sq_quote_argv(&opts.strategy_opts) + "\n",
         )?;
     }
     match opts.rerere_autoupdate {
@@ -596,7 +615,7 @@ fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
         .and_then(|value| value.strip_prefix("-S").map(str::to_string));
     let strategy = seq::read_state_line(&ctx.git_dir, "strategy");
     let strategy_opts = fs::read_to_string(ctx.state_path("strategy_opts"))
-        .map(|text| text.lines().map(str::to_string).collect())
+        .map(|text| read_strategy_opts_state(&text))
         .unwrap_or_default();
     let rerere_autoupdate = match seq::read_state_line(&ctx.git_dir, "allow_rerere_autoupdate") {
         Some(line) if line.contains("--no-rerere-autoupdate") => Some(false),
@@ -662,6 +681,77 @@ fn make_resolver<'a>(
             parents: record.parents.len(),
         }
     }
+}
+
+fn rebase_sq_quote_argv(args: &[String]) -> String {
+    let mut out = String::new();
+    for arg in args {
+        out.push(' ');
+        out.push_str(&sley_config::sq_quote(arg));
+    }
+    out
+}
+
+fn read_strategy_opts_state(text: &str) -> Vec<String> {
+    if text.trim_start().starts_with('\'') {
+        rebase_sq_dequote_to_vec(text)
+    } else {
+        text.lines().map(str::to_string).collect()
+    }
+}
+
+fn rebase_sq_dequote_to_vec(input: &str) -> Vec<String> {
+    let bytes = input.as_bytes();
+    let n = bytes.len();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    loop {
+        while i < n && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        if bytes[i] != b'\'' {
+            let start = i;
+            while i < n && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            tokens.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
+            continue;
+        }
+
+        let mut token = Vec::new();
+        let mut src = i;
+        loop {
+            src += 1;
+            if src >= n {
+                break;
+            }
+            let c = bytes[src];
+            if c != b'\'' {
+                token.push(c);
+                continue;
+            }
+            src += 1;
+            if src >= n {
+                break;
+            }
+            if bytes[src] == b'\\'
+                && src + 2 < n
+                && (bytes[src + 1] == b'\'' || bytes[src + 1] == b'!')
+                && bytes[src + 2] == b'\''
+            {
+                token.push(bytes[src + 1]);
+                src += 2;
+                continue;
+            }
+            break;
+        }
+        i = src;
+        tokens.push(String::from_utf8_lossy(&token).into_owned());
+    }
+    tokens
 }
 
 fn count_commands(items: &[RebaseTodoItem]) -> usize {
@@ -976,15 +1066,25 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
                 return result;
             }
             RebaseAction::Abort => {
+                let autostash = read_apply_autostash(&ctx);
                 let result =
                     commands::am::rebase_apply_abort(&ctx.git_dir, &ctx.worktree_root, ctx.format);
                 // Abort always ends the rebase; restore the autostash on top of
                 // the restored orig_head (git applies it after reset).
-                finish_apply_autostash(&ctx);
+                if result.is_ok() {
+                    if let Some(text) = autostash {
+                        apply_save_autostash_text(&ctx, &text, true);
+                    }
+                    seq::remove_merge_state(&ctx.git_dir);
+                }
                 return result;
             }
             RebaseAction::Quit => {
+                if let Some(text) = read_apply_autostash(&ctx) {
+                    apply_save_autostash_text(&ctx, &text, false);
+                }
                 let _ = fs::remove_dir_all(ctx.git_dir.join("rebase-apply"));
+                seq::remove_merge_state(&ctx.git_dir);
                 return Ok(());
             }
             RebaseAction::ShowCurrentPatch => {
@@ -1130,7 +1230,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             },
         }
     };
-    let upstream = if args.root {
+    let mut upstream = if args.root {
         None
     } else {
         let resolved = resolve_revision(&ctx.git_dir, ctx.format, &upstream_name)
@@ -1204,6 +1304,24 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             other.display()
         );
         return Err(GitError::Exit(128));
+    }
+
+    let fork_point = match args.fork_point {
+        Some(value) => value,
+        None => {
+            !args.root && args.onto_name.is_none() && !args.keep_base && args.positional.is_empty()
+        }
+    };
+    if fork_point
+        && let Some(fork_point) = merge_base_fork_point(
+            &ctx.common_git_dir,
+            ctx.format,
+            &db,
+            &upstream_name,
+            &orig_head,
+        )?
+    {
+        upstream = Some(fork_point);
     }
 
     // git creates the autostash BEFORE running the pre-rebase hook, and a hook
@@ -1496,6 +1614,8 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         // detection against the new base). Use the onto as the patch-id base.
         let cherry_base = if args.root && args.onto_name.is_some() {
             Some(&onto)
+        } else if fork_point {
+            Some(&onto)
         } else {
             upstream.as_ref()
         };
@@ -1714,6 +1834,8 @@ fn run_apply_backend(
             committer_date_is_author_date: args.committer_date_is_author_date,
             ignore_date: args.ignore_date,
             ignore_whitespace: args.ignore_whitespace,
+            apply_opts: rebase_apply_opts(args),
+            rerere_autoupdate: args.rerere_autoupdate,
             head_name: head_name.map(str::to_string),
             orig_head: *orig_head,
             onto: *onto,
@@ -1826,22 +1948,15 @@ fn require_clean_work_tree(ctx: &Ctx, action: &str, with_hint: bool) -> Result<(
     // changes` with `ignore_submodules = 1`, so a submodule that has moved its
     // HEAD or is dirty never blocks the rebase (t3426 "rebase interactive ignores
     // modified submodules"). Skip any gitlink (submodule) path on both sides.
-    let is_submodule = |entry: &sley_worktree::ShortStatusEntry| {
-        entry.submodule.is_some()
-            || [entry.head_mode, entry.index_mode, entry.worktree_mode]
-                .into_iter()
-                .flatten()
-                .any(sley_index::is_gitlink)
-    };
     let has_unstaged = status.iter().any(|entry| {
-        !is_submodule(entry)
+        !rebase_status_is_submodule(entry)
             && entry.worktree != b' '
             && entry.worktree != b'?'
             && entry.index != b'?'
     });
-    let has_staged = status
-        .iter()
-        .any(|entry| !is_submodule(entry) && entry.index != b' ' && entry.index != b'?');
+    let has_staged = status.iter().any(|entry| {
+        !rebase_status_is_submodule(entry) && entry.index != b' ' && entry.index != b'?'
+    });
     if !has_unstaged && !has_staged {
         return Ok(());
     }
@@ -1857,6 +1972,14 @@ fn require_clean_work_tree(ctx: &Ctx, action: &str, with_hint: bool) -> Result<(
         eprintln!("error: Please commit or stash them.");
     }
     Err(GitError::Exit(1))
+}
+
+fn rebase_status_is_submodule(entry: &sley_worktree::ShortStatusEntry) -> bool {
+    entry.submodule.is_some()
+        || [entry.head_mode, entry.index_mode, entry.worktree_mode]
+            .into_iter()
+            .flatten()
+            .any(sley_index::is_gitlink)
 }
 
 fn is_linear_history(
@@ -3988,7 +4111,7 @@ fn do_merge(
     }
 
     if let Some(strategy) = &opts.strategy
-        && !matches!(strategy.as_str(), "ort" | "recursive" | "resolve")
+        && custom_rebase_strategy_needs_external_driver(strategy)
     {
         return do_custom_strategy_merge(
             ctx,
@@ -4082,6 +4205,7 @@ fn do_merge(
     let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
     create_merge_commit_from_index(
         ctx,
+        opts,
         original.as_ref(),
         tree,
         vec![head, *merge_head],
@@ -4114,6 +4238,180 @@ fn do_merge(
     Ok(PickOutcome::Continue)
 }
 
+fn custom_rebase_strategy_needs_external_driver(strategy: &str) -> bool {
+    !matches!(strategy, "ort" | "recursive" | "resolve")
+}
+
+fn custom_strategy_args(
+    opts: &MachineOpts,
+    base: ObjectId,
+    head: ObjectId,
+    merge_head: ObjectId,
+) -> Vec<String> {
+    let mut command_args: Vec<String> = opts
+        .strategy_opts
+        .iter()
+        .map(|opt| format!("--{opt}"))
+        .collect();
+    command_args.push(base.to_hex());
+    command_args.push("--".to_string());
+    command_args.push(head.to_hex());
+    command_args.push(merge_head.to_hex());
+    command_args
+}
+
+fn run_custom_rebase_strategy(
+    ctx: &Ctx,
+    opts: &MachineOpts,
+    strategy: &str,
+    base: ObjectId,
+    head: ObjectId,
+    merge_head: ObjectId,
+) -> Result<i32> {
+    let status = std::process::Command::new(format!("git-merge-{strategy}"))
+        .args(custom_strategy_args(opts, base, head, merge_head))
+        .current_dir(&ctx.worktree_root)
+        .status()
+        .map_err(|err| GitError::Command(format!("failed to run merge strategy: {err}")))?;
+    Ok(status.code().unwrap_or(128))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pick_one_commit_with_custom_strategy(
+    ctx: &Ctx,
+    db: &FileObjectDatabase,
+    opts: &MachineOpts,
+    todo: &mut TodoList,
+    item: &RebaseTodoItem,
+    record: &sley_rev::CommitRecord,
+    head: ObjectId,
+    parent: Option<ObjectId>,
+    is_fixup: bool,
+    final_fixup: bool,
+    strategy: &str,
+) -> Result<PickOutcome> {
+    let base =
+        parent.ok_or_else(|| GitError::Command("custom rebase strategy needs a parent".into()))?;
+    let target_encoding = commit_encoding_config(&ctx.git_dir);
+    let mut message =
+        commit_message_for_commit_encoding(&record.commit, &target_encoding).into_owned();
+    if opts.signoff && !is_fixup {
+        message =
+            commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env()?);
+    }
+    if is_fixup {
+        update_squash_messages(ctx, db, item, record)?;
+    }
+    write_message_files(ctx, &message, is_fixup, final_fixup)?;
+    if !is_fixup {
+        fs::write(ctx.state_path("message"), &message)?;
+    }
+    fs::write(ctx.git_dir.join("MERGE_HEAD"), format!("{}\n", record.oid))?;
+
+    let status = run_custom_rebase_strategy(ctx, opts, strategy, base, head, record.oid)?;
+    if status != 0 {
+        let _ = commands::rerere::repo_rerere(&ctx.git_dir, ctx.format, opts.rerere_autoupdate);
+        print_conflict_hints();
+        return stop_with_patch(ctx, db, opts, record, item, status, false);
+    }
+
+    let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
+    let head_tree = commit_tree_oid(db, ctx.format, &head)?;
+    let parent_tree = commit_tree_oid(db, ctx.format, &base)?;
+    let index_unchanged = tree == head_tree;
+    let originally_empty = record.commit.tree == parent_tree;
+    let mut allow_empty = false;
+    if index_unchanged {
+        if originally_empty {
+            allow_empty = true;
+        } else if opts.keep_redundant_commits {
+            allow_empty = true;
+        } else if opts.drop_redundant_commits {
+            eprintln!(
+                "dropping {} {} -- patch contents already upstream",
+                record.oid,
+                commit_subject(&record.commit.message)
+            );
+            let _ = fs::remove_file(ctx.git_dir.join("MERGE_MSG"));
+            let _ = fs::remove_file(ctx.git_dir.join("MERGE_HEAD"));
+            return Ok(PickOutcome::Continue);
+        } else {
+            fs::write(
+                ctx.git_dir.join("CHERRY_PICK_HEAD"),
+                format!("{}\n", record.oid),
+            )?;
+            eprintln!(
+                "The previous cherry-pick is now empty, possibly due to conflict resolution."
+            );
+            eprintln!("If you wish to commit it anyway, use:");
+            eprintln!();
+            eprintln!("    git commit --allow-empty");
+            eprintln!();
+            eprintln!("Otherwise, please use 'git rebase --skip'");
+            return stop_with_patch(ctx, db, opts, record, item, 1, false);
+        }
+    }
+
+    let (commit_message_file, amend, edit) = if is_fixup {
+        if !final_fixup {
+            (Some(ctx.state_path("message-squash")), true, false)
+        } else if ctx.state_path("message-fixup").exists() {
+            (Some(ctx.state_path("message-fixup")), true, false)
+        } else {
+            (Some(ctx.state_path("message-squash")), true, true)
+        }
+    } else {
+        (Some(ctx.git_dir.join("MERGE_MSG")), false, false)
+    };
+    let result = machine_commit(
+        ctx,
+        db,
+        opts,
+        MachineCommit {
+            amend,
+            edit: edit || item.command == TodoCommand::Reword,
+            cleanup_message: !(is_fixup && !final_fixup),
+            allow_empty,
+            create_root: false,
+            message_file: commit_message_file,
+            reflog_sub: command_reflog_name(item.command),
+            original: Some(record),
+        },
+    )?;
+    match result {
+        CommitOutcome::Committed => {
+            record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
+        }
+        CommitOutcome::Failed(code) => {
+            if is_fixup {
+                intend_to_amend(ctx)?;
+                let squash = fs::read(ctx.state_path("message-squash")).unwrap_or_default();
+                fs::write(ctx.state_path("message"), &squash)?;
+                fs::write(ctx.git_dir.join("MERGE_MSG"), &squash)?;
+            }
+            return stop_with_patch(ctx, db, opts, record, item, code, false);
+        }
+    }
+
+    if final_fixup {
+        let _ = fs::remove_file(ctx.state_path("message-fixup"));
+        let _ = fs::remove_file(ctx.state_path("message-squash"));
+        let _ = fs::remove_file(ctx.state_path("current-fixups"));
+    }
+    if item.command == TodoCommand::Edit {
+        eprintln!(
+            "Stopped at {}...  {}",
+            find_unique_abbrev_hex(ctx, db, &record.oid),
+            item.arg
+        );
+        return stop_with_patch(ctx, db, opts, record, item, 0, true);
+    }
+    if item.command == TodoCommand::Reword || edit {
+        reread_todo_if_changed(ctx, db, todo)?;
+    }
+    Ok(PickOutcome::Continue)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn do_custom_strategy_merge(
     ctx: &Ctx,
@@ -4133,27 +4431,17 @@ fn do_custom_strategy_merge(
     fs::write(ctx.state_path("message"), &message)?;
     fs::write(ctx.git_dir.join("MERGE_HEAD"), format!("{merge_head}\n"))?;
 
-    let args = opts
-        .strategy_opts
-        .iter()
-        .map(|opt| format!("--{opt}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let command = if args.is_empty() {
-        format!("git-merge-{strategy}")
-    } else {
-        format!("git-merge-{strategy} {args}")
-    };
-    let status = commands::tool_launch::run_tool_shell(
-        &command,
-        &commands::tool_launch::ToolEnvironment::default(),
-    )?;
+    let bases = merge_bases(&ctx.common_git_dir, db, ctx.format, &head, &merge_head)?;
+    let base = bases
+        .first()
+        .ok_or_else(|| GitError::Command("custom rebase merge strategy needs a base".into()))?;
+    let status = run_custom_rebase_strategy(ctx, opts, strategy, *base, head, merge_head)?;
     if status != 0 {
         return Ok(PickOutcome::Fail(status));
     }
 
     let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
-    create_merge_commit_from_index(ctx, original, tree, vec![head, merge_head], &message)?;
+    create_merge_commit_from_index(ctx, opts, original, tree, vec![head, merge_head], &message)?;
     if let Some(record) = original {
         record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
     }
@@ -4272,6 +4560,7 @@ fn merge_todo_message(
 
 fn create_merge_commit_from_index(
     ctx: &Ctx,
+    opts: &MachineOpts,
     original: Option<&sley_rev::CommitRecord>,
     tree: ObjectId,
     parents: Vec<ObjectId>,
@@ -4290,7 +4579,7 @@ fn create_merge_commit_from_index(
             None => commit_identity_from_env("AUTHOR")?,
         },
     };
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let (author, committer) = rebase_commit_identities(opts, author)?;
     let encoding = commit_encoding_header_from_config(&ctx.git_dir);
     let mut writer = ctx.db();
     let new_oid = sley_sequencer::create_commit(
@@ -4323,7 +4612,7 @@ fn create_merge_commit_from_index(
 fn do_octopus_merge_commit(
     ctx: &Ctx,
     db: &FileObjectDatabase,
-    _opts: &MachineOpts,
+    opts: &MachineOpts,
     todo: &mut TodoList,
     item: &RebaseTodoItem,
     merge_heads: &[(String, ObjectId)],
@@ -4371,7 +4660,7 @@ fn do_octopus_merge_commit(
     }
     let labels: Vec<String> = merge_heads.iter().map(|(label, _)| label.clone()).collect();
     let message = merge_todo_message(ctx, item, original, &labels, oneline.as_deref())?;
-    create_merge_commit_from_index(ctx, original, merged_tree, parents, &message)?;
+    create_merge_commit_from_index(ctx, opts, original, merged_tree, parents, &message)?;
     if let Some(record) = original {
         record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
     }
@@ -4498,6 +4787,23 @@ fn pick_one_commit(
         reschedule_current(ctx, db, todo, item)?;
         return Ok(PickOutcome::Fail(1));
     }
+    if let Some(strategy) = opts.strategy.as_deref().filter(|strategy| {
+        custom_rebase_strategy_needs_external_driver(strategy) && parent.is_some()
+    }) {
+        return pick_one_commit_with_custom_strategy(
+            ctx,
+            db,
+            opts,
+            todo,
+            item,
+            &record,
+            head,
+            parent,
+            is_fixup,
+            final_fixup,
+            strategy,
+        );
+    }
     let base_map = stash_tree_entry_map(db, ctx.format, &parent_tree)?;
     let ours_map = stash_tree_entry_map(db, ctx.format, &head_tree)?;
     let theirs_map = stash_tree_entry_map(db, ctx.format, &theirs_tree)?;
@@ -4513,7 +4819,7 @@ fn pick_one_commit(
     // label is `parent of <msg.label>` (sequencer.c set_replay_opts /
     // `parent_label`). Honour merge.conflictStyle for the picked merge.
     let ancestor_label = format!("parent of {theirs_label}");
-    let (results, conflicts, _info) = three_way_merge_trees_inner_with_info(
+    let (results, conflicts, _info) = three_way_merge_trees_inner_with_info_opts_and_path_favor(
         &write_db,
         ctx.format,
         &base_map,
@@ -4524,6 +4830,14 @@ fn pick_one_commit(
         &ancestor_label,
         merge_favor_from_strategy_opts(&opts.strategy_opts),
         rebase_merge_conflict_style(),
+        rebase_ws_ignore_from_strategy_opts(&opts.strategy_opts),
+        RenameMergeConfig {
+            detect_renames: true,
+            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_limit: merge_rename_limit_config(),
+            directory_renames: directory_renames_config(),
+        },
+        None,
     )?;
 
     // Compose the message (fixup/squash machinery).
@@ -5159,6 +5473,33 @@ fn update_squash_message_for_fixup(msg: &[u8], comment: u8) -> Vec<u8> {
     out
 }
 
+fn remove_last_squash_message_section(
+    msg: &[u8],
+    remaining_messages: usize,
+    comment: u8,
+) -> Vec<u8> {
+    let comment_str = (comment as char).to_string();
+    let mut text = String::from_utf8_lossy(msg).into_owned();
+
+    if let Some(first_newline) = text.find('\n') {
+        let header = format!("{comment_str} This is a combination of ");
+        if text.starts_with(&header) {
+            let replacement =
+                format!("{comment_str} This is a combination of {remaining_messages} commits.");
+            text.replace_range(..first_newline, &replacement);
+        }
+    }
+
+    let markers = [
+        format!("\n{comment_str} This is the commit message #"),
+        format!("\n{comment_str} The commit message #"),
+    ];
+    if let Some(index) = markers.iter().filter_map(|marker| text.rfind(marker)).max() {
+        text.truncate(index + 1);
+    }
+    text.into_bytes()
+}
+
 /// Append the replacing/squashed message body (`append_squash_message`):
 /// the "commit message #N" header plus the fixup commit's body. For
 /// `fixup -C/-c` the body replaces the message, so it is added verbatim
@@ -5351,9 +5692,9 @@ fn machine_commit(
         None => head_record.commit.message.clone(),
     };
 
+    let editmsg = ctx.git_dir.join("COMMIT_EDITMSG");
     if commit.edit {
-        let path = ctx.git_dir.join("COMMIT_EDITMSG");
-        let comment = comment_char(&ctx.git_dir);
+        let comment_string = commands::status::commit_comment_string(&ctx.git_dir);
         let mut template = message.clone();
         if !template.ends_with(b"\n") {
             template.push(b'\n');
@@ -5363,18 +5704,42 @@ fn machine_commit(
         // an appended line (e.g. `fixup -c`'s amended subject) land in its own
         // paragraph after stripspace.
         template.push(b'\n');
-        let c = comment as char;
         template.extend_from_slice(
             format!(
-                "{c} Please enter the commit message for your changes. Lines starting\n{c} with '{c}' will be ignored, and an empty message aborts the commit.\n"
+                "{comment_string} Please enter the commit message for your changes. Lines starting\n{comment_string} with '{comment_string}' will be ignored, and an empty message aborts the commit.\n"
             )
             .as_bytes(),
         );
-        fs::write(&path, template)?;
-        launch_editor(&ctx.git_dir, &path)?;
-        let path_arg = path.to_string_lossy().into_owned();
+        template.extend_from_slice(&commands::commit::render_commit_editor_status_for_rebase(
+            &ctx.git_dir,
+            ctx.format,
+            &comment_string,
+            commit.amend,
+        )?);
+        fs::write(&editmsg, template)?;
+    } else {
+        fs::write(&editmsg, &message)?;
+    }
+    let prepare_source = if commit.amend && commit.message_file.is_none() {
+        commands::commit::PrepareCommitMsgSource::Commit("HEAD")
+    } else if ctx.git_dir.join("CHERRY_PICK_HEAD").is_file() {
+        commands::commit::PrepareCommitMsgSource::Merge
+    } else {
+        commands::commit::PrepareCommitMsgSource::Message
+    };
+    commands::commit::run_prepare_commit_msg_hook(
+        &editmsg,
+        prepare_source,
+        Vec::new(),
+        !commit.edit,
+    )?;
+    if commit.edit {
+        launch_editor(&ctx.git_dir, &editmsg)?;
+        let path_arg = editmsg.to_string_lossy().into_owned();
         commands::hooks::run_hook_l("commit-msg", &[path_arg.as_str()])?;
-        message = fs::read(&path)?;
+        message = fs::read(&editmsg)?;
+    } else {
+        message = fs::read(&editmsg)?;
     }
     if commit.edit {
         message = strip_comment_lines(&message, comment_char(&ctx.git_dir));
@@ -5439,23 +5804,7 @@ fn machine_commit(
     // committer date is then either "now" (`ignore_date`), the author's date
     // (`committer_date_is_author_date` without `ignore_date`), or the
     // environment's committer date.
-    let author = if opts.ignore_date {
-        reset_identity_date(&author, &rebase_now_date())
-    } else {
-        author
-    };
-    let committer = if opts.committer_date_is_author_date {
-        if opts.ignore_date {
-            reset_identity_date(&commit_identity_from_env("COMMITTER")?, &rebase_now_date())
-        } else {
-            let author_date = identity_date(&author).unwrap_or_else(rebase_now_date);
-            commit_identity_from_env_with_date("COMMITTER", &author_date)?
-        }
-    } else if opts.ignore_date {
-        reset_identity_date(&commit_identity_from_env("COMMITTER")?, &rebase_now_date())
-    } else {
-        commit_identity_from_env("COMMITTER")?
-    };
+    let (author, committer) = rebase_commit_identities(opts, author)?;
     let encoding = commit_encoding_header_from_config(&ctx.git_dir);
     let signature = rebase_commit_signature(
         ctx,
@@ -5506,6 +5855,39 @@ fn machine_commit(
 
     let _ = opts;
     Ok(CommitOutcome::Committed)
+}
+
+fn rebase_commit_identities(opts: &MachineOpts, author: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>)> {
+    let now = opts.ignore_date.then(rebase_now_date);
+    let author = match &now {
+        Some(now) => reset_identity_date(&author, now),
+        None => author,
+    };
+    let committer = match (opts.committer_date_is_author_date, now.as_deref()) {
+        (true, Some(now)) | (false, Some(now)) => {
+            reset_identity_date(&commit_identity_from_env("COMMITTER")?, now)
+        }
+        (true, None) => {
+            let author_date = identity_date(&author).unwrap_or_else(rebase_now_date);
+            commit_identity_from_env_with_date("COMMITTER", &author_date)?
+        }
+        (false, None) => commit_identity_from_env("COMMITTER")?,
+    };
+    Ok((author, committer))
+}
+
+fn rebase_ws_ignore_from_strategy_opts(opts: &[String]) -> sley_diff_merge::WsIgnore {
+    let mut ws_ignore = sley_diff_merge::WsIgnore::EMPTY;
+    for opt in opts {
+        match opt.as_str() {
+            "ignore-space-change" => ws_ignore.space_change = true,
+            "ignore-all-space" => ws_ignore.all_space = true,
+            "ignore-space-at-eol" => ws_ignore.space_at_eol = true,
+            "ignore-cr-at-eol" => ws_ignore.cr_at_eol = true,
+            _ => {}
+        }
+    }
+    ws_ignore
 }
 
 /// The current wall-clock time as git's raw `@<seconds> +0000`. Mirrors git's
@@ -5588,12 +5970,7 @@ fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
             name: "HEAD".into(),
             expected: None,
             new: RefTarget::Symbolic(head_name.clone()),
-            reflog: Some(ReflogEntry {
-                old_oid: head,
-                new_oid: head,
-                committer,
-                message: ctx.reflog("finish", Some(&format!("returning to {head_name}"))),
-            }),
+            reflog: None,
         });
         tx.commit()?;
         head_name_display = head_name.clone();
@@ -5955,14 +6332,27 @@ fn commit_staged_changes(
                 // Skipping a failed fixup/squash in a chain.
                 let fixups = fs::read_to_string(ctx.state_path("current-fixups"))?;
                 let mut lines: Vec<&str> = fixups.lines().collect();
-                let had_squash = lines.iter().any(|line| line.starts_with("squash "));
                 lines.pop();
+                let had_squash = lines.iter().any(|line| line.starts_with("squash "));
                 fs::write(ctx.state_path("current-fixups"), lines.join("\n"))?;
                 if !lines.is_empty() && !next_is_fixup_first(todo) {
                     final_fixup = true;
                     if !had_squash {
                         edit = false;
                         cleanup_only = true;
+                        let head_record = read_rev_list_commit_record(db, ctx.format, head)?;
+                        fs::write(
+                            ctx.state_path("message-squash"),
+                            &head_record.commit.message,
+                        )?;
+                    } else if let Ok(message_squash) = fs::read(ctx.state_path("message-squash")) {
+                        let remaining_messages = lines.len() + 1;
+                        let pruned = remove_last_squash_message_section(
+                            &message_squash,
+                            remaining_messages,
+                            comment_char(&ctx.git_dir),
+                        );
+                        fs::write(ctx.state_path("message-squash"), pruned)?;
                     }
                 } else if next_is_fixup_first(todo) {
                     // Update the squash message to skip the latest commit
@@ -6194,9 +6584,11 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
 
 fn create_autostash(ctx: &Ctx, use_apply_backend: bool) -> Result<()> {
     let status = crate::collect_short_status(&ctx.worktree_root, &ctx.git_dir, ctx.format)?;
-    let dirty = status
-        .iter()
-        .any(|entry| entry.index != b'?' && (entry.index != b' ' || entry.worktree != b' '));
+    let dirty = status.iter().any(|entry| {
+        !rebase_status_is_submodule(entry)
+            && entry.index != b'?'
+            && (entry.index != b' ' || entry.worktree != b' ')
+    });
     if !dirty {
         return Ok(());
     }
@@ -6237,6 +6629,11 @@ fn save_autostash(ctx: &Ctx) {
     apply_save_autostash(ctx, false);
 }
 
+fn read_apply_autostash(ctx: &Ctx) -> Option<String> {
+    let path = ctx.git_dir.join("rebase-apply").join("autostash");
+    fs::read_to_string(path).ok()
+}
+
 fn apply_save_autostash(ctx: &Ctx, attempt_apply: bool) {
     // The autostash lives in whichever backend's state dir created it:
     // `rebase-merge/autostash` (merge sequencer) or `rebase-apply/autostash`
@@ -6251,8 +6648,12 @@ fn apply_save_autostash(ctx: &Ctx, attempt_apply: bool) {
     let Ok(text) = fs::read_to_string(&path) else {
         return;
     };
-    let oid_text = text.trim().to_string();
     let _ = fs::remove_file(&path);
+    apply_save_autostash_text(ctx, &text, attempt_apply);
+}
+
+fn apply_save_autostash_text(ctx: &Ctx, text: &str, attempt_apply: bool) {
+    let oid_text = text.trim().to_string();
     if oid_text.is_empty() {
         return;
     }
@@ -6270,14 +6671,20 @@ fn apply_save_autostash(ctx: &Ctx, attempt_apply: bool) {
     if !stored {
         eprintln!("error: cannot store {oid_text}");
     } else if attempt_apply {
-        eprintln!("Applying autostash resulted in conflicts.");
-        eprintln!("Your changes are safe in the stash.");
-        eprintln!("You can run \"git stash pop\" or \"git stash drop\" at any time.");
+        print_autostash_conflict_advice();
     } else {
         eprintln!("Autostash exists; creating a new stash entry.");
         eprintln!("Your changes are safe in the stash.");
         eprintln!("You can run \"git stash pop\" or \"git stash drop\" at any time.");
     }
+}
+
+fn print_autostash_conflict_advice() {
+    eprintln!("Your local changes are stashed, however applying them");
+    eprintln!("resulted in conflicts.  You can either resolve the conflicts");
+    eprintln!("and then discard the stash with \"git stash drop\", or, if you");
+    eprintln!("do not want to resolve them now, run \"git reset --hard\" and");
+    eprintln!("apply the local changes later by running \"git stash pop\".");
 }
 
 fn cleanup_autostash_and_state(ctx: &Ctx) {

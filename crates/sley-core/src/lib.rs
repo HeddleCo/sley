@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
 
-pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.54.0";
+pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.55.0";
 
 static ORIGINAL_CWD: Mutex<Option<PathBuf>> = Mutex::new(None);
 

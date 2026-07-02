@@ -489,7 +489,7 @@ fn var_editor(specific_key: Option<&str>) -> Result<String> {
     if let Ok(value) = env::var("EDITOR") {
         return Ok(value);
     }
-    Ok("vi".to_string())
+    Err(GitError::Exit(1))
 }
 
 fn var_pager() -> String {

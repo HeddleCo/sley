@@ -246,6 +246,7 @@ fn init_templatedir_config_and_tilde_expansion_match_upstream_git() {
         let output = Command::new(program)
             .current_dir(&root)
             .env("HOME", &fake_home)
+            .env("NO_SET_GIT_TEMPLATE_DIR", "1")
             .args(["-c", &config_arg, "init", "-q", path])
             .output()
             .unwrap_or_else(|err| panic!("failed to run {program} init: {err}"));

@@ -379,16 +379,14 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
     warn_checkout_collisions(&collided_paths);
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let extensions = preserved_index_extensions(git_dir, format)?;
-    fs::write(
-        repository_index_path(git_dir),
-        Index {
-            version: 2,
-            entries: index_entries,
-            extensions,
-            checksum: None,
-        }
-        .write(format)?,
-    )?;
+    let mut index = Index {
+        version: 2,
+        entries: index_entries,
+        extensions,
+        checksum: None,
+    };
+    refresh_cache_tree(&mut index, &db);
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(target_entries.len())
 }
 
@@ -889,6 +887,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree_sparse(
         checksum: None,
     };
     normalize_index_version_for_extended_flags(&mut index);
+    refresh_cache_tree(&mut index, &db);
     write_repository_index_ref(git_dir, format, &index)?;
     Ok(target_entries.len())
 }
@@ -1432,6 +1431,7 @@ pub(crate) fn checkout_merge_unmerged_path(
             },
             favor: sley_diff_merge::MergeFavor::None,
             ws_ignore: sley_diff_merge::WsIgnore::EMPTY,
+            marker_size: 7,
         },
     );
     let file_path = worktree_path(worktree_root, ours.path.as_bytes())?;
@@ -1817,16 +1817,14 @@ pub fn reset_index_and_worktree_to_commit(
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let extensions = preserved_index_extensions(git_dir, format)?;
-    fs::write(
-        repository_index_path(git_dir),
-        Index {
-            version: 2,
-            entries: index_entries,
-            extensions,
-            checksum: None,
-        }
-        .write(format)?,
-    )?;
+    let mut index = Index {
+        version: 2,
+        entries: index_entries,
+        extensions,
+        checksum: None,
+    };
+    refresh_cache_tree(&mut index, &db);
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(RestoreResult {
         restored: target_entries.len(),
     })
@@ -2160,16 +2158,14 @@ pub fn checkout_tree_to_index_and_worktree(
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let extensions = preserved_index_extensions(git_dir, format)?;
-    fs::write(
-        repository_index_path(git_dir),
-        Index {
-            version: 2,
-            entries: index_entries,
-            extensions,
-            checksum: None,
-        }
-        .write(format)?,
-    )?;
+    let mut index = Index {
+        version: 2,
+        entries: index_entries,
+        extensions,
+        checksum: None,
+    };
+    refresh_cache_tree(&mut index, &db);
+    write_repository_index_ref(git_dir, format, &index)?;
     Ok(RestoreResult {
         restored: target_entries.len(),
     })
@@ -2217,6 +2213,7 @@ pub fn reset_index_to_commit(
         checksum: None,
     };
     index.upgrade_version_for_flags();
+    refresh_cache_tree(&mut index, &db);
     write_repository_index_ref(git_dir, format, &index)?;
     Ok(RestoreResult {
         restored: target_entries.len(),

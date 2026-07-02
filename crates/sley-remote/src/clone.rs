@@ -277,6 +277,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
 
     let store = FileRefStore::new(&git_dir, request.format);
     if let Some(detached) = &request.options.detached_head {
+        write_clone_remote_head(&store, request.options)?;
         if request.options.checkout {
             sley_worktree::checkout_detached_filtered(
                 request.destination,
@@ -376,22 +377,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         });
         tx.commit()?;
     }
-    if !request.options.remote_head_branch.is_empty()
-        && (!request.options.single_branch
-            || request.options.checkout_branch == request.options.remote_head_branch)
-    {
-        let mut tx = store.transaction();
-        tx.update(RefUpdate {
-            name: format!("refs/remotes/{}/HEAD", request.options.origin),
-            expected: None,
-            new: RefTarget::Symbolic(format!(
-                "refs/remotes/{}/{}",
-                request.options.origin, request.options.remote_head_branch
-            )),
-            reflog: None,
-        });
-        tx.commit()?;
-    }
+    write_clone_remote_head(&store, request.options)?;
 
     if request.options.checkout {
         sley_worktree::checkout_branch_filtered(
@@ -409,6 +395,25 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         branch_oid: Some(branch_oid),
         empty: false,
     })
+}
+
+fn write_clone_remote_head(store: &FileRefStore, options: &CloneOptions<'_>) -> Result<()> {
+    if options.remote_head_branch.is_empty()
+        || (options.single_branch && options.checkout_branch != options.remote_head_branch)
+    {
+        return Ok(());
+    }
+    let mut tx = store.transaction();
+    tx.update(RefUpdate {
+        name: format!("refs/remotes/{}/HEAD", options.origin),
+        expected: None,
+        new: RefTarget::Symbolic(format!(
+            "refs/remotes/{}/{}",
+            options.origin, options.remote_head_branch
+        )),
+        reflog: None,
+    });
+    tx.commit()
 }
 
 fn scheme_for_clone_source(source: &CloneSource) -> &'static str {

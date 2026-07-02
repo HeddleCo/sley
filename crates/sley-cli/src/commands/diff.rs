@@ -1128,7 +1128,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff output indicator controls are not supported for this output mode".into(),
         ));
     }
-    let patch_context = if diff_patch_context_control {
+    let no_index_patch_context = if diff_patch_context_control {
         sley_diff_merge::render::enable_function_context(context.unwrap_or(3))
     } else {
         context.unwrap_or(3)
@@ -1184,7 +1184,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             &cwd,
             &paths,
             DiffNoIndexParams {
-                context: patch_context,
+                context: no_index_patch_context,
                 color: color_always,
                 color_moved_cli: color_moved,
                 color_moved_ws_cli: color_moved_ws,
@@ -1221,6 +1221,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     }
     let git_dir = discover_git_dir(&cwd)?;
     let repo_config = read_repo_config(&git_dir).ok();
+    let resolved_context =
+        commands::diff_options::resolve_diff_context(context, repo_config.as_ref())?;
+    let patch_context = if diff_patch_context_control {
+        sley_diff_merge::render::enable_function_context(resolved_context)
+    } else {
+        resolved_context
+    };
     // git's `quote_path_fully` (`core.quotePath`, default true): drives whether
     // non-ASCII bytes in diffstat names are octal-escaped or shown verbatim.
     let quote_path_fully = repo_config
@@ -1565,6 +1572,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         match diff_trees.as_slice() {
             // `diff <rev>`: that tree vs the worktree (or the index with --cached).
             [tree] => {
+                reject_duplicate_tree_for_index_diff(&db, format, tree)?;
                 if cached {
                     if inexact_renames {
                         let diff =
@@ -1654,6 +1662,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             )?
         }
     } else if head {
+        let head_tree = diff_peel_rev_tree(&git_dir, format, &db, "HEAD")?;
+        reject_duplicate_tree_for_index_diff(&db, format, &head_tree)?;
         let worktree_root = worktree_root
             .as_ref()
             .expect("worktree root set for diff HEAD");
@@ -1674,19 +1684,38 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
     } else {
         let worktree_root = worktree_root.as_ref().expect("worktree root set for diff");
+        let mut stat_clean_validator = sley_worktree::StatCleanFilterValidator::new();
+        let mut validate_stat_clean =
+            |entry: sley_diff_merge::IndexWorktreeValidationEntry<'_>,
+             absolute_path: &Path,
+             metadata: &fs::Metadata| {
+                stat_clean_validator.validate_path(
+                    worktree_root,
+                    &git_dir,
+                    format,
+                    entry.mode,
+                    entry.oid,
+                    entry.size,
+                    entry.path,
+                    absolute_path,
+                    metadata,
+                )
+            };
         let diff = if inexact_renames {
-            sley_diff_merge::diff_name_status_index_worktree_with_rename_options_and_gitlinks(
+            sley_diff_merge::diff_name_status_index_worktree_with_options_and_gitlinks_validated(
                 worktree_root,
                 &git_dir,
                 format,
-                rename_options,
+                rename_options.base,
+                &mut validate_stat_clean,
             )?
         } else {
-            sley_diff_merge::diff_name_status_index_worktree_with_options_and_gitlinks(
+            sley_diff_merge::diff_name_status_index_worktree_with_options_and_gitlinks_validated(
                 worktree_root,
                 &git_dir,
                 format,
                 name_status_options,
+                &mut validate_stat_clean,
             )?
         };
         precomputed_staged_gitlinks = Some(diff.staged_gitlinks);
@@ -1762,12 +1791,14 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         entries
     } else {
         let prefix = diff_relative_prefix(&diff_relative, &cwd, &git_dir)?;
+        let entries = apply_diff_relative(entries, &prefix);
         if !prefix.is_empty()
+            && !entries.is_empty()
             && let Some(root) = worktree_root.as_mut()
         {
             root.push(repo_path_to_path(&prefix));
         }
-        apply_diff_relative(entries, &prefix)
+        entries
     };
     let worktree_clean_attributes = if use_worktree_new || use_worktree_old {
         worktree_root
@@ -2108,7 +2139,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         }
                         _ => None,
                     };
-                    let materialized_contents = if use_worktree_old || worktree_clean.is_some() {
+                    let materialized_contents = if !is_gitlink_pair(entry)
+                        && (use_worktree_old || worktree_clean.is_some())
+                    {
                         Some((
                             diff_entry_old_content_for_diff(
                                 entry,
@@ -2268,6 +2301,17 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     }
     if (quiet || exit_code) && has_differences {
         return Err(GitError::Exit(1));
+    }
+    Ok(())
+}
+
+fn reject_duplicate_tree_for_index_diff(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree: &ObjectId,
+) -> Result<()> {
+    if sley_diff_merge::tree_has_duplicate_leaf_paths(db, format, tree)? {
+        return Err(sley_diff_merge::corrupted_cache_tree_error());
     }
     Ok(())
 }
@@ -2623,7 +2667,7 @@ fn diff_entry_matches_pickaxe(
     )
 }
 
-fn resolve_diff_find_objects(
+pub(crate) fn resolve_diff_find_objects(
     git_dir: &Path,
     format: ObjectFormat,
     values: &[String],
@@ -2643,7 +2687,7 @@ fn resolve_diff_find_object(git_dir: &Path, format: ObjectFormat, value: &str) -
         .map_err(|_| diff_find_object_unable_to_resolve_error(value))
 }
 
-fn apply_diff_find_objects(
+pub(crate) fn apply_diff_find_objects(
     entries: Vec<sley_diff_merge::NameStatusEntry>,
     targets: &[ObjectId],
 ) -> Vec<sley_diff_merge::NameStatusEntry> {

@@ -66,6 +66,8 @@ struct AmOptions {
     utf8: bool,
     /// Prompt before applying each patch (`-i`/`--interactive`).
     interactive: bool,
+    /// `--rerere-autoupdate` / `--no-rerere-autoupdate`, persisted for resume.
+    rerere_autoupdate: Option<bool>,
     /// Prepend this directory to every path in each patch (`--directory=<dir>`,
     /// forwarded to `git apply --directory`).
     directory: Option<String>,
@@ -142,6 +144,28 @@ struct AmCommitOpts {
     /// `GIT_REFLOG_ACTION="<action> (pick)"`, builtin/rebase.c run_am), instead
     /// of the bare `am: <subject>` a standalone `git am` writes.
     rebase_pick_reflog: bool,
+}
+
+fn write_am_rerere_autoupdate(state_dir: &Path, value: Option<bool>) -> Result<()> {
+    match value {
+        Some(true) => fs::write(state_dir.join("rerere-autoupdate"), bool_flag(true))?,
+        Some(false) => fs::write(state_dir.join("rerere-autoupdate"), bool_flag(false))?,
+        None => {}
+    }
+    Ok(())
+}
+
+fn read_am_rerere_autoupdate(state_dir: &Path) -> Option<bool> {
+    match fs::read_to_string(state_dir.join("rerere-autoupdate")) {
+        Ok(line) if line.trim() == "t" => return Some(true),
+        Ok(line) if line.trim() == "f" => return Some(false),
+        _ => {}
+    }
+    match fs::read_to_string(state_dir.join("allow_rerere_autoupdate")) {
+        Ok(line) if line.contains("--no-rerere-autoupdate") => Some(false),
+        Ok(line) if line.contains("--rerere-autoupdate") => Some(true),
+        _ => None,
+    }
 }
 
 /// A single message extracted from an mbox: identity, message, and raw diff.
@@ -391,6 +415,9 @@ pub(crate) struct RebaseApplyParams {
     pub committer_date_is_author_date: bool,
     pub ignore_date: bool,
     pub ignore_whitespace: bool,
+    pub apply_opts: Vec<String>,
+    /// `--rerere-autoupdate` / `--no-rerere-autoupdate`, persisted for resume.
+    pub rerere_autoupdate: Option<bool>,
     /// `refs/heads/<branch>` to return to, or `None` for a detached HEAD rebase.
     pub head_name: Option<String>,
     /// The commit HEAD/orig branch started at (for `--abort`).
@@ -440,7 +467,9 @@ pub(crate) fn start_rebase_apply(
         mboxes: Vec::new(),
         quiet: params.quiet,
         signoff: params.signoff,
-        three_way: false,
+        // Upstream `git am --rebasing` forces three-way fallback so add/add
+        // conflicts materialize in the index and rerere can replay them.
+        three_way: true,
         keep_non_patch: false,
         empty_action: AmEmptyAction::Stop,
         keep_subject: false,
@@ -454,16 +483,11 @@ pub(crate) fn start_rebase_apply(
         scissors: false,
         utf8: true,
         interactive: false,
+        rerere_autoupdate: None,
         directory: None,
         patch_format: AmPatchFormat::Mbox,
         p_value: 1,
-        // The rebase apply backend forwards only `--ignore-whitespace` (when the
-        // user passed it); the rest default off, matching `git rebase --apply`.
-        git_apply_opts: if params.ignore_whitespace {
-            vec!["--ignore-whitespace".to_string()]
-        } else {
-            Vec::new()
-        },
+        git_apply_opts: params.apply_opts,
     };
 
     let refs = FileRefStore::new(git_dir, format);
@@ -505,6 +529,7 @@ pub(crate) fn start_rebase_apply(
         format!("{}\n", params.orig_head),
     )?;
     fs::write(state_dir.join("quiet"), bool_flag(params.quiet))?;
+    write_am_rerere_autoupdate(&state_dir, params.rerere_autoupdate)?;
 
     run_am_series(
         git_dir,
@@ -583,6 +608,7 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
         scissors: false,
         utf8: true,
         interactive: false,
+        rerere_autoupdate: None,
         directory: None,
         patch_format: AmPatchFormat::Auto,
         p_value: 1,
@@ -653,7 +679,9 @@ fn parse_am_options(args: &[String]) -> Result<AmOptions> {
             "--no-scissors" => options.scissors = false,
             "-u" | "--utf8" => options.utf8 = true,
             "--no-utf8" => options.utf8 = false,
-            "--rerere-autoupdate" | "--no-rerere-autoupdate" | "--allow-empty" => {}
+            "--rerere-autoupdate" => options.rerere_autoupdate = Some(true),
+            "--no-rerere-autoupdate" => options.rerere_autoupdate = Some(false),
+            "--allow-empty" => {}
             // Forwarded `git apply` options: collected into git_apply_opts in git's
             // recreate-opt form (`--whitespace=fix`, `-C1`, `-p2`, `--reject`, …),
             // persisted to apply-opt, and re-applied for every patch + on resume.
@@ -1933,6 +1961,7 @@ fn write_am_state_dir(
         state_dir.join("interactive"),
         bool_flag(options.interactive),
     )?;
+    write_am_rerere_autoupdate(state_dir, options.rerere_autoupdate)?;
     fs::write(state_dir.join("applying"), b"")?;
     // git records the forwarded `git apply` options here, sq-quoted as a single
     // line (`sq_quote_argv`), and re-passes them to `git apply` for every patch
@@ -2720,9 +2749,15 @@ fn apply_one_patch(
         am_prepend_directory(&mut file_patches, dir);
     }
 
-    match try_straight_apply(worktree_root, &file_patches, apply_opts)? {
+    match try_straight_apply(
+        common_git_dir,
+        worktree_root,
+        format,
+        &file_patches,
+        apply_opts,
+    )? {
         Some(actions) => {
-            apply_actions(worktree_root, &actions)?;
+            apply_actions(git_dir, worktree_root, format, &actions)?;
             let new_oid = stage_and_commit(
                 git_dir,
                 common_git_dir,
@@ -2785,11 +2820,14 @@ enum ApplyFileAction {
 /// Compute the file actions for every hunk against the current worktree, or
 /// `None` if any hunk fails to apply (so the whole patch is atomic, like git).
 fn try_straight_apply(
+    common_git_dir: &Path,
     worktree_root: &Path,
+    format: ObjectFormat,
     file_patches: &[sley_diff_merge::FilePatch],
     apply_opts: &AmApplyOpts,
 ) -> Result<Option<Vec<ApplyFileAction>>> {
     let mut actions = Vec::new();
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     for patch in file_patches {
         // git apply (`check_to_create` in apply.c) rejects a create patch when
         // the target already exists in the working tree — the whole patch fails
@@ -2823,6 +2861,35 @@ fn try_straight_apply(
         } else {
             Vec::new()
         };
+
+        if patch.is_binary {
+            match commands::plumbing::apply_binary_outcome(&db, format, patch, &base)? {
+                commands::plumbing::BinaryApply::Deletion => {
+                    if let Some(old) = &patch.old_path {
+                        actions.push(ApplyFileAction::Remove { path: old.clone() });
+                    }
+                }
+                commands::plumbing::BinaryApply::Content(content) => {
+                    let mode = patch.new_mode.or(patch.old_mode).unwrap_or(0o100644);
+                    let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone())
+                    else {
+                        return Err(GitError::InvalidFormat("patch missing target path".into()));
+                    };
+                    actions.push(ApplyFileAction::Write {
+                        path: target,
+                        mode,
+                        content,
+                    });
+                    if patch.is_rename
+                        && let Some(old) = &patch.old_path
+                    {
+                        actions.push(ApplyFileAction::Remove { path: old.clone() });
+                    }
+                }
+            }
+            continue;
+        }
+
         // `--whitespace=fix` rewrites added lines (strip trailing whitespace)
         // before they are applied, so the materialised file loses the whitespace
         // errors (t4252 "interrupted am --whitespace=fix" loses the space after
@@ -3219,7 +3286,13 @@ fn ws_fuzzy_matchlines(a: &[u8], b: &[u8]) -> bool {
     i == a.len() && j == b.len()
 }
 
-fn apply_actions(worktree_root: &Path, actions: &[ApplyFileAction]) -> Result<()> {
+fn apply_actions(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    actions: &[ApplyFileAction],
+) -> Result<()> {
+    let config = commands::remote_cmds::read_repo_config(git_dir).unwrap_or_default();
     // git's `write_out_results` materializes in two phases: every removal happens
     // before any write. This matters when a directory's tracked children are
     // removed and the directory is then (re)created as a gitlink — single-phase
@@ -3236,7 +3309,19 @@ fn apply_actions(worktree_root: &Path, actions: &[ApplyFileAction]) -> Result<()
             content,
         } = action
         {
-            merge_write_worktree_file(worktree_root, path, content, *mode)?;
+            let worktree_content = if (*mode & 0o170000) == 0o100000 {
+                Cow::Owned(sley_worktree::apply_smudge_filter(
+                    worktree_root,
+                    git_dir,
+                    format,
+                    &config,
+                    path,
+                    content,
+                )?)
+            } else {
+                Cow::Borrowed(content.as_slice())
+            };
+            merge_write_worktree_file(worktree_root, path, &worktree_content, *mode)?;
         }
     }
     Ok(())
@@ -3773,8 +3858,12 @@ fn apply_three_way(
             _ => sley_diff_merge::ConflictStyle::Merge,
         })
         .unwrap_or(sley_diff_merge::ConflictStyle::Merge);
+    let marker_attrs = vec![b"conflict-marker-size".to_vec()];
+    let path_marker_size = |path: &[u8]| {
+        am_conflict_marker_size_for_path(git_dir, worktree_root, format, path, &marker_attrs)
+    };
     let (results, conflicts, _info) =
-        commands::merge_rebase::three_way_merge_trees_inner_with_info(
+        commands::merge_rebase::three_way_merge_trees_inner_with_info_opts_and_path_resolvers(
             &db,
             format,
             &base_map,
@@ -3785,6 +3874,15 @@ fn apply_three_way(
             "constructed fake ancestor",
             sley_diff_merge::MergeFavor::None,
             conflict_style,
+            sley_diff_merge::WsIgnore::EMPTY,
+            commands::merge_rebase::RenameMergeConfig {
+                detect_renames: true,
+                rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                rename_limit: commands::merge_rebase::merge_rename_limit_config(),
+                directory_renames: commands::merge_rebase::directory_renames_config(),
+            },
+            None,
+            Some(&path_marker_size),
         )?;
 
     // git's merge refuses to clobber untracked working-tree files: a path the
@@ -3859,7 +3957,7 @@ fn apply_three_way(
         // records the preimage and, when a matching resolution was recorded
         // earlier, replays it into the worktree (t4150 "am -3 works with
         // rerere"). A no-op unless rerere.enabled.
-        commands::rerere::repo_rerere(git_dir, format, None)?;
+        commands::rerere::repo_rerere(git_dir, format, read_am_rerere_autoupdate(state_dir))?;
         eprintln!("error: Failed to merge in the changes.");
         Ok(ApplyResult::Conflict)
     }
@@ -4116,6 +4214,42 @@ fn write_merge_index_and_worktree(
     Ok(())
 }
 
+const AM_DEFAULT_CONFLICT_MARKER_SIZE: usize = 7;
+
+fn am_conflict_marker_size_for_path(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    path: &[u8],
+    requested: &[Vec<u8>],
+) -> usize {
+    let state = sley_worktree::standard_attributes_for_path_from_index(
+        worktree_root,
+        git_dir,
+        format,
+        path,
+        requested,
+        false,
+    )
+    .ok()
+    .and_then(|checks| checks.into_iter().next().and_then(|check| check.state));
+    am_conflict_marker_size_from_attr(state.as_ref())
+}
+
+fn am_conflict_marker_size_from_attr(state: Option<&sley_worktree::AttributeState>) -> usize {
+    let Some(sley_worktree::AttributeState::Value(value)) = state else {
+        return AM_DEFAULT_CONFLICT_MARKER_SIZE;
+    };
+    let raw = String::from_utf8_lossy(value);
+    match raw.parse::<isize>() {
+        Ok(size) if size > 0 => size as usize,
+        _ => {
+            eprintln!("warning: invalid marker-size '{raw}', expecting an integer");
+            AM_DEFAULT_CONFLICT_MARKER_SIZE
+        }
+    }
+}
+
 fn am_print_conflict_hints() {
     eprintln!("hint: Use 'git am --show-current-patch=diff' to see the failed patch");
     eprintln!("hint: When you have resolved this problem, run \"git am --continue\".");
@@ -4306,13 +4440,19 @@ fn apply_rebase_autostash(common_git_dir: &Path, state_dir: &Path) -> Result<()>
             if applied {
                 eprintln!("Applied autostash.");
             } else if commands::stash::store_stash_commit(&oid, "autostash").is_ok() {
-                eprintln!(
-                    "Applying autostash resulted in conflicts.\nYour changes are safe in the stash.\nYou can run \"git stash pop\" or \"git stash drop\" at any time."
-                );
+                print_rebase_autostash_conflict_advice();
             }
         }
     }
     Ok(())
+}
+
+fn print_rebase_autostash_conflict_advice() {
+    eprintln!("Your local changes are stashed, however applying them");
+    eprintln!("resulted in conflicts.  You can either resolve the conflicts");
+    eprintln!("and then discard the stash with \"git stash drop\", or, if you");
+    eprintln!("do not want to resolve them now, run \"git reset --hard\" and");
+    eprintln!("apply the local changes later by running \"git stash pop\".");
 }
 
 // ===========================================================================

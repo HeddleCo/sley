@@ -49,7 +49,6 @@ impl FetchRecurseSubmodules {
 
 pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let mut quiet = false;
-    let mut progress_requested = false;
     let mut explicit_bare = None::<bool>;
     let mut mirror = false;
     let mut checkout = true;
@@ -73,6 +72,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let mut separate_git_dir = None::<String>;
     let mut depth = None::<u32>;
     let mut local = None::<bool>;
+    let mut progress = None::<bool>;
     let mut no_hardlinks = false;
     let mut upload_pack = None::<String>;
     let mut deepen_since = None::<i64>;
@@ -86,6 +86,11 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let mut option_reject_shallow = None::<bool>;
     let mut ref_storage = match env::var("GIT_DEFAULT_REF_FORMAT") {
         Ok(value) if value == "reftable" => RefStorageFormat::Reftable,
+        _ if env::var("GIT_TEST_DEFAULT_REF_FORMAT")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("reftable")) =>
+        {
+            RefStorageFormat::Reftable
+        }
         _ => RefStorageFormat::Files,
     };
     let mut positional = Vec::new();
@@ -102,8 +107,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             "--no-mirror" => mirror = false,
             "--checkout" => checkout = true,
             "--no-checkout" | "-n" => checkout = false,
-            "--progress" => progress_requested = true,
-            "--no-progress" => progress_requested = false,
+            "--progress" => progress = Some(true),
+            "--no-progress" => progress = Some(false),
             "--single-branch" => explicit_single_branch = Some(true),
             "--no-single-branch" => explicit_single_branch = Some(false),
             "--tags" => tag_opt = None,
@@ -677,6 +682,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             bundle_uri: bundle_uri.as_ref(),
             depth,
             ref_storage,
+            progress,
             ssh_options,
         })?;
         return recurse_clone_submodules(
@@ -717,6 +723,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             bundle_uri: bundle_uri.as_ref(),
             depth,
             ref_storage,
+            progress,
             ssh_options,
         })?;
         return recurse_clone_submodules(
@@ -757,6 +764,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             bundle_uri: bundle_uri.as_ref(),
             depth,
             ref_storage,
+            progress,
             ssh_options,
         })?;
         return recurse_clone_submodules(
@@ -806,7 +814,11 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         Some(oid) => Some(oid.clone()),
         None => remote_head_detached(&remote_common_git_dir, format),
     };
-    let branch_at_detached_head = if branch.is_none() && branch_tag_oid.is_none() {
+    let source_bare = read_repo_config_on_disk(&remote_common_git_dir)
+        .ok()
+        .and_then(|config| config.get_bool("core", None, "bare"))
+        .unwrap_or(false);
+    let branch_at_detached_head = if source_bare && branch.is_none() && branch_tag_oid.is_none() {
         raw_detached_remote_head
             .as_ref()
             .map(|oid| clone_branch_pointing_at(&remote_common_git_dir, format, oid))
@@ -821,9 +833,12 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         raw_detached_remote_head
     };
     let remote_head_branch = match (&detached_remote_head, &branch, &branch_at_detached_head) {
-        // A detached source HEAD (or a `--branch=<tag>`) has no default branch;
-        // the clone checks the commit out detached.
-        (Some(_), _, _) if branch_tag_oid.is_some() => String::new(),
+        // `--branch=<tag>` checks out detached, but the remote can still have a
+        // default HEAD branch, and git writes refs/remotes/<origin>/HEAD when
+        // that branch was fetched by the configured refspec.
+        (Some(_), _, _) if branch_tag_oid.is_some() => {
+            clone_remote_head_branch(&remote_common_git_dir, format)?.unwrap_or_default()
+        }
         (_, None, Some(branch)) => branch.clone(),
         (Some(_), None, _) => String::new(),
         _ => clone_remote_head_branch(&remote_common_git_dir, format)?.unwrap_or_default(),
@@ -1077,7 +1092,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 format!("clone: from {repository}").into_bytes(),
                 &config,
             )?;
-            print_clone_detached_head_advice(revision_oid);
+            print_clone_detached_head_advice(&config, revision_oid);
             run_clone_post_checkout_hook(&git_dir, revision_oid)?;
         } else {
             sley_worktree::checkout_detached(
@@ -1136,7 +1151,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         ssh_options: None,
     };
     let mut credentials = sley_remote::NoCredentials;
-    let mut progress = StdoutProgress;
+    let mut progress_sink = StdoutProgress;
     let outcome = sley_remote::clone(
         sley_remote::CloneRequest {
             destination: &checkout_destination,
@@ -1149,11 +1164,15 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         sley_remote::CloneServices {
             configure: &mut |git_dir| {
                 let fetch_refspec = if branch_tag_oid.is_some() {
-                    Some(format!(
-                        "+refs/tags/{checkout_branch}:refs/tags/{checkout_branch}"
-                    ))
+                    if single_branch {
+                        Some(format!(
+                            "+refs/tags/{checkout_branch}:refs/tags/{checkout_branch}"
+                        ))
+                    } else {
+                        Some(format!("+refs/heads/*:refs/remotes/{origin}/*"))
+                    }
                 } else if clone_options.detached_head.is_some() {
-                    None
+                    (!single_branch).then(|| format!("+refs/heads/*:refs/remotes/{origin}/*"))
                 } else if single_branch {
                     Some(format!(
                         "+refs/heads/{checkout_branch}:refs/remotes/{origin}/{checkout_branch}"
@@ -1178,11 +1197,10 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 repo_config_with_transport_policy(git_dir)
             },
             credentials: &mut credentials,
-            progress: &mut progress,
+            progress: &mut progress_sink,
         },
     )?;
     let git_dir = outcome.git_dir;
-    emit_clone_progress_if_requested(progress_requested, quiet);
     if local_source {
         install_local_clone_objects(&source_alternates_git_dir, &git_dir, local_object_install)?;
     }
@@ -1203,10 +1221,17 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         && !outcome.empty
         && let Some(new_head) = outcome.branch_oid.as_ref()
     {
+        if branch_tag_oid.is_some() {
+            let config = read_repo_config(&git_dir)?;
+            print_clone_detached_head_advice(&config, new_head);
+        }
         run_clone_post_checkout_hook(&git_dir, new_head)?;
     }
     if let Some(separate_git_dir) = separate_git_dir.as_deref() {
         apply_clone_separate_git_dir(&checkout_destination, &git_dir, separate_git_dir)?;
+    }
+    if !local_source {
+        emit_explicit_clone_progress(progress, quiet, outcome.empty);
     }
     if !quiet && local_source {
         eprintln!("done.");
@@ -1446,6 +1471,7 @@ struct CloneHttpOptions<'a> {
     bundle_uri: Option<&'a CloneBundleUri>,
     depth: Option<u32>,
     ref_storage: RefStorageFormat,
+    progress: Option<bool>,
     ssh_options: sley_remote::SshTransportOptions,
 }
 
@@ -1677,6 +1703,7 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
     if let Some(separate_git_dir) = options.separate_git_dir {
         apply_clone_separate_git_dir(options.destination, &git_dir, separate_git_dir)?;
     }
+    emit_explicit_clone_progress(options.progress, options.quiet, empty);
     // An empty-repository clone stops before the checkout that would print
     // "done."; git emits only the warning in that case.
     if !options.quiet && !empty {
@@ -1887,12 +1914,19 @@ fn clone_network_repository(
     if let Some(separate_git_dir) = options.separate_git_dir {
         apply_clone_separate_git_dir(options.destination, &git_dir, separate_git_dir)?;
     }
+    emit_explicit_clone_progress(options.progress, options.quiet, empty);
     // An empty-repository clone stops before the checkout that would print
     // "done."; git emits only the warning in that case.
     if !options.quiet && !empty {
         eprintln!("done.");
     }
     Ok(())
+}
+
+fn emit_explicit_clone_progress(progress: Option<bool>, quiet: bool, empty: bool) {
+    if progress == Some(true) && !quiet && !empty {
+        eprintln!("Receiving objects: 100% (0/0), done.");
+    }
 }
 
 fn clone_bare_network_repository(
@@ -2058,7 +2092,11 @@ fn validate_local_clone_source_ref_dir(
         if name.ends_with(".lock") {
             continue;
         }
-        let reference = match sley_refs::parse_loose_ref(format, name.clone(), &fs::read(&path)?) {
+        let bytes = fs::read(&path)?;
+        if local_clone_ref_bytes_are_reftable_sentinel(&name, &bytes) {
+            continue;
+        }
+        let reference = match sley_refs::parse_loose_ref(format, name.clone(), &bytes) {
             Ok(reference) => reference,
             Err(GitError::InvalidFormat(message)) => {
                 eprintln!("fatal: {message}");
@@ -2074,6 +2112,10 @@ fn validate_local_clone_source_ref_dir(
         }
     }
     Ok(())
+}
+
+fn local_clone_ref_bytes_are_reftable_sentinel(name: &str, bytes: &[u8]) -> bool {
+    name == "refs/heads" && bytes == b"this repository uses the reftable format\n"
 }
 
 /// Parse a `--depth` value the way `git clone`/`git fetch` do: an optional `+`
@@ -2246,12 +2288,6 @@ fn trace_pack_objects_filter(filter: Option<&str>) {
         "run-command.c:667",
         &format!("trace: run_command: git pack-objects --filter={filter}"),
     );
-}
-
-fn emit_clone_progress_if_requested(progress_requested: bool, quiet: bool) {
-    if progress_requested && !quiet {
-        eprintln!("Receiving objects: 100% (0/0), done.");
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -3193,7 +3229,13 @@ fn apply_clone_sparse_checkout(
     Ok(())
 }
 
-fn print_clone_detached_head_advice(oid: &ObjectId) {
+fn print_clone_detached_head_advice(config: &GitConfig, oid: &ObjectId) {
+    if !config
+        .get_bool("advice", None, "detachedHead")
+        .unwrap_or(true)
+    {
+        return;
+    }
     eprintln!(
         "Note: switching to '{oid}'.
 
@@ -3936,6 +3978,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
             "--no-dry-run" => options.dry_run = false,
             "-f" | "--force" => options.force = true,
             "--no-force" => options.force = false,
+            "-k" | "--keep" => {}
             "--atomic" => options.atomic = true,
             "--no-atomic" => options.atomic = false,
             "--depth" => {
@@ -4279,6 +4322,9 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     } else {
         refspecs.clone()
     };
+    if prefetch {
+        options.refmap = Some(Vec::new());
+    }
     if fetch_raw_oid_refspecs(
         &git_dir,
         format,
@@ -4396,6 +4442,9 @@ fn fetch_multiple_remotes(req: FetchMultipleRequest<'_>) -> Result<()> {
         } else {
             req.refspecs.to_vec()
         };
+        if req.prefetch {
+            remote_options.refmap = Some(Vec::new());
+        }
         let before_fetch_refs = fetch_ref_snapshot(req.git_dir, req.format)?;
         let remote_server_options = if req.server_options_from_cli {
             req.server_options.to_vec()
@@ -5588,7 +5637,10 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
         write_ref_advertisement_set(
             &mut stdout,
             &RefAdvertisementSet {
-                protocol: ProtocolVersion::V0,
+                protocol: match requested_protocol_version_from_environment() {
+                    Some(ProtocolVersion::V1) => ProtocolVersion::V1,
+                    _ => ProtocolVersion::V0,
+                },
                 refs: advertisements,
                 shallow: Vec::new(),
             },
@@ -5636,14 +5688,18 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Whether the connecting client requested protocol v2 via the `GIT_PROTOCOL`
-/// environment variable (`version=2`, possibly among colon-separated tokens).
-/// Mirrors `git_protocol_version_from_environment` in protocol.c.
-fn upload_pack_requested_protocol_v2() -> bool {
+/// Protocol requested by the connecting client via `GIT_PROTOCOL`
+/// (`version=1`/`version=2`, possibly among colon-separated tokens). Mirrors
+/// `git_protocol_version_from_environment` in protocol.c for server commands.
+fn requested_protocol_version_from_environment() -> Option<ProtocolVersion> {
     let Ok(value) = std::env::var("GIT_PROTOCOL") else {
-        return false;
+        return None;
     };
-    value.split(':').any(|token| token == "version=2")
+    value.split(':').find_map(|token| match token {
+        "version=1" => Some(ProtocolVersion::V1),
+        "version=2" => Some(ProtocolVersion::V2),
+        _ => None,
+    })
 }
 
 pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
@@ -5686,7 +5742,9 @@ pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
     // environment variable (the daemon/file:// transport propagates it from the
     // connection's `version=2` extra-arg). Run the v2 server loop instead of the
     // v0 ref advertisement. Mirrors upload-pack.c's `determine_protocol_version`.
-    if upload_pack_requested_protocol_v2() {
+    let requested_protocol =
+        requested_protocol_version_from_environment().unwrap_or(ProtocolVersion::V0);
+    if requested_protocol == ProtocolVersion::V2 {
         let config = read_repo_config(&git_dir)?;
         let stdin = io::stdin();
         let mut stdin = stdin.lock();
@@ -5710,7 +5768,7 @@ pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
         write_ref_advertisement_set(
             &mut stdout,
             &RefAdvertisementSet {
-                protocol: ProtocolVersion::V0,
+                protocol: requested_protocol,
                 refs: advertisements,
                 shallow: Vec::new(),
             },
@@ -5960,6 +6018,7 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
         push_options: &[],
         force_with_lease: &force_with_lease,
         force_with_lease_default: false,
+        receive_pack_command: receive_pack_command.as_deref(),
         receive_config_overrides: &receive_config_overrides,
     })
 }
@@ -6001,6 +6060,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let mut follow_tags = false;
     let mut prune = false;
     let mut thin = sley_remote::PushThinMode::Auto;
+    let mut recurse_submodules = PushRecurseSubmodules::Default;
     let mut receive_pack_command: Option<String> = None;
     let mut push_options_cmdline: Option<Vec<String>> = None;
     // `--force-with-lease` requests: an explicit `ref:expect` lease, or the
@@ -6080,7 +6140,12 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             "--no-progress" => progress = false,
             "--thin" => thin = sley_remote::PushThinMode::Always,
             "--no-thin" => thin = sley_remote::PushThinMode::Never,
-            value if value.starts_with("--recurse-submodules=") => {}
+            "--no-recurse-submodules" => recurse_submodules = PushRecurseSubmodules::Off,
+            "--recurse-submodules" => recurse_submodules = PushRecurseSubmodules::Check,
+            value if value.starts_with("--recurse-submodules=") => {
+                recurse_submodules =
+                    parse_push_recurse_submodules(&value["--recurse-submodules=".len()..])?;
+            }
             // `OPT_IPVERSION` in builtin/push.c: accepted but a no-op for the
             // file:// transport (the `--no-` forms are not defined and fall
             // through to the unknown-option path, matching git).
@@ -6182,6 +6247,17 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         thin,
     };
     let config = transport_policy_config_for_cwd()?;
+    let repo_config = read_repo_config(&git_dir).unwrap_or_default();
+    let parent_remote_is_name = push_remote_name_exists(&repo_config, &remote);
+    let mut recurse_submodules = resolve_push_recurse_submodules(&repo_config, recurse_submodules)?;
+    if recurse_submodules == PushRecurseSubmodules::Only
+        && env::var_os("SLEY_PUSH_RECURSING_SUBMODULE").is_some()
+    {
+        eprintln!(
+            "warning: recursing into submodule with push.recurseSubmodules=only; using on-demand instead"
+        );
+        recurse_submodules = PushRecurseSubmodules::OnDemand;
+    }
     let resolved_remote = push_resolved_url(&remote)?;
     check_transport_allowed_url(&resolved_remote, Some(&config))?;
     let parsed_remote = parse_remote_url(&resolved_remote)?;
@@ -6253,7 +6329,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
                 remote_advertisements.as_deref().unwrap_or(&[]),
             )?;
         }
-        let config = read_repo_config(&git_dir).unwrap_or_default();
+        let config = repo_config;
         let force_if_includes = force_if_includes
             || config
                 .get_bool("push", None, "useforceifincludes")
@@ -6290,6 +6366,49 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
                 &mut force_with_lease,
             )?;
         }
+        match recurse_submodules {
+            PushRecurseSubmodules::Default | PushRecurseSubmodules::Off => {}
+            PushRecurseSubmodules::Check => {
+                check_submodule_push(
+                    &git_dir,
+                    format,
+                    remote_git_dir,
+                    &remote,
+                    parent_remote_is_name,
+                    &refspecs,
+                    &config,
+                )?;
+            }
+            PushRecurseSubmodules::OnDemand => {
+                if !options.dry_run {
+                    push_on_demand_submodules(
+                        &git_dir,
+                        format,
+                        &remote,
+                        parent_remote_is_name,
+                        &refspecs,
+                        &push_options,
+                        PushRecurseSubmodules::OnDemand,
+                        options.quiet,
+                    )?;
+                }
+            }
+            PushRecurseSubmodules::Only => {
+                if !options.dry_run {
+                    push_on_demand_submodules(
+                        &git_dir,
+                        format,
+                        &remote,
+                        parent_remote_is_name,
+                        &refspecs,
+                        &push_options,
+                        PushRecurseSubmodules::Only,
+                        options.quiet,
+                    )?;
+                }
+                return Ok(());
+            }
+        }
         trace_configured_local_protocol_version(Some(&config));
         let result = run_push_local_report(RunPushLocalReport {
             git_dir: &git_dir,
@@ -6306,6 +6425,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             push_options: &push_options,
             force_with_lease: &force_with_lease,
             force_with_lease_default,
+            receive_pack_command: receive_pack_command.as_deref(),
             receive_config_overrides: &receive_config_overrides,
         });
         if result.is_ok() {
@@ -6870,6 +6990,402 @@ fn push_options_from_config(config: &GitConfig) -> Result<Vec<String>> {
     Ok(out)
 }
 
+#[derive(Debug)]
+struct PushSubmodule {
+    path: String,
+    oid: ObjectId,
+    git_dir: PathBuf,
+    common_git_dir: PathBuf,
+    format: ObjectFormat,
+}
+
+fn check_submodule_push(
+    git_dir: &Path,
+    format: ObjectFormat,
+    remote_git_dir: &Path,
+    remote: &str,
+    parent_remote_is_name: bool,
+    refspecs: &[String],
+    _config: &GitConfig,
+) -> Result<()> {
+    let submodules = push_gitlink_submodules(git_dir, format)?;
+    let by_path = submodules
+        .iter()
+        .enumerate()
+        .map(|(idx, submodule)| (submodule.path.clone(), idx))
+        .collect::<std::collections::HashMap<_, _>>();
+    let targets = pushed_superproject_gitlinks(git_dir, format, remote_git_dir, refspecs)?;
+    if targets.is_empty() {
+        for submodule in &submodules {
+            check_one_submodule_target(submodule, submodule.oid, remote, parent_remote_is_name)?;
+        }
+        return Ok(());
+    }
+    for (path, oid) in targets {
+        let Some(idx) = by_path.get(&path) else {
+            continue;
+        };
+        check_one_submodule_target(&submodules[*idx], oid, remote, parent_remote_is_name)?;
+    }
+    Ok(())
+}
+
+fn check_one_submodule_target(
+    submodule: &PushSubmodule,
+    oid: ObjectId,
+    remote: &str,
+    parent_remote_is_name: bool,
+) -> Result<()> {
+    ensure_push_submodule_commit_oid(submodule, &oid)?;
+    let child_config = read_repo_config(&submodule.git_dir).unwrap_or_default();
+    let child_remote =
+        submodule_push_remote(submodule, &child_config, remote, parent_remote_is_name)?;
+    if submodule_commit_needs_push_oid(submodule, &oid, child_remote.as_deref())? {
+        eprintln!(
+            "fatal: submodule path '{}' contains changes that are not found on any remote",
+            submodule.path
+        );
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
+}
+
+fn pushed_superproject_gitlinks(
+    git_dir: &Path,
+    format: ObjectFormat,
+    remote_git_dir: &Path,
+    refspecs: &[String],
+) -> Result<Vec<(String, ObjectId)>> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let mut out = Vec::new();
+    for tip in pushed_superproject_tips(git_dir, format, remote_git_dir, refspecs)? {
+        let object = db.read_object(&tip)?;
+        if object.object_type != sley_object::ObjectType::Commit {
+            continue;
+        }
+        let commit = Commit::parse_ref(format, &object.body)?;
+        collect_tree_gitlinks(&db, format, &commit.tree, String::new(), &mut out)?;
+    }
+    out.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    out.dedup();
+    Ok(out)
+}
+
+fn pushed_superproject_tips(
+    git_dir: &Path,
+    format: ObjectFormat,
+    remote_git_dir: &Path,
+    refspecs: &[String],
+) -> Result<Vec<ObjectId>> {
+    let store = FileRefStore::new(git_dir, format);
+    let remote_store = FileRefStore::new(remote_git_dir, format);
+    let local_refs = store.list_refs()?;
+    let mut tips = Vec::new();
+    for refspec in refspecs {
+        let body = refspec.strip_prefix('+').unwrap_or(refspec);
+        if body == ":" {
+            for reference in local_refs
+                .iter()
+                .filter(|reference| reference.name.starts_with("refs/heads/"))
+            {
+                if remote_store.read_ref(&reference.name)?.is_none() {
+                    continue;
+                }
+                if let Some((oid, _)) = resolve_for_each_ref_target(&store, reference)? {
+                    tips.push(oid);
+                }
+            }
+            continue;
+        }
+        if body.contains('*') {
+            continue;
+        }
+        let src = body.split_once(':').map_or(body, |(src, _)| src);
+        if src.is_empty() {
+            continue;
+        }
+        if let Ok(oid) = sley_rev::resolve_revision(git_dir, format, src) {
+            tips.push(oid);
+        }
+    }
+    tips.sort();
+    tips.dedup();
+    Ok(tips)
+}
+
+fn collect_tree_gitlinks(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    prefix: String,
+    out: &mut Vec<(String, ObjectId)>,
+) -> Result<()> {
+    let object = db.read_object(tree_oid)?;
+    if object.object_type != sley_object::ObjectType::Tree {
+        return Ok(());
+    }
+    let tree = sley_object::Tree::parse(format, &object.body)?;
+    for entry in tree.entries {
+        let name = String::from_utf8_lossy(entry.name.as_bytes()).into_owned();
+        let path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if sley_index::is_gitlink(entry.mode) {
+            out.push((path, entry.oid));
+        } else if entry.mode == 0o040000 {
+            collect_tree_gitlinks(db, format, &entry.oid, path, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn push_on_demand_submodules(
+    git_dir: &Path,
+    format: ObjectFormat,
+    remote: &str,
+    parent_remote_is_name: bool,
+    refspecs: &[String],
+    push_options: &[String],
+    recurse_mode: PushRecurseSubmodules,
+    quiet: bool,
+) -> Result<()> {
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
+    for submodule in push_gitlink_submodules(git_dir, format)? {
+        ensure_push_submodule_commit(&submodule)?;
+        let child_config = read_repo_config(&submodule.git_dir).unwrap_or_default();
+        let Some(child_remote) =
+            submodule_push_remote(&submodule, &child_config, remote, parent_remote_is_name)?
+        else {
+            continue;
+        };
+        if !submodule_commit_needs_push(&submodule, Some(&child_remote))? {
+            continue;
+        }
+        validate_submodule_push_refspecs(&submodule, refspecs)?;
+        let submodule_root = worktree_root_for_git_dir(&submodule.git_dir)?;
+        let mut command = Proc::new(&exe);
+        clear_repo_env_for_submodule_child(&mut command);
+        command.env("SLEY_PUSH_RECURSING_SUBMODULE", "1");
+        command.arg("push");
+        if quiet {
+            command.arg("--quiet");
+        }
+        for option in push_options {
+            command.arg(format!("--push-option={option}"));
+        }
+        if recurse_mode == PushRecurseSubmodules::OnDemand {
+            command.arg("--recurse-submodules=on-demand");
+        }
+        command.arg(&child_remote);
+        command.args(refspecs);
+        let status = command
+            .current_dir(&submodule_root)
+            .status()
+            .map_err(|err| GitError::Io(err.to_string()))?;
+        if !status.success() {
+            eprintln!("fatal: failed to push all needed submodules");
+            return Err(GitError::Exit(status.code().unwrap_or(1)));
+        }
+        if submodule_commit_needs_push(&submodule, Some(&child_remote))? {
+            eprintln!(
+                "fatal: submodule path '{}' contains changes that could not be pushed",
+                submodule.path
+            );
+            return Err(GitError::Exit(1));
+        }
+    }
+    Ok(())
+}
+
+fn push_gitlink_submodules(git_dir: &Path, format: ObjectFormat) -> Result<Vec<PushSubmodule>> {
+    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(Vec::new());
+    };
+    let mut submodules = Vec::new();
+    for entry in index.entries {
+        if entry.stage() != sley_index::Stage::Normal || !sley_index::is_gitlink(entry.mode) {
+            continue;
+        }
+        let Ok(path) = String::from_utf8(entry.path.to_vec()) else {
+            continue;
+        };
+        let submodule_root = worktree_root.join(&path);
+        let Some(sub_git_dir) = sley_diff_merge::gitlink_git_dir(&submodule_root) else {
+            continue;
+        };
+        let sub_common_git_dir = common_git_dir_for_git_dir(&sub_git_dir)?;
+        let sub_format = repository_object_format(&sub_common_git_dir)?;
+        submodules.push(PushSubmodule {
+            path,
+            oid: entry.oid,
+            git_dir: sub_git_dir,
+            common_git_dir: sub_common_git_dir,
+            format: sub_format,
+        });
+    }
+    Ok(submodules)
+}
+
+fn ensure_push_submodule_commit(submodule: &PushSubmodule) -> Result<()> {
+    ensure_push_submodule_commit_oid(submodule, &submodule.oid)
+}
+
+fn ensure_push_submodule_commit_oid(submodule: &PushSubmodule, oid: &ObjectId) -> Result<()> {
+    let db = FileObjectDatabase::from_git_dir(&submodule.common_git_dir, submodule.format);
+    let object = db.read_object(oid).map_err(|_| {
+        eprintln!(
+            "fatal: submodule path '{}' does not contain commit {}",
+            submodule.path, oid
+        );
+        GitError::Exit(1)
+    })?;
+    if object.object_type != sley_object::ObjectType::Commit {
+        eprintln!(
+            "fatal: submodule entry '{}' ({}) is a {}, not a commit",
+            submodule.path,
+            oid,
+            object.object_type.as_str()
+        );
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
+}
+
+fn submodule_commit_needs_push(submodule: &PushSubmodule, remote: Option<&str>) -> Result<bool> {
+    submodule_commit_needs_push_oid(submodule, &submodule.oid, remote)
+}
+
+fn submodule_commit_needs_push_oid(
+    submodule: &PushSubmodule,
+    oid: &ObjectId,
+    remote: Option<&str>,
+) -> Result<bool> {
+    let Some(remote) = remote else {
+        return Ok(false);
+    };
+    let store = FileRefStore::new(&submodule.git_dir, submodule.format);
+    let db = FileObjectDatabase::from_git_dir(&submodule.common_git_dir, submodule.format);
+    let prefix = format!("refs/remotes/{remote}/");
+    for reference in store.list_refs()? {
+        if !reference.name.starts_with(&prefix) {
+            continue;
+        }
+        let Some((remote_oid, _)) = resolve_for_each_ref_target(&store, &reference)? else {
+            continue;
+        };
+        if commit_reaches(&db, submodule.format, &remote_oid, oid).unwrap_or(false) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn submodule_push_remote(
+    submodule: &PushSubmodule,
+    config: &GitConfig,
+    parent_remote: &str,
+    parent_remote_is_name: bool,
+) -> Result<Option<String>> {
+    let remote_names = push_remote_names(config);
+    if remote_names.is_empty() {
+        return Ok(None);
+    }
+    if parent_remote_is_name {
+        if push_remote_name_exists(config, parent_remote) {
+            return Ok(Some(parent_remote.to_string()));
+        }
+        eprintln!(
+            "fatal: remote '{}' not found in submodule path '{}'",
+            parent_remote, submodule.path
+        );
+        return Err(GitError::Exit(1));
+    }
+    Ok(Some(default_push_remote_name(
+        &submodule.git_dir,
+        submodule.format,
+        config,
+    )))
+}
+
+fn default_push_remote_name(git_dir: &Path, format: ObjectFormat, config: &GitConfig) -> String {
+    let store = FileRefStore::new(git_dir, format);
+    if let Ok(Some(branch)) = store.current_branch()
+        && let Some(remote) = config.get("branch", Some(&branch), "remote")
+    {
+        return remote.to_string();
+    }
+    let remotes = push_remote_names(config);
+    if remotes.len() == 1 {
+        return remotes[0].clone();
+    }
+    "origin".to_string()
+}
+
+fn push_remote_name_exists(config: &GitConfig, name: &str) -> bool {
+    config
+        .sections
+        .iter()
+        .any(|section| section.name == "remote" && section.subsection.as_deref() == Some(name))
+}
+
+fn push_remote_names(config: &GitConfig) -> Vec<String> {
+    let mut names = Vec::new();
+    for section in &config.sections {
+        if section.name != "remote" {
+            continue;
+        }
+        let Some(name) = section.subsection.as_ref() else {
+            continue;
+        };
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+fn validate_submodule_push_refspecs(submodule: &PushSubmodule, refspecs: &[String]) -> Result<()> {
+    let store = FileRefStore::new(&submodule.git_dir, submodule.format);
+    let current_branch = store.current_branch()?;
+    for refspec in refspecs {
+        let body = refspec.strip_prefix('+').unwrap_or(refspec);
+        let (src, dst) = body.split_once(':').unwrap_or((body, ""));
+        if src.is_empty() || src.contains('*') {
+            continue;
+        }
+        if ObjectId::from_hex(submodule.format, src).is_ok() {
+            eprintln!(
+                "fatal: cannot propagate object-id refspec into submodule path '{}'",
+                submodule.path
+            );
+            return Err(GitError::Exit(1));
+        }
+        if src == "HEAD"
+            && let Some(branch) = dst.strip_prefix("refs/heads/")
+            && current_branch.as_deref() != Some(branch)
+        {
+            eprintln!(
+                "fatal: HEAD refspec does not match current branch in submodule path '{}'",
+                submodule.path
+            );
+            return Err(GitError::Exit(1));
+        }
+    }
+    Ok(())
+}
+
+fn clear_repo_env_for_submodule_child(command: &mut Proc) {
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE");
+}
+
 fn default_head_push_destinations(store: &FileRefStore, refspecs: &mut [String]) -> Result<()> {
     for refspec in refspecs {
         let forced = refspec.starts_with('+');
@@ -6896,6 +7412,68 @@ struct PushOptions {
     dry_run: bool,
     progress: bool,
     thin: sley_remote::PushThinMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushRecurseSubmodules {
+    Default,
+    Off,
+    Check,
+    OnDemand,
+    Only,
+}
+
+fn parse_push_recurse_submodules(value: &str) -> Result<PushRecurseSubmodules> {
+    match value {
+        "check" => Ok(PushRecurseSubmodules::Check),
+        "on-demand" => Ok(PushRecurseSubmodules::OnDemand),
+        "only" => Ok(PushRecurseSubmodules::Only),
+        "no" | "false" | "off" => Ok(PushRecurseSubmodules::Off),
+        "yes" | "true" | "on" => {
+            eprintln!("fatal: unsupported --recurse-submodules mode '{value}'");
+            Err(GitError::Exit(128))
+        }
+        other => {
+            eprintln!("fatal: bad --recurse-submodules argument: {other}");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn parse_push_recurse_submodules_config(value: &str) -> Result<PushRecurseSubmodules> {
+    match value {
+        "check" => Ok(PushRecurseSubmodules::Check),
+        "on-demand" => Ok(PushRecurseSubmodules::OnDemand),
+        "only" => Ok(PushRecurseSubmodules::Only),
+        "no" | "false" | "off" => Ok(PushRecurseSubmodules::Off),
+        "yes" | "true" | "on" => {
+            eprintln!("fatal: unsupported push.recurseSubmodules mode '{value}'");
+            Err(GitError::Exit(128))
+        }
+        _ => Ok(PushRecurseSubmodules::Default),
+    }
+}
+
+fn resolve_push_recurse_submodules(
+    config: &GitConfig,
+    cli: PushRecurseSubmodules,
+) -> Result<PushRecurseSubmodules> {
+    if cli != PushRecurseSubmodules::Default {
+        return Ok(cli);
+    }
+    if let Some(value) = config.get("push", None, "recurseSubmodules") {
+        let mode = parse_push_recurse_submodules_config(value)?;
+        if mode != PushRecurseSubmodules::Default {
+            return Ok(mode);
+        }
+    }
+    if config
+        .get_bool("submodule", None, "recurse")
+        .unwrap_or(false)
+    {
+        return Ok(PushRecurseSubmodules::OnDemand);
+    }
+    Ok(PushRecurseSubmodules::Off)
 }
 
 /// Drive [`sley_remote::push`] for an already-resolved `destination` (HTTP or
@@ -6958,7 +7536,22 @@ fn run_push(
         return Ok(());
     }
     run_local_receive_pre_hooks(destination, &plan.commands, &[], &[])?;
+    run_local_receive_reference_transaction_hook_phase(
+        destination,
+        &plan.commands,
+        sley_refs::RefTransactionPhase::Preparing,
+    )?;
+    run_local_receive_reference_transaction_hook_phase(
+        destination,
+        &plan.commands,
+        sley_refs::RefTransactionPhase::Prepared,
+    )?;
     let outcome = sley_remote::execute_push_plan(request, &mut services, plan)?;
+    run_local_receive_reference_transaction_hook_phase(
+        destination,
+        &outcome.commands,
+        sley_refs::RefTransactionPhase::Committed,
+    )?;
     run_local_receive_post_hooks(destination, &outcome.commands, &[])?;
     update_push_remote_tracking_refs(git_dir, format, &config, remote, &outcome.commands)?;
     if options.set_upstream {
@@ -6989,6 +7582,7 @@ struct RunPushLocalReport<'a> {
     push_options: &'a [String],
     force_with_lease: &'a [(String, Option<ObjectId>)],
     force_with_lease_default: bool,
+    receive_pack_command: Option<&'a str>,
     receive_config_overrides: &'a [(String, String)],
 }
 
@@ -7114,6 +7708,19 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     };
 
     // Second pass: actually apply (unless dry-run or the hook declined).
+    if !req.options.dry_run && hook_decline.is_none() && !ok_commands.is_empty() {
+        run_local_receive_reference_transaction_hook_phase(
+            &destination,
+            &ok_commands,
+            sley_refs::RefTransactionPhase::Preparing,
+        )?;
+        run_local_receive_reference_transaction_hook_phase(
+            &destination,
+            &ok_commands,
+            sley_refs::RefTransactionPhase::Prepared,
+        )?;
+    }
+
     let mut report = if req.options.dry_run || hook_decline.is_some() {
         plan
     } else {
@@ -7136,6 +7743,13 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             &config,
         )?
     };
+    if !req.options.dry_run && hook_decline.is_none() && !ok_commands.is_empty() {
+        run_local_receive_reference_transaction_hook_phase(
+            &destination,
+            &ok_commands,
+            sley_refs::RefTransactionPhase::Committed,
+        )?;
+    }
     if !req.options.dry_run && hook_decline.is_none() {
         trace2_push_pack_objects(
             req.options.quiet,
@@ -7251,7 +7865,126 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         eprintln!("error: failed to push some refs to '{url}'");
         return Err(GitError::Exit(1));
     }
+    if let Some(command) = req.receive_pack_command
+        && !custom_receive_pack_command_is_native_git(command)
+        && !custom_receive_pack_command_exits_successfully(command, req.remote_git_dir)?
+    {
+        eprintln!("error: failed to push some refs to '{url}'");
+        return Err(GitError::Exit(1));
+    }
     Ok(())
+}
+
+fn custom_receive_pack_command_is_native_git(command: &str) -> bool {
+    let command = strip_receive_pack_shell_prefixes(command).trim_start();
+    command == "git-receive-pack"
+        || command.starts_with("git-receive-pack ")
+        || command == "git receive-pack"
+        || command.starts_with("git receive-pack ")
+        || command
+            .strip_prefix("git ")
+            .is_some_and(git_command_runs_receive_pack)
+}
+
+fn git_command_runs_receive_pack(rest: &str) -> bool {
+    let mut words = rest.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "-c" {
+            if words.next().is_none() {
+                return false;
+            }
+            continue;
+        }
+        if word.starts_with("-c") && word.len() > 2 {
+            continue;
+        }
+        return word == "receive-pack" || word == "git-receive-pack";
+    }
+    false
+}
+
+fn strip_receive_pack_shell_prefixes(mut command: &str) -> &str {
+    loop {
+        let trimmed = command.trim_start();
+        if let Some(rest) = strip_leading_unset_command(trimmed) {
+            command = rest;
+            continue;
+        }
+        if let Some(rest) = strip_leading_env_assignment(trimmed) {
+            command = rest;
+            continue;
+        }
+        return trimmed;
+    }
+}
+
+fn strip_leading_unset_command(command: &str) -> Option<&str> {
+    let rest = command.strip_prefix("unset ")?;
+    let semicolon = rest.find(';')?;
+    Some(&rest[semicolon + 1..])
+}
+
+fn strip_leading_env_assignment(command: &str) -> Option<&str> {
+    let bytes = command.as_bytes();
+    let mut idx = 0;
+    let first = *bytes.first()?;
+    if !is_shell_name_start(first) {
+        return None;
+    }
+    idx += 1;
+    while idx < bytes.len() && is_shell_name_char(bytes[idx]) {
+        idx += 1;
+    }
+    if bytes.get(idx) != Some(&b'=') {
+        return None;
+    }
+    idx += 1;
+    match bytes.get(idx).copied() {
+        Some(quote @ (b'\'' | b'"')) => {
+            idx += 1;
+            while idx < bytes.len() && bytes[idx] != quote {
+                idx += 1;
+            }
+            if idx >= bytes.len() {
+                return None;
+            }
+            idx += 1;
+        }
+        Some(_) => {
+            while idx < bytes.len() && !bytes[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+        }
+        None => return None,
+    }
+    if idx < bytes.len() && !bytes[idx].is_ascii_whitespace() {
+        return None;
+    }
+    Some(&command[idx..])
+}
+
+fn is_shell_name_start(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphabetic()
+}
+
+fn is_shell_name_char(byte: u8) -> bool {
+    is_shell_name_start(byte) || byte.is_ascii_digit()
+}
+
+fn custom_receive_pack_command_exits_successfully(
+    command: &str,
+    remote_git_dir: &Path,
+) -> Result<bool> {
+    let repo = remote_git_dir.to_string_lossy();
+    let command = format!("{command} {}", sley_config::sq_quote(&repo));
+    let status = Proc::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    Ok(status.success())
 }
 
 fn trace_local_receive_pack_advertisement(remote_git_dir: &Path, format: ObjectFormat) {
@@ -7608,6 +8341,11 @@ fn print_push_ref(
         PushRefStatus::RejectNonFastForward => (
             '!',
             "[rejected]".to_string(),
+            Some("non-fast-forward".to_string()),
+        ),
+        PushRefStatus::RejectFetchFirst => (
+            '!',
+            "[rejected]".to_string(),
             Some("fetch first".to_string()),
         ),
         PushRefStatus::RejectStale => (
@@ -7635,16 +8373,15 @@ fn print_push_ref(
         ),
     };
 
-    // The "from" side. git models a deletion's peer_ref as the literal
-    // "(delete)": a *successful* delete (`print_ok_ref_status`) prints with
-    // `from = NULL` (→ `:dst`), but a *rejected* delete (`print_ref_status` in
-    // the reject arms) prints the peer_ref `(delete)` (→ `(delete):dst`). A
-    // non-delete uses its source ref both ways.
+    // The "from" side. Human delete reports print only the destination; porcelain
+    // rejected deletes usually expose git's literal peer ref "(delete)" except
+    // for successful deletes and pre-receive declines, which render an empty source.
     let from = if reference.is_deletion() {
-        if matches!(reference.status, PushRefStatus::Ok)
+        if !porcelain
+            || matches!(reference.status, PushRefStatus::Ok)
             || matches!(
                 &reference.status,
-                PushRefStatus::RemoteReject(message) if message == "atomic push failure"
+                PushRefStatus::RemoteReject(message) if message == "pre-receive hook declined"
             )
         {
             None
@@ -7877,6 +8614,44 @@ fn run_local_receive_pre_hooks_report(
     None
 }
 
+fn run_local_receive_reference_transaction_hook_phase(
+    destination: &sley_remote::PushDestination,
+    push_commands: &[ReceivePackCommand],
+    phase: sley_refs::RefTransactionPhase,
+) -> Result<()> {
+    let sley_remote::PushDestination::Local {
+        git_dir: remote_git_dir,
+        ..
+    } = destination
+    else {
+        return Ok(());
+    };
+    if push_commands.is_empty() {
+        return Ok(());
+    }
+    let updates = push_commands
+        .iter()
+        .map(|command| sley_refs::RefTransactionHookUpdate {
+            old_value: command.old_id.to_string(),
+            new_value: command.new_id.to_string(),
+            refname: command.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let hook = crate::commands::refs::ReferenceTransactionHookRunner::new(remote_git_dir);
+    if sley_refs::ReferenceTransactionHook::run(&hook, phase, &updates)?
+        && matches!(
+            phase,
+            sley_refs::RefTransactionPhase::Preparing | sley_refs::RefTransactionPhase::Prepared
+        )
+    {
+        return Err(GitError::Transaction(format!(
+            "in '{}' phase, update aborted by the reference-transaction hook",
+            phase.as_str()
+        )));
+    }
+    Ok(())
+}
+
 fn receive_update_hook_order(push_commands: &[ReceivePackCommand]) -> Vec<&ReceivePackCommand> {
     let mut ordered = Vec::with_capacity(push_commands.len());
     ordered.extend(
@@ -8054,6 +8829,7 @@ fn pre_push_stdin_from_report(refs: &[sley_remote::PushReportRef]) -> String {
             !matches!(
                 reference.status,
                 sley_remote::PushRefStatus::RejectNonFastForward
+                    | sley_remote::PushRefStatus::RejectFetchFirst
                     | sley_remote::PushRefStatus::RejectRemoteUpdated
                     | sley_remote::PushRefStatus::RejectStale
                     | sley_remote::PushRefStatus::UpToDate

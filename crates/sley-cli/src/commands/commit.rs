@@ -9,6 +9,66 @@ use super::status::{
 };
 use crate::*;
 
+pub(crate) enum PrepareCommitMsgSource<'a> {
+    None,
+    Message,
+    Template,
+    Merge,
+    Commit(&'a str),
+}
+
+pub(crate) fn run_prepare_commit_msg_hook(
+    editmsg: &Path,
+    source: PrepareCommitMsgSource<'_>,
+    mut env: Vec<(String, String)>,
+    set_no_editor_env: bool,
+) -> Result<bool> {
+    let editmsg_arg = editmsg.to_string_lossy().into_owned();
+    let mut args = vec![editmsg_arg];
+    match source {
+        PrepareCommitMsgSource::None => {}
+        PrepareCommitMsgSource::Message => args.push("message".to_string()),
+        PrepareCommitMsgSource::Template => args.push("template".to_string()),
+        PrepareCommitMsgSource::Merge => args.push("merge".to_string()),
+        PrepareCommitMsgSource::Commit(rev) => {
+            args.push("commit".to_string());
+            args.push(rev.to_string());
+        }
+    }
+    if set_no_editor_env {
+        set_hook_env(&mut env, "GIT_EDITOR", ":");
+    }
+    match commands::hooks::run_hook(
+        "prepare-commit-msg",
+        commands::hooks::HookRun {
+            args,
+            env,
+            ..commands::hooks::HookRun::default()
+        },
+    ) {
+        Err(GitError::Exit(code)) => {
+            eprintln!("error: prepare-commit-msg hook failed");
+            Err(GitError::Exit(code))
+        }
+        result => result,
+    }
+}
+
+fn set_hook_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if let Some((_, existing)) = env.iter_mut().find(|(existing, _)| existing == key) {
+        *existing = value.to_string();
+    } else {
+        env.push((key.to_string(), value.to_string()));
+    }
+}
+
+fn refresh_commit_selection_cache_tree() -> Result<()> {
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let format = repository_object_format(&git_dir)?;
+    let odb = FileObjectDatabase::from_git_dir(&git_dir, format);
+    sley_worktree::refresh_repository_cache_tree(&git_dir, format, &odb)
+}
+
 enum CommitShortFlag {
     /// A boolean flag that takes no value (e.g. `-q`, `-s`, `-a`).
     Boolean,
@@ -623,7 +683,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                 pathspec_from_file = Some(value["--pathspec-from-file=".len()..].to_string());
                 pathspec_from_file_active = true;
             }
-            "--no-pathspec-from-file" => pathspec_from_file_active = false,
+            "--no-pathspec-from-file" => {}
             value if value.starts_with("--no-pathspec-from-file=") => {
                 return commit_option_takes_no_value_error("no-pathspec-from-file");
             }
@@ -857,10 +917,9 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     if dry_run {
         return cmd_commit_long_status_preview(amend, commit_untracked);
     }
-    if interactive {
-        return Err(GitError::Unsupported(
-            "commit interactive patch selection is not implemented".into(),
-        ));
+    if interactive && !patch {
+        commands::add_interactive::cmd_add_interactive(&pathspec_args)?;
+        refresh_commit_selection_cache_tree()?;
     }
     if patch {
         commands::add_interactive::cmd_add_patch(
@@ -869,6 +928,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             inter_hunk_context,
             true,
         )?;
+        refresh_commit_selection_cache_tree()?;
         if template_file.is_none()
             && file_message.is_none()
             && message_chunks.is_empty()
@@ -1238,32 +1298,33 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         )?;
     }
     fs::write(&editmsg, &template)?;
-    let editmsg_arg = editmsg.to_string_lossy().into_owned();
-    let mut prepare_args = vec![editmsg_arg.as_str()];
-    if amend {
-        prepare_args.push("commit");
-        prepare_args.push("HEAD");
+    let prepare_source = if amend {
+        PrepareCommitMsgSource::Commit("HEAD")
+    } else if in_rebase && (in_cherry_pick || in_revert) && git_dir.join("MERGE_MSG").is_file() {
+        PrepareCommitMsgSource::Message
+    } else if in_rebase && git_dir.join("MERGE_MSG").is_file() {
+        PrepareCommitMsgSource::Merge
     } else if in_merge
         || ((in_cherry_pick || in_revert) && git_dir.join("MERGE_MSG").is_file())
         || (git_dir.join("SQUASH_MSG").is_file() && git_dir.join("MERGE_MSG").is_file())
     {
-        prepare_args.push("merge");
+        PrepareCommitMsgSource::Merge
     } else if let Some(rev) = reuse_message.as_deref() {
-        prepare_args.push("commit");
-        prepare_args.push(rev);
+        PrepareCommitMsgSource::Commit(rev)
     } else if had_message_source {
-        prepare_args.push("message");
+        PrepareCommitMsgSource::Message
+    } else if template_message_source {
+        PrepareCommitMsgSource::Template
     } else {
-        prepare_args.push("template");
-    }
-    commands::hooks::run_hook(
-        "prepare-commit-msg",
-        commands::hooks::HookRun {
-            args: prepare_args.iter().map(|arg| (*arg).to_string()).collect(),
-            env: author_hook_env.clone(),
-            ..commands::hooks::HookRun::default()
-        },
+        PrepareCommitMsgSource::None
+    };
+    run_prepare_commit_msg_hook(
+        &editmsg,
+        prepare_source,
+        author_hook_env.clone(),
+        !use_editor && !in_rebase,
     )?;
+    let editmsg_arg = editmsg.to_string_lossy().into_owned();
     let has_unmerged_index_entries = commit_index_has_unmerged_entries(&git_dir, format)?;
     if use_editor
         && !has_unmerged_index_entries
@@ -1860,6 +1921,7 @@ fn commit_partial_paths(
         }),
     });
     tx.commit()?;
+    sley_worktree::refresh_repository_cache_tree(git_dir, format, &db)?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
     remove_commit_state_files(git_dir);
     if !quiet {
@@ -3246,6 +3308,15 @@ fn render_commit_template_status(
     let mut buf: Vec<u8> = Vec::new();
     sink.write_to(&mut buf);
     Ok(buf)
+}
+
+pub(crate) fn render_commit_editor_status_for_rebase(
+    git_dir: &Path,
+    format: ObjectFormat,
+    comment_char: &str,
+    amend: bool,
+) -> Result<Vec<u8>> {
+    render_commit_template_status(git_dir, format, comment_char, amend, None)
 }
 
 fn print_clean_commit_status(git_dir: &Path, format: ObjectFormat) -> Result<()> {

@@ -550,7 +550,19 @@ where
     walk_reachable_objects(reader, format, starts, &HashSet::new(), |_, _| {})
 }
 
-fn collect_reachable_object_ids_tolerating_missing<R, I>(
+pub fn collect_reachable_object_ids_tolerating_promised_missing<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+) -> Result<HashSet<ObjectId>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    collect_reachable_object_ids_excluding_promised_missing(reader, format, starts, &HashSet::new())
+}
+
+pub fn collect_reachable_object_ids_tolerating_missing<R, I>(
     reader: &R,
     format: ObjectFormat,
     starts: I,
@@ -1793,6 +1805,12 @@ pub struct GeometricRepackResult {
     pub rolled_up_packs: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeometricRepackPlan {
+    pub split: usize,
+    pub pack_count: usize,
+}
+
 /// Collect the local non-cruft, non-kept packs eligible for geometric rollup,
 /// keyed by promisor-ness, ordered ascending by object count.
 fn collect_geometry_packs(
@@ -1873,6 +1891,23 @@ fn compute_geometry_split(packs: &[GeometryPack], split_factor: u64) -> usize {
         }
     }
     split
+}
+
+pub fn geometric_repack_plan(
+    git_dir: &Path,
+    format: ObjectFormat,
+    split_factor: u64,
+    kept_pack_stems: &HashSet<String>,
+) -> Result<GeometricRepackPlan> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let packs: Vec<GeometryPack> = collect_geometry_packs(&objects_dir, format, kept_pack_stems)?
+        .into_iter()
+        .filter(|pack| !pack.is_promisor)
+        .collect();
+    Ok(GeometricRepackPlan {
+        split: compute_geometry_split(&packs, split_factor),
+        pack_count: packs.len(),
+    })
 }
 
 /// `git repack --geometric=<factor>`: roll up the smallest packs (plus loose
@@ -6305,19 +6340,23 @@ impl FileObjectDatabase {
         // so the recursive resolver re-entry (which may re-enter read_object) is
         // safe.
         let resolve_ref_base = |base: &ObjectId| self.read_object(base).map(Some);
+        let resolve_ofs_base =
+            |base_offset| self.read_ofs_delta_base_from_other_sources(pack_lookup, base_offset);
         let object = match &delta_adapter {
-            Some(adapter) => sley_pack::read_object_at_with_cache_arc(
+            Some(adapter) => sley_pack::read_object_at_with_cache_and_ofs_base_arc(
                 &bytes,
                 pack_lookup.offset,
                 self.format,
                 resolve_ref_base,
+                resolve_ofs_base,
                 adapter,
             )?,
-            None => sley_pack::read_object_at_arc(
+            None => sley_pack::read_object_at_with_ofs_base_arc(
                 &bytes,
                 pack_lookup.offset,
                 self.format,
                 resolve_ref_base,
+                resolve_ofs_base,
             )?,
         };
         // Trust the index → offset mapping rather than re-hashing every decoded
@@ -6575,6 +6614,50 @@ impl FileObjectDatabase {
             };
             let candidate = PackLookup::from_path(pack_path, entry.offset);
             if let Ok(object) = self.read_packed_object_at_lookup(oid, &candidate) {
+                return Ok(Some(object));
+            }
+        }
+        Ok(None)
+    }
+
+    fn pack_oid_at_offset(
+        &self,
+        pack_lookup: &PackLookup,
+        offset: u64,
+    ) -> Result<Option<ObjectId>> {
+        match pack_lookup.pack_index(self) {
+            Ok(index) => Ok(index
+                .entries
+                .iter()
+                .find(|entry| entry.offset == offset)
+                .map(|entry| entry.oid)),
+            Err(_) => self.midx_oid_for_pack_offset(pack_lookup, offset),
+        }
+    }
+
+    fn read_ofs_delta_base_from_other_sources(
+        &self,
+        pack_lookup: &PackLookup,
+        base_offset: u64,
+    ) -> Result<Option<Arc<EncodedObject>>> {
+        let Some(base_oid) = self.pack_oid_at_offset(pack_lookup, base_offset)? else {
+            return Ok(None);
+        };
+        if let Ok(mut cache) = self.decoded.lock()
+            && let Some(object) = cache.get(&base_oid)
+        {
+            return Ok(Some(object));
+        }
+        if let Ok(object) = self.loose.read_object(&base_oid) {
+            return Ok(Some(object));
+        }
+        if let Some(object) = self.read_packed_object_from_other_packs(&base_oid, pack_lookup)? {
+            return Ok(Some(object));
+        }
+        for alternate in &self.alternates {
+            if let Ok(object) =
+                Self::without_alternates(alternate, self.format).read_object(&base_oid)
+            {
                 return Ok(Some(object));
             }
         }
@@ -8282,6 +8365,95 @@ mod tests {
             "a good loose copy must shadow a corrupt packed copy"
         );
         fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn loose_ofs_delta_base_recovers_child_from_corrupt_pack_base() {
+        let root = temp_root("sley-ofs-delta-base-corrupt-loose-recovery");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+
+        let mut base_body = Vec::new();
+        for idx in 0..256u16 {
+            base_body.extend_from_slice(format!("shared line {idx:03}\n").as_bytes());
+        }
+        let base = EncodedObject::new(ObjectType::Blob, base_body.clone());
+        let mut first_body = base_body;
+        first_body.extend_from_slice(b"first delta payload\n");
+        let first = EncodedObject::new(ObjectType::Blob, first_body.clone());
+        let mut second_body = first_body;
+        second_body.extend_from_slice(b"second delta payload\n");
+        let second = EncodedObject::new(ObjectType::Blob, second_body);
+        let base_oid = base
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let first_oid = first
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let second_oid = second
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+
+        let options = PackWriteOptions::new()
+            .with_prefer_ofs_delta(true)
+            .with_reorder(false);
+        let written = PackFile::write_packed_with_options(
+            &[base, first.clone(), second.clone()],
+            ObjectFormat::Sha1,
+            &options,
+        )
+        .expect("test operation should succeed");
+        let stats = PackFile::verify_pack_stats(&written.pack, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let first_stat = stats
+            .objects
+            .iter()
+            .find(|stat| stat.oid == first_oid)
+            .expect("first object should be packed");
+        let second_stat = stats
+            .objects
+            .iter()
+            .find(|stat| stat.oid == second_oid)
+            .expect("second object should be packed");
+        assert_eq!(first_stat.base_oid, Some(base_oid));
+        assert_eq!(second_stat.base_oid, Some(first_oid));
+
+        let installed = db
+            .install_pack(&written)
+            .expect("test operation should succeed");
+        db.loose()
+            .write_object(first.clone())
+            .expect("test operation should succeed");
+
+        let mut corrupt_pack = written.pack;
+        let base_reference = ofs_delta_base_reference_position(&corrupt_pack, first_stat.offset);
+        corrupt_pack[base_reference] = if corrupt_pack[base_reference] == 1 {
+            2
+        } else {
+            1
+        };
+        assert!(PackFile::verify_pack_stats(&corrupt_pack, ObjectFormat::Sha1).is_err());
+        fs::write(&installed.pack_path, &corrupt_pack).expect("test operation should succeed");
+        db.refresh_read_cache();
+
+        assert_eq!(read_object_for_assert(&db, &first_oid), first);
+        assert_eq!(read_object_for_assert(&db, &second_oid), second);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    fn ofs_delta_base_reference_position(pack: &[u8], offset: u64) -> usize {
+        let mut cursor = usize::try_from(offset).expect("test operation should succeed");
+        let first = pack[cursor];
+        cursor += 1;
+        let kind = (first >> 4) & 0x07;
+        let mut byte = first;
+        while byte & 0x80 != 0 {
+            byte = pack[cursor];
+            cursor += 1;
+        }
+        assert_eq!(kind, 6, "expected an ofs-delta entry");
+        cursor
     }
 
     #[test]

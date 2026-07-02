@@ -103,6 +103,10 @@ fn parse_leading_oid(format: ObjectFormat, value: &str) -> Option<ObjectId> {
     ObjectId::from_hex(format, &value[..hexsz]).ok()
 }
 
+fn loose_ref_bytes_are_reftable_sentinel(name: &str, bytes: &[u8]) -> bool {
+    name == "refs/heads" && bytes == b"this repository uses the reftable format\n"
+}
+
 pub fn parse_loose_ref(format: ObjectFormat, name: impl Into<String>, bytes: &[u8]) -> Result<Ref> {
     let name = name.into();
     let value = std::str::from_utf8(bytes)
@@ -895,6 +899,14 @@ impl FileRefStore {
             return Ok(Vec::new());
         }
         parse_reflog(self.format, &fs::read(path)?)
+    }
+
+    pub fn reflog_exists(&self, name: &str) -> Result<bool> {
+        validate_ref_name_for_read(name)?;
+        if self.uses_reftable()? {
+            return self.reftable_log_exists(name);
+        }
+        Ok(self.reflog_path(name).exists())
     }
 
     pub fn should_write_reflog_for_update(&self, name: &str, create_reflog: bool) -> Result<bool> {
@@ -1906,7 +1918,11 @@ impl FileRefStore {
         if path.is_dir() {
             return Ok(None);
         }
-        Ok(Some(parse_loose_ref(self.format, name, &fs::read(path)?)?))
+        let bytes = fs::read(path)?;
+        if loose_ref_bytes_are_reftable_sentinel(name, &bytes) {
+            return Ok(None);
+        }
+        Ok(Some(parse_loose_ref(self.format, name, &bytes)?))
     }
 
     fn read_packed_ref(&self, name: &str) -> Result<Option<PackedRef>> {
@@ -2422,6 +2438,26 @@ impl FileRefStore {
         Ok(entries)
     }
 
+    fn reftable_log_exists(&self, name: &str) -> Result<bool> {
+        let mut by_index: BTreeMap<u64, bool> = BTreeMap::new();
+        for table in self.reftables()? {
+            for record in table.logs {
+                if record.refname != name {
+                    continue;
+                }
+                match record.value {
+                    ReftableLogValue::Deletion => {
+                        by_index.insert(record.update_index, false);
+                    }
+                    ReftableLogValue::Update(_) => {
+                        by_index.insert(record.update_index, true);
+                    }
+                }
+            }
+        }
+        Ok(by_index.into_values().any(|exists| exists))
+    }
+
     fn collect_loose_refs(
         &self,
         dir: &Path,
@@ -2435,10 +2471,14 @@ impl FileRefStore {
             if path.is_dir() {
                 self.collect_loose_refs(&path, &name, refs)?;
             } else if !name.ends_with(".lock") {
+                let bytes = fs::read(path)?;
+                if loose_ref_bytes_are_reftable_sentinel(&name, &bytes) {
+                    continue;
+                }
                 // git marks a loose ref whose content is unparseable, or that
                 // resolves to the null OID, as REF_ISBROKEN and skips it from
                 // iteration with a warning instead of aborting the whole walk.
-                match parse_loose_ref(self.format, name.clone(), &fs::read(path)?) {
+                match parse_loose_ref(self.format, name.clone(), &bytes) {
                     Ok(reference) if ref_target_is_broken(&reference.target) => {
                         warn_broken_ref(&name);
                     }

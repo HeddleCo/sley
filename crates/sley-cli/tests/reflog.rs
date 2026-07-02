@@ -235,13 +235,22 @@ fn copy_dir_all(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("create copy destination");
     for entry in fs::read_dir(src).expect("read copy source") {
         let entry = entry.expect("read copy entry");
+        if entry.file_name().to_string_lossy().ends_with(".lock") {
+            continue;
+        }
         let source_path = entry.path();
         let dest_path = dst.join(entry.file_name());
         let file_type = entry.file_type().expect("copy entry type");
         if file_type.is_dir() {
             copy_dir_all(&source_path, &dest_path);
         } else if file_type.is_file() {
-            fs::copy(&source_path, &dest_path).expect("copy file");
+            fs::copy(&source_path, &dest_path).unwrap_or_else(|err| {
+                panic!(
+                    "copy file {} -> {}: {err}",
+                    source_path.display(),
+                    dest_path.display()
+                )
+            });
         } else if file_type.is_symlink() {
             let target = fs::read_link(&source_path).expect("read symlink");
             std::os::unix::fs::symlink(target, &dest_path).expect("copy symlink");

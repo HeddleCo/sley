@@ -22,7 +22,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// flags, default formatting, and error wording change across releases, so a
 /// mismatched oracle produces large numbers of spurious parity "failures". The
 /// guard in [`oracle_git`] pins the oracle to this series.
-const REQUIRED_ORACLE_GIT_SERIES: &str = "2.54";
+const REQUIRED_ORACLE_GIT_SERIES: &str = "2.55";
 
 static ORACLE_GIT: OnceLock<&'static str> = OnceLock::new();
 
@@ -104,7 +104,7 @@ pub fn apply_standard_git_identity_env(command: &mut Command) -> &mut Command {
 ///
 /// Resolution order:
 /// * `$SLEY_TEST_GIT`, if set — the explicit, pinnable override (point it at a
-///   `git-2.54/bin/git`).
+///   `git-2.55/bin/git`).
 /// * otherwise `"git"` (the PATH git).
 ///
 /// On first call this also runs a one-time version guard (see
@@ -160,8 +160,8 @@ fn assert_oracle_git_version(program: &str) {
     }
 }
 
-/// Extracts the dotted version (e.g. `2.54.0`) from a `git --version` line such
-/// as `git version 2.54.0`. Returns `None` if no version token is found.
+/// Extracts the dotted version (e.g. `2.55.0`) from a `git --version` line such
+/// as `git version 2.55.0`. Returns `None` if no version token is found.
 fn parse_git_version(version_line: &str) -> Option<String> {
     version_line
         .split_whitespace()
@@ -169,8 +169,8 @@ fn parse_git_version(version_line: &str) -> Option<String> {
         .map(|token| token.to_string())
 }
 
-/// True if `version` (e.g. `2.54.0` or `2.54.1.windows.1`) is on the
-/// `series` series (e.g. `2.54`), i.e. its `major.minor` prefix matches.
+/// True if `version` (e.g. `2.55.0` or `2.55.1.windows.1`) is on the
+/// `series` series (e.g. `2.55`), i.e. its `major.minor` prefix matches.
 fn version_on_series(version: &str, series: &str) -> bool {
     let mut v = version.split('.');
     let mut s = series.split('.');

@@ -105,6 +105,13 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
     for tree in &parsed.trees {
         tree_oids.push(resolve_tree_ish(&repo, tree)?);
     }
+    if read_tree_check_cache_tree() {
+        for tree_oid in &tree_oids {
+            if sley_diff_merge::tree_has_duplicate_leaf_paths(db, format, tree_oid)? {
+                return Err(sley_diff_merge::corrupted_cache_tree_error());
+            }
+        }
+    }
 
     // git's `-n` / `--dry-run`: run the merge to validate it (and surface the
     // same errors / exit code), but leave the index and worktree untouched. The
@@ -130,24 +137,13 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             let mut entries = read_tree_overlay(db, format, repo.config(), &tree_oids)?;
             if apply_worktree {
                 let worktree_root = worktree_root_for_git_dir(git_dir)?;
-                let tree_attributes = if tree_oids.len() == 1 {
-                    Some(sley_worktree::TreeAttributes::from_tree(
-                        &worktree_root,
-                        git_dir,
-                        db,
-                        format,
-                        &tree_oids[0],
-                    )?)
-                } else {
-                    None
-                };
                 reset_worktree_to_entries(
                     &worktree_root,
                     git_dir,
                     format,
                     db,
                     repo.config(),
-                    tree_attributes.as_ref(),
+                    None,
                     &mut entries,
                     recurse_submodules,
                 )?;
@@ -477,6 +473,13 @@ fn tree_leaf_map(
     tree_oid: &ObjectId,
 ) -> Result<LeafMap> {
     sley_diff_merge::flatten_tree(db, format, tree_oid)
+}
+
+fn read_tree_check_cache_tree() -> bool {
+    !matches!(
+        std::env::var("GIT_TEST_CHECK_CACHE_TREE").as_deref(),
+        Ok("false" | "0")
+    )
 }
 
 /// Convert a leaf map to sorted stage-0 `(path, entry)` pairs.
@@ -1212,15 +1215,13 @@ pub(crate) fn reset_index_and_worktree_to_commit(
     let config = read_repo_config(git_dir).unwrap_or_default();
     let tree = commands::merge_rebase::commit_tree_oid(&db, format, commit)?;
     let mut entries = read_tree_overlay(&db, format, &config, &[tree])?;
-    let tree_attributes =
-        sley_worktree::TreeAttributes::from_tree(worktree_root, git_dir, &db, format, &tree)?;
     reset_worktree_to_entries(
         worktree_root,
         git_dir,
         format,
         &db,
         &config,
-        Some(&tree_attributes),
+        None,
         &mut entries,
         recurse_submodules,
     )?;
@@ -1613,6 +1614,7 @@ fn make_index_entry(path: Vec<u8>, entry: StagedEntry) -> Result<IndexEntry> {
 /// stage bits in `flags`; the index v2/v3 writer accepts those (the higher bits
 /// of `flags`), so a fixed version 2 layout matches git's `ls-files --stage`.
 fn persist_index(git_dir: &Path, format: ObjectFormat, entries: Vec<IndexEntry>) -> Result<()> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut index = Index {
         version: 2,
         entries,
@@ -1620,6 +1622,7 @@ fn persist_index(git_dir: &Path, format: ObjectFormat, entries: Vec<IndexEntry>)
         checksum: None,
     };
     index.upgrade_version_for_flags();
+    sley_worktree::refresh_cache_tree(&mut index, &db);
     sley_worktree::write_repository_index_ref(git_dir, format, &index)?;
     Ok(())
 }

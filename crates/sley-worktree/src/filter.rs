@@ -153,9 +153,13 @@ pub(crate) fn utf_bom_problem(suffix: &str, data: &[u8]) -> Option<BomProblem> {
     }
 }
 
-/// `true` on a little-endian host — matches glibc iconv's native byte order for
-/// the byte-order-agnostic `UTF-16` / `UTF-32` output (LE BOM + LE bytes on x86).
-pub(crate) const HOST_LE: bool = cfg!(target_endian = "little");
+/// The byte order used by the platform iconv for byte-order-agnostic
+/// `UTF-16` / `UTF-32` when no BOM says otherwise. Git delegates these names to
+/// iconv; glibc follows host endian, while macOS emits big-endian with a BOM.
+#[cfg(target_os = "macos")]
+pub(crate) const ICONV_UTF_DEFAULT_LE: bool = false;
+#[cfg(not(target_os = "macos"))]
+pub(crate) const ICONV_UTF_DEFAULT_LE: bool = cfg!(target_endian = "little");
 
 /// Decode worktree-encoded bytes to UTF-8 (encode_to_git's reencode), or `None`
 /// when the encoding is unsupported or the bytes are not valid in it.
@@ -185,14 +189,63 @@ pub(crate) fn encode_from_utf8(suffix: &str, utf8: &[u8]) -> Option<Vec<u8>> {
         "16BE" => encode_utf16(utf8, false, false),
         "16LE-BOM" => encode_utf16(utf8, true, true),
         "16BE-BOM" => encode_utf16(utf8, false, true),
-        "16" => encode_utf16(utf8, HOST_LE, true),
+        "16" => encode_utf16(utf8, ICONV_UTF_DEFAULT_LE, true),
         "32LE" => encode_utf32(utf8, true, false),
         "32BE" => encode_utf32(utf8, false, false),
         "32LE-BOM" => encode_utf32(utf8, true, true),
         "32BE-BOM" => encode_utf32(utf8, false, true),
-        "32" => encode_utf32(utf8, HOST_LE, true),
+        "32" => encode_utf32(utf8, ICONV_UTF_DEFAULT_LE, true),
         _ => None,
     }
+}
+
+pub(crate) fn decode_named_encoding_to_utf8(name: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    if let Some(suffix) = utf_suffix(name) {
+        return decode_to_utf8(&suffix, data);
+    }
+    let encoding = encoding_rs::Encoding::for_label(name)?;
+    let (decoded, _, had_errors) = encoding.decode(data);
+    (!had_errors).then(|| decoded.into_owned().into_bytes())
+}
+
+pub(crate) fn encode_utf8_to_named_encoding(name: &[u8], utf8: &[u8]) -> Option<Vec<u8>> {
+    if let Some(suffix) = utf_suffix(name) {
+        return encode_from_utf8(&suffix, utf8);
+    }
+    let text = std::str::from_utf8(utf8).ok()?;
+    let encoding = encoding_rs::Encoding::for_label(name)?;
+    let (encoded, _, had_errors) = encoding.encode(text);
+    (!had_errors).then(|| encoded.into_owned())
+}
+
+pub(crate) fn should_check_roundtrip_encoding(config: &GitConfig, name: &[u8]) -> bool {
+    match config.get("core", None, "checkRoundtripEncoding") {
+        Some(value) => value
+            .as_bytes()
+            .split(|byte| *byte == b',' || byte.is_ascii_whitespace())
+            .filter(|part| !part.is_empty())
+            .any(|part| same_encoding_name(part, name)),
+        None => same_encoding_name(b"SHIFT-JIS", name),
+    }
+}
+
+pub(crate) fn same_encoding_name(left: &[u8], right: &[u8]) -> bool {
+    match (utf_suffix(left), utf_suffix(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => left.eq_ignore_ascii_case(right),
+    }
+}
+
+pub(crate) fn trace_roundtrip_encoding_check(name: &[u8]) {
+    if std::env::var_os("GIT_TRACE_WORKING_TREE_ENCODING").is_none()
+        && std::env::var_os("GIT_TRACE").is_none()
+    {
+        return;
+    }
+    eprintln!(
+        "Checking roundtrip encoding for {}",
+        String::from_utf8_lossy(name)
+    );
 }
 
 pub(crate) fn strip_utf16_bom(data: &[u8]) -> (bool, &[u8]) {
@@ -201,7 +254,7 @@ pub(crate) fn strip_utf16_bom(data: &[u8]) -> (bool, &[u8]) {
     } else if data.starts_with(&[0xFE, 0xFF]) {
         (false, &data[2..])
     } else {
-        (HOST_LE, data)
+        (ICONV_UTF_DEFAULT_LE, data)
     }
 }
 
@@ -211,7 +264,7 @@ pub(crate) fn strip_utf32_bom(data: &[u8]) -> (bool, &[u8]) {
     } else if data.starts_with(&[0, 0, 0xFE, 0xFF]) {
         (false, &data[4..])
     } else {
-        (HOST_LE, data)
+        (ICONV_UTF_DEFAULT_LE, data)
     }
 }
 
@@ -299,10 +352,31 @@ pub(crate) fn check_wt_encoding_valid(encoding: &WtEncoding) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn clean_encoding_needs_stat_match_validation(
+    config: &GitConfig,
+    attributes: &[AttributeCheck],
+) -> bool {
+    let plan = ContentFilterPlan::resolve(config, attributes);
+    matches!(plan.encoding, WtEncoding::Invalid | WtEncoding::Named(_))
+}
+
+pub(crate) fn validate_clean_encoding_for_stat_match(
+    config: &GitConfig,
+    attributes: &[AttributeCheck],
+    path: &[u8],
+    content: &[u8],
+) -> Result<()> {
+    let plan = ContentFilterPlan::resolve(config, attributes);
+    check_wt_encoding_valid(&plan.encoding)?;
+    let _ = encode_to_git(config, &plan.encoding, path, Cow::Borrowed(content), false)?;
+    Ok(())
+}
+
 /// encode_to_git: decode worktree-encoded `data` to UTF-8 for storage in the
 /// object database. Runs the BOM validation first (fatal when writing an
 /// object). Returns the borrowed input unchanged when there is no encoding.
 pub(crate) fn encode_to_git<'a>(
+    config: &GitConfig,
     encoding: &WtEncoding,
     path: &[u8],
     data: Cow<'a, [u8]>,
@@ -348,8 +422,20 @@ working-tree-encoding."
             }
         }
     }
-    match utf_suffix(name).and_then(|suffix| decode_to_utf8(&suffix, &data)) {
-        Some(utf8) => Ok(Cow::Owned(utf8)),
+    match decode_named_encoding_to_utf8(name, &data) {
+        Some(utf8) => {
+            if should_check_roundtrip_encoding(config, name) {
+                trace_roundtrip_encoding_check(name);
+                if encode_utf8_to_named_encoding(name, &utf8).as_deref() != Some(data.as_ref()) {
+                    report_encode_failure(
+                        write_object,
+                        &format!("encoding round trip failed for '{display}' from {enc} to UTF-8"),
+                    )?;
+                    return Ok(data);
+                }
+            }
+            Ok(Cow::Owned(utf8))
+        }
         None => {
             report_encode_failure(
                 write_object,
@@ -376,7 +462,7 @@ pub(crate) fn encode_to_worktree<'a>(
     if data.is_empty() {
         return Ok(data);
     }
-    match utf_suffix(name).and_then(|suffix| encode_from_utf8(&suffix, &data)) {
+    match encode_utf8_to_named_encoding(name, &data) {
         Some(encoded) => Ok(Cow::Owned(encoded)),
         None => {
             let display = String::from_utf8_lossy(path);
@@ -1727,7 +1813,7 @@ pub(crate) fn apply_clean_filter_cow_inner<'a>(
     // encode_to_git runs before the EOL pass (convert.c order: filter →
     // encode_to_git → crlf_to_git): the worktree charset is decoded to UTF-8 so
     // the line-ending stats and conversion below see real LF/CRLF bytes.
-    data = encode_to_git(&plan.encoding, path, data, write_object)?;
+    data = encode_to_git(config, &plan.encoding, path, data, write_object)?;
     // The safecrlf check scans the (post-driver) buffer once for line-ending
     // stats. Gate it tightly so the extra scan never runs on the dominant
     // pass-through paths: only when safecrlf is enabled, the path is a real
@@ -1825,6 +1911,16 @@ pub(crate) fn apply_smudge_filter_with_attributes_maybe_delayed<'a>(
 ) -> Result<SmudgeFilterResult<'a>> {
     let plan = ContentFilterPlan::resolve(config, attributes);
     check_wt_encoding_valid(&plan.encoding)?;
+    let process_blob = if plan
+        .driver
+        .as_ref()
+        .and_then(|driver| driver.process.as_ref())
+        .is_some()
+    {
+        Some(EncodedObject::new(ObjectType::Blob, content.to_vec()).object_id(format)?)
+    } else {
+        None
+    };
     let mut data = Cow::Borrowed(content);
     if plan.ident {
         data = ident_to_worktree_cow(format, data)?;
@@ -1845,6 +1941,7 @@ pub(crate) fn apply_smudge_filter_with_attributes_maybe_delayed<'a>(
             driver.smudge.as_deref(),
             "smudge",
             Some(format),
+            process_blob,
             path,
             data,
             allow_delay,
@@ -1865,7 +1962,9 @@ pub(crate) fn run_driver<'a>(
     path: &[u8],
     content: Cow<'a, [u8]>,
 ) -> Result<Cow<'a, [u8]>> {
-    match run_driver_maybe_delayed(driver, command, direction, format, path, content, false)? {
+    match run_driver_maybe_delayed(
+        driver, command, direction, format, None, path, content, false,
+    )? {
         DriverFilterResult::Content(data) => Ok(data),
         DriverFilterResult::Delayed { .. } => unreachable!("delay was not enabled"),
     }
@@ -1876,17 +1975,19 @@ pub(crate) fn run_driver_maybe_delayed<'a>(
     command: Option<&str>,
     direction: &str,
     format: Option<ObjectFormat>,
+    process_blob: Option<ObjectId>,
     path: &[u8],
     content: Cow<'a, [u8]>,
     allow_delay: bool,
 ) -> Result<DriverFilterResult<'a>> {
     if let Some(process) = &driver.process {
         let blob = if direction == "smudge" {
-            match format {
-                Some(format) => {
+            match (process_blob, format) {
+                (Some(blob), _) => Some(blob),
+                (None, Some(format)) => {
                     Some(EncodedObject::new(ObjectType::Blob, content.to_vec()).object_id(format)?)
                 }
-                None => None,
+                (None, None) => None,
             }
         } else {
             None

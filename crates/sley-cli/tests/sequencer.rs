@@ -66,12 +66,17 @@ fn copy_dir_all(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("create dst");
     for entry in fs::read_dir(src).expect("read_dir") {
         let entry = entry.expect("entry");
+        if entry.file_name().to_string_lossy().ends_with(".lock") {
+            continue;
+        }
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if entry.file_type().expect("file_type").is_dir() {
             copy_dir_all(&from, &to);
         } else {
-            fs::copy(&from, &to).expect("copy file");
+            fs::copy(&from, &to).unwrap_or_else(|err| {
+                panic!("copy file {} -> {}: {err}", from.display(), to.display())
+            });
         }
     }
 }

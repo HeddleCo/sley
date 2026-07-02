@@ -8,6 +8,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+encoding_rs = "0.8"
 sley-config = { path = "../sley-config", version = "0.3.0" }
 sley-core = { path = "../sley-core", version = "0.3.0" }
 sley-diff-merge = { path = "../sley-diff-merge", version = "0.3.0" }

@@ -1042,7 +1042,8 @@ pub fn install_fetch_pack_via_local_upload_pack(
     if wants.is_empty() {
         return Ok(Vec::new());
     }
-    let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let local_db = FileObjectDatabase::from_git_dir(git_dir, format)
+        .with_promisor_remote_present(repo_has_promisor_remote(git_dir));
     let all_wants_present = wants
         .iter()
         .map(|want| local_db.contains(want))
@@ -1145,7 +1146,11 @@ pub fn install_fetch_pack_via_local_upload_pack(
             // remote may be intentionally incomplete while the client has the
             // missing bases already, so walk the exclusion closure locally and
             // keep the actual pack source pinned to the remote below.
-            collect_reachable_object_ids(&local_db, format, known_haves)?
+            sley_odb::collect_reachable_object_ids_tolerating_promised_missing(
+                &local_db,
+                format,
+                known_haves,
+            )?
         }
     };
     let mut starts = decoded_request.wants;
@@ -1187,6 +1192,25 @@ fn local_upload_pack_client_wants_v2(git_dir: &Path) -> bool {
         .and_then(|config| config.get("protocol", None, "version").map(str::to_string))
         .as_deref()
         == Some("2")
+}
+
+fn repo_has_promisor_remote(git_dir: &Path) -> bool {
+    let Ok(config) = sley_config::read_repo_config(git_dir, None) else {
+        return false;
+    };
+    if config
+        .get("extensions", None, "partialclone")
+        .is_some_and(|value| !value.is_empty())
+    {
+        return true;
+    }
+    config.sections.iter().any(|section| {
+        section.name.eq_ignore_ascii_case("remote")
+            && section
+                .subsection
+                .as_deref()
+                .is_some_and(|name| config.get_bool("remote", Some(name), "promisor") == Some(true))
+    })
 }
 
 fn trace_local_upload_pack_v2_capabilities(remote_git_dir: &Path, format: ObjectFormat) {

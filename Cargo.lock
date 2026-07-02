@@ -1479,6 +1479,7 @@ dependencies = [
 name = "sley-worktree"
 version = "0.3.0"
 dependencies = [
+ "encoding_rs",
  "sley-config",
  "sley-core",
  "sley-diff-merge",

@@ -137,6 +137,8 @@ struct DiffTreeOptions {
     pickaxe: Option<String>,
     /// `--pickaxe-all`: if any filepair matches `-S`, show the whole changeset.
     pickaxe_all: bool,
+    /// `--find-object=<oid>`: keep filepairs whose object occurrence changes.
+    find_object_values: Vec<String>,
     /// `--exit-code` / `--quiet`: exit with status 1 when any difference is
     /// found (0 otherwise). `--quiet` additionally suppresses the diff output.
     exit_code: bool,
@@ -192,6 +194,7 @@ impl Default for DiffTreeOptions {
             check: false,
             pickaxe: None,
             pickaxe_all: false,
+            find_object_values: Vec::new(),
             exit_code: false,
             ws_ignore: sley_diff_merge::WsIgnore::default(),
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
@@ -337,6 +340,16 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
                 options.pickaxe = Some(value.to_string());
             }
             "--pickaxe-all" => options.pickaxe_all = true,
+            "--find-object" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| log_option_requires_value_error("find-object"))?;
+                options.find_object_values.push(value.clone());
+            }
+            value if let Some(rest) = value.strip_prefix("--find-object=") => {
+                options.find_object_values.push(rest.to_string());
+            }
             "-a" | "--text" | "--no-ext-diff" | "--no-textconv" => {}
             // Rename / copy detection. diff-tree leaves these off unless asked.
             "-M" | "--find-renames" => options.detect_renames = true,
@@ -604,6 +617,8 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
     } else {
         None
     };
+    let find_objects =
+        commands::diff::resolve_diff_find_objects(git_dir, format, &options.find_object_values)?;
     // `--indent-heuristic` / `--no-indent-heuristic` win over the
     // `diff.indentHeuristic` config (which defaults to git's enabled behavior).
     let indent_heuristic = options.indent_heuristic.unwrap_or_else(|| {
@@ -630,6 +645,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
         diff_pathspec,
         raw_abbrev,
         patch_abbrev,
+        find_objects: &find_objects,
         indent_heuristic,
         ws_resolver,
         check_failed: std::cell::Cell::new(false),
@@ -1042,6 +1058,7 @@ struct DiffRequestContext<'a> {
     diff_pathspec: Option<DiffPathspec>,
     raw_abbrev: Option<usize>,
     patch_abbrev: usize,
+    find_objects: &'a [ObjectId],
     /// Resolved `--indent-heuristic` / `diff.indentHeuristic`.
     indent_heuristic: bool,
     /// `--check` whitespace-rule resolver (only built in check mode).
@@ -1115,6 +1132,7 @@ fn run_diff_request(
     } else {
         entries
     };
+    let entries = commands::diff::apply_diff_find_objects(entries, context.find_objects);
     let has_differences = !entries.is_empty();
 
     // `--check`: report whitespace errors in place of the normal diff body.
@@ -1261,12 +1279,17 @@ fn run_combined_request(
 ) -> Result<bool> {
     let format = context.format;
     let db = context.db;
-    let paths = commands::combined::combined_paths(
+    let mut paths = commands::combined::combined_paths(
         db,
         format,
         &combined.result_tree,
         &combined.parent_trees,
     )?;
+    if !context.find_objects.is_empty() {
+        paths.retain(|path| {
+            commands::combined::combined_path_matches_find_objects(path, context.find_objects)
+        });
+    }
 
     let output = context.options.output;
     let mut has_differences = !paths.is_empty();

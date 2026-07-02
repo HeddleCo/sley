@@ -18,6 +18,21 @@ pub fn process_ancestry() -> &'static [String] {
     PROCESS_ANCESTRY.get_or_init(platform::process_ancestry)
 }
 
+#[cfg(unix)]
+pub fn duplicate_fd(fd: i32) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+
+    // SAFETY: `dup` only inspects the numeric file descriptor and returns either
+    // a fresh descriptor owned by this process or -1 with errno set.
+    let duplicated = unsafe { libc::dup(fd) };
+    if duplicated < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `duplicated` is a newly returned descriptor, so wrapping it in
+    // `File` gives Rust ownership and closes exactly that duplicate on drop.
+    Ok(unsafe { std::fs::File::from_raw_fd(duplicated) })
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use std::mem::{MaybeUninit, size_of};

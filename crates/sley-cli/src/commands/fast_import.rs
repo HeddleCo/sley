@@ -429,8 +429,15 @@ fn fast_import_output_for_cat_blob(fd: Option<i32>) -> Result<Box<dyn Write>> {
     let Some(fd) = fd else {
         return Ok(Box::new(io::stdout()));
     };
-    let path = PathBuf::from(format!("/dev/fd/{fd}"));
-    Ok(Box::new(fs::OpenOptions::new().append(true).open(path)?))
+    #[cfg(unix)]
+    {
+        return Ok(Box::new(sley_procinfo::duplicate_fd(fd)?));
+    }
+    #[cfg(not(unix))]
+    {
+        let path = PathBuf::from(format!("/dev/fd/{fd}"));
+        Ok(Box::new(fs::OpenOptions::new().append(true).open(path)?))
+    }
 }
 
 fn option_value<'a>(arg: &'a str, prefix: &str) -> &'a str {

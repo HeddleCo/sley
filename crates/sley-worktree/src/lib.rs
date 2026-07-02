@@ -53,6 +53,7 @@ pub use checkout::*;
 pub use filter::*;
 pub use ignore::*;
 pub use index::*;
+pub use index_io::StatCleanFilterValidator;
 pub use move_remove::*;
 pub use status::*;
 pub use types_admin::*;
@@ -1383,6 +1384,99 @@ mod tests {
             restored, worktree,
             "smudge must restore CRLF from the LF blob"
         );
+    }
+
+    #[test]
+    fn working_tree_encoding_utf16_smudge_uses_platform_iconv_order() {
+        let config = config_from("");
+        let mut matcher = AttributeMatcher::default();
+        read_attribute_patterns_from_bytes(
+            b"*.utf16 text working-tree-encoding=utf-16",
+            &mut matcher,
+            &[],
+            b".gitattributes",
+        );
+        let checks = matcher.attributes_for_path(b"test.utf16", &filter_attribute_names(), false);
+
+        let restored = apply_smudge_filter_with_attributes(&config, &checks, b"test.utf16", b"A\n")
+            .expect("smudge must encode UTF-16");
+        let expected =
+            encode_utf16(b"A\n", ICONV_UTF_DEFAULT_LE, true).expect("valid UTF-8 encodes");
+
+        assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn working_tree_encoding_smudge_applies_eol_before_utf32() {
+        let config = config_from("[core]\n\teol = crlf\n");
+        let mut matcher = AttributeMatcher::default();
+        read_attribute_patterns_from_bytes(
+            b"*.utf32 text working-tree-encoding=utf-32",
+            &mut matcher,
+            &[],
+            b".gitattributes",
+        );
+        let checks = matcher.attributes_for_path(b"eol.utf32", &filter_attribute_names(), false);
+
+        let restored =
+            apply_smudge_filter_with_attributes(&config, &checks, b"eol.utf32", b"one\ntwo\n")
+                .expect("smudge must encode UTF-32");
+        let expected = encode_utf32(b"one\r\ntwo\r\n", ICONV_UTF_DEFAULT_LE, true)
+            .expect("valid UTF-8 encodes");
+
+        assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn working_tree_encoding_shift_jis_clean_and_roundtrip_config() {
+        let mut matcher = AttributeMatcher::default();
+        read_attribute_patterns_from_bytes(
+            b"*.shift text working-tree-encoding=SHIFT-JIS",
+            &mut matcher,
+            &[],
+            b".gitattributes",
+        );
+        let checks =
+            matcher.attributes_for_path(b"roundtrip.shift", &filter_attribute_names(), false);
+        let (shift_jis, _, had_errors) = encoding_rs::SHIFT_JIS.encode("hallo\n");
+        assert!(!had_errors);
+
+        let config = config_from("");
+        assert!(should_check_roundtrip_encoding(&config, b"SHIFT-JIS"));
+        let blob =
+            apply_clean_filter_with_attributes(&config, &checks, b"roundtrip.shift", &shift_jis)
+                .expect("SHIFT-JIS clean must decode to UTF-8");
+        assert_eq!(blob, b"hallo\n");
+
+        let disabled = config_from("[core]\n\tcheckRoundtripEncoding = garbage\n");
+        assert!(!should_check_roundtrip_encoding(&disabled, b"SHIFT-JIS"));
+    }
+
+    #[test]
+    fn working_tree_encoding_missing_bom_is_fatal_when_writing_object() {
+        let config = config_from("");
+        let mut matcher = AttributeMatcher::default();
+        read_attribute_patterns_from_bytes(
+            b"*.utf16 text working-tree-encoding=utf-16",
+            &mut matcher,
+            &[],
+            b".gitattributes",
+        );
+        let checks =
+            matcher.attributes_for_path(b"nonsense.utf16", &filter_attribute_names(), false);
+
+        let err = apply_clean_filter_cow_inner(
+            &config,
+            &checks,
+            b"nonsense.utf16",
+            b"\0a\0b\0c",
+            ConvFlags::Off,
+            SafeCrlfIndexBlob::None,
+            true,
+        )
+        .expect_err("UTF-16 without a BOM must be rejected when writing an object");
+
+        assert!(matches!(err, GitError::Exit(128)));
     }
 
     #[test]

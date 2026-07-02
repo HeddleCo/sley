@@ -63,12 +63,17 @@ fn copy_dir_all(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("create dst");
     for entry in fs::read_dir(src).expect("read_dir") {
         let entry = entry.expect("entry");
+        if entry.file_name().to_string_lossy().ends_with(".lock") {
+            continue;
+        }
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if entry.file_type().expect("file_type").is_dir() {
             copy_dir_all(&from, &to);
         } else {
-            fs::copy(&from, &to).expect("copy file");
+            fs::copy(&from, &to).unwrap_or_else(|err| {
+                panic!("copy file {} -> {}: {err}", from.display(), to.display())
+            });
         }
     }
 }
@@ -343,6 +348,67 @@ fn maintenance_run_matches_git_gc_behavior() {
             "history not fully readable after {label} maintenance run"
         );
     }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn maintenance_reflog_expire_auto_counts_head_only() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("maint-reflog-head-only");
+    let repo = root.join("repo");
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
+    write_file(&repo, "f.txt", "base\n");
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-qm", "base"]);
+    git_ok(&repo, &["branch", "noisy"]);
+
+    let head = String::from_utf8(git(&repo, &["rev-parse", "HEAD"]).stdout)
+        .expect("head oid utf8")
+        .trim()
+        .to_string();
+    let zero = "0".repeat(head.len());
+    let branch_log = repo.join(".git/logs/refs/heads/noisy");
+    let mut log = String::new();
+    for i in 0..120 {
+        log.push_str(&format!(
+            "{zero} {head} Tester <tester@example.com> 1 +0000\tbranch: noisy {i}\n"
+        ));
+    }
+    fs::write(&branch_log, log).expect("write noisy branch reflog");
+
+    let needed = sley(
+        &repo,
+        &["maintenance", "is-needed", "--auto", "--task=reflog-expire"],
+    );
+    assert!(
+        !needed.status.success(),
+        "non-HEAD reflogs should not trip reflog-expire auto"
+    );
+
+    let run = sley(
+        &repo,
+        &["maintenance", "run", "--auto", "--task=reflog-expire"],
+    );
+    assert!(
+        run.status.success(),
+        "maintenance run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let retained = fs::read_to_string(&branch_log)
+        .expect("read branch reflog")
+        .lines()
+        .count();
+    assert_eq!(retained, 120, "auto maintenance expired a non-HEAD reflog");
 
     fs::remove_dir_all(&root).ok();
 }

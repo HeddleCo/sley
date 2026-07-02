@@ -297,6 +297,29 @@ pub(crate) fn setup_diff_options(args: &[String]) -> Result<DiffOptions> {
     Ok(options)
 }
 
+pub(crate) fn resolve_diff_context(
+    cli_context: Option<usize>,
+    config: Option<&GitConfig>,
+) -> Result<usize> {
+    let config_context = match config.and_then(|config| config.get("diff", None, "context")) {
+        Some(value) => {
+            let Some(parsed) = sley_config::parse_config_int(value) else {
+                eprintln!(
+                    "fatal: bad numeric config value '{value}' for 'diff.context': invalid unit"
+                );
+                return Err(GitError::Exit(128));
+            };
+            if parsed < 0 {
+                eprintln!("fatal: bad config variable 'diff.context'");
+                return Err(GitError::Exit(128));
+            }
+            Some(parsed as usize)
+        }
+        None => None,
+    };
+    Ok(cli_context.or(config_context).unwrap_or(3))
+}
+
 const DIFF_USAGE: &[&str] = &["git diff [<options>] [<commit>] [--] [<path>...]"];
 
 fn diff_option_specs() -> &'static [OptionSpec<'static>] {
@@ -1419,7 +1442,7 @@ fn diff_validate_word_diff(value: &str) -> Result<()> {
     }
 }
 
-fn parse_unified_count(value: &str) -> usize {
+pub(crate) fn parse_unified_count(value: &str) -> usize {
     let (number, multiplier) = match value.as_bytes().last() {
         Some(b'k' | b'K') => (&value[..value.len() - 1], 1024usize),
         Some(b'm' | b'M') => (&value[..value.len() - 1], 1024 * 1024),

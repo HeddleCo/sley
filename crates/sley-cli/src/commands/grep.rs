@@ -536,6 +536,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             PatternTypeOption::Pcre => PatternKind::Perl,
             _ => PatternKind::Basic,
         };
+        reject_pcre_without_support(&opts)?;
         reject_nul_pattern_without_pcre(&opts)?;
         let color_config = repo.as_ref().map(|repo| repo.config());
         let any = grep_no_index(
@@ -583,6 +584,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         PatternTypeOption::Pcre => PatternKind::Perl,
         _ => PatternKind::Basic,
     };
+    reject_pcre_without_support(&opts)?;
     reject_nul_pattern_without_pcre(&opts)?;
     // `grep.*` config sets the default; an explicit CLI flag (tracked by the
     // `_set` markers) overrides it. git applies config first, then CLI overrides.
@@ -657,6 +659,14 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         opts.full_name,
         &opts.pathspecs,
     )?;
+    let userdiff_attributes = worktree_root
+        .as_deref()
+        .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
+        .transpose()?;
+    let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
+        userdiff_attributes,
+        Some(repo.config().clone()),
+    );
 
     let plan = GrepPlan {
         matcher: &matcher,
@@ -665,6 +675,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         pathspec: &pathspec,
         colors: GrepColors::from_config(repo.config(), opts.color),
         pager: pager_collector.as_ref(),
+        userdiff: Some(&userdiff),
     };
 
     let mut any_match = false;
@@ -733,6 +744,20 @@ struct GrepPlan<'a> {
     /// `-O`: when set, matched file display paths are collected here (instead of
     /// printed) so they can be handed to the pager once the search completes.
     pager: Option<&'a RefCell<Vec<Vec<u8>>>>,
+    userdiff: Option<&'a commands::userdiff::UserdiffResolver>,
+}
+
+fn grep_userdiff_driver(
+    plan: &GrepPlan<'_>,
+    path: &[u8],
+) -> Result<Option<std::rc::Rc<commands::userdiff::ResolvedDriver>>> {
+    if !(plan.opts.show_function || plan.opts.function_context) {
+        return Ok(None);
+    }
+    match plan.userdiff {
+        Some(userdiff) => userdiff.driver_for_path(path),
+        None => Ok(None),
+    }
 }
 
 struct GrepColors {
@@ -833,6 +858,14 @@ fn reject_nul_pattern_without_pcre(opts: &GrepOptions) -> Result<()> {
         eprintln!(
             "fatal: given pattern contains NULL byte (This is only supported with -P under PCRE v2)"
         );
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+fn reject_pcre_without_support(opts: &GrepOptions) -> Result<()> {
+    if opts.kind == PatternKind::Perl {
+        eprintln!("fatal: support for Perl-compatible regexes was not compiled in");
         return Err(GitError::Exit(128));
     }
     Ok(())
@@ -1162,6 +1195,7 @@ fn grep_no_index(
             .map(|config| GrepColors::from_config(config, opts.color))
             .unwrap_or_else(GrepColors::none),
         pager,
+        userdiff: None,
     };
     let ignore = if opts.exclude_standard {
         NoIndexIgnore::from_cwd(&cwd)?
@@ -1207,7 +1241,15 @@ fn grep_no_index(
         } else {
             file.display.clone()
         };
-        let matched = grep_buffer(&content, &display, None, &plan, &mut out, &mut printed_file)?;
+        let matched = grep_buffer(
+            &content,
+            &display,
+            None,
+            None,
+            &plan,
+            &mut out,
+            &mut printed_file,
+        )?;
         any_match = any_match || matched;
     }
     if opts.untracked {
@@ -1692,7 +1734,7 @@ fn grep_index_level(
                 i = next(false, i);
                 continue;
             }
-            let object = source.db.read_object(&oid)?;
+            let object = read_object_maybe_prefetch_promisor(source.db, &oid)?;
             Cow::Owned(object.body.to_vec())
         } else {
             let absolute = source.worktree_root.join(bytes_to_path(&path));
@@ -1705,7 +1747,9 @@ fn grep_index_level(
             }
         };
         let display = plan.pathspec.display(&full);
-        let matched = grep_buffer(&content, &display, None, plan, out, printed_file)?;
+        let driver = grep_userdiff_driver(plan, &full)?;
+        let funcname = driver.as_ref().and_then(|driver| driver.funcname.as_ref());
+        let matched = grep_buffer(&content, &display, None, funcname, plan, out, printed_file)?;
         any = any || matched;
         i = next(true, i);
     }
@@ -1792,11 +1836,14 @@ fn grep_tree_level(
             continue;
         }
         let display = plan.pathspec.display(&full);
-        let object = source.db.read_object(oid)?;
+        let object = read_object_maybe_prefetch_promisor(source.db, oid)?;
+        let driver = grep_userdiff_driver(plan, &full)?;
+        let funcname = driver.as_ref().and_then(|driver| driver.funcname.as_ref());
         let matched = grep_buffer(
             &object.body,
             &display,
             Some(source.rev),
+            funcname,
             plan,
             out,
             printed_file,
@@ -1821,6 +1868,7 @@ fn grep_buffer(
     content: &[u8],
     display_path: &[u8],
     rev: Option<&str>,
+    funcname: Option<&commands::userdiff::CompiledFuncname>,
     plan: &GrepPlan<'_>,
     out: &mut impl Write,
     printed_file: &mut bool,
@@ -1944,26 +1992,14 @@ fn grep_buffer(
         for hit in &hits {
             let line = lines[hit.line_no - 1];
             let spans = plan.matcher.match_spans_expr(plan.expr, line);
-            // git advances `cno` cumulatively: it starts at the 1-based offset of
-            // the first match, then after each match adds that match's end offset
-            // measured from the running `bol` (`cno += rm_eo; bol += rm_eo`). We
-            // mirror that with an explicit moving `bol`.
-            let mut cno = spans.first().map(|s| s.0 + 1).unwrap_or(0);
-            let mut bol = 0usize;
-            for (i, span) in spans.iter().enumerate() {
-                if i > 0 {
-                    // Add the previous match's rm_eo (relative to the prior bol).
-                    let prev = spans[i - 1];
-                    cno += prev.1 - bol;
-                    bol = prev.1;
-                }
+            for span in spans {
                 write_match_prefix(out, rev, display_path, show_filename, field_sep)?;
                 if opts.line_number {
                     out.write_all(hit.line_no.to_string().as_bytes())?;
                     out.write_all(field_sep)?;
                 }
                 if opts.column {
-                    out.write_all(cno.to_string().as_bytes())?;
+                    out.write_all((span.0 + 1).to_string().as_bytes())?;
                     out.write_all(field_sep)?;
                 }
                 out.write_all(&line[span.0..span.1])?;
@@ -1974,7 +2010,7 @@ fn grep_buffer(
     }
 
     // Determine the set of lines to print, including context and function context.
-    let to_print = compute_output_lines(&lines, &hits, opts);
+    let to_print = compute_output_lines(&lines, &hits, opts, funcname);
     emit_lines(
         out,
         &lines,
@@ -2069,7 +2105,12 @@ struct LineFlag {
 }
 
 /// Compute, for each input line, whether it is selected/context/function.
-fn compute_output_lines(lines: &[&[u8]], hits: &[LineHit], opts: &GrepOptions) -> Vec<LineFlag> {
+fn compute_output_lines(
+    lines: &[&[u8]],
+    hits: &[LineHit],
+    opts: &GrepOptions,
+    funcname: Option<&commands::userdiff::CompiledFuncname>,
+) -> Vec<LineFlag> {
     let mut flags = vec![LineFlag::default(); lines.len()];
     for hit in hits {
         flags[hit.line_no - 1].selected = true;
@@ -2092,15 +2133,18 @@ fn compute_output_lines(lines: &[&[u8]], hits: &[LineHit], opts: &GrepOptions) -
     if opts.function_context {
         for hit in hits {
             let center = hit.line_no - 1;
-            let (header, end, header_is_func) = function_bounds(lines, center);
+            let (start, end, func_header) = function_bounds(lines, center, funcname);
             for (i, line) in flags.iter_mut().enumerate().take(end + 1) {
-                if i >= header && i <= end && !line.selected {
+                if i >= start && i <= end && !line.selected {
                     line.context = true;
                 }
             }
             // Only mark the header with `=` when it is a real funcname line
             // (a bare include/preamble block above the match shows as `-`).
-            if header_is_func && header < center && !flags[header].selected {
+            if let Some(header) = func_header
+                && header < center
+                && !flags[header].selected
+            {
                 flags[header].context = false;
                 flags[header].function = true;
             }
@@ -2109,7 +2153,7 @@ fn compute_output_lines(lines: &[&[u8]], hits: &[LineHit], opts: &GrepOptions) -
         // -p: prepend the enclosing function header (a `=` line) per hunk.
         for hit in hits {
             let center = hit.line_no - 1;
-            if let Some(header) = enclosing_function(lines, center)
+            if let Some(header) = enclosing_function(lines, center, funcname)
                 && !flags[header].selected
             {
                 flags[header].function = true;
@@ -2121,30 +2165,49 @@ fn compute_output_lines(lines: &[&[u8]], hits: &[LineHit], opts: &GrepOptions) -
 
 /// A line is a "function" header under git's default `match_funcname`: a
 /// non-empty line whose first byte is a letter, `_`, or `$`.
-fn is_funcline(line: &[u8]) -> bool {
-    match line.first() {
-        None => false,
-        Some(&b) => b.is_ascii_alphabetic() || b == b'_' || b == b'$',
+fn is_funcline(line: &[u8], funcname: Option<&commands::userdiff::CompiledFuncname>) -> bool {
+    if let Some(funcname) = funcname {
+        funcname.match_line(line).is_some()
+    } else {
+        match line.first() {
+            None => false,
+            Some(&b) => b.is_ascii_alphabetic() || b == b'_' || b == b'$',
+        }
     }
 }
 
 /// Find the function header line at or above `from`.
-fn enclosing_function(lines: &[&[u8]], from: usize) -> Option<usize> {
-    (0..=from).rev().find(|&i| is_funcline(lines[i]))
+fn enclosing_function(
+    lines: &[&[u8]],
+    from: usize,
+    funcname: Option<&commands::userdiff::CompiledFuncname>,
+) -> Option<usize> {
+    (0..=from).rev().find(|&i| is_funcline(lines[i], funcname))
 }
 
-/// For -W: return `(function_header_line, last_line_of_function, header_is_func)`
-/// bracketing `from`. When no funcname line precedes the match, the body extends
-/// to the top of the file and `header_is_func` is false.
-fn function_bounds(lines: &[&[u8]], from: usize) -> (usize, usize, bool) {
-    let (header, header_is_func) = match enclosing_function(lines, from) {
-        Some(h) => (h, true),
-        None => (0, false),
+/// For -W: return `(first_context_line, last_line_of_function, func_header)`.
+/// When no funcname line precedes the match, the body extends to the top of the
+/// file and `func_header` is `None`.
+fn function_bounds(
+    lines: &[&[u8]],
+    from: usize,
+    funcname: Option<&commands::userdiff::CompiledFuncname>,
+) -> (usize, usize, Option<usize>) {
+    let func_header = enclosing_function(lines, from, funcname);
+    let mut start = match func_header {
+        Some(h) => h,
+        None => 0,
     };
+    if funcname.is_some() && func_header.is_some() {
+        while start > 0 && !lines[start - 1].is_empty() {
+            start -= 1;
+        }
+    }
     // The function ends just before the next function header.
     let mut end = lines.len() - 1;
-    for i in (header + 1)..lines.len() {
-        if is_funcline(lines[i]) {
+    let search_start = func_header.map_or(start + 1, |header| header + 1);
+    for i in search_start..lines.len() {
+        if is_funcline(lines[i], funcname) {
             end = i - 1;
             break;
         }
@@ -2153,7 +2216,7 @@ fn function_bounds(lines: &[&[u8]], from: usize) -> (usize, usize, bool) {
     while end > from && lines[end].is_empty() {
         end -= 1;
     }
-    (header, end, header_is_func)
+    (start, end, func_header)
 }
 
 #[allow(clippy::too_many_arguments)]

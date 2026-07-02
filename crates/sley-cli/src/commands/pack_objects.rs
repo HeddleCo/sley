@@ -17,6 +17,7 @@
 //! `pack-reused` / `packs-reused` totals and trace2 data events report that
 //! reuse exactly like upstream.
 
+use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -66,6 +67,7 @@ struct PackObjectsOptions {
     /// lazy backfill.
     exclude_promisor_objects: bool,
     path_walk: bool,
+    sparse: Option<bool>,
     thin: bool,
     write_bitmap_index: bool,
     name_hash_version: Option<i32>,
@@ -124,6 +126,8 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             "--no-delta-base-offset" if !saw_dashdash => options.delta_base_offset = false,
             "--path-walk" if !saw_dashdash => options.path_walk = true,
             "--no-path-walk" if !saw_dashdash => options.path_walk = false,
+            "--sparse" if !saw_dashdash => options.sparse = Some(true),
+            "--no-sparse" if !saw_dashdash => options.sparse = Some(false),
             "--thin" if !saw_dashdash => options.thin = true,
             "--no-thin" if !saw_dashdash => options.thin = false,
             "--write-bitmap-index" | "--write-bitmap-index-quiet" if !saw_dashdash => {
@@ -171,7 +175,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
                 options.exclude_promisor_objects = false;
             }
             "-q" | "--quiet" if !saw_dashdash => options.progress = Some(false),
-            "--no-quiet" if !saw_dashdash => {}
+            "--no-quiet" if !saw_dashdash => options.progress = Some(true),
             "--cruft" if !saw_dashdash => {
                 options.cruft = true;
             }
@@ -244,8 +248,6 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             | "--reflog"
             | "--indexed-objects"
             | "--delta-islands"
-            | "--sparse"
-            | "--no-sparse"
                 if !saw_dashdash => {}
             "--progress" | "--all-progress" | "--all-progress-implied" if !saw_dashdash => {
                 options.progress = Some(true)
@@ -1212,9 +1214,19 @@ fn collect_traversal_objects(
         }
     }
 
+    let config = read_repo_config(git_dir)?;
+    let use_sparse = options
+        .sparse
+        .unwrap_or_else(|| config.get_bool("pack", None, "useSparse").unwrap_or(true));
     // Uninteresting closure first: tolerant of missing objects (upstream
-    // never needs to open the have side's missing history).
-    let excluded = tolerant_reachable_closure(database, format, &haves)?;
+    // never needs to open the have side's missing history). With the sparse
+    // algorithm, tree/blob uninteresting marking is path-aware so copied
+    // subtrees can be revisited under their new names.
+    let excluded = if use_sparse {
+        tolerant_sparse_excluded_objects(database, format, &wants, &haves)?
+    } else {
+        tolerant_reachable_closure(database, format, &haves)?
+    };
     let mut traversal_state = FilteredPackTraversalState::default();
     {
         let walk = FilteredPackTraversal {
@@ -1549,11 +1561,12 @@ impl FilteredPackTraversal<'_> {
         provided: bool,
         state: &mut FilteredPackTraversalState,
     ) -> Result<()> {
+        let excluded = self.excluded.contains(&oid);
         let include = provided
             || self
                 .filter
                 .includes_object(ObjectType::Tree, &path, None, depth);
-        if include {
+        if include && !excluded {
             self.include_object(oid, Arc::clone(&object), state);
         } else {
             self.omit_object(oid, state);
@@ -1684,65 +1697,15 @@ impl FilteredPackTraversal<'_> {
 }
 
 fn parse_pack_filter_size(value: &str) -> Result<usize> {
-    let Some(parsed) = git_parse_unsigned_with_suffix(value) else {
-        eprintln!("fatal: invalid filter-spec 'blob:limit={value}'");
-        return Err(GitError::Exit(128));
-    };
-    usize::try_from(parsed).map_err(|_| {
-        eprintln!("fatal: invalid filter-spec 'blob:limit={value}'");
-        GitError::Exit(128)
-    })
+    sley_rev::revlist::parse_rev_list_blob_limit(value)
 }
 
 fn parse_pack_filter_depth(value: &str) -> Result<usize> {
-    let Some(parsed) = git_parse_unsigned_with_suffix(value) else {
-        eprintln!("fatal: expected 'tree:<depth>'");
-        return Err(GitError::Exit(128));
-    };
-    usize::try_from(parsed).map_err(|_| {
-        eprintln!("fatal: expected 'tree:<depth>'");
-        GitError::Exit(128)
-    })
+    sley_rev::revlist::parse_rev_list_tree_depth(value)
 }
 
 fn parse_pack_filter_object_type(value: &str) -> Result<ObjectType> {
-    match value {
-        "commit" => Ok(ObjectType::Commit),
-        "tree" => Ok(ObjectType::Tree),
-        "blob" => Ok(ObjectType::Blob),
-        "tag" => Ok(ObjectType::Tag),
-        _ => {
-            eprintln!("fatal: '{value}' for 'object:type=<type>' is not a valid object type");
-            Err(GitError::Exit(128))
-        }
-    }
-}
-
-fn git_parse_unsigned_with_suffix(value: &str) -> Option<u64> {
-    if value.is_empty() || value.contains('-') {
-        return None;
-    }
-    let (digits, factor) = match value.as_bytes()[value.len() - 1] {
-        b'k' | b'K' => (&value[..value.len() - 1], 1024u64),
-        b'm' | b'M' => (&value[..value.len() - 1], 1024 * 1024),
-        b'g' | b'G' => (&value[..value.len() - 1], 1024 * 1024 * 1024),
-        _ => (value, 1),
-    };
-    let base = parse_git_unsigned_base0(digits)?;
-    base.checked_mul(factor)
-}
-
-fn parse_git_unsigned_base0(value: &str) -> Option<u64> {
-    if let Some(hex) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    if value.len() > 1 && value.starts_with('0') {
-        return u64::from_str_radix(&value[1..], 8).ok();
-    }
-    value.parse::<u64>().ok()
+    sley_rev::revlist::parse_rev_list_object_type_filter(value)
 }
 
 fn pack_filter_decode_sub_filter(raw: &str) -> Result<String> {
@@ -2081,6 +2044,163 @@ fn raw_pack_entries_for_oids(
         out.push(pack_bytes[start..end].to_vec());
     }
     Ok(Some(out))
+}
+
+#[derive(Clone, Copy)]
+struct SparseTreeVisit {
+    oid: ObjectId,
+    uninteresting: bool,
+}
+
+fn tolerant_sparse_excluded_objects(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    wants: &[ObjectId],
+    haves: &[ObjectId],
+) -> Result<HashSet<ObjectId>> {
+    let mut excluded = HashSet::new();
+    let mut roots = Vec::new();
+
+    collect_sparse_commit_tree_roots(
+        database,
+        format,
+        haves,
+        None,
+        true,
+        &mut excluded,
+        &mut roots,
+    )?;
+    let have_excluded = excluded.clone();
+    collect_sparse_commit_tree_roots(
+        database,
+        format,
+        wants,
+        Some(&have_excluded),
+        false,
+        &mut excluded,
+        &mut roots,
+    )?;
+    mark_sparse_uninteresting_trees(database, format, roots, &mut excluded)?;
+    Ok(excluded)
+}
+
+fn collect_sparse_commit_tree_roots(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    starts: &[ObjectId],
+    stop: Option<&HashSet<ObjectId>>,
+    mark_uninteresting: bool,
+    excluded: &mut HashSet<ObjectId>,
+    roots: &mut Vec<SparseTreeVisit>,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut pending: Vec<ObjectId> = starts.to_vec();
+    while let Some(oid) = pending.pop() {
+        if stop.is_some_and(|stop| stop.contains(&oid)) || !seen.insert(oid) {
+            continue;
+        }
+        let object = match database.read_object(&oid) {
+            Ok(object) => object,
+            Err(GitError::NotFound(_)) if mark_uninteresting => {
+                excluded.insert(oid);
+                continue;
+            }
+            Err(GitError::NotFound(_)) => continue,
+            Err(err) => return Err(err),
+        };
+        if mark_uninteresting {
+            excluded.insert(oid);
+        }
+        match object.object_type {
+            ObjectType::Commit => {
+                let commit = Commit::parse_ref(format, &object.body)?;
+                roots.push(SparseTreeVisit {
+                    oid: commit.tree,
+                    uninteresting: mark_uninteresting,
+                });
+                if mark_uninteresting {
+                    excluded.insert(commit.tree);
+                }
+                pending.extend(commit.parents);
+            }
+            ObjectType::Tree => {
+                roots.push(SparseTreeVisit {
+                    oid,
+                    uninteresting: mark_uninteresting,
+                });
+            }
+            ObjectType::Tag => {
+                let tag = Tag::parse_ref(format, &object.body)?;
+                pending.push(tag.object);
+            }
+            ObjectType::Blob => {}
+        }
+    }
+    Ok(())
+}
+
+fn mark_sparse_uninteresting_trees(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    trees: Vec<SparseTreeVisit>,
+    excluded: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    let mut by_oid: HashMap<ObjectId, bool> = HashMap::new();
+    for tree in trees {
+        let uninteresting = tree.uninteresting || excluded.contains(&tree.oid);
+        by_oid
+            .entry(tree.oid)
+            .and_modify(|existing| *existing |= uninteresting)
+            .or_insert(uninteresting);
+    }
+
+    let mut has_interesting = false;
+    let mut has_uninteresting = false;
+    for uninteresting in by_oid.values().copied() {
+        if uninteresting {
+            has_uninteresting = true;
+        } else {
+            has_interesting = true;
+        }
+    }
+    if !has_interesting || !has_uninteresting {
+        return Ok(());
+    }
+
+    let mut by_path: BTreeMap<Vec<u8>, Vec<SparseTreeVisit>> = BTreeMap::new();
+    for (oid, uninteresting) in by_oid {
+        let object = match database.read_object(&oid) {
+            Ok(object) => object,
+            Err(GitError::NotFound(_)) => continue,
+            Err(err) => return Err(err),
+        };
+        if object.object_type != ObjectType::Tree {
+            continue;
+        }
+        for entry in TreeEntries::new(format, &object.body) {
+            let entry = entry?;
+            if entry.is_gitlink() {
+                continue;
+            }
+            if uninteresting {
+                excluded.insert(entry.oid);
+            }
+            if tree_entry_object_type(entry.mode) == ObjectType::Tree {
+                by_path
+                    .entry(entry.name.to_vec())
+                    .or_default()
+                    .push(SparseTreeVisit {
+                        oid: entry.oid,
+                        uninteresting,
+                    });
+            }
+        }
+    }
+
+    for child_trees in by_path.into_values() {
+        mark_sparse_uninteresting_trees(database, format, child_trees, excluded)?;
+    }
+    Ok(())
 }
 
 /// The reachability closure of `starts`, skipping objects that cannot be read

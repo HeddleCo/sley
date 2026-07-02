@@ -702,7 +702,7 @@ fn ps_strncmp(icase: bool, a: &[u8], b: &[u8], n: usize) -> bool {
 
 /// True if `path` contains a glob-special character.
 pub fn pathspec_is_glob(path: &[u8]) -> bool {
-    path.iter().any(|byte| matches!(byte, b'*' | b'?' | b'['))
+    path.iter().any(|byte| is_glob_special(*byte))
 }
 
 /// Port of git's `match_pathspec_item` for the single-pathspec / single-name case
@@ -1218,6 +1218,52 @@ mod tests {
         let p = ps(&[":(literal)a*b"]);
         assert!(p.matches(b"a*b"));
         assert!(!p.matches(b"axxb"));
+    }
+
+    #[test]
+    fn backslash_marks_pathspec_as_glob_special() {
+        assert!(pathspec_is_glob(br"a\*b"));
+        assert!(pathspec_is_glob(br"a\?b"));
+        assert!(pathspec_is_glob(br"a\[b"));
+        assert!(!pathspec_is_glob(b"plain/path"));
+    }
+
+    #[test]
+    fn escaped_wildcards_match_literal_bytes() {
+        let p = ps(&[r"a\*b", r"a\?b", r"a\[b"]);
+        assert!(p.matches(b"a*b"));
+        assert!(p.matches(b"a?b"));
+        assert!(p.matches(b"a[b"));
+        assert!(!p.matches(b"axxb"));
+        assert!(!p.matches(b"acb"));
+    }
+
+    #[test]
+    fn explicit_glob_literal_magic_overrides_global_defaults() {
+        let noglob_default = PathspecMatchMagic {
+            literal: true,
+            glob: false,
+            icase: false,
+            literal_pathspecs: false,
+        };
+        let glob = PathspecElement::parse(b":(glob)*.rs", noglob_default).expect("glob override");
+        assert!(glob.is_glob());
+        assert!(!glob.magic().literal);
+        assert!(glob.matches_path(b"lib.rs"));
+        assert!(!glob.matches_path(b"src/lib.rs"));
+
+        let glob_default = PathspecMatchMagic {
+            literal: false,
+            glob: true,
+            icase: false,
+            literal_pathspecs: false,
+        };
+        let literal =
+            PathspecElement::parse(b":(literal)*.rs", glob_default).expect("literal override");
+        assert!(!literal.is_glob());
+        assert!(literal.magic().literal);
+        assert!(literal.matches_path(b"*.rs"));
+        assert!(!literal.matches_path(b"lib.rs"));
     }
 
     #[test]

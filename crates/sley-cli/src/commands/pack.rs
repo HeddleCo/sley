@@ -5,7 +5,7 @@
 use crate::*;
 use regex::Regex;
 use sley_object::EncodedObject;
-use sley_odb::ObjectReader;
+use sley_odb::{ObjectReader, ObjectWriter};
 use sley_pack::{
     PackBitmapWriter, PackInput, PackReverseIndex, PackWriteOptions, pack_order_index_positions,
 };
@@ -1242,6 +1242,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             .get_bool("repack", None, "updateServerInfo")
             .unwrap_or(true)
     });
+    let has_promisor_packs = pack_dir_has_promisor_packs(&common_git_dir)?;
     let config_write_bitmaps = config.get_bool("repack", None, "writeBitmaps");
     let auto_bare_bitmaps = write_bitmaps.is_none()
         && config_write_bitmaps.is_none()
@@ -1249,7 +1250,8 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
         && !write_midx
         && config.get("pack", None, "packSizeLimit").is_none()
         && sley_worktree::worktree_root_for_git_dir(&common_git_dir)?.is_none()
-        && !pack_dir_has_kept_packs(&common_git_dir)?;
+        && !pack_dir_has_kept_packs(&common_git_dir)?
+        && !has_promisor_packs;
     let mut write_bitmaps = match write_bitmaps {
         Some(explicit) => explicit,
         None => config_write_bitmaps.unwrap_or(auto_bare_bitmaps),
@@ -1261,7 +1263,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
         eprintln!("warning: disabling bitmap writing, as some objects are not being packed");
         write_bitmaps = false;
     }
-    if write_bitmaps && all && pack_dir_has_promisor_packs(&common_git_dir)? {
+    if write_bitmaps && all && has_promisor_packs {
         eprintln!("fatal: cannot write bitmap index for a repack with promisor packs");
         return Err(GitError::Exit(128));
     }
@@ -1343,6 +1345,12 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             bitmap_tips.as_ref(),
             bitmap_pseudo_merge_groups.as_deref(),
         )?;
+    }
+    if prune {
+        prune_packed_loose_objects(&common_git_dir, format, false)?;
+        if all && has_promisor_packs {
+            trace2_perf_data("loosen_unused_packed_objects/loosened", "0");
+        }
     }
     if all && (!write_bitmaps || write_midx) {
         remove_pack_bitmap_sidecars(&common_git_dir)?;
@@ -1992,25 +2000,19 @@ fn gc_run_locked(
                 pack_kept_objects: false,
                 keep_pack_stems,
             };
-            let mut repack_roots = roots.clone();
-            if let Some(spec) = prune_expire.as_deref() {
-                let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
-                repack_roots.extend(prune_recent_object_roots(
-                    &FileObjectDatabase::from_git_dir(&common_git_dir, format),
-                    &common_git_dir,
-                    format,
-                    expire,
-                )?);
-                repack_roots.extend(prune_recent_hook_roots(&common_git_dir, format)?);
-                repack_roots.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-                repack_roots.dedup();
-            }
             if let Some(result) = sley_odb::repack_reachable_objects_with_options(
                 &common_git_dir,
                 format,
-                &repack_roots,
+                &roots,
                 &repack_options,
             )? {
+                gc_unpack_recent_unreachable_from_repack(
+                    &common_git_dir,
+                    format,
+                    &roots,
+                    prune_expire.as_deref(),
+                    &result,
+                )?;
                 sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
             }
         }
@@ -2338,6 +2340,56 @@ fn gc_filter_to_object_dir(filter_to: &str) -> Result<PathBuf> {
         .parent()
         .ok_or_else(|| GitError::InvalidPath(format!("invalid filter-to path '{filter_to}'")))?;
     Ok(object_dir.to_path_buf())
+}
+
+fn gc_unpack_recent_unreachable_from_repack(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    prune_expire: Option<&str>,
+    result: &sley_odb::RepackResult,
+) -> Result<()> {
+    let Some(spec) = prune_expire else {
+        return Ok(());
+    };
+    let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
+    if expire <= i64::MIN {
+        return Ok(());
+    }
+
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let mut preserve_roots = roots.to_vec();
+    preserve_roots.extend(prune_recent_object_roots(
+        &db,
+        common_git_dir,
+        format,
+        expire,
+    )?);
+    preserve_roots.extend(prune_recent_hook_roots(common_git_dir, format)?);
+    preserve_roots.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    preserve_roots.dedup();
+
+    let new_index = sley_pack::PackIndex::parse(&result.idx, format)?;
+    let newly_packed: HashSet<ObjectId> = new_index
+        .entries
+        .into_iter()
+        .map(|entry| entry.oid)
+        .collect();
+    let mut preserve =
+        sley_odb::collect_reachable_object_ids_tolerating_missing(&db, format, preserve_roots)?
+            .into_iter()
+            .filter(|oid| !newly_packed.contains(oid))
+            .collect::<Vec<_>>();
+    preserve.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+    for oid in preserve {
+        let object = match db.read_object(&oid) {
+            Ok(object) => object,
+            Err(_) => continue,
+        };
+        db.loose().write_object((*object).clone())?;
+    }
+    Ok(())
 }
 
 fn gc_pack_stems(common_git_dir: &Path) -> Result<HashSet<String>> {
@@ -2903,18 +2955,7 @@ fn maintenance_run_one(
                 None,
             )
         }
-        "geometric-repack" => {
-            let factor = config
-                .get("maintenance", Some("geometric-repack"), "splitFactor")
-                .unwrap_or("2");
-            let geometric = format!("--geometric={factor}");
-            let mut args = vec!["repack", "-d", "-l", geometric.as_str()];
-            if quiet {
-                args.push("--quiet");
-            }
-            args.push("--write-midx");
-            run_sley_child(&args, None)
-        }
+        "geometric-repack" => maintenance_geometric_repack(common_git_dir, config, quiet),
         _ => Ok(()),
     }
 }
@@ -2933,17 +2974,16 @@ fn maintenance_task_needed(common_git_dir: &Path, config: &GitConfig, task: &str
             100,
             loose_object_ids(common_git_dir)?.len(),
         )?,
-        "incremental-repack" | "geometric-repack" => {
-            maintenance_limit_satisfied(config, task, 10, count_pack_files(common_git_dir)?)?
-        }
+        "incremental-repack" => maintenance_pack_count_exceeds_limit(
+            config,
+            task,
+            10,
+            count_pack_files(common_git_dir)?,
+        )?,
+        "geometric-repack" => maintenance_geometric_repack_needed(common_git_dir, config)?,
         "worktree-prune" => worktree_prune_needed(common_git_dir, config)?,
         "rerere-gc" => rerere_gc_needed(common_git_dir, config)?,
-        "reflog-expire" => maintenance_limit_satisfied(
-            config,
-            "reflog-expire",
-            100,
-            count_reflog_entries(&common_git_dir.join("logs"))?,
-        )?,
+        "reflog-expire" => maintenance_reflog_expire_needed(common_git_dir, config)?,
         "pack-refs" => true,
         _ => false,
     })
@@ -2955,11 +2995,115 @@ fn maintenance_limit_satisfied(
     default: i64,
     count: usize,
 ) -> Result<bool> {
-    let limit = config
+    let limit = maintenance_auto_limit(config, task, default);
+    Ok(limit < 0 || (limit > 0 && count >= limit as usize))
+}
+
+fn maintenance_pack_count_exceeds_limit(
+    config: &GitConfig,
+    task: &str,
+    default: i64,
+    count: usize,
+) -> Result<bool> {
+    let limit = maintenance_auto_limit(config, task, default);
+    Ok(limit < 0 || (limit > 0 && count > limit as usize))
+}
+
+fn maintenance_geometric_split_factor(config: &GitConfig) -> u64 {
+    config
+        .get("maintenance", Some("geometric-repack"), "splitFactor")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&factor| factor > 0)
+        .unwrap_or(2)
+}
+
+fn maintenance_geometric_repack_plan(
+    common_git_dir: &Path,
+    config: &GitConfig,
+) -> Result<sley_odb::GeometricRepackPlan> {
+    let format = repository_object_format(common_git_dir)?;
+    sley_odb::geometric_repack_plan(
+        common_git_dir,
+        format,
+        maintenance_geometric_split_factor(config),
+        &HashSet::new(),
+    )
+}
+
+fn maintenance_geometric_repack(
+    common_git_dir: &Path,
+    config: &GitConfig,
+    quiet: bool,
+) -> Result<()> {
+    let factor = maintenance_geometric_split_factor(config);
+    let plan = maintenance_geometric_repack_plan(common_git_dir, config)?;
+    let mut args = vec!["repack", "-d", "-l"];
+    let geometric;
+    if plan.split < plan.pack_count {
+        geometric = format!("--geometric={factor}");
+        args.push(geometric.as_str());
+    } else {
+        args.push("--cruft");
+        args.push("--cruft-expiration=2.weeks.ago");
+    }
+    if quiet {
+        args.push("--quiet");
+    }
+    args.push("--write-midx");
+    run_sley_child(&args, None)
+}
+
+fn maintenance_geometric_repack_needed(common_git_dir: &Path, config: &GitConfig) -> Result<bool> {
+    let limit = maintenance_auto_limit(config, "geometric-repack", 100);
+    if limit == 0 {
+        return Ok(false);
+    }
+    if limit < 0 {
+        return Ok(true);
+    }
+    let plan = maintenance_geometric_repack_plan(common_git_dir, config)?;
+    if plan.split > 0 {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn maintenance_auto_limit(config: &GitConfig, task: &str, default: i64) -> i64 {
+    config
         .get("maintenance", Some(task), "auto")
         .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(default);
-    Ok(limit < 0 || (limit > 0 && count >= limit as usize))
+        .unwrap_or(default)
+}
+
+fn maintenance_reflog_expire_needed(common_git_dir: &Path, config: &GitConfig) -> Result<bool> {
+    let limit = maintenance_auto_limit(config, "reflog-expire", 100);
+    if limit == 0 {
+        return Ok(false);
+    }
+    if limit < 0 {
+        return Ok(true);
+    }
+
+    let cutoff = match config.get("gc", None, "reflogExpire") {
+        Some(value) => parse_reflog_expire_time(value, "gc.reflogExpire")?,
+        None => current_unix_seconds().saturating_sub(30 * 24 * 60 * 60),
+    };
+    if cutoff == i64::MIN {
+        return Ok(false);
+    }
+
+    let format = repository_object_format(common_git_dir)?;
+    let store = FileRefStore::new(common_git_dir, format);
+    let mut count = 0usize;
+    for entry in store.read_reflog("HEAD")? {
+        if entry.timestamp_seconds()? < cutoff {
+            count += 1;
+            if count >= limit as usize {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn cmd_maintenance_is_needed(args: &[String]) -> Result<()> {
@@ -3015,6 +3159,10 @@ fn run_sley_child(args: &[&str], stdin_data: Option<&str>) -> Result<()> {
     trace2_child_start(args);
     let mut child = ProcessCommand::new(env::current_exe()?);
     child.args(args);
+    child.env(
+        "SLEY_TRACE2_DEPTH",
+        (sley_core::trace2::depth() + 1).to_string(),
+    );
     if stdin_data.is_some() {
         child.stdin(std::process::Stdio::piped());
     }
@@ -3039,6 +3187,7 @@ pub(crate) fn trace2_child_start(args: &[&str]) {
     let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
         return;
     };
+    let sid = trace2_sid();
     let mut argv = vec!["git".to_string()];
     argv.extend(args.iter().map(|arg| (*arg).to_string()));
     let argv = argv
@@ -3047,7 +3196,7 @@ pub(crate) fn trace2_child_start(args: &[&str]) {
         .collect::<Vec<_>>()
         .join(",");
     let line = format!(
-        "{{\"event\":\"child_start\",\"sid\":\"sley\",\"child_id\":0,\"argv\":[{argv}]}}\n"
+        "{{\"event\":\"child_start\",\"sid\":\"{sid}\",\"child_id\":0,\"argv\":[{argv}]}}\n"
     );
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = file.write_all(line.as_bytes());
@@ -3061,6 +3210,15 @@ pub(crate) fn trace2_touch() {
     let _ = fs::OpenOptions::new().create(true).append(true).open(path);
 }
 
+fn trace2_sid() -> String {
+    let depth = sley_core::trace2::depth();
+    if depth == 0 {
+        "sley".to_string()
+    } else {
+        format!("sley/{depth}")
+    }
+}
+
 fn trace2_region(event: &str, category: &str, label: &str) {
     let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
         return;
@@ -3071,6 +3229,16 @@ fn trace2_region(event: &str, category: &str, label: &str) {
         json_escape(category),
         json_escape(label)
     );
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn trace2_perf_data(key: &str, value: &str) {
+    let Some(path) = env::var_os("GIT_TRACE2_PERF") else {
+        return;
+    };
+    let line = format!("data: {key}:{value}\n");
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = file.write_all(line.as_bytes());
     }
@@ -3406,22 +3574,6 @@ fn count_dir_entries(path: &Path) -> Result<usize> {
     Ok(fs::read_dir(path)?
         .filter_map(std::result::Result::ok)
         .count())
-}
-
-fn count_reflog_entries(path: &Path) -> Result<usize> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    let mut count = 0;
-    for entry in fs::read_dir(path)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            count += count_reflog_entries(&path)?;
-        } else if let Ok(text) = fs::read_to_string(path) {
-            count += text.lines().count();
-        }
-    }
-    Ok(count)
 }
 
 fn cmd_maintenance_register(args: &[String]) -> Result<()> {
@@ -5444,6 +5596,9 @@ fn prune_packed_loose_objects(git_dir: &Path, format: ObjectFormat, dry_run: boo
             Err(err) => return Err(GitError::Io(err.to_string())),
         }
     }
+    if !dry_run {
+        prune_empty_loose_object_dirs(&objects_dir)?;
+    }
     Ok(())
 }
 
@@ -5700,6 +5855,8 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     let mut incremental = false;
     let mut preferred_pack_name: Option<String> = None;
     let mut refs_snapshot: Option<PathBuf> = None;
+    let mut write_chain_file = true;
+    let mut base_checksum: Option<String> = None;
     let mut progress = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -5724,6 +5881,14 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
             "--no-bitmap" => write_bitmap = false,
             "--incremental" => incremental = true,
             "--no-incremental" => incremental = false,
+            "--write-chain-file" => write_chain_file = true,
+            "--no-write-chain-file" => write_chain_file = false,
+            "--base" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--base requires a value".into()))?;
+                base_checksum = Some(value.clone());
+            }
             "--preferred-pack" => {
                 let value = iter
                     .next()
@@ -5732,6 +5897,9 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--preferred-pack=") => {
                 preferred_pack_name = Some(value["--preferred-pack=".len()..].to_string());
+            }
+            value if value.starts_with("--base=") => {
+                base_checksum = Some(value["--base=".len()..].to_string());
             }
             "--refs-snapshot" => {
                 let value = iter
@@ -5752,6 +5920,14 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(&git_dir));
     let pack_dir = object_dir.join("pack");
     fs::create_dir_all(&pack_dir)?;
+    if !write_chain_file && !incremental {
+        eprintln!("error: cannot use --no-write-chain-file without --incremental");
+        return Err(GitError::Exit(128));
+    }
+    if base_checksum.is_some() && write_chain_file {
+        eprintln!("error: cannot use --base without --no-write-chain-file");
+        return Err(GitError::Exit(128));
+    }
     if incremental {
         return cmd_multi_pack_index_write_incremental(MidxWriteIncremental {
             git_dir: &git_dir,
@@ -5762,6 +5938,8 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
             write_bitmap,
             preferred_pack_name: preferred_pack_name.as_deref(),
             refs_snapshot: refs_snapshot.as_deref(),
+            write_chain_file,
+            base_checksum: base_checksum.as_deref(),
             progress,
         });
     }
@@ -6049,6 +6227,8 @@ struct MidxWriteIncremental<'a> {
     write_bitmap: bool,
     preferred_pack_name: Option<&'a str>,
     refs_snapshot: Option<&'a Path>,
+    write_chain_file: bool,
+    base_checksum: Option<&'a str>,
     progress: bool,
 }
 
@@ -6070,7 +6250,8 @@ fn cmd_multi_pack_index_write_incremental(options: MidxWriteIncremental<'_>) -> 
         chain.push(checksum);
     }
 
-    let layers = read_incremental_midx_layers(options.pack_dir, options.format, &chain)?;
+    let base_chain = incremental_midx_base_chain(&chain, options.base_checksum)?;
+    let layers = read_incremental_midx_layers(options.pack_dir, options.format, &base_chain)?;
     let mut chained_pack_names = HashSet::new();
     let mut chained_oids = HashSet::new();
     for layer in &layers {
@@ -6089,7 +6270,9 @@ fn cmd_multi_pack_index_write_incremental(options: MidxWriteIncremental<'_>) -> 
             eprintln!("error: no pack files to index.");
             return Err(GitError::Exit(1));
         }
-        write_midx_chain(options.pack_dir, &chain)?;
+        if options.write_chain_file {
+            write_midx_chain(options.pack_dir, &chain)?;
+        }
         return Ok(());
     }
 
@@ -6106,10 +6289,31 @@ fn cmd_multi_pack_index_write_incremental(options: MidxWriteIncremental<'_>) -> 
         1,
     )?;
     install_incremental_midx_layer(options.pack_dir, options.format, &layer)?;
-    chain.push(layer.checksum);
-    write_midx_chain(options.pack_dir, &chain)?;
-    clear_incremental_midx_sidecars(options.pack_dir, options.format)?;
+    if options.write_chain_file {
+        chain.push(layer.checksum);
+        write_midx_chain(options.pack_dir, &chain)?;
+        clear_incremental_midx_sidecars(options.pack_dir, options.format)?;
+    } else {
+        println!("{}", layer.checksum);
+    }
     Ok(())
+}
+
+fn incremental_midx_base_chain(
+    chain: &[String],
+    base_checksum: Option<&str>,
+) -> Result<Vec<String>> {
+    match base_checksum {
+        None => Ok(chain.to_vec()),
+        Some("none") => Ok(Vec::new()),
+        Some(base) => {
+            let Some(index) = chain.iter().position(|checksum| checksum == base) else {
+                eprintln!("error: unknown incremental MIDX base: {base}");
+                return Err(GitError::Exit(1));
+            };
+            Ok(chain[..=index].to_vec())
+        }
+    }
 }
 
 struct BuiltMidxLayer {
@@ -6497,10 +6701,8 @@ fn migrate_single_midx_to_incremental(
 fn remove_incremental_midx_dir(pack_dir: &Path) -> Result<()> {
     let midx_dir = incremental_midx_dir(pack_dir);
     match fs::remove_dir_all(&midx_dir) {
-        Ok(()) => fs::create_dir_all(&midx_dir).map_err(|err| GitError::Io(err.to_string())),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(&midx_dir).map_err(|err| GitError::Io(err.to_string()))
-        }
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(GitError::Io(err.to_string())),
     }
 }

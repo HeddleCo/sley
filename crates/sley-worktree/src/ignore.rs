@@ -147,7 +147,7 @@ pub(crate) fn glob_pathspec_may_match_under(pattern: &[u8], dir: &[u8]) -> bool 
 pub(crate) fn literal_prefix_before_glob(pattern: &[u8]) -> Vec<u8> {
     let mut prefix = Vec::new();
     for &byte in pattern {
-        if matches!(byte, b'*' | b'?' | b'[') {
+        if pathspec_is_glob(&[byte]) {
             break;
         }
         prefix.push(byte);
@@ -2916,5 +2916,19 @@ impl IgnoreMatcher {
             buckets.push(index, pattern);
         }
         self.buckets = buckets;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn untracked_glob_prefix_stops_at_backslash_escape() {
+        assert_eq!(literal_prefix_before_glob(br"dir/\*.rs"), b"dir/");
+        assert_eq!(
+            literal_prefix_before_glob(br"dir/plain.rs"),
+            b"dir/plain.rs"
+        );
     }
 }

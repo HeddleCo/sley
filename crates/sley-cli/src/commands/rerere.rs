@@ -160,17 +160,22 @@ pub(crate) fn repo_rerere(
         let Ok(content) = fs::read(&full) else {
             continue;
         };
-        let Some((normalized, hash)) = normalize_conflicted_content(&content, true)? else {
-            if let Some(pos) = rr
-                .iter()
-                .position(|entry| entry.path.as_bytes() == conflict.path)
-                && handle_resolved_path(git_dir, &mut rr[pos], &full)?
-            {
-                changed = true;
+        let (normalized, hash) = match scan_conflicted_content(&content, true)? {
+            ConflictScan::Conflicted { normalized, hash } => {
+                (normalized, hash.expect("hash requested"))
             }
-            continue;
+            ConflictScan::Clean => {
+                if let Some(pos) = rr
+                    .iter()
+                    .position(|entry| entry.path.as_bytes() == conflict.path)
+                    && handle_resolved_path(git_dir, &mut rr[pos], &full, true)?
+                {
+                    changed = true;
+                }
+                continue;
+            }
+            ConflictScan::Malformed => continue,
         };
-        let hash = hash.expect("hash requested");
         let hash_hex = hash.to_hex();
         let entry_pos = if let Some(pos) = rr
             .iter()
@@ -217,7 +222,7 @@ pub(crate) fn repo_rerere(
         if !full.is_file() {
             continue;
         }
-        if handle_resolved_path(git_dir, entry, &full)? {
+        if handle_resolved_path(git_dir, entry, &full, false)? {
             changed = true;
         }
     }
@@ -292,10 +297,16 @@ fn scan_variant_status(cache_dir: &Path, variant: u32) -> Result<()> {
     Ok(())
 }
 
-fn handle_resolved_path(git_dir: &Path, entry: &mut MergeRrEntry, full: &Path) -> Result<bool> {
+fn handle_resolved_path(
+    git_dir: &Path,
+    entry: &mut MergeRrEntry,
+    full: &Path,
+    keep_active: bool,
+) -> Result<bool> {
     let content = fs::read(full)?;
-    if normalize_conflicted_content(&content, false)?.is_some() {
-        return Ok(false);
+    match scan_conflicted_content(&content, false)? {
+        ConflictScan::Clean => {}
+        ConflictScan::Malformed | ConflictScan::Conflicted { .. } => return Ok(false),
     }
     let cache_dir = git_dir.join("rr-cache").join(&entry.hash);
     let preimage = rerere_cache_file_path(&cache_dir, entry.variant, "preimage");
@@ -306,6 +317,9 @@ fn handle_resolved_path(git_dir: &Path, entry: &mut MergeRrEntry, full: &Path) -
     if !postimage.is_file() {
         fs::write(&postimage, &content)?;
         eprintln!("Recorded resolution for '{}'.", entry.path);
+    }
+    if keep_active {
+        return Ok(false);
     }
     entry.variant = u32::MAX;
     Ok(true)
@@ -430,10 +444,16 @@ fn rerere_cache_file_path(cache_dir: &Path, variant: u32, name: &str) -> PathBuf
     }
 }
 
-fn normalize_conflicted_content(
-    content: &[u8],
-    compute_hash: bool,
-) -> Result<Option<(Vec<u8>, Option<ObjectId>)>> {
+enum ConflictScan {
+    Clean,
+    Malformed,
+    Conflicted {
+        normalized: Vec<u8>,
+        hash: Option<ObjectId>,
+    },
+}
+
+fn scan_conflicted_content(content: &[u8], compute_hash: bool) -> Result<ConflictScan> {
     let lines = split_lines(content);
     let mut out = Vec::with_capacity(content.len());
     let mut hash_input = Vec::new();
@@ -442,7 +462,7 @@ fn normalize_conflicted_content(
     while i < lines.len() {
         if is_cmarker(lines[i], b'<') {
             let Some((normalized, hash_part, next)) = parse_conflict(&lines, i + 1)? else {
-                return Ok(None);
+                return Ok(ConflictScan::Malformed);
             };
             out.extend_from_slice(&normalized);
             if compute_hash {
@@ -456,12 +476,25 @@ fn normalize_conflicted_content(
         }
     }
     if !found {
-        return Ok(None);
+        return Ok(ConflictScan::Clean);
     }
     let hash = compute_hash
         .then(|| sley_core::digest_bytes(ObjectFormat::Sha1, &hash_input))
         .transpose()?;
-    Ok(Some((out, hash)))
+    Ok(ConflictScan::Conflicted {
+        normalized: out,
+        hash,
+    })
+}
+
+fn normalize_conflicted_content(
+    content: &[u8],
+    compute_hash: bool,
+) -> Result<Option<(Vec<u8>, Option<ObjectId>)>> {
+    match scan_conflicted_content(content, compute_hash)? {
+        ConflictScan::Clean | ConflictScan::Malformed => Ok(None),
+        ConflictScan::Conflicted { normalized, hash } => Ok(Some((normalized, hash))),
+    }
 }
 
 type ParsedConflict = (Vec<u8>, Vec<u8>, usize);
@@ -730,6 +763,7 @@ fn try_replay_resolution_variant(
             style: sley_diff_merge::ConflictStyle::Merge,
             favor: sley_diff_merge::MergeFavor::None,
             ws_ignore: sley_diff_merge::WsIgnore::EMPTY,
+            marker_size: 7,
         },
     );
     if merged.conflicted {
@@ -838,7 +872,10 @@ fn worktree_path_still_has_conflicts(git_dir: &Path, path: &str) -> Result<bool>
     let Ok(content) = fs::read(full) else {
         return Ok(false);
     };
-    Ok(normalize_conflicted_content(&content, false)?.is_some())
+    Ok(!matches!(
+        scan_conflicted_content(&content, false)?,
+        ConflictScan::Clean
+    ))
 }
 
 fn rerere_diff(git_dir: &Path, format: ObjectFormat) -> Result<()> {

@@ -958,7 +958,6 @@ fn log_author_filter_matches_upstream_git() {
             vec!["log", "--author=Alpha", "--author=Gamma", "--format=%s"],
             vec!["log", r"--author=Alpha\|Gamma", "--format=%s"],
             vec!["log", "--author=[AB]eta", "--format=%s"],
-            vec!["log", "--author=", "--format=%s"],
             vec!["log", "--author", "--format=%s"],
         ] {
             let expected = git(&root, &args);
@@ -968,6 +967,7 @@ fn log_author_filter_matches_upstream_git() {
 
         for args in [
             vec!["log", "--author"],
+            vec!["log", "--author=", "--format=%s"],
             vec!["log", "--author=["],
             vec!["log", "--no-author"],
         ] {
@@ -1024,7 +1024,6 @@ fn log_committer_filter_matches_upstream_git() {
             ],
             vec!["log", r"--committer=Alpha\|Gamma", "--format=%s"],
             vec!["log", "--committer=[AB]eta", "--format=%s"],
-            vec!["log", "--committer=", "--format=%s"],
             vec!["log", "--committer", "--format=%s"],
             vec![
                 "log",
@@ -1042,6 +1041,7 @@ fn log_committer_filter_matches_upstream_git() {
 
         for args in [
             vec!["log", "--committer"],
+            vec!["log", "--committer=", "--format=%s"],
             vec!["log", "--committer=["],
             vec!["log", "--no-committer"],
         ] {
@@ -1406,7 +1406,6 @@ fn log_grep_filter_matches_upstream_git() {
             vec!["log", "--author", "Alpha", "--grep", "beta", "--format=%s"],
             vec!["log", r"--grep=alpha\|gamma", "--format=%s"],
             vec!["log", "--grep=[AB]eta", "--format=%s"],
-            vec!["log", "--grep=", "--format=%s"],
             vec!["log", "--grep", "--format=%s"],
             vec!["log", "--invert-grep", "--format=%s"],
             vec!["log", "--all-match", "--format=%s"],
@@ -1418,6 +1417,7 @@ fn log_grep_filter_matches_upstream_git() {
 
         for args in [
             vec!["log", "--grep"],
+            vec!["log", "--grep=", "--format=%s"],
             vec!["log", "--grep=["],
             vec!["log", "--no-grep"],
             vec!["log", "--invert-grep=yes"],

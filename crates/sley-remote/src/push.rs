@@ -250,6 +250,8 @@ pub enum PushRefStatus {
     UpToDate,
     /// Local-side rejection: a non-forced non-fast-forward branch update.
     RejectNonFastForward,
+    /// Local-side rejection: the remote tip is not present locally.
+    RejectFetchFirst,
     /// `--force-with-lease`/`--force-if-includes` expectation was not met.
     RejectStale,
     /// `--force-if-includes`: tracking ref was updated but not integrated.
@@ -1359,6 +1361,7 @@ pub fn push_local_with_report(
         matches!(
             reference.status,
             PushRefStatus::RejectNonFastForward
+                | PushRefStatus::RejectFetchFirst
                 | PushRefStatus::RejectStale
                 | PushRefStatus::RejectRemoteUpdated
                 | PushRefStatus::RejectAlreadyExists
@@ -1576,9 +1579,13 @@ fn classify_push_command(
         && command.name.starts_with("refs/heads/")
         && !command.old_id.is_null()
         && !command.new_id.is_null()
-        && !is_fast_forward(local_db, format, &command.old_id, &command.new_id)?
     {
-        return Ok(PushRefStatus::RejectNonFastForward);
+        if !local_db.contains(&command.old_id)? {
+            return Ok(PushRefStatus::RejectFetchFirst);
+        }
+        if !is_fast_forward(local_db, format, &command.old_id, &command.new_id)? {
+            return Ok(PushRefStatus::RejectNonFastForward);
+        }
     }
 
     if !request.dry_run && receive_denies_current_branch(format, command, config, remote_git_dir)? {

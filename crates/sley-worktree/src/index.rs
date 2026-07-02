@@ -2261,6 +2261,42 @@ pub(crate) fn update_cache_tree_for_git_paths(
     Ok(())
 }
 
+/// Rebuild the index cache-tree (`TREE`) extension from the current entries.
+///
+/// This is for commands that have just materialized a complete staged tree
+/// (read-tree, checkout/reset, write-tree/commit). Incremental index mutators
+/// should use [`update_cache_tree_for_git_paths`] so untouched valid subtrees
+/// can be preserved and touched paths become invalid, matching git-add.
+pub fn refresh_cache_tree(index: &mut Index, odb: &FileObjectDatabase) {
+    match build_cache_tree_for_index_update(&index.entries, b"", &[], odb) {
+        Ok(cache_tree) => {
+            if index.set_cache_tree(Some(&cache_tree)).is_err() {
+                index.extensions = index_extensions_without_cache_tree(&index.extensions);
+            }
+        }
+        Err(_) => {
+            index.extensions = index_extensions_without_cache_tree(&index.extensions);
+        }
+    }
+}
+
+pub fn refresh_repository_cache_tree(
+    git_dir: &Path,
+    format: ObjectFormat,
+    odb: &FileObjectDatabase,
+) -> Result<()> {
+    let index_path = repository_index_path(git_dir);
+    let Ok(bytes) = fs::read(&index_path) else {
+        return Ok(());
+    };
+    let mut index = Index::parse(&bytes, format)?;
+    if index.split_index_link(format)?.is_some() {
+        return Ok(());
+    }
+    refresh_cache_tree(&mut index, odb);
+    write_repository_index_ref(git_dir, format, &index)
+}
+
 fn invalidate_cache_tree_path(tree: &mut CacheTree, path: &[u8]) {
     tree.entry_count = -1;
     tree.oid = None;
@@ -2433,6 +2469,9 @@ fn build_cache_tree_for_index_update(
 }
 
 fn cache_tree_prefix_touched(prefix: &[u8], paths: &[Vec<u8>]) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
     if prefix.is_empty() {
         return true;
     }
@@ -3413,6 +3452,9 @@ pub fn update_index_cacheinfo(
         );
         return Err(GitError::Exit(128));
     }
+    if !untracked_cache_invalidation_paths.is_empty() {
+        index.extensions = index_extensions_without_cache_tree(&index.extensions);
+    }
     invalidate_untracked_cache_for_git_paths(
         &mut index,
         format,
@@ -3501,6 +3543,9 @@ pub fn update_index_index_info(
             .cmp(&right.path)
             .then_with(|| index_entry_stage(left).cmp(&index_entry_stage(right)))
     });
+    if !untracked_cache_invalidation_paths.is_empty() {
+        index.extensions = index_extensions_without_cache_tree(&index.extensions);
+    }
     invalidate_untracked_cache_for_git_paths(
         &mut index,
         format,
@@ -3619,18 +3664,25 @@ pub(crate) fn write_tree_from_index_with_options_and_odb(
         Err(err) => return Err(err.into()),
     };
     let mut checker = odb.presence_checker();
-    if Index::bytes_have_extension(&index_bytes, format, b"link")? {
+    let oid = if Index::bytes_have_extension(&index_bytes, format, b"link")? {
         let index = sley_index::read_repository_index(git_dir, format)?;
-        return write_tree_from_owned_index(&index, format, &options, odb, &mut checker);
+        write_tree_from_owned_index(&index, format, &options, odb, &mut checker)?
+    } else {
+        match BorrowedIndex::parse(&index_bytes, format) {
+            Ok(index) => {
+                write_tree_from_borrowed_index(&index, format, &options, odb, &mut checker)
+            }
+            Err(GitError::Unsupported(_)) => {
+                let index = Index::parse(&index_bytes, format)?;
+                write_tree_from_owned_index(&index, format, &options, odb, &mut checker)
+            }
+            Err(err) => Err(err),
+        }?
+    };
+    if options.prefix.is_none() {
+        refresh_repository_cache_tree(git_dir, format, odb)?;
     }
-    match BorrowedIndex::parse(&index_bytes, format) {
-        Ok(index) => write_tree_from_borrowed_index(&index, format, &options, odb, &mut checker),
-        Err(GitError::Unsupported(_)) => {
-            let index = Index::parse(&index_bytes, format)?;
-            write_tree_from_owned_index(&index, format, &options, odb, &mut checker)
-        }
-        Err(err) => Err(err),
-    }
+    Ok(oid)
 }
 
 pub(crate) fn write_tree_from_borrowed_index(
@@ -3991,6 +4043,132 @@ where
         }
         .write(),
     ))
+}
+
+pub(crate) fn index_entry_tree_oid_without_cache(
+    index: &Index,
+    format: ObjectFormat,
+) -> Result<ObjectId> {
+    let entries = write_tree_entries_for_prefix(
+        index
+            .entries
+            .iter()
+            .filter(|entry| entry.stage() == Stage::Normal && !entry.is_intent_to_add()),
+        None,
+    )?;
+    write_tree_entries_oid_without_cache(&entries, b"", format)
+}
+
+pub(crate) fn borrowed_index_entry_tree_oid_without_cache(
+    index: &BorrowedIndex<'_>,
+    format: ObjectFormat,
+) -> Result<ObjectId> {
+    let entries = write_tree_entries_for_prefix(
+        index
+            .entries
+            .iter()
+            .filter(|entry| entry.stage() == Stage::Normal && !entry.is_intent_to_add()),
+        None,
+    )?;
+    write_tree_entries_oid_without_cache(&entries, b"", format)
+}
+
+pub(crate) fn write_tree_entries_oid_without_cache<E>(
+    entries: &[E],
+    prefix: &[u8],
+    format: ObjectFormat,
+) -> Result<ObjectId>
+where
+    E: WriteTreeIndexEntry,
+{
+    let mut tree_entries = Vec::new();
+    let mut index = 0usize;
+    while index < entries.len() {
+        let entry = &entries[index];
+        let path = entry.write_tree_path();
+        let Some(remainder) = path.strip_prefix(prefix) else {
+            return Err(GitError::InvalidPath(format!(
+                "invalid index path {}",
+                String::from_utf8_lossy(path)
+            )));
+        };
+        if remainder.is_empty() || remainder[0] == b'/' {
+            return Err(GitError::InvalidPath(format!(
+                "invalid index path {}",
+                String::from_utf8_lossy(path)
+            )));
+        }
+
+        if entry.write_tree_mode() == SPARSE_DIR_MODE
+            && let Some(name) = remainder.strip_suffix(b"/")
+            && !name.is_empty()
+            && !name.contains(&b'/')
+        {
+            tree_entries.push(TreeEntry {
+                mode: SPARSE_DIR_MODE,
+                name: BString::from(name),
+                oid: entry.write_tree_oid(),
+            });
+            index += 1;
+            continue;
+        }
+
+        if let Some(slash) = remainder.iter().position(|byte| *byte == b'/') {
+            let name = &remainder[..slash];
+            if name.is_empty() {
+                return Err(GitError::InvalidPath(format!(
+                    "invalid index path {}",
+                    String::from_utf8_lossy(path)
+                )));
+            }
+            let start = index;
+            index += 1;
+            while index < entries.len()
+                && same_tree_component(entries[index].write_tree_path(), prefix, name)?
+            {
+                index += 1;
+            }
+            let mut child_prefix = Vec::with_capacity(prefix.len() + name.len() + 1);
+            child_prefix.extend_from_slice(prefix);
+            child_prefix.extend_from_slice(name);
+            child_prefix.push(b'/');
+            let oid = write_tree_entries_oid_without_cache(
+                &entries[start..index],
+                &child_prefix,
+                format,
+            )?;
+            tree_entries.push(TreeEntry {
+                mode: 0o040000,
+                name: BString::from(name),
+                oid,
+            });
+            continue;
+        }
+
+        tree_entries.push(TreeEntry {
+            mode: entry.write_tree_mode(),
+            name: BString::from(remainder),
+            oid: entry.write_tree_oid(),
+        });
+        index += 1;
+    }
+
+    tree_entries.sort_by(|left, right| {
+        git_tree_entry_cmp(
+            left.name.as_bytes(),
+            left.mode,
+            right.name.as_bytes(),
+            right.mode,
+        )
+    });
+    EncodedObject::new(
+        ObjectType::Tree,
+        Tree {
+            entries: tree_entries,
+        }
+        .write(),
+    )
+    .object_id(format)
 }
 
 pub(crate) fn valid_cache_tree_oid(

@@ -450,7 +450,7 @@ declare -A FLOOR=(
     [t7528-signed-commit-ssh.sh]=27
     [t7031-verify-tag-signed-ssh.sh]=13
     [t7030-verify-tag.sh]=10
-    [t3200-branch.sh]=145
+    [t3200-branch.sh]=167
     [t0027-auto-crlf.sh]=2578
     # t0020-crlf: was FLAKY 27/28. FIXED 2026-06-17 (codex-wave-3, 4 rounds): sorted worktree
     # readdir + checkout-- stat-refresh SCOPED to the call site (R4: reset's tree-sourced entries
@@ -551,9 +551,9 @@ declare -A FLOOR=(
     # wave-40 (rebase sequencer + apply -3 incidental): t3404 120->123.
     [t3404-rebase-interactive.sh]=127
     [t3406-rebase-message.sh]=32
-    [t3418-rebase-continue.sh]=24
+    [t3418-rebase-continue.sh]=30
     # wave-40 (rebase sequencer): t3420 40->41.
-    [t3420-rebase-autostash.sh]=44
+    [t3420-rebase-autostash.sh]=52
     [t5327-multi-pack-bitmaps-rev.sh]=314
     # w48 recov: 9->7 (wrong-floor). Integ-measured; base e9f8c92b == HEAD == 7
     # (no in-session pack_objects.rs change). Failing cells (#6,#8-11,#13,#14)
@@ -570,7 +570,7 @@ declare -A FLOOR=(
     [t4100-apply-stat.sh]=25
     # codex-wave-3 (2026-06-17): am --empty=stop/drop/keep + --allow-empty resume + -3 -q quiet 54->56.
     # wave-40 (am state machine): t4150 84->85 (am -3 + rerere).
-    [t4150-am.sh]=85
+    [t4150-am.sh]=87
     # wave-54 am subjects: format-patch/am preserve and round-trip multiline
     # title paragraphs, including `-k` RFC 2047 folded Subject headers.
     [t4152-am-subjects.sh]=13
@@ -650,9 +650,9 @@ declare -A FLOOR=(
     [t5300-pack-object.sh]=55
     [t5317-pack-objects-filter-objects.sh]=33
     [t5302-pack-index.sh]=31
-    [t5303-pack-corruption-resilience.sh]=31
+    [t5303-pack-corruption-resilience.sh]=36
     [t5304-prune.sh]=32
-    [t5319-multi-pack-index.sh]=95  # wave-39: 70->95 (midx bitmap/verify/expire/repack; banked 93 margin, 3 hard cells)
+    [t5319-multi-pack-index.sh]=98  # next-wave: alternate MIDX + bitmap-tip hierarchy now full green
     [t5324-split-commit-graph.sh]=26  # wave-52 graphpack: 25->26 (core.sharedRepository perms)
     [t5329-pack-objects-cruft.sh]=19
     [t5504-fetch-receive-strict.sh]=7
@@ -694,7 +694,7 @@ declare -A FLOOR=(
     # t5601 60->62 measured but HELD at 60 (clone server-handshake is parallel-flake-prone, +2 too
     # small to risk a fresh flaky floor — the +2 cells still land on main, just not floor-locked).
     [t5611-clone-config.sh]=13
-    [t5603-clone-dirname.sh]=45
+    [t5603-clone-dirname.sh]=47
     [t7502-commit-porcelain.sh]=77
     # codex-wave-1 (2026-06-17): config stop-at-non-option (+3) + commit SQUASH_MSG (+2),
     # disjoint files, combined t7600 44->49 (stable 49x3). describe enrolled at 84 (74->84).
@@ -715,7 +715,7 @@ declare -A FLOOR=(
     # behavior: --prefetch suppressing opportunistic tracking (#21), loose-objects
     # deferring the prune to run #2 (#22), and per-task incremental-repack/geometric
     # argv composition (#24,#27-31,#34,#47).
-    [t7900-maintenance.sh]=62
+    [t7900-maintenance.sh]=72
     # wave-1 integration (2026-06-18, integ/wave1): NEW floors for the difftool epic
     # (codex/parity-difftool: difftool.rs/mergetool.rs/tool_launch.rs) + status-cache
     # (codex/parity-status-cache: workspace.rs/index.rs). All measured on the integrated
@@ -758,7 +758,7 @@ declare -A FLOOR=(
     [t3415-rebase-autosquash.sh]=24
     [t3437-rebase-fixup-options.sh]=9
     [t1404-update-ref-errors.sh]=38
-    [t1416-ref-transaction-hooks.sh]=7
+    [t1416-ref-transaction-hooks.sh]=10
     # codex-wave-9 (sparse-checkout engine): cone/non-cone + escaped-cone patterns,
     # sparse-index expansion for diff/status, skip-worktree missing-file suppression,
     # sparse-dir write-tree, read-tree sparse reapply hook, native reset -p path.
@@ -900,8 +900,8 @@ declare -A FLOOR=(
     # t5407 10->17. NEW (measured): push features + post-checkout/merge hooks.
     [t5533-push-cas.sh]=23
     [t5408-send-pack-stdin.sh]=10
-    [t5545-push-options.sh]=9
-    [t5523-push-upstream.sh]=16
+    [t5545-push-options.sh]=10
+    [t5523-push-upstream.sh]=17
     [t5403-post-checkout-hook.sh]=14
     [t5402-post-merge-hook.sh]=7
     # wave-17 (2026-06-19, integ/wave17 onto 47d14609): v1/v2 wire handshake + connect-helper
@@ -963,7 +963,7 @@ declare -A FLOOR=(
     # == base, no regression) to guard the class per the d3f746e6 neighbor-guard lesson.
     [t2016-checkout-patch.sh]=19
     # wave-41 (apply engine round 2): t4108 3-way fallback 4->17.
-    [t4108-apply-threeway.sh]=17
+    [t4108-apply-threeway.sh]=18
     [t4117-apply-reject.sh]=8
     # wave-21 (2026-06-19, integ/wave21 onto 01421060): hard-tail, 4 disjoint slices. submodule
     # recursion in pull/am (t5572 34->40, t4255 1->17 — wired to the wave-20 worktree core;
@@ -985,7 +985,7 @@ declare -A FLOOR=(
     # rr-cache + 6 subcmds + replay/autoupdate hooks). rerere<->merge-rename merge.rs auto-merge
     # SAFE (t7600=83 t3404=94 t3501=21 t6402=35 held). Cross-guards held EXACTLY (t1091=53 t1011=19
     # t7508=119 t7102=37 t2013=51 t6112=48 t6006=58 t4202=124); cargo test green.
-    [t4200-rerere.sh]=34
+    [t4200-rerere.sh]=36
     # wave-30 (2026-06-21, core→peripheral; off main 3547af47): split-index, fetch-submodules,
     # worktree-list. t1700-split-index 8->29 FULL (link-extension EWAH codec + shared-base
     # merge/read, thin-index delta write, core.splitIndex/maxPercentChange/sharedIndexExpire,
@@ -1043,7 +1043,7 @@ declare -A FLOOR=(
     # t5512=40 t5526=56 t1500=81 t1501=39 t1502=37 t1507=29 t1512=35 t2018=25 t2020=26 t2024=21
     # t1400=275 t5510=7 t5516=110. cargo test --workspace green.
     [t2012-checkout-last.sh]=22
-    [t5605-clone-local.sh]=22
+    [t5605-clone-local.sh]=23
     [t1508-at-combinations.sh]=35
     # wave-34 (2026-06-21, sweep-picked off main 8fd7bb3d): clone-reference, reflog-updateref,
     # worktree-prune. t5604-clone-reference 24->31 (banked 30, 1-cell clone-family margin; --reference
@@ -1089,7 +1089,7 @@ declare -A FLOOR=(
     # binary. fetchmulti disjoint. Guards held/gained: t2400=219(banked 218) t2401=13 t2402=27 t5510=170
     # t5516=110 t5526=56 t5601=108 t2018=25 t2020=26 t2070=15 t4200=34 t3404=121 t7508=119. cargo test green.
     [t5514-fetch-multiple.sh]=24
-    [t2030-unresolve-info.sh]=13
+    [t2030-unresolve-info.sh]=14
     [t2407-worktree-heads.sh]=12
     # wave-37 (2026-06-21, post-sweep 84.7% off main 7f5514ba; t_push/diff/worktree-setup):
     # pre-push-hook, patch-id, cwd-empty. t5571-pre-push-hook 1->11 FULL (hook argv/stdin ref-feed +
@@ -1145,7 +1145,7 @@ declare -A FLOOR=(
     # (t4108 raised 4->17 in place above.)
     [t4103-apply-binary.sh]=24
     [t4114-apply-typechange.sh]=12
-    [t4129-apply-samemode.sh]=22
+    [t4129-apply-samemode.sh]=23
     [t4111-apply-subdir.sh]=10
     [t8013-blame-ignore-revs.sh]=19
     [t8011-blame-split-file.sh]=10
@@ -1156,12 +1156,12 @@ declare -A FLOOR=(
     [t8010-cat-file-filters.sh]=9
     [t8004-blame-with-conflicts.sh]=3
     [t8015-blame-diff-algorithm.sh]=3
-    [t0028-working-tree-encoding.sh]=13
+    [t0028-working-tree-encoding.sh]=22
     [t0022-crlf-rename.sh]=2
     [t6434-merge-recursive-rename-options.sh]=27
     [t6412-merge-large-rename.sh]=9
     [t7525-status-rename.sh]=15
-    [t4001-diff-rename.sh]=22
+    [t4001-diff-rename.sh]=23
     # wave-54 diff basic: non-recursive raw file/tree replacements, reverse
     # same-path add/delete ordering, diff-files ENOTDIR handling, and
     # --no-index stdin side support.
@@ -1188,7 +1188,7 @@ declare -A FLOOR=(
     [t2071-restore-patch.sh]=15
     [t2080-parallel-checkout-basics.sh]=1
     [t2026-checkout-pathspec-file.sh]=11
-    [t2017-checkout-orphan.sh]=12
+    [t2017-checkout-orphan.sh]=13
     [t2021-checkout-overwrite.sh]=4
     [t2025-checkout-no-overlay.sh]=6
     [t2022-checkout-paths.sh]=3
@@ -1291,7 +1291,7 @@ declare -A FLOOR=(
     [t1008-read-tree-overlay.sh]=1
     [t1012-read-tree-df.sh]=5
     [t1051-large-conversion.sh]=12
-    [t1307-config-blob.sh]=12
+    [t1307-config-blob.sh]=13
     [t1311-config-optional.sh]=2
     [t1405-main-ref-store.sh]=16
     [t1411-reflog-show.sh]=10
@@ -1333,14 +1333,14 @@ declare -A FLOOR=(
     [t1350-config-hooks-path.sh]=3
     [t1407-worktree-ref-store.sh]=4
     [t1413-reflog-detach.sh]=7
-    [t1421-reflog-write.sh]=8
+    [t1421-reflog-write.sh]=10
     [t1505-rev-parse-last.sh]=7
     [t1601-index-bogus.sh]=2
     [t2005-checkout-index-symlinks.sh]=1
     [t2009-checkout-statinfo.sh]=3
-    [t2015-checkout-unborn.sh]=5
+    [t2015-checkout-unborn.sh]=6
     [t2027-checkout-track.sh]=3
-    [t2072-restore-pathspec-file.sh]=10
+    [t2072-restore-pathspec-file.sh]=12
     [t2100-update-cache-badpath.sh]=1
     [t2104-update-index-skip-worktree.sh]=7
     [t2200-add-update.sh]=18
@@ -1349,12 +1349,15 @@ declare -A FLOOR=(
     [t3004-ls-files-basic.sh]=4
     [t3008-ls-files-lazy-init-name-hash.sh]=1
     [t3012-ls-files-dedup.sh]=1
-    [t3201-branch-contains.sh]=15
-    [t5003-archive-zip.sh]=81
+    [t3201-branch-contains.sh]=24
+    # Git 2.55.0's t5003 plan is 78, and the current oracle run passes all
+    # 78 cells. The older floor=81 came from a stale 2.54-era summary whose
+    # plan is now impossible to satisfy under the current archive-zip script.
+    [t5003-archive-zip.sh]=78
     [t5306-pack-nobase.sh]=4
     [t5311-pack-bitmaps-shallow.sh]=6
     [t5315-pack-objects-compression.sh]=5
-    [t5322-pack-objects-sparse.sh]=6
+    [t5322-pack-objects-sparse.sh]=11
     [t5330-no-lazy-fetch-with-commit-graph.sh]=2
     [t5335-compact-multi-pack-index.sh]=10
     [t6009-rev-list-parent.sh]=9
@@ -1377,7 +1380,9 @@ declare -A FLOOR=(
     [t1422-show-ref-exists.sh]=13
     [t1509-root-work-tree.sh]=0
     [t1515-rev-parse-outside-repo.sh]=4
-    [t2000-conflict-when-checking-files-out.sh]=10
+    # Git 2.55.0's t2000 plan is 6; Sley passes every current checkout-index
+    # conflict cell. The older floor=10 came from a stale upstream plan.
+    [t2000-conflict-when-checking-files-out.sh]=6
     [t2006-checkout-index-basic.sh]=5
     [t2010-checkout-ambiguous.sh]=7
     [t2023-checkout-m.sh]=4
@@ -1402,7 +1407,7 @@ declare -A FLOOR=(
     [t6600-test-reach.sh]=39
     [t7062-wtstatus-ignorecase.sh]=1
     [t7106-reset-unborn-branch.sh]=4
-    [t1000-read-tree-m-3way.sh]=82
+    [t1000-read-tree-m-3way.sh]=83
     [t1005-read-tree-reset.sh]=7
     [t1011-read-tree-sparse-checkout.sh]=19
     [t1022-read-tree-partial-clone.sh]=0
@@ -1437,7 +1442,7 @@ declare -A FLOOR=(
     [t6011-rev-list-with-bad-commit.sh]=3
     [t6041-bisect-submodule.sh]=9
     [t6114-keep-packs.sh]=3
-    [t6601-path-walk.sh]=14
+    [t6601-path-walk.sh]=15
     [t7101-reset-empty-subdirs.sh]=10
     [t7107-reset-pathspec-file.sh]=1
     [t7511-status-index.sh]=24
@@ -1506,14 +1511,14 @@ declare -A FLOOR=(
     # producing 0 TAP cells; they still catch missing rows and timeouts.
     [t0018-advice.sh]=4
     [t0025-crlf-renormalize.sh]=1
-    [t0026-eol-config.sh]=3
+    [t0026-eol-config.sh]=6
     [t0029-core-unsetenvvars.sh]=0
     [t0031-lockfile-pid.sh]=3
     [t0041-usage.sh]=10
     [t0050-filesystem.sh]=6
     [t0055-beyond-symlinks.sh]=1
     [t0060-path-utils.sh]=198
-    [t0090-cache-tree.sh]=3
+    [t0090-cache-tree.sh]=22
     [t0091-bugreport.sh]=9
     [t0100-previous.sh]=5
     [t0200-gettext-basic.sh]=16
@@ -1525,13 +1530,13 @@ declare -A FLOOR=(
     [t1420-lost-found.sh]=1
     [t1901-repo-structure.sh]=0
     [t3202-show-branch.sh]=16
-    [t3204-branch-name-interpretation.sh]=9
+    [t3204-branch-name-interpretation.sh]=16
     [t3205-branch-color.sh]=4
     [t3207-branch-submodule.sh]=3
     [t3300-funny-names.sh]=13
-    [t3303-notes-subtrees.sh]=19
-    [t3320-notes-merge-worktrees.sh]=8
-    [t3321-notes-stripspace.sh]=18
+    [t3303-notes-subtrees.sh]=23
+    [t3320-notes-merge-worktrees.sh]=9
+    [t3321-notes-stripspace.sh]=27
     [t3500-cherry.sh]=0
     [t3702-add-edit.sh]=2
     [t3703-add-magic-pathspec.sh]=4
@@ -1562,11 +1567,11 @@ declare -A FLOOR=(
     [t4049-diff-stat-count.sh]=3
     [t4050-diff-histogram.sh]=8
     [t4053-diff-no-index.sh]=41
-    [t4055-diff-context.sh]=5
-    [t4058-diff-duplicates.sh]=10
+    [t4055-diff-context.sh]=10
+    [t4058-diff-duplicates.sh]=16
     [t4059-diff-submodule-not-initialized.sh]=1
     [t4062-diff-pickaxe.sh]=1
-    [t4064-diff-oidfind.sh]=6
+    [t4064-diff-oidfind.sh]=10
     [t4066-diff-emit-delay.sh]=1
     [t4102-apply-rename.sh]=4
     [t4105-apply-fuzz.sh]=5
@@ -1619,15 +1624,15 @@ declare -A FLOOR=(
     [t5583-push-branches.sh]=4
     [t5600-clone-fail-cleanup.sh]=7
     [t5602-clone-remote-exec.sh]=2
-    [t5606-clone-options.sh]=16
+    [t5606-clone-options.sh]=21
     [t5607-clone-bundle.sh]=8
     [t5610-clone-detached.sh]=13
-    [t5612-clone-refspec.sh]=6
+    [t5612-clone-refspec.sh]=13
     [t5613-info-alternate.sh]=10
     [t5615-alternate-env.sh]=7
     [t5618-alternate-refs.sh]=2
     [t5619-clone-local-ambiguous-transport.sh]=0
-    [t5621-clone-revision.sh]=7
+    [t5621-clone-revision.sh]=12
     [t6401-merge-criss-cross.sh]=3
     [t6404-recursive-merge.sh]=4
     [t6405-merge-symlinks.sh]=6
@@ -1655,10 +1660,10 @@ declare -A FLOOR=(
     [t0202-gettext-perl.sh]=1
     [t0203-gettext-setlocale-sanity.sh]=2
     [t0204-gettext-reencode-sanity.sh]=8
-    [t0210-trace2-normal.sh]=13
-    [t0211-trace2-perf.sh]=9
+    [t0210-trace2-normal.sh]=14
+    [t0211-trace2-perf.sh]=17
     [t0212-trace2-event.sh]=11
-    [t0213-trace2-ancestry.sh]=1
+    [t0213-trace2-ancestry.sh]=5
     [t0300-credentials.sh]=1
     [t0301-credential-cache.sh]=0
     [t0303-credential-external.sh]=10
@@ -1687,7 +1692,7 @@ declare -A FLOOR=(
     [t3433-rebase-across-mode-change.sh]=2
     [t3434-rebase-i18n.sh]=6
     [t3435-rebase-gpg-sign.sh]=0
-    [t3436-rebase-more-options.sh]=5
+    [t3436-rebase-more-options.sh]=19
     [t3438-rebase-broken-files.sh]=1
     [t3440-rebase-trailer.sh]=1
     [t3450-history.sh]=0
@@ -1695,7 +1700,7 @@ declare -A FLOOR=(
     [t3452-history-split.sh]=0
     [t3503-cherry-pick-root.sh]=6
     [t3504-cherry-pick-rerere.sh]=4
-    [t3506-cherry-pick-ff.sh]=5
+    [t3506-cherry-pick-ff.sh]=11
     [t3508-cherry-pick-many-commits.sh]=11
     [t3509-cherry-pick-merge-df.sh]=6
     [t3511-cherry-pick-x.sh]=14
@@ -1729,12 +1734,12 @@ declare -A FLOOR=(
     [t6433-merge-toplevel.sh]=9
     [t6435-merge-sparse.sh]=6
     [t6436-merge-overwrite.sh]=11
-    [t6437-submodule-merge.sh]=20
+    [t6437-submodule-merge.sh]=22
     [t7005-editor.sh]=9
     [t7008-filter-branch-null-sha1.sh]=3
     [t7010-setup.sh]=13
-    [t7011-skip-worktree-reading.sh]=12
-    [t7012-skip-worktree-writing.sh]=10
+    [t7011-skip-worktree-reading.sh]=15
+    [t7012-skip-worktree-writing.sh]=11
     [t7301-clean-interactive.sh]=6
     [t7402-submodule-rebase.sh]=6
     [t7409-submodule-detached-work-tree.sh]=3
@@ -1748,15 +1753,15 @@ declare -A FLOOR=(
     [t7421-submodule-summary-add.sh]=5
     [t7422-submodule-output.sh]=18
     [t7423-submodule-symlinks.sh]=6
-    [t7503-pre-commit-and-pre-merge-commit-hooks.sh]=19
-    [t7504-commit-msg-hook.sh]=28
-    [t7505-prepare-commit-msg-hook.sh]=12
+    [t7503-pre-commit-and-pre-merge-commit-hooks.sh]=22
+    [t7504-commit-msg-hook.sh]=29
+    [t7505-prepare-commit-msg-hook.sh]=23
     [t7514-commit-patch.sh]=3
     [t7516-commit-races.sh]=0
     [t7517-per-repo-email.sh]=6
     [t7518-ident-corner-cases.sh]=1
     [t7520-ignored-hook-warning.sh]=5
-    [t7521-ignored-mode.sh]=11
+    [t7521-ignored-mode.sh]=12
     [t7524-commit-summary.sh]=1
     [t7526-commit-pathspec-file.sh]=9
     [t7609-mergetool--lib.sh]=1

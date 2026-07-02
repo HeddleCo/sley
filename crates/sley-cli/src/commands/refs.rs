@@ -702,7 +702,7 @@ fn cmd_reflog_write(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(129));
     }
     let reference = &args[0];
-    if validate_ref_name(reference).is_err() {
+    if !reflog_write_refname_is_valid(reference) {
         eprintln!("fatal: invalid reference name: {reference}");
         return Err(GitError::Exit(128));
     }
@@ -724,9 +724,23 @@ fn cmd_reflog_write(args: &[String]) -> Result<()> {
             old_oid,
             new_oid,
             committer: commit_identity_from_env("COMMITTER")?,
-            message: args[3].as_bytes().to_vec(),
+            message: normalize_reflog_write_message(&args[3]),
         },
     )
+}
+
+fn reflog_write_refname_is_valid(reference: &str) -> bool {
+    validate_ref_name(reference).is_ok()
+        || (!reference.starts_with("refs/") && sley_refs::refname_is_safe(reference))
+}
+
+fn normalize_reflog_write_message(message: &str) -> Vec<u8> {
+    message
+        .split(|ch: char| ch == '\n' || ch == '\r')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .into_bytes()
 }
 
 fn parse_reflog_write_oid(format: ObjectFormat, value: &str, role: &str) -> Result<ObjectId> {
@@ -1723,12 +1737,12 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
     } else {
         None
     };
-    check_update_ref_new_value(&git_dir, format, &name, &new_oid).map_err(|reason| {
-        eprintln!(
-            "fatal: update_ref failed for ref '{requested_name}': cannot update ref '{name}': {reason}"
-        );
-        GitError::Exit(128)
-    })?;
+    check_update_ref_new_value(&git_dir, format, &name, &requested_name, &new_oid).map_err(
+        |reason| {
+            eprintln!("fatal: update_ref failed for ref '{requested_name}': {reason}");
+            GitError::Exit(128)
+        },
+    )?;
     let current = store.read_ref(&name)?;
     if let Some(expected_oid) = expected_oid.as_ref() {
         check_update_ref_expected(format, &name, current.as_ref(), expected_oid)?;
@@ -1863,6 +1877,7 @@ struct UpdateRefStdinWriteRequest<'a> {
     expected_oid: Option<&'a ObjectId>,
 }
 
+#[derive(Clone)]
 struct UpdateRefStdinStagedWrite {
     name: String,
     requested: String,
@@ -1870,18 +1885,21 @@ struct UpdateRefStdinStagedWrite {
     expected_oid: Option<ObjectId>,
 }
 
+#[derive(Clone)]
 struct UpdateRefStdinStagedDelete {
     name: String,
     requested: String,
     expected_oid: Option<ObjectId>,
 }
 
+#[derive(Clone)]
 struct UpdateRefStdinStagedVerify {
     name: String,
     requested: String,
     expected_oid: ObjectId,
 }
 
+#[derive(Clone)]
 struct UpdateRefStdinStagedSymrefUpdate {
     requested: String,
     name: String,
@@ -1889,11 +1907,33 @@ struct UpdateRefStdinStagedSymrefUpdate {
     expected: Option<UpdateRefStdinSymrefExpected>,
 }
 
+#[derive(Clone)]
+struct UpdateRefStdinStagedSymrefCreate {
+    name: String,
+    target: String,
+}
+
+#[derive(Clone)]
+struct UpdateRefStdinStagedSymrefDelete {
+    name: String,
+    expected: Option<String>,
+}
+
+#[derive(Clone)]
+struct UpdateRefStdinStagedSymrefVerify {
+    name: String,
+    expected: Option<String>,
+}
+
+#[derive(Clone)]
 enum UpdateRefStdinStagedChange {
     Write(UpdateRefStdinStagedWrite),
     Delete(UpdateRefStdinStagedDelete),
     Verify(UpdateRefStdinStagedVerify),
+    SymrefCreate(UpdateRefStdinStagedSymrefCreate),
     SymrefUpdate(UpdateRefStdinStagedSymrefUpdate),
+    SymrefDelete(UpdateRefStdinStagedSymrefDelete),
+    SymrefVerify(UpdateRefStdinStagedSymrefVerify),
 }
 
 /// The three states git distinguishes for an old-value (`<old-oid>`) field
@@ -2209,7 +2249,7 @@ fn dispatch_ref_stdin_command(
             if let Some(err) = transaction.check_batch_df_against_queued(&requested, &name) {
                 return Err(err);
             }
-            if transaction.is_implicit() {
+            if transaction.is_active() {
                 transaction.stage_write(UpdateRefStdinStagedWrite {
                     name,
                     requested,
@@ -2278,7 +2318,7 @@ fn dispatch_ref_stdin_command(
             if let Some(err) = transaction.check_batch_df_against_queued(&requested, &name) {
                 return Err(err);
             }
-            if transaction.is_implicit() {
+            if transaction.is_active() {
                 transaction.stage_write(UpdateRefStdinStagedWrite {
                     name,
                     requested,
@@ -2342,7 +2382,7 @@ fn dispatch_ref_stdin_command(
             if transaction.capture(context.store, &effective.requested, &name)? {
                 return Ok(());
             }
-            if transaction.is_implicit() {
+            if transaction.is_active() {
                 transaction.stage_delete(UpdateRefStdinStagedDelete {
                     name,
                     requested: effective.requested,
@@ -2392,7 +2432,7 @@ fn dispatch_ref_stdin_command(
                     stdout,
                 );
             }
-            if transaction.is_implicit() {
+            if transaction.is_active() {
                 transaction.stage_verify(UpdateRefStdinStagedVerify {
                     name,
                     requested: effective.requested,
@@ -2423,6 +2463,10 @@ fn dispatch_ref_stdin_command(
 
             let name = update_ref_effective_name(context.store, &raw_name, *deref)?;
             if transaction.capture(context.store, &raw_name, &name)? {
+                return Ok(());
+            }
+            if transaction.is_active() {
+                transaction.stage_symref_create(UpdateRefStdinStagedSymrefCreate { name, target });
                 return Ok(());
             }
             transaction.mark_applied();
@@ -2485,7 +2529,7 @@ fn dispatch_ref_stdin_command(
             if transaction.capture(context.store, &effective.requested, &name)? {
                 return Ok(());
             }
-            if transaction.is_implicit() {
+            if transaction.is_active() {
                 transaction.stage_symref_update(UpdateRefStdinStagedSymrefUpdate {
                     requested: effective.requested,
                     name,
@@ -2506,6 +2550,13 @@ fn dispatch_ref_stdin_command(
             };
             let expected = cursor.parse_next_refname()?;
             cursor.finish("symref-verify", &raw_name)?;
+            if transaction.is_active() {
+                transaction.stage_symref_verify(UpdateRefStdinStagedSymrefVerify {
+                    name: raw_name,
+                    expected,
+                });
+                return Ok(());
+            }
             update_ref_stdin_symref_verify(context.store, &raw_name, expected.as_deref())
         }
         "symref-delete" => {
@@ -2520,6 +2571,13 @@ fn dispatch_ref_stdin_command(
             if transaction.capture(context.store, &raw_name, &raw_name)? {
                 return Ok(());
             }
+            if transaction.is_active() {
+                transaction.stage_symref_delete(UpdateRefStdinStagedSymrefDelete {
+                    name: raw_name,
+                    expected,
+                });
+                return Ok(());
+            }
             transaction.mark_applied();
             update_ref_stdin_symref_delete(context.store, &raw_name, expected.as_deref())
         }
@@ -2529,15 +2587,15 @@ fn dispatch_ref_stdin_command(
         }
         "prepare" => {
             cursor.finish("prepare", "")?;
-            transaction.prepare(context.git_dir, context.store, stdout)
+            transaction.prepare(context, context.git_dir, context.store, stdout)
         }
         "commit" => {
             cursor.finish("commit", "")?;
-            transaction.commit(context.store, stdout)
+            transaction.commit(context, stdout)
         }
         "abort" => {
             cursor.finish("abort", "")?;
-            transaction.abort(context.store, stdout)
+            transaction.abort(context, stdout)
         }
         _ => update_ref_stdin_bad_command(verb),
     }
@@ -2748,6 +2806,13 @@ impl UpdateRefStdinTransaction {
 
     fn capture(&mut self, store: &FileRefStore, requested: &str, name: &str) -> Result<bool> {
         if self.active {
+            if self.explicit {
+                if !self.originals.contains_key(name) {
+                    let original = self.original_ref(store, name)?;
+                    self.originals.insert(name.to_string(), original);
+                }
+                return Ok(false);
+            }
             if self.originals.contains_key(name) {
                 if self.duplicate.is_none() {
                     self.duplicate = Some(name.to_string());
@@ -2772,25 +2837,29 @@ impl UpdateRefStdinTransaction {
                 }
                 return Ok(true);
             }
-            let original = if name == "HEAD" || !name.starts_with("refs/") {
-                store.read_ref(name)?
-            } else {
-                if self.ref_snapshot.is_none() {
-                    self.ref_snapshot = Some(
-                        store
-                            .list_refs()?
-                            .into_iter()
-                            .map(|reference| (reference.name, reference.target))
-                            .collect(),
-                    );
-                }
-                self.ref_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.get(name).cloned())
-            };
+            let original = self.original_ref(store, name)?;
             self.originals.insert(name.to_string(), original);
         }
         Ok(false)
+    }
+
+    fn original_ref(&mut self, store: &FileRefStore, name: &str) -> Result<Option<RefTarget>> {
+        if name == "HEAD" || !name.starts_with("refs/") {
+            return store.read_ref(name);
+        }
+        if self.ref_snapshot.is_none() {
+            self.ref_snapshot = Some(
+                store
+                    .list_refs()?
+                    .into_iter()
+                    .map(|reference| (reference.name, reference.target))
+                    .collect(),
+            );
+        }
+        Ok(self
+            .ref_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get(name).cloned()))
     }
 
     fn is_prepared(&self) -> bool {
@@ -2803,6 +2872,14 @@ impl UpdateRefStdinTransaction {
 
     fn is_implicit(&self) -> bool {
         self.active && !self.explicit && !self.prepared
+    }
+
+    fn is_explicit(&self) -> bool {
+        self.active && self.explicit
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
     }
 
     fn mark_applied(&mut self) {
@@ -2826,6 +2903,21 @@ impl UpdateRefStdinTransaction {
             .push(UpdateRefStdinStagedChange::SymrefUpdate(update));
     }
 
+    fn stage_symref_create(&mut self, create: UpdateRefStdinStagedSymrefCreate) {
+        self.staged
+            .push(UpdateRefStdinStagedChange::SymrefCreate(create));
+    }
+
+    fn stage_symref_delete(&mut self, delete: UpdateRefStdinStagedSymrefDelete) {
+        self.staged
+            .push(UpdateRefStdinStagedChange::SymrefDelete(delete));
+    }
+
+    fn stage_symref_verify(&mut self, verify: UpdateRefStdinStagedSymrefVerify) {
+        self.staged
+            .push(UpdateRefStdinStagedChange::SymrefVerify(verify));
+    }
+
     fn start(&mut self, stdout: &mut dyn Write) -> Result<()> {
         if self.explicit {
             return update_ref_stdin_restart_transaction();
@@ -2843,6 +2935,7 @@ impl UpdateRefStdinTransaction {
 
     fn prepare(
         &mut self,
+        context: &UpdateRefStdinContext<'_>,
         git_dir: &Path,
         store: &FileRefStore,
         stdout: &mut dyn Write,
@@ -2856,21 +2949,75 @@ impl UpdateRefStdinTransaction {
             update_ref_stdin_duplicate_failure("prepare", &name, message.as_deref());
             return Err(GitError::Exit(128));
         }
+        if self.explicit
+            && let Some((name, message)) = self.staged_duplicate()
+        {
+            self.restore(store)?;
+            update_ref_stdin_duplicate_failure("prepare", &name, message.as_deref());
+            return Err(GitError::Exit(128));
+        }
+        if self.explicit {
+            self.run_explicit_hook(context, RefTransactionPhase::Preparing)?;
+            self.run_explicit_files_symref_delete_abort_hook(context)?;
+        }
         self.acquire_locks(git_dir)?;
+        if self.explicit {
+            self.run_explicit_hook(context, RefTransactionPhase::Prepared)?;
+        }
         self.prepared = true;
         writeln!(stdout, "prepare: ok")?;
         Ok(())
     }
 
-    fn commit(&mut self, store: &FileRefStore, stdout: &mut dyn Write) -> Result<()> {
+    fn commit(
+        &mut self,
+        context: &UpdateRefStdinContext<'_>,
+        stdout: &mut dyn Write,
+    ) -> Result<()> {
         if let Some(name) = self.duplicate.clone() {
-            let message = self
-                .duplicate_message
-                .clone()
-                .or_else(|| self.infer_duplicate_message(store, &name).ok().flatten());
-            self.restore(store)?;
+            let message = self.duplicate_message.clone().or_else(|| {
+                self.infer_duplicate_message(context.store, &name)
+                    .ok()
+                    .flatten()
+            });
+            self.restore(context.store)?;
             update_ref_stdin_duplicate_failure("commit", &name, message.as_deref());
             return Err(GitError::Exit(128));
+        }
+        if self.explicit
+            && let Some((name, message)) = self.staged_duplicate()
+        {
+            self.restore(context.store)?;
+            update_ref_stdin_duplicate_failure("commit", &name, message.as_deref());
+            return Err(GitError::Exit(128));
+        }
+        let staged = mem::take(&mut self.staged);
+        if !staged.is_empty() {
+            if self.explicit {
+                if !self.prepared {
+                    self.run_explicit_hook_for_staged(
+                        context,
+                        RefTransactionPhase::Preparing,
+                        &staged,
+                    )?;
+                    self.acquire_locks(context.git_dir)?;
+                    self.run_explicit_hook_for_staged(
+                        context,
+                        RefTransactionPhase::Prepared,
+                        &staged,
+                    )?;
+                }
+                self.release_locks();
+                update_ref_stdin_commit_staged(context, staged.clone(), false)?;
+                self.run_explicit_hook_for_staged(
+                    context,
+                    RefTransactionPhase::Committed,
+                    &staged,
+                )?;
+            } else {
+                self.release_locks();
+                update_ref_stdin_commit_staged(context, staged, true)?;
+            }
         }
         self.active = false;
         self.explicit = false;
@@ -2901,7 +3048,7 @@ impl UpdateRefStdinTransaction {
         }
         if !self.staged.is_empty() {
             let staged = mem::take(&mut self.staged);
-            update_ref_stdin_commit_staged(context, staged)?;
+            update_ref_stdin_commit_staged(context, staged, true)?;
         }
         self.active = false;
         self.prepared = false;
@@ -2913,9 +3060,75 @@ impl UpdateRefStdinTransaction {
         Ok(())
     }
 
-    fn abort(&mut self, store: &FileRefStore, stdout: &mut dyn Write) -> Result<()> {
-        self.restore(store)?;
+    fn abort(&mut self, context: &UpdateRefStdinContext<'_>, stdout: &mut dyn Write) -> Result<()> {
+        if self.explicit {
+            self.run_explicit_hook(context, RefTransactionPhase::Aborted)?;
+        }
+        self.restore(context.store)?;
         writeln!(stdout, "abort: ok")?;
+        Ok(())
+    }
+
+    fn run_explicit_hook(
+        &self,
+        context: &UpdateRefStdinContext<'_>,
+        phase: RefTransactionPhase,
+    ) -> Result<()> {
+        self.run_explicit_hook_for_staged(context, phase, &self.staged)
+    }
+
+    fn run_explicit_hook_for_staged(
+        &self,
+        context: &UpdateRefStdinContext<'_>,
+        phase: RefTransactionPhase,
+        staged: &[UpdateRefStdinStagedChange],
+    ) -> Result<()> {
+        let updates = update_ref_stdin_hook_updates(context, staged)?;
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let hook = ReferenceTransactionHookRunner::new(context.git_dir);
+        if hook.run(phase, &updates)?
+            && matches!(
+                phase,
+                RefTransactionPhase::Preparing | RefTransactionPhase::Prepared
+            )
+        {
+            return Err(GitError::Transaction(format!(
+                "in '{}' phase, update aborted by the reference-transaction hook",
+                phase.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    fn run_explicit_files_symref_delete_abort_hook(
+        &self,
+        context: &UpdateRefStdinContext<'_>,
+    ) -> Result<()> {
+        if context.store.uses_reftable()? {
+            return Ok(());
+        }
+        let zero = zero_oid(context.format)?.to_string();
+        let updates = self
+            .staged
+            .iter()
+            .filter_map(|change| match change {
+                UpdateRefStdinStagedChange::SymrefDelete(delete) => {
+                    Some(RefTransactionHookUpdate {
+                        old_value: zero.clone(),
+                        new_value: zero.clone(),
+                        refname: delete.name.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let hook = ReferenceTransactionHookRunner::new(context.git_dir);
+        let _ = hook.run(RefTransactionPhase::Aborted, &updates)?;
         Ok(())
     }
 
@@ -2961,6 +3174,30 @@ impl UpdateRefStdinTransaction {
             }
         }
         Ok(None)
+    }
+
+    fn staged_duplicate(&self) -> Option<(String, Option<String>)> {
+        let mut seen = BTreeMap::<&str, &str>::new();
+        for change in &self.staged {
+            let Some((name, requested)) = staged_ref_change_name(change) else {
+                continue;
+            };
+            if let Some(previous_requested) = seen.insert(name, requested) {
+                let message = if requested != name {
+                    Some(format!(
+                        "multiple updates for '{name}' (including one via symref '{requested}') are not allowed"
+                    ))
+                } else if previous_requested != name {
+                    Some(format!(
+                        "multiple updates for '{name}' (including one via symref '{previous_requested}') are not allowed"
+                    ))
+                } else {
+                    None
+                };
+                return Some((name.to_string(), message));
+            }
+        }
+        None
     }
 
     fn acquire_locks(&mut self, git_dir: &Path) -> Result<()> {
@@ -3093,13 +3330,125 @@ fn update_ref_stdin_current_target(
     }
 }
 
+fn update_ref_stdin_hook_updates(
+    context: &UpdateRefStdinContext<'_>,
+    staged: &[UpdateRefStdinStagedChange],
+) -> Result<Vec<RefTransactionHookUpdate>> {
+    let zero = zero_oid(context.format)?.to_string();
+    let mut updates = Vec::new();
+    for change in staged {
+        match change {
+            UpdateRefStdinStagedChange::Write(write) => {
+                updates.push(RefTransactionHookUpdate {
+                    old_value: write
+                        .expected_oid
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| zero.clone()),
+                    new_value: write.new_oid.to_string(),
+                    refname: write.requested.clone(),
+                });
+            }
+            UpdateRefStdinStagedChange::Delete(delete) => {
+                updates.push(RefTransactionHookUpdate {
+                    old_value: delete
+                        .expected_oid
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| zero.clone()),
+                    new_value: zero.clone(),
+                    refname: delete.requested.clone(),
+                });
+            }
+            UpdateRefStdinStagedChange::Verify(verify) => {
+                updates.push(RefTransactionHookUpdate {
+                    old_value: verify.expected_oid.to_string(),
+                    new_value: zero.clone(),
+                    refname: verify.requested.clone(),
+                });
+            }
+            UpdateRefStdinStagedChange::SymrefCreate(create) => {
+                updates.push(RefTransactionHookUpdate {
+                    old_value: zero.clone(),
+                    new_value: hook_symref_value(&create.target),
+                    refname: create.name.clone(),
+                });
+            }
+            UpdateRefStdinStagedChange::SymrefUpdate(update) => {
+                updates.push(RefTransactionHookUpdate {
+                    old_value: update_ref_stdin_symref_expected_hook_value(
+                        update.expected.as_ref(),
+                        &zero,
+                    ),
+                    new_value: hook_symref_value(&update.target),
+                    refname: update.requested.clone(),
+                });
+            }
+            UpdateRefStdinStagedChange::SymrefDelete(delete) => {
+                updates.push(RefTransactionHookUpdate {
+                    old_value: delete
+                        .expected
+                        .as_deref()
+                        .map(hook_symref_value)
+                        .unwrap_or_else(|| zero.clone()),
+                    new_value: zero.clone(),
+                    refname: delete.name.clone(),
+                });
+            }
+            UpdateRefStdinStagedChange::SymrefVerify(verify) => {
+                updates.push(RefTransactionHookUpdate {
+                    old_value: verify
+                        .expected
+                        .as_deref()
+                        .map(hook_symref_value)
+                        .unwrap_or_else(|| zero.clone()),
+                    new_value: zero.clone(),
+                    refname: verify.name.clone(),
+                });
+            }
+        }
+    }
+    Ok(updates)
+}
+
+fn staged_ref_change_name(change: &UpdateRefStdinStagedChange) -> Option<(&str, &str)> {
+    match change {
+        UpdateRefStdinStagedChange::Write(write) => Some((&write.name, &write.requested)),
+        UpdateRefStdinStagedChange::Delete(delete) => Some((&delete.name, &delete.requested)),
+        UpdateRefStdinStagedChange::Verify(verify) => Some((&verify.name, &verify.requested)),
+        UpdateRefStdinStagedChange::SymrefCreate(create) => Some((&create.name, &create.name)),
+        UpdateRefStdinStagedChange::SymrefUpdate(update) => Some((&update.name, &update.requested)),
+        UpdateRefStdinStagedChange::SymrefDelete(delete) => Some((&delete.name, &delete.name)),
+        UpdateRefStdinStagedChange::SymrefVerify(verify) => Some((&verify.name, &verify.name)),
+    }
+}
+
+fn hook_symref_value(target: &str) -> String {
+    format!("ref:{target}")
+}
+
+fn update_ref_stdin_symref_expected_hook_value(
+    expected: Option<&UpdateRefStdinSymrefExpected>,
+    zero: &str,
+) -> String {
+    match expected {
+        Some(UpdateRefStdinSymrefExpected::Target(target)) => hook_symref_value(target),
+        Some(UpdateRefStdinSymrefExpected::Oid(oid)) => oid.to_string(),
+        None => zero.to_string(),
+    }
+}
+
 fn update_ref_stdin_commit_staged(
     context: &UpdateRefStdinContext<'_>,
     staged: Vec<UpdateRefStdinStagedChange>,
+    run_hooks: bool,
 ) -> Result<()> {
     let zero = zero_oid(context.format)?;
     let hook = ReferenceTransactionHookRunner::new(context.git_dir);
-    let mut tx = context.store.transaction().with_hook(&hook);
+    let mut tx = context.store.transaction();
+    if run_hooks {
+        tx = tx.with_hook(&hook);
+    }
     let mut requested_by_name = BTreeMap::new();
     let current_refs = context
         .store
@@ -3132,12 +3481,16 @@ fn update_ref_stdin_commit_staged(
                     }
                     continue;
                 }
-                check_update_ref_new_value_cached(context, &write.name, &write.new_oid).map_err(
-                    |reason| {
-                        eprintln!("fatal: cannot update ref '{}': {reason}", write.name);
-                        GitError::Exit(128)
-                    },
-                )?;
+                check_update_ref_new_value_cached(
+                    context,
+                    &write.name,
+                    &write.requested,
+                    &write.new_oid,
+                )
+                .map_err(|reason| {
+                    eprintln!("fatal: {reason}");
+                    GitError::Exit(128)
+                })?;
                 let old_oid = match current {
                     Some(RefTarget::Direct(oid)) => oid,
                     _ => zero,
@@ -3194,14 +3547,92 @@ fn update_ref_stdin_commit_staged(
                     &verify.expected_oid,
                 )?;
             }
+            UpdateRefStdinStagedChange::SymrefCreate(create) => {
+                requested_by_name.insert(create.name.clone(), create.name.clone());
+                validate_ref_name(&create.name)?;
+                if let Some(current) = context.store.read_ref(&create.name)? {
+                    return match current {
+                        RefTarget::Symbolic(_) => {
+                            update_ref_stdin_symref_exists(&create.name, true)
+                        }
+                        RefTarget::Direct(_) => update_ref_stdin_symref_exists(&create.name, false),
+                    };
+                }
+                let reflog = update_ref_stdin_symref_reflog(context, &create.name, &create.target)?;
+                tx.update(RefUpdate {
+                    name: create.name,
+                    expected: None,
+                    new: RefTarget::Symbolic(create.target),
+                    reflog,
+                });
+            }
             UpdateRefStdinStagedChange::SymrefUpdate(update) => {
                 requested_by_name.insert(update.name.clone(), update.requested.clone());
-                update_ref_stdin_symref_update(
+                validate_ref_name(&update.name)?;
+                let current =
+                    update_ref_stdin_current_target(context, &current_refs, &update.name)?;
+                check_update_ref_stdin_symref_expected(
                     context,
                     &update.requested,
                     &update.name,
-                    &update.target,
-                    update.expected,
+                    current.as_ref(),
+                    update.expected.as_ref(),
+                )?;
+                let reflog = update_ref_stdin_symref_reflog(context, &update.name, &update.target)?;
+                tx.update(RefUpdate {
+                    name: update.name.clone(),
+                    expected: None,
+                    new: RefTarget::Symbolic(update.target.clone()),
+                    reflog: reflog.clone(),
+                });
+                if update.requested != update.name
+                    && let Some(reflog) = reflog
+                {
+                    context.store.append_reflog(&update.requested, &reflog)?;
+                }
+            }
+            UpdateRefStdinStagedChange::SymrefDelete(delete) => {
+                requested_by_name.insert(delete.name.clone(), delete.name.clone());
+                validate_ref_name(&delete.name)?;
+                let current =
+                    update_ref_stdin_current_target(context, &current_refs, &delete.name)?;
+                if let Some(expected) = delete.expected.as_deref() {
+                    update_ref_stdin_symref_verify_current(
+                        &delete.name,
+                        current.as_ref(),
+                        Some(expected),
+                    )?;
+                }
+                match current {
+                    Some(RefTarget::Symbolic(target)) => {
+                        tx.delete_with_precondition(
+                            delete.name,
+                            sley_refs::RefDeletePrecondition::Immediate(RefTarget::Symbolic(
+                                target,
+                            )),
+                            None,
+                        );
+                    }
+                    Some(RefTarget::Direct(_)) if delete.expected.is_none() => {
+                        tx.delete_with_precondition(
+                            delete.name,
+                            sley_refs::RefDeletePrecondition::Direct(None),
+                            None,
+                        );
+                    }
+                    Some(RefTarget::Direct(_)) => {}
+                    None => {}
+                }
+            }
+            UpdateRefStdinStagedChange::SymrefVerify(verify) => {
+                requested_by_name.insert(verify.name.clone(), verify.name.clone());
+                validate_ref_name(&verify.name)?;
+                let current =
+                    update_ref_stdin_current_target(context, &current_refs, &verify.name)?;
+                update_ref_stdin_symref_verify_current(
+                    &verify.name,
+                    current.as_ref(),
+                    verify.expected.as_deref(),
                 )?;
             }
         }
@@ -3408,7 +3839,16 @@ fn update_ref_stdin_symref_verify(
     expected: Option<&str>,
 ) -> Result<()> {
     validate_ref_name(name)?;
-    match (store.read_ref(name)?, expected) {
+    let current = store.read_ref(name)?;
+    update_ref_stdin_symref_verify_current(name, current.as_ref(), expected)
+}
+
+fn update_ref_stdin_symref_verify_current(
+    name: &str,
+    current: Option<&RefTarget>,
+    expected: Option<&str>,
+) -> Result<()> {
+    match (current, expected) {
         (None, None) => Ok(()),
         (None, Some(_)) => update_ref_stdin_symref_unresolved(name),
         (Some(RefTarget::Direct(_)), Some(expected)) => {
@@ -3426,6 +3866,29 @@ fn update_ref_stdin_symref_verify(
             );
             Err(GitError::Exit(128))
         }
+    }
+}
+
+fn check_update_ref_stdin_symref_expected(
+    context: &UpdateRefStdinContext<'_>,
+    requested: &str,
+    name: &str,
+    current: Option<&RefTarget>,
+    expected: Option<&UpdateRefStdinSymrefExpected>,
+) -> Result<()> {
+    match expected {
+        Some(UpdateRefStdinSymrefExpected::Target(expected)) => {
+            update_ref_stdin_symref_verify_current(name, current, Some(expected))
+        }
+        Some(UpdateRefStdinSymrefExpected::Oid(expected)) => update_ref_stdin_symref_verify_oid(
+            context.store,
+            context.format,
+            requested,
+            name,
+            current,
+            expected,
+        ),
+        None => Ok(()),
     }
 }
 
@@ -3633,6 +4096,7 @@ fn check_update_ref_new_value(
     git_dir: &Path,
     format: ObjectFormat,
     name: &str,
+    display_name: &str,
     new_oid: &ObjectId,
 ) -> std::result::Result<(), String> {
     if new_oid == &zero_oid(format).map_err(|err| err.to_string())? {
@@ -3641,13 +4105,13 @@ fn check_update_ref_new_value(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let object = db.read_object(new_oid).map_err(|err| match err {
         GitError::NotFound(_) => {
-            format!("trying to write ref '{name}' with nonexistent object {new_oid}")
+            format!("trying to write ref '{display_name}' with nonexistent object {new_oid}")
         }
         err => err.to_string(),
     })?;
     if update_ref_requires_commit(name) && object.object_type != ObjectType::Commit {
         return Err(format!(
-            "trying to write non-commit object {new_oid} to branch '{name}'"
+            "trying to write non-commit object {new_oid} to branch '{display_name}'"
         ));
     }
     Ok(())
@@ -3656,6 +4120,7 @@ fn check_update_ref_new_value(
 fn check_update_ref_new_value_cached(
     context: &UpdateRefStdinContext<'_>,
     name: &str,
+    display_name: &str,
     new_oid: &ObjectId,
 ) -> std::result::Result<(), String> {
     if new_oid == &zero_oid(context.format).map_err(|err| err.to_string())? {
@@ -3667,7 +4132,7 @@ fn check_update_ref_new_value_cached(
         let db = FileObjectDatabase::from_git_dir(context.git_dir, context.format);
         let object = db.read_object(new_oid).map_err(|err| match err {
             GitError::NotFound(_) => {
-                format!("trying to write ref '{name}' with nonexistent object {new_oid}")
+                format!("trying to write ref '{display_name}' with nonexistent object {new_oid}")
             }
             err => err.to_string(),
         })?;
@@ -3679,7 +4144,7 @@ fn check_update_ref_new_value_cached(
     };
     if update_ref_requires_commit(name) && object_type != ObjectType::Commit {
         return Err(format!(
-            "trying to write non-commit object {new_oid} to branch '{name}'"
+            "trying to write non-commit object {new_oid} to branch '{display_name}'"
         ));
     }
     Ok(())
@@ -3725,8 +4190,12 @@ fn update_ref_stdin_write_batch(
     if request.new_oid == zero {
         return update_ref_delete_stdin(context.store, context.format, &request.name, None);
     }
-    if let Err(reason) = check_update_ref_new_value_cached(context, &request.name, &request.new_oid)
-    {
+    if let Err(reason) = check_update_ref_new_value_cached(
+        context,
+        &request.name,
+        &request.requested,
+        &request.new_oid,
+    ) {
         writeln!(
             stdout,
             "rejected {} {} {} invalid new value provided",
@@ -3737,7 +4206,7 @@ fn update_ref_stdin_write_batch(
                 .map(ObjectId::to_string)
                 .unwrap_or_else(|| "(null)".to_string())
         )?;
-        eprintln!("error: cannot update ref '{}': {reason}", request.name);
+        eprintln!("error: {reason}");
         return Ok(());
     }
     // A directory/file refname conflict (e.g. creating `refs/heads/ref` while
@@ -3842,12 +4311,11 @@ fn update_ref_stdin_write(
             None,
         );
     }
-    check_update_ref_new_value_cached(context, &request.name, &request.new_oid).map_err(
-        |reason| {
-            eprintln!("fatal: cannot update ref '{}': {reason}", request.name);
+    check_update_ref_new_value_cached(context, &request.name, &request.requested, &request.new_oid)
+        .map_err(|reason| {
+            eprintln!("fatal: {reason}");
             GitError::Exit(128)
-        },
-    )?;
+        })?;
     let old_oid = match current {
         Some(RefTarget::Direct(oid)) => oid,
         _ => zero_oid(context.format)?,

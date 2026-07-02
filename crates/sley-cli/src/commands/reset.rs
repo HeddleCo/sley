@@ -410,6 +410,12 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         }
         let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
+        let target_tree = commands::merge_rebase::commit_tree_oid(&db, format, &target_commit)?;
+        if reset_check_cache_tree()
+            && sley_diff_merge::tree_has_duplicate_leaf_paths(&db, format, &target_tree)?
+        {
+            return Err(sley_diff_merge::corrupted_cache_tree_error());
+        }
         write_reset_orig_head(&git_dir, &old_head, format)?;
         if recurse_submodules {
             commands::read_tree::reset_index_and_worktree_to_commit(
@@ -878,6 +884,13 @@ fn reset_soft_blocked_by_merge(git_dir: &Path, format: ObjectFormat) -> Result<b
         .entries
         .iter()
         .any(|entry| entry.stage() != sley_index::Stage::Normal))
+}
+
+fn reset_check_cache_tree() -> bool {
+    !matches!(
+        std::env::var("GIT_TEST_CHECK_CACHE_TREE").as_deref(),
+        Ok("false" | "0")
+    )
 }
 
 fn apply_reset_sparse_checkout(

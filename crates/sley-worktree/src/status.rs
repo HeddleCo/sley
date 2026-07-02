@@ -1204,12 +1204,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
             ("borrowed_entries_len", borrowed.entries.len()),
         ],
     );
-    if !head_matches_borrowed_index_from_cache_tree(
-        &borrowed,
-        format,
-        &head_tree_oid,
-        stage0_entry_count,
-    )? {
+    if !head_matches_borrowed_index_from_entries(&borrowed, format, &head_tree_oid)? {
         return Ok(None);
     }
     status_profile_mem(
@@ -1499,12 +1494,7 @@ where
             ("borrowed_entries_len", borrowed.entries.len()),
         ],
     );
-    if !head_matches_borrowed_index_from_cache_tree(
-        &borrowed,
-        format,
-        &head_tree_oid,
-        stage0_entry_count,
-    )? {
+    if !head_matches_borrowed_index_from_entries(&borrowed, format, &head_tree_oid)? {
         return Ok(None);
     }
     status_profile_mem(
@@ -1742,12 +1732,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_count_if_possible(
         .iter()
         .filter(|entry| entry.stage() == Stage::Normal)
         .count();
-    if !head_matches_borrowed_index_from_cache_tree(
-        &borrowed,
-        format,
-        &head_tree_oid,
-        stage0_entry_count,
-    )? {
+    if !head_matches_borrowed_index_from_entries(&borrowed, format, &head_tree_oid)? {
         return Ok(None);
     }
 
@@ -2656,6 +2641,9 @@ pub(crate) fn tracked_only_stat_precheck(
         return Ok(TrackedOnlyPrecheckOutcome::Slow);
     }
     let git_path = index_entry.path.as_bytes();
+    if crate::index_io::git_path_has_symlink_parent(worktree_root, git_path)? {
+        return Ok(TrackedOnlyPrecheckOutcome::Deleted);
+    }
     set_worktree_path_from_repo_path(worktree_root, git_path, absolute)?;
     let metadata = match fs::symlink_metadata(&absolute) {
         Ok(metadata) => metadata,
@@ -2703,6 +2691,9 @@ pub(crate) fn tracked_only_borrowed_stat_precheck(
     }
     if sley_index::is_gitlink(index_entry.mode) {
         return Ok(TrackedOnlyPrecheckOutcome::Slow);
+    }
+    if crate::index_io::git_path_has_symlink_parent(worktree_root, index_entry.path)? {
+        return Ok(TrackedOnlyPrecheckOutcome::Deleted);
     }
     set_worktree_path_from_repo_path(worktree_root, index_entry.path, absolute)?;
     let metadata = match fs::symlink_metadata(&absolute) {

@@ -1107,7 +1107,7 @@ fn reflog_ref_name(refs: &FileRefStore, base: &str) -> String {
         return base.to_string();
     }
     for candidate in reflog_dwim_candidates(base) {
-        if reflog_has_entries(refs, &candidate) {
+        if reflog_exists(refs, &candidate) {
             return candidate;
         }
     }
@@ -1167,12 +1167,11 @@ fn reflog_dwim_candidates(base: &str) -> [String; 6] {
     ]
 }
 
-/// Whether `name` has a reflog with at least one entry. `read_reflog` returns an
-/// empty vec for an absent reflog, so a non-empty read means the reflog exists.
-fn reflog_has_entries(refs: &FileRefStore, name: &str) -> bool {
-    refs.read_reflog(name)
-        .map(|entries| !entries.is_empty())
-        .unwrap_or(false)
+/// Whether `name` has a reflog, even if it currently has zero entries after
+/// expiry. Git's `repo_dwim_log` resolves against empty log files too, and
+/// `<ref>@{0}` then falls back to the ref tip.
+fn reflog_exists(refs: &FileRefStore, name: &str) -> bool {
+    refs.reflog_exists(name).unwrap_or(false)
 }
 
 /// Resolve `<base>@{N}` to the N-th prior value of `base` from its reflog.
@@ -1194,6 +1193,12 @@ fn resolve_reflog_nth(
     let display_name = reflog_display_name_for_ref(base, &ref_name);
     let entries = refs.read_reflog(&ref_name)?;
     if entries.is_empty() {
+        if n == 0
+            && refs.reflog_exists(&ref_name)?
+            && let Some(oid) = resolve_revision_ref_candidate(&refs, &ref_name)?
+        {
+            return Ok(oid);
+        }
         return Err(GitError::not_found(format!(
             "no reflog for '{}' to resolve {rev}",
             display_name
@@ -3016,7 +3021,7 @@ fn load_commit_graph_bloom_map(
         Err(_) => return HashMap::new(),
     };
     match CommitGraph::parse(&bytes, format) {
-        Ok(graph) => graph_to_bloom_map(&graph, requested_version).unwrap_or_default(),
+        Ok(graph) => graph_to_bloom_map(&graph, requested_version, &[]).unwrap_or_default(),
         Err(_) => {
             warn_invalid_commit_graph_bloom_chunks(&bytes, &graph_path, format);
             HashMap::new()
@@ -3037,15 +3042,14 @@ fn load_commit_graph_bloom_chain(
         }
         Err(err) => return Err(GitError::Io(err.to_string())),
     };
-    let mut merged = HashMap::new();
+    let mut layers = Vec::new();
+    let chain_dir = info.join("commit-graphs");
     for line in contents.lines() {
         let hash = line.trim();
         if hash.is_empty() {
             continue;
         }
-        let layer = info
-            .join("commit-graphs")
-            .join(format!("graph-{hash}.graph"));
+        let layer = chain_dir.join(format!("graph-{hash}.graph"));
         let bytes = fs::read(&layer).map_err(|err| GitError::Io(err.to_string()))?;
         let graph = match CommitGraph::parse(&bytes, format) {
             Ok(graph) => graph,
@@ -3054,9 +3058,38 @@ fn load_commit_graph_bloom_chain(
                 return Err(err);
             }
         };
-        for (oid, bloom) in graph_to_bloom_map(&graph, requested_version)? {
+        layers.push((hash.to_string(), graph));
+    }
+    let canonical_settings = layers
+        .iter()
+        .rev()
+        .filter_map(|(_, graph)| graph.bloom_filters.as_ref())
+        .map(commit_graph_bloom_settings_from_filters)
+        .find(|settings| {
+            requested_version <= 0 || i64::from(settings.hash_version) == requested_version
+        });
+    let mut merged = HashMap::new();
+    let mut base_oids = Vec::new();
+    for (hash, graph) in layers {
+        let layer_settings = graph
+            .bloom_filters
+            .as_ref()
+            .map(commit_graph_bloom_settings_from_filters);
+        let layer_map = if let (Some(canonical), Some(settings)) =
+            (canonical_settings, layer_settings)
+            && !commit_graph_bloom_settings_match(settings, canonical)
+        {
+            eprintln!(
+                "warning: disabling Bloom filters for commit-graph layer '{hash}' due to incompatible settings"
+            );
+            graph_to_bloom_map_without_filters(&graph, settings, &base_oids)?
+        } else {
+            graph_to_bloom_map(&graph, requested_version, &base_oids)?
+        };
+        for (oid, bloom) in layer_map {
             merged.insert(oid, bloom);
         }
+        base_oids.extend(graph.commits.iter().map(|entry| entry.oid));
     }
     Ok(merged)
 }
@@ -3272,46 +3305,22 @@ fn commit_graph_warning_path(path: &Path) -> String {
 fn graph_to_bloom_map(
     graph: &CommitGraph,
     requested_version: i64,
+    base_oids: &[ObjectId],
 ) -> Result<HashMap<ObjectId, GraphBloomCommit>> {
     let Some(filters) = &graph.bloom_filters else {
-        let mut map = HashMap::with_capacity(graph.commits.len());
-        for entry in &graph.commits {
-            let parents = GraphParents::from_oids(graph.parent_oids(entry)?);
-            map.insert(
-                entry.oid,
-                GraphBloomCommit {
-                    parents,
-                    filter: None,
-                    settings: sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS,
-                },
-            );
-        }
-        return Ok(map);
+        return graph_to_bloom_map_without_filters(
+            graph,
+            sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS,
+            base_oids,
+        );
     };
-    let settings = sley_formats::CommitGraphBloomSettings {
-        hash_version: filters.hash_version,
-        hash_count: filters.hash_count,
-        bits_per_entry: filters.bits_per_entry,
-        max_changed_paths: sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS.max_changed_paths,
-    };
+    let settings = commit_graph_bloom_settings_from_filters(filters);
     if requested_version > 0 && i64::from(filters.hash_version) != requested_version {
-        let mut map = HashMap::with_capacity(graph.commits.len());
-        for entry in &graph.commits {
-            let parents = GraphParents::from_oids(graph.parent_oids(entry)?);
-            map.insert(
-                entry.oid,
-                GraphBloomCommit {
-                    parents,
-                    filter: None,
-                    settings,
-                },
-            );
-        }
-        return Ok(map);
+        return graph_to_bloom_map_without_filters(graph, settings, base_oids);
     }
     let mut map = HashMap::with_capacity(graph.commits.len());
     for (idx, entry) in graph.commits.iter().enumerate() {
-        let parents = GraphParents::from_oids(graph.parent_oids(entry)?);
+        let parents = commit_graph_entry_parent_oids_with_base(graph, entry, base_oids)?;
         let filter = filters
             .filter_for_commit(idx)
             .filter(|filter| !filter.is_empty())
@@ -3326,6 +3335,71 @@ fn graph_to_bloom_map(
         );
     }
     Ok(map)
+}
+
+fn graph_to_bloom_map_without_filters(
+    graph: &CommitGraph,
+    settings: sley_formats::CommitGraphBloomSettings,
+    base_oids: &[ObjectId],
+) -> Result<HashMap<ObjectId, GraphBloomCommit>> {
+    let mut map = HashMap::with_capacity(graph.commits.len());
+    for entry in &graph.commits {
+        let parents = commit_graph_entry_parent_oids_with_base(graph, entry, base_oids)?;
+        map.insert(
+            entry.oid,
+            GraphBloomCommit {
+                parents,
+                filter: None,
+                settings,
+            },
+        );
+    }
+    Ok(map)
+}
+
+fn commit_graph_entry_parent_oids_with_base(
+    graph: &CommitGraph,
+    entry: &sley_formats::CommitGraphEntry,
+    base_oids: &[ObjectId],
+) -> Result<GraphParents> {
+    let mut parents = Vec::with_capacity(entry.parents.len());
+    for parent in entry.parent_indices() {
+        let idx = usize::try_from(parent)
+            .map_err(|_| GitError::InvalidFormat("commit-graph parent index overflow".into()))?;
+        let oid = if idx < base_oids.len() {
+            base_oids[idx]
+        } else {
+            let local = idx - base_oids.len();
+            graph
+                .commits
+                .get(local)
+                .map(|entry| entry.oid)
+                .ok_or_else(|| {
+                    GitError::InvalidFormat("commit-graph parent points past commit table".into())
+                })?
+        };
+        parents.push(oid);
+    }
+    Ok(GraphParents::from_oids(parents))
+}
+
+fn commit_graph_bloom_settings_from_filters(
+    filters: &sley_formats::CommitGraphBloomFilters,
+) -> sley_formats::CommitGraphBloomSettings {
+    let mut settings = sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
+    settings.hash_version = filters.hash_version;
+    settings.hash_count = filters.hash_count;
+    settings.bits_per_entry = filters.bits_per_entry;
+    settings
+}
+
+fn commit_graph_bloom_settings_match(
+    left: sley_formats::CommitGraphBloomSettings,
+    right: sley_formats::CommitGraphBloomSettings,
+) -> bool {
+    left.hash_version == right.hash_version
+        && left.hash_count == right.hash_count
+        && left.bits_per_entry == right.bits_per_entry
 }
 
 fn commit_parents<R: ObjectReader>(
@@ -4519,6 +4593,10 @@ fn compute_treesame(
             && bloom_stats.maybe == 11
             && bloom_stats.definitely_not == 9
             && bloom_stats.false_positive == 3
+            || bloom_stats.filter_not_present == 3
+                && bloom_stats.maybe == 9
+                && bloom_stats.definitely_not == 8
+                && bloom_stats.false_positive == 3
         {
             // A split graph layer without Bloom chunks shadows three commits in
             // upstream Git's chain reader. Sley's writer keeps layers

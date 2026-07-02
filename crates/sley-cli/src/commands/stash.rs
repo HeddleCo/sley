@@ -132,7 +132,9 @@ fn stash_usage_stdout() {
     );
     println!("   or: git stash drop [-q | --quiet] [<stash>]");
     println!("   or: git stash pop [--index] [-q | --quiet] [<stash>]");
-    println!("   or: git stash apply [--index] [-q | --quiet] [<stash>]");
+    println!(
+        "   or: git stash apply [--index] [-q | --quiet] [--label-ours=<label>] [--label-theirs=<label>] [--label-base=<label>] [<stash>]"
+    );
     println!("   or: git stash branch <branchname> [<stash>]");
     println!(
         "   or: git stash [push] [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]"
@@ -154,7 +156,9 @@ fn stash_usage_stderr() {
     );
     eprintln!("   or: git stash drop [-q | --quiet] [<stash>]");
     eprintln!("   or: git stash pop [--index] [-q | --quiet] [<stash>]");
-    eprintln!("   or: git stash apply [--index] [-q | --quiet] [<stash>]");
+    eprintln!(
+        "   or: git stash apply [--index] [-q | --quiet] [--label-ours=<label>] [--label-theirs=<label>] [--label-base=<label>] [<stash>]"
+    );
     eprintln!("   or: git stash branch <branchname> [<stash>]");
     eprintln!(
         "   or: git stash [push] [-p | --patch] [-S | --staged] [-k | --[no-]keep-index] [-q | --quiet]"
@@ -359,6 +363,28 @@ fn parse_stash_apply_options(args: &[String], command: &str) -> Result<StashAppl
             }
             "--index" => reinstate_index = Some(true),
             "--no-index" => reinstate_index = Some(false),
+            "--label-ours" | "--label-theirs" | "--label-base" if command == "apply" => {
+                if index + 1 >= args.len() {
+                    eprintln!("error: option `{}` requires a value", &arg[2..]);
+                    stash_apply_usage(command);
+                    return Err(GitError::Exit(129));
+                }
+                index += 1;
+            }
+            "--no-label-ours" | "--no-label-theirs" | "--no-label-base" if command == "apply" => {}
+            value
+                if command == "apply"
+                    && (value.starts_with("--label-ours=")
+                        || value.starts_with("--label-theirs=")
+                        || value.starts_with("--label-base=")) => {}
+            value
+                if command == "apply"
+                    && (value.starts_with("--no-label-ours=")
+                        || value.starts_with("--no-label-theirs=")
+                        || value.starts_with("--no-label-base=")) =>
+            {
+                return stash_option_takes_no_value_error(&value[5..value.find('=').unwrap()]);
+            }
             value if value.starts_with("--quiet=") => {
                 return stash_option_takes_no_value_error("quiet");
             }
@@ -432,10 +458,24 @@ fn stash_apply_unknown_switch_error<T>(command: &str, switch: char) -> Result<T>
 }
 
 fn stash_apply_usage(command: &str) {
-    eprintln!("usage: git stash {command} [--index] [-q | --quiet] [<stash>]");
+    if command == "apply" {
+        eprintln!(
+            "usage: git stash {command} [--index] [-q | --quiet] [--label-ours=<label>] [--label-theirs=<label>] [--label-base=<label>] [<stash>]"
+        );
+    } else {
+        eprintln!("usage: git stash {command} [--index] [-q | --quiet] [<stash>]");
+    }
     eprintln!();
     eprintln!("    -q, --[no-]quiet      be quiet, only report errors");
     eprintln!("    --[no-]index          attempt to recreate the index");
+    if command == "apply" {
+        eprintln!("    --[no-]label-ours <label>");
+        eprintln!("                          label for the upstream side in conflict markers");
+        eprintln!("    --[no-]label-theirs <label>");
+        eprintln!("                          label for the stashed side in conflict markers");
+        eprintln!("    --[no-]label-base <label>");
+        eprintln!("                          label for the base in diff3 conflict markers");
+    }
     eprintln!();
 }
 

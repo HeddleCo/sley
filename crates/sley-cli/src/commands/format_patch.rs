@@ -212,6 +212,10 @@ struct FormatPatchOptions {
     suffix: Option<String>,
     /// Use the full 40/64-hex blob ids in `index` lines (`--full-index`).
     full_index: bool,
+    /// Emit applicable `GIT binary patch` bodies for binary files. Unlike most
+    /// diff porcelains, `format-patch` defaults this on so emailed binary
+    /// changes can be applied without access to the source object store.
+    binary: bool,
     /// Abbreviation width for patch `index` lines (`--abbrev=<n>`).
     abbrev: Option<usize>,
     /// Disable rename detection (`--no-renames`); on by default like git diff.
@@ -368,6 +372,7 @@ impl Default for FormatPatchOptions {
             numbered_files: false,
             suffix: None,
             full_index: false,
+            binary: true,
             abbrev: None,
             detect_renames: true,
             detect_copies: false,
@@ -3863,7 +3868,7 @@ fn format_patch_diff_options<'a>(
     abbrev: usize,
 ) -> crate::DiffRenderOptions<'a> {
     crate::DiffRenderOptions {
-        binary: false,
+        binary: options.binary,
         anchors: &[],
         allow_textconv: false,
         db,
@@ -4090,6 +4095,8 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                 }
             }
             "--full-index" => options.full_index = true,
+            "--binary" => options.binary = true,
+            "--no-binary" => options.binary = false,
             "--no-renames" => options.detect_renames = false,
             "-M" | "--find-renames" => options.detect_renames = true,
             value if let Some(rest) = value.strip_prefix("--find-renames=") => {
@@ -4296,9 +4303,8 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             | "--histogram"
             | "--indent-heuristic"
             | "--no-indent-heuristic"
-            | "--binary"
-            | "--no-binary"
             | "--text"
+            | "-m"
             | "-a"
             | "--ita-invisible-in-index" => {}
             // `--attach`/`--inline` wrap each patch in MIME multipart/mixed; the

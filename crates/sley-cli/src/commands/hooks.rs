@@ -586,15 +586,24 @@ fn hook_git_prefix(git_dir: &Path) -> Option<String> {
 }
 
 fn spawn_hook(hook: &HookCommand, options: &HookRun) -> Result<std::process::ExitStatus> {
+    let cwd = options.cwd.clone().or_else(default_hook_cwd);
     let mut command = match hook {
-        HookCommand::Traditional(path) => Command::new(path),
+        HookCommand::Traditional(path) => {
+            let program = cwd
+                .as_ref()
+                .and_then(|cwd| path.strip_prefix(cwd).ok())
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path.clone());
+            Command::new(program)
+        }
         HookCommand::Configured { command, .. } => {
             let mut cmd = Command::new("sh");
             cmd.arg("-c").arg(command);
             cmd
         }
     };
-    if let Some(cwd) = options.cwd.clone().or_else(default_hook_cwd) {
+    if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
     if let Some(git_dir) = &options.git_dir {

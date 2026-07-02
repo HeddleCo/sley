@@ -259,6 +259,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             }
             "--missing=print" => missing_action = RevListMissingAction::Print,
             "--missing=print-info" => missing_action = RevListMissingAction::PrintInfo,
+            "--missing=error" => missing_action = RevListMissingAction::Error,
             "--missing=allow-any" => missing_action = RevListMissingAction::AllowAny,
             "--missing=allow-promisor" => missing_action = RevListMissingAction::AllowPromisor,
             "--boundary" => boundary = true,
@@ -2870,7 +2871,7 @@ fn rev_list_collect_tree_objects(
             .and_modify(|seen_depth| *seen_depth = (*seen_depth).min(depth))
             .or_insert(depth);
     }
-    let object = match walk.db.read_object(tree_oid) {
+    let object = match rev_list_read_object(walk, tree_oid) {
         Ok(object) => object,
         Err(err) => {
             return rev_list_handle_missing_object(
@@ -2920,7 +2921,7 @@ fn rev_list_collect_tree_objects(
                         walk.missing_action,
                         RevListMissingAction::AllowAny | RevListMissingAction::AllowPromisor
                     )) {
-                let object = match walk.db.read_object(&entry.oid) {
+                let object = match rev_list_read_object(walk, &entry.oid) {
                     Ok(object) => object,
                     Err(err) => {
                         rev_list_handle_missing_object(
@@ -2966,6 +2967,17 @@ fn rev_list_collect_tree_objects(
         }
     }
     Ok(())
+}
+
+fn rev_list_read_object(
+    walk: &RevListObjectWalk<'_>,
+    oid: &ObjectId,
+) -> Result<Arc<EncodedObject>> {
+    if matches!(walk.missing_action, RevListMissingAction::Error) {
+        crate::read_object_maybe_prefetch_promisor(walk.db, oid)
+    } else {
+        walk.db.read_object(oid)
+    }
 }
 
 fn rev_list_filter_needs_blob_size(filter: &RevListObjectFilter) -> bool {

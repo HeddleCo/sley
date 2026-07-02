@@ -287,9 +287,26 @@ fn grep_only_matching_match_git() {
     }
     let root = unique_temp_dir("grep-only");
     let repo = build_repo(&root);
+    fs::write(
+        repo.join("mmap.txt"),
+        "foo mmap bar\nfoo_mmap bar mmap\nfoo mmap bar_mmap\n",
+    )
+    .expect("test operation should succeed");
+    git_ok(&repo, &["add", "mmap.txt"]);
+    git_ok(&repo, &["commit", "-qm", "mmap"]);
 
     assert_same(&repo, &["grep", "-o", "hello", "--", "a.txt"]);
     assert_same(&repo, &["grep", "-o", "-n", "hello", "--", "a.txt"]);
+    assert_same(
+        &repo,
+        &["grep", "--column", "-n", "-o", "mmap", "--", "mmap.txt"],
+    );
+    assert_same(
+        &repo,
+        &[
+            "grep", "--column", "-n", "-o", "mmap", "HEAD", "--", "mmap.txt",
+        ],
+    );
     assert_same(&repo, &["grep", "-o", r"[0-9]\{3\}", "--", "nums.txt"]);
     assert_same(&repo, &["grep", "-o", "-E", "[0-9]+", "--", "nums.txt"]);
 

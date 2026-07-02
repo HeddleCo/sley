@@ -212,7 +212,7 @@ fn bisect_start_with_revs_matches_git() {
 }
 
 /// A full bisection run (start, then alternating good/bad) must agree at every
-/// step, including the final "<oid> is the first bad commit" announcement and
+/// step, including the final "<oid> is the first 'bad' commit" announcement and
 /// the `git show`-style commit summary that follows it.
 #[test]
 fn bisect_full_run_converges_like_git() {
@@ -235,7 +235,7 @@ fn bisect_full_run_converges_like_git() {
     pair.assert_head_matches();
     let final_out = pair.assert_same(&["bisect", "good"]);
     assert!(
-        final_out.contains("is the first bad commit"),
+        final_out.contains("is the first 'bad' commit"),
         "expected convergence message, got: {final_out:?}",
     );
     pair.assert_state_matches("BISECT_LOG");
@@ -256,12 +256,15 @@ fn bisect_log_and_status_match_git() {
 
     // Starting with no revs leaves the bisection waiting for both endpoints.
     let waiting = pair.assert_same(&["bisect", "start"]);
-    assert_eq!(waiting, "status: waiting for both good and bad commits\n");
+    assert_eq!(
+        waiting,
+        "status: waiting for both 'good' and 'bad' commits\n"
+    );
     // Marking the tip bad leaves it waiting for a good commit.
     let waiting_good = pair.assert_same(&["bisect", "bad"]);
     assert_eq!(
         waiting_good,
-        "status: waiting for good commit(s), bad commit known\n",
+        "status: waiting for 'good' commit(s), 'bad' commit known\n",
     );
     // Marking a good commit kicks off the first real step.
     pair.assert_same(&["bisect", "good", &good]);

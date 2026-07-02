@@ -273,6 +273,23 @@ pub(crate) fn write_combined_name_status(
     Ok(())
 }
 
+pub(crate) fn combined_path_matches_find_objects(
+    path: &CombinedPath,
+    targets: &[ObjectId],
+) -> bool {
+    if targets.is_empty() {
+        return true;
+    }
+    let first_parent = path.parents.first();
+    targets.iter().any(|target| {
+        let old_has = first_parent
+            .and_then(|parent| parent.oid.as_ref())
+            .is_some_and(|oid| oid == target);
+        let new_has = path.result_oid.as_ref().is_some_and(|oid| oid == target);
+        old_has != new_has
+    })
+}
+
 fn combined_raw_oid(oid: Option<&ObjectId>, ctx: &CombinedRenderCtx<'_>) -> String {
     let mut hex = match oid {
         Some(oid) => {

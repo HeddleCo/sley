@@ -1319,14 +1319,22 @@ fn prepare_merge_commit_message_for_commit(
     } else {
         message
     };
+    let editmsg = git_dir.join("COMMIT_EDITMSG");
     if !options.no_verify {
         commands::hooks::run_hook("pre-merge-commit", commands::hooks::HookRun::default())?;
-        let editmsg = git_dir.join("COMMIT_EDITMSG");
-        fs::write(&editmsg, &message)?;
+    }
+    fs::write(&editmsg, &message)?;
+    commands::commit::run_prepare_commit_msg_hook(
+        &editmsg,
+        commands::commit::PrepareCommitMsgSource::Merge,
+        Vec::new(),
+        options.edit != Some(true),
+    )?;
+    if !options.no_verify {
         let editmsg_arg = editmsg.to_string_lossy().into_owned();
         commands::hooks::run_hook_l("commit-msg", &[editmsg_arg.as_str()])?;
-        message = fs::read(&editmsg)?;
     }
+    message = fs::read(&editmsg)?;
     Ok(message)
 }
 
@@ -3537,16 +3545,33 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         index.write(format)?,
     )?;
 
-    // Materialize merged/conflicted content into the worktree.
+    // Materialize merged/conflicted content into the worktree. Conflict entries
+    // below a populated HEAD gitlink are superproject index state only: writing
+    // them would dirty the submodule checkout itself.
+    let populated_ours_gitlink_prefixes =
+        populated_gitlink_directory_prefixes(&worktree_root, &ours_map)?;
     for (path, result) in &results {
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
                     let content = merge_worktree_content(&db, *mode, oid)?;
+                    if materialize_gitlink_child_conflict_file(
+                        &worktree_root,
+                        path,
+                        &populated_ours_gitlink_prefixes,
+                        &theirs_label,
+                        &content,
+                        *mode,
+                    )? {
+                        continue;
+                    }
                     merge_write_worktree_file(&worktree_root, path, &content, *mode)?;
                 }
             }
             MergePathResult::Resolved(None) => {
+                if path_is_inside_populated_gitlink(path, &populated_ours_gitlink_prefixes) {
+                    continue;
+                }
                 // git only removes a worktree file when its content is the tracked
                 // (ours/HEAD) version; an untracked file or one with divergent
                 // content at this path is left alone (the rename/delete "Gollum's
@@ -3558,6 +3583,16 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             }
             MergePathResult::Conflict { worktree, .. } => match worktree {
                 Some((mode, content)) => {
+                    if materialize_gitlink_child_conflict_file(
+                        &worktree_root,
+                        path,
+                        &populated_ours_gitlink_prefixes,
+                        &theirs_label,
+                        content,
+                        *mode,
+                    )? {
+                        continue;
+                    }
                     merge_write_worktree_file(&worktree_root, path, content, *mode)?
                 }
                 None if matches!(
@@ -3568,6 +3603,9 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                     }
                 ) => {}
                 None => {
+                    if path_is_inside_populated_gitlink(path, &populated_ours_gitlink_prefixes) {
+                        continue;
+                    }
                     if worktree_file_matches_ours(&db, &worktree_root, path, ours_map.get(path))? {
                         merge_remove_worktree_file(&worktree_root, path)?;
                     }
@@ -3927,21 +3965,46 @@ fn apply_merge_recursive_worktree(
     results: &MergePathResults,
     ours_map: &MergeTreeMap,
 ) -> Result<()> {
+    let populated_ours_gitlink_prefixes =
+        populated_gitlink_directory_prefixes(worktree_root, ours_map)?;
     for (path, result) in results {
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
                     let content = merge_worktree_content(db, *mode, oid)?;
+                    if materialize_gitlink_child_conflict_file(
+                        worktree_root,
+                        path,
+                        &populated_ours_gitlink_prefixes,
+                        "theirs",
+                        &content,
+                        *mode,
+                    )? {
+                        continue;
+                    }
                     merge_write_worktree_file(worktree_root, path, &content, *mode)?;
                 }
             }
             MergePathResult::Resolved(None) => {
+                if path_is_inside_populated_gitlink(path, &populated_ours_gitlink_prefixes) {
+                    continue;
+                }
                 if worktree_file_matches_ours(db, worktree_root, path, ours_map.get(path))? {
                     merge_remove_worktree_file(worktree_root, path)?;
                 }
             }
             MergePathResult::Conflict { worktree, .. } => match worktree {
                 Some((mode, content)) => {
+                    if materialize_gitlink_child_conflict_file(
+                        worktree_root,
+                        path,
+                        &populated_ours_gitlink_prefixes,
+                        "theirs",
+                        content,
+                        *mode,
+                    )? {
+                        continue;
+                    }
                     merge_write_worktree_file(worktree_root, path, content, *mode)?;
                 }
                 None if matches!(
@@ -3952,6 +4015,9 @@ fn apply_merge_recursive_worktree(
                     }
                 ) => {}
                 None => {
+                    if path_is_inside_populated_gitlink(path, &populated_ours_gitlink_prefixes) {
+                        continue;
+                    }
                     if worktree_file_matches_ours(db, worktree_root, path, ours_map.get(path))? {
                         merge_remove_worktree_file(worktree_root, path)?;
                     }
@@ -4453,23 +4519,14 @@ fn verify_merge_uptodate(
         }
     }
 
+    let conflicted_gitlinks = conflicted_gitlink_paths(results, ours_map);
     let target_map = merge_results_entry_map(results);
-    verify_no_populated_gitlink_directory_overwrite(worktree_root, &target_map, ours_map)?;
-    let conflicted_gitlinks: BTreeSet<Vec<u8>> = results
-        .iter()
-        .filter_map(|(path, result)| match result {
-            MergePathResult::Conflict {
-                base, ours, theirs, ..
-            } if base
-                .or(*ours)
-                .or(*theirs)
-                .is_some_and(|(mode, _)| sley_index::is_gitlink(mode)) =>
-            {
-                Some(path.clone())
-            }
-            _ => None,
-        })
-        .collect();
+    verify_no_populated_gitlink_directory_overwrite(
+        worktree_root,
+        &target_map,
+        ours_map,
+        &conflicted_gitlinks,
+    )?;
 
     let status = crate::collect_short_status(worktree_root, git_dir, format)?;
     for entry in &status {
@@ -4530,6 +4587,42 @@ fn verify_merge_uptodate(
     Ok(())
 }
 
+fn conflicted_gitlink_paths(
+    results: &MergePathResults,
+    ours_map: &MergeTreeMap,
+) -> BTreeSet<Vec<u8>> {
+    let mut paths = BTreeSet::new();
+    for (path, result) in results {
+        let MergePathResult::Conflict {
+            base,
+            ours,
+            theirs,
+            kind,
+            ..
+        } = result
+        else {
+            continue;
+        };
+        if [base, ours, theirs]
+            .iter()
+            .any(|entry| entry.is_some_and(|(mode, _)| sley_index::is_gitlink(mode)))
+        {
+            paths.insert(path.clone());
+        }
+        if let Some(
+            sley_diff_merge::MergeConflictKind::FileDirectory { original_path, .. }
+            | sley_diff_merge::MergeConflictKind::DistinctTypes { original_path, .. },
+        ) = kind
+            && ours_map
+                .get(original_path)
+                .is_some_and(|(mode, _)| sley_index::is_gitlink(*mode))
+        {
+            paths.insert(original_path.clone());
+        }
+    }
+    paths
+}
+
 pub(crate) fn verify_fast_forward_untracked_safe(
     worktree_root: &Path,
     git_dir: &Path,
@@ -4540,7 +4633,12 @@ pub(crate) fn verify_fast_forward_untracked_safe(
 ) -> Result<()> {
     let head_map = stash_tree_entry_map(db, format, head_tree)?;
     let target_map = stash_tree_entry_map(db, format, target_tree)?;
-    verify_no_populated_gitlink_directory_overwrite(worktree_root, &target_map, &head_map)?;
+    verify_no_populated_gitlink_directory_overwrite(
+        worktree_root,
+        &target_map,
+        &head_map,
+        &BTreeSet::new(),
+    )?;
     let status = crate::collect_short_status(worktree_root, git_dir, format)?;
     let untracked: BTreeSet<Vec<u8>> = status
         .iter()
@@ -4609,13 +4707,109 @@ fn path_with_trailing_slash(path: &[u8]) -> Vec<u8> {
     prefix
 }
 
+fn populated_gitlink_directory_prefixes(
+    worktree_root: &Path,
+    map: &MergeTreeMap,
+) -> Result<BTreeSet<Vec<u8>>> {
+    let mut prefixes = BTreeSet::new();
+    for (path, (mode, _)) in map {
+        if !sley_index::is_gitlink(*mode) {
+            continue;
+        }
+        let rel = std::str::from_utf8(path)
+            .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
+        if sley_diff_merge::gitlink_git_dir(&worktree_root.join(rel)).is_some() {
+            prefixes.insert(path_with_trailing_slash(path));
+        }
+    }
+    Ok(prefixes)
+}
+
+fn path_is_inside_populated_gitlink(path: &[u8], prefixes: &BTreeSet<Vec<u8>>) -> bool {
+    prefixes.iter().any(|prefix| path.starts_with(prefix))
+}
+
+fn populated_gitlink_prefix_for_path<'a>(
+    path: &[u8],
+    prefixes: &'a BTreeSet<Vec<u8>>,
+) -> Option<&'a [u8]> {
+    prefixes
+        .iter()
+        .find(|prefix| path.starts_with(prefix.as_slice()))
+        .map(Vec::as_slice)
+}
+
+fn materialize_gitlink_child_conflict_file(
+    worktree_root: &Path,
+    path: &[u8],
+    prefixes: &BTreeSet<Vec<u8>>,
+    label: &str,
+    content: &[u8],
+    mode: u32,
+) -> Result<bool> {
+    let Some(prefix) = populated_gitlink_prefix_for_path(path, prefixes) else {
+        return Ok(false);
+    };
+    if merge_worktree_path_exists(worktree_root, path) || sley_index::is_gitlink(mode) {
+        return Ok(true);
+    }
+    let alternate = gitlink_child_conflict_path(worktree_root, prefix, path, label);
+    merge_write_worktree_file(worktree_root, &alternate, content, mode)?;
+    Ok(true)
+}
+
+fn gitlink_child_conflict_path(
+    worktree_root: &Path,
+    prefix: &[u8],
+    path: &[u8],
+    label: &str,
+) -> Vec<u8> {
+    let gitlink_path = &prefix[..prefix.len().saturating_sub(1)];
+    let child_path = &path[prefix.len()..];
+    let mut base = gitlink_path.to_vec();
+    base.push(b'~');
+    base.extend_from_slice(flatten_merge_label(label).as_bytes());
+    let mut candidate = append_gitlink_child_path(&base, child_path);
+    if !merge_worktree_path_exists(worktree_root, &candidate) {
+        return candidate;
+    }
+    let mut suffix = 0usize;
+    loop {
+        let mut suffixed = base.clone();
+        suffixed.push(b'_');
+        suffixed.extend_from_slice(suffix.to_string().as_bytes());
+        candidate = append_gitlink_child_path(&suffixed, child_path);
+        if !merge_worktree_path_exists(worktree_root, &candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn append_gitlink_child_path(base: &[u8], child: &[u8]) -> Vec<u8> {
+    let mut path = base.to_vec();
+    if !child.is_empty() {
+        path.push(b'/');
+        path.extend_from_slice(child);
+    }
+    path
+}
+
+fn flatten_merge_label(label: &str) -> String {
+    label.replace('/', "_")
+}
+
 fn verify_no_populated_gitlink_directory_overwrite(
     worktree_root: &Path,
     target_map: &MergeTreeMap,
     head_map: &MergeTreeMap,
+    conflicted_gitlinks: &BTreeSet<Vec<u8>>,
 ) -> Result<()> {
     for (path, (mode, _)) in head_map {
         if !sley_index::is_gitlink(*mode) {
+            continue;
+        }
+        if conflicted_gitlinks.contains(path) && populated_gitlink_exists(worktree_root, path)? {
             continue;
         }
         let prefix = path_with_trailing_slash(path);
@@ -4638,6 +4832,12 @@ fn verify_no_populated_gitlink_directory_overwrite(
         return Err(GitError::Exit(2));
     }
     Ok(())
+}
+
+fn populated_gitlink_exists(worktree_root: &Path, path: &[u8]) -> Result<bool> {
+    let rel = std::str::from_utf8(path)
+        .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
+    Ok(sley_diff_merge::gitlink_git_dir(&worktree_root.join(rel)).is_some())
 }
 
 fn merge_worktree_path_exists(worktree_root: &Path, path: &[u8]) -> bool {
@@ -4729,6 +4929,8 @@ fn reset_merge_to_head(git_dir: &Path, worktree_root: &Path, format: ObjectForma
     let head_oid = resolve_revision(git_dir, format, "HEAD")?;
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
     let head_map = stash_tree_entry_map(&db, format, &head_tree)?;
+    let populated_head_gitlink_prefixes =
+        populated_gitlink_directory_prefixes(worktree_root, &head_map)?;
 
     // The set of paths the merge touched relative to HEAD: anything in the
     // current index that is not a clean stage-0 match for HEAD's entry.
@@ -4736,6 +4938,9 @@ fn reset_merge_to_head(git_dir: &Path, worktree_root: &Path, format: ObjectForma
     let mut touched: BTreeSet<Vec<u8>> = BTreeSet::new();
     for entry in &index.entries {
         let path = entry.path.to_vec();
+        if path_is_inside_populated_gitlink(&path, &populated_head_gitlink_prefixes) {
+            continue;
+        }
         let stage = index_entry_stage(entry);
         if stage > 0 {
             touched.insert(path);
@@ -5091,14 +5296,20 @@ fn apply_or_save_merge_autostash(git_dir: &Path, format: ObjectFormat, attempt_a
     if !stored {
         eprintln!("error: cannot store {oid_text}");
     } else if attempt_apply {
-        eprintln!("Applying autostash resulted in conflicts.");
-        eprintln!("Your changes are safe in the stash.");
-        eprintln!("You can run \"git stash pop\" or \"git stash drop\" at any time.");
+        print_merge_autostash_conflict_advice();
     } else {
         eprintln!("Autostash exists; creating a new stash entry.");
         eprintln!("Your changes are safe in the stash.");
         eprintln!("You can run \"git stash pop\" or \"git stash drop\" at any time.");
     }
+}
+
+fn print_merge_autostash_conflict_advice() {
+    eprintln!("Your local changes are stashed, however applying them");
+    eprintln!("resulted in conflicts.  You can either resolve the conflicts");
+    eprintln!("and then discard the stash with \"git stash drop\", or, if you");
+    eprintln!("do not want to resolve them now, run \"git reset --hard\" and");
+    eprintln!("apply the local changes later by running \"git stash pop\".");
 }
 
 /// git's `write_merge_state` MERGE_MODE leg: write `.git/MERGE_MODE` alongside

@@ -1645,13 +1645,21 @@ fn do_pick_commit(
     }
 
     // Optional message edit.
-    if should_edit(ctx.action, opts) {
-        message = edit_message(ctx, &message).map_err(|err| {
-            // Editor failure cancels the commit but keeps the state files.
-            eprintln!("error: {err}");
+    let edit = should_edit(ctx.action, opts);
+    let prepare_source = if edit {
+        commands::commit::PrepareCommitMsgSource::Merge
+    } else {
+        commands::commit::PrepareCommitMsgSource::Message
+    };
+    message = prepare_replay_commit_message(ctx, &message, prepare_source, edit, !edit).map_err(
+        |err| {
+            // Editor / hook failure cancels the commit but keeps the state files.
+            if !matches!(err, GitError::Exit(_)) {
+                eprintln!("error: {err}");
+            }
             ReplayHalt::Code(1)
-        })?;
-    }
+        },
+    )?;
 
     // Create the commit and advance HEAD.
     let author = match action {
@@ -1746,28 +1754,43 @@ fn should_edit(action: ReplayAction, opts: &ReplayOpts) -> bool {
     }
 }
 
-/// Launch the configured editor over `.git/COMMIT_EDITMSG` seeded with
-/// `message`; the edited result is cleaned of comment lines.
-fn edit_message(ctx: &ReplayCtx, message: &[u8]) -> Result<Vec<u8>> {
+/// Run prepare-commit-msg over `.git/COMMIT_EDITMSG`, optionally launch the
+/// editor, and return the cleaned message.
+fn prepare_replay_commit_message(
+    ctx: &ReplayCtx,
+    message: &[u8],
+    source: commands::commit::PrepareCommitMsgSource<'_>,
+    edit: bool,
+    set_no_editor_env: bool,
+) -> Result<Vec<u8>> {
     let path = ctx.git_dir.join("COMMIT_EDITMSG");
-    let comment = comment_char(&ctx.git_dir);
-    let mut template = message.to_vec();
-    if !template.ends_with(b"\n") {
+    if edit {
+        let comment = comment_char(&ctx.git_dir);
+        let mut template = message.to_vec();
+        if !template.ends_with(b"\n") {
+            template.push(b'\n');
+        }
+        // The editor template carries the commented help block git appends.
         template.push(b'\n');
+        let c = comment as char;
+        template.extend_from_slice(
+            format!(
+                "{c} Please enter the commit message for your changes. Lines starting\n{c} with '{c}' will be ignored, and an empty message aborts the commit.\n"
+            )
+            .as_bytes(),
+        );
+        fs::write(&path, template)?;
+    } else {
+        fs::write(&path, message)?;
     }
-    // The editor template carries the commented help block git appends.
-    template.push(b'\n');
-    let c = comment as char;
-    template.extend_from_slice(
-        format!(
-            "{c} Please enter the commit message for your changes. Lines starting\n{c} with '{c}' will be ignored, and an empty message aborts the commit.\n"
-        )
-        .as_bytes(),
-    );
-    fs::write(&path, template)?;
-    launch_editor(&ctx.git_dir, &path)?;
+    commands::commit::run_prepare_commit_msg_hook(&path, source, Vec::new(), set_no_editor_env)?;
+    if edit {
+        launch_editor(&ctx.git_dir, &path)?;
+        let path_arg = path.to_string_lossy().into_owned();
+        commands::hooks::run_hook_l("commit-msg", &[path_arg.as_str()])?;
+    }
     let edited = fs::read(&path)?;
-    Ok(strip_comment_lines(&edited, comment))
+    Ok(strip_comment_lines(&edited, comment_char(&ctx.git_dir)))
 }
 
 pub(crate) fn launch_editor(git_dir: &Path, path: &Path) -> Result<()> {
@@ -2502,12 +2525,13 @@ fn continue_single_pick(ctx: &ReplayCtx, opts: &ReplayOpts) -> Result<()> {
     let raw = fs::read(ctx.git_dir.join("MERGE_MSG")).unwrap_or_default();
     let mut message = strip_comment_lines(&raw, comment_char(&ctx.git_dir));
     let edit = opts.edit == Some(true);
-    if edit {
-        let path = ctx.git_dir.join("COMMIT_EDITMSG");
-        fs::write(&path, &message)?;
-        launch_editor(&ctx.git_dir, &path)?;
-        message = strip_comment_lines(&fs::read(&path)?, comment_char(&ctx.git_dir));
-    }
+    message = prepare_replay_commit_message(
+        ctx,
+        &message,
+        commands::commit::PrepareCommitMsgSource::Merge,
+        edit,
+        !edit,
+    )?;
     // Author: the picked commit's author for cherry-picks; env for reverts.
     let target_encoding = commit_encoding_config(&ctx.git_dir);
     let author = if cph.exists() {

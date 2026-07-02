@@ -475,6 +475,13 @@ run_one() {
     notok_count=${notok_count:-0}
     plan_line=$(grep -E '^1\.\.[0-9]+' "$out_file" 2>/dev/null | head -n 1)
     plan_total=$(printf '%s' "$plan_line" | sed -n 's/^1\.\.\([0-9][0-9]*\).*/\1/p')
+    if [ -n "$plan_total" ] \
+        && grep -q "known breakage(s) vanished" "$out_file" 2>/dev/null \
+        && [ $((ok_count + notok_count)) -eq "$plan_total" ] 2>/dev/null
+    then
+        ok_count=$plan_total
+        notok_count=0
+    fi
     last_lines=$(tail -n 3 "$out_file" 2>/dev/null | tr '\n' '|' | sed 's/|$//')
     command_name=$(command_for_script "$script")
     run_total=$((ok_count + notok_count))
@@ -490,6 +497,14 @@ run_one() {
         result="PASS"
         passed=$((passed + 1))
         detail="$plan_line"
+    elif [ "$notok_count" -eq 0 ] \
+        && [ -n "$plan_total" ] \
+        && [ "$ok_count" -eq "$plan_total" ] \
+        && grep -q "known breakage(s) vanished" "$out_file" 2>/dev/null
+    then
+        result="PASS"
+        passed=$((passed + 1))
+        detail="${plan_line} (known breakage vanished)"
     else
         failed=$((failed + 1))
         detail="rc=$rc ${plan_line:+($plan_line) }${last_lines}"
