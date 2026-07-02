@@ -292,7 +292,14 @@ impl GitConfig {
         context: &ConfigIncludeContext,
     ) -> Result<GitConfig> {
         let mut resolved = GitConfig::default();
-        splice_includes(self, base_dir, context, 0, false, &mut resolved.sections)?;
+        splice_includes(
+            self,
+            Some(base_dir),
+            context,
+            0,
+            false,
+            &mut resolved.sections,
+        )?;
         Ok(resolved)
     }
 }
@@ -358,6 +365,20 @@ impl ConfigIncludeContext {
     }
 }
 
+/// Absolutize a git directory for `includeIf.gitdir` without resolving
+/// symlinks. Git compares both this spelling and the realpath, so callers
+/// should preserve `$GIT_DIR`/discovery text here and let the matcher add the
+/// canonical alternate.
+pub fn git_dir_for_include_context(git_dir: &Path) -> PathBuf {
+    if git_dir.is_absolute() {
+        git_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(git_dir))
+            .unwrap_or_else(|_| git_dir.to_path_buf())
+    }
+}
+
 /// Read a config file from disk and resolve its `include`/`includeIf` directives.
 ///
 /// Missing files (including missing *included* files) are treated as empty, which
@@ -391,12 +412,10 @@ pub fn load_config_with_includes(path: &Path, context: &ConfigIncludeContext) ->
 /// `git config` does.
 pub fn read_repo_config(git_dir: &Path, parameters_env: Option<&str>) -> Result<GitConfig> {
     let path = git_dir.join("config");
-    // `includeIf "gitdir:"` matches against the absolute git directory; canonicalise
-    // so a relative `git_dir` still resolves includes correctly.
-    let git_dir_abs = match fs::canonicalize(git_dir) {
-        Ok(path) => path,
-        Err(_) => git_dir.to_path_buf(),
-    };
+    // `includeIf "gitdir:"` matches against the absolute git directory. Keep
+    // the textual spelling for symlink matching; the matcher also checks the
+    // realpath.
+    let git_dir_abs = git_dir_for_include_context(git_dir);
     let context = ConfigIncludeContext::new(Some(git_dir_abs), repo_current_branch_name(git_dir));
     let mut config = load_config_with_includes(&path, &context)?;
     if let Ok(parameters) = injected_config_parameters(parameters_env) {
@@ -447,7 +466,14 @@ fn load_config_file(
         Some(parent) => parent,
         None => Path::new("."),
     };
-    splice_includes(&parsed, base_dir, context, depth, forbid_remote_url, out)
+    splice_includes(
+        &parsed,
+        Some(base_dir),
+        context,
+        depth,
+        forbid_remote_url,
+        out,
+    )
 }
 
 fn annotate_config_parse_path(err: GitError, path: &Path) -> GitError {
@@ -479,7 +505,7 @@ fn annotate_config_parse_path(err: GitError, path: &Path) -> GitError {
 /// ordinary sections from this file that appear before each `includeIf`.
 fn splice_includes(
     parsed: &GitConfig,
-    base_dir: &Path,
+    base_dir: Option<&Path>,
     context: &ConfigIncludeContext,
     depth: usize,
     forbid_remote_url: bool,
@@ -487,7 +513,7 @@ fn splice_includes(
 ) -> Result<()> {
     if depth >= CONFIG_MAX_INCLUDE_DEPTH {
         return Err(GitError::InvalidFormat(format!(
-            "exceeded maximum config include depth of {CONFIG_MAX_INCLUDE_DEPTH}"
+            "exceeded maximum include depth of {CONFIG_MAX_INCLUDE_DEPTH}"
         )));
     }
     if forbid_remote_url {
@@ -540,7 +566,7 @@ fn splice_includes(
 /// For an include section, load every `path = <p>` entry in order.
 fn expand_include_paths(
     section: &ConfigSection,
-    base_dir: &Path,
+    base_dir: Option<&Path>,
     context: &ConfigIncludeContext,
     depth: usize,
     forbid_remote_url: bool,
@@ -556,7 +582,7 @@ fn expand_include_paths(
         if raw.is_empty() {
             continue;
         }
-        let resolved = resolve_include_path(raw, base_dir);
+        let resolved = resolve_include_path(raw, base_dir)?;
         load_config_file(&resolved, context, depth + 1, forbid_remote_url, out)?;
     }
     Ok(())
@@ -589,20 +615,26 @@ fn include_section_kind(section: &ConfigSection) -> Option<IncludeKind<'_>> {
 
 /// Resolve an include path string against `~`, the including file's directory,
 /// or treat it as absolute.
-fn resolve_include_path(raw: &str, base_dir: &Path) -> PathBuf {
+fn resolve_include_path(raw: &str, base_dir: Option<&Path>) -> Result<PathBuf> {
     if let Some(rest) = raw.strip_prefix("~/") {
         if let Some(home) = home_dir() {
-            return PathBuf::from(home).join(rest);
+            return Ok(PathBuf::from(home).join(rest));
         }
         // No usable HOME: fall back to a relative interpretation so the lookup
         // simply misses rather than panicking.
-        return base_dir.join(rest);
+        return base_dir.map(|base_dir| base_dir.join(rest)).ok_or_else(|| {
+            GitError::InvalidFormat("relative config includes must come from files".into())
+        });
     }
     let candidate = Path::new(raw);
     if candidate.is_absolute() {
-        candidate.to_path_buf()
+        Ok(candidate.to_path_buf())
     } else {
-        base_dir.join(candidate)
+        base_dir
+            .map(|base_dir| base_dir.join(candidate))
+            .ok_or_else(|| {
+                GitError::InvalidFormat("relative config includes must come from files".into())
+            })
     }
 }
 
@@ -617,7 +649,7 @@ fn resolve_include_path(raw: &str, base_dir: &Path) -> PathBuf {
 /// later in the same file.
 fn include_condition_matches(
     condition: &str,
-    base_dir: &Path,
+    base_dir: Option<&Path>,
     context: &ConfigIncludeContext,
     loaded: &[ConfigSection],
     current_file: &GitConfig,
@@ -702,14 +734,13 @@ fn reject_remote_urls_in_config(config: &GitConfig) -> Result<()> {
 /// Match a `gitdir:`/`gitdir/i:` pattern against the absolute git directory.
 fn gitdir_condition_matches(
     pattern: &str,
-    base_dir: &Path,
+    base_dir: Option<&Path>,
     context: &ConfigIncludeContext,
     case_insensitive: bool,
 ) -> bool {
     let Some(git_dir) = &context.git_dir else {
         return false;
     };
-    let target = normalize_path_for_match(git_dir);
 
     // Expand the pattern's own prefixes, then normalise separators.
     let expanded = expand_gitdir_pattern(pattern, base_dir);
@@ -720,11 +751,9 @@ fn gitdir_condition_matches(
     if pattern.ends_with('/') {
         pattern.push_str("**");
     }
-    // A pattern that does not contain a `/` (after expansion) is anchored to the
-    // path tail in git; for our supported prefixes the pattern is always rooted,
-    // so no extra handling is required here.
-
-    glob_match(&pattern, &target, case_insensitive)
+    gitdir_match_targets(git_dir)
+        .into_iter()
+        .any(|target| glob_match(&pattern, &target, case_insensitive))
 }
 
 // ---------------------------------------------------------------------------
@@ -926,6 +955,34 @@ impl ConfigStack {
         }
     }
 
+    /// Append the command-line/environment injection layer and resolve any
+    /// include directives it contains. Command-line entries have no file base,
+    /// so relative include paths fail just as they do in git.
+    pub fn push_parameters_with_includes(
+        &mut self,
+        parameters: &[ConfigParameter],
+        context: &ConfigIncludeContext,
+    ) -> Result<()> {
+        let parsed = GitConfig {
+            preamble: Vec::new(),
+            suffix: Vec::new(),
+            sections: injected_config_sections(parameters),
+        };
+        emit_parsed_config(
+            &parsed,
+            &ConfigOrigin::command_line(),
+            &EmitConfigOptions {
+                scope: ConfigScope::Command,
+                context,
+                depth: 0,
+                forbid_remote_url: false,
+                respect_includes: true,
+                included_from: None,
+            },
+            &mut self.entries,
+        )
+    }
+
     /// The last (highest-precedence) entry for the key, including value-less
     /// boolean-true entries.
     pub fn get(
@@ -1038,7 +1095,7 @@ fn emit_parsed_config(
     let respect_includes = *respect_includes;
     if depth >= CONFIG_MAX_INCLUDE_DEPTH {
         return Err(GitError::InvalidFormat(format!(
-            "exceeded maximum config include depth of {CONFIG_MAX_INCLUDE_DEPTH}"
+            "exceeded maximum include depth of {CONFIG_MAX_INCLUDE_DEPTH}"
         )));
     }
     if forbid_remote_url {
@@ -1185,7 +1242,6 @@ fn stack_include_condition_matches(
     emitted: &[ConfigStackEntry],
     current_file: &GitConfig,
 ) -> bool {
-    let base_dir = base_dir.unwrap_or_else(|| Path::new("."));
     if let Some(pattern) = condition.strip_prefix("gitdir:") {
         return gitdir_condition_matches(pattern, base_dir, context, false);
     }
@@ -1238,8 +1294,8 @@ fn expand_user_path_with_home(path: &str, home: Option<&str>) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Expand the `~/`, `./`, and bare-`**` leading forms of a `gitdir` pattern.
-fn expand_gitdir_pattern(pattern: &str, base_dir: &Path) -> String {
+/// Expand the `~/`, `./`, and unanchored leading forms of a `gitdir` pattern.
+fn expand_gitdir_pattern(pattern: &str, base_dir: Option<&Path>) -> String {
     if let Some(rest) = pattern.strip_prefix("~/") {
         if let Some(home) = home_dir() {
             return format!("{home}/{rest}");
@@ -1247,17 +1303,36 @@ fn expand_gitdir_pattern(pattern: &str, base_dir: &Path) -> String {
         return pattern.to_string();
     }
     if let Some(rest) = pattern.strip_prefix("./") {
-        let base = normalize_path_for_match(base_dir);
-        let base = base.trim_end_matches('/');
-        return format!("{base}/{rest}");
+        if let Some(base_dir) = base_dir {
+            let base = normalize_path_for_match(base_dir);
+            let base = base.trim_end_matches('/');
+            return format!("{base}/{rest}");
+        }
+        return pattern.to_string();
     }
-    // A pattern beginning with `**` matches anywhere; leave it as-is.
-    pattern.to_string()
+    if Path::new(pattern).is_absolute() || pattern.starts_with("**/") {
+        pattern.to_string()
+    } else {
+        format!("**/{pattern}")
+    }
 }
 
 /// Normalise a path to a forward-slash string for glob comparison.
 fn normalize_path_for_match(path: &Path) -> String {
     normalize_separators(&path.to_string_lossy())
+}
+
+/// Git matches both the textual `$GIT_DIR` path and its realpath so symlinked
+/// worktrees can use either spelling in `includeIf.gitdir`.
+fn gitdir_match_targets(git_dir: &Path) -> Vec<String> {
+    let mut targets = vec![normalize_path_for_match(git_dir)];
+    if let Ok(realpath) = fs::canonicalize(git_dir) {
+        let realpath = normalize_path_for_match(&realpath);
+        if !targets.iter().any(|target| target == &realpath) {
+            targets.push(realpath);
+        }
+    }
+    targets
 }
 
 /// Convert backslashes to forward slashes so matching is separator-agnostic.
@@ -2493,14 +2568,14 @@ pub fn append_injected_config_sections_with_includes(
     config: &mut GitConfig,
     parameters: &[ConfigParameter],
     context: &ConfigIncludeContext,
-    base_dir: &Path,
+    _base_dir: &Path,
 ) -> Result<()> {
     let injected = GitConfig {
         preamble: Vec::new(),
         suffix: Vec::new(),
         sections: injected_config_sections(parameters),
     };
-    splice_includes(&injected, base_dir, context, 0, false, &mut config.sections)
+    splice_includes(&injected, None, context, 0, false, &mut config.sections)
 }
 
 /// Quote a string as a single shell word, exactly as git's `sq_quote_buf`:
@@ -3632,6 +3707,23 @@ mod tests {
     }
 
     #[test]
+    fn config_include_if_gitdir_unanchored_matches_path_tail() {
+        let dir = unique_include_dir("inc-gitdir-unanchored");
+        let work = dir.join("foo");
+        fs::create_dir_all(&work).expect("test operation should succeed");
+        let main = dir.join("config");
+        fs::write(&main, "[includeIf \"gitdir:foo/\"]\n\tpath = matched.cfg\n")
+            .expect("test operation should succeed");
+        fs::write(dir.join("matched.cfg"), "[user]\n\tname = unanchored\n")
+            .expect("test operation should succeed");
+
+        let ctx = ConfigIncludeContext::new(Some(work.join(".git")), None);
+        let config = load_config_with_includes(&main, &ctx).expect("test operation should succeed");
+        assert_eq!(config.get("user", None, "name"), Some("unanchored"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn config_include_if_gitdir_case_insensitive() {
         let dir = unique_include_dir("inc-gitdir-i");
         let main = dir.join("config");
@@ -3671,6 +3763,51 @@ mod tests {
         let config = load_config_with_includes(&main, &off).expect("test operation should succeed");
         assert_eq!(config.get("user", None, "name"), None);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn command_line_include_absolute_paths_are_spliced() {
+        let dir = unique_include_dir("inc-cmdline-abs");
+        let include = dir.join("cmd.cfg");
+        fs::write(&include, "[user]\n\tname = command\n").expect("test operation should succeed");
+        let params = vec![ConfigParameter {
+            canonical_key: "include.path".into(),
+            value: Some(include.display().to_string()),
+        }];
+        let mut stack = ConfigStack::new();
+
+        stack
+            .push_parameters_with_includes(&params, &ConfigIncludeContext::default())
+            .expect("test operation should succeed");
+
+        assert!(stack.get("include", None, "path").is_some());
+        assert_eq!(
+            stack
+                .get("user", None, "name")
+                .and_then(|entry| entry.value.as_deref()),
+            Some("command")
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn command_line_include_relative_paths_require_file_origin() {
+        let params = vec![ConfigParameter {
+            canonical_key: "include.path".into(),
+            value: Some("relative.cfg".into()),
+        }];
+        let mut stack = ConfigStack::new();
+
+        let err = stack
+            .push_parameters_with_includes(&params, &ConfigIncludeContext::default())
+            .expect_err("relative command-line include should fail");
+
+        match err {
+            GitError::InvalidFormat(message) => {
+                assert_eq!(message, "relative config includes must come from files");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

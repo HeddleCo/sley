@@ -36,14 +36,19 @@
 //!
 //! The merge functions are line-for-line ports of the corresponding functions
 //! in `unpack-trees.c` (`oneway_merge`, `twoway_merge`, `threeway_merge`,
-//! `bind_merge`). The cases that depend on machinery sley does not model yet —
-//! sparse-checkout / sparse directories, the directory/file (D/F) conflict
-//! entry, submodule move-head hooks — are flagged with precise
-//! `// TODO(unpack-trees):` markers at the exact spot upstream invokes them, so
-//! a later wave can wire them in without re-deriving the control flow.
+//! `bind_merge`). D/F conflict markers, stat writeback for updated entries, and
+//! the submodule move-head probe hook are modeled here now. The remaining
+//! upstream machinery that still needs follow-up — sparse-checkout / sparse
+//! directories, full apply-phase D/F and ignored-file handling, and real
+//! submodule worktree mutation — is flagged with precise
+//! `// TODO(unpack-trees):` markers at the exact spot upstream invokes it, so a
+//! later wave can wire it in without re-deriving the control flow.
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use std::collections::BTreeMap;
+
+/// Upstream git's `MAX_UNPACK_TREES`.
+pub const MAX_UNPACK_TREES: usize = 8;
 
 /// git's `struct stat_data`: the `lstat`-derived fields the index caches so the
 /// "is this path dirty / up-to-date / racy-clean" machinery (`ce_match_stat`,
@@ -591,7 +596,8 @@ pub fn bind_merge<P: WorktreeProbe + ?Sized>(
 
 /// git's `threeway_merge`: the trivial 3-way merge that resolves what it can to
 /// stage 0 and records base/ours/theirs (stages 1/2/3) otherwise.
-/// `stages = [index, base, ours, theirs]` with `head_idx == 1`.
+/// `stages = [index, ancestor..., ours, theirs]` with `head_idx` pointing at
+/// the ours slot.
 pub fn threeway_merge<P: WorktreeProbe + ?Sized>(
     stages: &[Option<CacheEntry>],
     path: &[u8],
@@ -888,25 +894,33 @@ fn reject_merge(ce: &CacheEntry, path: &[u8]) -> Result<()> {
 
 /// Which merge primitive an [`unpack_trees`] run dispatches to per path,
 /// mirroring `o->fn`. The number of trees the caller supplies must match
-/// (1 for oneway/bind, 2 for twoway, 3 for threeway).
+/// (1 for oneway/bind, 2 for twoway, 3 or more for threeway).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeFn {
     /// `oneway_merge` — 1 tree.
     OneWay,
     /// `twoway_merge` — 2 trees.
     TwoWay,
-    /// `threeway_merge` — 3 trees.
+    /// `threeway_merge` — 3 or more trees.
     ThreeWay,
     /// `bind_merge` — 1 tree, into the current index under a prefix.
     Bind,
 }
 
 impl MergeFn {
-    fn tree_count(self) -> usize {
+    fn accepts_tree_count(self, count: usize) -> bool {
         match self {
-            MergeFn::OneWay | MergeFn::Bind => 1,
-            MergeFn::TwoWay => 2,
-            MergeFn::ThreeWay => 3,
+            MergeFn::OneWay | MergeFn::Bind => count == 1,
+            MergeFn::TwoWay => count == 2,
+            MergeFn::ThreeWay => (3..=MAX_UNPACK_TREES).contains(&count),
+        }
+    }
+
+    fn tree_count_description(self) -> &'static str {
+        match self {
+            MergeFn::OneWay | MergeFn::Bind => "1",
+            MergeFn::TwoWay => "2",
+            MergeFn::ThreeWay => "3..=8",
         }
     }
 }
@@ -989,11 +1003,11 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
     opts: &UnpackTreesOptions,
     probe: &P,
 ) -> Result<UnpackTreesResult> {
-    if trees.len() != merge_fn.tree_count() {
+    if !merge_fn.accepts_tree_count(trees.len()) {
         return Err(GitError::InvalidFormat(format!(
             "unpack_trees: {:?} needs {} tree(s), got {}",
             merge_fn,
-            merge_fn.tree_count(),
+            merge_fn.tree_count_description(),
             trees.len()
         )));
     }
@@ -1004,6 +1018,13 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
     let mut effective = opts.clone();
     if merge_fn == MergeFn::ThreeWay && opts.head_idx == 1 && trees.len() >= 3 {
         effective.head_idx = trees.len() - 1;
+    }
+    if merge_fn == MergeFn::ThreeWay && effective.head_idx + 1 >= trees.len() + 1 {
+        return Err(GitError::InvalidFormat(format!(
+            "unpack_trees: invalid head_idx {} for {} tree(s)",
+            effective.head_idx,
+            trees.len()
+        )));
     }
     let opts = &effective;
 
@@ -1034,7 +1055,16 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
             .get(path)
             .map(|(mode, oid, stat)| CacheEntry::stage0_with_stat(*mode, *oid, *stat));
         for (i, tree) in trees.iter().enumerate() {
-            let stage = (i + 1) as u8;
+            let slot = i + 1;
+            let stage = if !opts.merge {
+                0
+            } else if slot < opts.head_idx {
+                1
+            } else if slot > opts.head_idx {
+                3
+            } else {
+                2
+            };
             src[i + 1] = match tree.get(path) {
                 // A real leaf in this tree: take it at its slot's stage.
                 Some((mode, oid)) => Some(CacheEntry::staged(*mode, *oid, stage)),
@@ -1375,6 +1405,32 @@ mod tests {
         .expect("threeway conflict");
         let stages: Vec<u8> = res.entries.iter().map(|e| e.entry.stage).collect();
         assert_eq!(stages, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn threeway_multi_ancestor_16_keeps_head_and_remote_only() {
+        // t1000 case #16: one ancestor matches ours and another matches theirs.
+        // This suppresses the #13/#14 trivial-resolution arms and records only
+        // the real head/remote sides as conflict stages.
+        let index = idx(&[(b"F16", 2)]);
+        let ancestor_remote = flat(&[(b"F16", 1)]);
+        let ancestor_head = flat(&[(b"F16", 2)]);
+        let head = flat(&[(b"F16", 2)]);
+        let remote = flat(&[(b"F16", 1)]);
+        let res = unpack_trees(
+            &index,
+            &[ancestor_remote, ancestor_head, head, remote],
+            MergeFn::ThreeWay,
+            &opts(),
+            &NullWorktree,
+        )
+        .expect("multi-ancestor threeway");
+        let got: Vec<_> = res
+            .entries
+            .iter()
+            .map(|e| (e.entry.stage, e.entry.oid))
+            .collect();
+        assert_eq!(got, vec![(2, oid(2)), (3, oid(1))]);
     }
 
     /// `(stage, path)` pairs for the result, sorted as `git ls-files -s` emits.

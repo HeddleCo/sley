@@ -262,9 +262,13 @@ pub fn list_notes(
     store: &FileRefStore,
     notes_ref: &NotesRef,
 ) -> Result<Vec<Note>> {
-    let mut notes = iter_notes(git_dir, format, store, notes_ref)?.collect::<Result<Vec<_>>>()?;
-    notes.sort_by_key(|entry| entry.annotated.to_hex());
-    Ok(notes)
+    let Some(tree_oid) = notes_tree_oid(git_dir, format, store, notes_ref)? else {
+        return Ok(Vec::new());
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    Ok(notes_vec_from_map(notes_map_from_tree(
+        git_dir, &db, format, tree_oid,
+    )?))
 }
 
 /// Return the note blob oid for `annotated`, if any (fanout-aware, no full scan).
@@ -279,7 +283,7 @@ pub fn read_note_for(
         return Ok(None);
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    lookup_note_for(&db, format, &tree_oid, "", &annotated.to_hex())
+    lookup_note_for(git_dir, &db, format, &tree_oid, "", &annotated.to_hex())
 }
 
 /// Return the note blob oid for `annotated` from an already-resolved notes tree.
@@ -290,7 +294,7 @@ pub fn read_note_from_tree(
     annotated: &ObjectId,
 ) -> Result<Option<ObjectId>> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    lookup_note_for(&db, format, tree_oid, "", &annotated.to_hex())
+    lookup_note_for(git_dir, &db, format, tree_oid, "", &annotated.to_hex())
 }
 
 /// Return the note blob oid for `annotated`, if any.
@@ -439,9 +443,9 @@ pub fn merge_notes(
     let local_tree = commit_tree_oid(&db, format, &local_oid)?;
     let remote_tree = commit_tree_oid(&db, format, &remote_oid)?;
 
-    let base_notes = notes_map_from_tree(&db, format, base_tree)?;
-    let local_notes = notes_map_from_tree(&db, format, local_tree)?;
-    let remote_notes = notes_map_from_tree(&db, format, remote_tree)?;
+    let base_notes = notes_map_from_tree(git_dir, &db, format, base_tree)?;
+    let local_notes = notes_map_from_tree(git_dir, &db, format, local_tree)?;
+    let remote_notes = notes_map_from_tree(git_dir, &db, format, remote_tree)?;
     let mut merged = local_notes.clone();
     let mut conflicts = Vec::new();
 
@@ -551,7 +555,7 @@ pub fn finalize_notes_merge(
 ) -> Result<ObjectId> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let partial = read_commit(&db, format, &partial_commit)?;
-    let mut notes = notes_map_from_tree(&db, format, partial.tree)?;
+    let mut notes = notes_map_from_tree(git_dir, &db, format, partial.tree)?;
     let writable = FileObjectDatabase::from_git_dir(git_dir, format);
     for (annotated, body) in resolved {
         let blob = writable.write_object(EncodedObject::new(ObjectType::Blob, body.clone()))?;
@@ -768,12 +772,14 @@ fn load_hex_tree_entries(
 }
 
 fn lookup_note_for(
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: &ObjectId,
     prefix: &str,
     target_hex: &str,
 ) -> Result<Option<ObjectId>> {
+    let mut found = None;
     for (name, mode, oid) in load_hex_tree_entries(db, format, tree_oid)? {
         let mut hex = prefix.to_string();
         hex.push_str(&name);
@@ -781,14 +787,14 @@ fn lookup_note_for(
             if !target_hex.starts_with(&hex) {
                 continue;
             }
-            if let Some(blob) = lookup_note_for(db, format, &oid, &hex, target_hex)? {
-                return Ok(Some(blob));
+            if let Some(blob) = lookup_note_for(git_dir, db, format, &oid, &hex, target_hex)? {
+                found = combine_loaded_note(git_dir, db, format, found, blob)?;
             }
         } else if hex == target_hex {
-            return Ok(Some(oid));
+            found = combine_loaded_note(git_dir, db, format, found, oid)?;
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 fn is_hex_name(name: &str) -> bool {
@@ -893,6 +899,7 @@ fn notes_head_oid(store: &FileRefStore, notes_ref: &NotesRef) -> Result<Option<O
 }
 
 fn notes_map_from_tree(
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: ObjectId,
@@ -901,11 +908,12 @@ fn notes_map_from_tree(
     if tree_oid == ObjectId::empty_tree(format) {
         return Ok(notes);
     }
-    collect_notes_from_tree(db, format, tree_oid, "", &mut notes)?;
+    collect_notes_from_tree(git_dir, db, format, tree_oid, "", &mut notes)?;
     Ok(notes)
 }
 
 fn collect_notes_from_tree(
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: ObjectId,
@@ -916,14 +924,46 @@ fn collect_notes_from_tree(
         let mut hex = prefix.to_string();
         hex.push_str(&name);
         if tree_entry_object_type(mode) == ObjectType::Tree {
-            collect_notes_from_tree(db, format, oid, &hex, out)?;
+            collect_notes_from_tree(git_dir, db, format, oid, &hex, out)?;
         } else if hex.len() == format.hex_len()
             && let Ok(annotated) = ObjectId::from_hex(format, &hex)
         {
-            out.insert(annotated, oid);
+            let combined =
+                combine_loaded_note(git_dir, db, format, out.get(&annotated).copied(), oid)?;
+            match combined {
+                Some(blob) => {
+                    out.insert(annotated, blob);
+                }
+                None => {
+                    out.remove(&annotated);
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn combine_loaded_note(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    current: Option<ObjectId>,
+    next: ObjectId,
+) -> Result<Option<ObjectId>> {
+    if current.is_none() {
+        return Ok(Some(next));
+    }
+    if current == Some(next) {
+        return Ok(current);
+    }
+    combine_note_blobs(
+        git_dir,
+        db,
+        format,
+        current,
+        Some(next),
+        NoteBlobCombine::Union,
+    )
 }
 
 fn notes_vec_from_map(notes: BTreeMap<ObjectId, ObjectId>) -> Vec<Note> {

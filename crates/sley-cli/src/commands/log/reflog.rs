@@ -44,7 +44,7 @@ pub(super) fn log_walk_reflogs(
                 stdout.flush()?;
                 return Ok(());
             }
-            match opts.output {
+            let emitted_entry = match opts.output {
                 LogOutput::Compiled {
                     compiled,
                     final_newline,
@@ -56,15 +56,19 @@ pub(super) fn log_walk_reflogs(
                         db: &mut db,
                         format,
                         display_reference: &target.display_reference,
-                        full_reference: &target.display_reference,
+                        full_reference: &target.reference,
                         date_mode: opts.date_mode,
                         decorations: &decorations,
                         mailmap: &mailmap,
                     };
-                    emit_compiled_reflog_walk_format(&mut ctx, entry, index, &mut line)?;
-                    stdout.write_all(&line)?;
-                    if *final_newline && !line.ends_with(b"\n") {
-                        stdout.write_all(b"\n")?;
+                    if !emit_compiled_reflog_walk_format(&mut ctx, entry, index, &mut line)? {
+                        false
+                    } else {
+                        stdout.write_all(&line)?;
+                        if *final_newline && !line.ends_with(b"\n") {
+                            stdout.write_all(b"\n")?;
+                        }
+                        true
                     }
                 }
                 LogOutput::Default(_) => {
@@ -78,10 +82,12 @@ pub(super) fn log_walk_reflogs(
                         opts.date_mode,
                         &mailmap,
                         &mut stdout,
-                    )?;
+                    )?
                 }
+            };
+            if emitted_entry {
+                emitted += 1;
             }
-            emitted += 1;
         }
     }
     stdout.flush()?;
@@ -145,9 +151,9 @@ fn emit_default_reflog_walk_format(
     date_mode: &DateMode,
     mailmap: &commands::utility::Mailmap,
     out: &mut impl Write,
-) -> Result<()> {
+) -> Result<bool> {
     let Some(record) = reflog_walk_commit_record(db, format, entry)? else {
-        return Ok(());
+        return Ok(false);
     };
     writeln!(out, "commit {}", record.oid).map_err(io::Error::from)?;
     let (reflog_name, reflog_email) = commit_identity_name_email(&entry.committer);
@@ -183,7 +189,7 @@ fn emit_default_reflog_walk_format(
             out.write_all(b"\n")?;
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(super) fn compile_log_filter_matcher(
@@ -334,14 +340,21 @@ pub(super) fn log_grep_matcher_matches(
     filter: Option<&sley_grep::GrepMatcher>,
     all_match: bool,
     invert: bool,
+    output_encoding: &str,
 ) -> bool {
     let Some(filter) = filter else {
         return true;
     };
-    let matched = if all_match {
-        filter.matches_all(&record.commit.message)
+    let message = commit_message_for_commit_encoding(&record.commit, output_encoding);
+    let search_message = if encoding_is_utf8(output_encoding) {
+        Cow::Borrowed(message.as_ref())
     } else {
-        filter.matches_any(&record.commit.message)
+        Cow::Owned(argv_string_from_bytes(message.as_ref()).into_bytes())
+    };
+    let matched = if all_match {
+        filter.matches_all(&search_message)
+    } else {
+        filter.matches_any(&search_message)
     };
     matched != invert
 }
@@ -362,24 +375,22 @@ fn emit_compiled_reflog_walk_format(
     entry: &ReflogEntry,
     index: usize,
     out: &mut Vec<u8>,
-) -> Result<()> {
+) -> Result<bool> {
     let (reflog_name, reflog_email) = commit_identity_name_email(&entry.committer);
-    let commit_record = reflog_walk_commit_record(ctx.db, ctx.format, entry)?;
-    let commit_identity = commit_record.as_ref().map(|record| {
-        let (author_name, author_email) = commit_identity_name_email(&record.commit.author);
-        let (committer_name, committer_email) =
-            commit_identity_name_email(&record.commit.committer);
-        let author_timestamp = commit_identity_timestamp(&record.commit.author);
-        let committer_timestamp = commit_identity_timestamp(&record.commit.committer);
-        (
-            author_name,
-            author_email,
-            committer_name,
-            committer_email,
-            author_timestamp,
-            committer_timestamp,
-        )
-    });
+    let Some(commit_record) = reflog_walk_commit_record(ctx.db, ctx.format, entry)? else {
+        return Ok(false);
+    };
+    let (author_name, author_email) = commit_identity_name_email(&commit_record.commit.author);
+    let (committer_name, committer_email) =
+        commit_identity_name_email(&commit_record.commit.committer);
+    let commit_identity = (
+        author_name,
+        author_email,
+        committer_name,
+        committer_email,
+        commit_identity_timestamp(&commit_record.commit.author),
+        commit_identity_timestamp(&commit_record.commit.committer),
+    );
     let log_context = LogFormatContext {
         abbrev_len: Some(7),
         decorations: ctx.decorations,
@@ -413,26 +424,22 @@ fn emit_compiled_reflog_walk_format(
             FormatToken::Newline => out.push(b'\n'),
             FormatToken::HexByte(byte) => out.push(*byte),
             _ => {
-                if let (Some(record), Some(identity)) =
-                    (commit_record.as_ref(), commit_identity.as_ref())
-                {
-                    emit_log_one_token(
-                        token,
-                        record,
-                        &log_context,
-                        out,
-                        &identity.0,
-                        &identity.1,
-                        &identity.2,
-                        &identity.3,
-                        &identity.4,
-                        &identity.5,
-                    )?;
-                }
+                emit_log_one_token(
+                    token,
+                    &commit_record,
+                    &log_context,
+                    out,
+                    &commit_identity.0,
+                    &commit_identity.1,
+                    &commit_identity.2,
+                    &commit_identity.3,
+                    &commit_identity.4,
+                    &commit_identity.5,
+                )?;
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn reflog_walk_commit_record(

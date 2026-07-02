@@ -9,6 +9,66 @@ use super::status::{
 };
 use crate::*;
 
+pub(crate) enum PrepareCommitMsgSource<'a> {
+    None,
+    Message,
+    Template,
+    Merge,
+    Commit(&'a str),
+}
+
+pub(crate) fn run_prepare_commit_msg_hook(
+    editmsg: &Path,
+    source: PrepareCommitMsgSource<'_>,
+    mut env: Vec<(String, String)>,
+    set_no_editor_env: bool,
+) -> Result<bool> {
+    let editmsg_arg = editmsg.to_string_lossy().into_owned();
+    let mut args = vec![editmsg_arg];
+    match source {
+        PrepareCommitMsgSource::None => {}
+        PrepareCommitMsgSource::Message => args.push("message".to_string()),
+        PrepareCommitMsgSource::Template => args.push("template".to_string()),
+        PrepareCommitMsgSource::Merge => args.push("merge".to_string()),
+        PrepareCommitMsgSource::Commit(rev) => {
+            args.push("commit".to_string());
+            args.push(rev.to_string());
+        }
+    }
+    if set_no_editor_env {
+        set_hook_env(&mut env, "GIT_EDITOR", ":");
+    }
+    match commands::hooks::run_hook(
+        "prepare-commit-msg",
+        commands::hooks::HookRun {
+            args,
+            env,
+            ..commands::hooks::HookRun::default()
+        },
+    ) {
+        Err(GitError::Exit(code)) => {
+            eprintln!("error: prepare-commit-msg hook failed");
+            Err(GitError::Exit(code))
+        }
+        result => result,
+    }
+}
+
+fn set_hook_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if let Some((_, existing)) = env.iter_mut().find(|(existing, _)| existing == key) {
+        *existing = value.to_string();
+    } else {
+        env.push((key.to_string(), value.to_string()));
+    }
+}
+
+fn refresh_commit_selection_cache_tree() -> Result<()> {
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let format = repository_object_format(&git_dir)?;
+    let odb = FileObjectDatabase::from_git_dir(&git_dir, format);
+    sley_worktree::refresh_repository_cache_tree(&git_dir, format, &odb)
+}
+
 enum CommitShortFlag {
     /// A boolean flag that takes no value (e.g. `-q`, `-s`, `-a`).
     Boolean,
@@ -623,7 +683,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                 pathspec_from_file = Some(value["--pathspec-from-file=".len()..].to_string());
                 pathspec_from_file_active = true;
             }
-            "--no-pathspec-from-file" => pathspec_from_file_active = false,
+            "--no-pathspec-from-file" => {}
             value if value.starts_with("--no-pathspec-from-file=") => {
                 return commit_option_takes_no_value_error("no-pathspec-from-file");
             }
@@ -784,6 +844,16 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         eprintln!("fatal: options '-m' and '-F' cannot be used together");
         return Err(GitError::Exit(128));
     }
+    if pathspec_from_file_active && (interactive || patch) {
+        eprintln!(
+            "fatal: options '--pathspec-from-file' and '--interactive/--patch' cannot be used together"
+        );
+        return Err(GitError::Exit(128));
+    }
+    if pathspec_from_file_active && all {
+        eprintln!("fatal: options '--pathspec-from-file' and '-a' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
     // git: die only when no paths and (--include, or --only without --amend and
     // without --allow-empty). `git commit --allow-empty --only` is valid.
     let amend_style = amend
@@ -811,6 +881,13 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                     .map(|path| path.to_string_lossy().into_owned()),
             );
         }
+    }
+    if pathspec_from_file_active
+        && pathspec_args.is_empty()
+        && (include_without_paths || only_without_paths)
+    {
+        eprintln!("fatal: No paths with --include/--only does not make sense.");
+        return Err(GitError::Exit(128));
     }
     if !pathspec_args.is_empty() {
         if all {
@@ -840,10 +917,9 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     if dry_run {
         return cmd_commit_long_status_preview(amend, commit_untracked);
     }
-    if interactive {
-        return Err(GitError::Unsupported(
-            "commit interactive patch selection is not implemented".into(),
-        ));
+    if interactive && !patch {
+        commands::add_interactive::cmd_add_interactive(&pathspec_args)?;
+        refresh_commit_selection_cache_tree()?;
     }
     if patch {
         commands::add_interactive::cmd_add_patch(
@@ -852,6 +928,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             inter_hunk_context,
             true,
         )?;
+        refresh_commit_selection_cache_tree()?;
         if template_file.is_none()
             && file_message.is_none()
             && message_chunks.is_empty()
@@ -1151,9 +1228,15 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         }
         return Err(err);
     }
+    let author_hook_env = commit_author_hook_env(&author)?;
     if !no_verify
-        && let Err(err) =
-            commands::hooks::run_hook("pre-commit", commands::hooks::HookRun::default())
+        && let Err(err) = commands::hooks::run_hook(
+            "pre-commit",
+            commands::hooks::HookRun {
+                env: author_hook_env.clone(),
+                ..commands::hooks::HookRun::default()
+            },
+        )
     {
         if let Some(snapshot) = &partial_index_snapshot {
             let _ = restore_index_snapshot(&git_dir, snapshot);
@@ -1215,25 +1298,33 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         )?;
     }
     fs::write(&editmsg, &template)?;
-    let editmsg_arg = editmsg.to_string_lossy().into_owned();
-    let mut prepare_args = vec![editmsg_arg.as_str()];
-    if amend {
-        prepare_args.push("commit");
-        prepare_args.push("HEAD");
+    let prepare_source = if amend {
+        PrepareCommitMsgSource::Commit("HEAD")
+    } else if in_rebase && (in_cherry_pick || in_revert) && git_dir.join("MERGE_MSG").is_file() {
+        PrepareCommitMsgSource::Message
+    } else if in_rebase && git_dir.join("MERGE_MSG").is_file() {
+        PrepareCommitMsgSource::Merge
     } else if in_merge
         || ((in_cherry_pick || in_revert) && git_dir.join("MERGE_MSG").is_file())
         || (git_dir.join("SQUASH_MSG").is_file() && git_dir.join("MERGE_MSG").is_file())
     {
-        prepare_args.push("merge");
+        PrepareCommitMsgSource::Merge
     } else if let Some(rev) = reuse_message.as_deref() {
-        prepare_args.push("commit");
-        prepare_args.push(rev);
+        PrepareCommitMsgSource::Commit(rev)
     } else if had_message_source {
-        prepare_args.push("message");
+        PrepareCommitMsgSource::Message
+    } else if template_message_source {
+        PrepareCommitMsgSource::Template
     } else {
-        prepare_args.push("template");
-    }
-    commands::hooks::run_hook_l("prepare-commit-msg", &prepare_args)?;
+        PrepareCommitMsgSource::None
+    };
+    run_prepare_commit_msg_hook(
+        &editmsg,
+        prepare_source,
+        author_hook_env.clone(),
+        !use_editor && !in_rebase,
+    )?;
+    let editmsg_arg = editmsg.to_string_lossy().into_owned();
     let has_unmerged_index_entries = commit_index_has_unmerged_entries(&git_dir, format)?;
     if use_editor
         && !has_unmerged_index_entries
@@ -1244,7 +1335,14 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     if !no_verify {
-        commands::hooks::run_hook_l("commit-msg", &[editmsg_arg.as_str()])?;
+        commands::hooks::run_hook(
+            "commit-msg",
+            commands::hooks::HookRun {
+                args: vec![editmsg_arg.clone()],
+                env: author_hook_env,
+                ..commands::hooks::HookRun::default()
+            },
+        )?;
     }
     message = fs::read(&editmsg)?;
     message = commit_cleanup_message(message, cleanup_mode, &comment_char, verbose > 0);
@@ -1427,6 +1525,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     }?;
     commands::rerere::record_resolved_after_commit(&git_dir, format)?;
     remove_commit_state_files(&git_dir);
+    commands::hooks::run_post_index_change_hook(false, false)?;
     if let Some((summary_author, summary_committer, summary_message)) = summary {
         print_commit_summary(
             &git_dir,
@@ -1746,6 +1845,7 @@ fn conclude_replay_via_commit(
     tx.commit()?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
     remove_commit_state_files(git_dir);
+    commands::hooks::run_post_index_change_hook(false, false)?;
     if !quiet {
         println!("{new_oid}");
     }
@@ -1821,6 +1921,7 @@ fn commit_partial_paths(
         }),
     });
     tx.commit()?;
+    sley_worktree::refresh_repository_cache_tree(git_dir, format, &db)?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
     remove_commit_state_files(git_dir);
     if !quiet {
@@ -1856,59 +1957,65 @@ fn stage_partial_commit_paths(
         .chain(head_tree_map.keys().cloned())
         .collect();
 
-    // Expand the pathspecs over the tracked entries (directories and `.`
-    // cover everything beneath them).
+    let root = fs::canonicalize(&worktree_root)?;
+    let cwd = fs::canonicalize(&cwd)?;
+    let prefix = cwd
+        .strip_prefix(&root)
+        .map(|relative| relative.to_string_lossy().replace('\\', "/").into_bytes())
+        .unwrap_or_default();
+    let mut pathspecs = Vec::with_capacity(paths.len());
+    let mut have_include = false;
+    for path in paths {
+        let parse_path = normalize_absolute_cli_pathspec(&root, &cwd, path)?;
+        let element = sley_pathspec::parse_normalized_pathspec_element(
+            &prefix,
+            &parse_path,
+            effective_pathspec_flags(),
+        )?;
+        have_include |= !element.is_exclude();
+        pathspecs.push((path.as_str(), element, false));
+    }
+
+    // Expand the pathspecs over the tracked entries using git pathspec
+    // semantics. With only negative pathspecs, commit's implicit include is the
+    // whole tree, while the negative patterns themselves are still cwd-relative.
     let mut rel_paths: Vec<Vec<u8>> = Vec::new();
     let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for path in paths {
-        let absolute = if Path::new(path).is_absolute() {
-            PathBuf::from(path)
-        } else {
-            cwd.join(path)
-        };
-        let rel: Vec<u8> = match absolute.strip_prefix(&worktree_root) {
-            Ok(stripped) => stripped.to_string_lossy().into_owned().into_bytes(),
-            Err(_) => {
-                return Err(GitError::InvalidPath(format!(
-                    "pathspec outside repository: {path}"
-                )));
-            }
-        };
-        let mut matched = false;
-        if rel.is_empty() {
-            // `.` at the worktree root: every tracked entry.
-            for tracked in &known {
-                if seen.insert(tracked.clone()) {
-                    rel_paths.push(tracked.clone());
-                }
-                matched = true;
-            }
-        } else if known.contains(&rel) {
-            if seen.insert(rel.clone()) {
-                rel_paths.push(rel.clone());
-            }
-            matched = true;
-        } else {
-            let mut prefix = rel.clone();
-            prefix.push(b'/');
-            for tracked in &known {
-                if tracked.starts_with(&prefix) {
-                    if seen.insert(tracked.clone()) {
-                        rel_paths.push(tracked.clone());
-                    }
-                    matched = true;
+    for tracked in &known {
+        let mut included = false;
+        let mut excluded = false;
+        for (_, element, matched) in &mut pathspecs {
+            if element.matches_path(tracked) {
+                *matched = true;
+                if element.is_exclude() {
+                    excluded = true;
+                } else {
+                    included = true;
                 }
             }
         }
-        if !matched {
+        if !excluded && (!have_include || included) && seen.insert(tracked.clone()) {
+            rel_paths.push(tracked.clone());
+        }
+    }
+    for (path, element, matched) in &pathspecs {
+        if !element.is_exclude() && !matched {
             eprintln!("error: pathspec '{path}' did not match any file(s) known to git");
             return Err(GitError::Exit(128));
         }
     }
 
     // Stage the matched paths with the regular add machinery (clean filters,
-    // mode bits) — partial commits update those index entries too.
+    // mode bits) — partial commits update those index entries too. When the
+    // worktree executable bit is untrusted, keep the path's existing index/HEAD
+    // regular-file mode; `commit <path>` should not turn an indexed 100755 file
+    // into 100644 just because the filesystem reports it that way.
     let config = read_repo_config(git_dir)?;
+    let mode_preferences = if config.get_bool("core", None, "fileMode").unwrap_or(true) {
+        BTreeMap::new()
+    } else {
+        partial_commit_untrusted_mode_preferences(&index, head_tree_map, &rel_paths)
+    };
     // Partial-commit staging applies one uniform mode (`--add --remove`) to
     // every matched path, so stamp that mode onto each `UpdateIndexPath`.
     let commit_mode = sley_worktree::UpdateIndexPathMode {
@@ -1942,7 +2049,60 @@ fn stage_partial_commit_paths(
         &config,
         false,
     )?;
+    restore_partial_commit_untrusted_modes(git_dir, format, &mode_preferences)?;
     Ok(rel_paths)
+}
+
+fn partial_commit_untrusted_mode_preferences(
+    index: &Index,
+    head_tree_map: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
+    rel_paths: &[Vec<u8>],
+) -> BTreeMap<Vec<u8>, u32> {
+    rel_paths
+        .iter()
+        .filter_map(|rel| {
+            let mode = index
+                .entries
+                .iter()
+                .find(|entry| index_entry_stage(entry) == 0 && entry.path.as_bytes() == rel)
+                .map(|entry| entry.mode)
+                .or_else(|| head_tree_map.get(rel).map(|(mode, _)| *mode))?;
+            partial_commit_preservable_regular_mode(mode).then(|| (rel.clone(), mode))
+        })
+        .collect()
+}
+
+fn partial_commit_preservable_regular_mode(mode: u32) -> bool {
+    matches!(mode, 0o100644 | 0o100755)
+}
+
+fn restore_partial_commit_untrusted_modes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    mode_preferences: &BTreeMap<Vec<u8>, u32>,
+) -> Result<()> {
+    if mode_preferences.is_empty() {
+        return Ok(());
+    }
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    let mut changed = false;
+    for entry in &mut index.entries {
+        if index_entry_stage(entry) != 0 {
+            continue;
+        }
+        let Some(mode) = mode_preferences.get(entry.path.as_bytes()) else {
+            continue;
+        };
+        if partial_commit_preservable_regular_mode(entry.mode) && entry.mode != *mode {
+            entry.mode = *mode;
+            changed = true;
+        }
+    }
+    if changed {
+        fs::write(index_path, index.write(format)?)?;
+    }
+    Ok(())
 }
 
 fn read_index_snapshot(git_dir: &Path) -> Result<Option<Vec<u8>>> {
@@ -2322,7 +2482,7 @@ fn commit_invalid_untracked_files_mode_error(mode: &str) -> Result<()> {
 }
 
 fn commit_message_arg_chunk(message: &str) -> Vec<u8> {
-    let mut chunk = message.as_bytes().to_vec();
+    let mut chunk = argv_bytes_from_string(message);
     if !chunk.ends_with(b"\n") {
         chunk.push(b'\n');
     }
@@ -2591,9 +2751,10 @@ fn build_reused_commit_author_identity(
         validate_reused_commit_author_identity(reused_author)?;
         return Ok(reused_author.to_vec());
     }
-    let (reused_name, reused_email, reused_date) = parse_commit_identity_parts(reused_author)?;
-    let (name, email) = if let Some(author) = author {
-        parse_commit_author(author)?
+    let (reused_name, reused_email, reused_date) =
+        parse_commit_identity_parts_bytes(reused_author)?;
+    let (name, email): (Vec<u8>, Vec<u8>) = if let Some(author) = author {
+        parse_commit_author_bytes(&argv_bytes_from_string(author))?
     } else {
         (reused_name, reused_email)
     };
@@ -2603,7 +2764,7 @@ fn build_reused_commit_author_identity(
         Some(date) => canonicalize_commit_date(date),
         None => reused_date,
     };
-    sley_sequencer::format_commit_identity(&name, &email, &date)
+    sley_sequencer::format_commit_identity_bytes(&name, &email, &date)
 }
 
 fn validate_reused_commit_author_identity(identity: &[u8]) -> Result<()> {
@@ -2612,6 +2773,21 @@ fn validate_reused_commit_author_identity(identity: &[u8]) -> Result<()> {
     }
     eprintln!("fatal: empty ident name (for <>) not allowed");
     Err(GitError::Exit(128))
+}
+
+fn commit_author_hook_env(author: &[u8]) -> Result<Vec<(String, String)>> {
+    let (name, email, date) = parse_commit_identity_parts_bytes(author)?;
+    Ok(vec![
+        (
+            "GIT_AUTHOR_NAME".to_string(),
+            String::from_utf8_lossy(&name).into_owned(),
+        ),
+        (
+            "GIT_AUTHOR_EMAIL".to_string(),
+            String::from_utf8_lossy(&email).into_owned(),
+        ),
+        ("GIT_AUTHOR_DATE".to_string(), date),
+    ])
 }
 
 fn parse_commit_identity_parts(identity: &[u8]) -> Result<(String, String, String)> {
@@ -2628,6 +2804,29 @@ fn parse_commit_identity_parts(identity: &[u8]) -> Result<(String, String, Strin
         ));
     };
     let (name, email) = parse_commit_author(author)?;
+    Ok((name, email, format!("{timestamp} {timezone}")))
+}
+
+fn parse_commit_identity_parts_bytes(identity: &[u8]) -> Result<(Vec<u8>, Vec<u8>, String)> {
+    let Some(timezone_start) = identity.iter().rposition(|byte| *byte == b' ') else {
+        return Err(GitError::InvalidObject(
+            "commit identity missing timezone".into(),
+        ));
+    };
+    let (left, timezone_with_space) = identity.split_at(timezone_start);
+    let timezone = &timezone_with_space[1..];
+    let Some(timestamp_start) = left.iter().rposition(|byte| *byte == b' ') else {
+        return Err(GitError::InvalidObject(
+            "commit identity missing timestamp".into(),
+        ));
+    };
+    let (author, timestamp_with_space) = left.split_at(timestamp_start);
+    let timestamp = &timestamp_with_space[1..];
+    let (name, email) = parse_commit_author_bytes(author)?;
+    let timestamp = std::str::from_utf8(timestamp)
+        .map_err(|err| GitError::InvalidObject(format!("invalid commit timestamp: {err}")))?;
+    let timezone = std::str::from_utf8(timezone)
+        .map_err(|err| GitError::InvalidObject(format!("invalid commit timezone: {err}")))?;
     Ok((name, email, format!("{timestamp} {timezone}")))
 }
 
@@ -3111,6 +3310,15 @@ fn render_commit_template_status(
     Ok(buf)
 }
 
+pub(crate) fn render_commit_editor_status_for_rebase(
+    git_dir: &Path,
+    format: ObjectFormat,
+    comment_char: &str,
+    amend: bool,
+) -> Result<Vec<u8>> {
+    render_commit_template_status(git_dir, format, comment_char, amend, None)
+}
+
 fn print_clean_commit_status(git_dir: &Path, format: ObjectFormat) -> Result<()> {
     let _ = (git_dir, format);
     let _ = cmd_commit_long_status_preview(false, None);
@@ -3119,31 +3327,42 @@ fn print_clean_commit_status(git_dir: &Path, format: ObjectFormat) -> Result<()>
 
 fn build_commit_author_identity(author: Option<&str>, date: Option<&str>) -> Result<Vec<u8>> {
     let (name, email) = if let Some(author) = author {
-        parse_commit_author(author)?
+        parse_commit_author_bytes(&argv_bytes_from_string(author))?
     } else {
         // Same precedence as `commit_identity_from_env`: env var, then
-        // `-c`/`GIT_CONFIG_*`, then effective config (repo > global > system),
-        // then the built-in default.
-        let env_name = env::var("GIT_AUTHOR_NAME").ok();
-        let env_email = env::var("GIT_AUTHOR_EMAIL").ok();
+        // author.* config, then user.* config, then the built-in default.
+        let env_name = env::var_os("GIT_AUTHOR_NAME").map(argv_bytes_from_os);
+        let env_email = env::var_os("GIT_AUTHOR_EMAIL").map(argv_bytes_from_os);
         let mut config = if env_name.is_none() || env_email.is_none() {
             IdentityConfig::Lazy(None)
         } else {
             IdentityConfig::Skip
         };
         let name = env_name
-            .or_else(|| identity_config_value("user.name", &mut config))
-            .unwrap_or_else(|| "Git Rs".into());
+            .or_else(|| {
+                identity_config_value_for_role("AUTHOR", "name", &mut config)
+                    .map(String::into_bytes)
+            })
+            .or_else(|| identity_default_value("Git Rs", &mut config).map(String::into_bytes));
         let email = env_email
-            .or_else(|| identity_config_value("user.email", &mut config))
-            .unwrap_or_else(|| "sley@example.invalid".into());
+            .or_else(|| {
+                identity_config_value_for_role("AUTHOR", "email", &mut config)
+                    .map(String::into_bytes)
+            })
+            .or_else(|| {
+                identity_default_value("sley@example.invalid", &mut config).map(String::into_bytes)
+            });
+        let (Some(name), Some(email)) = (name, email) else {
+            return identity_use_config_only_error();
+        };
         (name, email)
     };
     let date = date
         .map(str::to_string)
         .unwrap_or_else(|| env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| "@0 +0000".into()));
     let date = canonicalize_commit_date(&date);
-    sley_sequencer::format_commit_identity(&name, &email, &date)
+    validate_commit_identity_name("AUTHOR", &name, &email)?;
+    sley_sequencer::format_commit_identity_bytes(&name, &email, &date)
 }
 
 fn parse_commit_author(author: &str) -> Result<(String, String)> {
@@ -3160,7 +3379,33 @@ fn parse_commit_author(author: &str) -> Result<(String, String)> {
     Ok((name.to_string(), email.to_string()))
 }
 
+fn parse_commit_author_bytes(author: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let Some(open) = author.iter().rposition(|byte| *byte == b'<') else {
+        return commit_invalid_author_bytes_error(author);
+    };
+    let Some(email_with_suffix) = author.get(open + 1..) else {
+        return commit_invalid_author_bytes_error(author);
+    };
+    let Some(email) = email_with_suffix.strip_suffix(b">") else {
+        return commit_invalid_author_bytes_error(author);
+    };
+    let mut name = &author[..open];
+    while name.ends_with(b" ") || name.ends_with(b"\t") {
+        name = &name[..name.len() - 1];
+    }
+    if name.is_empty() || email.is_empty() {
+        return commit_invalid_author_bytes_error(author);
+    }
+    Ok((name.to_vec(), email.to_vec()))
+}
+
 fn commit_invalid_author_error(author: &str) -> Result<(String, String)> {
+    eprintln!("fatal: --author '{author}' is not 'Name <email>' and matches no existing author");
+    Err(GitError::Exit(128))
+}
+
+fn commit_invalid_author_bytes_error<T>(author: &[u8]) -> Result<T> {
+    let author = String::from_utf8_lossy(author);
     eprintln!("fatal: --author '{author}' is not 'Name <email>' and matches no existing author");
     Err(GitError::Exit(128))
 }

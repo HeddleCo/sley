@@ -103,6 +103,10 @@ fn parse_leading_oid(format: ObjectFormat, value: &str) -> Option<ObjectId> {
     ObjectId::from_hex(format, &value[..hexsz]).ok()
 }
 
+fn loose_ref_bytes_are_reftable_sentinel(name: &str, bytes: &[u8]) -> bool {
+    name == "refs/heads" && bytes == b"this repository uses the reftable format\n"
+}
+
 pub fn parse_loose_ref(format: ObjectFormat, name: impl Into<String>, bytes: &[u8]) -> Result<Ref> {
     let name = name.into();
     let value = std::str::from_utf8(bytes)
@@ -897,6 +901,36 @@ impl FileRefStore {
         parse_reflog(self.format, &fs::read(path)?)
     }
 
+    pub fn reflog_exists(&self, name: &str) -> Result<bool> {
+        validate_ref_name_for_read(name)?;
+        if self.uses_reftable()? {
+            return self.reftable_log_exists(name);
+        }
+        Ok(self.reflog_path(name).exists())
+    }
+
+    pub fn should_write_reflog_for_update(&self, name: &str, create_reflog: bool) -> Result<bool> {
+        validate_ref_name_for_read(name)?;
+        let reflog_exists = if self.uses_reftable()? {
+            !self.read_reftable_logs(name)?.is_empty()
+        } else {
+            self.reflog_path(name).exists()
+        };
+        if create_reflog || reflog_exists {
+            return Ok(true);
+        }
+        let Ok(config) = GitConfig::read(self.common_dir.join("config")) else {
+            return Ok(false);
+        };
+        if let Some(value) = config.get("core", None, "logAllRefUpdates") {
+            return Ok(log_all_ref_updates_matches(name, value));
+        }
+        if config.get_bool("core", None, "bare").unwrap_or(false) {
+            return Ok(false);
+        }
+        Ok(log_all_ref_updates_matches(name, "true"))
+    }
+
     pub fn write_reflog(&self, name: &str, entries: &[ReflogEntry]) -> Result<()> {
         validate_ref_name_for_read(name)?;
         if self.uses_reftable()? {
@@ -1212,18 +1246,25 @@ impl FileRefStore {
     pub fn list_reflog_names(&self) -> Result<Vec<String>> {
         let mut names = BTreeSet::new();
         if self.uses_reftable()? {
+            let null = ObjectId::null(self.format);
+            let mut logs_by_index = BTreeMap::<(String, u64), bool>::new();
             for table in self.reftables()? {
                 for record in table.logs {
-                    names.insert(record.refname);
+                    let has_visible_entry = match record.value {
+                        ReftableLogValue::Deletion => false,
+                        ReftableLogValue::Update(update) => {
+                            !reftable_log_update_is_empty_marker(&update, null)
+                        }
+                    };
+                    logs_by_index.insert((record.refname, record.update_index), has_visible_entry);
                 }
             }
-            let mut live = Vec::new();
-            for name in names {
-                if !self.read_reftable_logs(&name)?.is_empty() {
-                    live.push(name);
+            for ((name, _), has_visible_entry) in logs_by_index {
+                if has_visible_entry {
+                    names.insert(name);
                 }
             }
-            return Ok(live);
+            return Ok(names.into_iter().collect());
         }
         self.collect_reflog_names(&self.storage_dir.join("logs"), "logs", &mut names)?;
         let worktree_logs = self.git_dir.join("logs");
@@ -1877,7 +1918,11 @@ impl FileRefStore {
         if path.is_dir() {
             return Ok(None);
         }
-        Ok(Some(parse_loose_ref(self.format, name, &fs::read(path)?)?))
+        let bytes = fs::read(path)?;
+        if loose_ref_bytes_are_reftable_sentinel(name, &bytes) {
+            return Ok(None);
+        }
+        Ok(Some(parse_loose_ref(self.format, name, &bytes)?))
     }
 
     fn read_packed_ref(&self, name: &str) -> Result<Option<PackedRef>> {
@@ -2385,12 +2430,32 @@ impl FileRefStore {
         let mut entries = Vec::new();
         for update in by_index.into_values().flatten() {
             // Drop the existence marker (old==new==null): it is not a real entry.
-            if update.old_oid == null && update.new_oid == null {
+            if reftable_log_update_is_empty_marker(&update, null) {
                 continue;
             }
             entries.push(reflog_entry_from_reftable(update));
         }
         Ok(entries)
+    }
+
+    fn reftable_log_exists(&self, name: &str) -> Result<bool> {
+        let mut by_index: BTreeMap<u64, bool> = BTreeMap::new();
+        for table in self.reftables()? {
+            for record in table.logs {
+                if record.refname != name {
+                    continue;
+                }
+                match record.value {
+                    ReftableLogValue::Deletion => {
+                        by_index.insert(record.update_index, false);
+                    }
+                    ReftableLogValue::Update(_) => {
+                        by_index.insert(record.update_index, true);
+                    }
+                }
+            }
+        }
+        Ok(by_index.into_values().any(|exists| exists))
     }
 
     fn collect_loose_refs(
@@ -2406,10 +2471,14 @@ impl FileRefStore {
             if path.is_dir() {
                 self.collect_loose_refs(&path, &name, refs)?;
             } else if !name.ends_with(".lock") {
+                let bytes = fs::read(path)?;
+                if loose_ref_bytes_are_reftable_sentinel(&name, &bytes) {
+                    continue;
+                }
                 // git marks a loose ref whose content is unparseable, or that
                 // resolves to the null OID, as REF_ISBROKEN and skips it from
                 // iteration with a warning instead of aborting the whole walk.
-                match parse_loose_ref(self.format, name.clone(), &fs::read(path)?) {
+                match parse_loose_ref(self.format, name.clone(), &bytes) {
                     Ok(reference) if ref_target_is_broken(&reference.target) => {
                         warn_broken_ref(&name);
                     }
@@ -3039,6 +3108,10 @@ fn reflog_entry_from_reftable(update: ReftableLogUpdate) -> ReflogEntry {
     }
 }
 
+fn reftable_log_update_is_empty_marker(update: &ReftableLogUpdate, null: ObjectId) -> bool {
+    update.old_oid == null && update.new_oid == null
+}
+
 /// Split a flat reflog committer line (`Name <email> <seconds> <±HHMM>`) plus the
 /// entry's oids/message into the reftable log update fields.
 fn reftable_update_from_reflog(entry: &ReflogEntry) -> Result<ReftableLogUpdate> {
@@ -3189,6 +3262,19 @@ fn repository_common_dir(git_dir: &Path) -> PathBuf {
         return fs::canonicalize(&common).unwrap_or(common);
     }
     git_dir.to_path_buf()
+}
+
+fn log_all_ref_updates_matches(name: &str, value: &str) -> bool {
+    if value.eq_ignore_ascii_case("always") {
+        return true;
+    }
+    if !sley_config::parse_config_bool(value).unwrap_or(false) {
+        return false;
+    }
+    name == "HEAD"
+        || name.starts_with("refs/heads/")
+        || name.starts_with("refs/remotes/")
+        || name.starts_with("refs/notes/")
 }
 
 /// The phase a [`ReferenceTransactionHook`] is invoked for, mirroring the
@@ -3380,6 +3466,11 @@ impl<'a> FileRefTransaction<'a> {
     /// and all outstanding lock files are deleted. Reflog entries are appended
     /// only after every ref change has landed.
     pub fn commit(self) -> Result<()> {
+        if env::var_os("GIT_QUARANTINE_PATH").is_some() {
+            return Err(GitError::Transaction(
+                "ref updates forbidden inside quarantine environment".into(),
+            ));
+        }
         let FileRefTransaction {
             store,
             changes,
@@ -6937,6 +7028,44 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         let null = ObjectId::null(ObjectFormat::Sha1);
         assert_eq!(update.old_oid, null);
         assert_eq!(update.new_oid, null);
+
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_store_lists_only_visible_reftable_reflog_names() {
+        let git_dir = temp_git_dir();
+        write_reftable_config(&git_dir);
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+
+        store
+            .write_reflog("refs/heads/empty", &[])
+            .expect("test operation should succeed");
+        store
+            .append_reflog("refs/heads/main", &reflog_entry(&oid, 1, "create main"))
+            .expect("test operation should succeed");
+
+        assert_eq!(
+            store
+                .list_reflog_names()
+                .expect("test operation should succeed"),
+            vec!["refs/heads/main".to_string()]
+        );
+
+        store
+            .write_reflog("refs/heads/main", &[])
+            .expect("test operation should succeed");
+        assert!(
+            store
+                .list_reflog_names()
+                .expect("test operation should succeed")
+                .is_empty()
+        );
 
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }

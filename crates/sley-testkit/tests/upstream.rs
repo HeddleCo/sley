@@ -60,11 +60,10 @@ fn upstream_default_subset_runs() {
                 !results.is_empty(),
                 "runner produced no parseable per-script results"
             );
+
             if all_passed {
                 eprintln!("All selected upstream scripts passed.");
-            } else if std::env::var_os("SLEY_UPSTREAM_REQUIRE_PASS").is_some()
-                || std::env::var_os("GIT_RS_UPSTREAM_REQUIRE_PASS").is_some()
-            {
+            } else if std::env::var_os("SLEY_UPSTREAM_REQUIRE_PASS").is_some() {
                 panic!("some selected upstream scripts failed; see the report above");
             } else {
                 eprintln!(

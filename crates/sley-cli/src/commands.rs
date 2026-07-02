@@ -32,6 +32,7 @@ pub(crate) mod diff_order;
 pub(crate) mod diff_tree;
 pub(crate) mod diff_words;
 pub(crate) mod difftool;
+pub(crate) mod fast_export;
 pub(crate) mod fast_import;
 pub(crate) mod fetch_pack;
 pub(crate) mod filter_branch;

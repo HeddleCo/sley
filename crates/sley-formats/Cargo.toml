@@ -14,10 +14,10 @@ license.workspace = true
 # sley-archive so Cargo resolves a single flate2 backend across the workspace
 # (no C toolchain).
 flate2 = { version = "1", default-features = false }
-sley-core = { path = "../sley-core", version = "0.3.0" }
-sley-config = { path = "../sley-config", version = "0.3.0" }
-sley-index = { path = "../sley-index", version = "0.3.0" }
-sley-object = { path = "../sley-object", version = "0.3.0" }
+sley-core.workspace = true
+sley-config.workspace = true
+sley-index.workspace = true
+sley-object.workspace = true
 
 [features]
 default = ["zlib-rs"]

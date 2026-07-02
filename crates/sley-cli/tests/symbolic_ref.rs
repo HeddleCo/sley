@@ -113,7 +113,7 @@ fn symbolic_ref_quiet_matches_upstream_git() {
             vec!["symbolic-ref", "-q", "refs/heads/main"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -147,7 +147,7 @@ fn symbolic_ref_reftable_repository_matches_upstream_git() {
             vec!["symbolic-ref", "--quiet", "refs/alias/rust"],
         ] {
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
     };
@@ -210,7 +210,7 @@ fn symbolic_ref_update_options_match_upstream_git() {
                 .expect("reset actual HEAD");
 
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_eq!(
                 read_head(&actual),
@@ -272,7 +272,7 @@ fn symbolic_ref_delete_matches_upstream_git() {
             }
 
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_eq!(
                 ref_exists(&actual, "refs/alias/two"),
@@ -326,7 +326,7 @@ fn symbolic_ref_onelevel_names_match_upstream_git() {
             vec!["symbolic-ref", "refs/heads/invalid", "foo..bar"],
         ] {
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
     };
@@ -373,7 +373,7 @@ fn symbolic_ref_short_edge_cases_match_upstream_git() {
         ] {
             run_success(sley_testkit::oracle_git(), &root, &set_args);
             let expected = run(sley_testkit::oracle_git(), &root, &read_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &read_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &read_args);
             assert_same_output(actual, expected, &read_args);
         }
     };
@@ -414,7 +414,7 @@ fn symbolic_ref_df_conflict_matches_upstream_git() {
 
         let args = ["symbolic-ref", "refs/heads/df/conflict", "refs/heads/df"];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -455,7 +455,7 @@ fn assert_symbolic_ref_matches_git(root: &Path, setup: impl Fn(&Path, &str)) {
     setup(&actual, &oid);
     let args = ["symbolic-ref", "HEAD"];
     let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-    let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+    let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
     assert_same_output(actual_output, expected_output, &args);
 }
 
@@ -542,14 +542,14 @@ fn symbolic_ref_head_reflog_matches_upstream_git() {
         }
         let args = ["symbolic-ref", "-m", "create", "HEAD", "refs/heads/log1"];
         run_success(sley_testkit::oracle_git(), &expected, &args);
-        run_success(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        run_success(sley_testkit::sley_bin!(), &actual, &args);
         let args = ["symbolic-ref", "-m", "update", "HEAD", "refs/heads/log2"];
         run_success(sley_testkit::oracle_git(), &expected, &args);
-        run_success(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        run_success(sley_testkit::sley_bin!(), &actual, &args);
 
         let read_args = ["log", "--format=%gs", "-g", "-2"];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &read_args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &read_args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &read_args);
         assert_same_output(actual_output, expected_output, &read_args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -587,7 +587,7 @@ fn symbolic_ref_top_level_target_matches_upstream_git() {
             vec!["rev-parse", "--verify", "HEAD"],
         ] {
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
     };
@@ -635,7 +635,7 @@ fn symbolic_ref_checkout_chain_matches_upstream_git() {
             vec!["symbolic-ref", "--no-recurse", "HEAD"],
         ] {
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
     };
@@ -692,7 +692,7 @@ fn symbolic_ref_short_and_no_recurse_match_upstream_git() {
             vec!["symbolic-ref", "refs/heads/main"],
         ] {
             let expected = run(sley_testkit::oracle_git(), &root, &args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };

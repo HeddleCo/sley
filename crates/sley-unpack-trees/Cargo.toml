@@ -7,8 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core" }
-sley-index = { path = "../sley-index" }
+sley-core.workspace = true
+sley-index.workspace = true
 
 [lints]
 workspace = true

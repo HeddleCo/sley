@@ -52,8 +52,8 @@ fn git_ok(cwd: &Path, args: &[&str]) {
     );
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git_available() -> bool {
@@ -92,7 +92,7 @@ fn assert_same(dir: &Path, args: &[&str]) {
     full.push("merge-tree");
     full.extend_from_slice(args);
     let reference = git(dir, &full);
-    let candidate = git_rs(dir, &full);
+    let candidate = sley(dir, &full);
     assert_eq!(
         candidate.status.code(),
         reference.status.code(),

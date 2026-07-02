@@ -86,6 +86,7 @@ pub enum RevListMissingAction {
     PrintInfo,
     AllowAny,
     AllowPromisor,
+    ExcludePromisor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -441,6 +442,7 @@ pub fn rev_list_walk_commits_with_missing_details(
     if !first_parent {
         return rev_list_walk_commits_all_parents_with_missing(db, format, starts, missing_action);
     }
+    validate_commit_graph_for_rev_walk(db, format)?;
     let grafts = load_commit_grafts(db, format);
     let mut seen = HashSet::new();
     let mut missing_seen = HashSet::new();
@@ -451,9 +453,12 @@ pub fn rev_list_walk_commits_with_missing_details(
         if !seen.insert(oid) {
             continue;
         }
+        if missing_action == RevListMissingAction::ExcludePromisor && db.is_promised_object(&oid) {
+            continue;
+        }
         let object = match db.read_object(&oid) {
             Ok(object) => object,
-            Err(err) if missing_action != RevListMissingAction::Error => {
+            Err(err) if rev_list_missing_allowed(db, &oid, missing_action) => {
                 let _ = err;
                 if matches!(
                     missing_action,
@@ -500,6 +505,13 @@ pub fn load_commit_grafts(
     let Some(git_dir) = db.objects_dir().parent() else {
         return HashMap::new();
     };
+    load_commit_grafts_from_git_dir(git_dir, format)
+}
+
+pub fn load_commit_grafts_from_git_dir(
+    git_dir: &std::path::Path,
+    format: ObjectFormat,
+) -> HashMap<ObjectId, Vec<ObjectId>> {
     let Ok(contents) = std::fs::read_to_string(git_dir.join("info").join("grafts")) else {
         return HashMap::new();
     };
@@ -541,6 +553,7 @@ fn rev_list_walk_commits_all_parents_with_missing(
     starts: impl IntoIterator<Item = ObjectId>,
     missing_action: RevListMissingAction,
 ) -> Result<RevListWalkWithMissing> {
+    validate_commit_graph_for_rev_walk(db, format)?;
     let grafts = load_commit_grafts(db, format);
     let mut seen = HashSet::new();
     let mut missing_seen = HashSet::new();
@@ -551,9 +564,12 @@ fn rev_list_walk_commits_all_parents_with_missing(
         if !seen.insert(oid) {
             continue;
         }
+        if missing_action == RevListMissingAction::ExcludePromisor && db.is_promised_object(&oid) {
+            continue;
+        }
         let object = match db.read_object(&oid) {
             Ok(object) => object,
-            Err(err) if missing_action != RevListMissingAction::Error => {
+            Err(err) if rev_list_missing_allowed(db, &oid, missing_action) => {
                 let _ = err;
                 if matches!(
                     missing_action,
@@ -585,6 +601,32 @@ fn rev_list_walk_commits_all_parents_with_missing(
         records: out,
         missing,
     })
+}
+
+fn rev_list_missing_allowed(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+    missing_action: RevListMissingAction,
+) -> bool {
+    match missing_action {
+        RevListMissingAction::Error => false,
+        RevListMissingAction::Print
+        | RevListMissingAction::PrintInfo
+        | RevListMissingAction::AllowAny => true,
+        RevListMissingAction::AllowPromisor | RevListMissingAction::ExcludePromisor => {
+            db.is_promised_object(oid)
+        }
+    }
+}
+
+fn validate_commit_graph_for_rev_walk(db: &FileObjectDatabase, format: ObjectFormat) -> Result<()> {
+    let Some(git_dir) = db.objects_dir().parent() else {
+        return Ok(());
+    };
+    match crate::load_direct_commit_graph(git_dir, format) {
+        crate::DirectCommitGraph::Invalid(message) => Err(GitError::InvalidFormat(message)),
+        crate::DirectCommitGraph::Missing | crate::DirectCommitGraph::Raw(_) => Ok(()),
+    }
 }
 
 pub fn rev_list_walk_commits_all_parents(

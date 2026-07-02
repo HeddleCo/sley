@@ -1915,6 +1915,7 @@ fn worktree_add_resolve_head(
             branch,
             start,
             options.force_branch,
+            false,
             committer,
         )?;
         // git delegates branch creation to `git branch <new> <start> [<track>]`,

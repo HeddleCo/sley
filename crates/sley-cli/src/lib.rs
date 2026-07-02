@@ -51,6 +51,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::mem;
@@ -69,6 +70,9 @@ static GLOBAL_WORK_TREE: Mutex<Option<PathBuf>> = Mutex::new(None);
 static GLOBAL_ATTR_SOURCE: Mutex<Option<String>> = Mutex::new(None);
 static GLOBAL_BARE: Mutex<bool> = Mutex::new(false);
 static GLOBAL_REPLACE_OBJECTS: Mutex<bool> = Mutex::new(true);
+static GLOBAL_LAZY_FETCH: Mutex<bool> = Mutex::new(true);
+static LOCAL_REPO_ENV_HIDDEN: Mutex<bool> = Mutex::new(false);
+static TRACE2_DEF_PARAMS_EMITTED: Mutex<bool> = Mutex::new(false);
 /// Default pathspec magic set by the global `--{glob,noglob,icase,literal}-pathspecs`
 /// options (and the corresponding `GIT_*_PATHSPECS` env vars). Mirrors git's
 /// `get_default_pathspec_flags()`: `--literal-pathspecs` wins and forces every
@@ -77,6 +81,7 @@ static GLOBAL_PATHSPEC_FLAGS: Mutex<PathspecFlags> = Mutex::new(PathspecFlags {
     literal: false,
     glob: false,
     icase: false,
+    literal_pathspecs: false,
 });
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -87,6 +92,8 @@ pub(crate) struct PathspecFlags {
     pub glob: bool,
     /// `--icase-pathspecs`: case-insensitive matching (`WM_CASEFOLD`).
     pub icase: bool,
+    /// `--literal-pathspecs`: even `:(...)` magic syntax is treated as bytes.
+    pub literal_pathspecs: bool,
 }
 
 pub(crate) fn collect_short_status(
@@ -153,6 +160,9 @@ pub fn run(args: Vec<String>) -> Result<()> {
     sley_core::set_original_cwd(env::current_dir().ok());
     let global = apply_global_options(&args)?;
     sley_core::trace2::touch();
+    sley_core::trace2::start(global.args);
+    trace2_emit_process_ancestry_at_depth(sley_core::trace2::depth(), &[]);
+    trace2_emit_def_params_once();
     // `-c` / `--config-env` overrides are folded into the process
     // `GIT_CONFIG_PARAMETERS` env var during option parsing, so the single
     // `injected_config_parameters()` reader is the source of truth for every
@@ -162,6 +172,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     set_global_attr_source(global.attr_source);
     set_global_bare(global.bare);
     set_global_replace_objects(global.replace_objects);
+    set_global_lazy_fetch(global.lazy_fetch);
     set_global_pathspec_flags(global.pathspec_flags);
     // Emit git's GIT_TRACE_SETUP output (the env/config/gitfile discovery trace)
     // before dispatching. This is the CLI-side repository setup that
@@ -172,6 +183,235 @@ pub fn run(args: Vec<String>) -> Result<()> {
         setup::trace_repo_setup(&setup_result);
     }
     dispatch_with_aliases(global.args, &global.config, 0)
+}
+
+fn trace2_target_enabled() -> bool {
+    env::var_os("GIT_TRACE2").is_some()
+        || env::var_os("GIT_TRACE2_PERF").is_some()
+        || env::var_os("GIT_TRACE2_EVENT").is_some()
+}
+
+fn trace2_emit_process_ancestry_at_depth(depth: usize, prefix: &[&str]) {
+    if !trace2_target_enabled() {
+        return;
+    }
+    let parent_names = sley_procinfo::process_ancestry();
+    if prefix.is_empty() && parent_names.is_empty() {
+        return;
+    }
+    let mut ancestry = Vec::with_capacity(prefix.len() + parent_names.len());
+    ancestry.extend(prefix.iter().map(|name| (*name).to_string()));
+    ancestry.extend(parent_names.iter().cloned());
+    sley_core::trace2::cmd_ancestry_at_depth(depth, &ancestry);
+}
+
+fn trace2_config_param_matches(pattern: &str, key: &str) -> bool {
+    let pattern = pattern.trim().to_ascii_lowercase();
+    let key = key.to_ascii_lowercase();
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern == "*" || pattern == key {
+        return true;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return false;
+    }
+    let mut remainder = key.as_str();
+    if let Some(first) = parts.first().filter(|part| !part.is_empty()) {
+        let Some(stripped) = remainder.strip_prefix(first) else {
+            return false;
+        };
+        remainder = stripped;
+    }
+    for part in parts
+        .iter()
+        .skip(1)
+        .take(parts.len().saturating_sub(2))
+        .filter(|part| !part.is_empty())
+    {
+        let Some(idx) = remainder.find(part) else {
+            return false;
+        };
+        remainder = &remainder[idx + part.len()..];
+    }
+    if let Some(last) = parts.last().filter(|part| !part.is_empty()) {
+        return remainder.ends_with(last);
+    }
+    true
+}
+
+fn trace2_dispatch_config() -> Result<GitConfig> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd).ok();
+    let common_git_dir = git_dir
+        .as_deref()
+        .and_then(|git_dir| common_git_dir_for_git_dir(git_dir).ok());
+    let branch = git_dir
+        .as_deref()
+        .and_then(|git_dir| repo_current_branch_name(git_dir));
+    let context = sley_config::ConfigIncludeContext::new(common_git_dir.clone(), branch);
+    let mut config = sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)?;
+    let parameters = injected_config_parameters()?;
+    sley_config::append_injected_config_sections_with_includes(
+        &mut config,
+        &parameters,
+        &context,
+        &cwd,
+    )?;
+    Ok(config)
+}
+
+fn trace2_config_key(section: &ConfigSection, entry: &ConfigEntry) -> String {
+    match section.subsection.as_deref() {
+        Some(subsection) if !subsection.is_empty() => {
+            format!("{}.{}.{}", section.name, subsection, entry.key)
+        }
+        _ => format!("{}.{}", section.name, entry.key),
+    }
+}
+
+fn trace2_requested_config_patterns(config: &GitConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(value) = env::var("GIT_TRACE2_CONFIG_PARAMS")
+        && !value.is_empty()
+    {
+        out.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if let Some(value) = config
+        .get("trace2", None, "configParams")
+        .filter(|value| !value.is_empty())
+    {
+        out.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string),
+        );
+    }
+    out
+}
+
+fn trace2_emit_def_params_at_depth(depth: usize) {
+    if !trace2_target_enabled() {
+        return;
+    }
+    let Ok(config) = trace2_dispatch_config() else {
+        return;
+    };
+    let patterns = trace2_requested_config_patterns(&config);
+    if !patterns.is_empty() {
+        for section in &config.sections {
+            for entry in &section.entries {
+                let key = trace2_config_key(section, entry);
+                if patterns
+                    .iter()
+                    .any(|pattern| trace2_config_param_matches(pattern, &key))
+                {
+                    let value = entry.value.as_deref().unwrap_or("true");
+                    sley_core::trace2::def_param_at_depth(depth, &key, value);
+                }
+            }
+        }
+    }
+    let envvars = env::var("GIT_TRACE2_ENV_VARS")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            config
+                .get("trace2", None, "envvars")
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    if let Some(envvars) = envvars {
+        for name in envvars
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if let Ok(value) = env::var(name) {
+                sley_core::trace2::def_param_at_depth(depth, name, value);
+            }
+        }
+    }
+}
+
+fn trace2_emit_def_params_once() {
+    let mut emitted = TRACE2_DEF_PARAMS_EMITTED.lock().unwrap();
+    if *emitted {
+        return;
+    }
+    *emitted = true;
+    drop(emitted);
+    trace2_emit_def_params_at_depth(sley_core::trace2::depth());
+}
+
+const ARGV_BYTE_SENTINEL_BASE: u32 = 0xE000;
+
+pub fn argv_string_from_os(arg: OsString) -> String {
+    match arg.into_string() {
+        Ok(value) => value,
+        Err(arg) => argv_string_from_non_utf8_os(arg),
+    }
+}
+
+#[cfg(unix)]
+fn argv_string_from_non_utf8_os(arg: OsString) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    argv_string_from_bytes(arg.as_os_str().as_bytes())
+}
+
+#[cfg(not(unix))]
+fn argv_string_from_non_utf8_os(arg: OsString) -> String {
+    arg.to_string_lossy().into_owned()
+}
+
+pub(crate) fn argv_string_from_bytes(bytes: &[u8]) -> String {
+    if let Ok(value) = std::str::from_utf8(bytes) {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(bytes.len());
+    for byte in bytes {
+        if byte.is_ascii() {
+            out.push(*byte as char);
+        } else if let Some(ch) = char::from_u32(ARGV_BYTE_SENTINEL_BASE + u32::from(*byte)) {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+pub(crate) fn argv_bytes_from_string(value: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len());
+    for ch in value.chars() {
+        let code = ch as u32;
+        if (ARGV_BYTE_SENTINEL_BASE..=ARGV_BYTE_SENTINEL_BASE + 0xff).contains(&code) {
+            out.push((code - ARGV_BYTE_SENTINEL_BASE) as u8);
+        } else {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+pub(crate) fn argv_bytes_from_os(value: OsString) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    value.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn argv_bytes_from_os(value: OsString) -> Vec<u8> {
+    value.to_string_lossy().into_owned().into_bytes()
 }
 
 fn dispatch_with_aliases(
@@ -209,14 +449,23 @@ fn dispatch_with_aliases(
                     return Err(GitError::Exit(128));
                 }
                 commands::alias::AliasLookup::Value(alias_string) => {
+                    trace2_run_dashed(&command, expanded_aliases.len());
                     // `git <alias> -h` prints what the alias resolves to.
                     if args.len() == 2 && args[1] == "-h" {
                         eprintln!("'{command}' is aliased to '{alias_string}'");
                     }
                     if let Some(shell) = alias_string.strip_prefix('!') {
+                        trace2_alias(&command, &[shell.to_string()]);
+                        trace2_alias_cmd_name("_run_shell_alias_", expanded_aliases.len());
+                        trace2_alias_child_command(
+                            "version",
+                            "_run_shell_alias_",
+                            expanded_aliases.len(),
+                        );
                         return commands::alias::run_shell_alias(shell, &args[1..]);
                     }
                     let mut expanded = commands::alias::split_alias_value(&alias_string);
+                    trace2_alias(&command, &expanded);
                     expanded.extend(args[1..].iter().cloned());
                     // An alias body may begin with global options (`-c`, `-C`,
                     // `--config-env`, ...); git re-parses those before the real
@@ -231,6 +480,14 @@ fn dispatch_with_aliases(
                     if real_command == command {
                         eprintln!("fatal: recursive alias: {command}");
                         return Err(GitError::Exit(128));
+                    }
+                    if commands::alias::is_builtin_command(&real_command) {
+                        trace2_alias_cmd_name("_run_git_alias_", expanded_aliases.len());
+                        trace2_alias_child_command(
+                            &real_command,
+                            "_run_git_alias_",
+                            expanded_aliases.len(),
+                        );
                     }
                     expanded_aliases.push(command);
                     if let Some(seen) = expanded_aliases
@@ -257,6 +514,45 @@ fn dispatch_with_aliases(
     Err(GitError::Exit(128))
 }
 
+fn trace2_dashed_hierarchy(alias_depth: usize) -> String {
+    std::iter::repeat_n("_run_dashed_", alias_depth + 1)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn trace2_alias_hierarchy(kind: &str, alias_depth: usize) -> String {
+    let mut parts = Vec::with_capacity(alias_depth + 2);
+    parts.extend(std::iter::repeat_n("_run_dashed_", alias_depth + 1));
+    parts.push(kind);
+    parts.join("/")
+}
+
+fn trace2_run_dashed(command: &str, alias_depth: usize) {
+    let hierarchy = trace2_dashed_hierarchy(alias_depth);
+    sley_core::trace2::cmd_name("_run_dashed_", Some(&hierarchy));
+    sley_core::trace2::child_start("dashed", &[format!("git-{command}")]);
+}
+
+fn trace2_alias(command: &str, argv: &[String]) {
+    sley_core::trace2::alias(command, argv);
+}
+
+fn trace2_alias_cmd_name(kind: &str, alias_depth: usize) {
+    let hierarchy = trace2_alias_hierarchy(kind, alias_depth);
+    sley_core::trace2::cmd_name(kind, Some(&hierarchy));
+}
+
+fn trace2_alias_child_command(command: &str, alias_kind: &str, alias_depth: usize) {
+    let hierarchy = format!(
+        "{}/{}",
+        trace2_alias_hierarchy(alias_kind, alias_depth),
+        command
+    );
+    trace2_emit_process_ancestry_at_depth(1, &["git"]);
+    sley_core::trace2::cmd_name_at_depth(1, command, Some(&hierarchy));
+    trace2_emit_def_params_at_depth(1);
+}
+
 /// Re-parse leading global options on an expanded alias argv, applying them the
 /// same way the top-level parser does, and return the remaining argv.
 fn reapply_global_options(expanded: &[String]) -> Result<Vec<String>> {
@@ -272,6 +568,9 @@ fn reapply_global_options(expanded: &[String]) -> Result<Vec<String>> {
     }
     if nested.bare {
         set_global_bare(true);
+    }
+    if !nested.lazy_fetch {
+        set_global_lazy_fetch(false);
     }
     if nested.pathspec_flags != PathspecFlags::default() {
         set_global_pathspec_flags(nested.pathspec_flags);
@@ -307,6 +606,8 @@ fn run_external_or_unknown(command: &str, args: &[String]) -> Result<()> {
     let mut argv = Vec::with_capacity(args.len());
     argv.push(external.clone());
     argv.extend(args[1..].iter().cloned());
+    trace2_run_dashed(command, 0);
+    trace2_external_child_metadata(command);
     if setup::git_trace_enabled() {
         let mut line = String::from("trace: run_command:");
         for arg in &argv {
@@ -316,8 +617,13 @@ fn run_external_or_unknown(command: &str, args: &[String]) -> Result<()> {
         setup::git_trace_line("run-command.c:672", &line);
     }
     if let Some(path) = locate_external_in_path(&external) {
-        let status = std::process::Command::new(path)
-            .args(&args[1..])
+        let mut process = std::process::Command::new(path);
+        process.args(&args[1..]);
+        process.env(
+            "SLEY_TRACE2_DEPTH",
+            (sley_core::trace2::depth() + 1).to_string(),
+        );
+        let status = process
             .status()
             .map_err(|err| GitError::Io(err.to_string()))?;
         return match status.code() {
@@ -327,6 +633,15 @@ fn run_external_or_unknown(command: &str, args: &[String]) -> Result<()> {
         };
     }
     commands::help::unknown_command(command, 1)
+}
+
+fn trace2_external_child_metadata(command: &str) {
+    let child_name = match command {
+        "remote-http" | "remote-https" | "remote-ftp" | "remote-ftps" => "remote-curl",
+        other => other,
+    };
+    sley_core::trace2::cmd_name_at_depth(1, child_name, None);
+    trace2_emit_def_params_at_depth(1);
 }
 
 /// Locate an executable `git-<cmd>` on `PATH` (git's `locate_in_PATH`), or
@@ -380,6 +695,14 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
     // are prefixed `packet: %12s` with this value (e.g. `ls-remote`, `clone`,
     // `fetch`, `upload-pack`).
     sley_protocol::set_packet_trace_identity(command);
+    let trace2_command_name = match command {
+        "--exec-path" | "--html-path" | "--man-path" | "--info-path" | "--list-cmds=builtins" => {
+            "_query_"
+        }
+        "-v" | "--version" => "version",
+        _ => command,
+    };
+    sley_core::trace2::cmd_name(trace2_command_name, None);
     if command != "help"
         && args.len() == 2
         && args.get(1).is_some_and(|arg| arg == "-h")
@@ -391,6 +714,8 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
     }
     match command {
         "help" => commands::help::cmd_help(&args[1..]),
+        "--exec-path" => cmd_exec_path(),
+        "--html-path" | "--man-path" | "--info-path" => cmd_info_path(),
         "--list-cmds=builtins" => {
             commands::help::print_builtin_commands();
             Ok(())
@@ -518,7 +843,10 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "diff-tree" => commands::diff_tree::cmd_diff_tree(&args[1..]),
         "diff-index" => commands::diff_index::cmd_diff_index(&args[1..]),
         "diff-files" => commands::diff_files::cmd_diff_files(&args[1..]),
+        "fast-export" => commands::fast_export::cmd_fast_export(&args[1..]),
         "fast-import" => commands::fast_import::cmd_fast_import(&args[1..]),
+        #[cfg(feature = "git-compat-i18n")]
+        "sh-i18n--envsubst" => cmd_sh_i18n_envsubst(&args[1..]),
         "merge-tree" => commands::merge_tree::cmd_merge_tree(&args[1..]),
         "merge-file" => commands::merge_file::cmd_merge_file(&args[1..]),
         "merge-index" => commands::merge_index::cmd_merge_index(&args[1..]),
@@ -533,13 +861,60 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
     }
 }
 
+fn cmd_exec_path() -> Result<()> {
+    println!("{}", git_exec_path()?.display());
+    Ok(())
+}
+
+fn cmd_info_path() -> Result<()> {
+    println!("{}", git_exec_path()?.display());
+    Ok(())
+}
+
+fn git_exec_path() -> Result<PathBuf> {
+    #[cfg(feature = "git-compat-i18n")]
+    {
+        sley_i18n::materialize_git_i18n_helpers().map_err(|err| GitError::Io(err.to_string()))
+    }
+    #[cfg(not(feature = "git-compat-i18n"))]
+    {
+        if let Ok(exe) = env::current_exe()
+            && let Some(parent) = exe.parent()
+        {
+            return Ok(parent.to_path_buf());
+        }
+        env::current_dir().map_err(|err| GitError::Io(err.to_string()))
+    }
+}
+
+#[cfg(feature = "git-compat-i18n")]
+fn cmd_sh_i18n_envsubst(args: &[String]) -> Result<()> {
+    if args.len() == 2 && args[0] == "--variables" {
+        for variable in sley_i18n::envsubst_variables(&args[1]) {
+            println!("{variable}");
+        }
+        return Ok(());
+    }
+    if args.len() != 1 {
+        eprintln!("fatal: first argument must be --variables when two are given");
+        return Err(GitError::Exit(128));
+    }
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    let expanded = sley_i18n::envsubst(&input, &args[0], |name| env::var(name).ok());
+    print!("{expanded}");
+    Ok(())
+}
+
 /// Emit the `git version --build-options` block, mirroring git 2.54's line
 /// shapes. Only the fields with a parity-relevant meaning for sley are reported
 /// with truthful values; the rest match git's format so harness parsers (which
 /// read specific `key: value` lines) keep working.
 
 fn common_git_dir_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
-    if let Some(common_dir) = env::var_os("GIT_COMMON_DIR") {
+    if !local_repo_env_hidden()
+        && let Some(common_dir) = env::var_os("GIT_COMMON_DIR")
+    {
         return Ok(PathBuf::from(common_dir));
     }
     let commondir = git_dir.join("commondir");
@@ -564,6 +939,7 @@ struct GlobalOptions<'a> {
     attr_source: Option<String>,
     bare: bool,
     replace_objects: bool,
+    lazy_fetch: bool,
     pathspec_flags: PathspecFlags,
 }
 
@@ -581,6 +957,7 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
     let mut attr_source = None;
     let mut bare = false;
     let mut replace_objects = env::var_os("GIT_NO_REPLACE_OBJECTS").is_none();
+    let mut lazy_fetch = true;
     let mut pathspec_flags = PathspecFlags::default();
     while let Some(arg) = args.get(index) {
         match arg.as_str() {
@@ -618,13 +995,11 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
                 config.push(push_config_env(spec)?);
                 index += 2;
             }
-            "-p"
-            | "--paginate"
-            | "-P"
-            | "--no-pager"
-            | "--no-lazy-fetch"
-            | "--no-optional-locks"
-            | "--no-advice" => {
+            "-p" | "--paginate" | "-P" | "--no-pager" | "--no-optional-locks" | "--no-advice" => {
+                index += 1;
+            }
+            "--no-lazy-fetch" => {
+                lazy_fetch = false;
                 index += 1;
             }
             "--no-replace-objects" => {
@@ -633,6 +1008,7 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
             }
             "--literal-pathspecs" => {
                 pathspec_flags.literal = true;
+                pathspec_flags.literal_pathspecs = true;
                 index += 1;
             }
             "--glob-pathspecs" => {
@@ -708,6 +1084,7 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
         attr_source,
         bare,
         replace_objects,
+        lazy_fetch,
         pathspec_flags,
     })
 }
@@ -880,16 +1257,10 @@ pub(crate) const DEFAULT_BIG_FILE_THRESHOLD: u64 = 512 * 1024 * 1024;
 
 pub(crate) fn core_big_file_threshold(git_dir: Option<&Path>) -> Result<u64> {
     let context = match git_dir {
-        Some(git_dir) => {
-            let git_dir_abs = match fs::canonicalize(git_dir) {
-                Ok(path) => path,
-                Err(_) => git_dir.to_path_buf(),
-            };
-            sley_config::ConfigIncludeContext::new(
-                Some(git_dir_abs),
-                sley_config::repo_current_branch_name(git_dir),
-            )
-        }
+        Some(git_dir) => sley_config::ConfigIncludeContext::new(
+            Some(sley_config::git_dir_for_include_context(git_dir)),
+            sley_config::repo_current_branch_name(git_dir),
+        ),
         None => sley_config::ConfigIncludeContext::new(None, None),
     };
     let mut config = sley_config::load_pre_dispatch_config(git_dir, &context)
@@ -959,6 +1330,44 @@ fn set_global_replace_objects(replace_objects: bool) {
     }
 }
 
+fn set_global_lazy_fetch(lazy_fetch: bool) {
+    if let Ok(mut value) = GLOBAL_LAZY_FETCH.lock() {
+        *value = lazy_fetch;
+    }
+}
+
+struct LocalRepoEnvGuard {
+    previous: Option<bool>,
+}
+
+impl Drop for LocalRepoEnvGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous
+            && let Ok(mut value) = LOCAL_REPO_ENV_HIDDEN.lock()
+        {
+            *value = previous;
+        }
+    }
+}
+
+fn hide_local_repo_env_for_scope() -> LocalRepoEnvGuard {
+    match LOCAL_REPO_ENV_HIDDEN.lock() {
+        Ok(mut value) => {
+            let previous = *value;
+            *value = true;
+            LocalRepoEnvGuard {
+                previous: Some(previous),
+            }
+        }
+        Err(_) => LocalRepoEnvGuard { previous: None },
+    }
+}
+
+pub(crate) fn with_local_repo_env_hidden<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _guard = hide_local_repo_env_for_scope();
+    f()
+}
+
 fn set_global_pathspec_flags(flags: PathspecFlags) {
     if let Ok(mut value) = GLOBAL_PATHSPEC_FLAGS.lock() {
         *value = flags;
@@ -976,6 +1385,7 @@ pub(crate) fn effective_pathspec_flags() -> sley_worktree::PathspecMatchMagic {
         .unwrap_or_default();
     if git_env_bool("GIT_LITERAL_PATHSPECS") {
         flags.literal = true;
+        flags.literal_pathspecs = true;
     }
     if git_env_bool("GIT_NOGLOB_PATHSPECS") {
         flags.literal = true;
@@ -988,8 +1398,9 @@ pub(crate) fn effective_pathspec_flags() -> sley_worktree::PathspecMatchMagic {
     }
     sley_worktree::PathspecMatchMagic {
         literal: flags.literal,
-        glob: flags.glob && !flags.literal,
+        glob: flags.glob && !flags.literal && !flags.literal_pathspecs,
         icase: flags.icase,
+        literal_pathspecs: flags.literal_pathspecs,
     }
 }
 
@@ -1017,10 +1428,16 @@ fn git_env_bool(name: &str) -> bool {
 }
 
 fn global_git_dir() -> Option<PathBuf> {
+    if local_repo_env_hidden() {
+        return None;
+    }
     GLOBAL_GIT_DIR.lock().ok()?.clone()
 }
 
 fn global_work_tree() -> Option<PathBuf> {
+    if local_repo_env_hidden() {
+        return None;
+    }
     GLOBAL_WORK_TREE.lock().ok()?.clone()
 }
 
@@ -1029,6 +1446,9 @@ pub(crate) fn global_attr_source() -> Option<String> {
 }
 
 fn environment_git_dir() -> Option<PathBuf> {
+    if local_repo_env_hidden() {
+        return None;
+    }
     env::var_os("GIT_DIR").map(PathBuf::from)
 }
 
@@ -1037,6 +1457,9 @@ fn explicit_git_dir() -> Option<PathBuf> {
 }
 
 fn environment_work_tree() -> Option<PathBuf> {
+    if local_repo_env_hidden() {
+        return None;
+    }
     env::var_os("GIT_WORK_TREE").map(PathBuf::from)
 }
 
@@ -1045,12 +1468,26 @@ fn explicit_work_tree() -> Option<PathBuf> {
 }
 
 fn global_bare() -> bool {
+    if local_repo_env_hidden() {
+        return false;
+    }
     GLOBAL_BARE.lock().is_ok_and(|value| *value)
+}
+
+fn local_repo_env_hidden() -> bool {
+    LOCAL_REPO_ENV_HIDDEN.lock().is_ok_and(|value| *value)
 }
 
 fn global_replace_objects() -> bool {
     GLOBAL_REPLACE_OBJECTS.lock().map_or(true, |value| *value)
         && env::var_os("GIT_NO_REPLACE_OBJECTS").is_none()
+}
+
+pub(crate) fn global_lazy_fetch_enabled() -> bool {
+    GLOBAL_LAZY_FETCH.lock().map_or(true, |value| *value)
+        && env::var("GIT_NO_LAZY_FETCH")
+            .map(|value| value == "0")
+            .unwrap_or(true)
 }
 
 pub(crate) fn replace_objects_active(refs: &FileRefStore) -> Result<bool> {
@@ -1163,16 +1600,10 @@ fn init_config_value(
         return Ok(Some(value));
     }
     let context = match config_git_dir {
-        Some(git_dir) => {
-            let git_dir_abs = match fs::canonicalize(git_dir) {
-                Ok(path) => path,
-                Err(_) => git_dir.to_path_buf(),
-            };
-            sley_config::ConfigIncludeContext::new(
-                Some(git_dir_abs),
-                sley_config::repo_current_branch_name(git_dir),
-            )
-        }
+        Some(git_dir) => sley_config::ConfigIncludeContext::new(
+            Some(sley_config::git_dir_for_include_context(git_dir)),
+            sley_config::repo_current_branch_name(git_dir),
+        ),
         None => sley_config::ConfigIncludeContext::new(None, None),
     };
     let mut config = sley_config::load_pre_dispatch_config(config_git_dir, &context)
@@ -1235,6 +1666,12 @@ pub(crate) fn submodule_path_config_enabled(git_dir: &Path) -> bool {
 pub(crate) fn report_config_setup_error(err: GitError) -> GitError {
     match err {
         GitError::InvalidFormat(message) => {
+            if message == "relative config includes must come from files"
+                || message.starts_with("exceeded maximum include depth")
+            {
+                eprintln!("fatal: {message}");
+                return GitError::Exit(128);
+            }
             if message
                 == "remote URLs cannot be configured in file directly or indirectly included by includeIf.hasconfig:remote.*.url"
             {
@@ -1778,6 +2215,7 @@ fn checkout_create_or_reset_branch(
     branch: &str,
     start: &str,
     force: bool,
+    create_reflog: bool,
     committer: Vec<u8>,
 ) -> Result<bool> {
     let store = FileRefStore::new(git_dir, format);
@@ -1835,12 +2273,22 @@ fn checkout_create_or_reset_branch(
         tx.commit()?;
         Ok(true)
     } else {
-        store.create_branch(
-            branch,
-            start_oid,
-            committer,
-            format!("branch: Created from {start}").into_bytes(),
-        )?;
+        let reflog = store
+            .should_write_reflog_for_update(&name, create_reflog)?
+            .then(|| ReflogEntry {
+                old_oid: ObjectId::null(format),
+                new_oid: start_oid,
+                committer,
+                message: format!("branch: Created from {start}").into_bytes(),
+            });
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name,
+            expected: None,
+            new: RefTarget::Direct(start_oid),
+            reflog,
+        });
+        tx.commit()?;
         Ok(false)
     }
 }
@@ -2247,6 +2695,15 @@ fn read_commit_pathspecs_from_file(path: &Path, nul: bool) -> Result<Vec<PathBuf
             if entry.is_empty() {
                 None
             } else {
+                if !nul && entry.first() == Some(&b'"') {
+                    let mut unquoted = Vec::new();
+                    if commands::ref_command_stream::unquote_c_style(entry, &mut unquoted).is_some()
+                    {
+                        return Some(PathBuf::from(
+                            String::from_utf8_lossy(&unquoted).into_owned(),
+                        ));
+                    }
+                }
                 Some(PathBuf::from(String::from_utf8_lossy(entry).into_owned()))
             }
         })
@@ -2673,6 +3130,12 @@ fn diff_raw_oid(
         hex.push_str("...");
     }
     hex
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DiffWorktreeCleanContext<'a> {
+    pub(crate) config: &'a GitConfig,
+    pub(crate) attributes: &'a sley_worktree::WorktreeAttributes,
 }
 
 #[derive(Clone, Copy)]
@@ -3278,9 +3741,10 @@ pub(crate) fn write_diff_patch_entry(
     if let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
         && sley_diff_merge::is_type_change(old_mode, new_mode)
     {
+        let deletion_path = entry.old_path.clone().unwrap_or_else(|| entry.path.clone());
         let deletion = sley_diff_merge::NameStatusEntry {
             status: sley_diff_merge::NameStatus::Deleted,
-            path: entry.path.clone(),
+            path: deletion_path,
             old_path: None,
             old_mode: Some(old_mode),
             new_mode: None,
@@ -3322,6 +3786,7 @@ pub(crate) fn write_diff_patch_entry(
                 options.db,
                 options.worktree_root,
                 options.use_worktree_new,
+                None,
             )?,
         ),
     };
@@ -3499,26 +3964,36 @@ pub(crate) fn write_diff_patch_entry(
     if !content_changed {
         return Ok(());
     }
-    write_diff_meta_line(
-        stdout,
-        colors,
-        &format!(
-            "index {}..{}{}",
-            diff_patch_oid(
-                entry.old_oid.as_ref(),
-                old_content.as_deref(),
-                options.format,
-                options.abbrev,
+    let no_index_stdin_add = options.no_index_contents.is_some()
+        && matches!(entry.status, sley_diff_merge::NameStatus::Added)
+        && entry.path.as_bytes() == b"-"
+        && entry.old_oid.is_none()
+        && entry.new_oid == Some(ObjectId::null(options.format));
+    let no_index_stream_pair = options.no_index_contents.is_some()
+        && entry.old_oid == Some(ObjectId::null(options.format))
+        && entry.new_oid == Some(ObjectId::null(options.format));
+    if !no_index_stdin_add && !no_index_stream_pair {
+        write_diff_meta_line(
+            stdout,
+            colors,
+            &format!(
+                "index {}..{}{}",
+                diff_patch_oid(
+                    entry.old_oid.as_ref(),
+                    old_content.as_deref(),
+                    options.format,
+                    options.abbrev,
+                ),
+                diff_patch_oid(
+                    entry.new_oid.as_ref(),
+                    new_content.as_deref(),
+                    options.format,
+                    options.abbrev,
+                ),
+                diff_patch_mode_suffix(entry)
             ),
-            diff_patch_oid(
-                entry.new_oid.as_ref(),
-                new_content.as_deref(),
-                options.format,
-                options.abbrev,
-            ),
-            diff_patch_mode_suffix(entry)
-        ),
-    )?;
+        )?;
+    }
     let empty_add_or_delete = matches!(
         entry.status,
         sley_diff_merge::NameStatus::Added | sley_diff_merge::NameStatus::Deleted
@@ -3866,6 +4341,14 @@ fn write_diff_numstat_materialized_entry(
     stats: DiffLineStats,
     z: bool,
 ) -> Result<()> {
+    let stats = if matches!(entry.status, sley_diff_merge::NameStatus::Unmerged) {
+        DiffLineStats::Text {
+            inserted: 0,
+            deleted: 0,
+        }
+    } else {
+        stats
+    };
     if z {
         write_diff_numstat_counts(stdout, stats)?;
         if let Some(old_path) = &entry.old_path {
@@ -3911,7 +4394,12 @@ fn write_diff_shortstat_materialized(
         return Ok(());
     }
     let (inserted, deleted) = diff_stat_totals(entries);
-    write_diff_stat_summary_line(stdout, entries.len(), inserted, deleted)
+    write_diff_stat_summary_line(
+        stdout,
+        diff_stat_changed_file_count(entries),
+        inserted,
+        deleted,
+    )
 }
 
 /// The `--stat=<width>[,<name-width>[,<count>]]` / `--stat-*-width` knobs plus
@@ -4039,6 +4527,9 @@ fn write_diff_stat_materialized_with_widths(
         let len = diff_stat_display_width(&row.path);
         max_len = max_len.max(len);
         match row.stats {
+            DiffStatStats::Unmerged => {
+                bin_width = bin_width.max("Unmerged".len() as i64);
+            }
             DiffStatStats::Binary {
                 old_size,
                 new_size,
@@ -4136,6 +4627,9 @@ fn write_diff_stat_materialized_with_widths(
         let padding = (len - diff_stat_display_width(name)).max(0) as usize;
 
         match row.stats {
+            DiffStatStats::Unmerged => {
+                writeln!(stdout, " {marker}{name}{:padding$} | Unmerged", "")?;
+            }
             DiffStatStats::Binary {
                 old_size,
                 new_size,
@@ -4196,9 +4690,10 @@ fn write_diff_stat_materialized_with_widths(
     }
 
     // Totals cover every row (display truncation does not affect them);
-    // binary rows count as changed files but contribute no line counts.
+    // binary rows count as changed files but contribute no line counts;
+    // unmerged rows are displayed but skipped from both totals.
     let (adds, dels) = diff_stat_totals(entries);
-    write_diff_stat_summary_line(stdout, rows.len(), adds, dels)
+    write_diff_stat_summary_line(stdout, diff_stat_changed_file_count(entries), adds, dels)
 }
 
 fn write_diff_stat_materialized(
@@ -4311,6 +4806,7 @@ fn write_diff_dirstat(
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
+    worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
     options: DirstatOptions,
 ) -> Result<()> {
     let mut files = Vec::with_capacity(entries.len());
@@ -4327,8 +4823,13 @@ fn write_diff_dirstat(
                 DirstatMode::Files => 1,
                 DirstatMode::Lines => {
                     let old_content = diff_entry_old_content(entry, db)?;
-                    let new_content =
-                        diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+                    let new_content = diff_entry_new_content(
+                        entry,
+                        db,
+                        worktree_root,
+                        use_worktree_new,
+                        worktree_clean,
+                    )?;
                     match diff_line_stats(old_content.as_deref(), new_content.as_deref()) {
                         DiffLineStats::Binary { .. } => {
                             let bytes = old_content.as_ref().map_or(0, Vec::len)
@@ -4340,8 +4841,13 @@ fn write_diff_dirstat(
                 }
                 DirstatMode::Changes => {
                     let old_content = diff_entry_old_content(entry, db)?;
-                    let new_content =
-                        diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+                    let new_content = diff_entry_new_content(
+                        entry,
+                        db,
+                        worktree_root,
+                        use_worktree_new,
+                        worktree_clean,
+                    )?;
                     let damage = match (old_content.as_deref(), new_content.as_deref()) {
                         (Some(old), Some(new)) => {
                             let (copied, added) = sley_diff_merge::count_changes(old, new);
@@ -4492,6 +4998,22 @@ fn collect_diff_stat_entries<'a>(
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
 ) -> Result<Vec<DiffStatEntryData<'a>>> {
+    collect_diff_stat_entries_with_worktree_clean(
+        entries,
+        db,
+        worktree_root,
+        use_worktree_new,
+        None,
+    )
+}
+
+fn collect_diff_stat_entries_with_worktree_clean<'a>(
+    entries: &'a [sley_diff_merge::NameStatusEntry],
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+    worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+) -> Result<Vec<DiffStatEntryData<'a>>> {
     let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         let old_content = diff_entry_old_stat_content(entry, db)?;
@@ -4499,8 +5021,13 @@ fn collect_diff_stat_entries<'a>(
             let old_bytes = old_content.as_ref().map(DiffBlobContent::as_slice);
             diff_line_stats(old_bytes, old_bytes)
         } else {
-            let new_content =
-                diff_entry_new_stat_content(entry, db, worktree_root, use_worktree_new)?;
+            let new_content = diff_entry_new_stat_content(
+                entry,
+                db,
+                worktree_root,
+                use_worktree_new,
+                worktree_clean,
+            )?;
             diff_line_stats(
                 old_content.as_ref().map(DiffBlobContent::as_slice),
                 new_content.as_ref().map(DiffBlobContent::as_slice),
@@ -4515,6 +5042,9 @@ fn diff_stat_totals(entries: &[DiffStatEntryData<'_>]) -> (usize, usize) {
     let mut inserted = 0;
     let mut deleted = 0;
     for entry in entries {
+        if matches!(entry.entry.status, sley_diff_merge::NameStatus::Unmerged) {
+            continue;
+        }
         if let DiffLineStats::Text {
             inserted: entry_inserted,
             deleted: entry_deleted,
@@ -4527,6 +5057,13 @@ fn diff_stat_totals(entries: &[DiffStatEntryData<'_>]) -> (usize, usize) {
     (inserted, deleted)
 }
 
+fn diff_stat_changed_file_count(entries: &[DiffStatEntryData<'_>]) -> usize {
+    entries
+        .iter()
+        .filter(|entry| !matches!(entry.entry.status, sley_diff_merge::NameStatus::Unmerged))
+        .count()
+}
+
 fn diff_stat_rows_from_materialized(
     entries: &[DiffStatEntryData<'_>],
     compact_summary: bool,
@@ -4534,17 +5071,23 @@ fn diff_stat_rows_from_materialized(
 ) -> Vec<DiffStatRow> {
     let mut rows = Vec::with_capacity(entries.len());
     for data in entries {
-        let stats = match data.stats {
-            DiffLineStats::Binary {
-                old_size,
-                new_size,
-                unchanged,
-            } => DiffStatStats::Binary {
-                old_size,
-                new_size,
-                unchanged,
-            },
-            DiffLineStats::Text { inserted, deleted } => DiffStatStats::Text { inserted, deleted },
+        let stats = if matches!(data.entry.status, sley_diff_merge::NameStatus::Unmerged) {
+            DiffStatStats::Unmerged
+        } else {
+            match data.stats {
+                DiffLineStats::Binary {
+                    old_size,
+                    new_size,
+                    unchanged,
+                } => DiffStatStats::Binary {
+                    old_size,
+                    new_size,
+                    unchanged,
+                },
+                DiffLineStats::Text { inserted, deleted } => {
+                    DiffStatStats::Text { inserted, deleted }
+                }
+            }
         };
         rows.push(DiffStatRow {
             path: diff_stat_path(data.entry, compact_summary, quote_path_fully),
@@ -4562,6 +5105,7 @@ struct DiffStatRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffStatStats {
+    Unmerged,
     Binary {
         old_size: usize,
         new_size: usize,
@@ -5259,6 +5803,7 @@ pub(crate) fn diff_entry_produces_output(
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
+    worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
     interhunk: usize,
     context: usize,
     ws_ignore: sley_diff_merge::WsIgnore,
@@ -5274,7 +5819,8 @@ pub(crate) fn diff_entry_produces_output(
         return Ok(true);
     }
     let old_content = diff_entry_old_content(entry, db)?;
-    let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+    let new_content =
+        diff_entry_new_content(entry, db, worktree_root, use_worktree_new, worktree_clean)?;
     if old_content.as_deref() == new_content.as_deref() {
         return Ok(false);
     }
@@ -5335,6 +5881,7 @@ fn diff_entry_new_stat_content(
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree: bool,
+    worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
 ) -> Result<Option<DiffBlobContent>> {
     if entry.new_mode.is_none() {
         return Ok(None);
@@ -5358,14 +5905,8 @@ fn diff_entry_new_stat_content(
         return Ok(oid.map(|oid| DiffBlobContent::Owned(gitlink_diff_content(&oid, false))));
     }
     if use_worktree {
-        let root = worktree_root.ok_or_else(|| {
-            GitError::Command("diff numstat requires a worktree for worktree comparisons".into())
-        })?;
-        let path = root.join(repo_path_to_path(&entry.path));
-        if path.exists() {
-            return Ok(Some(DiffBlobContent::Owned(fs::read(path)?)));
-        }
-        return Ok(None);
+        return diff_entry_new_content(entry, db, worktree_root, true, worktree_clean)
+            .map(|content| content.map(DiffBlobContent::Owned));
     }
     entry
         .new_oid
@@ -5396,6 +5937,7 @@ fn diff_entry_new_content(
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree: bool,
+    worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
 ) -> Result<Option<Vec<u8>>> {
     if entry.new_mode.is_none() {
         return Ok(None);
@@ -5430,7 +5972,16 @@ fn diff_entry_new_content(
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Ok(Some(sley_diff_merge::symlink_target_bytes(&path)?));
             }
-            Ok(_) => return Ok(Some(fs::read(path)?)),
+            Ok(_) => {
+                let content = fs::read(path)?;
+                return match worktree_clean {
+                    Some(clean) => clean
+                        .attributes
+                        .apply_clean_filter(clean.config, &entry.path, &content)
+                        .map(Some),
+                    None => Ok(Some(content)),
+                };
+            }
             Err(_) => return Ok(None),
         }
     }
@@ -5478,6 +6029,28 @@ fn validate_diff_rename_limit(value: &str) -> Result<()> {
     } else {
         Err(diff_rename_limit_requires_integer_error())
     }
+}
+
+fn parse_diff_rename_limit(value: &str) -> usize {
+    let value = value.trim();
+    if value.starts_with('-') {
+        return 0;
+    }
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let (digits, multiplier) = match value.as_bytes().last().copied() {
+        Some(b'k') => (&value[..value.len() - 1], 1024usize),
+        Some(b'm') => (&value[..value.len() - 1], 1024usize.saturating_mul(1024)),
+        Some(b'g') => (
+            &value[..value.len() - 1],
+            1024usize.saturating_mul(1024).saturating_mul(1024),
+        ),
+        _ => (value, 1),
+    };
+    digits
+        .parse::<usize>()
+        .ok()
+        .and_then(|limit| limit.checked_mul(multiplier))
+        .unwrap_or(usize::MAX)
 }
 
 fn diff_rename_limit_requires_integer_error() -> GitError {
@@ -5534,6 +6107,9 @@ fn promisor_remote_names(config: &GitConfig) -> Vec<String> {
 }
 
 fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Result<bool> {
+    if !global_lazy_fetch_enabled() {
+        return Ok(false);
+    }
     let Some(git_dir) = database_git_dir(db) else {
         return Ok(false);
     };
@@ -5547,6 +6123,20 @@ fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Re
         let Some(url) = config.get("remote", Some(&remote_name), "url") else {
             continue;
         };
+        let filter = config
+            .get("remote", Some(&remote_name), "partialclonefilter")
+            .and_then(commands::remote_cmds::pack_filter_from_spec)
+            .or(Some(sley_odb::PackObjectFilter::BlobNone));
+        let quiet = config.get_bool("promisor", None, "quiet").unwrap_or(false);
+        trace2_promisor_fetch_child_start(&remote_name, quiet);
+        if let Some(command) = config.get("remote", Some(&remote_name), "uploadpack") {
+            let _ = prefetch_via_configured_upload_pack(command, url)?;
+            db.refresh_read_cache();
+            if db.contains(oid).unwrap_or(false) {
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         let Ok(remote_git_dir) = commands::remote_cmds::ls_remote_git_dir(url) else {
             continue;
         };
@@ -5558,7 +6148,7 @@ fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Re
             None,
             true,
             false,
-            None,
+            filter,
             false,
             None,
         )
@@ -5575,6 +6165,63 @@ fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Re
         }
     }
     Ok(false)
+}
+
+fn trace2_promisor_fetch_child_start(remote_name: &str, quiet: bool) {
+    let Some(path) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let mut argv = vec![
+        "git",
+        "-c",
+        "fetch.negotiationAlgorithm=noop",
+        "fetch",
+        remote_name,
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--recurse-submodules=no",
+        "--stdin",
+    ];
+    if quiet {
+        argv.push("--quiet");
+    }
+    let argv = argv
+        .iter()
+        .map(|arg| format!("\"{}\"", trace2_json_escape(arg)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let line = format!(
+        "{{\"event\":\"child_start\",\"sid\":\"sley\",\"child_id\":0,\"argv\":[{argv}]}}\n"
+    );
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn trace2_json_escape(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn prefetch_via_configured_upload_pack(command: &str, repository: &str) -> Result<bool> {
+    let command = format!("{command} {}", sley_config::sq_quote(repository));
+    let output = ProcessCommand::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    io::stderr().write_all(&output.stderr)?;
+    Ok(output.status.success())
 }
 
 fn read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
@@ -6690,6 +7337,35 @@ fn for_each_ref_upstream_track(
     for_each_ref_ahead_behind(git_dir, db, format, oid, &upstream_oid)
 }
 
+fn for_each_ref_ahead_behind_with_diagnostic(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+    target: &ObjectId,
+) -> Result<Option<ForEachRefTrack>> {
+    let Ok(local_commit) = sley_rev::peel_to_commit(db, format, oid) else {
+        if let Ok(object) = db.read_object(oid) {
+            eprintln!(
+                "error: object {} is a {}, not a commit",
+                oid,
+                object.object_type.as_str()
+            );
+        }
+        return Ok(None);
+    };
+    let Ok(target_commit) = sley_rev::peel_to_commit(db, format, target) else {
+        return Ok(None);
+    };
+    let (ahead, behind) =
+        sley_rev::ahead_behind_counts(git_dir, format, db, &local_commit, &target_commit)?;
+    Ok(Some(ForEachRefTrack {
+        ahead,
+        behind,
+        gone: false,
+    }))
+}
+
 fn for_each_ref_ahead_behind(
     git_dir: &Path,
     db: &FileObjectDatabase,
@@ -7515,7 +8191,7 @@ fn print_for_each_ref_format(
                         result?;
                     } else if let Some(rev) = other.strip_prefix("ahead-behind:") {
                         let target = resolve_revision(context.git_dir, context.format, rev)?;
-                        if let Some(track) = for_each_ref_ahead_behind(
+                        if let Some(track) = for_each_ref_ahead_behind_with_diagnostic(
                             context.git_dir,
                             context.db,
                             context.format,
@@ -8805,14 +9481,14 @@ fn log_validate_inter_hunk_context(value: &str) -> Result<()> {
         _ => value,
     };
     let digits = match number.as_bytes().first() {
-        Some(b'+' | b'-') if number.len() > 1 => &number[1..],
+        Some(b'+') if number.len() > 1 => &number[1..],
         _ => number,
     };
     if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return Ok(());
     }
     eprintln!(
-        "error: option `inter-hunk-context' expects an integer value with an optional k/m/g suffix"
+        "error: option `inter-hunk-context' expects a non-negative integer value with an optional k/m/g suffix"
     );
     Err(GitError::Exit(129))
 }
@@ -8823,13 +9499,16 @@ fn log_inter_hunk_context_requires_number_error() -> Result<()> {
 }
 
 fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
-    // git's diff_opt_char (diff.c) requires exactly one byte: an empty value is
-    // rejected (exit 129) and a multibyte single Unicode scalar (len 2+) is
-    // rejected, matching git 2.54.
+    // git's diff_opt_char (diff.c) requires exactly one byte; empty and multibyte
+    // values are rejected.
     if value.len() == 1 {
         return Ok(());
     }
-    eprintln!("error: {option} expects a character, got '{value}'");
+    if value.is_empty() {
+        eprintln!("error: {option} expects a character, got ''");
+    } else {
+        eprintln!("error: {option} expects a character, got '{value}'");
+    }
     Err(GitError::Exit(129))
 }
 
@@ -9216,6 +9895,16 @@ impl SimpleLogRegex {
         mode: SimpleLogRegexMode,
         diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity,
     ) -> Result<Self> {
+        if pattern.is_empty() {
+            return Ok(Self {
+                alternatives: vec![SimpleLogRegexAlternative {
+                    anchor_start: false,
+                    anchor_end: false,
+                    tokens: Vec::new(),
+                }],
+                perl: None,
+            });
+        }
         if let SimpleLogRegexMode::Perl = mode {
             let regex =
                 sley_grep::Regex::compile(pattern, sley_grep::RegexMode::Pcre, false, false)?;
@@ -9398,7 +10087,7 @@ fn parse_log_filter_patterns(
     parse_log_filter_patterns_with_diagnostic_verbosity(
         patterns,
         mode,
-        sley_grep::RegexDiagnosticVerbosity::from_env(),
+        sley_grep::RegexDiagnosticVerbosity::Verbose,
     )
 }
 
@@ -9456,7 +10145,7 @@ fn compile_log_message_grep_matcher(
             ignore_case,
             word: false,
             line_regexp: false,
-            diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity::from_env(),
+            diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity::Verbose,
         },
         "command line",
     )
@@ -9850,6 +10539,39 @@ struct LogSignatureContext<'a> {
     git_dir: &'a Path,
     db: &'a FileObjectDatabase,
     config: &'a GitConfig,
+    source_tag_signatures: &'a HashMap<ObjectId, commands::signing::GpgVerification>,
+}
+
+fn source_tag_signatures_for_revision_tips(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    config: &GitConfig,
+    tips: &[sley_rev::RevisionTip],
+) -> Result<HashMap<ObjectId, commands::signing::GpgVerification>> {
+    let mut signatures = HashMap::new();
+    for tip in tips {
+        let object = db.read_object(&tip.oid)?;
+        if object.object_type != ObjectType::Tag {
+            continue;
+        }
+        let commit = match sley_rev::peel_to_commit(db, format, &tip.oid) {
+            Ok(commit) => commit,
+            Err(err) if tip.from_ref_selector => {
+                let _ = err;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        let Some((payload, signature)) = commands::signing::tag_signature_payload(&object.body)
+        else {
+            continue;
+        };
+        let verification =
+            commands::signing::verify_payload(git_dir, Some(config), payload, signature)?;
+        signatures.insert(commit, verification);
+    }
+    Ok(signatures)
 }
 
 fn print_log_format(
@@ -10374,6 +11096,9 @@ fn log_signature_verification(
             ..commands::signing::GpgVerification::default()
         });
     };
+    if let Some(verification) = context.source_tag_signatures.get(&record.oid) {
+        return Ok(verification.clone());
+    }
     let object = context.db.read_object(&record.oid)?;
     let Some((payload, signature)) = commands::signing::commit_signature_payload(&object.body)
     else {
@@ -11285,6 +12010,14 @@ fn commit_message_for_commit_encoding<'a>(
     commit_message_for_output(&commit.message, commit.encoding.as_deref(), output_encoding)
 }
 
+fn commit_author_for_commit_encoding<'a>(
+    commit: &'a Commit,
+    output_encoding: &str,
+) -> std::borrow::Cow<'a, [u8]> {
+    let from = commit_encoding(commit);
+    log_reencode_message(&commit.author, &from, output_encoding)
+}
+
 fn commit_message_has_nul(message: &[u8]) -> bool {
     message.contains(&b'\0')
 }
@@ -12177,32 +12910,40 @@ fn pack_index_object_count(path: &Path) -> Result<u32> {
 fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {
     // git's identity precedence for the name/email of an author or committer:
     //   GIT_{role}_NAME/EMAIL env var
-    //     -> `-c user.name=` / GIT_CONFIG_* command-line overrides
-    //       -> effective config user.name (repo, then global, then system)
-    //         -> sley's built-in default identity
+    //     -> `-c {author,committer}.name=` / GIT_CONFIG_* command-line overrides
+    //       -> effective config {author,committer}.name/email
+    //         -> effective config user.name/email
+    //           -> sley's built-in default identity
     // Higher-precedence env/`-c`/repo sources are evaluated exactly as before;
     // the global+system config layer is the new fallback below repo config.
     // The effective config is loaded at most once, and only when the env vars do
     // not already supply both fields, so the common env-driven path is unchanged.
-    let env_name = env::var(format!("GIT_{role}_NAME")).ok();
-    let env_email = env::var(format!("GIT_{role}_EMAIL")).ok();
+    let env_name = env::var_os(format!("GIT_{role}_NAME")).map(argv_bytes_from_os);
+    let env_email = env::var_os(format!("GIT_{role}_EMAIL")).map(argv_bytes_from_os);
     let mut config = if env_name.is_none() || env_email.is_none() {
         IdentityConfig::Lazy(None)
     } else {
         IdentityConfig::Skip
     };
     let name = env_name
-        .or_else(|| identity_config_value("user.name", &mut config))
-        .or_else(|| identity_default_value("Git Rs", &mut config));
+        .or_else(|| {
+            identity_config_value_for_role(role, "name", &mut config).map(String::into_bytes)
+        })
+        .or_else(|| identity_default_value("Git Rs", &mut config).map(String::into_bytes));
     let email = env_email
-        .or_else(|| identity_config_value("user.email", &mut config))
-        .or_else(|| identity_default_value("sley@example.invalid", &mut config));
+        .or_else(|| {
+            identity_config_value_for_role(role, "email", &mut config).map(String::into_bytes)
+        })
+        .or_else(|| {
+            identity_default_value("sley@example.invalid", &mut config).map(String::into_bytes)
+        });
     let (Some(name), Some(email)) = (name, email) else {
         return identity_use_config_only_error();
     };
+    validate_commit_identity_name(role, &name, &email)?;
     let date = env::var(format!("GIT_{role}_DATE")).unwrap_or_else(|_| "@0 +0000".into());
     let date = canonicalize_commit_date(&date);
-    sley_sequencer::format_commit_identity(&name, &email, &date)
+    sley_sequencer::format_commit_identity_bytes(&name, &email, &date)
 }
 
 /// Like [`commit_identity_from_env`] but with the date forced to `date_override`
@@ -12211,24 +12952,57 @@ fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {
 /// --committer-date-is-author-date`, which keeps the environment committer
 /// name/email but substitutes the author date.
 fn commit_identity_from_env_with_date(role: &str, date_override: &str) -> Result<Vec<u8>> {
-    let env_name = env::var(format!("GIT_{role}_NAME")).ok();
-    let env_email = env::var(format!("GIT_{role}_EMAIL")).ok();
+    let env_name = env::var_os(format!("GIT_{role}_NAME")).map(argv_bytes_from_os);
+    let env_email = env::var_os(format!("GIT_{role}_EMAIL")).map(argv_bytes_from_os);
     let mut config = if env_name.is_none() || env_email.is_none() {
         IdentityConfig::Lazy(None)
     } else {
         IdentityConfig::Skip
     };
     let name = env_name
-        .or_else(|| identity_config_value("user.name", &mut config))
-        .or_else(|| identity_default_value("Git Rs", &mut config));
+        .or_else(|| {
+            identity_config_value_for_role(role, "name", &mut config).map(String::into_bytes)
+        })
+        .or_else(|| identity_default_value("Git Rs", &mut config).map(String::into_bytes));
     let email = env_email
-        .or_else(|| identity_config_value("user.email", &mut config))
-        .or_else(|| identity_default_value("sley@example.invalid", &mut config));
+        .or_else(|| {
+            identity_config_value_for_role(role, "email", &mut config).map(String::into_bytes)
+        })
+        .or_else(|| {
+            identity_default_value("sley@example.invalid", &mut config).map(String::into_bytes)
+        });
     let (Some(name), Some(email)) = (name, email) else {
         return identity_use_config_only_error();
     };
+    validate_commit_identity_name(role, &name, &email)?;
     let date = canonicalize_commit_date(date_override);
-    sley_sequencer::format_commit_identity(&name, &email, &date)
+    sley_sequencer::format_commit_identity_bytes(&name, &email, &date)
+}
+
+fn committer_identity_for_reflog() -> Result<Vec<u8>> {
+    let env_name = env::var_os("GIT_COMMITTER_NAME").map(argv_bytes_from_os);
+    let env_email = env::var_os("GIT_COMMITTER_EMAIL").map(argv_bytes_from_os);
+    let mut config = if env_name.is_none() || env_email.is_none() {
+        IdentityConfig::Lazy(None)
+    } else {
+        IdentityConfig::Skip
+    };
+    let name = env_name
+        .or_else(|| {
+            identity_config_value_for_role("COMMITTER", "name", &mut config).map(String::into_bytes)
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| b"Git Rs".to_vec());
+    let email = env_email
+        .or_else(|| {
+            identity_config_value_for_role("COMMITTER", "email", &mut config)
+                .map(String::into_bytes)
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| b"sley@example.invalid".to_vec());
+    let date = env::var("GIT_COMMITTER_DATE").unwrap_or_else(|_| "@0 +0000".into());
+    let date = canonicalize_commit_date(&date);
+    sley_sequencer::format_commit_identity_bytes(&name, &email, &date)
 }
 
 /// Canonicalise a `GIT_*_DATE`/`--date=` value to git's raw `<seconds> +HHMM`
@@ -12242,10 +13016,21 @@ fn commit_identity_from_env_with_date(role: &str, date_override: &str) -> Result
 /// the canonical raw form. Values that do not parse are passed through verbatim
 /// so the sequencer still reports the original "invalid date" error.
 fn canonicalize_commit_date(date: &str) -> String {
+    if date.is_empty() {
+        return default_commit_date();
+    }
     match commands::approxidate::parse_commit_date(date) {
         Some((seconds, tz)) => format!("{seconds} {tz}"),
         None => date.to_string(),
     }
+}
+
+fn default_commit_date() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0);
+    format!("{seconds} +0000")
 }
 
 /// Lazily-loaded effective config used as the identity fallback. `Skip` means
@@ -12274,6 +13059,22 @@ fn identity_config_value(key: &str, config: &mut IdentityConfig) -> Option<Strin
         .and_then(|config| config.get(section, None, name).map(str::to_string))
 }
 
+fn identity_config_value_for_role(
+    role: &str,
+    field: &str,
+    config: &mut IdentityConfig,
+) -> Option<String> {
+    let role_key = match role {
+        "AUTHOR" => Some(format!("author.{field}")),
+        "COMMITTER" => Some(format!("committer.{field}")),
+        _ => None,
+    };
+    role_key
+        .as_deref()
+        .and_then(|key| identity_config_value(key, config))
+        .or_else(|| identity_config_value(&format!("user.{field}"), config))
+}
+
 fn identity_default_value(value: &str, config: &mut IdentityConfig) -> Option<String> {
     if identity_use_config_only(config) {
         None
@@ -12292,6 +13093,40 @@ fn identity_use_config_only(config: &mut IdentityConfig) -> bool {
 fn identity_use_config_only_error<T>() -> Result<T> {
     eprintln!("fatal: no email was given and auto-detection is disabled");
     Err(GitError::Exit(128))
+}
+
+fn validate_commit_identity_name(role: &str, name: &[u8], email: &[u8]) -> Result<()> {
+    if name.is_empty() {
+        print_identity_unknown_hint(role);
+        eprintln!(
+            "fatal: empty ident name (for <{}>) not allowed",
+            String::from_utf8_lossy(email)
+        );
+        return Err(GitError::Exit(128));
+    }
+    if !name.iter().any(|byte| !commit_identity_name_crud(*byte)) {
+        eprintln!(
+            "fatal: name consists only of disallowed characters: {}",
+            String::from_utf8_lossy(name)
+        );
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+fn commit_identity_name_crud(byte: u8) -> bool {
+    matches!(
+        byte,
+        0..=32 | b',' | b':' | b';' | b'<' | b'>' | b'"' | b'\\' | b'\''
+    )
+}
+
+fn print_identity_unknown_hint(role: &str) {
+    match role {
+        "AUTHOR" => eprintln!("Author identity unknown"),
+        "COMMITTER" => eprintln!("Committer identity unknown"),
+        _ => {}
+    }
 }
 
 /// Load the effective config (repository + global + system, with includes) for
@@ -12327,23 +13162,39 @@ fn identity_effective_config() -> Option<GitConfig> {
 fn commit_signoff_from_env() -> Result<Vec<u8>> {
     // git's `--signoff` uses the committer identity, so resolve it with the same
     // precedence as `commit_identity_from_env("COMMITTER")`.
-    let env_name = env::var("GIT_COMMITTER_NAME").ok();
-    let env_email = env::var("GIT_COMMITTER_EMAIL").ok();
+    let env_name = env::var_os("GIT_COMMITTER_NAME").map(argv_bytes_from_os);
+    let env_email = env::var_os("GIT_COMMITTER_EMAIL").map(argv_bytes_from_os);
     let mut config = if env_name.is_none() || env_email.is_none() {
         IdentityConfig::Lazy(None)
     } else {
         IdentityConfig::Skip
     };
     let name = env_name
-        .or_else(|| identity_config_value("user.name", &mut config))
-        .unwrap_or_else(|| "Git Rs".into());
+        .or_else(|| {
+            identity_config_value_for_role("COMMITTER", "name", &mut config).map(String::into_bytes)
+        })
+        .or_else(|| identity_default_value("Git Rs", &mut config).map(String::into_bytes));
     let email = env_email
-        .or_else(|| identity_config_value("user.email", &mut config))
-        .unwrap_or_else(|| "sley@example.invalid".into());
+        .or_else(|| {
+            identity_config_value_for_role("COMMITTER", "email", &mut config)
+                .map(String::into_bytes)
+        })
+        .or_else(|| {
+            identity_default_value("sley@example.invalid", &mut config).map(String::into_bytes)
+        });
+    let (Some(name), Some(email)) = (name, email) else {
+        return identity_use_config_only_error();
+    };
+    validate_commit_identity_name("COMMITTER", &name, &email)?;
     let date = env::var("GIT_COMMITTER_DATE").unwrap_or_else(|_| "@0 +0000".into());
     let date = canonicalize_commit_date(&date);
-    sley_sequencer::format_commit_identity(&name, &email, &date)?;
-    Ok(format!("Signed-off-by: {name} <{email}>").into_bytes())
+    sley_sequencer::format_commit_identity_bytes(&name, &email, &date)?;
+    let mut out = b"Signed-off-by: ".to_vec();
+    out.extend_from_slice(&name);
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(&email);
+    out.push(b'>');
+    Ok(out)
 }
 
 fn commit_reflog_message(message: &[u8], amend: bool) -> Vec<u8> {

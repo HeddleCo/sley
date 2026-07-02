@@ -73,8 +73,8 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 /// Path to the `sley` binary under test.
-fn git_rs() -> &'static str {
-    env!("CARGO_BIN_EXE_sley")
+fn sley() -> &'static str {
+    sley_testkit::sley_bin!()
 }
 
 /// Assert two command runs produced identical stdout, stderr, and exit code.
@@ -200,7 +200,7 @@ fn paired_history(root: &Path) -> (PathBuf, PathBuf, String, String) {
 /// agree on output *and* on the resulting index listing.
 fn assert_read_tree_parity(upstream: &Path, rust: &Path, args: &[&str]) {
     let expected = run_output(sley_testkit::oracle_git(), upstream, args);
-    let actual = run_output(git_rs(), rust, args);
+    let actual = run_output(sley(), rust, args);
     assert_same_output(&actual, &expected, args);
     assert_eq!(
         index_listing(rust),
@@ -346,7 +346,7 @@ fn read_tree_reset_update_resets_index_and_worktree() {
         // c.txt from disk in both repos.
         let args = ["read-tree", "--reset", "-u", &tree1];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(git_rs(), &rust, &args);
+        let actual = run_output(sley(), &rust, &args);
         assert_same_output(&actual, &expected, &args);
         assert_eq!(
             index_listing(&rust),
@@ -378,7 +378,7 @@ fn read_tree_u_without_merge_mode_is_rejected() {
         // same way (fatal + exit 128) without disturbing the index.
         let args = ["read-tree", "-u", &tree1];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(git_rs(), &rust, &args);
+        let actual = run_output(sley(), &rust, &args);
         assert_same_output(&actual, &expected, &args);
         assert_eq!(
             index_listing(&rust),
@@ -400,7 +400,7 @@ fn read_tree_invalid_tree_ish_is_rejected() {
         let (upstream, rust, _t1, _t2) = paired_history(&root);
         let args = ["read-tree", "definitely-not-a-real-object"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(git_rs(), &rust, &args);
+        let actual = run_output(sley(), &rust, &args);
         assert_same_output(&actual, &expected, &args);
     });
     let _ = fs::remove_dir_all(&root);
@@ -417,7 +417,7 @@ fn read_tree_empty_with_tree_argument_conflicts() {
         let (upstream, rust, tree1, _tree2) = paired_history(&root);
         let args = ["read-tree", "--empty", &tree1];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(git_rs(), &rust, &args);
+        let actual = run_output(sley(), &rust, &args);
         assert_same_output(&actual, &expected, &args);
     });
     let _ = fs::remove_dir_all(&root);
@@ -435,7 +435,7 @@ fn read_tree_merge_and_prefix_together_conflict() {
         // -m together with --prefix is rejected ("Which one?").
         let args = ["read-tree", "-m", "--prefix=x/", &tree1];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(git_rs(), &rust, &args);
+        let actual = run_output(sley(), &rust, &args);
         assert_same_output(&actual, &expected, &args);
     });
     let _ = fs::remove_dir_all(&root);
@@ -452,7 +452,7 @@ fn read_tree_merge_requires_a_tree() {
         let (upstream, rust, _t1, _t2) = paired_history(&root);
         let args = ["read-tree", "-m"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(git_rs(), &rust, &args);
+        let actual = run_output(sley(), &rust, &args);
         assert_same_output(&actual, &expected, &args);
     });
     let _ = fs::remove_dir_all(&root);

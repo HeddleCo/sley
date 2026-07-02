@@ -5,6 +5,14 @@
 **Oracle:** git 2.54.0 (PCRE) at `/tmp/git-pcre-prefix`. SHA-1.
 **Author:** orchestrator scoping pass, 2026-06-15.
 
+**2026-07-01 update:** Several path/routing statements in this spike are now
+historical. Checkout/switch code has moved out of the old `workspace.rs`
+location, and the current two-way checkout path plus `reset --keep` route
+through `sley_unpack_trees::twoway_merge` via
+`crates/sley-cli/src/commands/read_tree.rs::checkout_two_way_engine`. Treat the
+old "bypasses the engine entirely" language below as the baseline that motivated
+that follow-up work, not as current topology.
+
 `unpack-trees` is git's core n-way tree→index→worktree merge engine
 (`unpack-trees.c`, 3071 lines). It powers `read-tree -m`, `checkout` /
 `switch` / `restore`, `reset` (`--hard` / `--merge` / `--keep`), the
@@ -32,23 +40,23 @@ t-files, and proposes a staged completion plan.
 - The engine's **per-path merge logic is largely correct already**; the misses
   are almost entirely in the *plumbing around* the engine: index **stat-info**
   refresh, the `-u` `check_updates` apply (D/F directory handling, ordering),
-  and the fact that the **checkout/switch/restore porcelain bypasses the engine
-  entirely** with a hand-rolled re-implementation.
+  and, at the time of this spike, porcelain routing that bypassed the engine.
+  That routing claim is now partly superseded for two-way checkout/switch and
+  `reset --keep`; remaining restore/reset modes should be checked against the
+  current `checkout.rs`, `reset.rs`, and `read_tree.rs` paths.
 
 ### Structural finding (the load-bearing one)
 
-There is **no `checkout.rs` / `switch.rs` / `restore.rs`**. The porcelain lives
-in `crates/sley-cli/src/commands/workspace.rs` (5462 lines) as `cmd_checkout`,
-`cmd_switch`, `cmd_restore`, `cmd_reset` — and **none of them import
-`sley_unpack_trees`**. Instead, `workspace.rs:1303 fn checkout_twoway_dirty`
-hand-rolls ~150 lines of twoway-merge logic (its own carry/block/update
-classification at lines 1356–1404, its own error strings at 1391–1413) that
-*parallels* `twoway_merge` in the engine but diverges from it. `cmd_reset`
-similarly does not route through `oneway_merge`. So the engine is exercised only
-by `read-tree`, `stash`, and `replay`; the highest-traffic porcelain
-(checkout/switch/restore/reset) runs a separate, less-faithful code path. The
-single highest-leverage move in this whole plan is **routing that porcelain
-through the engine** — it both fixes parity *and* deletes the divergent fork.
+At the time of this spike, checkout/switch/restore/reset porcelain lived in the
+large `workspace.rs` command file and two-way checkout hand-rolled a parallel
+merge. That structural finding has since been partly superseded: checkout now
+lives in `crates/sley-cli/src/commands/checkout.rs`, the shared filesystem
+bridge lives in `crates/sley-cli/src/commands/read_tree.rs`, and the documented
+`checkout_two_way_engine` path dispatches through
+`sley_unpack_trees::twoway_merge`; `reset --keep` calls the same path. The
+remaining high-leverage work is no longer "make checkout import the engine" in
+the broad sense, but completing the apply/stat/D-F/sparse/submodule gaps and
+auditing any restore/reset modes that still have bespoke apply behavior.
 
 ---
 
@@ -63,16 +71,16 @@ each slice to the chosen `MergeFn`.
 | git capability | sley status | evidence (file:line) | which caller(s) / t-files need it |
 |---|---|---|---|
 | `oneway_merge` (1-tree fast-forward / reset read) | **done** | `lib.rs:341 oneway_merge` | read-tree `--reset`, reset `--hard` |
-| `twoway_merge` (switch old→new, carry local adds) | **done (logic); not wired to porcelain** | `lib.rs:372 twoway_merge`; bypassed by `workspace.rs:1303 checkout_twoway_dirty` | read-tree -m 2-tree, checkout/switch |
+| `twoway_merge` (switch old→new, carry local adds) | **done and wired for current two-way checkout/switch/reset --keep paths** | `lib.rs:372 twoway_merge`; current CLI bridge `read_tree.rs::checkout_two_way_engine` | read-tree -m 2-tree, checkout/switch |
 | `threeway_merge` (trivial 3-way, emit stages 1/2/3) | **done (logic); aggressive done)** | `lib.rs:462 threeway_merge`, aggressive arm `lib.rs:544` | read-tree -m 3-tree, merge, reset --merge |
 | `bind_merge` (`--prefix`, refuse overlap) | **done** | `lib.rs:434 bind_merge` | read-tree --prefix |
 | `verify_uptodate` / `verify_absent` (overwrite / remove) | **trait surface done; FS impl lives only in `read_tree.rs`** | trait `lib.rs:166`; impl `read_tree.rs:446 ReadTreeWorktree` | every -u path; checkout porcelain has its *own* ad-hoc check |
 | `check_submodule_move_head` gitlink hook | **trait + engine call done; real impl in `sley-submodule`** | engine call `lib.rs:650,668`; impl `sley-submodule/src/move_head.rs:125` | t1013, t2013, t7112, t7406 (the 277-cell cluster) |
-| `check_updates` (apply: removals→writes) | **partial — flat, no D/F dir handling, no stat-info writeback, unconditional rewrite** | `lib.rs:849 check_updates` (writer.remove then writer.write_blob; no dir-vs-file, no `lstat` refresh) | read-tree -u, checkout -u, reset --hard |
-| **index stat-info refresh** (write `lstat` mtime/size into kept/updated entries; racy-clean) | **MISSING** | engine carries only `(mode, oid)` — `CacheEntry` `lib.rs:55` has no stat fields; `check_updates` never re-stats | t1001/t1002 `check_cache_at … dirty`, refresh semantics |
-| `verify_clean_subdirectory` (D/F conflict: replacing a dir with a file / vice-versa) | **MISSING (TODO markers)** | `lib.rs:411,475` `// TODO(unpack-trees): … D/F-conflict … collapse to the reject below` | t1012, t6400, t2025 `--no-overlay … D/F` |
-| sparse / `SKIP_WORKTREE` (`apply_sparse_checkout`, `mark_new_skip_worktree`, sparse-dir entries `S_ISSPARSEDIR`) | **MISSING (TODO markers)** | `lib.rs:411,513,523,590` `S_ISSPARSEDIR → merged_sparse_dir` TODOs; no `skip_worktree` field on `CacheEntry` | t1011, t1091, t1092, t3602, t7002 |
-| `df_conflict_entry` synthesis (D/F marker passed into merge fns) | **MISSING (always 0)** | `lib.rs:474` "sley does not synthesize a df_conflict_entry" | merge / checkout D/F edges |
+| `check_updates` (apply: removals→writes) | **partial — ordering + stat writeback done; deeper apply semantics still caller/writer-bound** | `lib.rs:1107 check_updates` removes before writes and stores returned `StatInfo`; `WorktreeWriter` still owns per-path D/F cleanup, symlink/regular-file writes, ignored-file policy, and submodule checkout | read-tree -u, checkout -u, reset --hard |
+| **index stat-info refresh** (write `lstat` mtime/size into kept/updated entries; racy-clean) | **partial in engine** | `CacheEntry::stat`, `StatInfo`, and `check_updates` writeback exist; remaining work is caller/probe/index refresh coverage and parity for racy-clean cases | t1001/t1002 `check_cache_at … dirty`, refresh semantics |
+| `verify_clean_subdirectory` (D/F conflict: replacing a dir with a file / vice-versa) | **still missing as a dedicated upstream-style clean-subdir check** | D/F markers are synthesized, but apply-time directory cleanup/refusal remains in the caller/writer path rather than a port of `verify_clean_subdirectory` | t1012, t6400, t2025 `--no-overlay … D/F` |
+| sparse / `SKIP_WORKTREE` (`apply_sparse_checkout`, `mark_new_skip_worktree`, sparse-dir entries `S_ISSPARSEDIR`) | **MISSING (TODO markers)** | `S_ISSPARSEDIR → merged_sparse_dir` TODOs remain; no `skip_worktree` field on `CacheEntry` | t1011, t1091, t1092, t3602, t7002 |
+| `df_conflict_entry` synthesis (D/F marker passed into merge fns) | **done for flat tree slots; apply-time D/F cleanup still incomplete** | `CacheEntry::df_conflict_marker`, `df_conflict_slot`, and `unpack_trees` marker insertion mirror `o->df_conflict_entry` for merge-function inputs | merge / checkout D/F edges |
 | `o->reset` matrix (`UNPACK_RESET_NONE` / `_OVERWRITE_UNTRACKED`) | **partial — only the 2 values sley exercises** | `ResetType` `lib.rs:103`; comment "Only the two values sley exercises today are modeled" | reset `--keep` semantics (t7110) need finer reset modes |
 | `o->preserve_ignored` / `o->dir` (ignored-file protection during apply) | **MISSING** | no `dir`/ignore plumbing in crate | t1004 "clobbering an ignored file", checkout overwrite edges |
 | porcelain error message catalog (`setup_unpack_trees_porcelain`, 8 error + 3 warning types) | **partial / divergent** | engine `reject_merge` `lib.rs:715` prints one fixed string; porcelain strings duplicated in `workspace.rs:1391–1413`, `read_tree.rs` | exact-text diffs in many cells |
@@ -82,21 +90,25 @@ each slice to the chosen `MergeFn`.
 1. **The merge primitives are essentially done.** oneway/twoway/threeway/bind +
    the aggressive arm + the gitlink hook plumbing are faithful ports. The crate
    is *not* the bottleneck for the trivial-merge cells.
-2. **Index stat-info is the missing substrate.** `CacheEntry` is `(mode, oid,
-   stage)` with no `lstat` fields, and `check_updates` never re-stats written
-   files. git's whole "is this path dirty / up-to-date / racy-clean" machinery —
-   which `check_cache_at`, `diff-files`, and refresh all key on — has nothing to
-   read. This single gap fails most of t1001/t1002 and ripples into reset/status.
-3. **`check_updates` is too flat.** No directory-vs-file (D/F) handling, no
-   `verify_clean_subdirectory`, no ignored-file protection (`o->dir`). It just
-   removes-then-writes a flat path list.
+2. **Index stat-info is no longer absent in the engine, but caller coverage is
+   still the parity risk.** `CacheEntry::stat`, `StatInfo`, and post-write
+   writeback exist; the remaining work is making every caller populate,
+   preserve, serialize, and refresh the data in the same places git does,
+   including racy-clean cases.
+3. **`check_updates` still needs the apply semantics around the flat sequence.**
+   The engine now removes before writes and records returned stat info, but
+   directory-vs-file cleanup, `verify_clean_subdirectory`, ignored-file
+   protection (`o->dir`), symlink-specific apply, and submodule worktree updates
+   still live in incomplete caller/writer paths.
 4. **Sparse / `skip-worktree` is entirely unmodeled** (explicit TODO markers at
    every `S_ISSPARSEDIR` site). The sparse t-files also need the sparse-*index*
    format (a separate serialization concern), so only part of their misses are
    engine work.
-5. **The porcelain doesn't use the engine.** checkout/switch/restore/reset in
-   `workspace.rs` re-implement the merge by hand. Until they route through the
-   engine, fixes to the engine don't reach the highest-traffic commands.
+5. **Porcelain routing is partly complete.** The original `workspace.rs`
+   bypass has been superseded for current two-way checkout/switch and
+   `reset --keep`, which now share the `twoway_merge` path. Remaining parity
+   work should focus on the incomplete apply/stat/D-F/sparse/submodule pieces
+   and verify any restore/reset modes that still have bespoke behavior.
 
 ---
 
@@ -189,8 +201,8 @@ cells the hand-rolled path currently squeaks through.
 
 | Stage | Engine work (functions / files) | Target t-files | Est. engine cells | Parallel? | Effort |
 |---|---|---|---|---|---|
-| **A — stat-info + check_updates apply** | Add `lstat` fields to `CacheEntry` (or a parallel stat map) and write them back on apply; make `check_updates` (`lib.rs:849`) re-stat written files, handle removals-before-writes ordering, symlinks, and **D/F directory replacement** (`verify_clean_subdirectory` port, currently TODO at `lib.rs:411,475`). Wire the `ReadTreeWorktree` probe (`read_tree.rs:446`) to populate stat-info. | t1000, t1001, t1002, t1004, t1005, t1008, t1012, t2000, t2003, t2006, t2007, t2008, t7104, t7113, t6400, t6408, t6424 | **~110–130** | **Sequential (foundation for B/D)** | **xhigh** (touches the CacheEntry model + index serialization; format-sensitive) |
-| **B — route checkout/switch/restore/reset porcelain through the engine** | Delete `checkout_twoway_dirty` (`workspace.rs:1303`) and the ad-hoc reset apply; build a `WorktreeProbe`/`WorktreeWriter` for the real worktree (lift the FS impl out of `read_tree.rs` into a shared module); dispatch `cmd_checkout`/`cmd_switch`/`cmd_restore` via `twoway_merge`/`threeway_merge`, `cmd_reset` via `oneway_merge`; unify the porcelain error catalog with git's `setup_unpack_trees_porcelain` strings. | t2021, t2022, t2023, t2025, t2070, t2060, t7110 (reset-mode matrix), residual t7102, t6408, t6424 | **~70–90** | **Sequential (needs A)** | **xhigh** (large `workspace.rs` refactor; deletes a divergent fork — high blast radius, exact-text error parity) |
+| **A — finish stat-info + check_updates apply** | `CacheEntry` stat fields, post-write stat writeback, and removals-before-writes ordering are now present. Finish caller/probe/index refresh coverage, then make the writer/apply path handle symlinks, ignored-file protection, submodule gitlinks, and **D/F directory replacement** (`verify_clean_subdirectory` port). | t1000, t1001, t1002, t1004, t1005, t1008, t1012, t2000, t2003, t2006, t2007, t2008, t7104, t7113, t6400, t6408, t6424 | **~110–130** | **Sequential (foundation for B/D)** | **xhigh** (touches caller refresh/index serialization and worktree apply semantics) |
+| **B — finish/audit checkout/switch/restore/reset porcelain engine routing** | Current two-way checkout/switch and `reset --keep` already flow through `read_tree.rs::checkout_two_way_engine` and `twoway_merge`. Finish any remaining restore/reset routing, keep the real-worktree `WorktreeProbe`/`WorktreeWriter` bridge shared, and unify the porcelain error catalog with git's `setup_unpack_trees_porcelain` strings. | t2021, t2022, t2023, t2025, t2070, t2060, t7110 (reset-mode matrix), residual t7102, t6408, t6424 | **~70–90** | **Sequential (needs A)** | **xhigh** (large porcelain audit; high blast radius, exact-text error parity) |
 | **C — submodule gitlink checkout on the engine** | With A+B in place, the `is_gitlink` arm of `merged_entry` (`lib.rs:650,668`) + `check_submodule_move_head` (`sley-submodule/src/move_head.rs:125`) fire end-to-end: actually check out / update / move the submodule worktree during `check_updates` for gitlink entries, honor `--recurse-submodules`, `verify_clean_submodule`. | **t1013 (68), t2013 (73), t7112 (82), t7406 (54)**, plus t7400 / t7506 residual | **~250–280 (the big cluster)** | **Sequential (needs A+B apply path)** | **xhigh** (cross-crate: cli + sley-submodule; recursive worktree mutation) |
 | **D — sparse / skip-worktree merge arms** | Implement the `S_ISSPARSEDIR`/`apply_sparse_checkout`/`mark_new_skip_worktree` arms (the `lib.rs:411,513,523,590` TODOs); add a `skip_worktree` bit to `CacheEntry`; the sparse *engine* half of read-tree / checkout under sparse patterns. (The sparse-index serialization for t1092 is a **separate** non-engine workstream — flag, don't fold in.) | t1011, t3602, t7002, engine-half of t1091 | **~50–70 (engine half)** | **Parallelizable with C** (disjoint files: sparse arms vs gitlink apply) | **medium** (bounded to the sparse merge arms once A lands) |
 

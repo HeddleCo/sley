@@ -45,9 +45,9 @@ use sley_transport::RemoteUrl;
 use crate::fetch::{FetchOptions, FetchSource, fetch};
 use crate::{CredentialProvider, ProgressSink};
 
-/// The unborn placeholder branch the destination is initialized on, replaced by
-/// the real checked-out branch; mirrors the CLI's previous clone init.
-const CLONE_UNBORN_BRANCH: &str = "__git_rs_clone_unborn__";
+/// Internal placeholder branch used while clone initializes before it knows
+/// which branch, detached commit, or unborn remote state will own `HEAD`.
+const CLONE_UNBORN_BRANCH: &str = "__sley_clone_unborn__";
 
 /// How [`clone`] reaches the remote it is cloning from.
 ///
@@ -277,6 +277,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
 
     let store = FileRefStore::new(&git_dir, request.format);
     if let Some(detached) = &request.options.detached_head {
+        write_clone_remote_head(&store, request.options)?;
         if request.options.checkout {
             sley_worktree::checkout_detached_filtered(
                 request.destination,
@@ -376,22 +377,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         });
         tx.commit()?;
     }
-    if !request.options.remote_head_branch.is_empty()
-        && (!request.options.single_branch
-            || request.options.checkout_branch == request.options.remote_head_branch)
-    {
-        let mut tx = store.transaction();
-        tx.update(RefUpdate {
-            name: format!("refs/remotes/{}/HEAD", request.options.origin),
-            expected: None,
-            new: RefTarget::Symbolic(format!(
-                "refs/remotes/{}/{}",
-                request.options.origin, request.options.remote_head_branch
-            )),
-            reflog: None,
-        });
-        tx.commit()?;
-    }
+    write_clone_remote_head(&store, request.options)?;
 
     if request.options.checkout {
         sley_worktree::checkout_branch_filtered(
@@ -409,6 +395,25 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         branch_oid: Some(branch_oid),
         empty: false,
     })
+}
+
+fn write_clone_remote_head(store: &FileRefStore, options: &CloneOptions<'_>) -> Result<()> {
+    if options.remote_head_branch.is_empty()
+        || (options.single_branch && options.checkout_branch != options.remote_head_branch)
+    {
+        return Ok(());
+    }
+    let mut tx = store.transaction();
+    tx.update(RefUpdate {
+        name: format!("refs/remotes/{}/HEAD", options.origin),
+        expected: None,
+        new: RefTarget::Symbolic(format!(
+            "refs/remotes/{}/{}",
+            options.origin, options.remote_head_branch
+        )),
+        reflog: None,
+    });
+    tx.commit()
 }
 
 fn scheme_for_clone_source(source: &CloneSource) -> &'static str {
@@ -436,9 +441,18 @@ fn fetch_local_partial_clone_checkout_blobs(
         return Ok(());
     };
 
+    let local_db = FileObjectDatabase::from_git_dir(git_dir, request.format);
     let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, request.format);
     let mut wants = Vec::new();
-    collect_checkout_blob_wants(&remote_db, request.format, commit_oid, &mut wants)?;
+    let mut seen = std::collections::HashSet::new();
+    collect_checkout_materialization_wants(
+        &remote_db,
+        &local_db,
+        request.format,
+        commit_oid,
+        &mut seen,
+        &mut wants,
+    )?;
     crate::local::install_fetch_pack_via_local_upload_pack(
         git_dir,
         remote_git_dir,
@@ -447,20 +461,22 @@ fn fetch_local_partial_clone_checkout_blobs(
         None,
         true,
         false,
-        Some(sley_odb::PackObjectFilter::BlobNone),
+        None,
         false,
         None,
     )?;
     Ok(())
 }
 
-fn collect_checkout_blob_wants(
-    db: &FileObjectDatabase,
+fn collect_checkout_materialization_wants(
+    remote_db: &FileObjectDatabase,
+    local_db: &FileObjectDatabase,
     format: ObjectFormat,
     commit_oid: ObjectId,
+    seen: &mut std::collections::HashSet<ObjectId>,
     wants: &mut Vec<ObjectId>,
 ) -> Result<()> {
-    let commit_object = db.read_object(&commit_oid)?;
+    let commit_object = remote_db.read_object(&commit_oid)?;
     if commit_object.object_type != ObjectType::Commit {
         return Err(GitError::InvalidObject(format!(
             "expected commit {commit_oid}, found {}",
@@ -468,16 +484,24 @@ fn collect_checkout_blob_wants(
         )));
     }
     let commit = Commit::parse_ref(format, &commit_object.body)?;
-    collect_tree_blob_wants(db, format, commit.tree, wants)
+    collect_tree_materialization_wants(remote_db, local_db, format, commit.tree, seen, wants)
 }
 
-fn collect_tree_blob_wants(
-    db: &FileObjectDatabase,
+fn collect_tree_materialization_wants(
+    remote_db: &FileObjectDatabase,
+    local_db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: ObjectId,
+    seen: &mut std::collections::HashSet<ObjectId>,
     wants: &mut Vec<ObjectId>,
 ) -> Result<()> {
-    let tree_object = db.read_object(&tree_oid)?;
+    if !seen.insert(tree_oid) {
+        return Ok(());
+    }
+    if !local_db.contains(&tree_oid)? {
+        wants.push(tree_oid);
+    }
+    let tree_object = remote_db.read_object(&tree_oid)?;
     if tree_object.object_type != ObjectType::Tree {
         return Err(GitError::InvalidObject(format!(
             "expected tree {tree_oid}, found {}",
@@ -486,9 +510,13 @@ fn collect_tree_blob_wants(
     }
     for entry in Tree::parse(format, &tree_object.body)?.entries {
         if entry.is_tree() {
-            collect_tree_blob_wants(db, format, entry.oid, wants)?;
+            collect_tree_materialization_wants(
+                remote_db, local_db, format, entry.oid, seen, wants,
+            )?;
         } else if !entry.is_gitlink() {
-            wants.push(entry.oid);
+            if seen.insert(entry.oid) && !local_db.contains(&entry.oid)? {
+                wants.push(entry.oid);
+            }
         }
     }
     Ok(())
@@ -513,6 +541,7 @@ fn clone_fetch_options(
         prune: false,
         prune_tags: false,
         dry_run: false,
+        force: false,
         append: false,
         write_fetch_head: true,
         tag_option_explicit: false,

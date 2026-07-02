@@ -35,8 +35,8 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
     run(sley_testkit::oracle_git(), cwd, args)
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn assert_remote_config_matches(expected: &Path, actual: &Path, label: &str) {
@@ -89,9 +89,9 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
             "origin",
             "https://example.invalid/repo.git",
         ];
-        assert_eq!(git(&upstream, &add_args), git_rs(&rust, &add_args));
+        assert_eq!(git(&upstream, &add_args), sley(&rust, &add_args));
         let backup_args = ["remote", "add", "backup", "../backup.git"];
-        assert_eq!(git(&upstream, &backup_args), git_rs(&rust, &backup_args));
+        assert_eq!(git(&upstream, &backup_args), sley(&rust, &backup_args));
 
         for args in [
             ["remote"].as_slice(),
@@ -107,14 +107,14 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
             ["remote", "get-url", "backup"].as_slice(),
         ] {
             let expected = git(&upstream, args);
-            let actual = git_rs(&rust, args);
+            let actual = sley(&rust, args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
 
         let remove_args = ["remote", "remove", "backup"];
-        assert_eq!(git(&upstream, &remove_args), git_rs(&rust, &remove_args));
+        assert_eq!(git(&upstream, &remove_args), sley(&rust, &remove_args));
         let expected = git(&upstream, &["remote", "-v"]);
-        let actual = git_rs(&rust, &["remote", "-v"]);
+        let actual = sley(&rust, &["remote", "-v"]);
         assert_eq!(actual, expected, "sley output differed after remove");
 
         let set_url_args = [
@@ -123,9 +123,9 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
             "origin",
             "https://example.invalid/renamed.git",
         ];
-        assert_eq!(git(&upstream, &set_url_args), git_rs(&rust, &set_url_args));
+        assert_eq!(git(&upstream, &set_url_args), sley(&rust, &set_url_args));
         let expected = git(&upstream, &["remote", "get-url", "origin"]);
-        let actual = git_rs(&rust, &["remote", "get-url", "origin"]);
+        let actual = sley(&rust, &["remote", "get-url", "origin"]);
         assert_eq!(actual, expected, "sley output differed after set-url");
 
         let add_url_args = [
@@ -135,7 +135,7 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
             "origin",
             "https://example.invalid/mirror.git",
         ];
-        assert_eq!(git(&upstream, &add_url_args), git_rs(&rust, &add_url_args));
+        assert_eq!(git(&upstream, &add_url_args), sley(&rust, &add_url_args));
         let replace_url_args = [
             "remote",
             "set-url",
@@ -145,10 +145,10 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
         ];
         assert_eq!(
             git(&upstream, &replace_url_args),
-            git_rs(&rust, &replace_url_args)
+            sley(&rust, &replace_url_args)
         );
         let expected = git(&upstream, &["remote", "get-url", "--all", "origin"]);
-        let actual = git_rs(&rust, &["remote", "get-url", "--all", "origin"]);
+        let actual = sley(&rust, &["remote", "get-url", "--all", "origin"]);
         assert_eq!(
             actual, expected,
             "sley output differed after old-url replacement"
@@ -163,21 +163,21 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
         ];
         assert_eq!(
             git(&upstream, &delete_url_args),
-            git_rs(&rust, &delete_url_args)
+            sley(&rust, &delete_url_args)
         );
         let expected = git(&upstream, &["remote", "get-url", "--all", "origin"]);
-        let actual = git_rs(&rust, &["remote", "get-url", "--all", "origin"]);
+        let actual = sley(&rust, &["remote", "get-url", "--all", "origin"]);
         assert_eq!(actual, expected, "sley output differed after --delete");
 
         let set_branches_args = ["remote", "set-branches", "origin", "main", "dev"];
         assert_eq!(
             git(&upstream, &set_branches_args),
-            git_rs(&rust, &set_branches_args)
+            sley(&rust, &set_branches_args)
         );
         let add_branch_args = ["remote", "set-branches", "--add", "origin", "release"];
         assert_eq!(
             git(&upstream, &add_branch_args),
-            git_rs(&rust, &add_branch_args)
+            sley(&rust, &add_branch_args)
         );
         let expected = git(&upstream, &["config", "--get-all", "remote.origin.fetch"]);
         let actual = git(&rust, &["config", "--get-all", "remote.origin.fetch"]);
@@ -193,7 +193,7 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
             ["remote", "show", "-n", "missing"].as_slice(),
         ] {
             let expected = git(&upstream, args);
-            let actual = git_rs(&rust, args);
+            let actual = sley(&rust, args);
             assert_eq!(
                 actual, expected,
                 "sley remote show output differed for {args:?}"
@@ -209,7 +209,7 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
         ];
         assert_eq!(
             git(&upstream, &set_push_url_args),
-            git_rs(&rust, &set_push_url_args)
+            sley(&rust, &set_push_url_args)
         );
         for args in [
             ["remote", "get-url", "--push", "origin"].as_slice(),
@@ -229,11 +229,11 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
             .as_slice(),
         ] {
             let expected = git(&upstream, args);
-            let actual = git_rs(&rust, args);
+            let actual = sley(&rust, args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
         let expected = git(&upstream, &["remote", "-v"]);
-        let actual = git_rs(&rust, &["remote", "-v"]);
+        let actual = sley(&rust, &["remote", "-v"]);
         assert_eq!(
             actual, expected,
             "sley verbose output differed after pushurl"
@@ -249,7 +249,7 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
         ];
         assert_eq!(
             git(&upstream, &add_push_url_args),
-            git_rs(&rust, &add_push_url_args)
+            sley(&rust, &add_push_url_args)
         );
         let replace_push_url_args = [
             "remote",
@@ -261,7 +261,7 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
         ];
         assert_eq!(
             git(&upstream, &replace_push_url_args),
-            git_rs(&rust, &replace_push_url_args)
+            sley(&rust, &replace_push_url_args)
         );
         let delete_push_url_args = [
             "remote",
@@ -273,13 +273,13 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
         ];
         assert_eq!(
             git(&upstream, &delete_push_url_args),
-            git_rs(&rust, &delete_push_url_args)
+            sley(&rust, &delete_push_url_args)
         );
         let expected = git(
             &upstream,
             &["remote", "get-url", "--push", "--all", "origin"],
         );
-        let actual = git_rs(&rust, &["remote", "get-url", "--push", "--all", "origin"]);
+        let actual = sley(&rust, &["remote", "get-url", "--push", "--all", "origin"]);
         assert_eq!(
             actual, expected,
             "sley output differed after pushurl delete"
@@ -307,7 +307,7 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
             ["remote", "get-url", "--push", "--all", "rewrite"].as_slice(),
         ] {
             let expected = git(&upstream, args);
-            let actual = git_rs(&rust, args);
+            let actual = sley(&rust, args);
             assert_eq!(
                 actual, expected,
                 "sley rewritten remote URL output differed for {args:?}"
@@ -343,7 +343,7 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
         }
 
         let rename_args = ["remote", "rename", "origin", "upstream"];
-        assert_eq!(git(&upstream, &rename_args), git_rs(&rust, &rename_args));
+        assert_eq!(git(&upstream, &rename_args), sley(&rust, &rename_args));
         for args in [
             ["remote"].as_slice(),
             ["remote", "-v"].as_slice(),
@@ -351,7 +351,7 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
             ["remote", "get-url", "--push", "--all", "upstream"].as_slice(),
         ] {
             let expected = git(&upstream, args);
-            let actual = git_rs(&rust, args);
+            let actual = sley(&rust, args);
             assert_eq!(
                 actual, expected,
                 "sley output differed after rename for {args:?}"
@@ -433,16 +433,13 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
             git(repo, &["config", "branch.dev.merge", "refs/heads/dev"]);
         }
         let expected = git(&upstream, &["remote", "show", "-n", "upstream"]);
-        let actual = git_rs(&rust, &["remote", "show", "-n", "upstream"]);
+        let actual = sley(&rust, &["remote", "show", "-n", "upstream"]);
         assert_eq!(
             actual, expected,
             "sley remote show output differed with local remote refs"
         );
         let set_head_args = ["remote", "set-head", "upstream", "main"];
-        assert_eq!(
-            git(&upstream, &set_head_args),
-            git_rs(&rust, &set_head_args)
-        );
+        assert_eq!(git(&upstream, &set_head_args), sley(&rust, &set_head_args));
         let expected = git(&upstream, &["symbolic-ref", "refs/remotes/upstream/HEAD"]);
         let actual = git(&rust, &["symbolic-ref", "refs/remotes/upstream/HEAD"]);
         assert_eq!(actual, expected, "sley remote HEAD target differed");
@@ -450,7 +447,7 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
         let delete_head_args = ["remote", "set-head", "upstream", "-d"];
         assert_eq!(
             git(&upstream, &delete_head_args),
-            git_rs(&rust, &delete_head_args)
+            sley(&rust, &delete_head_args)
         );
         assert!(
             !rust.join(".git/refs/remotes/upstream/HEAD").exists(),
@@ -498,7 +495,7 @@ fn remote_rename_moves_packed_remote_tracking_refs_match_upstream_git() {
         }
 
         let args = ["remote", "rename", "origin", "upstream"];
-        assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+        assert_eq!(git(&upstream, &args), sley(&rust, &args));
         let expected = git(
             &upstream,
             &[
@@ -588,7 +585,7 @@ fn remote_remove_cleans_refs_and_branch_config_match_upstream_git() {
 
         let args = ["remote", "remove", "origin"];
         assert_same_output(
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args),
+            run_output(sley_testkit::sley_bin!(), &rust, &args),
             run_output(sley_testkit::oracle_git(), &upstream, &args),
             &args,
         );
@@ -754,7 +751,7 @@ fn remote_set_url_old_url_errors_match_upstream_git() {
             ["remote", "set-url", "--delete", "origin", "missing"].as_slice(),
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &upstream, args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
+            let actual = run_output(sley_testkit::sley_bin!(), &rust, args);
             assert_same_output(actual, expected, args);
         }
 
@@ -771,7 +768,7 @@ fn remote_set_url_old_url_errors_match_upstream_git() {
             .as_slice(),
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &upstream, args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
+            let actual = run_output(sley_testkit::sley_bin!(), &rust, args);
             assert_same_output(actual, expected, args);
         }
         let expected = run_output(
@@ -839,7 +836,7 @@ fn remote_set_branches_negations_match_upstream_git() {
             ["remote", "set-branches", "--no-add", "origin", "reset"].as_slice(),
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &upstream, args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
+            let actual = run_output(sley_testkit::sley_bin!(), &rust, args);
             assert_same_output(actual, expected, args);
             let expected = git(&upstream, &["config", "--get-all", "remote.origin.fetch"]);
             let actual = git(&rust, &["config", "--get-all", "remote.origin.fetch"]);
@@ -911,7 +908,7 @@ fn remote_set_head_option_order_matches_upstream_git() {
             ["remote", "set-head", "-a", "--no-auto", "origin", "main"].as_slice(),
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &upstream, args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
+            let actual = run_output(sley_testkit::sley_bin!(), &rust, args);
             assert_same_output(actual, expected, args);
             let expected = run_output(
                 sley_testkit::oracle_git(),
@@ -968,7 +965,7 @@ fn remote_set_head_auto_local_remote_matches_upstream_git() {
             ["remote", "set-head", "--auto", "origin"].as_slice(),
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &upstream, args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
+            let actual = run_output(sley_testkit::sley_bin!(), &rust, args);
             assert_same_output(actual, expected, args);
             let expected = git(&upstream, &["symbolic-ref", "refs/remotes/origin/HEAD"]);
             let actual = git(&rust, &["symbolic-ref", "refs/remotes/origin/HEAD"]);
@@ -990,7 +987,7 @@ fn remote_set_head_auto_local_remote_matches_upstream_git() {
         }
         let args = ["remote", "set-head", "-a", "origin"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
         let expected = git(&upstream, &["symbolic-ref", "refs/remotes/origin/HEAD"]);
         let actual = git(&rust, &["symbolic-ref", "refs/remotes/origin/HEAD"]);
@@ -1036,7 +1033,7 @@ fn remote_show_local_remote_matches_upstream_git() {
             ["remote", "show", "-n", "--", "origin"].as_slice(),
         ] {
             assert_same_output(
-                run_output(env!("CARGO_BIN_EXE_sley"), &rust, args),
+                run_output(sley_testkit::sley_bin!(), &rust, args),
                 run_output(sley_testkit::oracle_git(), &upstream, args),
                 args,
             );
@@ -1048,7 +1045,7 @@ fn remote_show_local_remote_matches_upstream_git() {
         }
         let args = ["remote", "show", "origin"];
         assert_same_output(
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args),
+            run_output(sley_testkit::sley_bin!(), &rust, &args),
             run_output(sley_testkit::oracle_git(), &upstream, &args),
             &args,
         );
@@ -1065,7 +1062,7 @@ fn remote_show_local_remote_matches_upstream_git() {
             );
         }
         assert_same_output(
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args),
+            run_output(sley_testkit::sley_bin!(), &rust, &args),
             run_output(sley_testkit::oracle_git(), &upstream, &args),
             &args,
         );
@@ -1112,7 +1109,7 @@ fn remote_prune_local_remote_matches_upstream_git() {
 
         let dry_run_args = ["remote", "prune", "--dry-run", "--", "origin"];
         assert_same_output(
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &dry_run_args),
+            run_output(sley_testkit::sley_bin!(), &rust, &dry_run_args),
             run_output(sley_testkit::oracle_git(), &upstream, &dry_run_args),
             &dry_run_args,
         );
@@ -1139,7 +1136,7 @@ fn remote_prune_local_remote_matches_upstream_git() {
 
         let dry_run_reset_args = ["remote", "prune", "--dry-run", "--no-dry-run", "origin"];
         assert_same_output(
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &dry_run_reset_args),
+            run_output(sley_testkit::sley_bin!(), &rust, &dry_run_reset_args),
             run_output(sley_testkit::oracle_git(), &upstream, &dry_run_reset_args),
             &dry_run_reset_args,
         );
@@ -1164,7 +1161,7 @@ fn remote_prune_local_remote_matches_upstream_git() {
         }
         let no_dry_run_reset_args = ["remote", "prune", "--no-dry-run", "--dry-run", "origin"];
         assert_same_output(
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &no_dry_run_reset_args),
+            run_output(sley_testkit::sley_bin!(), &rust, &no_dry_run_reset_args),
             run_output(
                 sley_testkit::oracle_git(),
                 &upstream,
@@ -1174,7 +1171,7 @@ fn remote_prune_local_remote_matches_upstream_git() {
         );
         let prune_args = ["remote", "prune", "origin"];
         assert_same_output(
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &prune_args),
+            run_output(sley_testkit::sley_bin!(), &rust, &prune_args),
             run_output(sley_testkit::oracle_git(), &upstream, &prune_args),
             &prune_args,
         );
@@ -1222,7 +1219,7 @@ fn remote_add_track_branches_match_upstream_git() {
             "origin",
             "https://example.invalid/repo.git",
         ];
-        assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+        assert_eq!(git(&upstream, &args), sley(&rust, &args));
         let expected = git(&upstream, &["config", "--get-all", "remote.origin.fetch"]);
         let actual = git(&rust, &["config", "--get-all", "remote.origin.fetch"]);
         assert_eq!(
@@ -1230,7 +1227,7 @@ fn remote_add_track_branches_match_upstream_git() {
             "sley tracked remote fetch refspecs differed"
         );
         let expected = git(&upstream, &["remote", "-v"]);
-        let actual = git_rs(&rust, &["remote", "-v"]);
+        let actual = sley(&rust, &["remote", "-v"]);
         assert_eq!(actual, expected, "sley verbose remote output differed");
     };
     let _ = fs::remove_dir_all(&root);
@@ -1392,7 +1389,7 @@ fn remote_add_config_options_match_upstream_git() {
         git(&actual, &["init", "-q", "-b", "main"]);
 
         let expected_output = run_output(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_remote_config_matches(&expected, &actual, label);
         let expected_head = fs::read(expected.join(".git/refs/remotes/origin/HEAD")).ok();

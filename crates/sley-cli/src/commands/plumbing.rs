@@ -22,6 +22,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
     let mut pathspecs = Vec::new();
     let mut list = false;
     let mut verbose = false;
+    let mut worktree_attributes = false;
     let mut mtime_option: Option<String> = None;
     let mut compression_level: Option<u32> = None;
     let mut extra_files: Vec<ArchiveExtraFile> = Vec::new();
@@ -41,6 +42,7 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             "--end-of-options" => positional_only = true,
             "-l" | "--list" => list = true,
             "-v" | "--verbose" => verbose = true,
+            "--worktree-attributes" => worktree_attributes = true,
             "--format" => {
                 format_name = Some(
                     iter.next()
@@ -226,8 +228,9 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
     // `.gitattributes`, matching `git archive`'s `convert_to_working_tree`, plus
     // `export-subst` keyword substitution against the archived commit. The
     // attribute root is the worktree (when non-bare) or the git dir (bare); the
-    // git dir locates `info/attributes`. TODO(convert): `--worktree-attributes`
-    // (read live `.gitattributes`) and the `ident` filter are not wired yet.
+    // git dir locates `info/attributes`. `--worktree-attributes` switches this
+    // to live worktree attributes, or `attr.tree` for bare repositories. The
+    // remaining conversion gap is the lower-level `ident` filter.
     // Format resolution: explicit `--format`, else inferred from the `--output`
     // filename extension, else `tar` (upstream `archive_format_from_filename`).
     let format_name = match format_name {
@@ -253,23 +256,74 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
             )));
         }
     };
-    let attr_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?
+    let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?;
+    let attr_root = worktree_root
+        .clone()
         .unwrap_or_else(|| git_dir.to_path_buf());
-    let mut convert = sley_archive::ArchiveConvert::from_tree(
-        &attr_root, &git_dir, &config, &db, format, &tree_oid,
-    )?;
+    let archive_process_filter_metadata =
+        archive_process_filter_metadata(&git_dir, format, &treeish, &oid);
+    let archive_attr_tree_oid = if worktree_attributes && worktree_root.is_none() {
+        archive_attr_tree_oid(&git_dir, &db, format, &config)?
+    } else {
+        None
+    };
+    let mut convert = if worktree_attributes {
+        if let Some(worktree_root) = &worktree_root {
+            sley_archive::ArchiveConvert::from_worktree(worktree_root, &config)?
+        } else if let Some(attr_tree_oid) = &archive_attr_tree_oid {
+            sley_archive::ArchiveConvert::from_tree(
+                &attr_root,
+                &git_dir,
+                &config,
+                &db,
+                format,
+                attr_tree_oid,
+            )?
+        } else {
+            sley_archive::ArchiveConvert::from_tree(
+                &attr_root, &git_dir, &config, &db, format, &tree_oid,
+            )?
+        }
+    } else {
+        sley_archive::ArchiveConvert::from_tree(
+            &attr_root, &git_dir, &config, &db, format, &tree_oid,
+        )?
+    };
+    convert = convert.with_process_filter_metadata(archive_process_filter_metadata);
     // export-subst only runs when archiving a commit (git sets `args->convert`
     // only when a commit is available).
     if let Some(record) = &commit_record {
-        convert = convert.with_subst(move |fmt| format_subst_for_commit(record, fmt));
+        let describe_available = std::cell::Cell::new(true);
+        let git_dir_ref = &git_dir;
+        let db_ref = &db;
+        let record_ref = record;
+        convert = convert.with_subst(move |fmt| {
+            archive_format_subst_for_commit(
+                git_dir_ref,
+                db_ref,
+                format,
+                record_ref,
+                &describe_available,
+                fmt,
+            )
+        });
     }
     // Text/binary classification for the zip backend, driven by the tree's
     // `diff` userdiff attribute (the same `entry_is_binary` upstream uses). Read
     // attributes from the archived *tree* (not the worktree). The
     // `UserdiffResolver` resolves `diff=<name>` ⇒ `diff.<name>.binary` config and
     // builtin driver flags.
-    let diff_attributes =
-        sley_worktree::TreeAttributes::from_tree(&attr_root, &git_dir, &db, format, &tree_oid)?;
+    let diff_attributes = archive_diff_attributes(
+        &attr_root,
+        &git_dir,
+        &db,
+        format,
+        &tree_oid,
+        worktree_attributes
+            .then_some(worktree_root.as_deref())
+            .flatten(),
+        archive_attr_tree_oid.as_ref(),
+    )?;
     let userdiff =
         commands::userdiff::UserdiffResolver::with_attributes(None, Some(config.clone()));
     convert = convert
@@ -369,6 +423,65 @@ enum ArchiveFormatKind {
     TarGz,
     TarFilter,
     Zip,
+}
+
+fn archive_process_filter_metadata(
+    git_dir: &Path,
+    format: ObjectFormat,
+    treeish: &str,
+    oid: &ObjectId,
+) -> Vec<(String, String)> {
+    let mut metadata = Vec::new();
+    if let Ok(Some(refname)) =
+        sley_rev::resolve_revision_symbolic_full_name(git_dir, format, treeish)
+    {
+        metadata.push(("ref".to_string(), refname));
+    }
+    metadata.push(("treeish".to_string(), oid.to_hex()));
+    metadata
+}
+
+fn archive_attr_tree_oid(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    config: &GitConfig,
+) -> Result<Option<ObjectId>> {
+    let Some(attr_tree) = config.get("attr", None, "tree") else {
+        return Ok(None);
+    };
+    let oid = resolve_revision(git_dir, format, attr_tree)?;
+    Ok(Some(sley_rev::peel_to_tree(db, format, &oid)?))
+}
+
+enum ArchiveDiffAttributes {
+    Tree(sley_worktree::TreeAttributes),
+    Worktree(sley_worktree::StandardAttributeMatcher),
+}
+
+fn archive_diff_attributes(
+    attr_root: &Path,
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    worktree_root: Option<&Path>,
+    attr_tree_oid: Option<&ObjectId>,
+) -> Result<ArchiveDiffAttributes> {
+    if let Some(worktree_root) = worktree_root {
+        return Ok(ArchiveDiffAttributes::Worktree(
+            sley_worktree::StandardAttributeMatcher::from_worktree_root(worktree_root)?,
+        ));
+    }
+    Ok(ArchiveDiffAttributes::Tree(
+        sley_worktree::TreeAttributes::from_tree(
+            attr_root,
+            git_dir,
+            db,
+            format,
+            attr_tree_oid.unwrap_or(tree_oid),
+        )?,
+    ))
 }
 
 /// Run `body` with a writer that is either the `--output` file or stdout.
@@ -664,11 +777,11 @@ fn archive_virtual_extra_file(spec: &str) -> Result<ArchiveExtraFile> {
 /// (`Some(true)` = binary, `Some(false)` = text, `None` = auto-detect via
 /// content). Mirrors `userdiff_find_by_path(...)->binary`.
 fn archive_diff_binary(
-    attributes: &sley_worktree::TreeAttributes,
+    attributes: &ArchiveDiffAttributes,
     userdiff: &commands::userdiff::UserdiffResolver,
     path: &[u8],
 ) -> Option<bool> {
-    match attributes.diff_attribute_for_path(path) {
+    match archive_diff_attribute_for_path(attributes, path) {
         // `diff` set ⇒ driver_true ⇒ text.
         Some(sley_worktree::AttributeState::Set) => Some(false),
         // `-diff` ⇒ driver_false ⇒ binary.
@@ -682,6 +795,118 @@ fn archive_diff_binary(
         // unspecified ⇒ no driver override; auto-detect via content.
         None => None,
     }
+}
+
+fn archive_diff_attribute_for_path(
+    attributes: &ArchiveDiffAttributes,
+    path: &[u8],
+) -> Option<sley_worktree::AttributeState> {
+    match attributes {
+        ArchiveDiffAttributes::Tree(attributes) => attributes.diff_attribute_for_path(path),
+        ArchiveDiffAttributes::Worktree(attributes) => attributes
+            .attributes_for_path(path, &[b"diff".to_vec()], false)
+            .into_iter()
+            .next()
+            .and_then(|check| check.state),
+    }
+}
+
+fn archive_format_subst_for_commit(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    record: &sley_rev::CommitRecord,
+    describe_available: &std::cell::Cell<bool>,
+    fmt: &[u8],
+) -> Result<Vec<u8>> {
+    let describe = LogDescribeContext {
+        git_dir,
+        db,
+        format,
+    };
+    let Some(first) = archive_find_describe_atom(fmt, 0) else {
+        return archive_render_commit_format(record, fmt, None);
+    };
+    let mut out = Vec::with_capacity(fmt.len());
+    let mut cursor = 0;
+    let mut next = Some(first);
+    while let Some((start, end)) = next {
+        out.extend(archive_render_commit_format(
+            record,
+            &fmt[cursor..start],
+            None,
+        )?);
+        if describe_available.replace(false) {
+            out.extend(archive_render_commit_format(
+                record,
+                &fmt[start..end],
+                Some(&describe),
+            )?);
+        } else {
+            out.extend_from_slice(&fmt[start..end]);
+        }
+        cursor = end;
+        next = archive_find_describe_atom(fmt, cursor);
+    }
+    out.extend(archive_render_commit_format(record, &fmt[cursor..], None)?);
+    Ok(out)
+}
+
+fn archive_render_commit_format(
+    record: &sley_rev::CommitRecord,
+    fmt: &[u8],
+    describe: Option<&LogDescribeContext<'_>>,
+) -> Result<Vec<u8>> {
+    let fmt = String::from_utf8_lossy(fmt);
+    let compiled = CompiledLogFormat::compile(&fmt, LogFormatDialect::Log)?;
+    let decorations = std::collections::HashMap::new();
+    let date_mode = DateMode::Default;
+    let mailmap = commands::utility::Mailmap::default();
+    let context = LogFormatContext {
+        abbrev_len: Some(7),
+        decorations: &decorations,
+        marker: '>',
+        dialect: LogFormatDialect::Log,
+        source: None,
+        date_mode: &date_mode,
+        source_oid: None,
+        describe,
+        signature: None,
+        color: false,
+        output_encoding: "UTF-8",
+        mailmap: &mailmap,
+        use_mailmap: false,
+    };
+    let mut out = Vec::with_capacity(compiled.estimated_line_capacity());
+    emit_compiled_log_format(
+        record,
+        &compiled,
+        &context,
+        &mut out,
+        0..compiled.tokens.len(),
+    )?;
+    Ok(out)
+}
+
+fn archive_find_describe_atom(fmt: &[u8], mut offset: usize) -> Option<(usize, usize)> {
+    let marker = b"%(describe";
+    while offset < fmt.len() {
+        let relative = fmt[offset..]
+            .windows(marker.len())
+            .position(|window| window == marker)?;
+        let start = offset + relative;
+        let after_marker = start + marker.len();
+        match fmt.get(after_marker).copied() {
+            Some(b')') => return Some((start, after_marker + 1)),
+            Some(b':') => {
+                let rest = &fmt[after_marker + 1..];
+                let close = rest.iter().position(|byte| *byte == b')')?;
+                return Some((start, after_marker + 1 + close + 1));
+            }
+            _ => offset = after_marker,
+        }
+    }
+    None
 }
 
 fn handle_archive_result(result: Result<()>) -> Result<()> {
@@ -717,11 +942,19 @@ fn archive_pathspecs_for_current_prefix(
         ]);
     }
     let current_components = archive_path_components(current_prefix);
-    pathspecs
+    let mut have_include = false;
+    let mut normalized = pathspecs
         .into_iter()
         .map(|pathspec| {
             if pathspec.starts_with(b":") {
-                return Ok(pathspec);
+                let normalized = archive_normalize_magic_pathspec(current_prefix, &pathspec)?;
+                let element =
+                    sley_pathspec::PathspecElement::parse(&normalized, effective_pathspec_flags())
+                        .map_err(|err| {
+                            GitError::InvalidPath(format!("invalid archive pathspec: {err}"))
+                        })?;
+                have_include |= !element.is_exclude();
+                return Ok(normalized);
             }
             let mut components = current_components.clone();
             for component in pathspec.split(|byte| *byte == b'/') {
@@ -742,9 +975,56 @@ fn archive_pathspecs_for_current_prefix(
                     "pathspec is outside the current directory".into(),
                 ));
             }
+            have_include = true;
             Ok(components.join(&b'/'))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    if !have_include && normalized.iter().all(|pathspec| pathspec.starts_with(b":")) {
+        normalized.insert(
+            0,
+            current_prefix
+                .strip_suffix(b"/")
+                .unwrap_or(current_prefix)
+                .to_vec(),
+        );
+    }
+    Ok(normalized)
+}
+
+fn archive_normalize_magic_pathspec(current_prefix: &[u8], pathspec: &[u8]) -> Result<Vec<u8>> {
+    let raw = String::from_utf8_lossy(pathspec);
+    let (magic, pattern, top) = split_archive_pathspec_magic_prefix(&raw);
+    let base = if top { b"".as_slice() } else { current_prefix };
+    let normalized = sley_pathspec::normalize_ls_files_pathspec(base, pattern)?;
+    let mut out = magic.as_bytes().to_vec();
+    out.extend_from_slice(&normalized);
+    Ok(out)
+}
+
+fn split_archive_pathspec_magic_prefix(raw: &str) -> (&str, &str, bool) {
+    if let Some(after_open) = raw.strip_prefix(":(")
+        && let Some(close) = after_open.find(')')
+    {
+        let magic_end = 2 + close + 1;
+        let magic = &raw[..magic_end];
+        let body = &after_open[..close];
+        let top = body.split(',').any(|word| word == "top");
+        return (magic, &raw[magic_end..], top);
+    }
+    let bytes = raw.as_bytes();
+    let mut idx = 1;
+    let mut top = false;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'!' | b'^' => idx += 1,
+            b'/' => {
+                top = true;
+                idx += 1;
+            }
+            _ => break,
+        }
+    }
+    (&raw[..idx], &raw[idx..], top)
 }
 
 fn archive_path_components(path: &[u8]) -> Vec<Vec<u8>> {
@@ -1396,23 +1676,10 @@ fn resolve_init_template_dir(
                     Ok(Some(resolve_cli_path(cwd, &path)))
                 }
             } else {
-                Ok(default_init_template_dir())
+                Ok(None)
             }
         }
     }
-}
-
-fn default_init_template_dir() -> Option<PathBuf> {
-    let output = ProcessCommand::new("git")
-        .arg("--exec-path")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let exec_path = String::from_utf8_lossy(&output.stdout);
-    let candidate = PathBuf::from(exec_path.trim()).join("../share/git-core/templates");
-    candidate.canonicalize().ok().filter(|path| path.is_dir())
 }
 
 fn init_config_bool(
@@ -1434,6 +1701,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         let mut interactive = false;
         let mut patch = false;
         let mut dry_run = false;
+        let mut pathspec_from_file = false;
         let mut spec: Vec<String> = Vec::new();
         // Explicit `-U<n>` / `--inter-hunk-context=<n>` from add's own argv. `None`
         // means "fall back to diff.context / diff.interHunkContext config".
@@ -1455,6 +1723,13 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                 "--no-dry-run" => dry_run = false,
                 "-i" | "--interactive" => interactive = true,
                 "-p" | "--patch" => patch = true,
+                "--pathspec-from-file" => {
+                    pathspec_from_file = true;
+                    iter.next();
+                }
+                value if value.starts_with("--pathspec-from-file=") => {
+                    pathspec_from_file = true;
+                }
                 "--auto-advance" => auto_advance = Some(true),
                 "--no-auto-advance" => auto_advance = Some(false),
                 "-U" | "--unified" => {
@@ -1515,6 +1790,12 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             );
             return Err(GitError::Exit(128));
         }
+        if (patch || interactive) && pathspec_from_file {
+            eprintln!(
+                "fatal: options '--pathspec-from-file' and '--interactive/--patch' cannot be used together"
+            );
+            return Err(GitError::Exit(128));
+        }
         if patch {
             return super::add_interactive::cmd_add_patch(
                 &spec,
@@ -1539,9 +1820,11 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let mut intent_to_add = false;
     let mut sparse = false;
     let mut refresh = false;
+    let mut warn_embedded_repos = true;
     let mut chmod = None;
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
+    let mut edit_option = false;
     let mut parsing_options = true;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -1596,9 +1879,27 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             "--no-ignore-errors" => ignore_errors = false,
             "--sparse" => sparse = true,
             "--no-sparse" => sparse = false,
+            "--warn-embedded-repo" => warn_embedded_repos = true,
+            "--no-warn-embedded-repo" => warn_embedded_repos = false,
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
+            "--edit" | "-e" => {
+                if pathspec_from_file.is_some() {
+                    eprintln!(
+                        "fatal: options '--pathspec-from-file' and '--edit' cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                edit_option = true;
+                paths.push(PathBuf::from(arg));
+            }
             "--pathspec-from-file" => {
+                if edit_option {
+                    eprintln!(
+                        "fatal: options '--pathspec-from-file' and '--edit' cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
                 if !paths.is_empty() {
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
@@ -1612,6 +1913,12 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             }
             "--no-pathspec-from-file" => {}
             value if value.starts_with("--pathspec-from-file=") => {
+                if edit_option {
+                    eprintln!(
+                        "fatal: options '--pathspec-from-file' and '--edit' cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
                 if !paths.is_empty() {
                     eprintln!(
                         "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
@@ -1884,7 +2191,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         .collect::<Vec<_>>();
     if !action_paths.is_empty() {
         let config = read_repo_config(&git_dir)?;
-        let warn_embedded = actions_may_add_embedded_repo(&actions);
+        let warn_embedded = warn_embedded_repos && actions_may_add_embedded_repo(&actions);
         // Snapshot the tracked paths before staging only when the warning can
         // actually fire. Ordinary file adds never need this second index pass.
         let previously_tracked: BTreeSet<Vec<u8>> = if warn_embedded {
@@ -1951,6 +2258,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         print_add_ignored_paths(&git_dir, &ignored_paths);
         return Err(GitError::Exit(1));
     }
+    commands::hooks::run_post_index_change_hook(false, false)?;
     Ok(())
 }
 
@@ -2127,13 +2435,15 @@ fn refresh_index_after_add(
                 .unwrap_or(false)
         });
     let selected: &[PathBuf] = if only_files { refresh_paths } else { &[] };
-    sley_worktree::refresh_index_paths(
+    sley_worktree::refresh_index_paths_with_options(
         worktree_root,
         git_dir,
         format,
         selected,
         /* quiet */ true,
         /* ignore_missing */ true,
+        /* ignore_submodules */ false,
+        /* allow_unmerged */ false,
         /* really_refresh */ false,
     )?;
     Ok(())
@@ -2394,6 +2704,123 @@ struct AddRegularResolution {
     ignored_paths: Vec<Vec<u8>>,
 }
 
+struct AddCompiledPathspec {
+    display: String,
+    element: sley_pathspec::PathspecElement,
+    matched: bool,
+}
+
+struct AddCompiledPathspecs {
+    specs: Vec<AddCompiledPathspec>,
+    have_include: bool,
+    last_matched_includes: Vec<usize>,
+}
+
+impl AddCompiledPathspecs {
+    fn parse(cwd: &Path, worktree_root: &Path, paths: &[PathBuf]) -> Result<Self> {
+        let root = fs::canonicalize(worktree_root)?;
+        let cwd_prefix = fs::canonicalize(cwd)
+            .ok()
+            .and_then(|cwd| cwd.strip_prefix(&root).ok().map(Path::to_path_buf))
+            .map(|relative| relative.to_string_lossy().replace('\\', "/").into_bytes())
+            .unwrap_or_default();
+        let mut specs = Vec::with_capacity(paths.len());
+        let mut have_include = false;
+        for path in paths {
+            let arg = add_pathspec_arg_for_matcher(worktree_root, path)?;
+            let element = sley_pathspec::parse_normalized_pathspec_element(
+                &cwd_prefix,
+                &arg,
+                effective_pathspec_flags(),
+            )?;
+            have_include |= !element.is_exclude();
+            specs.push(AddCompiledPathspec {
+                display: path.to_string_lossy().into_owned(),
+                element,
+                matched: false,
+            });
+        }
+        Ok(Self {
+            specs,
+            have_include,
+            last_matched_includes: Vec::new(),
+        })
+    }
+
+    fn have_include(&self) -> bool {
+        self.have_include
+    }
+
+    fn mark_matched(&mut self, idx: usize) {
+        if let Some(spec) = self.specs.get_mut(idx) {
+            spec.matched = true;
+        }
+    }
+
+    fn matched_include_indexes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.last_matched_includes.iter().copied()
+    }
+
+    fn matches(&mut self, path: &[u8]) -> bool {
+        if self.specs.is_empty() {
+            return true;
+        }
+        self.last_matched_includes.clear();
+        let mut included = false;
+        let mut excluded = false;
+        for (idx, spec) in self.specs.iter_mut().enumerate() {
+            if spec.element.matches_path(path) {
+                spec.matched = true;
+                if spec.element.is_exclude() {
+                    excluded = true;
+                } else {
+                    included = true;
+                    self.last_matched_includes.push(idx);
+                }
+            }
+        }
+        !excluded && (!self.have_include || included)
+    }
+
+    fn unmatched_includes(&self) -> impl Iterator<Item = &AddCompiledPathspec> {
+        self.specs
+            .iter()
+            .filter(|spec| !spec.element.is_exclude() && !spec.matched)
+    }
+}
+
+fn add_pathspec_arg_for_matcher(worktree_root: &Path, path: &Path) -> Result<String> {
+    if !path.is_absolute() {
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    let absolute = normalize_add_pathspec_absolute_path_lexically(path);
+    let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+        GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+    })?;
+    let git_path = add_git_path_bytes(relative)?;
+    if git_path.is_empty() {
+        Ok(":/".to_string())
+    } else {
+        Ok(format!(":/{}", String::from_utf8_lossy(&git_path)))
+    }
+}
+
+fn normalize_add_pathspec_absolute_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(_)
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 struct ExactTrackedAdd {
     git_path: Vec<u8>,
     needs_index_update: bool,
@@ -2428,6 +2855,7 @@ fn resolve_add_regular_actions(
             ignored_paths: Vec::new(),
         });
     }
+    let mut compiled_pathspecs = AddCompiledPathspecs::parse(cwd, worktree_root, &paths)?;
     let pathspecs = paths
         .into_iter()
         .map(|path| {
@@ -2440,6 +2868,11 @@ fn resolve_add_regular_actions(
         .iter()
         .map(|(_, _, matched)| *matched)
         .collect::<Vec<_>>();
+    for (idx, matched) in matched.iter().copied().enumerate() {
+        if matched {
+            compiled_pathspecs.mark_matched(idx);
+        }
+    }
     let mut actions = Vec::new();
     let mut seen = BTreeSet::new();
     let mut ignored_paths = BTreeSet::new();
@@ -2454,6 +2887,7 @@ fn resolve_add_regular_actions(
             &indexed_paths,
         )? {
             matched[idx] = true;
+            compiled_pathspecs.mark_matched(idx);
             ignored_paths.insert(ignored_path);
         }
     }
@@ -2469,11 +2903,21 @@ fn resolve_add_regular_actions(
             std::str::from_utf8(entry.path)
                 .map_err(|err| GitError::InvalidPath(err.to_string()))?,
         );
-        let mut path_matches = false;
-        for (idx, (_, pathspec, _)) in pathspecs.iter().enumerate() {
-            if add_path_matches(&path, pathspec) {
-                matched[idx] = true;
-                path_matches = true;
+        let path_matches = compiled_pathspecs.matches(entry.path);
+        if path_matches {
+            for (idx, (_, pathspec, _)) in pathspecs.iter().enumerate() {
+                if add_path_matches(&path, pathspec) {
+                    matched[idx] = true;
+                }
+            }
+            if !compiled_pathspecs.have_include() {
+                for matched in &mut matched {
+                    *matched = true;
+                }
+            } else {
+                for idx in compiled_pathspecs.matched_include_indexes() {
+                    matched[idx] = true;
+                }
             }
         }
         if !path_matches {
@@ -2503,6 +2947,7 @@ fn resolve_add_regular_actions(
                     continue;
                 }
                 matched[idx] = true;
+                compiled_pathspecs.mark_matched(idx);
                 if seen.insert(path.clone()) {
                     actions.push(AddAction::Add(path));
                 }
@@ -2518,16 +2963,14 @@ fn resolve_add_regular_actions(
                 ignored_missing_add_pathspec(worktree_root, display, pathspec)?
             {
                 matched[idx] = true;
+                compiled_pathspecs.mark_matched(idx);
                 ignored_paths.insert(ignored_path);
             }
         }
     }
-    for ((display, _, _), matched) in pathspecs.iter().zip(matched) {
-        if !matched && !options.ignore_missing {
-            eprintln!(
-                "fatal: pathspec '{}' did not match any files",
-                display.to_string_lossy()
-            );
+    for spec in compiled_pathspecs.unmatched_includes() {
+        if !options.ignore_missing {
+            eprintln!("fatal: pathspec '{}' did not match any files", spec.display);
             return Err(GitError::Exit(128));
         }
     }
@@ -3653,11 +4096,15 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     } else {
         worktree_root.clone()
     };
+    let repo_config = read_repo_config(&git_dir)?;
+    let trust_filemode = repo_config
+        .get_bool("core", None, "fileMode")
+        .unwrap_or(true);
     let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(&git_dir)?;
     // `apply.whitespace` config supplies the default whitespace action when the
     // command line did not give an explicit `--whitespace=`.
     if !ws_action_explicit
-        && let Some(value) = read_repo_config(&git_dir)?.get("apply", None, "whitespace")
+        && let Some(value) = repo_config.get("apply", None, "whitespace")
         && let Ok(action) = parse_ws_action(value)
     {
         ws_action = action;
@@ -3679,6 +4126,13 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                         if message.starts_with("malformed hunk header") =>
                     {
                         apply_corrupt_patch_error(input, name)
+                    }
+                    GitError::InvalidFormat(message)
+                        if message.starts_with("corrupt-hunk-body:") =>
+                    {
+                        let line = message.strip_prefix("corrupt-hunk-body:").unwrap_or("1");
+                        eprintln!("error: corrupt patch at {name}:{line}");
+                        GitError::Exit(1)
                     }
                     GitError::InvalidFormat(message)
                         if message.starts_with("git diff header lacks filename") =>
@@ -3716,6 +4170,9 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                     other => other,
                 })?,
         );
+    }
+    if !recount && patches.iter().any(apply_patch_is_noop) {
+        return Err(GitError::Exit(1));
     }
     // `-R`/`--reverse`: undo the patch by reversing each file patch before any
     // whitespace handling or application (git reverses the parsed patches up
@@ -3796,6 +4253,15 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         })
         .unwrap_or_default();
 
+    // Path-safety: refuse to read/create/delete files that escape the working
+    // tree. This must run before whitespace/preimage reads so `--index` and
+    // `--cached` report "beyond a symbolic link" instead of failing earlier on
+    // an index lookup for the path below the symlink. git turns `--unsafe-paths`
+    // off whenever the index is touched (`--index`/`--cached`), so the gate only
+    // relaxes for pure worktree applies.
+    let unsafe_paths = unsafe_paths && !touch_index;
+    check_apply_path_safety(&worktree_base, &patches, unsafe_paths, index.as_ref())?;
+
     // Phase 0: whitespace handling. Resolve the per-path rule, then warn/error
     // or fix the introduced (`+`) lines per `--whitespace=<action>`. In `fix`
     // mode this rewrites the patch's Insert lines (and trims new blank lines at
@@ -3828,6 +4294,10 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             }
             let base = read_patch_base(
                 &worktree_base,
+                &worktree_root,
+                &git_dir,
+                format,
+                &repo_config,
                 patch,
                 index.as_ref(),
                 &db,
@@ -3878,12 +4348,6 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     let patches = patches;
-
-    // Path-safety: refuse to read/create/delete files that escape the working
-    // tree. git turns `--unsafe-paths` off whenever the index is touched
-    // (`--index`/`--cached`), so the gate only relaxes for pure worktree applies.
-    let unsafe_paths = unsafe_paths && !touch_index;
-    check_apply_path_safety(&worktree_base, &patches, unsafe_paths)?;
 
     // git's `check_to_create`: a newly created path (or rename/copy target) must
     // not already exist in the index or working tree, unless another patch in the
@@ -3943,6 +4407,10 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             }
             let base = read_patch_base(
                 &worktree_base,
+                &worktree_root,
+                &git_dir,
+                format,
+                &repo_config,
                 patch,
                 index.as_ref(),
                 &db,
@@ -3985,6 +4453,10 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         }
         let base = read_patch_base(
             &worktree_base,
+            &worktree_root,
+            &git_dir,
+            format,
+            &repo_config,
             patch,
             index.as_ref(),
             &db,
@@ -4004,8 +4476,15 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                     else {
                         return Err(GitError::InvalidFormat("patch missing target path".into()));
                     };
-                    let mode = apply_write_mode(&worktree_base, patch, &target)?;
+                    let mode = apply_write_mode(&worktree_base, patch, &target, trust_filemode)?;
                     let index_mode = apply_index_mode_and_warn(patch, &target, mode, &index_modes);
+                    let mode = apply_worktree_mode_for_index_apply(
+                        mode,
+                        index_mode,
+                        patch,
+                        update_index,
+                        cached,
+                    );
                     actions.push(ApplyAction::Write {
                         path: target,
                         mode,
@@ -4105,8 +4584,10 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone()) else {
                 return Err(GitError::InvalidFormat("patch missing target path".into()));
             };
-            let mode = apply_write_mode(&worktree_base, patch, &target)?;
+            let mode = apply_write_mode(&worktree_base, patch, &target, trust_filemode)?;
             let index_mode = apply_index_mode_and_warn(patch, &target, mode, &index_modes);
+            let mode =
+                apply_worktree_mode_for_index_apply(mode, index_mode, patch, update_index, cached);
             actions.push(ApplyAction::Write {
                 path: target,
                 mode,
@@ -4157,6 +4638,10 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 if !cached {
                     apply_write_worktree_file(
                         &worktree_base,
+                        &worktree_root,
+                        &git_dir,
+                        format,
+                        &repo_config,
                         path,
                         content,
                         *mode,
@@ -4210,6 +4695,10 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         index
             .entries
             .sort_by(|left, right| left.path.cmp(&right.path));
+        // Apply mutates entries after parsing the index; any carried TREE
+        // extension now describes the old entry set/content and must not be
+        // trusted by later write-tree/commit operations.
+        index.set_cache_tree(None)?;
         fs::write(
             sley_worktree::repository_index_path(&git_dir),
             index.write(format)?,
@@ -4339,6 +4828,7 @@ fn check_apply_path_safety(
     worktree_root: &Path,
     patches: &[sley_diff_merge::FilePatch],
     unsafe_paths: bool,
+    index: Option<&Index>,
 ) -> Result<()> {
     // verify_path: a `..` or absolute component is never written, unless the
     // user opted into `--unsafe-paths` for a pure worktree apply.
@@ -4397,6 +4887,7 @@ fn check_apply_path_safety(
             }
             if created_symlinks.iter().any(|s| *s == ancestor)
                 || worktree_component_is_symlink(worktree_root, ancestor)
+                || index_component_is_symlink(index, ancestor)
             {
                 eprintln!(
                     "error: affected file '{}' is beyond a symbolic link",
@@ -4428,6 +4919,16 @@ fn worktree_component_is_symlink(worktree_root: &Path, component: &[u8]) -> bool
     std::fs::symlink_metadata(worktree_root.join(rel))
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
+}
+
+fn index_component_is_symlink(index: Option<&Index>, component: &[u8]) -> bool {
+    index.is_some_and(|index| {
+        index.entries.iter().any(|entry| {
+            entry.path.as_bytes() == component
+                && (entry.flags >> 12) & 0x3 == 0
+                && entry.mode == 0o120000
+        })
+    })
 }
 
 fn write_apply_fake_ancestor_index(
@@ -4655,6 +5156,13 @@ fn apply_patch_name_status_entry(
 }
 
 fn apply_patch_line_stats(patch: &sley_diff_merge::FilePatch) -> DiffLineStats {
+    if patch.is_binary {
+        return DiffLineStats::Binary {
+            old_size: 0,
+            new_size: 0,
+            unchanged: true,
+        };
+    }
     let mut inserted = 0usize;
     let mut deleted = 0usize;
     for hunk in &patch.hunks {
@@ -4937,12 +5445,16 @@ fn apply_write_mode(
     worktree_root: &Path,
     patch: &sley_diff_merge::FilePatch,
     target: &[u8],
+    trust_filemode: bool,
 ) -> Result<u32> {
     if let Some(mode) = patch.new_mode {
         return Ok(mode);
     }
     if patch.is_new {
         return Ok(0o100644);
+    }
+    if !trust_filemode && let Some(mode) = patch.old_mode {
+        return Ok(mode);
     }
     let path = std::str::from_utf8(target)
         .map_err(|err| GitError::InvalidPath(err.to_string()))
@@ -4983,6 +5495,20 @@ fn apply_index_mode_and_warn(
         actual
     } else {
         canon_mode(worktree_mode)
+    }
+}
+
+fn apply_worktree_mode_for_index_apply(
+    worktree_mode: u32,
+    index_mode: u32,
+    patch: &sley_diff_merge::FilePatch,
+    update_index: bool,
+    cached: bool,
+) -> u32 {
+    if update_index && !cached && patch.new_mode.is_none() {
+        index_mode
+    } else {
+        worktree_mode
     }
 }
 
@@ -5070,6 +5596,26 @@ fn apply_check_to_create(
 /// the working tree gains only an (empty) directory.
 fn apply_patch_is_gitlink(patch: &sley_diff_merge::FilePatch) -> bool {
     patch.old_mode == Some(0o160000) || patch.new_mode == Some(0o160000)
+}
+
+fn apply_patch_is_noop(patch: &sley_diff_merge::FilePatch) -> bool {
+    if patch.is_new
+        || patch.is_delete
+        || patch.is_rename
+        || patch.is_copy
+        || patch.is_binary
+        || patch.old_mode != patch.new_mode
+    {
+        return false;
+    }
+    !patch.hunks.iter().any(|hunk| {
+        hunk.lines.iter().any(|line| {
+            matches!(
+                line,
+                sley_diff_merge::HunkLine::Insert(_) | sley_diff_merge::HunkLine::Delete(_)
+            )
+        })
+    })
 }
 
 /// Reconstruct a gitlink patch's preimage (`Subproject commit <old>\n`) from its
@@ -5188,7 +5734,11 @@ impl ApplyAction {
 /// Read the worktree base content a patch applies against (empty for a new
 /// file). Shared by the whitespace pass and the apply pass.
 fn read_patch_base(
-    worktree_root: &Path,
+    worktree_base: &Path,
+    filter_worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
     patch: &sley_diff_merge::FilePatch,
     index: Option<&Index>,
     db: &FileObjectDatabase,
@@ -5237,7 +5787,13 @@ fn read_patch_base(
         };
         let blob = db.read_object(&entry.oid)?.body.clone();
         if verify_worktree_match
-            && let Some(worktree) = read_worktree_blob_bytes(worktree_root, old)?
+            && let Some(worktree) = read_worktree_patch_blob_bytes(
+                worktree_base,
+                filter_worktree_root,
+                git_dir,
+                config,
+                old,
+            )?
             && worktree != blob
         {
             eprintln!(
@@ -5248,7 +5804,10 @@ fn read_patch_base(
         }
         return Ok(blob);
     }
-    Ok(read_worktree_blob_bytes(worktree_root, old)?.unwrap_or_default())
+    Ok(
+        read_worktree_patch_blob_bytes(worktree_base, filter_worktree_root, git_dir, config, old)?
+            .unwrap_or_default(),
+    )
 }
 
 /// Write a worktree file for `git apply`, mirroring git's `try_create_file`: a
@@ -5259,12 +5818,28 @@ fn read_patch_base(
 /// `umask_complement` is `0777 & ~umask`, derived once per invocation.
 fn apply_write_worktree_file(
     worktree_base: &Path,
+    filter_worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
     path: &[u8],
     content: &[u8],
     mode: u32,
     umask_complement: u32,
 ) -> Result<()> {
-    merge_write_worktree_file(worktree_base, path, content, mode)?;
+    let content = if (mode & 0o170000) == 0o100000 {
+        sley_worktree::apply_smudge_filter(
+            filter_worktree_root,
+            git_dir,
+            format,
+            config,
+            path,
+            content,
+        )?
+    } else {
+        content.to_vec()
+    };
+    merge_write_worktree_file(worktree_base, path, &content, mode)?;
     // Only regular files carry a umask-derived mode; symlinks/gitlinks are left
     // as `merge_write_worktree_file` created them.
     #[cfg(unix)]
@@ -5314,13 +5889,31 @@ fn worktree_umask_complement(dir: &Path) -> u32 {
 
 /// Read the blob-form bytes of a worktree path (the symlink target for a
 /// symlink, the file bytes otherwise), or `None` when the path does not exist.
-fn read_worktree_blob_bytes(worktree_root: &Path, path: &[u8]) -> Result<Option<Vec<u8>>> {
+fn read_worktree_patch_blob_bytes(
+    worktree_base: &Path,
+    filter_worktree_root: &Path,
+    git_dir: &Path,
+    config: &GitConfig,
+    path: &[u8],
+) -> Result<Option<Vec<u8>>> {
     let rel = std::str::from_utf8(path)
         .map_err(|_| GitError::InvalidFormat("non-utf8 patch path".into()))?;
-    let full = worktree_root.join(rel);
+    let full = worktree_base.join(rel);
     // A symlink's blob content is its target path, not the bytes it points at —
     // read the link rather than following it (symlink↔file/dir typechanges).
-    if fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink()) {
+    let metadata = match fs::symlink_metadata(&full) {
+        Ok(metadata) => metadata,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.file_type().is_symlink() {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
@@ -5329,11 +5922,21 @@ fn read_worktree_blob_bytes(worktree_root: &Path, path: &[u8]) -> Result<Option<
                 .map(|target| target.into_os_string().into_vec()));
         }
     }
-    Ok(fs::read(full).ok())
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let body = fs::read(full)?;
+    Ok(Some(sley_worktree::apply_clean_filter(
+        filter_worktree_root,
+        git_dir,
+        config,
+        path,
+        &body,
+    )?))
 }
 
 /// Outcome of applying a binary file patch.
-enum BinaryApply {
+pub(crate) enum BinaryApply {
     /// The postimage bytes to write.
     Content(Vec<u8>),
     /// The new blob OID is null — the file is removed.
@@ -5345,7 +5948,7 @@ enum BinaryApply {
 /// require a full index line, verify the preimage matches `old_oid`, then either
 /// read the postimage straight from the object store or reconstruct it from the
 /// binary fragment and verify it hashes to `new_oid`.
-fn apply_binary_outcome(
+pub(crate) fn apply_binary_outcome(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     patch: &sley_diff_merge::FilePatch,
@@ -6026,6 +6629,7 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     }
 
     if explicit_oids.is_empty() && !only_tags {
+        ref_error_bits |= fsck_reflog_roots(&db, format, &git_dir)?;
         ref_error_bits |= fsck_worktree_head_refs(
             &db,
             format,
@@ -6415,6 +7019,36 @@ fn fsck_worktree_head_refs(
     Ok(bits)
 }
 
+fn fsck_reflog_roots(db: &FileObjectDatabase, format: ObjectFormat, git_dir: &Path) -> Result<i32> {
+    let store = FileRefStore::new(git_dir, format);
+    let mut bits = 0i32;
+    let mut seen = HashSet::new();
+    for name in store.list_reflog_names()? {
+        let entries = match store.read_reflog(&name) {
+            Ok(entries) => entries,
+            Err(GitError::NotFound(_)) => continue,
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            for oid in [entry.old_oid, entry.new_oid] {
+                if oid.is_null() || !seen.insert(oid) {
+                    continue;
+                }
+                match db.read_object(&oid) {
+                    Ok(_) => {}
+                    Err(GitError::NotFound(_)) if db.is_promised_object(&oid) => {}
+                    Err(GitError::NotFound(_)) => {
+                        eprintln!("error: {name}: invalid reflog entry {oid}");
+                        bits |= sley_fsck::ERROR_REACHABLE;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+    }
+    Ok(bits)
+}
+
 /// git's `fsck_index` for every worktree index: mark each entry's blob
 /// reachable (appending existing ones to `roots`), report a missing blob with
 /// git's `missing blob <oid>` line (annotated `(<index>:<name>)` under
@@ -6585,7 +7219,7 @@ fn fsck_index_display_path(git_dir: &Path, index_path: &Path) -> String {
 /// `repo_has_promisor_remote`: either `extensions.partialclone` names a default
 /// promisor remote, or some `remote.<name>.promisor` is true. Only then does git
 /// treat objects in `.promisor` packs as legitimately-absent "promised" objects.
-fn repo_has_promisor_remote(config: &GitConfig) -> bool {
+pub(crate) fn repo_has_promisor_remote(config: &GitConfig) -> bool {
     if config
         .get("extensions", None, "partialclone")
         .is_some_and(|value| !value.is_empty())
@@ -7875,6 +8509,10 @@ fn mv_git_path_bytes(path: &Path) -> Result<Vec<u8>> {
         .into_bytes())
 }
 
+fn normalize_absolute_path_lexically(path: &Path) -> PathBuf {
+    normalize_mv_absolute_path_lexically(path)
+}
+
 fn normalize_mv_absolute_path_lexically(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -8379,7 +9017,7 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
             .and_then(|value| commit_graph_parse_max_new_filters(value).ok())
     });
     let existing_filters = if changed_paths {
-        existing_commit_graph_bloom_filters(&object_dir, format)?
+        existing_commit_graph_bloom_filters(&object_dir, format, bloom_settings)?
     } else {
         HashMap::new()
     };
@@ -8444,11 +9082,19 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
     let shared_read_mode = commit_graph_shared_read_mode(&git_dir);
+    let split_layers_owner_writable = !commit_graph_has_shared_repository(&git_dir);
     if split.mode == CommitGraphSplitMode::Off {
         write_commit_graph_file(&graph_dir.join("commit-graph"), &graph, shared_read_mode)?;
         remove_split_commit_graphs(&object_dir)?;
     } else {
-        write_split_commit_graph_file(&object_dir, format, &graph, split, shared_read_mode)?;
+        write_split_commit_graph_file(
+            &object_dir,
+            format,
+            &graph,
+            split,
+            shared_read_mode,
+            split_layers_owner_writable,
+        )?;
     }
     Ok(())
 }
@@ -8532,6 +9178,13 @@ fn commit_graph_shared_read_mode(git_dir: &Path) -> u32 {
     read
 }
 
+fn commit_graph_has_shared_repository(git_dir: &Path) -> bool {
+    let Ok(config) = read_repo_config(git_dir) else {
+        return false;
+    };
+    config.get("core", None, "sharedRepository").is_some()
+}
+
 fn commit_graph_parse_max_new_filters(value: &str) -> Result<usize> {
     value.parse::<usize>().map_err(|_| {
         GitError::Command(format!(
@@ -8569,6 +9222,7 @@ fn write_split_commit_graph_file(
     graph: &[u8],
     options: CommitGraphSplitOptions,
     shared_read_mode: u32,
+    split_layers_owner_writable: bool,
 ) -> Result<()> {
     let info = object_dir.join("info");
     let graphs = info.join("commit-graphs");
@@ -8586,7 +9240,12 @@ fn write_split_commit_graph_file(
         let hash = graph_file_checksum(&bytes, format)?;
         let path = graphs.join(format!("graph-{hash}.graph"));
         if !path.exists() {
-            write_commit_graph_file(&path, &bytes, shared_read_mode)?;
+            write_commit_graph_layer_file(
+                &path,
+                &bytes,
+                shared_read_mode,
+                split_layers_owner_writable,
+            )?;
         }
         layers.push(CommitGraphLayer {
             hash,
@@ -8661,7 +9320,12 @@ fn write_split_commit_graph_file(
     )?;
     let hash = graph_file_checksum(&graph, format)?;
     let graph_path = graphs.join(format!("graph-{hash}.graph"));
-    write_commit_graph_file(&graph_path, &graph, shared_read_mode)?;
+    write_commit_graph_layer_file(
+        &graph_path,
+        &graph,
+        shared_read_mode,
+        split_layers_owner_writable,
+    )?;
 
     let mut chain = base_hashes;
     chain.push(hash);
@@ -8680,6 +9344,24 @@ fn write_split_commit_graph_file(
         let _ = fs::remove_file(&single);
     }
     expire_split_commit_graphs(&graphs, &chain, options.expire_time)?;
+    Ok(())
+}
+
+fn write_commit_graph_layer_file(
+    path: &Path,
+    bytes: &[u8],
+    shared_read_mode: u32,
+    owner_writable: bool,
+) -> Result<()> {
+    write_commit_graph_file(path, bytes, shared_read_mode)?;
+    #[cfg(unix)]
+    if owner_writable {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)?.permissions().mode() | 0o200;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = owner_writable;
     Ok(())
 }
 
@@ -8897,7 +9579,7 @@ fn write_reachable_commit_graph(
     bloom_settings: sley_formats::CommitGraphBloomSettings,
     write_generation_data: bool,
     max_new_filters: Option<usize>,
-    existing_filters: &HashMap<ObjectId, Vec<u8>>,
+    existing_filters: &HashMap<ObjectId, CommitGraphExistingBloomFilter>,
     split: CommitGraphSplitOptions,
     progress: bool,
 ) -> Result<()> {
@@ -8915,11 +9597,19 @@ fn write_reachable_commit_graph(
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
     let shared_read_mode = commit_graph_shared_read_mode(git_dir);
+    let split_layers_owner_writable = !commit_graph_has_shared_repository(git_dir);
     if split.mode == CommitGraphSplitMode::Off {
         write_commit_graph_file(&graph_dir.join("commit-graph"), &graph, shared_read_mode)?;
         remove_split_commit_graphs(object_dir)?;
     } else {
-        write_split_commit_graph_file(object_dir, format, &graph, split, shared_read_mode)?;
+        write_split_commit_graph_file(
+            object_dir,
+            format,
+            &graph,
+            split,
+            shared_read_mode,
+            split_layers_owner_writable,
+        )?;
     }
     Ok(())
 }
@@ -9132,6 +9822,10 @@ fn verify_split_commit_graph_chain(chain_path: &Path, format: ObjectFormat) -> R
         .parent()
         .ok_or_else(|| GitError::InvalidPath("commit-graph chain path has no parent".into()))?;
     let chain_bytes = fs::read(chain_path)?;
+    if chain_bytes.len() < format.hex_len() {
+        eprintln!("error: commit-graph chain file too small");
+        return Err(GitError::Exit(1));
+    }
     let text = std::str::from_utf8(&chain_bytes)
         .map_err(|err| GitError::InvalidFormat(err.to_string()))?;
     let mut graph_hashes = Vec::new();
@@ -9139,39 +9833,53 @@ fn verify_split_commit_graph_chain(chain_path: &Path, format: ObjectFormat) -> R
         if line.is_empty() {
             continue;
         }
+        if line.len() != format.hex_len() || !line.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+            eprintln!("error: invalid commit-graph chain");
+            return Err(GitError::Exit(1));
+        }
         graph_hashes.push(ObjectId::from_hex(format, line)?);
     }
     if graph_hashes.is_empty() {
-        return Err(GitError::InvalidFormat(
-            "commit-graph chain is empty".into(),
-        ));
+        eprintln!("error: commit-graph chain file too small");
+        return Err(GitError::Exit(1));
     }
     for (idx, expected_hash) in graph_hashes.iter().enumerate() {
         let graph_path = chain_dir.join(format!("graph-{expected_hash}.graph"));
-        let graph = CommitGraph::parse(&fs::read(&graph_path)?, format)?;
+        let graph_bytes = match fs::read(&graph_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                eprintln!("error: unable to find all commit-graph files");
+                return Err(GitError::Exit(1));
+            }
+            Err(err) => return Err(GitError::Io(err.to_string())),
+        };
+        let graph = match CommitGraph::parse(&graph_bytes, format) {
+            Ok(graph) => graph,
+            Err(_) => {
+                eprintln!("error: commit-graph file is too small");
+                eprintln!("error: incorrect checksum");
+                eprintln!("error: commit-graph chain does not match");
+                return Err(GitError::Exit(1));
+            }
+        };
         if &graph.checksum != expected_hash {
-            return Err(GitError::InvalidFormat(format!(
-                "commit-graph {} checksum is {}, expected {expected_hash}",
-                graph_path.display(),
-                graph.checksum
-            )));
+            eprintln!("error: incorrect checksum");
+            eprintln!("error: commit-graph chain does not match");
+            return Err(GitError::Exit(1));
         }
         if graph.base_graph_count as usize != graph.base_graphs.len() {
-            return Err(GitError::InvalidFormat(
-                "commit-graph BASE count does not match parsed base list".into(),
-            ));
+            eprintln!("error: commit-graph chain does not match");
+            return Err(GitError::Exit(1));
         }
         if graph.base_graph_count as usize > idx {
-            return Err(GitError::InvalidFormat(
-                "commit-graph has more base graphs than previous chain entries".into(),
-            ));
+            eprintln!("error: commit-graph chain does not match");
+            return Err(GitError::Exit(1));
         }
         if !graph.base_graphs.is_empty() {
             let expected_bases = &graph_hashes[idx - graph.base_graphs.len()..idx];
             if graph.base_graphs != expected_bases {
-                return Err(GitError::InvalidFormat(
-                    "commit-graph BASE hashes do not match chain order".into(),
-                ));
+                eprintln!("error: commit-graph chain does not match");
+                return Err(GitError::Exit(1));
             }
         }
     }
@@ -9720,7 +10428,7 @@ fn commit_graph_for_reachable_refs(
     bloom_settings: sley_formats::CommitGraphBloomSettings,
     write_generation_data: bool,
     max_new_filters: Option<usize>,
-    existing_filters: &HashMap<ObjectId, Vec<u8>>,
+    existing_filters: &HashMap<ObjectId, CommitGraphExistingBloomFilter>,
     progress: bool,
 ) -> Result<Vec<u8>> {
     let db = FileObjectDatabase::new(object_dir, format);
@@ -9767,7 +10475,7 @@ fn commit_graph_from_starts(
     bloom_settings: sley_formats::CommitGraphBloomSettings,
     write_generation_data: bool,
     max_new_filters: Option<usize>,
-    existing_filters: &HashMap<ObjectId, Vec<u8>>,
+    existing_filters: &HashMap<ObjectId, CommitGraphExistingBloomFilter>,
     progress: bool,
 ) -> Result<Vec<u8>> {
     // git's `close_reachable` walk parses every reachable commit (including
@@ -9794,9 +10502,50 @@ fn commit_graph_from_starts(
     let mut bloom_stats = CommitGraphBloomWriteStats::default();
     for record in &records {
         let bloom_filter = if changed_paths {
-            if let Some(filter) = existing_filters.get(&record.oid) {
-                bloom_stats.filter_not_computed += 1;
-                Some(filter.clone())
+            if let Some(existing) = existing_filters.get(&record.oid) {
+                match commit_graph_reusable_bloom_filter_for_record(
+                    db,
+                    format,
+                    record,
+                    &record_map,
+                    bloom_settings,
+                    existing,
+                )? {
+                    CommitGraphBloomReuse::Reuse(filter) => {
+                        bloom_stats.filter_not_computed += 1;
+                        Some(filter)
+                    }
+                    CommitGraphBloomReuse::Upgrade(filter) => {
+                        bloom_stats.filter_not_computed += 1;
+                        bloom_stats.filter_upgraded += 1;
+                        Some(filter)
+                    }
+                    CommitGraphBloomReuse::Recompute => {
+                        if max_new_filters.is_some_and(|max| bloom_stats.filter_computed >= max) {
+                            bloom_stats.filter_not_computed += 1;
+                            None
+                        } else {
+                            let (filter, disposition) = commit_graph_bloom_filter_for_record(
+                                db,
+                                format,
+                                record,
+                                &record_map,
+                                bloom_settings,
+                            )?;
+                            bloom_stats.filter_computed += 1;
+                            match disposition {
+                                CommitGraphBloomDisposition::Empty => {
+                                    bloom_stats.filter_trunc_empty += 1
+                                }
+                                CommitGraphBloomDisposition::Large => {
+                                    bloom_stats.filter_trunc_large += 1
+                                }
+                                CommitGraphBloomDisposition::Normal => {}
+                            }
+                            Some(filter)
+                        }
+                    }
+                }
             } else if max_new_filters.is_some_and(|max| bloom_stats.filter_computed >= max) {
                 bloom_stats.filter_not_computed += 1;
                 None
@@ -9869,7 +10618,11 @@ fn commit_graph_from_starts(
             "filter-trunc-large",
             bloom_stats.filter_trunc_large,
         );
-        sley_core::trace2::data("commit-graph", "filter-upgraded", 0);
+        sley_core::trace2::data(
+            "commit-graph",
+            "filter-upgraded",
+            bloom_stats.filter_upgraded,
+        );
     }
     CommitGraph::write_with_options(format, &entries, bloom_settings, write_generation_data)
 }
@@ -9909,12 +10662,25 @@ struct CommitGraphBloomWriteStats {
     filter_not_computed: usize,
     filter_trunc_empty: usize,
     filter_trunc_large: usize,
+    filter_upgraded: usize,
 }
 
 enum CommitGraphBloomDisposition {
     Normal,
     Empty,
     Large,
+}
+
+enum CommitGraphBloomReuse {
+    Reuse(Vec<u8>),
+    Upgrade(Vec<u8>),
+    Recompute,
+}
+
+#[derive(Debug, Clone)]
+struct CommitGraphExistingBloomFilter {
+    filter: Vec<u8>,
+    settings: sley_formats::CommitGraphBloomSettings,
 }
 
 fn commit_graph_bloom_filter_for_record(
@@ -9924,6 +10690,41 @@ fn commit_graph_bloom_filter_for_record(
     records: &HashMap<ObjectId, &sley_rev::CommitRecord>,
     bloom_settings: sley_formats::CommitGraphBloomSettings,
 ) -> Result<(Vec<u8>, CommitGraphBloomDisposition)> {
+    let changes = commit_graph_changed_paths_for_record(db, format, record, records)?;
+    Ok(commit_graph_bloom_filter_for_changes(
+        &changes,
+        bloom_settings,
+    ))
+}
+
+fn commit_graph_reusable_bloom_filter_for_record(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    record: &sley_rev::CommitRecord,
+    records: &HashMap<ObjectId, &sley_rev::CommitRecord>,
+    bloom_settings: sley_formats::CommitGraphBloomSettings,
+    existing: &CommitGraphExistingBloomFilter,
+) -> Result<CommitGraphBloomReuse> {
+    if commit_graph_bloom_settings_match(existing.settings, bloom_settings) {
+        return Ok(CommitGraphBloomReuse::Reuse(existing.filter.clone()));
+    }
+    if !commit_graph_bloom_filter_can_upgrade(existing.settings, bloom_settings) {
+        return Ok(CommitGraphBloomReuse::Recompute);
+    }
+    let changes = commit_graph_changed_paths_for_record(db, format, record, records)?;
+    if commit_graph_bloom_paths_v1_v2_compatible(&changes) {
+        Ok(CommitGraphBloomReuse::Upgrade(existing.filter.clone()))
+    } else {
+        Ok(CommitGraphBloomReuse::Recompute)
+    }
+}
+
+fn commit_graph_changed_paths_for_record(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    record: &sley_rev::CommitRecord,
+    records: &HashMap<ObjectId, &sley_rev::CommitRecord>,
+) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
     let options = sley_diff_merge::DiffNameStatusOptions {
         detect_renames: false,
         detect_copies: false,
@@ -9955,14 +10756,21 @@ fn commit_graph_bloom_filter_for_record(
             options,
         )?
     };
+    Ok(changes)
+}
+
+fn commit_graph_bloom_filter_for_changes(
+    changes: &[sley_diff_merge::NameStatusEntry],
+    bloom_settings: sley_formats::CommitGraphBloomSettings,
+) -> (Vec<u8>, CommitGraphBloomDisposition) {
     if changes.is_empty() {
-        return Ok((
+        return (
             sley_formats::commit_graph_bloom_filter_for_paths(
                 std::iter::empty::<&[u8]>(),
                 bloom_settings,
             ),
             CommitGraphBloomDisposition::Empty,
-        ));
+        );
     }
     let filter = sley_formats::commit_graph_bloom_filter_for_paths(
         changes.iter().map(|entry| entry.path.as_bytes()),
@@ -9973,7 +10781,36 @@ fn commit_graph_bloom_filter_for_record(
     } else {
         CommitGraphBloomDisposition::Normal
     };
-    Ok((filter, disposition))
+    (filter, disposition)
+}
+
+fn commit_graph_bloom_settings_match(
+    left: sley_formats::CommitGraphBloomSettings,
+    right: sley_formats::CommitGraphBloomSettings,
+) -> bool {
+    left.hash_version == right.hash_version
+        && left.hash_count == right.hash_count
+        && left.bits_per_entry == right.bits_per_entry
+}
+
+fn commit_graph_bloom_filter_can_upgrade(
+    existing: sley_formats::CommitGraphBloomSettings,
+    target: sley_formats::CommitGraphBloomSettings,
+) -> bool {
+    existing.hash_version == 1
+        && target.hash_version == 2
+        && existing.hash_count == target.hash_count
+        && existing.bits_per_entry == target.bits_per_entry
+}
+
+fn commit_graph_bloom_paths_v1_v2_compatible(changes: &[sley_diff_merge::NameStatusEntry]) -> bool {
+    changes.iter().all(|entry| {
+        entry.path.as_bytes().iter().all(u8::is_ascii)
+            && entry
+                .old_path
+                .as_ref()
+                .is_none_or(|path| path.as_bytes().iter().all(u8::is_ascii))
+    })
 }
 
 /// `commitGraph.generationVersion` (git's `get_configured_generation_version`):
@@ -10069,7 +10906,7 @@ fn existing_commit_graph_bloom_settings(
         None => return Ok(None),
     };
     let hashes = read_commit_graph_chain_hashes(&chain_path, format).unwrap_or_default();
-    for hash in hashes.iter().rev() {
+    if let Some(hash) = hashes.last() {
         let path = chain_dir.join(format!("graph-{hash}.graph"));
         if let Some(settings) = commit_graph_bloom_settings_from_file(&path, format) {
             return Ok(Some(settings));
@@ -10084,24 +10921,31 @@ fn commit_graph_bloom_settings_from_file(
 ) -> Option<sley_formats::CommitGraphBloomSettings> {
     let bytes = fs::read(path).ok()?;
     let graph = CommitGraph::parse(&bytes, format).ok()?;
-    graph.bloom_filters.map(|filters| {
-        let mut settings = sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
-        settings.hash_version = filters.hash_version;
-        settings.hash_count = filters.hash_count;
-        settings.bits_per_entry = filters.bits_per_entry;
-        settings
-    })
+    graph
+        .bloom_filters
+        .map(|filters| commit_graph_bloom_settings_from_filters(&filters))
+}
+
+fn commit_graph_bloom_settings_from_filters(
+    filters: &sley_formats::CommitGraphBloomFilters,
+) -> sley_formats::CommitGraphBloomSettings {
+    let mut settings = sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
+    settings.hash_version = filters.hash_version;
+    settings.hash_count = filters.hash_count;
+    settings.bits_per_entry = filters.bits_per_entry;
+    settings
 }
 
 fn existing_commit_graph_bloom_filters(
     object_dir: &Path,
     format: ObjectFormat,
-) -> Result<HashMap<ObjectId, Vec<u8>>> {
+    target_settings: sley_formats::CommitGraphBloomSettings,
+) -> Result<HashMap<ObjectId, CommitGraphExistingBloomFilter>> {
     let mut out = HashMap::new();
     let info = object_dir.join("info");
     let single = info.join("commit-graph");
     if single.exists() {
-        load_commit_graph_bloom_filters_from_file(&single, format, &mut out);
+        load_commit_graph_bloom_filters_from_file(&single, format, None, &mut out);
         return Ok(out);
     }
     let chain = info.join("commit-graphs").join("commit-graph-chain");
@@ -10111,7 +10955,12 @@ fn existing_commit_graph_bloom_filters(
     };
     for hash in read_commit_graph_chain_hashes(&chain, format).unwrap_or_default() {
         let path = chain_dir.join(format!("graph-{hash}.graph"));
-        load_commit_graph_bloom_filters_from_file(&path, format, &mut out);
+        load_commit_graph_bloom_filters_from_file(
+            &path,
+            format,
+            Some((hash, target_settings)),
+            &mut out,
+        );
     }
     Ok(out)
 }
@@ -10119,7 +10968,8 @@ fn existing_commit_graph_bloom_filters(
 fn load_commit_graph_bloom_filters_from_file(
     path: &Path,
     format: ObjectFormat,
-    out: &mut HashMap<ObjectId, Vec<u8>>,
+    split_target: Option<(ObjectId, sley_formats::CommitGraphBloomSettings)>,
+    out: &mut HashMap<ObjectId, CommitGraphExistingBloomFilter>,
 ) {
     let Ok(bytes) = fs::read(path) else {
         return;
@@ -10130,12 +10980,27 @@ fn load_commit_graph_bloom_filters_from_file(
     let Some(filters) = &graph.bloom_filters else {
         return;
     };
+    let settings = commit_graph_bloom_settings_from_filters(filters);
+    if let Some((hash, target_settings)) = split_target
+        && !commit_graph_bloom_settings_match(settings, target_settings)
+    {
+        eprintln!(
+            "warning: disabling Bloom filters for commit-graph layer '{hash}' due to incompatible settings"
+        );
+        return;
+    }
     for (idx, entry) in graph.commits.iter().enumerate() {
         let Some(filter) = filters.filter_for_commit(idx) else {
             continue;
         };
         if !filter.is_empty() {
-            out.insert(entry.oid, filter.to_vec());
+            out.insert(
+                entry.oid,
+                CommitGraphExistingBloomFilter {
+                    filter: filter.to_vec(),
+                    settings,
+                },
+            );
         }
     }
 }

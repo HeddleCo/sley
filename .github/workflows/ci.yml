@@ -17,7 +17,7 @@ defaults:
     shell: bash --noprofile --norc -eo pipefail {0}
 
 env:
-  ORACLE_GIT_TAG: v2.54.0
+  ORACLE_GIT_TAG: v2.55.0
   CARGO_TERM_COLOR: always
   RUSTC_WRAPPER: sccache
   # sccache caches to LOCAL DISK; avoids GHA cache churn.
@@ -52,7 +52,7 @@ jobs:
       # Cache the built git source tree, keyed on the version tag. A cache hit
 
       # Pin the oracle git the cargo test suite compares against. The runner
-      # image's distro git happens to be 2.54.0 today, but the testkit version
+      # image's distro git happens to be 2.55.0 today, but the testkit version
       # guard would hard-fail the day the image bumps — build the pinned
       # version from source instead (shares the cache with upstream-parity).
       - name: Cache upstream git source (built)

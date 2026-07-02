@@ -88,6 +88,13 @@ fn prepare_identity(root: &Path) {
     git(root, &["config", "user.email", "example@example.invalid"]);
 }
 
+fn rev_parse(program: &str, root: &Path, rev: &str) -> String {
+    String::from_utf8(run_output(program, root, &["rev-parse", rev]).stdout)
+        .expect("rev-parse output utf8")
+        .trim()
+        .to_string()
+}
+
 fn prepare_conflict_repos(upstream: &Path, rust: &Path) {
     for root in [upstream, rust] {
         git(root, &["init", "-q", "-b", "master"]);
@@ -111,6 +118,86 @@ fn prepare_conflict_repos(upstream: &Path, rust: &Path) {
         git_with_identity(root, &["commit", "-m", "main", "-q"]);
         git(root, &["checkout", "topic", "-q"]);
     }
+}
+
+fn prepare_tag_target_rebase_abort_repo(root: &Path) {
+    git(root, &["init", "-q", "-b", "main"]);
+    prepare_identity(root);
+    fs::write(root.join("a"), b"a\n").expect("write a");
+    git(root, &["add", "a"]);
+    git_with_identity(root, &["commit", "-m", "a", "-q"]);
+    git(root, &["tag", "a"]);
+    git(root, &["branch", "to-rebase"]);
+
+    fs::write(root.join("a"), b"b\n").expect("write b");
+    git(root, &["add", "a"]);
+    git_with_identity(root, &["commit", "-m", "b", "-q"]);
+    git(root, &["tag", "b"]);
+    fs::write(root.join("a"), b"c\n").expect("write c");
+    git(root, &["add", "a"]);
+    git_with_identity(root, &["commit", "-m", "c", "-q"]);
+    git(root, &["tag", "c"]);
+
+    git(root, &["checkout", "to-rebase", "-q"]);
+    fs::write(root.join("a"), b"d\n").expect("write d");
+    git(root, &["add", "a"]);
+    git_with_identity(root, &["commit", "-m", "merge should fail on this", "-q"]);
+    fs::write(root.join("a"), b"e\n").expect("write e");
+    git(root, &["add", "a"]);
+    git_with_identity(
+        root,
+        &["commit", "-m", "merge should fail on this, too", "-q"],
+    );
+    git(root, &["tag", "pre-rebase"]);
+}
+
+#[test]
+fn rebase_abort_after_non_branch_target_stays_detached() {
+    let root = unique_temp_dir("rebase-abort-tag-target");
+    for backend in ["--apply", "--merge"] {
+        let repo = root.join(backend.trim_start_matches("--"));
+        fs::create_dir_all(&repo).expect("create repo");
+        prepare_tag_target_rebase_abort_repo(&repo);
+
+        let pre_rebase = rev_parse(sley_testkit::oracle_git(), &repo, "pre-rebase^{commit}");
+        let onto = rev_parse(sley_testkit::oracle_git(), &repo, "b^{commit}");
+        let start = run_output_with_identity(
+            sley_testkit::sley_bin!(),
+            &repo,
+            &["rebase", backend, "--onto", "b", "c", "pre-rebase"],
+        );
+        assert!(
+            !start.status.success(),
+            "expected rebase {backend} to stop with a conflict\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&start.stdout),
+            String::from_utf8_lossy(&start.stderr)
+        );
+        assert_eq!(
+            rev_parse(sley_testkit::oracle_git(), &repo, "HEAD"),
+            onto,
+            "rebase {backend} should stop on the onto commit"
+        );
+
+        let abort =
+            run_output_with_identity(sley_testkit::sley_bin!(), &repo, &["rebase", "--abort"]);
+        assert!(
+            abort.status.success(),
+            "rebase --abort failed for {backend}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&abort.stdout),
+            String::from_utf8_lossy(&abort.stderr)
+        );
+        assert_eq!(
+            rev_parse(sley_testkit::oracle_git(), &repo, "HEAD"),
+            pre_rebase,
+            "rebase --abort should restore the tag target commit for {backend}"
+        );
+        let symbolic = run_output(sley_testkit::oracle_git(), &repo, &["symbolic-ref", "HEAD"]);
+        assert!(
+            !symbolic.status.success(),
+            "rebase --abort should leave HEAD detached for {backend}"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
 }
 
 fn topic_head(program: &str, root: &Path) -> String {
@@ -155,17 +242,17 @@ fn rebase_conflict_then_abort_matches_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     prepare_conflict_repos(&upstream, &rust);
     let upstream_pre_rebase = topic_head(sley_testkit::oracle_git(), &upstream);
-    let rust_pre_rebase = topic_head(env!("CARGO_BIN_EXE_sley"), &rust);
+    let rust_pre_rebase = topic_head(sley_testkit::sley_bin!(), &rust);
     assert_eq!(
         upstream_pre_rebase, rust_pre_rebase,
         "pre-rebase topic differed"
     );
     start_conflict_rebase(sley_testkit::oracle_git(), &upstream);
-    start_conflict_rebase(env!("CARGO_BIN_EXE_sley"), &rust);
+    start_conflict_rebase(sley_testkit::sley_bin!(), &rust);
 
     let args = ["rebase", "--abort"];
     let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
-    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
     assert_same_output(actual, expected, &args);
 
     assert!(
@@ -174,7 +261,7 @@ fn rebase_conflict_then_abort_matches_upstream_git() {
     );
     assert!(
         !rust.join(".git/rebase-merge").exists(),
-        "git-rs rebase-merge should be removed"
+        "Sley rebase-merge should be removed"
     );
     assert!(
         !upstream.join(".git/REBASE_HEAD").is_file(),
@@ -182,7 +269,7 @@ fn rebase_conflict_then_abort_matches_upstream_git() {
     );
     assert!(
         !rust.join(".git/REBASE_HEAD").is_file(),
-        "git-rs REBASE_HEAD should be removed"
+        "Sley REBASE_HEAD should be removed"
     );
     assert_eq!(
         run_output(
@@ -191,7 +278,7 @@ fn rebase_conflict_then_abort_matches_upstream_git() {
             &["rev-parse", "HEAD"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after rebase --abort"
     );
     let upstream_post_abort_head = String::from_utf8(
@@ -221,12 +308,7 @@ fn rebase_conflict_then_abort_matches_upstream_git() {
             &["status", "--porcelain"]
         )
         .stdout,
-        run_output(
-            env!("CARGO_BIN_EXE_sley"),
-            &rust,
-            &["status", "--porcelain"]
-        )
-        .stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["status", "--porcelain"]).stdout,
         "status differed after rebase --abort"
     );
     assert_eq!(
@@ -237,7 +319,7 @@ fn rebase_conflict_then_abort_matches_upstream_git() {
         )
         .stdout,
         run_output(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &rust,
             &["ls-files", "--unmerged"]
         )
@@ -256,13 +338,13 @@ fn rebase_conflict_then_continue_matches_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     prepare_conflict_repos(&upstream, &rust);
     start_conflict_rebase(sley_testkit::oracle_git(), &upstream);
-    start_conflict_rebase(env!("CARGO_BIN_EXE_sley"), &rust);
+    start_conflict_rebase(sley_testkit::sley_bin!(), &rust);
     resolve_conflict(&upstream);
     resolve_conflict(&rust);
 
     let args = ["rebase", "--continue"];
     let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
-    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
     assert_same_output(actual, expected, &args);
 
     assert!(
@@ -271,7 +353,7 @@ fn rebase_conflict_then_continue_matches_upstream_git() {
     );
     assert!(
         !rust.join(".git/rebase-merge").exists(),
-        "git-rs rebase-merge should be removed"
+        "Sley rebase-merge should be removed"
     );
     assert_eq!(
         upstream.join(".git/REBASE_HEAD").is_file(),
@@ -285,12 +367,12 @@ fn rebase_conflict_then_continue_matches_upstream_git() {
             &["rev-parse", "HEAD"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after rebase --continue"
     );
     assert_eq!(
         run_output(sley_testkit::oracle_git(), &upstream, &["log", "--oneline"]).stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "--oneline"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["log", "--oneline"]).stdout,
         "log order differed after rebase --continue"
     );
     assert_eq!(
@@ -300,7 +382,7 @@ fn rebase_conflict_then_continue_matches_upstream_git() {
             &["rev-parse", "topic"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "topic"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["rev-parse", "topic"]).stdout,
         "topic branch differed after rebase --continue"
     );
     assert_eq!(
@@ -328,7 +410,7 @@ fn rebase_abort_without_rebase_fails() {
 
     let args = ["rebase", "--abort"];
     let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
-    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
     assert_same_output(actual, expected, &args);
     let _ = fs::remove_dir_all(&root);
 }
@@ -370,11 +452,11 @@ fn rebase_conflict_then_skip_matches_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     prepare_conflict_repos(&upstream, &rust);
     start_conflict_rebase(sley_testkit::oracle_git(), &upstream);
-    start_conflict_rebase(env!("CARGO_BIN_EXE_sley"), &rust);
+    start_conflict_rebase(sley_testkit::sley_bin!(), &rust);
 
     let args = ["rebase", "--skip"];
     let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
-    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
     assert_same_output(actual, expected, &args);
 
     assert!(
@@ -383,7 +465,7 @@ fn rebase_conflict_then_skip_matches_upstream_git() {
     );
     assert!(
         !rust.join(".git/rebase-merge").exists(),
-        "git-rs rebase-merge should be removed"
+        "Sley rebase-merge should be removed"
     );
     assert_eq!(
         upstream.join(".git/REBASE_HEAD").is_file(),
@@ -397,12 +479,12 @@ fn rebase_conflict_then_skip_matches_upstream_git() {
             &["rev-parse", "HEAD"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after rebase --skip"
     );
     assert_eq!(
         run_output(sley_testkit::oracle_git(), &upstream, &["log", "--oneline"]).stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "--oneline"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["log", "--oneline"]).stdout,
         "log order differed after rebase --skip"
     );
     assert_eq!(
@@ -412,7 +494,7 @@ fn rebase_conflict_then_skip_matches_upstream_git() {
             &["rev-parse", "topic"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "topic"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["rev-parse", "topic"]).stdout,
         "topic branch differed after rebase --skip"
     );
     assert_eq!(
@@ -422,7 +504,7 @@ fn rebase_conflict_then_skip_matches_upstream_git() {
             &["rev-parse", "master"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "master"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["rev-parse", "master"]).stdout,
         "topic should match master after skipping sole topic commit"
     );
     assert_eq!(
@@ -437,12 +519,7 @@ fn rebase_conflict_then_skip_matches_upstream_git() {
             &["status", "--porcelain"]
         )
         .stdout,
-        run_output(
-            env!("CARGO_BIN_EXE_sley"),
-            &rust,
-            &["status", "--porcelain"]
-        )
-        .stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["status", "--porcelain"]).stdout,
         "status differed after rebase --skip"
     );
     let _ = fs::remove_dir_all(&root);
@@ -457,11 +534,11 @@ fn rebase_multi_commit_conflict_then_skip_matches_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     prepare_multi_commit_conflict_repos(&upstream, &rust);
     start_conflict_rebase(sley_testkit::oracle_git(), &upstream);
-    start_conflict_rebase(env!("CARGO_BIN_EXE_sley"), &rust);
+    start_conflict_rebase(sley_testkit::sley_bin!(), &rust);
 
     let args = ["rebase", "--skip"];
     let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
-    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),
@@ -479,7 +556,7 @@ fn rebase_multi_commit_conflict_then_skip_matches_upstream_git() {
     );
     assert!(
         !rust.join(".git/rebase-merge").exists(),
-        "git-rs rebase-merge should be removed"
+        "Sley rebase-merge should be removed"
     );
     assert_eq!(
         run_output(
@@ -488,12 +565,12 @@ fn rebase_multi_commit_conflict_then_skip_matches_upstream_git() {
             &["rev-parse", "HEAD"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after multi-commit rebase --skip"
     );
     assert_eq!(
         run_output(sley_testkit::oracle_git(), &upstream, &["log", "--oneline"]).stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "--oneline"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["log", "--oneline"]).stdout,
         "log order differed after multi-commit rebase --skip"
     );
     assert_eq!(
@@ -503,7 +580,7 @@ fn rebase_multi_commit_conflict_then_skip_matches_upstream_git() {
             &["rev-parse", "topic"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "topic"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["rev-parse", "topic"]).stdout,
         "topic branch differed after multi-commit rebase --skip"
     );
     assert_eq!(
@@ -536,7 +613,7 @@ fn rebase_skip_without_rebase_fails() {
 
     let args = ["rebase", "--skip"];
     let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
-    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
     assert_same_output(actual, expected, &args);
     let _ = fs::remove_dir_all(&root);
 }
@@ -558,7 +635,7 @@ fn rebase_continue_without_rebase_fails() {
 
     let args = ["rebase", "--continue"];
     let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
-    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
     assert_same_output(actual, expected, &args);
     let _ = fs::remove_dir_all(&root);
 }

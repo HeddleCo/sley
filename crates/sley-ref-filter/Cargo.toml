@@ -7,8 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core" }
-sley-strbuf-expand = { path = "../sley-strbuf-expand" }
+sley-core.workspace = true
+sley-strbuf-expand.workspace = true
 
 [lints]
 workspace = true

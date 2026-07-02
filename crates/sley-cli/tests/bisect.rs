@@ -71,8 +71,8 @@ fn git(cwd: &Path, args: &[&str]) -> Output {
     run_env(sley_testkit::oracle_git(), cwd, args)
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git_available() -> bool {
@@ -127,7 +127,7 @@ impl RepoPair {
     /// agree. Returns the shared stdout for further inspection.
     fn assert_same(&self, args: &[&str]) -> String {
         let g = git(&self.git_repo, args);
-        let r = git_rs(&self.rs_repo, args);
+        let r = sley(&self.rs_repo, args);
         let g_out = String::from_utf8_lossy(&g.stdout).into_owned();
         let r_out = String::from_utf8_lossy(&r.stdout).into_owned();
         assert_eq!(
@@ -212,7 +212,7 @@ fn bisect_start_with_revs_matches_git() {
 }
 
 /// A full bisection run (start, then alternating good/bad) must agree at every
-/// step, including the final "<oid> is the first bad commit" announcement and
+/// step, including the final "<oid> is the first 'bad' commit" announcement and
 /// the `git show`-style commit summary that follows it.
 #[test]
 fn bisect_full_run_converges_like_git() {
@@ -235,7 +235,7 @@ fn bisect_full_run_converges_like_git() {
     pair.assert_head_matches();
     let final_out = pair.assert_same(&["bisect", "good"]);
     assert!(
-        final_out.contains("is the first bad commit"),
+        final_out.contains("is the first 'bad' commit"),
         "expected convergence message, got: {final_out:?}",
     );
     pair.assert_state_matches("BISECT_LOG");
@@ -256,12 +256,15 @@ fn bisect_log_and_status_match_git() {
 
     // Starting with no revs leaves the bisection waiting for both endpoints.
     let waiting = pair.assert_same(&["bisect", "start"]);
-    assert_eq!(waiting, "status: waiting for both good and bad commits\n");
+    assert_eq!(
+        waiting,
+        "status: waiting for both 'good' and 'bad' commits\n"
+    );
     // Marking the tip bad leaves it waiting for a good commit.
     let waiting_good = pair.assert_same(&["bisect", "bad"]);
     assert_eq!(
         waiting_good,
-        "status: waiting for good commit(s), bad commit known\n",
+        "status: waiting for 'good' commit(s), 'bad' commit known\n",
     );
     // Marking a good commit kicks off the first real step.
     pair.assert_same(&["bisect", "good", &good]);

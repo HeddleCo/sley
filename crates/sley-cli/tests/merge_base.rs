@@ -32,8 +32,8 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_output(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_output(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
@@ -166,7 +166,7 @@ fn merge_base_two_commits_matches_upstream_git() {
             vec!["merge-base", "--independent", &left, &left],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -195,12 +195,12 @@ fn merge_base_no_common_history_matches_upstream_git() {
 
         let args = ["merge-base", first.as_str(), second.as_str()];
         let expected = git(&root, &args);
-        let actual = git_rs(&root, &args);
+        let actual = sley(&root, &args);
         assert_same_output(actual, expected, &args);
 
         let args = ["merge-base", "--octopus", first.as_str(), second.as_str()];
         let expected = git(&root, &args);
-        let actual = git_rs(&root, &args);
+        let actual = sley(&root, &args);
         assert_same_output(actual, expected, &args);
 
         let args = [
@@ -210,7 +210,7 @@ fn merge_base_no_common_history_matches_upstream_git() {
             second.as_str(),
         ];
         let expected = git(&root, &args);
-        let actual = git_rs(&root, &args);
+        let actual = sley(&root, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -257,9 +257,25 @@ fn merge_base_fork_point_matches_upstream_git() {
             vec!["merge-base", "--fork-point", "main", &upstream],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_same_output(actual, expected, &args);
         }
+
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &[
+                "-c",
+                "core.logallrefupdates=false",
+                "branch",
+                "no-reflog",
+                "main",
+            ],
+        );
+        let args = ["merge-base", "--fork-point", "no-reflog", &topic];
+        let expected = git(&root, &args);
+        let actual = sley(&root, &args);
+        assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
 }

@@ -43,6 +43,7 @@ pub(crate) const BUILTIN_COMMANDS: &[&str] = &[
     "diff-index",
     "diff-tree",
     "difftool",
+    "fast-export",
     "fast-import",
     "fetch",
     "fetch-pack",
@@ -107,6 +108,8 @@ pub(crate) const BUILTIN_COMMANDS: &[&str] = &[
     "revert",
     "rm",
     "send-pack",
+    #[cfg(feature = "git-compat-i18n")]
+    "sh-i18n--envsubst",
     "shortlog",
     "show",
     "show-branch",
@@ -448,6 +451,9 @@ pub(crate) fn print_common_help() {
 
 pub(crate) fn print_builtin_commands() {
     for command in BUILTIN_COMMANDS {
+        if *command == "submodule" {
+            continue;
+        }
         println!("{command}");
     }
 }

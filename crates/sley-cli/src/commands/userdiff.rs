@@ -182,7 +182,7 @@ static BUILTIN_DRIVERS: &[BuiltinDriver] = &[
         name: "scheme",
         icase: false,
         funcname: Some(b"^[\t ]*(\\(((define|def(struct|syntax|class|method|rules|record|proto|alias)?)[-*/ \t]|(library|module|struct|class)[*+ \t]).*)$"),
-        word_regex: Some(b"\\|([^\\\\]*)\\||([^][)(}{[ \t])+|[^[:space:]]|[\xc0-\xff][\x80-\xbf]+"),
+        word_regex: Some(b"\\|([^|\\\\]|\\\\.)*\\||([^][)(}{ \t])+|[^[:space:]]|[\xc0-\xff][\x80-\xbf]+"),
     },
     BuiltinDriver {
         name: "tex",

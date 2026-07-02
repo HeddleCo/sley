@@ -51,8 +51,8 @@ fn git_ok(cwd: &Path, args: &[&str]) {
     );
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git_available() -> bool {
@@ -71,12 +71,17 @@ fn copy_dir_all(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).expect("create dst");
     for entry in fs::read_dir(src).expect("read_dir") {
         let entry = entry.expect("entry");
+        if entry.file_name().to_string_lossy().ends_with(".lock") {
+            continue;
+        }
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if entry.file_type().expect("file_type").is_dir() {
             copy_dir_all(&from, &to);
         } else {
-            fs::copy(&from, &to).expect("copy file");
+            fs::copy(&from, &to).unwrap_or_else(|err| {
+                panic!("copy file {} -> {}: {err}", from.display(), to.display())
+            });
         }
     }
 }
@@ -161,7 +166,7 @@ fn merge_branch_mergeoptions_malformed_on_main_fails_like_git() {
     copy_dir_all(&reference, &candidate);
 
     let ref_out = git(&reference, &["merge", "main"]);
-    let rs_out = git_rs(&candidate, &["merge", "main"]);
+    let rs_out = sley(&candidate, &["merge", "main"]);
 
     assert_eq!(ref_out.status.code(), Some(128));
     assert_eq!(rs_out.status.code(), Some(128));
@@ -192,7 +197,7 @@ fn merge_branch_mergeoptions_are_prepended_before_cli_args() {
 
     let args = ["merge", "side", "--no-ff", "-m", "manual merge"];
     let ref_out = git(&reference, &args);
-    let rs_out = git_rs(&candidate, &args);
+    let rs_out = sley(&candidate, &args);
 
     assert!(
         ref_out.status.success(),
@@ -233,7 +238,7 @@ fn merge_clean_threeway_matches_git() {
         &reference,
         &["merge", "-m", "Merge branch 'feature'", "feature"],
     );
-    let rs_out = git_rs(
+    let rs_out = sley(
         &candidate,
         &["merge", "-m", "Merge branch 'feature'", "feature"],
     );
@@ -297,7 +302,7 @@ fn merge_fast_forward_matches_git() {
     copy_dir_all(&reference, &candidate);
 
     let ref_out = git(&reference, &["merge", "feature"]);
-    let rs_out = git_rs(&candidate, &["merge", "feature"]);
+    let rs_out = sley(&candidate, &["merge", "feature"]);
     assert!(ref_out.status.success());
     assert!(
         rs_out.status.success(),
@@ -348,7 +353,7 @@ fn merge_already_up_to_date_matches_git() {
     git_ok(&repo, &["commit", "-qm", "c2"]);
 
     // Merging an ancestor ("old") is a no-op.
-    let rs_out = git_rs(&repo, &["merge", "old"]);
+    let rs_out = sley(&repo, &["merge", "old"]);
     assert!(rs_out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&rs_out.stdout).trim(),
@@ -389,7 +394,7 @@ fn merge_conflict_matches_git() {
     copy_dir_all(&reference, &candidate);
 
     let ref_out = git(&reference, &["merge", "-m", "M", "feature"]);
-    let rs_out = git_rs(&candidate, &["merge", "-m", "M", "feature"]);
+    let rs_out = sley(&candidate, &["merge", "-m", "M", "feature"]);
 
     // Both fail with the same conflict exit code.
     assert_eq!(ref_out.status.code(), Some(1));
@@ -451,10 +456,10 @@ fn merge_abort_restores_pre_merge_state() {
     git_ok(&repo, &["commit", "-qm", "mainwork"]);
     let pre_head = head(&repo);
 
-    let conflict = git_rs(&repo, &["merge", "-m", "M", "feature"]);
+    let conflict = sley(&repo, &["merge", "-m", "M", "feature"]);
     assert_eq!(conflict.status.code(), Some(1));
 
-    let abort = git_rs(&repo, &["merge", "--abort"]);
+    let abort = sley(&repo, &["merge", "--abort"]);
     assert!(
         abort.status.success(),
         "sley merge --abort failed: {}",
@@ -476,6 +481,165 @@ fn merge_abort_restores_pre_merge_state() {
     assert!(
         git(&repo, &["ls-files", "-u"]).stdout.is_empty(),
         "unmerged entries remain after abort"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+fn setup_directory_submodule_conflict(repo: &Path) {
+    git_ok(
+        repo.parent().unwrap_or(repo),
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
+    git_ok(repo, &["commit", "--allow-empty", "-qm", "O"]);
+    for branch in ["A", "B1", "B2"] {
+        git_ok(repo, &["branch", branch]);
+    }
+
+    git_ok(repo, &["checkout", "-q", "B1"]);
+    fs::create_dir_all(repo.join("path")).expect("create B1 path dir");
+    write_file(&repo.join("path"), "file", "contents\n");
+    git_ok(repo, &["add", "path/file"]);
+    git_ok(repo, &["commit", "-qm", "B1"]);
+
+    git_ok(repo, &["checkout", "-q", "B2"]);
+    fs::create_dir_all(repo.join("path")).expect("create B2 path dir");
+    write_file(&repo.join("path"), "world", "contents\n");
+    git_ok(repo, &["add", "path/world"]);
+    git_ok(repo, &["commit", "-qm", "B2"]);
+
+    git_ok(repo, &["checkout", "-q", "A"]);
+    git_ok(repo, &["init", "-q", "-b", "main", "path"]);
+    write_file(&repo.join("path"), "world", "hello\n");
+    git_ok(&repo.join("path"), &["add", "world"]);
+    git_ok(&repo.join("path"), &["commit", "-qm", "hello"]);
+    git_ok(
+        repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            "./path",
+        ],
+    );
+    git_ok(repo, &["commit", "-qm", "A"]);
+}
+
+#[test]
+fn merge_directory_submodule_conflict_keeps_submodule_clean_and_abort_works() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("merge-directory-submodule-conflict");
+    let repo = root.join("repo");
+    setup_directory_submodule_conflict(&repo);
+
+    let b1 = sley(&repo, &["merge", "B1"]);
+    assert_eq!(
+        b1.status.code(),
+        Some(1),
+        "Sley should report a directory/submodule conflict\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&b1.stdout),
+        String::from_utf8_lossy(&b1.stderr)
+    );
+    assert!(
+        repo.join("path/.git").exists(),
+        "path/ should remain a populated submodule"
+    );
+    assert!(
+        !repo.join("path/file").exists(),
+        "merge wrote B1's file into the submodule checkout"
+    );
+    let unmerged =
+        String::from_utf8(git(&repo, &["ls-files", "-u"]).stdout).expect("ls-files -u utf8");
+    assert_eq!(
+        unmerged.lines().count(),
+        1,
+        "B1 conflict should leave only the gitlink unmerged"
+    );
+    let listed =
+        String::from_utf8(git(&repo, &["ls-files", "-co"]).stdout).expect("ls-files -co utf8");
+    let aside_has_contents = listed.lines().any(|path| {
+        !path.starts_with("path/")
+            && fs::read(repo.join(path))
+                .map(|bytes| bytes == b"contents\n")
+                .unwrap_or(false)
+    });
+    assert!(
+        aside_has_contents,
+        "B1's path/file content should be materialized outside the submodule"
+    );
+    assert!(
+        git(&repo.join("path"), &["status", "--short"])
+            .stdout
+            .is_empty(),
+        "B1 conflict dirtied the submodule checkout"
+    );
+    let abort_b1 = sley(&repo, &["merge", "--abort"]);
+    assert!(
+        abort_b1.status.success(),
+        "Sley merge --abort after B1 failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&abort_b1.stdout),
+        String::from_utf8_lossy(&abort_b1.stderr)
+    );
+
+    let b2 = sley(&repo, &["merge", "B2"]);
+    assert_eq!(
+        b2.status.code(),
+        Some(1),
+        "Sley should report a directory/submodule conflict for B2\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&b2.stdout),
+        String::from_utf8_lossy(&b2.stderr)
+    );
+    assert!(
+        repo.join(".git/MERGE_HEAD").is_file(),
+        "MERGE_HEAD should exist during the conflicted merge"
+    );
+    assert_eq!(
+        fs::read(repo.join("path/world")).expect("read submodule file"),
+        b"hello\n",
+        "B2 merge should not overwrite the submodule's own file"
+    );
+    assert!(
+        git(&repo.join("path"), &["status", "--short"])
+            .stdout
+            .is_empty(),
+        "B2 conflict dirtied the submodule checkout before abort"
+    );
+
+    let abort_b2 = sley(&repo, &["merge", "--abort"]);
+    assert!(
+        abort_b2.status.success(),
+        "Sley merge --abort after B2 failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&abort_b2.stdout),
+        String::from_utf8_lossy(&abort_b2.stderr)
+    );
+    assert!(
+        !repo.join(".git/MERGE_HEAD").exists(),
+        "MERGE_HEAD still present after abort"
+    );
+    assert!(
+        git(&repo, &["ls-files", "-u"]).stdout.is_empty(),
+        "unmerged entries remain after abort"
+    );
+    assert_eq!(
+        fs::read(repo.join("path/world")).expect("read submodule file after abort"),
+        b"hello\n",
+        "abort should leave the submodule worktree intact"
+    );
+    assert!(
+        git(&repo.join("path"), &["status", "--short"])
+            .stdout
+            .is_empty(),
+        "abort dirtied the submodule checkout"
     );
 
     fs::remove_dir_all(&root).ok();
@@ -527,7 +691,7 @@ fn merge_rename_clean_matches_git() {
         &reference,
         &["merge", "-m", "Merge branch 'feature'", "feature"],
     );
-    let rs_out = git_rs(
+    let rs_out = sley(
         &candidate,
         &["merge", "-m", "Merge branch 'feature'", "feature"],
     );
@@ -573,7 +737,7 @@ fn merge_rename_conflict_matches_git() {
         &reference,
         &["merge", "-m", "Merge branch 'feature'", "feature"],
     );
-    let rs_out = git_rs(
+    let rs_out = sley(
         &candidate,
         &["merge", "-m", "Merge branch 'feature'", "feature"],
     );

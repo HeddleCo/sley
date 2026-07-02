@@ -71,7 +71,7 @@ impl SparseMatcher {
                     let candidate = &path[..end];
                     let mut matched = None;
                     for pattern in patterns {
-                        if pattern.matches(candidate, is_dir) {
+                        if sparse_pattern_matches_candidate(pattern, candidate, is_dir) {
                             matched = Some(!pattern.negated);
                         }
                     }
@@ -89,6 +89,34 @@ impl SparseMatcher {
             SparseMatcher::Cone(cone) => cone.includes_file(path),
         }
     }
+}
+
+fn sparse_pattern_matches_candidate(pattern: &IgnorePattern, path: &[u8], is_dir: bool) -> bool {
+    if !pattern.directory_only {
+        return pattern.matches(path, is_dir);
+    }
+    if !is_dir {
+        return false;
+    }
+    sparse_directory_pattern_matches_candidate(pattern, path)
+}
+
+fn sparse_directory_pattern_matches_candidate(pattern: &IgnorePattern, path: &[u8]) -> bool {
+    let path = if pattern.base.is_empty() {
+        path
+    } else {
+        let Some(rest) = path
+            .strip_prefix(pattern.base.as_slice())
+            .and_then(|rest| rest.strip_prefix(b"/"))
+        else {
+            return false;
+        };
+        rest
+    };
+    if pattern.anchored || pattern.has_slash {
+        return pattern.match_path(path);
+    }
+    pattern.match_segment(path_basename(path))
 }
 
 impl ConeMatcher {

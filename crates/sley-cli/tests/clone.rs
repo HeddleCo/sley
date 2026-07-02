@@ -311,7 +311,7 @@ fn clone_local_repository_matches_upstream_git() {
             &["clone", "-q", source_arg, expected_arg],
         );
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["clone", "-q", source_arg, actual_arg],
         );
@@ -384,7 +384,7 @@ fn clone_local_repository_default_directory_matches_upstream_git() {
             &["clone", "-q", &source_arg],
         );
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_root,
             &["clone", "-q", &source_arg],
         );
@@ -426,7 +426,7 @@ fn clone_local_repository_bare_matches_upstream_git() {
             &["clone", "-q", "--bare", source_arg, expected_arg],
         );
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["clone", "-q", "--bare", source_arg, actual_arg],
         );
@@ -494,7 +494,7 @@ fn clone_local_repository_bare_options_match_upstream_git() {
             ],
         );
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_root,
             &[
                 "clone",
@@ -569,7 +569,7 @@ fn clone_local_repository_bare_and_mirror_origin_option_match_upstream_git() {
                 ],
             );
             let actual = run(
-                env!("CARGO_BIN_EXE_sley"),
+                sley_testkit::sley_bin!(),
                 &root,
                 &[
                     "clone", "-q", mode, "--origin", "upstream", source_arg, actual_arg,
@@ -630,7 +630,7 @@ fn clone_local_repository_mirror_matches_upstream_git() {
             &["clone", "-q", "--mirror", &source_arg],
         );
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_root,
             &["clone", "-q", "--mirror", &source_arg],
         );
@@ -688,7 +688,7 @@ fn clone_local_repository_no_mirror_restores_non_bare_clone_like_upstream_git() 
             ],
         );
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &[
                 "clone",
@@ -758,7 +758,7 @@ fn clone_local_repository_single_branch_matches_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -807,7 +807,7 @@ fn clone_local_repository_bare_and_mirror_single_branch_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -845,7 +845,7 @@ fn clone_local_repository_no_checkout_matches_upstream_git() {
             &["clone", "-q", "--no-checkout", source_arg, expected_arg],
         );
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["clone", "-q", "--no-checkout", source_arg, actual_arg],
         );
@@ -899,7 +899,7 @@ fn clone_sha256_no_checkout_and_sparse_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -942,7 +942,7 @@ fn clone_local_repository_tag_options_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -973,6 +973,7 @@ fn clone_local_repository_branch_option_matches_upstream_git() {
             ("long-space", vec!["--branch", "feature/topic"]),
             ("long-equals", vec!["--branch=feature/topic"]),
             ("short-compact", vec!["-bfeature/topic"]),
+            ("tag", vec!["--branch", "v1.0"]),
             ("reset", vec!["--branch", "feature/topic", "--no-branch"]),
         ] {
             let expected_repo = root.join(format!("{label}-expected"));
@@ -987,12 +988,13 @@ fn clone_local_repository_branch_option_matches_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
                 vec!["show-ref"],
                 vec!["rev-parse", "--abbrev-ref", "HEAD"],
+                vec!["config", "--get", "remote.origin.fetch"],
                 vec!["config", "--get", "branch.main.remote"],
                 vec!["config", "--get", "branch.main.merge"],
                 vec!["config", "--get", "branch.feature/topic.remote"],
@@ -1045,7 +1047,7 @@ fn clone_local_repository_revision_option_matches_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -1108,7 +1110,7 @@ fn clone_local_repository_revision_option_matches_upstream_git() {
             ],
         );
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &[
                 "clone",
@@ -1166,7 +1168,7 @@ fn clone_local_repository_revision_option_matches_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
         }
     };
@@ -1201,7 +1203,7 @@ fn clone_local_repository_origin_option_matches_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -1264,7 +1266,7 @@ fn clone_local_repository_config_options_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -1363,7 +1365,7 @@ fn clone_local_repository_template_options_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -1445,7 +1447,7 @@ fn clone_local_repository_filter_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -1496,7 +1498,7 @@ fn clone_file_repository_filter_marks_promisor_pack_like_upstream_git() {
         ];
 
         let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-        let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+        let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
         assert_same_output(actual, expected, &actual_args);
 
         for args in [
@@ -1567,7 +1569,7 @@ fn clone_local_repository_bundle_uri_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -1609,7 +1611,7 @@ fn clone_local_repository_bundle_uri_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
         }
     };
@@ -1664,7 +1666,7 @@ fn clone_local_repository_sparse_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -1780,7 +1782,7 @@ fn clone_local_repository_separate_git_dir_flags_match_upstream_git() {
             let actual_arg_refs = actual_args.iter().map(String::as_str).collect::<Vec<_>>();
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_arg_refs);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_arg_refs);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_arg_refs);
             let mut replacements = vec![(expected_repo.as_path(), actual_repo.as_path())];
             if let (Some(expected_git_dir), Some(actual_git_dir)) = (
                 case.expected_git_dir.as_deref(),
@@ -1877,7 +1879,7 @@ fn clone_local_repository_separate_git_dir_flags_match_upstream_git() {
             ];
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output_with_normalized_paths(
                 actual,
                 expected,
@@ -1996,7 +1998,7 @@ fn clone_local_repository_reference_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -2065,7 +2067,7 @@ fn clone_local_repository_local_transport_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -2123,7 +2125,7 @@ fn clone_local_repository_upload_pack_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -2184,7 +2186,7 @@ fn clone_local_repository_server_option_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -2240,7 +2242,7 @@ fn clone_local_repository_jobs_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -2293,7 +2295,7 @@ fn clone_local_repository_ref_format_files_matches_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -2344,7 +2346,7 @@ fn clone_local_repository_reject_shallow_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -2419,7 +2421,7 @@ fn clone_local_repository_shallow_hint_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -2521,7 +2523,7 @@ fn clone_no_local_depth_matches_upstream_git() {
             actual_args.extend([repository, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output_with_normalized_destination(
                 actual,
                 expected,
@@ -2595,7 +2597,7 @@ fn clone_local_repository_recurse_submodules_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -2675,7 +2677,7 @@ fn clone_local_repository_submodule_hint_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -2732,7 +2734,7 @@ fn clone_local_repository_submodule_hint_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
         }
     };
@@ -2770,7 +2772,7 @@ fn clone_local_repository_ip_family_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -2842,7 +2844,7 @@ fn clone_local_repository_negative_noop_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
             for args in [
@@ -2895,7 +2897,7 @@ fn clone_local_repository_progress_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output_with_normalized_destination(
                 actual,
                 expected,
@@ -2951,7 +2953,7 @@ fn clone_local_repository_verbose_flags_match_upstream_git() {
             actual_args.extend([source_arg, actual_arg]);
 
             let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
-            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            let actual = run(sley_testkit::sley_bin!(), &root, &actual_args);
             assert_same_output_with_normalized_destination(
                 actual,
                 expected,

@@ -35,8 +35,8 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -78,7 +78,7 @@ fn ls_tree_usage_and_option_errors_exit_like_upstream_git() {
             vec!["ls-tree", "--object-only", "--name-only", "HEAD"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_eq!(
                 actual.status.code(),
                 expected.status.code(),
@@ -131,7 +131,7 @@ fn ls_tree_pathspecs_match_upstream_git() {
             vec!["ls-tree", "HEAD", "missing"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -175,7 +175,7 @@ fn ls_tree_show_trees_matches_upstream_git() {
             vec!["ls-tree", "-r", "-t", "--long", "HEAD"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -219,7 +219,7 @@ fn ls_tree_directories_only_matches_upstream_git() {
             vec!["ls-tree", "-d", "--long", "HEAD", "dir/"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -259,7 +259,7 @@ fn ls_tree_name_status_matches_upstream_git() {
             vec!["ls-tree", "--name-status", "-d", "HEAD", "dir/"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -308,7 +308,7 @@ fn ls_tree_quoted_paths_match_upstream_git() {
             ],
         ] {
             let expected = git(&repo, &args);
-            let actual = git_rs(&repo, &args);
+            let actual = sley(&repo, &args);
             assert_eq!(
                 actual, expected,
                 "sley output differed for {args:?} path {path:?}"
@@ -355,7 +355,7 @@ fn ls_tree_abbrev_matches_upstream_git() {
             vec!["ls-tree", "--abbrev=8", "--no-abbrev", "HEAD"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -420,7 +420,7 @@ fn ls_tree_nested_cwd_full_name_and_full_tree_match_upstream_git() {
             vec!["ls-tree", "--full-tree", "HEAD", "sub"],
         ] {
             let expected = git(&nested, &args);
-            let actual = git_rs(&nested, &args);
+            let actual = sley(&nested, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -471,7 +471,7 @@ fn ls_tree_format_placeholders_match_upstream_git() {
             vec!["ls-tree", "--format", "%(path)", "HEAD", "dir/"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };

@@ -2151,8 +2151,19 @@ fn print_tag_list(
             .iter()
             .any(|sort| sort.needs_object_metadata()))
     .then(|| FileObjectDatabase::from_git_dir(git_dir, format));
-    let merged_reachable = tag_merged_reachable_sets(db.as_ref(), format, options.merged)?;
-    let no_merged_reachable = tag_merged_reachable_sets(db.as_ref(), format, options.no_merged)?;
+    let mut reachability = db
+        .as_ref()
+        .map(|db| sley_rev::CommitReachability::new(git_dir, format, db));
+    let merged_reachable =
+        tag_merged_reachable_set(db.as_ref(), reachability.as_mut(), format, options.merged)?;
+    let no_merged_reachable = tag_merged_reachable_set(
+        db.as_ref(),
+        reachability.as_mut(),
+        format,
+        options.no_merged,
+    )?;
+    let contains_target_set = options.contains.iter().copied().collect::<HashSet<_>>();
+    let no_contains_target_set = options.no_contains.iter().copied().collect::<HashSet<_>>();
     let mut entries = Vec::new();
     for reference in store.list_refs_with_prefix("refs/tags/")? {
         if let Some(name) = reference.name.strip_prefix("refs/tags/")
@@ -2163,10 +2174,11 @@ fn print_tag_list(
             && tag_points_at(&db, format, &reference.target, options.points_at)?
             && tag_contains(
                 &db,
+                reachability.as_mut(),
                 format,
                 &reference.target,
-                options.contains,
-                options.no_contains,
+                &contains_target_set,
+                &no_contains_target_set,
             )?
             && tag_merged(
                 &db,
@@ -3256,10 +3268,11 @@ fn tag_version_refname_cmp(
 
 fn tag_contains(
     db: &Option<FileObjectDatabase>,
+    reachability: Option<&mut sley_rev::CommitReachability<'_, FileObjectDatabase>>,
     format: ObjectFormat,
     target: &RefTarget,
-    contains: &[ObjectId],
-    no_contains: &[ObjectId],
+    contains: &HashSet<ObjectId>,
+    no_contains: &HashSet<ObjectId>,
 ) -> Result<bool> {
     if contains.is_empty() && no_contains.is_empty() {
         return Ok(true);
@@ -3270,28 +3283,22 @@ fn tag_contains(
     let Some(db) = db else {
         return Ok(false);
     };
+    let Some(reachability) = reachability else {
+        return Ok(false);
+    };
     let Ok(tip) = sley_rev::peel_to_commit(db, format, oid) else {
         return Ok(false);
     };
-    let reachable = sley_rev::walk_commits(db, format, [tip])?
-        .into_iter()
-        .map(|record| record.oid)
-        .collect::<HashSet<_>>();
-    if !contains.is_empty() && !contains.iter().any(|target| reachable.contains(target)) {
-        return Ok(false);
-    }
-    if no_contains.iter().any(|target| reachable.contains(target)) {
-        return Ok(false);
-    }
-    Ok(true)
+    let target_match = reachability.target_match(&tip, contains, no_contains, false)?;
+    Ok(target_match.reached_required && !target_match.reached_excluded)
 }
 
 fn tag_merged(
     db: &Option<FileObjectDatabase>,
     format: ObjectFormat,
     target: &RefTarget,
-    merged_reachable: &[HashSet<ObjectId>],
-    no_merged_reachable: &[HashSet<ObjectId>],
+    merged_reachable: &HashSet<ObjectId>,
+    no_merged_reachable: &HashSet<ObjectId>,
 ) -> Result<bool> {
     if merged_reachable.is_empty() && no_merged_reachable.is_empty() {
         return Ok(true);
@@ -3305,35 +3312,31 @@ fn tag_merged(
     let Ok(tip) = sley_rev::peel_to_commit(db, format, oid) else {
         return Ok(false);
     };
-    let merged_match =
-        merged_reachable.is_empty() || merged_reachable.iter().any(|set| set.contains(&tip));
-    let no_merged_match = no_merged_reachable.iter().any(|set| set.contains(&tip));
+    let merged_match = merged_reachable.is_empty() || merged_reachable.contains(&tip);
+    let no_merged_match = no_merged_reachable.contains(&tip);
     Ok(merged_match && !no_merged_match)
 }
 
-fn tag_merged_reachable_sets(
+fn tag_merged_reachable_set(
     db: Option<&FileObjectDatabase>,
+    reachability: Option<&mut sley_rev::CommitReachability<'_, FileObjectDatabase>>,
     format: ObjectFormat,
     filters: &[ObjectId],
-) -> Result<Vec<HashSet<ObjectId>>> {
+) -> Result<HashSet<ObjectId>> {
     if filters.is_empty() {
-        return Ok(Vec::new());
+        return Ok(HashSet::new());
     }
     let Some(db) = db else {
-        return Ok(Vec::new());
+        return Ok(HashSet::new());
     };
-    filters
+    let Some(reachability) = reachability else {
+        return Ok(HashSet::new());
+    };
+    let commits = filters
         .iter()
-        .map(|oid| {
-            let commit = sley_rev::peel_to_commit(db, format, oid)?;
-            sley_rev::walk_commits(db, format, [commit]).map(|records| {
-                records
-                    .into_iter()
-                    .map(|record| record.oid)
-                    .collect::<HashSet<_>>()
-            })
-        })
-        .collect()
+        .map(|oid| sley_rev::peel_to_commit(db, format, oid))
+        .collect::<Result<Vec<_>>>()?;
+    reachability.reachable_oids(commits, false)
 }
 
 fn tag_points_at(

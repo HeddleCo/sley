@@ -257,7 +257,12 @@ const NOTE_TEMPLATE: &str = "\nWrite/edit the notes for the following object:\n"
 /// edited note body. `seed` is the pre-editor buffer (concatenated -m/-F/-c/-C
 /// content); `old_note` supplies the initial body for a bare `edit` with no
 /// content sources.
-fn launch_note_editor(git_dir: &Path, seed: &[u8], old_note: Option<&[u8]>) -> Result<Vec<u8>> {
+fn launch_note_editor(
+    git_dir: &Path,
+    seed: &[u8],
+    old_note: Option<&[u8]>,
+    stripspace: NotesStripspace,
+) -> Result<Vec<u8>> {
     let edit_path = git_dir.join("NOTES_EDITMSG");
 
     let mut template = Vec::new();
@@ -306,8 +311,13 @@ fn launch_note_editor(git_dir: &Path, seed: &[u8], old_note: Option<&[u8]>) -> R
 
     let edited = fs::read(&edit_path).unwrap_or_default();
     let _ = fs::remove_file(&edit_path);
-    // Default stripspace strips comment lines and normalizes whitespace.
-    Ok(tag_stripspace_message(&edited, true))
+    if stripspace == NotesStripspace::No {
+        Ok(edited)
+    } else {
+        // Unspecified and explicit --stripspace both strip comment lines after
+        // the editor, matching prepare_note_data().
+        Ok(tag_stripspace_message(&edited, true))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +348,13 @@ impl NoteContent {
             stripspace: false,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NotesStripspace {
+    Unspecified,
+    No,
+    Yes,
 }
 
 /// The `--separator` / `--no-separator` setting. git's `separator` global
@@ -372,7 +389,11 @@ impl Separator {
 /// non-empty, and the whole buffer is stripspaced after a source whose
 /// stripspace flag is set (the default-unspecified stripspace path). Returns
 /// None when no `-m/-F/-c/-C` was given.
-fn build_note_body(sources: &[NoteContent], separator: &Separator) -> Option<Vec<u8>> {
+fn build_note_body(
+    sources: &[NoteContent],
+    separator: &Separator,
+    stripspace: NotesStripspace,
+) -> Option<Vec<u8>> {
     if sources.is_empty() {
         return None;
     }
@@ -382,7 +403,9 @@ fn build_note_body(sources: &[NoteContent], separator: &Separator) -> Option<Vec
             separator.append_to(&mut body);
         }
         body.extend_from_slice(&source.bytes);
-        if source.stripspace {
+        if stripspace == NotesStripspace::Yes
+            || (stripspace == NotesStripspace::Unspecified && source.stripspace)
+        {
             body = tag_stripspace_message(&body, false);
         }
     }
@@ -409,6 +432,7 @@ struct EditOptions {
     allow_empty: bool,
     object: Option<String>,
     separator: Separator,
+    stripspace: NotesStripspace,
     /// Set by `-e`/`--edit` and implicitly by `-c`/`--reedit-message`.
     use_editor: bool,
 }
@@ -429,6 +453,7 @@ fn parse_edit_options(
     let mut allow_empty = false;
     let mut object = None;
     let mut separator = Separator::default();
+    let mut stripspace = NotesStripspace::Unspecified;
     let mut use_editor = false;
     let mut iter = args.iter();
     let mut positional_only = false;
@@ -529,7 +554,8 @@ fn parse_edit_options(
                 separator = Separator(Some(value.as_bytes()["--separator=".len()..].to_vec()));
             }
             "--no-separator" => separator = Separator(None),
-            "--stripspace" | "--no-stripspace" => {}
+            "--stripspace" => stripspace = NotesStripspace::Yes,
+            "--no-stripspace" => stripspace = NotesStripspace::No,
             value if value.starts_with('-') && value.len() > 1 && value != "-" => {
                 return Err(notes_unknown_option(value, usage));
             }
@@ -542,6 +568,7 @@ fn parse_edit_options(
         allow_empty,
         object,
         separator,
+        stripspace,
         use_editor,
     })
 }
@@ -684,9 +711,10 @@ fn notes_add(git_dir: &Path, format: ObjectFormat, notes_ref: &str, args: &[Stri
 
     // Concatenate content sources, then run the editor when requested (or when
     // no content was supplied at all, which is git's default add path).
-    let mut body = build_note_body(&options.contents, &options.separator).unwrap_or_default();
+    let mut body = build_note_body(&options.contents, &options.separator, options.stripspace)
+        .unwrap_or_default();
     if options.use_editor || !has_messages {
-        body = launch_note_editor(git_dir, &body, None)?;
+        body = launch_note_editor(git_dir, &body, None, options.stripspace)?;
     }
 
     write_note_or_remove(
@@ -722,8 +750,8 @@ fn write_note_or_remove(
 ) -> Result<()> {
     let handle = notes_ref_handle(notes_ref);
     if body.is_empty() && !allow_empty {
+        eprintln!("Removing note for object {spec}");
         if had_existing {
-            eprintln!("Removing note for object {spec}");
             let mut notes = list_notes(git_dir, format, store, &handle)?;
             remove_note(&mut notes, target);
             write_notes(
@@ -784,13 +812,14 @@ fn notes_edit(
     // edit always opens the editor (use_editor || !msg_nr is always true here
     // because edit has no non-editor path). Seed with concatenated content, or
     // with the prior note when there was no content.
-    let seed = build_note_body(&options.contents, &options.separator).unwrap_or_default();
+    let seed = build_note_body(&options.contents, &options.separator, options.stripspace)
+        .unwrap_or_default();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let old_note = match &existing {
         Some(blob) => Some(db.read_object(blob)?.body.clone()),
         None => None,
     };
-    let body = launch_note_editor(git_dir, &seed, old_note.as_deref())?;
+    let body = launch_note_editor(git_dir, &seed, old_note.as_deref(), options.stripspace)?;
 
     write_note_or_remove(
         git_dir,
@@ -830,9 +859,10 @@ fn notes_append(
     // Concatenate the new content, then run the editor when requested (or when
     // no content was supplied). For append, the editor is seeded only with the
     // new content (not the prior note); the prior note is prepended afterwards.
-    let mut appended = build_note_body(&options.contents, &options.separator).unwrap_or_default();
+    let mut appended = build_note_body(&options.contents, &options.separator, options.stripspace)
+        .unwrap_or_default();
     if options.use_editor || !has_messages {
-        appended = launch_note_editor(git_dir, &appended, None)?;
+        appended = launch_note_editor(git_dir, &appended, None, options.stripspace)?;
     }
 
     // Prepend the existing note, separated from the new content with the
@@ -1451,6 +1481,7 @@ fn notes_merge_cmd(
         }
         NotesMergeOutcome::Merged { .. } => Ok(()),
         NotesMergeOutcome::Conflicted { partial, conflicts } => {
+            ensure_no_shared_notes_merge(git_dir, local_ref.as_str())?;
             write_notes_merge_conflicts(
                 git_dir,
                 format,
@@ -1664,12 +1695,89 @@ fn conflict_note_body(
                     style: ConflictStyle::Merge,
                     favor: sley_diff_merge::MergeFavor::None,
                     ws_ignore: sley_diff_merge::WsIgnore::EMPTY,
+                    marker_size: 7,
                 },
             )
             .content)
         }
         _ => Ok(Vec::new()),
     }
+}
+
+fn ensure_no_shared_notes_merge(git_dir: &Path, notes_ref: &str) -> Result<()> {
+    if let Some(path) = find_shared_notes_merge(git_dir, notes_ref)? {
+        eprintln!(
+            "fatal: a notes merge into {notes_ref} is already in-progress at {}",
+            path.display()
+        );
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+fn find_shared_notes_merge(git_dir: &Path, notes_ref: &str) -> Result<Option<PathBuf>> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    for state_git_dir in notes_merge_state_git_dirs(&common_git_dir)? {
+        if paths_refer_to_same_dir(&state_git_dir, git_dir) {
+            continue;
+        }
+        let Some(active_ref) = read_notes_merge_ref_at(&state_git_dir)? else {
+            continue;
+        };
+        if active_ref == notes_ref {
+            return Ok(Some(notes_merge_worktree_path(
+                &common_git_dir,
+                &state_git_dir,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn notes_merge_state_git_dirs(common_git_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = vec![common_git_dir.to_path_buf()];
+    let worktrees = common_git_dir.join("worktrees");
+    let Ok(entries) = fs::read_dir(worktrees) else {
+        return Ok(dirs);
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            dirs.push(entry.path());
+        }
+    }
+    Ok(dirs)
+}
+
+fn read_notes_merge_ref_at(git_dir: &Path) -> Result<Option<String>> {
+    let path = git_dir.join("NOTES_MERGE_REF");
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    Ok(Some(
+        text.trim()
+            .strip_prefix("ref:")
+            .map(str::trim)
+            .unwrap_or_else(|| text.trim())
+            .to_string(),
+    ))
+}
+
+fn notes_merge_worktree_path(common_git_dir: &Path, state_git_dir: &Path) -> PathBuf {
+    if paths_refer_to_same_dir(common_git_dir, state_git_dir)
+        && let Ok(root) = worktree_root_for_git_dir(common_git_dir)
+    {
+        return root;
+    }
+    if let Ok(gitdir) = fs::read_to_string(state_git_dir.join("gitdir")) {
+        let gitdir = PathBuf::from(gitdir.trim());
+        if let Some(parent) = gitdir.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    state_git_dir.to_path_buf()
 }
 
 fn read_note_blob_body(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {

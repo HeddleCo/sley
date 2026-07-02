@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sley_core::{Capability, ObjectFormat, ObjectId};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
-    ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures,
+    ProtocolVersion, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures,
     ReceivePackPushRequestOptions, ReceivePackUnpackStatus, UploadPackAcknowledgment,
     UploadPackNegotiationRequest, UploadPackRequest, build_receive_pack_push_request,
     demux_upload_pack_packfile_response, read_receive_pack_report_status,
@@ -71,9 +71,20 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn run_with_stdin(program: &str, cwd: &Path, args: &[&str], input: &[u8]) -> Output {
+    run_with_stdin_env(program, cwd, args, input, &[])
+}
+
+fn run_with_stdin_env(
+    program: &str,
+    cwd: &Path,
+    args: &[&str],
+    input: &[u8],
+    envs: &[(&str, &str)],
+) -> Output {
     let mut child = Command::new(program)
         .current_dir(cwd)
         .args(args)
+        .envs(envs.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -287,6 +298,22 @@ fn assert_ref_missing(repo: &Path, name: &str) {
     );
 }
 
+fn write_push_option_recording_hooks(git_dir: &Path) {
+    let hooks = git_dir.join("hooks");
+    fs::create_dir_all(&hooks).expect("create hooks dir");
+    for hook in ["pre-receive", "post-receive"] {
+        let path = hooks.join(hook);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif test -n \"$GIT_PUSH_OPTION_COUNT\"; then\n\tidx=0\n\t>hooks/{hook}.push_options\n\twhile test \"$idx\" -lt \"$GIT_PUSH_OPTION_COUNT\"; do\n\t\teval \"value=\\$GIT_PUSH_OPTION_$idx\"\n\t\techo \"$value\" >>hooks/{hook}.push_options\n\t\tidx=$((idx + 1))\n\tdone\nfi\n"
+            ),
+        )
+        .expect("write hook");
+        make_executable(&path);
+    }
+}
+
 #[test]
 fn receive_pack_service_updates_bare_repo_with_raw_pack() {
     let root = unique_temp_dir("receive-pack-service");
@@ -367,7 +394,7 @@ fn receive_pack_service_updates_bare_repo_with_raw_pack() {
         .expect("encode receive-pack request");
 
     let output = run_with_stdin(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["receive-pack", &remote_arg],
         &encoded_request,
@@ -507,7 +534,7 @@ fn receive_pack_service_accepts_push_options() {
         .expect("encode receive-pack request");
 
     let output = run_with_stdin(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["receive-pack", &remote_arg],
         &encoded_request,
@@ -639,7 +666,7 @@ fn receive_pack_service_accepts_empty_push_options_section() {
         .expect("encode receive-pack request");
 
     let output = run_with_stdin(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["receive-pack", &remote_arg],
         &encoded_request,
@@ -676,6 +703,45 @@ fn receive_pack_service_accepts_empty_push_options_section() {
         ),
     );
     assert_eq!(remote_head, new_id);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn receive_pack_service_advertises_protocol_v1_when_requested() {
+    let root = unique_temp_dir("receive-pack-protocol-v1-service");
+    fs::create_dir_all(&root).expect("create temp root");
+    let remote = root.join("remote.git");
+    let work = root.join("work");
+    let remote_arg = remote.to_string_lossy().to_string();
+    fs::create_dir_all(&remote).expect("create remote");
+    fs::create_dir_all(&work).expect("create work");
+    create_bare_repo(&remote, None);
+    create_work_repo(&work, None);
+    run_success(
+        sley_testkit::oracle_git(),
+        &work,
+        &["push", "-q", &remote_arg, "main"],
+    );
+
+    let output = run_with_stdin_env(
+        sley_testkit::sley_bin!(),
+        &root,
+        &["receive-pack", &remote_arg],
+        b"0000",
+        &[("GIT_PROTOCOL", "version=1")],
+    );
+    assert!(
+        output.status.success(),
+        "receive-pack failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut stdout = output.stdout.as_slice();
+    let advertisements = read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout)
+        .expect("parse receive-pack advertisements");
+    assert_eq!(advertisements.protocol, ProtocolVersion::V1);
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -723,7 +789,7 @@ fn upload_pack_service_serves_raw_pack() {
 
     let source_arg = source.to_string_lossy();
     let output = run_with_stdin(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["upload-pack", &source_arg],
         &encoded_request,
@@ -774,6 +840,37 @@ fn upload_pack_service_serves_raw_pack() {
 }
 
 #[test]
+fn upload_pack_service_advertises_protocol_v1_when_requested() {
+    let root = unique_temp_dir("upload-pack-protocol-v1-service");
+    fs::create_dir_all(&root).expect("create temp root");
+    let source = root.join("source");
+    fs::create_dir_all(&source).expect("create source");
+    create_work_repo(&source, None);
+
+    let source_arg = source.to_string_lossy();
+    let output = run_with_stdin_env(
+        sley_testkit::sley_bin!(),
+        &root,
+        &["upload-pack", &source_arg],
+        b"",
+        &[("GIT_PROTOCOL", "version=1")],
+    );
+    assert!(
+        output.status.success(),
+        "upload-pack failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut stdout = output.stdout.as_slice();
+    let advertisements = read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout)
+        .expect("parse upload-pack advertisements");
+    assert_eq!(advertisements.protocol, ProtocolVersion::V1);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn upload_pack_service_serves_sideband_64k_pack() {
     let root = unique_temp_dir("upload-pack-sideband-service");
     fs::create_dir_all(&root).expect("create temp root");
@@ -816,7 +913,7 @@ fn upload_pack_service_serves_sideband_64k_pack() {
 
     let source_arg = source.to_string_lossy();
     let output = run_with_stdin(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["upload-pack", &source_arg],
         &encoded_request,
@@ -876,7 +973,7 @@ fn push_local_branch_to_bare_repo_matches_upstream_ref_and_objects() {
 
     let remote_arg = remote.to_string_lossy();
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, "main"],
     );
@@ -901,6 +998,176 @@ fn push_local_branch_to_bare_repo_matches_upstream_ref_and_objects() {
 }
 
 #[test]
+fn push_options_propagate_to_on_demand_submodule_push() {
+    let root = unique_temp_dir("push-options-submodules");
+    fs::create_dir_all(&root).expect("create temp root");
+    let seed = root.join("seed");
+    let upstream = root.join("upstream.git");
+    let parent = root.join("parent");
+    let parent_upstream = root.join("parent_upstream.git");
+    fs::create_dir_all(&seed).expect("create seed");
+    fs::create_dir_all(&upstream).expect("create upstream");
+    fs::create_dir_all(&parent).expect("create parent");
+    fs::create_dir_all(&parent_upstream).expect("create parent upstream");
+
+    create_work_repo(&seed, None);
+    create_bare_repo(&upstream, None);
+    create_work_repo(&parent, None);
+    create_bare_repo(&parent_upstream, None);
+    write_push_option_recording_hooks(&upstream);
+    write_push_option_recording_hooks(&parent_upstream);
+    run_success(
+        sley_testkit::oracle_git(),
+        &upstream,
+        &["config", "receive.advertisePushOptions", "true"],
+    );
+    run_success(
+        sley_testkit::oracle_git(),
+        &parent_upstream,
+        &["config", "receive.advertisePushOptions", "true"],
+    );
+
+    let upstream_arg = upstream.to_string_lossy();
+    let parent_upstream_arg = parent_upstream.to_string_lossy();
+    run_success(
+        sley_testkit::oracle_git(),
+        &seed,
+        &["push", "-q", &upstream_arg, "main"],
+    );
+    run_success(
+        sley_testkit::oracle_git(),
+        &parent,
+        &["remote", "add", "up", &parent_upstream_arg],
+    );
+    run_success(
+        sley_testkit::oracle_git(),
+        &parent,
+        &["push", "-q", "up", "main"],
+    );
+    run_success(
+        sley_testkit::oracle_git(),
+        &parent,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &upstream_arg,
+            "workbench",
+        ],
+    );
+    run_success(
+        sley_testkit::oracle_git(),
+        &parent.join("workbench"),
+        &["remote", "add", "up", &upstream_arg],
+    );
+    run_success(
+        sley_testkit::oracle_git(),
+        &parent,
+        &[
+            "-c",
+            "user.name=Example User",
+            "-c",
+            "user.email=example@example.invalid",
+            "commit",
+            "-am",
+            "add submodule",
+            "-q",
+        ],
+    );
+
+    fs::write(
+        parent.join("workbench").join("payload.txt"),
+        b"recursive push option\n",
+    )
+    .expect("write submodule update");
+    run_success(
+        sley_testkit::oracle_git(),
+        &parent.join("workbench"),
+        &["add", "payload.txt"],
+    );
+    run_success(
+        sley_testkit::oracle_git(),
+        &parent.join("workbench"),
+        &[
+            "-c",
+            "user.name=Example User",
+            "-c",
+            "user.email=example@example.invalid",
+            "commit",
+            "-m",
+            "submodule update",
+            "-q",
+        ],
+    );
+    run_success(sley_testkit::oracle_git(), &parent, &["add", "workbench"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        &parent,
+        &[
+            "-c",
+            "user.name=Example User",
+            "-c",
+            "user.email=example@example.invalid",
+            "commit",
+            "-m",
+            "record submodule update",
+            "-q",
+        ],
+    );
+
+    run_success(
+        sley_testkit::sley_bin!(),
+        &parent,
+        &[
+            "push",
+            "--push-option=asdf",
+            "--push-option=more structured text",
+            "--recurse-submodules=on-demand",
+            "up",
+            "main",
+        ],
+    );
+
+    assert_eq!(
+        run_success(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["rev-parse", "refs/heads/main"],
+        ),
+        run_success(
+            sley_testkit::oracle_git(),
+            &parent.join("workbench"),
+            &["rev-parse", "refs/heads/main"],
+        )
+    );
+    assert_eq!(
+        run_success(
+            sley_testkit::oracle_git(),
+            &parent_upstream,
+            &["rev-parse", "refs/heads/main"],
+        ),
+        run_success(
+            sley_testkit::oracle_git(),
+            &parent,
+            &["rev-parse", "refs/heads/main"],
+        )
+    );
+
+    let expected = "asdf\nmore structured text\n";
+    for git_dir in [&upstream, &parent_upstream] {
+        for hook in ["pre-receive", "post-receive"] {
+            let actual =
+                fs::read_to_string(git_dir.join("hooks").join(format!("{hook}.push_options")))
+                    .expect("read recorded push options");
+            assert_eq!(actual, expected, "{hook} options in {}", git_dir.display());
+        }
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn failing_pre_push_hook_leaves_remote_ref_unchanged_and_runs_at_worktree_root() {
     let root = unique_temp_dir("push-pre-push-fails-before-ref-update");
     fs::create_dir_all(&root).expect("create temp root");
@@ -913,7 +1180,7 @@ fn failing_pre_push_hook_leaves_remote_ref_unchanged_and_runs_at_worktree_root()
 
     let remote_arg = remote.to_string_lossy();
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, "main"],
     );
@@ -955,7 +1222,7 @@ fn failing_pre_push_hook_leaves_remote_ref_unchanged_and_runs_at_worktree_root()
     let subdir = work.join("subdir");
     fs::create_dir_all(&subdir).expect("create subdir");
     let output = run(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &subdir,
         &["push", "-q", &remote_arg, "main"],
     );
@@ -1027,7 +1294,7 @@ fn push_ssh_branch_to_bare_repo_matches_upstream_git_protocol_v0() {
             &[("GIT_SSH", fake_ssh)],
         );
         let actual = run_with_env(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_work,
             &actual_args,
             &[("GIT_SSH", fake_ssh)],
@@ -1108,7 +1375,7 @@ fn push_configured_percent_encoded_ssh_remote_matches_upstream_git_protocol_v0()
             &[("GIT_SSH", fake_ssh)],
         );
         let actual = run_with_env(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual_work,
             &actual_args,
             &[("GIT_SSH", fake_ssh)],
@@ -1166,7 +1433,7 @@ fn push_configured_percent_encoded_file_remote_updates_bare_repo() {
         );
 
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &work,
             &["push", "-q", "origin", "main"],
         );
@@ -1267,7 +1534,7 @@ fn push_rejects_non_fast_forward_without_force() {
         );
 
         let actual = run(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &work,
             &["push", "-q", &remote_arg, "main"],
         );
@@ -1364,7 +1631,7 @@ fn push_force_refspec_updates_non_fast_forward_branch() {
         );
 
         run_success(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &work,
             &["push", "-q", &remote_arg, "+main"],
         );
@@ -1394,7 +1661,7 @@ fn push_update_pack_excludes_objects_reachable_from_remote_refs() {
 
     let remote_arg = remote.to_string_lossy();
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, "main"],
     );
@@ -1450,7 +1717,7 @@ fn push_update_pack_excludes_objects_reachable_from_remote_refs() {
     .trim()
     .to_string();
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, "main"],
     );
@@ -1494,7 +1761,7 @@ fn push_delete_refspec_removes_remote_branch() {
 
     let remote_arg = remote.to_string_lossy();
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, "main"],
     );
@@ -1505,7 +1772,7 @@ fn push_delete_refspec_removes_remote_branch() {
     );
 
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, ":old"],
     );
@@ -1526,7 +1793,7 @@ fn push_delete_option_removes_remote_branch() {
 
     let remote_arg = remote.to_string_lossy();
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, "main"],
     );
@@ -1537,7 +1804,7 @@ fn push_delete_option_removes_remote_branch() {
     );
 
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", "--delete", &remote_arg, "old"],
     );
@@ -1558,7 +1825,7 @@ fn push_delete_missing_remote_branch_fails() {
 
     let remote_arg = remote.to_string_lossy();
     let output = run(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_arg, ":missing"],
     );
@@ -1582,7 +1849,7 @@ fn push_sha256_branch_to_file_remote_sets_upstream() {
 
     let remote_url = format!("file://{}", remote.display());
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", "-u", &remote_url, "main"],
     );
@@ -1635,7 +1902,7 @@ fn push_delete_sha256_remote_branch() {
 
     let remote_url = format!("file://{}", remote.display());
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", &remote_url, "main"],
     );
@@ -1646,7 +1913,7 @@ fn push_delete_sha256_remote_branch() {
     );
 
     run_success(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &work,
         &["push", "-q", "--delete", &remote_url, "old"],
     );

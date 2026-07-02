@@ -35,8 +35,8 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
     run(sley_testkit::oracle_git(), cwd, args)
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
@@ -180,7 +180,7 @@ fn clean_long_option_negations_match_upstream_git() {
 
         let args = ["clean", "-n", "--no-dry-run", "-f", "top.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             files(&rust),
@@ -190,7 +190,7 @@ fn clean_long_option_negations_match_upstream_git() {
 
         let args = ["clean", "-q", "--no-quiet", "-f", "tracked/extra.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             files(&rust),
@@ -214,7 +214,7 @@ fn clean_no_force_and_no_interactive_match_upstream_git() {
 
         let args = ["clean", "-f", "--no-force"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             files(&rust),
@@ -224,7 +224,7 @@ fn clean_no_force_and_no_interactive_match_upstream_git() {
 
         let args = ["clean", "--no-interactive", "-n", "top.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -248,7 +248,7 @@ fn clean_dry_run_and_force_match_upstream_git() {
         ] {
             assert_eq!(
                 git(&upstream, args),
-                git_rs(&rust, args),
+                sley(&rust, args),
                 "sley clean output differed for {args:?}"
             );
         }
@@ -256,7 +256,7 @@ fn clean_dry_run_and_force_match_upstream_git() {
 
         assert_eq!(
             git(&upstream, &["clean", "-f"]),
-            git_rs(&rust, &["clean", "-f"])
+            sley(&rust, &["clean", "-f"])
         );
         assert_eq!(
             files(&rust),
@@ -270,7 +270,7 @@ fn clean_dry_run_and_force_match_upstream_git() {
 
         assert_eq!(
             git(&upstream, &["clean", "-fd"]),
-            git_rs(&rust, &["clean", "-fd"])
+            sley(&rust, &["clean", "-fd"])
         );
         assert_eq!(
             files(&rust),
@@ -300,7 +300,7 @@ fn clean_include_ignored_option_matches_upstream_git_without_ignored_files() {
             ["clean", "-fxd"].as_slice(),
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &upstream, args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
+            let actual = run_output(sley_testkit::sley_bin!(), &rust, args);
             assert_same_output(actual, expected, args);
             assert_eq!(
                 files(&rust),
@@ -331,7 +331,7 @@ fn clean_exclude_patterns_match_upstream_git() {
         exclude_fixture(&rust);
 
         let expected = run_output(sley_testkit::oracle_git(), &upstream, args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, args);
         assert_same_output(actual, expected, args);
         assert_eq!(
             files(&rust),
@@ -361,7 +361,7 @@ fn clean_respects_root_gitignore_and_x_matches_upstream_git() {
         ignore_fixture(&rust);
 
         let expected = run_output(sley_testkit::oracle_git(), &upstream, args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, args);
         assert_same_output(actual, expected, args);
         assert_eq!(
             files(&rust),
@@ -379,7 +379,7 @@ fn clean_requires_force_or_dry_run_like_upstream_git() {
     {
         fixture(&root);
         let expected = run_output(sley_testkit::oracle_git(), &root, &["clean"]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &["clean"]);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &["clean"]);
         assert_eq!(
             actual.status.code(),
             expected.status.code(),
@@ -410,14 +410,14 @@ fn clean_pathspecs_match_upstream_git() {
         ] {
             assert_eq!(
                 git(&upstream, args),
-                git_rs(&rust, args),
+                sley(&rust, args),
                 "sley clean output differed for {args:?}"
             );
         }
 
         assert_eq!(
             git(&upstream, &["clean", "-f", "scratch/file.txt"]),
-            git_rs(&rust, &["clean", "-f", "scratch/file.txt"])
+            sley(&rust, &["clean", "-f", "scratch/file.txt"])
         );
         assert_eq!(
             files(&rust),
@@ -431,7 +431,7 @@ fn clean_pathspecs_match_upstream_git() {
 
         assert_eq!(
             git(&upstream, &["clean", "-f", "scratch"]),
-            git_rs(&rust, &["clean", "-f", "scratch"])
+            sley(&rust, &["clean", "-f", "scratch"])
         );
         assert_eq!(
             files(&rust),
@@ -453,11 +453,11 @@ fn clean_require_force_false_matches_upstream_git() {
         fixture(&upstream);
         fixture(&rust);
         git(&upstream, &["config", "clean.requireForce", "false"]);
-        git_rs(&rust, &["config", "clean.requireForce", "false"]);
+        sley(&rust, &["config", "clean.requireForce", "false"]);
 
         assert_eq!(
             git(&upstream, &["clean"]),
-            git_rs(&rust, &["clean"]),
+            sley(&rust, &["clean"]),
             "sley clean output differed with clean.requireForce=false"
         );
         assert_eq!(

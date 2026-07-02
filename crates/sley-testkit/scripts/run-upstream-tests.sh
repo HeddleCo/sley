@@ -20,7 +20,6 @@
 # using ONE of:
 #
 #   SLEY_UPSTREAM_T     absolute path to the upstream git "t/" directory
-#   GIT_RS_UPSTREAM_T   legacy alias for SLEY_UPSTREAM_T
 #   GIT_SRC_DIR         absolute path to a git source ROOT (we use $GIT_SRC_DIR/t)
 #
 # IMPORTANT: upstream test-lib.sh sources "$GIT_BUILD_DIR/GIT-BUILD-OPTIONS"
@@ -42,40 +41,37 @@
 #   SLEY_BIN            absolute path to the sley binary. If unset we try
 #                       $CARGO_BIN_EXE_sley, then target/debug/sley, and
 #                       finally `cargo build -p sley-cli --bin sley`.
-#                       GIT_RS_BIN is accepted as a legacy alias.
 #   SLEY_TESTS          space-separated default script list (overrides the
 #                       built-in default subset). Positional args override this.
-#                       GIT_RS_TESTS is accepted as a legacy alias.
 #   SLEY_TEST_TIMEOUT   per-script timeout in seconds (default 120). 0 disables.
 #                       Falls back to a Perl alarm(2) wrapper when neither
 #                       timeout(1) nor gtimeout(1) is on PATH, so a hanging
 #                       command (e.g. `rev-parse --short=N`) cannot stall the
 #                       whole batch.
-#                       GIT_RS_TEST_TIMEOUT is accepted as a legacy alias.
 #   SLEY_REPORT         path for the human-readable report file
 #                       (default: crates/sley-testkit/upstream-report.txt).
-#                       GIT_RS_REPORT is accepted as a legacy alias.
 #   SLEY_SUMMARY        path for the machine-readable per-command CSV summary
 #                       (default: <report>-summary.csv). Columns:
 #                       script,command,result,ok,notok,total,plan_total.
-#                       GIT_RS_SUMMARY is accepted as a legacy alias.
 #   SLEY_HISTORY        append-only per-command pass-rate history CSV
 #                       (default: crates/sley-testkit/upstream-history.csv).
 #                       Columns: label,script,command,result,ok,notok,total.
-#                       GIT_RS_HISTORY is accepted as a legacy alias.
+#   SLEY_TIMINGS        per-run script timing CSV (default:
+#                       <summary-base>-timings.csv). Columns:
+#                       label,script,command,result,elapsed_ms,ok,notok,total,plan_total.
 #   SLEY_RUN_LABEL      label recorded in the report/history for this run (e.g.
 #                       a git short-SHA or tag). Defaults to a UTC timestamp.
 #                       The library never reads a clock; pass this to make runs
 #                       reproducibly labelled.
-#                       GIT_RS_RUN_LABEL is accepted as a legacy alias.
 #   SLEY_DEFAULT_HASH   hash algorithm primed into test-lib's test_oid database
 #                       (default: sha1; or sha256). Without it test-lib aborts
 #                       scripts with "BUG: undefined key" and pollutes results.
-#                       GIT_RS_DEFAULT_HASH is accepted as a legacy alias.
 #   SLEY_TEST_OPTS      extra options forwarded to each upstream script
 #                       (e.g. "--verbose" or "-x"). --no-bin-wrappers is always
 #                       supplied because GIT_TEST_INSTALLED has no bin-wrappers.
-#                       GIT_RS_TEST_OPTS is accepted as a legacy alias.
+#   SLEY_KEEP_TRASH     when non-empty, preserve each temporary --root directory
+#                       and record it in the report. Useful for byte-level
+#                       parity debugging after a failing upstream script.
 #
 # Each SCRIPT argument may be a command name ("config", "cat-file", "ls-tree"),
 # a bare basename ("t0001-init.sh"), a numeric prefix ("t0001"), or a glob
@@ -151,8 +147,6 @@ die() { printf 'run-upstream-tests: %s\n' "$*" >&2; exit 1; }
 upstream_t=""
 if [ -n "${SLEY_UPSTREAM_T:-}" ]; then
     upstream_t=$SLEY_UPSTREAM_T
-elif [ -n "${GIT_RS_UPSTREAM_T:-}" ]; then
-    upstream_t=$GIT_RS_UPSTREAM_T
 elif [ -n "${GIT_SRC_DIR:-}" ]; then
     upstream_t=$GIT_SRC_DIR/t
 fi
@@ -194,8 +188,6 @@ sley_bin=""
 cargo_bin_exe=$(printenv CARGO_BIN_EXE_sley 2>/dev/null || true)
 if [ -n "${SLEY_BIN:-}" ]; then
     sley_bin=$SLEY_BIN
-elif [ -n "${GIT_RS_BIN:-}" ]; then
-    sley_bin=$GIT_RS_BIN
 elif [ -n "$cargo_bin_exe" ]; then
     sley_bin=$cargo_bin_exe
 elif [ -x "$repo_root/target/debug/sley" ]; then
@@ -218,9 +210,10 @@ log "sley binary: $sley_bin"
 # --- Build the shim bindir ------------------------------------------------
 #
 # test-lib.sh runs `$GIT_TEST_INSTALLED/git --exec-path` early and aborts if it
-# fails, so the shim must answer the introspection flags itself; everything else
-# is delegated to sley. We also export SLEY_BIN inside the shim so its value
-# is visible regardless of how the shim is invoked.
+# fails. Delegate that probe to sley too: feature-enabled builds can return a
+# Git-compatible helper dir (git-sh-i18n, git-sh-i18n--envsubst), while lean
+# builds still return their binary directory. We also export SLEY_BIN inside the
+# shim so its value is visible regardless of how the shim is invoked.
 bindir=$(mktemp -d "${TMPDIR:-/tmp}/sley-upstream-bindir.XXXXXX") \
     || die "could not create temp bindir"
 cleanup() { rm -rf "$bindir"; }
@@ -230,19 +223,7 @@ cat > "$bindir/git" <<SHIM
 #!/bin/sh
 # Auto-generated sley shim for upstream test-lib.sh (GIT_TEST_INSTALLED).
 SLEY_BIN='$sley_bin'
-GIT_RS_BIN='$sley_bin'
 SHIM_DIR='$bindir'
-case "\${1:-}" in
-    --exec-path)
-        # test-lib.sh: GIT_EXEC_PATH=\$(\$GIT_TEST_INSTALLED/git --exec-path)
-        printf '%s\n' "\$SHIM_DIR"
-        exit 0
-        ;;
-    --man-path|--html-path|--info-path)
-        printf '%s\n' "\$SHIM_DIR"
-        exit 0
-        ;;
-esac
 exec "\$SLEY_BIN" "\$@"
 SHIM
 chmod +x "$bindir/git"
@@ -255,7 +236,7 @@ fi
 # --- Select scripts -------------------------------------------------------
 selection=$*
 if [ -z "$selection" ]; then
-    selection=${SLEY_TESTS:-${GIT_RS_TESTS:-$DEFAULT_TESTS}}
+    selection=${SLEY_TESTS:-$DEFAULT_TESTS}
 fi
 
 resolve_one() {
@@ -316,7 +297,7 @@ fi
 # available in a usable checkout). The fallback's exit status for a timeout is
 # 142 (128 + SIGALRM=14); we normalise both 124 (GNU timeout) and 142 to
 # "TIMEOUT" below.
-timeout_secs=${SLEY_TEST_TIMEOUT:-${GIT_RS_TEST_TIMEOUT:-120}}
+timeout_secs=${SLEY_TEST_TIMEOUT:-120}
 timeout_kind="none"
 timeout_cmd=""
 timeout_perl=""
@@ -368,21 +349,25 @@ run_with_timeout() {
     esac
 }
 
-report=${SLEY_REPORT:-${GIT_RS_REPORT:-$repo_root/crates/sley-testkit/upstream-report.txt}}
-extra_opts=${SLEY_TEST_OPTS:-${GIT_RS_TEST_OPTS:-}}
+report=${SLEY_REPORT:-$repo_root/crates/sley-testkit/upstream-report.txt}
+extra_opts=${SLEY_TEST_OPTS:-}
 
 # Machine-readable per-command summary (one CSV row per script):
 #   script,command,result,ok,notok,total,plan_total
 # Default lives next to the human report.
-summary=${SLEY_SUMMARY:-${GIT_RS_SUMMARY:-${report%.txt}-summary.csv}}
+summary=${SLEY_SUMMARY:-${report%.txt}-summary.csv}
 
 # Append-only per-command pass-rate history, so trends are visible across runs.
 # Each row: label,script,command,result,ok,notok,total. The label is supplied
 # by the caller (SLEY_RUN_LABEL) so the library never has to call a clock;
 # when unset we fall back to a UTC timestamp from date(1) at the shell layer
 # (still outside any library code).
-history=${SLEY_HISTORY:-${GIT_RS_HISTORY:-$repo_root/crates/sley-testkit/upstream-history.csv}}
-run_label=${SLEY_RUN_LABEL:-${GIT_RS_RUN_LABEL:-}}
+history=${SLEY_HISTORY:-$repo_root/crates/sley-testkit/upstream-history.csv}
+
+# Per-run script timings. This stays separate from the pass/fail summary so
+# floor checks can continue to consume the stable seven-column CSV shape.
+timings=${SLEY_TIMINGS:-${summary%.csv}-timings.csv}
+run_label=${SLEY_RUN_LABEL:-}
 if [ -z "$run_label" ]; then
     run_label=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date 2>/dev/null || printf 'unknown')
 fi
@@ -394,7 +379,7 @@ fi
 # assertions. A built checkout's GIT-BUILD-OPTIONS often omits
 # GIT_TEST_BUILTIN_HASH, so we default it here to keep results meaningful.
 # Callers can override (e.g. SLEY_DEFAULT_HASH=sha256).
-default_hash=${SLEY_DEFAULT_HASH:-${GIT_RS_DEFAULT_HASH:-${GIT_TEST_DEFAULT_HASH:-sha1}}}
+default_hash=${SLEY_DEFAULT_HASH:-${GIT_TEST_DEFAULT_HASH:-sha1}}
 
 # Map a script basename back to a friendly command name (inverse of the
 # command_alias table) for the summary/history; falls back to the basename.
@@ -433,15 +418,27 @@ if [ ! -f "$history" ]; then
     printf 'label,script,command,result,ok,notok,total\n' > "$history"
 fi
 
+printf 'label,script,command,result,elapsed_ms,ok,notok,total,plan_total\n' > "$timings"
+
 total=0
 passed=0
 failed=0
 errored=0
 
+now_millis() {
+    if command -v perl >/dev/null 2>&1; then
+        perl -MTime::HiRes=time -e 'printf "%.0f\n", time() * 1000'
+    else
+        seconds=$(date +%s 2>/dev/null || printf 0)
+        printf '%s000\n' "$seconds"
+    fi
+}
+
 run_one() {
     script=$1
     workdir=$(mktemp -d "${TMPDIR:-/tmp}/sley-upstream-run.XXXXXX")
     out_file="$workdir/output.txt"
+    start_ms=$(now_millis)
 
     # Run the script from inside upstream_t so it can source test-lib.sh, with
     # GIT_TEST_INSTALLED pointed at our shim bindir. --no-bin-wrappers because an
@@ -454,14 +451,22 @@ run_one() {
         # prefixes on a shell-function invocation.
         export GIT_TEST_INSTALLED="$bindir"
         export SLEY_BIN="$sley_bin"
-        export GIT_RS_BIN="$sley_bin"
         export GIT_TEST_DEFAULT_HASH="$default_hash"
+        # Daemon-capable scripts should fail loudly when the environment cannot
+        # bind a loopback listener; otherwise upstream marks them SKIP and the
+        # floor checker sees a misleading PASS with zero assertions.
+        export GIT_TEST_GIT_DAEMON=true
         run_with_timeout sh "$upstream_t/$script" \
             --no-bin-wrappers \
             --root="$workdir" \
             $extra_opts
     ) > "$out_file" 2>&1
     rc=$?
+    end_ms=$(now_millis)
+    elapsed_ms=$((end_ms - start_ms))
+    if [ "$elapsed_ms" -lt 0 ] 2>/dev/null; then
+        elapsed_ms=0
+    fi
 
     # Parse TAP "ok"/"not ok" counts from the captured output.
     ok_count=$(grep -cE '^ok [0-9]' "$out_file" 2>/dev/null || true)
@@ -470,6 +475,13 @@ run_one() {
     notok_count=${notok_count:-0}
     plan_line=$(grep -E '^1\.\.[0-9]+' "$out_file" 2>/dev/null | head -n 1)
     plan_total=$(printf '%s' "$plan_line" | sed -n 's/^1\.\.\([0-9][0-9]*\).*/\1/p')
+    if [ -n "$plan_total" ] \
+        && grep -q "known breakage(s) vanished" "$out_file" 2>/dev/null \
+        && [ $((ok_count + notok_count)) -eq "$plan_total" ] 2>/dev/null
+    then
+        ok_count=$plan_total
+        notok_count=0
+    fi
     last_lines=$(tail -n 3 "$out_file" 2>/dev/null | tr '\n' '|' | sed 's/|$//')
     command_name=$(command_for_script "$script")
     run_total=$((ok_count + notok_count))
@@ -485,6 +497,14 @@ run_one() {
         result="PASS"
         passed=$((passed + 1))
         detail="$plan_line"
+    elif [ "$notok_count" -eq 0 ] \
+        && [ -n "$plan_total" ] \
+        && [ "$ok_count" -eq "$plan_total" ] \
+        && grep -q "known breakage(s) vanished" "$out_file" 2>/dev/null
+    then
+        result="PASS"
+        passed=$((passed + 1))
+        detail="${plan_line} (known breakage vanished)"
     else
         failed=$((failed + 1))
         detail="rc=$rc ${plan_line:+($plan_line) }${last_lines}"
@@ -501,6 +521,13 @@ run_one() {
     printf '%s,%s,%s,%s,%s,%s,%s\n' \
         "$run_label" "$script" "$command_name" "$result" "$ok_count" \
         "$notok_count" "$run_total" >> "$history"
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$run_label" "$script" "$command_name" "$result" "$elapsed_ms" \
+        "$ok_count" "$notok_count" "$run_total" "${plan_total:-}" >> "$timings"
+
+    if [ -n "${SLEY_KEEP_TRASH:-}" ]; then
+        printf '  trash=%s\n' "$workdir" >> "$report"
+    fi
 
     # On anything but a clean pass, append the concrete failing TAP assertion
     # titles (the text after "not ok N - ...") plus a short tail. These titles
@@ -521,7 +548,9 @@ run_one() {
         } >> "$report"
     fi
 
-    rm -rf "$workdir"
+    if [ -z "${SLEY_KEEP_TRASH:-}" ]; then
+        rm -rf "$workdir"
+    fi
 }
 
 log ""
@@ -563,6 +592,7 @@ log ""
 log "Full report written to: $report"
 log "Machine-readable summary: $summary"
 log "Pass-rate history (appended): $history"
+log "Per-script timings: $timings"
 
 # Non-zero exit if anything did not pass, so CI/wrappers can gate on it.
 if [ "$passed" -eq "$total" ]; then

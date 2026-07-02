@@ -465,7 +465,14 @@ fn bisect_print_status(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Wri
         return Ok(());
     }
     if state.nr_good == 0 && state.nr_bad == 0 {
-        bisect_log_printf(repo, out, "status: waiting for both good and bad commits\n")?;
+        bisect_log_printf(
+            repo,
+            out,
+            &format!(
+                "status: waiting for both '{}' and '{}' commits\n",
+                terms.good, terms.bad
+            ),
+        )?;
     } else if state.nr_good > 0 {
         let plural = if state.nr_good == 1 {
             "commit"
@@ -476,15 +483,18 @@ fn bisect_print_status(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Wri
             repo,
             out,
             &format!(
-                "status: waiting for bad commit, {} good {plural} known\n",
-                state.nr_good
+                "status: waiting for '{}' commit, {} '{}' {plural} known\n",
+                terms.bad, state.nr_good, terms.good
             ),
         )?;
     } else {
         bisect_log_printf(
             repo,
             out,
-            "status: waiting for good commit(s), bad commit known\n",
+            &format!(
+                "status: waiting for '{}' commit(s), '{}' commit known\n",
+                terms.good, terms.bad
+            ),
         )?;
     }
     Ok(())
@@ -662,10 +672,13 @@ fn cmd_bisect_skip(args: &[String]) -> Result<()> {
                 eprintln!("fatal: Bad rev input: {arg}");
                 return Err(GitError::Exit(128));
             };
-            let mut excluded: HashSet<ObjectId> = HashSet::new();
-            for record in sley_rev::walk_commits(&db, repo.format, [left_oid])? {
-                excluded.insert(record.oid);
-            }
+            let excluded = sley_rev::reachable_commit_oids(
+                &repo.git_dir,
+                repo.format,
+                &db,
+                [left_oid],
+                false,
+            )?;
             for record in sley_rev::walk_commits(&db, repo.format, [right_oid])? {
                 if !excluded.contains(&record.oid) {
                     argv_state.push(record.oid.to_hex());
@@ -716,7 +729,7 @@ fn bisect_next(repo: &BisectRepo, terms: &mut BisectTerms, out: &mut dyn Write) 
                 repo,
                 &format!(
                     "# first {} commit: [{}] {subject}\n",
-                    terms.bad,
+                    quote_term(&terms.bad),
                     bad.to_hex()
                 ),
             )?;
@@ -754,7 +767,7 @@ fn bisect_log_skipped_commits(repo: &BisectRepo, terms: &BisectTerms) -> Result<
     for record in &candidates {
         text.push_str(&format!(
             "# possible first {} commit: [{}] {}\n",
-            terms.bad,
+            quote_term(&terms.bad),
             record.oid.to_hex(),
             commit_subject(&record.commit.message)
         ));
@@ -1195,8 +1208,8 @@ fn bisect_terms_print(
     }
     match option {
         None => {
-            println!("Your current terms are {} for the old state", terms.good);
-            println!("and {} for the new state.", terms.bad);
+            println!("Your current terms are '{}' for the old state", terms.good);
+            println!("and '{}' for the new state.", terms.bad);
             Ok(BISECT_OK)
         }
         Some("--term-good") | Some("--term-old") => {
@@ -1375,11 +1388,14 @@ fn bisect_run(repo: &BisectRepo, terms: &mut BisectTerms, args: &[String]) -> Re
             let rc = verify_good(repo, terms, &command)?;
             is_first_run = false;
             if !(0..128).contains(&rc) {
-                eprintln!("error: unable to verify {command} on good revision");
+                eprintln!(
+                    "error: unable to verify {command} on '{}' revision",
+                    terms.good
+                );
                 return Ok(BISECT_FAILED);
             }
             if rc == res {
-                eprintln!("error: bogus exit code {rc} for good revision");
+                eprintln!("error: bogus exit code {rc} for '{}' revision", terms.good);
                 return Ok(BISECT_FAILED);
             }
         }
@@ -1412,7 +1428,7 @@ fn bisect_run(repo: &BisectRepo, terms: &mut BisectTerms, args: &[String]) -> Re
             println!("bisect run success");
             return Ok(BISECT_OK);
         } else if state_res == BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND {
-            println!("bisect found first bad commit");
+            println!("bisect found first '{}' commit", terms.bad);
             return Ok(BISECT_OK);
         } else if state_res != BISECT_OK {
             eprintln!(
@@ -1436,12 +1452,13 @@ fn bisect_candidate_records(
     first_parent: bool,
 ) -> Result<Vec<sley_rev::CommitRecord>> {
     let db = repo.db();
-    let mut excluded: HashSet<ObjectId> = HashSet::new();
-    for good in goods {
-        for record in sley_rev::walk_commits(&db, repo.format, [*good])? {
-            excluded.insert(record.oid);
-        }
-    }
+    let excluded = sley_rev::reachable_commit_oids(
+        &repo.git_dir,
+        repo.format,
+        &db,
+        goods.iter().copied(),
+        false,
+    )?;
     let records = rev_list_walk_commits(&db, repo.format, [*bad], first_parent)?;
     let kept: Vec<sley_rev::CommitRecord> = records
         .into_iter()
@@ -1496,7 +1513,7 @@ fn error_if_skipped_commits(
     writeln!(
         out,
         "There are only 'skip'ped commits left to test.\nThe first {} commit could be any of:",
-        terms.bad
+        quote_term(&terms.bad)
     )?;
     for oid in tried {
         writeln!(out, "{}", oid.to_hex())?;
@@ -1649,7 +1666,10 @@ fn check_merge_bases(
             }
             eprintln!(
                 "Some {} revs are not ancestors of the {} rev.\ngit bisect cannot work properly in this case.\nMaybe you mistook {} and {} revs?",
-                terms.good, terms.bad, terms.good, terms.bad
+                terms.good,
+                terms.bad,
+                quote_term(&terms.good),
+                quote_term(&terms.bad)
             );
             return Ok(BISECT_FAILED);
         } else if goods.contains(base) {
@@ -1761,8 +1781,8 @@ fn bisect_next_all(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Write) 
             out,
             "{} was both {} and {}",
             bad.to_hex(),
-            terms.good,
-            terms.bad
+            quote_term(&terms.good),
+            quote_term(&terms.bad)
         )?;
         return Ok(BISECT_FAILED);
     }
@@ -1818,8 +1838,8 @@ fn bisect_next_all(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Write) 
             out,
             "{} was both {} and {}",
             bad.to_hex(),
-            terms.good,
-            terms.bad
+            quote_term(&terms.good),
+            quote_term(&terms.bad)
         )?;
         return Ok(BISECT_FAILED);
     };
@@ -1833,7 +1853,7 @@ fn bisect_next_all(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Write) 
             out,
             "{} is the first {} commit",
             bisect_rev.to_hex(),
-            terms.bad
+            quote_term(&terms.bad)
         )?;
         bisect_show_commit(repo, &bisect_rev, out)?;
         return Ok(BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND);
@@ -1943,4 +1963,8 @@ fn bisect_show_commit(repo: &BisectRepo, oid: &ObjectId, out: &mut dyn Write) ->
 
 fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     if count == 1 { singular } else { plural }
+}
+
+fn quote_term(term: &str) -> String {
+    format!("'{term}'")
 }

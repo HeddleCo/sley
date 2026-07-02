@@ -53,6 +53,7 @@ pub use checkout::*;
 pub use filter::*;
 pub use ignore::*;
 pub use index::*;
+pub use index_io::StatCleanFilterValidator;
 pub use move_remove::*;
 pub use status::*;
 pub use types_admin::*;
@@ -976,6 +977,35 @@ mod tests {
     }
 
     #[test]
+    fn full_sparse_checkout_later_ancestor_exclusion_wins() {
+        let sparse = SparseCheckout {
+            patterns: vec![
+                b"a".to_vec(),
+                b"!/x".to_vec(),
+                b"y/".to_vec(),
+                b"!x/y/z".to_vec(),
+            ],
+            sparse_index: false,
+        };
+
+        assert!(path_in_sparse_checkout(
+            b"a",
+            &sparse,
+            SparseCheckoutMode::Full
+        ));
+        assert!(path_in_sparse_checkout(
+            b"x/y/keep",
+            &sparse,
+            SparseCheckoutMode::Full
+        ));
+        assert!(!path_in_sparse_checkout(
+            b"x/y/z/new-a",
+            &sparse,
+            SparseCheckoutMode::Full
+        ));
+    }
+
+    #[test]
     fn apply_sparse_checkout_honors_preexisting_skip_worktree_via_idempotence() {
         let root = temp_root();
         let git_dir = root.join(".git");
@@ -1063,6 +1093,42 @@ mod tests {
         assert!(index_entry_skip_worktree(skipped));
         // The skipped entry still carries the committed blob id and mode.
         assert_eq!(skipped.mode, 0o100644);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn restore_from_tree_default_wildcard_matches_subdirectory_file() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("subdir")).expect("test operation should succeed");
+        fs::write(root.join("subdir").join("file3"), b"file3-1\n")
+            .expect("test operation should succeed");
+        let old_commit = build_commit(&root, &git_dir, &["subdir/file3"]);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let old_tree = read_commit(&db, ObjectFormat::Sha1, &old_commit)
+            .expect("test operation should succeed")
+            .tree;
+
+        fs::write(root.join("subdir").join("file3"), b"file3-2\n")
+            .expect("test operation should succeed");
+        build_commit(&root, &git_dir, &["subdir/file3"]);
+
+        let result = restore_index_and_worktree_paths_from_tree(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &old_tree,
+            &[PathBuf::from("*file3")],
+            false,
+        )
+        .expect("wildcard pathspec should select subdir/file3");
+
+        assert_eq!(result.restored, 1);
+        assert_eq!(
+            fs::read(root.join("subdir").join("file3")).expect("test operation should succeed"),
+            b"file3-1\n"
+        );
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
@@ -1318,6 +1384,99 @@ mod tests {
             restored, worktree,
             "smudge must restore CRLF from the LF blob"
         );
+    }
+
+    #[test]
+    fn working_tree_encoding_utf16_smudge_uses_platform_iconv_order() {
+        let config = config_from("");
+        let mut matcher = AttributeMatcher::default();
+        read_attribute_patterns_from_bytes(
+            b"*.utf16 text working-tree-encoding=utf-16",
+            &mut matcher,
+            &[],
+            b".gitattributes",
+        );
+        let checks = matcher.attributes_for_path(b"test.utf16", &filter_attribute_names(), false);
+
+        let restored = apply_smudge_filter_with_attributes(&config, &checks, b"test.utf16", b"A\n")
+            .expect("smudge must encode UTF-16");
+        let expected =
+            encode_utf16(b"A\n", ICONV_UTF_DEFAULT_LE, true).expect("valid UTF-8 encodes");
+
+        assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn working_tree_encoding_smudge_applies_eol_before_utf32() {
+        let config = config_from("[core]\n\teol = crlf\n");
+        let mut matcher = AttributeMatcher::default();
+        read_attribute_patterns_from_bytes(
+            b"*.utf32 text working-tree-encoding=utf-32",
+            &mut matcher,
+            &[],
+            b".gitattributes",
+        );
+        let checks = matcher.attributes_for_path(b"eol.utf32", &filter_attribute_names(), false);
+
+        let restored =
+            apply_smudge_filter_with_attributes(&config, &checks, b"eol.utf32", b"one\ntwo\n")
+                .expect("smudge must encode UTF-32");
+        let expected = encode_utf32(b"one\r\ntwo\r\n", ICONV_UTF_DEFAULT_LE, true)
+            .expect("valid UTF-8 encodes");
+
+        assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn working_tree_encoding_shift_jis_clean_and_roundtrip_config() {
+        let mut matcher = AttributeMatcher::default();
+        read_attribute_patterns_from_bytes(
+            b"*.shift text working-tree-encoding=SHIFT-JIS",
+            &mut matcher,
+            &[],
+            b".gitattributes",
+        );
+        let checks =
+            matcher.attributes_for_path(b"roundtrip.shift", &filter_attribute_names(), false);
+        let (shift_jis, _, had_errors) = encoding_rs::SHIFT_JIS.encode("hallo\n");
+        assert!(!had_errors);
+
+        let config = config_from("");
+        assert!(should_check_roundtrip_encoding(&config, b"SHIFT-JIS"));
+        let blob =
+            apply_clean_filter_with_attributes(&config, &checks, b"roundtrip.shift", &shift_jis)
+                .expect("SHIFT-JIS clean must decode to UTF-8");
+        assert_eq!(blob, b"hallo\n");
+
+        let disabled = config_from("[core]\n\tcheckRoundtripEncoding = garbage\n");
+        assert!(!should_check_roundtrip_encoding(&disabled, b"SHIFT-JIS"));
+    }
+
+    #[test]
+    fn working_tree_encoding_missing_bom_is_fatal_when_writing_object() {
+        let config = config_from("");
+        let mut matcher = AttributeMatcher::default();
+        read_attribute_patterns_from_bytes(
+            b"*.utf16 text working-tree-encoding=utf-16",
+            &mut matcher,
+            &[],
+            b".gitattributes",
+        );
+        let checks =
+            matcher.attributes_for_path(b"nonsense.utf16", &filter_attribute_names(), false);
+
+        let err = apply_clean_filter_cow_inner(
+            &config,
+            &checks,
+            b"nonsense.utf16",
+            b"\0a\0b\0c",
+            ConvFlags::Off,
+            SafeCrlfIndexBlob::None,
+            true,
+        )
+        .expect_err("UTF-16 without a BOM must be rejected when writing an object");
+
+        assert!(matches!(err, GitError::Exit(128)));
     }
 
     #[test]

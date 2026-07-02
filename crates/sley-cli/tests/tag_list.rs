@@ -139,8 +139,8 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
     );
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -314,7 +314,7 @@ fn tag_create_errors_match_upstream_git() {
             vec!["tag", "-a", "too", "many", "arguments", "-m", "msg"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -399,7 +399,7 @@ fn tag_file_messages_match_upstream_git_objects() {
 
             let expected =
                 run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
-            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(sley_testkit::sley_bin!(), &actual_root, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
                 cat_tag(sley_testkit::oracle_git(), &actual_root, name),
@@ -416,7 +416,7 @@ fn tag_file_messages_match_upstream_git_objects() {
         prepare_tag_message_repo(&actual_root);
         let args = ["tag", "-F", "message-no-lf.txt", "-m", "inline", "mixed"];
         let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
-        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+        let actual = run_output_with_identity(sley_testkit::sley_bin!(), &actual_root, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -457,14 +457,14 @@ fn tag_delete_missing_matches_upstream_git() {
             vec!["tag", "-d", "--", "bad/name/"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
 
         let args = ["tag", "-d", "v1", "missing"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["tag", "v1"]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -589,7 +589,7 @@ fn tag_cleanup_modes_match_upstream_git_objects() {
 
             let expected =
                 run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
-            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(sley_testkit::sley_bin!(), &actual_root, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
                 cat_tag(sley_testkit::oracle_git(), &actual_root, name),
@@ -617,7 +617,7 @@ fn tag_cleanup_modes_match_upstream_git_objects() {
 
             let expected =
                 run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
-            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(sley_testkit::sley_bin!(), &actual_root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -770,9 +770,9 @@ fn tag_trailers_match_upstream_git_objects() {
                 run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args)
             };
             let actual = if name == "trailer-only" {
-                run_output_with_identity_and_editor(env!("CARGO_BIN_EXE_sley"), &actual_root, &args)
+                run_output_with_identity_and_editor(sley_testkit::sley_bin!(), &actual_root, &args)
             } else {
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args)
+                run_output_with_identity(sley_testkit::sley_bin!(), &actual_root, &args)
             };
             assert_same_output(actual, expected, &args);
             assert_eq!(
@@ -801,7 +801,7 @@ fn tag_trailers_match_upstream_git_objects() {
         ] {
             let expected =
                 run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
-            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(sley_testkit::sley_bin!(), &actual_root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -858,7 +858,7 @@ fn tag_force_create_and_update_match_upstream_git() {
         let args = ["tag", "--force", "new-force", first_oid.as_str()];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["tag", "-d", "new-force"]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&root, &["rev-parse", "new-force"]),
@@ -868,7 +868,7 @@ fn tag_force_create_and_update_match_upstream_git() {
         let args = ["tag", "--", "separator", first_oid.as_str()];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["tag", "-d", "separator"]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&root, &["rev-parse", "separator"]),
@@ -879,7 +879,7 @@ fn tag_force_create_and_update_match_upstream_git() {
         let args = ["tag", "-f", "v1", second_oid.as_str()];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["tag", "-f", "v1", first_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&root, &["rev-parse", "v1"]),
@@ -888,14 +888,14 @@ fn tag_force_create_and_update_match_upstream_git() {
 
         let args = ["tag", "-f", "--no-force", "v1", second_oid.as_str()];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
 
         let args = ["tag", "--no-force", "-f", "v1", second_oid.as_str()];
         git(&root, &["tag", "-f", "v1", first_oid.as_str()]);
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["tag", "-f", "v1", first_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&root, &["rev-parse", "v1"]),
@@ -914,7 +914,7 @@ fn tag_force_create_and_update_match_upstream_git() {
         ];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["tag", "-f", "ann", first_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(git(&root, &["cat-file", "-t", "ann"]), b"tag\n");
     };
@@ -935,7 +935,7 @@ fn tag_no_edit_lightweight_matches_upstream_git() {
 
         let args = ["tag", "no-edit-lightweight", "--no-edit"];
         let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
-        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+        let actual = run_output_with_identity(sley_testkit::sley_bin!(), &actual_root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&actual_root, &["rev-parse", "no-edit-lightweight"]),
@@ -978,11 +978,8 @@ fn tag_edit_option_matches_upstream_git_objects() {
                 &expected_root,
                 &args,
             );
-            let actual = run_output_with_identity_and_editor(
-                env!("CARGO_BIN_EXE_sley"),
-                &actual_root,
-                &args,
-            );
+            let actual =
+                run_output_with_identity_and_editor(sley_testkit::sley_bin!(), &actual_root, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
                 cat_tag(sley_testkit::oracle_git(), &actual_root, name),
@@ -1010,11 +1007,8 @@ fn tag_edit_option_matches_upstream_git_objects() {
                 &expected_root,
                 &args,
             );
-            let actual = run_output_with_identity_and_editor(
-                env!("CARGO_BIN_EXE_sley"),
-                &actual_root,
-                &args,
-            );
+            let actual =
+                run_output_with_identity_and_editor(sley_testkit::sley_bin!(), &actual_root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -1105,7 +1099,7 @@ fn tag_create_reflog_matches_upstream_git() {
                 "tag@example.invalid",
             );
             let actual = run_output_with_named_identity_at(
-                env!("CARGO_BIN_EXE_sley"),
+                sley_testkit::sley_bin!(),
                 &actual_root,
                 &args,
                 timestamp,
@@ -1169,7 +1163,7 @@ fn tag_annotate_negation_matches_upstream_git() {
         prepare_tag_message_repo(&actual_root);
 
         let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
-        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+        let actual = run_output_with_identity(sley_testkit::sley_bin!(), &actual_root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&actual_root, &["cat-file", "-t", name]),
@@ -1213,7 +1207,7 @@ fn tag_verify_unsigned_and_lightweight_match_upstream_git() {
             vec!["tag", "-v", "-n", "ann"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -1241,7 +1235,7 @@ fn tag_local_user_negation_and_missing_values_match_upstream_git() {
 
             let expected =
                 run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
-            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(sley_testkit::sley_bin!(), &actual_root, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
                 git(&actual_root, &["cat-file", "-t", name]),
@@ -1250,7 +1244,7 @@ fn tag_local_user_negation_and_missing_values_match_upstream_git() {
             );
             if name == "annotated" {
                 assert_eq!(
-                    cat_tag(env!("CARGO_BIN_EXE_sley"), &actual_root, name),
+                    cat_tag(sley_testkit::sley_bin!(), &actual_root, name),
                     cat_tag(sley_testkit::oracle_git(), &expected_root, name),
                     "annotated tag object differed for {args:?}"
                 );
@@ -1262,7 +1256,7 @@ fn tag_local_user_negation_and_missing_values_match_upstream_git() {
         prepare_tag_message_repo(&errors_root);
         for args in [vec!["tag", "-u"], vec!["tag", "--local-user"]] {
             let expected = run_output(sley_testkit::oracle_git(), &errors_root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &errors_root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &errors_root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -1412,7 +1406,7 @@ fn tag_list_ignore_case_sorts_metadata_like_upstream_git() {
             ],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -1468,7 +1462,7 @@ fn tag_list_column_modes_match_upstream_git() {
             vec!["tag", "--delete=foo"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -1857,7 +1851,7 @@ fn tag_list_patterns_match_upstream_git() {
             vec!["tag", "-l", "--ignore-case", "--sort=-refname", "qa-?"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
 
@@ -1881,24 +1875,24 @@ fn tag_list_patterns_match_upstream_git() {
             vec!["tag", "--no-merged", first_oid.as_str()],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
         let contains_eq = format!("--contains={second_oid}");
         let expected = git(&root, &["tag", contains_eq.as_str()]);
-        let actual = git_rs(&root, &["tag", contains_eq.as_str()]);
+        let actual = sley(&root, &["tag", contains_eq.as_str()]);
         assert_eq!(actual, expected, "sley output differed for --contains=");
         let no_contains_eq = format!("--no-contains={second_oid}");
         let expected = git(&root, &["tag", no_contains_eq.as_str()]);
-        let actual = git_rs(&root, &["tag", no_contains_eq.as_str()]);
+        let actual = sley(&root, &["tag", no_contains_eq.as_str()]);
         assert_eq!(actual, expected, "sley output differed for --no-contains=");
         let merged_eq = format!("--merged={first_oid}");
         let expected = git(&root, &["tag", merged_eq.as_str()]);
-        let actual = git_rs(&root, &["tag", merged_eq.as_str()]);
+        let actual = sley(&root, &["tag", merged_eq.as_str()]);
         assert_eq!(actual, expected, "sley output differed for --merged=");
         let no_merged_eq = format!("--no-merged={first_oid}");
         let expected = git(&root, &["tag", no_merged_eq.as_str()]);
-        let actual = git_rs(&root, &["tag", no_merged_eq.as_str()]);
+        let actual = sley(&root, &["tag", no_merged_eq.as_str()]);
         assert_eq!(actual, expected, "sley output differed for --no-merged=");
     };
     let _ = fs::remove_dir_all(&root);

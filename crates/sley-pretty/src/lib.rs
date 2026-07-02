@@ -489,6 +489,21 @@ impl CompiledLogFormat {
         self.fields.contains(FormatFields::REV_SOURCE)
     }
 
+    pub fn uses_signature(&self) -> bool {
+        self.tokens.iter().any(|token| {
+            matches!(
+                token,
+                FormatToken::GRefname
+                    | FormatToken::GTrailers
+                    | FormatToken::GPlaceholder
+                    | FormatToken::GSignature
+                    | FormatToken::GKey
+                    | FormatToken::GFingerprint
+                    | FormatToken::GPassthrough
+            )
+        })
+    }
+
     /// True when the format emits only full oids (`%H`) plus inert literals/newlines.
     #[allow(dead_code)]
     pub fn is_oid_only(&self) -> bool {
@@ -1252,6 +1267,7 @@ mod tests {
         let compiled = CompiledLogFormat::compile("%G?|%GS", LogFormatDialect::Log)
             .expect("signature format should compile");
         assert!(!compiled.is_oid_only());
+        assert!(compiled.uses_signature());
     }
 
     #[test]

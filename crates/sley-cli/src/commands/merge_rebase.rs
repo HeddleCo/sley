@@ -31,7 +31,8 @@ pub(crate) use merge_util::{
     merge_read_blob, merge_refuse_if_current_working_directory_becomes_file,
     merge_remove_worktree_file, merge_worktree_content, merge_write_worktree_file,
     three_way_merge_trees, three_way_merge_trees_inner_with_info,
-    three_way_merge_trees_inner_with_info_opts, three_way_merge_trees_styled,
+    three_way_merge_trees_inner_with_info_opts_and_path_favor,
+    three_way_merge_trees_inner_with_info_opts_and_path_resolvers, three_way_merge_trees_styled,
     three_way_merge_trees_with_favor, virtual_ancestor_entry_map, worktree_file_matches_ours,
 };
 pub(crate) use pull::{

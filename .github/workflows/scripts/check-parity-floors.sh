@@ -450,7 +450,7 @@ declare -A FLOOR=(
     [t7528-signed-commit-ssh.sh]=27
     [t7031-verify-tag-signed-ssh.sh]=13
     [t7030-verify-tag.sh]=10
-    [t3200-branch.sh]=145
+    [t3200-branch.sh]=167
     [t0027-auto-crlf.sh]=2578
     # t0020-crlf: was FLAKY 27/28. FIXED 2026-06-17 (codex-wave-3, 4 rounds): sorted worktree
     # readdir + checkout-- stat-refresh SCOPED to the call site (R4: reset's tree-sourced entries
@@ -459,7 +459,7 @@ declare -A FLOOR=(
     # 2026-06-26: oscillates 33/34 across isolated runs; W52 raised it to a flaky-high 34. Floor at stable-low 33.
     [t0020-crlf.sh]=33
     # wave-2 (2026-06-21): clean/smudge filter-process + ident + eol/encoding conversion ordering 21->33.
-    [t0021-conversion.sh]=33
+    [t0021-conversion.sh]=42
     [t3920-crlf-messages.sh]=12
     # codex-wave-5 (2026-06-17): lib new commands — repo-info t1900 full@38 / replay t3650@43.
     [t1900-repo-info.sh]=38
@@ -497,7 +497,7 @@ declare -A FLOOR=(
     # All guards neutral incl t1450-fsck=96 t1400=275 t7700=29.
     [t6006-rev-list-format.sh]=77
     [t6007-rev-list-cherry-pick-file.sh]=23
-    [t6112-rev-list-filters-objects.sh]=48
+    [t6112-rev-list-filters-objects.sh]=54
     [t6113-rev-list-bitmap-filters.sh]=13
     [t1800-hook.sh]=55
     # wave-27 (2026-06-21, core): pack-object option/split 46->55 (+bonus t5303 21->31); restore modes
@@ -527,6 +527,11 @@ declare -A FLOOR=(
     [t4201-shortlog.sh]=28
     [t1014-read-tree-confusing.sh]=28
     [t3000-ls-files-others.sh]=15
+    # wave-54 ls-tree pathspec traversal: stream one filtered tree walk in
+    # canonical order, preserve trailing-slash directory semantics, collapse
+    # duplicate/redundant pathspecs, and show traversed trees for -t.
+    [t3100-ls-tree-restrict.sh]=14
+    [t3101-ls-tree-dirname.sh]=19
     [t3103-ls-tree-misc.sh]=10
     # codex-wave-9 (ls-tree output): gitlink mode 160000 classified as commit
     # object type; -d shows gitlinks (skip only blobs); subdir ../ pathspec norm
@@ -546,9 +551,9 @@ declare -A FLOOR=(
     # wave-40 (rebase sequencer + apply -3 incidental): t3404 120->123.
     [t3404-rebase-interactive.sh]=127
     [t3406-rebase-message.sh]=32
-    [t3418-rebase-continue.sh]=24
+    [t3418-rebase-continue.sh]=30
     # wave-40 (rebase sequencer): t3420 40->41.
-    [t3420-rebase-autostash.sh]=44
+    [t3420-rebase-autostash.sh]=52
     [t5327-multi-pack-bitmaps-rev.sh]=314
     # w48 recov: 9->7 (wrong-floor). Integ-measured; base e9f8c92b == HEAD == 7
     # (no in-session pack_objects.rs change). Failing cells (#6,#8-11,#13,#14)
@@ -565,7 +570,10 @@ declare -A FLOOR=(
     [t4100-apply-stat.sh]=25
     # codex-wave-3 (2026-06-17): am --empty=stop/drop/keep + --allow-empty resume + -3 -q quiet 54->56.
     # wave-40 (am state machine): t4150 84->85 (am -3 + rerere).
-    [t4150-am.sh]=85
+    [t4150-am.sh]=87
+    # wave-54 am subjects: format-patch/am preserve and round-trip multiline
+    # title paragraphs, including `-k` RFC 2047 folded Subject headers.
+    [t4152-am-subjects.sh]=13
     # codex-wave-6 (2026-06-17): diff function-context t4051@32 / submodule-format t4060@7; t4015 101->102.
     # wave-2 submodule (2026-06-18, integ/submodule): t4060 7->15 (diff porcelain options).
     [t4051-diff-function-context.sh]=38
@@ -583,6 +591,10 @@ declare -A FLOOR=(
     [t4018-diff-funcname.sh]=287
     [t4124-apply-ws-rule.sh]=84
     [t4019-diff-wserror.sh]=19
+    # wave-54 diff retval: diff-tree `-S` pickaxe filtering participates in
+    # --exit-code, and diff --check reports leftover conflict markers with
+    # conflict-marker-size attributes.
+    [t4017-diff-retval.sh]=38
     [t4034-diff-words.sh]=64
     [t5407-post-rewrite-hook.sh]=17
     [t5500-fetch-pack.sh]=353
@@ -638,9 +650,9 @@ declare -A FLOOR=(
     [t5300-pack-object.sh]=55
     [t5317-pack-objects-filter-objects.sh]=33
     [t5302-pack-index.sh]=31
-    [t5303-pack-corruption-resilience.sh]=31
+    [t5303-pack-corruption-resilience.sh]=36
     [t5304-prune.sh]=32
-    [t5319-multi-pack-index.sh]=95  # wave-39: 70->95 (midx bitmap/verify/expire/repack; banked 93 margin, 3 hard cells)
+    [t5319-multi-pack-index.sh]=98  # next-wave: alternate MIDX + bitmap-tip hierarchy now full green
     [t5324-split-commit-graph.sh]=26  # wave-52 graphpack: 25->26 (core.sharedRepository perms)
     [t5329-pack-objects-cruft.sh]=19
     [t5504-fetch-receive-strict.sh]=7
@@ -682,7 +694,7 @@ declare -A FLOOR=(
     # t5601 60->62 measured but HELD at 60 (clone server-handshake is parallel-flake-prone, +2 too
     # small to risk a fresh flaky floor — the +2 cells still land on main, just not floor-locked).
     [t5611-clone-config.sh]=13
-    [t5603-clone-dirname.sh]=45
+    [t5603-clone-dirname.sh]=47
     [t7502-commit-porcelain.sh]=77
     # codex-wave-1 (2026-06-17): config stop-at-non-option (+3) + commit SQUASH_MSG (+2),
     # disjoint files, combined t7600 44->49 (stable 49x3). describe enrolled at 84 (74->84).
@@ -703,7 +715,7 @@ declare -A FLOOR=(
     # behavior: --prefetch suppressing opportunistic tracking (#21), loose-objects
     # deferring the prune to run #2 (#22), and per-task incremental-repack/geometric
     # argv composition (#24,#27-31,#34,#47).
-    [t7900-maintenance.sh]=62
+    [t7900-maintenance.sh]=72
     # wave-1 integration (2026-06-18, integ/wave1): NEW floors for the difftool epic
     # (codex/parity-difftool: difftool.rs/mergetool.rs/tool_launch.rs) + status-cache
     # (codex/parity-status-cache: workspace.rs/index.rs). All measured on the integrated
@@ -746,7 +758,7 @@ declare -A FLOOR=(
     [t3415-rebase-autosquash.sh]=24
     [t3437-rebase-fixup-options.sh]=9
     [t1404-update-ref-errors.sh]=38
-    [t1416-ref-transaction-hooks.sh]=7
+    [t1416-ref-transaction-hooks.sh]=10
     # codex-wave-9 (sparse-checkout engine): cone/non-cone + escaped-cone patterns,
     # sparse-index expansion for diff/status, skip-worktree missing-file suppression,
     # sparse-dir write-tree, read-tree sparse reapply hook, native reset -p path.
@@ -790,10 +802,9 @@ declare -A FLOOR=(
     # side t5520 32->38).
     [t7601-merge-pull-config.sh]=65
     [t7700-repack.sh]=34
-    # w48 recov: 11->10 (wrong-floor). Integ-measured; base e9f8c92b == HEAD == 10
-    # (no in-session change). The 8 failing cells all depend on `test_commit_bulk`/
-    # fast-import emitting a pack per import, but sley's fast-import always writes
-    # loose objects (fastimport.unpacklimit accepted-and-ignored), so 10 is real.
+    # w48 recov: 11->10 (wrong-floor). Integ-measured; base e9f8c92b == HEAD == 10.
+    # Fast-import now flushes packs for unpackLimit=0, but keep this floor until
+    # t7703 is remeasured directly.
     [t7703-repack-geometric.sh]=10
     [t7704-repack-cruft.sh]=15
     [t6500-gc.sh]=34  # wave-38: 15->35 (repack/prune/auto-heuristic/commit-graph), banked 34 margin
@@ -808,7 +819,7 @@ declare -A FLOOR=(
     # tip against the same binary; floor-guards (t4013=191 t7810=235) held.
     [t4020-diff-external.sh]=72
     [t4072-diff-max-depth.sh]=76
-    [t6132-pathspec-exclude.sh]=23
+    [t6132-pathspec-exclude.sh]=31
     [t6135-pathspec-with-attrs.sh]=27
     [t6022-rev-list-missing.sh]=40
     [t1013-read-tree-submodule.sh]=58
@@ -889,8 +900,8 @@ declare -A FLOOR=(
     # t5407 10->17. NEW (measured): push features + post-checkout/merge hooks.
     [t5533-push-cas.sh]=23
     [t5408-send-pack-stdin.sh]=10
-    [t5545-push-options.sh]=9
-    [t5523-push-upstream.sh]=16
+    [t5545-push-options.sh]=10
+    [t5523-push-upstream.sh]=17
     [t5403-post-checkout-hook.sh]=14
     [t5402-post-merge-hook.sh]=7
     # wave-17 (2026-06-19, integ/wave17 onto 47d14609): v1/v2 wire handshake + connect-helper
@@ -952,7 +963,7 @@ declare -A FLOOR=(
     # == base, no regression) to guard the class per the d3f746e6 neighbor-guard lesson.
     [t2016-checkout-patch.sh]=19
     # wave-41 (apply engine round 2): t4108 3-way fallback 4->17.
-    [t4108-apply-threeway.sh]=17
+    [t4108-apply-threeway.sh]=18
     [t4117-apply-reject.sh]=8
     # wave-21 (2026-06-19, integ/wave21 onto 01421060): hard-tail, 4 disjoint slices. submodule
     # recursion in pull/am (t5572 34->40, t4255 1->17 — wired to the wave-20 worktree core;
@@ -974,7 +985,7 @@ declare -A FLOOR=(
     # rr-cache + 6 subcmds + replay/autoupdate hooks). rerere<->merge-rename merge.rs auto-merge
     # SAFE (t7600=83 t3404=94 t3501=21 t6402=35 held). Cross-guards held EXACTLY (t1091=53 t1011=19
     # t7508=119 t7102=37 t2013=51 t6112=48 t6006=58 t4202=124); cargo test green.
-    [t4200-rerere.sh]=34
+    [t4200-rerere.sh]=36
     # wave-30 (2026-06-21, core→peripheral; off main 3547af47): split-index, fetch-submodules,
     # worktree-list. t1700-split-index 8->29 FULL (link-extension EWAH codec + shared-base
     # merge/read, thin-index delta write, core.splitIndex/maxPercentChange/sharedIndexExpire,
@@ -1032,7 +1043,7 @@ declare -A FLOOR=(
     # t5512=40 t5526=56 t1500=81 t1501=39 t1502=37 t1507=29 t1512=35 t2018=25 t2020=26 t2024=21
     # t1400=275 t5510=7 t5516=110. cargo test --workspace green.
     [t2012-checkout-last.sh]=22
-    [t5605-clone-local.sh]=22
+    [t5605-clone-local.sh]=23
     [t1508-at-combinations.sh]=35
     # wave-34 (2026-06-21, sweep-picked off main 8fd7bb3d): clone-reference, reflog-updateref,
     # worktree-prune. t5604-clone-reference 24->31 (banked 30, 1-cell clone-family margin; --reference
@@ -1078,7 +1089,7 @@ declare -A FLOOR=(
     # binary. fetchmulti disjoint. Guards held/gained: t2400=219(banked 218) t2401=13 t2402=27 t5510=170
     # t5516=110 t5526=56 t5601=108 t2018=25 t2020=26 t2070=15 t4200=34 t3404=121 t7508=119. cargo test green.
     [t5514-fetch-multiple.sh]=24
-    [t2030-unresolve-info.sh]=13
+    [t2030-unresolve-info.sh]=14
     [t2407-worktree-heads.sh]=12
     # wave-37 (2026-06-21, post-sweep 84.7% off main 7f5514ba; t_push/diff/worktree-setup):
     # pre-push-hook, patch-id, cwd-empty. t5571-pre-push-hook 1->11 FULL (hook argv/stdin ref-feed +
@@ -1134,7 +1145,7 @@ declare -A FLOOR=(
     # (t4108 raised 4->17 in place above.)
     [t4103-apply-binary.sh]=24
     [t4114-apply-typechange.sh]=12
-    [t4129-apply-samemode.sh]=22
+    [t4129-apply-samemode.sh]=23
     [t4111-apply-subdir.sh]=10
     [t8013-blame-ignore-revs.sh]=19
     [t8011-blame-split-file.sh]=10
@@ -1145,12 +1156,16 @@ declare -A FLOOR=(
     [t8010-cat-file-filters.sh]=9
     [t8004-blame-with-conflicts.sh]=3
     [t8015-blame-diff-algorithm.sh]=3
-    [t0028-working-tree-encoding.sh]=13
+    [t0028-working-tree-encoding.sh]=22
     [t0022-crlf-rename.sh]=2
     [t6434-merge-recursive-rename-options.sh]=27
     [t6412-merge-large-rename.sh]=9
     [t7525-status-rename.sh]=15
-    [t4001-diff-rename.sh]=22
+    [t4001-diff-rename.sh]=23
+    # wave-54 diff basic: non-recursive raw file/tree replacements, reverse
+    # same-path add/delete ordering, diff-files ENOTDIR handling, and
+    # --no-index stdin side support.
+    [t4002-diff-basic.sh]=63
     [t4007-rename-3.sh]=11
     [t4003-diff-rename-1.sh]=4
     [t4023-diff-rename-typechange.sh]=1
@@ -1173,9 +1188,9 @@ declare -A FLOOR=(
     [t2071-restore-patch.sh]=15
     [t2080-parallel-checkout-basics.sh]=1
     [t2026-checkout-pathspec-file.sh]=11
-    [t2017-checkout-orphan.sh]=12
+    [t2017-checkout-orphan.sh]=13
     [t2021-checkout-overwrite.sh]=4
-    [t2025-checkout-no-overlay.sh]=4
+    [t2025-checkout-no-overlay.sh]=6
     [t2022-checkout-paths.sh]=3
     [t7425-submodule-gitdir-path-extension.sh]=7
     [t7403-submodule-sync.sh]=18
@@ -1218,8 +1233,8 @@ declare -A FLOOR=(
     [t4212-log-corrupt.sh]=13
     [t4213-log-tabexpand.sh]=8
     [t4207-log-decoration-colors.sh]=1
-    [t8005-blame-i18n.sh]=1
-    [t0410-partial-clone.sh]=23
+    [t8005-blame-i18n.sh]=5
+    [t0410-partial-clone.sh]=37
     # wave-52 graphpack (commit-graph + pack-objects cluster): pack-objects
     # --stdin-packs standard mode (t5331 1->13, NEW floor); git pack-redundant
     # full impl (t5323 4->18 full, NEW floor); commit-graph --stdin-commits tag
@@ -1227,8 +1242,553 @@ declare -A FLOOR=(
     # commit-graph write honors core.sharedRepository (t5324 25->26, raised
     # 25->26). Guards held: t5300=55 t5302=31 t5304=32 t5310=221 t5319=95
     # t5326=345 t6012=42 t4202=131. cargo test --workspace green.
-    [t5331-pack-objects-stdin.sh]=13
+    # wave-53 focused facade/parity hardening: config include, archive attrs,
+    # rev-list stdin/count/parents/filter edges, merge-base, partial-clone
+    # materialization for stdin-packs, checkout no-overlay stage removal, and
+    # pathspec glob/literal/exclude all full-pass in a 14-script wave.
+    [t1305-config-include.sh]=37
+    [t5001-archive-attr.sh]=44
+    [t5002-archive-attr-pattern.sh]=19
+    [t5331-pack-objects-stdin.sh]=18
+    [t6005-rev-list-count.sh]=6
+    [t6010-merge-base.sh]=12
+    [t6017-rev-list-stdin.sh]=37
+    [t6101-rev-parse-parents.sh]=38
+    [t6130-pathspec-noglob.sh]=21
+    [t6137-pathspec-wildcards-literal.sh]=25
+    # wave-53 outside-scope promotion: small adjacent scripts verified locally.
+    # t3305-notes-fanout stayed out because it timed out after four assertions
+    # under the 120s candidate-wave ceiling; do not enroll it until bounded.
+    [t1100-commit-tree-options.sh]=5
+    [t1303-wacky-config.sh]=11
+    [t3102-ls-tree-wildcards.sh]=3
+    [t3104-ls-tree-format.sh]=19
+    [t3304-notes-mixed.sh]=6
+    [t3307-notes-man.sh]=3
+    [t3601-rm-pathspec-file.sh]=5
+    [t4006-diff-mode.sh]=7
+    [t4016-diff-quote.sh]=5
+    [t4101-apply-nonl.sh]=12
+    [t7513-interpret-trailers.sh]=99
+    # wave-54 outside-scope promotion: focused candidate fixes for embeddable
+    # facade parity neighbors. Git-var/config path variables, configurable
+    # stripspace comments, add pathspec-file option errors, no-op apply --check,
+    # and update-server-info no-op mtime preservation are now full-pass.
+    [t0007-git-var.sh]=27
+    [t0030-stripspace.sh]=30
+    [t3704-add-pathspec-file.sh]=11
+    [t4136-apply-check.sh]=6
+    [t5200-update-server-info.sh]=8
     [t5323-pack-redundant.sh]=18
+    # wave-55 floor-all-selected catch-up: every selected script now has an
+    # explicit ok-count floor from /private/tmp/sley-expanded-559-with-diffbasic-
+    # summary.csv. Low/zero floors are intentional measurement guards: they catch
+    # drops, timeouts, and missing rows without claiming the script is complete.
+    [t0002-gitfile.sh]=13
+    [t0056-git-C.sh]=4
+    [t0101-at-syntax.sh]=6
+    [t1001-read-tree-m-2way.sh]=25
+    [t1008-read-tree-overlay.sh]=1
+    [t1012-read-tree-df.sh]=5
+    [t1051-large-conversion.sh]=12
+    [t1307-config-blob.sh]=13
+    [t1311-config-optional.sh]=2
+    [t1405-main-ref-store.sh]=16
+    [t1411-reflog-show.sh]=10
+    [t1418-reflog-exists.sh]=3
+    [t1504-ceiling-dirs.sh]=42
+    [t2003-checkout-cache-mkdir.sh]=7
+    [t2008-checkout-subdir.sh]=6
+    [t2014-checkout-switch.sh]=4
+    [t2082-parallel-checkout-attributes.sh]=0
+    [t2103-update-index-ignore-missing.sh]=5
+    [t2108-update-index-refresh-racy.sh]=6
+    [t2206-add-submodule-ignored.sh]=5
+    [t2405-worktree-submodule.sh]=4
+    [t3003-ls-files-exclude.sh]=7
+    [t3011-common-prefixes-and-directory-traversal.sh]=21
+    [t5305-include-tag.sh]=9
+    [t5309-pack-delta-cycles.sh]=4
+    [t5314-pack-cycle-detection.sh]=2
+    [t5321-pack-large-objects.sh]=2
+    [t5328-commit-graph-64bit-time.sh]=5
+    [t5334-incremental-multi-pack-index.sh]=16
+    [t6000-rev-list-misc.sh]=12
+    [t6008-rev-list-submodule.sh]=2
+    [t6013-rev-list-reverse-parents.sh]=2
+    [t6018-rev-list-glob.sh]=90
+    [t6050-replace.sh]=6
+    [t6102-rev-list-unexpected-objects.sh]=11
+    [t6134-pathspec-in-submodule.sh]=2
+    [t6700-tree-depth.sh]=2
+    [t7104-reset-hard.sh]=3
+    [t7515-status-symlinks.sh]=3
+    [t7702-repack-cyclic-alternate.sh]=2
+    [t0062-revision-walking.sh]=2
+    [t1003-read-tree-prefix.sh]=2
+    [t1009-read-tree-new-index.sh]=2
+    [t1015-read-index-unmerged.sh]=5
+    [t1090-sparse-checkout-scope.sh]=4
+    [t1308-config-set.sh]=37
+    [t1350-config-hooks-path.sh]=3
+    [t1407-worktree-ref-store.sh]=4
+    [t1413-reflog-detach.sh]=7
+    [t1421-reflog-write.sh]=10
+    [t1505-rev-parse-last.sh]=7
+    [t1601-index-bogus.sh]=2
+    [t2005-checkout-index-symlinks.sh]=1
+    [t2009-checkout-statinfo.sh]=3
+    [t2015-checkout-unborn.sh]=6
+    [t2027-checkout-track.sh]=3
+    [t2072-restore-pathspec-file.sh]=12
+    [t2100-update-cache-badpath.sh]=1
+    [t2104-update-index-skip-worktree.sh]=7
+    [t2200-add-update.sh]=18
+    [t2300-cd-to-toplevel.sh]=0
+    [t2500-untracked-overwriting.sh]=4
+    [t3004-ls-files-basic.sh]=4
+    [t3008-ls-files-lazy-init-name-hash.sh]=1
+    [t3012-ls-files-dedup.sh]=1
+    [t3201-branch-contains.sh]=24
+    # Git 2.55.0's t5003 plan is 78, and the current oracle run passes all
+    # 78 cells. The older floor=81 came from a stale 2.54-era summary whose
+    # plan is now impossible to satisfy under the current archive-zip script.
+    [t5003-archive-zip.sh]=78
+    [t5306-pack-nobase.sh]=4
+    [t5311-pack-bitmaps-shallow.sh]=6
+    [t5315-pack-objects-compression.sh]=5
+    [t5322-pack-objects-sparse.sh]=11
+    [t5330-no-lazy-fetch-with-commit-graph.sh]=2
+    [t5335-compact-multi-pack-index.sh]=10
+    [t6009-rev-list-parent.sh]=9
+    [t6014-rev-list-all.sh]=3
+    [t6019-rev-list-ancestry-path.sh]=11
+    [t6110-rev-list-sparse.sh]=2
+    [t6136-pathspec-in-bare.sh]=1
+    [t6501-freshen-objects.sh]=42
+    [t7105-reset-patch.sh]=5
+    [t7519-status-fsmonitor.sh]=19
+    [t0034-root-safe-directory.sh]=0
+    [t0411-clone-from-partial.sh]=7
+    [t1004-read-tree-m-u-wf.sh]=14
+    [t1010-mktree.sh]=6
+    [t1020-subdirectory.sh]=14
+    [t1309-early-config.sh]=8
+    [t1402-check-ref-format.sh]=97
+    [t1408-packed-refs.sh]=3
+    [t1414-reflog-walk.sh]=5
+    [t1422-show-ref-exists.sh]=13
+    [t1509-root-work-tree.sh]=0
+    [t1515-rev-parse-outside-repo.sh]=4
+    # Git 2.55.0's t2000 plan is 6; Sley passes every current checkout-index
+    # conflict cell. The older floor=10 came from a stale upstream plan.
+    [t2000-conflict-when-checking-files-out.sh]=6
+    [t2006-checkout-index-basic.sh]=5
+    [t2010-checkout-ambiguous.sh]=7
+    [t2023-checkout-m.sh]=4
+    [t2050-git-dir-relative.sh]=4
+    [t2101-update-index-reupdate.sh]=7
+    [t2105-update-index-gitfile.sh]=4
+    [t2201-add-update-typechange.sh]=2
+    [t2403-worktree-move.sh]=27
+    [t3001-ls-files-others-exclude.sh]=17
+    [t3009-ls-files-others-nonsubmodule.sh]=2
+    [t3211-peel-ref.sh]=8
+    [t5004-archive-corner-cases.sh]=11
+    [t5307-pack-missing-commit.sh]=5
+    [t5312-prune-corruption.sh]=7
+    [t5316-pack-delta-depth.sh]=0
+    [t5351-unpack-large-objects.sh]=4
+    [t6004-rev-list-path-optim.sh]=7
+    [t6016-rev-list-graph-simplify-history.sh]=7
+    [t6021-rev-list-exclude-hidden.sh]=55
+    [t6100-rev-list-in-order.sh]=2
+    [t6131-pathspec-icase.sh]=0
+    [t6600-test-reach.sh]=39
+    [t7062-wtstatus-ignorecase.sh]=1
+    [t7106-reset-unborn-branch.sh]=4
+    [t1000-read-tree-m-3way.sh]=83
+    [t1005-read-tree-reset.sh]=7
+    [t1011-read-tree-sparse-checkout.sh]=19
+    [t1022-read-tree-partial-clone.sh]=0
+    [t1306-xdg-files.sh]=21
+    [t1310-config-default.sh]=4
+    [t1403-show-ref.sh]=10
+    [t1409-avoid-packing-refs.sh]=11
+    [t1415-worktree-refs.sh]=5
+    [t1503-rev-parse-verify.sh]=12
+    [t1511-rev-parse-caret.sh]=10
+    [t1517-outside-repo.sh]=8
+    [t2002-checkout-cache-u.sh]=2
+    [t2007-checkout-symlink.sh]=2
+    [t2011-checkout-invalid-head.sh]=9
+    [t2019-checkout-ambiguous-ref.sh]=7
+    [t2060-switch.sh]=9
+    [t2081-parallel-checkout-collisions.sh]=1
+    [t2102-update-index-symlinks.sh]=2
+    [t2106-update-index-assume-unchanged.sh]=2
+    [t2202-add-addremove.sh]=3
+    [t2404-worktree-config.sh]=9
+    [t3002-ls-files-dashpath.sh]=6
+    [t3006-ls-files-long.sh]=3
+    [t3010-ls-files-killed-modified.sh]=6
+    [t3020-ls-files-error-unmatch.sh]=3
+    [t5301-sliding-window.sh]=6
+    [t5308-pack-detect-duplicates.sh]=4
+    [t5313-pack-bounds-checks.sh]=3
+    [t5320-delta-islands.sh]=3
+    [t5325-reverse-index.sh]=5
+    [t5333-pseudo-merge-bitmaps.sh]=18
+    [t6011-rev-list-with-bad-commit.sh]=3
+    [t6041-bisect-submodule.sh]=9
+    [t6114-keep-packs.sh]=3
+    [t6601-path-walk.sh]=15
+    [t7101-reset-empty-subdirs.sh]=10
+    [t7107-reset-pathspec-file.sh]=1
+    [t7511-status-index.sh]=24
+    [t7701-repack-unpack-unreachable.sh]=0
+    # wave-56 unselected-script promotions: full-pass scripts with non-empty
+    # assertion counts from /private/tmp/sley-new-candidates-summary.csv.
+    [t0006-date.sh]=129
+    [t0017-env-helper.sh]=5
+    [t0019-json-writer.sh]=16
+    [t0023-crlf-am.sh]=2
+    [t0024-crlf-archive.sh]=3
+    [t0066-dir-iterator.sh]=10
+    [t0067-parse_pathspec_file.sh]=8
+    [t0070-fundamental.sh]=11
+    [t0071-sort.sh]=1
+    [t0081-find-pack.sh]=4
+    [t0095-bloom.sh]=11
+    [t0601-reffiles-pack-refs.sh]=47
+    [t1412-reflog-loop.sh]=3
+    [t1419-exclude-refs.sh]=13
+    [t1451-fsck-buffer.sh]=72
+    [t4112-apply-renames.sh]=2
+    [t4118-apply-empty-context.sh]=3
+    [t4121-apply-diffs.sh]=2
+    # wave-57 unselected-script promotions: second scout wave full-pass scripts.
+    [t4024-diff-optimize-common.sh]=2
+    [t4028-format-patch-mime-headers.sh]=3
+    [t4037-diff-r-t-dirs.sh]=2
+    [t4054-diff-bogus-tree.sh]=14
+    [t4071-diff-minimal.sh]=1
+    [t4074-diff-shifted-matched-group.sh]=4
+    [t4113-apply-ending.sh]=3
+    [t4116-apply-reverse.sh]=7
+    [t6407-merge-binary.sh]=3
+    [t7111-reset-table.sh]=42
+    [t7605-merge-resolve.sh]=4
+    [t7608-merge-messages.sh]=5
+    # wave-58 unselected-script promotions: third scout wave full-pass scripts.
+    [t3908-stash-in-worktree.sh]=2
+    [t4036-format-patch-signer-mime.sh]=5
+    [t4057-diff-combined-paths.sh]=4
+    [t4123-apply-shrink.sh]=2
+    [t4125-apply-ws-fuzz.sh]=4
+    [t4131-apply-fake-ancestor.sh]=3
+    [t4138-apply-ws-expansion.sh]=5
+    [t6400-merge-df.sh]=7
+    [t6414-merge-rename-nocruft.sh]=3
+    # wave-59 unselected-script promotions: fourth scout wave full-pass scripts.
+    [t1406-submodule-ref-store.sh]=15
+    [t3040-subprojects-basic.sh]=11
+    [t3050-subprojects-fetch.sh]=4
+    [t5405-send-pack-rewind.sh]=3
+    [t5406-remote-rejects.sh]=3
+    [t5507-remote-environment.sh]=5
+    [t5513-fetch-track.sh]=2
+    [t5522-pull-symlink.sh]=4
+    [t5524-pull-msg.sh]=3
+    [t5525-fetch-tagopt.sh]=5
+    [t5527-fetch-odd-refs.sh]=5
+    [t5573-pull-verify-signatures.sh]=16
+    [t5609-clone-branch.sh]=7
+    [t5701-git-serve.sh]=25
+    [t5750-bundle-uri-parse.sh]=13
+    # wave-60 target coverage enrollment: measured non-email/non-legacy scripts.
+    # Zero floors are intentional weak-signal guards for scripts currently
+    # producing 0 TAP cells; they still catch missing rows and timeouts.
+    [t0018-advice.sh]=4
+    [t0025-crlf-renormalize.sh]=1
+    [t0026-eol-config.sh]=6
+    [t0029-core-unsetenvvars.sh]=0
+    [t0031-lockfile-pid.sh]=3
+    [t0041-usage.sh]=10
+    [t0050-filesystem.sh]=6
+    [t0055-beyond-symlinks.sh]=1
+    [t0060-path-utils.sh]=198
+    [t0090-cache-tree.sh]=22
+    [t0091-bugreport.sh]=9
+    [t0100-previous.sh]=5
+    [t0200-gettext-basic.sh]=16
+    [t0201-gettext-fallbacks.sh]=8
+    [t0302-credential-store.sh]=2
+    [t1016-compatObjectFormat.sh]=0
+    [t1301-shared-repo.sh]=7
+    [t1302-repo-version.sh]=14
+    [t1420-lost-found.sh]=1
+    [t1901-repo-structure.sh]=0
+    [t3202-show-branch.sh]=16
+    [t3204-branch-name-interpretation.sh]=16
+    [t3205-branch-color.sh]=4
+    [t3207-branch-submodule.sh]=3
+    [t3300-funny-names.sh]=13
+    [t3303-notes-subtrees.sh]=23
+    [t3320-notes-merge-worktrees.sh]=9
+    [t3321-notes-stripspace.sh]=27
+    [t3500-cherry.sh]=0
+    [t3702-add-edit.sh]=2
+    [t3703-add-magic-pathspec.sh]=4
+    [t3901-i18n-patch.sh]=20
+    [t3902-quoted.sh]=8
+    [t3904-stash-patch.sh]=4
+    [t3905-stash-include-untracked.sh]=28
+    [t3906-stash-submodule.sh]=5
+    [t3907-stash-show-config.sh]=5
+    [t3909-stash-pathspec-file.sh]=4
+    [t4000-diff-format.sh]=35
+    [t4004-diff-rename-symlink.sh]=3
+    [t4005-diff-rename-2.sh]=3
+    [t4008-diff-break-rewrite.sh]=10
+    [t4009-diff-rename-4.sh]=6
+    [t4010-diff-pathspec.sh]=15
+    [t4025-hunk-header.sh]=1
+    [t4026-color.sh]=17
+    [t4029-diff-trailing-space.sh]=0
+    [t4032-diff-inter-hunk-context.sh]=27
+    [t4033-diff-patience.sh]=9
+    [t4035-diff-quiet.sh]=16
+    [t4038-diff-combined.sh]=15
+    [t4039-diff-assume-unchanged.sh]=1
+    [t4040-whitespace-status.sh]=7
+    [t4043-diff-rename-binary.sh]=2
+    [t4044-diff-index-unique-abbrev.sh]=1
+    [t4049-diff-stat-count.sh]=3
+    [t4050-diff-histogram.sh]=8
+    [t4053-diff-no-index.sh]=41
+    [t4055-diff-context.sh]=10
+    [t4058-diff-duplicates.sh]=16
+    [t4059-diff-submodule-not-initialized.sh]=1
+    [t4062-diff-pickaxe.sh]=1
+    [t4064-diff-oidfind.sh]=10
+    [t4066-diff-emit-delay.sh]=1
+    [t4102-apply-rename.sh]=4
+    [t4105-apply-fuzz.sh]=5
+    [t4106-apply-stdin.sh]=1
+    [t4107-apply-ignore-whitespace.sh]=9
+    [t4109-apply-multifrag.sh]=0
+    [t4110-apply-scan.sh]=0
+    [t4115-apply-symlink.sh]=5
+    [t4122-apply-symlink-inside.sh]=4
+    [t4126-apply-empty.sh]=4
+    [t4127-apply-same-fn.sh]=2
+    [t4130-apply-criss-cross-rename.sh]=5
+    [t4132-apply-removal.sh]=11
+    [t4133-apply-filenames.sh]=2
+    [t4134-apply-submodule.sh]=1
+    [t4140-apply-ita.sh]=2
+    [t4206-log-follow-harder-copies.sh]=6
+    [t4208-log-magic-pathspec.sh]=12
+    [t4210-log-i18n.sh]=21
+    [t4217-log-limit.sh]=1
+    [t4300-merge-tree.sh]=17
+    [t5150-request-pull.sh]=2
+    [t5401-update-hooks.sh]=11
+    [t5409-colorize-remote-messages.sh]=2
+    [t5410-receive-pack.sh]=1
+    [t5411-proc-receive-hook.sh]=101
+    [t5501-fetch-push-alternates.sh]=2
+    [t5502-quickfetch.sh]=2
+    [t5503-tagfollow.sh]=6
+    [t5506-remote-groups.sh]=7
+    [t5509-fetch-push-namespaces.sh]=4
+    [t5517-push-mirror.sh]=12
+    [t5518-fetch-exit-status.sh]=2
+    [t5519-push-alternates.sh]=7
+    [t5529-push-errors.sh]=5
+    [t5530-upload-pack-error.sh]=3
+    [t5531-deep-submodule-push.sh]=7
+    [t5534-push-signed.sh]=9
+    [t5535-fetch-push-symref.sh]=2
+    [t5536-fetch-conflicts.sh]=4
+    [t5538-push-shallow.sh]=2
+    [t5544-pack-objects-hook.sh]=2
+    [t5546-receive-limits.sh]=14
+    [t5547-push-quarantine.sh]=5
+    [t5552-skipping-fetch-negotiator.sh]=0
+    [t5554-noop-fetch-negotiator.sh]=0
+    [t5565-push-multiple.sh]=1
+    [t5574-fetch-output.sh]=2
+    [t5582-fetch-negative-refspec.sh]=9
+    [t5583-push-branches.sh]=4
+    [t5600-clone-fail-cleanup.sh]=7
+    [t5602-clone-remote-exec.sh]=2
+    [t5606-clone-options.sh]=21
+    [t5607-clone-bundle.sh]=8
+    [t5610-clone-detached.sh]=13
+    [t5612-clone-refspec.sh]=13
+    [t5613-info-alternate.sh]=10
+    [t5615-alternate-env.sh]=7
+    [t5618-alternate-refs.sh]=2
+    [t5619-clone-local-ambiguous-transport.sh]=0
+    [t5621-clone-revision.sh]=12
+    [t6401-merge-criss-cross.sh]=3
+    [t6404-recursive-merge.sh]=4
+    [t6405-merge-symlinks.sh]=6
+    [t6408-merge-up-to-date.sh]=6
+    [t6409-merge-subtree.sh]=7
+    [t6411-merge-filemode.sh]=17
+    [t6413-merge-crlf.sh]=2
+    [t7007-show.sh]=10
+    [t7113-post-index-change-hook.sh]=1
+    [t7603-merge-reduce-heads.sh]=11
+    [t7606-merge-custom.sh]=2
+    [t7816-grep-binary-pattern.sh]=145
+    # wave-61 target coverage enrollment: non-timeout rows from the remaining
+    # non-risk target scripts.
+    [t0000-basic.sh]=45
+    [t0004-unwritable.sh]=5
+    [t0005-signals.sh]=2
+    [t0010-racy-git.sh]=10
+    [t0013-sha1dc.sh]=1
+    [t0040-parse-options.sh]=94
+    [t0051-windows-named-pipe.sh]=0
+    [t0052-simple-ipc.sh]=0
+    [t0061-run-command.sh]=24
+    [t0080-unit-test-output.sh]=1
+    [t0202-gettext-perl.sh]=1
+    [t0203-gettext-setlocale-sanity.sh]=2
+    [t0204-gettext-reencode-sanity.sh]=8
+    [t0210-trace2-normal.sh]=14
+    [t0211-trace2-perf.sh]=17
+    [t0212-trace2-event.sh]=11
+    [t0213-trace2-ancestry.sh]=5
+    [t0300-credentials.sh]=1
+    [t0301-credential-cache.sh]=0
+    [t0303-credential-external.sh]=10
+    [t0450-txt-doc-vs-help.sh]=636
+    [t0500-progress-display.sh]=16
+    [t0611-reftable-httpd.sh]=0
+    [t0612-reftable-jgit-compatibility.sh]=0
+    [t1304-default-acl.sh]=4
+    [t3302-notes-index-expensive.sh]=12
+    [t3401-rebase-and-am-rename.sh]=6
+    [t3402-rebase-merge.sh]=12
+    [t3405-rebase-malformed.sh]=5
+    [t3407-rebase-abort.sh]=17
+    [t3408-rebase-multi-line.sh]=2
+    [t3409-rebase-environ.sh]=3
+    [t3413-rebase-hook.sh]=15
+    [t3416-rebase-onto-threedots.sh]=18
+    [t3417-rebase-whitespace-fix.sh]=1
+    [t3419-rebase-patch-id.sh]=8
+    [t3423-rebase-reword.sh]=3
+    [t3425-rebase-topology-merges.sh]=13
+    [t3427-rebase-subtree.sh]=1
+    [t3428-rebase-signoff.sh]=1
+    [t3429-rebase-edit-todo.sh]=7
+    [t3431-rebase-fork-point.sh]=14
+    [t3433-rebase-across-mode-change.sh]=2
+    [t3434-rebase-i18n.sh]=6
+    [t3435-rebase-gpg-sign.sh]=0
+    [t3436-rebase-more-options.sh]=19
+    [t3438-rebase-broken-files.sh]=1
+    [t3440-rebase-trailer.sh]=1
+    [t3450-history.sh]=0
+    [t3451-history-reword.sh]=0
+    [t3452-history-split.sh]=0
+    [t3503-cherry-pick-root.sh]=6
+    [t3504-cherry-pick-rerere.sh]=4
+    [t3506-cherry-pick-ff.sh]=11
+    [t3508-cherry-pick-many-commits.sh]=11
+    [t3509-cherry-pick-merge-df.sh]=6
+    [t3511-cherry-pick-x.sh]=14
+    [t3514-cherry-pick-revert-gpg.sh]=0
+    [t3602-rm-sparse-checkout.sh]=4
+    [t3910-mac-os-precompose.sh]=18
+    [t4067-diff-partial-clone.sh]=1
+    [t5532-fetch-proxy.sh]=4
+    [t5580-unc-paths.sh]=0
+    [t5614-clone-submodules-shallow.sh]=4
+    [t5617-clone-submodules-remote.sh]=5
+    [t5620-backfill.sh]=3
+    [t5703-upload-pack-ref-in-want.sh]=8
+    [t5710-promisor-remote-capability.sh]=2
+    [t5730-protocol-v2-bundle-uri-file.sh]=6
+    [t5731-protocol-v2-bundle-uri-git.sh]=0
+    [t5801-remote-helpers.sh]=4
+    [t5812-proto-disable-http.sh]=0
+    [t5815-submodule-protos.sh]=8
+    [t5900-repo-selection.sh]=8
+    [t6403-merge-file.sh]=22
+    [t6416-recursive-corner-cases.sh]=24
+    [t6419-merge-ignorecase.sh]=0
+    [t6421-merge-partial-clone.sh]=0
+    [t6424-merge-unrelated-index-changes.sh]=16
+    [t6425-merge-rename-delete.sh]=1
+    [t6426-merge-skip-unneeded-updates.sh]=8
+    [t6428-merge-conflicts-sparse.sh]=1
+    [t6429-merge-sequence-rename-caching.sh]=3
+    [t6431-merge-criscross.sh]=2
+    [t6433-merge-toplevel.sh]=9
+    [t6435-merge-sparse.sh]=6
+    [t6436-merge-overwrite.sh]=11
+    [t6437-submodule-merge.sh]=22
+    [t7005-editor.sh]=9
+    [t7008-filter-branch-null-sha1.sh]=3
+    [t7010-setup.sh]=13
+    [t7011-skip-worktree-reading.sh]=15
+    [t7012-skip-worktree-writing.sh]=11
+    [t7301-clean-interactive.sh]=6
+    [t7402-submodule-rebase.sh]=6
+    [t7409-submodule-detached-work-tree.sh]=3
+    [t7411-submodule-config.sh]=20
+    [t7413-submodule-is-active.sh]=10
+    [t7414-submodule-mistakes.sh]=5
+    [t7417-submodule-path-url.sh]=5
+    [t7418-submodule-sparse-gitmodules.sh]=9
+    [t7419-submodule-set-branch.sh]=9
+    [t7420-submodule-set-url.sh]=3
+    [t7421-submodule-summary-add.sh]=5
+    [t7422-submodule-output.sh]=18
+    [t7423-submodule-symlinks.sh]=6
+    [t7503-pre-commit-and-pre-merge-commit-hooks.sh]=22
+    [t7504-commit-msg-hook.sh]=29
+    [t7505-prepare-commit-msg-hook.sh]=23
+    [t7514-commit-patch.sh]=3
+    [t7516-commit-races.sh]=0
+    [t7517-per-repo-email.sh]=6
+    [t7518-ident-corner-cases.sh]=1
+    [t7520-ignored-hook-warning.sh]=5
+    [t7521-ignored-mode.sh]=12
+    [t7524-commit-summary.sh]=1
+    [t7526-commit-pathspec-file.sh]=9
+    [t7609-mergetool--lib.sh]=1
+    [t7612-merge-verify-signatures.sh]=16
+    [t7614-merge-signoff.sh]=4
+    [t7615-diff-algo-with-mergy-operations.sh]=3
+    [t7812-grep-icase-non-ascii.sh]=18
+    [t7813-grep-icase-iso.sh]=2
+    [t7815-grep-binary.sh]=15
+    [t8009-blame-vs-topicbranches.sh]=1
+    [t9002-column.sh]=1
+    [t9003-help-autocorrect.sh]=1
+    [t9210-scalar.sh]=8
+    [t9211-scalar-clone.sh]=2
+    [t9300-fast-import.sh]=256
+    [t9301-fast-import-notes.sh]=11
+    [t9302-fast-import-unpack-limit.sh]=1
+    [t9303-fast-import-compression.sh]=4
+    [t9304-fast-import-marks.sh]=3
+    [t9305-fast-import-signatures.sh]=21
+    [t9306-fast-import-signed-tags.sh]=18
+    [t9350-fast-export.sh]=25
+    [t9351-fast-export-anonymize.sh]=7
+    [t9700-perl-git.sh]=3
+    [t9901-git-web--browse.sh]=0
+    [t9902-completion.sh]=185
+    [t9903-bash-prompt.sh]=54
 
 )
 

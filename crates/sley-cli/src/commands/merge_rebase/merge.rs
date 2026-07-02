@@ -73,6 +73,37 @@ fn merge_diffstat_mode(options: &MergeOptions) -> MergeDiffstat {
     }
 }
 
+struct MergeAttributeFavorResolver {
+    matcher: Option<sley_worktree::StandardAttributeMatcher>,
+}
+
+impl MergeAttributeFavorResolver {
+    fn from_worktree_root(worktree_root: &Path) -> Self {
+        Self {
+            matcher: sley_worktree::StandardAttributeMatcher::from_worktree_root(worktree_root)
+                .ok(),
+        }
+    }
+
+    fn favor_for_path(&self, path: &[u8]) -> sley_diff_merge::MergeFavor {
+        let Some(matcher) = self.matcher.as_ref() else {
+            return sley_diff_merge::MergeFavor::None;
+        };
+        let requested = [b"merge".to_vec()];
+        let state = matcher
+            .attributes_for_path(path, &requested, false)
+            .into_iter()
+            .next()
+            .and_then(|check| check.state);
+        match state {
+            Some(sley_worktree::AttributeState::Value(value)) if value == b"union" => {
+                sley_diff_merge::MergeFavor::Union
+            }
+            _ => sley_diff_merge::MergeFavor::None,
+        }
+    }
+}
+
 /// Create a merge commit with two parents and advance the current branch (or
 /// detached HEAD) to it, writing a reflog entry.
 fn merge_commit_and_advance(
@@ -85,9 +116,12 @@ fn merge_commit_and_advance(
     message: Vec<u8>,
     options: &MergeOptions,
 ) -> Result<ObjectId> {
-    let message = prepare_merge_commit_message_for_commit(git_dir, message, options)?;
+    let message = prepare_merge_commit_message_for_commit_with_rollback(
+        git_dir, format, head_oid, message, options,
+    )?;
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
+    let encoding = commit_encoding_header_from_config(git_dir);
     let signature = merge_commit_signature(
         git_dir,
         format,
@@ -96,6 +130,7 @@ fn merge_commit_and_advance(
         &author,
         &committer,
         &message,
+        encoding.as_deref(),
         options,
     )?;
     let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -107,7 +142,7 @@ fn merge_commit_and_advance(
             author,
             committer: committer.clone(),
             message,
-            encoding: None,
+            encoding,
             signature,
         },
     )?;
@@ -148,9 +183,12 @@ fn merge_ours_commit_and_advance(
     message: Vec<u8>,
     options: &MergeOptions,
 ) -> Result<ObjectId> {
-    let message = prepare_merge_commit_message_for_commit(git_dir, message, options)?;
+    let message = prepare_merge_commit_message_for_commit_with_rollback(
+        git_dir, format, head_oid, message, options,
+    )?;
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
+    let encoding = commit_encoding_header_from_config(git_dir);
     let signature = merge_commit_signature(
         git_dir,
         format,
@@ -159,6 +197,7 @@ fn merge_ours_commit_and_advance(
         &author,
         &committer,
         &message,
+        encoding.as_deref(),
         options,
     )?;
     let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -170,7 +209,7 @@ fn merge_ours_commit_and_advance(
             author,
             committer: committer.clone(),
             message,
-            encoding: None,
+            encoding,
             signature,
         },
     )?;
@@ -204,6 +243,7 @@ fn merge_commit_signature(
     author: &[u8],
     committer: &[u8],
     message: &[u8],
+    encoding: Option<&[u8]>,
     options: &MergeOptions,
 ) -> Result<Option<Vec<u8>>> {
     if !options.gpg_sign {
@@ -215,7 +255,7 @@ fn merge_commit_signature(
         parents,
         author: author.to_vec(),
         committer: committer.to_vec(),
-        encoding: None,
+        encoding: encoding.map(<[u8]>::to_vec),
         message: message.to_vec(),
     };
     let key =
@@ -601,6 +641,7 @@ fn merge_octopus(
 
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
+    let encoding = commit_encoding_header_from_config(git_dir);
     let mut write_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     // git's `collect_parents`/`reduce_parents`: the parent set is the reduced
     // independent heads, with HEAD prepended only when HEAD was NOT subsumed
@@ -624,7 +665,7 @@ fn merge_octopus(
             author,
             committer: committer.clone(),
             message: prepare_merge_commit_message(git_dir, &message, options)?,
-            encoding: None,
+            encoding,
             signature: None,
         },
     )?;
@@ -645,7 +686,13 @@ fn merge_octopus(
         }),
     });
     tx.commit()?;
-    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &merged_oid)?;
+    sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
+        worktree_root,
+        git_dir,
+        format,
+        &merged_oid,
+        Some(vec![("treeish".to_string(), merged_oid.to_hex())]),
+    )?;
     Ok(())
 }
 
@@ -1045,6 +1092,13 @@ fn merge_log_shortlog(
     Ok(out)
 }
 
+fn complete_line_bytes(mut value: Vec<u8>) -> Vec<u8> {
+    if !value.is_empty() && !value.ends_with(b"\n") {
+        value.push(b'\n');
+    }
+    value
+}
+
 /// Build the full merge commit message git would write to `.git/MERGE_MSG`:
 /// the title (auto-generated unless `-m` pins it) plus the `--log` / `merge.log`
 /// shortlog body when `shortlog_len` is non-zero. This is the single producer
@@ -1059,15 +1113,15 @@ fn build_merge_message(
     options: &MergeOptions,
     head_oid: &ObjectId,
     targets: &[(String, ObjectId)],
-) -> Result<String> {
+) -> Result<Vec<u8>> {
     let names: Vec<String> = targets.iter().map(|(name, _)| name.clone()).collect();
     // Message source precedence (git): -F file, then -m, else the autogenerated
     // title. A user-supplied message (file or -m) suppresses the auto title.
     let mut message = if let Some(path) = &options.message_file {
-        String::from_utf8_lossy(&fs::read(path)?).into_owned()
+        fs::read(path)?
     } else {
         match &options.message {
-            Some(m) => m.clone(),
+            Some(m) => argv_bytes_from_string(m),
             None => merge_message_title(
                 refs,
                 git_dir,
@@ -1075,7 +1129,8 @@ fn build_merge_message(
                 format,
                 &names,
                 options.into_name.as_deref(),
-            )?,
+            )?
+            .into_bytes(),
         }
     };
     append_merge_target_tag_messages(&mut message, db, git_dir, format, &names)?;
@@ -1085,21 +1140,19 @@ fn build_merge_message(
         // git's `strbuf_complete_line`: the title is terminated with a newline
         // before the shortlog (which itself opens with a blank line), giving the
         // blank-line separator between an `-m` subject and the `* <ref>:` body.
-        if !message.is_empty() && !message.ends_with('\n') {
-            message.push('\n');
-        }
+        message = complete_line_bytes(message);
         let body = merge_log_shortlog(refs, git_dir, db, format, head_oid, targets, limit)?;
-        message.push_str(&body);
+        message.extend_from_slice(body.as_bytes());
     }
     Ok(message)
 }
 
-fn merge_msg_file_contents(message: &str) -> String {
-    complete_line_string(message.to_string())
+fn merge_msg_file_contents(message: &[u8]) -> Vec<u8> {
+    complete_line_bytes(message.to_vec())
 }
 
 fn append_merge_target_tag_messages(
-    out: &mut String,
+    out: &mut Vec<u8>,
     db: &FileObjectDatabase,
     git_dir: &Path,
     format: ObjectFormat,
@@ -1127,12 +1180,12 @@ fn append_merge_target_tag_messages(
     if blocks.is_empty() {
         return Ok(());
     }
-    append_blank_separator(out);
+    append_blank_separator_bytes(out);
     for (idx, block) in blocks.iter().enumerate() {
         if idx > 0 {
-            out.push('\n');
+            out.push(b'\n');
         }
-        out.push_str(block);
+        out.extend_from_slice(block.as_bytes());
     }
     Ok(())
 }
@@ -1266,15 +1319,57 @@ fn prepare_merge_commit_message_for_commit(
     } else {
         message
     };
+    let editmsg = git_dir.join("COMMIT_EDITMSG");
     if !options.no_verify {
         commands::hooks::run_hook("pre-merge-commit", commands::hooks::HookRun::default())?;
-        let editmsg = git_dir.join("COMMIT_EDITMSG");
-        fs::write(&editmsg, &message)?;
+    }
+    fs::write(&editmsg, &message)?;
+    commands::commit::run_prepare_commit_msg_hook(
+        &editmsg,
+        commands::commit::PrepareCommitMsgSource::Merge,
+        Vec::new(),
+        options.edit != Some(true),
+    )?;
+    if !options.no_verify {
         let editmsg_arg = editmsg.to_string_lossy().into_owned();
         commands::hooks::run_hook_l("commit-msg", &[editmsg_arg.as_str()])?;
-        message = fs::read(&editmsg)?;
     }
+    message = fs::read(&editmsg)?;
     Ok(message)
+}
+
+fn prepare_merge_commit_message_for_commit_with_rollback(
+    git_dir: &Path,
+    format: ObjectFormat,
+    head_oid: &ObjectId,
+    message: Vec<u8>,
+    options: &MergeOptions,
+) -> Result<Vec<u8>> {
+    match prepare_merge_commit_message_for_commit(git_dir, message, options) {
+        Ok(message) => Ok(message),
+        Err(err) => {
+            rollback_refused_merge_commit(git_dir, format, head_oid, options);
+            Err(err)
+        }
+    }
+}
+
+fn rollback_refused_merge_commit(
+    git_dir: &Path,
+    format: ObjectFormat,
+    head_oid: &ObjectId,
+    options: &MergeOptions,
+) {
+    if let Ok(worktree_root) = worktree_root_for_git_dir(git_dir) {
+        let _ = reset_index_and_worktree_to_commit_for_merge(
+            &worktree_root,
+            git_dir,
+            format,
+            head_oid,
+            options.recurse_submodules,
+        );
+    }
+    clear_in_progress_merge_state(git_dir);
 }
 
 impl MergeOptions {
@@ -1422,7 +1517,7 @@ pub(crate) fn cmd_fmt_merge_msg(args: &[String]) -> Result<()> {
         .clone()
         .or_else(|| current_branch_short_name(&refs).ok().flatten())
         .unwrap_or_else(|| "HEAD".to_string());
-    let origins = parse_fmt_merge_fetch_head(&input, &db, format, &head_oid)?;
+    let origins = parse_fmt_merge_fetch_head(&input, &common_git_dir, &db, format, &head_oid)?;
 
     let mut out = String::new();
     if let Some(message) = options.message {
@@ -1557,6 +1652,7 @@ fn fmt_merge_msg_config_log_len() -> Option<usize> {
 
 fn parse_fmt_merge_fetch_head(
     input: &[u8],
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     head_oid: &ObjectId,
@@ -1587,7 +1683,7 @@ fn parse_fmt_merge_fetch_head(
             candidates.push(origin);
         }
     }
-    reduce_fmt_merge_origins(db, format, head_oid, candidates)
+    reduce_fmt_merge_origins(git_dir, db, format, head_oid, candidates)
 }
 
 fn fmt_merge_origin_from_desc(
@@ -1670,6 +1766,7 @@ fn unquote_fetch_name(value: &str) -> &str {
 }
 
 fn reduce_fmt_merge_origins(
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     head_oid: &ObjectId,
@@ -1678,18 +1775,13 @@ fn reduce_fmt_merge_origins(
     if origins.is_empty() {
         return Ok(origins);
     }
+    let mut reachability = sley_rev::CommitReachability::new(git_dir, format, db);
     let mut reachables: Vec<(ObjectId, HashSet<ObjectId>)> = Vec::new();
     for origin in &origins {
-        let reachable = sley_rev::walk_commits(db, format, [origin.commit_oid])?
-            .into_iter()
-            .map(|record| record.oid)
-            .collect();
+        let reachable = reachability.reachable_oids([origin.commit_oid], false)?;
         reachables.push((origin.commit_oid, reachable));
     }
-    let head_reachable: HashSet<ObjectId> = sley_rev::walk_commits(db, format, [*head_oid])?
-        .into_iter()
-        .map(|record| record.oid)
-        .collect();
+    let head_reachable = reachability.reachable_oids([*head_oid], false)?;
     let mut reduced = Vec::new();
     for (idx, origin) in origins.into_iter().enumerate() {
         if head_reachable.contains(&origin.commit_oid) {
@@ -1860,6 +1952,13 @@ fn append_blank_separator(out: &mut String) {
         out.push('\n');
     }
     out.push('\n');
+}
+
+fn append_blank_separator_bytes(out: &mut Vec<u8>) {
+    if !out.is_empty() && !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    out.push(b'\n');
 }
 
 fn append_synthetic_signature_note(out: &mut String, kind: SyntheticSignatureKind) {
@@ -2138,13 +2237,13 @@ fn resolve_merge_cleanup_mode(options: &MergeOptions) -> CommitCleanupMode {
 
 fn prepare_merge_commit_message(
     git_dir: &Path,
-    message: &str,
+    message: &[u8],
     options: &MergeOptions,
 ) -> Result<Vec<u8>> {
     let mode = resolve_merge_cleanup_mode(options);
     if options.edit == Some(true) {
         let path = git_dir.join("MERGE_MSG");
-        fs::write(&path, format!("{message}\n"))?;
+        fs::write(&path, complete_line_bytes(message.to_vec()))?;
         if let Err(err) = commands::replay::launch_editor(git_dir, &path) {
             eprintln!("error: {err}");
             eprintln!("Please supply the message using either -m or -F option.");
@@ -2154,12 +2253,7 @@ fn prepare_merge_commit_message(
         let _ = fs::remove_file(&path);
         return Ok(commit_cleanup_message(edited, mode, "#", true));
     }
-    Ok(commit_cleanup_message(
-        message.as_bytes().to_vec(),
-        mode,
-        "#",
-        false,
-    ))
+    Ok(commit_cleanup_message(message.to_vec(), mode, "#", false))
 }
 
 fn merge_option_takes_no_value_error(option: &str) -> GitError {
@@ -3177,18 +3271,30 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     // unique base, and "merged common ancestors" for a recursive (multi-base)
     // merge. The abbreviation width matches `git rev-parse --short`.
     let ancestor_label = merge_diff3_ancestor_label(&common_git_dir, format, &bases);
-    let (results, conflicts, info_messages) = three_way_merge_trees_inner_with_info(
-        &write_db,
-        format,
-        &base_map,
-        &ours_map,
-        &theirs_map,
-        &ours_label,
-        &theirs_label,
-        &ancestor_label,
-        options.favor,
-        conflict_style,
-    )?;
+    let attribute_favor = MergeAttributeFavorResolver::from_worktree_root(&worktree_root);
+    let path_favor = |path: &[u8]| attribute_favor.favor_for_path(path);
+    let (mut results, mut conflicts, info_messages) =
+        three_way_merge_trees_inner_with_info_opts_and_path_favor(
+            &write_db,
+            format,
+            &base_map,
+            &ours_map,
+            &theirs_map,
+            &ours_label,
+            &theirs_label,
+            &ancestor_label,
+            options.favor,
+            conflict_style,
+            sley_diff_merge::WsIgnore::EMPTY,
+            RenameMergeConfig {
+                detect_renames: true,
+                rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                rename_limit: merge_rename_limit_config(),
+                directory_renames: directory_renames_config(),
+            },
+            Some(&path_favor),
+        )?;
+    resolve_trivial_submodule_conflicts(&worktree_root, format, &mut results, &mut conflicts)?;
 
     // git's pre-merge `verify_uptodate` (unpack-trees): a real 3-way merge
     // requires a clean starting state. Refuse — without writing any MERGE_HEAD —
@@ -3439,16 +3545,33 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         index.write(format)?,
     )?;
 
-    // Materialize merged/conflicted content into the worktree.
+    // Materialize merged/conflicted content into the worktree. Conflict entries
+    // below a populated HEAD gitlink are superproject index state only: writing
+    // them would dirty the submodule checkout itself.
+    let populated_ours_gitlink_prefixes =
+        populated_gitlink_directory_prefixes(&worktree_root, &ours_map)?;
     for (path, result) in &results {
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
                     let content = merge_worktree_content(&db, *mode, oid)?;
+                    if materialize_gitlink_child_conflict_file(
+                        &worktree_root,
+                        path,
+                        &populated_ours_gitlink_prefixes,
+                        &theirs_label,
+                        &content,
+                        *mode,
+                    )? {
+                        continue;
+                    }
                     merge_write_worktree_file(&worktree_root, path, &content, *mode)?;
                 }
             }
             MergePathResult::Resolved(None) => {
+                if path_is_inside_populated_gitlink(path, &populated_ours_gitlink_prefixes) {
+                    continue;
+                }
                 // git only removes a worktree file when its content is the tracked
                 // (ours/HEAD) version; an untracked file or one with divergent
                 // content at this path is left alone (the rename/delete "Gollum's
@@ -3460,6 +3583,16 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             }
             MergePathResult::Conflict { worktree, .. } => match worktree {
                 Some((mode, content)) => {
+                    if materialize_gitlink_child_conflict_file(
+                        &worktree_root,
+                        path,
+                        &populated_ours_gitlink_prefixes,
+                        &theirs_label,
+                        content,
+                        *mode,
+                    )? {
+                        continue;
+                    }
                     merge_write_worktree_file(&worktree_root, path, content, *mode)?
                 }
                 None if matches!(
@@ -3470,6 +3603,9 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                     }
                 ) => {}
                 None => {
+                    if path_is_inside_populated_gitlink(path, &populated_ours_gitlink_prefixes) {
+                        continue;
+                    }
                     if worktree_file_matches_ours(&db, &worktree_root, path, ours_map.get(path))? {
                         merge_remove_worktree_file(&worktree_root, path)?;
                     }
@@ -3492,7 +3628,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         write_squash_message(&git_dir, &db, format, &head_oid, &other_oid)?;
         fs::write(git_dir.join("MERGE_MSG"), &conflicts_block)?;
         print_merge_info_messages(&info_messages);
-        print_merge_conflict_messages(&results);
+        print_merge_conflict_messages(&worktree_root, format, &results);
         println!("Squash commit -- not updating HEAD");
         if merge_autostash {
             save_squash_conflict_autostash(&git_dir, format);
@@ -3501,13 +3637,10 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(1));
     }
 
-    write_merge_state(
-        &git_dir,
-        &[other_oid],
-        format!("{message}\n{merge_msg_conflicts_block}"),
-        &options,
-        None,
-    )?;
+    let mut merge_state_message = message;
+    merge_state_message.push(b'\n');
+    merge_state_message.extend_from_slice(merge_msg_conflicts_block.as_bytes());
+    write_merge_state(&git_dir, &[other_oid], merge_state_message, &options, None)?;
     run_rerere_after_conflicted_merge(&git_dir, format, &options)?;
     if merge_autostash {
         write_merge_autostash_marker(&git_dir)?;
@@ -3515,7 +3648,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
 
     print_merge_info_messages(&info_messages);
-    print_merge_conflict_messages(&results);
+    print_merge_conflict_messages(&worktree_root, format, &results);
     eprintln!("Automatic merge failed; fix conflicts and then commit the result.");
     Err(GitError::Exit(1))
 }
@@ -3721,31 +3854,36 @@ pub(crate) fn cmd_merge_recursive(args: &[String]) -> Result<()> {
     let ours_map = stash_tree_entry_map(&db, format, &head_tree)?;
     let theirs_map = stash_tree_entry_map(&db, format, &remote_tree)?;
 
-    let (results, conflicts, info_messages) = three_way_merge_trees_inner_with_info_opts(
-        &db,
-        format,
-        &base_map,
-        &ours_map,
-        &theirs_map,
-        head,
-        remote,
-        "merged common ancestors",
-        favor,
-        sley_diff_merge::ConflictStyle::Merge,
-        ws_ignore,
-        RenameMergeConfig {
-            detect_renames,
-            rename_threshold,
-            rename_limit: merge_rename_limit_config(),
-            directory_renames: directory_renames_config(),
-        },
-    )?;
+    let attribute_favor = MergeAttributeFavorResolver::from_worktree_root(&worktree_root);
+    let path_favor = |path: &[u8]| attribute_favor.favor_for_path(path);
+    let (mut results, mut conflicts, info_messages) =
+        three_way_merge_trees_inner_with_info_opts_and_path_favor(
+            &db,
+            format,
+            &base_map,
+            &ours_map,
+            &theirs_map,
+            head,
+            remote,
+            "merged common ancestors",
+            favor,
+            sley_diff_merge::ConflictStyle::Merge,
+            ws_ignore,
+            RenameMergeConfig {
+                detect_renames,
+                rename_threshold,
+                rename_limit: merge_rename_limit_config(),
+                directory_renames: directory_renames_config(),
+            },
+            Some(&path_favor),
+        )?;
+    resolve_trivial_submodule_conflicts(&worktree_root, format, &mut results, &mut conflicts)?;
 
     write_merge_recursive_index(&git_dir, format, &results)?;
     apply_merge_recursive_worktree(&db, &worktree_root, &results, &ours_map)?;
 
     print_merge_info_messages(&info_messages);
-    print_merge_conflict_messages(&results);
+    print_merge_conflict_messages(&worktree_root, format, &results);
 
     if conflicts.is_empty() {
         Ok(())
@@ -3827,21 +3965,46 @@ fn apply_merge_recursive_worktree(
     results: &MergePathResults,
     ours_map: &MergeTreeMap,
 ) -> Result<()> {
+    let populated_ours_gitlink_prefixes =
+        populated_gitlink_directory_prefixes(worktree_root, ours_map)?;
     for (path, result) in results {
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
                     let content = merge_worktree_content(db, *mode, oid)?;
+                    if materialize_gitlink_child_conflict_file(
+                        worktree_root,
+                        path,
+                        &populated_ours_gitlink_prefixes,
+                        "theirs",
+                        &content,
+                        *mode,
+                    )? {
+                        continue;
+                    }
                     merge_write_worktree_file(worktree_root, path, &content, *mode)?;
                 }
             }
             MergePathResult::Resolved(None) => {
+                if path_is_inside_populated_gitlink(path, &populated_ours_gitlink_prefixes) {
+                    continue;
+                }
                 if worktree_file_matches_ours(db, worktree_root, path, ours_map.get(path))? {
                     merge_remove_worktree_file(worktree_root, path)?;
                 }
             }
             MergePathResult::Conflict { worktree, .. } => match worktree {
                 Some((mode, content)) => {
+                    if materialize_gitlink_child_conflict_file(
+                        worktree_root,
+                        path,
+                        &populated_ours_gitlink_prefixes,
+                        "theirs",
+                        content,
+                        *mode,
+                    )? {
+                        continue;
+                    }
                     merge_write_worktree_file(worktree_root, path, content, *mode)?;
                 }
                 None if matches!(
@@ -3852,6 +4015,9 @@ fn apply_merge_recursive_worktree(
                     }
                 ) => {}
                 None => {
+                    if path_is_inside_populated_gitlink(path, &populated_ours_gitlink_prefixes) {
+                        continue;
+                    }
                     if worktree_file_matches_ours(db, worktree_root, path, ours_map.get(path))? {
                         merge_remove_worktree_file(worktree_root, path)?;
                     }
@@ -3860,6 +4026,87 @@ fn apply_merge_recursive_worktree(
         }
     }
     Ok(())
+}
+
+fn resolve_trivial_submodule_conflicts(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    results: &mut MergePathResults,
+    conflicts: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    let mut resolved = BTreeSet::new();
+    for path in conflicts.iter() {
+        let Some(entry) =
+            trivial_submodule_conflict_resolution(worktree_root, format, path, results)
+        else {
+            continue;
+        };
+        results.insert(path.to_vec(), MergePathResult::Resolved(Some(entry)));
+        resolved.insert(path.to_vec());
+    }
+    if !resolved.is_empty() {
+        conflicts.retain(|path| !resolved.contains(path));
+    }
+    Ok(())
+}
+
+fn trivial_submodule_conflict_resolution(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    path: &[u8],
+    results: &MergePathResults,
+) -> Option<(u32, ObjectId)> {
+    let MergePathResult::Conflict {
+        base, ours, theirs, ..
+    } = results.get(path)?
+    else {
+        return None;
+    };
+    let Some((ours_mode, ours_oid)) = ours else {
+        return None;
+    };
+    let Some((theirs_mode, theirs_oid)) = theirs else {
+        return None;
+    };
+    if !sley_index::is_gitlink(*ours_mode) || !sley_index::is_gitlink(*theirs_mode) {
+        return None;
+    }
+    let sub_root = worktree_root.join(repo_path_to_path(path));
+    let sub_git_dir = sley_diff_merge::gitlink_git_dir(&sub_root)?;
+    let sub_format = repository_object_format(&sub_git_dir)
+        .ok()
+        .unwrap_or(format);
+    let sub_db = FileObjectDatabase::from_git_dir(&sub_git_dir, sub_format);
+    let Some((base_mode, base_oid)) = base else {
+        return None;
+    };
+    if !sley_index::is_gitlink(*base_mode)
+        || !submodule_commit_is_ancestor(&sub_git_dir, &sub_db, sub_format, base_oid, ours_oid)
+        || !submodule_commit_is_ancestor(&sub_git_dir, &sub_db, sub_format, base_oid, theirs_oid)
+    {
+        return None;
+    }
+    if submodule_commit_is_ancestor(&sub_git_dir, &sub_db, sub_format, ours_oid, theirs_oid) {
+        Some((*theirs_mode, *theirs_oid))
+    } else if submodule_commit_is_ancestor(&sub_git_dir, &sub_db, sub_format, theirs_oid, ours_oid)
+    {
+        Some((*ours_mode, *ours_oid))
+    } else {
+        None
+    }
+}
+
+fn submodule_commit_is_ancestor(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    ancestor: &ObjectId,
+    descendant: &ObjectId,
+) -> bool {
+    ancestor == descendant
+        || sley_rev::merge_bases(git_dir, format, db, ancestor, descendant)
+            .ok()
+            .is_some_and(|bases| bases.iter().any(|base| base == ancestor))
 }
 
 fn print_merge_info_messages(messages: &[sley_diff_merge::MergeInfoMessage]) {
@@ -3946,7 +4193,11 @@ fn print_merge_info_messages(messages: &[sley_diff_merge::MergeInfoMessage]) {
 /// textual 3-way merge, and each conflict kind renders its own message. The
 /// `results` map is keyed by path so iteration is already sorted like git's
 /// message ordering.
-fn print_merge_conflict_messages(results: &MergePathResults) {
+fn print_merge_conflict_messages(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    results: &MergePathResults,
+) {
     for (path, result) in results {
         let MergePathResult::Conflict {
             kind, auto_merged, ..
@@ -3955,6 +4206,27 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
             continue;
         };
         let path_str = String::from_utf8_lossy(path);
+        if let Some(advice) = merge_submodule_conflict_advice(worktree_root, format, path, result) {
+            for candidate in &advice.candidates {
+                println!("Possible submodule merge resolution for {path_str}: {candidate}");
+            }
+            eprintln!("Failed to merge submodule {path_str}");
+            eprintln!("CONFLICT (submodule): Merge conflict in {path_str}");
+            eprintln!("Recursive merging with submodules currently only supports trivial cases.");
+            eprintln!("Please manually handle the merging of each conflicted submodule.");
+            eprintln!("This can be accomplished with the following steps:");
+            eprintln!(
+                " - go to submodule ({path_str}), and either merge commit {}",
+                advice.theirs
+            );
+            eprintln!("   or update to an existing commit which has merged those changes");
+            eprintln!(" - come back to superproject and run:");
+            eprintln!("      git add {path_str}");
+            eprintln!("   to record the above merge or update");
+            eprintln!(" - resolve any other conflicts in the superproject");
+            eprintln!(" - commit the resulting index in the superproject");
+            continue;
+        }
         if *auto_merged {
             println!("Auto-merging {path_str}");
         }
@@ -4077,6 +4349,89 @@ fn print_merge_conflict_messages(results: &MergePathResults) {
     }
 }
 
+struct MergeSubmoduleConflictAdvice {
+    theirs: String,
+    candidates: Vec<String>,
+}
+
+fn merge_submodule_conflict_advice(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    path: &[u8],
+    result: &MergePathResult,
+) -> Option<MergeSubmoduleConflictAdvice> {
+    let MergePathResult::Conflict {
+        base, ours, theirs, ..
+    } = result
+    else {
+        return None;
+    };
+    if ![base, ours, theirs]
+        .into_iter()
+        .flatten()
+        .any(|(mode, _)| sley_index::is_gitlink(*mode))
+    {
+        return None;
+    }
+    let (_, theirs_oid) = theirs.as_ref()?;
+    let candidates = submodule_merge_resolution_candidates(
+        worktree_root,
+        format,
+        path,
+        ours.map(|(_, oid)| oid),
+        *theirs_oid,
+    )
+    .into_iter()
+    .map(|oid| short_oid(&oid))
+    .collect();
+    Some(MergeSubmoduleConflictAdvice {
+        theirs: short_oid(theirs_oid),
+        candidates,
+    })
+}
+
+fn short_oid(oid: &ObjectId) -> String {
+    oid.to_hex()[..oid.abbrev_hex_len(7)].to_string()
+}
+
+fn submodule_merge_resolution_candidates(
+    worktree_root: &Path,
+    format: ObjectFormat,
+    path: &[u8],
+    ours: Option<ObjectId>,
+    theirs: ObjectId,
+) -> Vec<ObjectId> {
+    let Some(ours) = ours else {
+        return Vec::new();
+    };
+    let sub_root = worktree_root.join(repo_path_to_path(path));
+    let Some(sub_git_dir) = sley_diff_merge::gitlink_git_dir(&sub_root) else {
+        return Vec::new();
+    };
+    let sub_format = repository_object_format(&sub_git_dir)
+        .ok()
+        .unwrap_or(format);
+    let sub_db = FileObjectDatabase::from_git_dir(&sub_git_dir, sub_format);
+    let refs = FileRefStore::new(&sub_git_dir, sub_format)
+        .list_refs()
+        .unwrap_or_default();
+    let mut out = BTreeSet::new();
+    for reference in refs {
+        let sley_refs::RefTarget::Direct(candidate) = reference.target else {
+            continue;
+        };
+        if candidate == ours || candidate == theirs {
+            continue;
+        }
+        if submodule_commit_is_ancestor(&sub_git_dir, &sub_db, sub_format, &ours, &candidate)
+            && submodule_commit_is_ancestor(&sub_git_dir, &sub_db, sub_format, &theirs, &candidate)
+        {
+            out.insert(candidate);
+        }
+    }
+    out.into_iter().collect()
+}
+
 fn merge_conflicts_block(conflicts: &[Vec<u8>], scissors: bool) -> String {
     let mut out = String::new();
     if scissors {
@@ -4164,23 +4519,14 @@ fn verify_merge_uptodate(
         }
     }
 
+    let conflicted_gitlinks = conflicted_gitlink_paths(results, ours_map);
     let target_map = merge_results_entry_map(results);
-    verify_no_populated_gitlink_directory_overwrite(worktree_root, &target_map, ours_map)?;
-    let conflicted_gitlinks: BTreeSet<Vec<u8>> = results
-        .iter()
-        .filter_map(|(path, result)| match result {
-            MergePathResult::Conflict {
-                base, ours, theirs, ..
-            } if base
-                .or(*ours)
-                .or(*theirs)
-                .is_some_and(|(mode, _)| sley_index::is_gitlink(mode)) =>
-            {
-                Some(path.clone())
-            }
-            _ => None,
-        })
-        .collect();
+    verify_no_populated_gitlink_directory_overwrite(
+        worktree_root,
+        &target_map,
+        ours_map,
+        &conflicted_gitlinks,
+    )?;
 
     let status = crate::collect_short_status(worktree_root, git_dir, format)?;
     for entry in &status {
@@ -4241,6 +4587,42 @@ fn verify_merge_uptodate(
     Ok(())
 }
 
+fn conflicted_gitlink_paths(
+    results: &MergePathResults,
+    ours_map: &MergeTreeMap,
+) -> BTreeSet<Vec<u8>> {
+    let mut paths = BTreeSet::new();
+    for (path, result) in results {
+        let MergePathResult::Conflict {
+            base,
+            ours,
+            theirs,
+            kind,
+            ..
+        } = result
+        else {
+            continue;
+        };
+        if [base, ours, theirs]
+            .iter()
+            .any(|entry| entry.is_some_and(|(mode, _)| sley_index::is_gitlink(mode)))
+        {
+            paths.insert(path.clone());
+        }
+        if let Some(
+            sley_diff_merge::MergeConflictKind::FileDirectory { original_path, .. }
+            | sley_diff_merge::MergeConflictKind::DistinctTypes { original_path, .. },
+        ) = kind
+            && ours_map
+                .get(original_path)
+                .is_some_and(|(mode, _)| sley_index::is_gitlink(*mode))
+        {
+            paths.insert(original_path.clone());
+        }
+    }
+    paths
+}
+
 pub(crate) fn verify_fast_forward_untracked_safe(
     worktree_root: &Path,
     git_dir: &Path,
@@ -4251,7 +4633,12 @@ pub(crate) fn verify_fast_forward_untracked_safe(
 ) -> Result<()> {
     let head_map = stash_tree_entry_map(db, format, head_tree)?;
     let target_map = stash_tree_entry_map(db, format, target_tree)?;
-    verify_no_populated_gitlink_directory_overwrite(worktree_root, &target_map, &head_map)?;
+    verify_no_populated_gitlink_directory_overwrite(
+        worktree_root,
+        &target_map,
+        &head_map,
+        &BTreeSet::new(),
+    )?;
     let status = crate::collect_short_status(worktree_root, git_dir, format)?;
     let untracked: BTreeSet<Vec<u8>> = status
         .iter()
@@ -4320,13 +4707,109 @@ fn path_with_trailing_slash(path: &[u8]) -> Vec<u8> {
     prefix
 }
 
+fn populated_gitlink_directory_prefixes(
+    worktree_root: &Path,
+    map: &MergeTreeMap,
+) -> Result<BTreeSet<Vec<u8>>> {
+    let mut prefixes = BTreeSet::new();
+    for (path, (mode, _)) in map {
+        if !sley_index::is_gitlink(*mode) {
+            continue;
+        }
+        let rel = std::str::from_utf8(path)
+            .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
+        if sley_diff_merge::gitlink_git_dir(&worktree_root.join(rel)).is_some() {
+            prefixes.insert(path_with_trailing_slash(path));
+        }
+    }
+    Ok(prefixes)
+}
+
+fn path_is_inside_populated_gitlink(path: &[u8], prefixes: &BTreeSet<Vec<u8>>) -> bool {
+    prefixes.iter().any(|prefix| path.starts_with(prefix))
+}
+
+fn populated_gitlink_prefix_for_path<'a>(
+    path: &[u8],
+    prefixes: &'a BTreeSet<Vec<u8>>,
+) -> Option<&'a [u8]> {
+    prefixes
+        .iter()
+        .find(|prefix| path.starts_with(prefix.as_slice()))
+        .map(Vec::as_slice)
+}
+
+fn materialize_gitlink_child_conflict_file(
+    worktree_root: &Path,
+    path: &[u8],
+    prefixes: &BTreeSet<Vec<u8>>,
+    label: &str,
+    content: &[u8],
+    mode: u32,
+) -> Result<bool> {
+    let Some(prefix) = populated_gitlink_prefix_for_path(path, prefixes) else {
+        return Ok(false);
+    };
+    if merge_worktree_path_exists(worktree_root, path) || sley_index::is_gitlink(mode) {
+        return Ok(true);
+    }
+    let alternate = gitlink_child_conflict_path(worktree_root, prefix, path, label);
+    merge_write_worktree_file(worktree_root, &alternate, content, mode)?;
+    Ok(true)
+}
+
+fn gitlink_child_conflict_path(
+    worktree_root: &Path,
+    prefix: &[u8],
+    path: &[u8],
+    label: &str,
+) -> Vec<u8> {
+    let gitlink_path = &prefix[..prefix.len().saturating_sub(1)];
+    let child_path = &path[prefix.len()..];
+    let mut base = gitlink_path.to_vec();
+    base.push(b'~');
+    base.extend_from_slice(flatten_merge_label(label).as_bytes());
+    let mut candidate = append_gitlink_child_path(&base, child_path);
+    if !merge_worktree_path_exists(worktree_root, &candidate) {
+        return candidate;
+    }
+    let mut suffix = 0usize;
+    loop {
+        let mut suffixed = base.clone();
+        suffixed.push(b'_');
+        suffixed.extend_from_slice(suffix.to_string().as_bytes());
+        candidate = append_gitlink_child_path(&suffixed, child_path);
+        if !merge_worktree_path_exists(worktree_root, &candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn append_gitlink_child_path(base: &[u8], child: &[u8]) -> Vec<u8> {
+    let mut path = base.to_vec();
+    if !child.is_empty() {
+        path.push(b'/');
+        path.extend_from_slice(child);
+    }
+    path
+}
+
+fn flatten_merge_label(label: &str) -> String {
+    label.replace('/', "_")
+}
+
 fn verify_no_populated_gitlink_directory_overwrite(
     worktree_root: &Path,
     target_map: &MergeTreeMap,
     head_map: &MergeTreeMap,
+    conflicted_gitlinks: &BTreeSet<Vec<u8>>,
 ) -> Result<()> {
     for (path, (mode, _)) in head_map {
         if !sley_index::is_gitlink(*mode) {
+            continue;
+        }
+        if conflicted_gitlinks.contains(path) && populated_gitlink_exists(worktree_root, path)? {
             continue;
         }
         let prefix = path_with_trailing_slash(path);
@@ -4349,6 +4832,12 @@ fn verify_no_populated_gitlink_directory_overwrite(
         return Err(GitError::Exit(2));
     }
     Ok(())
+}
+
+fn populated_gitlink_exists(worktree_root: &Path, path: &[u8]) -> Result<bool> {
+    let rel = std::str::from_utf8(path)
+        .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
+    Ok(sley_diff_merge::gitlink_git_dir(&worktree_root.join(rel)).is_some())
 }
 
 fn merge_worktree_path_exists(worktree_root: &Path, path: &[u8]) -> bool {
@@ -4392,7 +4881,13 @@ fn reset_index_and_worktree_to_commit_for_merge(
             true,
         )
     } else {
-        sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, commit)?;
+        sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
+            worktree_root,
+            git_dir,
+            format,
+            commit,
+            Some(vec![("treeish".to_string(), commit.to_hex())]),
+        )?;
         Ok(())
     }
 }
@@ -4434,6 +4929,8 @@ fn reset_merge_to_head(git_dir: &Path, worktree_root: &Path, format: ObjectForma
     let head_oid = resolve_revision(git_dir, format, "HEAD")?;
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
     let head_map = stash_tree_entry_map(&db, format, &head_tree)?;
+    let populated_head_gitlink_prefixes =
+        populated_gitlink_directory_prefixes(worktree_root, &head_map)?;
 
     // The set of paths the merge touched relative to HEAD: anything in the
     // current index that is not a clean stage-0 match for HEAD's entry.
@@ -4441,6 +4938,9 @@ fn reset_merge_to_head(git_dir: &Path, worktree_root: &Path, format: ObjectForma
     let mut touched: BTreeSet<Vec<u8>> = BTreeSet::new();
     for entry in &index.entries {
         let path = entry.path.to_vec();
+        if path_is_inside_populated_gitlink(&path, &populated_head_gitlink_prefixes) {
+            continue;
+        }
         let stage = index_entry_stage(entry);
         if stage > 0 {
             touched.insert(path);
@@ -4535,6 +5035,7 @@ pub(crate) fn conclude_in_progress_merge(
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
     let message = commit_cleanup_message(message, CommitCleanupMode::Whitespace, "#", false);
+    let encoding = commit_encoding_header_from_config(git_dir);
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let mut writer = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let commit_oid = sley_sequencer::create_commit(
@@ -4545,7 +5046,7 @@ pub(crate) fn conclude_in_progress_merge(
             author,
             committer: committer.clone(),
             message: message.clone(),
-            encoding: None,
+            encoding,
             signature: None,
         },
     )?;
@@ -4659,6 +5160,7 @@ pub(crate) fn conclude_rebase_step_via_commit(
     if let Some(script_author) = read_rebase_author_script_identity(git_dir)? {
         author = script_author;
     }
+    let encoding = commit_encoding_header_from_config(git_dir);
     let mut writer = FileObjectDatabase::from_git_dir(git_dir, format);
     let commit_oid = sley_sequencer::create_commit(
         &mut writer,
@@ -4668,7 +5170,7 @@ pub(crate) fn conclude_rebase_step_via_commit(
             author,
             committer: committer.clone(),
             message: message.clone(),
-            encoding: None,
+            encoding,
             signature: None,
         },
     )?;
@@ -4690,13 +5192,13 @@ pub(crate) fn conclude_rebase_step_via_commit(
 
 fn read_rebase_author_script_identity(git_dir: &Path) -> Result<Option<Vec<u8>>> {
     let path = rebase_merge_dir(git_dir).join("author-script");
-    let Ok(text) = fs::read_to_string(path) else {
+    let Ok(text) = fs::read(path) else {
         return Ok(None);
     };
-    let Some((name, email, date)) = sley_sequencer::rebase::parse_author_script(&text) else {
+    let Some((name, email, date)) = sley_sequencer::rebase::parse_author_script_bytes(&text) else {
         return Ok(None);
     };
-    Ok(Some(sley_sequencer::format_commit_identity(
+    Ok(Some(sley_sequencer::format_commit_identity_bytes(
         &name, &email, &date,
     )?))
 }
@@ -4794,14 +5296,20 @@ fn apply_or_save_merge_autostash(git_dir: &Path, format: ObjectFormat, attempt_a
     if !stored {
         eprintln!("error: cannot store {oid_text}");
     } else if attempt_apply {
-        eprintln!("Applying autostash resulted in conflicts.");
-        eprintln!("Your changes are safe in the stash.");
-        eprintln!("You can run \"git stash pop\" or \"git stash drop\" at any time.");
+        print_merge_autostash_conflict_advice();
     } else {
         eprintln!("Autostash exists; creating a new stash entry.");
         eprintln!("Your changes are safe in the stash.");
         eprintln!("You can run \"git stash pop\" or \"git stash drop\" at any time.");
     }
+}
+
+fn print_merge_autostash_conflict_advice() {
+    eprintln!("Your local changes are stashed, however applying them");
+    eprintln!("resulted in conflicts.  You can either resolve the conflicts");
+    eprintln!("and then discard the stash with \"git stash drop\", or, if you");
+    eprintln!("do not want to resolve them now, run \"git reset --hard\" and");
+    eprintln!("apply the local changes later by running \"git stash pop\".");
 }
 
 /// git's `write_merge_state` MERGE_MODE leg: write `.git/MERGE_MODE` alongside

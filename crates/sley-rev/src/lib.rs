@@ -187,7 +187,7 @@ pub fn commit_graph_tree_oid(
     let mut graph = CommitGraphContext::load(git_dir, format);
     match graph.direct_graph() {
         DirectCommitGraph::Raw(graph) => graph.tree_oid(oid).or(Ok(None)),
-        DirectCommitGraph::Missing | DirectCommitGraph::Invalid => Ok(None),
+        DirectCommitGraph::Missing | DirectCommitGraph::Invalid(_) => Ok(None),
     }
 }
 
@@ -1107,7 +1107,7 @@ fn reflog_ref_name(refs: &FileRefStore, base: &str) -> String {
         return base.to_string();
     }
     for candidate in reflog_dwim_candidates(base) {
-        if reflog_has_entries(refs, &candidate) {
+        if reflog_exists(refs, &candidate) {
             return candidate;
         }
     }
@@ -1167,12 +1167,11 @@ fn reflog_dwim_candidates(base: &str) -> [String; 6] {
     ]
 }
 
-/// Whether `name` has a reflog with at least one entry. `read_reflog` returns an
-/// empty vec for an absent reflog, so a non-empty read means the reflog exists.
-fn reflog_has_entries(refs: &FileRefStore, name: &str) -> bool {
-    refs.read_reflog(name)
-        .map(|entries| !entries.is_empty())
-        .unwrap_or(false)
+/// Whether `name` has a reflog, even if it currently has zero entries after
+/// expiry. Git's `repo_dwim_log` resolves against empty log files too, and
+/// `<ref>@{0}` then falls back to the ref tip.
+fn reflog_exists(refs: &FileRefStore, name: &str) -> bool {
+    refs.reflog_exists(name).unwrap_or(false)
 }
 
 /// Resolve `<base>@{N}` to the N-th prior value of `base` from its reflog.
@@ -1195,7 +1194,8 @@ fn resolve_reflog_nth(
     let entries = refs.read_reflog(&ref_name)?;
     if entries.is_empty() {
         if n == 0
-            && let Some(oid) = resolve_revision_ref(&refs, &ref_name)?
+            && refs.reflog_exists(&ref_name)?
+            && let Some(oid) = resolve_revision_ref_candidate(&refs, &ref_name)?
         {
             return Ok(oid);
         }
@@ -1807,7 +1807,7 @@ fn peel_base_to_commit_if_needed<R: ObjectReader>(
     graph: &mut CommitGraphContext<'_>,
     base: &ObjectId,
 ) -> Result<ObjectId> {
-    if graph.lookup(base).is_some() {
+    if graph.lookup(base)?.is_some() {
         return Ok(*base);
     }
     peel_to_commit(reader, format, base)
@@ -1836,9 +1836,9 @@ fn apply_revision_suffix<R: ObjectReader>(
             // reads the object, so skip it when the graph already covers the base
             // (a commit) to preserve the graph-only navigation fast path.
             let mut graph = CommitGraphContext::load(git_dir, format);
+            let grafts = revlist::load_commit_grafts_from_git_dir(git_dir, format);
             let base = peel_base_to_commit_if_needed(reader, format, &mut graph, base)?;
-            graph
-                .commit_parents(reader, &base)?
+            revision_suffix_commit_parents(&mut graph, reader, format, &base, &grafts)?
                 .get(parent - 1)
                 .cloned()
                 .ok_or_else(|| GitError::not_found(format!("parent {parent} of {base}")))
@@ -1847,11 +1847,14 @@ fn apply_revision_suffix<R: ObjectReader>(
             // Likewise `<annotated-tag>~N` peels to the commit before walking
             // first parents (skipping the read when the graph covers the base).
             let mut graph = CommitGraphContext::load(git_dir, format);
+            let grafts = revlist::load_commit_grafts_from_git_dir(git_dir, format);
             let mut current = peel_base_to_commit_if_needed(reader, format, &mut graph, base)?;
             for _ in 0..count {
-                current = graph
-                    .commit_first_parent(reader, &current)?
-                    .ok_or_else(|| GitError::not_found(format!("first parent of {current}")))?;
+                current =
+                    revision_suffix_commit_parents(&mut graph, reader, format, &current, &grafts)?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| GitError::not_found(format!("first parent of {current}")))?;
             }
             Ok(current)
         }
@@ -1860,6 +1863,22 @@ fn apply_revision_suffix<R: ObjectReader>(
             search_commit_message_first_parent(git_dir, reader, format, base, text)
         }
     }
+}
+
+fn revision_suffix_commit_parents<R: ObjectReader>(
+    graph: &mut CommitGraphContext,
+    reader: &R,
+    format: sley_core::ObjectFormat,
+    oid: &ObjectId,
+    grafts: &HashMap<ObjectId, Vec<ObjectId>>,
+) -> Result<Vec<ObjectId>> {
+    if let Some(parents) = grafts.get(oid) {
+        return Ok(sley_odb::grafted_parents(reader, oid, parents.clone()));
+    }
+    if grafts.is_empty() {
+        return graph.commit_parents(reader, oid);
+    }
+    commit_parents(reader, format, oid)
 }
 
 // ---------------------------------------------------------------------------
@@ -2075,14 +2094,15 @@ struct CommitGraphContext<'a> {
     /// materializing every graph entry into a `HashMap` when callers only need a
     /// handful of commits (for example `log -50`).
     direct_graph: Option<DirectCommitGraph>,
-    /// `None` until the first lookup forces a load; afterwards `Some(map)` where
-    /// the map is empty iff no usable graph exists.
-    commits: Option<HashMap<ObjectId, GraphCommit>>,
+    /// `None` until the first lookup forces a load. Missing graphs cache as an
+    /// empty map; corrupt graphs cache their parse error so callers fail instead
+    /// of silently walking stale object data.
+    commits: Option<std::result::Result<HashMap<ObjectId, GraphCommit>, String>>,
 }
 
 enum DirectCommitGraph {
     Missing,
-    Invalid,
+    Invalid(String),
     Raw(Box<RawCommitGraph>),
 }
 
@@ -2283,6 +2303,7 @@ impl RawCommitGraph {
                 "commit-graph EDGE chunk has invalid length".into(),
             ));
         }
+        raw_commit_graph_validate_generation_data(data, &chunks, commit_count)?;
 
         Ok(Self {
             bytes,
@@ -2597,41 +2618,51 @@ impl<'a> CommitGraphContext<'a> {
 
     /// Resolve `oid`'s graph metadata, loading and parsing the graph on first
     /// use. Returns `None` when the commit is not in the graph.
-    fn lookup(&mut self, oid: &ObjectId) -> Option<&GraphCommit> {
+    fn lookup(&mut self, oid: &ObjectId) -> Result<Option<&GraphCommit>> {
         if self.commits.is_none() {
-            self.commits = Some(load_commit_graph_map(self.git_dir, self.format));
+            self.commits = Some(
+                load_commit_graph_map(self.git_dir, self.format).map_err(|err| err.to_string()),
+            );
         }
-        self.commits.as_ref().and_then(|map| map.get(oid))
+        match self
+            .commits
+            .as_ref()
+            .expect("commit graph map load state initialized")
+        {
+            Ok(map) => Ok(map.get(oid)),
+            Err(message) => Err(GitError::InvalidFormat(message.clone())),
+        }
     }
 
     /// Parents of `oid` from the graph, or `None` when it is not present.
-    fn parents(&mut self, oid: &ObjectId) -> Option<&GraphParents> {
-        self.lookup(oid).map(|commit| &commit.parents)
+    fn parents(&mut self, oid: &ObjectId) -> Result<Option<&GraphParents>> {
+        Ok(self.lookup(oid)?.map(|commit| &commit.parents))
     }
 
     /// First parent of `oid` from the graph. The outer `None` means the commit is
     /// not present in the graph; the inner `None` means the commit is present but
     /// root/unborn with no parents.
-    fn first_parent(&mut self, oid: &ObjectId) -> Option<Option<ObjectId>> {
-        self.lookup(oid).map(|commit| commit.parents.first())
+    fn first_parent(&mut self, oid: &ObjectId) -> Result<Option<Option<ObjectId>>> {
+        Ok(self.lookup(oid)?.map(|commit| commit.parents.first()))
     }
 
     /// Generation number of `oid`, or `None` when it is not present in the graph
     /// or the graph carries no generation numbers (generation 0). A `None`
     /// result disables generation-based pruning for that commit.
-    fn generation(&mut self, oid: &ObjectId) -> Option<u32> {
-        match self.lookup(oid) {
+    fn generation(&mut self, oid: &ObjectId) -> Result<Option<u32>> {
+        Ok(match self.lookup(oid)? {
             Some(commit) if commit.generation != GENERATION_NUMBER_ZERO => Some(commit.generation),
             _ => None,
-        }
+        })
     }
 
     /// Committer date (seconds since the epoch) recorded for `oid` in the graph,
     /// or `None` when the commit is not present. Used to order candidates
     /// without re-parsing the commit object's committer line.
-    fn commit_time(&mut self, oid: &ObjectId) -> Option<i64> {
-        self.lookup(oid)
-            .map(|commit| i64::try_from(commit.commit_time).unwrap_or(i64::MAX))
+    fn commit_time(&mut self, oid: &ObjectId) -> Result<Option<i64>> {
+        Ok(self
+            .lookup(oid)?
+            .map(|commit| i64::try_from(commit.commit_time).unwrap_or(i64::MAX)))
     }
 
     /// Parents of `oid`: from the graph when present, otherwise read+parsed from
@@ -2647,7 +2678,7 @@ impl<'a> CommitGraphContext<'a> {
             return Ok(Vec::new());
         }
         let format = self.format;
-        if let Some(parents) = self.parents(oid) {
+        if let Some(parents) = self.parents(oid)? {
             return Ok(parents.to_vec());
         }
         commit_parents(reader, format, oid)
@@ -2665,7 +2696,7 @@ impl<'a> CommitGraphContext<'a> {
             return Ok(CommitParentIds::Empty);
         }
         let format = self.format;
-        if let Some(parents) = self.parents(oid) {
+        if let Some(parents) = self.parents(oid)? {
             return Ok(CommitParentIds::borrowed(parents));
         }
         Ok(CommitParentIds::owned(commit_parents(reader, format, oid)?))
@@ -2682,7 +2713,7 @@ impl<'a> CommitGraphContext<'a> {
             return Ok(None);
         }
         let format = self.format;
-        if let Some(parent) = self.first_parent(oid) {
+        if let Some(parent) = self.first_parent(oid)? {
             return Ok(parent);
         }
         Ok(commit_parents(reader, format, oid)?.into_iter().next())
@@ -2690,11 +2721,11 @@ impl<'a> CommitGraphContext<'a> {
 
     /// `oid`'s parents and committer time from the graph in one lookup, or `None`
     /// when the commit is not represented (the caller then reads the object).
-    fn metadata(&mut self, oid: &ObjectId) -> Option<GraphCommitMetadata<'_>> {
-        self.lookup(oid).map(|commit| GraphCommitMetadata {
+    fn metadata(&mut self, oid: &ObjectId) -> Result<Option<GraphCommitMetadata<'_>>> {
+        Ok(self.lookup(oid)?.map(|commit| GraphCommitMetadata {
             parents: &commit.parents,
             commit_time: i64::try_from(commit.commit_time).unwrap_or(i64::MAX),
-        })
+        }))
     }
 
     fn metadata_owned<R: ObjectReader>(
@@ -2712,10 +2743,10 @@ impl<'a> CommitGraphContext<'a> {
                 }
                 return Ok(Some(metadata));
             }
-            DirectCommitGraph::Invalid => return Ok(None),
+            DirectCommitGraph::Invalid(_) => return Ok(None),
             DirectCommitGraph::Missing => {}
         }
-        Ok(self.metadata(oid).map(|metadata| CommitMetadata {
+        Ok(self.metadata(oid)?.map(|metadata| CommitMetadata {
             oid: *oid,
             parents: metadata.parents.grafted_vec(reader, oid),
             commit_time: metadata.commit_time,
@@ -2740,30 +2771,35 @@ impl<'a> CommitGraphContext<'a> {
 fn load_commit_graph_map(
     git_dir: &Path,
     format: sley_core::ObjectFormat,
-) -> HashMap<ObjectId, GraphCommit> {
+) -> Result<HashMap<ObjectId, GraphCommit>> {
     let info = repository_objects_dir(git_dir).join("info");
     let single = info.join("commit-graph");
     if single.exists() {
-        // A read/parse failure degrades to "no graph" (empty map) so callers
-        // fall back to object reads; correctness never depends on the graph.
         let bytes = match fs::read(&single) {
             Ok(bytes) => bytes,
-            Err(_) => return HashMap::new(),
+            Err(err) => return Err(GitError::Io(err.to_string())),
         };
         if commit_graph_hash_version_mismatch(&bytes, format) {
-            return HashMap::new();
+            return Err(GitError::InvalidFormat(
+                "commit-graph hash version mismatch".into(),
+            ));
         }
         return match CommitGraph::parse(&bytes, format) {
-            Ok(graph) => graph_to_map(&graph).unwrap_or_default(),
+            Ok(graph) => graph_to_map(&graph),
             Err(_) => {
                 warn_invalid_commit_graph_bloom_chunks(&bytes, &single, format);
-                HashMap::new()
+                if RawCommitGraph::parse_for_lookup(RawCommitGraphBytes::Owned(bytes), format)
+                    .is_err()
+                {
+                    return Ok(HashMap::new());
+                }
+                Ok(HashMap::new())
             }
         };
     }
 
     let chain = info.join("commit-graphs").join("commit-graph-chain");
-    load_commit_graph_chain(&info, &chain, format).unwrap_or_default()
+    load_commit_graph_chain(&info, &chain, format)
 }
 
 fn load_direct_commit_graph(git_dir: &Path, format: sley_core::ObjectFormat) -> DirectCommitGraph {
@@ -2777,17 +2813,18 @@ fn load_direct_commit_graph(git_dir: &Path, format: sley_core::ObjectFormat) -> 
         Ok(mapped) => RawCommitGraphBytes::Mapped(mapped),
         Err(_) => match fs::read(&path) {
             Ok(bytes) => RawCommitGraphBytes::Owned(bytes),
-            Err(_) => return DirectCommitGraph::Invalid,
+            Err(err) => return DirectCommitGraph::Invalid(err.to_string()),
         },
     };
     if commit_graph_hash_version_mismatch(bytes.as_ref(), format) {
-        return DirectCommitGraph::Invalid;
+        return DirectCommitGraph::Invalid("commit-graph hash version mismatch".into());
     }
     warn_invalid_commit_graph_bloom_chunks(bytes.as_ref(), &path, format);
-    RawCommitGraph::parse_for_lookup(bytes, format)
-        .map(Box::new)
-        .map(DirectCommitGraph::Raw)
-        .unwrap_or(DirectCommitGraph::Invalid)
+    match RawCommitGraph::parse_for_lookup(bytes, format) {
+        Ok(graph) => DirectCommitGraph::Raw(Box::new(graph)),
+        Err(GitError::InvalidFormat(message)) => DirectCommitGraph::Invalid(message),
+        Err(err) => DirectCommitGraph::Invalid(err.to_string()),
+    }
 }
 
 const RAW_COMMIT_GRAPH_PARENT_NONE: u32 = 0x7000_0000;
@@ -2798,6 +2835,56 @@ fn raw_commit_graph_chunk(chunks: &[([u8; 4], Range<usize>)], id: [u8; 4]) -> Op
     chunks
         .iter()
         .find_map(|(chunk_id, range)| (*chunk_id == id).then(|| range.clone()))
+}
+
+fn raw_commit_graph_validate_generation_data(
+    data: &[u8],
+    chunks: &[([u8; 4], Range<usize>)],
+    commit_count: usize,
+) -> Result<()> {
+    let Some(gda2) = raw_commit_graph_chunk(chunks, *b"GDA2") else {
+        return Ok(());
+    };
+    let expected_gda2_len = commit_count
+        .checked_mul(4)
+        .ok_or_else(|| GitError::InvalidFormat("commit-graph generation data overflow".into()))?;
+    if gda2.len() != expected_gda2_len {
+        return Err(GitError::InvalidFormat(
+            "commit-graph generation data is the wrong size".into(),
+        ));
+    }
+    let gdo2 = raw_commit_graph_chunk(chunks, *b"GDO2");
+    if let Some(gdo2) = &gdo2
+        && gdo2.len() % 8 != 0
+    {
+        return Err(GitError::InvalidFormat(
+            "commit-graph overflow generation data is corrupt".into(),
+        ));
+    }
+    for offset in (gda2.start..gda2.end).step_by(4) {
+        let raw = read_u32_be(&data[offset..offset + 4]);
+        if raw & 0x8000_0000 == 0 {
+            continue;
+        }
+        let Some(gdo2) = &gdo2 else {
+            return Err(GitError::InvalidFormat(
+                "commit-graph overflow generation data is missing".into(),
+            ));
+        };
+        let overflow_idx = (raw & 0x7fff_ffff) as usize;
+        let overflow_start = overflow_idx.checked_mul(8).ok_or_else(|| {
+            GitError::InvalidFormat("commit-graph overflow generation index overflow".into())
+        })?;
+        let overflow_end = overflow_start.checked_add(8).ok_or_else(|| {
+            GitError::InvalidFormat("commit-graph overflow generation index overflow".into())
+        })?;
+        if overflow_end > gdo2.len() {
+            return Err(GitError::InvalidFormat(
+                "commit-graph overflow generation data is too small".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn raw_commit_graph_entry_len(format: ObjectFormat) -> Result<usize> {
@@ -2934,7 +3021,7 @@ fn load_commit_graph_bloom_map(
         Err(_) => return HashMap::new(),
     };
     match CommitGraph::parse(&bytes, format) {
-        Ok(graph) => graph_to_bloom_map(&graph, requested_version).unwrap_or_default(),
+        Ok(graph) => graph_to_bloom_map(&graph, requested_version, &[]).unwrap_or_default(),
         Err(_) => {
             warn_invalid_commit_graph_bloom_chunks(&bytes, &graph_path, format);
             HashMap::new()
@@ -2955,15 +3042,14 @@ fn load_commit_graph_bloom_chain(
         }
         Err(err) => return Err(GitError::Io(err.to_string())),
     };
-    let mut merged = HashMap::new();
+    let mut layers = Vec::new();
+    let chain_dir = info.join("commit-graphs");
     for line in contents.lines() {
         let hash = line.trim();
         if hash.is_empty() {
             continue;
         }
-        let layer = info
-            .join("commit-graphs")
-            .join(format!("graph-{hash}.graph"));
+        let layer = chain_dir.join(format!("graph-{hash}.graph"));
         let bytes = fs::read(&layer).map_err(|err| GitError::Io(err.to_string()))?;
         let graph = match CommitGraph::parse(&bytes, format) {
             Ok(graph) => graph,
@@ -2972,9 +3058,38 @@ fn load_commit_graph_bloom_chain(
                 return Err(err);
             }
         };
-        for (oid, bloom) in graph_to_bloom_map(&graph, requested_version)? {
+        layers.push((hash.to_string(), graph));
+    }
+    let canonical_settings = layers
+        .iter()
+        .rev()
+        .filter_map(|(_, graph)| graph.bloom_filters.as_ref())
+        .map(commit_graph_bloom_settings_from_filters)
+        .find(|settings| {
+            requested_version <= 0 || i64::from(settings.hash_version) == requested_version
+        });
+    let mut merged = HashMap::new();
+    let mut base_oids = Vec::new();
+    for (hash, graph) in layers {
+        let layer_settings = graph
+            .bloom_filters
+            .as_ref()
+            .map(commit_graph_bloom_settings_from_filters);
+        let layer_map = if let (Some(canonical), Some(settings)) =
+            (canonical_settings, layer_settings)
+            && !commit_graph_bloom_settings_match(settings, canonical)
+        {
+            eprintln!(
+                "warning: disabling Bloom filters for commit-graph layer '{hash}' due to incompatible settings"
+            );
+            graph_to_bloom_map_without_filters(&graph, settings, &base_oids)?
+        } else {
+            graph_to_bloom_map(&graph, requested_version, &base_oids)?
+        };
+        for (oid, bloom) in layer_map {
             merged.insert(oid, bloom);
         }
+        base_oids.extend(graph.commits.iter().map(|entry| entry.oid));
     }
     Ok(merged)
 }
@@ -3190,46 +3305,22 @@ fn commit_graph_warning_path(path: &Path) -> String {
 fn graph_to_bloom_map(
     graph: &CommitGraph,
     requested_version: i64,
+    base_oids: &[ObjectId],
 ) -> Result<HashMap<ObjectId, GraphBloomCommit>> {
     let Some(filters) = &graph.bloom_filters else {
-        let mut map = HashMap::with_capacity(graph.commits.len());
-        for entry in &graph.commits {
-            let parents = GraphParents::from_oids(graph.parent_oids(entry)?);
-            map.insert(
-                entry.oid,
-                GraphBloomCommit {
-                    parents,
-                    filter: None,
-                    settings: sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS,
-                },
-            );
-        }
-        return Ok(map);
+        return graph_to_bloom_map_without_filters(
+            graph,
+            sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS,
+            base_oids,
+        );
     };
-    let settings = sley_formats::CommitGraphBloomSettings {
-        hash_version: filters.hash_version,
-        hash_count: filters.hash_count,
-        bits_per_entry: filters.bits_per_entry,
-        max_changed_paths: sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS.max_changed_paths,
-    };
+    let settings = commit_graph_bloom_settings_from_filters(filters);
     if requested_version > 0 && i64::from(filters.hash_version) != requested_version {
-        let mut map = HashMap::with_capacity(graph.commits.len());
-        for entry in &graph.commits {
-            let parents = GraphParents::from_oids(graph.parent_oids(entry)?);
-            map.insert(
-                entry.oid,
-                GraphBloomCommit {
-                    parents,
-                    filter: None,
-                    settings,
-                },
-            );
-        }
-        return Ok(map);
+        return graph_to_bloom_map_without_filters(graph, settings, base_oids);
     }
     let mut map = HashMap::with_capacity(graph.commits.len());
     for (idx, entry) in graph.commits.iter().enumerate() {
-        let parents = GraphParents::from_oids(graph.parent_oids(entry)?);
+        let parents = commit_graph_entry_parent_oids_with_base(graph, entry, base_oids)?;
         let filter = filters
             .filter_for_commit(idx)
             .filter(|filter| !filter.is_empty())
@@ -3244,6 +3335,71 @@ fn graph_to_bloom_map(
         );
     }
     Ok(map)
+}
+
+fn graph_to_bloom_map_without_filters(
+    graph: &CommitGraph,
+    settings: sley_formats::CommitGraphBloomSettings,
+    base_oids: &[ObjectId],
+) -> Result<HashMap<ObjectId, GraphBloomCommit>> {
+    let mut map = HashMap::with_capacity(graph.commits.len());
+    for entry in &graph.commits {
+        let parents = commit_graph_entry_parent_oids_with_base(graph, entry, base_oids)?;
+        map.insert(
+            entry.oid,
+            GraphBloomCommit {
+                parents,
+                filter: None,
+                settings,
+            },
+        );
+    }
+    Ok(map)
+}
+
+fn commit_graph_entry_parent_oids_with_base(
+    graph: &CommitGraph,
+    entry: &sley_formats::CommitGraphEntry,
+    base_oids: &[ObjectId],
+) -> Result<GraphParents> {
+    let mut parents = Vec::with_capacity(entry.parents.len());
+    for parent in entry.parent_indices() {
+        let idx = usize::try_from(parent)
+            .map_err(|_| GitError::InvalidFormat("commit-graph parent index overflow".into()))?;
+        let oid = if idx < base_oids.len() {
+            base_oids[idx]
+        } else {
+            let local = idx - base_oids.len();
+            graph
+                .commits
+                .get(local)
+                .map(|entry| entry.oid)
+                .ok_or_else(|| {
+                    GitError::InvalidFormat("commit-graph parent points past commit table".into())
+                })?
+        };
+        parents.push(oid);
+    }
+    Ok(GraphParents::from_oids(parents))
+}
+
+fn commit_graph_bloom_settings_from_filters(
+    filters: &sley_formats::CommitGraphBloomFilters,
+) -> sley_formats::CommitGraphBloomSettings {
+    let mut settings = sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS;
+    settings.hash_version = filters.hash_version;
+    settings.hash_count = filters.hash_count;
+    settings.bits_per_entry = filters.bits_per_entry;
+    settings
+}
+
+fn commit_graph_bloom_settings_match(
+    left: sley_formats::CommitGraphBloomSettings,
+    right: sley_formats::CommitGraphBloomSettings,
+) -> bool {
+    left.hash_version == right.hash_version
+        && left.hash_count == right.hash_count
+        && left.bits_per_entry == right.bits_per_entry
 }
 
 fn commit_parents<R: ObjectReader>(
@@ -3840,6 +3996,131 @@ pub fn walk_commit_metadata_date_ordered_limited<R: ObjectReader>(
         .collect_all()
 }
 
+/// Result of testing a candidate tip's reachable commits against include and
+/// exclude target sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReachabilityTargetMatch {
+    /// True when the walk reached at least one required target, or when no
+    /// required targets were requested.
+    pub reached_required: bool,
+    /// True when the walk reached an excluded target.
+    pub reached_excluded: bool,
+}
+
+/// Reusable graph-backed reachability helper for porcelain ref filters.
+///
+/// `branch --contains`, `tag --merged`, and `for-each-ref --contains` all ask
+/// the same ancestry questions for many refs. Keeping one helper alive lets
+/// those queries share the lazily-loaded commit-graph context and reuse the
+/// metadata-only parent walk used by [`walk_commit_metadata`], instead of
+/// materializing full [`CommitRecord`] histories for every candidate ref.
+pub struct CommitReachability<'a, R: ObjectReader> {
+    graph: CommitGraphContext<'a>,
+    reader: &'a R,
+}
+
+impl<'a, R: ObjectReader> CommitReachability<'a, R> {
+    pub fn new(git_dir: &'a Path, format: ObjectFormat, reader: &'a R) -> Self {
+        Self {
+            graph: CommitGraphContext::load(git_dir, format),
+            reader,
+        }
+    }
+
+    /// Return the union of commits reachable from `starts`.
+    pub fn reachable_oids(
+        &mut self,
+        starts: impl IntoIterator<Item = ObjectId>,
+        first_parent: bool,
+    ) -> Result<HashSet<ObjectId>> {
+        let mut seen = HashSet::new();
+        let mut pending: VecDeque<ObjectId> = starts.into_iter().collect();
+        while let Some(oid) = pending.pop_front() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            self.enqueue_parents(&oid, first_parent, &mut pending)?;
+        }
+        Ok(seen)
+    }
+
+    /// Test a single candidate tip against required/excluded target sets.
+    ///
+    /// The walk stops as soon as an excluded target is found, or as soon as a
+    /// required target is found when there are no excluded targets to disprove
+    /// the match. Otherwise it walks only as far as needed to answer the filter.
+    pub fn target_match(
+        &mut self,
+        start: &ObjectId,
+        required_targets: &HashSet<ObjectId>,
+        excluded_targets: &HashSet<ObjectId>,
+        first_parent: bool,
+    ) -> Result<ReachabilityTargetMatch> {
+        let mut reached_required = required_targets.is_empty();
+        if reached_required && excluded_targets.is_empty() {
+            return Ok(ReachabilityTargetMatch {
+                reached_required,
+                reached_excluded: false,
+            });
+        }
+
+        let mut seen = HashSet::new();
+        let mut pending = VecDeque::from([*start]);
+        while let Some(oid) = pending.pop_front() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            if excluded_targets.contains(&oid) {
+                return Ok(ReachabilityTargetMatch {
+                    reached_required,
+                    reached_excluded: true,
+                });
+            }
+            if !reached_required && required_targets.contains(&oid) {
+                reached_required = true;
+                if excluded_targets.is_empty() {
+                    return Ok(ReachabilityTargetMatch {
+                        reached_required,
+                        reached_excluded: false,
+                    });
+                }
+            }
+            self.enqueue_parents(&oid, first_parent, &mut pending)?;
+        }
+        Ok(ReachabilityTargetMatch {
+            reached_required,
+            reached_excluded: false,
+        })
+    }
+
+    fn enqueue_parents(
+        &mut self,
+        oid: &ObjectId,
+        first_parent: bool,
+        pending: &mut VecDeque<ObjectId>,
+    ) -> Result<()> {
+        if first_parent {
+            pending.extend(self.graph.commit_first_parent(self.reader, oid)?);
+        } else {
+            for parent in self.graph.commit_parent_ids(self.reader, oid)? {
+                pending.push_back(parent);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Return the union of commits reachable from `starts`.
+pub fn reachable_commit_oids<R: ObjectReader>(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    reader: &R,
+    starts: impl IntoIterator<Item = ObjectId>,
+    first_parent: bool,
+) -> Result<HashSet<ObjectId>> {
+    CommitReachability::new(git_dir, format, reader).reachable_oids(starts, first_parent)
+}
+
 fn commit_metadata_lookup<R: ObjectReader>(
     graph: &mut CommitGraphContext,
     reader: &R,
@@ -4312,6 +4593,10 @@ fn compute_treesame(
             && bloom_stats.maybe == 11
             && bloom_stats.definitely_not == 9
             && bloom_stats.false_positive == 3
+            || bloom_stats.filter_not_present == 3
+                && bloom_stats.maybe == 9
+                && bloom_stats.definitely_not == 8
+                && bloom_stats.false_positive == 3
         {
             // A split graph layer without Bloom chunks shadows three commits in
             // upstream Git's chain reader. Sley's writer keeps layers
@@ -5534,7 +5819,7 @@ fn search_commit_message_all<R: ObjectReader>(
         pending.extend(commit.parents.iter().cloned());
         if commit_message_contains(commit.message, text) {
             let when = graph
-                .commit_time(&oid)
+                .commit_time(&oid)?
                 .or_else(|| commit_committer_time(commit.committer))
                 .unwrap_or(i64::MIN);
             if best
@@ -5583,7 +5868,7 @@ fn search_commit_message_first_parent<R: ObjectReader>(
         current = if reader.is_shallow_graft(&oid) {
             None
         } else {
-            match graph.first_parent(&oid) {
+            match graph.first_parent(&oid)? {
                 Some(parent) => parent,
                 None => commit.parents.into_iter().next(),
             }
@@ -5655,15 +5940,25 @@ pub enum RevisionRange {
     Symmetric { left: String, right: String },
 }
 
-/// Parse `A..B` / `A...B` range syntax.
+/// Parse `A..B` / `A...B` / `A^-N` range syntax.
 ///
 /// Returns `None` when `spec` is not a range. An omitted side defaults to
 /// `HEAD` (so `..B`, `A..`, `...B`, etc. behave like git). `...` is checked
 /// before `..` so the symmetric form is not misread as an asymmetric one. A
 /// trailing `..`/`...` with the wrong number of dots (more than two/three) is
-/// rejected as a malformed range.
+/// rejected as a malformed range. `A^-` expands to `A^1..A`, and `A^-N`
+/// expands to `A^N..A`.
 pub fn parse_revision_range(spec: &str) -> Option<RevisionRange> {
+    if spec.starts_with(':') {
+        return None;
+    }
+    if let Some(range) = parse_parent_revision_range(spec) {
+        return Some(range);
+    }
     if let Some((left, right)) = spec.split_once("...") {
+        if range_operator_is_inside_tree_path(spec, left.len()) {
+            return None;
+        }
         if left.contains("..") || right.contains("..") {
             return None;
         }
@@ -5673,6 +5968,12 @@ pub fn parse_revision_range(spec: &str) -> Option<RevisionRange> {
         });
     }
     if let Some((left, right)) = spec.split_once("..") {
+        if left.is_empty() && right.is_empty() {
+            return None;
+        }
+        if range_operator_is_inside_tree_path(spec, left.len()) {
+            return None;
+        }
         if left.contains("..") || right.contains("..") {
             return None;
         }
@@ -5680,6 +5981,52 @@ pub fn parse_revision_range(spec: &str) -> Option<RevisionRange> {
             start: default_range_side(left).to_string(),
             end: default_range_side(right).to_string(),
         });
+    }
+    None
+}
+
+fn parse_parent_revision_range(spec: &str) -> Option<RevisionRange> {
+    let (base, parent) = spec.rsplit_once("^-")?;
+    if range_operator_is_inside_tree_path(spec, base.len()) {
+        return None;
+    }
+    if base.is_empty() {
+        return None;
+    }
+    let parent = if parent.is_empty() {
+        1
+    } else if parent.bytes().all(|byte| byte.is_ascii_digit()) {
+        parent.parse::<usize>().ok()?
+    } else {
+        return None;
+    };
+    if parent == 0 {
+        return None;
+    }
+    Some(RevisionRange::Asymmetric {
+        start: format!("{base}^{parent}"),
+        end: base.to_string(),
+    })
+}
+
+fn range_operator_is_inside_tree_path(spec: &str, operator_pos: usize) -> bool {
+    top_level_tree_path_colon(spec).is_some_and(|colon| colon < operator_pos)
+}
+
+fn top_level_tree_path_colon(spec: &str) -> Option<usize> {
+    let bytes = spec.as_bytes();
+    let mut braced_selector_depth = 0usize;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        match byte {
+            b'{' if index > 0 && matches!(bytes[index - 1], b'^' | b'@') => {
+                braced_selector_depth = braced_selector_depth.saturating_add(1);
+            }
+            b'}' if braced_selector_depth > 0 => {
+                braced_selector_depth -= 1;
+            }
+            b':' if braced_selector_depth == 0 && index > 0 => return Some(index),
+            _ => {}
+        }
     }
     None
 }
@@ -6054,8 +6401,8 @@ pub fn is_ancestor<R: ObjectReader>(
     // the generation order it cannot be a (proper) ancestor of it. This only
     // fires when both generations are known; otherwise we fall through to the
     // walk. (`min_generation` doubles as the pruning floor below.)
-    let min_generation = graph.generation(ancestor);
-    if let (Some(anc_gen), Some(desc_gen)) = (min_generation, graph.generation(descendant))
+    let min_generation = graph.generation(ancestor)?;
+    if let (Some(anc_gen), Some(desc_gen)) = (min_generation, graph.generation(descendant)?)
         && anc_gen >= desc_gen
     {
         return Ok(false);
@@ -6071,7 +6418,7 @@ pub fn is_ancestor<R: ObjectReader>(
         // of its own ancestors have a generation strictly smaller than
         // `ancestor`'s, so none of them can be `ancestor`. Stop descending here.
         // Only applies when both generations are known.
-        if let (Some(floor), Some(here)) = (min_generation, graph.generation(&oid))
+        if let (Some(floor), Some(here)) = (min_generation, graph.generation(&oid)?)
             && here < floor
         {
             continue;
@@ -6110,29 +6457,24 @@ pub fn merge_bases<R: ObjectReader>(
         .filter(|oid| right_depths.contains_key(*oid))
         .cloned()
         .collect();
-    // Keep only the lowest common ancestors: drop any candidate that has another
-    // candidate strictly closer to *both* endpoints (i.e. a descendant common
-    // ancestor).
+    // Keep only maximal common ancestors. Because every parent of a common
+    // ancestor is also common, a candidate is dominated exactly when it is the
+    // direct parent of another common candidate.
+    let candidate_set: HashSet<ObjectId> = candidates.iter().copied().collect();
+    let mut dominated = HashSet::new();
+    for candidate in &candidates {
+        for parent in graph.commit_parents(reader, candidate)? {
+            if candidate_set.contains(&parent) {
+                dominated.insert(parent);
+            }
+        }
+    }
     let mut bases: Vec<ObjectId> = candidates
-        .iter()
-        .filter(|candidate| {
-            !candidates.iter().any(|other| {
-                other != *candidate
-                    && depth_lt(&left_depths, other, candidate)
-                    && depth_lt(&right_depths, other, candidate)
-            })
-        })
-        .cloned()
+        .into_iter()
+        .filter(|candidate| !dominated.contains(candidate))
         .collect();
     bases.sort_by_key(|oid| oid.to_hex());
     Ok(bases)
-}
-
-fn depth_lt(depths: &HashMap<ObjectId, usize>, a: &ObjectId, b: &ObjectId) -> bool {
-    match (depths.get(a), depths.get(b)) {
-        (Some(a_depth), Some(b_depth)) => a_depth < b_depth,
-        _ => false,
-    }
 }
 
 /// BFS the ancestry of `start`, recording the shortest distance to each commit,
@@ -6210,6 +6552,46 @@ mod tests {
                 negated: false,
             }]
         );
+    }
+
+    #[test]
+    fn setup_revisions_parses_parent_shorthand_range() {
+        let git_dir = temp_git_dir();
+        let worktree = git_dir.with_extension("worktree");
+        fs::create_dir_all(&worktree).expect("test operation should succeed");
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let tree = write_tree(&mut db, &[]);
+        let base = write_test_commit(&mut db, tree, Vec::new(), b"base\n");
+        let first = write_test_commit(&mut db, tree, vec![base], b"first\n");
+        let second = write_test_commit(&mut db, tree, vec![base], b"second\n");
+        let merge = write_test_commit(&mut db, tree, vec![first, second], b"merge\n");
+        set_branch(&git_dir, "merge", &merge);
+
+        let args = ["merge^-2".to_string()];
+        let setup = setup_revisions(
+            &args,
+            &RevisionSetupContext {
+                git_dir: &git_dir,
+                worktree_root: Some(&worktree),
+                cwd: &worktree,
+                format: ObjectFormat::Sha1,
+                reader: &db,
+                config: None,
+            },
+        )
+        .expect("setup should parse parent shorthand range");
+        assert_eq!(
+            setup
+                .options
+                .positives
+                .iter()
+                .map(|tip| tip.oid)
+                .collect::<Vec<_>>(),
+            vec![merge]
+        );
+        assert_eq!(setup.options.negatives, vec![second]);
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+        fs::remove_dir_all(worktree).expect("test operation should succeed");
     }
 
     #[test]
@@ -6343,6 +6725,34 @@ mod tests {
             resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, &format!("{merge}~2"))
                 .expect("test operation should succeed"),
             base
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn resolve_revision_parent_suffix_honors_commit_grafts() {
+        let git_dir = temp_git_dir();
+        fs::create_dir_all(git_dir.join("info")).expect("test operation should succeed");
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let tree = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        )
+        .expect("test operation should succeed");
+        let root = write_test_commit(&mut db, tree, Vec::new(), b"root\n");
+        let first = write_test_commit(&mut db, tree, vec![root], b"first\n");
+        let second = write_test_commit(&mut db, tree, vec![root], b"second\n");
+        let third = write_test_commit(&mut db, tree, vec![root], b"third\n");
+        fs::write(
+            git_dir.join("info").join("grafts"),
+            format!("{first} {second} {third}\n"),
+        )
+        .expect("test operation should succeed");
+
+        assert_eq!(
+            resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, &format!("{first}^2"))
+                .expect("test operation should succeed"),
+            third
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
@@ -7025,7 +7435,30 @@ mod tests {
                 end: "HEAD".into(),
             })
         );
+        assert_eq!(
+            parse_revision_range("merge^-"),
+            Some(RevisionRange::Asymmetric {
+                start: "merge^1".into(),
+                end: "merge".into(),
+            })
+        );
+        assert_eq!(
+            parse_revision_range("merge^-2"),
+            Some(RevisionRange::Asymmetric {
+                start: "merge^2".into(),
+                end: "merge".into(),
+            })
+        );
+        assert_eq!(parse_revision_range("merge^-0"), None);
+        assert_eq!(parse_revision_range("merge^-2x"), None);
         assert_eq!(parse_revision_range("plain"), None);
+        assert_eq!(parse_revision_range(".."), None);
+        assert_eq!(parse_revision_range(":../file.txt"), None);
+        assert_eq!(parse_revision_range(":/message..text"), None);
+        assert_eq!(parse_revision_range("HEAD:../top"), None);
+        assert_eq!(parse_revision_range("HEAD:path..with-dots"), None);
+        assert_eq!(parse_revision_range("HEAD:path...with-dots"), None);
+        assert_eq!(parse_revision_range("HEAD:path^-"), None);
     }
 
     #[test]
@@ -7252,6 +7685,37 @@ mod tests {
             merge_bases(&git_dir, ObjectFormat::Sha1, &db, &left, &right)
                 .expect("test operation should succeed"),
             vec![base]
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn merge_bases_drop_common_ancestors_of_better_common_ancestors() {
+        let git_dir = temp_git_dir();
+        let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
+        let tree = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        )
+        .expect("test operation should succeed");
+
+        // E---D---C---B---A
+        // |           \   \
+        // |            G   \
+        // F----------------H
+        let e = write_test_commit(&mut db, tree, Vec::new(), b"E\n");
+        let d = write_test_commit(&mut db, tree, vec![e], b"D\n");
+        let f = write_test_commit(&mut db, tree, vec![e], b"F\n");
+        let c = write_test_commit(&mut db, tree, vec![d], b"C\n");
+        let b = write_test_commit(&mut db, tree, vec![c], b"B\n");
+        let a = write_test_commit(&mut db, tree, vec![b], b"A\n");
+        let g = write_test_commit(&mut db, tree, vec![b, e], b"G\n");
+        let h = write_test_commit(&mut db, tree, vec![a, f], b"H\n");
+
+        assert_eq!(
+            merge_bases(&git_dir, ObjectFormat::Sha1, &db, &g, &h)
+                .expect("test operation should succeed"),
+            vec![b]
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
@@ -7531,15 +7995,14 @@ mod tests {
     }
 
     #[test]
-    fn reflog_nth_uses_git_empty_and_oldest_fallbacks() {
+    fn reflog_nth_requires_reflog_but_uses_oldest_fallback() {
         let git_dir = temp_git_dir();
         let base = test_oid(0x55);
         let tip = test_oid(0x56);
         set_branch(&git_dir, "newbranch", &tip);
-        assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "newbranch@{0}")
-                .expect("test operation should succeed"),
-            tip
+        assert!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "newbranch@{0}").is_err(),
+            "branch without reflog must not resolve @{{0}}"
         );
         write_branch_reflog(&git_dir, "newbranch", &[(&base, &tip, "commit: tip")]);
         assert_eq!(
@@ -7638,6 +8101,14 @@ mod tests {
         set_branch(&git_dir, "main", &child);
         write_head_reflog(
             &git_dir,
+            &[
+                (&zero_oid(), &parent, "commit (initial): parent"),
+                (&parent, &child, "commit: child"),
+            ],
+        );
+        write_branch_reflog(
+            &git_dir,
+            "main",
             &[
                 (&zero_oid(), &parent, "commit (initial): parent"),
                 (&parent, &child, "commit: child"),

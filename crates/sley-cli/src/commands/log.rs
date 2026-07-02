@@ -999,6 +999,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--remotes"
             | "--no-ignore-missing" => setup_args.push(arg.clone()),
             "--boundary" => boundary = true,
+            "-t" => {}
             "--ignore-missing" => {
                 ignored_missing_input = true;
                 setup_args.push(arg.clone());
@@ -1852,6 +1853,28 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 diff_opts.patch = true;
                 diff_format_explicit = true;
             }
+            "-U" | "--unified" => {
+                diff_opts.context = Some(3);
+                diff_opts.patch = true;
+                diff_format_explicit = true;
+            }
+            value if value.starts_with("-U") && value.len() > 2 => {
+                let raw = &value[2..];
+                patch_validate_unified_context(raw, true)?;
+                diff_opts.context = Some(commands::diff_options::parse_unified_count(raw));
+                diff_opts.patch = true;
+                diff_format_explicit = true;
+            }
+            "--unified=" => {
+                return commit_unified_expects_numerical_value_error(false);
+            }
+            value if value.starts_with("--unified=") => {
+                let raw = &value["--unified=".len()..];
+                patch_validate_unified_context(raw, false)?;
+                diff_opts.context = Some(commands::diff_options::parse_unified_count(raw));
+                diff_opts.patch = true;
+                diff_format_explicit = true;
+            }
             "-s" | "--no-patch" => {
                 diff_opts = LogDiffOptions::default();
                 diff_format_explicit = true;
@@ -1999,17 +2022,18 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     if read_stdin {
         let mut input = String::new();
         io::stdin().read_to_string(&mut input)?;
-        if setup_not {
-            setup_args.push("--not".to_string());
-        }
         if ignored_missing_input && input.lines().any(|line| !line.is_empty()) {
             revision_input_with_ignore_missing = true;
         }
-        setup_args.extend(
-            input
-                .lines()
-                .filter(|line| !line.is_empty())
-                .map(str::to_string),
+        let stdin_args = input
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        crate::commands::rev_list::merge_setup_args_from_stdin(
+            &mut setup_args,
+            stdin_args,
+            setup_not,
         );
     }
     if show_parents && show_children {
@@ -2200,6 +2224,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // Compile any `-I<regex>` patterns now (a malformed regex fails like git's
     // diff_opt_ignore_regex, exit 129).
     diff_opts.ignore_regexes = crate::compile_ignore_matching_regexes(&ignore_regex_patterns)?;
+    if diff_opts.any() || diff_opts.merges_imply_patch {
+        diff_opts.context = Some(commands::diff_options::resolve_diff_context(
+            diff_opts.context,
+            Some(&config),
+        )?);
+    }
     // Resolve and validate pickaxe (`-S`/`-G`/`--find-object`). git OR-s the
     // kind bits and rejects any combination of the three kinds; `-G` cannot be
     // combined with `--pickaxe-regex`; `--pickaxe-all` cannot be combined with
@@ -2871,7 +2901,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             || !log_age_filters_match(record, max_age, min_age)?
             || !log_author_matcher_matches(record, author_filters.as_ref(), filter_mailmap)
             || !log_committer_matcher_matches(record, committer_filters.as_ref(), filter_mailmap)
-            || !log_grep_matcher_matches(record, grep_filters.as_ref(), grep_all_match, invert_grep)
+            || !log_grep_matcher_matches(
+                record,
+                grep_filters.as_ref(),
+                grep_all_match,
+                invert_grep,
+                &output_encoding,
+            )
         {
             continue;
         }
@@ -3167,10 +3203,25 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         db: &db,
         format,
     };
+    let source_tag_signatures = if matches!(
+        &output,
+        LogOutput::Compiled { compiled, .. } if compiled.uses_signature()
+    ) {
+        source_tag_signatures_for_revision_tips(
+            &git_dir,
+            &db,
+            format,
+            &config,
+            &revision_options.positives,
+        )?
+    } else {
+        HashMap::new()
+    };
     let signature_ctx = LogSignatureContext {
         git_dir: &git_dir,
         db: &db,
         config: &config,
+        source_tag_signatures: &source_tag_signatures,
     };
     // `%S` source labels: each commit is tagged with the start ref from which it
     // is reachable; when several starts reach it, the last one (command-line

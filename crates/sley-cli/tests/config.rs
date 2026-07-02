@@ -88,7 +88,7 @@ fn run_output_with_env_removed(
 /// given args and environment overlay.
 fn assert_env_match(upstream: &Path, rust: &Path, args: &[&str], envs: &[(&str, &str)]) {
     let expected = run_output_with_env(sley_testkit::oracle_git(), upstream, args, envs);
-    let actual = run_output_with_env(env!("CARGO_BIN_EXE_sley"), rust, args, envs);
+    let actual = run_output_with_env(sley_testkit::sley_bin!(), rust, args, envs);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),
@@ -115,7 +115,7 @@ fn assert_env_removed_match(
 ) {
     let expected =
         run_output_with_env_removed(sley_testkit::oracle_git(), upstream, args, envs, removed);
-    let actual = run_output_with_env_removed(env!("CARGO_BIN_EXE_sley"), rust, args, envs, removed);
+    let actual = run_output_with_env_removed(sley_testkit::sley_bin!(), rust, args, envs, removed);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),
@@ -137,19 +137,19 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
     run(sley_testkit::oracle_git(), cwd, args)
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn assert_outputs_match(upstream: &Path, rust: &Path, args: &[&str]) {
     let expected = git(upstream, args);
-    let actual = git_rs(rust, args);
+    let actual = sley(rust, args);
     assert_eq!(actual, expected, "sley output differed for {args:?}");
 }
 
 fn assert_status_stdout_stderr_match(upstream: &Path, rust: &Path, args: &[&str]) {
     let expected = run_output(sley_testkit::oracle_git(), upstream, args);
-    let actual = run_output(env!("CARGO_BIN_EXE_sley"), rust, args);
+    let actual = run_output(sley_testkit::sley_bin!(), rust, args);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),
@@ -169,7 +169,7 @@ fn assert_status_stdout_stderr_match(upstream: &Path, rust: &Path, args: &[&str]
 
 fn assert_status_match(upstream: &Path, rust: &Path, args: &[&str]) {
     let expected = run_output(sley_testkit::oracle_git(), upstream, args);
-    let actual = run_output(env!("CARGO_BIN_EXE_sley"), rust, args);
+    let actual = run_output(sley_testkit::sley_bin!(), rust, args);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),
@@ -186,7 +186,7 @@ fn assert_status_stdout_stderr_match_with_input(
     stdin: &[u8],
 ) {
     let expected = run_output_with_input(sley_testkit::oracle_git(), upstream, args, stdin);
-    let actual = run_output_with_input(env!("CARGO_BIN_EXE_sley"), rust, args, stdin);
+    let actual = run_output_with_input(sley_testkit::sley_bin!(), rust, args, stdin);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),
@@ -216,7 +216,7 @@ fn config_modern_subcommands_match_upstream_git_for_local_config() {
         git(&rust, &["init", "-q", "-b", "main"]);
 
         let set_name = ["config", "set", "--local", "user.name", "Ada Lovelace"];
-        assert_eq!(git(&upstream, &set_name), git_rs(&rust, &set_name));
+        assert_eq!(git(&upstream, &set_name), sley(&rust, &set_name));
         assert_outputs_match(&upstream, &rust, &["config", "get", "--local", "user.name"]);
         assert_outputs_match(
             &upstream,
@@ -261,7 +261,7 @@ fn config_modern_subcommands_match_upstream_git_for_local_config() {
         );
 
         let set_bool = ["config", "set", "--local", "feature.enabled", "yes"];
-        assert_eq!(git(&upstream, &set_bool), git_rs(&rust, &set_bool));
+        assert_eq!(git(&upstream, &set_bool), sley(&rust, &set_bool));
         assert_outputs_match(
             &upstream,
             &rust,
@@ -287,7 +287,7 @@ fn config_modern_subcommands_match_upstream_git_for_local_config() {
             "remote.origin.fetch",
             "+refs/heads/main:refs/remotes/origin/main",
         ];
-        assert_eq!(git(&upstream, &append_main), git_rs(&rust, &append_main));
+        assert_eq!(git(&upstream, &append_main), sley(&rust, &append_main));
         let append_dev = [
             "config",
             "set",
@@ -296,7 +296,7 @@ fn config_modern_subcommands_match_upstream_git_for_local_config() {
             "remote.origin.fetch",
             "+refs/heads/dev:refs/remotes/origin/dev",
         ];
-        assert_eq!(git(&upstream, &append_dev), git_rs(&rust, &append_dev));
+        assert_eq!(git(&upstream, &append_dev), sley(&rust, &append_dev));
         assert_outputs_match(
             &upstream,
             &rust,
@@ -309,7 +309,7 @@ fn config_modern_subcommands_match_upstream_git_for_local_config() {
             &["config", "unset", "--local", "remote.origin.fetch"],
         );
         let unset_all = ["config", "unset", "--local", "--all", "remote.origin.fetch"];
-        assert_eq!(git(&upstream, &unset_all), git_rs(&rust, &unset_all));
+        assert_eq!(git(&upstream, &unset_all), sley(&rust, &unset_all));
         assert_status_stdout_stderr_match(
             &upstream,
             &rust,
@@ -317,7 +317,7 @@ fn config_modern_subcommands_match_upstream_git_for_local_config() {
         );
 
         let unset_name = ["config", "unset", "--local", "user.name"];
-        assert_eq!(git(&upstream, &unset_name), git_rs(&rust, &unset_name));
+        assert_eq!(git(&upstream, &unset_name), sley(&rust, &unset_name));
         assert_status_stdout_stderr_match(
             &upstream,
             &rust,
@@ -326,7 +326,7 @@ fn config_modern_subcommands_match_upstream_git_for_local_config() {
 
         for (key, value) in [("demo.old.one", "1"), ("demo.old.two", "2")] {
             let args = ["config", "set", "--local", key, value];
-            assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+            assert_eq!(git(&upstream, &args), sley(&rust, &args));
         }
         let rename_section = [
             "config",
@@ -337,7 +337,7 @@ fn config_modern_subcommands_match_upstream_git_for_local_config() {
         ];
         assert_eq!(
             git(&upstream, &rename_section),
-            git_rs(&rust, &rename_section)
+            sley(&rust, &rename_section)
         );
         assert_outputs_match(
             &upstream,
@@ -358,7 +358,7 @@ fn config_modern_subcommands_match_upstream_git_for_local_config() {
         let remove_section = ["config", "remove-section", "--local", "demo.new"];
         assert_eq!(
             git(&upstream, &remove_section),
-            git_rs(&rust, &remove_section)
+            sley(&rust, &remove_section)
         );
         assert_status_match(
             &upstream,
@@ -426,7 +426,7 @@ fn config_file_and_stdin_sources_match_upstream_git() {
             "core.pager",
             "less",
         ];
-        assert_eq!(git(&upstream, &set_args), git_rs(&rust, &set_args));
+        assert_eq!(git(&upstream, &set_args), sley(&rust, &set_args));
         assert_outputs_match(
             &upstream,
             &rust,
@@ -434,7 +434,7 @@ fn config_file_and_stdin_sources_match_upstream_git() {
         );
 
         let unset_args = ["config", "unset", "--file", "custom.config", "core.editor"];
-        assert_eq!(git(&upstream, &unset_args), git_rs(&rust, &unset_args));
+        assert_eq!(git(&upstream, &unset_args), sley(&rust, &unset_args));
         assert_status_stdout_stderr_match(
             &upstream,
             &rust,
@@ -449,7 +449,7 @@ fn config_file_and_stdin_sources_match_upstream_git() {
             "core.editor",
             "nano",
         ];
-        assert_eq!(git(&upstream, &create_args), git_rs(&rust, &create_args));
+        assert_eq!(git(&upstream, &create_args), sley(&rust, &create_args));
         assert_outputs_match(
             &upstream,
             &rust,
@@ -534,7 +534,7 @@ fn config_edit_matches_upstream_git_editor_precedence() {
         ] {
             assert_eq!(
                 git(&upstream, &["config", "-f", "tmp", "test.value", "no"]),
-                git_rs(&rust, &["config", "-f", "tmp", "test.value", "no"])
+                sley(&rust, &["config", "-f", "tmp", "test.value", "no"])
             );
             assert_env_match(&upstream, &rust, &edit_mode, &editor_env);
             assert_outputs_match(&upstream, &rust, &["config", "list", "-f", "tmp"]);
@@ -542,14 +542,14 @@ fn config_edit_matches_upstream_git_editor_precedence() {
 
         assert_eq!(
             git(&upstream, &["config", "-f", "tmp", "test.value", "no"]),
-            git_rs(&rust, &["config", "-f", "tmp", "test.value", "no"])
+            sley(&rust, &["config", "-f", "tmp", "test.value", "no"])
         );
         assert_eq!(
             git(
                 &upstream,
                 &["config", "core.editor", "echo [test]value=yes >"],
             ),
-            git_rs(&rust, &["config", "core.editor", "echo [test]value=yes >"],)
+            sley(&rust, &["config", "core.editor", "echo [test]value=yes >"],)
         );
         assert_env_removed_match(
             &upstream,
@@ -605,7 +605,7 @@ fn config_writes_preserve_git_case_rules() {
                 "Settings.Main",
             ],
         ] {
-            assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+            assert_eq!(git(&upstream, &args), sley(&rust, &args));
         }
         assert_eq!(
             fs::read(upstream.join("custom.config")).expect("read upstream config"),
@@ -621,7 +621,7 @@ fn config_writes_preserve_git_case_rules() {
             "Camel.Section.Mixed-Key",
             "Value",
         ];
-        assert_eq!(git(&upstream, &create_args), git_rs(&rust, &create_args));
+        assert_eq!(git(&upstream, &create_args), sley(&rust, &create_args));
         assert_eq!(
             fs::read(upstream.join("created.config")).expect("read upstream created config"),
             fs::read(rust.join("created.config")).expect("read rust created config"),
@@ -674,7 +674,7 @@ fn config_comment_writes_match_upstream_git() {
                 "Grace",
             ],
         ] {
-            assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+            assert_eq!(git(&upstream, &args), sley(&rust, &args));
         }
         assert_eq!(
             fs::read(upstream.join("custom.config")).expect("read upstream config"),
@@ -736,7 +736,7 @@ fn config_trailing_cr_round_trip_matches_upstream_git() {
         git(&rust, &["init", "-q", "-b", "main"]);
         let value = format!("bar{}", '\r');
         let set_args = ["config", "set", "core.foo", value.as_str()];
-        assert_eq!(git(&upstream, &set_args), git_rs(&rust, &set_args));
+        assert_eq!(git(&upstream, &set_args), sley(&rust, &set_args));
         assert_outputs_match(&upstream, &rust, &["config", "get", "core.foo"]);
     }
     let _ = fs::remove_dir_all(&root);
@@ -822,7 +822,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
         git(&rust, &["init", "-q", "-b", "main"]);
 
         let set_name = ["config", "user.name", "Ada Lovelace"];
-        assert_eq!(git(&upstream, &set_name), git_rs(&rust, &set_name));
+        assert_eq!(git(&upstream, &set_name), sley(&rust, &set_name));
         assert_outputs_match(&upstream, &rust, &["config", "user.name"]);
         assert_outputs_match(&upstream, &rust, &["config", "--get", "user.name"]);
         assert_eq!(
@@ -831,7 +831,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
         );
 
         let set_email = ["config", "--local", "user.email", "ada@example.invalid"];
-        assert_eq!(git(&upstream, &set_email), git_rs(&rust, &set_email));
+        assert_eq!(git(&upstream, &set_email), sley(&rust, &set_email));
         assert_outputs_match(&upstream, &rust, &["config", "--get", "user.email"]);
 
         let add_main = [
@@ -840,14 +840,14 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             "remote.origin.fetch",
             "+refs/heads/main:refs/remotes/origin/main",
         ];
-        assert_eq!(git(&upstream, &add_main), git_rs(&rust, &add_main));
+        assert_eq!(git(&upstream, &add_main), sley(&rust, &add_main));
         let add_dev = [
             "config",
             "--add",
             "remote.origin.fetch",
             "+refs/heads/dev:refs/remotes/origin/dev",
         ];
-        assert_eq!(git(&upstream, &add_dev), git_rs(&rust, &add_dev));
+        assert_eq!(git(&upstream, &add_dev), sley(&rust, &add_dev));
         assert_outputs_match(
             &upstream,
             &rust,
@@ -877,7 +877,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             "remote.origin.fetch",
             "+refs/heads/replaced:refs/remotes/origin/replaced",
         ];
-        assert_eq!(git(&upstream, &replace_all), git_rs(&rust, &replace_all));
+        assert_eq!(git(&upstream, &replace_all), sley(&rust, &replace_all));
         assert_outputs_match(
             &upstream,
             &rust,
@@ -889,7 +889,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             "remote.origin.fetch",
             "+refs/heads/dev:refs/remotes/origin/dev",
         ];
-        assert_eq!(git(&upstream, &add_dev), git_rs(&rust, &add_dev));
+        assert_eq!(git(&upstream, &add_dev), sley(&rust, &add_dev));
         let replace_main_only = [
             "config",
             "--replace-all",
@@ -899,7 +899,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
         ];
         assert_eq!(
             git(&upstream, &replace_main_only),
-            git_rs(&rust, &replace_main_only)
+            sley(&rust, &replace_main_only)
         );
         assert_outputs_match(
             &upstream,
@@ -915,7 +915,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
         ];
         assert_eq!(
             git(&upstream, &append_no_match),
-            git_rs(&rust, &append_no_match)
+            sley(&rust, &append_no_match)
         );
         assert_outputs_match(
             &upstream,
@@ -925,7 +925,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
         let unset_dev_only = ["config", "--unset", "remote.origin.fetch", "dev"];
         assert_eq!(
             git(&upstream, &unset_dev_only),
-            git_rs(&rust, &unset_dev_only)
+            sley(&rust, &unset_dev_only)
         );
         assert_outputs_match(
             &upstream,
@@ -939,12 +939,12 @@ fn config_get_set_add_and_unset_match_upstream_git() {
         );
         for (key, value) in [("demo.old.one", "1"), ("demo.old.two", "2")] {
             let args = ["config", key, value];
-            assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+            assert_eq!(git(&upstream, &args), sley(&rust, &args));
         }
         let rename_section = ["config", "--rename-section", "demo.old", "demo.new"];
         assert_eq!(
             git(&upstream, &rename_section),
-            git_rs(&rust, &rename_section)
+            sley(&rust, &rename_section)
         );
         assert_outputs_match(&upstream, &rust, &["config", "--get", "demo.new.one"]);
         assert_status_match(
@@ -955,7 +955,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
         let remove_section = ["config", "--remove-section", "demo.new"];
         assert_eq!(
             git(&upstream, &remove_section),
-            git_rs(&rust, &remove_section)
+            sley(&rust, &remove_section)
         );
         assert_status_stdout_stderr_match(
             &upstream,
@@ -983,7 +983,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             ("feature.numeric", "1"),
         ] {
             let args = ["config", key, value];
-            assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+            assert_eq!(git(&upstream, &args), sley(&rust, &args));
         }
         assert_outputs_match(&upstream, &rust, &["config", "--bool", "feature.enabled"]);
         assert_outputs_match(
@@ -1059,9 +1059,9 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             ],
         );
         let add_bool = ["config", "--add", "feature.multi", "true"];
-        assert_eq!(git(&upstream, &add_bool), git_rs(&rust, &add_bool));
+        assert_eq!(git(&upstream, &add_bool), sley(&rust, &add_bool));
         let add_bool = ["config", "--add", "feature.multi", "no"];
-        assert_eq!(git(&upstream, &add_bool), git_rs(&rust, &add_bool));
+        assert_eq!(git(&upstream, &add_bool), sley(&rust, &add_bool));
         assert_outputs_match(
             &upstream,
             &rust,
@@ -1096,7 +1096,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
         assert_status_match(&upstream, &rust, &["config", "--unset", "feature.multi"]);
         assert_outputs_match(&upstream, &rust, &["config", "--get-all", "feature.multi"]);
         let unset_multi = ["config", "--unset-all", "feature.multi"];
-        assert_eq!(git(&upstream, &unset_multi), git_rs(&rust, &unset_multi));
+        assert_eq!(git(&upstream, &unset_multi), sley(&rust, &unset_multi));
         assert_status_stdout_stderr_match(
             &upstream,
             &rust,
@@ -1105,7 +1105,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
 
         for value in ["one", "tone", "two"] {
             let args = ["config", "--add", "pattern.multi", value];
-            assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+            assert_eq!(git(&upstream, &args), sley(&rust, &args));
         }
         assert_status_match(
             &upstream,
@@ -1114,20 +1114,20 @@ fn config_get_set_add_and_unset_match_upstream_git() {
         );
         assert_outputs_match(&upstream, &rust, &["config", "--get-all", "pattern.multi"]);
         let replace_many = ["config", "--replace-all", "pattern.multi", "X", "o.*e"];
-        assert_eq!(git(&upstream, &replace_many), git_rs(&rust, &replace_many));
+        assert_eq!(git(&upstream, &replace_many), sley(&rust, &replace_many));
         assert_outputs_match(&upstream, &rust, &["config", "--get-all", "pattern.multi"]);
         let unset_all_pattern = ["config", "--unset-all", "pattern.multi", "t.*"];
         assert_eq!(
             git(&upstream, &unset_all_pattern),
-            git_rs(&rust, &unset_all_pattern)
+            sley(&rust, &unset_all_pattern)
         );
         assert_outputs_match(&upstream, &rust, &["config", "--get-all", "pattern.multi"]);
         for value in ["o.*e", "one"] {
             let args = ["config", "--add", "fixed.multi", value];
-            assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+            assert_eq!(git(&upstream, &args), sley(&rust, &args));
         }
         let unset_fixed = ["config", "--unset", "--fixed-value", "fixed.multi", "o.*e"];
-        assert_eq!(git(&upstream, &unset_fixed), git_rs(&rust, &unset_fixed));
+        assert_eq!(git(&upstream, &unset_fixed), sley(&rust, &unset_fixed));
         assert_outputs_match(&upstream, &rust, &["config", "--get-all", "fixed.multi"]);
         let replace_fixed_missing = [
             "config",
@@ -1139,7 +1139,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
         ];
         assert_eq!(
             git(&upstream, &replace_fixed_missing),
-            git_rs(&rust, &replace_fixed_missing)
+            sley(&rust, &replace_fixed_missing)
         );
         assert_outputs_match(&upstream, &rust, &["config", "--get-all", "fixed.multi"]);
         let replace_fixed = [
@@ -1150,10 +1150,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             "exact",
             "literal",
         ];
-        assert_eq!(
-            git(&upstream, &replace_fixed),
-            git_rs(&rust, &replace_fixed)
-        );
+        assert_eq!(git(&upstream, &replace_fixed), sley(&rust, &replace_fixed));
         assert_outputs_match(&upstream, &rust, &["config", "--get-all", "fixed.multi"]);
 
         for (key, value) in [
@@ -1164,7 +1161,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             ("pack.octal", "010"),
         ] {
             let args = ["config", key, value];
-            assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+            assert_eq!(git(&upstream, &args), sley(&rust, &args));
         }
         assert_outputs_match(&upstream, &rust, &["config", "--int", "pack.windowmemory"]);
         assert_outputs_match(&upstream, &rust, &["config", "--int", "pack.hex"]);
@@ -1207,7 +1204,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             ("gc.prunenever", "never"),
         ] {
             let args = ["config", key, value];
-            assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+            assert_eq!(git(&upstream, &args), sley(&rust, &args));
         }
         assert_outputs_match(
             &upstream,
@@ -1245,7 +1242,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             ("color.normal", "normal"),
         ] {
             let args = ["config", key, value];
-            assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+            assert_eq!(git(&upstream, &args), sley(&rust, &args));
             assert_outputs_match(&upstream, &rust, &["config", "--type=color", key]);
         }
         assert_outputs_match(
@@ -1293,7 +1290,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             ("color.invalid", "maybe"),
         ] {
             let args = ["config", key, value];
-            assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+            assert_eq!(git(&upstream, &args), sley(&rust, &args));
         }
         assert_outputs_match(
             &upstream,
@@ -1368,7 +1365,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             ("http.https://example.com/a%20b/.postBuffer", "encoded"),
         ] {
             let args = ["config", key, value];
-            assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+            assert_eq!(git(&upstream, &args), sley(&rust, &args));
         }
         assert_outputs_match(
             &upstream,
@@ -1590,7 +1587,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             ("http.https://*.example.com.sslVerify", "false"),
         ] {
             let args = ["config", key, value];
-            assert_eq!(git(&upstream, &args), git_rs(&rust, &args));
+            assert_eq!(git(&upstream, &args), sley(&rust, &args));
         }
         for url in [
             "https://example.com",
@@ -1632,7 +1629,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
         );
 
         let path_args = ["config", "core.editorpath", "~/bin/editor"];
-        assert_eq!(git(&upstream, &path_args), git_rs(&rust, &path_args));
+        assert_eq!(git(&upstream, &path_args), sley(&rust, &path_args));
         assert_outputs_match(&upstream, &rust, &["config", "--path", "core.editorpath"]);
         assert_outputs_match(
             &upstream,
@@ -1643,7 +1640,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
         let unset_email = ["config", "--unset", "user.email"];
         assert_eq!(
             git(&upstream, &unset_email),
-            git_rs(&rust, &unset_email),
+            sley(&rust, &unset_email),
             "sley unset output differed"
         );
         assert_status_stdout_stderr_match(
@@ -1655,7 +1652,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
         let unset_fetch = ["config", "--unset-all", "remote.origin.fetch"];
         assert_eq!(
             git(&upstream, &unset_fetch),
-            git_rs(&rust, &unset_fetch),
+            sley(&rust, &unset_fetch),
             "sley unset-all output differed"
         );
         assert_status_stdout_stderr_match(
@@ -1917,7 +1914,7 @@ fn config_injection_matches_upstream_git() {
 
         // --- precedence: command line beats env beats file ----------------
         let set_pair = ["config", "set", "--local", "pair.one", "fromfile"];
-        assert_eq!(git(&upstream, &set_pair), git_rs(&rust, &set_pair));
+        assert_eq!(git(&upstream, &set_pair), sley(&rust, &set_pair));
         // env-count overrides the file.
         assert_env_match(
             &upstream,

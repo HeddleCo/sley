@@ -884,7 +884,14 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     if matches!(source, ConfigSource::Repository(_)) {
         let parameters = crate::injected_config_parameters()?;
         let mut stack = sley_config::ConfigStack { entries };
-        stack.push_parameters(&parameters);
+        if respect_includes_opt == Some(false) {
+            stack.push_parameters(&parameters);
+        } else {
+            let context = config_include_context();
+            stack
+                .push_parameters_with_includes(&parameters, &context)
+                .map_err(|err| report_config_parse_error(err, None))?;
+        }
         entries = stack.entries;
     }
     let entries = entries;
@@ -957,6 +964,9 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 if matches!(source, ConfigSource::Stdin) {
                     return Err(report_config_stdin_parse_error(err));
                 }
+                if let ConfigSource::Blob(spec) = &source {
+                    return Err(report_config_blob_parse_error(err, spec));
+                }
                 return Err(report_config_parse_error(err, path.as_deref()));
             }
         }
@@ -984,83 +994,54 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 }
                 return Ok(());
             }
-            let entry = entries_get(&entries, &key);
-            // git attributes a `--default` fallback to the command line.
-            let meta = entry
-                .map(ConfigValueMeta::of)
-                .unwrap_or_else(ConfigValueMeta::command_line);
             let name = config_key_name(&key);
-            let formatted = match value_type {
-                ConfigValueType::Bool => {
-                    let value = match entry {
-                        Some(entry) => match entry.value.as_deref() {
-                            None => true,
-                            Some(value) => match sley_config::parse_config_bool(value) {
-                                Some(parsed) => parsed,
-                                None => {
-                                    eprintln!(
-                                        "fatal: bad boolean config value '{value}' for '{name}'"
-                                    );
-                                    return Err(GitError::Exit(128));
-                                }
-                            },
-                        },
-                        None => {
-                            let Some(value) = default_value
-                                .as_deref()
-                                .and_then(sley_config::parse_config_bool)
-                            else {
-                                return Err(GitError::Exit(1));
-                            };
-                            value
-                        }
+            let mut selected = None;
+            for entry in entries
+                .iter()
+                .rev()
+                .filter(|entry| entry.matches(&key.section, key.subsection.as_deref(), &key.key))
+            {
+                let meta = ConfigValueMeta::of(entry);
+                let Some(value) = format_config_entry_value(
+                    entry.value.as_deref(),
+                    value_type,
+                    &name,
+                    Some(&entry.origin),
+                )?
+                else {
+                    continue;
+                };
+                selected = Some((meta, value));
+                break;
+            }
+            let (meta, value) = match selected {
+                Some(selected) => selected,
+                None => {
+                    let Some(default) = default_value.as_deref() else {
+                        return Err(GitError::Exit(1));
                     };
-                    value.to_string()
+                    let Some(value) = format_default_config_value(default, value_type)? else {
+                        return Err(GitError::Exit(1));
+                    };
+                    (
+                        ConfigValueMeta::command_line(),
+                        ConfigFormattedValue::Value(value),
+                    )
                 }
-                ConfigValueType::BoolOrInt => match entry {
-                    Some(entry) => match entry.value.as_deref() {
-                        None => "true".to_string(),
-                        Some(value) => format_config_value_with(
-                            value,
-                            value_type,
-                            Some(&name),
-                            Some(&entry.origin),
-                        )?,
-                    },
-                    None => {
-                        let Some(default) = default_value.as_deref() else {
-                            return Err(GitError::Exit(1));
-                        };
-                        format_config_value_with(default, value_type, Some(&name), None)?
-                    }
-                },
-                _ => match entry {
-                    Some(entry) => match entry.value.as_deref() {
-                        Some(value) => format_config_value_with(
-                            value,
-                            value_type,
-                            Some(&name),
-                            Some(&entry.origin),
-                        )?,
-                        None if value_type == ConfigValueType::Path => {
-                            return config_missing_path_value(&name, entry);
-                        }
-                        None => String::new(),
-                    },
-                    None => {
-                        let Some(default) = default_value.as_deref() else {
-                            return Err(GitError::Exit(1));
-                        };
-                        format_config_value_with(default, value_type, Some(&name), None)?
-                    }
-                },
             };
-            write_config_value(
+            write_config_formatted_entry(
                 &mut io::stdout(),
                 &meta,
-                display,
-                &formatted,
-                null_terminate,
+                &name,
+                &value,
+                ConfigEntryWriteOptions {
+                    display,
+                    name_only: false,
+                    show_keys: false,
+                    value_type,
+                    null_terminate,
+                    equals_separator: false,
+                },
             )?;
         }
         ConfigAction::GetColor => {
@@ -1162,30 +1143,35 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 return Err(GitError::Exit(1));
             }
             let mut stdout = io::stdout();
+            let mut wrote = false;
             for entry in values {
-                let formatted = match entry.value.as_deref() {
-                    None if matches!(
-                        value_type,
-                        ConfigValueType::Bool | ConfigValueType::BoolOrInt
-                    ) =>
-                    {
-                        "true".to_string()
-                    }
-                    None => String::new(),
-                    Some(value) => format_config_value_with(
-                        value,
-                        value_type,
-                        Some(&name),
-                        Some(&entry.origin),
-                    )?,
+                let Some(formatted) = format_config_entry_value(
+                    entry.value.as_deref(),
+                    value_type,
+                    &name,
+                    Some(&entry.origin),
+                )?
+                else {
+                    continue;
                 };
-                write_config_value(
+                wrote = true;
+                write_config_formatted_entry(
                     &mut stdout,
                     &ConfigValueMeta::of(entry),
-                    display,
+                    &name,
                     &formatted,
-                    null_terminate,
+                    ConfigEntryWriteOptions {
+                        display,
+                        name_only: false,
+                        show_keys: false,
+                        value_type,
+                        null_terminate,
+                        equals_separator: false,
+                    },
                 )?;
+            }
+            if !wrote {
+                return Err(GitError::Exit(1));
             }
         }
         ConfigAction::GetRegexp => {
@@ -1231,13 +1217,14 @@ fn load_read_entries(
     respect_includes_opt: Option<bool>,
 ) -> Result<LoadedEntries> {
     let context = config_include_context();
+    let respect_repository_includes = respect_includes_opt.unwrap_or(true);
     let mut stack = sley_config::ConfigStack::new();
     let mut tail_error = None;
     match source {
         ConfigSource::Repository(git_dir) => {
             for (path, scope) in sley_config::default_config_layer_paths() {
                 stack
-                    .push_file(&path, scope, true, &context)
+                    .push_file(&path, scope, respect_repository_includes, &context)
                     .map_err(|err| report_config_parse_error(err, Some(&path)))?;
             }
             // An explicit-but-missing git dir (e.g. `--git-dir=nonexistent`)
@@ -1248,7 +1235,12 @@ fn load_read_entries(
             };
             let local_path = config_display_path(common.join("config"));
             stack
-                .push_file(&local_path, sley_config::ConfigScope::Local, true, &context)
+                .push_file(
+                    &local_path,
+                    sley_config::ConfigScope::Local,
+                    respect_repository_includes,
+                    &context,
+                )
                 .map_err(|err| report_config_parse_error(err, Some(&local_path)))?;
             if worktree_config_extension_enabled(&common) {
                 let worktree_path = config_display_path(git_dir.join("config.worktree"));
@@ -1256,7 +1248,7 @@ fn load_read_entries(
                     .push_file(
                         &worktree_path,
                         sley_config::ConfigScope::Worktree,
-                        true,
+                        respect_repository_includes,
                         &context,
                     )
                     .map_err(|err| report_config_parse_error(err, Some(&worktree_path)))?;
@@ -1299,7 +1291,7 @@ fn load_read_entries(
         }
         ConfigSource::Blob(spec) => {
             let bytes = read_config_blob(spec)?;
-            let (parsed, tail) = parse_config_bytes(&bytes, action, None)?;
+            let (parsed, tail) = parse_blob_config_bytes(&bytes, action, spec)?;
             tail_error = tail;
             stack
                 .push_parsed(
@@ -1382,6 +1374,21 @@ fn parse_stdin_config_bytes(
         GitConfig::parse(bytes)
             .map(|config| (config, None))
             .map_err(report_config_stdin_parse_error)
+    }
+}
+
+fn parse_blob_config_bytes(
+    bytes: &[u8],
+    action: ConfigAction,
+    spec: &str,
+) -> Result<(GitConfig, Option<GitError>)> {
+    if action == ConfigAction::List {
+        let (config, tail_error) = GitConfig::parse_collecting(bytes)?;
+        Ok((config, tail_error))
+    } else {
+        GitConfig::parse(bytes)
+            .map(|config| (config, None))
+            .map_err(|err| report_config_blob_parse_error(err, spec))
     }
 }
 
@@ -1661,15 +1668,26 @@ fn config_include_context() -> sley_config::ConfigIncludeContext {
     let Ok(cwd) = env::current_dir() else {
         return sley_config::ConfigIncludeContext::default();
     };
-    match discover_git_dir(&cwd) {
-        Ok(git_dir) => {
-            let git_dir_abs = fs::canonicalize(&git_dir).unwrap_or_else(|_| git_dir.clone());
-            sley_config::ConfigIncludeContext::new(
-                Some(git_dir_abs),
-                repo_current_branch_name(&git_dir),
-            )
-        }
+    let start = logical_cwd_for_include_context(&cwd);
+    match discover_git_dir(&start) {
+        Ok(git_dir) => sley_config::ConfigIncludeContext::new(
+            Some(sley_config::git_dir_for_include_context(&git_dir)),
+            repo_current_branch_name(&git_dir),
+        ),
         Err(_) => sley_config::ConfigIncludeContext::default(),
+    }
+}
+
+fn logical_cwd_for_include_context(cwd: &Path) -> PathBuf {
+    let Some(pwd) = env::var_os("PWD").map(PathBuf::from) else {
+        return cwd.to_path_buf();
+    };
+    if !pwd.is_absolute() {
+        return cwd.to_path_buf();
+    }
+    match (fs::canonicalize(&pwd), fs::canonicalize(cwd)) {
+        (Ok(pwd_real), Ok(cwd_real)) if pwd_real == cwd_real => pwd,
+        _ => cwd.to_path_buf(),
     }
 }
 
@@ -1777,6 +1795,14 @@ fn config_blob_resolve_error<T>(spec: &str) -> Result<T> {
 fn report_config_parse_error(err: GitError, path: Option<&Path>) -> GitError {
     match err {
         GitError::InvalidFormat(message) => {
+            if message == "relative config includes must come from files"
+                || message.starts_with("exceeded maximum include depth")
+                || message
+                    == "remote URLs cannot be configured in file directly or indirectly included by includeIf.hasconfig:remote.*.url"
+            {
+                eprintln!("fatal: {message}");
+                return GitError::Exit(128);
+            }
             if let Some((line, message_path)) = parse_bad_config_line_with_path(&message) {
                 eprintln!("fatal: bad config line {line} in file {message_path}");
                 return GitError::Exit(128);
@@ -1800,6 +1826,19 @@ fn report_config_stdin_parse_error(err: GitError) -> GitError {
         GitError::InvalidFormat(message) => {
             if let Some(line) = parse_bad_config_line_without_path(&message) {
                 eprintln!("fatal: bad config line {line} in standard input");
+                return GitError::Exit(128);
+            }
+            GitError::InvalidFormat(message)
+        }
+        other => other,
+    }
+}
+
+fn report_config_blob_parse_error(err: GitError, spec: &str) -> GitError {
+    match err {
+        GitError::InvalidFormat(message) => {
+            if let Some(line) = parse_bad_config_line_without_path(&message) {
+                eprintln!("fatal: bad config line {line} in blob {spec}");
                 return GitError::Exit(128);
             }
             GitError::InvalidFormat(message)
@@ -2780,7 +2819,7 @@ fn config_subcommand_get(
     // Collect matching (name, value) pairs in config (file) order, exactly as
     // git's `collect_config` callback does, so that "last match wins" without
     // `--all` picks the same entry git would.
-    let mut matches: Vec<(String, Option<String>, ConfigValueMeta)> = Vec::new();
+    let mut matches: Vec<ConfigGetMatch> = Vec::new();
     for entry in entries {
         let name = stack_entry_name(entry);
         let key_matches = match &key {
@@ -2797,7 +2836,20 @@ fn config_subcommand_get(
         {
             continue;
         }
-        matches.push((name, entry.value.clone(), ConfigValueMeta::of(entry)));
+        let Some(value) = format_config_entry_value(
+            entry.value.as_deref(),
+            value_type,
+            &name,
+            Some(&entry.origin),
+        )?
+        else {
+            continue;
+        };
+        matches.push(ConfigGetMatch {
+            name,
+            value,
+            meta: ConfigValueMeta::of(entry),
+        });
     }
 
     // git falls back to `--default` only when nothing matched. The default is
@@ -2812,11 +2864,13 @@ fn config_subcommand_get(
             SubcommandGetKey::Exact(exact) => config_key_name(exact),
             SubcommandGetKey::Regexp(_) => String::new(),
         };
-        matches.push((
-            name,
-            Some(default.to_string()),
-            ConfigValueMeta::command_line(),
-        ));
+        if let Some(value) = format_default_config_value(default, value_type)? {
+            matches.push(ConfigGetMatch {
+                name,
+                value: ConfigFormattedValue::Value(value),
+                meta: ConfigValueMeta::command_line(),
+            });
+        }
     }
 
     if matches.is_empty() {
@@ -2825,15 +2879,15 @@ fn config_subcommand_get(
 
     let mut stdout = io::stdout();
     let last = matches.len() - 1;
-    for (idx, (name, value, meta)) in matches.iter().enumerate() {
+    for (idx, matched) in matches.iter().enumerate() {
         if !all && idx != last {
             continue;
         }
-        write_config_entry(
+        write_config_formatted_entry(
             &mut stdout,
-            meta,
-            name,
-            value.as_deref(),
+            &matched.meta,
+            &matched.name,
+            &matched.value,
             ConfigEntryWriteOptions {
                 display,
                 name_only,
@@ -3037,6 +3091,80 @@ impl SimpleConfigRegex {
     }
 }
 
+struct ConfigGetMatch {
+    name: String,
+    value: ConfigFormattedValue,
+    meta: ConfigValueMeta,
+}
+
+enum ConfigFormattedValue {
+    NoValue,
+    Value(String),
+}
+
+fn format_config_entry_value(
+    value: Option<&str>,
+    value_type: ConfigValueType,
+    name: &str,
+    origin: Option<&sley_config::ConfigOrigin>,
+) -> Result<Option<ConfigFormattedValue>> {
+    match value {
+        None if matches!(
+            value_type,
+            ConfigValueType::Bool | ConfigValueType::BoolOrInt
+        ) =>
+        {
+            Ok(Some(ConfigFormattedValue::Value("true".to_string())))
+        }
+        None if value_type == ConfigValueType::Path => {
+            eprintln!("error: missing value for '{name}'");
+            Err(GitError::Exit(128))
+        }
+        None => Ok(Some(ConfigFormattedValue::NoValue)),
+        Some(value) if value_type == ConfigValueType::Path => {
+            let Some(formatted) = format_config_path_output_value(value)? else {
+                return Ok(None);
+            };
+            Ok(Some(ConfigFormattedValue::Value(formatted)))
+        }
+        Some(value) => Ok(Some(ConfigFormattedValue::Value(format_config_value_with(
+            value,
+            value_type,
+            Some(name),
+            origin,
+        )?))),
+    }
+}
+
+fn format_default_config_value(value: &str, value_type: ConfigValueType) -> Result<Option<String>> {
+    if value_type == ConfigValueType::Path {
+        if let Some(formatted) = format_config_path_output_value(value)? {
+            return Ok(Some(formatted));
+        }
+        return Ok(None);
+    }
+    if value_type != ConfigValueType::Raw && !value_canonicalizes_as(value, value_type) {
+        if matches!(
+            value_type,
+            ConfigValueType::Bool | ConfigValueType::Int | ConfigValueType::BoolOrInt
+        ) {
+            return format_config_value_with(value, value_type, None, None).map(Some);
+        }
+        eprintln!("fatal: failed to format default config value: {value}");
+        return Err(GitError::Exit(128));
+    }
+    format_config_value_with(value, value_type, None, None).map(Some)
+}
+
+fn format_config_path_output_value(value: &str) -> Result<Option<String>> {
+    if let Some(optional) = strip_config_optional_path(value)
+        && !optional_path_exists(optional)
+    {
+        return Ok(None);
+    }
+    format_config_path_value(value).map(|value| Some(value.into_owned()))
+}
+
 /// Parse a bracket expression `[...]` starting at `start` (which must point at
 /// `[`). Returns the atom and the index just past the closing `]`, or `None`
 /// when the class is unterminated. Mirrors POSIX-ERE basics: a leading `^`
@@ -3166,6 +3294,41 @@ fn write_config_value(
     } else {
         writeln!(stdout, "{value}")?;
     }
+    Ok(())
+}
+
+fn write_config_formatted_entry(
+    stdout: &mut impl Write,
+    meta: &ConfigValueMeta,
+    name: &str,
+    value: &ConfigFormattedValue,
+    options: ConfigEntryWriteOptions,
+) -> Result<()> {
+    write_config_metadata(stdout, meta, options.display, options.null_terminate)?;
+    let terminator = if options.null_terminate { '\0' } else { '\n' };
+    if options.name_only {
+        if options.show_keys {
+            write!(stdout, "{name}")?;
+        }
+        write!(stdout, "{terminator}")?;
+        return Ok(());
+    }
+    let key_delim = if options.null_terminate {
+        '\n'
+    } else if options.equals_separator {
+        '='
+    } else {
+        ' '
+    };
+    if options.show_keys {
+        write!(stdout, "{name}")?;
+        if let ConfigFormattedValue::Value(value) = value {
+            write!(stdout, "{key_delim}{value}")?;
+        }
+    } else if let ConfigFormattedValue::Value(value) = value {
+        write!(stdout, "{value}")?;
+    }
+    write!(stdout, "{terminator}")?;
     Ok(())
 }
 

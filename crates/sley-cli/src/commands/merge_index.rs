@@ -253,6 +253,7 @@ fn merge_one_file(
                     style: sley_diff_merge::ConflictStyle::Merge,
                     favor: sley_diff_merge::MergeFavor::None,
                     ws_ignore: sley_diff_merge::WsIgnore::EMPTY,
+                    marker_size: 7,
                 },
             );
             // The working tree always gets the merge result (markers and all),

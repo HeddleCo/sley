@@ -111,8 +111,8 @@ fn branch_test_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
     }
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -151,7 +151,7 @@ fn branch_delete_merged_matches_upstream_git() {
             vec!["branch", "-D"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -168,53 +168,53 @@ fn branch_delete_merged_matches_upstream_git() {
             vec!["branch", "--all=topic", "-d", "topic"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
 
         let args = ["branch", "-d", "merged"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "merged", base_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
 
         git(&root, &["branch", "separator-merged", base_oid.as_str()]);
         let args = ["branch", "-d", "--", "separator-merged"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "separator-merged", base_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
 
         git(&root, &["branch", "merged", base_oid.as_str()]);
         let args = ["branch", "--delete", "merged"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "merged", base_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
 
         let args = ["branch", "--delete", "--force", "unmerged"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "unmerged", unmerged_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         git(&root, &["branch", "unmerged", unmerged_oid.as_str()]);
 
         let args = ["branch", "-D", "--", "unmerged"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "unmerged", unmerged_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         git(&root, &["branch", "unmerged", unmerged_oid.as_str()]);
 
         let args = ["branch", "--delete", "--force", "--no-force", "unmerged"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
 
         let args = ["branch", "--delete", "--no-force", "--force", "unmerged"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "unmerged", unmerged_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
 
         let args = [
@@ -226,7 +226,7 @@ fn branch_delete_merged_matches_upstream_git() {
         ];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "-D", "cancelled-delete"]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&root, &["rev-parse", "cancelled-delete"]),
@@ -237,7 +237,7 @@ fn branch_delete_merged_matches_upstream_git() {
         let args = ["branch", "-d", "--quiet", "quiet-merged"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "quiet-merged", base_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
 
         git(&root, &["branch", "noisy-merged", base_oid.as_str()]);
@@ -250,7 +250,7 @@ fn branch_delete_merged_matches_upstream_git() {
         ];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "noisy-merged", base_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
 
         for (args, branch) in [
@@ -276,7 +276,7 @@ fn branch_delete_merged_matches_upstream_git() {
             git(&root, &["branch", branch, base_oid.as_str()]);
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             git(&root, &["branch", branch, base_oid.as_str()]);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -288,7 +288,7 @@ fn branch_delete_merged_matches_upstream_git() {
             vec!["branch", "-D", "--", "-looks-like-option"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -296,14 +296,14 @@ fn branch_delete_merged_matches_upstream_git() {
         let args = ["branch", "-D", "doomed", "missing"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "doomed", base_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
 
         git(&root, &["branch", "merged", base_oid.as_str()]);
         let args = ["branch", "-d", "merged", "missing"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "merged", base_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -361,7 +361,7 @@ fn branch_delete_remote_tracking_matches_upstream_git() {
                 &["update-ref", "refs/remotes/origin/topic", "HEAD"],
             );
             let expected_output = run_output(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run_output(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_eq!(
                 git(&actual, &["branch", "-r"]),
@@ -391,7 +391,7 @@ fn branch_force_update_matches_upstream_git() {
 
         let args = ["branch", "--"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
 
         for args in [
@@ -402,7 +402,7 @@ fn branch_force_update_matches_upstream_git() {
             vec!["branch", "--force", "--", "--list"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -431,7 +431,7 @@ fn branch_force_update_matches_upstream_git() {
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             git(&root, &["branch", "-D", branch]);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
                 git(&root, &["rev-parse", branch]),
@@ -442,7 +442,7 @@ fn branch_force_update_matches_upstream_git() {
         let args = ["branch", "--force", "topic", base_oid.as_str()];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "-D", "topic"]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&root, &["rev-parse", "topic"]),
@@ -496,7 +496,7 @@ fn branch_force_update_matches_upstream_git() {
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             git(&root, &["branch", "-D", branch]);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
                 git(&root, &["rev-parse", branch]),
@@ -508,7 +508,7 @@ fn branch_force_update_matches_upstream_git() {
         let args = ["branch", "-f", "topic", head_oid.as_str()];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "-f", "topic", base_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&root, &["rev-parse", "topic"]),
@@ -519,7 +519,7 @@ fn branch_force_update_matches_upstream_git() {
         let args = ["branch", "--force", "--", "topic", head_oid.as_str()];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "-f", "topic", base_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&root, &["rev-parse", "topic"]),
@@ -536,7 +536,7 @@ fn branch_force_update_matches_upstream_git() {
         ];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "-f", "topic", base_oid.as_str()]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&root, &["rev-parse", "topic"]),
@@ -551,13 +551,13 @@ fn branch_force_update_matches_upstream_git() {
             base_oid.as_str(),
         ];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
 
         git(&root, &["checkout", "topic", "-q"]);
         let args = ["branch", "--force", "topic", base_oid.as_str()];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -595,7 +595,7 @@ fn branch_upstream_config_matches_upstream_git() {
                 &root,
                 &["branch", "--unset-upstream", "topic"],
             );
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
             let remote = String::from_utf8(git(&root, &["config", "branch.topic.remote"]))
                 .expect("remote utf8");
@@ -618,7 +618,7 @@ fn branch_upstream_config_matches_upstream_git() {
         let args = ["branch", "--unset-upstream", "topic"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "-u", "main", "topic"]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             run_output(
@@ -635,7 +635,7 @@ fn branch_upstream_config_matches_upstream_git() {
         let args = ["branch", "--unset-upstream", "--", "topic"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "-u", "main", "topic"]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
 
         for args in [
@@ -660,7 +660,7 @@ fn branch_upstream_config_matches_upstream_git() {
             vec!["branch", "-u", "main", "main"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -785,7 +785,7 @@ fn branch_create_tracking_matches_upstream_git() {
             ),
         ] {
             let expected_output = branch_test_output(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = branch_test_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = branch_test_output(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             let config_pattern = format!("^branch\\.{branch}\\.");
             let config_args = ["config", "--get-regexp", config_pattern.as_str()];
@@ -803,7 +803,7 @@ fn branch_create_tracking_matches_upstream_git() {
             "origin/main",
         ];
         let expected_output = branch_test_output(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = branch_test_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = branch_test_output(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         for args in [
@@ -843,7 +843,7 @@ fn branch_create_tracking_matches_upstream_git() {
             vec!["branch", "--no-edit-description=main", "edit-no-value"],
         ] {
             let expected_output = branch_test_output(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = branch_test_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = branch_test_output(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
 
@@ -857,7 +857,7 @@ fn branch_create_tracking_matches_upstream_git() {
             vec!["branch", "--edit-description", "--no-edit-description"],
         ] {
             let expected_output = branch_test_output(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = branch_test_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = branch_test_output(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
 
@@ -865,7 +865,7 @@ fn branch_create_tracking_matches_upstream_git() {
         git(&actual, &["checkout", "--detach", "-q"]);
         let args = ["branch", "--edit-description"];
         let expected_output = branch_test_output(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = branch_test_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = branch_test_output(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -887,7 +887,7 @@ fn branch_rename_and_copy_match_upstream_git() {
         git(&root, &["branch", "-D", "renamed"]);
         git(&root, &["branch", "topic"]);
         git(&root, &["branch", "-u", "main", "topic"]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&root, &["rev-parse", "renamed"]),
@@ -906,7 +906,7 @@ fn branch_rename_and_copy_match_upstream_git() {
         let args = ["branch", "-c", "renamed", "copied"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "-D", "copied"]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&root, &["config", "branch.copied.merge"]),
@@ -945,7 +945,7 @@ fn branch_rename_and_copy_match_upstream_git() {
                 git(&root, &["branch", "-D", target]);
             }
             git(&root, &["branch", "-f", source, "main"]);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
                 git(&root, &["rev-parse", target]),
@@ -958,7 +958,7 @@ fn branch_rename_and_copy_match_upstream_git() {
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "-m", "current-name", "renamed"]);
         git(&root, &["checkout", "renamed", "-q"]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&root, &["symbolic-ref", "HEAD"]),
@@ -976,7 +976,7 @@ fn branch_rename_and_copy_match_upstream_git() {
             vec!["branch", "-c", "a", "b", "c"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -1001,7 +1001,7 @@ fn branch_rename_and_copy_match_upstream_git() {
             vec!["branch", "--no-copy=x", "current-name", "new-copy"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -1009,7 +1009,7 @@ fn branch_rename_and_copy_match_upstream_git() {
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         git(&root, &["branch", "-m", "target", "current-name"]);
         git(&root, &["branch", "target", "main"]);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&root, &["symbolic-ref", "HEAD"]),
@@ -1019,7 +1019,7 @@ fn branch_rename_and_copy_match_upstream_git() {
         git(&root, &["branch", "source-copy"]);
         let args = ["branch", "-C", "source-copy", "target"];
         let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             git(&root, &["symbolic-ref", "HEAD"]),
@@ -1083,7 +1083,7 @@ fn branch_verbose_listing_matches_upstream_git() {
                     &["branch", "-D", "created-from-verbose"],
                 );
             }
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -4883,7 +4883,7 @@ fn branch_list_patterns_match_upstream_git() {
             ],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
         for args in [
@@ -4891,44 +4891,44 @@ fn branch_list_patterns_match_upstream_git() {
             vec!["branch", "--no-show-current=feature/foo"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
         let contains_base_eq = format!("--contains={base_oid}");
         let contains_eq = format!("--contains={main_oid}");
         let expected = git(&root, &["branch", contains_eq.as_str()]);
-        let actual = git_rs(&root, &["branch", contains_eq.as_str()]);
+        let actual = sley(&root, &["branch", contains_eq.as_str()]);
         assert_eq!(actual, expected, "sley output differed for --contains=");
         let points_at_eq = format!("--points-at={main_oid}");
         let expected = git(&root, &["branch", points_at_eq.as_str()]);
-        let actual = git_rs(&root, &["branch", points_at_eq.as_str()]);
+        let actual = sley(&root, &["branch", points_at_eq.as_str()]);
         assert_eq!(actual, expected, "sley output differed for --points-at=");
         let expected = git(&root, &["branch", "--list", points_at_eq.as_str(), "m*"]);
-        let actual = git_rs(&root, &["branch", "--list", points_at_eq.as_str(), "m*"]);
+        let actual = sley(&root, &["branch", "--list", points_at_eq.as_str(), "m*"]);
         assert_eq!(
             actual, expected,
             "sley output differed for --list --points-at= pattern"
         );
         let expected = git(&root, &["branch", points_at_eq.as_str(), "--no-points-at"]);
-        let actual = git_rs(&root, &["branch", points_at_eq.as_str(), "--no-points-at"]);
+        let actual = sley(&root, &["branch", points_at_eq.as_str(), "--no-points-at"]);
         assert_eq!(
             actual, expected,
             "sley output differed for --points-at= --no-points-at"
         );
         let expected = git(&root, &["branch", "--no-points-at", points_at_eq.as_str()]);
-        let actual = git_rs(&root, &["branch", "--no-points-at", points_at_eq.as_str()]);
+        let actual = sley(&root, &["branch", "--no-points-at", points_at_eq.as_str()]);
         assert_eq!(
             actual, expected,
             "sley output differed for --no-points-at --points-at="
         );
         let expected = git(&root, &["branch", "-r", points_at_eq.as_str()]);
-        let actual = git_rs(&root, &["branch", "-r", points_at_eq.as_str()]);
+        let actual = sley(&root, &["branch", "-r", points_at_eq.as_str()]);
         assert_eq!(actual, expected, "sley output differed for -r --points-at=");
         let expected = git(
             &root,
             &["branch", "-r", "--list", points_at_eq.as_str(), "origin/*"],
         );
-        let actual = git_rs(
+        let actual = sley(
             &root,
             &["branch", "-r", "--list", points_at_eq.as_str(), "origin/*"],
         );
@@ -4940,7 +4940,7 @@ fn branch_list_patterns_match_upstream_git() {
             &root,
             &["branch", "-r", points_at_eq.as_str(), "--no-points-at"],
         );
-        let actual = git_rs(
+        let actual = sley(
             &root,
             &["branch", "-r", points_at_eq.as_str(), "--no-points-at"],
         );
@@ -4952,7 +4952,7 @@ fn branch_list_patterns_match_upstream_git() {
             &root,
             &["branch", "-r", "--no-points-at", points_at_eq.as_str()],
         );
-        let actual = git_rs(
+        let actual = sley(
             &root,
             &["branch", "-r", "--no-points-at", points_at_eq.as_str()],
         );
@@ -4961,13 +4961,13 @@ fn branch_list_patterns_match_upstream_git() {
             "sley output differed for -r --no-points-at --points-at="
         );
         let expected = git(&root, &["branch", "-a", points_at_eq.as_str()]);
-        let actual = git_rs(&root, &["branch", "-a", points_at_eq.as_str()]);
+        let actual = sley(&root, &["branch", "-a", points_at_eq.as_str()]);
         assert_eq!(actual, expected, "sley output differed for -a --points-at=");
         let expected = git(
             &root,
             &["branch", "-a", "--list", points_at_eq.as_str(), "origin/*"],
         );
-        let actual = git_rs(
+        let actual = sley(
             &root,
             &["branch", "-a", "--list", points_at_eq.as_str(), "origin/*"],
         );
@@ -4979,7 +4979,7 @@ fn branch_list_patterns_match_upstream_git() {
             &root,
             &["branch", "-a", points_at_eq.as_str(), "--no-points-at"],
         );
-        let actual = git_rs(
+        let actual = sley(
             &root,
             &["branch", "-a", points_at_eq.as_str(), "--no-points-at"],
         );
@@ -4991,7 +4991,7 @@ fn branch_list_patterns_match_upstream_git() {
             &root,
             &["branch", "-a", "--no-points-at", points_at_eq.as_str()],
         );
-        let actual = git_rs(
+        let actual = sley(
             &root,
             &["branch", "-a", "--no-points-at", points_at_eq.as_str()],
         );
@@ -5001,11 +5001,11 @@ fn branch_list_patterns_match_upstream_git() {
         );
         let no_contains_eq = format!("--no-contains={main_oid}");
         let expected = git(&root, &["branch", no_contains_eq.as_str()]);
-        let actual = git_rs(&root, &["branch", no_contains_eq.as_str()]);
+        let actual = sley(&root, &["branch", no_contains_eq.as_str()]);
         assert_eq!(actual, expected, "sley output differed for --no-contains=");
         let merged_eq = format!("--merged={main_oid}");
         let expected = git(&root, &["branch", merged_eq.as_str()]);
-        let actual = git_rs(&root, &["branch", merged_eq.as_str()]);
+        let actual = sley(&root, &["branch", merged_eq.as_str()]);
         assert_eq!(actual, expected, "sley output differed for --merged=");
         let no_merged_base_eq = format!("--no-merged={base_oid}");
         let no_merged_eq = format!("--no-merged={main_oid}");
@@ -5140,11 +5140,11 @@ fn branch_list_patterns_match_upstream_git() {
             ],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
         let expected = git(&root, &["branch", no_merged_eq.as_str()]);
-        let actual = git_rs(&root, &["branch", no_merged_eq.as_str()]);
+        let actual = sley(&root, &["branch", no_merged_eq.as_str()]);
         assert_eq!(actual, expected, "sley output differed for --no-merged=");
     };
     let _ = fs::remove_dir_all(&root);

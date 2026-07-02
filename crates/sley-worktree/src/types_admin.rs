@@ -710,6 +710,7 @@ pub enum CheckoutConflictStyle {
 pub struct CheckoutIndexPathOptions<'a> {
     pub force: bool,
     pub merge: bool,
+    pub overlay: bool,
     pub stage: Option<CheckoutStage>,
     pub conflict_style: CheckoutConflictStyle,
     pub smudge_config: Option<&'a GitConfig>,
@@ -761,6 +762,12 @@ pub fn read_repository_index(
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     if !index_path.exists() {
+        return Ok(None);
+    }
+    if fs::metadata(&index_path)
+        .map(|metadata| metadata.len() == 0)
+        .unwrap_or(false)
+    {
         return Ok(None);
     }
     Ok(Some(sley_index::read_repository_index(git_dir, format)?))

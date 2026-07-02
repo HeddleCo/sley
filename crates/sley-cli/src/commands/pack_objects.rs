@@ -17,6 +17,7 @@
 //! `pack-reused` / `packs-reused` totals and trace2 data events report that
 //! reuse exactly like upstream.
 
+use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -60,7 +61,13 @@ struct PackObjectsOptions {
     /// reachability walk from the commits of the included (and excluded-open
     /// `!`) packs to rescue objects that live in packs not named on stdin.
     stdin_packs_follow: bool,
+    /// `--exclude-promisor-objects`: with `--stdin-packs`, included promisor
+    /// packs are rejected up front and follow-mode traversal treats objects in
+    /// promisor packs as a missing-object boundary instead of attempting any
+    /// lazy backfill.
+    exclude_promisor_objects: bool,
     path_walk: bool,
+    sparse: Option<bool>,
     thin: bool,
     write_bitmap_index: bool,
     name_hash_version: Option<i32>,
@@ -119,6 +126,8 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             "--no-delta-base-offset" if !saw_dashdash => options.delta_base_offset = false,
             "--path-walk" if !saw_dashdash => options.path_walk = true,
             "--no-path-walk" if !saw_dashdash => options.path_walk = false,
+            "--sparse" if !saw_dashdash => options.sparse = Some(true),
+            "--no-sparse" if !saw_dashdash => options.sparse = Some(false),
             "--thin" if !saw_dashdash => options.thin = true,
             "--no-thin" if !saw_dashdash => options.thin = false,
             "--write-bitmap-index" | "--write-bitmap-index-quiet" if !saw_dashdash => {
@@ -159,8 +168,14 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
                     return Err(GitError::Exit(128));
                 }
             }
+            "--exclude-promisor-objects" if !saw_dashdash => {
+                options.exclude_promisor_objects = true;
+            }
+            "--no-exclude-promisor-objects" if !saw_dashdash => {
+                options.exclude_promisor_objects = false;
+            }
             "-q" | "--quiet" if !saw_dashdash => options.progress = Some(false),
-            "--no-quiet" if !saw_dashdash => {}
+            "--no-quiet" if !saw_dashdash => options.progress = Some(true),
             "--cruft" if !saw_dashdash => {
                 options.cruft = true;
             }
@@ -233,8 +248,6 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             | "--reflog"
             | "--indexed-objects"
             | "--delta-islands"
-            | "--sparse"
-            | "--no-sparse"
                 if !saw_dashdash => {}
             "--progress" | "--all-progress" | "--all-progress-implied" if !saw_dashdash => {
                 options.progress = Some(true)
@@ -303,7 +316,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
         let oids = read_pack_objects_stdin(format)?;
         let mut objects = Vec::with_capacity(oids.len());
         for oid in &oids {
-            match database.read_object(oid) {
+            match crate::read_object_maybe_prefetch_promisor(&database, oid) {
                 Ok(object) => objects.push(object),
                 Err(GitError::NotFound(_)) => {
                     eprintln!("fatal: unable to read {oid}");
@@ -688,6 +701,8 @@ const STDIN_PACK_EXCLUDE_OPEN: u8 = 1 << 2;
 struct StdinPackFile {
     oids: Vec<ObjectId>,
     mtime: std::time::SystemTime,
+    pack_path: PathBuf,
+    is_promisor: bool,
 }
 
 /// `git pack-objects --stdin-packs`: read pack basenames from standard input
@@ -794,6 +809,8 @@ fn collect_stdin_packs_objects(
                 StdinPackFile {
                     oids: index.entries.into_iter().map(|entry| entry.oid).collect(),
                     mtime,
+                    pack_path: pack_path.clone(),
+                    is_promisor: pack_path.with_extension("promisor").exists(),
                 },
             );
         }
@@ -813,14 +830,54 @@ fn collect_stdin_packs_objects(
         return Err(GitError::Exit(128));
     }
 
-    // 4. Objects in any excluded pack veto inclusion (closed and open both).
-    let mut excluded: HashSet<ObjectId> = HashSet::new();
-    for (key, &kind) in &requested {
-        if kind & (STDIN_PACK_EXCLUDE_CLOSED | STDIN_PACK_EXCLUDE_OPEN) != 0
-            && let Some(pack) = found.get(key)
-        {
-            excluded.extend(pack.oids.iter().copied());
+    if options.exclude_promisor_objects {
+        for key in &order {
+            let Some(pack) = found.get(key) else {
+                continue;
+            };
+            if requested
+                .get(key)
+                .is_some_and(|kind| kind & STDIN_PACK_INCLUDE != 0)
+                && pack.is_promisor
+            {
+                eprintln!(
+                    "fatal: packfile {} is a promisor but --exclude-promisor-objects was given",
+                    pack.pack_path.display()
+                );
+                return Err(GitError::Exit(128));
+            }
         }
+    }
+
+    // 4. Objects in any excluded pack veto inclusion (closed and open both).
+    let mut closed_excluded: HashSet<ObjectId> = HashSet::new();
+    let mut open_excluded: HashSet<ObjectId> = HashSet::new();
+    for (key, &kind) in &requested {
+        if let Some(pack) = found.get(key) {
+            if kind & STDIN_PACK_EXCLUDE_CLOSED != 0 {
+                closed_excluded.extend(pack.oids.iter().copied());
+            }
+            if kind & STDIN_PACK_EXCLUDE_OPEN != 0 {
+                open_excluded.extend(pack.oids.iter().copied());
+            }
+        }
+    }
+    let promisor_excluded = if options.exclude_promisor_objects {
+        collect_promisor_pack_oids(&object_dirs, format)?
+    } else {
+        HashSet::new()
+    };
+    let mut omitted = closed_excluded.clone();
+    omitted.extend(open_excluded.iter().copied());
+    omitted.extend(promisor_excluded.iter().copied());
+
+    // Git only treats closed-excluded packs as traversal boundaries when an
+    // open-excluded pack is also present. Without a `!pack`, follow mode may
+    // walk through `^pack` objects to rescue older objects from unnamed packs.
+    // Promisor objects are always a boundary under `--exclude-promisor-objects`.
+    let mut traversal_stop = promisor_excluded;
+    if !open_excluded.is_empty() {
+        traversal_stop.extend(closed_excluded.iter().copied());
     }
 
     // 5. Walk the included packs in ascending-mtime order (newest objects laid
@@ -838,15 +895,43 @@ fn collect_stdin_packs_objects(
 
     let mut oids: Vec<ObjectId> = Vec::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut object_cache: HashMap<ObjectId, Arc<EncodedObject>> = HashMap::new();
+    let mut follow_starts: Vec<ObjectId> = Vec::new();
     for key in included_keys {
         let Some(pack) = found.get(key) else {
             continue;
         };
         for oid in &pack.oids {
-            if excluded.contains(oid) || !seen.insert(*oid) {
+            if follow
+                && let Some(object) =
+                    read_stdin_pack_object_tolerant(database, oid, &mut object_cache)?
+                && object.object_type == ObjectType::Commit
+            {
+                follow_starts.push(*oid);
+            }
+            if omitted.contains(oid) || !seen.insert(*oid) {
                 continue;
             }
             oids.push(*oid);
+        }
+    }
+
+    if follow {
+        for (key, &kind) in &requested {
+            if kind & STDIN_PACK_EXCLUDE_OPEN == 0 {
+                continue;
+            }
+            let Some(pack) = found.get(key) else {
+                continue;
+            };
+            for oid in &pack.oids {
+                if let Some(object) =
+                    read_stdin_pack_object_tolerant(database, oid, &mut object_cache)?
+                    && object.object_type == ObjectType::Commit
+                {
+                    follow_starts.push(*oid);
+                }
+            }
         }
     }
 
@@ -859,17 +944,47 @@ fn collect_stdin_packs_objects(
         let mut loose: Vec<ObjectId> = loose.into_iter().collect();
         loose.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         for oid in loose {
-            if excluded.contains(&oid) || !seen.insert(oid) {
+            let object = if follow {
+                read_stdin_pack_object_tolerant(database, &oid, &mut object_cache)?
+            } else {
+                None
+            };
+            if follow
+                && let Some(object) = &object
+                && object.object_type == ObjectType::Commit
+            {
+                follow_starts.push(oid);
+            }
+            if omitted.contains(&oid) || !seen.insert(oid) {
                 continue;
             }
             oids.push(oid);
         }
     }
 
+    if follow {
+        let mut state = StdinPackFollowState {
+            oids: &mut oids,
+            seen: &mut seen,
+            expanded: HashSet::new(),
+            omitted: &omitted,
+            stop: &traversal_stop,
+            object_cache: &mut object_cache,
+        };
+        for oid in follow_starts {
+            walk_stdin_pack_follow_object(database, format, oid, &mut state)?;
+        }
+    }
+
     // 7. Materialise the object bodies for the writer.
     let mut objects = Vec::with_capacity(oids.len());
     for oid in &oids {
-        match database.read_object(oid) {
+        match object_cache
+            .get(oid)
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| database.read_object(oid))
+        {
             Ok(object) => objects.push(object),
             Err(GitError::NotFound(_)) => {
                 eprintln!("fatal: unable to read {oid}");
@@ -880,6 +995,105 @@ fn collect_stdin_packs_objects(
     }
 
     Ok((oids, objects))
+}
+
+struct StdinPackFollowState<'a> {
+    oids: &'a mut Vec<ObjectId>,
+    seen: &'a mut HashSet<ObjectId>,
+    expanded: HashSet<ObjectId>,
+    omitted: &'a HashSet<ObjectId>,
+    stop: &'a HashSet<ObjectId>,
+    object_cache: &'a mut HashMap<ObjectId, Arc<EncodedObject>>,
+}
+
+fn read_stdin_pack_object_tolerant(
+    database: &FileObjectDatabase,
+    oid: &ObjectId,
+    cache: &mut HashMap<ObjectId, Arc<EncodedObject>>,
+) -> Result<Option<Arc<EncodedObject>>> {
+    if let Some(object) = cache.get(oid) {
+        return Ok(Some(Arc::clone(object)));
+    }
+    match database.read_object(oid) {
+        Ok(object) => {
+            cache.insert(*oid, Arc::clone(&object));
+            Ok(Some(object))
+        }
+        Err(GitError::NotFound(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn walk_stdin_pack_follow_object(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: ObjectId,
+    state: &mut StdinPackFollowState<'_>,
+) -> Result<()> {
+    if state.stop.contains(&oid) {
+        return Ok(());
+    }
+    let Some(object) = read_stdin_pack_object_tolerant(database, &oid, state.object_cache)? else {
+        return Ok(());
+    };
+    if !state.omitted.contains(&oid) && state.seen.insert(oid) {
+        state.oids.push(oid);
+    }
+    if !state.expanded.insert(oid) {
+        return Ok(());
+    }
+    match object.object_type {
+        ObjectType::Commit => {
+            let commit = Commit::parse_ref(format, &object.body)?;
+            walk_stdin_pack_follow_object(database, format, commit.tree, state)?;
+            for parent in commit.parents {
+                walk_stdin_pack_follow_object(database, format, parent, state)?;
+            }
+        }
+        ObjectType::Tree => {
+            for entry in TreeEntries::new(format, &object.body) {
+                let entry = entry?;
+                if !entry.is_gitlink() {
+                    walk_stdin_pack_follow_object(database, format, entry.oid, state)?;
+                }
+            }
+        }
+        ObjectType::Tag => {
+            let tag = Tag::parse_ref(format, &object.body)?;
+            walk_stdin_pack_follow_object(database, format, tag.object, state)?;
+        }
+        ObjectType::Blob => {}
+    }
+    Ok(())
+}
+
+fn collect_promisor_pack_oids(
+    object_dirs: &[PathBuf],
+    format: ObjectFormat,
+) -> Result<HashSet<ObjectId>> {
+    let mut oids = HashSet::new();
+    for dir in object_dirs {
+        let pack_dir = dir.join("pack");
+        let Ok(entries) = fs::read_dir(&pack_dir) else {
+            continue;
+        };
+        for entry in entries {
+            let idx_path = entry?.path();
+            if idx_path.extension().and_then(|ext| ext.to_str()) != Some("idx")
+                || !idx_path.with_extension("promisor").exists()
+            {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&idx_path) else {
+                continue;
+            };
+            let Ok(index) = PackIndex::parse(&bytes, format) else {
+                continue;
+            };
+            oids.extend(index.entries.into_iter().map(|entry| entry.oid));
+        }
+    }
+    Ok(oids)
 }
 
 /// The final progress totals line and the trace2 data events upstream emits
@@ -954,6 +1168,33 @@ fn collect_traversal_objects(
             if rev.is_empty() {
                 break;
             }
+            if let Some(range) = sley_rev::parse_revision_range(rev) {
+                match range {
+                    sley_rev::RevisionRange::Asymmetric { start, end } => {
+                        let start_oid = match resolve_revision(git_dir, format, &start) {
+                            Ok(oid) => oid,
+                            Err(_) => {
+                                eprintln!("fatal: bad revision '{start}'");
+                                return Err(GitError::Exit(128));
+                            }
+                        };
+                        let end_oid = match resolve_revision(git_dir, format, &end) {
+                            Ok(oid) => oid,
+                            Err(_) => {
+                                eprintln!("fatal: bad revision '{end}'");
+                                return Err(GitError::Exit(128));
+                            }
+                        };
+                        haves.push(start_oid);
+                        wants.push(end_oid);
+                    }
+                    sley_rev::RevisionRange::Symmetric { .. } => {
+                        eprintln!("fatal: bad revision '{rev}'");
+                        return Err(GitError::Exit(128));
+                    }
+                }
+                continue;
+            }
             let (negative, rev) = match rev.strip_prefix('^') {
                 Some(rest) => (true, rest),
                 None => (false, rev),
@@ -973,9 +1214,19 @@ fn collect_traversal_objects(
         }
     }
 
+    let config = read_repo_config(git_dir)?;
+    let use_sparse = options
+        .sparse
+        .unwrap_or_else(|| config.get_bool("pack", None, "useSparse").unwrap_or(true));
     // Uninteresting closure first: tolerant of missing objects (upstream
-    // never needs to open the have side's missing history).
-    let excluded = tolerant_reachable_closure(database, format, &haves)?;
+    // never needs to open the have side's missing history). With the sparse
+    // algorithm, tree/blob uninteresting marking is path-aware so copied
+    // subtrees can be revisited under their new names.
+    let excluded = if use_sparse {
+        tolerant_sparse_excluded_objects(database, format, &wants, &haves)?
+    } else {
+        tolerant_reachable_closure(database, format, &haves)?
+    };
     let mut traversal_state = FilteredPackTraversalState::default();
     {
         let walk = FilteredPackTraversal {
@@ -1224,7 +1475,7 @@ impl FilteredPackTraversal<'_> {
         if self.excluded.contains(&oid) {
             return Ok(());
         }
-        let object = self.database.read_object(&oid)?;
+        let object = crate::read_object_maybe_prefetch_promisor(self.database, &oid)?;
         match object.object_type {
             ObjectType::Commit => self.visit_commit(oid, object, provided, state),
             ObjectType::Tree => self.visit_tree(oid, object, path, depth, provided, state),
@@ -1287,7 +1538,10 @@ impl FilteredPackTraversal<'_> {
         provided: bool,
         state: &mut FilteredPackTraversalState,
     ) -> Result<()> {
-        let object = match self.database.read_object(&oid) {
+        if self.excluded.contains(&oid) {
+            return Ok(());
+        }
+        let object = match crate::read_object_maybe_prefetch_promisor(self.database, &oid) {
             Ok(object) => object,
             Err(GitError::NotFound(_)) => {
                 eprintln!("fatal: bad tree object {oid}");
@@ -1307,11 +1561,12 @@ impl FilteredPackTraversal<'_> {
         provided: bool,
         state: &mut FilteredPackTraversalState,
     ) -> Result<()> {
+        let excluded = self.excluded.contains(&oid);
         let include = provided
             || self
                 .filter
                 .includes_object(ObjectType::Tree, &path, None, depth);
-        if include {
+        if include && !excluded {
             self.include_object(oid, Arc::clone(&object), state);
         } else {
             self.omit_object(oid, state);
@@ -1348,6 +1603,9 @@ impl FilteredPackTraversal<'_> {
         object: Option<Arc<EncodedObject>>,
         state: &mut FilteredPackTraversalState,
     ) -> Result<()> {
+        if self.excluded.contains(&oid) {
+            return Ok(());
+        }
         if state.want_set.contains(&oid) {
             return Ok(());
         }
@@ -1355,7 +1613,7 @@ impl FilteredPackTraversal<'_> {
         let size = if self.filter.needs_blob_size() {
             match object {
                 Some(ref object) => Some(object.body.len()),
-                None => match self.database.read_object(&oid) {
+                None => match crate::read_object_maybe_prefetch_promisor(self.database, &oid) {
                     Ok(read) => {
                         let len = read.body.len();
                         object = Some(read);
@@ -1379,7 +1637,7 @@ impl FilteredPackTraversal<'_> {
         if include {
             let object = match object {
                 Some(object) => object,
-                None => match self.database.read_object(&oid) {
+                None => match crate::read_object_maybe_prefetch_promisor(self.database, &oid) {
                     Ok(object) => object,
                     Err(GitError::NotFound(_))
                         if self.missing_action == PackObjectsMissingAction::AllowAny =>
@@ -1439,65 +1697,15 @@ impl FilteredPackTraversal<'_> {
 }
 
 fn parse_pack_filter_size(value: &str) -> Result<usize> {
-    let Some(parsed) = git_parse_unsigned_with_suffix(value) else {
-        eprintln!("fatal: invalid filter-spec 'blob:limit={value}'");
-        return Err(GitError::Exit(128));
-    };
-    usize::try_from(parsed).map_err(|_| {
-        eprintln!("fatal: invalid filter-spec 'blob:limit={value}'");
-        GitError::Exit(128)
-    })
+    sley_rev::revlist::parse_rev_list_blob_limit(value)
 }
 
 fn parse_pack_filter_depth(value: &str) -> Result<usize> {
-    let Some(parsed) = git_parse_unsigned_with_suffix(value) else {
-        eprintln!("fatal: expected 'tree:<depth>'");
-        return Err(GitError::Exit(128));
-    };
-    usize::try_from(parsed).map_err(|_| {
-        eprintln!("fatal: expected 'tree:<depth>'");
-        GitError::Exit(128)
-    })
+    sley_rev::revlist::parse_rev_list_tree_depth(value)
 }
 
 fn parse_pack_filter_object_type(value: &str) -> Result<ObjectType> {
-    match value {
-        "commit" => Ok(ObjectType::Commit),
-        "tree" => Ok(ObjectType::Tree),
-        "blob" => Ok(ObjectType::Blob),
-        "tag" => Ok(ObjectType::Tag),
-        _ => {
-            eprintln!("fatal: '{value}' for 'object:type=<type>' is not a valid object type");
-            Err(GitError::Exit(128))
-        }
-    }
-}
-
-fn git_parse_unsigned_with_suffix(value: &str) -> Option<u64> {
-    if value.is_empty() || value.contains('-') {
-        return None;
-    }
-    let (digits, factor) = match value.as_bytes()[value.len() - 1] {
-        b'k' | b'K' => (&value[..value.len() - 1], 1024u64),
-        b'm' | b'M' => (&value[..value.len() - 1], 1024 * 1024),
-        b'g' | b'G' => (&value[..value.len() - 1], 1024 * 1024 * 1024),
-        _ => (value, 1),
-    };
-    let base = parse_git_unsigned_base0(digits)?;
-    base.checked_mul(factor)
-}
-
-fn parse_git_unsigned_base0(value: &str) -> Option<u64> {
-    if let Some(hex) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    if value.len() > 1 && value.starts_with('0') {
-        return u64::from_str_radix(&value[1..], 8).ok();
-    }
-    value.parse::<u64>().ok()
+    sley_rev::revlist::parse_rev_list_object_type_filter(value)
 }
 
 fn pack_filter_decode_sub_filter(raw: &str) -> Result<String> {
@@ -1602,8 +1810,8 @@ fn pack_reuse_mode(git_dir: &Path) -> Result<PackReuseMode> {
     Ok(mode)
 }
 
-/// Find local bitmapped packs whose every object is in `want_set`: each such
-/// pack can be spliced into the output verbatim.
+/// Find local bitmapped pack entries that can be spliced into the output
+/// verbatim for the requested `want_set`.
 fn find_verbatim_reusable_packs(
     common_git_dir: &Path,
     format: ObjectFormat,
@@ -1650,16 +1858,34 @@ fn find_verbatim_reusable_packs(
         let Ok(pack_bytes) = fs::read(&pack_path) else {
             continue;
         };
-        let wanted: HashSet<ObjectId> = index.entries.iter().map(|entry| entry.oid).collect();
-        let Some(entry_bytes) =
-            raw_pack_entries_for_oids(format, &pack_bytes, &index.entries, &wanted, false)?
-        else {
-            continue;
-        };
-        return Ok(Some(vec![ReusablePackCandidate {
-            entry_bytes,
-            oids: index.entries.into_iter().map(|entry| entry.oid).collect(),
-        }]));
+        let all_pack_oids: HashSet<ObjectId> =
+            index.entries.iter().map(|entry| entry.oid).collect();
+        let wanted_count = index
+            .entries
+            .iter()
+            .filter(|entry| want_set.contains(&entry.oid))
+            .count();
+        let whole_pack = wanted_count == index.entries.len();
+        if whole_pack {
+            let Some(entry_bytes) = raw_pack_entries_for_oids(
+                format,
+                &pack_bytes,
+                &index.entries,
+                &all_pack_oids,
+                false,
+            )?
+            else {
+                continue;
+            };
+            return Ok(Some(vec![ReusablePackCandidate {
+                entry_bytes,
+                oids: all_pack_oids,
+            }]));
+        } else if let Some((oids, entry_bytes)) =
+            raw_partial_pack_entries_for_wanted_oids(format, &pack_bytes, &index.entries, want_set)?
+        {
+            return Ok(Some(vec![ReusablePackCandidate { entry_bytes, oids }]));
+        }
     }
     Ok(None)
 }
@@ -1818,6 +2044,163 @@ fn raw_pack_entries_for_oids(
         out.push(pack_bytes[start..end].to_vec());
     }
     Ok(Some(out))
+}
+
+#[derive(Clone, Copy)]
+struct SparseTreeVisit {
+    oid: ObjectId,
+    uninteresting: bool,
+}
+
+fn tolerant_sparse_excluded_objects(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    wants: &[ObjectId],
+    haves: &[ObjectId],
+) -> Result<HashSet<ObjectId>> {
+    let mut excluded = HashSet::new();
+    let mut roots = Vec::new();
+
+    collect_sparse_commit_tree_roots(
+        database,
+        format,
+        haves,
+        None,
+        true,
+        &mut excluded,
+        &mut roots,
+    )?;
+    let have_excluded = excluded.clone();
+    collect_sparse_commit_tree_roots(
+        database,
+        format,
+        wants,
+        Some(&have_excluded),
+        false,
+        &mut excluded,
+        &mut roots,
+    )?;
+    mark_sparse_uninteresting_trees(database, format, roots, &mut excluded)?;
+    Ok(excluded)
+}
+
+fn collect_sparse_commit_tree_roots(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    starts: &[ObjectId],
+    stop: Option<&HashSet<ObjectId>>,
+    mark_uninteresting: bool,
+    excluded: &mut HashSet<ObjectId>,
+    roots: &mut Vec<SparseTreeVisit>,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut pending: Vec<ObjectId> = starts.to_vec();
+    while let Some(oid) = pending.pop() {
+        if stop.is_some_and(|stop| stop.contains(&oid)) || !seen.insert(oid) {
+            continue;
+        }
+        let object = match database.read_object(&oid) {
+            Ok(object) => object,
+            Err(GitError::NotFound(_)) if mark_uninteresting => {
+                excluded.insert(oid);
+                continue;
+            }
+            Err(GitError::NotFound(_)) => continue,
+            Err(err) => return Err(err),
+        };
+        if mark_uninteresting {
+            excluded.insert(oid);
+        }
+        match object.object_type {
+            ObjectType::Commit => {
+                let commit = Commit::parse_ref(format, &object.body)?;
+                roots.push(SparseTreeVisit {
+                    oid: commit.tree,
+                    uninteresting: mark_uninteresting,
+                });
+                if mark_uninteresting {
+                    excluded.insert(commit.tree);
+                }
+                pending.extend(commit.parents);
+            }
+            ObjectType::Tree => {
+                roots.push(SparseTreeVisit {
+                    oid,
+                    uninteresting: mark_uninteresting,
+                });
+            }
+            ObjectType::Tag => {
+                let tag = Tag::parse_ref(format, &object.body)?;
+                pending.push(tag.object);
+            }
+            ObjectType::Blob => {}
+        }
+    }
+    Ok(())
+}
+
+fn mark_sparse_uninteresting_trees(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    trees: Vec<SparseTreeVisit>,
+    excluded: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    let mut by_oid: HashMap<ObjectId, bool> = HashMap::new();
+    for tree in trees {
+        let uninteresting = tree.uninteresting || excluded.contains(&tree.oid);
+        by_oid
+            .entry(tree.oid)
+            .and_modify(|existing| *existing |= uninteresting)
+            .or_insert(uninteresting);
+    }
+
+    let mut has_interesting = false;
+    let mut has_uninteresting = false;
+    for uninteresting in by_oid.values().copied() {
+        if uninteresting {
+            has_uninteresting = true;
+        } else {
+            has_interesting = true;
+        }
+    }
+    if !has_interesting || !has_uninteresting {
+        return Ok(());
+    }
+
+    let mut by_path: BTreeMap<Vec<u8>, Vec<SparseTreeVisit>> = BTreeMap::new();
+    for (oid, uninteresting) in by_oid {
+        let object = match database.read_object(&oid) {
+            Ok(object) => object,
+            Err(GitError::NotFound(_)) => continue,
+            Err(err) => return Err(err),
+        };
+        if object.object_type != ObjectType::Tree {
+            continue;
+        }
+        for entry in TreeEntries::new(format, &object.body) {
+            let entry = entry?;
+            if entry.is_gitlink() {
+                continue;
+            }
+            if uninteresting {
+                excluded.insert(entry.oid);
+            }
+            if tree_entry_object_type(entry.mode) == ObjectType::Tree {
+                by_path
+                    .entry(entry.name.to_vec())
+                    .or_default()
+                    .push(SparseTreeVisit {
+                        oid: entry.oid,
+                        uninteresting,
+                    });
+            }
+        }
+    }
+
+    for child_trees in by_path.into_values() {
+        mark_sparse_uninteresting_trees(database, format, child_trees, excluded)?;
+    }
+    Ok(())
 }
 
 /// The reachability closure of `starts`, skipping objects that cannot be read

@@ -54,8 +54,8 @@ fn base_command(program: &str, cwd: &Path) -> Command {
     command
 }
 
-fn git_rs_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_sley")
+fn sley_bin() -> &'static str {
+    sley_testkit::sley_bin!()
 }
 
 fn run(program: &str, cwd: &Path, args: &[&str]) -> Output {
@@ -94,7 +94,7 @@ fn assert_same_stdin(args: &[&str], stdin: &[u8]) {
     rs_args.extend_from_slice(args);
 
     let expected = run_with_stdin(sley_testkit::oracle_git(), &cwd, &git_args, stdin);
-    let actual = run_with_stdin(git_rs_bin(), &cwd, &rs_args, stdin);
+    let actual = run_with_stdin(sley_bin(), &cwd, &rs_args, stdin);
 
     assert_eq!(
         actual.status.code(),
@@ -130,7 +130,7 @@ fn assert_same_args(cwd: &Path, args: &[&str]) {
     rs_args.extend_from_slice(args);
 
     let expected = run(sley_testkit::oracle_git(), cwd, &git_args);
-    let actual = run(git_rs_bin(), cwd, &rs_args);
+    let actual = run(sley_bin(), cwd, &rs_args);
 
     assert_eq!(
         actual.status.code(),
@@ -585,7 +585,7 @@ fn in_place_rewrites_file_identically() {
         ],
     );
     let rs_out = run(
-        git_rs_bin(),
+        sley_bin(),
         &rs_dir,
         &[
             "interpret-trailers",

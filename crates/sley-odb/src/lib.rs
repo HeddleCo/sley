@@ -550,6 +550,30 @@ where
     walk_reachable_objects(reader, format, starts, &HashSet::new(), |_, _| {})
 }
 
+pub fn collect_reachable_object_ids_tolerating_promised_missing<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+) -> Result<HashSet<ObjectId>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    collect_reachable_object_ids_excluding_promised_missing(reader, format, starts, &HashSet::new())
+}
+
+pub fn collect_reachable_object_ids_tolerating_missing<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+) -> Result<HashSet<ObjectId>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    walk_reachable_objects_tolerating_missing(reader, format, starts)
+}
+
 /// [`collect_reachable_object_ids`] with a cut set: commits in `cut` are
 /// collected, but the walk does not continue to their parents — the view a
 /// shallow repository has of its own refs (`$GIT_DIR/shallow` of the *other*
@@ -581,6 +605,54 @@ where
     I: IntoIterator<Item = ObjectId>,
 {
     walk_reachable_objects(reader, format, starts, excluded, |_, _| {})
+}
+
+fn collect_reachable_object_ids_excluding_promised_missing<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+) -> Result<HashSet<ObjectId>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    let mut seen = HashSet::new();
+    let mut pending: Vec<ObjectId> = starts.into_iter().collect();
+    while let Some(oid) = pending.pop() {
+        if excluded.contains(&oid) || !seen.insert(oid) {
+            continue;
+        }
+        let object = match reader
+            .read_object(&oid)
+            .map_err(|err| with_missing_object_context(err, oid, MissingObjectContext::Traversal))
+        {
+            Ok(object) => object,
+            Err(GitError::NotFound(_)) if reader.is_promised_object(&oid) => continue,
+            Err(err) => return Err(err),
+        };
+        match object.object_type {
+            ObjectType::Commit => {
+                let commit = Commit::parse_ref(format, &object.body)?;
+                pending.extend(grafted_parents(reader, &oid, commit.parents));
+                pending.push(commit.tree);
+            }
+            ObjectType::Tree => {
+                for entry in TreeEntries::new(format, &object.body) {
+                    let entry = entry?;
+                    if !entry.is_gitlink() {
+                        pending.push(entry.oid);
+                    }
+                }
+            }
+            ObjectType::Tag => {
+                let tag = Tag::parse_ref(format, &object.body)?;
+                pending.push(tag.object);
+            }
+            ObjectType::Blob => {}
+        }
+    }
+    Ok(seen)
 }
 
 pub fn collect_reachable_objects<R, I>(
@@ -1303,6 +1375,8 @@ pub struct RepackResult {
     /// Pack stems (`pack-<checksum>`) that policy says must survive pruning
     /// even if the new pack contains all of their objects.
     retained_pack_stems: Vec<String>,
+    /// Whether the freshly written pack should receive a `.promisor` sidecar.
+    promisor: bool,
     pack_checksum: ObjectId,
     index_entries: Vec<PackIndexEntry>,
 }
@@ -1366,12 +1440,16 @@ pub fn repack_reachable_objects_with_options(
     } else {
         pack_oids_for_stems(&objects_dir.join("pack"), format, &retained_pack_stems)?
     };
+    let promisor_oids = promisor_pack_object_ids(&objects_dir, format)?;
 
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut objects: Vec<ReachablePackObject> = Vec::new();
     let mut pending: Vec<ObjectId> = roots.to_vec();
     while let Some(oid) = pending.pop() {
         if !seen.insert(oid) {
+            continue;
+        }
+        if promisor_oids.contains(&oid) {
             continue;
         }
         let object = match database.read_object(&oid) {
@@ -1455,6 +1533,7 @@ pub fn repack_reachable_objects_with_options(
         obsolete_packs,
         packed_loose,
         retained_pack_stems,
+        promisor: false,
         pack_checksum,
         index_entries,
     }))
@@ -1583,8 +1662,76 @@ pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option
         obsolete_packs,
         packed_loose,
         retained_pack_stems: Vec::new(),
+        promisor: false,
         pack_checksum: written.checksum,
         index_entries: written.entries,
+    }))
+}
+
+/// Consolidate multiple existing promisor packs into one promisor pack.
+///
+/// A single promisor pack is left untouched, which preserves its content-derived
+/// pack name for callers that expect that exact pack to survive.
+pub fn repack_promisor_objects(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Option<RepackResult>> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let pack_dir = objects_dir.join("pack");
+    let promisor_packs = existing_pack_files(&pack_dir)?
+        .into_iter()
+        .filter(|path| path.with_extension("promisor").exists())
+        .collect::<Vec<_>>();
+    if promisor_packs.len() <= 1 {
+        return Ok(None);
+    }
+
+    let database = FileObjectDatabase::new(objects_dir.clone(), format);
+    let mut seen = HashSet::new();
+    let mut objects = Vec::new();
+    for pack_path in &promisor_packs {
+        let index_path = pack_path.with_extension("idx");
+        if !index_path.exists() {
+            continue;
+        }
+        let index = PackIndex::parse(&fs::read(index_path)?, format)?;
+        for entry in index.entries {
+            if !seen.insert(entry.oid) {
+                continue;
+            }
+            objects.push(ReachablePackObject {
+                oid: entry.oid,
+                object: database.read_object(&entry.oid)?,
+            });
+        }
+    }
+    if objects.is_empty() {
+        return Ok(None);
+    }
+    objects.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
+
+    let inputs = pack_inputs(&objects);
+    let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
+    let object_count = written.entries.len();
+    let packed_oid_set: HashSet<&ObjectId> = written.entries.iter().map(|e| &e.oid).collect();
+    let mut packed_loose: Vec<ObjectId> = loose_object_ids(&objects_dir, format)?
+        .into_iter()
+        .filter(|oid| packed_oid_set.contains(oid))
+        .collect();
+    packed_loose.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+    let pack_checksum = written.checksum;
+    let index_entries = written.entries.clone();
+    Ok(Some(RepackResult {
+        pack: written.pack,
+        idx: written.index,
+        object_count,
+        obsolete_packs: promisor_packs,
+        packed_loose,
+        retained_pack_stems: Vec::new(),
+        promisor: true,
+        pack_checksum,
+        index_entries,
     }))
 }
 
@@ -1628,6 +1775,7 @@ pub fn repack_loose_objects(git_dir: &Path, format: ObjectFormat) -> Result<Opti
         obsolete_packs: Vec::new(),
         packed_loose,
         retained_pack_stems: Vec::new(),
+        promisor: false,
         pack_checksum,
         index_entries,
     }))
@@ -1655,6 +1803,12 @@ pub struct GeometricRepackResult {
     pub result: Option<RepackResult>,
     /// Pack `.pack` paths below the split that may now be removed under `-d`.
     pub rolled_up_packs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeometricRepackPlan {
+    pub split: usize,
+    pub pack_count: usize,
 }
 
 /// Collect the local non-cruft, non-kept packs eligible for geometric rollup,
@@ -1737,6 +1891,23 @@ fn compute_geometry_split(packs: &[GeometryPack], split_factor: u64) -> usize {
         }
     }
     split
+}
+
+pub fn geometric_repack_plan(
+    git_dir: &Path,
+    format: ObjectFormat,
+    split_factor: u64,
+    kept_pack_stems: &HashSet<String>,
+) -> Result<GeometricRepackPlan> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let packs: Vec<GeometryPack> = collect_geometry_packs(&objects_dir, format, kept_pack_stems)?
+        .into_iter()
+        .filter(|pack| !pack.is_promisor)
+        .collect();
+    Ok(GeometricRepackPlan {
+        split: compute_geometry_split(&packs, split_factor),
+        pack_count: packs.len(),
+    })
 }
 
 /// `git repack --geometric=<factor>`: roll up the smallest packs (plus loose
@@ -1843,6 +2014,7 @@ pub fn repack_geometric(
             obsolete_packs: rolled_up_packs.clone(),
             packed_loose,
             retained_pack_stems: Vec::new(),
+            promisor: false,
             pack_checksum,
             index_entries,
         }),
@@ -1870,7 +2042,7 @@ pub fn install_repack_result(
     result: &RepackResult,
     prune: bool,
 ) -> Result<()> {
-    install_repack_result_with_bitmap(git_dir, format, result, prune, None)
+    install_repack_result_with_bitmap(git_dir, format, result, prune, None, None)
 }
 
 /// [`install_repack_result`] that additionally writes a `pack-<checksum>.bitmap`
@@ -1884,6 +2056,7 @@ pub fn install_repack_result_with_bitmap(
     result: &RepackResult,
     prune: bool,
     bitmap_tips: Option<&HashSet<ObjectId>>,
+    bitmap_pseudo_merge_groups: Option<&[BitmapPseudoMergeGroup]>,
 ) -> Result<()> {
     let objects_dir = repository_objects_dir(git_dir);
     let pack_dir = objects_dir.join("pack");
@@ -1920,6 +2093,7 @@ pub fn install_repack_result_with_bitmap(
     write_pack_component(&new_pack_path, &result.pack)?;
     write_pack_component(&new_rev_path, &reverse_index)?;
     write_pack_component(&new_index_path, &result.idx)?;
+    let new_promisor_path = write_promisor_pack_sidecar(&pack_dir, &pack_name, result.promisor)?;
 
     if let Some(tips) = bitmap_tips {
         // Build before pruning: the closure walk reads objects through the
@@ -1931,6 +2105,7 @@ pub fn install_repack_result_with_bitmap(
             &result.index_entries,
             &result.pack_checksum,
             tips,
+            bitmap_pseudo_merge_groups.unwrap_or(&[]),
         )? {
             // Unlike the pack/idx/rev (content-addressed by the pack
             // checksum), the bitmap depends on selection inputs (e.g.
@@ -1957,8 +2132,14 @@ pub fn install_repack_result_with_bitmap(
         &result.obsolete_packs,
         &new_pack_path,
         &result.retained_pack_stems,
+        result.promisor,
     )?;
     prune_loose_objects(&objects_dir, format, result.packed_loose.iter(), &present)?;
+    if result.promisor && new_promisor_path.is_none() {
+        return Err(GitError::InvalidFormat(
+            "promisor repack did not write sidecar".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2014,6 +2195,7 @@ pub fn install_geometric_repack_result(
             &result.index_entries,
             &result.pack_checksum,
             tips,
+            &[],
         )? {
             let bitmap_path = pack_dir.join(format!("{pack_name}.bitmap"));
             remove_file_if_exists(&bitmap_path)?;
@@ -2313,9 +2495,20 @@ pub fn repack_cruft_with_options(
     } else {
         pack_oids_for_stems(&pack_dir, format, &retained_pack_stems)?
     };
+    let promisor_oids = promisor_pack_object_ids(&objects_dir, format)?;
+    let database = if promisor_oids.is_empty() {
+        database
+    } else {
+        database.with_promisor_remote_present(true)
+    };
 
     // Reachable closure → the new "reachable" pack.
-    let mut reachable_ids = collect_reachable_object_ids(&database, format, roots.iter().copied())?;
+    let mut reachable_ids = collect_reachable_object_ids_excluding_promised_missing(
+        &database,
+        format,
+        roots.iter().copied(),
+        &promisor_oids,
+    )?;
     reachable_ids.retain(|oid| !excluded_oids.contains(oid));
     let reachable_result = if reachable_ids.is_empty() {
         None
@@ -2348,6 +2541,7 @@ pub fn repack_cruft_with_options(
                 obsolete_packs: Vec::new(),
                 packed_loose,
                 retained_pack_stems: Vec::new(),
+                promisor: false,
                 pack_checksum: written.checksum,
                 index_entries: written.entries,
             })
@@ -2358,7 +2552,11 @@ pub fn repack_cruft_with_options(
     // with their best mtime.
     let mut survivors: HashMap<ObjectId, u32> = object_mtimes_on_disk(&objects_dir, format)?
         .into_iter()
-        .filter(|(oid, _)| !reachable_ids.contains(oid) && !excluded_oids.contains(oid))
+        .filter(|(oid, _)| {
+            !reachable_ids.contains(oid)
+                && !excluded_oids.contains(oid)
+                && !promisor_oids.contains(oid)
+        })
         .collect();
 
     // Expiration: rescue older objects reachable from a recent one, drop the rest.
@@ -2532,6 +2730,9 @@ pub fn install_cruft_repack_result(
         if pack_path.with_extension("keep").exists() {
             continue;
         }
+        if pack_path.with_extension("promisor").exists() {
+            continue;
+        }
         if let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str()) {
             removed_stems.insert(stem.to_string());
         }
@@ -2584,9 +2785,42 @@ pub fn prune_unreachable_loose<I>(
 where
     I: IntoIterator<Item = ObjectId>,
 {
+    prune_unreachable_loose_with_reachability(git_dir, format, roots, delete, false)
+}
+
+/// Like [`prune_unreachable_loose`], but missing links encountered while walking
+/// reachable roots are ignored. `git gc` uses this mode for pre-existing broken
+/// unreachable commits/trees/tags: the broken object itself is kept when recent,
+/// but its absent children do not make housekeeping fail.
+pub fn prune_unreachable_loose_tolerating_missing<I>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: I,
+    delete: bool,
+) -> Result<Vec<ObjectId>>
+where
+    I: IntoIterator<Item = ObjectId>,
+{
+    prune_unreachable_loose_with_reachability(git_dir, format, roots, delete, true)
+}
+
+fn prune_unreachable_loose_with_reachability<I>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: I,
+    delete: bool,
+    tolerate_missing: bool,
+) -> Result<Vec<ObjectId>>
+where
+    I: IntoIterator<Item = ObjectId>,
+{
     let objects_dir = repository_objects_dir(git_dir);
     let database = FileObjectDatabase::new(objects_dir.clone(), format);
-    let reachable = collect_reachable_object_ids(&database, format, roots)?;
+    let reachable = if tolerate_missing {
+        collect_reachable_object_ids_tolerating_missing(&database, format, roots)?
+    } else {
+        collect_reachable_object_ids(&database, format, roots)?
+    };
 
     let store = LooseObjectStore::new(objects_dir.clone(), format);
     let mut pruned: Vec<ObjectId> = loose_object_ids(&objects_dir, format)?
@@ -2649,6 +2883,7 @@ fn prune_obsolete_pack_paths(
     packs: &[PathBuf],
     keep: &Path,
     retained_pack_stems: &[String],
+    prune_promisor: bool,
 ) -> Result<()> {
     prune_pack_paths_matching(
         objects_dir,
@@ -2656,6 +2891,7 @@ fn prune_obsolete_pack_paths(
         packs.iter(),
         keep,
         retained_pack_stems,
+        prune_promisor,
         |_| Ok(true),
     )
 }
@@ -2666,6 +2902,7 @@ fn prune_pack_paths_matching<'a>(
     packs: impl IntoIterator<Item = &'a PathBuf>,
     keep: &Path,
     retained_pack_stems: &[String],
+    prune_promisor: bool,
     mut should_prune: impl FnMut(&Path) -> Result<bool>,
 ) -> Result<()> {
     let pack_dir = objects_dir.join("pack");
@@ -2689,9 +2926,10 @@ fn prune_pack_paths_matching<'a>(
         {
             continue;
         }
-        if pack_path.with_extension("keep").exists()
-            || pack_path.with_extension("promisor").exists()
-        {
+        if pack_path.with_extension("keep").exists() {
+            continue;
+        }
+        if pack_path.with_extension("promisor").exists() && !prune_promisor {
             continue;
         }
         if !should_prune(pack_path)? {
@@ -2699,7 +2937,7 @@ fn prune_pack_paths_matching<'a>(
         }
         remove_file_if_exists(pack_path)?;
         remove_file_if_exists(&pack_path.with_extension("idx"))?;
-        for ext in ["rev", "mtimes", "bitmap"] {
+        for ext in ["rev", "mtimes", "bitmap", "promisor"] {
             remove_file_if_exists(&pack_path.with_extension(ext))?;
         }
         removed_stems.insert(stem.to_string_lossy().into_owned());
@@ -2772,7 +3010,7 @@ struct PackIndexOffsetInfo {
 fn scan_pack_index_offsets(
     index: &PackIndex,
     target_offset: u64,
-    trailer_offset: u64,
+    trailer_offset: Option<u64>,
     delta_base_offset: Option<u64>,
 ) -> Result<PackIndexOffsetInfo> {
     let mut target_count = 0usize;
@@ -2811,11 +3049,125 @@ fn scan_pack_index_offsets(
         // duplicate offsets: the next sorted entry has the same offset.
         end_offset: if target_count > 1 {
             target_offset
+        } else if let Some(offset) = next_offset {
+            offset
         } else {
-            next_offset.unwrap_or(trailer_offset)
+            trailer_offset.ok_or_else(|| {
+                GitError::InvalidFormat("pack size unavailable for final indexed object".into())
+            })?
         },
         delta_base_oid,
     })
+}
+
+fn scan_pack_offsets_without_index(
+    format: ObjectFormat,
+    pack: &[u8],
+    target_offset: u64,
+) -> Result<Option<u64>> {
+    let trailer_len = format.raw_len();
+    if pack.len() < 12 + trailer_len {
+        return Err(GitError::InvalidFormat("pack file too short".into()));
+    }
+    let trailer_offset = pack.len() - trailer_len;
+    let checksum = sley_core::digest_bytes(format, &pack[..trailer_offset])?;
+    let expected = ObjectId::from_raw(format, &pack[trailer_offset..])?;
+    if checksum != expected {
+        return Err(GitError::InvalidFormat(format!(
+            "pack checksum mismatch: expected {expected}, got {checksum}"
+        )));
+    }
+    if &pack[..4] != b"PACK" {
+        return Err(GitError::InvalidFormat("missing PACK signature".into()));
+    }
+    let version = u32_be(&pack[4..8]);
+    if version != 2 && version != 3 {
+        return Err(GitError::Unsupported(format!("pack version {version}")));
+    }
+
+    let count = u32_be(&pack[8..12]);
+    let mut cursor = 12usize;
+    for _ in 0..count {
+        let entry_offset = cursor as u64;
+        let first = pack_next_byte(pack, &mut cursor)?;
+        let kind = (first >> 4) & 0x07;
+        let mut byte = first;
+        while byte & 0x80 != 0 {
+            byte = pack_next_byte(pack, &mut cursor)?;
+        }
+        match kind {
+            1..=4 => {}
+            6 => {
+                parse_ofs_delta_base_offset(pack, &mut cursor, entry_offset)?;
+            }
+            7 => {
+                parse_ref_delta_base_oid(format, pack, &mut cursor)?;
+            }
+            _ => {
+                return Err(GitError::InvalidFormat(format!(
+                    "invalid pack object kind {kind}"
+                )));
+            }
+        }
+        if cursor > trailer_offset {
+            return Err(GitError::InvalidFormat(
+                "pack entry extends past checksum".into(),
+            ));
+        }
+        let consumed = inflate_pack_member_len(&pack[cursor..trailer_offset])?;
+        if consumed == 0 {
+            return Err(GitError::InvalidFormat(
+                "empty compressed pack entry".into(),
+            ));
+        }
+        cursor = cursor
+            .checked_add(consumed)
+            .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
+        if cursor > trailer_offset {
+            return Err(GitError::InvalidFormat(
+                "pack entry extends past checksum".into(),
+            ));
+        }
+        if entry_offset == target_offset {
+            return Ok(Some(cursor as u64));
+        }
+    }
+    if cursor != trailer_offset {
+        return Err(GitError::InvalidFormat(format!(
+            "pack has {} trailing bytes before checksum",
+            trailer_offset - cursor
+        )));
+    }
+    Ok(None)
+}
+
+fn u32_be(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn inflate_pack_member_len(compressed: &[u8]) -> Result<usize> {
+    let mut decompress = Decompress::new(true);
+    let mut input = compressed;
+    let mut consumed_total = 0usize;
+    let mut out = [0u8; 8192];
+    loop {
+        let before_in = decompress.total_in();
+        let before_out = decompress.total_out();
+        let status = decompress
+            .decompress(input, &mut out, FlushDecompress::None)
+            .map_err(|err| GitError::InvalidObject(format!("zlib inflate failed: {err}")))?;
+        let consumed = (decompress.total_in() - before_in) as usize;
+        let produced = decompress.total_out() - before_out;
+        input = &input[consumed..];
+        consumed_total += consumed;
+        match status {
+            flate2::Status::StreamEnd => return Ok(consumed_total),
+            _ if consumed == 0 && produced == 0 => {
+                return Err(GitError::InvalidObject("truncated zlib stream".into()));
+            }
+            _ => {}
+        }
+    }
 }
 
 fn pack_entry_delta_base(
@@ -2985,7 +3337,68 @@ where
     Ok(seen)
 }
 
+fn walk_reachable_objects_tolerating_missing<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+) -> Result<HashSet<ObjectId>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    let mut seen = HashSet::new();
+    let mut pending: Vec<ObjectId> = starts.into_iter().collect();
+    while let Some(oid) = pending.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        let object = match reader
+            .read_object(&oid)
+            .map_err(|err| with_missing_object_context(err, oid, MissingObjectContext::Traversal))
+        {
+            Ok(object) => object,
+            Err(GitError::NotFound(_)) => continue,
+            Err(err) => return Err(err),
+        };
+        match object.object_type {
+            ObjectType::Commit => {
+                let commit = Commit::parse_ref(format, &object.body)?;
+                pending.extend(grafted_parents(reader, &oid, commit.parents));
+                pending.push(commit.tree);
+            }
+            ObjectType::Tree => {
+                for entry in TreeEntries::new(format, &object.body) {
+                    let entry = entry?;
+                    if !entry.is_gitlink() {
+                        pending.push(entry.oid);
+                    }
+                }
+            }
+            ObjectType::Tag => {
+                let tag = Tag::parse_ref(format, &object.body)?;
+                pending.push(tag.object);
+            }
+            ObjectType::Blob => {}
+        }
+    }
+    Ok(seen)
+}
+
 // ===== reachability bitmaps (.bitmap write + consult) =====
+
+#[derive(Debug, Clone)]
+pub struct BitmapPseudoMergeGroup {
+    pub commits: Vec<ObjectId>,
+    pub exclude_selected: bool,
+    pub partition: Option<BitmapPseudoMergePartition>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BitmapPseudoMergePartition {
+    pub max_merges: usize,
+    pub decay: f64,
+    pub sample_rate: f64,
+}
 
 /// Bit accessors over a `Vec<u64>` bitset using git's bitmap convention:
 /// bit `i` lives in word `i / 64` at bit `i % 64` (LSB-first within a word).
@@ -3005,6 +3418,13 @@ fn bitset_or(acc: &mut [u64], other: &[u64]) {
     for (dst, src) in acc.iter_mut().zip(other) {
         *dst |= *src;
     }
+}
+
+fn bitset_is_subset(needles: &[u64], haystack: &[u64]) -> bool {
+    needles
+        .iter()
+        .zip(haystack)
+        .all(|(needle, hay)| needle & !hay == 0)
 }
 
 /// Sorted set-bit positions of a bitset (the inverse of repeated [`bitset_set`]).
@@ -3072,6 +3492,7 @@ pub fn build_pack_bitmap(
     index_entries: &[PackIndexEntry],
     pack_checksum: &ObjectId,
     preferred_tips: &HashSet<ObjectId>,
+    pseudo_merge_groups: &[BitmapPseudoMergeGroup],
 ) -> Result<Option<Vec<u8>>> {
     // `index_entries` carries no ordering guarantee (writer provenance is in
     // pack-write order); bit numbering follows pack (offset) order.
@@ -3081,7 +3502,14 @@ pub fn build_pack_bitmap(
         .into_iter()
         .map(|slot| index_entries[slot].oid)
         .collect();
-    build_reachability_bitmap(db, format, pack_checksum, &bit_order, preferred_tips)
+    build_reachability_bitmap(
+        db,
+        format,
+        pack_checksum,
+        &bit_order,
+        preferred_tips,
+        pseudo_merge_groups,
+    )
 }
 
 /// [`build_pack_bitmap`]'s multi-pack sibling: builds the serialised
@@ -3096,6 +3524,7 @@ pub fn build_midx_bitmap(
     midx_checksum: &ObjectId,
     preferred_pack: u32,
     preferred_tips: &HashSet<ObjectId>,
+    pseudo_merge_groups: &[BitmapPseudoMergeGroup],
 ) -> Result<Option<Vec<u8>>> {
     let mut pseudo: Vec<usize> = (0..midx_entries.len()).collect();
     pseudo.sort_by_key(|&slot| {
@@ -3110,7 +3539,14 @@ pub fn build_midx_bitmap(
         .into_iter()
         .map(|slot| midx_entries[slot].oid)
         .collect();
-    build_reachability_bitmap(db, format, midx_checksum, &bit_order, preferred_tips)
+    build_reachability_bitmap(
+        db,
+        format,
+        midx_checksum,
+        &bit_order,
+        preferred_tips,
+        pseudo_merge_groups,
+    )
 }
 
 /// Upstream `bitmap_builder_init`'s `num_maximal` counter (pack-bitmap-write.c):
@@ -3222,6 +3658,7 @@ fn build_reachability_bitmap(
     checksum: &ObjectId,
     bit_order: &[ObjectId],
     preferred_tips: &HashSet<ObjectId>,
+    pseudo_merge_groups: &[BitmapPseudoMergeGroup],
 ) -> Result<Option<Vec<u8>>> {
     if bit_order.is_empty() || bit_order.len() > u32::MAX as usize {
         return Ok(None);
@@ -3316,6 +3753,15 @@ fn build_reachability_bitmap(
         let num_maximal = bitmap_num_maximal_commits(db, format, &selected_oids)?;
         sley_core::trace2::data("pack-bitmap-write", "num_selected_commits", selected.len());
         sley_core::trace2::data("pack-bitmap-write", "num_maximal_commits", num_maximal);
+        let reusable_pseudo_merges = pseudo_merge_groups
+            .iter()
+            .filter(|group| !group.exclude_selected)
+            .count();
+        sley_core::trace2::data(
+            "pack-bitmap-write",
+            "building_bitmaps_pseudo_merge_reused",
+            reusable_pseudo_merges,
+        );
     }
 
     // Reachability closures, oldest-first so newer walks stop at memoised
@@ -3323,34 +3769,11 @@ fn build_reachability_bitmap(
     let word_count = object_count.div_ceil(64);
     let mut memo: HashMap<ObjectId, Arc<Vec<u64>>> = HashMap::new();
     for commit in selected.iter().rev() {
-        let mut acc = vec![0u64; word_count];
-        let mut pending = vec![commit.oid];
-        while let Some(oid) = pending.pop() {
-            let Some(&pack_pos) = oid_to_pack.get(&oid) else {
-                // Mirrors upstream's "Packfile doesn't have full closure".
-                eprintln!(
-                    "warning: Failed to write bitmap index. Packfile doesn't have full closure (object {oid} is missing)"
-                );
-                return Ok(None);
-            };
-            if bitset_get(&acc, pack_pos) {
-                continue;
-            }
-            if let Some(stored) = memo.get(&oid) {
-                bitset_or(&mut acc, stored);
-                continue;
-            }
-            bitset_set(&mut acc, pack_pos);
-            let object = db.read_object(&oid)?;
-            let tree = {
-                let parsed = Commit::parse_ref(format, &object.body)?;
-                pending.extend(grafted_parents(db, &oid, parsed.parents));
-                parsed.tree
-            };
-            if !bitmap_mark_tree(db, format, &tree, &oid_to_pack, &mut acc)? {
-                return Ok(None);
-            }
-        }
+        let Some(acc) =
+            bitmap_commit_closure(db, format, &[commit.oid], &oid_to_pack, word_count, &memo)?
+        else {
+            return Ok(None);
+        };
         memo.insert(commit.oid, Arc::new(acc));
     }
 
@@ -3362,7 +3785,155 @@ fn build_reachability_bitmap(
         };
         writer.add_commit(commit.pack_pos, commit.index_pos, &bitset_positions(words))?;
     }
+    if !pseudo_merge_groups.is_empty() {
+        let selected_oids: HashSet<ObjectId> = selected.iter().map(|commit| commit.oid).collect();
+        for group in pseudo_merge_groups {
+            let mut commits = Vec::new();
+            for oid in &group.commits {
+                if group.exclude_selected && selected_oids.contains(oid) {
+                    continue;
+                }
+                let Some(&pack_pos) = oid_to_pack.get(oid) else {
+                    continue;
+                };
+                if object_types.get(pack_pos as usize) != Some(&ObjectType::Commit) {
+                    continue;
+                }
+                commits.push((*oid, pack_pos));
+            }
+            if commits.is_empty() {
+                continue;
+            }
+            if let Some(partition) = &group.partition {
+                let mut start = 0usize;
+                for merge_index in 0..partition.max_merges {
+                    if start >= commits.len() {
+                        break;
+                    }
+                    let size = bitmap_pseudo_merge_group_size(
+                        partition.max_merges,
+                        partition.decay,
+                        commits.len(),
+                        merge_index,
+                    );
+                    let end = if size < 8 {
+                        commits.len()
+                    } else {
+                        start.saturating_add(size).min(commits.len())
+                    };
+                    let sample_stride = if partition.sample_rate <= 0.0 {
+                        usize::MAX
+                    } else {
+                        ((1.0 / partition.sample_rate) as usize).max(1)
+                    };
+                    let sampled: Vec<(ObjectId, u32)> = commits[start..end]
+                        .iter()
+                        .enumerate()
+                        .filter(|(offset, _candidate)| *offset % sample_stride == 0)
+                        .map(|(_offset, candidate)| *candidate)
+                        .collect();
+                    if !sampled.is_empty()
+                        && !bitmap_add_pseudo_merge(
+                            &mut writer,
+                            db,
+                            format,
+                            &sampled,
+                            &oid_to_pack,
+                            word_count,
+                            &memo,
+                        )?
+                    {
+                        return Ok(None);
+                    }
+                    start = end;
+                    if end >= commits.len() {
+                        break;
+                    }
+                }
+            } else if !bitmap_add_pseudo_merge(
+                &mut writer,
+                db,
+                format,
+                &commits,
+                &oid_to_pack,
+                word_count,
+                &memo,
+            )? {
+                return Ok(None);
+            }
+        }
+    }
     writer.write().map(Some)
+}
+
+fn bitmap_pseudo_merge_group_size(
+    max_merges: usize,
+    decay: f64,
+    unstable_len: usize,
+    index: usize,
+) -> usize {
+    let mut scale = 0.0;
+    for n in 0..max_merges {
+        scale += 1.0 / ((n + 1) as f64).powf(decay);
+    }
+    if scale == 0.0 {
+        return 0;
+    }
+    ((unstable_len as f64 / scale) / ((index + 1) as f64).powf(decay) + 0.5) as usize
+}
+
+fn bitmap_add_pseudo_merge(
+    writer: &mut PackBitmapWriter,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commits: &[(ObjectId, u32)],
+    oid_to_pack: &HashMap<ObjectId, u32>,
+    word_count: usize,
+    memo: &HashMap<ObjectId, Arc<Vec<u64>>>,
+) -> Result<bool> {
+    let roots: Vec<ObjectId> = commits.iter().map(|(oid, _position)| *oid).collect();
+    let Some(words) = bitmap_commit_closure(db, format, &roots, oid_to_pack, word_count, memo)?
+    else {
+        return Ok(false);
+    };
+    let commit_positions: Vec<u32> = commits.iter().map(|(_oid, position)| *position).collect();
+    writer.add_pseudo_merge(&commit_positions, &bitset_positions(&words))?;
+    Ok(true)
+}
+
+fn bitmap_commit_closure(
+    db: &impl ObjectReader,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    oid_to_pack: &HashMap<ObjectId, u32>,
+    word_count: usize,
+    memo: &HashMap<ObjectId, Arc<Vec<u64>>>,
+) -> Result<Option<Vec<u64>>> {
+    let mut acc = vec![0u64; word_count];
+    let mut pending = roots.to_vec();
+    while let Some(oid) = pending.pop() {
+        let Some(&pack_pos) = oid_to_pack.get(&oid) else {
+            eprintln!(
+                "warning: Failed to write bitmap index. Packfile doesn't have full closure (object {oid} is missing)"
+            );
+            return Ok(None);
+        };
+        if bitset_get(&acc, pack_pos) {
+            continue;
+        }
+        if let Some(stored) = memo.get(&oid) {
+            bitset_or(&mut acc, stored);
+            continue;
+        }
+        bitset_set(&mut acc, pack_pos);
+        let object = db.read_object(&oid)?;
+        let parsed = Commit::parse_ref(format, &object.body)?;
+        pending.extend(grafted_parents(db, &oid, parsed.parents));
+        if !bitmap_mark_tree(db, format, &parsed.tree, oid_to_pack, &mut acc)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(acc))
 }
 
 /// Marks `tree` and everything below it (sub-trees, blobs) in `acc`, skipping
@@ -3417,10 +3988,16 @@ pub struct LoadedPackBitmap {
     oid_to_pack: HashMap<ObjectId, u32>,
     pack_to_oid: Vec<ObjectId>,
     commit_words: HashMap<ObjectId, Arc<Vec<u64>>>,
+    pseudo_merges: Vec<LoadedPseudoMerge>,
     commits: Vec<u64>,
     trees: Vec<u64>,
     blobs: Vec<u64>,
     tags: Vec<u64>,
+}
+
+struct LoadedPseudoMerge {
+    commits: Arc<Vec<u64>>,
+    bitmap: Arc<Vec<u64>>,
 }
 
 impl LoadedPackBitmap {
@@ -3446,6 +4023,16 @@ impl LoadedPackBitmap {
     /// Oids of every commit with a stored bitmap entry (unordered).
     pub fn bitmapped_commits(&self) -> impl Iterator<Item = &ObjectId> {
         self.commit_words.keys()
+    }
+
+    pub fn pseudo_merge_count(&self) -> usize {
+        self.pseudo_merges.len()
+    }
+
+    pub fn pseudo_merge_words(&self, index: usize) -> Option<(&[u64], &[u64])> {
+        self.pseudo_merges
+            .get(index)
+            .map(|merge| (merge.commits.as_slice(), merge.bitmap.as_slice()))
     }
 
     /// The type bitmap for `object_type` (bit per pack position).
@@ -3479,6 +4066,9 @@ pub fn load_pack_bitmap(
     }
     // A multi-pack bitmap wins over single-pack bitmaps, like upstream's
     // open_bitmap trying the midx first.
+    if let Some(bitmap) = load_incremental_midx_bitmap(&pack_dir, format)? {
+        return Ok(Some(bitmap));
+    }
     if let Some(bitmap) = load_midx_bitmap(&pack_dir, format)? {
         return Ok(Some(bitmap));
     }
@@ -3502,6 +4092,106 @@ pub fn load_pack_bitmap(
         }
     }
     Ok(None)
+}
+
+fn load_incremental_midx_bitmap(
+    pack_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Option<LoadedPackBitmap>> {
+    let chain = read_incremental_midx_chain(pack_dir)?;
+    if chain.is_empty() {
+        return Ok(None);
+    }
+    let midx_dir = pack_dir.join("multi-pack-index.d");
+    if !chain.iter().any(|checksum| {
+        midx_dir
+            .join(format!("multi-pack-index-{checksum}.bitmap"))
+            .exists()
+    }) {
+        return Ok(None);
+    }
+
+    let mut pack_to_oid = Vec::new();
+    for checksum in &chain {
+        let path = midx_dir.join(format!("multi-pack-index-{checksum}.midx"));
+        let Ok(bytes) = fs::read(path) else {
+            return Ok(None);
+        };
+        let Ok(midx) = MultiPackIndex::parse(&bytes, format) else {
+            return Ok(None);
+        };
+        let mut positions: Vec<usize> = match &midx.reverse_index {
+            Some(reverse) => reverse.iter().map(|position| *position as usize).collect(),
+            None => {
+                let mut positions: Vec<usize> = (0..midx.objects.len()).collect();
+                positions.sort_by_key(|&position| {
+                    let entry = &midx.objects[position];
+                    (entry.pack_int_id, entry.offset)
+                });
+                positions
+            }
+        };
+        for position in positions.drain(..) {
+            let Some(entry) = midx.objects.get(position) else {
+                return Ok(None);
+            };
+            pack_to_oid.push(entry.oid);
+        }
+    }
+
+    let object_count = pack_to_oid.len();
+    if object_count == 0 || object_count > u32::MAX as usize {
+        return Ok(None);
+    }
+    let mut oid_to_pack = HashMap::with_capacity(object_count);
+    for (position, oid) in pack_to_oid.iter().enumerate() {
+        oid_to_pack.insert(*oid, position as u32);
+    }
+
+    let Some(objects_dir) = pack_dir.parent() else {
+        return Ok(None);
+    };
+    let db = FileObjectDatabase::new(objects_dir.to_path_buf(), format);
+    let word_count = object_count.div_ceil(64);
+    let mut commits = vec![0u64; word_count];
+    let mut trees = vec![0u64; word_count];
+    let mut blobs = vec![0u64; word_count];
+    let mut tags = vec![0u64; word_count];
+    let mut commit_oids = Vec::new();
+    for (position, oid) in pack_to_oid.iter().enumerate() {
+        let Ok(Some((object_type, _size))) = db.read_object_header(oid) else {
+            return Ok(None);
+        };
+        let position = position as u32;
+        match object_type {
+            ObjectType::Commit => {
+                bitset_set(&mut commits, position);
+                commit_oids.push(*oid);
+            }
+            ObjectType::Tree => bitset_set(&mut trees, position),
+            ObjectType::Blob => bitset_set(&mut blobs, position),
+            ObjectType::Tag => bitset_set(&mut tags, position),
+        }
+    }
+
+    let mut loaded = LoadedPackBitmap {
+        object_count: object_count as u32,
+        oid_to_pack,
+        pack_to_oid,
+        commit_words: HashMap::new(),
+        pseudo_merges: Vec::new(),
+        commits,
+        trees,
+        blobs,
+        tags,
+    };
+    for oid in commit_oids {
+        let result = bitmap_reachable(&loaded, &db, format, &[oid], true)?;
+        if result.extended.is_empty() {
+            loaded.commit_words.insert(oid, Arc::new(result.words));
+        }
+    }
+    Ok(Some(loaded))
 }
 
 /// Loads `multi-pack-index-<checksum>.bitmap` when the pack directory has a
@@ -3728,12 +4418,20 @@ fn assemble_loaded_bitmap(
             .ok_or_else(|| GitError::InvalidFormat("bitmap entry position out of range".into()))?;
         commit_words.insert(commit_oid, words);
     }
+    let mut pseudo_merges = Vec::with_capacity(parsed.pseudo_merges.len());
+    for merge in &parsed.pseudo_merges {
+        pseudo_merges.push(LoadedPseudoMerge {
+            commits: Arc::new(expand(&merge.commits)?),
+            bitmap: Arc::new(expand(&merge.bitmap)?),
+        });
+    }
 
     Ok(LoadedPackBitmap {
         object_count: object_count as u32,
         oid_to_pack,
         pack_to_oid,
         commit_words,
+        pseudo_merges,
         commits: expand(&parsed.type_bitmaps.commits)?,
         trees: expand(&parsed.type_bitmaps.trees)?,
         blobs: expand(&parsed.type_bitmaps.blobs)?,
@@ -3747,6 +4445,8 @@ fn assemble_loaded_bitmap(
 pub struct BitmapWalkResult {
     pub words: Vec<u64>,
     pub extended: Vec<(ObjectId, ObjectType)>,
+    pub pseudo_merges_satisfied: usize,
+    pub pseudo_merges_cascades: usize,
 }
 
 impl BitmapWalkResult {
@@ -3837,10 +4537,39 @@ pub fn bitmap_reachable(
         }
     }
 
+    let (pseudo_merges_satisfied, pseudo_merges_cascades) =
+        bitmap_cascade_pseudo_merges(bitmap, &mut walk.words);
+
     Ok(BitmapWalkResult {
         words: walk.words,
         extended: walk.extended,
+        pseudo_merges_satisfied,
+        pseudo_merges_cascades,
     })
+}
+
+fn bitmap_cascade_pseudo_merges(bitmap: &LoadedPackBitmap, words: &mut [u64]) -> (usize, usize) {
+    if bitmap.pseudo_merges.is_empty() {
+        return (0, 0);
+    }
+    let mut satisfied = vec![false; bitmap.pseudo_merges.len()];
+    let mut total = 0usize;
+    loop {
+        let mut any = false;
+        for (index, merge) in bitmap.pseudo_merges.iter().enumerate() {
+            if satisfied[index] || !bitset_is_subset(merge.commits.as_slice(), words) {
+                continue;
+            }
+            bitset_or(words, merge.bitmap.as_slice());
+            satisfied[index] = true;
+            any = true;
+            total += 1;
+        }
+        if !any {
+            break;
+        }
+    }
+    (total, usize::from(total > 0))
 }
 
 struct BitmapFillWalk<'a> {
@@ -4893,6 +5622,29 @@ pub fn packed_object_ids(
     Ok(oids)
 }
 
+pub fn kept_pack_object_ids(
+    objects_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<HashSet<ObjectId>> {
+    let pack_dir = objects_dir.as_ref().join("pack");
+    let mut oids = HashSet::new();
+    if !pack_dir.exists() {
+        return Ok(oids);
+    }
+    for entry in fs::read_dir(pack_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+            continue;
+        }
+        if !path.with_extension("pack").exists() || !path.with_extension("keep").exists() {
+            continue;
+        }
+        let index = PackIndex::parse(&fs::read(path)?, format)?;
+        oids.extend(index.entries.into_iter().map(|entry| entry.oid));
+    }
+    Ok(oids)
+}
+
 fn collect_packed_object_ids(
     pack_dir: &Path,
     format: ObjectFormat,
@@ -4908,6 +5660,7 @@ fn collect_packed_object_ids(
         midx_pack_names.extend(midx.pack_names.iter().cloned());
         oids.extend(midx.objects.into_iter().map(|entry| entry.oid));
     }
+    collect_incremental_midx_object_ids(pack_dir, format, oids)?;
     for entry in fs::read_dir(pack_dir)? {
         let path = entry?.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
@@ -4933,6 +5686,39 @@ fn collect_packed_object_ids(
             Err(err) => return Err(err),
         };
         oids.extend(index.entries.into_iter().map(|entry| entry.oid));
+    }
+    Ok(())
+}
+
+fn read_incremental_midx_chain(pack_dir: &Path) -> Result<Vec<String>> {
+    let path = pack_dir
+        .join("multi-pack-index.d")
+        .join("multi-pack-index-chain");
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Ok(Vec::new());
+    };
+    Ok(contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn collect_incremental_midx_object_ids(
+    pack_dir: &Path,
+    format: ObjectFormat,
+    oids: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    let chain = read_incremental_midx_chain(pack_dir)?;
+    if chain.is_empty() {
+        return Ok(());
+    }
+    let midx_dir = pack_dir.join("multi-pack-index.d");
+    for checksum in chain {
+        let path = midx_dir.join(format!("multi-pack-index-{checksum}.midx"));
+        let midx = MultiPackIndex::parse_without_checksum(&fs::read(path)?, format)?;
+        oids.extend(midx.objects.into_iter().map(|entry| entry.oid));
     }
     Ok(())
 }
@@ -5554,19 +6340,23 @@ impl FileObjectDatabase {
         // so the recursive resolver re-entry (which may re-enter read_object) is
         // safe.
         let resolve_ref_base = |base: &ObjectId| self.read_object(base).map(Some);
+        let resolve_ofs_base =
+            |base_offset| self.read_ofs_delta_base_from_other_sources(pack_lookup, base_offset);
         let object = match &delta_adapter {
-            Some(adapter) => sley_pack::read_object_at_with_cache_arc(
+            Some(adapter) => sley_pack::read_object_at_with_cache_and_ofs_base_arc(
                 &bytes,
                 pack_lookup.offset,
                 self.format,
                 resolve_ref_base,
+                resolve_ofs_base,
                 adapter,
             )?,
-            None => sley_pack::read_object_at_arc(
+            None => sley_pack::read_object_at_with_ofs_base_arc(
                 &bytes,
                 pack_lookup.offset,
                 self.format,
                 resolve_ref_base,
+                resolve_ofs_base,
             )?,
         };
         // Trust the index → offset mapping rather than re-hashing every decoded
@@ -5675,6 +6465,42 @@ impl FileObjectDatabase {
             Err(err) => return Err(err),
         };
         if let Ok(mut cache) = self.multi_pack_oid_lookups.lock() {
+            cache.insert(midx_path.to_path_buf(), Arc::clone(&midx));
+        }
+        Ok(Some(midx))
+    }
+
+    fn cached_multi_pack_index(&self, midx_path: &Path) -> Result<Option<Arc<MultiPackIndex>>> {
+        if !midx_path.exists() {
+            return Ok(None);
+        }
+        if let Ok(cache) = self.multi_pack_indexes.lock()
+            && let Some(midx) = cache.get(midx_path)
+        {
+            return Ok(Some(Arc::clone(midx)));
+        }
+        let bytes = load_multi_pack_index_lookup_data(midx_path)?;
+        let midx = match MultiPackIndex::parse(bytes.as_bytes(), self.format) {
+            Ok(midx) => Arc::new(midx),
+            Err(GitError::InvalidFormat(message))
+                if message.starts_with("multi-pack-index hash id ") =>
+            {
+                let actual = message
+                    .strip_prefix("multi-pack-index hash id ")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .unwrap_or("0");
+                let expected = match self.format {
+                    ObjectFormat::Sha1 => 1,
+                    ObjectFormat::Sha256 => 2,
+                };
+                eprintln!(
+                    "error: multi-pack-index hash version {actual} does not match version {expected}"
+                );
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
+        if let Ok(mut cache) = self.multi_pack_indexes.lock() {
             cache.insert(midx_path.to_path_buf(), Arc::clone(&midx));
         }
         Ok(Some(midx))
@@ -5794,6 +6620,50 @@ impl FileObjectDatabase {
         Ok(None)
     }
 
+    fn pack_oid_at_offset(
+        &self,
+        pack_lookup: &PackLookup,
+        offset: u64,
+    ) -> Result<Option<ObjectId>> {
+        match pack_lookup.pack_index(self) {
+            Ok(index) => Ok(index
+                .entries
+                .iter()
+                .find(|entry| entry.offset == offset)
+                .map(|entry| entry.oid)),
+            Err(_) => self.midx_oid_for_pack_offset(pack_lookup, offset),
+        }
+    }
+
+    fn read_ofs_delta_base_from_other_sources(
+        &self,
+        pack_lookup: &PackLookup,
+        base_offset: u64,
+    ) -> Result<Option<Arc<EncodedObject>>> {
+        let Some(base_oid) = self.pack_oid_at_offset(pack_lookup, base_offset)? else {
+            return Ok(None);
+        };
+        if let Ok(mut cache) = self.decoded.lock()
+            && let Some(object) = cache.get(&base_oid)
+        {
+            return Ok(Some(object));
+        }
+        if let Ok(object) = self.loose.read_object(&base_oid) {
+            return Ok(Some(object));
+        }
+        if let Some(object) = self.read_packed_object_from_other_packs(&base_oid, pack_lookup)? {
+            return Ok(Some(object));
+        }
+        for alternate in &self.alternates {
+            if let Ok(object) =
+                Self::without_alternates(alternate, self.format).read_object(&base_oid)
+            {
+                return Ok(Some(object));
+            }
+        }
+        Ok(None)
+    }
+
     fn find_pack_containing(&self, oid: &ObjectId) -> Result<Option<PackLookup>> {
         if oid.format() != self.format {
             return Err(GitError::InvalidObjectId(format!(
@@ -5843,23 +6713,58 @@ impl FileObjectDatabase {
         let Some(pack_lookup) = self.find_pack_containing(oid)? else {
             return Ok(None);
         };
-        let pack_len = fs::metadata(pack_lookup.pack_path())?.len();
-        let trailer_offset = pack_len
-            .checked_sub(self.format.raw_len() as u64)
-            .ok_or_else(|| GitError::InvalidFormat("pack file shorter than checksum".into()))?;
-        let index = pack_lookup.pack_index(self)?;
-        let pack = pack_lookup.pack_bytes(self)?;
-        let delta_base = pack_entry_delta_base(self.format, &pack, pack_lookup.offset)?;
+        let index = pack_lookup.pack_index(self).ok();
+        let pack = match pack_lookup.pack_bytes(self) {
+            Ok(pack) => Some(pack),
+            Err(_err) if index.is_some() => None,
+            Err(err) => return Err(err),
+        };
+        let trailer_offset = pack
+            .as_ref()
+            .map(|pack| {
+                (pack.len() as u64)
+                    .checked_sub(self.format.raw_len() as u64)
+                    .ok_or_else(|| {
+                        GitError::InvalidFormat("pack file shorter than checksum".into())
+                    })
+            })
+            .transpose()?;
+        let delta_base = match &pack {
+            Some(pack) => pack_entry_delta_base(self.format, pack, pack_lookup.offset)?,
+            None => None,
+        };
         let delta_base_offset = match &delta_base {
             Some(PackDeltaBase::Offset(offset)) => Some(*offset),
             Some(PackDeltaBase::Ref(_)) | None => None,
         };
-        let offset_info = scan_pack_index_offsets(
-            &index,
-            pack_lookup.offset,
-            trailer_offset,
-            delta_base_offset,
-        )?;
+        let offset_info = if let Some(index) = &index {
+            scan_pack_index_offsets(index, pack_lookup.offset, trailer_offset, delta_base_offset)?
+        } else if let Some(pack) = &pack {
+            let end_offset =
+                scan_pack_offsets_without_index(self.format, pack, pack_lookup.offset)?
+                    .ok_or_else(|| {
+                        GitError::InvalidFormat(format!(
+                            "pack offset {} not found",
+                            pack_lookup.offset
+                        ))
+                    })?;
+            let delta_base_oid = match delta_base_offset {
+                Some(offset) => self
+                    .midx_oid_for_pack_offset(&pack_lookup, offset)?
+                    .ok_or_else(|| {
+                        GitError::InvalidFormat(format!("ofs-delta base offset {offset} not found"))
+                    })?,
+                None => zero_oid(self.format)?,
+            };
+            PackIndexOffsetInfo {
+                end_offset,
+                delta_base_oid: delta_base_offset.map(|_| delta_base_oid),
+            }
+        } else {
+            return Err(GitError::InvalidFormat(
+                "packed object metadata source unavailable".into(),
+            ));
+        };
         let disk_size = offset_info
             .end_offset
             .checked_sub(pack_lookup.offset)
@@ -5882,16 +6787,53 @@ impl FileObjectDatabase {
         }))
     }
 
+    fn midx_oid_for_pack_offset(
+        &self,
+        pack_lookup: &PackLookup,
+        offset: u64,
+    ) -> Result<Option<ObjectId>> {
+        let pack_dir = self.objects_dir.join("pack");
+        let midx_path = pack_dir.join("multi-pack-index");
+        let Some(midx) = self.cached_multi_pack_index(&midx_path)? else {
+            return Ok(None);
+        };
+        let Some(pack_name) = pack_lookup
+            .pack_path()
+            .file_name()
+            .and_then(|name| name.to_str())
+        else {
+            return Ok(None);
+        };
+        let idx_name = pack_name
+            .strip_suffix(".pack")
+            .map(|stem| format!("{stem}.idx"))
+            .unwrap_or_else(|| pack_name.to_string());
+        let Some(pack_int_id) = midx
+            .pack_names
+            .iter()
+            .position(|candidate| candidate == &idx_name)
+        else {
+            return Ok(None);
+        };
+        Ok(midx
+            .objects
+            .iter()
+            .find(|entry| entry.pack_int_id == pack_int_id as u32 && entry.offset == offset)
+            .map(|entry| entry.oid))
+    }
+
     fn find_midx_pack_containing(
         &self,
         pack_dir: &Path,
         oid: &ObjectId,
     ) -> Result<Option<PackLookup>> {
         let midx_path = pack_dir.join("multi-pack-index");
-        let Some(midx) = self.cached_multi_pack_index_oid_lookup(&midx_path)? else {
-            return Ok(None);
-        };
-        self.midx_oid_lookup_pack_paths(pack_dir, &midx, oid)
+        if let Some(midx) = self.cached_multi_pack_index_oid_lookup(&midx_path)?
+            && let Some(pack_lookup) = self.midx_oid_lookup_pack_paths(pack_dir, &midx, oid)?
+        {
+            return Ok(Some(pack_lookup));
+        }
+        self.find_incremental_midx_pack_containing(pack_dir, oid)
     }
 
     fn midx_oid_lookup_pack_paths(
@@ -5914,6 +6856,33 @@ impl FileObjectDatabase {
             .unwrap_or_else(|| pack_name.to_string());
         let pack = pack_dir.join(pack_file_name);
         Ok(Some(PackLookup::from_path(pack, entry.offset)))
+    }
+
+    fn find_incremental_midx_pack_containing(
+        &self,
+        pack_dir: &Path,
+        oid: &ObjectId,
+    ) -> Result<Option<PackLookup>> {
+        let chain = read_incremental_midx_chain(pack_dir)?;
+        if chain.is_empty() {
+            return Ok(None);
+        }
+        let midx_dir = pack_dir.join("multi-pack-index.d");
+        for checksum in chain.iter().rev() {
+            let path = midx_dir.join(format!("multi-pack-index-{checksum}.midx"));
+            if !path.exists() {
+                continue;
+            }
+            let bytes = load_multi_pack_index_lookup_data(&path)?;
+            let midx = match MultiPackIndexOidLookup::parse(bytes, self.format) {
+                Ok(midx) => midx,
+                Err(_) => continue,
+            };
+            if let Some(pack_lookup) = self.midx_oid_lookup_pack_paths(pack_dir, &midx, oid)? {
+                return Ok(Some(pack_lookup));
+            }
+        }
+        Ok(None)
     }
 
     fn cached_loaded_multi_pack_index_oid_lookup(&self) -> Option<Arc<MultiPackIndexOidLookup>> {
@@ -6241,6 +7210,46 @@ impl FileObjectDatabase {
             promised
         })
     }
+
+    fn freshen_existing_object(&self, oid: &ObjectId) -> Result<bool> {
+        if self.freshen_loose_object(oid)? {
+            return Ok(true);
+        }
+        if self.freshen_packed_object(oid)? {
+            return Ok(true);
+        }
+        for alternate in &self.alternates {
+            if Self::without_alternates(alternate, self.format).freshen_existing_object(oid)? {
+                return Ok(true);
+            }
+        }
+        // A previous negative loose-cache probe may predate a sibling write.
+        self.loose.invalidate_cache();
+        self.freshen_loose_object(oid)
+    }
+
+    fn freshen_loose_object(&self, oid: &ObjectId) -> Result<bool> {
+        let path = self.loose.object_path(oid)?;
+        freshen_file_mtime(&path)
+    }
+
+    fn freshen_packed_object(&self, oid: &ObjectId) -> Result<bool> {
+        let Some(pack_lookup) = self.find_pack_containing(oid)? else {
+            return Ok(false);
+        };
+        freshen_file_mtime(pack_lookup.pack_path())
+    }
+}
+
+fn freshen_file_mtime(path: &Path) -> Result<bool> {
+    let file = match fs::OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    file.set_modified(std::time::SystemTime::now())
+        .map_err(|err| GitError::Io(err.to_string()))?;
+    Ok(true)
 }
 
 fn promisor_pack_object_ids(objects_dir: &Path, format: ObjectFormat) -> Result<HashSet<ObjectId>> {
@@ -6287,11 +7296,10 @@ impl ObjectWriter for FileObjectDatabase {
     fn write_object(&self, object: EncodedObject) -> Result<ObjectId> {
         // Mirror git's freshen semantics (`write_object_file`:
         // `freshen_packed_object || freshen_loose_object`): an object already
-        // present anywhere in the database — loose, packed, or through an
-        // alternate — is not written again, so e.g. `git add` after
-        // `git repack -ad` does not resurrect a loose copy of a packed object.
+        // present anywhere in the database is not written again, but its backing
+        // loose object or pack is touched so concurrent GC treats it as recent.
         let oid = object.object_id(self.format)?;
-        if self.contains(&oid)? {
+        if self.freshen_existing_object(&oid)? {
             return Ok(oid);
         }
         self.loose.write_object(object)
@@ -7199,10 +8207,16 @@ mod tests {
         let written = PackFile::write_undeltified_sha1(std::slice::from_ref(&object))
             .expect("test operation should succeed");
         let pack_name = written.checksum.to_hex();
-        fs::write(pack_dir.join(format!("pack-{pack_name}.pack")), written.pack)
-            .expect("test operation should succeed");
-        fs::write(pack_dir.join(format!("pack-{pack_name}.idx")), written.index)
-            .expect("test operation should succeed");
+        fs::write(
+            pack_dir.join(format!("pack-{pack_name}.pack")),
+            written.pack,
+        )
+        .expect("test operation should succeed");
+        fs::write(
+            pack_dir.join(format!("pack-{pack_name}.idx")),
+            written.index,
+        )
+        .expect("test operation should succeed");
 
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         // Header read takes the loose-first path; it must still resolve from the pack
@@ -7269,10 +8283,16 @@ mod tests {
         let written = PackFile::write_undeltified_sha1(std::slice::from_ref(&packed))
             .expect("test operation should succeed");
         let pack_name = written.checksum.to_hex();
-        fs::write(pack_dir.join(format!("pack-{pack_name}.pack")), written.pack)
-            .expect("test operation should succeed");
-        fs::write(pack_dir.join(format!("pack-{pack_name}.idx")), written.index)
-            .expect("test operation should succeed");
+        fs::write(
+            pack_dir.join(format!("pack-{pack_name}.pack")),
+            written.pack,
+        )
+        .expect("test operation should succeed");
+        fs::write(
+            pack_dir.join(format!("pack-{pack_name}.idx")),
+            written.index,
+        )
+        .expect("test operation should succeed");
         let packed_oid = packed
             .object_id(ObjectFormat::Sha1)
             .expect("test operation should succeed");
@@ -7321,8 +8341,11 @@ mod tests {
         let pack_name = written.checksum.to_hex();
         let pack_path = pack_dir.join(format!("pack-{pack_name}.pack"));
         fs::write(&pack_path, written.pack).expect("test operation should succeed");
-        fs::write(pack_dir.join(format!("pack-{pack_name}.idx")), written.index)
-            .expect("test operation should succeed");
+        fs::write(
+            pack_dir.join(format!("pack-{pack_name}.idx")),
+            written.index,
+        )
+        .expect("test operation should succeed");
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         db.loose()
             .write_object(object.clone())
@@ -7342,6 +8365,95 @@ mod tests {
             "a good loose copy must shadow a corrupt packed copy"
         );
         fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn loose_ofs_delta_base_recovers_child_from_corrupt_pack_base() {
+        let root = temp_root("sley-ofs-delta-base-corrupt-loose-recovery");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+
+        let mut base_body = Vec::new();
+        for idx in 0..256u16 {
+            base_body.extend_from_slice(format!("shared line {idx:03}\n").as_bytes());
+        }
+        let base = EncodedObject::new(ObjectType::Blob, base_body.clone());
+        let mut first_body = base_body;
+        first_body.extend_from_slice(b"first delta payload\n");
+        let first = EncodedObject::new(ObjectType::Blob, first_body.clone());
+        let mut second_body = first_body;
+        second_body.extend_from_slice(b"second delta payload\n");
+        let second = EncodedObject::new(ObjectType::Blob, second_body);
+        let base_oid = base
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let first_oid = first
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let second_oid = second
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+
+        let options = PackWriteOptions::new()
+            .with_prefer_ofs_delta(true)
+            .with_reorder(false);
+        let written = PackFile::write_packed_with_options(
+            &[base, first.clone(), second.clone()],
+            ObjectFormat::Sha1,
+            &options,
+        )
+        .expect("test operation should succeed");
+        let stats = PackFile::verify_pack_stats(&written.pack, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let first_stat = stats
+            .objects
+            .iter()
+            .find(|stat| stat.oid == first_oid)
+            .expect("first object should be packed");
+        let second_stat = stats
+            .objects
+            .iter()
+            .find(|stat| stat.oid == second_oid)
+            .expect("second object should be packed");
+        assert_eq!(first_stat.base_oid, Some(base_oid));
+        assert_eq!(second_stat.base_oid, Some(first_oid));
+
+        let installed = db
+            .install_pack(&written)
+            .expect("test operation should succeed");
+        db.loose()
+            .write_object(first.clone())
+            .expect("test operation should succeed");
+
+        let mut corrupt_pack = written.pack;
+        let base_reference = ofs_delta_base_reference_position(&corrupt_pack, first_stat.offset);
+        corrupt_pack[base_reference] = if corrupt_pack[base_reference] == 1 {
+            2
+        } else {
+            1
+        };
+        assert!(PackFile::verify_pack_stats(&corrupt_pack, ObjectFormat::Sha1).is_err());
+        fs::write(&installed.pack_path, &corrupt_pack).expect("test operation should succeed");
+        db.refresh_read_cache();
+
+        assert_eq!(read_object_for_assert(&db, &first_oid), first);
+        assert_eq!(read_object_for_assert(&db, &second_oid), second);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    fn ofs_delta_base_reference_position(pack: &[u8], offset: u64) -> usize {
+        let mut cursor = usize::try_from(offset).expect("test operation should succeed");
+        let first = pack[cursor];
+        cursor += 1;
+        let kind = (first >> 4) & 0x07;
+        let mut byte = first;
+        while byte & 0x80 != 0 {
+            byte = pack[cursor];
+            cursor += 1;
+        }
+        assert_eq!(kind, 6, "expected an ofs-delta entry");
+        cursor
     }
 
     #[test]
@@ -7521,6 +8633,75 @@ mod tests {
                 .expect("test operation should succeed"),
             None
         );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn object_storage_info_uses_midx_when_pack_sidecar_is_missing() {
+        let root = temp_root("sley-object-storage-midx-fallback");
+        let git_dir = root.join(".git");
+        let pack_dir = git_dir.join("objects").join("pack");
+        fs::create_dir_all(&pack_dir).expect("test operation should succeed");
+        let format = ObjectFormat::Sha1;
+        let first = EncodedObject::new(ObjectType::Blob, b"first packed object\n".to_vec());
+        let second = EncodedObject::new(ObjectType::Blob, b"second packed object\n".to_vec());
+        let written = PackFile::write_undeltified_sha1(&[first, second])
+            .expect("test operation should succeed");
+        let pack_name = written.checksum.to_hex();
+        let pack_path = pack_dir.join(format!("pack-{pack_name}.pack"));
+        let idx_path = pack_dir.join(format!("pack-{pack_name}.idx"));
+        fs::write(&pack_path, &written.pack).expect("test operation should succeed");
+        fs::write(&idx_path, &written.index).expect("test operation should succeed");
+
+        let idx_name = idx_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("test operation should succeed")
+            .to_string();
+        let midx_objects = written
+            .entries
+            .iter()
+            .map(|entry| sley_pack::MultiPackIndexEntry {
+                oid: entry.oid,
+                pack_int_id: 0,
+                offset: entry.offset,
+                force_large_offset: false,
+            })
+            .collect::<Vec<_>>();
+        let midx = MultiPackIndex::write(format, 1, &[idx_name], &midx_objects)
+            .expect("test operation should succeed");
+        fs::write(pack_dir.join("multi-pack-index"), midx).expect("test operation should succeed");
+
+        let target = written
+            .entries
+            .iter()
+            .min_by_key(|entry| entry.offset)
+            .expect("test operation should succeed")
+            .oid;
+        let indexed_info = FileObjectDatabase::from_git_dir(&git_dir, format)
+            .object_storage_info(&target)
+            .expect("test operation should succeed")
+            .expect("test operation should succeed");
+
+        fs::remove_file(&idx_path).expect("test operation should succeed");
+        let missing_idx_info = FileObjectDatabase::from_git_dir(&git_dir, format)
+            .object_storage_info(&target)
+            .expect("test operation should succeed")
+            .expect("test operation should succeed");
+        assert_eq!(missing_idx_info, indexed_info);
+
+        fs::write(&idx_path, &written.index).expect("test operation should succeed");
+        fs::remove_file(&pack_path).expect("test operation should succeed");
+        let missing_pack_info = FileObjectDatabase::from_git_dir(&git_dir, format)
+            .object_storage_info(&target)
+            .expect("test operation should succeed")
+            .expect("test operation should succeed");
+        assert_eq!(missing_pack_info.disk_size, indexed_info.disk_size);
+        assert_eq!(
+            missing_pack_info.deltabase,
+            zero_oid(format).expect("test operation should succeed")
+        );
+
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 

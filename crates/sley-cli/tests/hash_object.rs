@@ -87,8 +87,8 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
     );
 }
 
-fn git_rs(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
-    run_with_stdin(env!("CARGO_BIN_EXE_sley"), cwd, args, stdin)
+fn sley(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
+    run_with_stdin(sley_testkit::sley_bin!(), cwd, args, stdin)
 }
 
 fn git(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
@@ -119,7 +119,7 @@ fn hash_object_usage_and_option_errors_exit_like_upstream_git() {
             vec!["hash-object", "--path"],
         ] {
             let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, stdin);
-            let actual = run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, stdin);
+            let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, stdin);
             assert_eq!(
                 actual.status.code(),
                 expected.status.code(),
@@ -164,7 +164,7 @@ fn hash_object_git_object_directory_matches_upstream_git() {
             stdin,
         );
         let actual_write = run_output_with_env_and_stdin(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &write_args,
             &envs,
@@ -194,7 +194,7 @@ fn hash_object_git_object_directory_matches_upstream_git() {
             &[],
         );
         let actual_cat = run_output_with_env_and_stdin(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &cat_args,
             &envs,
@@ -258,7 +258,7 @@ fn hash_object_multiple_inputs_match_upstream_git() {
             vec!["hash-object", "--"],
         ] {
             let expected = git(&root, &args, stdin);
-            let actual = git_rs(&root, &args, stdin);
+            let actual = sley(&root, &args, stdin);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -304,10 +304,10 @@ fn hash_object_sha256_repo_default_matches_upstream_git() {
             let expected_output =
                 run_output_with_stdin(sley_testkit::oracle_git(), &expected, &args, stdin);
             let actual_output =
-                run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, stdin);
+                run_output_with_stdin(sley_testkit::sley_bin!(), &actual, &args, stdin);
             assert_same_output(actual_output, expected_output, &args);
             assert!(
-                String::from_utf8_lossy(&git_rs(&actual, &args, stdin))
+                String::from_utf8_lossy(&sley(&actual, &args, stdin))
                     .lines()
                     .all(|line| line.len() == 64),
                 "expected SHA-256 object ids for {args:?}"
@@ -371,7 +371,7 @@ fn hash_object_filter_path_and_option_errors_match_upstream_git() {
             vec!["hash-object", "--no-path=value", "--stdin"],
         ] {
             let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, stdin);
-            let actual = run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, stdin);
+            let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -419,7 +419,7 @@ fn hash_object_stdin_paths_matches_upstream_git() {
             ),
         ] {
             let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, stdin);
-            let actual = run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, stdin);
+            let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
     };

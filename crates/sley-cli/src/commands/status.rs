@@ -361,7 +361,10 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             _ => {}
         }
     }
-    if !explicit_ahead_behind && config.get_bool("status", None, "aheadbehind") == Some(false) {
+    if !explicit_ahead_behind
+        && !porcelain_v2
+        && config.get_bool("status", None, "aheadbehind") == Some(false)
+    {
         ahead_behind = false;
     }
     // advice.statusHints defaults to true; `relativePaths` to true; comment
@@ -415,6 +418,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             )?;
         }
         apply_status_split_index_config(&git_dir, format, &config)?;
+        commands::hooks::run_post_index_change_hook(false, false)?;
         return Ok(());
     }
     // Resolve the per-submodule ignore setting (command line > `.git/config` >
@@ -558,6 +562,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
         )?;
     }
     apply_status_split_index_config(&git_dir, format, &config)?;
+    commands::hooks::run_post_index_change_hook(false, false)?;
     Ok(())
 }
 

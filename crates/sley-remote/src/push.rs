@@ -19,14 +19,19 @@
 //! functions) so there is a single implementation.
 
 use std::collections::HashMap;
+use std::fs;
 #[cfg(feature = "http")]
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, ObjectType};
-use sley_odb::{FileObjectDatabase, ObjectReader, collect_reachable_object_ids};
+use sley_odb::{
+    FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
+    collect_reachable_object_ids,
+};
 #[cfg(feature = "http")]
 use sley_protocol::{
     GitService, ReceivePackFeatures, ReceivePackPushRequestOptions, parse_receive_pack_features,
@@ -245,6 +250,8 @@ pub enum PushRefStatus {
     UpToDate,
     /// Local-side rejection: a non-forced non-fast-forward branch update.
     RejectNonFastForward,
+    /// Local-side rejection: the remote tip is not present locally.
+    RejectFetchFirst,
     /// `--force-with-lease`/`--force-if-includes` expectation was not met.
     RejectStale,
     /// `--force-if-includes`: tracking ref was updated but not integrated.
@@ -1020,10 +1027,8 @@ fn execute_push_local(
     _command_forces: Vec<(ReceivePackCommand, bool)>,
     pack_objects: Vec<ObjectId>,
 ) -> Result<PushOutcome> {
-    let remote_excluded_tips = remote_refs
-        .iter()
-        .map(|reference| reference.oid)
-        .collect::<Vec<_>>();
+    let remote_excluded_tips =
+        remote_excluded_tip_roots(&remote_git_dir, request.format, &remote_refs)?;
     let starts = push_pack_roots(&commands, &pack_objects);
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
     let remote_db = FileObjectDatabase::from_git_dir(&remote_common_git_dir, request.format);
@@ -1073,6 +1078,141 @@ fn remote_transfer_fsck_objects(remote_common_git_dir: &Path) -> bool {
         .ok()
         .and_then(|config| config.get_bool("transfer", None, "fsckObjects"))
         .unwrap_or(false)
+}
+
+/// Disposable object directory used to expose incoming local-push objects to
+/// receive-side hooks without making them part of the destination repository.
+pub struct PushQuarantine {
+    object_dir: PathBuf,
+}
+
+impl PushQuarantine {
+    pub fn object_dir(&self) -> &Path {
+        &self.object_dir
+    }
+}
+
+impl Drop for PushQuarantine {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.object_dir);
+    }
+}
+
+pub fn stage_local_push_quarantine(
+    remote_git_dir: &Path,
+    remote_common_git_dir: &Path,
+    format: ObjectFormat,
+    source_db: &FileObjectDatabase,
+    commands: &[ReceivePackCommand],
+) -> Result<Option<PushQuarantine>> {
+    let starts = push_pack_roots(commands, &[]);
+    if starts.is_empty() {
+        return Ok(None);
+    }
+    let remote_refs = crate::local::local_fetch_advertisements(remote_git_dir, format)?;
+    let remote_excluded_tips = remote_excluded_tip_roots(remote_git_dir, format, &remote_refs)?;
+    let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, format);
+    let remote_excluded = collect_reachable_object_ids(&remote_db, format, remote_excluded_tips)?;
+    let object_dir = create_push_quarantine_object_dir(remote_common_git_dir)?;
+    let quarantine_db = FileObjectDatabase::new(object_dir.clone(), format);
+    let installed = match build_and_install_reachable_pack(
+        source_db,
+        &quarantine_db,
+        format,
+        starts,
+        &remote_excluded,
+        RawPackInstallOptions { promisor: false },
+    ) {
+        Ok(installed) => installed,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&object_dir);
+            return Err(err);
+        }
+    };
+    if installed.is_none() {
+        let _ = fs::remove_dir_all(&object_dir);
+        return Ok(None);
+    }
+    Ok(Some(PushQuarantine { object_dir }))
+}
+
+fn create_push_quarantine_object_dir(remote_common_git_dir: &Path) -> Result<PathBuf> {
+    let objects_dir = remote_common_git_dir.join("objects");
+    fs::create_dir_all(&objects_dir)?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0..100 {
+        let object_dir = objects_dir.join(format!(
+            "tmp_objdir-incoming-{}-{nanos}-{attempt}",
+            std::process::id()
+        ));
+        match fs::create_dir(&object_dir) {
+            Ok(()) => {
+                fs::create_dir_all(object_dir.join("pack"))?;
+                fs::create_dir_all(object_dir.join("info"))?;
+                return Ok(object_dir);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(GitError::Io(err.to_string())),
+        }
+    }
+    Err(GitError::Io(
+        "could not create push quarantine object directory".into(),
+    ))
+}
+
+fn remote_excluded_tip_roots(
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    remote_refs: &[RefAdvertisement],
+) -> Result<Vec<ObjectId>> {
+    let mut tips = remote_refs
+        .iter()
+        .map(|reference| reference.oid)
+        .collect::<Vec<_>>();
+    append_remote_alternate_ref_tips(remote_git_dir, format, &mut tips)?;
+    Ok(tips)
+}
+
+fn append_remote_alternate_ref_tips(
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    tips: &mut Vec<ObjectId>,
+) -> Result<()> {
+    let alternates = remote_git_dir.join("objects/info/alternates");
+    let Ok(text) = fs::read_to_string(alternates) else {
+        return Ok(());
+    };
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let objects_dir = if Path::new(line).is_absolute() {
+            PathBuf::from(line)
+        } else {
+            remote_git_dir.join("objects").join(line)
+        };
+        let Some(alternate_git_dir) = objects_dir.parent() else {
+            continue;
+        };
+        let store = FileRefStore::new(alternate_git_dir, format);
+        let refs = match store.list_refs() {
+            Ok(refs) => refs,
+            Err(_) => continue,
+        };
+        for reference in refs {
+            let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? else {
+                continue;
+            };
+            if !tips.contains(&oid) {
+                tips.push(oid);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Run fsck over the objects this push introduces (reachable from `starts`,
@@ -1221,6 +1361,7 @@ pub fn push_local_with_report(
         matches!(
             reference.status,
             PushRefStatus::RejectNonFastForward
+                | PushRefStatus::RejectFetchFirst
                 | PushRefStatus::RejectStale
                 | PushRefStatus::RejectRemoteUpdated
                 | PushRefStatus::RejectAlreadyExists
@@ -1257,8 +1398,8 @@ pub fn push_local_with_report(
         .collect();
 
     if !send.is_empty() {
-        let remote_excluded_tips: Vec<ObjectId> =
-            remote_refs.iter().map(|reference| reference.oid).collect();
+        let remote_excluded_tips =
+            remote_excluded_tip_roots(request.remote_git_dir, format, &remote_refs)?;
         let pack_objects: Vec<ObjectId> = Vec::new();
         let starts = push_pack_roots(&send, &pack_objects);
         let remote_db = FileObjectDatabase::from_git_dir(request.remote_common_git_dir, format);
@@ -1358,12 +1499,6 @@ fn classify_push_command(
         }
     }
 
-    if !request.dry_run && receive_denies_current_branch(format, command, config, remote_git_dir)? {
-        return Ok(PushRefStatus::RemoteReject(
-            "branch is currently checked out".to_string(),
-        ));
-    }
-
     if command.name.starts_with("refs/heads/") && !command.new_id.is_null() {
         let object = local_db.read_object(&command.new_id)?;
         if object.object_type != ObjectType::Commit {
@@ -1444,9 +1579,19 @@ fn classify_push_command(
         && command.name.starts_with("refs/heads/")
         && !command.old_id.is_null()
         && !command.new_id.is_null()
-        && !is_fast_forward(local_db, format, &command.old_id, &command.new_id)?
     {
-        return Ok(PushRefStatus::RejectNonFastForward);
+        if !local_db.contains(&command.old_id)? {
+            return Ok(PushRefStatus::RejectFetchFirst);
+        }
+        if !is_fast_forward(local_db, format, &command.old_id, &command.new_id)? {
+            return Ok(PushRefStatus::RejectNonFastForward);
+        }
+    }
+
+    if !request.dry_run && receive_denies_current_branch(format, command, config, remote_git_dir)? {
+        return Ok(PushRefStatus::RemoteReject(
+            "branch is currently checked out".to_string(),
+        ));
     }
 
     Ok(PushRefStatus::Ok)

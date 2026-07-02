@@ -250,17 +250,20 @@ fn commit_tree_with_amend_with_odb(
     )?;
     let expected = parent.map(RefTarget::Direct);
     let old_oid = parent.unwrap_or(zero_oid(format)?);
+    let reflog = refs
+        .should_write_reflog_for_update(&updated_ref, false)?
+        .then(|| ReflogEntry {
+            old_oid,
+            new_oid: oid,
+            committer: options.committer,
+            message: options.reflog_message,
+        });
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
         name: updated_ref.clone(),
         expected,
         new: RefTarget::Direct(oid),
-        reflog: Some(ReflogEntry {
-            old_oid,
-            new_oid: oid,
-            committer: options.committer,
-            message: options.reflog_message,
-        }),
+        reflog,
     });
     tx.commit()?;
     Ok(CommitIndexResult {
@@ -272,10 +275,22 @@ fn commit_tree_with_amend_with_odb(
 }
 
 pub fn format_commit_identity(name: &str, email: &str, date: &str) -> Result<Vec<u8>> {
-    validate_identity_component("name", name)?;
-    validate_identity_component("email", email)?;
+    format_commit_identity_bytes(name.as_bytes(), email.as_bytes(), date)
+}
+
+pub fn format_commit_identity_bytes(name: &[u8], email: &[u8], date: &str) -> Result<Vec<u8>> {
+    validate_identity_component_bytes("name", name)?;
+    validate_identity_component_bytes("email", email)?;
     let (seconds, timezone) = parse_raw_git_date(date)?;
-    Ok(format!("{name} <{email}> {seconds} {timezone}").into_bytes())
+    let mut out = Vec::with_capacity(name.len() + email.len() + timezone.len() + 32);
+    out.extend_from_slice(name);
+    out.extend_from_slice(b" <");
+    out.extend_from_slice(email);
+    out.extend_from_slice(b"> ");
+    out.extend_from_slice(seconds.to_string().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(timezone.as_bytes());
+    Ok(out)
 }
 
 pub fn commit_message_from_chunks(chunks: &[Vec<u8>]) -> Vec<u8> {
@@ -308,8 +323,8 @@ fn zero_oid(format: sley_core::ObjectFormat) -> Result<ObjectId> {
     Ok(ObjectId::null(format))
 }
 
-fn validate_identity_component(name: &str, value: &str) -> Result<()> {
-    if value.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0)) {
+fn validate_identity_component_bytes(name: &str, value: &[u8]) -> Result<()> {
+    if value.iter().any(|byte| matches!(*byte, b'\n' | b'\r' | 0)) {
         return Err(GitError::InvalidFormat(format!(
             "commit identity {name} contains a control byte"
         )));

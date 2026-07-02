@@ -623,9 +623,9 @@ fn write_reftable_log_block(
     // git sorts log records by (refname asc, update_index desc) which is exactly
     // ascending key order, since the key embeds the reversed update index.
     let mut logs = logs.to_vec();
-    logs.sort_by(|left, right| {
-        reftable_log_key(&left.refname, left.update_index)
-            .cmp(&reftable_log_key(&right.refname, right.update_index))
+    logs.sort_by(|left, right| match left.refname.cmp(&right.refname) {
+        std::cmp::Ordering::Equal => right.update_index.cmp(&left.update_index),
+        order => order,
     });
 
     let block_start = out.len() as u64;

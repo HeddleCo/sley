@@ -40,8 +40,8 @@ fn run_status(program: &str, cwd: &Path, args: &[&str]) -> (i32, Vec<u8>, Vec<u8
     )
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -68,7 +68,7 @@ fn init_initial_branch_matches_upstream_git_head() {
         let upstream_stdout = git(&root, &upstream_args);
         let mut rust_args = args;
         rust_args.push(rust.to_str().expect("utf8 temp path"));
-        let rust_stdout = git_rs(&root, &rust_args);
+        let rust_stdout = sley(&root, &rust_args);
         assert_eq!(rust_stdout, upstream_stdout, "stdout differed for {name}");
 
         let expected = git(&upstream, &["symbolic-ref", "HEAD"]);
@@ -93,7 +93,7 @@ fn init_bare_stdout_and_reinit_match_upstream_git() {
         assert_eq!(expected.0, 0, "upstream init failed");
         fs::remove_dir_all(&repo).expect("remove upstream repo");
         let actual = run_status(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["init", "-b", "topic", repo_arg],
         );
@@ -110,7 +110,7 @@ fn init_bare_stdout_and_reinit_match_upstream_git() {
         assert_eq!(expected.0, 0, "upstream bare init failed");
         fs::remove_dir_all(&bare).expect("remove upstream bare repo");
         let actual = run_status(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["init", "--bare", "-b", "topic", bare_arg],
         );
@@ -130,9 +130,9 @@ fn init_bare_stdout_and_reinit_match_upstream_git() {
         );
         let expected_head = git(&reinit, &["symbolic-ref", "HEAD"]);
         fs::remove_dir_all(&reinit).expect("remove upstream reinit repo");
-        git_rs(&root, &["init", "-q", "-b", "topic", reinit_arg]);
+        sley(&root, &["init", "-q", "-b", "topic", reinit_arg]);
         let actual = run_status(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["init", "-b", "other", reinit_arg],
         );
@@ -156,12 +156,12 @@ fn init_bare_stdout_and_reinit_match_upstream_git() {
             &["--git-dir", bare_reinit_arg, "symbolic-ref", "HEAD"],
         );
         fs::remove_dir_all(&bare_reinit).expect("remove upstream bare reinit repo");
-        git_rs(
+        sley(
             &root,
             &["init", "-q", "--bare", "-b", "topic", bare_reinit_arg],
         );
         let actual = run_status(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["init", "--bare", bare_reinit_arg],
         );
@@ -200,7 +200,7 @@ fn init_template_and_templatedir_match_upstream_git() {
         let mut rust_args = vec!["init", "-q", "-b", "main"];
         rust_args.extend_from_slice(&extra_args);
         rust_args.push(rust_path);
-        git_rs(&root, &rust_args);
+        sley(&root, &rust_args);
 
         for cmd in [
             vec!["config", "--get", "core.repositoryformatversion"],
@@ -241,11 +241,12 @@ fn init_templatedir_config_and_tilde_expansion_match_upstream_git() {
 
     for (program, path) in [
         (sley_testkit::oracle_git(), upstream_path),
-        (env!("CARGO_BIN_EXE_sley"), rust_path),
+        (sley_testkit::sley_bin!(), rust_path),
     ] {
         let output = Command::new(program)
             .current_dir(&root)
             .env("HOME", &fake_home)
+            .env("NO_SET_GIT_TEMPLATE_DIR", "1")
             .args(["-c", &config_arg, "init", "-q", path])
             .output()
             .unwrap_or_else(|err| panic!("failed to run {program} init: {err}"));
@@ -274,14 +275,14 @@ fn init_separate_git_dir_matches_upstream_git() {
     let gitdir_arg = gitdir.to_str().expect("utf8 temp path");
     let args = ["init", "-q", "--separate-git-dir", gitdir_arg, worktree_arg];
     git(&root, &args);
-    git_rs(&root, &args);
+    sley(&root, &args);
 
     let expected_gitfile = fs::read_to_string(worktree.join(".git")).expect("upstream gitfile");
     let actual_gitfile = fs::read_to_string(worktree.join(".git")).expect("rust gitfile");
     assert_eq!(actual_gitfile, expected_gitfile, "gitfile differed");
     assert_eq!(
         git(&worktree, &["symbolic-ref", "HEAD"]),
-        git_rs(&worktree, &["symbolic-ref", "HEAD"]),
+        sley(&worktree, &["symbolic-ref", "HEAD"]),
         "HEAD differed"
     );
     assert!(
@@ -307,7 +308,7 @@ fn init_shared_and_object_format_match_upstream_git() {
         rust_args.push(rust.to_str().expect("utf8 temp path"));
         let mut upstream_cmd = Command::new(sley_testkit::oracle_git());
         upstream_cmd.current_dir(&root).args(&upstream_args);
-        let mut rust_cmd = Command::new(env!("CARGO_BIN_EXE_sley"));
+        let mut rust_cmd = Command::new(sley_testkit::sley_bin!());
         rust_cmd.current_dir(&root).args(&rust_args);
         if name == "sha256-env" {
             upstream_cmd.env("GIT_DEFAULT_HASH", "sha256");
@@ -335,7 +336,7 @@ fn init_shared_and_object_format_match_upstream_git() {
         };
         for cmd in cmds {
             assert_eq!(
-                git_rs(&rust, &cmd),
+                sley(&rust, &cmd),
                 git(&upstream, &cmd),
                 "output differed for {name} {cmd:?}"
             );
@@ -356,7 +357,7 @@ fn init_ref_format_reftable_matches_upstream_git() {
         &root,
         &["init", "-q", "--ref-format=reftable", upstream_arg],
     );
-    git_rs(&root, &["init", "-q", "--ref-format=reftable", rust_arg]);
+    sley(&root, &["init", "-q", "--ref-format=reftable", rust_arg]);
 
     for cmd in [
         vec!["rev-parse", "--show-ref-format"],
@@ -364,7 +365,7 @@ fn init_ref_format_reftable_matches_upstream_git() {
         vec!["symbolic-ref", "HEAD"],
     ] {
         assert_eq!(
-            git_rs(&rust, &cmd),
+            sley(&rust, &cmd),
             git(&upstream, &cmd),
             "output differed for {cmd:?}"
         );
@@ -384,7 +385,7 @@ fn init_unknown_ref_format_matches_upstream_git() {
         &["init", "--ref-format=garbage", repo_arg],
     );
     let actual = run_status(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["init", "--ref-format=garbage", repo_arg],
     );
@@ -454,7 +455,7 @@ fn init_default_branch_honors_config_and_falls_back_to_master() {
         );
         assert_eq!(expected.0, 0, "upstream init failed for {name}");
         let actual = run_status_env(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["init", "-q", rust_arg],
             &envs,
@@ -498,7 +499,7 @@ fn init_invalid_default_object_format_warns_like_upstream_git() {
         &envs,
     );
     let actual = run_status_env(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["init", "-q", rust.to_str().expect("utf8 temp path")],
         &envs,
@@ -547,7 +548,7 @@ fn init_invalid_default_ref_format_config_warns_env_is_fatal() {
         &config_envs,
     );
     let actual = run_status_env(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["init", "-q", rust.to_str().expect("utf8 temp path")],
         &config_envs,
@@ -572,7 +573,7 @@ fn init_invalid_default_ref_format_config_warns_env_is_fatal() {
         &env_envs,
     );
     let actual_env = run_status_env(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["init", "-q", rust_env.to_str().expect("utf8 temp path")],
         &env_envs,
@@ -639,7 +640,7 @@ fn init_object_format_env_and_cli_precedence_match_upstream_git() {
         rust_args.push(rust.to_str().expect("utf8 temp path"));
 
         let expected = run_status_env(sley_testkit::oracle_git(), &root, &upstream_args, case.envs);
-        let actual = run_status_env(env!("CARGO_BIN_EXE_sley"), &root, &rust_args, case.envs);
+        let actual = run_status_env(sley_testkit::sley_bin!(), &root, &rust_args, case.envs);
         assert_eq!(
             actual, expected,
             "object-format case {} differed",
@@ -690,7 +691,7 @@ fn init_reinit_with_conflicting_format_fails_like_upstream_git() {
         let program = if path == &upstream {
             sley_testkit::oracle_git()
         } else {
-            env!("CARGO_BIN_EXE_sley")
+            sley_testkit::sley_bin!()
         };
         let created = run_status_env(
             program,
@@ -714,7 +715,7 @@ fn init_reinit_with_conflicting_format_fails_like_upstream_git() {
         &envs,
     );
     let actual_conflict = run_status_env(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["init", "-q", "--object-format=sha1", rust_arg],
         &envs,
@@ -743,7 +744,7 @@ fn init_reinit_with_conflicting_format_fails_like_upstream_git() {
         &envs,
     );
     let actual_same = run_status_env(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["init", "--object-format=sha256", rust_arg],
         &envs,
@@ -761,7 +762,7 @@ fn init_reinit_with_conflicting_format_fails_like_upstream_git() {
     let rust_ref = root.join("rust-ref");
     for (program, path) in [
         (sley_testkit::oracle_git(), &upstream_ref),
-        (env!("CARGO_BIN_EXE_sley"), &rust_ref),
+        (sley_testkit::sley_bin!(), &rust_ref),
     ] {
         let created = run_status_env(
             program,
@@ -783,7 +784,7 @@ fn init_reinit_with_conflicting_format_fails_like_upstream_git() {
         &envs,
     );
     let actual_ref = run_status_env(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &[
             "init",
@@ -816,7 +817,7 @@ fn init_reinit_ignores_default_hash_env_like_upstream_git() {
     let rust = root.join("rust-repo");
     for (program, path) in [
         (sley_testkit::oracle_git(), &upstream),
-        (env!("CARGO_BIN_EXE_sley"), &rust),
+        (sley_testkit::sley_bin!(), &rust),
     ] {
         let created = run_status_env(
             program,
@@ -838,7 +839,7 @@ fn init_reinit_ignores_default_hash_env_like_upstream_git() {
         &reinit_envs,
     );
     let actual = run_status_env(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         &root,
         &["init", "-q", rust.to_str().expect("utf8 temp path")],
         &reinit_envs,

@@ -21,7 +21,7 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
 
 fn assert_status_stdout_stderr_match(upstream: &Path, rust: &Path, args: &[&str]) {
     let expected = run_output(sley_testkit::oracle_git(), upstream, args);
-    let actual = run_output(env!("CARGO_BIN_EXE_sley"), rust, args);
+    let actual = run_output(sley_testkit::sley_bin!(), rust, args);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),
@@ -67,7 +67,7 @@ fn alias_init_via_config_matches_upstream_git_outside_repo() {
     {
         for (dir, config_path, program) in [
             (&upstream, &upstream_config, sley_testkit::oracle_git()),
-            (&rust, &rust_config, env!("CARGO_BIN_EXE_sley")),
+            (&rust, &rust_config, sley_testkit::sley_bin!()),
         ] {
             let output = Command::new(program)
                 .current_dir(dir)
@@ -100,7 +100,7 @@ fn alias_init_via_config_matches_upstream_git_outside_repo() {
                 .args(["aliasedinit", "-q"])
                 .output()
                 .expect("upstream git aliasedinit");
-            let actual = Command::new(env!("CARGO_BIN_EXE_sley"))
+            let actual = Command::new(sley_testkit::sley_bin!())
                 .current_dir(dir)
                 .env("GIT_CONFIG_GLOBAL", config_path)
                 .env_remove("GIT_CONFIG_SYSTEM")
@@ -163,7 +163,7 @@ fn alias_checkconfig_expands_instead_of_unsupported_command() {
     fs::create_dir_all(&root).expect("create temp dir");
     {
         let output = run_output(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &root,
             &["-c", "alias.checkconfig=config --list", "checkconfig"],
         );

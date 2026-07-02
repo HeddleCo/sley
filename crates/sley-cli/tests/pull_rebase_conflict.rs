@@ -172,7 +172,7 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
     prepare_conflict_clone(&origin, &rust);
 
     let upstream_pre_pull = start_conflict_pull_rebase(sley_testkit::oracle_git(), &upstream);
-    let rust_pre_pull = start_conflict_pull_rebase(env!("CARGO_BIN_EXE_sley"), &rust);
+    let rust_pre_pull = start_conflict_pull_rebase(sley_testkit::sley_bin!(), &rust);
     assert_eq!(upstream_pre_pull, rust_pre_pull, "pre-pull HEAD differed");
 
     resolve_conflict(&upstream);
@@ -180,7 +180,7 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
 
     let args = ["rebase", "--continue"];
     let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
-    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
     assert_same_output(actual, expected, &args);
 
     assert!(
@@ -189,7 +189,7 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
     );
     assert!(
         !rust.join(".git/rebase-merge").exists(),
-        "git-rs rebase-merge should be removed"
+        "Sley rebase-merge should be removed"
     );
     assert_eq!(
         upstream.join(".git/REBASE_HEAD").is_file(),
@@ -203,12 +203,12 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
             &["rev-parse", "HEAD"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after rebase --continue"
     );
     assert_eq!(
         run_output(sley_testkit::oracle_git(), &upstream, &["log", "--oneline"]).stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "--oneline"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["log", "--oneline"]).stdout,
         "log order differed after rebase --continue"
     );
     assert_eq!(
@@ -218,7 +218,7 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
             &["rev-parse", "master"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "master"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["rev-parse", "master"]).stdout,
         "master branch differed after rebase --continue"
     );
     assert_eq!(
@@ -234,7 +234,7 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
         )
         .stdout,
         run_output(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &rust,
             &["log", "-1", "--format=%s"]
         )

@@ -618,84 +618,104 @@ pub fn remove_merge_state(git_dir: &Path) {
     let _ = fs::remove_dir_all(merge_dir(git_dir));
 }
 
-/// `sq_quote_buf`: wrap in single quotes, escaping embedded quotes
+/// `sq_quote_buf`: wrap in single quotes, escaping embedded quotes and bangs
 /// (`'` becomes `'\''`).
-fn sq_quote(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('\'');
-    for c in value.chars() {
-        if c == '\'' || c == '!' {
-            out.push('\'');
-            out.push('\\');
-            out.push(c);
-            out.push('\'');
+fn sq_quote_bytes(value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len() + 2);
+    out.push(b'\'');
+    for byte in value {
+        if *byte == b'\'' || *byte == b'!' {
+            out.push(b'\'');
+            out.push(b'\\');
+            out.push(*byte);
+            out.push(b'\'');
         } else {
-            out.push(c);
+            out.push(*byte);
         }
     }
-    out.push('\'');
+    out.push(b'\'');
     out
 }
 
 /// `write_author_script`: persist the stopped commit's author identity.
 /// `author` is the raw `Name <email> ts tz` identity line.
-pub fn format_author_script(author: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(author);
-    let open = text.find('<')?;
-    let close = text[open..].find('>')? + open;
-    let name = text[..open].trim_end();
-    let email = &text[open + 1..close];
-    let date = text[close + 1..].trim();
-    Some(format!(
-        "GIT_AUTHOR_NAME={}\nGIT_AUTHOR_EMAIL={}\nGIT_AUTHOR_DATE={}\n",
-        sq_quote(name),
-        sq_quote(email),
-        sq_quote(&format!("@{date}"))
-    ))
+pub fn format_author_script(author: &[u8]) -> Option<Vec<u8>> {
+    let fields = sley_core::split_ident_line(author)?;
+    let date = fields.date?;
+    let tz = fields.tz?;
+    let mut out = b"GIT_AUTHOR_NAME=".to_vec();
+    out.extend_from_slice(&sq_quote_bytes(fields.name));
+    out.extend_from_slice(b"\nGIT_AUTHOR_EMAIL=");
+    out.extend_from_slice(&sq_quote_bytes(fields.email));
+    out.extend_from_slice(b"\nGIT_AUTHOR_DATE=");
+    let mut raw_date = b"@".to_vec();
+    raw_date.extend_from_slice(date);
+    raw_date.push(b' ');
+    raw_date.extend_from_slice(tz);
+    out.extend_from_slice(&sq_quote_bytes(&raw_date));
+    out.push(b'\n');
+    Some(out)
 }
 
 /// Parse `author-script` back into the raw identity pieces
 /// (name, email, `@ts tz` date).
-pub fn parse_author_script(text: &str) -> Option<(String, String, String)> {
+pub fn parse_author_script_bytes(text: &[u8]) -> Option<(Vec<u8>, Vec<u8>, String)> {
     let mut name = None;
     let mut email = None;
     let mut date = None;
-    for line in text.lines() {
-        let (key, value) = line.split_once('=')?;
-        let value = sq_dequote(value)?;
+    for line in text
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let equals = line.iter().position(|byte| *byte == b'=')?;
+        let (key, value) = line.split_at(equals);
+        let value = sq_dequote_bytes(&value[1..])?;
         match key {
-            "GIT_AUTHOR_NAME" => name = Some(value),
-            "GIT_AUTHOR_EMAIL" => email = Some(value),
-            "GIT_AUTHOR_DATE" => date = Some(value),
+            b"GIT_AUTHOR_NAME" => name = Some(value),
+            b"GIT_AUTHOR_EMAIL" => email = Some(value),
+            b"GIT_AUTHOR_DATE" => date = Some(String::from_utf8(value).ok()?),
             _ => return None,
         }
     }
     Some((name?, email?, date?))
 }
 
-fn sq_dequote(value: &str) -> Option<String> {
-    let mut out = String::new();
-    let mut chars = value.chars().peekable();
-    if chars.next()? != '\'' {
+pub fn parse_author_script(text: &str) -> Option<(String, String, String)> {
+    let (name, email, date) = parse_author_script_bytes(text.as_bytes())?;
+    Some((
+        String::from_utf8(name).ok()?,
+        String::from_utf8(email).ok()?,
+        date,
+    ))
+}
+
+fn sq_dequote_bytes(value: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut index = 0usize;
+    if value.get(index) != Some(&b'\'') {
         return None;
     }
+    index += 1;
     loop {
-        let c = chars.next()?;
-        if c == '\'' {
-            match chars.peek() {
+        let byte = *value.get(index)?;
+        index += 1;
+        if byte == b'\'' {
+            match value.get(index) {
                 None => return Some(out),
-                Some('\\') => {
-                    chars.next();
-                    let escaped = chars.next()?;
+                Some(b'\\') => {
+                    index += 1;
+                    let escaped = *value.get(index)?;
+                    index += 1;
                     out.push(escaped);
-                    if chars.next()? != '\'' {
+                    if value.get(index) != Some(&b'\'') {
                         return None;
                     }
+                    index += 1;
                 }
                 Some(_) => return None,
             }
         } else {
-            out.push(c);
+            out.push(byte);
         }
     }
 }
@@ -825,12 +845,23 @@ mod tests {
             .expect("test operation should succeed");
         assert_eq!(
             script,
-            "GIT_AUTHOR_NAME='A U Thor'\nGIT_AUTHOR_EMAIL='a@example.com'\nGIT_AUTHOR_DATE='@1234567890 +0100'\n"
+            b"GIT_AUTHOR_NAME='A U Thor'\nGIT_AUTHOR_EMAIL='a@example.com'\nGIT_AUTHOR_DATE='@1234567890 +0100'\n"
         );
         let (name, email, date) =
-            parse_author_script(&script).expect("test operation should succeed");
-        assert_eq!(name, "A U Thor");
-        assert_eq!(email, "a@example.com");
+            parse_author_script_bytes(&script).expect("test operation should succeed");
+        assert_eq!(name, b"A U Thor");
+        assert_eq!(email, b"a@example.com");
         assert_eq!(date, "@1234567890 +0100");
+    }
+
+    #[test]
+    fn author_script_preserves_non_utf8_name_bytes() {
+        let script = format_author_script(b"\xC1\xE9\xED \xF3\xFA <a@example.com> 1 +0000")
+            .expect("format non-utf8 author script");
+        let (name, email, date) =
+            parse_author_script_bytes(&script).expect("parse non-utf8 author script");
+        assert_eq!(name, b"\xC1\xE9\xED \xF3\xFA");
+        assert_eq!(email, b"a@example.com");
+        assert_eq!(date, "@1 +0000");
     }
 }

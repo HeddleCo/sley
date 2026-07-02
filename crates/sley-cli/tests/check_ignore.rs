@@ -46,8 +46,8 @@ fn run_output(program: &str, cwd: &Path, args: &[&str], stdin: Option<&[u8]>) ->
         .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"))
 }
 
-fn git_rs(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
-    run_output(env!("CARGO_BIN_EXE_sley"), cwd, args, stdin)
+fn sley(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
+    run_output(sley_testkit::sley_bin!(), cwd, args, stdin)
 }
 
 fn git(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
@@ -246,7 +246,7 @@ fn check_ignore_matches_upstream_git() {
             ),
         ] {
             let expected = git(&upstream, &args, stdin);
-            let actual = git_rs(&rust, &args, stdin);
+            let actual = sley(&rust, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -285,7 +285,7 @@ fn check_ignore_sha256_tracked_paths_match_upstream_git() {
             ),
         ] {
             let expected = git(&upstream, &args, stdin);
-            let actual = git_rs(&rust, &args, stdin);
+            let actual = sley(&rust, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
     };

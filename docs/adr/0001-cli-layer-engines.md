@@ -4,6 +4,12 @@
 - **Date:** 2026-06-13
 - **Supersedes the framing of:** sley#8 (CLI god-module split)
 
+**2026-07-01 update:** The facade notes below describe the ADR snapshot, not
+the current state. `sley::Repository` now has active in-crate consumers and the
+CLI setup layer documents the boundary it deliberately keeps outside
+`Repository::discover`; command migration should treat the facade as an
+available repo-intrinsic entry point, not as a dormant/bypassed experiment.
+
 ## Context
 
 sley targets byte-for-byte parity with upstream git 2.54.0. The working method to date has been **gap-closing**: measure git's t-suite, find a failing t-file, hand-write whatever behavior makes its cells pass. This works, but it accumulates **per-command edge-case handlers** that drift — most visibly, the 2026-06-13 hardening branch shipped two regressions (`log_regex_unterminated_class_error` hand-matched git's exact regex diagnostic strings; `log_validate_output_indicator_for_log` hand-validated one option's empty-value behavior on a false premise). Those are not isolated bugs; they are symptoms of a structural pattern.
@@ -25,7 +31,11 @@ The absence of tier 3 is the entire "tacking on edge-case handlers" phenomenon. 
 - `sley-cli` is **96k–108k lines — larger than all 23 engine crates combined (~85k).** A thin shell over engines inverts that ratio.
 - `branch.rs` alone is **8,887 lines** with **6 hand-rolled option parsers**, each repeating the identical `--force=`/`--no-force=` "takes no value" ladder.
 - There are **56 `parse_*_options` functions** and 100+ `while let Some(arg)` loops across the CLI, each re-deriving `=value` splitting, `--no-` negation, short-flag bundling, and `--` end-of-options.
-- The `sley::Repository` facade engine — the intended clean library entry point — exists with **zero dependents**: it was built and then bypassed, the CLI wiring 11 low-level crates by hand in every command.
+- At this ADR's snapshot, the `sley::Repository` facade engine — the intended
+  clean library entry point — had **zero CLI dependents**, leaving commands to
+  wire low-level crates by hand. That observation has since been superseded in
+  part: the facade is active inside the library, while CLI adoption remains a
+  migration target where the repo-intrinsic boundary fits.
 - Git *behavior* is trapped one tier too high: the unified-**patch renderer** lives in `sley-cli`, not `sley-diff-merge` (the library can *parse* a patch but cannot *produce* one); `log`'s notes + `--graph` logic is a CLI-resident state machine; the rebase interactive loop sits above a `sley-sequencer` engine that only holds data structures.
 
 ### Why this reframes the work
@@ -38,7 +48,8 @@ Each failing t-cell is not a missing *handler* — it is a missing *row in a tie
 
 1. **Build the three missing CLI-layer engines** (ranked by leverage below).
 2. **Migrate commands onto them in waves.** Each migration wave *homes that command's behavior in an engine* — the patch renderer into `sley-diff-merge`, log/graph formatting into a format engine over `sley-rev`, rebase orchestration into `sley-sequencer`. This is the real fix for the god-module; relocating functions within `sley-cli` (sley#8's current phases) moves zero behavior into engines.
-3. **Adopt the dormant `sley::Repository` facade** as the single repo-setup entry point so commands stop hand-wiring 11 crates.
+3. **Adopt `sley::Repository` facade entry points where they fit the
+   repo-intrinsic boundary** so commands stop hand-wiring low-level crates.
 4. **Complete the two feature-incomplete compute engines** (revwalk simplification, transport coverage) as separate capability epics — *after* the CLI layer is table-driven, so they compose cleanly.
 
 ### The missing tier-3 engines (leverage-ranked)
@@ -70,9 +81,9 @@ Each failing t-cell is not a missing *handler* — it is a missing *row in a tie
 - **Engine-epic A — `sley-options`** (parse-options + typed values). The keystone; everything else is easier after it. Built as a new crate with a small pilot migration (e.g. `branch.rs`'s 6 parsers) to validate the design before fan-out.
 - **Engine-epic B — diff-options + `setup_revisions`** argv model.
 - **Engine-epic C — format substrate + `DateMode`** (merge the two `%`-engines) + the grep-source, pathspec-collector, and command-setup shims.
-- **Command-migration waves** (the retargeted sley#8): per command, declare its option table, route through `sley::Repository`, and extract its trapped behavior (patch renderer → `sley-diff-merge`; log/graph → format engine; rebase driver → `sley-sequencer`; recursive merge-base → `sley-diff-merge`).
+- **Command-migration waves** (the retargeted sley#8): per command, declare its option table, route repo-intrinsic operations through `sley::Repository` where applicable, and extract its trapped behavior (patch renderer → `sley-diff-merge`; log/graph → format engine; rebase driver → `sley-sequencer`; recursive merge-base → `sley-diff-merge`).
 - **Compute-completion epics** (after the CLI is table-driven): revwalk simplification modes (unlocks the rev-list option family); transport feature coverage (the fetch/push/clone frontier — and the `t5510-fetch` setup-crash bug).
 
 ## Evidence
 
-This ADR is backed by a three-axis read of the codebase at sley `a972cef` (command-flow/layering; edge-case-handler hotspots; engine/primitive coverage). Key citations: `sley-rev/src/lib.rs` (`RevWalk`), `sley-refs/src/lib.rs` (`FileRefStore`/`FileRefTransaction`), `sley-diff-merge/src/lib.rs` (`merge_trees`) + `sley-cli/src/commands/merge_rebase.rs` (`virtual_ancestor_entry_map`, the stranded recursive-base strategy), `sley-cli/src/commands/args.rs` (mechanical-only option helpers — the gap), `sley-cli/src/lib.rs` (`log_validate_*` cluster, the patch renderer), `sley-cli/src/log_format.rs` vs `sley-ref-filter/src/lib.rs` (the two `%`-engines), and `crates/sley/src/lib.rs` (the zero-dependent `Repository` facade).
+This ADR is backed by a three-axis read of the codebase at sley `a972cef` (command-flow/layering; edge-case-handler hotspots; engine/primitive coverage). Key citations: `sley-rev/src/lib.rs` (`RevWalk`), `sley-refs/src/lib.rs` (`FileRefStore`/`FileRefTransaction`), `sley-diff-merge/src/lib.rs` (`merge_trees`) + `sley-cli/src/commands/merge_rebase.rs` (`virtual_ancestor_entry_map`, the stranded recursive-base strategy), `sley-cli/src/commands/args.rs` (mechanical-only option helpers — the gap), `sley-cli/src/lib.rs` (`log_validate_*` cluster, the patch renderer), `sley-cli/src/log_format.rs` vs `sley-ref-filter/src/lib.rs` (the two `%`-engines), and `crates/sley/src/lib.rs` (the then-zero-CLI-dependent `Repository` facade).

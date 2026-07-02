@@ -109,7 +109,7 @@ fn rm_tracked_paths_match_upstream_git() {
 
         let args = ["rm", "file.txt", "dir/nested.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert!(!rust.join("file.txt").exists(), "sley rm left tracked file");
@@ -144,7 +144,7 @@ fn rm_sha256_tracked_paths_match_upstream_git() {
 
         let args = ["rm", "file.txt", "dir/nested.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
             upstream.join("file.txt").exists(),
@@ -185,7 +185,7 @@ fn rm_cached_keeps_worktree_and_removes_index_like_upstream_git() {
 
         let args = ["rm", "--cached", "file.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -220,7 +220,7 @@ fn rm_dry_run_reports_paths_without_removing_like_upstream_git() {
 
         let args = ["rm", "-n", "file.txt", "dir/nested.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert!(rust.join("file.txt").exists(), "sley rm -n removed file");
@@ -255,7 +255,7 @@ fn rm_no_dry_run_overrides_dry_run_like_upstream_git() {
 
         let args = ["rm", "-n", "--no-dry-run", "file.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert!(!rust.join("file.txt").exists(), "sley rm left file");
@@ -281,7 +281,7 @@ fn rm_no_quiet_overrides_quiet_like_upstream_git() {
 
         let args = ["rm", "-q", "--no-quiet", "file.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -306,7 +306,7 @@ fn rm_no_cached_overrides_cached_like_upstream_git() {
 
         let args = ["rm", "--cached", "--no-cached", "file.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert!(
@@ -338,7 +338,7 @@ fn rm_no_force_overrides_force_like_upstream_git() {
 
         let args = ["rm", "-f", "--no-force", "file.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert!(
@@ -362,7 +362,7 @@ fn rm_combined_short_options_match_upstream_git() {
 
         let args = ["rm", "-rn", "dir"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert!(
@@ -396,7 +396,7 @@ fn rm_ignore_unmatch_skips_missing_paths_like_upstream_git() {
 
         let args = ["rm", "--ignore-unmatch", "missing.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert!(
@@ -430,7 +430,7 @@ fn rm_ignore_unmatch_removes_matched_paths_like_upstream_git() {
 
         let args = ["rm", "--ignore-unmatch", "missing.txt", "file.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert!(
@@ -469,7 +469,7 @@ fn rm_no_ignore_unmatch_restores_missing_path_error_like_upstream_git() {
             "missing.txt",
         ];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -488,7 +488,7 @@ fn rm_sparse_flags_are_accepted_like_upstream_git() {
 
         let args = ["rm", "--sparse", "--no-sparse", "file.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -517,7 +517,7 @@ fn rm_pathspec_from_file_matches_upstream_git() {
 
         let args = ["rm", "--pathspec-from-file=pathspecs"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert!(
@@ -564,7 +564,7 @@ fn rm_pathspec_file_nul_matches_upstream_git() {
             "pathspecs",
         ];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert!(
@@ -611,7 +611,7 @@ fn rm_no_pathspec_file_nul_overrides_previous_value_like_upstream_git() {
             "--pathspec-from-file=pathspecs",
         ];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert_eq!(
@@ -644,7 +644,7 @@ fn rm_no_pathspec_from_file_keeps_inline_rejection_like_upstream_git() {
             "dir/nested.txt",
         ];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -666,7 +666,7 @@ fn rm_pathspec_from_file_rejects_inline_pathspecs_like_upstream_git() {
 
         let args = ["rm", "--pathspec-from-file=pathspecs", "dir/nested.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -685,7 +685,7 @@ fn rm_pathspec_file_nul_requires_pathspec_from_file_like_upstream_git() {
 
         let args = ["rm", "--pathspec-file-nul", "file.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -708,7 +708,7 @@ fn rm_force_removes_modified_paths_like_upstream_git() {
 
         let args = ["rm", "-f", "file.txt"];
         let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
-        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         assert!(!rust.join("file.txt").exists(), "sley rm -f left file");

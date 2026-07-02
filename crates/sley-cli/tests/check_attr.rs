@@ -64,15 +64,15 @@ fn run_output_with_env(
         .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"))
 }
 
-fn git_rs(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
-    run_output(env!("CARGO_BIN_EXE_sley"), cwd, args, stdin)
+fn sley(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
+    run_output(sley_testkit::sley_bin!(), cwd, args, stdin)
 }
 
 fn git(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
     run_output(sley_testkit::oracle_git(), cwd, args, stdin)
 }
 
-fn git_rs_with_env(
+fn sley_with_env(
     cwd: &Path,
     args: &[&str],
     stdin: Option<&[u8]>,
@@ -80,7 +80,7 @@ fn git_rs_with_env(
     env_remove: &[&str],
 ) -> Output {
     run_output_with_env(
-        env!("CARGO_BIN_EXE_sley"),
+        sley_testkit::sley_bin!(),
         cwd,
         args,
         stdin,
@@ -259,7 +259,7 @@ fn check_attr_matches_upstream_git() {
             ),
         ] {
             let expected = git(&upstream, &args, stdin);
-            let actual = git_rs(&rust, &args, stdin);
+            let actual = sley(&rust, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -368,7 +368,7 @@ fn check_attr_cached_toggle_matches_upstream_git() {
             ),
         ] {
             let expected = git(&upstream, &args, stdin);
-            let actual = git_rs(&rust, &args, stdin);
+            let actual = sley(&rust, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -470,7 +470,7 @@ fn check_attr_source_option_matches_upstream_when_tree_matches_worktree() {
             ),
         ] {
             let expected = git(&upstream, &args, stdin);
-            let actual = git_rs(&rust, &args, stdin);
+            let actual = sley(&rust, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -528,7 +528,7 @@ fn check_attr_cached_honors_git_index_file_like_upstream_git() {
             &[("GIT_INDEX_FILE", &upstream_index)],
             &[],
         );
-        let actual = git_rs_with_env(&rust, &args, None, &[("GIT_INDEX_FILE", &rust_index)], &[]);
+        let actual = sley_with_env(&rust, &args, None, &[("GIT_INDEX_FILE", &rust_index)], &[]);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -581,7 +581,7 @@ fn check_attr_default_global_attributes_match_upstream_git() {
             &[("HOME", &home)],
             &["XDG_CONFIG_HOME"],
         );
-        let actual = git_rs_with_env(&rust, &args, None, &[("HOME", &home)], &["XDG_CONFIG_HOME"]);
+        let actual = sley_with_env(&rust, &args, None, &[("HOME", &home)], &["XDG_CONFIG_HOME"]);
         assert_same_output(actual, expected, &args);
 
         let expected = git_with_env(
@@ -591,7 +591,7 @@ fn check_attr_default_global_attributes_match_upstream_git() {
             &[("HOME", &home), ("XDG_CONFIG_HOME", &xdg)],
             &[],
         );
-        let actual = git_rs_with_env(
+        let actual = sley_with_env(
             &rust,
             &args,
             None,

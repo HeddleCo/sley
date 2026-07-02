@@ -51,8 +51,8 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
     );
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -231,7 +231,7 @@ fn status_z_matches_upstream_git() {
             vec!["status", "--porcelain", "--ignore-submodules=all"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -280,7 +280,7 @@ fn status_display_option_errors_match_upstream_git() {
             vec!["status", "--long", "--null"],
         ] {
             let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -334,7 +334,7 @@ fn status_porcelain_v2_tracked_changes_match_upstream_git() {
             ],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -375,7 +375,7 @@ fn status_tracked_file_replaced_by_directory_matches_upstream_git() {
             vec!["status", "--porcelain=v2", "--untracked-files=all"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -415,7 +415,7 @@ fn status_tracked_directory_replaced_by_file_matches_upstream_git() {
             vec!["status", "--porcelain=v2", "--untracked-files=all"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -459,9 +459,15 @@ fn status_ignored_directory_rollup_and_negation_match_upstream_git() {
             vec!["status", "--short", "--ignored"],
             vec!["status", "--short", "--ignored=matching"],
             vec!["status", "--porcelain=v2", "--ignored"],
+            vec![
+                "status",
+                "--porcelain=v2",
+                "--ignored=matching",
+                "--untracked-files=all",
+            ],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -502,7 +508,7 @@ fn status_nested_repository_boundary_matches_upstream_git() {
             vec!["status", "--porcelain=v2", "--untracked-files=all"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -545,7 +551,7 @@ fn status_skip_worktree_untracked_modes_match_upstream_git() {
             vec!["status", "--porcelain=v2", "--untracked-files=all"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
     };
@@ -592,7 +598,7 @@ fn status_long_matches_upstream_git() {
             vec!["status", "--porcelain=v2", "--no-porcelain"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(
                 actual, expected,
                 "sley long status output differed for {args:?}"
@@ -614,7 +620,7 @@ fn status_long_unborn_clean_matches_upstream_git() {
             vec!["status", "--short", "--long"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(
                 actual, expected,
                 "sley unborn clean long status output differed for {args:?}"
@@ -649,7 +655,7 @@ fn status_show_stash_matches_upstream_git() {
             vec!["status", "--show-stash", "--short"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(
                 actual, expected,
                 "sley show-stash output differed for {args:?}"
@@ -691,7 +697,7 @@ fn status_branch_ahead_behind_matches_upstream_git() {
             vec!["status", "--porcelain=v2", "--branch", "--no-ahead-behind"],
         ] {
             let expected = git(&work, &args);
-            let actual = git_rs(&work, &args);
+            let actual = sley(&work, &args);
             assert_eq!(
                 actual, expected,
                 "sley clean tracking header differed for {args:?}"
@@ -716,7 +722,7 @@ fn status_branch_ahead_behind_matches_upstream_git() {
             vec!["status", "--porcelain=v2", "--branch", "--no-ahead-behind"],
         ] {
             let expected = git(&work, &args);
-            let actual = git_rs(&work, &args);
+            let actual = sley(&work, &args);
             assert_eq!(
                 actual, expected,
                 "sley behind tracking header differed for {args:?}"
@@ -734,7 +740,7 @@ fn status_branch_ahead_behind_matches_upstream_git() {
             vec!["status", "--porcelain=v2", "--branch", "--no-ahead-behind"],
         ] {
             let expected = git(&work, &args);
-            let actual = git_rs(&work, &args);
+            let actual = sley(&work, &args);
             assert_eq!(
                 actual, expected,
                 "sley ahead tracking header differed for {args:?}"
@@ -750,7 +756,7 @@ fn status_branch_ahead_behind_matches_upstream_git() {
             vec!["status", "--porcelain=v2", "--branch", "--no-ahead-behind"],
         ] {
             let expected = git(&work, &args);
-            let actual = git_rs(&work, &args);
+            let actual = sley(&work, &args);
             assert_eq!(
                 actual, expected,
                 "sley divergent tracking header differed for {args:?}"
@@ -768,7 +774,7 @@ fn status_branch_ahead_behind_matches_upstream_git() {
             vec!["status", "--porcelain=v2", "--branch", "--no-ahead-behind"],
         ] {
             let expected = git(&work, &args);
-            let actual = git_rs(&work, &args);
+            let actual = sley(&work, &args);
             assert_eq!(
                 actual, expected,
                 "sley gone tracking header differed for {args:?}"
@@ -801,7 +807,7 @@ fn status_detached_head_matches_upstream_git() {
             vec!["status", "--porcelain=v2", "--branch"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(
                 actual, expected,
                 "sley detached status output differed for {args:?}"
@@ -910,7 +916,7 @@ fn status_hides_root_gitignore_matches_like_upstream_git() {
             vec!["status", "--porcelain=v2", "--ignored", "-z"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(
                 actual, expected,
                 "sley ignored-file output differed for {args:?}"
@@ -950,7 +956,7 @@ fn status_pathspecs_match_upstream_git() {
             vec!["status", "--porcelain=v2", "-z", "dir"],
         ] {
             let expected = git(&root, &args);
-            let actual = git_rs(&root, &args);
+            let actual = sley(&root, &args);
             assert_eq!(
                 actual, expected,
                 "sley pathspec output differed for {args:?}"
@@ -990,7 +996,7 @@ fn status_nested_cwd_paths_match_upstream_git() {
             vec!["status", "--porcelain=v2", "-z"],
         ] {
             let expected = git(&cwd, &args);
-            let actual = git_rs(&cwd, &args);
+            let actual = sley(&cwd, &args);
             assert_eq!(
                 actual, expected,
                 "sley nested-cwd output differed for {args:?}"
@@ -1022,7 +1028,7 @@ fn status_quoted_paths_match_upstream_git() {
             vec!["status", "--porcelain=v2", "-z"],
         ] {
             let expected = git(&repo, &args);
-            let actual = git_rs(&repo, &args);
+            let actual = sley(&repo, &args);
             assert_eq!(
                 actual, expected,
                 "sley untracked output differed for {args:?} path {path:?}"
@@ -1053,7 +1059,7 @@ fn status_quoted_paths_match_upstream_git() {
             vec!["status", "--porcelain=v2", "-z"],
         ] {
             let expected = git(&repo, &args);
-            let actual = git_rs(&repo, &args);
+            let actual = sley(&repo, &args);
             assert_eq!(
                 actual, expected,
                 "sley tracked output differed for {args:?} path {path:?}"

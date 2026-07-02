@@ -142,13 +142,13 @@ fn merge_continue_after_resolving_conflict_matches_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     prepare_conflict_repos(&upstream, &rust);
     start_conflict_merge(sley_testkit::oracle_git(), &upstream);
-    start_conflict_merge(env!("CARGO_BIN_EXE_sley"), &rust);
+    start_conflict_merge(sley_testkit::sley_bin!(), &rust);
     resolve_conflict(&upstream);
     resolve_conflict(&rust);
 
     let args = ["merge", "--continue"];
     let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
-    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
     assert_same_output(actual, expected, &args);
 
     assert!(
@@ -157,7 +157,7 @@ fn merge_continue_after_resolving_conflict_matches_upstream_git() {
     );
     assert!(
         !rust.join(".git/MERGE_HEAD").is_file(),
-        "git-rs MERGE_HEAD should be removed"
+        "Sley MERGE_HEAD should be removed"
     );
     assert!(
         !upstream.join(".git/MERGE_MSG").is_file(),
@@ -165,7 +165,7 @@ fn merge_continue_after_resolving_conflict_matches_upstream_git() {
     );
     assert!(
         !rust.join(".git/MERGE_MSG").is_file(),
-        "git-rs MERGE_MSG should be removed"
+        "Sley MERGE_MSG should be removed"
     );
     assert_eq!(
         run_output(
@@ -174,7 +174,7 @@ fn merge_continue_after_resolving_conflict_matches_upstream_git() {
             &["rev-parse", "HEAD"]
         )
         .stdout,
-        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::sley_bin!(), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after merge --continue"
     );
     assert_eq!(
@@ -185,7 +185,7 @@ fn merge_continue_after_resolving_conflict_matches_upstream_git() {
         )
         .stdout,
         run_output(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &rust,
             &["log", "-1", "--format=%P"]
         )
@@ -200,7 +200,7 @@ fn merge_continue_after_resolving_conflict_matches_upstream_git() {
         )
         .stdout,
         run_output(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &rust,
             &["log", "-1", "--format=%s"]
         )
@@ -224,11 +224,11 @@ fn merge_continue_with_unmerged_entries_fails() {
     fs::create_dir_all(&rust).expect("create rust repo");
     prepare_conflict_repos(&upstream, &rust);
     start_conflict_merge(sley_testkit::oracle_git(), &upstream);
-    start_conflict_merge(env!("CARGO_BIN_EXE_sley"), &rust);
+    start_conflict_merge(sley_testkit::sley_bin!(), &rust);
 
     let args = ["merge", "--continue"];
     let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
-    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
     assert_same_output(actual, expected, &args);
     let _ = fs::remove_dir_all(&root);
 }
@@ -250,7 +250,7 @@ fn merge_continue_without_merge_fails() {
 
     let args = ["merge", "--continue"];
     let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
-    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
     assert_same_output(actual, expected, &args);
     let _ = fs::remove_dir_all(&root);
 }

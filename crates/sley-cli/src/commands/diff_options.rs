@@ -132,6 +132,7 @@ pub(crate) struct DiffOptions {
     pub(crate) renames_explicit: bool,
     pub(crate) rename_threshold: u8,
     pub(crate) copy_threshold: u8,
+    pub(crate) rename_limit: usize,
     pub(crate) diff_filter: DiffFilter,
     pub(crate) ignore_submodules_cli: Option<SubmoduleIgnoreMode>,
     pub(crate) merge_base: bool,
@@ -217,6 +218,7 @@ impl Default for DiffOptions {
             renames_explicit: false,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_limit: 0,
             diff_filter: DiffFilter::default(),
             ignore_submodules_cli: None,
             merge_base: false,
@@ -293,6 +295,29 @@ pub(crate) fn setup_diff_options(args: &[String]) -> Result<DiffOptions> {
     }
     options.validate()?;
     Ok(options)
+}
+
+pub(crate) fn resolve_diff_context(
+    cli_context: Option<usize>,
+    config: Option<&GitConfig>,
+) -> Result<usize> {
+    let config_context = match config.and_then(|config| config.get("diff", None, "context")) {
+        Some(value) => {
+            let Some(parsed) = sley_config::parse_config_int(value) else {
+                eprintln!(
+                    "fatal: bad numeric config value '{value}' for 'diff.context': invalid unit"
+                );
+                return Err(GitError::Exit(128));
+            };
+            if parsed < 0 {
+                eprintln!("fatal: bad config variable 'diff.context'");
+                return Err(GitError::Exit(128));
+            }
+            Some(parsed as usize)
+        }
+        None => None,
+    };
+    Ok(cli_context.or(config_context).unwrap_or(3))
 }
 
 const DIFF_USAGE: &[&str] = &["git diff [<options>] [<commit>] [--] [<path>...]"];
@@ -1322,7 +1347,11 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
             options.renames_explicit = true;
         }
         (_, Some("rename-empty")) => options.rename_empty = bool_value(option),
-        (Some('l'), None) => validate_diff_rename_limit(str_value(option))?,
+        (Some('l'), None) => {
+            let value = str_value(option);
+            validate_diff_rename_limit(value)?;
+            options.rename_limit = parse_diff_rename_limit(value);
+        }
         (_, Some("diff-filter")) => options.diff_filter = parse_diff_filter(str_value(option))?,
         _ => {}
     }
@@ -1413,7 +1442,7 @@ fn diff_validate_word_diff(value: &str) -> Result<()> {
     }
 }
 
-fn parse_unified_count(value: &str) -> usize {
+pub(crate) fn parse_unified_count(value: &str) -> usize {
     let (number, multiplier) = match value.as_bytes().last() {
         Some(b'k' | b'K') => (&value[..value.len() - 1], 1024usize),
         Some(b'm' | b'M') => (&value[..value.len() - 1], 1024 * 1024),

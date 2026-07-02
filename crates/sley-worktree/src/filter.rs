@@ -153,9 +153,13 @@ pub(crate) fn utf_bom_problem(suffix: &str, data: &[u8]) -> Option<BomProblem> {
     }
 }
 
-/// `true` on a little-endian host — matches glibc iconv's native byte order for
-/// the byte-order-agnostic `UTF-16` / `UTF-32` output (LE BOM + LE bytes on x86).
-pub(crate) const HOST_LE: bool = cfg!(target_endian = "little");
+/// The byte order used by the platform iconv for byte-order-agnostic
+/// `UTF-16` / `UTF-32` when no BOM says otherwise. Git delegates these names to
+/// iconv; glibc follows host endian, while macOS emits big-endian with a BOM.
+#[cfg(target_os = "macos")]
+pub(crate) const ICONV_UTF_DEFAULT_LE: bool = false;
+#[cfg(not(target_os = "macos"))]
+pub(crate) const ICONV_UTF_DEFAULT_LE: bool = cfg!(target_endian = "little");
 
 /// Decode worktree-encoded bytes to UTF-8 (encode_to_git's reencode), or `None`
 /// when the encoding is unsupported or the bytes are not valid in it.
@@ -185,14 +189,63 @@ pub(crate) fn encode_from_utf8(suffix: &str, utf8: &[u8]) -> Option<Vec<u8>> {
         "16BE" => encode_utf16(utf8, false, false),
         "16LE-BOM" => encode_utf16(utf8, true, true),
         "16BE-BOM" => encode_utf16(utf8, false, true),
-        "16" => encode_utf16(utf8, HOST_LE, true),
+        "16" => encode_utf16(utf8, ICONV_UTF_DEFAULT_LE, true),
         "32LE" => encode_utf32(utf8, true, false),
         "32BE" => encode_utf32(utf8, false, false),
         "32LE-BOM" => encode_utf32(utf8, true, true),
         "32BE-BOM" => encode_utf32(utf8, false, true),
-        "32" => encode_utf32(utf8, HOST_LE, true),
+        "32" => encode_utf32(utf8, ICONV_UTF_DEFAULT_LE, true),
         _ => None,
     }
+}
+
+pub(crate) fn decode_named_encoding_to_utf8(name: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    if let Some(suffix) = utf_suffix(name) {
+        return decode_to_utf8(&suffix, data);
+    }
+    let encoding = encoding_rs::Encoding::for_label(name)?;
+    let (decoded, _, had_errors) = encoding.decode(data);
+    (!had_errors).then(|| decoded.into_owned().into_bytes())
+}
+
+pub(crate) fn encode_utf8_to_named_encoding(name: &[u8], utf8: &[u8]) -> Option<Vec<u8>> {
+    if let Some(suffix) = utf_suffix(name) {
+        return encode_from_utf8(&suffix, utf8);
+    }
+    let text = std::str::from_utf8(utf8).ok()?;
+    let encoding = encoding_rs::Encoding::for_label(name)?;
+    let (encoded, _, had_errors) = encoding.encode(text);
+    (!had_errors).then(|| encoded.into_owned())
+}
+
+pub(crate) fn should_check_roundtrip_encoding(config: &GitConfig, name: &[u8]) -> bool {
+    match config.get("core", None, "checkRoundtripEncoding") {
+        Some(value) => value
+            .as_bytes()
+            .split(|byte| *byte == b',' || byte.is_ascii_whitespace())
+            .filter(|part| !part.is_empty())
+            .any(|part| same_encoding_name(part, name)),
+        None => same_encoding_name(b"SHIFT-JIS", name),
+    }
+}
+
+pub(crate) fn same_encoding_name(left: &[u8], right: &[u8]) -> bool {
+    match (utf_suffix(left), utf_suffix(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => left.eq_ignore_ascii_case(right),
+    }
+}
+
+pub(crate) fn trace_roundtrip_encoding_check(name: &[u8]) {
+    if std::env::var_os("GIT_TRACE_WORKING_TREE_ENCODING").is_none()
+        && std::env::var_os("GIT_TRACE").is_none()
+    {
+        return;
+    }
+    eprintln!(
+        "Checking roundtrip encoding for {}",
+        String::from_utf8_lossy(name)
+    );
 }
 
 pub(crate) fn strip_utf16_bom(data: &[u8]) -> (bool, &[u8]) {
@@ -201,7 +254,7 @@ pub(crate) fn strip_utf16_bom(data: &[u8]) -> (bool, &[u8]) {
     } else if data.starts_with(&[0xFE, 0xFF]) {
         (false, &data[2..])
     } else {
-        (HOST_LE, data)
+        (ICONV_UTF_DEFAULT_LE, data)
     }
 }
 
@@ -211,7 +264,7 @@ pub(crate) fn strip_utf32_bom(data: &[u8]) -> (bool, &[u8]) {
     } else if data.starts_with(&[0, 0, 0xFE, 0xFF]) {
         (false, &data[4..])
     } else {
-        (HOST_LE, data)
+        (ICONV_UTF_DEFAULT_LE, data)
     }
 }
 
@@ -299,10 +352,31 @@ pub(crate) fn check_wt_encoding_valid(encoding: &WtEncoding) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn clean_encoding_needs_stat_match_validation(
+    config: &GitConfig,
+    attributes: &[AttributeCheck],
+) -> bool {
+    let plan = ContentFilterPlan::resolve(config, attributes);
+    matches!(plan.encoding, WtEncoding::Invalid | WtEncoding::Named(_))
+}
+
+pub(crate) fn validate_clean_encoding_for_stat_match(
+    config: &GitConfig,
+    attributes: &[AttributeCheck],
+    path: &[u8],
+    content: &[u8],
+) -> Result<()> {
+    let plan = ContentFilterPlan::resolve(config, attributes);
+    check_wt_encoding_valid(&plan.encoding)?;
+    let _ = encode_to_git(config, &plan.encoding, path, Cow::Borrowed(content), false)?;
+    Ok(())
+}
+
 /// encode_to_git: decode worktree-encoded `data` to UTF-8 for storage in the
 /// object database. Runs the BOM validation first (fatal when writing an
 /// object). Returns the borrowed input unchanged when there is no encoding.
 pub(crate) fn encode_to_git<'a>(
+    config: &GitConfig,
     encoding: &WtEncoding,
     path: &[u8],
     data: Cow<'a, [u8]>,
@@ -348,8 +422,20 @@ working-tree-encoding."
             }
         }
     }
-    match utf_suffix(name).and_then(|suffix| decode_to_utf8(&suffix, &data)) {
-        Some(utf8) => Ok(Cow::Owned(utf8)),
+    match decode_named_encoding_to_utf8(name, &data) {
+        Some(utf8) => {
+            if should_check_roundtrip_encoding(config, name) {
+                trace_roundtrip_encoding_check(name);
+                if encode_utf8_to_named_encoding(name, &utf8).as_deref() != Some(data.as_ref()) {
+                    report_encode_failure(
+                        write_object,
+                        &format!("encoding round trip failed for '{display}' from {enc} to UTF-8"),
+                    )?;
+                    return Ok(data);
+                }
+            }
+            Ok(Cow::Owned(utf8))
+        }
         None => {
             report_encode_failure(
                 write_object,
@@ -376,7 +462,7 @@ pub(crate) fn encode_to_worktree<'a>(
     if data.is_empty() {
         return Ok(data);
     }
-    match utf_suffix(name).and_then(|suffix| encode_from_utf8(&suffix, &data)) {
+    match encode_utf8_to_named_encoding(name, &data) {
         Some(encoded) => Ok(Cow::Owned(encoded)),
         None => {
             let display = String::from_utf8_lossy(path);
@@ -944,11 +1030,16 @@ pub(crate) const PKT_DATA_MAX: usize = 65_516;
 
 pub(crate) static PROCESS_FILTERS: OnceLock<Mutex<HashMap<String, ProcessFilter>>> =
     OnceLock::new();
-pub(crate) type ProcessFilterMetadata = Vec<(String, String)>;
+pub(crate) static PROCESS_FILTER_ABORTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// Extra protocol metadata sent on smudge requests when the caller knows the
+/// tree-ish/ref context of the materialization.
+pub type ProcessFilterMetadata = Vec<(String, String)>;
 pub(crate) static PROCESS_FILTER_METADATA: OnceLock<Mutex<Option<ProcessFilterMetadata>>> =
     OnceLock::new();
+pub(crate) static PROCESS_FILTER_CWD: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
-pub(crate) struct ProcessFilterMetadataGuard {
+/// Restores the previous process-filter metadata when dropped.
+pub struct ProcessFilterMetadataGuard {
     previous: Option<ProcessFilterMetadata>,
 }
 
@@ -963,7 +1054,7 @@ impl Drop for ProcessFilterMetadataGuard {
     }
 }
 
-pub(crate) fn set_process_filter_metadata(
+pub fn set_process_filter_metadata(
     metadata: Option<ProcessFilterMetadata>,
 ) -> ProcessFilterMetadataGuard {
     let mutex = PROCESS_FILTER_METADATA.get_or_init(|| Mutex::new(None));
@@ -974,6 +1065,28 @@ pub(crate) fn set_process_filter_metadata(
     ProcessFilterMetadataGuard { previous }
 }
 
+/// Restores the previous process-filter working directory when dropped.
+pub struct ProcessFilterCwdGuard {
+    previous: Option<PathBuf>,
+}
+
+impl Drop for ProcessFilterCwdGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = PROCESS_FILTER_CWD.get_or_init(|| Mutex::new(None)).lock() {
+            *guard = self.previous.take();
+        }
+    }
+}
+
+pub fn set_process_filter_cwd(cwd: Option<PathBuf>) -> ProcessFilterCwdGuard {
+    let mutex = PROCESS_FILTER_CWD.get_or_init(|| Mutex::new(None));
+    let previous = mutex
+        .lock()
+        .map(|mut guard| std::mem::replace(&mut *guard, cwd))
+        .unwrap_or(None);
+    ProcessFilterCwdGuard { previous }
+}
+
 pub(crate) fn current_process_filter_metadata() -> Option<ProcessFilterMetadata> {
     PROCESS_FILTER_METADATA
         .get_or_init(|| Mutex::new(None))
@@ -982,11 +1095,20 @@ pub(crate) fn current_process_filter_metadata() -> Option<ProcessFilterMetadata>
         .and_then(|guard| guard.clone())
 }
 
+pub(crate) fn current_process_filter_cwd() -> Option<PathBuf> {
+    PROCESS_FILTER_CWD
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
 pub(crate) struct ProcessFilter {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: ChildStdout,
     capabilities: u8,
+    closed: bool,
 }
 
 pub(crate) enum ProcessFilterOutcome {
@@ -995,9 +1117,19 @@ pub(crate) enum ProcessFilterOutcome {
     Status(String),
 }
 
+pub(crate) enum DriverFilterResult<'a> {
+    Content(Cow<'a, [u8]>),
+    Delayed { process: String },
+}
+
+pub(crate) enum SmudgeFilterResult<'a> {
+    Content(Cow<'a, [u8]>),
+    Delayed { process: String },
+}
+
 pub(crate) struct ProcessFilterFailure {
-    message: String,
-    protocol: bool,
+    pub(crate) message: String,
+    pub(crate) protocol: bool,
 }
 
 impl ProcessFilterFailure {
@@ -1015,7 +1147,16 @@ pub(crate) fn run_process_filter(
     path: &[u8],
     content: &[u8],
     blob: Option<ObjectId>,
+    can_delay: bool,
 ) -> std::result::Result<ProcessFilterOutcome, ProcessFilterFailure> {
+    if PROCESS_FILTER_ABORTED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|aborted| aborted.contains(command))
+        .unwrap_or(false)
+    {
+        return Ok(ProcessFilterOutcome::Status("abort".to_string()));
+    }
     let filters = PROCESS_FILTERS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut filters = filters
         .lock()
@@ -1027,7 +1168,37 @@ pub(crate) fn run_process_filter(
     let result = filters
         .get_mut(command)
         .expect("process filter was inserted")
-        .apply(direction, path, content, blob);
+        .apply(direction, path, content, blob, can_delay);
+    if matches!(result, Ok(ProcessFilterOutcome::Status(ref status)) if status == "abort") {
+        if let Some(mut filter) = filters.remove(command) {
+            filter.finish_gracefully();
+        }
+        if let Ok(mut aborted) = PROCESS_FILTER_ABORTED
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+        {
+            aborted.insert(command.to_string());
+        }
+    }
+    if result.as_ref().is_err_and(|err| err.protocol) {
+        filters.remove(command);
+    }
+    result
+}
+
+pub(crate) fn list_available_process_filter_blobs(
+    command: &str,
+) -> std::result::Result<Vec<Vec<u8>>, ProcessFilterFailure> {
+    let filters = PROCESS_FILTERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut filters = filters
+        .lock()
+        .map_err(|_| ProcessFilterFailure::protocol("process filter cache poisoned"))?;
+    let Some(filter) = filters.get_mut(command) else {
+        return Err(ProcessFilterFailure::protocol(format!(
+            "external filter '{command}' is not available anymore although not all paths have been filtered"
+        )));
+    };
+    let result = filter.list_available_blobs();
     if result.as_ref().is_err_and(|err| err.protocol) {
         filters.remove(command);
     }
@@ -1041,18 +1212,21 @@ impl ProcessFilter {
         } else {
             ("/bin/sh", "-c")
         };
-        let mut child = Command::new(shell)
+        let mut process = Command::new(shell);
+        process
             .arg(flag)
             .arg(command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|err| {
-                ProcessFilterFailure::protocol(format!(
-                    "cannot fork to run subprocess '{command}': {err}"
-                ))
-            })?;
+            .stderr(Stdio::inherit());
+        if let Some(cwd) = current_process_filter_cwd() {
+            process.current_dir(cwd);
+        }
+        let mut child = process.spawn().map_err(|err| {
+            ProcessFilterFailure::protocol(format!(
+                "cannot fork to run subprocess '{command}': {err}"
+            ))
+        })?;
         let mut stdin = child
             .stdin
             .take()
@@ -1107,9 +1281,10 @@ impl ProcessFilter {
 
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout,
             capabilities,
+            closed: false,
         })
     }
 
@@ -1119,6 +1294,7 @@ impl ProcessFilter {
         path: &[u8],
         content: &[u8],
         blob: Option<ObjectId>,
+        can_delay: bool,
     ) -> std::result::Result<ProcessFilterOutcome, ProcessFilterFailure> {
         let wanted = match direction {
             "clean" => PROCESS_CAP_CLEAN,
@@ -1129,24 +1305,36 @@ impl ProcessFilter {
             return Ok(ProcessFilterOutcome::Unsupported);
         }
 
-        write_pkt_text(&mut self.stdin, &format!("command={direction}\n"))?;
-        write_pkt_text(
-            &mut self.stdin,
-            &format!("pathname={}\n", String::from_utf8_lossy(path)),
-        )?;
-        if direction == "smudge"
-            && let Some(blob) = blob
+        let can_delay =
+            can_delay && direction == "smudge" && self.capabilities & PROCESS_CAP_DELAY != 0;
+
         {
-            if let Some(metadata) = current_process_filter_metadata() {
-                for (key, value) in metadata {
-                    write_pkt_text(&mut self.stdin, &format!("{key}={value}\n"))?;
+            let stdin = self
+                .stdin
+                .as_mut()
+                .ok_or_else(|| ProcessFilterFailure::protocol("process filter stdin closed"))?;
+            write_pkt_text(stdin, &format!("command={direction}\n"))?;
+            write_pkt_text(
+                stdin,
+                &format!("pathname={}\n", String::from_utf8_lossy(path)),
+            )?;
+            if direction == "smudge"
+                && let Some(blob) = blob
+            {
+                if let Some(metadata) = current_process_filter_metadata() {
+                    for (key, value) in metadata {
+                        write_pkt_text(stdin, &format!("{key}={value}\n"))?;
+                    }
                 }
+                write_pkt_text(stdin, &format!("blob={}\n", blob.to_hex()))?;
             }
-            write_pkt_text(&mut self.stdin, &format!("blob={}\n", blob.to_hex()))?;
+            if can_delay {
+                write_pkt_text(stdin, "can-delay=1\n")?;
+            }
+            write_flush(stdin)?;
+            write_pkt_content(stdin, content)?;
+            write_flush(stdin)?;
         }
-        write_flush(&mut self.stdin)?;
-        write_pkt_content(&mut self.stdin, content)?;
-        write_flush(&mut self.stdin)?;
 
         let mut status = read_process_status(&mut self.stdout)?.unwrap_or_default();
         match status.as_str() {
@@ -1171,11 +1359,64 @@ impl ProcessFilter {
             ))),
         }
     }
+
+    fn list_available_blobs(&mut self) -> std::result::Result<Vec<Vec<u8>>, ProcessFilterFailure> {
+        if self.capabilities & PROCESS_CAP_DELAY == 0 {
+            return Ok(Vec::new());
+        }
+        {
+            let stdin = self
+                .stdin
+                .as_mut()
+                .ok_or_else(|| ProcessFilterFailure::protocol("process filter stdin closed"))?;
+            write_pkt_text(stdin, "command=list_available_blobs\n")?;
+            write_flush(stdin)?;
+        }
+
+        let mut paths = Vec::new();
+        while let Some(line) = read_pkt_text(&mut self.stdout)? {
+            if let Some(path) = line.strip_prefix("pathname=") {
+                paths.push(path.as_bytes().to_vec());
+            }
+        }
+        let status = read_process_status(&mut self.stdout)?.unwrap_or_default();
+        match status.as_str() {
+            "" | "success" => Ok(paths),
+            other => Err(ProcessFilterFailure::protocol(format!(
+                "external filter returned unsupported status '{other}'"
+            ))),
+        }
+    }
+
+    fn finish_gracefully(&mut self) {
+        self.stdin.take();
+        for _ in 0..10 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.closed = true;
+                    return;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(_) => {
+                    self.closed = true;
+                    return;
+                }
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.closed = true;
+    }
 }
 
 impl Drop for ProcessFilter {
     fn drop(&mut self) {
-        let _ = self.stdin.flush();
+        if self.closed {
+            return;
+        }
+        if let Some(stdin) = self.stdin.as_mut() {
+            let _ = stdin.flush();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -1572,7 +1813,7 @@ pub(crate) fn apply_clean_filter_cow_inner<'a>(
     // encode_to_git runs before the EOL pass (convert.c order: filter →
     // encode_to_git → crlf_to_git): the worktree charset is decoded to UTF-8 so
     // the line-ending stats and conversion below see real LF/CRLF bytes.
-    data = encode_to_git(&plan.encoding, path, data, write_object)?;
+    data = encode_to_git(config, &plan.encoding, path, data, write_object)?;
     // The safecrlf check scans the (post-driver) buffer once for line-ending
     // stats. Gate it tightly so the extra scan never runs on the dominant
     // pass-through paths: only when safecrlf is enabled, the path is a real
@@ -1652,8 +1893,34 @@ pub(crate) fn apply_smudge_filter_with_attributes_cow_format<'a>(
     content: &'a [u8],
     format: ObjectFormat,
 ) -> Result<Cow<'a, [u8]>> {
+    match apply_smudge_filter_with_attributes_maybe_delayed(
+        config, attributes, path, content, format, false,
+    )? {
+        SmudgeFilterResult::Content(data) => Ok(data),
+        SmudgeFilterResult::Delayed { .. } => unreachable!("delay was not enabled"),
+    }
+}
+
+pub(crate) fn apply_smudge_filter_with_attributes_maybe_delayed<'a>(
+    config: &GitConfig,
+    attributes: &[AttributeCheck],
+    path: &[u8],
+    content: &'a [u8],
+    format: ObjectFormat,
+    allow_delay: bool,
+) -> Result<SmudgeFilterResult<'a>> {
     let plan = ContentFilterPlan::resolve(config, attributes);
     check_wt_encoding_valid(&plan.encoding)?;
+    let process_blob = if plan
+        .driver
+        .as_ref()
+        .and_then(|driver| driver.process.as_ref())
+        .is_some()
+    {
+        Some(EncodedObject::new(ObjectType::Blob, content.to_vec()).object_id(format)?)
+    } else {
+        None
+    };
     let mut data = Cow::Borrowed(content);
     if plan.ident {
         data = ident_to_worktree_cow(format, data)?;
@@ -1669,16 +1936,21 @@ pub(crate) fn apply_smudge_filter_with_attributes_cow_format<'a>(
     // line-ending-converted, then reencoded into the worktree charset.
     data = encode_to_worktree(&plan.encoding, path, data)?;
     if let Some(driver) = &plan.driver {
-        data = run_driver(
+        return match run_driver_maybe_delayed(
             driver,
             driver.smudge.as_deref(),
             "smudge",
             Some(format),
+            process_blob,
             path,
             data,
-        )?;
+            allow_delay,
+        )? {
+            DriverFilterResult::Content(data) => Ok(SmudgeFilterResult::Content(data)),
+            DriverFilterResult::Delayed { process } => Ok(SmudgeFilterResult::Delayed { process }),
+        };
     }
-    Ok(data)
+    Ok(SmudgeFilterResult::Content(data))
 }
 
 /// Execute one direction of a driver filter, honouring the `required` flag.
@@ -1690,28 +1962,54 @@ pub(crate) fn run_driver<'a>(
     path: &[u8],
     content: Cow<'a, [u8]>,
 ) -> Result<Cow<'a, [u8]>> {
+    match run_driver_maybe_delayed(
+        driver, command, direction, format, None, path, content, false,
+    )? {
+        DriverFilterResult::Content(data) => Ok(data),
+        DriverFilterResult::Delayed { .. } => unreachable!("delay was not enabled"),
+    }
+}
+
+pub(crate) fn run_driver_maybe_delayed<'a>(
+    driver: &FilterDriver,
+    command: Option<&str>,
+    direction: &str,
+    format: Option<ObjectFormat>,
+    process_blob: Option<ObjectId>,
+    path: &[u8],
+    content: Cow<'a, [u8]>,
+    allow_delay: bool,
+) -> Result<DriverFilterResult<'a>> {
     if let Some(process) = &driver.process {
         let blob = if direction == "smudge" {
-            match format {
-                Some(format) => {
+            match (process_blob, format) {
+                (Some(blob), _) => Some(blob),
+                (None, Some(format)) => {
                     Some(EncodedObject::new(ObjectType::Blob, content.to_vec()).object_id(format)?)
                 }
-                None => None,
+                (None, None) => None,
             }
         } else {
             None
         };
-        match run_process_filter(process, direction, path, &content, blob) {
-            Ok(ProcessFilterOutcome::Filtered(output)) => return Ok(Cow::Owned(output)),
+        match run_process_filter(process, direction, path, &content, blob, allow_delay) {
+            Ok(ProcessFilterOutcome::Filtered(output)) => {
+                return Ok(DriverFilterResult::Content(Cow::Owned(output)));
+            }
             Ok(ProcessFilterOutcome::Unsupported) => {}
             Ok(ProcessFilterOutcome::Status(status)) => {
+                if allow_delay && status == "delayed" {
+                    return Ok(DriverFilterResult::Delayed {
+                        process: process.clone(),
+                    });
+                }
                 if driver.required {
                     return Err(GitError::Command(format!(
                         "external filter '{}' returned status {status}",
                         process
                     )));
                 }
-                return Ok(content);
+                return Ok(DriverFilterResult::Content(content));
             }
             Err(err) => {
                 if err.protocol {
@@ -1720,7 +2018,7 @@ pub(crate) fn run_driver<'a>(
                 if driver.required {
                     return Err(GitError::Command(err.message));
                 }
-                return Ok(content);
+                return Ok(DriverFilterResult::Content(content));
             }
         }
     }
@@ -1737,17 +2035,17 @@ pub(crate) fn run_driver<'a>(
             }
             return Err(GitError::Exit(128));
         }
-        return Ok(content);
+        return Ok(DriverFilterResult::Content(content));
     };
     match run_filter_command(command, path, &content) {
-        Ok(output) => Ok(Cow::Owned(output)),
+        Ok(output) => Ok(DriverFilterResult::Content(Cow::Owned(output))),
         Err(err) => {
             if driver.required {
                 Err(err)
             } else {
                 // Non-required filter failure: fall back to the unfiltered
                 // content, matching git's behaviour.
-                Ok(content)
+                Ok(DriverFilterResult::Content(content))
             }
         }
     }

@@ -129,8 +129,8 @@ fn run_with_stdin(program: &str, cwd: &Path, args: &[&str], stdin: &[u8]) -> Out
         .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"))
 }
 
-fn git_rs_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_sley")
+fn sley_bin() -> &'static str {
+    sley_testkit::sley_bin!()
 }
 
 fn assert_same(repo: &Path, args: &[&str]) {
@@ -139,7 +139,7 @@ fn assert_same(repo: &Path, args: &[&str]) {
     let mut rs_args = vec!["shortlog"];
     rs_args.extend_from_slice(args);
     let expected = run(sley_testkit::oracle_git(), repo, &git_args);
-    let actual = run(git_rs_bin(), repo, &rs_args);
+    let actual = run(sley_bin(), repo, &rs_args);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),
@@ -165,7 +165,7 @@ fn assert_same_stdin(repo: &Path, args: &[&str], stdin: &[u8]) {
     let mut rs_args = vec!["shortlog"];
     rs_args.extend_from_slice(args);
     let expected = run_with_stdin(sley_testkit::oracle_git(), repo, &git_args, stdin);
-    let actual = run_with_stdin(git_rs_bin(), repo, &rs_args, stdin);
+    let actual = run_with_stdin(sley_bin(), repo, &rs_args, stdin);
     assert_eq!(
         actual.status.code(),
         expected.status.code(),

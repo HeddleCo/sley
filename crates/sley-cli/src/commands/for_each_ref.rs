@@ -319,6 +319,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         .map(|rev| resolve_revision(&git_dir, format, rev))
         .collect::<Result<Vec<_>>>()?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let mut reachability = sley_rev::CommitReachability::new(&git_dir, format, &db);
     for_each_ref_validate_ahead_behind(&format_spec, &git_dir, format)?;
     for_each_ref_validate_describe(&format_spec)?;
     // The abbreviation candidate set is only needed by `%(objectname:short...)`;
@@ -342,14 +343,13 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             sley_rev::peel_to_commit(&db, format, &oid)
         })
         .collect::<Result<Vec<_>>>()?;
+    let contains_target_set = contains_targets.iter().copied().collect::<HashSet<_>>();
+    let no_contains_target_set = no_contains_targets.iter().copied().collect::<HashSet<_>>();
     let merged_filter = merged_filter
         .map(|(rev, include)| {
             let oid = resolve_revision(&git_dir, format, &rev)?;
             let commit = sley_rev::peel_to_commit(&db, format, &oid)?;
-            let reachable = sley_rev::walk_commits(&db, format, [commit])?
-                .into_iter()
-                .map(|record| record.oid)
-                .collect::<HashSet<_>>();
+            let reachable = reachability.reachable_oids([commit], false)?;
             Ok::<_, GitError>((reachable, include))
         })
         .transpose()?;
@@ -439,31 +439,24 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             }
         }
         if !contains_targets.is_empty() || !no_contains_targets.is_empty() {
-            let reachable = sley_rev::peel_to_commit(&db, format, &oid)
+            let target_match = sley_rev::peel_to_commit(&db, format, &oid)
                 .ok()
                 .map(|tip| {
-                    sley_rev::walk_commits(&db, format, [tip]).map(|records| {
-                        records
-                            .into_iter()
-                            .map(|record| record.oid)
-                            .collect::<HashSet<_>>()
-                    })
+                    reachability.target_match(
+                        &tip,
+                        &contains_target_set,
+                        &no_contains_target_set,
+                        false,
+                    )
                 })
                 .transpose()?;
-            let Some(reachable) = reachable else {
+            let Some(target_match) = target_match else {
                 continue;
             };
-            if !contains_targets.is_empty()
-                && !contains_targets
-                    .iter()
-                    .any(|target| reachable.contains(target))
-            {
+            if !target_match.reached_required {
                 continue;
             }
-            if no_contains_targets
-                .iter()
-                .any(|target| reachable.contains(target))
-            {
+            if target_match.reached_excluded {
                 continue;
             }
         }

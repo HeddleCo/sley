@@ -1328,12 +1328,10 @@ fn validate_ssh_user(value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(GitError::InvalidFormat("SSH user is empty".into()));
     }
-    if value.bytes().any(|byte| {
-        matches!(
-            byte,
-            b'@' | b'/' | b'?' | b'#' | b' ' | b'\t' | b'\n' | b'\r' | 0
-        )
-    }) {
+    if value
+        .bytes()
+        .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b' ' | b'\t' | b'\n' | b'\r' | 0))
+    {
         return Err(GitError::InvalidFormat(
             "SSH user contains a delimiter byte".into(),
         ));
@@ -2446,6 +2444,21 @@ mod tests {
                 "2222".to_string(),
                 "git@2001:db8::1".to_string(),
                 "git-upload-pack '/org/it'\\''s.git'".to_string(),
+            ]
+        );
+
+        let remote = parse_remote_url("ssh://user:passw@rd@example.com:2222/repo.git")
+            .expect("test operation should succeed");
+        assert_eq!(remote.user.as_deref(), Some("user:passw@rd"));
+        assert_eq!(remote.host.as_deref(), Some("example.com"));
+        assert_eq!(
+            ssh_process_args(&remote, GitService::UploadPack, SshCommandVariant::OpenSsh)
+                .expect("test operation should succeed"),
+            vec![
+                "-p".to_string(),
+                "2222".to_string(),
+                "user:passw@rd@example.com".to_string(),
+                "git-upload-pack '/repo.git'".to_string(),
             ]
         );
     }

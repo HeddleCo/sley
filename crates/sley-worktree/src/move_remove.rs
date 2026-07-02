@@ -93,81 +93,91 @@ pub fn remove_index_and_worktree_paths(
     // stage entries (so resolving an unmerged path by removal drops stages
     // 1/2/3 together), matching git's name-keyed removal.
     let mut selected = BTreeSet::new();
-    for path in paths {
-        let absolute = if path.is_absolute() {
-            path.clone()
-        } else {
-            worktree_root.join(path)
-        };
-        // Capture a directory-only pathspec before lexical normalization drops
-        // the trailing separator.
-        let has_trailing_slash = path_has_trailing_separator(&absolute);
-        let absolute = normalize_absolute_path_lexically(&absolute);
-        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
-            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
-        })?;
-        // A pathspec with a trailing slash (e.g. `git rm dir/`) only matches a
-        // directory: it must never match a same-named tracked file.
-        let git_path = git_path_bytes(relative)?;
-        if !has_trailing_slash && index_paths.contains(&git_path) {
-            selected.insert(git_path);
-            continue;
+    if let Some(mut pathspecs) = RemoveCompiledPathspecs::parse(worktree_root, paths)? {
+        for entry in &index_paths {
+            if !sparse_dir_paths.contains(entry) && pathspecs.matches(entry) {
+                selected.insert(entry.clone());
+            }
         }
-        if has_trailing_slash && gitlink_paths.contains(&git_path) && absolute.is_dir() {
-            selected.insert(git_path);
-            continue;
-        }
-        // A wildcard pathspec (e.g. `git rm "*"` or `git rm "dir/*.c"`) matches
-        // index entries by git's pathspec matcher rather than by literal path or
-        // directory prefix. Try the glob match first when the spec contains
-        // wildcard metacharacters; a glob match removes the entries directly
-        // (no `-r` needed — the pathspec already names the files).
-        if pathspec_is_glob(&git_path) {
-            let glob_matched = index_paths
+        pathspecs.require_matched_includes(options.ignore_unmatch)?;
+    } else {
+        for path in paths {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                worktree_root.join(path)
+            };
+            // Capture a directory-only pathspec before lexical normalization drops
+            // the trailing separator.
+            let has_trailing_slash = path_has_trailing_separator(&absolute);
+            let absolute = normalize_absolute_path_lexically(&absolute);
+            let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+                GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+            })?;
+            // A pathspec with a trailing slash (e.g. `git rm dir/`) only matches a
+            // directory: it must never match a same-named tracked file.
+            let git_path = git_path_bytes(relative)?;
+            if !has_trailing_slash && index_paths.contains(&git_path) {
+                selected.insert(git_path);
+                continue;
+            }
+            if has_trailing_slash && gitlink_paths.contains(&git_path) && absolute.is_dir() {
+                selected.insert(git_path);
+                continue;
+            }
+            // A wildcard pathspec (e.g. `git rm "*"` or `git rm "dir/*.c"`) matches
+            // index entries by git's pathspec matcher rather than by literal path or
+            // directory prefix. Try the glob match first when the spec contains
+            // wildcard metacharacters; a glob match removes the entries directly
+            // (no `-r` needed — the pathspec already names the files).
+            if pathspec_is_glob(&git_path) {
+                let glob_matched = index_paths
+                    .iter()
+                    .filter(|entry| {
+                        pathspec_item_matches(&git_path, entry, PathspecMatchMagic::default())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !glob_matched.is_empty() {
+                    selected.extend(glob_matched);
+                    continue;
+                }
+                if options.ignore_unmatch {
+                    continue;
+                }
+                eprintln!(
+                    "fatal: pathspec '{}' did not match any files",
+                    String::from_utf8_lossy(&git_path)
+                );
+                return Err(GitError::Exit(128));
+            }
+            let matched = index_paths
                 .iter()
                 .filter(|entry| {
-                    pathspec_item_matches(&git_path, entry, PathspecMatchMagic::default())
+                    !sparse_dir_paths.contains(*entry)
+                        && index_entry_is_under_path(entry, &git_path)
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            if !glob_matched.is_empty() {
-                selected.extend(glob_matched);
-                continue;
+            if matched.is_empty() {
+                if options.ignore_unmatch {
+                    continue;
+                }
+                eprintln!(
+                    "fatal: pathspec '{}' did not match any files",
+                    String::from_utf8_lossy(&git_path)
+                );
+                return Err(GitError::Exit(128));
             }
-            if options.ignore_unmatch {
-                continue;
+            if !options.recursive {
+                eprintln!(
+                    "fatal: not removing '{}' recursively without -r",
+                    String::from_utf8_lossy(&git_path)
+                );
+                return Err(GitError::Exit(128));
             }
-            eprintln!(
-                "fatal: pathspec '{}' did not match any files",
-                String::from_utf8_lossy(&git_path)
-            );
-            return Err(GitError::Exit(128));
+            selected.extend(matched);
         }
-        let matched = index_paths
-            .iter()
-            .filter(|entry| {
-                !sparse_dir_paths.contains(*entry) && index_entry_is_under_path(entry, &git_path)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if matched.is_empty() {
-            if options.ignore_unmatch {
-                continue;
-            }
-            eprintln!(
-                "fatal: pathspec '{}' did not match any files",
-                String::from_utf8_lossy(&git_path)
-            );
-            return Err(GitError::Exit(128));
-        }
-        if !options.recursive {
-            eprintln!(
-                "fatal: not removing '{}' recursively without -r",
-                String::from_utf8_lossy(&git_path)
-            );
-            return Err(GitError::Exit(128));
-        }
-        selected.extend(matched);
     }
 
     // `git rm` runs the local-modification safety check unless `-f` is given —
@@ -405,26 +415,148 @@ pub fn remove_index_and_worktree_paths(
         .into_iter()
         .filter(|entry| !selected.contains(entry.path.as_bytes()))
         .collect::<Vec<_>>();
-    // Removing entries invalidates the cache-tree (`TREE` extension): a stale
-    // cached subtree id makes `git diff --cached`/`git status` short-circuit the
-    // comparison of an affected directory against HEAD and miss the deletion
-    // (observed: `git rm dir/nested.txt` left a valid `dir/` cache-tree, so the
-    // deletion never showed in the cached diff). Git invalidates the cache-tree
-    // on any index mutation; drop it so it is rebuilt on the next write, exactly
-    // like the `add` path does above.
-    let extensions = index_extensions_without_cache_tree(&resolve_undo_index.extensions);
     let selected_paths = selected.iter().cloned().collect::<Vec<_>>();
     let mut index = Index {
         version: index_version,
         entries,
-        extensions,
+        extensions: resolve_undo_index.extensions,
         checksum: None,
     };
+    update_cache_tree_for_git_paths(&mut index, format, &db, &selected_paths)?;
     invalidate_untracked_cache_for_git_paths(&mut index, format, &selected_paths)?;
     fs::write(index_path, index.write(format)?)?;
     Ok(RemoveResult {
         removed: selected.into_iter().collect(),
     })
+}
+
+struct RemoveCompiledPathspec {
+    display: String,
+    element: sley_pathspec::PathspecElement,
+    matched: bool,
+}
+
+struct RemoveCompiledPathspecs {
+    specs: Vec<RemoveCompiledPathspec>,
+    have_include: bool,
+    implicit_prefix: Vec<u8>,
+}
+
+impl RemoveCompiledPathspecs {
+    fn parse(worktree_root: &Path, paths: &[PathBuf]) -> Result<Option<Self>> {
+        let mut saw_magic = false;
+        let mut specs = Vec::with_capacity(paths.len());
+        let mut have_include = false;
+        let mut implicit_prefix = Vec::new();
+        for path in paths {
+            let parsed = remove_pathspec_parts(worktree_root, path)?;
+            saw_magic |= parsed.from_magic;
+            if parsed.from_magic && implicit_prefix.is_empty() {
+                implicit_prefix = parsed.prefix.clone();
+            }
+            let element = sley_pathspec::parse_normalized_pathspec_element(
+                &parsed.prefix,
+                &parsed.raw,
+                PathspecMatchMagic::default(),
+            )?;
+            have_include |= !element.is_exclude();
+            specs.push(RemoveCompiledPathspec {
+                display: parsed.display,
+                element,
+                matched: false,
+            });
+        }
+        Ok(saw_magic.then_some(Self {
+            specs,
+            have_include,
+            implicit_prefix,
+        }))
+    }
+
+    fn matches(&mut self, path: &[u8]) -> bool {
+        let mut included = false;
+        let mut excluded = false;
+        for spec in &mut self.specs {
+            if spec.element.matches_path(path) {
+                spec.matched = true;
+                if spec.element.is_exclude() {
+                    excluded = true;
+                } else {
+                    included = true;
+                }
+            }
+        }
+        !excluded
+            && if self.have_include {
+                included
+            } else {
+                remove_path_under_prefix(path, &self.implicit_prefix)
+            }
+    }
+
+    fn require_matched_includes(&self, ignore_unmatch: bool) -> Result<()> {
+        if ignore_unmatch {
+            return Ok(());
+        }
+        for spec in &self.specs {
+            if !spec.element.is_exclude() && !spec.matched {
+                eprintln!("fatal: pathspec '{}' did not match any files", spec.display);
+                return Err(GitError::Exit(128));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct RemovePathspecParts {
+    display: String,
+    raw: String,
+    prefix: Vec<u8>,
+    from_magic: bool,
+}
+
+fn remove_pathspec_parts(worktree_root: &Path, path: &Path) -> Result<RemovePathspecParts> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        worktree_root.join(path)
+    };
+    let absolute = normalize_absolute_path_lexically(&absolute);
+    let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+        GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+    })?;
+    let git_path = git_path_bytes(relative)?;
+    let components = git_path
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    let magic_index = components
+        .iter()
+        .position(|component| component.starts_with(b":"));
+    let Some(magic_index) = magic_index else {
+        return Ok(RemovePathspecParts {
+            display: path.to_string_lossy().into_owned(),
+            raw: String::from_utf8_lossy(&git_path).into_owned(),
+            prefix: Vec::new(),
+            from_magic: false,
+        });
+    };
+    let prefix = components[..magic_index].join(&b'/');
+    let raw = components[magic_index..].join(&b'/');
+    Ok(RemovePathspecParts {
+        display: path.to_string_lossy().into_owned(),
+        raw: String::from_utf8_lossy(&raw).into_owned(),
+        prefix,
+        from_magic: true,
+    })
+}
+
+fn remove_path_under_prefix(path: &[u8], prefix: &[u8]) -> bool {
+    prefix.is_empty()
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with(b"/"))
 }
 
 /// Remove a tracked path from the working tree, mirroring builtin/rm.c's

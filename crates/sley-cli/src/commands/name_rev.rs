@@ -33,6 +33,69 @@ struct Tip {
     deref: bool,
 }
 
+/// Commit headers used by `name-rev`, cached per command invocation.
+#[derive(Clone)]
+struct CommitMetadata {
+    parents: Vec<ObjectId>,
+    committerdate: i64,
+}
+
+#[derive(Default)]
+struct CommitMetadataCache {
+    commits: HashMap<ObjectId, CommitMetadata>,
+}
+
+impl CommitMetadataCache {
+    fn get_cached(&self, oid: &ObjectId) -> Option<&CommitMetadata> {
+        self.commits.get(oid)
+    }
+
+    fn get_or_read(
+        &mut self,
+        db: &FileObjectDatabase,
+        format: ObjectFormat,
+        oid: &ObjectId,
+    ) -> Result<Option<&CommitMetadata>> {
+        if !self.commits.contains_key(oid) {
+            let object = db.read_object(oid)?;
+            if object.object_type != ObjectType::Commit {
+                return Ok(None);
+            }
+            let commit = Commit::parse(format, &object.body)?;
+            self.commits.insert(
+                *oid,
+                CommitMetadata {
+                    parents: commit.parents,
+                    committerdate: committer_timestamp(&commit.committer).unwrap_or(i64::MAX),
+                },
+            );
+        }
+        Ok(self.commits.get(oid))
+    }
+
+    fn get_or_parse_commit(
+        &mut self,
+        format: ObjectFormat,
+        oid: &ObjectId,
+        body: &[u8],
+    ) -> Result<&CommitMetadata> {
+        if !self.commits.contains_key(oid) {
+            let commit = Commit::parse(format, body)?;
+            self.commits.insert(
+                *oid,
+                CommitMetadata {
+                    parents: commit.parents,
+                    committerdate: committer_timestamp(&commit.committer).unwrap_or(i64::MAX),
+                },
+            );
+        }
+        Ok(self
+            .commits
+            .get(oid)
+            .expect("commit metadata was inserted or already cached"))
+    }
+}
+
 /// The best name discovered for a commit during the walk.
 #[derive(Clone)]
 struct RevName {
@@ -80,9 +143,10 @@ pub(crate) fn cmd_name_rev(args: &[String]) -> Result<()> {
     let format = repo.format();
     let db = repo.objects();
 
-    let tips = collect_tips(git_dir, format, db, &options)?;
+    let mut commit_cache = CommitMetadataCache::default();
+    let tips = collect_tips(git_dir, format, db, &options, &mut commit_cache)?;
     let mut rev_names: HashMap<ObjectId, RevName> = HashMap::new();
-    name_all_tips(db, format, &tips, &mut rev_names)?;
+    name_all_tips(db, format, &tips, &mut rev_names, &mut commit_cache)?;
 
     if options.all {
         return emit_all(db, &rev_names, &options);
@@ -189,6 +253,7 @@ fn collect_tips(
     format: ObjectFormat,
     db: &FileObjectDatabase,
     options: &NameRevOptions,
+    commit_cache: &mut CommitMetadataCache,
 ) -> Result<Vec<Tip>> {
     let store = FileRefStore::new(git_dir, format);
     let mut refs = store.list_refs()?;
@@ -239,14 +304,22 @@ fn collect_tips(
         let mut taggerdate = i64::MAX;
         let mut commit = None;
         loop {
+            if let Some(metadata) = commit_cache.get_cached(&current) {
+                if taggerdate == i64::MAX {
+                    taggerdate = metadata.committerdate;
+                }
+                commit = Some(current);
+                break;
+            }
             let object = db.read_object(&current)?;
             match object.object_type {
                 ObjectType::Commit => {
-                    let parsed = Commit::parse(format, &object.body)?;
+                    let metadata =
+                        commit_cache.get_or_parse_commit(format, &current, &object.body)?;
                     if taggerdate == i64::MAX {
-                        taggerdate = committer_timestamp(&parsed.committer).unwrap_or(i64::MAX);
+                        taggerdate = metadata.committerdate;
                     }
-                    commit = Some(current.clone());
+                    commit = Some(current);
                     break;
                 }
                 ObjectType::Tag => {
@@ -292,6 +365,7 @@ fn name_all_tips(
     format: ObjectFormat,
     tips: &[Tip],
     rev_names: &mut HashMap<ObjectId, RevName>,
+    commit_cache: &mut CommitMetadataCache,
 ) -> Result<()> {
     let mut order: Vec<usize> = (0..tips.len()).collect();
     // Stable sort over the alphabetically-ordered tips: tags first, then older
@@ -308,7 +382,7 @@ fn name_all_tips(
         let Some(commit) = &tip.commit else {
             continue;
         };
-        name_rev(db, format, commit, tip, rev_names)?;
+        name_rev(db, format, commit, tip, rev_names, commit_cache)?;
     }
     Ok(())
 }
@@ -320,6 +394,7 @@ fn name_rev(
     start: &ObjectId,
     tip: &Tip,
     rev_names: &mut HashMap<ObjectId, RevName>,
+    commit_cache: &mut CommitMetadataCache,
 ) -> Result<()> {
     let tip_name = if tip.deref {
         format!("{}^0", tip.refname)
@@ -338,11 +413,9 @@ fn name_rev(
         let Some(current) = rev_names.get(&oid).cloned() else {
             continue;
         };
-        let object = db.read_object(&oid)?;
-        if object.object_type != ObjectType::Commit {
+        let Some(commit) = commit_cache.get_or_read(db, format, &oid)? else {
             continue;
-        }
-        let commit = Commit::parse(format, &object.body)?;
+        };
         // Push parents so the first parent is processed before the others, just
         // like upstream's two-stack arrangement.
         let mut to_queue = Vec::new();

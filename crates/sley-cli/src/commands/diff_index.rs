@@ -408,8 +408,15 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     // whitespace error, OR-ing in 1 when `--exit-code`/`--quiet` + changes).
     if check {
         let resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(git_dir)?;
-        let check_failed =
-            commands::diff::run_diff_check(&entries, db, worktree_root, false, !cached, &resolver)?;
+        let check_failed = commands::diff::run_diff_check(
+            &entries,
+            db,
+            worktree_root,
+            false,
+            !cached,
+            None,
+            &resolver,
+        )?;
         let mut code = 0;
         if check_failed {
             code |= 0o2;

@@ -303,12 +303,20 @@ pub(super) fn pickaxe_commit_matches(
         Some(pathspec) => apply_diff_pathspec(entries, pathspec),
         None => entries,
     };
-    // --find-object: match purely on blob oids, no blob reads.
+    // --find-object: the common blob/gitlink case is answered from filepair oids;
+    // tree targets fall back to comparing tree-entry occurrence counts.
     if let CompiledPickaxe::FindObject { oids } = pickaxe {
-        return Ok(entries.iter().any(|entry| {
+        if entries.iter().any(|entry| {
             entry.old_oid.as_ref().is_some_and(|oid| oids.contains(oid))
                 || entry.new_oid.as_ref().is_some_and(|oid| oids.contains(oid))
-        }));
+        }) {
+            return Ok(true);
+        }
+        return if pathspec.is_none() {
+            find_object_tree_occurrence_changed(db, format, parent_tree.as_ref(), tree, oids)
+        } else {
+            Ok(false)
+        };
     }
     let skips_binary = pickaxe.skips_binary() && !text;
     for entry in &entries {
@@ -345,6 +353,57 @@ pub(super) fn pickaxe_commit_matches(
         }
     }
     Ok(false)
+}
+
+fn find_object_tree_occurrence_changed(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    old_tree: Option<&ObjectId>,
+    new_tree: &ObjectId,
+    targets: &HashSet<ObjectId>,
+) -> Result<bool> {
+    let old_count = match old_tree {
+        Some(tree) => count_tree_object_occurrences(db, format, tree, targets)?,
+        None => 0,
+    };
+    let new_count = count_tree_object_occurrences(db, format, new_tree, targets)?;
+    Ok(old_count != new_count)
+}
+
+fn count_tree_object_occurrences(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    targets: &HashSet<ObjectId>,
+) -> Result<usize> {
+    count_tree_object_occurrences_inner(db, format, tree_oid, targets, true)
+}
+
+fn count_tree_object_occurrences_inner(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    targets: &HashSet<ObjectId>,
+    include_root: bool,
+) -> Result<usize> {
+    let mut count = usize::from(include_root && targets.contains(tree_oid));
+    if *tree_oid == ObjectId::empty_tree(format) {
+        return Ok(count);
+    }
+    let object = db.read_object(tree_oid)?;
+    if object.object_type != ObjectType::Tree {
+        return Ok(count);
+    }
+    for entry in sley_object::TreeEntries::new(format, &object.body) {
+        let entry = entry?;
+        if targets.contains(&entry.oid) {
+            count += 1;
+        }
+        if sley_object::tree_entry_object_type(entry.mode) == ObjectType::Tree {
+            count += count_tree_object_occurrences_inner(db, format, &entry.oid, targets, false)?;
+        }
+    }
+    Ok(count)
 }
 
 pub(super) fn pickaxe_filter_entries(

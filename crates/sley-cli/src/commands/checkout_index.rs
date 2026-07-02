@@ -559,7 +559,7 @@ fn checkout_one_index_entry(
     }
 
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+        checkout_index_ensure_parent_dirs(parent, context.options.force)?;
     }
 
     // Mode 0o120000 is a symlink; everything else is a regular file (executable
@@ -644,7 +644,7 @@ fn checkout_index_modes_match(entry_mode: u32, metadata: &fs::Metadata) -> bool 
 fn write_checkout_symlink(dest: &Path, target: &[u8], exists: bool) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     if exists {
-        fs::remove_file(dest)?;
+        checkout_index_remove_existing_path(dest)?;
     }
     let target = std::ffi::OsStr::from_bytes(target);
     std::os::unix::fs::symlink(target, dest)?;
@@ -656,7 +656,7 @@ fn write_checkout_symlink(dest: &Path, target: &[u8], exists: bool) -> Result<()
     // No symlink support: fall back to writing the link text as a regular file,
     // matching git's behaviour on filesystems without symlink support.
     if exists {
-        fs::remove_file(dest)?;
+        checkout_index_remove_existing_path(dest)?;
     }
     fs::write(dest, target)?;
     Ok(())
@@ -666,12 +666,57 @@ fn write_checkout_regular_file(dest: &Path, body: &[u8], mode: u32) -> Result<()
     // Replace any existing symlink with a real file rather than writing through
     // it, mirroring git's create-or-truncate semantics.
     if let Ok(metadata) = fs::symlink_metadata(dest)
-        && metadata.file_type().is_symlink()
+        && (metadata.file_type().is_symlink() || metadata.is_dir())
     {
-        fs::remove_file(dest)?;
+        checkout_index_remove_existing_path(dest)?;
     }
     fs::write(dest, body)?;
     apply_checkout_file_mode(dest, mode)?;
+    Ok(())
+}
+
+fn checkout_index_ensure_parent_dirs(path: &Path, force: bool) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        if !force {
+            fs::create_dir_all(path)?;
+            return Ok(());
+        }
+        checkout_index_remove_existing_path(path)?;
+    }
+    if let Some(parent) = path.parent() {
+        checkout_index_ensure_parent_dirs(parent, force)?;
+    }
+    match fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path)?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                Ok(())
+            } else if force {
+                checkout_index_remove_existing_path(path)?;
+                fs::create_dir(path)?;
+                Ok(())
+            } else {
+                Err(err.into())
+            }
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn checkout_index_remove_existing_path(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
     Ok(())
 }
 

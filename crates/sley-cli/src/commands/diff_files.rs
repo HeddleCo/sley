@@ -955,21 +955,10 @@ fn diff_files_entry_is_racy_clean_equivalent(
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Ok(false);
     }
-    // An entry whose cached stat was left zeroed (e.g. written by a merge or
-    // rebase without a stat refresh) is racily clean: its size is unreliable, so
-    // re-hash rather than trusting a size mismatch (git re-checks such entries).
-    let stat_zeroed = index_entry.mtime_seconds == 0 && index_entry.mtime_nanoseconds == 0;
-    if !stat_zeroed && index_entry.size != diff_files_index_size(&metadata) {
-        return Ok(false);
-    }
     let body = fs::read(&absolute)?;
     let clean = sley_worktree::apply_clean_filter(worktree_root, git_dir, config, path, &body)?;
     let clean_oid = EncodedObject::new(ObjectType::Blob, clean).object_id(format)?;
     Ok(clean_oid == old_oid)
-}
-
-fn diff_files_index_size(metadata: &fs::Metadata) -> u32 {
-    metadata.len().min(u32::MAX as u64) as u32
 }
 
 #[cfg(unix)]

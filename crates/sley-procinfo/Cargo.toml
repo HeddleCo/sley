@@ -1,0 +1,22 @@
+[package]
+name = "sley-procinfo"
+version.workspace = true
+description = "Small, audited process-ancestry helpers for Git-compatible trace2 output."
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+
+# Keep process-inspection unsafe isolated from the rest of the workspace. The
+# public API returns owned process names and has no unsafe contract for callers.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "deny"
+dbg_macro = "deny"
+todo = "deny"
+clone_on_copy = "allow"

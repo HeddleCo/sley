@@ -77,8 +77,12 @@ impl PathspecElement {
         let mut top = false;
         let mut attrs: Vec<Vec<u8>> = Vec::new();
         let mut attr_requirements: Vec<PathspecAttrRequirement> = Vec::new();
+        let mut explicit_literal = false;
+        let mut explicit_glob = false;
 
-        let rest = if let Some(after) = arg.strip_prefix(b":(") {
+        let rest = if defaults.literal_pathspecs {
+            arg
+        } else if let Some(after) = arg.strip_prefix(b":(") {
             // Long form: :(magic[,magic...])pattern
             let close = after
                 .iter()
@@ -89,8 +93,16 @@ impl PathspecElement {
                 match word.as_slice() {
                     b"exclude" => exclude = true,
                     b"icase" => icase = true,
-                    b"literal" => literal = true,
-                    b"glob" => glob = true,
+                    b"literal" => {
+                        explicit_literal = true;
+                        literal = true;
+                        glob = false;
+                    }
+                    b"glob" => {
+                        explicit_glob = true;
+                        glob = true;
+                        literal = false;
+                    }
                     b"top" => top = true,
                     other => {
                         if let Some(attr) = other.strip_prefix(b"attr:") {
@@ -126,7 +138,7 @@ impl PathspecElement {
         };
 
         // `:(glob)` and `:(literal)` are mutually exclusive in git.
-        if glob && literal {
+        if (glob && literal) || (explicit_glob && explicit_literal) {
             return Err(PathspecParseError::GlobLiteralConflict);
         }
 
@@ -182,6 +194,7 @@ impl PathspecElement {
             literal: self.literal,
             glob: self.glob,
             icase: self.icase,
+            literal_pathspecs: false,
         }
     }
 
@@ -405,20 +418,51 @@ pub fn normalized_revwalk_pathspec(
     pathspecs: &[String],
     magic: PathspecMatchMagic,
 ) -> sley_core::Result<Pathspec> {
-    let prefix = if let Some(root) = worktree_root {
+    let (prefix, root_and_cwd) = if let Some(root) = worktree_root {
         let root = fs::canonicalize(root)?;
         let cwd = fs::canonicalize(cwd)?;
-        cwd.strip_prefix(&root)
+        let prefix = cwd
+            .strip_prefix(&root)
             .map(|relative| relative.to_string_lossy().replace('\\', "/").into_bytes())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (prefix, Some((root, cwd)))
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
     let elements = pathspecs
         .iter()
-        .map(|spec| parse_normalized_pathspec_element(&prefix, spec, magic))
+        .map(|spec| {
+            let parse_spec = match root_and_cwd.as_ref() {
+                Some((root, cwd)) => normalize_absolute_pathspec_arg(root, cwd, spec)?,
+                None => spec.to_string(),
+            };
+            parse_normalized_pathspec_element(&prefix, &parse_spec, magic)
+        })
         .collect::<sley_core::Result<Vec<_>>>()?;
     Ok(Pathspec::from_elements(elements))
+}
+
+fn normalize_absolute_pathspec_arg(
+    root: &Path,
+    cwd: &Path,
+    arg: &str,
+) -> sley_core::Result<String> {
+    let path = Path::new(arg);
+    if !path.is_absolute() {
+        return Ok(arg.to_string());
+    }
+    let absolute = fs::canonicalize(path)?;
+    let relative = absolute
+        .strip_prefix(root)
+        .map_err(|_| GitError::InvalidPath(format!("pathspec {arg} is outside worktree")))?;
+    let repo_path = relative.to_string_lossy().replace('\\', "/");
+    if repo_path.is_empty() {
+        return Ok(":/".to_string());
+    }
+    if cwd == root {
+        return Ok(repo_path);
+    }
+    Ok(format!(":(top){repo_path}"))
 }
 
 pub fn normalize_ls_files_pathspec(prefix: &[u8], arg: &str) -> sley_core::Result<Vec<u8>> {
@@ -613,6 +657,9 @@ pub struct PathspecMatchMagic {
     pub literal: bool,
     pub glob: bool,
     pub icase: bool,
+    /// `--literal-pathspecs` / `GIT_LITERAL_PATHSPECS`: the entire pathspec is
+    /// literal, including leading `:(...)` magic syntax.
+    pub literal_pathspecs: bool,
 }
 
 /// git `is_glob_special`: characters that make a pathspec a wildcard.
@@ -655,7 +702,7 @@ fn ps_strncmp(icase: bool, a: &[u8], b: &[u8], n: usize) -> bool {
 
 /// True if `path` contains a glob-special character.
 pub fn pathspec_is_glob(path: &[u8]) -> bool {
-    path.iter().any(|byte| matches!(byte, b'*' | b'?' | b'['))
+    path.iter().any(|byte| is_glob_special(*byte))
 }
 
 /// Port of git's `match_pathspec_item` for the single-pathspec / single-name case
@@ -1156,10 +1203,67 @@ mod tests {
     }
 
     #[test]
+    fn default_wildcard_can_cross_directory_separator() {
+        let p = ps(&["*file3"]);
+        assert!(p.matches(b"file3"));
+        assert!(p.matches(b"subdir/file3"));
+
+        let glob = ps(&[":(glob)*file3"]);
+        assert!(glob.matches(b"file3"));
+        assert!(!glob.matches(b"subdir/file3"));
+    }
+
+    #[test]
     fn literal_magic_disables_wildcards() {
         let p = ps(&[":(literal)a*b"]);
         assert!(p.matches(b"a*b"));
         assert!(!p.matches(b"axxb"));
+    }
+
+    #[test]
+    fn backslash_marks_pathspec_as_glob_special() {
+        assert!(pathspec_is_glob(br"a\*b"));
+        assert!(pathspec_is_glob(br"a\?b"));
+        assert!(pathspec_is_glob(br"a\[b"));
+        assert!(!pathspec_is_glob(b"plain/path"));
+    }
+
+    #[test]
+    fn escaped_wildcards_match_literal_bytes() {
+        let p = ps(&[r"a\*b", r"a\?b", r"a\[b"]);
+        assert!(p.matches(b"a*b"));
+        assert!(p.matches(b"a?b"));
+        assert!(p.matches(b"a[b"));
+        assert!(!p.matches(b"axxb"));
+        assert!(!p.matches(b"acb"));
+    }
+
+    #[test]
+    fn explicit_glob_literal_magic_overrides_global_defaults() {
+        let noglob_default = PathspecMatchMagic {
+            literal: true,
+            glob: false,
+            icase: false,
+            literal_pathspecs: false,
+        };
+        let glob = PathspecElement::parse(b":(glob)*.rs", noglob_default).expect("glob override");
+        assert!(glob.is_glob());
+        assert!(!glob.magic().literal);
+        assert!(glob.matches_path(b"lib.rs"));
+        assert!(!glob.matches_path(b"src/lib.rs"));
+
+        let glob_default = PathspecMatchMagic {
+            literal: false,
+            glob: true,
+            icase: false,
+            literal_pathspecs: false,
+        };
+        let literal =
+            PathspecElement::parse(b":(literal)*.rs", glob_default).expect("literal override");
+        assert!(!literal.is_glob());
+        assert!(literal.magic().literal);
+        assert!(literal.matches_path(b"*.rs"));
+        assert!(!literal.matches_path(b"lib.rs"));
     }
 
     #[test]

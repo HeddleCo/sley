@@ -319,7 +319,7 @@ fn update_index_path_modes_match_upstream_git() {
             reset_fixture(&expected);
             reset_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             let expected_success = expected_output.status.success();
             assert_same_output(actual_output, expected_output, &args);
             if expected_success {
@@ -418,7 +418,7 @@ fn update_index_add_symlink_matches_upstream_git() {
         setup(&actual);
 
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         let expected_success = expected_output.status.success();
         assert_same_output(actual_output, expected_output, &args);
         // The index must match whether the command succeeded (the symlink was
@@ -484,7 +484,7 @@ fn update_index_no_input_compat_flags_match_upstream_git() {
             let _ = fs::remove_file(expected.join(".git").join("index"));
             let _ = fs::remove_file(actual.join(".git").join("index"));
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches(&expected, &actual, &args);
             assert_index_version_matches(&expected, &actual, &format!("{args:?}"));
@@ -494,7 +494,7 @@ fn update_index_no_input_compat_flags_match_upstream_git() {
             reset_clean_fixture(&expected);
             reset_clean_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches(&expected, &actual, &args);
             assert_index_version_matches(&expected, &actual, &format!("{args:?}"));
@@ -530,7 +530,7 @@ fn update_index_git_index_file_matches_upstream_git() {
         let update_args = ["update-index", "--add", "file.txt"];
         let expected_output =
             run_with_env(sley_testkit::oracle_git(), &expected, &update_args, &envs);
-        let actual_output = run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &update_args, &envs);
+        let actual_output = run_with_env(sley_testkit::sley_bin!(), &actual, &update_args, &envs);
         assert_same_output(actual_output, expected_output, &update_args);
 
         for args in [
@@ -539,7 +539,7 @@ fn update_index_git_index_file_matches_upstream_git() {
             vec!["write-tree"],
         ] {
             let expected_output = run_with_env(sley_testkit::oracle_git(), &expected, &args, &envs);
-            let actual_output = run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &args, &envs);
+            let actual_output = run_with_env(sley_testkit::sley_bin!(), &actual, &args, &envs);
             assert_same_output(actual_output, expected_output, &args);
         }
 
@@ -547,7 +547,7 @@ fn update_index_git_index_file_matches_upstream_git() {
         assert!(actual.join("custom-index").join("index").exists());
         let default_args = ["ls-files", "--stage"];
         assert_same_output(
-            run(env!("CARGO_BIN_EXE_sley"), &actual, &default_args),
+            run(sley_testkit::sley_bin!(), &actual, &default_args),
             run(sley_testkit::oracle_git(), &expected, &default_args),
             &default_args,
         );
@@ -593,7 +593,7 @@ fn update_index_test_untracked_cache_matches_upstream_git() {
             ],
         ] {
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output_with_normalized_stderr(
                 actual_output,
                 expected_output,
@@ -634,7 +634,7 @@ fn update_index_fsmonitor_matches_upstream_git_when_unset() {
             vec!["update-index", "--no-fsmonitor", "--fsmonitor"],
         ] {
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches(&expected, &actual, &args);
             assert_index_version_matches(&expected, &actual, &format!("{args:?}"));
@@ -650,7 +650,7 @@ fn update_index_fsmonitor_matches_upstream_git_when_unset() {
             reset_fixture(&expected);
             reset_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             let expected_success = expected_output.status.success();
             assert_same_output(actual_output, expected_output, &args);
             if expected_success {
@@ -689,7 +689,7 @@ fn update_index_unresolve_no_resolve_undo_matches_upstream_git() {
             reset_clean_fixture(&expected);
             reset_clean_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches(&expected, &actual, &args);
             assert_index_version_matches(&expected, &actual, &format!("{args:?}"));
@@ -710,7 +710,7 @@ fn update_index_unresolve_no_resolve_undo_matches_upstream_git() {
             reset_fixture(&expected);
             reset_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches(&expected, &actual, &args);
             assert_index_version_matches(&expected, &actual, &format!("{args:?}"));
@@ -788,7 +788,7 @@ fn update_index_again_matches_upstream_git() {
             }
 
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches(&expected, &actual, &args);
         }
@@ -803,7 +803,7 @@ fn update_index_again_matches_upstream_git() {
         }
         let args = ["update-index", "--again"];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_index_matches(&expected, &actual, &args);
     };
@@ -852,7 +852,7 @@ fn update_index_verbose_matches_upstream_git() {
             reset_fixture(&expected);
             reset_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             let expected_success = expected_output.status.success();
             assert_same_output(actual_output, expected_output, &args);
             if expected_success {
@@ -891,7 +891,7 @@ fn update_index_refresh_matches_upstream_git() {
             reset_clean_fixture(&expected);
             reset_clean_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches(&expected, &actual, &args);
         }
@@ -904,7 +904,7 @@ fn update_index_refresh_matches_upstream_git() {
             reset_fixture(&expected);
             reset_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             let expected_success = expected_output.status.success();
             assert_same_output(actual_output, expected_output, &args);
             if expected_success {
@@ -928,7 +928,7 @@ fn update_index_refresh_matches_upstream_git() {
                 &["update-index", "--assume-unchanged", "keep.txt"],
             );
             run_success(
-                env!("CARGO_BIN_EXE_sley"),
+                sley_testkit::sley_bin!(),
                 &actual,
                 &["update-index", "--assume-unchanged", "keep.txt"],
             );
@@ -937,7 +937,7 @@ fn update_index_refresh_matches_upstream_git() {
             fs::write(expected.join("one.txt"), b"changed").expect("modify expected one");
             fs::write(actual.join("one.txt"), b"changed").expect("modify actual one");
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches(&expected, &actual, &args);
             assert_ls_files_verbose_matches(&expected, &actual, &format!("{args:?}"));
@@ -1017,7 +1017,7 @@ fn update_index_refresh_quiet_ordering_matches_upstream_git() {
                 fs::write(repo.join("f3.txt"), b"MODIFIED LONGER CONTENT\n").expect("modify f3");
             }
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
     };
@@ -1067,7 +1067,7 @@ fn update_index_refresh_ignore_missing_matches_upstream_git() {
             reset_fixture(&expected);
             reset_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             let expected_success = expected_output.status.success();
             assert_same_output(actual_output, expected_output, &args);
             if expected_success {
@@ -1116,7 +1116,7 @@ fn update_index_clear_resolve_undo_matches_upstream_git() {
             reset_fixture(&expected);
             reset_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             let expected_success = expected_output.status.success();
             assert_same_output(actual_output, expected_output, &args);
             if expected_success {
@@ -1173,7 +1173,7 @@ fn update_index_assume_unchanged_matches_upstream_git() {
             reset_clean_fixture(&expected);
             reset_clean_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches_for_label(&expected, &actual, label);
             assert_ls_files_verbose_matches(&expected, &actual, label);
@@ -1193,7 +1193,7 @@ fn update_index_assume_unchanged_matches_upstream_git() {
         );
         let args = ["update-index", "--no-assume-unchanged", "keep.txt"];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_index_matches_for_label(&expected, &actual, "clear-existing-assume");
         assert_ls_files_verbose_matches(&expected, &actual, "clear-existing-assume");
@@ -1244,7 +1244,7 @@ fn update_index_skip_worktree_matches_upstream_git() {
             reset_clean_fixture(&expected);
             reset_clean_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches_for_label(&expected, &actual, label);
             assert_ls_files_verbose_matches(&expected, &actual, label);
@@ -1259,13 +1259,13 @@ fn update_index_skip_worktree_matches_upstream_git() {
             &["update-index", "--skip-worktree", "keep.txt"],
         );
         run_success(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &["update-index", "--skip-worktree", "keep.txt"],
         );
         let args = ["update-index", "--no-skip-worktree", "keep.txt"];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_index_matches_for_label(&expected, &actual, "clear-existing-skip");
         assert_ls_files_verbose_matches(&expected, &actual, "clear-existing-skip");
@@ -1285,7 +1285,7 @@ fn update_index_skip_worktree_matches_upstream_git() {
         );
         let args = ["update-index", "--no-skip-worktree", "keep.txt"];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_index_matches_for_label(&expected, &actual, "clear-upstream-written-skip");
         assert_ls_files_verbose_matches(&expected, &actual, "clear-upstream-written-skip");
@@ -1374,7 +1374,7 @@ fn update_index_ignore_skip_worktree_entries_matches_upstream_git() {
             fs::write(expected.join("keep.txt"), b"changed").expect("modify expected keep");
             fs::write(actual.join("keep.txt"), b"changed").expect("modify actual keep");
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches_for_label(&expected, &actual, label);
             assert_ls_files_verbose_matches(&expected, &actual, label);
@@ -1428,7 +1428,7 @@ fn update_index_fsmonitor_valid_matches_upstream_git() {
             reset_fixture(&expected);
             reset_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             let expected_success = expected_output.status.success();
             assert_same_output(actual_output, expected_output, &args);
             if expected_success {
@@ -1478,7 +1478,7 @@ fn update_index_info_only_matches_upstream_git() {
             reset_fixture(&expected);
             reset_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches_for_label(&expected, &actual, label);
             assert_object_existence_matches(&expected, &actual, "new.txt", label);
@@ -1489,7 +1489,7 @@ fn update_index_info_only_matches_upstream_git() {
         reset_fixture(&expected);
         reset_fixture(&actual);
         let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, stdin);
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, stdin);
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, stdin);
         assert_same_output(actual_output, expected_output, &args);
         assert_index_matches_for_label(&expected, &actual, "info-only-stdin");
         assert_object_existence_matches(&expected, &actual, "new.txt", "info-only-stdin");
@@ -1525,7 +1525,7 @@ fn update_index_show_index_version_matches_upstream_git() {
             ],
         ] {
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches(&expected, &actual, &args);
         }
@@ -1548,9 +1548,142 @@ fn update_index_show_index_version_matches_upstream_git() {
             ],
         ] {
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches(&expected, &actual, &args);
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn update_index_refresh_unmerged_matches_upstream_git() {
+    let root = unique_temp_dir("update-index-refresh-unmerged");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo dir");
+    fs::create_dir_all(&actual).expect("create actual repo dir");
+    {
+        for repo in [&expected, &actual] {
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["init", "-q", "-b", "main"],
+            );
+            fs::write(repo.join("one"), b"one\n").expect("write one");
+            fs::write(repo.join("two"), b"two\n").expect("write two");
+            fs::write(repo.join("three"), b"three\n").expect("write three");
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["add", "one", "two", "three"],
+            );
+            let info = run_success(sley_testkit::oracle_git(), repo, &["ls-files", "-s", "one"]);
+            let info = String::from_utf8(info)
+                .expect("stage output utf8")
+                .replace(" 0\t", " 1\t");
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["rm", "--cached", "-q", "one"],
+            );
+            let output = run_with_stdin(
+                sley_testkit::oracle_git(),
+                repo,
+                &["update-index", "--index-info"],
+                info.as_bytes(),
+            );
+            assert!(
+                output.status.success(),
+                "git update-index --index-info failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        for args in [
+            vec!["update-index", "--refresh"],
+            vec!["update-index", "--unmerged", "--refresh"],
+        ] {
+            let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
+            let expected_success = expected_output.status.success();
+            assert_same_output(actual_output, expected_output, &args);
+            if expected_success {
+                assert_index_matches(&expected, &actual, &args);
+            }
+        }
+
+        fs::write(expected.join("two"), b"changed\n").expect("modify expected two");
+        fs::write(actual.join("two"), b"changed\n").expect("modify actual two");
+        let args = ["update-index", "--unmerged", "--refresh"];
+        let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
+        assert_same_output(actual_output, expected_output, &args);
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn update_index_refresh_ignore_submodules_matches_upstream_git() {
+    let root = unique_temp_dir("update-index-refresh-ignore-submodules");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo dir");
+    fs::create_dir_all(&actual).expect("create actual repo dir");
+    {
+        for repo in [&expected, &actual] {
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["init", "-q", "-b", "main"],
+            );
+            let sub = repo.join("sub");
+            fs::create_dir_all(&sub).expect("create submodule dir");
+            run_success(
+                sley_testkit::oracle_git(),
+                &sub,
+                &["init", "-q", "-b", "main"],
+            );
+            run_success(
+                sley_testkit::oracle_git(),
+                &sub,
+                &[
+                    "-c",
+                    "user.name=Example User",
+                    "-c",
+                    "user.email=example@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ],
+            );
+            run_success(sley_testkit::oracle_git(), repo, &["add", "sub"]);
+            run_success(
+                sley_testkit::oracle_git(),
+                &sub,
+                &[
+                    "-c",
+                    "user.name=Example User",
+                    "-c",
+                    "user.email=example@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "updated",
+                ],
+            );
+        }
+
+        for args in [
+            vec!["update-index", "--refresh"],
+            vec!["update-index", "--ignore-missing", "--refresh"],
+            vec!["update-index", "--ignore-submodules", "--refresh"],
+        ] {
+            let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
+            assert_same_output(actual_output, expected_output, &args);
         }
     };
     let _ = fs::remove_dir_all(&root);
@@ -1590,7 +1723,7 @@ fn update_index_index_version_matches_upstream_git() {
             ("empty-v4-equals", vec!["update-index", "--index-version=4"]),
         ] {
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_version_matches(&expected, &actual, label);
             assert_index_matches_for_label(&expected, &actual, label);
@@ -1625,7 +1758,7 @@ fn update_index_index_version_matches_upstream_git() {
             reset_clean_fixture(&expected);
             reset_clean_fixture(&actual);
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_version_matches(&expected, &actual, label);
             assert_index_matches_for_label(&expected, &actual, label);
@@ -1639,7 +1772,7 @@ fn update_index_index_version_matches_upstream_git() {
             &["update-index", "--skip-worktree", "keep.txt"],
         );
         run_success(
-            env!("CARGO_BIN_EXE_sley"),
+            sley_testkit::sley_bin!(),
             &actual,
             &["update-index", "--skip-worktree", "keep.txt"],
         );
@@ -1658,7 +1791,7 @@ fn update_index_index_version_matches_upstream_git() {
             ),
         ] {
             let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_version_matches(&expected, &actual, label);
             assert_index_matches_for_label(&expected, &actual, label);
@@ -1741,7 +1874,7 @@ fn update_index_cacheinfo_matches_upstream_git() {
         ] {
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
             let expected_output = run(sley_testkit::oracle_git(), &expected, &arg_refs);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &arg_refs);
+            let actual_output = run(sley_testkit::sley_bin!(), &actual, &arg_refs);
             let expected_success = expected_output.status.success();
             assert_same_output(actual_output, expected_output, &arg_refs);
             if expected_success {
@@ -1800,23 +1933,26 @@ fn update_index_index_info_matches_upstream_git() {
         let staged = format!(
             "0 0000000000000000000000000000000000000000\tconflict\n100644 {one} 1\tconflict\n100644 {two} 2\tconflict\n"
         );
+        let ls_tree_style =
+            format!("100644 blob {one}\tls-tree/file\n120000 blob {two}\tls-tree/link\n");
 
         for (label, stdin) in [
             ("simple", simple.as_bytes()),
             ("remove", remove.as_bytes()),
             ("staged", staged.as_bytes()),
+            ("ls-tree-style", ls_tree_style.as_bytes()),
         ] {
             let args = ["update-index", "--index-info"];
             let expected_output =
                 run_with_stdin(sley_testkit::oracle_git(), &expected, &args, stdin);
-            let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, stdin);
+            let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, stdin);
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches_for_label(&expected, &actual, label);
         }
 
         let args = ["update-index", "--index-info", "extra"];
         let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, b"");
-        let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, b"");
+        let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, b"");
         assert_same_output(actual_output, expected_output, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -1864,7 +2000,7 @@ fn update_index_stdin_modes_match_upstream_git() {
             reset_fixture(&actual);
             let expected_output =
                 run_with_stdin(sley_testkit::oracle_git(), &expected, &args, &stdin);
-            let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, &stdin);
+            let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, &stdin);
             let expected_success = expected_output.status.success();
             assert_same_output(actual_output, expected_output, &args);
             if expected_success {
@@ -1898,7 +2034,7 @@ fn update_index_adds_sha256_index_entries() {
 
         let args = ["update-index", "--add", "a.txt"];
         let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
-        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_index_matches(&expected, &actual, &args);
     };

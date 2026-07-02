@@ -8,7 +8,7 @@ use sley_pathspec::{
     PathspecAttributeCheck, PathspecAttributeState, PathspecElement, PathspecMatchMagic,
     pathspec_attrs_match_with, pathspec_item_matches,
 };
-use sley_worktree::TreeAttributes;
+use sley_worktree::{AttributeCheck, AttributeState, StandardAttributeMatcher, TreeAttributes};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::Write;
@@ -35,13 +35,13 @@ const TAR_RECORD_SIZE: usize = 10 * 1024;
 /// [`write_tar_archive_with_convert`]; the plain [`write_tar_archive`] emits raw
 /// blob bytes (no conversion).
 ///
-/// Not yet wired: `export-subst` (`$Format:…$` keyword substitution via
-/// `format_subst`) and the `ident` filter (`$Id$` expansion) — both are
-/// archive/convert features the underlying engine does not yet implement; see
-/// the `TODO(convert)` markers.
+/// Also supports `export-subst` (`$Format:…$` keyword substitution) when the
+/// caller installs a commit formatter. The remaining conversion gap is the
+/// `ident` filter (`$Id$` expansion), which the lower-level conversion engine
+/// does not yet implement.
 pub struct ArchiveConvert<'a> {
     config: &'a GitConfig,
-    attributes: TreeAttributes,
+    attributes: ArchiveAttributes,
     /// `export-subst` keyword expander: given a `$Format:<fmt>$` inner format
     /// string, render it against the archived commit (the same pretty-format
     /// placeholders as `git log --pretty`). `None` for tree-ish archives, where
@@ -53,6 +53,69 @@ pub struct ArchiveConvert<'a> {
     /// `Some(false)` = forced text, `None` = auto-detect via content. Drives the
     /// zip "is text" flag. `None` closure ⇒ always auto-detect.
     diff_binary: Option<Box<dyn Fn(&[u8]) -> Option<bool> + 'a>>,
+    process_filter_metadata: Option<sley_worktree::ProcessFilterMetadata>,
+}
+
+enum ArchiveAttributes {
+    Tree(TreeAttributes),
+    Worktree(StandardAttributeMatcher),
+}
+
+impl ArchiveAttributes {
+    fn apply_smudge_filter(
+        &self,
+        config: &GitConfig,
+        path: &[u8],
+        content: &[u8],
+    ) -> Result<Vec<u8>> {
+        match self {
+            ArchiveAttributes::Tree(attributes) => {
+                attributes.apply_smudge_filter(config, path, content)
+            }
+            ArchiveAttributes::Worktree(attributes) => {
+                let checks =
+                    attributes.attributes_for_path(path, &archive_filter_attribute_names(), false);
+                sley_worktree::apply_smudge_filter_with_attributes(config, &checks, path, content)
+            }
+        }
+    }
+
+    fn attributes_for_path(&self, path: &[u8], requested: &[Vec<u8>]) -> Vec<AttributeCheck> {
+        match self {
+            ArchiveAttributes::Tree(attributes) => attributes.attributes_for_path(path, requested),
+            ArchiveAttributes::Worktree(attributes) => {
+                attributes.attributes_for_path(path, requested, false)
+            }
+        }
+    }
+
+    fn export_subst_for_path(&self, path: &[u8]) -> bool {
+        self.attribute_is_set(path, b"export-subst")
+    }
+
+    fn export_ignore_for_path(&self, path: &[u8]) -> bool {
+        self.attribute_is_set(path, b"export-ignore")
+    }
+
+    fn attribute_is_set(&self, path: &[u8], attribute: &[u8]) -> bool {
+        let requested = [attribute.to_vec()];
+        let checks = self.attributes_for_path(path, &requested);
+        matches!(
+            checks.first().and_then(|check| check.state.as_ref()),
+            Some(AttributeState::Set)
+        )
+    }
+}
+
+fn archive_filter_attribute_names() -> Vec<Vec<u8>> {
+    vec![
+        b"text".to_vec(),
+        b"crlf".to_vec(),
+        b"ident".to_vec(),
+        b"eol".to_vec(),
+        b"filter".to_vec(),
+        b"working-tree-encoding".to_vec(),
+    ]
 }
 
 impl<'a> ArchiveConvert<'a> {
@@ -71,9 +134,31 @@ impl<'a> ArchiveConvert<'a> {
     ) -> Result<Self> {
         Ok(Self {
             config,
-            attributes: TreeAttributes::from_tree(attr_root, git_dir, db, format, tree_oid)?,
+            attributes: ArchiveAttributes::Tree(TreeAttributes::from_tree(
+                attr_root, git_dir, db, format, tree_oid,
+            )?),
             subst: None,
             diff_binary: None,
+            process_filter_metadata: None,
+        })
+    }
+
+    /// Capture live worktree attributes once for `git archive
+    /// --worktree-attributes`. The archive walk still streams tree entries from
+    /// the object database; only attribute lookup comes from the current
+    /// worktree chain.
+    pub fn from_worktree(
+        worktree_root: impl AsRef<std::path::Path>,
+        config: &'a GitConfig,
+    ) -> Result<Self> {
+        Ok(Self {
+            config,
+            attributes: ArchiveAttributes::Worktree(StandardAttributeMatcher::from_worktree_root(
+                worktree_root,
+            )?),
+            subst: None,
+            diff_binary: None,
+            process_filter_metadata: None,
         })
     }
 
@@ -94,6 +179,16 @@ impl<'a> ArchiveConvert<'a> {
         self
     }
 
+    /// Attach process-filter metadata to every smudge request emitted while
+    /// archiving this tree.
+    pub fn with_process_filter_metadata(
+        mut self,
+        metadata: sley_worktree::ProcessFilterMetadata,
+    ) -> Self {
+        self.process_filter_metadata = Some(metadata);
+        self
+    }
+
     /// git's `entry_is_binary`: the path's `diff` driver `binary` flag when set,
     /// else content auto-detection (`buffer_is_binary`).
     fn is_binary(&self, path: &[u8], body: &[u8]) -> bool {
@@ -111,11 +206,31 @@ impl<'a> ArchiveConvert<'a> {
         self.attributes.export_ignore_for_path(path)
     }
 
+    fn export_ignore_directory(&self, path: &[u8], directory: &[u8]) -> bool {
+        if self.attributes.export_ignore_for_path(path)
+            || self.attributes.export_ignore_for_path(directory)
+        {
+            return true;
+        }
+        let Some(index) = path.iter().rposition(|byte| *byte == b'/') else {
+            return false;
+        };
+        let basename = &path[index + 1..];
+        self.attributes.export_ignore_for_path(basename)
+            || self
+                .attributes
+                .export_ignore_for_path(&ensure_trailing_slash(basename))
+    }
+
     /// Apply the smudge conversion for a regular-file blob at tree-relative
     /// `path`, then `export-subst` keyword substitution when the path carries the
     /// `export-subst` attribute. Returns the original bytes (borrowed) when
     /// nothing converts.
     fn smudge<'b>(&self, path: &[u8], body: &'b [u8]) -> Result<Cow<'b, [u8]>> {
+        let _process_filter_metadata = self
+            .process_filter_metadata
+            .as_ref()
+            .map(|metadata| sley_worktree::set_process_filter_metadata(Some(metadata.clone())));
         let converted = self
             .attributes
             .apply_smudge_filter(self.config, path, body)?;
@@ -525,7 +640,9 @@ where
     if let Some(pathspec) = pathspecs
         .iter()
         .zip(&matched)
-        .find_map(|(pathspec, matched)| (!*matched).then_some(pathspec))
+        .find_map(|(pathspec, matched)| {
+            (!pathspec.element.is_exclude() && !*matched).then_some(pathspec)
+        })
     {
         return Err(GitError::InvalidPath(format!(
             "pathspec '{}' did not match any files",
@@ -703,22 +820,10 @@ where
                 // checks the attribute on the trailing-slash path, then returns
                 // without recursing).
                 let relative_directory = ensure_trailing_slash(&relative_path);
-                if context
-                    .convert
-                    .is_some_and(|convert| convert.export_ignore(&relative_directory))
-                {
+                if context.convert.is_some_and(|convert| {
+                    convert.export_ignore_directory(&relative_path, &relative_directory)
+                }) {
                     continue;
-                }
-                if selection.full_subtree
-                    && let Some(output_relative_path) =
-                        strip_archive_prefix(&relative_path, context.strip_prefix)
-                    && !output_relative_path.is_empty()
-                {
-                    let directory =
-                        ensure_trailing_slash(&join_path(context.prefix, output_relative_path));
-                    if emitted_directories.insert(directory.clone()) {
-                        sink.emit(ArchiveEntry::Directory { path: directory })?;
-                    }
                 }
                 mark_exact_pathspec_matches(
                     &relative_path,
@@ -781,9 +886,8 @@ where
                     // Convert blob -> worktree form per the archived tree's
                     // attributes, keyed by the *tree-relative* path (git's
                     // `path_without_prefix`), not the prefixed output path.
-                    // TODO(convert): upstream also applies `export-subst`
-                    // (`$Format:…$`) and the `ident` filter here; neither the
-                    // archive crate nor the convert engine implements those yet.
+                    // `export-subst` is handled inside `smudge`; the remaining
+                    // conversion gap is the lower-level `ident` filter.
                     let body = match context.convert {
                         Some(convert) => convert.smudge(&relative_path, &object.body)?,
                         None => Cow::Borrowed(object.body.as_slice()),
@@ -928,22 +1032,34 @@ fn archive_tree_selection(
         };
     }
     let directory = ensure_trailing_slash(relative_path);
+    if archive_pathspec_excluded(pathspecs, relative_path, None)
+        || archive_pathspec_excluded(pathspecs, &directory, None)
+    {
+        return ArchiveTreeSelection {
+            descend: false,
+            full_subtree: false,
+        };
+    }
+    if archive_pathspecs_select_path(pathspecs, relative_path, false, None, None)
+        || archive_pathspecs_select_path(pathspecs, &directory, false, None, None)
+    {
+        return ArchiveTreeSelection {
+            descend: true,
+            full_subtree: true,
+        };
+    }
+    let have_include = archive_pathspecs_have_include(pathspecs);
     let mut descendant = false;
     for pathspec in pathspecs {
-        if archive_pathspec_matches_path(pathspec, relative_path, None)
-            || archive_pathspec_matches_path(pathspec, &directory, None)
-        {
-            return ArchiveTreeSelection {
-                descend: true,
-                full_subtree: true,
-            };
+        if pathspec.element.is_exclude() {
+            continue;
         }
         if pathspec.needs_full_descent() || pathspec.element.pattern().starts_with(&directory) {
             descendant = true;
         }
     }
     ArchiveTreeSelection {
-        descend: descendant,
+        descend: descendant || !have_include,
         full_subtree: false,
     }
 }
@@ -955,17 +1071,13 @@ fn archive_blob_selected(
     convert: Option<&ArchiveConvert<'_>>,
     matched: &mut [bool],
 ) -> bool {
-    if pathspecs.is_empty() {
-        return true;
-    }
-    let mut selected = false;
-    for (index, pathspec) in pathspecs.iter().enumerate() {
-        if archive_pathspec_matches_path(pathspec, relative_path, convert) {
-            matched[index] = true;
-            selected = true;
-        }
-    }
-    selected || force_include
+    archive_pathspecs_select_path(
+        pathspecs,
+        relative_path,
+        force_include,
+        convert,
+        Some(matched),
+    )
 }
 
 fn mark_exact_pathspec_matches(
@@ -982,6 +1094,55 @@ fn mark_exact_pathspec_matches(
             matched[index] = true;
         }
     }
+}
+
+fn archive_pathspecs_select_path(
+    pathspecs: &[ArchivePathspec],
+    path: &[u8],
+    force_include: bool,
+    convert: Option<&ArchiveConvert<'_>>,
+    mut matched: Option<&mut [bool]>,
+) -> bool {
+    if pathspecs.is_empty() {
+        return true;
+    }
+    let mut included = force_include;
+    let mut have_include = false;
+    for (index, pathspec) in pathspecs.iter().enumerate() {
+        if pathspec.element.is_exclude() {
+            if archive_pathspec_matches_path(pathspec, path, convert) {
+                if let Some(matched) = matched.as_deref_mut() {
+                    matched[index] = true;
+                }
+                return false;
+            }
+            continue;
+        }
+        have_include = true;
+        if archive_pathspec_matches_path(pathspec, path, convert) {
+            if let Some(matched) = matched.as_deref_mut() {
+                matched[index] = true;
+            }
+            included = true;
+        }
+    }
+    included || !have_include
+}
+
+fn archive_pathspec_excluded(
+    pathspecs: &[ArchivePathspec],
+    path: &[u8],
+    convert: Option<&ArchiveConvert<'_>>,
+) -> bool {
+    pathspecs.iter().any(|pathspec| {
+        pathspec.element.is_exclude() && archive_pathspec_matches_path(pathspec, path, convert)
+    })
+}
+
+fn archive_pathspecs_have_include(pathspecs: &[ArchivePathspec]) -> bool {
+    pathspecs
+        .iter()
+        .any(|pathspec| !pathspec.element.is_exclude())
 }
 
 /// ustar `mtime` field max; a larger archive time is carried in a global pax

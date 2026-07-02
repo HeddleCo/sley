@@ -7,8 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core", version = "0.3.0" }
-sley-config = { path = "../sley-config", version = "0.3.0" }
+sley-core.workspace = true
+sley-config.workspace = true
 
 [lints]
 workspace = true

@@ -61,7 +61,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             branches,
         } = delete;
         return if matches!(mode, BranchDeleteMode::Remote) {
-            delete_remote_tracking_branches(store, &branches, quiet)
+            delete_remote_tracking_branches(git_dir, format, store, &branches, quiet)
         } else if matches!(mode, BranchDeleteMode::All) {
             eprintln!("fatal: cannot use -a with -d");
             Err(GitError::Exit(128))
@@ -5953,10 +5953,10 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             delete_merged_branches(git_dir, format, store, branches, false)
         }
         [flag, branch] if flag == "-f" || flag == "--force" => {
-            force_update_branch(git_dir, format, store, branch, None)
+            force_update_branch(git_dir, format, store, branch, None).map(|_| ())
         }
         [flag, branch, start] if flag == "-f" || flag == "--force" => {
-            force_update_branch(git_dir, format, store, branch, Some(start))
+            force_update_branch(git_dir, format, store, branch, Some(start)).map(|_| ())
         }
         [branch] => {
             create_branch_from_start(git_dir, format, store, branch, None)?;
@@ -5994,9 +5994,11 @@ pub(crate) enum BranchTrackMode {
 struct BranchVerboseListOptions {
     mode: BranchListMode,
     patterns: Vec<String>,
+    filters: BranchListFilters,
     ignore_case: bool,
     verbosity: usize,
     abbrev: Option<Option<usize>>,
+    color: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6008,10 +6010,28 @@ enum BranchColumnStyle {
 struct BranchGeneralListOptions {
     mode: BranchListMode,
     patterns: Vec<String>,
+    filters: BranchListFilters,
     ignore_case: bool,
     color: bool,
     column: Option<BranchColumnStyle>,
     sort: Option<BranchSort>,
+}
+
+#[derive(Clone, Default)]
+struct BranchListFilters {
+    contains: Vec<String>,
+    no_contains: Vec<String>,
+    merged: Vec<String>,
+    no_merged: Vec<String>,
+}
+
+impl BranchListFilters {
+    fn is_empty(&self) -> bool {
+        self.contains.is_empty()
+            && self.no_contains.is_empty()
+            && self.merged.is_empty()
+            && self.no_merged.is_empty()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -6083,6 +6103,76 @@ fn branch_positionals(parsed: &Parsed<'_>) -> Vec<String> {
         .iter()
         .map(|value| (*value).to_string())
         .collect()
+}
+
+fn parse_branch_list_filter_arg(
+    args: &[String],
+    idx: &mut usize,
+    filters: &mut BranchListFilters,
+) -> Result<bool> {
+    let Some(arg) = args.get(*idx).map(String::as_str) else {
+        return Ok(false);
+    };
+    let mut read_optional_rev = |name: &str| -> String {
+        if let Some(next) = args.get(*idx + 1)
+            && !next.starts_with('-')
+        {
+            *idx += 1;
+            return next.clone();
+        }
+        name.to_string()
+    };
+    match arg {
+        "--contains" => {
+            filters.contains.push(read_optional_rev("HEAD"));
+            Ok(true)
+        }
+        "--no-contains" => {
+            filters.no_contains.push(read_optional_rev("HEAD"));
+            Ok(true)
+        }
+        "--merged" => {
+            filters.merged.push(read_optional_rev("HEAD"));
+            Ok(true)
+        }
+        "--no-merged" => {
+            filters.no_merged.push(read_optional_rev("HEAD"));
+            Ok(true)
+        }
+        value if branch_contains_eq_value(value).is_some() => {
+            filters.contains.push(
+                branch_contains_eq_value(value)
+                    .expect("guard checked branch option")
+                    .to_string(),
+            );
+            Ok(true)
+        }
+        value if branch_no_contains_eq_value(value).is_some() => {
+            filters.no_contains.push(
+                branch_no_contains_eq_value(value)
+                    .expect("guard checked branch option")
+                    .to_string(),
+            );
+            Ok(true)
+        }
+        value if branch_merged_eq_value(value).is_some() => {
+            filters.merged.push(
+                branch_merged_eq_value(value)
+                    .expect("guard checked branch option")
+                    .to_string(),
+            );
+            Ok(true)
+        }
+        value if branch_no_merged_eq_value(value).is_some() => {
+            filters.no_merged.push(
+                branch_no_merged_eq_value(value)
+                    .expect("guard checked branch option")
+                    .to_string(),
+            );
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn parse_branch_track_value(
@@ -6203,6 +6293,7 @@ fn parse_branch_general_list_options(
 ) -> Result<Option<BranchGeneralListOptions>> {
     let mut mode = BranchListMode::Local;
     let mut patterns = Vec::new();
+    let mut filters = BranchListFilters::default();
     let mut ignore_case = false;
     let mut color = false;
     let mut column = None;
@@ -6212,6 +6303,11 @@ fn parse_branch_general_list_options(
     let mut saw_list_control = args.is_empty();
     let mut idx = 0;
     while idx < args.len() {
+        if parse_branch_list_filter_arg(args, &mut idx, &mut filters)? {
+            saw_list_control = true;
+            idx += 1;
+            continue;
+        }
         match args[idx].as_str() {
             "-l" | "--list" => {
                 explicit_list = true;
@@ -6291,6 +6387,7 @@ fn parse_branch_general_list_options(
 
     if !patterns.is_empty()
         && !explicit_list
+        && filters.is_empty()
         && !matches!(mode, BranchListMode::Remote | BranchListMode::All)
     {
         return Ok(None);
@@ -6321,6 +6418,7 @@ fn parse_branch_general_list_options(
     Ok(saw_list_control.then_some(BranchGeneralListOptions {
         mode,
         patterns,
+        filters,
         ignore_case,
         color,
         column,
@@ -6466,7 +6564,7 @@ fn branch_config_column_style(config: &GitConfig) -> BranchColumnStyle {
 }
 
 #[rustfmt::skip]
-fn branch_verbose_list_option_specs() -> [OptionSpec<'static>; 11] {
+fn branch_verbose_list_option_specs() -> [OptionSpec<'static>; 15] {
     [
         branch_bool_option!(Some('v'), Some("verbose"), OptFlags::NONE, "show hash and subject, give twice for upstream branch"),
         branch_bool_option!(Some('l'), Some("list"), OptFlags::NONE, "list branch names"),
@@ -6479,6 +6577,10 @@ fn branch_verbose_list_option_specs() -> [OptionSpec<'static>; 11] {
         branch_str_option!(None, Some("column"), "style", OptFlags::OPTARG, "list branches in columns"),
         branch_str_option!(None, Some("abbrev"), "n", OptFlags::OPTARG, "use <n> digits to display object names"),
         branch_str_option!(None, Some("sort"), "key", OptFlags::NONE, "field name to sort on"),
+        branch_str_option!(None, Some("contains"), "commit", OptFlags::OPTARG, "print only branches that contain the commit"),
+        branch_str_option!(None, Some("no-contains"), "commit", OptFlags::OPTARG, "print only branches that don't contain the commit"),
+        branch_str_option!(None, Some("merged"), "commit", OptFlags::OPTARG, "print only branches that are merged"),
+        branch_str_option!(None, Some("no-merged"), "commit", OptFlags::OPTARG, "print only branches that are not merged"),
     ]
 }
 
@@ -6488,6 +6590,7 @@ fn parse_branch_verbose_list_options(args: &[String]) -> Result<Option<BranchVer
     let mut mode = BranchListMode::Local;
     let mut ignore_case = false;
     let mut abbrev = None;
+    let mut color = false;
     let mut saw_verbose = false;
     let mut saw_column = false;
     let specs = branch_verbose_list_option_specs();
@@ -6518,6 +6621,8 @@ fn parse_branch_verbose_list_options(args: &[String]) -> Result<Option<BranchVer
     }
     for arg in args {
         match arg.as_str() {
+            "--color" | "--color=always" => color = true,
+            "--no-color" | "--color=never" | "--color=auto" => color = false,
             "--abbrev" => abbrev = None,
             "--no-abbrev" => abbrev = Some(None),
             value if value.starts_with("--abbrev=") => {
@@ -6543,19 +6648,59 @@ fn parse_branch_verbose_list_options(args: &[String]) -> Result<Option<BranchVer
         eprintln!("fatal: options '--column' and '--verbose' cannot be used together");
         return Err(GitError::Exit(128));
     }
+    let (patterns, filters) = branch_verbose_patterns_and_filters(args)?;
     if !explicit_list
         && !matches!(mode, BranchListMode::Remote | BranchListMode::All)
-        && !parsed.positionals.is_empty()
+        && !patterns.is_empty()
+        && filters.is_empty()
     {
         return Ok(None);
     }
     Ok(Some(BranchVerboseListOptions {
         mode,
-        patterns: branch_positionals(&parsed),
+        patterns,
+        filters,
         ignore_case,
         verbosity,
         abbrev,
+        color,
     }))
+}
+
+fn branch_verbose_patterns_and_filters(
+    args: &[String],
+) -> Result<(Vec<String>, BranchListFilters)> {
+    let mut patterns = Vec::new();
+    let mut filters = BranchListFilters::default();
+    let mut idx = 0;
+    while idx < args.len() {
+        if parse_branch_list_filter_arg(args, &mut idx, &mut filters)? {
+            idx += 1;
+            continue;
+        }
+        match args[idx].as_str() {
+            "-v" | "--verbose" | "--no-verbose" | "-l" | "--list" | "--no-list" | "-r"
+            | "--remotes" | "-a" | "--all" | "-i" | "--ignore-case" | "--no-ignore-case"
+            | "--color" | "--no-color" | "--column" | "--no-column" | "--abbrev"
+            | "--no-abbrev" | "--show-current" | "--no-show-current" | "--no-delete" => {}
+            value
+                if value.starts_with('-')
+                    && value.len() > 2
+                    && value[1..].bytes().all(|byte| byte == b'v') => {}
+            value
+                if value.starts_with("--color=")
+                    || value.starts_with("--column=")
+                    || value.starts_with("--abbrev=")
+                    || value.starts_with("--sort=") => {}
+            "--sort" => {
+                idx += 1;
+            }
+            value if value.starts_with('-') => {}
+            value => patterns.push(value.to_string()),
+        }
+        idx += 1;
+    }
+    Ok((patterns, filters))
 }
 
 fn run_branch_verbose_list_options(
@@ -6565,12 +6710,11 @@ fn run_branch_verbose_list_options(
     options: BranchVerboseListOptions,
 ) -> Result<()> {
     if options.verbosity == 0 {
-        return print_branch_list_matching(
-            store,
-            options.mode,
-            &options.patterns,
-            options.ignore_case,
-        );
+        return if options.color {
+            print_branch_list_matching_colored(store, options.mode, &options.patterns)
+        } else {
+            print_branch_list_matching(store, options.mode, &options.patterns, options.ignore_case)
+        };
     }
     print_branch_list_verbose(git_dir, format, store, options)
 }
@@ -6648,10 +6792,17 @@ fn run_branch_move_options(
     options: BranchMoveOptions,
 ) -> Result<()> {
     let (old_branch, new_branch) = branch_move_branches(store, options.kind, &options.branches)?;
+    let format = repository_object_format(git_dir)?;
+    let (old_branch, old_ref) = branch_resolve_local_branch_operand(
+        git_dir,
+        format,
+        store,
+        &old_branch,
+        BranchOperandKind::Existing,
+    )?;
     if old_branch == new_branch {
         return Ok(());
     }
-    let old_ref = validate_branch_source_name(&old_branch)?;
     let new_ref = validate_branch_creation_name(&new_branch)?;
     if store.read_ref(&old_ref)?.is_none() {
         // branch.c `copy_or_rename_branch`: renaming the current *unborn*
@@ -6659,19 +6810,24 @@ fn run_branch_move_options(
         // repoints the HEAD symref; copying it (or touching any other missing
         // branch) dies.
         let old_is_head = store.current_branch_ref()?.as_deref() == Some(old_ref.as_str());
-        if matches!(options.kind, BranchMoveKind::Rename) && old_is_head {
+        if matches!(options.kind, BranchMoveKind::Rename)
+            && (old_is_head || any_worktree_head_points_at(git_dir, &old_ref)?)
+        {
             if !options.force && store.read_ref(&new_ref)?.is_some() {
                 eprintln!("fatal: a branch named '{new_branch}' already exists");
                 return Err(GitError::Exit(128));
             }
-            let mut tx = store.transaction();
-            tx.update(RefUpdate {
-                name: "HEAD".into(),
-                expected: None,
-                new: RefTarget::Symbolic(new_ref.clone()),
-                reflog: None,
-            });
-            tx.commit()?;
+            if old_is_head {
+                let mut tx = store.transaction();
+                tx.update(RefUpdate {
+                    name: "HEAD".into(),
+                    expected: None,
+                    new: RefTarget::Symbolic(new_ref.clone()),
+                    reflog: None,
+                });
+                tx.commit()?;
+            }
+            update_all_worktree_heads(git_dir, &old_ref, &new_ref)?;
             rename_branch_config(git_dir, &old_branch, &new_branch)?;
             return Ok(());
         }
@@ -6691,6 +6847,7 @@ fn run_branch_move_options(
     }
     if options.force
         && old_ref != new_ref
+        && store.read_ref(&new_ref)?.is_some()
         && let Some(worktree_root) = branch_checked_out_worktree_path(git_dir, store, &new_ref)?
     {
         eprintln!(
@@ -6708,19 +6865,34 @@ fn run_branch_move_options(
                 Some(RefTarget::Direct(oid)) => oid,
                 _ => zero_oid(repository_object_format(git_dir)?)?,
             };
-            let head_reflog = ReflogEntry {
-                old_oid,
-                new_oid: old_oid,
-                committer: committer.clone(),
-                message: format!("Branch: renamed {old_ref} to {new_ref}").into_bytes(),
-            };
+            let head_reflog_message =
+                format!("Branch: renamed {old_ref} to {new_ref}").into_bytes();
             if let Err(err) = store.move_branch(&old_branch, &new_branch, options.force, committer)
             {
                 return branch_move_failed(err, "rename");
             }
-            let linked_update = update_linked_worktree_heads(git_dir, &old_ref, &new_ref);
+            let linked_update = update_all_worktree_heads(git_dir, &old_ref, &new_ref);
             if head_was_old {
-                store.append_reflog("HEAD", &head_reflog)?;
+                let null_oid = ObjectId::null(repository_object_format(git_dir)?);
+                let committer = branch_reflog_committer_identity(store, &new_branch)?;
+                store.append_reflog(
+                    "HEAD",
+                    &ReflogEntry {
+                        old_oid,
+                        new_oid: null_oid,
+                        committer: committer.clone(),
+                        message: head_reflog_message.clone(),
+                    },
+                )?;
+                store.append_reflog(
+                    "HEAD",
+                    &ReflogEntry {
+                        old_oid: null_oid,
+                        new_oid: old_oid,
+                        committer,
+                        message: head_reflog_message,
+                    },
+                )?;
             }
             rename_branch_config(git_dir, &old_branch, &new_branch)?;
             linked_update?;
@@ -6748,23 +6920,14 @@ fn branch_move_failed(err: GitError, operation: &str) -> Result<()> {
     }
 }
 
-fn update_linked_worktree_heads(git_dir: &Path, old_ref: &str, new_ref: &str) -> Result<()> {
-    let worktrees_dir = common_git_dir_for_git_dir(git_dir)?.join("worktrees");
-    let Ok(entries) = fs::read_dir(worktrees_dir) else {
-        return Ok(());
-    };
+fn any_worktree_head_points_at(git_dir: &Path, refname: &str) -> Result<bool> {
+    Ok(!worktree_head_paths(git_dir, refname)?.is_empty())
+}
+
+fn update_all_worktree_heads(git_dir: &Path, old_ref: &str, new_ref: &str) -> Result<()> {
     let mut failed = false;
-    for entry in entries {
-        let entry = entry?;
-        let admin_dir = entry.path();
-        let head_path = admin_dir.join("HEAD");
-        let Ok(head) = fs::read_to_string(&head_path) else {
-            continue;
-        };
-        if head.trim().strip_prefix("ref: ") != Some(old_ref) {
-            continue;
-        }
-        if admin_dir.join("HEAD.lock").exists() {
+    for head_path in worktree_head_paths(git_dir, old_ref)? {
+        if head_path.with_file_name("HEAD.lock").exists() {
             failed = true;
             continue;
         }
@@ -6775,6 +6938,38 @@ fn update_linked_worktree_heads(git_dir: &Path, old_ref: &str, new_ref: &str) ->
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn worktree_head_paths(git_dir: &Path, refname: &str) -> Result<Vec<PathBuf>> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let mut heads = Vec::new();
+    let main_head = common_git_dir.join("HEAD");
+    if fs::read_to_string(&main_head)
+        .ok()
+        .and_then(|head| head.trim().strip_prefix("ref: ").map(str::to_string))
+        .as_deref()
+        == Some(refname)
+    {
+        heads.push(main_head);
+    }
+
+    let worktrees_dir = common_git_dir.join("worktrees");
+    let Ok(entries) = fs::read_dir(worktrees_dir) else {
+        return Ok(heads);
+    };
+    for entry in entries {
+        let entry = entry?;
+        let admin_dir = entry.path();
+        let head_path = admin_dir.join("HEAD");
+        let Ok(head) = fs::read_to_string(&head_path) else {
+            continue;
+        };
+        if head.trim().strip_prefix("ref: ") != Some(refname) {
+            continue;
+        }
+        heads.push(head_path);
+    }
+    Ok(heads)
 }
 
 fn branch_reflog_committer_identity(store: &FileRefStore, branch: &str) -> Result<Vec<u8>> {
@@ -6838,21 +7033,36 @@ fn branch_move_branches(
 }
 
 fn rename_branch_config(git_dir: &Path, old_branch: &str, new_branch: &str) -> Result<()> {
-    let mut config = read_repo_config(git_dir)?;
-    let mut renamed = false;
-    for section in &mut config.sections {
-        if section.name == "branch" && section.subsection.as_deref() == Some(old_branch) {
-            section.subsection = Some(new_branch.to_string());
-            renamed = true;
+    let path = git_dir.join("config");
+    let contents = match fs::read(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let old_section = branch_config_section_name(old_branch);
+    let new_section = branch_config_section_name(new_branch);
+    match sley_config::raw_edit::rename_or_remove_section(
+        &contents,
+        &old_section,
+        Some(&new_section),
+    ) {
+        sley_config::raw_edit::SectionEditOutcome::Changed(out) => {
+            write_raw_repo_config(git_dir, out)?;
         }
-    }
-    if renamed {
-        write_repo_config(git_dir, &config)?;
+        sley_config::raw_edit::SectionEditOutcome::NotFound => {}
+        sley_config::raw_edit::SectionEditOutcome::LineTooLong(line) => {
+            return Err(GitError::InvalidFormat(format!(
+                "config line {line} is too long"
+            )));
+        }
     }
     Ok(())
 }
 
 fn copy_branch_config(git_dir: &Path, old_branch: &str, new_branch: &str) -> Result<()> {
+    if copy_branch_config_raw(git_dir, old_branch, new_branch)? {
+        return Ok(());
+    }
     let mut config = read_repo_config(git_dir)?;
     let mut copied = false;
     let mut sections = Vec::with_capacity(config.sections.len());
@@ -6869,9 +7079,130 @@ fn copy_branch_config(git_dir: &Path, old_branch: &str, new_branch: &str) -> Res
     }
     if copied {
         config.sections = sections;
-        write_repo_config(git_dir, &config)?;
+        write_branch_repo_config(git_dir, &config)?;
     }
     Ok(())
+}
+
+fn copy_branch_config_raw(git_dir: &Path, old_branch: &str, new_branch: &str) -> Result<bool> {
+    let path = git_dir.join("config");
+    let contents = match fs::read(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    let old_header = branch_config_section_header(old_branch);
+    let new_header = branch_config_section_header(new_branch);
+    let mut out = Vec::with_capacity(contents.len() + new_header.len());
+    let mut pos = 0usize;
+    let mut copied = false;
+    while pos < contents.len() {
+        let line_start = pos;
+        while pos < contents.len() && contents[pos] != b'\n' {
+            pos += 1;
+        }
+        if pos < contents.len() {
+            pos += 1;
+        }
+        let line_end = pos;
+        if !config_line_matches_header(&contents[line_start..line_end], &old_header) {
+            out.extend_from_slice(&contents[line_start..line_end]);
+            continue;
+        }
+
+        let body_start = line_end;
+        let mut section_end = body_start;
+        while section_end < contents.len() {
+            let next_line = section_end;
+            while section_end < contents.len() && contents[section_end] != b'\n' {
+                section_end += 1;
+            }
+            if section_end < contents.len() {
+                section_end += 1;
+            }
+            if config_line_starts_section(&contents[next_line..section_end]) {
+                section_end = next_line;
+                break;
+            }
+        }
+
+        out.extend_from_slice(&contents[line_start..section_end]);
+        out.extend_from_slice(new_header.as_bytes());
+        out.extend_from_slice(&contents[body_start..section_end]);
+        copied = true;
+        pos = section_end;
+    }
+    if copied {
+        write_raw_repo_config(git_dir, out)?;
+    }
+    Ok(copied)
+}
+
+fn branch_config_section_name(branch: &str) -> String {
+    format!("branch.{branch}")
+}
+
+fn branch_config_section_header(branch: &str) -> String {
+    let escaped = branch.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("[branch \"{escaped}\"]\n")
+}
+
+fn config_line_matches_header(line: &[u8], header: &str) -> bool {
+    trim_config_line_newline(line) == header.trim_end_matches('\n').as_bytes()
+}
+
+fn config_line_starts_section(line: &[u8]) -> bool {
+    trim_config_line_newline(line)
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'[')
+}
+
+fn trim_config_line_newline(mut line: &[u8]) -> &[u8] {
+    while matches!(line.last(), Some(b'\n' | b'\r')) {
+        line = &line[..line.len() - 1];
+    }
+    line
+}
+
+fn write_raw_repo_config(git_dir: &Path, bytes: Vec<u8>) -> Result<()> {
+    let path = git_dir.join("config");
+    match sley_config::raw_edit::write_config_file_locked(
+        &path,
+        &bytes,
+        sley_config::raw_edit::ConfigFileWriteOptions::default(),
+    ) {
+        Ok(()) => Ok(()),
+        Err(sley_config::raw_edit::ConfigFileWriteError::ExistingLock(_)) => {
+            eprintln!(
+                "error: could not lock config file {}: File exists",
+                branch_config_display_path(git_dir)
+            );
+            Err(GitError::Exit(255))
+        }
+        Err(err) => Err(GitError::Io(err.to_string())),
+    }
+}
+
+fn write_branch_repo_config(git_dir: &Path, config: &GitConfig) -> Result<()> {
+    if git_dir.join("config.lock").exists() {
+        eprintln!(
+            "error: could not lock config file {}: File exists",
+            branch_config_display_path(git_dir)
+        );
+        return Err(GitError::Exit(255));
+    }
+    fs::write(git_dir.join("config"), config.to_canonical_bytes())?;
+    Ok(())
+}
+
+fn branch_config_display_path(git_dir: &Path) -> String {
+    if git_dir.file_name().and_then(|name| name.to_str()) == Some(".git") {
+        ".git/config".to_string()
+    } else {
+        git_dir.join("config").display().to_string()
+    }
 }
 
 enum BranchUpstreamAction {
@@ -6931,6 +7262,7 @@ fn run_branch_upstream_options(
     store: &FileRefStore,
     options: BranchUpstreamOptions,
 ) -> Result<()> {
+    let format = repository_object_format(git_dir)?;
     match options.action {
         BranchUpstreamAction::Set(upstream) => {
             if options.branches.len() > 1 {
@@ -6938,8 +7270,14 @@ fn run_branch_upstream_options(
                 return Err(GitError::Exit(128));
             }
             let upstream = branch_upstream_resolve_previous_checkout(git_dir, &upstream)?;
-            let branch =
-                branch_upstream_target_branch(store, options.branches.first(), true, &upstream)?;
+            let branch = branch_upstream_target_branch(
+                git_dir,
+                format,
+                store,
+                options.branches.first(),
+                true,
+                &upstream,
+            )?;
             set_branch_upstream(git_dir, store, &branch, &upstream)
         }
         BranchUpstreamAction::Unset => {
@@ -6947,7 +7285,14 @@ fn run_branch_upstream_options(
                 eprintln!("fatal: too many arguments to unset upstream");
                 return Err(GitError::Exit(128));
             }
-            let branch = branch_upstream_target_branch(store, options.branches.first(), false, "")?;
+            let branch = branch_upstream_target_branch(
+                git_dir,
+                format,
+                store,
+                options.branches.first(),
+                false,
+                "",
+            )?;
             unset_branch_upstream(git_dir, &branch)
         }
     }
@@ -6971,20 +7316,23 @@ fn branch_upstream_resolve_previous_checkout(git_dir: &Path, upstream: &str) -> 
 }
 
 fn branch_upstream_target_branch(
+    git_dir: &Path,
+    format: ObjectFormat,
     store: &FileRefStore,
     explicit: Option<&String>,
     setting: bool,
     upstream: &str,
 ) -> Result<String> {
     if let Some(branch) = explicit {
-        let refname = match branch_ref_name(branch) {
-            Ok(refname) => refname,
-            Err(GitError::InvalidPath(_)) => {
-                branch_upstream_missing_branch(branch, setting);
-                return Err(GitError::Exit(128));
-            }
-            Err(err) => return Err(err),
-        };
+        let (branch, refname) =
+            match branch_resolve_upstream_target_branch_operand(git_dir, format, store, branch) {
+                Ok(resolved) => resolved,
+                Err(GitError::InvalidPath(_)) => {
+                    branch_upstream_missing_branch(branch, setting);
+                    return Err(GitError::Exit(128));
+                }
+                Err(err) => return Err(err),
+            };
         if store.read_ref(&refname)?.is_none() {
             if setting {
                 eprintln!("fatal: branch '{branch}' does not exist");
@@ -6993,7 +7341,7 @@ fn branch_upstream_target_branch(
             }
             return Err(GitError::Exit(128));
         }
-        return Ok(branch.to_string());
+        return Ok(branch);
     }
     let Some(branch) = store.current_branch()? else {
         if setting {
@@ -7010,12 +7358,66 @@ fn branch_upstream_target_branch(
     Ok(branch)
 }
 
+fn branch_resolve_upstream_target_branch_operand(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    branch: &str,
+) -> Result<(String, String)> {
+    if branch.contains("@{") {
+        return branch_resolve_local_branch_operand(
+            git_dir,
+            format,
+            store,
+            branch,
+            BranchOperandKind::Existing,
+        );
+    }
+    match sley_refs::branch_ref_name_for_source(branch) {
+        Ok(refname) => Ok((branch.to_string(), refname)),
+        Err(GitError::InvalidPath(_)) => Err(GitError::InvalidPath(branch.to_string())),
+        Err(err) => Err(err),
+    }
+}
+
 fn branch_upstream_missing_branch(branch: &str, setting: bool) {
     if setting {
         eprintln!("fatal: branch '{branch}' does not exist");
     } else {
         eprintln!("fatal: branch '{branch}' has no upstream information");
     }
+}
+
+#[derive(Clone, Copy)]
+enum BranchOperandKind {
+    Existing,
+    UpdateOrCreate,
+}
+
+fn branch_resolve_local_branch_operand(
+    git_dir: &Path,
+    format: ObjectFormat,
+    _store: &FileRefStore,
+    branch: &str,
+    kind: BranchOperandKind,
+) -> Result<(String, String)> {
+    if branch.contains("@{") {
+        let Some(refname) = sley_rev::resolve_revision_symbolic_full_name(git_dir, format, branch)?
+        else {
+            eprintln!("fatal: '{branch}' does not name a branch");
+            return Err(GitError::Exit(128));
+        };
+        let Some(local) = refname.strip_prefix("refs/heads/") else {
+            eprintln!("fatal: '{branch}' does not name a local branch");
+            return Err(GitError::Exit(128));
+        };
+        return Ok((local.to_string(), refname));
+    }
+    let refname = match kind {
+        BranchOperandKind::Existing => validate_branch_source_name(branch)?,
+        BranchOperandKind::UpdateOrCreate => validate_branch_creation_name(branch)?,
+    };
+    Ok((branch.to_string(), refname))
 }
 
 fn set_branch_upstream(
@@ -7026,6 +7428,12 @@ fn set_branch_upstream(
 ) -> Result<()> {
     let mut config = read_repo_config(git_dir)?;
     let format = repository_object_format(git_dir)?;
+    if branch_upstream_is_non_ref(git_dir, format, upstream)? {
+        eprintln!(
+            "fatal: cannot set up tracking information; starting point '{upstream}' is not a branch"
+        );
+        return Err(GitError::Exit(128));
+    }
     let Some(upstream) = resolve_branch_upstream(git_dir, format, store, &config, upstream)? else {
         eprintln!("fatal: the requested upstream branch '{upstream}' does not exist");
         eprintln!("hint:");
@@ -7060,9 +7468,24 @@ fn set_branch_upstream(
         "merge",
         &upstream.merge,
     );
-    write_repo_config(git_dir, &config)?;
+    write_branch_repo_config(git_dir, &config)?;
     println!("branch '{branch}' set up to track '{}'.", upstream.display);
     Ok(())
+}
+
+fn branch_upstream_is_non_ref(
+    git_dir: &Path,
+    format: ObjectFormat,
+    upstream: &str,
+) -> Result<bool> {
+    if sley_rev::resolve_revision_symbolic_full_name(git_dir, format, upstream)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return Ok(false);
+    }
+    Ok(resolve_revision(git_dir, format, upstream).is_ok())
 }
 
 struct ResolvedBranchUpstream {
@@ -7121,19 +7544,7 @@ fn branch_upstream_remote_ref(
     remote: &str,
     upstream: &str,
 ) -> Option<(String, String)> {
-    let remote_ref = if upstream.starts_with("refs/") {
-        upstream.to_string()
-    } else {
-        upstream
-            .strip_prefix("refs/remotes/")
-            .map(str::to_string)
-            .or_else(|| {
-                upstream
-                    .strip_prefix(&format!("{remote}/"))
-                    .map(|branch| format!("{remote}/{branch}"))
-            })
-            .map(|name| format!("refs/remotes/{name}"))?
-    };
+    let remote_ref = branch_remote_ref_candidate(remote, upstream)?;
     for fetch in config
         .get_all("remote", Some(remote), "fetch")
         .into_iter()
@@ -7164,6 +7575,29 @@ fn branch_upstream_remote_ref(
     None
 }
 
+fn branch_remote_ref_candidate(remote: &str, upstream: &str) -> Option<String> {
+    if upstream.starts_with("refs/") {
+        return Some(upstream.to_string());
+    }
+    if let Some(name) = upstream.strip_prefix("remotes/") {
+        return Some(format!("refs/remotes/{name}"));
+    }
+    if let Some(branch) = upstream.strip_prefix(&format!("{remote}/")) {
+        return Some(format!("refs/remotes/{remote}/{branch}"));
+    }
+    Some(branch_tracking_ref_candidate(upstream))
+}
+
+fn branch_tracking_ref_candidate(upstream: &str) -> String {
+    if upstream.starts_with("refs/") {
+        upstream.to_string()
+    } else if let Some(name) = upstream.strip_prefix("remotes/") {
+        format!("refs/remotes/{name}")
+    } else {
+        format!("refs/heads/{upstream}")
+    }
+}
+
 fn unset_branch_upstream(git_dir: &Path, branch: &str) -> Result<()> {
     let mut config = read_repo_config(git_dir)?;
     let Some(section_idx) = config.sections.iter().rposition(|section| {
@@ -7187,7 +7621,7 @@ fn unset_branch_upstream(git_dir: &Path, branch: &str) -> Result<()> {
     config
         .sections
         .retain(|section| !(section.name == "branch" && section.entries.is_empty()));
-    write_repo_config(git_dir, &config)
+    write_branch_repo_config(git_dir, &config)
 }
 
 fn remove_branch_config(git_dir: &Path, branch: &str) -> Result<()> {
@@ -7197,7 +7631,7 @@ fn remove_branch_config(git_dir: &Path, branch: &str) -> Result<()> {
         !(section.name == "branch" && section.subsection.as_deref() == Some(branch))
     });
     if config.sections.len() != before {
-        write_repo_config(git_dir, &config)?;
+        write_branch_repo_config(git_dir, &config)?;
     }
     Ok(())
 }
@@ -7283,7 +7717,7 @@ fn run_branch_create_options(
         return Err(GitError::Exit(128));
     }
     if options.edit_description {
-        return branch_edit_description(store, &options.positionals);
+        return branch_edit_description(git_dir, format, store, &options.positionals);
     }
     if options.legacy_set_upstream && !options.positionals.is_empty() {
         eprintln!(
@@ -7294,8 +7728,8 @@ fn run_branch_create_options(
     match options.positionals.as_slice() {
         [] => print_branch_list(store, BranchListMode::Local),
         [branch] if options.force => {
-            force_update_branch(git_dir, format, store, branch, None)?;
-            branch_create_set_tracking(git_dir, store, branch, None, options.track, options.quiet)
+            let branch = force_update_branch(git_dir, format, store, branch, None)?;
+            branch_create_set_tracking(git_dir, store, &branch, None, options.track, options.quiet)
         }
         [branch] => {
             create_branch_from_start_with_reflog(
@@ -7316,11 +7750,11 @@ fn run_branch_create_options(
             )
         }
         [branch, start] if options.force => {
-            force_update_branch(git_dir, format, store, branch, Some(start))?;
+            let branch = force_update_branch(git_dir, format, store, branch, Some(start))?;
             branch_create_set_tracking(
                 git_dir,
                 store,
-                branch,
+                &branch,
                 Some(start),
                 options.track,
                 options.quiet,
@@ -7368,27 +7802,80 @@ fn branch_create_set_tracking_or_rollback(
     }
 }
 
-fn branch_edit_description(store: &FileRefStore, positionals: &[String]) -> Result<()> {
-    match positionals {
+fn branch_edit_description(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    positionals: &[String],
+) -> Result<()> {
+    let branch = match positionals {
         [] => {
-            if store.current_branch()?.is_none() {
+            if let Some(branch) = store.current_branch()? {
+                let refname = branch_ref_name(&branch)?;
+                if store.read_ref(&refname)?.is_none() {
+                    eprintln!("fatal: cannot give description to unborn branch '{branch}'");
+                    return Err(GitError::Exit(128));
+                }
+                branch
+            } else {
                 eprintln!("fatal: cannot give description to detached HEAD");
                 return Err(GitError::Exit(128));
             }
-            Ok(())
         }
         [branch] => {
-            if store.read_ref(&branch_ref_name(branch)?)?.is_none() {
+            let (branch, refname) = branch_resolve_local_branch_operand(
+                git_dir,
+                format,
+                store,
+                branch,
+                BranchOperandKind::Existing,
+            )?;
+            if store.read_ref(&refname)?.is_none() {
                 eprintln!("error: no branch named '{branch}'");
                 return Err(GitError::Exit(1));
             }
-            Ok(())
+            branch
         }
         _ => {
             eprintln!("fatal: cannot edit description of more than one branch");
-            Err(GitError::Exit(128))
+            return Err(GitError::Exit(128));
+        }
+    };
+
+    let mut config = read_repo_config(git_dir)?;
+    let existing = config
+        .get("branch", Some(&branch), "description")
+        .unwrap_or("");
+    let path = git_dir.join("EDIT_DESCRIPTION");
+    fs::write(&path, existing)?;
+    commands::replay::launch_editor(git_dir, &path)?;
+    let description = fs::read_to_string(&path)?;
+    let _ = fs::remove_file(&path);
+    if description.is_empty() {
+        unset_branch_description(&mut config, &branch);
+    } else {
+        set_config_value(
+            &mut config,
+            "branch",
+            Some(&branch),
+            "description",
+            &description,
+        );
+    }
+    write_repo_config(git_dir, &config)
+}
+
+fn unset_branch_description(config: &mut GitConfig, branch: &str) {
+    for section in &mut config.sections {
+        if section.name == "branch" && section.subsection.as_deref() == Some(branch) {
+            section
+                .entries
+                .retain(|entry| !entry.key.eq_ignore_ascii_case("description"));
         }
     }
+    config
+        .sections
+        .retain(|section| !(section.name == "branch" && section.entries.is_empty()));
 }
 
 /// The effective tracking mode, mirroring git's `enum branch_track`. When the
@@ -7454,10 +7941,15 @@ pub(crate) fn branch_create_set_tracking(
         EffectiveTrack::Inherit => {
             branch_create_inherit_upstream(git_dir, store, branch, start, quiet)
         }
-        EffectiveTrack::Explicit | EffectiveTrack::Always => {
-            // --track / autosetupmerge=always: track even a local start-point.
+        EffectiveTrack::Explicit => {
+            // --track: track even a local start-point, and fail when it is not a branch.
             let upstream = branch_create_direct_upstream(store, start)?;
             set_branch_upstream_quiet(git_dir, store, branch, &upstream, quiet)
+        }
+        EffectiveTrack::Always => {
+            // autosetupmerge=always tracks branch start-points, but a detached
+            // HEAD or other non-branch commit-ish simply creates the branch.
+            branch_create_set_tracking_if_branch(git_dir, store, branch, start, quiet)
         }
         EffectiveTrack::Remote | EffectiveTrack::Simple => {
             // Default / autosetupmerge=simple: only track when the start-point
@@ -7480,6 +7972,27 @@ pub(crate) fn branch_create_set_tracking(
     }
 }
 
+fn branch_create_set_tracking_if_branch(
+    git_dir: &Path,
+    store: &FileRefStore,
+    branch: &str,
+    start: Option<&String>,
+    quiet: bool,
+) -> Result<()> {
+    let upstream = branch_create_direct_upstream(store, start)?;
+    let config = read_repo_config(git_dir)?;
+    let format = repository_object_format(git_dir)?;
+    let Some(resolved) = resolve_branch_upstream(git_dir, format, store, &config, &upstream)?
+    else {
+        return Ok(());
+    };
+    if resolved.remote == "." && resolved.merge == branch_ref_name(branch)? {
+        eprintln!("warning: not setting branch '{branch}' as its own upstream");
+        return Ok(());
+    }
+    install_tracking_config(git_dir, store, branch, &resolved, quiet)
+}
+
 /// Resolve a start-point to a remote-tracking upstream, mirroring git's
 /// `setup_tracking` for `BRANCH_TRACK_REMOTE`: only matches when the
 /// start-point names a remote-tracking branch covered by some remote's fetch
@@ -7490,6 +8003,7 @@ fn resolve_remote_tracking_upstream(
     config: &GitConfig,
     start: &str,
 ) -> Result<Option<ResolvedBranchUpstream>> {
+    let mut matches = Vec::new();
     for remote in remote_names(config) {
         let Some((remote_ref, merge)) = branch_upstream_remote_ref(config, &remote, start) else {
             continue;
@@ -7499,14 +8013,34 @@ fn resolve_remote_tracking_upstream(
                 .strip_prefix("refs/remotes/")
                 .unwrap_or(remote_ref.as_str())
                 .to_string();
-            return Ok(Some(ResolvedBranchUpstream {
+            matches.push(ResolvedBranchUpstream {
                 remote,
                 merge,
                 display,
-            }));
+            });
         }
     }
-    Ok(None)
+    if matches.len() > 1 {
+        let remote_ref = branch_tracking_ref_candidate(start);
+        branch_tracking_ambiguous(&remote_ref, &matches);
+        return Err(GitError::Exit(128));
+    }
+    Ok(matches.into_iter().next())
+}
+
+fn branch_tracking_ambiguous(remote_ref: &str, matches: &[ResolvedBranchUpstream]) {
+    eprintln!("fatal: not tracking: ambiguous information for ref '{remote_ref}'");
+    eprintln!("hint: There are multiple remotes whose fetch refspecs map to the remote");
+    eprintln!("hint: tracking ref '{remote_ref}':");
+    for resolved in matches {
+        eprintln!("hint:   {}", resolved.remote);
+    }
+    eprintln!("hint:");
+    eprintln!("hint: This is typically a configuration error.");
+    eprintln!("hint:");
+    eprintln!("hint: To support setting up tracking branches, ensure that");
+    eprintln!("hint: different remotes' fetch refspecs map into different");
+    eprintln!("hint: tracking namespaces.");
 }
 
 /// Resolve `branch.autosetuprebase` (environment.c), returning whether the
@@ -7580,7 +8114,7 @@ fn install_tracking_config(
     if rebasing {
         set_config_value(&mut config, "branch", Some(branch), "rebase", "true");
     }
-    write_repo_config(git_dir, &config)?;
+    write_branch_repo_config(git_dir, &config)?;
     if !quiet {
         if rebasing {
             println!(
@@ -7657,7 +8191,7 @@ fn branch_create_inherit_upstream(
     let mut config = config;
     set_config_value(&mut config, "branch", Some(branch), "remote", &remote);
     set_config_value(&mut config, "branch", Some(branch), "merge", &merge);
-    write_repo_config(git_dir, &config)?;
+    write_branch_repo_config(git_dir, &config)?;
     if !quiet {
         let display = branch_tracking_display(&config, &remote, &merge);
         println!("branch '{branch}' set up to track '{display}'.");
@@ -7874,9 +8408,10 @@ fn branch_log_all_ref_updates_matches(name: &str, value: &str) -> bool {
 }
 
 fn validate_branch_creation_name(branch: &str) -> Result<String> {
-    // git's strbuf_check_branch_ref rejects "HEAD" (and "@") as a branch name
-    // even though refs/heads/HEAD passes check_refname_format (t3200 #10).
-    if branch == "HEAD" || branch == "@" {
+    // git's strbuf_check_branch_ref rejects "HEAD" as a branch name even
+    // though refs/heads/HEAD passes check_refname_format (t3200 #10). A literal
+    // "@" is still a valid local branch operand here (t3204).
+    if branch == "HEAD" {
         eprintln!("fatal: '{branch}' is not a valid branch name");
         print_branch_ref_syntax_hint();
         return Err(GitError::Exit(128));
@@ -8069,6 +8604,8 @@ fn branch_delete_resolve_local_branch_arg(
 }
 
 fn delete_remote_tracking_branches(
+    git_dir: &Path,
+    format: ObjectFormat,
     store: &FileRefStore,
     branches: &[String],
     quiet: bool,
@@ -8079,7 +8616,7 @@ fn delete_remote_tracking_branches(
     }
     let mut failed = false;
     for branch in branches {
-        let name = format!("refs/remotes/{branch}");
+        let (branch, name) = branch_delete_resolve_remote_branch_arg(git_dir, format, branch)?;
         let Some(RefTarget::Direct(_)) = store.read_ref(&name)? else {
             eprintln!("error: remote-tracking branch '{branch}' not found");
             failed = true;
@@ -8099,14 +8636,40 @@ fn delete_remote_tracking_branches(
     Ok(())
 }
 
+fn branch_delete_resolve_remote_branch_arg(
+    git_dir: &Path,
+    format: ObjectFormat,
+    branch: &str,
+) -> Result<(String, String)> {
+    if branch.contains("@{") {
+        let Some(refname) = sley_rev::resolve_revision_symbolic_full_name(git_dir, format, branch)?
+        else {
+            eprintln!("error: remote-tracking branch '{branch}' not found");
+            return Err(GitError::Exit(1));
+        };
+        let Some(remote) = refname.strip_prefix("refs/remotes/") else {
+            eprintln!("error: remote-tracking branch '{branch}' not found");
+            return Err(GitError::Exit(1));
+        };
+        return Ok((remote.to_string(), refname));
+    }
+    Ok((branch.to_string(), format!("refs/remotes/{branch}")))
+}
+
 fn force_update_branch(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
     branch: &str,
     start: Option<&String>,
-) -> Result<()> {
-    let name = validate_branch_creation_name(branch)?;
+) -> Result<String> {
+    let (branch, name) = branch_resolve_local_branch_operand(
+        git_dir,
+        format,
+        store,
+        branch,
+        BranchOperandKind::UpdateOrCreate,
+    )?;
     if let Some(worktree_root) = branch_checked_out_worktree_path(git_dir, store, &name)? {
         eprintln!(
             "fatal: cannot force update the branch '{branch}' used by worktree at '{}'",
@@ -8148,7 +8711,8 @@ fn force_update_branch(
         new: RefTarget::Direct(new_oid),
         reflog,
     });
-    tx.commit()
+    tx.commit()?;
+    Ok(branch)
 }
 
 fn delete_merged_branches(
@@ -8168,14 +8732,7 @@ fn delete_merged_branches(
     let head_reachable = resolve_revision(git_dir, format, "HEAD")
         .ok()
         .and_then(|head| sley_rev::peel_to_commit(&db, format, &head).ok())
-        .map(|head| {
-            sley_rev::walk_commits(&db, format, [head]).map(|records| {
-                records
-                    .into_iter()
-                    .map(|record| record.oid)
-                    .collect::<HashSet<_>>()
-            })
-        })
+        .map(|head| sley_rev::reachable_commit_oids(git_dir, format, &db, [head], false))
         .transpose()?;
 
     let mut failed = false;
@@ -8212,6 +8769,7 @@ fn delete_merged_branches(
         };
         let reachable = branch_delete_reachable_base(
             store,
+            git_dir,
             &db,
             format,
             &config,
@@ -8253,6 +8811,7 @@ fn branch_delete_display(branch: &str, refname: &str, oid: &ObjectId) -> String 
 
 fn branch_delete_reachable_base<'a>(
     store: &FileRefStore,
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     config: &GitConfig,
@@ -8269,10 +8828,7 @@ fn branch_delete_reachable_base<'a>(
         if let Some((oid, _)) = resolve_for_each_ref_target(store, &upstream_ref)?
             && let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid)
         {
-            let reachable = sley_rev::walk_commits(db, format, [commit])?
-                .into_iter()
-                .map(|record| record.oid)
-                .collect::<HashSet<_>>();
+            let reachable = sley_rev::reachable_commit_oids(git_dir, format, db, [commit], false)?;
             return Ok(Some(Cow::Owned(reachable)));
         }
     }
@@ -8424,6 +8980,7 @@ fn run_branch_general_list_options(
             _ => {}
         }
     }
+    refs = branch_filter_refs_by_reachability(git_dir, format, store, refs, &options.filters)?;
     if let Some(style) = options.column {
         let show_detached = options.patterns.is_empty();
         let rows = collect_branch_rows(
@@ -8655,6 +9212,98 @@ fn print_branch_list_points_at_matching(
     })
 }
 
+fn branch_filter_refs_by_reachability(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    refs: Vec<sley_refs::Ref>,
+    filters: &BranchListFilters,
+) -> Result<Vec<sley_refs::Ref>> {
+    if filters.is_empty() {
+        return Ok(refs);
+    }
+
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let contains_oids = branch_resolve_filter_revs(git_dir, format, &filters.contains)?;
+    let no_contains_oids = branch_resolve_filter_revs(git_dir, format, &filters.no_contains)?;
+    let merged_oids = branch_resolve_filter_revs(git_dir, format, &filters.merged)?;
+    let no_merged_oids = branch_resolve_filter_revs(git_dir, format, &filters.no_merged)?;
+    let contains_targets = branch_peel_filter_oids(&db, format, &filters.contains, &contains_oids)?;
+    let no_contains_targets =
+        branch_peel_filter_oids(&db, format, &filters.no_contains, &no_contains_oids)?;
+    let merged_targets = branch_peel_filter_oids(&db, format, &filters.merged, &merged_oids)?;
+    let no_merged_targets =
+        branch_peel_filter_oids(&db, format, &filters.no_merged, &no_merged_oids)?;
+
+    let contains_target_set = contains_targets.iter().copied().collect::<HashSet<_>>();
+    let no_contains_target_set = no_contains_targets.iter().copied().collect::<HashSet<_>>();
+    let mut reachability = sley_rev::CommitReachability::new(git_dir, format, &db);
+    let merged_reachable = reachability.reachable_oids(merged_targets, false)?;
+    let no_merged_reachable = reachability.reachable_oids(no_merged_targets, false)?;
+    let mut out = Vec::with_capacity(refs.len());
+    for reference in refs {
+        let RefTarget::Direct(tip) = &reference.target else {
+            continue;
+        };
+        let Ok(tip) = sley_rev::peel_to_commit(&db, format, tip) else {
+            continue;
+        };
+        let contains_match = reachability.target_match(
+            &tip,
+            &contains_target_set,
+            &no_contains_target_set,
+            false,
+        )?;
+        let merged_match = filters.merged.is_empty() || merged_reachable.contains(&tip);
+        let no_merged_match = no_merged_reachable.contains(&tip);
+        if contains_match.reached_required
+            && !contains_match.reached_excluded
+            && merged_match
+            && !no_merged_match
+        {
+            out.push(reference);
+        }
+    }
+    Ok(out)
+}
+
+fn branch_resolve_filter_revs(
+    git_dir: &Path,
+    format: ObjectFormat,
+    revs: &[String],
+) -> Result<Vec<ObjectId>> {
+    revs.iter()
+        .map(|rev| resolve_revision(git_dir, format, rev))
+        .collect()
+}
+
+fn branch_peel_filter_oids(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    revs: &[String],
+    oids: &[ObjectId],
+) -> Result<Vec<ObjectId>> {
+    revs.iter()
+        .zip(oids)
+        .map(|(rev, oid)| branch_peel_filter_oid(db, format, rev, oid))
+        .collect()
+}
+
+fn branch_peel_filter_oid(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    rev: &str,
+    oid: &ObjectId,
+) -> Result<ObjectId> {
+    match sley_rev::peel_to_commit(db, format, oid) {
+        Ok(commit) => Ok(commit),
+        Err(_) => {
+            eprintln!("error: object {rev} must point to a commit");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
 fn print_branch_list_contains(
     git_dir: &Path,
     format: ObjectFormat,
@@ -8721,6 +9370,9 @@ fn print_branch_list_contains_filters_matching(
         .iter()
         .map(|oid| sley_rev::peel_to_commit(&db, format, oid))
         .collect::<Result<Vec<_>>>()?;
+    let contains_target_set = contains_targets.iter().copied().collect::<HashSet<_>>();
+    let no_contains_target_set = no_contains_targets.iter().copied().collect::<HashSet<_>>();
+    let mut reachability = sley_rev::CommitReachability::new(git_dir, format, &db);
     let mut included = HashSet::new();
     for reference in branch_refs_for_mode(store, mode)? {
         let RefTarget::Direct(tip) = &reference.target else {
@@ -8729,18 +9381,13 @@ fn print_branch_list_contains_filters_matching(
         let Ok(tip) = sley_rev::peel_to_commit(&db, format, tip) else {
             continue;
         };
-        let reachable = sley_rev::walk_commits(&db, format, [tip])?
-            .into_iter()
-            .map(|record| record.oid)
-            .collect::<HashSet<_>>();
-        let contains_match = contains_targets.is_empty()
-            || contains_targets
-                .iter()
-                .any(|target| reachable.contains(target));
-        let no_contains_match = no_contains_targets
-            .iter()
-            .any(|target| reachable.contains(target));
-        if contains_match && !no_contains_match {
+        let target_match = reachability.target_match(
+            &tip,
+            &contains_target_set,
+            &no_contains_target_set,
+            false,
+        )?;
+        if target_match.reached_required && !target_match.reached_excluded {
             included.insert(reference.name.clone());
         }
     }
@@ -8807,30 +9454,17 @@ fn print_branch_list_merged_filters_matching(
     patterns: &[String],
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let merged_reachable = merged_oids
+    let merged_targets = merged_oids
         .iter()
-        .map(|oid| {
-            let target = sley_rev::peel_to_commit(&db, format, oid)?;
-            sley_rev::walk_commits(&db, format, [target]).map(|records| {
-                records
-                    .into_iter()
-                    .map(|record| record.oid)
-                    .collect::<HashSet<_>>()
-            })
-        })
+        .map(|oid| sley_rev::peel_to_commit(&db, format, oid))
         .collect::<Result<Vec<_>>>()?;
-    let no_merged_reachable = no_merged_oids
+    let no_merged_targets = no_merged_oids
         .iter()
-        .map(|oid| {
-            let target = sley_rev::peel_to_commit(&db, format, oid)?;
-            sley_rev::walk_commits(&db, format, [target]).map(|records| {
-                records
-                    .into_iter()
-                    .map(|record| record.oid)
-                    .collect::<HashSet<_>>()
-            })
-        })
+        .map(|oid| sley_rev::peel_to_commit(&db, format, oid))
         .collect::<Result<Vec<_>>>()?;
+    let mut reachability = sley_rev::CommitReachability::new(git_dir, format, &db);
+    let merged_reachable = reachability.reachable_oids(merged_targets, false)?;
+    let no_merged_reachable = reachability.reachable_oids(no_merged_targets, false)?;
     let mut included = HashSet::new();
     for reference in branch_refs_for_mode(store, mode)? {
         let RefTarget::Direct(tip) = &reference.target else {
@@ -8839,9 +9473,8 @@ fn print_branch_list_merged_filters_matching(
         let Ok(tip) = sley_rev::peel_to_commit(&db, format, tip) else {
             continue;
         };
-        let merged_match =
-            merged_reachable.is_empty() || merged_reachable.iter().any(|set| set.contains(&tip));
-        let no_merged_match = no_merged_reachable.iter().any(|set| set.contains(&tip));
+        let merged_match = merged_oids.is_empty() || merged_reachable.contains(&tip);
+        let no_merged_match = no_merged_reachable.contains(&tip);
         if merged_match && !no_merged_match {
             included.insert(reference.name.clone());
         }
@@ -9783,11 +10416,15 @@ fn detached_head_branch_line() -> Option<String> {
     }
     for dir in ["rebase-merge", "rebase-apply"] {
         if let Ok(head_name) = fs::read_to_string(git_dir.join(dir).join("head-name")) {
-            let branch = head_name
-                .trim()
-                .strip_prefix("refs/heads/")
-                .unwrap_or(head_name.trim())
-                .to_string();
+            let head_name = head_name.trim();
+            let branch = if matches!(head_name, "detached HEAD" | "HEAD") {
+                format!("detached HEAD {}", format_log_abbrev_oid(&oid))
+            } else {
+                head_name
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(head_name)
+                    .to_string()
+            };
             return Some(format!("(no branch, rebasing {branch})"));
         }
     }
@@ -9840,13 +10477,18 @@ fn print_branch_refs(
     worktree_paths: Option<&HashMap<String, String>>,
     mut include: impl FnMut(&sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
+    let colors = if color {
+        Some(branch_list_colors_from_current_repo()?)
+    } else {
+        None
+    };
     if matches!(mode, BranchListMode::Local | BranchListMode::All)
         && current.is_none()
         && show_detached
         && let Some(line) = detached_head_branch_line()
     {
-        if color {
-            println!("* \x1b[32m{line}\x1b[m");
+        if let Some(colors) = &colors {
+            println!("* {}", colors.paint(BranchColorSlot::Current, &line));
         } else {
             println!("* {line}");
         }
@@ -9874,20 +10516,13 @@ fn print_branch_refs(
                 ' '
             };
             let target = local_symbolic_branch_target(&reference);
-            if color && marker == '*' {
-                print!("{marker} \x1b[32m{name}\x1b[m");
-                if let Some(target) = target {
-                    print!(" -> {target}");
-                }
-                println!();
-            } else if color && marker == '+' {
-                print!("{marker} \x1b[36m{name}\x1b[m");
-                if let Some(target) = target {
-                    print!(" -> {target}");
-                }
-                println!();
-            } else if color {
-                print!("{marker} {name}\x1b[m");
+            if let Some(colors) = &colors {
+                let slot = match marker {
+                    '*' => BranchColorSlot::Current,
+                    '+' => BranchColorSlot::Worktree,
+                    _ => BranchColorSlot::Local,
+                };
+                print!("{marker} {}", colors.paint(slot, name));
                 if let Some(target) = target {
                     print!(" -> {target}");
                 }
@@ -9912,8 +10547,8 @@ fn print_branch_refs(
             if !include(&reference, name) {
                 continue;
             }
-            if color {
-                println!("  \x1b[31m{display}\x1b[m");
+            if let Some(colors) = &colors {
+                println!("  {}", colors.paint(BranchColorSlot::Remote, &display));
             } else {
                 println!("  {display}");
             }
@@ -9931,13 +10566,21 @@ fn collect_branch_rows(
     mut include: impl FnMut(&sley_refs::Ref, &str) -> bool,
 ) -> Result<Vec<String>> {
     let mut rows = Vec::new();
+    let colors = if color {
+        Some(branch_list_colors_from_current_repo()?)
+    } else {
+        None
+    };
     if matches!(mode, BranchListMode::Local | BranchListMode::All)
         && current.is_none()
         && show_detached
         && let Some(line) = detached_head_branch_line()
     {
-        if color {
-            rows.push(format!("* \x1b[32m{line}\x1b[m"));
+        if let Some(colors) = &colors {
+            rows.push(format!(
+                "* {}",
+                colors.paint(BranchColorSlot::Current, &line)
+            ));
         } else {
             rows.push(format!("* {line}"));
         }
@@ -9960,14 +10603,13 @@ fn collect_branch_rows(
                 ' '
             };
             let target = local_symbolic_branch_target(&reference);
-            if color && marker == '*' {
-                let mut row = format!("{marker} \x1b[32m{name}\x1b[m");
-                if let Some(target) = target {
-                    row.push_str(&format!(" -> {target}"));
-                }
-                rows.push(row);
-            } else if color {
-                let mut row = format!("{marker} {name}\x1b[m");
+            if let Some(colors) = &colors {
+                let slot = if marker == '*' {
+                    BranchColorSlot::Current
+                } else {
+                    BranchColorSlot::Local
+                };
+                let mut row = format!("{marker} {}", colors.paint(slot, name));
                 if let Some(target) = target {
                     row.push_str(&format!(" -> {target}"));
                 }
@@ -9992,8 +10634,11 @@ fn collect_branch_rows(
             if !include(&reference, name) {
                 continue;
             }
-            if color {
-                rows.push(format!("  \x1b[31m{display}\x1b[m"));
+            if let Some(colors) = &colors {
+                rows.push(format!(
+                    "  {}",
+                    colors.paint(BranchColorSlot::Remote, &display)
+                ));
             } else {
                 rows.push(format!("  {display}"));
             }
@@ -10035,6 +10680,57 @@ fn remote_branch_display(reference: &sley_refs::Ref, name: &str, mode: BranchLis
         return display;
     };
     format!("{display} -> {target_name}")
+}
+
+#[derive(Clone, Copy)]
+enum BranchColorSlot {
+    Current,
+    Local,
+    Remote,
+    Worktree,
+}
+
+struct BranchListColors {
+    current: String,
+    local: String,
+    remote: String,
+    worktree: String,
+    reset: String,
+}
+
+impl BranchListColors {
+    fn from_config(config: &GitConfig) -> Self {
+        Self {
+            current: branch_color(config, "current", "green"),
+            local: branch_color(config, "local", "normal"),
+            remote: branch_color(config, "remote", "red"),
+            worktree: branch_color(config, "worktree", "cyan"),
+            reset: git_color_spec_to_ansi("reset", true),
+        }
+    }
+
+    fn paint(&self, slot: BranchColorSlot, text: &str) -> String {
+        let color = match slot {
+            BranchColorSlot::Current => &self.current,
+            BranchColorSlot::Local => &self.local,
+            BranchColorSlot::Remote => &self.remote,
+            BranchColorSlot::Worktree => &self.worktree,
+        };
+        format!("{color}{text}{}", self.reset)
+    }
+}
+
+fn branch_list_colors_from_current_repo() -> Result<BranchListColors> {
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let config = read_repo_config(&git_dir)?;
+    Ok(BranchListColors::from_config(&config))
+}
+
+fn branch_color(config: &GitConfig, key: &str, default: &str) -> String {
+    git_color_spec_to_ansi(
+        config.get("color", Some("branch"), key).unwrap_or(default),
+        true,
+    )
 }
 
 fn print_branch_columns(rows: &[String], style: BranchColumnStyle) -> Result<()> {
@@ -10128,7 +10824,14 @@ fn print_branch_list_verbose(
             upstream_track: None,
         });
     }
-    for reference in branch_refs_for_mode(store, options.mode)? {
+    let refs = branch_filter_refs_by_reachability(
+        git_dir,
+        format,
+        store,
+        branch_refs_for_mode(store, options.mode)?,
+        &options.filters,
+    )?;
+    for reference in refs {
         let Some((display, pattern_name)) =
             branch_verbose_display_name(&reference.name, options.mode)
         else {
@@ -10160,6 +10863,11 @@ fn print_branch_list_verbose(
         });
     }
     let width = rows.iter().map(|row| row.display.len()).max().unwrap_or(0);
+    let colors = if options.color {
+        Some(branch_list_colors_from_current_repo()?)
+    } else {
+        None
+    };
     for row in rows {
         let marker = if row.is_head {
             '*'
@@ -10176,14 +10884,22 @@ fn print_branch_list_verbose(
         {
             tracking.push_str(&format!(" ({worktree_path})"));
         }
-        println!(
-            "{marker} {:width$} {}{} {}",
-            row.display,
-            row.oid,
-            tracking,
-            row.subject,
-            width = width
-        );
+        let display = format!("{:<width$}", row.display, width = width);
+        let display = if let Some(colors) = &colors {
+            let slot = if row.is_head {
+                BranchColorSlot::Current
+            } else if row.worktree_path.is_some() {
+                BranchColorSlot::Worktree
+            } else if row.display.starts_with("remotes/") {
+                BranchColorSlot::Remote
+            } else {
+                BranchColorSlot::Local
+            };
+            colors.paint(slot, &display)
+        } else {
+            display
+        };
+        println!("{marker} {display} {}{} {}", row.oid, tracking, row.subject);
     }
     Ok(())
 }

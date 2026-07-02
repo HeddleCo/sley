@@ -20,35 +20,38 @@ filetime = "0.2"
 # Binary patch payloads (`git apply` of a `GIT binary patch`) are zlib-deflated;
 # the backend is unified to zlib-rs by the transitive sley-odb default feature.
 flate2 = { version = "1", default-features = false }
-sley-archive = { path = "../sley-archive" }
-sley-config = { path = "../sley-config" }
-sley-core = { path = "../sley-core" }
-sley-diff-format = { path = "../sley-diff-format" }
-sley-diff-merge = { path = "../sley-diff-merge" }
-sley-fetch = { path = "../sley-fetch" }
-sley-formats = { path = "../sley-formats" }
-sley-grep = { path = "../sley-grep" }
-sley-fsck = { path = "../sley-fsck" }
-sley-index = { path = "../sley-index" }
-sley-notes = { path = "../sley-notes" }
-sley-object = { path = "../sley-object" }
-sley-odb = { path = "../sley-odb" }
-sley-options = { path = "../sley-options" }
-sley-pack = { path = "../sley-pack" }
-sley-pathspec = { path = "../sley-pathspec" }
-sley-pretty = { path = "../sley-pretty" }
-sley-protocol = { path = "../sley-protocol" }
-sley-ref-filter = { path = "../sley-ref-filter" }
-sley-refs = { path = "../sley-refs" }
-sley-remote = { path = "../sley-remote" }
-sley-rev = { path = "../sley-rev" }
-sley-sequencer = { path = "../sley-sequencer" }
-sley-strbuf-expand = { path = "../sley-strbuf-expand" }
-sley-submodule = { path = "../sley-submodule" }
-sley-testkit = { path = "../sley-testkit" }
-sley-transport = { path = "../sley-transport", features = ["http-client", "tls-rustls"] }
-sley-unpack-trees = { path = "../sley-unpack-trees" }
-sley-worktree = { path = "../sley-worktree" }
+regex = "1"
+sley-archive.workspace = true
+sley-config.workspace = true
+sley-core.workspace = true
+sley-diff-format.workspace = true
+sley-diff-merge.workspace = true
+sley-fetch.workspace = true
+sley-formats.workspace = true
+sley-grep.workspace = true
+sley-i18n = { workspace = true, optional = true }
+sley-fsck.workspace = true
+sley-index.workspace = true
+sley-notes.workspace = true
+sley-object.workspace = true
+sley-odb.workspace = true
+sley-options.workspace = true
+sley-pack.workspace = true
+sley-pathspec.workspace = true
+sley-pretty.workspace = true
+sley-procinfo.workspace = true
+sley-protocol.workspace = true
+sley-ref-filter.workspace = true
+sley-refs.workspace = true
+sley-remote.workspace = true
+sley-rev.workspace = true
+sley-sequencer.workspace = true
+sley-strbuf-expand.workspace = true
+sley-submodule.workspace = true
+sley-testkit.workspace = true
+sley-transport = { workspace = true, features = ["http-client", "tls-rustls"] }
+sley-unpack-trees.workspace = true
+sley-worktree.workspace = true
 
 [features]
 default = ["mmap", "fast-sha1"]
@@ -70,6 +73,7 @@ mmap = ["sley-odb/mmap"]
 tls-rustls = ["sley-transport/tls-rustls"]
 tls-native-tls = ["sley-transport/tls-native-tls"]
 tls-platform-verifier = ["sley-transport/tls-platform-verifier"]
+git-compat-i18n = ["dep:sley-i18n"]
 
 [lints]
 workspace = true

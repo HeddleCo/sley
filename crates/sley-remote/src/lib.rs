@@ -87,11 +87,11 @@ pub use pack::{
 mod push;
 pub use push::{
     PushAction, PushActionPlan, PushActionRequest, PushCommand, PushDestination, PushOptions,
-    PushOutcome, PushPlan, PushRefStatus, PushReportRef, PushReportRequest, PushRequest,
-    PushServices, PushStatusReport, PushThinMode, execute_push_action_plan, execute_push_plan,
-    local_push_source_refs, normalize_push_refname, normalize_push_refspec, plan_push,
-    plan_push_actions, push, push_actions, push_local_with_report, reject_non_fast_forward_pushes,
-    validate_receive_pack_report,
+    PushOutcome, PushPlan, PushQuarantine, PushRefStatus, PushReportRef, PushReportRequest,
+    PushRequest, PushServices, PushStatusReport, PushThinMode, execute_push_action_plan,
+    execute_push_plan, local_push_source_refs, normalize_push_refname, normalize_push_refspec,
+    plan_push, plan_push_actions, push, push_actions, push_local_with_report,
+    reject_non_fast_forward_pushes, stage_local_push_quarantine, validate_receive_pack_report,
 };
 
 mod ls_remote;
@@ -262,6 +262,7 @@ mod tests {
             prune: false,
             prune_tags: false,
             dry_run: false,
+            force: false,
             append: false,
             write_fetch_head: true,
             tag_option_explicit: true,

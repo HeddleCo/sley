@@ -303,15 +303,21 @@ pub(crate) fn merge_base_fork_point(
     };
     let store = FileRefStore::new(git_dir, format);
     let reflog = store.read_reflog(&refname)?;
-    if reflog.is_empty() {
-        return Ok(None);
-    }
     let commit_depths = ancestor_depths(db, format, commit)?;
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
-    for entry in reflog {
-        if commit_depths.contains_key(&entry.new_oid) && seen.insert(entry.new_oid) {
-            candidates.push(entry.new_oid);
+    if reflog.is_empty() {
+        if let Some(oid) = sley_refs::resolve_ref_peeled(&store, &refname)? {
+            let tip = sley_rev::peel_to_commit(db, format, &oid)?;
+            if commit_depths.contains_key(&tip) {
+                candidates.push(tip);
+            }
+        }
+    } else {
+        for entry in reflog {
+            if commit_depths.contains_key(&entry.new_oid) && seen.insert(entry.new_oid) {
+                candidates.push(entry.new_oid);
+            }
         }
     }
     if candidates.is_empty() {

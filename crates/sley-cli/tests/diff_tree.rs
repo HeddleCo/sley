@@ -78,8 +78,8 @@ fn git_ok(cwd: &Path, args: &[&str]) {
     );
 }
 
-fn git_rs(cwd: &Path, args: &[&str]) -> Output {
-    run_env(env!("CARGO_BIN_EXE_sley"), cwd, args)
+fn sley(cwd: &Path, args: &[&str]) -> Output {
+    run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
 fn git_available() -> bool {
@@ -108,7 +108,7 @@ fn rev_parse(cwd: &Path, spec: &str) -> String {
 /// Assert `git` and `sley` agree on stdout, stderr, and exit code for `args`.
 fn assert_same(cwd: &Path, args: &[&str]) {
     let g = git(cwd, args);
-    let r = git_rs(cwd, args);
+    let r = sley(cwd, args);
     assert_eq!(
         String::from_utf8_lossy(&r.stdout),
         String::from_utf8_lossy(&g.stdout),
@@ -131,7 +131,7 @@ fn assert_same(cwd: &Path, args: &[&str]) {
 /// lossy string compare could mask differences).
 fn assert_same_bytes(cwd: &Path, args: &[&str]) {
     let g = git(cwd, args);
-    let r = git_rs(cwd, args);
+    let r = sley(cwd, args);
     assert_eq!(r.stdout, g.stdout, "stdout bytes differ for {args:?}");
     assert_eq!(
         r.status.code(),
@@ -143,7 +143,7 @@ fn assert_same_bytes(cwd: &Path, args: &[&str]) {
 /// As [`assert_same`] but with data on stdin (for `--stdin`).
 fn assert_same_stdin(cwd: &Path, args: &[&str], stdin_data: &str) {
     let g = run_env_stdin(sley_testkit::oracle_git(), cwd, args, stdin_data);
-    let r = run_env_stdin(env!("CARGO_BIN_EXE_sley"), cwd, args, stdin_data);
+    let r = run_env_stdin(sley_testkit::sley_bin!(), cwd, args, stdin_data);
     assert_eq!(
         String::from_utf8_lossy(&r.stdout),
         String::from_utf8_lossy(&g.stdout),
@@ -233,7 +233,7 @@ fn replace_paren_percent(text: &str) -> String {
 /// out (see [`normalize_scores`]). Exit codes are still compared exactly.
 fn assert_same_scoreless(cwd: &Path, args: &[&str]) {
     let g = git(cwd, args);
-    let r = git_rs(cwd, args);
+    let r = sley(cwd, args);
     assert_eq!(
         normalize_scores(&String::from_utf8_lossy(&r.stdout)),
         normalize_scores(&String::from_utf8_lossy(&g.stdout)),
@@ -630,7 +630,7 @@ fn diff_tree_error_cases_match_git() {
     // the first usage line, since git's full usage block is long and version
     // dependent; matching stdout emptiness and exit is the meaningful contract.
     let g = git(&repo, &["diff-tree"]);
-    let r = git_rs(&repo, &["diff-tree"]);
+    let r = sley(&repo, &["diff-tree"]);
     assert_eq!(r.status.code(), g.status.code(), "no-arg exit differs");
     assert!(r.stdout.is_empty(), "no-arg stdout should be empty");
     assert!(

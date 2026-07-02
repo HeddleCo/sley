@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
 
-pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.54.0";
+pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.55.0";
 
 static ORIGINAL_CWD: Mutex<Option<PathBuf>> = Mutex::new(None);
 
@@ -379,6 +379,7 @@ pub mod trace2 {
     use std::fmt::Display;
     use std::fmt::Write as _;
     use std::io::Write;
+    use std::path::PathBuf;
 
     fn escape_json(raw: &str) -> String {
         let mut out = String::with_capacity(raw.len());
@@ -397,19 +398,135 @@ pub mod trace2 {
         out
     }
 
+    fn trace_target(var: &str) -> Option<String> {
+        let target = std::env::var_os(var)?.to_string_lossy().into_owned();
+        // Upstream accepts fd and socket target spellings too; sley only honors
+        // absolute path targets in the test harness.
+        target.starts_with('/').then_some(target)
+    }
+
+    fn append_to_target(var: &str, line: &str) {
+        let Some(target) = trace_target(var) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(target)
+        {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.write_all(b"\n");
+        }
+    }
+
+    fn redact_enabled() -> bool {
+        std::env::var("GIT_TRACE2_REDACT").map_or(true, |value| value != "0")
+    }
+
+    fn is_scheme_char(ch: char) -> bool {
+        ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.')
+    }
+
+    fn redact_unsafe_urls(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len());
+        let mut rest = raw;
+        while let Some(scheme_end) = rest.find("://") {
+            let scheme_start = rest[..scheme_end]
+                .char_indices()
+                .rev()
+                .find_map(|(idx, ch)| (!is_scheme_char(ch)).then_some(idx + ch.len_utf8()))
+                .unwrap_or(0);
+            out.push_str(&rest[..scheme_start]);
+
+            let authority_start = scheme_end + 3;
+            let authority_end = rest[authority_start..]
+                .find(|ch: char| matches!(ch, '/' | '?' | '#' | ' ' | '\t' | '\r' | '\n'))
+                .map(|idx| authority_start + idx)
+                .unwrap_or(rest.len());
+            let authority = &rest[authority_start..authority_end];
+            if let Some(at) = authority.rfind('@') {
+                out.push_str(&rest[scheme_start..authority_start]);
+                out.push_str("<redacted>@");
+                out.push_str(&authority[at + 1..]);
+            } else {
+                out.push_str(&rest[scheme_start..authority_end]);
+            }
+            rest = &rest[authority_end..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn maybe_redact(raw: &str) -> String {
+        if redact_enabled() {
+            redact_unsafe_urls(raw)
+        } else {
+            raw.to_string()
+        }
+    }
+
+    fn quote_arg(arg: &str) -> String {
+        if !arg.is_empty()
+            && !arg
+                .chars()
+                .any(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"' | '\\'))
+        {
+            return arg.to_string();
+        }
+        let mut out = String::with_capacity(arg.len() + 2);
+        out.push('\'');
+        for ch in arg.chars() {
+            if ch == '\'' {
+                out.push_str("'\\''");
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('\'');
+        out
+    }
+
+    fn argv0() -> String {
+        let Some(arg0) = std::env::args_os().next() else {
+            return "sley".to_string();
+        };
+        let path = PathBuf::from(arg0);
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "sley".to_string())
+    }
+
+    fn render_argv(args: &[String]) -> String {
+        let mut rendered = Vec::with_capacity(args.len() + 1);
+        rendered.push(quote_arg(&argv0()));
+        rendered.extend(args.iter().map(|arg| quote_arg(arg)));
+        rendered.join(" ")
+    }
+
+    pub fn depth() -> usize {
+        std::env::var("SLEY_TRACE2_DEPTH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn perf_line(depth: usize, event: &str, rest: &str) {
+        append_to_target(
+            "GIT_TRACE2_PERF",
+            &format!("d{depth} | main | {event} |  |  |  |  | {rest}"),
+        );
+    }
+
     /// Create the trace2 targets when tracing is enabled, even if this command
     /// emits no data/region/perf events — git opens the `GIT_TRACE2_EVENT` and
     /// `GIT_TRACE2_PERF` files at startup, so consumers (and test cleanups that
     /// `rm` the file) can rely on their existence.
     pub fn touch() {
-        for var in ["GIT_TRACE2_EVENT", "GIT_TRACE2_PERF"] {
-            let Some(target) = std::env::var_os(var) else {
+        for var in ["GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF"] {
+            let Some(target) = trace_target(var) else {
                 continue;
             };
-            let target = target.to_string_lossy().into_owned();
-            if !target.starts_with('/') {
-                continue;
-            }
             let _ = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -417,19 +534,99 @@ pub mod trace2 {
         }
     }
 
+    /// Emit the small normal/perf `start` records that downstream tools commonly
+    /// use for argv auditing. Full trace2 lifecycle modelling remains out of
+    /// scope; these records intentionally cover the stable clone/status tests.
+    pub fn start(args: &[String]) {
+        let argv = maybe_redact(&render_argv(args));
+        append_to_target("GIT_TRACE2", &format!("start {argv}"));
+        perf_line(depth(), "start", &argv);
+    }
+
+    pub fn cmd_ancestry_at_depth(depth: usize, ancestry: &[String]) {
+        if ancestry.is_empty() {
+            return;
+        }
+        append_to_target(
+            "GIT_TRACE2",
+            &format!("cmd_ancestry {}", ancestry.join(" <- ")),
+        );
+        perf_line(
+            depth,
+            "cmd_ancestry",
+            &format!("ancestry:[{}]", ancestry.join(" ")),
+        );
+        let event_ancestry = ancestry
+            .iter()
+            .map(|name| format!("\"{}\"", escape_json(name)))
+            .collect::<Vec<_>>()
+            .join(",");
+        append_to_target(
+            "GIT_TRACE2_EVENT",
+            &format!(
+                "{{\"event\":\"cmd_ancestry\",\"sid\":\"sley\",\"thread\":\"main\",\"ancestry\":[{event_ancestry}]}}"
+            ),
+        );
+    }
+
+    pub fn cmd_name(name: &str, hierarchy: Option<&str>) {
+        let rest = match hierarchy {
+            Some(hierarchy) => format!("{name} ({hierarchy})"),
+            None => name.to_string(),
+        };
+        perf_line(depth(), "cmd_name", &rest);
+    }
+
+    pub fn cmd_name_at_depth(depth: usize, name: &str, hierarchy: Option<&str>) {
+        let rest = match hierarchy {
+            Some(hierarchy) => format!("{name} ({hierarchy})"),
+            None => name.to_string(),
+        };
+        perf_line(depth, "cmd_name", &rest);
+    }
+
+    pub fn child_start(class: &str, argv: &[String]) {
+        let argv = argv
+            .iter()
+            .map(|arg| maybe_redact(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        perf_line(
+            depth(),
+            "child_start",
+            &format!("child_id:0 class:{class} argv:[{argv}]"),
+        );
+    }
+
+    pub fn alias(name: &str, argv: &[String]) {
+        let argv = argv
+            .iter()
+            .map(|arg| maybe_redact(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        perf_line(depth(), "alias", &format!("alias:{name} argv:[{argv}]"));
+    }
+
+    /// Emit a trace2 config-parameter record to the normal and perf targets.
+    pub fn def_param(key: &str, value: impl Display) {
+        def_param_at_depth(depth(), key, value);
+    }
+
+    pub fn def_param_at_depth(depth: usize, key: &str, value: impl Display) {
+        let value = value.to_string();
+        let normal = maybe_redact(&format!("{key}={value}"));
+        append_to_target("GIT_TRACE2", &format!("def_param {normal}"));
+        let perf = maybe_redact(&format!("{key}:{value}"));
+        perf_line(depth, "def_param", &perf);
+    }
+
     /// Emit a trace2 `data` event (upstream `trace2_data_string` /
     /// `trace2_data_intmax`): a JSON line appended to the `GIT_TRACE2_EVENT`
     /// file when that target is enabled.
     pub fn data(category: &str, key: &str, value: impl Display) {
-        let Some(target) = std::env::var_os("GIT_TRACE2_EVENT") else {
+        let Some(target) = trace_target("GIT_TRACE2_EVENT") else {
             return;
         };
-        let target = target.to_string_lossy().into_owned();
-        // Upstream accepts absolute paths (and fd/unix-socket forms sley does
-        // not support); only path-like targets are honored here.
-        if !target.starts_with('/') {
-            return;
-        }
         let line = format!(
             "{{\"event\":\"data\",\"sid\":\"sley\",\"thread\":\"main\",\"nesting\":1,\"category\":\"{}\",\"key\":\"{}\",\"value\":\"{}\"}}\n",
             escape_json(category),
@@ -448,13 +645,9 @@ pub mod trace2 {
     /// Emit a trace2 `counter` event. Git writes these for accumulated counters
     /// such as fsync hardware flushes when the event target is enabled.
     pub fn counter(category: &str, name: &str, count: impl Display) {
-        let Some(target) = std::env::var_os("GIT_TRACE2_EVENT") else {
+        let Some(target) = trace_target("GIT_TRACE2_EVENT") else {
             return;
         };
-        let target = target.to_string_lossy().into_owned();
-        if !target.starts_with('/') {
-            return;
-        }
         let line = format!(
             "{{\"event\":\"counter\",\"sid\":\"sley\",\"thread\":\"main\",\"category\":\"{}\",\"name\":\"{}\",\"count\":{}}}\n",
             escape_json(category),
@@ -479,13 +672,9 @@ pub mod trace2 {
     }
 
     fn region_event(event: &str, category: &str, label: &str) {
-        let Some(target) = std::env::var_os("GIT_TRACE2_EVENT") else {
+        let Some(target) = trace_target("GIT_TRACE2_EVENT") else {
             return;
         };
-        let target = target.to_string_lossy().into_owned();
-        if !target.starts_with('/') {
-            return;
-        }
         let line = format!(
             "{{\"event\":\"{}\",\"sid\":\"sley\",\"thread\":\"main\",\"nesting\":1,\"category\":\"{}\",\"label\":\"{}\"}}\n",
             escape_json(event),
@@ -509,13 +698,9 @@ pub mod trace2 {
         definitely_not: usize,
         false_positive: usize,
     ) {
-        let Some(target) = std::env::var_os("GIT_TRACE2_PERF") else {
+        let Some(target) = trace_target("GIT_TRACE2_PERF") else {
             return;
         };
-        let target = target.to_string_lossy().into_owned();
-        if !target.starts_with('/') {
-            return;
-        }
         let line = format!(
             "statistics:{{\"filter_not_present\":{filter_not_present},\"maybe\":{maybe},\"definitely_not\":{definitely_not},\"false_positive\":{false_positive}}}\n"
         );
@@ -531,13 +716,9 @@ pub mod trace2 {
     /// Emit a compact trace2 perf `data` row for tests that extract the
     /// read-directory statistics with pipe-field parsing.
     pub fn perf_read_directory_data(key: &str, value: impl Display) {
-        let Some(target) = std::env::var_os("GIT_TRACE2_PERF") else {
+        let Some(target) = trace_target("GIT_TRACE2_PERF") else {
             return;
         };
-        let target = target.to_string_lossy().into_owned();
-        if !target.starts_with('/') {
-            return;
-        }
         let line = format!(
             "19:00:00.000000 file.c:1 | d0 | main | data | r1 | ? | ? | read_directory | ....{key}:{value}\n"
         );
@@ -555,13 +736,9 @@ pub mod trace2 {
     /// `implicit-bare-repository:<dir>` marker the safe.bareRepository tests
     /// grep for. Only the grep-stable `<key>:<value>` tail is significant.
     pub fn perf_setup_data(key: &str, value: impl Display) {
-        let Some(target) = std::env::var_os("GIT_TRACE2_PERF") else {
+        let Some(target) = trace_target("GIT_TRACE2_PERF") else {
             return;
         };
-        let target = target.to_string_lossy().into_owned();
-        if !target.starts_with('/') {
-            return;
-        }
         let line = format!(
             "19:00:00.000000 setup.c:1 | d0 | main | data | r0 | ? | ? | setup | ....{key}:{value}\n"
         );

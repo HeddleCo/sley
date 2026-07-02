@@ -14,6 +14,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut unified_context = false;
     let mut inter_hunk_context = false;
     let mut guess = None::<bool>;
+    let mut create_reflog = false;
     let mut path_merge = false;
     let mut conflict_implies_merge = false;
     let mut conflict_style = None::<sley_worktree::CheckoutConflictStyle>;
@@ -102,10 +103,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 inter_hunk_context = true;
             }
             "--progress" | "--no-progress" => {}
-            // `-l`/`--log` forces a reflog for the newly created branch. sley
-            // always materializes a reflog on the first commit, so this only
-            // needs to be recognized (and not mistaken for a start-point arg).
-            "-l" | "--log" => {}
+            // `-l`/`--log` forces a reflog for the newly created branch.
+            "-l" | "--log" => create_reflog = true,
             "--overlay" => overlay_mode = Some(true),
             "--no-overlay" => overlay_mode = Some(false),
             "--overwrite-ignore" => overwrite_ignore = true,
@@ -118,7 +117,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 })?;
                 pathspec_from_file = Some(PathBuf::from(value));
             }
-            "--no-pathspec-from-file" => pathspec_from_file = None,
+            "--no-pathspec-from-file" => {}
             value if value.starts_with("--pathspec-from-file=") => {
                 let value = &value["--pathspec-from-file=".len()..];
                 pathspec_from_file = Some(PathBuf::from(value));
@@ -137,6 +136,21 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             }
             "--no-track" => {
                 track = Some(crate::commands::branch::BranchTrackMode::Never);
+            }
+            "-lb" => {
+                if !matches!(branch_mode, CheckoutBranchMode::Existing) {
+                    eprintln!("fatal: options '--detach' and '-b' cannot be used together");
+                    return Err(GitError::Exit(128));
+                }
+                create_reflog = true;
+                let branch = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("checkout -b requires a branch".into()))?;
+                branch_mode = CheckoutBranchMode::Create {
+                    branch: branch.to_string(),
+                    force: false,
+                    orphan: false,
+                };
             }
             "-b" => {
                 if !matches!(branch_mode, CheckoutBranchMode::Existing) {
@@ -441,7 +455,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                             _ => sley_worktree::CheckoutConflictStyle::Merge,
                         }
                     });
-                    sley_worktree::checkout_index_paths(
+                    let result = sley_worktree::checkout_index_paths(
                         worktree_root,
                         &git_dir,
                         format,
@@ -449,13 +463,19 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         sley_worktree::CheckoutIndexPathOptions {
                             force,
                             merge: path_merge || conflict_implies_merge,
+                            overlay: overlay_mode.unwrap_or(true),
                             stage: checkout_stage,
                             conflict_style,
                             smudge_config: Some(&config),
                         },
                     )?;
+                    if !quiet && dashdash_index.is_none() && result.restored > 0 {
+                        let suffix = if result.restored == 1 { "" } else { "s" };
+                        eprintln!("Updated {} path{} from the index", result.restored, suffix);
+                    }
                 }
             }
+            commands::hooks::run_post_index_change_hook(false, false)?;
             run_post_checkout_hook(&checkout_old_head, &checkout_old_head, false)?;
             return Ok(());
         }
@@ -488,12 +508,22 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     )
                 });
             if !switches_to_other_branch {
-                sley_worktree::reset_index_and_worktree_to_commit(
-                    &worktree_root,
-                    &git_dir,
-                    format,
-                    &target_oid,
-                )?;
+                if recurse_submodules {
+                    commands::read_tree::reset_index_and_worktree_to_commit(
+                        &worktree_root,
+                        &git_dir,
+                        format,
+                        &target_oid,
+                        true,
+                    )?;
+                } else {
+                    sley_worktree::reset_index_and_worktree_to_commit(
+                        &worktree_root,
+                        &git_dir,
+                        format,
+                        &target_oid,
+                    )?;
+                }
                 sley_sequencer::replay::remove_branch_state(&git_dir);
                 return Ok(());
             }
@@ -506,12 +536,22 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     if force {
         let store = FileRefStore::new(&git_dir, format);
         if let Ok(Some(head_oid)) = resolve_ref_peeled(&store, "HEAD") {
-            sley_worktree::reset_index_and_worktree_to_commit(
-                &worktree_root,
-                &git_dir,
-                format,
-                &head_oid,
-            )?;
+            if recurse_submodules {
+                commands::read_tree::reset_index_and_worktree_to_commit(
+                    &worktree_root,
+                    &git_dir,
+                    format,
+                    &head_oid,
+                    true,
+                )?;
+            } else {
+                sley_worktree::reset_index_and_worktree_to_commit(
+                    &worktree_root,
+                    &git_dir,
+                    format,
+                    &head_oid,
+                )?;
+            }
         } else {
             // Unborn HEAD: discard the staged state entirely.
             let index_path = sley_worktree::repository_index_path(&git_dir);
@@ -572,7 +612,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     &git_dir,
                     format,
                     &target_oid,
-                    commit_identity_from_env("COMMITTER")?,
+                    committer_identity_for_reflog()?,
                     message.clone(),
                     &config,
                 ) {
@@ -591,6 +631,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     Err(err) => return Err(err),
                 }
             }
+            commands::hooks::run_post_index_change_hook(true, false)?;
             sley_sequencer::replay::remove_branch_state(&git_dir);
             if !quiet {
                 checkout_print_previous_detached_head(
@@ -626,9 +667,11 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     // current branch: git reports local changes on stdout and
                     // succeeds (no error), leaving the index/worktree untouched.
                     let store = FileRefStore::new(&git_dir, format);
-                    if let Ok(Some(head)) = resolve_ref_peeled(&store, "HEAD") {
-                        let _ = checkout_show_local_changes(&git_dir, &head, quiet, force);
-                    }
+                    let Some(head) = resolve_ref_peeled(&store, "HEAD")? else {
+                        eprintln!("fatal: You are on a branch yet to be born");
+                        return Err(GitError::Exit(128));
+                    };
+                    let _ = checkout_show_local_changes(&git_dir, &head, quiet, force);
                     return Ok(());
                 }
                 return Err(GitError::Command(
@@ -656,6 +699,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             if let Some(current_branch) = attached_current_branch {
                 CheckoutMessage::Existing {
                     branch: current_branch,
+                    announce: false,
                 }
             } else if !is_branch
                 && branch.contains("@{")
@@ -666,6 +710,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             {
                 CheckoutMessage::Existing {
                     branch: local_branch.to_string(),
+                    announce: true,
                 }
             } else if !is_branch
                 && let Ok(target_oid) = checkout_resolve_start_oid(&git_dir, format, branch)
@@ -697,7 +742,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         &git_dir,
                         format,
                         &target_oid,
-                        commit_identity_from_env("COMMITTER")?,
+                        committer_identity_for_reflog()?,
                         message.clone(),
                         &config,
                     ) {
@@ -736,6 +781,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         subject
                     );
                 }
+                commands::hooks::run_post_index_change_hook(true, false)?;
                 run_post_checkout_hook(&checkout_old_head, &target_oid, true)?;
                 commands::hooks::run_hook(
                     "reference-transaction",
@@ -765,7 +811,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         &branch_name,
                         &dwim.remote_ref,
                         false,
-                        commit_identity_from_env("COMMITTER")?,
+                        create_reflog,
+                        committer_identity_for_reflog()?,
                     )?;
                     let tracking_start = Some(dwim.remote_ref);
                     crate::commands::branch::branch_create_set_tracking(
@@ -792,6 +839,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             } else {
                 CheckoutMessage::Existing {
                     branch: branch.clone(),
+                    announce: true,
                 }
             }
         }
@@ -811,7 +859,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 }
                 // --orphan cannot reuse an existing branch name (there is no
                 // force variant); reject before touching the index or HEAD.
-                if store.read_ref(&branch_ref_name(&branch)?)?.is_some() {
+                let branch_ref = branch_ref_name(&branch)?;
+                if store.read_ref(&branch_ref)?.is_some() {
                     eprintln!("fatal: a branch named '{branch}' already exists");
                     return Err(GitError::Exit(128));
                 }
@@ -837,6 +886,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     )?;
                 }
                 checkout_switch_to_unborn_branch(&git_dir, &branch)?;
+                if create_reflog {
+                    store.write_reflog(&branch_ref, &[])?;
+                }
                 sley_sequencer::replay::remove_branch_state(&git_dir);
                 if !quiet {
                     eprintln!("Switched to a new branch '{branch}'");
@@ -875,7 +927,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 &branch,
                 start,
                 force,
-                commit_identity_from_env("COMMITTER")?,
+                create_reflog,
+                committer_identity_for_reflog()?,
             )?;
             let tracking_start = positional.first().map(|start| {
                 if start.contains("@{") {
@@ -908,6 +961,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let config = read_repo_config(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let branch_ref = branch_ref_name(branch)?;
+    let checkout_reflog_from = checkout_reflog_from_name(&store);
     if !ignore_other_worktrees
         && !matches!(
             store.read_ref("HEAD"),
@@ -974,7 +1028,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         return Ok(());
     }
     if recurse_submodules || (branch_update_rollback.is_some() && !force) {
-        let from = checkout_reflog_from_name(&store);
+        let from = checkout_reflog_from.clone();
         let target = branch_target.ok_or_else(|| GitError::reference_not_found("branch"))?;
         if let Err(err) = checkout_twoway_dirty(
             &git_dir,
@@ -998,13 +1052,13 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             git_dir.clone(),
             format,
             branch,
-            commit_identity_from_env("COMMITTER")?,
+            committer_identity_for_reflog()?,
             &config,
         ) {
             Ok(_) => {}
             Err(err) if checkout_is_dirty_tree_error(&err) => {
                 let store = FileRefStore::new(&git_dir, format);
-                let from = checkout_reflog_from_name(&store);
+                let from = checkout_reflog_from.clone();
                 let target = sley_refs::resolve_ref_peeled(&store, &branch_ref_name(branch)?)?
                     .ok_or_else(|| GitError::reference_not_found("branch"))?;
                 if let Err(err) = checkout_twoway_dirty(
@@ -1031,9 +1085,17 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             }
         }
     }
+    let branch_target = branch_target.ok_or_else(|| GitError::reference_not_found("branch"))?;
+    ensure_head_checkout_reflog_entry(
+        &FileRefStore::new(&git_dir, format),
+        format,
+        &branch_target,
+        format!("checkout: moving from {checkout_reflog_from} to {branch}").into_bytes(),
+    )?;
     sley_sequencer::replay::remove_branch_state(&git_dir);
     let checkout_new_head = resolve_ref_peeled(&FileRefStore::new(&git_dir, format), "HEAD")?
         .unwrap_or(checkout_old_head);
+    commands::hooks::run_post_index_change_hook(true, false)?;
     run_post_checkout_hook(&checkout_old_head, &checkout_new_head, true)?;
     commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
     if !quiet {
@@ -1047,7 +1109,9 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         )?;
         checkout_message.print();
     }
-    checkout_show_branch_tracking(&git_dir, format, branch, quiet)?;
+    if checkout_message.announces() {
+        checkout_show_branch_tracking(&git_dir, format, branch, quiet)?;
+    }
     // git's `show_local_changes`: report carried-forward worktree modifications
     // relative to the newly checked-out commit (`M\t<path>`, etc.).
     checkout_show_local_changes(&git_dir, &checkout_new_head, quiet, force)?;
@@ -1849,6 +1913,10 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         );
         return Err(GitError::Exit(128));
     }
+    if pathspec_from_file.is_some() && patch {
+        eprintln!("fatal: options '--pathspec-from-file' and '--patch' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
     if patch {
         let cwd = env::current_dir()?;
         let git_dir = discover_git_dir(&cwd)?;
@@ -1866,9 +1934,8 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         paths.extend(read_pathspecs_from_file(&pathspec_file, pathspec_file_nul)?);
     }
     if paths.is_empty() {
-        return Err(GitError::Command(
-            "restore requires at least one path".into(),
-        ));
+        eprintln!("fatal: you must specify path(s) to restore");
+        return Err(GitError::Exit(128));
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
@@ -1952,6 +2019,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
             sley_worktree::CheckoutIndexPathOptions {
                 force: ignore_unmerged,
                 merge: path_merge || conflict_implies_merge,
+                overlay: false,
                 stage: checkout_stage,
                 conflict_style,
                 smudge_config: Some(&config),
@@ -2208,7 +2276,7 @@ fn detach_head_with_reflog(
         reflog: Some(ReflogEntry {
             old_oid: ObjectId::null(format),
             new_oid: *target,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: committer_identity_for_reflog()?,
             message,
         }),
     });
@@ -2224,6 +2292,7 @@ fn switch_head_symbolic_with_reflog(
 ) -> Result<()> {
     let refs = FileRefStore::new(git_dir, format);
     let mut tx = refs.transaction();
+    let message = format!("checkout: moving from {from} to {branch}").into_bytes();
     tx.update(RefUpdate {
         name: "HEAD".into(),
         expected: None,
@@ -2231,11 +2300,36 @@ fn switch_head_symbolic_with_reflog(
         reflog: Some(ReflogEntry {
             old_oid: *target,
             new_oid: *target,
-            committer: commit_identity_from_env("COMMITTER")?,
-            message: format!("checkout: moving from {from} to {branch}").into_bytes(),
+            committer: committer_identity_for_reflog()?,
+            message: message.clone(),
         }),
     });
-    tx.commit()
+    tx.commit()?;
+    ensure_head_checkout_reflog_entry(&refs, format, target, message)
+}
+
+fn ensure_head_checkout_reflog_entry(
+    refs: &FileRefStore,
+    format: ObjectFormat,
+    target: &ObjectId,
+    message: Vec<u8>,
+) -> Result<()> {
+    if let Ok(entries) = refs.read_reflog("HEAD")
+        && entries
+            .last()
+            .is_some_and(|entry| entry.new_oid == *target && entry.message == message)
+    {
+        return Ok(());
+    }
+    refs.append_reflog(
+        "HEAD",
+        &ReflogEntry {
+            old_oid: *target,
+            new_oid: *target,
+            committer: committer_identity_for_reflog()?,
+            message,
+        },
+    )
 }
 
 fn checkout_rollback_branch_update(
@@ -2437,7 +2531,7 @@ fn checkout_switch_to_unborn_branch(git_dir: &Path, branch: &str) -> Result<()> 
 }
 
 enum CheckoutMessage {
-    Existing { branch: String },
+    Existing { branch: String, announce: bool },
     New { branch: String },
     Reset { branch: String },
 }
@@ -2445,13 +2539,24 @@ enum CheckoutMessage {
 impl CheckoutMessage {
     fn branch(&self) -> &str {
         match self {
-            Self::Existing { branch } | Self::New { branch } | Self::Reset { branch } => branch,
+            Self::Existing { branch, .. } | Self::New { branch } | Self::Reset { branch } => branch,
+        }
+    }
+
+    fn announces(&self) -> bool {
+        match self {
+            Self::Existing { announce, .. } => *announce,
+            Self::New { .. } | Self::Reset { .. } => true,
         }
     }
 
     fn print(&self) {
         match self {
-            Self::Existing { branch } => eprintln!("Switched to branch '{branch}'"),
+            Self::Existing { branch, announce } => {
+                if *announce {
+                    eprintln!("Switched to branch '{branch}'");
+                }
+            }
             Self::New { branch } => eprintln!("Switched to a new branch '{branch}'"),
             Self::Reset { branch } => eprintln!("Switched to and reset branch '{branch}'"),
         }

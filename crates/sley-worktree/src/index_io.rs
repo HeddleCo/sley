@@ -19,6 +19,28 @@ pub(crate) fn restore_index_entry(
     smudge_config: Option<&GitConfig>,
     stat_cache: Option<&IndexStatCache>,
 ) -> Result<Option<IndexEntry>> {
+    restore_index_entry_maybe_delayed(
+        worktree_root,
+        git_dir,
+        format,
+        db,
+        entry,
+        smudge_config,
+        stat_cache,
+        None,
+    )
+}
+
+pub(crate) fn restore_index_entry_maybe_delayed(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    entry: &IndexEntry,
+    smudge_config: Option<&GitConfig>,
+    stat_cache: Option<&IndexStatCache>,
+    mut delayed: Option<&mut DelayedCheckoutQueue>,
+) -> Result<Option<IndexEntry>> {
     // A gitlink (mode 160000) names a commit in the submodule's repository, not
     // a blob here — reading it as a blob fails ("not found: blob object"). git's
     // `checkout_entry` S_IFGITLINK arm just ensures the submodule directory
@@ -49,13 +71,30 @@ pub(crate) fn restore_index_entry(
                 format,
                 entry.path.as_bytes(),
             )?;
-            apply_smudge_filter_with_attributes_cow_format(
+            match apply_smudge_filter_with_attributes_maybe_delayed(
                 config,
                 &checks,
                 entry.path.as_bytes(),
                 &object.body,
                 format,
-            )?
+                delayed.is_some() && (entry.mode & 0o170000) != 0o120000,
+            )? {
+                SmudgeFilterResult::Content(body) => body,
+                SmudgeFilterResult::Delayed { process } => {
+                    let queue = delayed
+                        .as_deref_mut()
+                        .expect("delay is only reported when a queue is available");
+                    queue.enqueue(
+                        process,
+                        entry.path.as_bytes(),
+                        &TrackedEntry {
+                            mode: entry.mode,
+                            oid: entry.oid,
+                        },
+                    );
+                    return Ok(Some(unmaterialized_index_entry_from_index(entry)));
+                }
+            }
         }
         None => Cow::Borrowed(&object.body),
     };
@@ -107,12 +146,6 @@ pub(crate) fn restored_head_index_entry(
         flags_extended: 0,
         path: BString::from(path),
     })
-}
-
-pub(crate) fn index_has_entry_under(entries: &[IndexEntry], directory: &[u8]) -> bool {
-    entries
-        .iter()
-        .any(|entry| index_entry_is_under_path(entry.path.as_bytes(), directory))
 }
 
 pub(crate) fn index_entry_is_under_path(entry_path: &[u8], directory: &[u8]) -> bool {
@@ -635,57 +668,36 @@ pub(crate) fn checkout_switch_head_symbolic(
     tx.commit()
 }
 
-pub(crate) fn cache_tree_is_valid(tree: &CacheTree) -> bool {
-    if tree.entry_count < 0 || tree.oid.is_none() {
-        return false;
-    }
-    tree.subtrees
-        .iter()
-        .all(|child| cache_tree_is_valid(&child.tree))
-}
-
-pub(crate) fn head_matches_index_from_cache_tree(
+pub(crate) fn head_matches_index_from_entries(
     index: &Index,
     format: ObjectFormat,
     head_tree_oid: &ObjectId,
-    stage0_entry_count: usize,
 ) -> Result<bool> {
-    let cache_tree = match index.cache_tree(format) {
-        Ok(Some(cache_tree)) => cache_tree,
-        Ok(None) | Err(_) => return Ok(false),
-    };
-    if !cache_tree_is_valid(&cache_tree) {
+    if index
+        .entries
+        .iter()
+        .any(|entry| entry.stage() != Stage::Normal)
+    {
         return Ok(false);
     }
-    let Some(root_oid) = cache_tree.oid.as_ref() else {
-        return Ok(false);
-    };
-    if root_oid != head_tree_oid {
-        return Ok(false);
-    }
-    Ok(cache_tree.entry_count as usize == stage0_entry_count)
+    let index_tree = index_entry_tree_oid_without_cache(index, format)?;
+    Ok(&index_tree == head_tree_oid)
 }
 
-pub(crate) fn head_matches_borrowed_index_from_cache_tree(
+pub(crate) fn head_matches_borrowed_index_from_entries(
     index: &BorrowedIndex<'_>,
     format: ObjectFormat,
     head_tree_oid: &ObjectId,
-    stage0_entry_count: usize,
 ) -> Result<bool> {
-    let cache_tree = match index.cache_tree(format) {
-        Ok(Some(cache_tree)) => cache_tree,
-        Ok(None) | Err(_) => return Ok(false),
-    };
-    if !cache_tree_is_valid(&cache_tree) {
+    if index
+        .entries
+        .iter()
+        .any(|entry| entry.stage() != Stage::Normal)
+    {
         return Ok(false);
     }
-    let Some(root_oid) = cache_tree.oid.as_ref() else {
-        return Ok(false);
-    };
-    if root_oid != head_tree_oid {
-        return Ok(false);
-    }
-    Ok(cache_tree.entry_count as usize == stage0_entry_count)
+    let index_tree = borrowed_index_entry_tree_oid_without_cache(index, format)?;
+    Ok(&index_tree == head_tree_oid)
 }
 
 /// Parses the index a single time and returns both the path -> [`TrackedEntry`]
@@ -751,20 +763,13 @@ pub(crate) fn read_index_with_stat_cache_entries(
     };
     let index = sley_index::read_repository_index(git_dir, format)?;
     let index_mtime = file_mtime_parts(&index_metadata);
-    let stage0_entry_count = index
-        .entries
-        .iter()
-        .filter(|entry| index_entry_stage(entry) == 0)
-        .count();
     let stat_cache = if include_entries {
         IndexStatCache::from_index_mtime(&index, index_mtime)
     } else {
         IndexStatCache::from_index_mtime_only(index_mtime)
     };
     let head_matches_index = match resolve_head_tree_oid(git_dir, format, db)? {
-        Some(head_tree_oid) => {
-            head_matches_index_from_cache_tree(&index, format, &head_tree_oid, stage0_entry_count)?
-        }
+        Some(head_tree_oid) => head_matches_index_from_entries(&index, format, &head_tree_oid)?,
         None => false,
     };
     Ok((index, stat_cache, head_matches_index))
@@ -948,6 +953,9 @@ pub(crate) fn worktree_entry_for_git_path(
     expected_mode: u32,
     stat_cache: Option<&IndexStatCache>,
 ) -> Result<Option<TrackedEntry>> {
+    if git_path_has_symlink_parent(worktree_root, git_path)? {
+        return Ok(None);
+    }
     let absolute = worktree_root.join(repo_path_to_os_path(git_path)?);
     let metadata = match fs::symlink_metadata(&absolute) {
         Ok(metadata) => metadata,
@@ -1030,6 +1038,9 @@ pub(crate) fn worktree_entry_for_index_entry_with_attributes(
 ) -> Result<Option<TrackedEntry>> {
     let git_path = index_entry.path.as_bytes();
     let expected_mode = index_entry.mode;
+    if git_path_has_symlink_parent(worktree_root, git_path)? {
+        return Ok(None);
+    }
     let absolute = worktree_root.join(repo_path_to_os_path(git_path)?);
     let metadata = match fs::symlink_metadata(&absolute) {
         Ok(metadata) => metadata,
@@ -1117,6 +1128,9 @@ pub(crate) fn worktree_entry_for_index_entry_ref_with_attributes(
 ) -> Result<Option<TrackedEntry>> {
     let git_path = index_entry.path;
     let expected_mode = index_entry.mode;
+    if git_path_has_symlink_parent(worktree_root, git_path)? {
+        return Ok(None);
+    }
     let absolute = worktree_root.join(repo_path_to_os_path(git_path)?);
     let metadata = match fs::symlink_metadata(&absolute) {
         Ok(metadata) => metadata,
@@ -1208,6 +1222,78 @@ pub(crate) fn clean_filtered_oid_for_status(
         return EncodedObject::new(ObjectType::Blob, raw_body.to_vec()).object_id(format);
     }
     Ok(clean_oid)
+}
+
+#[derive(Default)]
+pub struct StatCleanFilterValidator {
+    clean_filter: Option<TrackedOnlyCleanFilter>,
+}
+
+impl StatCleanFilterValidator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn validate_path(
+        &mut self,
+        worktree_root: &Path,
+        git_dir: &Path,
+        format: ObjectFormat,
+        _index_mode: u32,
+        index_oid: ObjectId,
+        _index_size: u32,
+        git_path: &[u8],
+        absolute_path: &Path,
+        metadata: &fs::Metadata,
+    ) -> Result<Option<sley_diff_merge::IndexWorktreeValidatedEntry>> {
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        let clean_filter =
+            tracked_only_clean_filter(&mut self.clean_filter, worktree_root, git_dir);
+        clean_filter.read_attributes_for_path(worktree_root, git_path)?;
+        let checks =
+            clean_filter
+                .matcher
+                .attributes_for_path(git_path, &clean_filter.requested, false);
+        let body = fs::read(absolute_path)?;
+        if !clean_encoding_needs_stat_match_validation(&clean_filter.config, &checks) {
+            let clean =
+                apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?;
+            let oid = EncodedObject::new(ObjectType::Blob, clean).object_id(format)?;
+            let oid = clean_or_raw_oid_for_index(format, &body, oid, index_oid)?;
+            return Ok(Some(sley_diff_merge::IndexWorktreeValidatedEntry {
+                mode: worktree_entry_mode(metadata),
+                oid,
+            }));
+        }
+        validate_clean_encoding_for_stat_match(&clean_filter.config, &checks, git_path, &body)?;
+        let clean =
+            apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?;
+        let oid = EncodedObject::new(ObjectType::Blob, clean).object_id(format)?;
+        let oid = clean_or_raw_oid_for_index(format, &body, oid, index_oid)?;
+        Ok(Some(sley_diff_merge::IndexWorktreeValidatedEntry {
+            mode: worktree_entry_mode(metadata),
+            oid,
+        }))
+    }
+}
+
+fn clean_or_raw_oid_for_index(
+    format: ObjectFormat,
+    raw_body: &[u8],
+    clean_oid: ObjectId,
+    index_oid: ObjectId,
+) -> Result<ObjectId> {
+    if clean_oid == index_oid {
+        return Ok(clean_oid);
+    }
+    let raw_oid = EncodedObject::new(ObjectType::Blob, raw_body.to_vec()).object_id(format)?;
+    if raw_oid == index_oid {
+        Ok(raw_oid)
+    } else {
+        Ok(clean_oid)
+    }
 }
 
 pub(crate) struct TrackedOnlyCleanFilter {
@@ -1644,6 +1730,35 @@ pub(crate) fn is_embedded_git_internals(root: &Path, path: &Path) -> bool {
         current.push(component);
     }
     false
+}
+
+pub(crate) fn git_path_has_symlink_parent(worktree_root: &Path, git_path: &[u8]) -> Result<bool> {
+    let text =
+        std::str::from_utf8(git_path).map_err(|err| GitError::InvalidPath(err.to_string()))?;
+    let mut current = worktree_root.to_path_buf();
+    let mut components = text.split('/').peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn worktree_entry_mode(metadata: &fs::Metadata) -> u32 {

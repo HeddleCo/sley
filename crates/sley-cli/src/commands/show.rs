@@ -427,6 +427,7 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
                 .unwrap_or(false),
         );
     }
+    show_warn_graft_file_deprecated(git_dir, config);
 
     // Ref decorations feed the `commit`/oneline header and the `%d`/`%D`
     // placeholders. `git show` leaves them off unless `--decorate` is given, but a
@@ -571,6 +572,23 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
     stdout.flush()?;
     show_profile_mark(profile_enabled, "flush", profile_start, &mut profile_last);
     Ok(())
+}
+
+fn show_warn_graft_file_deprecated(git_dir: &Path, config: &GitConfig) {
+    if config
+        .get_bool("advice", None, "graftFileDeprecated")
+        .unwrap_or(true)
+        && git_dir.join("info").join("grafts").exists()
+    {
+        eprintln!("hint: Support for <GIT_DIR>/info/grafts is deprecated");
+        eprintln!("hint: and will be removed in a future Git version.");
+        eprintln!("hint: ");
+        eprintln!("hint: Please use \"git replace --convert-graft-file\"");
+        eprintln!("hint: to convert the grafts into replace refs.");
+        eprintln!("hint: ");
+        eprintln!("hint: Turn this message off by running");
+        eprintln!("hint: \"git config set advice.graftFileDeprecated false\"");
+    }
 }
 
 fn show_profile_enabled() -> bool {
@@ -903,10 +921,12 @@ fn show_commit(
             stdout.write_all(b"\n")?;
         }
         ShowCommitFormat::Custom { compiled, .. } => {
+            let source_tag_signatures = HashMap::new();
             let signature_ctx = LogSignatureContext {
                 git_dir: context.git_dir,
                 db: context.db,
                 config: context.config,
+                source_tag_signatures: &source_tag_signatures,
             };
             // `git show --format=…` is a userformat: `%N` injects the note
             // (raw), so route through the notes-aware emitter when notes are
