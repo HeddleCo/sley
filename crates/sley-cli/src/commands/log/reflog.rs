@@ -201,10 +201,6 @@ pub(super) fn compile_log_filter_matcher(
     if patterns.is_empty() {
         return Ok(None);
     }
-    if !matches!(kind, sley_grep::PatternKind::Fixed) && patterns.iter().any(|pat| pat.is_empty()) {
-        eprintln!("fatal: {error_context}, '': empty (sub)expression");
-        return Err(GitError::Exit(128));
-    }
     sley_grep::GrepMatcher::compile_with_error_context(
         sley_grep::GrepCompileConfig {
             patterns,
@@ -212,7 +208,7 @@ pub(super) fn compile_log_filter_matcher(
             ignore_case,
             word: false,
             line_regexp: false,
-            diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity::Verbose,
+            diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity::Default,
         },
         error_context,
     )

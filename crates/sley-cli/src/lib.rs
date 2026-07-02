@@ -9499,12 +9499,16 @@ fn log_inter_hunk_context_requires_number_error() -> Result<()> {
 }
 
 fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
-    // git's diff_opt_char (diff.c) accepts an empty string (suppress the marker)
-    // or exactly one byte; multibyte Unicode scalars are rejected.
-    if value.len() <= 1 {
+    // git's diff_opt_char (diff.c) requires exactly one byte; empty and multibyte
+    // values are rejected.
+    if value.len() == 1 {
         return Ok(());
     }
-    eprintln!("error: {option} expects a character, got '{value}'");
+    if value.is_empty() {
+        eprintln!("error: {option} expects a character, got ''");
+    } else {
+        eprintln!("error: {option} expects a character, got '{value}'");
+    }
     Err(GitError::Exit(129))
 }
 
@@ -9891,6 +9895,16 @@ impl SimpleLogRegex {
         mode: SimpleLogRegexMode,
         diagnostic_verbosity: sley_grep::RegexDiagnosticVerbosity,
     ) -> Result<Self> {
+        if pattern.is_empty() {
+            return Ok(Self {
+                alternatives: vec![SimpleLogRegexAlternative {
+                    anchor_start: false,
+                    anchor_end: false,
+                    tokens: Vec::new(),
+                }],
+                perl: None,
+            });
+        }
         if let SimpleLogRegexMode::Perl = mode {
             let regex =
                 sley_grep::Regex::compile(pattern, sley_grep::RegexMode::Pcre, false, false)?;
