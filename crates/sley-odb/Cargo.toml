@@ -11,11 +11,11 @@ license.workspace = true
 # Backend selected by the mutually-exclusive zlib-rs/pure-rust features below;
 # no backend baked into the dep line (see sley-pack for the cfg-cascade rationale).
 flate2 = { version = "1", default-features = false }
-sley-core = { path = "../sley-core", version = "0.4.0" }
-sley-formats = { path = "../sley-formats", version = "0.4.0" }
-sley-mmap = { path = "../sley-mmap", version = "0.4.0", optional = true }
-sley-object = { path = "../sley-object", version = "0.4.0" }
-sley-pack = { path = "../sley-pack", version = "0.4.0", default-features = false }
+sley-core.workspace = true
+sley-formats.workspace = true
+sley-mmap = { workspace = true, optional = true }
+sley-object.workspace = true
+sley-pack = { path = "../sley-pack", version = "0.4.0", default-features = false } # inline: default-features override cant use workspace inherit
 
 [features]
 default = ["zlib-rs"]

@@ -8,16 +8,16 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-config = { path = "../sley-config", version = "0.4.0" }
-sley-core = { path = "../sley-core", version = "0.4.0" }
-sley-diff-merge = { path = "../sley-diff-merge", version = "0.4.0" }
-sley-formats = { path = "../sley-formats", version = "0.4.0" }
-sley-index = { path = "../sley-index", version = "0.4.0" }
-sley-mmap = { path = "../sley-mmap", version = "0.4.0" }
-sley-object = { path = "../sley-object", version = "0.4.0" }
-sley-odb = { path = "../sley-odb", version = "0.4.0" }
-sley-pathspec = { path = "../sley-pathspec", version = "0.4.0" }
-sley-refs = { path = "../sley-refs", version = "0.4.0" }
+sley-config.workspace = true
+sley-core.workspace = true
+sley-diff-merge.workspace = true
+sley-formats.workspace = true
+sley-index.workspace = true
+sley-mmap.workspace = true
+sley-object.workspace = true
+sley-odb.workspace = true
+sley-pathspec.workspace = true
+sley-refs.workspace = true
 
 [lints]
 workspace = true

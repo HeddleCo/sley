@@ -11,13 +11,13 @@ crc32fast = "1"
 # zip deflate. default-features=false + zlib-rs matches sley-pack so the
 # workspace resolves a single flate2 backend (no C toolchain).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-sley-config = { path = "../sley-config" }
-sley-core = { path = "../sley-core" }
-sley-formats = { path = "../sley-formats" }
-sley-object = { path = "../sley-object" }
-sley-odb = { path = "../sley-odb" }
-sley-pathspec = { path = "../sley-pathspec" }
-sley-worktree = { path = "../sley-worktree" }
+sley-config.workspace = true
+sley-core.workspace = true
+sley-formats.workspace = true
+sley-object.workspace = true
+sley-odb.workspace = true
+sley-pathspec.workspace = true
+sley-worktree.workspace = true
 
 [lints]
 workspace = true
