@@ -7,12 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-core = { path = "../sley-core", version = "0.3.0" }
-sley-config = { path = "../sley-config", version = "0.3.0" }
-sley-formats = { path = "../sley-formats", version = "0.3.0" }
-sley-object = { path = "../sley-object", version = "0.3.0" }
-sley-odb = { path = "../sley-odb", version = "0.3.0" }
-sley-submodule = { path = "../sley-submodule", version = "0.3.0" }
+sley-core = { path = "../sley-core", version = "0.4.0" }
+sley-config = { path = "../sley-config", version = "0.4.0" }
+sley-formats = { path = "../sley-formats", version = "0.4.0" }
+sley-object = { path = "../sley-object", version = "0.4.0" }
+sley-odb = { path = "../sley-odb", version = "0.4.0" }
+sley-submodule = { path = "../sley-submodule", version = "0.4.0" }
 
 [lints]
 workspace = true

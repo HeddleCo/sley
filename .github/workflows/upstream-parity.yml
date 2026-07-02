@@ -2,7 +2,7 @@ name: Upstream Git Parity Tests
 
 # Run sley against the upstream git t/*.sh test suite — the authoritative
 # parity oracle. This workflow:
-#   1. Builds git 2.54.0 from source (cached) so test-lib.sh has a real built
+#   1. Builds git 2.55.0 from source (cached) so test-lib.sh has a real built
 #      checkout (GIT-BUILD-OPTIONS + t/).
 #   2. Builds the sley binary and runs the expanded t-file subset through
 #      crates/sley-testkit/scripts/run-upstream-tests-waves.sh.
@@ -10,7 +10,7 @@ name: Upstream Git Parity Tests
 #      its recorded ok-assertion count. A net gain never fails the gate; only a
 #      regression below floor does.
 #
-# Triggered manually or weekly. Pinned to git 2.54.0 so the floors below stay
+# Triggered manually or weekly. Pinned to git 2.55.0 so the floors below stay
 # meaningful across runs (a newer git could add/rename assertions and shift the
 # baseline out from under the floors).
 
@@ -18,9 +18,9 @@ on:
   workflow_dispatch:
     inputs:
       git_version:
-        description: 'Upstream git version tag to build from source (default v2.54.0)'
+        description: 'Upstream git version tag to build from source (default v2.55.0)'
         required: false
-        default: 'v2.54.0'
+        default: 'v2.55.0'
   schedule:
     # Weekly: Thursdays 08:00 UTC.
     - cron: '0 8 * * 4'
@@ -33,7 +33,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ORACLE_GIT_TAG: ${{ github.event.inputs.git_version || 'v2.54.0' }}
+  ORACLE_GIT_TAG: ${{ github.event.inputs.git_version || 'v2.55.0' }}
 
 jobs:
   upstream-parity:
@@ -1026,7 +1026,7 @@ jobs:
       # count. Reads the per-script summary CSV the runner writes
       # (script,command,result,ok,notok,total,plan_total). A net GAIN passes;
       # only a DROP below floor fails. Floors recorded 2026-06-10 against
-      # base b069dbe + git 2.54.0.
+      # base b069dbe + git 2.55.0.
       - name: Check parity floors
         run: |
           bash .github/workflows/scripts/check-parity-floors.sh \
