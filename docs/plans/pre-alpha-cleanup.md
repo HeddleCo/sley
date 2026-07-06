@@ -8,7 +8,22 @@
 |------|--------|-------|
 | W00 | ✅ done | expect_used, capability inlines, flatten_tree wrappers, README, docs |
 | W10–W13 | ✅ done | pack cap, inflate bounds, URL redact, cred cap |
-| W20–W90 | ⏳ pending | |
+| W20 | ✅ done | sley-protocol module split |
+| W21 | ✅ done | sley-pack module split |
+| W22 | ✅ done | sley-diff-merge + absorb sley-diff-format |
+| W23a–c | ✅ done | fanout prefix, mmap index paths |
+| W23d–e | ✅ done | sley-odb module split (install/loose/pack/registry/reachability/repack) |
+| W24 | ✅ done | lint burn-down non-CLI engines |
+| W30 | ✅ done | unified ancestor_depths on sley-rev |
+| W31 | ✅ done | log format → sley-pretty; CLI adapter wiring |
+| W32 | ⚠️ partial | worktree + pack parsers (13/47) |
+| W34 | ⚠️ partial | sley-rev diff_options module landed |
+| W40 | ✅ done | engine parity harness |
+| W41 | ⚠️ partial | 62 parity tests (target 200) |
+| W50–W52 | ⏳ pending | CliSession, facade-only deps |
+| W52a | ✅ done | hooks + env-aware OpenOptions in sley facade |
+| W51, W60–W72, W90 | ⏳ pending | remote_cmds delete, CLI splits, manual parity gate |
+| W71 | ✅ done | sley-fetch → sley-remote::install |
 
 **Decisions locked:** `sley-pretty` in place (no rename); hooks **(a)** → W52a; integration branch until W90; parity gate manual at end.  
 **Date:** 2026-07-05  
