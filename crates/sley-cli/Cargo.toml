@@ -21,6 +21,7 @@ filetime = "0.2"
 # the backend is unified to zlib-rs by the transitive sley-odb default feature.
 flate2 = { version = "1", default-features = false }
 regex = "1"
+sley.workspace = true
 sley-archive.workspace = true
 sley-config.workspace = true
 sley-core.workspace = true

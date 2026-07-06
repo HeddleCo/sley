@@ -17,7 +17,12 @@
 //! * [`Repository::copy_reachable_from`] — pack-based object transfer.
 //! * [`Repository::remote`] / [`remote::RemoteContext`] — URL rewriting and
 //!   [`sley_remote`] fetch/push/clone/ls-remote orchestration (HTTP v2 fetch,
-//!   SSH, bundle fetch, thin-pack push).
+//!   SSH, bundle fetch, thin-pack push). Porcelain paths on the facade
+//!   ([`Repository::push`], and future commit/checkout helpers) invoke git
+//!   hooks via [`hooks`] when a hook is configured.
+//! * [`hooks`] — traditional and config-defined hook discovery/execution.
+//! * [`OpenOptions::respect_environment`] / [`Repository::open_from_environment`]
+//!   — honor `GIT_DIR`, `GIT_WORK_TREE`, and related discovery env vars.
 //! * [`notes`] — git notes read/write for round-trip fidelity.
 //! * [`Repository::capabilities`] / [`Repository::transport_capabilities`] —
 //!   capability probes before calling in.
@@ -43,9 +48,11 @@
 mod capabilities;
 mod config_edit;
 mod diff;
+pub mod hooks;
 mod index_io;
 mod notes_repo;
 mod objects;
+mod open_env;
 mod pack_plan;
 mod refs;
 mod remote_edit;
@@ -140,6 +147,10 @@ pub use refs::{
     RefDeleteExpected, RefUpdateOptions, ReflogMessage,
 };
 pub use rev_graph::{ReachableCommit, ReachableCommitOptions, RevGraph};
+pub use hooks::{
+    HookEnvironment, HookRun, KNOWN_HOOKS, cmd_hook, hook_exists, run_hook, run_hook_l,
+    run_post_index_change_hook, run_reference_transaction_hook_at, run_traditional_hook_at,
+};
 pub use status_plan::{
     OwnedStatusRow, StatusCacheKey, StatusCode, StatusPlan, StatusPlanBuilder, StatusRow,
 };
@@ -303,11 +314,12 @@ impl HeadState {
 }
 
 /// Repository open behavior for callers that need to distinguish discovery from
-/// exact git-directory opening.
+/// exact git-directory opening and whether process environment overrides apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenOptions {
     exact_path: bool,
     bare: bool,
+    respect_environment: bool,
 }
 
 impl OpenOptions {
@@ -315,6 +327,7 @@ impl OpenOptions {
         Self {
             exact_path: false,
             bare: false,
+            respect_environment: false,
         }
     }
 
@@ -331,12 +344,25 @@ impl OpenOptions {
         self
     }
 
+    /// When true, honor `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`,
+    /// `GIT_CEILING_DIRECTORIES`, and `GIT_DISCOVERY_ACROSS_FILESYSTEM` while
+    /// resolving `path`. Embedders and harnesses that mirror git's subprocess
+    /// environment should enable this (see [`Repository::open_from_environment`]).
+    pub fn respect_environment(mut self, respect_environment: bool) -> Self {
+        self.respect_environment = respect_environment;
+        self
+    }
+
     pub fn is_exact_path(self) -> bool {
         self.exact_path
     }
 
     pub fn requires_bare(self) -> bool {
         self.bare
+    }
+
+    pub fn respects_environment(self) -> bool {
+        self.respect_environment
     }
 }
 
@@ -350,16 +376,26 @@ impl Default for OpenOptions {
 ///
 /// Construct one with [`Repository::open`] (when you already know the git
 /// directory), [`Repository::discover`] (to search upward from a working-tree
-/// path), or [`Repository::init`] / [`Repository::init_bare`] (to create a new
-/// repository). The handle is cheap to clone and shares a session-scoped object
-/// database ([`Repository::objects`]) whose read caches survive across calls
-/// until [`Repository::refresh_objects`] (automatic after `fetch` / pack copy).
+/// path), [`Repository::open_from_environment`] (when `GIT_DIR` / `GIT_WORK_TREE`
+/// are set), or [`Repository::init`] / [`Repository::init_bare`] (to create a
+/// new repository).
+///
+/// Porcelain operations exposed on this type run git hooks when configured:
+/// [`Repository::push`] (and future commit/checkout helpers) invoke the
+/// matching `pre-*` / `post-*` hooks through [`hooks`], matching CLI behavior.
+/// Low-level helpers ([`Repository::write_object`], [`Repository::apply_ref_changes`],
+/// etc.) do not run hooks — callers opt in explicitly via [`run_hook`].
+///
+/// The handle is cheap to clone and shares a session-scoped object database
+/// ([`Repository::objects`]) whose read caches survive across calls until
+/// [`Repository::refresh_objects`] (automatic after `fetch` / pack copy).
 #[derive(Debug, Clone)]
 pub struct Repository {
     git_dir: PathBuf,
     common_dir: PathBuf,
     format: ObjectFormat,
     objects: Arc<FileObjectDatabase>,
+    work_tree_override: Option<PathBuf>,
 }
 
 impl PartialEq for Repository {
@@ -367,6 +403,7 @@ impl PartialEq for Repository {
         self.git_dir == other.git_dir
             && self.common_dir == other.common_dir
             && self.format == other.format
+            && self.work_tree_override == other.work_tree_override
     }
 }
 
@@ -389,19 +426,32 @@ impl Repository {
                 git_dir.display()
             )));
         }
-        Self::from_git_dir(git_dir)
+        Self::from_git_dir(git_dir, None)
     }
 
-    /// Open a repository with explicit discovery and bare-worktree policy.
+    /// Open a repository with explicit discovery, bare-worktree, and
+    /// environment policy.
     ///
     /// Use `OpenOptions::new().exact_path(true).bare(true)` for scratch bare
     /// directories where silently discovering a parent checkout would be wrong.
+    /// Use [`OpenOptions::respect_environment`] (or [`Repository::open_from_environment`])
+    /// when `GIT_DIR` / `GIT_WORK_TREE` must be honored.
     pub fn open_with(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
-        let repo = if options.exact_path {
-            Self::open(path)
+        let (git_dir, work_tree_override) = if options.respect_environment {
+            let resolved = open_env::resolve_repository(path.as_ref(), options.exact_path)?;
+            (resolved.git_dir, resolved.work_tree_override)
+        } else if options.exact_path {
+            (resolve_git_dir(path.as_ref())?, None)
         } else {
-            Self::discover(path)
-        }?;
+            (discover_git_dir(path.as_ref())?, None)
+        };
+        if !is_git_dir(&git_dir) {
+            return Err(GitError::repository_not_found(format!(
+                "not a git repository: {}",
+                git_dir.display()
+            )));
+        }
+        let repo = Self::from_git_dir(git_dir, work_tree_override)?;
         if options.bare && repo.workdir().is_some() {
             return Err(GitError::InvalidFormat(format!(
                 "repository is not bare: {}",
@@ -409,6 +459,13 @@ impl Repository {
             )));
         }
         Ok(repo)
+    }
+
+    /// Open a repository honoring `GIT_DIR`, `GIT_WORK_TREE`, and related
+    /// discovery environment variables (equivalent to
+    /// `OpenOptions::new().respect_environment(true)`).
+    pub fn open_from_environment(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, OpenOptions::new().respect_environment(true))
     }
 
     /// Open exactly `git_dir` as a bare repository, never discovering a parent.
@@ -421,7 +478,7 @@ impl Repository {
     /// file, or a bare repository at an ancestor).
     pub fn discover(path: impl AsRef<Path>) -> Result<Self> {
         let git_dir = discover_git_dir(path.as_ref())?;
-        Self::from_git_dir(git_dir)
+        Self::from_git_dir(git_dir, None)
     }
 
     /// Initialize a new non-bare repository rooted at `path` (creating its
@@ -445,10 +502,10 @@ impl Repository {
         bare: bool,
     ) -> Result<Self> {
         let layout = sley_formats::RepositoryLayout::init_at(path, format, bare)?;
-        Self::from_git_dir(layout.git_dir)
+        Self::from_git_dir(layout.git_dir, None)
     }
 
-    fn from_git_dir(git_dir: PathBuf) -> Result<Self> {
+    fn from_git_dir(git_dir: PathBuf, work_tree_override: Option<PathBuf>) -> Result<Self> {
         let common_dir = sley_odb::repository_common_dir(&git_dir);
         let format = read_object_format(&common_dir)?;
         let objects = Arc::new(FileObjectDatabase::from_git_dir(&common_dir, format));
@@ -457,6 +514,7 @@ impl Repository {
             common_dir,
             format,
             objects,
+            work_tree_override,
         })
     }
 
@@ -477,12 +535,15 @@ impl Repository {
     ///
     /// Resolution follows git's repository-intrinsic rules: a `core.worktree`
     /// override, then a linked worktree's recorded location, then the parent of
-    /// the `.git` directory for an ordinary checkout. It does *not* consult the
-    /// process-level `GIT_WORK_TREE`/`GIT_DIR` overrides (those belong to a CLI
-    /// front-end, not a library handle). A working tree that is configured but
-    /// cannot be resolved on disk (e.g. a `core.worktree` pointing at a missing
-    /// path) is reported as `None` rather than erroring.
+    /// the `.git` directory for an ordinary checkout. When this handle was opened
+    /// with [`OpenOptions::respect_environment`] and `GIT_WORK_TREE` was set,
+    /// that override wins. A working tree that is configured but cannot be
+    /// resolved on disk (e.g. a `core.worktree` pointing at a missing path) is
+    /// reported as `None` rather than erroring.
     pub fn workdir(&self) -> Option<PathBuf> {
+        if let Some(work_tree) = &self.work_tree_override {
+            return Some(work_tree.clone());
+        }
         sley_worktree::worktree_root_for_git_dir(&self.git_dir)
             .ok()
             .flatten()
