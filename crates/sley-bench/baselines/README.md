@@ -8,8 +8,13 @@ CSV snapshots from `cargo bench -p sley-bench` for regression tracking (W70).
 cargo bench -p sley-bench --bench rev_parse 2>&1 | tee /tmp/sley-bench-rev_parse.txt
 ```
 
-Record the `odb_resolve_prefix/1000` and `odb_resolve_prefix/100000` medians in
+Record the `odb_resolve_prefix/1000` (`rev_parse_oid_resolve_1k`) and
+`odb_resolve_prefix/100000` (`rev_parse_oid_resolve_100k`) medians in
 `rev_parse.csv` after each intentional perf change.
+
+The 100k fixture is built on first bench run via
+[`LARGE_FIXTURE_OBJECT_COUNT`](../../src/lib.rs); allow several minutes for the
+initial pack write.
 
 ## Suites
 

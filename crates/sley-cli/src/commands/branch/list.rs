@@ -960,6 +960,26 @@ pub(super) fn branch_remote_or_all_mode(value: &str) -> Option<BranchListMode> {
     }
 }
 
+/// Resolve `-r` / `--remotes` / `-a` / `--all` after match guards validated `flag`.
+pub(super) fn branch_remote_or_all_mode_unchecked(flag: &str) -> BranchListMode {
+    branch_remote_or_all_mode(flag).expect("flag is -r/--remotes/-a/--all")
+}
+
+pub(super) fn print_branch_list_remote_or_all_flag(
+    store: &FileRefStore,
+    flag: &str,
+) -> Result<()> {
+    print_branch_list(store, branch_remote_or_all_mode_unchecked(flag))
+}
+
+pub(super) fn print_branch_list_colored_remote_or_all_flag(
+    git_dir: &Path,
+    store: &FileRefStore,
+    flag: &str,
+) -> Result<()> {
+    print_branch_list_colored(git_dir, store, branch_remote_or_all_mode_unchecked(flag))
+}
+
 pub(super) fn branch_column_noop_flag(value: &str) -> bool {
     matches!(
         value,

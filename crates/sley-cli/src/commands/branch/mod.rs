@@ -12,6 +12,7 @@ mod list;
 mod move_;
 mod operand;
 mod positional;
+mod positional_table;
 mod upstream;
 
 // Names in scope for branch_options.rs (`use super::{...}`).

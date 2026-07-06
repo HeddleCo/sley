@@ -1,13 +1,33 @@
 //! Positional / legacy argv patterns for `git branch`.
 //!
-//! Mechanical argv `match` with guard-then-`.expect()` after `is_some()` checks;
-//! isolated `expect_used` allow until the match is table-driven (post-W90).
+//! This module is the W60 mechanical argv `match` (~5.9k LOC). Each arm uses
+//! guard-then-`.expect()` after `is_some()` checks; the module-level
+//! `expect_used` allow is intentional until the table lands post-W90.
+//!
+//! **Post-W90 table-driven migration path** (do not rewrite wholesale before
+//! the parity gate):
+//!
+//! 1. **Extract shared permutations** — remote/all list + noop-display arms
+//!    already route through [`super::positional_table`] and
+//!    [`branch_remote_or_all_mode_unchecked`]; extend that table for the next
+//!    highest-churn clusters (color/column/abbrev noop flags, create/delete).
+//! 2. **Introduce an argv pattern table** — keyed by `(argc, token classes)`
+//!    with small dispatch closures; keep `match` as a thin router over table
+//!    hits until coverage is complete.
+//! 3. **Burn down `expect_used`** — replace guard+`.expect()` with table
+//!    entries that encode the invariant; drop this module's `#![allow]` once
+//!    clippy is clean.
+//!
+//! See also [`super::positional_table`] and plan §12 / W72.
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
 
 use super::create::{branch_create_set_tracking, create_branch_from_start};
 use super::delete::{delete_merged_branches, force_delete_branches, force_update_branch};
 use super::list::*;
+use super::positional_table::{
+    RemoteOrAllNoopDisplayCount, dispatch_remote_or_all_noop_display,
+};
 use crate::*;
 
 pub(super) fn dispatch_branch_positional_args(
@@ -61,53 +81,47 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_color_always_flag(color)
                 && no_color == "--no-color" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            print_branch_list(store, mode)
+            dispatch_remote_or_all_noop_display(store, flag, RemoteOrAllNoopDisplayCount::Two)
         }
         [flag, no_color, color]
             if branch_remote_or_all_mode(flag).is_some()
                 && no_color == "--no-color"
                 && branch_color_always_flag(color) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            print_branch_list_colored(git_dir, store, mode)
+            print_branch_list_colored_remote_or_all_flag(git_dir, store, flag)
         }
         [flag, display_flag]
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_list_noop_display_flag(display_flag) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            print_branch_list(store, mode)
+            dispatch_remote_or_all_noop_display(store, flag, RemoteOrAllNoopDisplayCount::One)
         }
         [display_flag, flag]
             if branch_list_noop_display_flag(display_flag)
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            print_branch_list(store, mode)
+            dispatch_remote_or_all_noop_display(store, flag, RemoteOrAllNoopDisplayCount::One)
         }
         [flag, first, second]
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_column_noop_flag(first)
                 && branch_column_noop_flag(second) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            print_branch_list(store, mode)
+            dispatch_remote_or_all_noop_display(store, flag, RemoteOrAllNoopDisplayCount::Two)
         }
         [first, second, flag]
             if branch_column_noop_flag(first)
                 && branch_column_noop_flag(second)
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
-            print_branch_list(store, mode)
+            dispatch_remote_or_all_noop_display(store, flag, RemoteOrAllNoopDisplayCount::Two)
         }
         [flag, first, second]
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_abbrev_noop_flag(first)
                 && branch_abbrev_noop_flag(second) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [first, second, flag]
@@ -115,7 +129,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_abbrev_noop_flag(second)
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, first, second]
@@ -123,7 +137,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_omit_empty_value(first).is_some()
                 && branch_omit_empty_value(second).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [first, second, flag]
@@ -131,7 +145,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_omit_empty_value(second).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, sort, key]
@@ -139,14 +153,14 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && key == "refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, sort]
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_version_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_version_sorted(store, mode, descending)
@@ -156,7 +170,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_version_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_version_sorted(store, mode, descending)
@@ -165,7 +179,7 @@ pub(super) fn dispatch_branch_positional_args(
             if branch_version_sort_value(sort).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_version_sorted(store, mode, descending)
@@ -175,7 +189,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_version_sort_value(key).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_version_sorted(store, mode, descending)
@@ -184,7 +198,7 @@ pub(super) fn dispatch_branch_positional_args(
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_objectname_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objectname_sorted(store, mode, descending)
@@ -194,7 +208,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_objectname_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objectname_sorted(store, mode, descending)
@@ -203,7 +217,7 @@ pub(super) fn dispatch_branch_positional_args(
             if branch_objectname_sort_value(sort).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objectname_sorted(store, mode, descending)
@@ -213,7 +227,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objectname_sort_value(key).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objectname_sorted(store, mode, descending)
@@ -222,7 +236,7 @@ pub(super) fn dispatch_branch_positional_args(
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_objecttype_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
@@ -232,7 +246,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_objecttype_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
@@ -241,7 +255,7 @@ pub(super) fn dispatch_branch_positional_args(
             if branch_objecttype_sort_value(sort).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
@@ -251,7 +265,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objecttype_sort_value(key).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
@@ -260,7 +274,7 @@ pub(super) fn dispatch_branch_positional_args(
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_objectsize_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
@@ -269,7 +283,7 @@ pub(super) fn dispatch_branch_positional_args(
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_date_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let (field, descending) =
                 branch_date_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_date_sorted(git_dir, format, store, mode, field, descending)
@@ -278,7 +292,7 @@ pub(super) fn dispatch_branch_positional_args(
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_upstream_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
@@ -286,7 +300,7 @@ pub(super) fn dispatch_branch_positional_args(
         [flag, sort]
             if branch_remote_or_all_mode(flag).is_some() && branch_push_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
@@ -295,7 +309,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_objectsize_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
@@ -305,7 +319,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_date_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let (field, descending) =
                 branch_date_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_date_sorted(git_dir, format, store, mode, field, descending)
@@ -315,7 +329,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_upstream_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
@@ -325,7 +339,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_push_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
@@ -333,7 +347,7 @@ pub(super) fn dispatch_branch_positional_args(
             if branch_objectsize_sort_value(sort).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
@@ -342,7 +356,7 @@ pub(super) fn dispatch_branch_positional_args(
             if branch_date_sort_value(sort).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let (field, descending) =
                 branch_date_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_date_sorted(git_dir, format, store, mode, field, descending)
@@ -351,7 +365,7 @@ pub(super) fn dispatch_branch_positional_args(
             if branch_upstream_sort_value(sort).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
@@ -360,7 +374,7 @@ pub(super) fn dispatch_branch_positional_args(
             if branch_push_sort_value(sort).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
@@ -369,7 +383,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objectsize_sort_value(key).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
@@ -379,7 +393,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_date_sort_value(key).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let (field, descending) =
                 branch_date_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_date_sorted(git_dir, format, store, mode, field, descending)
@@ -389,7 +403,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_upstream_sort_value(key).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
@@ -399,14 +413,14 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_push_sort_value(key).is_some()
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
         [flag, sort]
             if branch_remote_or_all_mode(flag).is_some() && sort == "--sort=-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_sorted(store, mode, true)
         }
         [flag, sort, key]
@@ -414,13 +428,13 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && key == "-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_sorted(store, mode, true)
         }
         [sort, flag]
             if sort == "--sort=-refname" && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_sorted(store, mode, true)
         }
         [sort, key, flag]
@@ -428,7 +442,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && key == "-refname"
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_sorted(store, mode, true)
         }
         [flag, sort, no_sort]
@@ -436,7 +450,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort=refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, sort, no_sort]
@@ -444,7 +458,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && (branch_non_refname_sort_value(sort))
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, sort, no_sort]
@@ -452,7 +466,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort=-refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, no_sort, sort]
@@ -460,7 +474,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && sort == "--sort=refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, no_sort, sort]
@@ -468,7 +482,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && branch_version_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_version_sorted(store, mode, descending)
@@ -478,7 +492,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && branch_objectname_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objectname_sorted(store, mode, descending)
@@ -488,7 +502,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && branch_objecttype_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
@@ -498,7 +512,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && branch_objectsize_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
@@ -508,7 +522,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && branch_date_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let (field, descending) =
                 branch_date_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_date_sorted(git_dir, format, store, mode, field, descending)
@@ -518,7 +532,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && branch_upstream_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
@@ -528,7 +542,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && branch_push_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
@@ -537,7 +551,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && sort == "--sort=-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_sorted(store, mode, true)
         }
         [flag, sort, key, no_sort]
@@ -546,7 +560,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && key == "refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, sort, key, no_sort]
@@ -555,7 +569,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && (branch_non_refname_sort_value(key))
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, sort, key, no_sort]
@@ -564,7 +578,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && key == "-refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, no_sort, sort, key]
@@ -573,7 +587,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && key == "refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, no_sort, sort, key]
@@ -582,7 +596,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_version_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_version_sorted(store, mode, descending)
@@ -593,7 +607,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_objectname_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objectname_sorted(store, mode, descending)
@@ -604,7 +618,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_objecttype_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
@@ -615,7 +629,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_objectsize_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
@@ -626,7 +640,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_date_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let (field, descending) =
                 branch_date_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_date_sorted(git_dir, format, store, mode, field, descending)
@@ -637,7 +651,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_upstream_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
@@ -648,7 +662,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_push_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
@@ -658,7 +672,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && key == "-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_sorted(store, mode, true)
         }
         [sort, key, flag]
@@ -666,7 +680,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && key == "refname"
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag] if branch_ignore_case_flag(flag) => print_branch_list(store, BranchListMode::Local),
@@ -679,13 +693,13 @@ pub(super) fn dispatch_branch_positional_args(
         [flag, ignore]
             if branch_remote_or_all_mode(flag).is_some() && branch_ignore_case_flag(ignore) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [ignore, flag]
             if branch_ignore_case_flag(ignore) && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag] if flag == "--no-points-at" => print_branch_list(store, BranchListMode::Local),
@@ -1960,7 +1974,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_color_always_flag(color)
                 && no_color == "--no-color" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, color, patterns @ ..]
@@ -1997,7 +2011,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_color == "--no-color"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, no_color, color, patterns @ ..]
@@ -2006,7 +2020,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_color == "--no-color"
                 && branch_color_always_flag(color) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching_colored(store, mode, patterns)
         }
         [flag, no_color, color, list, patterns @ ..]
@@ -2015,7 +2029,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_color_always_flag(color)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching_colored(store, mode, patterns)
         }
         [flag, rev] if flag == "--points-at" => {
@@ -2316,7 +2330,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && contains == "--contains"
                 && no_contains == "--no-contains" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let contains_oid = resolve_revision(git_dir, format, contains_rev)?;
             let no_contains_oid = resolve_revision(git_dir, format, no_contains_rev)?;
             print_branch_list_contains_filters(
@@ -2333,7 +2347,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_contains == "--no-contains"
                 && contains == "--contains" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let contains_oid = resolve_revision(git_dir, format, contains_rev)?;
             let no_contains_oid = resolve_revision(git_dir, format, no_contains_rev)?;
             print_branch_list_contains_filters(
@@ -2399,7 +2413,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && merged == "--merged"
                 && no_merged == "--no-merged" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let merged_oid = resolve_revision(git_dir, format, merged_rev)?;
             let no_merged_oid = resolve_revision(git_dir, format, no_merged_rev)?;
             print_branch_list_merged_filters(
@@ -2416,7 +2430,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_merged == "--no-merged"
                 && merged == "--merged" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let merged_oid = resolve_revision(git_dir, format, merged_rev)?;
             let no_merged_oid = resolve_revision(git_dir, format, no_merged_rev)?;
             print_branch_list_merged_filters(
@@ -3216,7 +3230,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_contains_eq_value(contains).is_some()
                 && branch_no_contains_eq_value(no_contains).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let contains_oid = resolve_revision(
                 git_dir,
                 format,
@@ -3241,7 +3255,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_no_contains_eq_value(no_contains).is_some()
                 && branch_contains_eq_value(contains).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let contains_oid = resolve_revision(
                 git_dir,
                 format,
@@ -3266,7 +3280,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_merged_eq_value(merged).is_some()
                 && branch_no_merged_eq_value(no_merged).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let merged_oid = resolve_revision(
                 git_dir,
                 format,
@@ -3291,7 +3305,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_no_merged_eq_value(no_merged).is_some()
                 && branch_merged_eq_value(merged).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let merged_oid = resolve_revision(
                 git_dir,
                 format,
@@ -3436,7 +3450,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && format_flag.starts_with("--format=")
                 && no_format == "--no-format" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, format_flag, format_spec, no_format]
@@ -3445,7 +3459,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_format == "--no-format" =>
         {
             let _ = format_spec;
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, no_format, format_flag]
@@ -3453,7 +3467,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_format == "--no-format"
                 && format_flag.starts_with("--format=") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -3464,7 +3478,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_format == "--no-format"
                 && format_flag == "--format" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_format(git_dir, format, store, mode, &[], false, format_spec)
         }
         [flag, format_flag, no_format, list, patterns @ ..]
@@ -3473,7 +3487,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_format == "--no-format"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, format_flag, format_spec, no_format, list, patterns @ ..]
@@ -3483,7 +3497,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list" =>
         {
             let _ = format_spec;
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, no_format, format_flag, list, patterns @ ..]
@@ -3492,7 +3506,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && format_flag.starts_with("--format=")
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -3504,7 +3518,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && format_flag == "--format"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_format(git_dir, format, store, mode, patterns, false, format_spec)
         }
         [flag, list, format_flag, no_format, patterns @ ..]
@@ -3513,7 +3527,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && format_flag.starts_with("--format=")
                 && no_format == "--no-format" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, format_flag, format_spec, no_format, patterns @ ..]
@@ -3523,7 +3537,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_format == "--no-format" =>
         {
             let _ = format_spec;
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, format_flag, omit_empty]
@@ -3531,7 +3545,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && format_flag.starts_with("--format=")
                 && branch_omit_empty_value(omit_empty).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -3554,7 +3568,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_omit_empty_value(omit_empty).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -3577,7 +3591,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && format_flag.starts_with("--format=")
                 && branch_omit_empty_value(omit_empty).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -3599,7 +3613,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && format_flag == "--format"
                 && branch_omit_empty_value(omit_empty).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_format_omit_empty(
                 git_dir,
                 format,
@@ -3619,7 +3633,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_omit_empty_value(omit_empty).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_format_omit_empty(
                 git_dir,
                 format,
@@ -3639,7 +3653,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && format_flag == "--format"
                 && branch_omit_empty_value(omit_empty).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_format_omit_empty(
                 git_dir,
                 format,
@@ -3848,7 +3862,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && branch_list_noop_display_flag(display_flag) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, list, display_flag, patterns @ ..]
@@ -3856,7 +3870,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && branch_list_noop_display_flag(display_flag) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, first, second, list, patterns @ ..]
@@ -3865,7 +3879,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_column_noop_flag(second)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, first, second, patterns @ ..]
@@ -3874,7 +3888,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_column_noop_flag(first)
                 && branch_column_noop_flag(second) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, first, second, list, patterns @ ..]
@@ -3883,7 +3897,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_abbrev_noop_flag(second)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, first, second, patterns @ ..]
@@ -3892,7 +3906,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_abbrev_noop_flag(first)
                 && branch_abbrev_noop_flag(second) =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, display_flag, list]
@@ -3900,7 +3914,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_list_noop_display_flag(display_flag)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, display_flag, list, patterns @ ..]
@@ -3908,7 +3922,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_list_noop_display_flag(display_flag)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, first, second, list, patterns @ ..]
@@ -3917,7 +3931,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_omit_empty_value(second).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, first, second, patterns @ ..]
@@ -3926,7 +3940,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_omit_empty_value(first).is_some()
                 && branch_omit_empty_value(second).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, sort, key]
@@ -3935,7 +3949,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && key == "refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, list, sort]
@@ -3943,7 +3957,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && branch_version_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_version_sorted(store, mode, descending)
@@ -3954,7 +3968,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_version_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_version_sorted(store, mode, descending)
@@ -3964,7 +3978,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && branch_objectname_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objectname_sorted(store, mode, descending)
@@ -3975,7 +3989,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_objectname_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objectname_sorted(store, mode, descending)
@@ -3985,7 +3999,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && branch_objecttype_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
@@ -3996,7 +4010,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_objecttype_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
@@ -4006,7 +4020,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && branch_objectsize_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
@@ -4017,7 +4031,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_objectsize_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
@@ -4027,7 +4041,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && branch_upstream_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
@@ -4037,7 +4051,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && branch_push_sort_value(sort).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
@@ -4047,7 +4061,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_upstream_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
@@ -4058,7 +4072,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && branch_push_sort_value(key).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
@@ -4068,7 +4082,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objectname_sort_value(sort).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_objectname_sorted(store, mode, patterns, false, descending)
@@ -4080,7 +4094,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objectname_sort_value(key).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_objectname_sorted(store, mode, patterns, false, descending)
@@ -4091,7 +4105,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objecttype_sort_value(sort).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_objecttype_sorted(
@@ -4105,7 +4119,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objecttype_sort_value(key).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_objecttype_sorted(
@@ -4118,7 +4132,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objectsize_sort_value(sort).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_objectsize_sorted(
@@ -4132,7 +4146,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objectsize_sort_value(key).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_objectsize_sorted(
@@ -4145,7 +4159,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_upstream_sort_value(sort).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_upstream_sorted(
@@ -4158,7 +4172,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_push_sort_value(sort).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_push_sorted(
                 git_dir, store, mode, patterns, false, descending,
@@ -4171,7 +4185,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_upstream_sort_value(key).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_upstream_sorted(
@@ -4185,7 +4199,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_push_sort_value(key).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_push_sorted(
                 git_dir, store, mode, patterns, false, descending,
@@ -4197,7 +4211,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && (branch_non_refname_sort_value(sort))
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, sort, key, no_sort, patterns @ ..]
@@ -4207,7 +4221,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && (branch_non_refname_sort_value(key))
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, sort, patterns @ ..]
@@ -4216,7 +4230,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_version_sort_value(sort).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_version_sorted(store, mode, patterns, false, descending)
@@ -4228,7 +4242,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_version_sort_value(key).is_some()
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_version_sorted(store, mode, patterns, false, descending)
@@ -4238,7 +4252,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && sort == "--sort=-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_sorted(store, mode, true)
         }
         [flag, list, sort, key]
@@ -4247,7 +4261,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && key == "-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_sorted(store, mode, true)
         }
         [flag, list, sort, no_sort, patterns @ ..]
@@ -4256,7 +4270,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort=-refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, sort, key, no_sort, patterns @ ..]
@@ -4266,7 +4280,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && key == "-refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, sort, patterns @ ..]
@@ -4274,7 +4288,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && sort == "--sort=-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching_sorted(store, mode, patterns, false, true)
         }
         [flag, list, sort, key, patterns @ ..]
@@ -4283,7 +4297,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && key == "-refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching_sorted(store, mode, patterns, false, true)
         }
         [flag, list, sort, key, patterns @ ..]
@@ -4292,7 +4306,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort"
                 && key == "refname" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, sort, key, list]
@@ -4301,7 +4315,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && key == "refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list(store, mode)
         }
         [flag, sort, list]
@@ -4309,7 +4323,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_version_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_version_sorted(store, mode, descending)
@@ -4320,7 +4334,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_version_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_version_sorted(store, mode, descending)
@@ -4330,7 +4344,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objectname_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objectname_sorted(store, mode, descending)
@@ -4341,7 +4355,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objectname_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objectname_sorted(store, mode, descending)
@@ -4351,7 +4365,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objecttype_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
@@ -4362,7 +4376,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objecttype_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objecttype_sorted(git_dir, format, store, mode, descending)
@@ -4372,7 +4386,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objectsize_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
@@ -4383,7 +4397,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objectsize_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_objectsize_sorted(git_dir, format, store, mode, descending)
@@ -4393,7 +4407,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_upstream_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
@@ -4403,7 +4417,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_push_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
@@ -4413,7 +4427,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_upstream_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_upstream_sorted(git_dir, store, mode, descending)
@@ -4424,7 +4438,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_push_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_push_sorted(git_dir, store, mode, descending)
         }
@@ -4434,7 +4448,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_objectname_sorted(store, mode, patterns, false, descending)
@@ -4446,7 +4460,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_objectname_sorted(store, mode, patterns, false, descending)
@@ -4457,7 +4471,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_objecttype_sorted(
@@ -4471,7 +4485,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_objecttype_sorted(
@@ -4484,7 +4498,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_objectsize_sorted(
@@ -4498,7 +4512,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_objectsize_sorted(
@@ -4511,7 +4525,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_upstream_sorted(
@@ -4524,7 +4538,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_push_sorted(
                 git_dir, store, mode, patterns, false, descending,
@@ -4537,7 +4551,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_upstream_sorted(
@@ -4551,7 +4565,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_push_sorted(
                 git_dir, store, mode, patterns, false, descending,
@@ -4563,7 +4577,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_version_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_version_sorted(store, mode, patterns, false, descending)
@@ -4574,7 +4588,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objectname_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_objectname_sorted(store, mode, patterns, false, descending)
@@ -4585,7 +4599,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objecttype_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_objecttype_sorted(
@@ -4598,7 +4612,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objectsize_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_objectsize_sorted(
@@ -4611,7 +4625,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_date_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let (field, descending) =
                 branch_date_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_date_sorted(
@@ -4630,7 +4644,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_upstream_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_upstream_sorted(
@@ -4643,7 +4657,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_push_sort_value(sort).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_push_sorted(
                 git_dir, store, mode, patterns, false, descending,
@@ -4656,7 +4670,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_version_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_version_sorted(store, mode, patterns, false, descending)
@@ -4668,7 +4682,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objectname_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectname_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_objectname_sorted(store, mode, patterns, false, descending)
@@ -4680,7 +4694,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objecttype_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objecttype_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_objecttype_sorted(
@@ -4694,7 +4708,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_objectsize_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_objectsize_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_objectsize_sorted(
@@ -4708,7 +4722,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_date_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let (field, descending) =
                 branch_date_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_date_sorted(
@@ -4728,7 +4742,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_upstream_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_upstream_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_upstream_sorted(
@@ -4742,7 +4756,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_push_sort_value(key).is_some()
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending = branch_push_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_push_sorted(
                 git_dir, store, mode, patterns, false, descending,
@@ -4754,7 +4768,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(sort).expect("guard checked branch sort value");
             print_branch_list_matching_version_sorted(store, mode, patterns, false, descending)
@@ -4766,7 +4780,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && patterns.first().is_none_or(|value| *value != "--no-sort") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let descending =
                 branch_version_sort_value(key).expect("guard checked branch sort value");
             print_branch_list_matching_version_sorted(store, mode, patterns, false, descending)
@@ -4776,7 +4790,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort=-refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_sorted(store, mode, true)
         }
         [flag, sort, key, list]
@@ -4785,7 +4799,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && key == "-refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_sorted(store, mode, true)
         }
         [flag, sort, list, patterns @ ..]
@@ -4793,7 +4807,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort=-refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching_sorted(store, mode, patterns, false, true)
         }
         [flag, sort, key, list, patterns @ ..]
@@ -4802,7 +4816,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && key == "-refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching_sorted(store, mode, patterns, false, true)
         }
         [flag, no_sort, sort, list, patterns @ ..]
@@ -4811,7 +4825,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort=-refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching_sorted(store, mode, patterns, false, true)
         }
         [flag, no_sort, sort, key, list, patterns @ ..]
@@ -4821,7 +4835,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && key == "-refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching_sorted(store, mode, patterns, false, true)
         }
         [flag, sort, key, list, patterns @ ..]
@@ -4830,7 +4844,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && key == "refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, sort, no_sort, list, patterns @ ..]
@@ -4839,7 +4853,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, sort, no_sort, list, patterns @ ..]
@@ -4848,7 +4862,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, sort, no_sort, list, patterns @ ..]
@@ -4857,7 +4871,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, no_sort, sort, list, patterns @ ..]
@@ -4866,7 +4880,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort=refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, sort, no_sort, patterns @ ..]
@@ -4875,7 +4889,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && sort == "--sort=refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, sort, key, no_sort, list, patterns @ ..]
@@ -4885,7 +4899,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, sort, key, no_sort, list, patterns @ ..]
@@ -4895,7 +4909,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, sort, key, no_sort, list, patterns @ ..]
@@ -4905,7 +4919,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_sort == "--no-sort"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, no_sort, sort, key, list, patterns @ ..]
@@ -4915,7 +4929,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && key == "refname"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, sort, key, no_sort, patterns @ ..]
@@ -4925,7 +4939,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && key == "refname"
                 && no_sort == "--no-sort" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, format_flag, ignore, list, patterns @ ..]
@@ -4934,7 +4948,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_ignore_case_enabled_flag(ignore)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -4946,7 +4960,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_ignore_case_enabled_flag(ignore)
                 && format_flag.starts_with("--format=") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -4959,7 +4973,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && reset == "--no-ignore-case"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let format_spec = format_flag
                 .strip_prefix("--format=")
                 .ok_or_else(|| GitError::Command("branch --format requires a value".into()))?;
@@ -4971,7 +4985,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_ignore_case_enabled_flag(ignore)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_format(git_dir, format, store, mode, patterns, true, format_spec)
         }
         [flag, list, ignore, format_flag, format_spec, patterns @ ..]
@@ -4980,7 +4994,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_ignore_case_enabled_flag(ignore)
                 && format_flag == "--format" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_format(git_dir, format, store, mode, patterns, true, format_spec)
         }
         [flag, format_flag, format_spec, ignore, reset, list, patterns @ ..]
@@ -4990,7 +5004,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && reset == "--no-ignore-case"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_format(git_dir, format, store, mode, patterns, false, format_spec)
         }
         [flag, list, ignore, reset, patterns @ ..]
@@ -4999,7 +5013,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_ignore_case_enabled_flag(ignore)
                 && reset == "--no-ignore-case" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, ignore, list, reset, patterns @ ..]
@@ -5008,7 +5022,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && reset == "--no-ignore-case" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, ignore, reset, list, patterns @ ..]
@@ -5017,7 +5031,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && reset == "--no-ignore-case"
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             print_branch_list_matching(store, mode, patterns, false)
         }
         [flag, list, points_at, rev, patterns @ ..]
@@ -5025,7 +5039,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && points_at == "--points-at" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let oid = resolve_revision(git_dir, format, rev)?;
             print_branch_list_points_at_matching(store, mode, &oid, patterns)
         }
@@ -5034,7 +5048,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && points_at.starts_with("--points-at=") =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let rev = points_at
                 .strip_prefix("--points-at=")
                 .ok_or_else(|| GitError::Command("branch --points-at requires a value".into()))?;
@@ -5047,7 +5061,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && contains == "--contains"
                 && no_contains == "--no-contains" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let contains_oid = resolve_revision(git_dir, format, contains_rev)?;
             let no_contains_oid = resolve_revision(git_dir, format, no_contains_rev)?;
             print_branch_list_contains_filters_matching(
@@ -5066,7 +5080,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_contains == "--no-contains"
                 && contains == "--contains" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let contains_oid = resolve_revision(git_dir, format, contains_rev)?;
             let no_contains_oid = resolve_revision(git_dir, format, no_contains_rev)?;
             print_branch_list_contains_filters_matching(
@@ -5085,7 +5099,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && merged == "--merged"
                 && no_merged == "--no-merged" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let merged_oid = resolve_revision(git_dir, format, merged_rev)?;
             let no_merged_oid = resolve_revision(git_dir, format, no_merged_rev)?;
             print_branch_list_merged_filters_matching(
@@ -5104,7 +5118,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && no_merged == "--no-merged"
                 && merged == "--merged" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let merged_oid = resolve_revision(git_dir, format, merged_rev)?;
             let no_merged_oid = resolve_revision(git_dir, format, no_merged_rev)?;
             print_branch_list_merged_filters_matching(
@@ -5123,7 +5137,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_contains_eq_value(contains).is_some()
                 && branch_no_contains_eq_value(no_contains).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let contains_oid = resolve_revision(
                 git_dir,
                 format,
@@ -5150,7 +5164,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_no_contains_eq_value(no_contains).is_some()
                 && branch_contains_eq_value(contains).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let contains_oid = resolve_revision(
                 git_dir,
                 format,
@@ -5177,7 +5191,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_merged_eq_value(merged).is_some()
                 && branch_no_merged_eq_value(no_merged).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let merged_oid = resolve_revision(
                 git_dir,
                 format,
@@ -5204,7 +5218,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_no_merged_eq_value(no_merged).is_some()
                 && branch_merged_eq_value(merged).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let merged_oid = resolve_revision(
                 git_dir,
                 format,
@@ -5230,7 +5244,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && contains == "--contains" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let oid = resolve_revision(git_dir, format, rev)?;
             print_branch_list_contains_filters_matching(
                 git_dir,
@@ -5247,7 +5261,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && contains == "--no-contains" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let oid = resolve_revision(git_dir, format, rev)?;
             print_branch_list_contains_filters_matching(
                 git_dir,
@@ -5264,7 +5278,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && merged == "--merged" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let oid = resolve_revision(git_dir, format, rev)?;
             print_branch_list_merged_filters_matching(
                 git_dir,
@@ -5281,7 +5295,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && merged == "--no-merged" =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let oid = resolve_revision(git_dir, format, rev)?;
             print_branch_list_merged_filters_matching(
                 git_dir,
@@ -5298,7 +5312,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && branch_contains_eq_value(contains).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let oid = resolve_revision(
                 git_dir,
                 format,
@@ -5319,7 +5333,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && branch_no_contains_eq_value(contains).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let oid = resolve_revision(
                 git_dir,
                 format,
@@ -5340,7 +5354,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && branch_merged_eq_value(merged).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let oid = resolve_revision(
                 git_dir,
                 format,
@@ -5361,7 +5375,7 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && branch_no_merged_eq_value(merged).is_some() =>
         {
-            let mode = branch_remote_or_all_mode(flag).expect("guard checked branch mode");
+            let mode = branch_remote_or_all_mode_unchecked(flag);
             let oid = resolve_revision(
                 git_dir,
                 format,
