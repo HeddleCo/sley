@@ -569,6 +569,7 @@ fn git_protocol_v2_fetch_into_repository(
         ofs_delta: true,
         done: true,
         wait_for_done: v2_features.wait_for_done,
+        sideband_all: v2_features.sideband_all,
         ..ProtocolV2FetchRequest::default()
     };
     write_protocol_v2_fetch_request(&mut stream, &fetch)?;

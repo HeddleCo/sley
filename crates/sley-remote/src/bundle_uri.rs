@@ -59,6 +59,10 @@ pub fn transfer_bundle_uri_enabled(config: &GitConfig) -> bool {
         .unwrap_or(false)
 }
 
+fn bundle_uri_key_eq(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
 pub fn parse_bundle_uri_line(list: &mut BundleUriList, line: &str) -> Result<()> {
     if line.is_empty() {
         return Err(GitError::InvalidFormat("bundle-uri: got an empty line".into()));
@@ -68,12 +72,14 @@ pub fn parse_bundle_uri_line(list: &mut BundleUriList, line: &str) -> Result<()>
             "bundle-uri: line is not of the form 'key=value'".into(),
         ));
     };
+    let key = key.trim();
+    let value = value.trim();
     if key.is_empty() || value.is_empty() {
         return Err(GitError::InvalidFormat(
             "bundle-uri: line has empty key or value".into(),
         ));
     }
-    if key == "bundle.version" {
+    if bundle_uri_key_eq(key, "bundle.version") {
         list.version = value.parse().map_err(|_| {
             GitError::InvalidFormat("bundle-uri: invalid bundle.version".into())
         })?;
@@ -82,15 +88,15 @@ pub fn parse_bundle_uri_line(list: &mut BundleUriList, line: &str) -> Result<()>
         }
         return Ok(());
     }
-    if key == "bundle.mode" {
-        list.mode_all = value == "all";
+    if bundle_uri_key_eq(key, "bundle.mode") {
+        list.mode_all = value.eq_ignore_ascii_case("all");
         return Ok(());
     }
-    if key == "bundle.heuristic" {
+    if bundle_uri_key_eq(key, "bundle.heuristic") {
         list.creation_token_heuristic = value.eq_ignore_ascii_case("creationToken");
         return Ok(());
     }
-    let Some(rest) = key.strip_prefix("bundle.") else {
+    let Some(rest) = key.strip_prefix("bundle.").or_else(|| key.strip_prefix("Bundle.")) else {
         return Ok(());
     };
     let Some((id, subkey)) = rest.split_once('.') else {
@@ -100,7 +106,7 @@ pub fn parse_bundle_uri_line(list: &mut BundleUriList, line: &str) -> Result<()>
         id: id.to_string(),
         ..BundleUriEntry::default()
     });
-    if subkey == "uri" {
+    if bundle_uri_key_eq(subkey, "uri") {
         if entry.uri.is_some() {
             return Err(GitError::InvalidFormat(format!(
                 "bundle-uri: duplicate uri for bundle \"{id}\""
@@ -215,12 +221,24 @@ pub fn prefetch_advertised_bundle_uris(
         if uri.is_empty() {
             continue;
         }
-        let temp = download_bundle_uri_to_temp(&uri)?;
-        let bytes = fs::read(&temp)?;
-        let _ = fs::remove_file(&temp);
-        let bundle = Bundle::parse(&bytes, format)?;
-        let reader = FileObjectDatabase::from_git_dir(git_dir, format);
-        install_bundle_pack(&bundle, &reader, &reader)?;
+        match download_bundle_uri_to_temp(&uri)
+            .and_then(|temp| {
+                let result = (|| {
+                    let bytes = fs::read(&temp)?;
+                    let bundle = Bundle::parse(&bytes, format)?;
+                    let reader = FileObjectDatabase::from_git_dir(git_dir, format);
+                    install_bundle_pack(&bundle, &reader, &reader)?;
+                    Ok(())
+                })();
+                let _ = fs::remove_file(&temp);
+                result
+            }) {
+            Ok(()) => {}
+            Err(_) => {
+                eprintln!("warning: failed to download bundle from URI '{uri}'");
+                eprintln!("warning: failed to fetch objects from bundle URI '{uri}'");
+            }
+        }
     }
     Ok(())
 }
@@ -248,7 +266,7 @@ fn download_https_bundle_uri(uri: &str) -> Result<PathBuf> {
             .unwrap_or(0)
     ));
     let argv = vec!["git-remote-https".to_string(), uri.to_string()];
-    sley_core::trace2::child_start("??", &argv);
+    sley_core::trace2::child_start("git-remote-https", &argv);
     let mut child = Command::new(&helper)
         .arg(&uri)
         .stdin(Stdio::piped())
@@ -311,8 +329,12 @@ fn locate_git_remote_https() -> Result<PathBuf> {
 
 fn git_exec_path_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Ok(exec_path) = std::env::var("GIT_EXEC_PATH") {
-        paths.push(PathBuf::from(exec_path));
+    for var in ["GIT_TEST_EXEC_PATH", "GIT_BUILD_DIR", "GIT_EXEC_PATH"] {
+        if let Ok(path) = std::env::var(var)
+            && !path.is_empty()
+        {
+            paths.push(PathBuf::from(path));
+        }
     }
     for var in ["SLEY_TEST_GIT", "GIT_TEST_GIT"] {
         if let Ok(program) = std::env::var(var)
@@ -359,4 +381,60 @@ fn git_exec_path_from_program(program: &str) -> Option<PathBuf> {
 
 pub fn remote_url_from_bundle_uri(uri: &str) -> Result<RemoteUrl> {
     parse_remote_url(uri)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_list() -> BundleUriList {
+        BundleUriList {
+            version: 1,
+            mode_all: true,
+            creation_token_heuristic: true,
+            base_uri: "http://127.0.0.1:18080/smart/repo4.git".into(),
+            ..BundleUriList::default()
+        }
+    }
+
+    #[test]
+    fn bundle_uri_fetch_order_sorts_by_creation_token_descending() {
+        let mut list = sample_list();
+        for (id, token, uri) in [
+            ("everything", 1, "http://127.0.0.1:18080/everything.bundle"),
+            ("new", 2, "http://127.0.0.1:18080/new.bundle"),
+            ("newest", 3, "http://127.0.0.1:18080/newest.bundle"),
+        ] {
+            list.bundles.insert(
+                id.to_string(),
+                BundleUriEntry {
+                    id: id.to_string(),
+                    uri: Some(uri.to_string()),
+                    creation_token: token,
+                },
+            );
+        }
+        assert_eq!(
+            bundle_uri_fetch_order(&list),
+            vec![
+                "http://127.0.0.1:18080/newest.bundle".to_string(),
+                "http://127.0.0.1:18080/new.bundle".to_string(),
+                "http://127.0.0.1:18080/everything.bundle".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_bundle_uri_line_accepts_creation_token_heuristic_lines() {
+        let mut list = BundleUriList::default();
+        parse_bundle_uri_line(&mut list, "bundle.heuristic=creationToken").expect("test operation should succeed");
+        assert!(list.creation_token_heuristic);
+        parse_bundle_uri_line(&mut list, "bundle.newest.creationtoken=3")
+            .expect("test operation should succeed");
+        parse_bundle_uri_line(&mut list, "bundle.newest.uri=http://127.0.0.1/newest.bundle")
+            .expect("test operation should succeed");
+        let entry = list.bundles.get("newest").expect("bundle entry");
+        assert_eq!(entry.creation_token, 3);
+        assert_eq!(entry.uri.as_deref(), Some("http://127.0.0.1/newest.bundle"));
+    }
 }

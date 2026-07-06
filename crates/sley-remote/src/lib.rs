@@ -598,6 +598,7 @@ mod tests {
             branch_explicit: true,
             ref_storage: sley_formats::RefStorageFormat::Files,
             ssh_options: None,
+            reject_shallow: false,
         };
         let mut clone_credentials = NoCredentials;
         let mut progress = SilentProgress;

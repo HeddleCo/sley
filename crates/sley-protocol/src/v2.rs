@@ -2294,13 +2294,7 @@ fn append_protocol_v2_ls_refs_attributes(out: &mut String, attributes: &[String]
 
 fn parse_fetch_section_header(payload: &[u8]) -> Result<String> {
     let name = parse_protocol_v2_line_text("fetch response section", payload)?;
-    validate_capability_name(name).map_err(|err| match err {
-        GitError::InvalidFormat(message) => GitError::InvalidFormat(format!(
-            "{message}: fetch response section line {:?}",
-            String::from_utf8_lossy(trim_trailing_lf(payload))
-        )),
-        other => other,
-    })?;
+    validate_capability_name(name)?;
     Ok(name.to_string())
 }
 

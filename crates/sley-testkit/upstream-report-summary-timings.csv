@@ -1,2 +1,4 @@
 label,script,command,result,elapsed_ms,ok,notok,total,plan_total
-2026-07-06T18:09:45Z,t7816-grep-binary-pattern.sh,t7816-grep-binary-pattern.sh,PASS,3499,145,0,145,145
+2026-07-06T21:12:48Z,t5601-clone.sh,t5601-clone.sh,FAIL,51526,109,6,115,115
+2026-07-06T21:12:55Z,t5601-clone.sh,t5601-clone.sh,FAIL,83951,110,5,115,115
+2026-07-06T21:12:35Z,t5601-clone.sh,t5601-clone.sh,FAIL,173765,110,5,115,115

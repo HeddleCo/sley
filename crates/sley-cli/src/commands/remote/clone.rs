@@ -1728,6 +1728,7 @@ fn clone_network_repository(
     let tag_opt = options.tag_opt;
     let config_overrides = options.config_overrides;
     let submodule_active = options.submodule_active;
+    let http_remote = matches!(transport, CloneNetworkTransport::Http).then(|| remote.clone());
     let remote_source = match transport {
         CloneNetworkTransport::Http => sley_remote::CloneSource::Http(remote.clone()),
         CloneNetworkTransport::Ssh => sley_remote::CloneSource::Ssh(remote),
@@ -1758,13 +1759,6 @@ fn clone_network_repository(
     let mut progress = StdoutProgress;
     let http_client = matches!(transport, CloneNetworkTransport::Http)
         .then(sley_remote::new_http_client);
-    let http_remote = matches!(transport, CloneNetworkTransport::Http)
-        .then(|| {
-            ls_remote_resolved_url(options.repository)
-                .ok()
-                .and_then(|url| parse_remote_url(&url).ok())
-        })
-        .flatten();
     let prefetch_handshake = v2_handshake.clone();
     let outcome = sley_remote::clone(
         sley_remote::CloneRequest {

@@ -59,6 +59,10 @@ const SYSTEM_GIT_EXEC_HELPERS: &[&str] = &[
     "git-remote-https",
 ];
 
+/// Prefer the upstream git build for upload-pack when present: it advertises
+/// protocol v2 features (bundle-uri, fetch filter) that a stock install may omit.
+const PREFERRED_BUILD_EXEC_HELPERS: &[&str] = &["git-upload-pack"];
+
 pub fn materialize_git_i18n_helpers() -> io::Result<PathBuf> {
     let dir = env::temp_dir().join(format!(
         "sley-git-compat-i18n-{}",
@@ -76,36 +80,94 @@ pub fn materialize_git_i18n_helpers() -> io::Result<PathBuf> {
 }
 
 fn link_system_git_exec_helpers(dir: &Path) -> io::Result<()> {
-    let Some(system_exec_path) = discover_system_git_exec_path() else {
+    let system_exec_path = discover_system_git_exec_path();
+    let build_exec_path = discover_build_git_exec_path();
+    for name in PREFERRED_BUILD_EXEC_HELPERS {
+        let Some(source) = build_exec_path
+            .as_ref()
+            .map(|path| path.join(name))
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                system_exec_path
+                    .as_ref()
+                    .map(|path| path.join(name))
+                    .filter(|path| path.is_file())
+            })
+        else {
+            continue;
+        };
+        link_exec_helper(dir, name, &source)?;
+    }
+    let Some(system_exec_path) = system_exec_path else {
         return Ok(());
     };
     for name in SYSTEM_GIT_EXEC_HELPERS {
         let source = system_exec_path.join(name);
-        let dest = dir.join(name);
         if !source.is_file() {
             continue;
         }
-        if dest.exists() {
-            continue;
-        }
-        #[cfg(unix)]
+        link_exec_helper(dir, name, &source)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn link_exec_helper(dir: &Path, name: &str, source: &Path) -> io::Result<()> {
+    use std::os::unix::fs::symlink;
+    let dest = dir.join(name);
+    if dest.exists() {
+        if dest
+            .read_link()
+            .ok()
+            .filter(|target| target == source)
+            .is_some()
         {
-            use std::os::unix::fs::symlink;
-            if let Err(err) = symlink(&source, &dest) {
-                if err.kind() != io::ErrorKind::AlreadyExists {
-                    return Err(err);
-                }
-            }
+            return Ok(());
         }
-        #[cfg(not(unix))]
-        {
-            fs::copy(&source, &dest)?;
+        fs::remove_file(&dest)?;
+    }
+    if let Err(err) = symlink(source, &dest) {
+        if err.kind() != io::ErrorKind::AlreadyExists {
+            return Err(err);
         }
     }
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn link_exec_helper(dir: &Path, name: &str, source: &Path) -> io::Result<()> {
+    let dest = dir.join(name);
+    if dest.exists() {
+        if fs::canonicalize(&dest).ok().as_deref() == fs::canonicalize(source).ok().as_deref() {
+            return Ok(());
+        }
+        fs::remove_file(&dest)?;
+    }
+    fs::copy(source, &dest)?;
+    Ok(())
+}
+
+fn discover_build_git_exec_path() -> Option<PathBuf> {
+    for var in ["GIT_BUILD_DIR", "GIT_SRC_DIR"] {
+        if let Ok(path) = env::var(var)
+            && !path.is_empty()
+        {
+            let candidate = PathBuf::from(path);
+            if candidate.join("git-upload-pack").is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 fn discover_system_git_exec_path() -> Option<PathBuf> {
+    if let Ok(path) = env::var("GIT_TEST_EXEC_PATH")
+        && !path.is_empty()
+        && git_exec_helper_dir(Path::new(&path)).is_some()
+    {
+        return Some(PathBuf::from(path));
+    }
     if let Ok(path) = env::var("SLEY_TEST_GIT")
         && !path.is_empty()
         && let Some(exec_path) = git_exec_path_from_program(&path)
@@ -141,11 +203,15 @@ fn discover_system_git_exec_path() -> Option<PathBuf> {
         "/usr/libexec/git-core",
     ] {
         let path = PathBuf::from(candidate);
-        if path.join("git-http-backend").is_file() {
+        if git_exec_helper_dir(&path).is_some() {
             return Some(path);
         }
     }
     None
+}
+
+fn git_exec_helper_dir(path: &Path) -> Option<()> {
+    path.join("git-http-backend").is_file().then_some(())
 }
 
 fn git_exec_path_from_program(program: &str) -> Option<PathBuf> {
