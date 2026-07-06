@@ -492,9 +492,19 @@ pub fn encode_git_credential(credential: &GitCredential) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+const MAX_GIT_CREDENTIAL_RESPONSE_BYTES: usize = 64 * 1024;
+
 pub fn read_git_credential(reader: &mut impl Read) -> Result<GitCredential> {
     let mut input = Vec::new();
-    reader.read_to_end(&mut input)?;
+    reader
+        .take((MAX_GIT_CREDENTIAL_RESPONSE_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut input)?;
+    if input.len() > MAX_GIT_CREDENTIAL_RESPONSE_BYTES {
+        return Err(GitError::InvalidFormat(format!(
+            "credential helper response exceeds maximum size of {} bytes (64 KiB)",
+            MAX_GIT_CREDENTIAL_RESPONSE_BYTES
+        )));
+    }
     parse_git_credential(&input)
 }
 
@@ -2204,6 +2214,44 @@ mod tests {
         assert_eq!(
             read_git_credential(&mut input).expect("test operation should succeed"),
             credential
+        );
+    }
+
+    #[test]
+    fn git_credentials_reject_oversized_helper_responses() {
+        let oversized = vec![b'x'; MAX_GIT_CREDENTIAL_RESPONSE_BYTES + 1];
+        let mut input = oversized.as_slice();
+        let err = read_git_credential(&mut input).expect_err("oversized response should fail");
+        assert!(
+            matches!(
+                err,
+                GitError::InvalidFormat(ref message)
+                    if message.contains("credential helper response exceeds maximum size")
+                        && message.contains("65536")
+                        && message.contains("64 KiB")
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn git_credentials_accept_responses_at_size_limit() {
+        let prefix = b"protocol=https\npadding=";
+        let suffix = b"\n\n";
+        let padding_len =
+            MAX_GIT_CREDENTIAL_RESPONSE_BYTES - prefix.len() - suffix.len();
+        let mut input = Vec::with_capacity(MAX_GIT_CREDENTIAL_RESPONSE_BYTES);
+        input.extend_from_slice(prefix);
+        input.extend(std::iter::repeat_n(b'x', padding_len));
+        input.extend_from_slice(suffix);
+        assert_eq!(input.len(), MAX_GIT_CREDENTIAL_RESPONSE_BYTES);
+
+        let mut reader = input.as_slice();
+        let credential = read_git_credential(&mut reader).expect("at-limit response should succeed");
+        assert_eq!(credential.protocol.as_deref(), Some("https"));
+        assert_eq!(
+            credential.extra,
+            vec![("padding".into(), "x".repeat(padding_len))]
         );
     }
 
