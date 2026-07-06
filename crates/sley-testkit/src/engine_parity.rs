@@ -110,6 +110,27 @@ impl HermeticRepo {
         path
     }
 
+    /// Seed a mixed worktree/index fixture for `update-index` parity tests.
+    ///
+    /// After this call the index contains `one.txt` and `keep.txt`; `one.txt` is
+    /// removed from disk, `keep.txt` is modified, and `new.txt` / `z.txt` exist
+    /// unstaged.
+    pub fn seed_update_index_fixture(&self) {
+        self.init_default();
+        self.write_file("one.txt", b"one");
+        self.write_file("keep.txt", b"keep");
+        self.oracle_ok(&["add", "one.txt", "keep.txt"]);
+        self.write_file("keep.txt", b"changed");
+        let _ = fs::remove_file(self.root.join("one.txt"));
+        self.write_file("new.txt", b"new");
+        self.write_file("z.txt", b"z");
+    }
+
+    /// Capture `git ls-files --stage` stdout for this fixture.
+    pub fn index_stage_output(&self) -> EngineOutput {
+        self.oracle(&["ls-files", "--stage"])
+    }
+
     /// Write an empty `shallow` marker under `git_dir`.
     pub fn write_shallow_marker(&self, git_dir: &Path) {
         fs::write(git_dir.join("shallow"), b"").expect("write shallow marker");
@@ -368,6 +389,40 @@ pub fn git_config_get_all_lines(values: &[Option<&str>]) -> Vec<u8> {
             out.extend_from_slice(value.as_bytes());
             out.push(b'\n');
         }
+    }
+    out
+}
+
+/// Format a git-style path line (`{path}\n`), used by `rev-parse --show-toplevel`.
+pub fn git_path_line(path: impl AsRef<Path>) -> Vec<u8> {
+    let path = fs::canonicalize(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
+    let mut line = path.to_string_lossy().into_owned().into_bytes();
+    line.push(b'\n');
+    line
+}
+
+/// Format a git-style object size line (`{size}\n`), used by `cat-file -s`.
+pub fn git_size_line(size: u64) -> Vec<u8> {
+    let mut line = size.to_string().into_bytes();
+    line.push(b'\n');
+    line
+}
+
+/// Format a symbolic ref target line (`refs/heads/main\n`).
+pub fn git_symbolic_ref_line(target: &str) -> Vec<u8> {
+    let mut line = target.as_bytes().to_vec();
+    line.push(b'\n');
+    line
+}
+
+/// Format index entries the way `git ls-files --stage` prints them.
+pub fn format_index_stage_lines(entries: &[sley_index::IndexEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let stage = (entry.flags >> 12) & 0x3;
+        out.extend_from_slice(format!("{:06o} {} {stage}\t", entry.mode, entry.oid).as_bytes());
+        out.extend_from_slice(entry.path.as_bytes());
+        out.push(b'\n');
     }
     out
 }
