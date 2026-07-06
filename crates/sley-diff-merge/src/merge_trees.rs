@@ -1,6 +1,7 @@
 //! Three-way tree merge engine.
 
 use sley_core::{BString, GitError, ObjectFormat, ObjectId, Result};
+use sley_index::{is_gitlink, is_symlink_mode};
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntries, TreeEntry};
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use std::collections::{BTreeMap, BTreeSet};
@@ -3021,4 +3022,102 @@ fn entry_map_as_tracked(map: &MergeEntryMap) -> BTreeMap<Vec<u8>, TrackedEntry> 
             )
         })
         .collect()
+}
+
+/// Build the flattened entry map of the *virtual ancestor* for a 3-way merge,
+/// recursively merging the merge bases together (merge-recursive's criss-cross
+/// construction). Conflicts in the virtual merge are folded into the tree rather
+/// than surfaced — the outer merge owns conflict reporting.
+///
+/// `merge_bases` supplies the pairwise merge-base list for two commits (typically
+/// [`sley_rev::merge_bases`] at the call site; kept injectable to avoid a
+/// `sley-diff-merge` ↔ `sley-rev` dependency cycle).
+pub fn virtual_ancestor_entry_map(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    bases: &[ObjectId],
+    merge_bases: impl Fn(&ObjectId, &ObjectId) -> Result<Vec<ObjectId>>,
+) -> Result<MergeEntryMap> {
+    let first = bases
+        .first()
+        .ok_or_else(|| GitError::Command("virtual ancestor needs at least one base".into()))?;
+    let acc_tree = commit_tree_oid(db, format, first)?;
+    let mut acc_map = flatten_tree(db, format, &acc_tree)?;
+    let mut acc_commits = vec![*first];
+
+    for base in &bases[1..] {
+        let other_tree = commit_tree_oid(db, format, base)?;
+        let other_map = flatten_tree(db, format, &other_tree)?;
+        let sub_bases = merge_bases(&acc_commits[0], base)?;
+        let sub_base_map = match sub_bases.first() {
+            Some(sb) => {
+                let sb_tree = commit_tree_oid(db, format, sb)?;
+                flatten_tree(db, format, &sb_tree)?
+            }
+            None => MergeEntryMap::new(),
+        };
+        let merge = merge_entry_maps(
+            db,
+            format,
+            &sub_base_map,
+            &acc_map,
+            &other_map,
+            &MergeTreesOptions {
+                ours_label: "Temporary merge branch 1",
+                theirs_label: "Temporary merge branch 2",
+                detect_renames: true,
+                rename_threshold: DEFAULT_RENAME_THRESHOLD,
+                ..Default::default()
+            },
+        )?;
+        let mut next = MergeEntryMap::new();
+        for entry in merge.paths {
+            if let Some(leaf) = fold_virtual_ancestor_path(db, &entry)? {
+                next.insert(entry.path, leaf);
+            }
+        }
+        acc_map = next;
+        acc_commits = vec![*base];
+    }
+    Ok(acc_map)
+}
+
+fn commit_tree_oid(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+) -> Result<ObjectId> {
+    let object = db.read_object(commit_oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {commit_oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    Ok(Commit::parse_ref(format, &object.body)?.tree)
+}
+
+fn fold_virtual_ancestor_path(
+    db: &FileObjectDatabase,
+    entry: &MergedPath,
+) -> Result<Option<(u32, ObjectId)>> {
+    if entry.conflict.is_none() {
+        return Ok(entry.result);
+    }
+    let base = entry.stages.base;
+    let ours = entry.stages.ours;
+    let theirs = entry.stages.theirs;
+    if let Some((mode, _)) = entry.worktree.as_ref() {
+        if is_symlink_mode(*mode) {
+            return Ok(base);
+        }
+        if is_gitlink(*mode) {
+            return Ok(theirs.or(ours));
+        }
+        if let Some((mode, bytes)) = &entry.worktree {
+            let oid = db.write_object(EncodedObject::new(ObjectType::Blob, bytes.clone()))?;
+            return Ok(Some((*mode, oid)));
+        }
+    }
+    Ok(ours.or(theirs))
 }

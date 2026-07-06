@@ -27,7 +27,7 @@
 | W52a | ✅ done | hooks + env-aware OpenOptions in sley facade |
 | W60 | ✅ done | `branch/` tree; `dispatch.rs` **102** LOC; `positional.rs` legacy argv match |
 | W61 | ✅ done | `plumbing.rs` → `plumbing/` tree (14 modules) |
-| W62 | ⚠️ partial | `diff_render.rs` extracted (3.5k LOC) |
+| W62 | ⚠️ partial | `diff_render.rs` extracted; `virtual_ancestor_entry_map` → `sley-diff-merge` |
 | W70 | ⚠️ partial | `sley-bench` suites exist; `baselines/` scaffold added |
 | W72, W90 | ⏳ pending | CLI clippy burn-down, manual parity gate |
 | W71 | ✅ done | sley-fetch → sley-remote::install |
