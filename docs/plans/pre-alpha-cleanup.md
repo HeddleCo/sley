@@ -23,11 +23,12 @@
 | W41 | ✅ done | 203 engine parity tests (target 200) |
 | W50 | ✅ done | CliSession + discovery.rs; 0 `discover_git_dir` / `GLOBAL_*` |
 | W51 | ⚠️ partial | `remote_cmds.rs` deleted → `commands/remote/` tree (~13k LOC); orchestration still CLI-resident |
-| W52 | ⚠️ partial | 12 engine deps removed; `dispatch.rs` (490 LOC); `lib.rs` helpers remain (~10.5k) |
+| W52 | ⚠️ partial | 12 engine deps removed; `dispatch.rs` (490); `lib.rs` **1,406** LOC (was 10.5k); 10+ helper modules |
 | W52a | ✅ done | hooks + env-aware OpenOptions in sley facade |
 | W60 | ⚠️ partial | `branch.rs` → `branch/` tree; `dispatch.rs` still 6k |
 | W61 | ✅ done | `plumbing.rs` → `plumbing/` tree (14 modules) |
-| W62, W70, W72, W90 | ⏳ pending | diff thinning, benches, clippy, manual parity gate |
+| W62 | ⚠️ partial | `diff_render.rs` extracted (3.5k LOC) |
+| W70, W72, W90 | ⏳ pending | benches, clippy, manual parity gate |
 | W71 | ✅ done | sley-fetch → sley-remote::install |
 
 **Decisions locked:** `sley-pretty` in place (no rename); hooks **(a)** → W52a; integration branch until W90; parity gate manual at end.  
