@@ -1674,15 +1674,11 @@ fn cover_diff_entries(
     origin_tree: &ObjectId,
     head_tree: &ObjectId,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
-    let base = sley_diff_merge::DiffNameStatusOptions {
+    let name_status_options = sley_diff_merge::DiffNameStatusOptions {
         detect_renames: options.detect_renames,
         detect_copies: options.detect_copies,
         find_copies_harder: options.find_copies_harder,
         rename_empty: true,
-        ..Default::default()
-    };
-    let options = sley_diff_merge::DiffNameStatusOptions {
-        base,
         detect_inexact: true,
         rename_threshold: options.rename_threshold,
         copy_threshold: options.copy_threshold,
@@ -1694,7 +1690,7 @@ fn cover_diff_entries(
         format,
         origin_tree,
         head_tree,
-        options,
+        name_status_options,
     )?;
     let entries = match diff_pathspec {
         Some(pathspec) => apply_diff_pathspec(entries, pathspec),
@@ -3256,15 +3252,11 @@ fn first_parent_diff_entries(
     diff_pathspec: Option<&DiffPathspec>,
     commit: &Commit,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
-    let base = sley_diff_merge::DiffNameStatusOptions {
+    let name_status_options = sley_diff_merge::DiffNameStatusOptions {
         detect_renames: options.detect_renames,
         detect_copies: options.detect_copies,
         find_copies_harder: options.find_copies_harder,
         rename_empty: true,
-        ..Default::default()
-    };
-    let options = sley_diff_merge::DiffNameStatusOptions {
-        base,
         detect_inexact: true,
         rename_threshold: options.rename_threshold,
         copy_threshold: options.copy_threshold,
@@ -3280,14 +3272,14 @@ fn first_parent_diff_entries(
                 format,
                 &parent_commit.tree,
                 &commit.tree,
-                options,
+                name_status_options,
             )
         }
         None => sley_diff_merge::diff_name_status_empty_tree_with_options(
             db,
             format,
             &commit.tree,
-            options,
+            name_status_options,
         ),
     }?;
     let entries = match diff_pathspec {

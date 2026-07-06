@@ -315,7 +315,10 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         ..Default::default()
     };
     let options = sley_diff_merge::DiffNameStatusOptions {
-        base: base_options,
+        detect_renames,
+        detect_copies,
+        find_copies_harder,
+        rename_empty,
         detect_inexact: true,
         rename_threshold,
         copy_threshold,

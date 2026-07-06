@@ -46,17 +46,15 @@ pub(crate) fn combined_paths(
         return Ok(Vec::new());
     };
     let options = sley_diff_merge::DiffNameStatusOptions {
-        base: sley_diff_merge::DiffNameStatusOptions {
-            detect_renames: false,
-            detect_copies: false,
-            find_copies_harder: false,
-            rename_empty: true,
-        ..Default::default()
-    },
+        detect_renames: false,
+        detect_copies: false,
+        find_copies_harder: false,
+        rename_empty: true,
         detect_inexact: false,
         rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
         copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
         rename_limit: 0,
+        ..Default::default()
     };
 
     let mut first_parent_entries = sley_diff_merge::diff_name_status_trees_with_options(

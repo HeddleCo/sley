@@ -2139,17 +2139,15 @@ fn find_parent_origin(
         &parent_tree,
         &child_tree,
         sley_diff_merge::DiffNameStatusOptions {
-            base: sley_diff_merge::DiffNameStatusOptions {
-                detect_renames: true,
-                detect_copies: allow_whole_copy,
-                find_copies_harder: allow_whole_copy,
-                rename_empty: true,
-            ..Default::default()
-        },
+            detect_renames: true,
+            detect_copies: allow_whole_copy,
+            find_copies_harder: allow_whole_copy,
+            rename_empty: true,
             detect_inexact: true,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             rename_limit: 0,
+            ..Default::default()
         },
     )?;
 

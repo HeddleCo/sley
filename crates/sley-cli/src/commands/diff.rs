@@ -1541,13 +1541,6 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
-    let options = sley_diff_merge::DiffNameStatusOptions {
-        detect_renames,
-        detect_copies,
-        find_copies_harder,
-        rename_empty,
-        ..Default::default()
-    };
     // The new-side oid is real (shown, not zeroed) when it comes from a tree or the
     // index; it is zeroed only when the new side is the worktree.
     let zero_worktree_oids = match diff_trees.len() {
@@ -1560,8 +1553,18 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     // tree and we're not diffing the index (`--cached`). A two-tree `diff A B` takes
     // its new content from tree B's blobs, never the worktree.
     let use_worktree_new = !cached && diff_trees.len() != 2;
+    let base_options = sley_diff_merge::DiffNameStatusOptions {
+        detect_renames,
+        detect_copies,
+        find_copies_harder,
+        rename_empty,
+        ..Default::default()
+    };
     let options = sley_diff_merge::DiffNameStatusOptions {
-        base: options,
+        detect_renames,
+        detect_copies,
+        find_copies_harder,
+        rename_empty,
         detect_inexact: true,
         rename_threshold,
         copy_threshold,
@@ -1708,7 +1711,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 worktree_root,
                 &git_dir,
                 format,
-                options.base,
+                base_options,
                 &mut validate_stat_clean,
             )?
         } else {

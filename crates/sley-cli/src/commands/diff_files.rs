@@ -556,10 +556,6 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         detect_copies: o.detect_copies,
         find_copies_harder: o.find_copies_harder,
         rename_empty: o.rename_empty,
-        ..Default::default()
-    };
-    let options = sley_diff_merge::DiffNameStatusOptions {
-        base: options,
         detect_inexact: true,
         rename_threshold: o.rename_threshold,
         copy_threshold: o.copy_threshold,

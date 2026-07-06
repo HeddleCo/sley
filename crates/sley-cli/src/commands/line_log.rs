@@ -856,7 +856,10 @@ fn commit_name_status(
             parent,
             tree,
             sley_diff_merge::DiffNameStatusOptions {
-                base,
+                detect_renames,
+                detect_copies: false,
+                find_copies_harder: false,
+                rename_empty: true,
                 detect_inexact: true,
                 rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,

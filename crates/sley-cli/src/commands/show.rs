@@ -1417,15 +1417,11 @@ fn commit_diff_entries(
     commit: &Commit,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
     let (detect_renames, detect_copies) = show_effective_rename_detection(options, config);
-    let base = sley_diff_merge::DiffNameStatusOptions {
+    let options = sley_diff_merge::DiffNameStatusOptions {
         detect_renames,
         detect_copies,
         find_copies_harder: options.find_copies_harder,
         rename_empty: true,
-        ..Default::default()
-    };
-    let options = sley_diff_merge::DiffNameStatusOptions {
-        base,
         detect_inexact: true,
         rename_threshold: options.rename_threshold,
         copy_threshold: options.copy_threshold,
