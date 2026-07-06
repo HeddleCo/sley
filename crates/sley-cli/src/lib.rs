@@ -65,24 +65,13 @@ use std::sync::{Arc, Mutex};
 /// `unsafe`/`set_var`); appended after any inherited `GIT_CONFIG_PARAMETERS` to
 /// form the effective parameter list.
 static CMDLINE_CONFIG_PARAMETERS: Mutex<String> = Mutex::new(String::new());
-static GLOBAL_GIT_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
-static GLOBAL_WORK_TREE: Mutex<Option<PathBuf>> = Mutex::new(None);
-static GLOBAL_ATTR_SOURCE: Mutex<Option<String>> = Mutex::new(None);
-static GLOBAL_BARE: Mutex<bool> = Mutex::new(false);
-static GLOBAL_REPLACE_OBJECTS: Mutex<bool> = Mutex::new(true);
-static GLOBAL_LAZY_FETCH: Mutex<bool> = Mutex::new(true);
-static LOCAL_REPO_ENV_HIDDEN: Mutex<bool> = Mutex::new(false);
+
 static TRACE2_DEF_PARAMS_EMITTED: Mutex<bool> = Mutex::new(false);
 /// Default pathspec magic set by the global `--{glob,noglob,icase,literal}-pathspecs`
 /// options (and the corresponding `GIT_*_PATHSPECS` env vars). Mirrors git's
 /// `get_default_pathspec_flags()`: `--literal-pathspecs` wins and forces every
 /// pathspec to be matched literally; otherwise glob/icase magic is OR'd in.
-static GLOBAL_PATHSPEC_FLAGS: Mutex<PathspecFlags> = Mutex::new(PathspecFlags {
-    literal: false,
-    glob: false,
-    icase: false,
-    literal_pathspecs: false,
-});
+
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PathspecFlags {
@@ -134,6 +123,7 @@ mod ownership;
 mod remote;
 mod repo_path;
 mod repository;
+mod session;
 mod setup;
 
 pub(crate) use sley_pretty::{
@@ -183,13 +173,17 @@ pub fn run(args: Vec<String>) -> Result<()> {
     // `GIT_CONFIG_PARAMETERS` env var during option parsing, so the single
     // `injected_config_parameters()` reader is the source of truth for every
     // config read; no separate global-override store is needed.
-    set_global_git_dir(global.git_dir.clone());
-    set_global_work_tree(global.work_tree);
-    set_global_attr_source(global.attr_source);
-    set_global_bare(global.bare);
-    set_global_replace_objects(global.replace_objects);
-    set_global_lazy_fetch(global.lazy_fetch);
-    set_global_pathspec_flags(global.pathspec_flags);
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    session::install_cli_session(session::CliSession::from_parsed_globals(
+        cwd,
+        global.git_dir.clone(),
+        global.work_tree.clone(),
+        global.attr_source.clone(),
+        global.bare,
+        global.replace_objects,
+        global.lazy_fetch,
+        global.pathspec_flags,
+    ));
     // Emit git's GIT_TRACE_SETUP output (the env/config/gitfile discovery trace)
     // before dispatching. This is the CLI-side repository setup that
     // `sley::Repository::discover` deliberately leaves to this layer.
@@ -573,24 +567,14 @@ fn trace2_alias_child_command(command: &str, alias_kind: &str, alias_depth: usiz
 /// same way the top-level parser does, and return the remaining argv.
 fn reapply_global_options(expanded: &[String]) -> Result<Vec<String>> {
     let nested = apply_global_options(expanded)?;
-    if nested.git_dir.is_some() {
-        set_global_git_dir(nested.git_dir.clone());
-    }
-    if nested.work_tree.is_some() {
-        set_global_work_tree(nested.work_tree);
-    }
-    if nested.attr_source.is_some() {
-        set_global_attr_source(nested.attr_source);
-    }
-    if nested.bare {
-        set_global_bare(true);
-    }
-    if !nested.lazy_fetch {
-        set_global_lazy_fetch(false);
-    }
-    if nested.pathspec_flags != PathspecFlags::default() {
-        set_global_pathspec_flags(nested.pathspec_flags);
-    }
+    session::merge_global_overrides(
+        nested.git_dir.clone(),
+        nested.work_tree.clone(),
+        nested.attr_source.clone(),
+        nested.bare,
+        nested.lazy_fetch,
+        nested.pathspec_flags,
+    );
     Ok(nested.args.to_vec())
 }
 
@@ -1316,78 +1300,8 @@ fn report_config_parameter_error(err: sley_config::ConfigParameterError) -> GitE
     GitError::Exit(128)
 }
 
-fn set_global_git_dir(git_dir: Option<PathBuf>) {
-    if let Ok(mut value) = GLOBAL_GIT_DIR.lock() {
-        *value = git_dir;
-    }
-}
-
-fn set_global_work_tree(work_tree: Option<PathBuf>) {
-    if let Ok(mut value) = GLOBAL_WORK_TREE.lock() {
-        *value = work_tree;
-    }
-}
-
-fn set_global_attr_source(attr_source: Option<String>) {
-    if let Ok(mut value) = GLOBAL_ATTR_SOURCE.lock() {
-        *value = attr_source;
-    }
-}
-
-fn set_global_bare(bare: bool) {
-    if let Ok(mut value) = GLOBAL_BARE.lock() {
-        *value = bare;
-    }
-}
-
-fn set_global_replace_objects(replace_objects: bool) {
-    if let Ok(mut value) = GLOBAL_REPLACE_OBJECTS.lock() {
-        *value = replace_objects;
-    }
-}
-
-fn set_global_lazy_fetch(lazy_fetch: bool) {
-    if let Ok(mut value) = GLOBAL_LAZY_FETCH.lock() {
-        *value = lazy_fetch;
-    }
-}
-
-struct LocalRepoEnvGuard {
-    previous: Option<bool>,
-}
-
-impl Drop for LocalRepoEnvGuard {
-    fn drop(&mut self) {
-        if let Some(previous) = self.previous
-            && let Ok(mut value) = LOCAL_REPO_ENV_HIDDEN.lock()
-        {
-            *value = previous;
-        }
-    }
-}
-
-fn hide_local_repo_env_for_scope() -> LocalRepoEnvGuard {
-    match LOCAL_REPO_ENV_HIDDEN.lock() {
-        Ok(mut value) => {
-            let previous = *value;
-            *value = true;
-            LocalRepoEnvGuard {
-                previous: Some(previous),
-            }
-        }
-        Err(_) => LocalRepoEnvGuard { previous: None },
-    }
-}
-
 pub(crate) fn with_local_repo_env_hidden<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let _guard = hide_local_repo_env_for_scope();
-    f()
-}
-
-fn set_global_pathspec_flags(flags: PathspecFlags) {
-    if let Ok(mut value) = GLOBAL_PATHSPEC_FLAGS.lock() {
-        *value = flags;
-    }
+    session::with_local_repo_env_hidden_session(f)
 }
 
 /// Effective default pathspec magic, folding in the global options *and* the
@@ -1395,9 +1309,8 @@ fn set_global_pathspec_flags(flags: PathspecFlags) {
 /// (`--literal-pathspecs`/`--noglob-pathspecs`/`GIT_LITERAL_PATHSPECS`/
 /// `GIT_NOGLOB_PATHSPECS`) suppresses glob magic.
 pub(crate) fn effective_pathspec_flags() -> sley_worktree::PathspecMatchMagic {
-    let mut flags = GLOBAL_PATHSPEC_FLAGS
-        .lock()
-        .map(|value| *value)
+    let mut flags = session::cli_session()
+        .map(|session| session.pathspec_flags())
         .unwrap_or_default();
     if git_env_bool("GIT_LITERAL_PATHSPECS") {
         flags.literal = true;
@@ -1444,21 +1357,15 @@ fn git_env_bool(name: &str) -> bool {
 }
 
 fn global_git_dir() -> Option<PathBuf> {
-    if local_repo_env_hidden() {
-        return None;
-    }
-    GLOBAL_GIT_DIR.lock().ok()?.clone()
+    session::cli_session().and_then(|session| session.git_dir_override())
 }
 
 fn global_work_tree() -> Option<PathBuf> {
-    if local_repo_env_hidden() {
-        return None;
-    }
-    GLOBAL_WORK_TREE.lock().ok()?.clone()
+    session::cli_session().and_then(|session| session.work_tree_override())
 }
 
 pub(crate) fn global_attr_source() -> Option<String> {
-    GLOBAL_ATTR_SOURCE.lock().ok()?.clone()
+    session::cli_session().and_then(|session| session.attr_source())
 }
 
 fn environment_git_dir() -> Option<PathBuf> {
@@ -1484,23 +1391,30 @@ fn explicit_work_tree() -> Option<PathBuf> {
 }
 
 fn global_bare() -> bool {
-    if local_repo_env_hidden() {
+    let Some(session) = session::cli_session() else {
+        return false;
+    };
+    if session.local_repo_env_hidden() {
         return false;
     }
-    GLOBAL_BARE.lock().is_ok_and(|value| *value)
+    session.bare()
 }
 
 fn local_repo_env_hidden() -> bool {
-    LOCAL_REPO_ENV_HIDDEN.lock().is_ok_and(|value| *value)
+    session::cli_session().is_some_and(|session| session.local_repo_env_hidden())
 }
 
 fn global_replace_objects() -> bool {
-    GLOBAL_REPLACE_OBJECTS.lock().map_or(true, |value| *value)
+    session::cli_session()
+        .map(|session| session.replace_objects())
+        .unwrap_or(true)
         && env::var_os("GIT_NO_REPLACE_OBJECTS").is_none()
 }
 
 pub(crate) fn global_lazy_fetch_enabled() -> bool {
-    GLOBAL_LAZY_FETCH.lock().map_or(true, |value| *value)
+    session::cli_session()
+        .map(|session| session.lazy_fetch())
+        .unwrap_or(true)
         && env::var("GIT_NO_LAZY_FETCH")
             .map(|value| value == "0")
             .unwrap_or(true)

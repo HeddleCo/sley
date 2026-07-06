@@ -17,10 +17,12 @@
 | W30 | ✅ done | unified ancestor_depths on sley-rev |
 | W31 | ✅ done | log format → sley-pretty; CLI adapter wiring |
 | W32 | ⚠️ partial | worktree + pack parsers (13/47) |
+| W33 | ✅ done | 0 `parse_*_options` remaining |
 | W34 | ⚠️ partial | sley-rev diff_options module landed |
 | W40 | ✅ done | engine parity harness |
 | W41 | ⚠️ partial | 62 parity tests (target 200) |
-| W50–W52 | ⏳ pending | CliSession, facade-only deps |
+| W50 | ⚠️ partial | CliSession scaffold; `GLOBAL_*` statics removed |
+| W51–W52 | ⏳ pending | remote_cmds delete, facade-only deps |
 | W52a | ✅ done | hooks + env-aware OpenOptions in sley facade |
 | W51, W60–W72, W90 | ⏳ pending | remote_cmds delete, CLI splits, manual parity gate |
 | W71 | ✅ done | sley-fetch → sley-remote::install |
