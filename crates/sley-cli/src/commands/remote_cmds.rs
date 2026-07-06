@@ -7528,7 +7528,7 @@ fn run_push(
     // run receive-side hooks nor update local tracking refs (git's TRANSPORT_PUSH_DRY_RUN).
     if options.dry_run {
         if !options.quiet {
-            eprintln!("To {remote}");
+            eprintln!("To {}", push_display_remote(remote));
             for command in &plan.commands {
                 eprintln!("   {}  {}", command.new_id, command.name);
             }
@@ -7558,7 +7558,7 @@ fn run_push(
         configure_push_upstreams(git_dir, remote, &outcome.commands)?;
     }
     if !options.quiet {
-        eprintln!("To {remote}");
+        eprintln!("To {}", push_display_remote(remote));
         for command in &outcome.commands {
             eprintln!("   {}  {}", command.new_id, command.name);
         }
@@ -7643,7 +7643,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             let body = refspec.strip_prefix('+').unwrap_or(refspec);
             body == ":"
         }) {
-            let url = push_resolved_url(req.remote).unwrap_or_else(|_| req.remote.to_string());
+            let url = push_display_url(req.remote);
             eprintln!("No refs in common and none specified; doing nothing.");
             eprintln!("Perhaps you should specify a branch.");
             eprintln!("fatal: the remote end hung up unexpectedly");
@@ -7845,7 +7845,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
 
     // git's status header and the trailing error use the *resolved* push URL
     // (`transport->url` / `anon_url`), not the remote name the user typed.
-    let url = push_resolved_url(req.remote).unwrap_or_else(|_| req.remote.to_string());
+    let url = push_display_url(req.remote);
 
     let had_errors = report.had_errors();
     if !req.options.quiet || had_errors {
@@ -8917,6 +8917,18 @@ fn push_resolved_url(remote: &str) -> Result<String> {
         return Ok(resolve_remote_push_url(&config, remote));
     }
     Ok(remote.to_string())
+}
+
+/// Resolved push URL with embedded credentials stripped for user-visible output.
+fn push_display_url(remote: &str) -> String {
+    sley_remote::push_url_for_display(
+        &push_resolved_url(remote).unwrap_or_else(|_| remote.to_string()),
+    )
+}
+
+/// Remote name or URL argument with embedded credentials stripped for display.
+fn push_display_remote(remote: &str) -> String {
+    sley_remote::push_url_for_display(remote)
 }
 
 struct PushRemoteAndRefspecs {

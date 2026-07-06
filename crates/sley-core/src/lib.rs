@@ -367,6 +367,45 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
+fn is_scheme_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.')
+}
+
+/// Strip embedded credentials from `url` before showing it in user-facing output.
+///
+/// HTTP(S) userinfo (`user:password@host`) is replaced with `<redacted>@host`,
+/// matching trace2's `GIT_TRACE2_REDACT` behavior. Non-URL strings (remote
+/// names, file paths) are returned unchanged.
+pub fn redact_url_for_display(url: &str) -> String {
+    let mut out = String::with_capacity(url.len());
+    let mut rest = url;
+    while let Some(scheme_end) = rest.find("://") {
+        let scheme_start = rest[..scheme_end]
+            .char_indices()
+            .rev()
+            .find_map(|(idx, ch)| (!is_scheme_char(ch)).then_some(idx + ch.len_utf8()))
+            .unwrap_or(0);
+        out.push_str(&rest[..scheme_start]);
+
+        let authority_start = scheme_end + 3;
+        let authority_end = rest[authority_start..]
+            .find(|ch: char| matches!(ch, '/' | '?' | '#' | ' ' | '\t' | '\r' | '\n'))
+            .map(|idx| authority_start + idx)
+            .unwrap_or(rest.len());
+        let authority = &rest[authority_start..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            out.push_str(&rest[scheme_start..authority_start]);
+            out.push_str("<redacted>@");
+            out.push_str(&authority[at + 1..]);
+        } else {
+            out.push_str(&rest[scheme_start..authority_end]);
+        }
+        rest = &rest[authority_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Minimal trace2 event-target support (`GIT_TRACE2_EVENT`).
 ///
 /// Upstream's trace2 event target writes one JSON object per line to the file
@@ -423,43 +462,9 @@ pub mod trace2 {
         std::env::var("GIT_TRACE2_REDACT").map_or(true, |value| value != "0")
     }
 
-    fn is_scheme_char(ch: char) -> bool {
-        ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.')
-    }
-
-    fn redact_unsafe_urls(raw: &str) -> String {
-        let mut out = String::with_capacity(raw.len());
-        let mut rest = raw;
-        while let Some(scheme_end) = rest.find("://") {
-            let scheme_start = rest[..scheme_end]
-                .char_indices()
-                .rev()
-                .find_map(|(idx, ch)| (!is_scheme_char(ch)).then_some(idx + ch.len_utf8()))
-                .unwrap_or(0);
-            out.push_str(&rest[..scheme_start]);
-
-            let authority_start = scheme_end + 3;
-            let authority_end = rest[authority_start..]
-                .find(|ch: char| matches!(ch, '/' | '?' | '#' | ' ' | '\t' | '\r' | '\n'))
-                .map(|idx| authority_start + idx)
-                .unwrap_or(rest.len());
-            let authority = &rest[authority_start..authority_end];
-            if let Some(at) = authority.rfind('@') {
-                out.push_str(&rest[scheme_start..authority_start]);
-                out.push_str("<redacted>@");
-                out.push_str(&authority[at + 1..]);
-            } else {
-                out.push_str(&rest[scheme_start..authority_end]);
-            }
-            rest = &rest[authority_end..];
-        }
-        out.push_str(rest);
-        out
-    }
-
     fn maybe_redact(raw: &str) -> String {
         if redact_enabled() {
-            redact_unsafe_urls(raw)
+            super::redact_url_for_display(raw)
         } else {
             raw.to_string()
         }
@@ -2597,5 +2602,22 @@ mod tests {
             ident_render_date(b"0", b"+0000", &DateMode::Default),
             "Thu Jan 1 00:00:00 1970 +0000"
         );
+    }
+
+    #[test]
+    fn redact_url_for_display_strips_https_userinfo() {
+        assert_eq!(
+            redact_url_for_display("https://user:pass@host/repo.git"),
+            "https://<redacted>@host/repo.git"
+        );
+    }
+
+    #[test]
+    fn redact_url_for_display_leaves_urls_without_userinfo_unchanged() {
+        assert_eq!(
+            redact_url_for_display("https://host/repo.git"),
+            "https://host/repo.git"
+        );
+        assert_eq!(redact_url_for_display("origin"), "origin");
     }
 }

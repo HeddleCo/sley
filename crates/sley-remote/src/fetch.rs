@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_config::GitConfig;
 use sley_config::remotes::{remote_config_values, remote_exists, rewrite_url_with_config};
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result, redact_url_for_display};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, collect_reachable_object_ids,
     collect_reachable_object_ids_excluding,
@@ -1841,7 +1841,7 @@ pub fn fetch_head_source_description(config: &GitConfig, source: &str) -> String
         .next()
         .map(|url| rewrite_url_with_config(config, &url, false))
         .unwrap_or_else(|| rewrite_url_with_config(config, source, false));
-    trim_fetch_head_display_url(&url)
+    redact_url_for_display(&trim_fetch_head_display_url(&url))
 }
 
 /// Mirror git's `display_state` URL trimming (builtin/fetch.c): strip trailing
@@ -1895,10 +1895,12 @@ pub fn prune_refs_from_advertisements(
             progress.message(line);
         }
     };
-    let display_url = remote_config_values(input.config, input.remote, "url")
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| input.remote.into());
+    let display_url = redact_url_for_display(
+        &remote_config_values(input.config, input.remote, "url")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| input.remote.into()),
+    );
     emit(&format!("Pruning {}", input.remote));
     emit(&format!("URL: {display_url}"));
     let mut pruned = Vec::new();
@@ -1999,6 +2001,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use sley_config::{ConfigEntry, ConfigSection};
     use sley_formats::RepositoryLayout;
     use sley_object::{Commit, EncodedObject, ObjectType, Tree};
     use sley_odb::{FileObjectDatabase, ObjectWriter};
@@ -2248,6 +2251,25 @@ mod tests {
             shallow
         );
         assert_eq!(shallow, vec![tip]);
+    }
+
+    #[test]
+    fn fetch_head_source_description_redacts_embedded_credentials() {
+        let config = GitConfig {
+            sections: vec![ConfigSection::new(
+                "remote",
+                Some("origin".into()),
+                vec![ConfigEntry::new(
+                    "url",
+                    Some("https://user:pass@host/repo.git".into()),
+                )],
+            )],
+            ..GitConfig::default()
+        };
+        assert_eq!(
+            fetch_head_source_description(&config, "origin"),
+            "https://<redacted>@host/repo"
+        );
     }
 
     #[test]

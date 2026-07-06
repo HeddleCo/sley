@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_config::GitConfig;
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result, redact_url_for_display};
 use sley_object::{Commit, ObjectType};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
@@ -2243,6 +2243,12 @@ fn receive_pack_commands_from_action_plan(
         .collect()
 }
 
+/// Redact embedded credentials from a push URL before showing it in
+/// user-visible diagnostics.
+pub fn push_url_for_display(url: &str) -> String {
+    redact_url_for_display(url)
+}
+
 /// Validate a receive-pack report-status, surfacing a failed unpack or any
 /// rejected ref as an error (matching git's exit-failure message form).
 pub fn validate_receive_pack_report(report: &ReceivePackReportStatus) -> Result<()> {
@@ -3040,6 +3046,14 @@ mod tests {
                 .read_ref("refs/heads/main")
                 .expect("remote ref should read"),
             Some(RefTarget::Direct(base))
+        );
+    }
+
+    #[test]
+    fn push_url_for_display_redacts_embedded_credentials() {
+        assert_eq!(
+            push_url_for_display("https://user:pass@host/repo.git"),
+            "https://<redacted>@host/repo.git"
         );
     }
 
