@@ -218,3 +218,34 @@ mod platform {
         Vec::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_ancestry_is_cached() {
+        let first = process_ancestry().as_ptr();
+        let second = process_ancestry().as_ptr();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn process_ancestry_returns_valid_names() {
+        for name in process_ancestry() {
+            assert!(!name.contains('\0'));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn duplicate_fd_returns_distinct_owned_descriptor() {
+        use std::os::fd::AsRawFd;
+
+        let stderr = std::io::stderr();
+        let original = stderr.as_raw_fd();
+        let dup = duplicate_fd(original).expect("dup should succeed for stderr");
+        assert!(dup.as_raw_fd() >= 0);
+        assert_ne!(dup.as_raw_fd(), original);
+    }
+}

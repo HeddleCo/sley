@@ -123,16 +123,14 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_abbrev_noop_flag(first)
                 && branch_abbrev_noop_flag(second) =>
         {
-            let mode = branch_remote_or_all_mode_unchecked(flag);
-            print_branch_list(store, mode)
+            dispatch_remote_or_all_noop_display(store, flag, RemoteOrAllNoopDisplayCount::Two)
         }
         [first, second, flag]
             if branch_abbrev_noop_flag(first)
                 && branch_abbrev_noop_flag(second)
                 && branch_remote_or_all_mode(flag).is_some() =>
         {
-            let mode = branch_remote_or_all_mode_unchecked(flag);
-            print_branch_list(store, mode)
+            dispatch_remote_or_all_noop_display(store, flag, RemoteOrAllNoopDisplayCount::Two)
         }
         [flag, first, second]
             if branch_remote_or_all_mode(flag).is_some()
@@ -773,16 +771,16 @@ pub(super) fn dispatch_branch_positional_args(
             print_branch_list_matching_colored(store, BranchListMode::Local, patterns)
         }
         [list, color] if list == "--list" && branch_color_noop_flag(color) => {
-            print_branch_list(store, BranchListMode::Local)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::None, &[])
         }
         [list, color, patterns @ ..] if list == "--list" && branch_color_noop_flag(color) => {
-            print_branch_list_matching(store, BranchListMode::Local, patterns, false)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::Patterns, patterns)
         }
         [color, list] if branch_color_noop_flag(color) && list == "--list" => {
-            print_branch_list(store, BranchListMode::Local)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::None, &[])
         }
         [color, list, patterns @ ..] if branch_color_noop_flag(color) && list == "--list" => {
-            print_branch_list_matching(store, BranchListMode::Local, patterns, false)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::Patterns, patterns)
         }
         [list, points_at, _rev, no_points_at]
             if list == "--list" && points_at == "--points-at" && no_points_at == "--no-points-at" =>
@@ -2997,40 +2995,40 @@ pub(super) fn dispatch_branch_positional_args(
             print_branch_list_matching(store, BranchListMode::Local, patterns, true)
         }
         [list, column] if list == "--list" && branch_column_noop_flag(column) => {
-            print_branch_list(store, BranchListMode::Local)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::None, &[])
         }
         [list, column, patterns @ ..]
             if list == "--list" && branch_column_noop_flag(column) =>
         {
-            print_branch_list_matching(store, BranchListMode::Local, patterns, false)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::Patterns, patterns)
         }
         [column, list] if branch_column_noop_flag(column) && list == "--list" => {
-            print_branch_list(store, BranchListMode::Local)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::None, &[])
         }
         [column, list, patterns @ ..]
             if branch_column_noop_flag(column) && list == "--list" =>
         {
-            print_branch_list_matching(store, BranchListMode::Local, patterns, false)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::Patterns, patterns)
         }
         [first, second, list, patterns @ ..]
             if branch_column_noop_flag(first) && branch_column_noop_flag(second) && list == "--list" =>
         {
-            print_branch_list_matching(store, BranchListMode::Local, patterns, false)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::Patterns, patterns)
         }
         [list, first, second, patterns @ ..]
             if list == "--list" && branch_column_noop_flag(first) && branch_column_noop_flag(second) =>
         {
-            print_branch_list_matching(store, BranchListMode::Local, patterns, false)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::Patterns, patterns)
         }
         [first, second, list, patterns @ ..]
             if branch_abbrev_noop_flag(first) && branch_abbrev_noop_flag(second) && list == "--list" =>
         {
-            print_branch_list_matching(store, BranchListMode::Local, patterns, false)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::Patterns, patterns)
         }
         [list, first, second, patterns @ ..]
             if list == "--list" && branch_abbrev_noop_flag(first) && branch_abbrev_noop_flag(second) =>
         {
-            print_branch_list_matching(store, BranchListMode::Local, patterns, false)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::Patterns, patterns)
         }
         [format_flag, no_format, list, patterns @ ..]
             if format_flag.starts_with("--format=") && no_format == "--no-format" && list == "--list" =>
@@ -3889,8 +3887,12 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_column_noop_flag(second)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode_unchecked(flag);
-            print_branch_list_matching(store, mode, patterns, false)
+            dispatch_remote_or_all_list_noop_display(
+                store,
+                flag,
+                RemoteOrAllListNoopDisplayTail::Patterns,
+                patterns,
+            )
         }
         [flag, list, first, second, patterns @ ..]
             if branch_remote_or_all_mode(flag).is_some()
@@ -3898,8 +3900,12 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_column_noop_flag(first)
                 && branch_column_noop_flag(second) =>
         {
-            let mode = branch_remote_or_all_mode_unchecked(flag);
-            print_branch_list_matching(store, mode, patterns, false)
+            dispatch_remote_or_all_list_noop_display(
+                store,
+                flag,
+                RemoteOrAllListNoopDisplayTail::Patterns,
+                patterns,
+            )
         }
         [flag, first, second, list, patterns @ ..]
             if branch_remote_or_all_mode(flag).is_some()
@@ -3907,8 +3913,12 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_abbrev_noop_flag(second)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode_unchecked(flag);
-            print_branch_list_matching(store, mode, patterns, false)
+            dispatch_remote_or_all_list_noop_display(
+                store,
+                flag,
+                RemoteOrAllListNoopDisplayTail::Patterns,
+                patterns,
+            )
         }
         [flag, list, first, second, patterns @ ..]
             if branch_remote_or_all_mode(flag).is_some()
@@ -3916,8 +3926,12 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_abbrev_noop_flag(first)
                 && branch_abbrev_noop_flag(second) =>
         {
-            let mode = branch_remote_or_all_mode_unchecked(flag);
-            print_branch_list_matching(store, mode, patterns, false)
+            dispatch_remote_or_all_list_noop_display(
+                store,
+                flag,
+                RemoteOrAllListNoopDisplayTail::Patterns,
+                patterns,
+            )
         }
         [flag, display_flag, list]
             if branch_remote_or_all_mode(flag).is_some()
@@ -5732,10 +5746,10 @@ pub(super) fn dispatch_branch_positional_args(
             print_branch_list(store, BranchListMode::Local)
         }
         [first, second] if branch_column_noop_flag(first) && branch_column_noop_flag(second) => {
-            print_branch_list(store, BranchListMode::Local)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::None, &[])
         }
         [first, second] if branch_abbrev_noop_flag(first) && branch_abbrev_noop_flag(second) => {
-            print_branch_list(store, BranchListMode::Local)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::None, &[])
         }
         [flag, no_format] if flag.starts_with("--format=") && no_format == "--no-format" => {
             print_branch_list(store, BranchListMode::Local)

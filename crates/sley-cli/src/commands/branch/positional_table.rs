@@ -1,7 +1,8 @@
 //! Table-driven argv helpers for [`super::positional`].
 //!
 //! Starter for migrating the mechanical `match` arms: consolidate repeated
-//! remote/all list permutations here before the full argv table lands post-W90.
+//! remote/all list, color/column/abbrev noop-flag, and noop-display
+//! permutations here before the full argv table lands post-W90.
 
 use super::list::{
     branch_remote_or_all_mode_unchecked, print_branch_list, print_branch_list_matching,
