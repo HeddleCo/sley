@@ -446,13 +446,19 @@ fn spawn_service_process(
     Ok((child, stdin, stdout, stderr_drain))
 }
 
-fn ssh_command_failure_message(program: &str, stderr: &[u8]) -> String {
-    let message = String::from_utf8_lossy(stderr);
-    let trimmed = message.trim();
-    if trimmed.is_empty() {
-        program.to_string()
+fn ssh_command_failure_message(
+    program: &str,
+    stderr: &[u8],
+    status: std::process::ExitStatus,
+) -> String {
+    let trimmed = String::from_utf8_lossy(stderr).trim().to_string();
+    if !trimmed.is_empty() {
+        return trimmed;
+    }
+    if let Some(code) = status.code() {
+        format!("{program} exited with code {code}")
     } else {
-        trimmed.to_string()
+        format!("{program} terminated abnormally")
     }
 }
 
@@ -739,7 +745,7 @@ pub(crate) fn execute_push_ssh_plan(
         return Err(GitError::Command(format!(
             "ssh receive-pack failed for {}: {}",
             ssh_remote_display(&plan.remote),
-            ssh_command_failure_message("ssh receive-pack", &stderr)
+            ssh_command_failure_message("ssh receive-pack", &stderr, status)
         )));
     }
 
@@ -782,7 +788,7 @@ pub(crate) fn ls_remote_ssh(
             return Err(GitError::Command(format!(
                 "ssh upload-pack failed for {}: {}",
                 ssh_remote_display(remote),
-                ssh_command_failure_message("ssh upload-pack", &stderr)
+                ssh_command_failure_message("ssh upload-pack", &stderr, status)
             )));
         }
         Err(err) => return Err(err),
@@ -943,7 +949,7 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
         return Err(GitError::Command(format!(
             "ssh upload-pack failed for {}: {}",
             ssh_remote_display(request.remote),
-            ssh_command_failure_message("ssh upload-pack", &stderr)
+            ssh_command_failure_message("ssh upload-pack", &stderr, status)
         )));
     }
     Ok(shallow_info)
@@ -1007,7 +1013,7 @@ pub fn ssh_upload_pack_advertisements_with_options(
             return Err(GitError::Command(format!(
                 "ssh upload-pack failed for {}: {}",
                 ssh_remote_display(remote),
-                ssh_command_failure_message("ssh upload-pack", &stderr)
+                ssh_command_failure_message("ssh upload-pack", &stderr, status)
             )));
         }
         Err(err) => return Err(err),

@@ -73,7 +73,14 @@ impl GitConnection {
             }
         }
     }
+}
 
+impl Drop for GitConnection {
+    fn drop(&mut self) {
+        if let GitConnectionInner::Proxy { child, .. } = &mut self.inner {
+            let _ = child.wait();
+        }
+    }
 }
 
 /// Open a `git://` byte stream to `host`:`port`, using `core.gitproxy` when set.
@@ -102,7 +109,9 @@ fn spawn_git_proxy(command: &str, host: &str, port: &str) -> Result<GitConnectio
         .arg(port)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Upstream git inherits stderr; piping without draining deadlocks when the
+        // proxy is chatty (same class of bug as SSH service stderr in ssh.rs).
+        .stderr(Stdio::inherit())
         .spawn()
         .map_err(|err| GitError::Command(format!("cannot start proxy {command}: {err}")))?;
     let stdin = child.stdin.take().ok_or_else(|| {
@@ -131,28 +140,30 @@ pub(crate) fn resolve_git_proxy_command(
         return Some(command);
     }
     let config = config?;
-    for value in config.get_all("core", None, "gitproxy").into_iter().rev() {
+    // connect.c's git_proxy_command_options overwrites on every matching line while
+    // repo_config walks the file in order — last matching entry wins.
+    let mut resolved = None;
+    for value in config.get_all("core", None, "gitproxy") {
         let Some(value) = value else {
             continue;
         };
         if let Some(command) = match_git_proxy_value(value, host) {
-            return Some(command);
+            resolved = Some(command);
         }
     }
-    None
+    resolved
 }
 
 fn match_git_proxy_value(value: &str, host: &str) -> Option<String> {
-    let (command, host_pattern) = if let Some(for_pos) = value.find(" for ") {
+    let command = if let Some(for_pos) = value.find(" for ") {
         let host_pattern = &value[for_pos + 5..];
         if !host_matches_git_proxy_pattern(host, host_pattern) {
             return None;
         }
-        (&value[..for_pos], host_pattern)
+        &value[..for_pos]
     } else {
-        (value, host)
+        value
     };
-    let _ = host_pattern;
     if command == "none" {
         return None;
     }
@@ -218,5 +229,35 @@ mod tests {
     fn blocked_hostnames_are_rejected() {
         assert!(validate_git_daemon_host("-remote").is_err());
         assert!(validate_git_daemon_host("example.com").is_ok());
+    }
+
+    #[test]
+    fn gitproxy_last_match_wins() {
+        let config = GitConfig::parse(
+            b"\
+[core]\n\
+\tgitproxy = first-proxy for example.com\n\
+\tgitproxy = second-proxy for example.com\n\
+\tgitproxy = fallback-proxy\n\
+",
+        )
+        .expect("config");
+        // Universal fallback is last and matches every host (connect.c semantics).
+        assert_eq!(
+            resolve_git_proxy_command(Some(&config), "git.example.com").as_deref(),
+            Some("fallback-proxy")
+        );
+        let config = GitConfig::parse(
+            b"\
+[core]\n\
+\tgitproxy = fallback-proxy\n\
+\tgitproxy = host-proxy for example.com\n\
+",
+        )
+        .expect("config");
+        assert_eq!(
+            resolve_git_proxy_command(Some(&config), "git.example.com").as_deref(),
+            Some("host-proxy")
+        );
     }
 }

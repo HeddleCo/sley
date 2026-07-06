@@ -1751,8 +1751,9 @@ fn clone_network_repository(
     }
 
     let remote = parse_remote_url(&ls_remote_resolved_url(options.repository)?)?;
+    let transport_config = transport_policy_config_for_cwd()?;
     if matches!(transport, CloneNetworkTransport::Ssh) {
-        trace_configured_local_protocol_version(None);
+        trace_configured_local_protocol_version(Some(&transport_config));
     }
     let (advertisements, features) = match transport {
         CloneNetworkTransport::Ssh => sley_remote::ssh_upload_pack_advertisements_with_options(
@@ -1764,8 +1765,8 @@ fn clone_network_repository(
             let discovered = sley_remote::git_upload_pack_advertisements_with_protocol(
                 &remote,
                 ObjectFormat::Sha1,
-                configured_protocol_version(None) == Some(ProtocolVersion::V2),
-                None,
+                configured_protocol_version(Some(&transport_config)) == Some(ProtocolVersion::V2),
+                Some(&transport_config),
             )?;
             (discovered.refs, discovered.features)
         }
@@ -1817,7 +1818,8 @@ fn clone_network_repository(
         CloneNetworkTransport::Ssh => sley_remote::CloneSource::Ssh(remote),
         CloneNetworkTransport::Git => sley_remote::CloneSource::Git {
             remote,
-            protocol_v2: configured_protocol_version(None) == Some(ProtocolVersion::V2),
+            protocol_v2: configured_protocol_version(Some(&transport_config))
+                == Some(ProtocolVersion::V2),
         },
     };
     let clone_options = sley_remote::CloneOptions {
@@ -1957,7 +1959,7 @@ fn clone_bare_network_repository(
         CloneNetworkTransport::Ssh => sley_remote::FetchSource::Ssh(remote),
         CloneNetworkTransport::Git => sley_remote::FetchSource::Git {
             remote,
-            protocol_v2: configured_protocol_version(None) == Some(ProtocolVersion::V2),
+            protocol_v2: configured_protocol_version(Some(&config)) == Some(ProtocolVersion::V2),
         },
     };
     let mut refspecs = if options.single_branch {
