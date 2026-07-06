@@ -11,6 +11,7 @@ license.workspace = true
 # Backend selected by the mutually-exclusive zlib-rs/pure-rust features below;
 # no backend baked into the dep line (see sley-pack for the cfg-cascade rationale).
 flate2 = { version = "1", default-features = false }
+parking_lot = "0.12"
 sley-core.workspace = true
 sley-formats.workspace = true
 sley-mmap = { workspace = true, optional = true }
