@@ -12,6 +12,10 @@ use sley_odb::ObjectReader;
 use sley_remote::{FetchOptions, LsRemoteRecord};
 use std::process::Command as Proc;
 
+#[path = "remote_ls_options.rs"]
+mod remote_ls_options;
+use remote_ls_options::setup_ls_remote_options;
+
 /// Internal placeholder branch used while clone initializes before it knows
 /// which branch, detached commit, or unborn remote state will own `HEAD`.
 const CLONE_UNBORN_BRANCH: &str = "__sley_clone_unborn__";
@@ -10018,7 +10022,7 @@ fn ls_remote_filter(options: &LsRemoteOptions) -> sley_remote::LsRemoteFilter {
 }
 
 #[derive(Debug, Default)]
-struct LsRemoteOptions {
+pub(super) struct LsRemoteOptions {
     heads: bool,
     tags: bool,
     refs_only: bool,
@@ -10034,7 +10038,7 @@ struct LsRemoteOptions {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum LsRemoteSort {
+pub(super) enum LsRemoteSort {
     Refname,
     RefnameDescending,
     VersionRefname,
@@ -10240,7 +10244,7 @@ fn default_ls_remote_remote() -> Result<String> {
 }
 
 pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
-    let mut options = parse_ls_remote_options(args)?;
+    let mut options = setup_ls_remote_options(args)?;
     let implicit_repository = options.repository.is_none();
     let repository = match options.repository.as_deref() {
         Some(repository) => repository.to_string(),
@@ -10457,103 +10461,7 @@ fn ls_remote_upload_pack_command_records(
     Ok(records)
 }
 
-fn parse_ls_remote_options(args: &[String]) -> Result<LsRemoteOptions> {
-    let mut options = LsRemoteOptions::default();
-    let mut positional = Vec::new();
-    let mut positional_only = false;
-    let mut args = GitArgCursor::new(args);
-    while let Some(arg) = args.next() {
-        if positional_only {
-            positional.push(arg.to_string());
-            continue;
-        }
-        match arg {
-            "--" => positional_only = true,
-            "-b" | "-h" | "--heads" | "--branches" => options.heads = true,
-            "--no-heads" | "--no-branches" => options.heads = false,
-            "-t" | "--tags" => options.tags = true,
-            "--no-tags" => options.tags = false,
-            "--refs" => options.refs_only = true,
-            "--no-refs" => options.refs_only = false,
-            "--symref" => options.symref = true,
-            "--no-symref" => options.symref = false,
-            "--exit-code" => options.exit_code = true,
-            "--no-exit-code" => options.exit_code = false,
-            "-q" | "--quiet" => options.quiet = true,
-            "--no-quiet" => options.quiet = false,
-            "--get-url" => options.get_url = true,
-            "--no-get-url" => options.get_url = false,
-            "--upload-pack" => {
-                let Some(value) = args.next_value() else {
-                    return ls_remote_usage();
-                };
-                options.upload_pack_command = Some(value.to_string());
-            }
-            value if let Some(upload_pack) = long_option_value(value, "upload-pack") => {
-                options.upload_pack_command = Some(upload_pack.to_string());
-            }
-            "--server-option" | "-o" => {
-                let Some(value) = args.next_value() else {
-                    return ls_remote_usage();
-                };
-                options.server_options.push(value.to_string());
-            }
-            "--sort" => {
-                let Some(value) = args.next_value() else {
-                    return ls_remote_usage();
-                };
-                options.sort = Some(parse_ls_remote_sort(value)?);
-            }
-            "--no-upload-pack" | "--no-server-option" => {}
-            "--no-sort" => options.sort = None,
-            value if let Some(option) = long_option_value(value, "server-option") => {
-                options.server_options.push(option.to_string());
-            }
-            value if let Some(sort) = long_option_value(value, "sort") => {
-                options.sort = Some(parse_ls_remote_sort(sort)?);
-            }
-            value if value.starts_with('-') => {
-                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
-                return ls_remote_usage();
-            }
-            value => positional.push(value.to_string()),
-        }
-    }
-    if let Some(repository) = positional.first() {
-        options.repository = Some(repository.clone());
-        options.patterns = positional[1..].to_vec();
-    }
-    Ok(options)
-}
 
-fn parse_ls_remote_sort(value: &str) -> Result<LsRemoteSort> {
-    match value {
-        "refname" => Ok(LsRemoteSort::Refname),
-        "-refname" => Ok(LsRemoteSort::RefnameDescending),
-        "version:refname" | "v:refname" => Ok(LsRemoteSort::VersionRefname),
-        "-version:refname" | "-v:refname" => Ok(LsRemoteSort::VersionRefnameDescending),
-        "objectname" => Ok(LsRemoteSort::ObjectName),
-        "-objectname" => Ok(LsRemoteSort::ObjectNameDescending),
-        "objecttype" => Ok(LsRemoteSort::ObjectType),
-        "-objecttype" => Ok(LsRemoteSort::ObjectTypeDescending),
-        "objectsize" => Ok(LsRemoteSort::ObjectSize),
-        "-objectsize" => Ok(LsRemoteSort::ObjectSizeDescending),
-        "objectsize:disk" => Ok(LsRemoteSort::ObjectSizeDisk),
-        "-objectsize:disk" => Ok(LsRemoteSort::ObjectSizeDiskDescending),
-        "authordate" => Ok(LsRemoteSort::AuthorDate),
-        "-authordate" => Ok(LsRemoteSort::AuthorDateDescending),
-        "committerdate" => Ok(LsRemoteSort::CommitterDate),
-        "-committerdate" => Ok(LsRemoteSort::CommitterDateDescending),
-        "taggerdate" => Ok(LsRemoteSort::TaggerDate),
-        "-taggerdate" => Ok(LsRemoteSort::TaggerDateDescending),
-        "creatordate" => Ok(LsRemoteSort::CreatorDate),
-        "-creatordate" => Ok(LsRemoteSort::CreatorDateDescending),
-        other => {
-            eprintln!("fatal: unknown field name: {other}");
-            Err(GitError::Exit(128))
-        }
-    }
-}
 
 fn validate_ls_remote_sort_context(sort: Option<LsRemoteSort>) -> Result<Option<PathBuf>> {
     if !matches!(
@@ -11073,28 +10981,7 @@ fn print_ls_remote_ref(record: &LsRemoteRecord, show_symref: bool) {
     println!("{}\t{}", record.oid, record.name);
 }
 
-fn ls_remote_usage<T>() -> Result<T> {
-    eprintln!("usage: git ls-remote [--branches] [--tags] [--refs] [--upload-pack=<exec>]");
-    eprintln!("                     [-q | --quiet] [--exit-code] [--get-url] [--sort=<key>]");
-    eprintln!("                     [--symref] [<repository> [<patterns>...]]");
-    eprintln!();
-    eprintln!("    -q, --[no-]quiet      do not print remote URL");
-    eprintln!("    --[no-]upload-pack <exec>");
-    eprintln!("                          path of git-upload-pack on the remote host");
-    eprintln!("    -t, --[no-]tags       limit to tags");
-    eprintln!("    -b, --[no-]branches   limit to branches");
-    eprintln!("    --[no-]refs           do not show peeled tags");
-    eprintln!("    --[no-]get-url        take url.<base>.insteadOf into account");
-    eprintln!("    --[no-]sort <key>     field name to sort on");
-    eprintln!("    --[no-]exit-code      exit with exit code 2 if no matching refs are found");
-    eprintln!(
-        "    --[no-]symref         show underlying ref in addition to the object pointed by it"
-    );
-    eprintln!("    -o, --[no-]server-option <server-specific>");
-    eprintln!("                          option to transmit");
-    eprintln!();
-    Err(GitError::Exit(129))
-}
+
 pub(crate) fn cmd_remote(args: &[String]) -> Result<()> {
     let mut verbose = false;
     let mut idx = 0;

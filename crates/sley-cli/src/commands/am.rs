@@ -288,7 +288,7 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         };
     }
 
-    let mut options = parse_am_options(&option_args)?;
+    let mut options = setup_am_options(&option_args)?;
 
     if allow_empty_resume && options.mboxes.is_empty() && state_dir.exists() {
         return am_continue_allow_empty(
@@ -301,7 +301,7 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
     }
 
     // git seeds am.messageid / am.threeWay from config, then lets the
-    // command-line flag (handled in parse_am_options) override. parse_am_options
+    // command-line flag (handled in setup_am_options) override. setup_am_options
     // leaves an unspecified flag at false, so OR the config default in only when
     // the user did not pass an explicit `--[no-]…` form.
     apply_am_config_defaults(&git_dir, &option_args, &mut options);
@@ -589,7 +589,7 @@ pub(crate) fn rebase_apply_abort(
 }
 
 /// Parse the non-resume flags of `git am`.
-fn parse_am_options(args: &[String]) -> Result<AmOptions> {
+fn setup_am_options(args: &[String]) -> Result<AmOptions> {
     let mut options = AmOptions {
         mboxes: Vec::new(),
         quiet: false,
@@ -2484,7 +2484,7 @@ fn am_do_interactive(message: &[u8]) -> Result<AmInteractiveDecision> {
 
 /// Parse the option overrides a resume verb (`--retry`/`--continue`) may carry.
 /// Only options that change saved session state are tracked; others are ignored
-/// (the resume path does not run the full `parse_am_options`).
+/// (the resume path does not run the full `setup_am_options`).
 fn parse_am_resume_overrides(option_args: &[String]) -> AmResumeOverrides {
     let mut overrides = AmResumeOverrides::default();
     for arg in option_args {

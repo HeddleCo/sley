@@ -8171,7 +8171,7 @@ struct ForEachRefEmailOptions {
 /// each must be an exact `trim`/`localpart`/`mailmap` token between commas.
 /// On an unrecognized token, returns `Err(bad_arg)` where `bad_arg` is the
 /// unconsumed remainder at the point of failure (git reports this verbatim).
-fn parse_for_each_ref_email_options(
+fn setup_for_each_ref_email_options(
     arg: &str,
 ) -> std::result::Result<ForEachRefEmailOptions, String> {
     let mut options = ForEachRefEmailOptions::default();
@@ -8233,7 +8233,7 @@ fn for_each_ref_try_email_atom(
         _ => return None,
     };
     let options = match arg {
-        Some(arg) => match parse_for_each_ref_email_options(arg) {
+        Some(arg) => match setup_for_each_ref_email_options(arg) {
             Ok(options) => options,
             Err(bad_arg) => {
                 let name = atom.strip_prefix('*').unwrap_or(atom);

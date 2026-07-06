@@ -4,6 +4,10 @@
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
 
+#[path = "plumbing_options.rs"]
+mod plumbing_options;
+use plumbing_options::{setup_rerere_options, setup_replace_options};
+
 /// An `--add-file` / `--add-virtual-file` entry: the output path (already
 /// prefixed) plus its content + mode. Disk-backed files are read at parse time
 /// so the base prefix in effect at that point is captured.
@@ -7265,28 +7269,28 @@ fn fsck_root_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<(String, O
 }
 
 #[derive(Debug)]
-enum ReplaceMode {
+pub(super) enum ReplaceMode {
     Create { object: String, replacement: String },
     List { pattern: Option<String> },
     Delete { objects: Vec<String> },
 }
 
 #[derive(Debug)]
-struct ReplaceOptions {
+pub(super) struct ReplaceOptions {
     force: bool,
     format: ReplaceListFormat,
     mode: ReplaceMode,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ReplaceListFormat {
+pub(super) enum ReplaceListFormat {
     Short,
     Medium,
     Long,
 }
 
 pub(crate) fn cmd_replace(args: &[String]) -> Result<()> {
-    let options = parse_replace_options(args)?;
+    let options = setup_replace_options(args)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
@@ -7311,118 +7315,6 @@ pub(crate) fn cmd_replace(args: &[String]) -> Result<()> {
             &replacement,
             options.force,
         ),
-    }
-}
-
-fn parse_replace_options(args: &[String]) -> Result<ReplaceOptions> {
-    let mut force = false;
-    let mut format = ReplaceListFormat::Short;
-    let mut list = false;
-    let mut delete = false;
-    let mut unsupported_mode = None::<&str>;
-    let mut positional = Vec::new();
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--" => {
-                positional.extend(iter.cloned());
-                break;
-            }
-            "-f" | "--force" => force = true,
-            "--no-force" => force = false,
-            "-l" | "--list" => list = true,
-            "-d" | "--delete" => delete = true,
-            "-e" | "--edit" => unsupported_mode = Some("--edit"),
-            "-g" | "--graft" => unsupported_mode = Some("--graft"),
-            "--convert-graft-file" => unsupported_mode = Some("--convert-graft-file"),
-            "--raw" | "--no-raw" => {}
-            "--format" => {
-                let Some(value) = iter.next() else {
-                    eprintln!("error: option `format' requires a value");
-                    return Err(GitError::Exit(129));
-                };
-                format = parse_replace_list_format(value)?;
-            }
-            "--no-format" => format = ReplaceListFormat::Short,
-            value if let Some(value) = long_option_value(value, "format") => {
-                format = parse_replace_list_format(value)?;
-            }
-            value if value.starts_with("--no-force=") => {
-                eprintln!("error: option `no-force' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with("--") => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                return replace_usage();
-            }
-            value if value.starts_with('-') && value.len() > 1 => {
-                for option in value[1..].chars() {
-                    match option {
-                        'f' => force = true,
-                        'l' => list = true,
-                        'd' => delete = true,
-                        'e' => unsupported_mode = Some("--edit"),
-                        'g' => unsupported_mode = Some("--graft"),
-                        other => {
-                            eprintln!("error: unknown switch `{other}'");
-                            return replace_usage();
-                        }
-                    }
-                }
-            }
-            value => positional.push(value.to_string()),
-        }
-    }
-    if let Some(mode) = unsupported_mode {
-        return Err(GitError::Unsupported(format!("replace {mode}")));
-    }
-    if delete {
-        if positional.is_empty() {
-            return replace_usage();
-        }
-        return Ok(ReplaceOptions {
-            force,
-            format,
-            mode: ReplaceMode::Delete {
-                objects: positional,
-            },
-        });
-    }
-    if list || positional.len() <= 1 {
-        if positional.len() > 1 {
-            return replace_usage();
-        }
-        return Ok(ReplaceOptions {
-            force,
-            format,
-            mode: ReplaceMode::List {
-                pattern: positional.pop(),
-            },
-        });
-    }
-    if positional.len() == 2 {
-        return Ok(ReplaceOptions {
-            force,
-            format,
-            mode: ReplaceMode::Create {
-                object: positional.remove(0),
-                replacement: positional.remove(0),
-            },
-        });
-    }
-    replace_usage()
-}
-
-fn parse_replace_list_format(value: &str) -> Result<ReplaceListFormat> {
-    match value {
-        "short" => Ok(ReplaceListFormat::Short),
-        "medium" => Ok(ReplaceListFormat::Medium),
-        "long" => Ok(ReplaceListFormat::Long),
-        other => {
-            eprintln!("error: invalid replace format '{other}'");
-            eprintln!("valid formats are 'short', 'medium' and 'long'");
-            Err(GitError::Exit(255))
-        }
     }
 }
 
@@ -7560,27 +7452,6 @@ fn replace_object_type(
         .unwrap_or("unknown"))
 }
 
-fn replace_usage<T>() -> Result<T> {
-    eprintln!("usage: git replace [-f] <object> <replacement>");
-    eprintln!("   or: git replace [-f] --edit <object>");
-    eprintln!("   or: git replace [-f] --graft <commit> [<parent>...]");
-    eprintln!("   or: git replace [-f] --convert-graft-file");
-    eprintln!("   or: git replace -d <object>...");
-    eprintln!("   or: git replace [--format=<format>] [-l [<pattern>]]");
-    eprintln!();
-    eprintln!("    -l, --list            list replace refs");
-    eprintln!("    -d, --delete          delete replace refs");
-    eprintln!("    -e, --edit            edit existing object");
-    eprintln!("    -g, --graft           change a commit's parents");
-    eprintln!("    --convert-graft-file  convert existing graft file");
-    eprintln!("    -f, --[no-]force      replace the ref if it exists");
-    eprintln!("    --[no-]raw            do not pretty-print contents for --edit");
-    eprintln!("    --[no-]format <format>");
-    eprintln!("                          use this format");
-    eprintln!();
-    Err(GitError::Exit(129))
-}
-
 pub(crate) fn cmd_prune_packed(args: &[String]) -> Result<()> {
     let mut dry_run = false;
     let mut positional = 0usize;
@@ -7671,7 +7542,7 @@ struct MergeRrEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RerereSubcommand {
+pub(super) enum RerereSubcommand {
     Clear,
     Forget,
     Gc,
@@ -7679,13 +7550,13 @@ enum RerereSubcommand {
 }
 
 #[derive(Debug)]
-struct RerereOptions {
+pub(super) struct RerereOptions {
     subcommand: Option<RerereSubcommand>,
     paths: Vec<String>,
 }
 
 pub(crate) fn cmd_rerere(args: &[String]) -> Result<()> {
-    let options = parse_rerere_options(args)?;
+    let options = setup_rerere_options(args)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
     match options.subcommand {
         None => Ok(()),
@@ -7694,56 +7565,6 @@ pub(crate) fn cmd_rerere(args: &[String]) -> Result<()> {
         Some(RerereSubcommand::Forget) => rerere_forget(&git_dir, &options.paths),
         Some(RerereSubcommand::Gc) => rerere_gc(&git_dir),
     }
-}
-
-fn parse_rerere_options(args: &[String]) -> Result<RerereOptions> {
-    let mut autoupdate = None;
-    let mut subcommand = None;
-    let mut paths = Vec::new();
-    let mut positional_only = false;
-    for arg in args {
-        if positional_only {
-            paths.push(arg.clone());
-            continue;
-        }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "--rerere-autoupdate" => autoupdate = Some(true),
-            "--no-rerere-autoupdate" => autoupdate = Some(false),
-            value if value.starts_with("--no-rerere-autoupdate=") => {
-                eprintln!("error: option `no-rerere-autoupdate' takes no value");
-                return rerere_usage();
-            }
-            value if value.starts_with("--rerere-autoupdate=") => {
-                eprintln!("error: option `rerere-autoupdate' takes no value");
-                return rerere_usage();
-            }
-            value if value.starts_with("--") => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                return rerere_usage();
-            }
-            "clear" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Clear),
-            "forget" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Forget),
-            "gc" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Gc),
-            "status" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Status),
-            _ if subcommand.is_none() => return rerere_usage(),
-            value => paths.push(value.to_string()),
-        }
-    }
-    if matches!(subcommand, Some(RerereSubcommand::Forget)) && paths.is_empty() {
-        eprintln!("warning: 'git rerere forget' without paths is deprecated");
-    }
-    let _ = autoupdate;
-    Ok(RerereOptions { subcommand, paths })
-}
-
-fn rerere_usage<T>() -> Result<T> {
-    eprintln!("usage: git rerere [clear | forget <pathspec>... | diff | status | remaining | gc]");
-    eprintln!();
-    eprintln!("    --[no-]rerere-autoupdate");
-    eprintln!("                          register clean resolutions in index");
-    eprintln!();
-    Err(GitError::Exit(129))
 }
 
 fn is_rerere_enabled(git_dir: &Path) -> Result<bool> {

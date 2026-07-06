@@ -441,7 +441,7 @@ struct EditOptions {
 /// `allow_force` controls whether `-f`/`--force` is accepted (only `add`/`copy`
 /// take it). Content options preserve relative order so paragraph joining and
 /// verbatim reuse interleave exactly as on the command line.
-fn parse_edit_options(
+fn setup_edit_options(
     git_dir: &Path,
     format: ObjectFormat,
     args: &[String],
@@ -681,7 +681,7 @@ fn notes_tree_from_revision(
 }
 
 fn notes_add(git_dir: &Path, format: ObjectFormat, notes_ref: &str, args: &[String]) -> Result<()> {
-    let options = parse_edit_options(git_dir, format, args, true, NotesUsage::Add)?;
+    let options = setup_edit_options(git_dir, format, args, true, NotesUsage::Add)?;
     let has_messages = !options.contents.is_empty();
     let spec = options.object.clone().unwrap_or_else(|| "HEAD".to_string());
     let target = resolve_note_object(git_dir, format, &spec)?;
@@ -791,7 +791,7 @@ fn notes_edit(
     notes_ref: &str,
     args: &[String],
 ) -> Result<()> {
-    let options = parse_edit_options(git_dir, format, args, false, NotesUsage::Edit)?;
+    let options = setup_edit_options(git_dir, format, args, false, NotesUsage::Edit)?;
     let has_messages = !options.contents.is_empty();
     if has_messages {
         eprintln!(
@@ -841,7 +841,7 @@ fn notes_append(
     notes_ref: &str,
     args: &[String],
 ) -> Result<()> {
-    let options = parse_edit_options(git_dir, format, args, false, NotesUsage::Append)?;
+    let options = setup_edit_options(git_dir, format, args, false, NotesUsage::Append)?;
     let has_messages = !options.contents.is_empty();
     let spec = options.object.clone().unwrap_or_else(|| "HEAD".to_string());
     let target = resolve_note_object(git_dir, format, &spec)?;

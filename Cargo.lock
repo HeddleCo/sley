@@ -1201,6 +1201,7 @@ dependencies = [
  "filetime",
  "flate2",
  "regex",
+ "sley",
  "sley-archive",
  "sley-config",
  "sley-core",
