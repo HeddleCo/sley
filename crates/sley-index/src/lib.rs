@@ -1718,6 +1718,29 @@ pub fn repository_index_path(git_dir: impl AsRef<Path>) -> PathBuf {
         .unwrap_or_else(|| git_dir.as_ref().join("index"))
 }
 
+enum RepositoryIndexBytes {
+    Owned(Vec<u8>),
+    Mapped(sley_mmap::MappedFile),
+}
+
+impl AsRef<[u8]> for RepositoryIndexBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(mapped) => mapped.as_bytes(),
+        }
+    }
+}
+
+/// Load repository index bytes, memory-mapping the standard `$GIT_DIR/index`
+/// path when possible and falling back to a heap read otherwise.
+fn read_repository_index_bytes(index_path: &Path) -> Result<RepositoryIndexBytes> {
+    match sley_mmap::MappedFile::open_index(index_path) {
+        Ok(mapped) => Ok(RepositoryIndexBytes::Mapped(mapped)),
+        Err(_) => Ok(RepositoryIndexBytes::Owned(fs::read(index_path)?)),
+    }
+}
+
 /// Read this repository's index and expand a split index through its
 /// `sharedindex.<hash>` base when a `link` extension is present.
 pub fn read_repository_index(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Result<Index> {
@@ -1731,7 +1754,8 @@ fn read_index_file_expanded(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<Index> {
-    let mut index = Index::parse(&fs::read(index_path)?, format)?;
+    let index_bytes = read_repository_index_bytes(index_path)?;
+    let mut index = Index::parse(index_bytes.as_ref(), format)?;
     let Some(link) = index.split_index_link(format)? else {
         return Ok(index);
     };

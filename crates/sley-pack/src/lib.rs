@@ -1174,6 +1174,45 @@ mod tests {
     }
 
     #[test]
+    fn reverse_index_resolves_oid_at_offset() {
+        let objects = (0..3)
+            .map(|idx| {
+                EncodedObject::new(
+                    ObjectType::Blob,
+                    format!("reverse index lookup object {idx}\n").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let written = PackFile::write_packed(&objects, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let index = PackIndex::parse(&written.index, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let view = PackIndexViewData::parse_trusted_without_checksum(
+            Arc::from(written.index.clone().into_boxed_slice()),
+            ObjectFormat::Sha1,
+        )
+        .expect("test operation should succeed");
+        let positions = pack_order_index_positions(&index.entries);
+        let reverse = PackReverseIndex::parse(
+            &PackReverseIndex::write(ObjectFormat::Sha1, &positions, &index.pack_checksum)
+                .expect("test operation should succeed"),
+            ObjectFormat::Sha1,
+            index.entries.len(),
+        )
+        .expect("test operation should succeed");
+
+        for entry in &index.entries {
+            assert_eq!(
+                reverse
+                    .oid_at_offset(&view, entry.offset)
+                    .expect("test operation should succeed"),
+                entry.oid
+            );
+        }
+        assert!(reverse.oid_at_offset(&view, 999).is_none());
+    }
+
+    #[test]
     fn parses_pack_reverse_index() {
         let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
             .expect("test operation should succeed");

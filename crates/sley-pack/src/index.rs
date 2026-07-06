@@ -603,6 +603,33 @@ impl PackIndexViewData {
         }
     }
 
+    /// Offset/CRC lookup for the entry at `idx` in oid-sorted pack-index order.
+    pub fn lookup_at(&self, idx: usize) -> Option<PackIndexLookup> {
+        self.as_view().lookup_at(idx)
+    }
+
+    /// The object id at `idx` in oid-sorted pack-index order.
+    pub fn oid_at(&self, idx: usize) -> Result<ObjectId> {
+        if idx >= self.count {
+            return Err(GitError::InvalidFormat(
+                "pack index position out of range".into(),
+            ));
+        }
+        ObjectId::from_raw(self.format, self.as_view().oid_bytes_at(idx))
+    }
+
+    /// Resolve a pack offset to its object id by scanning every index entry.
+    pub fn oid_at_offset_linear(&self, offset: u64) -> Option<ObjectId> {
+        let view = self.as_view();
+        for idx in 0..self.count {
+            let lookup = view.lookup_at(idx)?;
+            if lookup.offset == offset {
+                return self.oid_at(idx).ok();
+            }
+        }
+        None
+    }
+
     pub(crate) fn parse_impl(
         bytes: Arc<dyn PackIndexByteSource>,
         format: ObjectFormat,
@@ -1306,6 +1333,34 @@ impl PackReverseIndex {
             pack_checksum,
             index_checksum,
         })
+    }
+
+    /// Resolve a pack offset to its object id using this reverse index.
+    ///
+    /// `positions` are listed in pack offset order; each value names the
+    /// oid-sorted index position for that object. When the reverse index's pack
+    /// checksum does not match `index`, returns `None`.
+    pub fn oid_at_offset(&self, index: &PackIndexViewData, offset: u64) -> Option<ObjectId> {
+        if self.pack_checksum != index.pack_checksum {
+            return None;
+        }
+        let view = index.as_view();
+        let positions = &self.positions;
+        let mut lo = 0usize;
+        let mut hi = positions.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let idx_pos = positions[mid] as usize;
+            let entry_offset = view.lookup_at(idx_pos)?.offset;
+            if entry_offset < offset {
+                lo = mid + 1;
+            } else if entry_offset > offset {
+                hi = mid;
+            } else {
+                return index.oid_at(idx_pos).ok();
+            }
+        }
+        None
     }
 }
 

@@ -15,7 +15,7 @@ use sley_object::{
 use sley_pack::{
     MultiPackIndex, MultiPackIndexOidLookup, PackBitmapIndex, PackBitmapWriter, PackFile,
     PackIndex, PackIndexByteSource, PackIndexEntry, PackIndexViewData, PackInput,
-    PackStreamIndexBuild, PackWrite, PackWriteOptions, PackWriteSummary,
+    PackReverseIndex, PackStreamIndexBuild, PackWrite, PackWriteOptions, PackWriteSummary,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -3059,7 +3059,7 @@ struct PackIndexOffsetInfo {
 }
 
 fn scan_pack_index_offsets(
-    index: &PackIndex,
+    index: &PackIndexViewData,
     target_offset: u64,
     trailer_offset: Option<u64>,
     delta_base_offset: Option<u64>,
@@ -3068,17 +3068,20 @@ fn scan_pack_index_offsets(
     let mut next_offset = None;
     let mut delta_base_oid = None;
 
-    for entry in &index.entries {
-        if entry.offset == target_offset {
+    for idx in 0..index.count {
+        let Some(lookup) = index.lookup_at(idx) else {
+            continue;
+        };
+        if lookup.offset == target_offset {
             target_count += 1;
-        } else if entry.offset > target_offset {
+        } else if lookup.offset > target_offset {
             match next_offset {
-                Some(current) if current <= entry.offset => {}
-                _ => next_offset = Some(entry.offset),
+                Some(current) if current <= lookup.offset => {}
+                _ => next_offset = Some(lookup.offset),
             }
         }
-        if Some(entry.offset) == delta_base_offset {
-            delta_base_oid = Some(entry.oid);
+        if Some(lookup.offset) == delta_base_offset {
+            delta_base_oid = Some(index.oid_at(idx)?);
         }
     }
 
@@ -5123,7 +5126,11 @@ impl sley_pack::HeaderTypeCache for PackHeaderTypeCacheAdapter<'_> {
 /// remains for MIDX and path-only fallback lookups; normal pack-directory scans
 /// use [`PackRegistrySnapshot`] so the lookup hot path can walk already-parsed
 /// pack records directly.
-type PackIndexCache = Arc<Mutex<HashMap<PathBuf, Arc<PackIndex>>>>;
+type PackIndexCache = Arc<Mutex<HashMap<PathBuf, Arc<PackIndexViewData>>>>;
+
+/// Optional `.rev` reverse indexes keyed by `.idx` path, shared across cloned
+/// handles. A cached `None` means no usable reverse index was found.
+type PackReverseIndexCache = Arc<Mutex<HashMap<PathBuf, Option<Arc<PackReverseIndex>>>>>;
 
 /// Parsed multi-pack-index files keyed by path, shared across cloned handles.
 /// Caches the MIDX parse so object lookups in repositories with a MIDX avoid
@@ -5286,9 +5293,9 @@ impl PackLookup {
         }
     }
 
-    fn pack_index(&self, database: &FileObjectDatabase) -> Result<Arc<PackIndex>> {
+    fn pack_index(&self, database: &FileObjectDatabase) -> Result<Arc<PackIndexViewData>> {
         match &self.registered {
-            Some(pack) => database.cached_pack_index(&pack.idx),
+            Some(pack) => pack.index(database.format),
             None => database.cached_pack_index(&self.pack.with_extension("idx")),
         }
     }
@@ -5316,6 +5323,7 @@ pub struct FileObjectDatabase {
     format: ObjectFormat,
     pack_bytes: PackBytesCache,
     pack_indexes: PackIndexCache,
+    pack_reverse_indexes: PackReverseIndexCache,
     multi_pack_indexes: MultiPackIndexCache,
     multi_pack_oid_lookups: MultiPackIndexOidLookupCache,
     pack_registry: PackRegistryCache,
@@ -6013,6 +6021,7 @@ impl FileObjectDatabase {
             format,
             pack_bytes: Arc::new(Mutex::new(HashMap::new())),
             pack_indexes: Arc::new(Mutex::new(HashMap::new())),
+            pack_reverse_indexes: Arc::new(Mutex::new(HashMap::new())),
             multi_pack_indexes: Arc::new(Mutex::new(HashMap::new())),
             multi_pack_oid_lookups: Arc::new(Mutex::new(HashMap::new())),
             pack_registry: Arc::new(Mutex::new(None)),
@@ -6034,6 +6043,7 @@ impl FileObjectDatabase {
             format,
             pack_bytes: Arc::new(Mutex::new(HashMap::new())),
             pack_indexes: Arc::new(Mutex::new(HashMap::new())),
+            pack_reverse_indexes: Arc::new(Mutex::new(HashMap::new())),
             multi_pack_indexes: Arc::new(Mutex::new(HashMap::new())),
             multi_pack_oid_lookups: Arc::new(Mutex::new(HashMap::new())),
             pack_registry: Arc::new(Mutex::new(None)),
@@ -6701,17 +6711,51 @@ impl FileObjectDatabase {
     /// Parsed index for the `.idx` at `index_path`, parsed at most once per
     /// database handle. On a poisoned lock it falls back to parsing without
     /// caching, preserving correctness.
-    fn cached_pack_index(&self, index_path: &Path) -> Result<Arc<PackIndex>> {
+    fn cached_pack_index(&self, index_path: &Path) -> Result<Arc<PackIndexViewData>> {
         if let Ok(cache) = self.pack_indexes.lock()
             && let Some(index) = cache.get(index_path)
         {
             return Ok(Arc::clone(index));
         }
-        let index = Arc::new(PackIndex::parse(&fs::read(index_path)?, self.format)?);
+        let index_bytes = load_pack_index_data(index_path)?;
+        let index = Arc::new(PackIndexViewData::parse_trusted_source_without_checksum(
+            index_bytes,
+            self.format,
+        )?);
         if let Ok(mut cache) = self.pack_indexes.lock() {
             cache.insert(index_path.to_path_buf(), Arc::clone(&index));
         }
         Ok(index)
+    }
+
+    /// Optional reverse index for the `.idx` at `index_path`, loaded at most once
+    /// per database handle when a matching `.rev` sidecar is present.
+    fn cached_pack_reverse_index(
+        &self,
+        index_path: &Path,
+        index: &PackIndexViewData,
+    ) -> Result<Option<Arc<PackReverseIndex>>> {
+        if let Ok(cache) = self.pack_reverse_indexes.lock()
+            && let Some(cached) = cache.get(index_path)
+        {
+            return Ok(cached.as_ref().map(Arc::clone));
+        }
+        let rev_path = index_path.with_extension("rev");
+        let reverse = if rev_path.exists() {
+            let bytes = fs::read(&rev_path)?;
+            match PackReverseIndex::parse(&bytes, self.format, index.count) {
+                Ok(parsed) if parsed.pack_checksum == index.pack_checksum => {
+                    Some(Arc::new(parsed))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Ok(mut cache) = self.pack_reverse_indexes.lock() {
+            cache.insert(index_path.to_path_buf(), reverse.as_ref().map(Arc::clone));
+        }
+        Ok(reverse)
     }
 
     fn cached_multi_pack_index_oid_lookup(
@@ -6908,12 +6952,18 @@ impl FileObjectDatabase {
         pack_lookup: &PackLookup,
         offset: u64,
     ) -> Result<Option<ObjectId>> {
+        let index_path = match &pack_lookup.registered {
+            Some(pack) => pack.idx.clone(),
+            None => pack_lookup.pack.with_extension("idx"),
+        };
         match pack_lookup.pack_index(self) {
-            Ok(index) => Ok(index
-                .entries
-                .iter()
-                .find(|entry| entry.offset == offset)
-                .map(|entry| entry.oid)),
+            Ok(index) => {
+                if let Some(reverse) = self.cached_pack_reverse_index(&index_path, &index)? {
+                    Ok(reverse.oid_at_offset(&index, offset))
+                } else {
+                    Ok(index.oid_at_offset_linear(offset))
+                }
+            }
             Err(_) => self.midx_oid_for_pack_offset(pack_lookup, offset),
         }
     }
