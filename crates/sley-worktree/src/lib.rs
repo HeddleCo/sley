@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![allow(
     clippy::collapsible_if,
     clippy::if_same_then_else,

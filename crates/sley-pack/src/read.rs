@@ -387,7 +387,7 @@ thread_local! {
 /// bounds the speculative allocation. git never pre-allocates an attacker's
 /// declared size beyond a streaming buffer either (see index-pack.c's
 /// `unpack_entry_data`).
-
+///
 /// Inflate the entire zlib stream at the front of `compressed`, appending the
 /// decoded bytes to `out`, reusing the thread-local inflate state. `size_hint`
 /// is the caller's expectation for the decompressed length, but it is treated as

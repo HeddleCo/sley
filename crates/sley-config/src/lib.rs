@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 //! git-config — Git's configuration system: parsing, serialization, value
 //! typing, and conditional includes.
 //!
@@ -1628,11 +1630,12 @@ impl<'a> ConfigParser<'a> {
                     }
                 }
                 Some('#') | Some(';') => {
-                    let sigil = self.bump().expect("peeked comment sigil");
-                    pending_preamble.push(ConfigPreambleLine::Comment {
-                        sigil,
-                        text: self.parse_comment_text(),
-                    });
+                    if let Some(sigil) = self.bump() {
+                        pending_preamble.push(ConfigPreambleLine::Comment {
+                            sigil,
+                            text: self.parse_comment_text(),
+                        });
+                    }
                 }
                 Some('[') => match self.parse_section_header() {
                     Ok(mut section) => {
@@ -1775,7 +1778,9 @@ impl<'a> ConfigParser<'a> {
     fn parse_entry(&mut self) -> Result<ConfigEntry> {
         let mut indent = String::new();
         while matches!(self.peek(), Some(' ') | Some('\t')) {
-            indent.push(self.bump().expect("peeked whitespace"));
+            if let Some(ch) = self.bump() {
+                indent.push(ch);
+            }
         }
         if indent.is_empty() {
             indent.push('\t');
@@ -2155,28 +2160,28 @@ pub struct ConfigParameter {
     pub value: Option<String>,
 }
 
+fn split_canonical_key(canonical_key: &str) -> (&str, Option<&str>, &str) {
+    if let (Some(first), Some(last)) = (canonical_key.find('.'), canonical_key.rfind('.')) {
+        let section = &canonical_key[..first];
+        let key = &canonical_key[last + 1..];
+        let subsection = if first == last {
+            None
+        } else {
+            Some(&canonical_key[first + 1..last])
+        };
+        (section, subsection, key)
+    } else {
+        (canonical_key, None, "")
+    }
+}
+
 impl ConfigParameter {
     /// Split the canonical key into `(section, subsection, key)`, matching how
     /// [`GitConfig`] indexes entries. The split is on the first and last `.`:
     /// section before the first dot, key after the last dot, subsection (if any)
     /// in between. The key is guaranteed valid because it was canonicalised.
     pub fn split_key(&self) -> (&str, Option<&str>, &str) {
-        let first = self
-            .canonical_key
-            .find('.')
-            .expect("canonical key has a section");
-        let last = self
-            .canonical_key
-            .rfind('.')
-            .expect("canonical key has a key");
-        let section = &self.canonical_key[..first];
-        let key = &self.canonical_key[last + 1..];
-        let subsection = if first == last {
-            None
-        } else {
-            Some(&self.canonical_key[first + 1..last])
-        };
-        (section, subsection, key)
+        split_canonical_key(&self.canonical_key)
     }
 }
 
@@ -2276,7 +2281,11 @@ pub fn canonicalize_config_key(key: &str) -> std::result::Result<String, ConfigP
         }
         out.push(c);
     }
-    Ok(String::from_utf8(out).expect("ascii-lowercased valid utf-8 stays valid utf-8"))
+    match String::from_utf8(out) {
+        Ok(s) => Ok(s),
+        // Only ASCII bytes were modified from valid UTF-8 input.
+        Err(err) => Ok(String::from_utf8_lossy(err.as_bytes()).into_owned()),
+    }
 }
 
 /// Parse a single `key[=value]` parameter (git's `git_config_parse_parameter`,
@@ -2358,8 +2367,11 @@ fn sq_dequote_step(bytes: &[u8], pos: usize) -> Option<(String, usize)> {
                 // which case the escaped char is emitted and quoting resumes.
                 let escaped = bytes.get(src + 1).copied();
                 let resumes = bytes.get(src + 2).copied() == Some(b'\'');
-                if matches!(escaped, Some(b'\'') | Some(b'!')) && resumes {
-                    out.push(escaped.expect("escaped byte present"));
+                if let Some(byte) = escaped
+                    && matches!(byte, b'\'' | b'!')
+                    && resumes
+                {
+                    out.push(byte);
                     src += 2; // src now indexes the resuming quote; loop pre-incs past it
                     continue;
                 }

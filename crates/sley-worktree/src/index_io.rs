@@ -81,9 +81,11 @@ pub(crate) fn restore_index_entry_maybe_delayed(
             )? {
                 SmudgeFilterResult::Content(body) => body,
                 SmudgeFilterResult::Delayed { process } => {
-                    let queue = delayed
-                        .as_deref_mut()
-                        .expect("delay is only reported when a queue is available");
+                    let Some(queue) = delayed.as_deref_mut() else {
+                        return Err(GitError::InvalidFormat(
+                            "smudge filter requested delay without a checkout queue".into(),
+                        ));
+                    };
                     queue.enqueue(
                         process,
                         entry.path.as_bytes(),
@@ -1343,17 +1345,12 @@ pub(crate) fn tracked_only_clean_filter<'a>(
     worktree_root: &Path,
     git_dir: &Path,
 ) -> &'a mut TrackedOnlyCleanFilter {
-    if clean_filter.is_none() {
-        *clean_filter = Some(TrackedOnlyCleanFilter {
-            config: sley_config::read_repo_config(git_dir, None).unwrap_or_default(),
-            matcher: AttributeMatcher::from_worktree_base(worktree_root),
-            requested: filter_attribute_names(),
-            attribute_dirs: BTreeSet::new(),
-        });
-    }
-    clean_filter
-        .as_mut()
-        .expect("tracked-only clean filter initialized")
+    clean_filter.get_or_insert_with(|| TrackedOnlyCleanFilter {
+        config: sley_config::read_repo_config(git_dir, None).unwrap_or_default(),
+        matcher: AttributeMatcher::from_worktree_base(worktree_root),
+        requested: filter_attribute_names(),
+        attribute_dirs: BTreeSet::new(),
+    })
 }
 
 pub(crate) fn tracked_only_clean_filter_with_config<'a>(
@@ -1361,17 +1358,12 @@ pub(crate) fn tracked_only_clean_filter_with_config<'a>(
     worktree_root: &Path,
     config: &GitConfig,
 ) -> &'a mut TrackedOnlyCleanFilter {
-    if clean_filter.is_none() {
-        *clean_filter = Some(TrackedOnlyCleanFilter {
-            config: config.clone(),
-            matcher: AttributeMatcher::from_worktree_base(worktree_root),
-            requested: filter_attribute_names(),
-            attribute_dirs: BTreeSet::new(),
-        });
-    }
-    clean_filter
-        .as_mut()
-        .expect("tracked-only clean filter initialized")
+    clean_filter.get_or_insert_with(|| TrackedOnlyCleanFilter {
+        config: config.clone(),
+        matcher: AttributeMatcher::from_worktree_base(worktree_root),
+        requested: filter_attribute_names(),
+        attribute_dirs: BTreeSet::new(),
+    })
 }
 
 pub(crate) struct WorktreeEntriesWalk<'a> {

@@ -1453,7 +1453,15 @@ pub fn move_index_and_worktree_path(
         });
     }
 
-    let position = source_position.expect("tracked non-directory source must have an index entry");
+    let Some(position) = source_position else {
+        return Ok(MoveResult {
+            source: source_path,
+            destination: destination_path,
+            skipped: false,
+            fatal: None,
+            details: Vec::new(),
+        });
+    };
     if options.dry_run {
         return Ok(MoveResult {
             source: source_path,

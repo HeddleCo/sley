@@ -2424,7 +2424,9 @@ pub(crate) fn stage0_index_chunk_ranges<E>(
         end = idx + 1;
         normals_in_chunk += 1;
         if normals_in_chunk == chunk_size {
-            ranges.push(start.expect("chunk start must exist")..end);
+            if let Some(start) = start {
+                ranges.push(start..end);
+            }
             start = None;
             normals_in_chunk = 0;
         }

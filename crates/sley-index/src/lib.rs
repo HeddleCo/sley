@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 //! git-index — Git's index (staging area) file format.
 //!
 //! This crate owns the [`Index`] / [`IndexEntry`] model and the readers and

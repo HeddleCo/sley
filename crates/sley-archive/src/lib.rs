@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use sley_config::GitConfig;
@@ -330,7 +331,7 @@ impl ArchiveExtras {
         for (index, file) in self.files.iter().enumerate() {
             // git synthesizes a fake oid `put_be64(hash, i+1)` for each extra
             // file (used only by tar's pax fallback naming).
-            let oid = fake_extra_file_oid(format, index as u64 + 1);
+            let oid = fake_extra_file_oid(format, index as u64 + 1)?;
             if file.mode == 0o120000 {
                 sink.emit(ArchiveEntry::Symlink {
                     path: file.path.clone(),
@@ -353,10 +354,10 @@ impl ArchiveExtras {
 
 /// git's `put_be64(fake_oid.hash, i + 1)`: an object id whose first 8 bytes are
 /// the big-endian counter and the rest are zero.
-fn fake_extra_file_oid(format: ObjectFormat, counter: u64) -> ObjectId {
+fn fake_extra_file_oid(format: ObjectFormat, counter: u64) -> Result<ObjectId> {
     let mut bytes = vec![0u8; format.raw_len()];
     bytes[..8].copy_from_slice(&counter.to_be_bytes());
-    ObjectId::from_raw(format, &bytes).expect("hash-length byte slice is a valid oid")
+    ObjectId::from_raw(format, &bytes)
 }
 
 /// One emitted archive entry, after prefix/strip-prefix rewriting and (for
@@ -1197,7 +1198,7 @@ const USTAR_MAX_SIZE: u64 = 0o777_7777_7777;
 fn write_directory_entry(writer: &mut impl Write, path: &[u8], mtime: u64) -> Result<()> {
     // Directories never overflow ustar in our trees (no oid needed for a pax
     // fallback path); a synthetic placeholder keeps the signature uniform.
-    let placeholder = ObjectId::from_raw(ObjectFormat::Sha1, &[0u8; 20]).expect("zero oid");
+    let placeholder = ObjectId::from_raw(ObjectFormat::Sha1, &[0u8; 20])?;
     write_entry_with_pax(writer, path, 0o775, 0, mtime, b'5', b"", &placeholder)
 }
 

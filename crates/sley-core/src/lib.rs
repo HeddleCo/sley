@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use std::borrow::Borrow;
 use std::error::Error;
 use std::fmt;
@@ -389,7 +391,7 @@ pub fn redact_url_for_display(url: &str) -> String {
 
         let authority_start = scheme_end + 3;
         let authority_end = rest[authority_start..]
-            .find(|ch: char| matches!(ch, '/' | '?' | '#' | ' ' | '\t' | '\r' | '\n'))
+            .find(|ch: char| ['/', '?', '#', ' ', '\t', '\r', '\n'].contains(&ch))
             .map(|idx| authority_start + idx)
             .unwrap_or(rest.len());
         let authority = &rest[authority_start..authority_end];
@@ -842,8 +844,7 @@ impl ObjectId {
 
     pub fn to_hex(&self) -> String {
         let mut out = String::with_capacity(self.format.hex_len());
-        self.write_hex(&mut out)
-            .expect("writing object id hex to a String cannot fail");
+        let _ = self.write_hex(&mut out);
         out
     }
 
@@ -1921,7 +1922,7 @@ impl StreamingDigest {
 
 pub fn to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
-    write_hex_bytes(bytes, &mut out).expect("writing hex to a String cannot fail");
+    let _ = write_hex_bytes(bytes, &mut out);
     out
 }
 

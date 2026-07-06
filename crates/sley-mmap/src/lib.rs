@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 //! The single, isolated home for sley's only `unsafe`: read-only memory maps of
 //! immutable git files. Every other crate in the workspace keeps
 //! `unsafe_code = "forbid"`; this crate exists so that the one unavoidable unsafe

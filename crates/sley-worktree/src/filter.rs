@@ -1165,10 +1165,12 @@ pub(crate) fn run_process_filter(
         let filter = ProcessFilter::start(command)?;
         filters.insert(command.to_string(), filter);
     }
-    let result = filters
-        .get_mut(command)
-        .expect("process filter was inserted")
-        .apply(direction, path, content, blob, can_delay);
+    let Some(filter) = filters.get_mut(command) else {
+        return Err(ProcessFilterFailure::protocol(
+            "process filter missing after insert",
+        ));
+    };
+    let result = filter.apply(direction, path, content, blob, can_delay);
     if matches!(result, Ok(ProcessFilterOutcome::Status(ref status)) if status == "abort") {
         if let Some(mut filter) = filters.remove(command) {
             filter.finish_gracefully();

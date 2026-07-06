@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod bisect;
 pub mod graph;
 pub mod revlist;
@@ -2561,12 +2563,8 @@ impl<'a> CommitGraphContext<'a> {
     }
 
     fn direct_graph(&mut self) -> &DirectCommitGraph {
-        if self.direct_graph.is_none() {
-            self.direct_graph = Some(load_direct_commit_graph(self.git_dir, self.format));
-        }
         self.direct_graph
-            .as_ref()
-            .expect("direct commit graph load state initialized")
+            .get_or_insert_with(|| load_direct_commit_graph(self.git_dir, self.format))
     }
 
     fn count_reachable_direct(
@@ -2619,16 +2617,10 @@ impl<'a> CommitGraphContext<'a> {
     /// Resolve `oid`'s graph metadata, loading and parsing the graph on first
     /// use. Returns `None` when the commit is not in the graph.
     fn lookup(&mut self, oid: &ObjectId) -> Result<Option<&GraphCommit>> {
-        if self.commits.is_none() {
-            self.commits = Some(
-                load_commit_graph_map(self.git_dir, self.format).map_err(|err| err.to_string()),
-            );
-        }
-        match self
-            .commits
-            .as_ref()
-            .expect("commit graph map load state initialized")
-        {
+        let commits = self.commits.get_or_insert_with(|| {
+            load_commit_graph_map(self.git_dir, self.format).map_err(|err| err.to_string())
+        });
+        match commits {
             Ok(map) => Ok(map.get(oid)),
             Err(message) => Err(GitError::InvalidFormat(message.clone())),
         }
