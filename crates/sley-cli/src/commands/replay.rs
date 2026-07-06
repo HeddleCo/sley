@@ -2175,16 +2175,10 @@ fn apply_merge_results_to_index_and_worktree(
             .cmp(&right.path)
             .then_with(|| index_entry_stage(left).cmp(&index_entry_stage(right)))
     });
-    fs::write(
-        &index_path,
-        Index {
-            version: 2,
-            entries,
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(ctx.format)?,
-    )?;
+    // The index is written AFTER the worktree phases below so freshly resolved
+    // stage-0 entries can record the on-disk stat (git refreshes merged results
+    // via fill_stat_cache_info; a zeroed stat makes diff-files report them
+    // dirty). Entries reused from the old index keep their existing stat.
 
     // git's unpack-trees materializes removals before creations. This matters
     // when a directory's tracked children are removed and the directory is then
@@ -2238,6 +2232,31 @@ fn apply_merge_results_to_index_and_worktree(
             }
         }
     }
+
+    for entry in &mut entries {
+        if index_entry_stage(entry) != 0
+            || sley_index::is_gitlink(entry.mode)
+            || entry.mtime_seconds != 0
+            || entry.ctime_seconds != 0
+        {
+            continue;
+        }
+        if let Ok(rel) = std::str::from_utf8(entry.path.as_bytes())
+            && let Ok(metadata) = fs::symlink_metadata(ctx.worktree_root.join(rel))
+        {
+            sley_worktree::fill_index_entry_stat_cache(entry, &metadata);
+        }
+    }
+    fs::write(
+        &index_path,
+        Index {
+            version: 2,
+            entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write(ctx.format)?,
+    )?;
     Ok(())
 }
 

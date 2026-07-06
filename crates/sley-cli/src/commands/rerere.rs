@@ -810,12 +810,14 @@ fn stage_resolved_path(
         .into_iter()
         .filter(|entry| entry.path.as_bytes() != path.as_bytes())
         .collect();
-    entries.push(commands::merge_rebase::merge_index_entry(
-        path.as_bytes(),
-        mode,
-        oid,
-        0,
-    ));
+    let mut staged = commands::merge_rebase::merge_index_entry(path.as_bytes(), mode, oid, 0);
+    // git's update_paths stages via add_file_to_index, which records the
+    // file's stat (fill_stat_cache_info); a zeroed stat would make diff-files
+    // report the freshly staged path as modified.
+    if let Ok(metadata) = fs::metadata(&full) {
+        sley_worktree::fill_index_entry_stat_cache(&mut staged, &metadata);
+    }
+    entries.push(staged);
     entries.sort_by(|left, right| {
         left.path
             .cmp(&right.path)

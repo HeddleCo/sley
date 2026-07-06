@@ -5187,11 +5187,51 @@ fn apply_merge_results(
     ours_map: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
     with_conflicts: bool,
 ) -> Result<()> {
+    // Materialize the worktree BEFORE building the index so resolved stage-0
+    // entries can record the on-disk stat (git refreshes merged results via
+    // fill_stat_cache_info; a zeroed stat makes diff-files report them dirty).
+    for (path, result) in results {
+        match result {
+            MergePathResult::Resolved(Some((mode, oid))) => {
+                if ours_map.get(path) != Some(&(*mode, *oid)) {
+                    let content = if sley_index::is_gitlink(*mode) {
+                        Vec::new()
+                    } else {
+                        merge_read_blob(db, oid)?
+                    };
+                    merge_write_worktree_file(&ctx.worktree_root, path, &content, *mode)?;
+                }
+            }
+            MergePathResult::Resolved(None) => {
+                if ours_map.contains_key(path) {
+                    merge_remove_worktree_file(&ctx.worktree_root, path)?;
+                }
+            }
+            MergePathResult::Conflict { worktree, .. } => {
+                if with_conflicts {
+                    match worktree {
+                        Some((mode, content)) => {
+                            merge_write_worktree_file(&ctx.worktree_root, path, content, *mode)?
+                        }
+                        None => merge_remove_worktree_file(&ctx.worktree_root, path)?,
+                    }
+                }
+            }
+        }
+    }
+
     let mut entries = Vec::new();
     for (path, result) in results {
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
-                entries.push(merge_index_entry(path, *mode, *oid, 0));
+                let mut entry = merge_index_entry(path, *mode, *oid, 0);
+                if !sley_index::is_gitlink(*mode)
+                    && let Ok(rel) = std::str::from_utf8(path)
+                    && let Ok(metadata) = fs::symlink_metadata(ctx.worktree_root.join(rel))
+                {
+                    sley_worktree::fill_index_entry_stat_cache(&mut entry, &metadata);
+                }
+                entries.push(entry);
             }
             MergePathResult::Resolved(None) => {}
             MergePathResult::Conflict {
@@ -5224,35 +5264,6 @@ fn apply_merge_results(
         }
         .write(ctx.format)?,
     )?;
-    for (path, result) in results {
-        match result {
-            MergePathResult::Resolved(Some((mode, oid))) => {
-                if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = if sley_index::is_gitlink(*mode) {
-                        Vec::new()
-                    } else {
-                        merge_read_blob(db, oid)?
-                    };
-                    merge_write_worktree_file(&ctx.worktree_root, path, &content, *mode)?;
-                }
-            }
-            MergePathResult::Resolved(None) => {
-                if ours_map.contains_key(path) {
-                    merge_remove_worktree_file(&ctx.worktree_root, path)?;
-                }
-            }
-            MergePathResult::Conflict { worktree, .. } => {
-                if with_conflicts {
-                    match worktree {
-                        Some((mode, content)) => {
-                            merge_write_worktree_file(&ctx.worktree_root, path, content, *mode)?
-                        }
-                        None => merge_remove_worktree_file(&ctx.worktree_root, path)?,
-                    }
-                }
-            }
-        }
-    }
     Ok(())
 }
 

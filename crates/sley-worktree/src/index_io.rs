@@ -192,6 +192,25 @@ pub(crate) fn index_entry_from_metadata(
     entry
 }
 
+/// Populate `entry`'s cached stat fields from on-disk `metadata`, as git's
+/// `fill_stat_cache_info` does when staging a worktree file (e.g. rerere
+/// autoupdate's `add_file_to_index`). Leaves mode, oid, flags, and path
+/// untouched. Without this, a staged entry carries a zeroed stat and
+/// `diff-files` must report it dirty (`ie_match_stat` semantics).
+pub fn fill_index_entry_stat_cache(entry: &mut IndexEntry, metadata: &fs::Metadata) {
+    let duration = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .unwrap_or_default();
+    entry.mtime_seconds = duration.as_secs().min(u32::MAX as u64) as u32;
+    entry.mtime_nanoseconds = duration.subsec_nanos();
+    entry.ctime_seconds = entry.mtime_seconds;
+    entry.ctime_nanoseconds = entry.mtime_nanoseconds;
+    entry.size = index_size_from_metadata(metadata);
+    apply_unix_metadata_to_index_entry(entry, metadata);
+}
+
 pub(crate) fn index_entry_from_metadata_with_filemode(
     path: impl Into<BString>,
     oid: ObjectId,
