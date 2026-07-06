@@ -6,20 +6,18 @@ use std::fmt;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::OnceLock;
 
 pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.55.0";
 
-static ORIGINAL_CWD: Mutex<Option<PathBuf>> = Mutex::new(None);
+static ORIGINAL_CWD: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 pub fn set_original_cwd(path: Option<PathBuf>) {
-    if let Ok(mut original) = ORIGINAL_CWD.lock() {
-        *original = path;
-    }
+    let _ = ORIGINAL_CWD.set(path);
 }
 
 pub fn original_cwd() -> Option<PathBuf> {
-    ORIGINAL_CWD.lock().ok()?.clone()
+    ORIGINAL_CWD.get()?.clone()
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

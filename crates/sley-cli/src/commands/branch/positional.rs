@@ -26,7 +26,9 @@ use super::create::{branch_create_set_tracking, create_branch_from_start};
 use super::delete::{delete_merged_branches, force_delete_branches, force_update_branch};
 use super::list::*;
 use super::positional_table::{
-    RemoteOrAllNoopDisplayCount, dispatch_remote_or_all_noop_display,
+    LocalListNoopDisplayTail, RemoteOrAllListNoopDisplayTail, RemoteOrAllNoopDisplayCount,
+    dispatch_local_list_noop_display, dispatch_remote_or_all_list_noop_display,
+    dispatch_remote_or_all_noop_display,
 };
 use crate::*;
 
@@ -814,22 +816,22 @@ pub(super) fn dispatch_branch_positional_args(
         [list, display_flag]
             if list == "--list" && branch_list_noop_display_flag(display_flag) =>
         {
-            print_branch_list(store, BranchListMode::Local)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::None, &[])
         }
         [list, display_flag, patterns @ ..]
             if list == "--list" && branch_list_noop_display_flag(display_flag) =>
         {
-            print_branch_list_matching(store, BranchListMode::Local, patterns, false)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::Patterns, patterns)
         }
         [display_flag, list]
             if branch_list_noop_display_flag(display_flag) && list == "--list" =>
         {
-            print_branch_list(store, BranchListMode::Local)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::None, &[])
         }
         [display_flag, list, patterns @ ..]
             if branch_list_noop_display_flag(display_flag) && list == "--list" =>
         {
-            print_branch_list_matching(store, BranchListMode::Local, patterns, false)
+            dispatch_local_list_noop_display(store, LocalListNoopDisplayTail::Patterns, patterns)
         }
         [first, second, list, patterns @ ..]
             if branch_omit_empty_value(first).is_some()
@@ -3862,16 +3864,24 @@ pub(super) fn dispatch_branch_positional_args(
                 && list == "--list"
                 && branch_list_noop_display_flag(display_flag) =>
         {
-            let mode = branch_remote_or_all_mode_unchecked(flag);
-            print_branch_list(store, mode)
+            dispatch_remote_or_all_list_noop_display(
+                store,
+                flag,
+                RemoteOrAllListNoopDisplayTail::None,
+                &[],
+            )
         }
         [flag, list, display_flag, patterns @ ..]
             if branch_remote_or_all_mode(flag).is_some()
                 && list == "--list"
                 && branch_list_noop_display_flag(display_flag) =>
         {
-            let mode = branch_remote_or_all_mode_unchecked(flag);
-            print_branch_list_matching(store, mode, patterns, false)
+            dispatch_remote_or_all_list_noop_display(
+                store,
+                flag,
+                RemoteOrAllListNoopDisplayTail::Patterns,
+                patterns,
+            )
         }
         [flag, first, second, list, patterns @ ..]
             if branch_remote_or_all_mode(flag).is_some()
@@ -3914,16 +3924,24 @@ pub(super) fn dispatch_branch_positional_args(
                 && branch_list_noop_display_flag(display_flag)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode_unchecked(flag);
-            print_branch_list(store, mode)
+            dispatch_remote_or_all_list_noop_display(
+                store,
+                flag,
+                RemoteOrAllListNoopDisplayTail::None,
+                &[],
+            )
         }
         [flag, display_flag, list, patterns @ ..]
             if branch_remote_or_all_mode(flag).is_some()
                 && branch_list_noop_display_flag(display_flag)
                 && list == "--list" =>
         {
-            let mode = branch_remote_or_all_mode_unchecked(flag);
-            print_branch_list_matching(store, mode, patterns, false)
+            dispatch_remote_or_all_list_noop_display(
+                store,
+                flag,
+                RemoteOrAllListNoopDisplayTail::Patterns,
+                patterns,
+            )
         }
         [flag, first, second, list, patterns @ ..]
             if branch_remote_or_all_mode(flag).is_some()

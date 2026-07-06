@@ -1,0 +1,398 @@
+sley upstream wave test report
+run label: w90-21b01a40
+waves: 8
+selected scripts: 8
+per-script timeout: 240s
+serial runner: /Users/lukethorne/dev/HeddleCo/sley/crates/sley-testkit/scripts/run-upstream-tests.sh
+
+
+===== wave 1 stdout =====
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t0001-init.sh                FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+init           FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 1 stderr =====
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+
+Running upstream scripts against sley...
+
+
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-1/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-1/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-1/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-1/timings.csv
+
+===== wave 1 report =====
+sley upstream test report
+run label: w90-21b01a40-wave-1
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+upstream t/: /tmp/git-src/t
+default hash: sha1
+per-script timeout: 240s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t0001-init.sh                FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+----- t0001-init.sh (FAIL): failing assertions -----
+----- t0001-init.sh (FAIL) last 25 lines -----
+Bail out! You haven't built things yet, have you?
+----- end t0001-init.sh -----
+
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+init           FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 2 stdout =====
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t1006-cat-file.sh            FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+cat-file       FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 2 stderr =====
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+
+Running upstream scripts against sley...
+
+
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-2/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-2/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-2/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-2/timings.csv
+
+===== wave 2 report =====
+sley upstream test report
+run label: w90-21b01a40-wave-2
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+upstream t/: /tmp/git-src/t
+default hash: sha1
+per-script timeout: 240s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t1006-cat-file.sh            FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+----- t1006-cat-file.sh (FAIL): failing assertions -----
+----- t1006-cat-file.sh (FAIL) last 25 lines -----
+Bail out! You haven't built things yet, have you?
+----- end t1006-cat-file.sh -----
+
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+cat-file       FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 3 stdout =====
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t1007-hash-object.sh         FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+hash-object    FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 3 stderr =====
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+
+Running upstream scripts against sley...
+
+
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-3/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-3/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-3/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-3/timings.csv
+
+===== wave 3 report =====
+sley upstream test report
+run label: w90-21b01a40-wave-3
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+upstream t/: /tmp/git-src/t
+default hash: sha1
+per-script timeout: 240s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t1007-hash-object.sh         FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+----- t1007-hash-object.sh (FAIL): failing assertions -----
+----- t1007-hash-object.sh (FAIL) last 25 lines -----
+Bail out! You haven't built things yet, have you?
+----- end t1007-hash-object.sh -----
+
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+hash-object    FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 4 stdout =====
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t1300-config.sh              FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+config         FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 4 stderr =====
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+
+Running upstream scripts against sley...
+
+
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-4/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-4/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-4/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-4/timings.csv
+
+===== wave 4 report =====
+sley upstream test report
+run label: w90-21b01a40-wave-4
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+upstream t/: /tmp/git-src/t
+default hash: sha1
+per-script timeout: 240s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t1300-config.sh              FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+----- t1300-config.sh (FAIL): failing assertions -----
+----- t1300-config.sh (FAIL) last 25 lines -----
+Bail out! You haven't built things yet, have you?
+----- end t1300-config.sh -----
+
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+config         FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 5 stdout =====
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t1500-rev-parse.sh           FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+rev-parse      FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 5 stderr =====
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+
+Running upstream scripts against sley...
+
+
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-5/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-5/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-5/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-5/timings.csv
+
+===== wave 5 report =====
+sley upstream test report
+run label: w90-21b01a40-wave-5
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+upstream t/: /tmp/git-src/t
+default hash: sha1
+per-script timeout: 240s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t1500-rev-parse.sh           FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+----- t1500-rev-parse.sh (FAIL): failing assertions -----
+----- t1500-rev-parse.sh (FAIL) last 25 lines -----
+Bail out! You haven't built things yet, have you?
+----- end t1500-rev-parse.sh -----
+
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+rev-parse      FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 6 stdout =====
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t3000-ls-files-others.sh     FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+ls-files       FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 6 stderr =====
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+
+Running upstream scripts against sley...
+
+
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-6/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-6/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-6/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-6/timings.csv
+
+===== wave 6 report =====
+sley upstream test report
+run label: w90-21b01a40-wave-6
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+upstream t/: /tmp/git-src/t
+default hash: sha1
+per-script timeout: 240s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t3000-ls-files-others.sh     FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+----- t3000-ls-files-others.sh (FAIL): failing assertions -----
+----- t3000-ls-files-others.sh (FAIL) last 25 lines -----
+Bail out! You haven't built things yet, have you?
+----- end t3000-ls-files-others.sh -----
+
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+ls-files       FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 7 stdout =====
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t3103-ls-tree-misc.sh        FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+ls-tree        FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 7 stderr =====
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+
+Running upstream scripts against sley...
+
+
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-7/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-7/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-7/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-7/timings.csv
+
+===== wave 7 report =====
+sley upstream test report
+run label: w90-21b01a40-wave-7
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+upstream t/: /tmp/git-src/t
+default hash: sha1
+per-script timeout: 240s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t3103-ls-tree-misc.sh        FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+----- t3103-ls-tree-misc.sh (FAIL): failing assertions -----
+----- t3103-ls-tree-misc.sh (FAIL) last 25 lines -----
+Bail out! You haven't built things yet, have you?
+----- end t3103-ls-tree-misc.sh -----
+
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+ls-tree        FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 8 stdout =====
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t1401-symbolic-ref.sh        FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+symbolic-ref   FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+===== wave 8 stderr =====
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+
+Running upstream scripts against sley...
+
+
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-8/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-8/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-8/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.ge9OGs/wave-8/timings.csv
+
+===== wave 8 report =====
+sley upstream test report
+run label: w90-21b01a40-wave-8
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+upstream t/: /tmp/git-src/t
+default hash: sha1
+per-script timeout: 240s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t1401-symbolic-ref.sh        FAIL         0     0  rc=1 Bail out! You haven't built things yet, have you?
+
+----- t1401-symbolic-ref.sh (FAIL): failing assertions -----
+----- t1401-symbolic-ref.sh (FAIL) last 25 lines -----
+Bail out! You haven't built things yet, have you?
+----- end t1401-symbolic-ref.sh -----
+
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+symbolic-ref   FAIL              0      0      0  0%
+
+SUMMARY: 1 script(s): 0 passed, 1 failed, 0 timed out.
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND                      RESULT           OK   FAIL  TOTAL  PASS%
+init                         FAIL              0      0      0  0%
+cat-file                     FAIL              0      0      0  0%
+hash-object                  FAIL              0      0      0  0%
+config                       FAIL              0      0      0  0%
+rev-parse                    FAIL              0      0      0  0%
+ls-files                     FAIL              0      0      0  0%
+ls-tree                      FAIL              0      0      0  0%
+symbolic-ref                 FAIL              0      0      0  0%
+
+ASSERTION SUMMARY: ok=0 fail=0 total=0 pass=0%
+SCRIPT SUMMARY: 8 script(s): 0 passed, 8 failed, 0 timed out.
+WAVE SUMMARY: 8 active wave(s), 8 wave(s) returned non-zero.

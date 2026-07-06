@@ -1,0 +1,9 @@
+script,command,result,ok,notok,total,plan_total
+t0001-init.sh,init,FAIL,0,0,0,
+t1006-cat-file.sh,cat-file,FAIL,0,0,0,
+t1007-hash-object.sh,hash-object,FAIL,0,0,0,
+t1300-config.sh,config,FAIL,0,0,0,
+t1500-rev-parse.sh,rev-parse,FAIL,0,0,0,
+t3000-ls-files-others.sh,ls-files,FAIL,0,0,0,
+t3103-ls-tree-misc.sh,ls-tree,FAIL,0,0,0,
+t1401-symbolic-ref.sh,symbolic-ref,FAIL,0,0,0,

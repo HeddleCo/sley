@@ -1,0 +1,9 @@
+label,script,command,result,elapsed_ms,ok,notok,total,plan_total
+w90-21b01a40-wave-1,t0001-init.sh,init,FAIL,149,0,0,0,
+w90-21b01a40-wave-2,t1006-cat-file.sh,cat-file,FAIL,148,0,0,0,
+w90-21b01a40-wave-3,t1007-hash-object.sh,hash-object,FAIL,146,0,0,0,
+w90-21b01a40-wave-4,t1300-config.sh,config,FAIL,147,0,0,0,
+w90-21b01a40-wave-5,t1500-rev-parse.sh,rev-parse,FAIL,146,0,0,0,
+w90-21b01a40-wave-6,t3000-ls-files-others.sh,ls-files,FAIL,142,0,0,0,
+w90-21b01a40-wave-7,t3103-ls-tree-misc.sh,ls-tree,FAIL,148,0,0,0,
+w90-21b01a40-wave-8,t1401-symbolic-ref.sh,symbolic-ref,FAIL,143,0,0,0,
