@@ -486,7 +486,10 @@ pub fn receive_pack_reachable_pack_into_local_repository(
                 format,
                 starts,
                 &excluded,
-                RawPackInstallOptions { promisor: false },
+                RawPackInstallOptions {
+                    promisor: false,
+                    ..Default::default()
+                },
             )?;
             Ok(())
         },
@@ -1170,7 +1173,10 @@ pub fn install_fetch_pack_via_local_upload_pack(
         format,
         starts,
         &excluded,
-        RawPackInstallOptions { promisor },
+        RawPackInstallOptions {
+            promisor,
+            ..Default::default()
+        },
         filter.clone(),
         unpack_limit,
     )?;

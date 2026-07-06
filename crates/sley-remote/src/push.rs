@@ -1121,7 +1121,10 @@ pub fn stage_local_push_quarantine(
         format,
         starts,
         &remote_excluded,
-        RawPackInstallOptions { promisor: false },
+        RawPackInstallOptions {
+            promisor: false,
+            ..Default::default()
+        },
     ) {
         Ok(installed) => installed,
         Err(err) => {

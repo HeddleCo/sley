@@ -73,6 +73,9 @@ pub struct GitFetchPackRequest<'a> {
     pub deepen: Option<u32>,
     pub promisor: bool,
     pub protocol_v2: bool,
+    /// Maximum raw pack bytes to accept from the remote (`fetch.maxInputSize` /
+    /// `transfer.maxSize`). `None` means unlimited.
+    pub max_input_size: Option<u64>,
 }
 
 pub struct GitUploadPackAdvertisements {
@@ -224,6 +227,7 @@ pub fn install_fetch_pack_via_git_upload_pack(
                 request.format,
                 &mut stream,
                 &local_db,
+                request.max_input_size,
             )?;
             shallow_info
         } else {
@@ -231,6 +235,7 @@ pub fn install_fetch_pack_via_git_upload_pack(
                 request.format,
                 &mut stream,
                 &local_db,
+                request.max_input_size,
             )?;
             shallow_info
         };
@@ -241,9 +246,10 @@ pub fn install_fetch_pack_via_git_upload_pack(
             request.format,
             &mut stream,
             &local_db,
+            request.max_input_size,
         )?;
     } else {
-        install_upload_pack_raw_response_from_reader(request.format, &mut stream, &local_db)?;
+        install_upload_pack_raw_response_from_reader(request.format, &mut stream, &local_db, request.max_input_size)?;
     }
     Ok(Vec::new())
 }
@@ -543,6 +549,7 @@ fn git_protocol_v2_fetch_into_repository(
             &mut stream,
             false,
             local_db,
+            request.max_input_size,
         )?
     } else {
         install_protocol_v2_fetch_response_from_reader(
@@ -550,6 +557,7 @@ fn git_protocol_v2_fetch_into_repository(
             &mut stream,
             false,
             local_db,
+            request.max_input_size,
         )?
     };
     Ok(shallow_info_from_protocol_v2_fetch_header(&header))

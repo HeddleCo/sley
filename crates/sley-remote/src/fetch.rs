@@ -246,6 +246,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         .get_bool("remote", Some(request.remote_name), "promisor")
         .unwrap_or(false)
         || request.options.filter.is_some();
+    let max_input_size = fetch_max_input_size(request.config);
     let configured_refspecs = if request.refspecs.is_empty() {
         remote_config_values(request.config, request.remote_name, "fetch")
     } else {
@@ -396,6 +397,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 shallow: existing_shallow,
                 deepen: options.depth,
                 promisor: promisor_remote,
+                max_input_size,
             };
             let shallow_info = if discovered.set.protocol == ProtocolVersion::V2 {
                 let handshake = discovered.handshake.as_ref().ok_or_else(|| {
@@ -486,6 +488,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     deepen: options.depth,
                     promisor: promisor_remote,
                     command_options: ssh_options,
+                    max_input_size,
                 },
             )?;
             if !options.dry_run {
@@ -549,6 +552,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     deepen: options.depth,
                     promisor: promisor_remote,
                     protocol_v2: discovered.protocol_v2,
+                    max_input_size,
                 },
             )?;
             if !options.dry_run {
@@ -1376,6 +1380,21 @@ fn apply_fetch_ref_updates(
         });
     }
     tx.commit()
+}
+
+/// Effective fetch pack input cap, mirroring git's `fetch.maxInputSize` with
+/// `transfer.maxSize` as the fallback when the fetch-specific key is unset.
+pub fn fetch_max_input_size(config: &GitConfig) -> Option<u64> {
+    config_max_input_size(config, "fetch", "maxInputSize")
+        .or_else(|| config_max_input_size(config, "transfer", "maxSize"))
+}
+
+fn config_max_input_size(config: &GitConfig, section: &str, key: &str) -> Option<u64> {
+    let raw = config.get(section, None, key)?;
+    match sley_config::parse_config_int(raw) {
+        Some(limit) if limit > 0 => Some(limit as u64),
+        _ => None,
+    }
 }
 
 fn fetch_log_all_ref_updates(config: &GitConfig) -> bool {
@@ -2337,5 +2356,40 @@ mod tests {
             Some(RefTarget::Direct(old))
         );
         assert!(!local.join("FETCH_HEAD").exists());
+    }
+
+    fn config_from_ini(ini: &str) -> GitConfig {
+        GitConfig::parse(ini.as_bytes()).expect("config should parse")
+    }
+
+    #[test]
+    fn fetch_max_input_size_unset_means_unlimited() {
+        assert_eq!(fetch_max_input_size(&GitConfig::default()), None);
+    }
+
+    #[test]
+    fn fetch_max_input_size_honors_fetch_section() {
+        let cfg = config_from_ini("[fetch]\n\tmaxInputSize = 64\n");
+        assert_eq!(fetch_max_input_size(&cfg), Some(64));
+    }
+
+    #[test]
+    fn fetch_max_input_size_falls_back_to_transfer_max_size() {
+        let cfg = config_from_ini("[transfer]\n\tmaxSize = 1k\n");
+        assert_eq!(fetch_max_input_size(&cfg), Some(1024));
+    }
+
+    #[test]
+    fn fetch_max_input_size_prefers_fetch_over_transfer() {
+        let cfg = config_from_ini(
+            "[fetch]\n\tmaxInputSize = 64\n[transfer]\n\tmaxSize = 1k\n",
+        );
+        assert_eq!(fetch_max_input_size(&cfg), Some(64));
+    }
+
+    #[test]
+    fn fetch_max_input_size_non_positive_means_unlimited() {
+        let cfg = config_from_ini("[fetch]\n\tmaxInputSize = 0\n");
+        assert_eq!(fetch_max_input_size(&cfg), None);
     }
 }

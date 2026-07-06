@@ -465,6 +465,9 @@ pub struct HttpFetchPackRequest<'a> {
     pub deepen: Option<u32>,
     /// Whether to install the response as a promisor pack.
     pub promisor: bool,
+    /// Maximum raw pack bytes to accept from the remote (`fetch.maxInputSize` /
+    /// `transfer.maxSize`). `None` means unlimited.
+    pub max_input_size: Option<u64>,
 }
 
 pub fn install_fetch_pack_via_http_upload_pack(
@@ -502,12 +505,14 @@ pub fn install_fetch_pack_via_http_upload_pack(
                 request.format,
                 &mut response.body,
                 &local_db,
+                request.max_input_size,
             )?;
         } else {
             install_upload_pack_raw_response_from_reader(
                 request.format,
                 &mut response.body,
                 &local_db,
+                request.max_input_size,
             )?;
         }
         return Ok(Vec::new());
@@ -525,6 +530,7 @@ pub fn install_fetch_pack_via_http_upload_pack(
             request.format,
             &mut response.body,
             &local_db,
+            request.max_input_size,
         )?;
         shallow_info
     } else {
@@ -532,6 +538,7 @@ pub fn install_fetch_pack_via_http_upload_pack(
             request.format,
             &mut response.body,
             &local_db,
+            request.max_input_size,
         )?;
         shallow_info
     };
@@ -573,6 +580,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
             &mut response.body,
             sideband_all,
             &local_db,
+            request.max_input_size,
         )?
     } else {
         install_protocol_v2_fetch_response_from_reader(
@@ -580,6 +588,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
             &mut response.body,
             sideband_all,
             &local_db,
+            request.max_input_size,
         )?
     };
     Ok(shallow_info_from_protocol_v2_fetch_header(&header))

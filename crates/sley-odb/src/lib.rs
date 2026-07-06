@@ -157,6 +157,8 @@ pub struct RawPackIndexedObject {
 struct PackInstallTeeReader<'a, R, W> {
     reader: &'a mut R,
     writer: &'a mut W,
+    max_input_size: Option<u64>,
+    written: u64,
 }
 
 impl<R, W> Read for PackInstallTeeReader<'_, R, W>
@@ -167,7 +169,19 @@ where
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let len = self.reader.read(buf)?;
         if len > 0 {
+            let next_written = self.written.checked_add(len as u64).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "pack size overflow")
+            })?;
+            if let Some(limit) = self.max_input_size
+                && next_written > limit
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("pack exceeds maximum allowed size ({limit})"),
+                ));
+            }
             self.writer.write_all(&buf[..len])?;
+            self.written = next_written;
         }
         Ok(len)
     }
@@ -194,12 +208,26 @@ pub struct ReachablePackWriteSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RawPackInstallOptions {
     pub promisor: bool,
+    /// Maximum raw pack bytes to accept from the reader. `None` means unlimited,
+    /// mirroring unset `fetch.maxInputSize` / `transfer.maxSize`.
+    pub max_input_size: Option<u64>,
 }
 
 pub trait RawPackInstaller {
-    fn install_raw_pack_from_reader<R>(&self, reader: &mut R) -> Result<RawPackInstallResult>
+    fn install_raw_pack_from_reader_with_options<R>(
+        &self,
+        reader: &mut R,
+        options: RawPackInstallOptions,
+    ) -> Result<RawPackInstallResult>
     where
         R: Read;
+
+    fn install_raw_pack_from_reader<R>(&self, reader: &mut R) -> Result<RawPackInstallResult>
+    where
+        R: Read,
+    {
+        self.install_raw_pack_from_reader_with_options(reader, RawPackInstallOptions::default())
+    }
 }
 
 #[cfg(test)]
@@ -221,11 +249,16 @@ pub struct ObjectStorageInfo {
 }
 
 impl RawPackInstaller for FileObjectDatabase {
-    fn install_raw_pack_from_reader<R>(&self, reader: &mut R) -> Result<RawPackInstallResult>
+    fn install_raw_pack_from_reader_with_options<R>(
+        &self,
+        reader: &mut R,
+        options: RawPackInstallOptions,
+    ) -> Result<RawPackInstallResult>
     where
         R: Read,
     {
-        let result = FileObjectDatabase::install_raw_pack_from_reader(self, reader)?;
+        let result =
+            FileObjectDatabase::install_raw_pack_from_reader_with_options(self, reader, options)?;
         Ok(RawPackInstallResult {
             object_ids: result.object_ids,
         })
@@ -233,12 +266,30 @@ impl RawPackInstaller for FileObjectDatabase {
 }
 
 impl RawPackInstaller for ObjectDatabase {
-    fn install_raw_pack_from_reader<R>(&self, reader: &mut R) -> Result<RawPackInstallResult>
+    fn install_raw_pack_from_reader_with_options<R>(
+        &self,
+        reader: &mut R,
+        options: RawPackInstallOptions,
+    ) -> Result<RawPackInstallResult>
     where
         R: Read,
     {
         let mut pack_bytes = Vec::new();
-        reader.read_to_end(&mut pack_bytes)?;
+        match options.max_input_size {
+            Some(limit) => {
+                reader
+                    .take(limit.saturating_add(1))
+                    .read_to_end(&mut pack_bytes)?;
+                if pack_bytes.len() as u64 > limit {
+                    return Err(GitError::InvalidFormat(format!(
+                        "pack exceeds maximum allowed size ({limit})"
+                    )));
+                }
+            }
+            None => {
+                reader.read_to_end(&mut pack_bytes)?;
+            }
+        }
         let result = unpack_packfile_objects(&pack_bytes, self.format, self)?;
         Ok(RawPackInstallResult {
             object_ids: result.written_objects,
@@ -6134,6 +6185,8 @@ impl FileObjectDatabase {
                 let mut tee = PackInstallTeeReader {
                     reader,
                     writer: &mut file,
+                    max_input_size: options.max_input_size,
+                    written: 0,
                 };
                 PackIndex::write_v2_for_pack_reader_to_trailer(&mut tee, self.format)?
             };
@@ -8988,6 +9041,72 @@ mod tests {
     }
 
     #[test]
+    fn file_database_rejects_raw_pack_stream_exceeding_max_input_size() {
+        let root = temp_root("sley-file-odb-install-raw-pack-max-size");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let object = EncodedObject::new(ObjectType::Blob, b"bounded raw pack install\n".to_vec());
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let pack_dir = git_dir.join("objects").join("pack");
+        let before = fs::read_dir(&pack_dir)
+            .map(|entries| entries.count())
+            .unwrap_or_default();
+        let mut reader = pack.pack.as_slice();
+        let limit = 32u64;
+
+        let err = db
+            .install_raw_pack_from_reader_with_options(
+                &mut reader,
+                RawPackInstallOptions {
+                    max_input_size: Some(limit),
+                    ..Default::default()
+                },
+            )
+            .expect_err("oversized stream should be rejected");
+
+        assert!(
+            err.to_string().contains("pack exceeds maximum allowed size"),
+            "unexpected error: {err}"
+        );
+        let temp_files = fs::read_dir(&pack_dir)
+            .expect("pack dir should exist")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("tmp_obj_"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            temp_files.is_empty(),
+            "temp pack staging file should be removed on failure"
+        );
+        let after = fs::read_dir(&pack_dir)
+            .map(|entries| entries.count())
+            .unwrap_or_default();
+        assert_eq!(after, before, "no durable pack files should be installed");
+        let installed = fs::read_dir(&pack_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            == Some("pack")
+                    })
+                    .count()
+            })
+            .unwrap_or_default();
+        assert_eq!(installed, 0);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
     fn file_database_rejects_unknown_length_raw_pack_with_trailing_bytes() {
         let root = temp_root("sley-file-odb-install-raw-pack-reader-trailing");
         let git_dir = root.join(".git");
@@ -9050,7 +9169,10 @@ mod tests {
         let result = db
             .install_raw_pack_from_reader_with_options(
                 &mut reader,
-                RawPackInstallOptions { promisor: true },
+                RawPackInstallOptions {
+                    promisor: true,
+                    ..Default::default()
+                },
             )
             .expect("test operation should succeed");
 
@@ -9544,9 +9666,10 @@ mod tests {
         }
 
         impl RawPackInstaller for RecordingInstaller {
-            fn install_raw_pack_from_reader<R>(
+            fn install_raw_pack_from_reader_with_options<R>(
                 &self,
                 reader: &mut R,
+                _options: RawPackInstallOptions,
             ) -> Result<RawPackInstallResult>
             where
                 R: Read,
@@ -10287,7 +10410,13 @@ mod tests {
             PackFile::write_undeltified(std::slice::from_ref(&promisor_blob), format)
                 .expect("test operation should succeed");
         let promisor_install = db
-            .install_pack_with_options(&promisor_pack, RawPackInstallOptions { promisor: true })
+            .install_pack_with_options(
+                &promisor_pack,
+                RawPackInstallOptions {
+                    promisor: true,
+                    ..Default::default()
+                },
+            )
             .expect("test operation should succeed");
         let promisor_sidecar = promisor_install
             .promisor_path

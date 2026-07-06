@@ -816,6 +816,9 @@ pub struct SshFetchPackRequest<'a> {
     /// SSH command-line shape (variant and `-4`/`-6`), usually derived by the
     /// caller from effective config and command-line flags.
     pub command_options: SshTransportOptions,
+    /// Maximum raw pack bytes to accept from the remote (`fetch.maxInputSize` /
+    /// `transfer.maxSize`). `None` means unlimited.
+    pub max_input_size: Option<u64>,
 }
 
 pub fn install_fetch_pack_via_ssh_upload_pack(
@@ -862,6 +865,7 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
                 request.format,
                 &mut stdout,
                 &local_db,
+                request.max_input_size,
             )?;
             shallow_info
         } else {
@@ -869,6 +873,7 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
                 request.format,
                 &mut stdout,
                 &local_db,
+                request.max_input_size,
             )?;
             shallow_info
         }
@@ -878,9 +883,10 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
                 request.format,
                 &mut stdout,
                 &local_db,
+                request.max_input_size,
             )?;
         } else {
-            install_upload_pack_raw_response_from_reader(request.format, &mut stdout, &local_db)?;
+            install_upload_pack_raw_response_from_reader(request.format, &mut stdout, &local_db, request.max_input_size)?;
         }
         Vec::new()
     };
