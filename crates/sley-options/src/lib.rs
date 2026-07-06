@@ -288,7 +288,9 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            if arg == "-h" || arg == "--help" {
+            if arg == "--help"
+                || (arg == "-h" && !self.specs.iter().any(|spec| spec.short == Some('h')))
+            {
                 return Err(UsageError::usage_only(self.usage_text()));
             }
 
@@ -930,6 +932,47 @@ mod tests {
         let argv = args(&["--quiet=yes"]);
         let err = parse(&argv, &specs).expect_err("takes no value");
         assert_eq!(err.message(), Some("option `quiet' takes no value"));
+        assert_eq!(err.exit_code(), 129);
+    }
+
+    #[test]
+    fn short_h_is_option_when_registered_not_help() {
+        let specs = [
+            OptionSpec {
+                short: Some('h'),
+                long: None,
+                value: OptValue::Bool,
+                flags: OptFlags::NONE,
+                help: "limit to branches",
+            },
+            OptionSpec {
+                short: Some('q'),
+                long: Some("quiet"),
+                value: OptValue::Bool,
+                flags: OptFlags::NONE,
+                help: "be quiet",
+            },
+        ];
+        let argv = args(&["-h", "origin"]);
+        let parsed = parse(&argv, &specs).expect("parse");
+        assert!(parsed
+            .options
+            .iter()
+            .any(|option| matches!(option.short, Some('h'))));
+        assert_eq!(parsed.positionals, ["origin"]);
+    }
+
+    #[test]
+    fn short_h_is_help_when_not_registered() {
+        let specs = [OptionSpec {
+            short: Some('q'),
+            long: Some("quiet"),
+            value: OptValue::Bool,
+            flags: OptFlags::NONE,
+            help: "be quiet",
+        }];
+        let argv = args(&["-h"]);
+        let err = parse(&argv, &specs).expect_err("help");
         assert_eq!(err.exit_code(), 129);
     }
 

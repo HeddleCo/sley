@@ -41,6 +41,9 @@ pub struct HookEnvironment {
     /// When `None`, [`sley_config::injected_config_parameters`] is read from the
     /// process environment.
     pub injected_config: Option<Vec<ConfigParameter>>,
+    /// Explicit git directory (`--git-dir`, embedder override). When set, hook
+    /// discovery uses this instead of walk-up / `GIT_DIR` env discovery alone.
+    pub git_dir: Option<PathBuf>,
 }
 
 impl HookEnvironment {
@@ -49,6 +52,7 @@ impl HookEnvironment {
     pub fn from_process() -> Self {
         Self {
             injected_config: sley_config::injected_config_parameters(None).ok(),
+            git_dir: None,
         }
     }
 }
@@ -135,11 +139,14 @@ pub fn run_hook(hook_name: &str, options: HookRun, hook_env: &HookEnvironment) -
         return Ok(false);
     }
     let mut options = options;
-    if options.git_dir.is_none()
-        && let Ok(cwd) = env::current_dir()
-        && let Ok(git_dir) = discover_git_dir_respecting_environment(&cwd)
-    {
-        options.git_dir = Some(git_dir);
+    if options.git_dir.is_none() {
+        if let Some(git_dir) = hook_env.git_dir.clone() {
+            options.git_dir = Some(git_dir);
+        } else if let Ok(cwd) = env::current_dir()
+            && let Ok(git_dir) = discover_git_dir_respecting_environment(&cwd)
+        {
+            options.git_dir = Some(git_dir);
+        }
     }
     for hook in runnable {
         let status = spawn_hook(&hook, &options)?;
@@ -389,17 +396,22 @@ fn list_hook_commands(hook_name: &str, hook_env: &HookEnvironment) -> Result<Vec
     for hook in configured_hooks(&config, hook_name)? {
         hooks.push(hook);
     }
-    if let Some(path) = find_hook(&config, hook_name)? {
+    if let Some(path) = find_hook(&config, hook_name, hook_env)? {
         hooks.push(HookCommand::Traditional(path));
     }
     Ok(hooks)
 }
 
+fn resolve_hook_git_dir(hook_env: &HookEnvironment) -> Option<PathBuf> {
+    if let Some(git_dir) = hook_env.git_dir.as_ref() {
+        return Some(git_dir.clone());
+    }
+    let cwd = env::current_dir().ok()?;
+    discover_git_dir_respecting_environment(&cwd).ok()
+}
+
 fn hook_config(hook_env: &HookEnvironment) -> Vec<ScopedSection> {
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let common_git_dir = discover_git_dir_respecting_environment(&cwd)
-        .ok()
-        .map(|git_dir| repository_common_dir(&git_dir));
+    let common_git_dir = resolve_hook_git_dir(hook_env).map(|git_dir| repository_common_dir(&git_dir));
     let context = sley_config::ConfigIncludeContext::new(common_git_dir.clone(), None);
     let mut out = Vec::new();
     if let Ok(config) = sley_config::load_pre_dispatch_config(None, &context) {
@@ -527,11 +539,13 @@ fn configured_hooks(config: &[ScopedSection], hook_name: &str) -> Result<Vec<Hoo
     Ok(out)
 }
 
-fn find_hook(config: &[ScopedSection], hook_name: &str) -> Result<Option<PathBuf>> {
-    let cwd = env::current_dir()?;
-    let git_dir = match discover_git_dir_respecting_environment(&cwd) {
-        Ok(git_dir) => git_dir,
-        Err(_) => return Ok(None),
+fn find_hook(
+    config: &[ScopedSection],
+    hook_name: &str,
+    hook_env: &HookEnvironment,
+) -> Result<Option<PathBuf>> {
+    let Some(git_dir) = resolve_hook_git_dir(hook_env) else {
+        return Ok(None);
     };
     let common_git_dir = repository_common_dir(&git_dir);
     let hooks_path = scoped_config_get(config, "core", None, "hooksPath");

@@ -183,6 +183,14 @@ if [ ! -f "$build_dir/GIT-BUILD-OPTIONS" ]; then
     log "         Run 'make GIT-BUILD-OPTIONS' in $build_dir first."
 fi
 
+fake_ssh="$build_dir/t/helper/test-fake-ssh"
+if [ ! -x "$fake_ssh" ]; then
+    log "WARNING: test helper missing: $fake_ssh"
+    log "         Upstream SSH transport tests copy this to GIT_SSH; without it"
+    log "         they hang on the real /usr/bin/ssh (e.g. t5601-clone @ 900s)."
+    log "         Fix: cd $build_dir && make t/helper/test-fake-ssh"
+fi
+
 # --- Resolve the sley binary ----------------------------------------------
 sley_bin=""
 cargo_bin_exe=$(printenv CARGO_BIN_EXE_sley 2>/dev/null || true)
@@ -285,6 +293,20 @@ if [ -n "$missing" ]; then
 fi
 if [ -z "$scripts" ]; then
     die "no upstream scripts selected (looked in $upstream_t)"
+fi
+
+# SSH/git transport scripts copy test-fake-ssh to GIT_SSH; without the helper
+# they fall through to real ssh and hang (t5601-clone is the canonical example).
+if [ ! -x "$fake_ssh" ]; then
+    needs_fake_ssh=""
+    for script in $scripts; do
+        case $script in
+            t55*|t56*) needs_fake_ssh=1; break ;;
+        esac
+    done
+    if [ -n "$needs_fake_ssh" ]; then
+        die "test-fake-ssh is required for selected transport scripts but missing: $fake_ssh (run: cd $build_dir && make t/helper/test-fake-ssh)"
+    fi
 fi
 
 # --- Timeout helper -------------------------------------------------------

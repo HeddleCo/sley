@@ -1003,8 +1003,12 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     }
     // `i18n.commitEncoding` is recorded as the commit's `encoding` header so that
     // `git log` can re-encode the message to the log output encoding (UTF-8 by
-    // default). git omits the header for UTF-8.
-    let commit_encoding = commit_encoding_config(&git_dir);
+    // default). git omits the header for UTF-8. Use the `-c`-aware config loaded
+    // above — `commit_encoding_config` reads disk-only and drops CLI overrides.
+    let commit_encoding = repo_config
+        .as_ref()
+        .and_then(|config| config.get("i18n", None, "commitEncoding").map(str::to_string))
+        .unwrap_or_else(|| "UTF-8".to_string());
     let commit_encoding_header =
         (!encoding_is_utf8(&commit_encoding)).then(|| commit_encoding.clone().into_bytes());
     let committer = commit_identity_from_env("COMMITTER")?;

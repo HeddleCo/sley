@@ -8,6 +8,7 @@ pub(crate) use sley::hooks::{
 fn hook_environment() -> sley::hooks::HookEnvironment {
     sley::hooks::HookEnvironment {
         injected_config: crate::injected_config_parameters().ok(),
+        git_dir: crate::session::cli_git_dir().ok(),
     }
 }
 

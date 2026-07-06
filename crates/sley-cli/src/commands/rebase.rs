@@ -5971,7 +5971,12 @@ fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
             name: "HEAD".into(),
             expected: None,
             new: RefTarget::Symbolic(head_name.clone()),
-            reflog: None,
+            reflog: Some(ReflogEntry {
+                old_oid: head,
+                new_oid: head,
+                committer: committer.clone(),
+                message: ctx.reflog("finish", Some(&format!("returning to {head_name}"))),
+            }),
         });
         tx.commit()?;
         head_name_display = head_name.clone();
