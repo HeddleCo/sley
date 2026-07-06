@@ -1,4 +1,5 @@
 use super::*;
+use sley::plumbing::{sley_diff_merge, sley_rev};
 
 /// Bundle of the context `run_line_log_output` needs (avoids a 20-arg fn).
 pub(super) struct LineLogOutputCtx<'a> {

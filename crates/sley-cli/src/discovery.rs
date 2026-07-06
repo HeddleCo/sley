@@ -8,7 +8,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use sley_core::{GitError, Result};
+use sley::{GitError, Result};
 
 use crate::ownership;
 

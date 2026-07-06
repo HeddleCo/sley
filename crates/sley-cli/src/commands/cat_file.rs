@@ -3,11 +3,12 @@
 use std::fmt::Write as _;
 use std::io::{self, BufRead, BufWriter, Write};
 use std::path::Path;
+use sley::plumbing::{sley_index, sley_rev, sley_worktree};
 
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use sley_object::ObjectType;
-use sley_odb::{FileObjectDatabase, ObjectStorageInfo};
-
+use sley::{GitError, ObjectFormat, ObjectId, Result};
+use sley::plumbing::sley_object::ObjectType;
+use sley::{ObjectDatabase as FileObjectDatabase};
+use sley::plumbing::sley_odb::{ObjectStorageInfo};
 use super::args::{GitArgCursor, LongOption, option_takes_no_value, switch_requires_value};
 use crate::*;
 

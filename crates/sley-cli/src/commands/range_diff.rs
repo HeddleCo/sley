@@ -1,8 +1,9 @@
 //! `git range-diff` — compare two commit series by patch similarity.
 
 use crate::*;
-use sley_diff_merge::range::{PatchRef, assign_patch_series};
+use sley::plumbing::sley_diff_merge::range::{PatchRef, assign_patch_series};
 use sley_notes::{NotesRef, read_note_bytes};
+use sley::plumbing::{sley_rev};
 
 const DEFAULT_CREATION_FACTOR: i32 = 60;
 

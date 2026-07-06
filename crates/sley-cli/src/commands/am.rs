@@ -19,6 +19,7 @@
 //! `repository_object_format`, `FileObjectDatabase`, `three_way_merge_trees`,
 //! and friends are all in scope without re-listing them.
 use crate::*;
+use sley::plumbing::{sley_index, sley_worktree};
 
 /// Parsed command-line configuration for a fresh `git am` invocation.
 struct AmOptions {
@@ -2960,7 +2961,7 @@ fn try_straight_apply(
 /// "Six"). Context and deleted lines are left untouched, so hunk matching is
 /// unaffected.
 fn am_whitespace_fix_patch(patch: &sley_diff_merge::FilePatch) -> sley_diff_merge::FilePatch {
-    use sley_diff_merge::HunkLine;
+    use sley::plumbing::sley_diff_merge::HunkLine;
     let mut fixed = patch.clone();
     for hunk in &mut fixed.hunks {
         for line in &mut hunk.lines {
@@ -2985,7 +2986,7 @@ fn am_apply_context_fuzz(
     patch: &sley_diff_merge::FilePatch,
     p_context: usize,
 ) -> Option<Vec<u8>> {
-    use sley_diff_merge::HunkLine;
+    use sley::plumbing::sley_diff_merge::HunkLine;
     if patch.is_delete && patch.hunks.is_empty() {
         return Some(Vec::new());
     }
@@ -3143,7 +3144,7 @@ fn am_find_pos(
 /// hunk's *new* lines while context lines keep the base's existing whitespace.
 /// Returns `None` if any hunk cannot be located even with whitespace ignored.
 fn apply_file_patch_ignore_ws(base: &[u8], patch: &sley_diff_merge::FilePatch) -> Option<Vec<u8>> {
-    use sley_diff_merge::HunkLine;
+    use sley::plumbing::sley_diff_merge::HunkLine;
 
     if patch.is_delete && patch.hunks.is_empty() {
         return Some(Vec::new());

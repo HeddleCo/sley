@@ -1,5 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
+use sley::plumbing::{sley_config, sley_core, sley_index, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -8,10 +9,11 @@ use crate::commands::cli_options::{
 };
 use regex::Regex;
 use sley_options::{OptFlags, OptionName, parse_options, ParsedValue};
-use sley_object::EncodedObject;
-use sley_odb::{ObjectReader, ObjectWriter};
-use sley_pack::{
-    PackBitmapWriter, PackInput, PackReverseIndex, PackWriteOptions, pack_order_index_positions,
+use sley::plumbing::sley_object::EncodedObject;
+use sley::plumbing::sley_odb::{ObjectReader, ObjectWriter};
+use sley::PackWriteOptions;
+use sley::plumbing::sley_pack::{
+    PackBitmapWriter, PackInput, PackReverseIndex, pack_order_index_positions,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;

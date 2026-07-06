@@ -27,7 +27,8 @@
 //! A glob of the crate root brings every shared helper/type into scope via
 //! descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley_object::TreeEntries;
+use sley::plumbing::sley_object::TreeEntries;
+use sley::plumbing::{sley_diff_merge, sley_rev, sley_worktree};
 
 /// Which output formats to produce, mirroring git's `output_format` bitmask:
 /// the explicit format options accumulate (`--stat --summary` prints both, and

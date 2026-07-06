@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use sley_config::GitConfig;
-use sley_core::Result;
+use sley::GitConfig;
+use sley::Result;
 
 use crate::discovery;
 use crate::repository::RepositoryContext;

@@ -2,7 +2,7 @@
 
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
-use sley_diff_merge::{ConflictStyle, MergeBlobOptions, merge_blobs};
+use sley::plumbing::sley_diff_merge::{ConflictStyle, MergeBlobOptions, merge_blobs};
 use sley_notes::{
     NotesCommitIdentity, NotesMergeConflict, NotesMergeOutcome, NotesMergeStrategy, NotesRef,
     finalize_notes_merge, list_notes, merge_notes, notes_ref_expected, read_note,

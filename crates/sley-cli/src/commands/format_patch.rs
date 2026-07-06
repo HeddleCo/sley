@@ -19,6 +19,7 @@
 //! format-patch keeps only the mbox framing here and delegates patch/summary
 //! rendering to the unified diff path.
 
+use sley::plumbing::{sley_core, sley_diff_merge, sley_object, sley_rev};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 use sley_notes::{NotesRef, read_note_bytes};

@@ -2,8 +2,9 @@ use crate::{
     common_git_dir_for_git_dir, global_config_value, injected_config_parameters,
     report_config_setup_error,
 };
-use sley_config::ConfigIncludeContext;
-use sley_core::{GitError, Result};
+use crate::sley_config;
+use sley::plumbing::sley_config::ConfigIncludeContext;
+use sley::{GitError, Result};
 use std::collections::BTreeSet;
 use std::env;
 use std::path::Path;

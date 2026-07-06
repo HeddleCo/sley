@@ -11,9 +11,9 @@ use sley::{
     BString, GitConfig, GitError, Index, IndexEntry, ObjectFormat, ObjectId, RefPrecondition,
     ReferenceTarget as RefTarget, Result,
 };
-use sley::plumbing::{
-    sley_config, sley_core, sley_formats, sley_index, sley_object, sley_odb, sley_pack, sley_pretty,
-    sley_refs, sley_rev, sley_remote, sley_worktree,
+pub(crate) use sley::plumbing::{
+    sley_config, sley_core, sley_diff_merge, sley_formats, sley_index, sley_object, sley_odb,
+    sley_pack, sley_pretty, sley_refs, sley_rev, sley_remote, sley_worktree,
 };
 use sley::plumbing::sley_config::{ConfigBoolOrInt, ConfigEntry, ConfigSection};
 use sley::plumbing::sley_core::DateMode;

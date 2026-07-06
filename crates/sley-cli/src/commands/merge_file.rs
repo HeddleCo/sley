@@ -17,6 +17,7 @@
 //! `merge_blobs` is built on (`split_lines` + `myers_diff_lines`), so conflict
 //! detection and region boundaries stay consistent across every flag.
 
+use sley::plumbing::{sley_diff_merge};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 

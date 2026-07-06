@@ -17,8 +17,9 @@
 
 use std::io::{self, Write};
 use std::path::Path;
+use sley::plumbing::{sley_core, sley_diff_merge, sley_rev};
 
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley::{GitError, ObjectFormat, ObjectId, Result};
 
 // Pull in the crate-root helpers this command shares with `cmd_diff`
 // (RepositoryContext, FileObjectDatabase, the

@@ -28,14 +28,15 @@
 //! is not implemented here, so for a *clean* working tree this matches
 //! `git blame` exactly, and for explicit revisions it always matches.
 
+use sley::plumbing::{sley_index, sley_rev, sley_worktree};
 // Glob the crate root for shared plumbing (RepositoryContext, repository_abbrev,
 // FileObjectDatabase, FileRefStore, Commit, Tree, the identity/date formatting
 // helpers, and so on). See commands::stash for the rationale: a submodule can
 // reach its ancestor module's private items, so everything visible at the crate
 // root is in scope here without re-listing it.
 use crate::*;
-use sley_core::Signature;
-use sley_object::TreeEntries;
+use sley::Signature;
+use sley::plumbing::sley_object::TreeEntries;
 
 /// What to print in the metadata column for each line's author.
 #[derive(Clone, Copy)]
@@ -828,7 +829,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
 /// Parse a `--diff-algorithm <value>` argument to a [`DiffAlgorithm`]. An
 /// unknown value is the same fatal git reports.
 fn parse_blame_diff_algorithm(value: &str) -> Result<sley_diff_merge::DiffAlgorithm> {
-    use sley_diff_merge::DiffAlgorithm;
+    use sley::plumbing::sley_diff_merge::DiffAlgorithm;
     Ok(match value {
         "myers" | "default" => DiffAlgorithm::Myers,
         "minimal" => DiffAlgorithm::Minimal,

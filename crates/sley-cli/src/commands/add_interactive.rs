@@ -14,9 +14,10 @@ use std::env;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use sley::plumbing::{sley_config};
 
-use sley_config::GitConfig;
-use sley_core::{GitError, Result};
+use sley::GitConfig;
+use sley::{GitError, Result};
 
 use crate::{worktree_root_for_git_dir};
 

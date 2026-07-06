@@ -6,7 +6,7 @@ use crate::commands::remote::{
     fetch_source_is_ssh, fetch_ssh_repository, ls_remote_git_dir, resolve_fetch_recurse_submodules,
 };
 use crate::*;
-use sley_remote::FetchOptions;
+use sley::plumbing::sley_remote::FetchOptions;
 
 mod merge;
 mod merge_base;

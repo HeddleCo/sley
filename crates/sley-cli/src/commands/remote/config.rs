@@ -2,6 +2,7 @@
 
 use crate::*;
 use std::path::{Path, PathBuf};
+use sley::plumbing::{sley_config, sley_refs};
 
 pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
     // Single effective-config reader shared with the library crates: resolves

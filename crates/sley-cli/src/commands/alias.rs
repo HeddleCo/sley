@@ -11,13 +11,15 @@
 //! - `[alias "<name>"] command = <value>` — subsection, case-*sensitive* name.
 //!   An empty subsection (`alias..<key>`) is treated as the plain form.
 
-use sley_config::{ConfigIncludeContext, GitConfig};
-use sley_core::{GitError, Result};
+use sley::plumbing::sley_config::ConfigIncludeContext;
+use sley::{GitConfig, GitError, Result};
 use std::env;
 use std::fs;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use crate::sley_config;
+use sley::plumbing::sley_core;
 
 use crate::commands::remote::repo_current_branch_name;
 use crate::{

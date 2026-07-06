@@ -1,6 +1,7 @@
 //! `git stash` and its subcommands
 //! (push/save/pop/apply/branch/clear/drop/create/store/show/list).
 
+use sley::plumbing::{sley_config, sley_core, sley_diff_merge, sley_rev, sley_worktree};
 // Command modules pull their shared plumbing from the crate root. A glob import
 // works because a submodule can access its ancestor module's items (including
 // private ones), so every helper, type, and re-export visible at the crate root
@@ -10,7 +11,7 @@ use crate::*;
 #[path = "stash_options.rs"]
 mod stash_options;
 use stash_options::{setup_stash_apply_options, setup_stash_list_options};
-use sley_object::TreeEntries;
+use sley::plumbing::sley_object::TreeEntries;
 #[derive(Debug)]
 pub(super) struct StashListOptions {
     format: StashListFormat,

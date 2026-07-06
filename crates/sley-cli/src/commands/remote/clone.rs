@@ -24,8 +24,8 @@ use crate::remote::{
     rewrite_url_with_config,
 };
 use crate::*;
-use sley_odb::ObjectReader;
-use sley_remote::{FetchOptions, LsRemoteRecord};
+use sley::plumbing::sley_odb::ObjectReader;
+use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord};
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 

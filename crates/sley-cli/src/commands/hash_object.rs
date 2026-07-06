@@ -6,11 +6,12 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use sley::plumbing::{sley_worktree};
 
-use sley_config::GitConfig;
-use sley_core::{GitError, ObjectFormat, Result};
-use sley_object::ObjectType;
-use sley_odb::LooseObjectStore;
+use sley::GitConfig;
+use sley::{GitError, ObjectFormat, Result};
+use sley::plumbing::sley_object::ObjectType;
+use sley::plumbing::sley_odb::LooseObjectStore;
 
 use super::args::{
     GitArgCursor, LongOption, Terminator, option_takes_no_value, switch_requires_value, usage_error,

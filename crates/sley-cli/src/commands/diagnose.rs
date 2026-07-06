@@ -10,6 +10,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use sley::plumbing::{sley_config, sley_core};
 
 use sley_archive::{ArchiveExtraEntry, ArchiveExtras, ZipArchiveOptions};
 

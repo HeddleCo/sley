@@ -1,6 +1,7 @@
 //! `git config`: read and write repository configuration.
 
 use crate::*;
+use sley::plumbing::{sley_config, sley_rev};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigAction {

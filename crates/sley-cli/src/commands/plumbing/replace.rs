@@ -13,9 +13,9 @@ pub(super) enum ReplaceMode {
 
 #[derive(Debug)]
 pub(super) struct ReplaceOptions {
-    pub(super) force: bool,
-    pub(super) format: ReplaceListFormat,
-    pub(super) mode: ReplaceMode,
+    pub(crate) force: bool,
+    pub(crate) format: ReplaceListFormat,
+    pub(crate) mode: ReplaceMode,
 }
 
 #[derive(Debug, Clone, Copy)]

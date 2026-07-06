@@ -1,5 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
+use sley::plumbing::{sley_config, sley_diff_merge, sley_index, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;

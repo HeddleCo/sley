@@ -7,11 +7,12 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use sley::plumbing::{sley_core, sley_rev};
 
-use sley_config::GitConfig;
-use sley_core::{ObjectFormat, Result};
-use sley_odb::FileObjectDatabase;
-use sley_refs::FileRefStore;
+use sley::GitConfig;
+use sley::{ObjectFormat, Result};
+use sley::ObjectDatabase as FileObjectDatabase;
+use sley::RefStore as FileRefStore;
 
 use crate::{
     common_git_dir_for_git_dir, read_repo_config, repository_abbrev,

@@ -14,6 +14,7 @@
 //! the same kind of "unsupported" error the general pull path produces, so
 //! behaviour only *grows* for the `-s ours` case.
 use crate::*;
+use sley::plumbing::{sley_rev};
 
 /// Returns `Some(index)` when `args` carries a `-s`/`--strategy` option, with
 /// `index` pointing at the option itself (its value may live in the same token

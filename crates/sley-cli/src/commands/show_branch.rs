@@ -23,6 +23,7 @@
 //! can see its ancestor module's private items, so nothing has to be re-listed.
 
 use crate::*;
+use sley::plumbing::{sley_rev};
 
 /// git's `REV_SHIFT`: the two low flag bits are reserved (`UNINTERESTING`
 /// occupies bit 0), so ref `i` is tracked by bit `i + REV_SHIFT`.

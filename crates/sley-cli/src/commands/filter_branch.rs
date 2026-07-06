@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sley_core::{GitError, Result};
+use sley::{GitError, Result};
 
 pub(crate) fn cmd_filter_branch(args: &[String]) -> Result<()> {
     let exe = env::current_exe().map_err(|err| {

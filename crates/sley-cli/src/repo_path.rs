@@ -3,7 +3,7 @@
 use std::ffi::OsStr;
 use std::path::{Component, Path};
 
-use sley_core::{GitError, Result};
+use sley::{GitError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RepoPathBuf(Vec<u8>);

@@ -1,6 +1,7 @@
 //! Branch listing, sorting, formatting, and verbose output.
 
 use crate::*;
+use sley::plumbing::{sley_refs, sley_rev};
 
 pub(super) struct BranchVerboseListOptions {
     pub(crate) mode: BranchListMode,

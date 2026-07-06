@@ -8,6 +8,7 @@
 //! filters plus the `--all`/`--annotate-stdin`/positional input modes match the
 //! real command's output and exit codes.
 
+use sley::plumbing::{sley_rev};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::commands::cli_options::opt_bool;
 use crate::*;

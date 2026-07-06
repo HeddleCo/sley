@@ -8,6 +8,7 @@
 //! text, the streams it lands on, and exit codes match upstream so the command
 //! is a drop-in replacement.
 
+use sley::plumbing::{sley_worktree};
 // Pull shared plumbing (RepositoryContext, ObjectReader, Index/IndexEntry,
 // GitError/Result, std::* re-exports, …) from the crate root.
 // A submodule can see its ancestors' items, so the glob keeps this file in step

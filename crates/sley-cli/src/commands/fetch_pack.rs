@@ -8,7 +8,7 @@
 
 use crate::commands::remote::ls_remote_git_dir;
 use crate::*;
-use sley_remote::{apply_shallow_info, compute_local_deepen, read_shallow};
+use sley::plumbing::sley_remote::{apply_shallow_info, compute_local_deepen, read_shallow};
 
 const FETCH_PACK_USAGE: &str = "usage: git fetch-pack [--all] [--stdin] [--quiet | -q] [--keep | -k] [--thin] [--include-tag] [--upload-pack=<git-upload-pack>] [--depth=<n>] [--no-progress] [--diag-url] [-v] [<host>:]<directory> [<refs>...]";
 

@@ -1,6 +1,7 @@
 //! `git worktree`: manage multiple working trees attached to one repository.
 
 use crate::*;
+use sley::plumbing::{sley_config, sley_core, sley_index, sley_worktree};
 
 #[path = "worktree_options.rs"]
 mod worktree_options;

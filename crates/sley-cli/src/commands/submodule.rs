@@ -1,5 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
+use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -836,7 +837,7 @@ fn submodule_default_remote(sub_git_dir: &Path, sub_format: ObjectFormat) -> Res
 
 /// True when the index carries an unmerged (stage > 0) gitlink at `path`.
 fn submodule_index_is_unmerged(index: &Option<Index>, path: &str) -> bool {
-    use sley_index::Stage;
+    use sley::IndexStage as Stage;
     let path = path.as_bytes();
     index.as_ref().is_some_and(|index| {
         index
@@ -2034,7 +2035,7 @@ fn index_relevant_paths_for_files(
     format: ObjectFormat,
     index: &Option<Index>,
 ) -> Result<BTreeMap<String, (u32, ObjectId)>> {
-    use sley_index::Stage;
+    use sley::IndexStage as Stage;
     let mut out = BTreeMap::new();
     if let Some(index) = index {
         for entry in &index.entries {
@@ -2113,7 +2114,7 @@ fn index_relevant_paths(
     index: &Option<Index>,
     tree_side: &BTreeMap<String, (u32, ObjectId)>,
 ) -> BTreeMap<String, (u32, ObjectId)> {
-    use sley_index::Stage;
+    use sley::IndexStage as Stage;
     let mut out = BTreeMap::new();
     if let Some(index) = index {
         for entry in &index.entries {
@@ -3071,7 +3072,7 @@ fn summary_tip_commit(
 }
 
 fn submodule_index_oid(index: &Option<Index>, path: &str) -> Option<ObjectId> {
-    use sley_index::Stage;
+    use sley::IndexStage as Stage;
 
     let path = path.as_bytes();
     index

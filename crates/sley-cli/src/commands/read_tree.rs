@@ -27,6 +27,7 @@
 //! pattern.
 
 use crate::*;
+use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_rev, sley_worktree};
 
 /// A flat map from a repository-relative path to a tree leaf's `(mode, oid)`.
 type LeafMap = BTreeMap<Vec<u8>, (u32, ObjectId)>;

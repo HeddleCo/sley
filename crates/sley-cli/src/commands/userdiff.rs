@@ -11,12 +11,13 @@
 //! content matches upstream exactly.
 
 use crate::*;
-pub(crate) use sley_diff_merge::format::CompiledFuncname;
+pub(crate) use sley::plumbing::sley_diff_merge::format::CompiledFuncname;
 #[cfg(test)]
 use sley_grep::{Regex, RegexMode};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use sley::plumbing::{sley_config, sley_worktree};
 
 /// One row of the upstream builtin driver table.
 pub(crate) struct BuiltinDriver {

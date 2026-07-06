@@ -1,6 +1,7 @@
 //! Branch-related repository config read/write helpers.
 
 use crate::*;
+use sley::plumbing::{sley_config};
 
 pub(super) fn rename_branch_config(git_dir: &Path, old_branch: &str, new_branch: &str) -> Result<()> {
     let path = git_dir.join("config");

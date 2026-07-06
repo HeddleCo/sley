@@ -13,7 +13,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use sley_core::{GitError, Result};
+use sley::{GitError, Result};
 
 /// Which kind of patch session. Mirrors add-patch.c's `patch_mode_*` table:
 /// each variant fixes the diff command, the apply direction, and the prompt

@@ -7,6 +7,7 @@
 //! unless `--summary` is requested, the folded subject of every commit indented
 //! beneath a `Name (count):` header.
 
+use sley::plumbing::{sley_rev};
 // Command modules pull their shared plumbing from the crate root. A glob import
 // works because a submodule can access its ancestor module's items (including
 // private ones), so every helper, type, and re-export visible at the crate root

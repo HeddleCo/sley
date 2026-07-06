@@ -21,6 +21,7 @@
 //! private ones), so every helper, type, and re-export visible at the crate root
 //! is in scope here without re-listing it.
 use crate::*;
+use sley::plumbing::{sley_config, sley_core, sley_rev};
 
 /// Which top-level mode `git merge-tree` runs in. Selected explicitly via
 /// `--write-tree` / `--trivial-merge`, otherwise inferred from the positional
@@ -575,7 +576,7 @@ fn stdin_record_options(
 /// favouring options affect merge-tree output; everything else is ignored, as
 /// upstream tolerates (and largely ignores) most strategy options here.
 fn parse_strategy_favor(options: &[String]) -> Result<sley_diff_merge::MergeFavor> {
-    use sley_diff_merge::MergeFavor;
+    use sley::plumbing::sley_diff_merge::MergeFavor;
     let mut favor = MergeFavor::None;
     for option in options {
         match option.as_str() {

@@ -17,6 +17,7 @@
 //! * `refs/bisect/<term-good>-<oid>` -- one ref per known-good commit.
 //! * `refs/bisect/skip-<oid>` -- one ref per skipped commit.
 use crate::*;
+use sley::plumbing::{sley_diff_merge, sley_worktree};
 
 // Upstream `enum bisect_error` values; the process exit code is the negation.
 const BISECT_OK: i32 = 0;
@@ -1498,7 +1499,7 @@ fn bisect_pathspec(repo: &BisectRepo) -> Result<Option<sley_rev::Pathspec>> {
 /// the `approx_halfway` early exit, and the `filter_skipped` + `skip_away` skip
 /// machinery) lives in [`sley_rev::bisect`] — a shared primitive used both here
 /// and by `rev-list --bisect`.
-use sley_rev::bisect::{SkipFilter, do_find_bisection, estimate_bisect_steps, managed_skipped};
+use sley::plumbing::sley_rev::bisect::{SkipFilter, do_find_bisection, estimate_bisect_steps, managed_skipped};
 
 fn error_if_skipped_commits(
     repo: &BisectRepo,

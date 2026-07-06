@@ -34,6 +34,7 @@
 
 use crate::*;
 use std::io::{BufRead, Write};
+use sley::plumbing::{sley_config, sley_pack, sley_refs, sley_rev};
 
 #[derive(Default)]
 struct FastImportOptions {

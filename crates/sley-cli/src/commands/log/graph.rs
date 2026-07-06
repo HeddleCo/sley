@@ -1,4 +1,5 @@
 use super::*;
+use sley::plumbing::{sley_rev};
 
 pub(super) fn graph_show_commit(
     graph: &mut sley_rev::graph::Graph,

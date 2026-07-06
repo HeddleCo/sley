@@ -16,8 +16,9 @@
 //! re-listing them.
 
 use crate::*;
-use sley_object::TreeEntries;
+use sley::plumbing::sley_object::TreeEntries;
 use std::cell::{Ref, RefCell};
+use sley::plumbing::{sley_diff_merge, sley_rev, sley_worktree};
 
 /// How the per-object diff (for commits) is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -20,8 +20,8 @@ use crate::remote::{
     rewrite_url_with_config,
 };
 use crate::*;
-use sley_odb::ObjectReader;
-use sley_remote::{FetchOptions, LsRemoteRecord};
+use sley::plumbing::sley_odb::ObjectReader;
+use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
@@ -2778,7 +2778,7 @@ fn print_push_ref(
     local_db: &FileObjectDatabase,
     remote_db: &FileObjectDatabase,
 ) {
-    use sley_remote::PushRefStatus;
+    use sley::plumbing::sley_remote::PushRefStatus;
     let (flag, summary, msg): (char, String, Option<String>) = match &reference.status {
         PushRefStatus::Ok => push_ok_summary(reference, local_db, remote_db),
         PushRefStatus::UpToDate => ('=', "[up to date]".to_string(), None),

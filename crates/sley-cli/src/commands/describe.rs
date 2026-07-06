@@ -13,6 +13,7 @@
 //! (`git rev-list <target> ^<tag>`). The winner is the candidate with the
 //! smallest depth, ties broken by registration order (which follows commit date).
 
+use sley::plumbing::{sley_rev, sley_worktree};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 

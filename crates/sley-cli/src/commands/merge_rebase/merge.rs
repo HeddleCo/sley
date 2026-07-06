@@ -1,4 +1,5 @@
 use super::*;
+use sley::plumbing::{sley_config, sley_core, sley_index, sley_refs, sley_rev, sley_worktree};
 
 /// Render git merge's post-merge `--stat`/`--compact-summary` block.
 ///
@@ -2444,7 +2445,7 @@ pub(crate) fn effective_config_with_overrides() -> Option<GitConfig> {
 /// unrecognised) is `conflict`: directory renames are detected but each re-homed
 /// path is flagged rather than applied silently.
 pub(crate) fn directory_renames_config() -> sley_diff_merge::DirectoryRenames {
-    use sley_diff_merge::DirectoryRenames;
+    use sley::plumbing::sley_diff_merge::DirectoryRenames;
     let value = effective_config_with_overrides().and_then(|config| {
         config
             .get("merge", None, "directoryRenames")

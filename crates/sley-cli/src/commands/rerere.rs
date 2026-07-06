@@ -4,6 +4,7 @@ use crate::commands::cli_options::opt_bool;
 use crate::*;
 use sley_options::{parse_options, OptionSpec};
 use std::time::{Duration, SystemTime};
+use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_worktree};
 
 const RERERE_MARKER_SIZE: usize = 7;
 const RERERE_RESOLVED_DAYS: u64 = 60;

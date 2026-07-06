@@ -20,8 +20,8 @@ pub(super) enum RerereSubcommand {
 
 #[derive(Debug)]
 pub(super) struct RerereOptions {
-    pub(super) subcommand: Option<RerereSubcommand>,
-    pub(super) paths: Vec<String>,
+    pub(crate) subcommand: Option<RerereSubcommand>,
+    pub(crate) paths: Vec<String>,
 }
 
 pub(crate) fn cmd_rerere(args: &[String]) -> Result<()> {

@@ -21,7 +21,7 @@
 use crate::*;
 
 use crate::commands::ref_command_stream::unquote_c_style;
-use sley_worktree::{
+use sley::plumbing::sley_worktree::{
     SparseCheckout, SparseCheckoutMode, apply_sparse_checkout_with_mode, path_in_sparse_checkout,
 };
 

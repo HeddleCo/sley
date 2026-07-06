@@ -19,9 +19,9 @@
 //! the per-line diff that drives range mapping uses sley's Myers diff.
 
 use crate::*;
-use sley_diff_merge::render::LineRange;
-use sley_odb::FileObjectDatabase;
-use sley_rev::{CommitRecord, resolve_tree_path_entry};
+use sley::plumbing::sley_diff_merge::render::LineRange;
+use sley::ObjectDatabase as FileObjectDatabase;
+use sley::plumbing::sley_rev::{CommitRecord, resolve_tree_path_entry};
 use std::collections::HashMap;
 
 /// One `-L` argument before resolution: the raw `<range>:<file>` string.

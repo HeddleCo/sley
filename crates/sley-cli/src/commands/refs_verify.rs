@@ -10,6 +10,7 @@ use sley_fsck::SeverityConfig;
 use sley_fsck::content::{MsgId, Severity};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use sley::plumbing::{sley_formats};
 
 /// Resolved options for a verify run (severity table + verbosity).
 pub(crate) struct RefsVerifyOptions {

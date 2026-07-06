@@ -1,4 +1,5 @@
 use super::*;
+use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_worktree};
 
 // ===== git merge (3-way) =====
 

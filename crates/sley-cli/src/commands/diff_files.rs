@@ -13,6 +13,7 @@
 //! the `diff-files`-specific argument parser and dispatch. Shared plumbing is
 //! pulled in via the crate-root glob; see `commands::stash` for the rationale.
 use crate::*;
+use sley::plumbing::{sley_diff_merge, sley_index, sley_worktree};
 
 /// Usage text emitted for `-h` (to stdout) and on a parse error (to stderr),
 /// matching `git diff-files`'s built-in usage. Kept as a single block so both

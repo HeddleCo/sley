@@ -9,9 +9,11 @@
 //! the check can be exercised regardless of real on-disk ownership.
 
 use std::path::{Component, Path, PathBuf};
+use crate::sley_config;
+use sley::plumbing::sley_core;
 
-use sley_config::ConfigIncludeContext;
-use sley_core::{GitError, Result};
+use sley::plumbing::sley_config::ConfigIncludeContext;
+use sley::{GitError, Result};
 
 use crate::{git_env_bool, injected_config_parameters};
 

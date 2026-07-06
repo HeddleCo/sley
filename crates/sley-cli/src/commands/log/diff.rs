@@ -1,4 +1,5 @@
 use super::*;
+use sley::plumbing::{sley_diff_merge, sley_rev};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LogDiffMerges {
