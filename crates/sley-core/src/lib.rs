@@ -591,16 +591,31 @@ pub mod trace2 {
     }
 
     pub fn child_start(class: &str, argv: &[String]) {
-        let argv = argv
-            .iter()
-            .map(|arg| maybe_redact(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let redacted: Vec<String> = argv.iter().map(|arg| maybe_redact(arg)).collect();
+        let joined = redacted.join(" ");
         perf_line(
             depth(),
             "child_start",
-            &format!("child_id:0 class:{class} argv:[{argv}]"),
+            &format!("child_id:0 class:{class} argv:[{joined}]"),
         );
+        if let Some(target) = trace_target("GIT_TRACE2_EVENT") {
+            let json_argv = redacted
+                .iter()
+                .map(|arg| format!("\"{}\"", escape_json(arg)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let line = format!(
+                "{{\"event\":\"child_start\",\"sid\":\"sley\",\"thread\":\"main\",\"child_id\":0,\"child_class\":\"{}\",\"use_shell\":false,\"argv\":[{json_argv}]}}\n",
+                escape_json(class),
+            );
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&target)
+            {
+                let _ = file.write_all(line.as_bytes());
+            }
+        }
     }
 
     pub fn alias(name: &str, argv: &[String]) {

@@ -688,7 +688,8 @@ declare -A FLOOR=(
     # wave-2 (2026-06-21): push refmaps/forced-tag-status/denyDeleteCurrent/non-commit-reject 92->99 (guards t5510/t5601 held).
     [t5516-fetch-push.sh]=111
     [t5520-pull.sh]=75
-    [t5601-clone.sh]=109
+    # headroom (clone includeIf): t5601 109->110 (cell 110 onbranch guard during clone).
+    [t5601-clone.sh]=110
     # codex-wave-11 (partial clone): --filter=blob:none/blob:limit/tree/sparse:oid,
     # remote.origin.promisor + partialclonefilter config, promisor-pack + lazy
     # object fetch-on-read, filter+depth. t5616 14->36. MERGE-RESOLUTION: clone's

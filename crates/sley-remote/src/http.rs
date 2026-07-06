@@ -14,21 +14,22 @@
 
 use std::path::Path;
 
+use sley_config::GitConfig;
 use sley_core::{
     Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
 };
 use crate::install::{
     install_protocol_v2_fetch_promisor_response_from_reader,
     install_protocol_v2_fetch_response_from_reader,
-    install_upload_pack_raw_promisor_response_from_reader,
-    install_upload_pack_raw_response_from_reader,
-    install_upload_pack_shallow_raw_promisor_response_from_reader,
-    install_upload_pack_shallow_raw_response_from_reader,
+    install_upload_pack_packfile_promisor_response_from_reader,
+    install_upload_pack_packfile_response_from_reader,
+    install_upload_pack_shallow_packfile_promisor_response_from_reader,
+    install_upload_pack_shallow_packfile_response_from_reader,
     shallow_info_from_protocol_v2_fetch_header,
 };
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
-    GitService, ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchRequest,
+    GitService, ProtocolVersion, ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchRequest,
     ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRequest,
     RefAdvertisement, RefAdvertisementSet, TransportHandshake, UploadPackFeatures,
     UploadPackNegotiationRequest, UploadPackRequest, encode_protocol_v2_command_options,
@@ -41,9 +42,9 @@ use sley_protocol::{
     write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_transport::{
-    HttpClient, HttpResponse, RemoteTransport, RemoteUrl, ServiceDiscoveryPayload, UreqHttpClient,
-    git_credential_basic_authorization, http_smart_info_refs_url, http_smart_rpc_url,
-    parse_remote_url, read_service_discovery_response,
+    GitProtocolHeader, HttpClient, HttpResponse, RemoteTransport, RemoteUrl, ServiceDiscoveryPayload,
+    UreqHttpClient, encode_git_protocol_header, git_credential_basic_authorization,
+    http_smart_info_refs_url, http_smart_rpc_url, parse_remote_url, read_service_discovery_response,
 };
 
 use crate::CredentialProvider;
@@ -123,12 +124,46 @@ pub fn http_send_with_auth(
     Ok(retry)
 }
 
+/// Resolve the client protocol version for smart HTTP, defaulting to v2 like upstream git.
+pub fn http_protocol_version_from_config(config: Option<&GitConfig>) -> Option<ProtocolVersion> {
+    match config.and_then(|config| config.get("protocol", None, "version")) {
+        Some("0") => Some(ProtocolVersion::V0),
+        Some("1") => Some(ProtocolVersion::V1),
+        Some("2") => Some(ProtocolVersion::V2),
+        _ => Some(ProtocolVersion::V2),
+    }
+}
+
+/// Encode the `Git-Protocol` request header value, if any (`None` for protocol v0).
+pub fn http_git_protocol_header_value(config: Option<&GitConfig>) -> Result<Option<String>> {
+    match http_protocol_version_from_config(config) {
+        Some(ProtocolVersion::V0) => Ok(None),
+        Some(version) => encode_git_protocol_header(&GitProtocolHeader {
+            protocol: Some(version),
+            extra_parameters: Vec::new(),
+        }),
+        None => Ok(None),
+    }
+}
+
+/// Build smart-HTTP request headers for an optional credential and `Git-Protocol` value.
+pub fn http_request_headers<'a>(
+    auth: Option<&'a str>,
+    git_protocol: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut headers = Vec::with_capacity(2);
+    if let Some(value) = git_protocol {
+        headers.push(("Git-Protocol", value));
+    }
+    if let Some(value) = auth {
+        headers.push(("Authorization", value));
+    }
+    headers
+}
+
 /// Build the `Authorization` header list for an optional credential header value.
 pub fn http_authorization_headers(auth: Option<&str>) -> Vec<(&str, &str)> {
-    match auth {
-        Some(value) => vec![("Authorization", value)],
-        None => Vec::new(),
-    }
+    http_request_headers(auth, None)
 }
 
 /// Map an HTTP response status to success or a descriptive error for `url`.
@@ -344,6 +379,7 @@ fn http_protocol_v2_ls_refs_advertisements(
     service: GitService,
     handshake: TransportHandshake,
     credentials: &mut dyn CredentialProvider,
+    git_protocol: Option<&str>,
 ) -> Result<RefAdvertisementSet> {
     let command = protocol_v2_ls_refs_command_request(format, &handshake)?;
     let url = http_smart_rpc_url(remote, service)?;
@@ -354,7 +390,7 @@ fn http_protocol_v2_ls_refs_advertisements(
         client.post(
             &url,
             &content_type,
-            &http_authorization_headers(auth),
+            &http_request_headers(auth, git_protocol),
             &body,
         )
     })?;
@@ -371,10 +407,15 @@ pub fn http_service_advertisements(
     format: ObjectFormat,
     service: GitService,
     credentials: &mut dyn CredentialProvider,
+    config: Option<&GitConfig>,
 ) -> Result<HttpServiceAdvertisements> {
+    let git_protocol = http_git_protocol_header_value(config)?;
     let url = http_smart_info_refs_url(remote, service)?;
     let mut response = http_send_with_auth(remote, credentials, |auth| {
-        client.get(&url, &http_authorization_headers(auth))
+        client.get(
+            &url,
+            &http_request_headers(auth, git_protocol.as_deref()),
+        )
     })?;
     http_check_status(&response, &url)?;
     http_validate_content_type(&response, &smart_http_advertisement_content_type(service)?)?;
@@ -392,6 +433,7 @@ pub fn http_service_advertisements(
                 service,
                 handshake.clone(),
                 credentials,
+                git_protocol.as_deref(),
             )?;
             Ok(HttpServiceAdvertisements {
                 set,
@@ -407,16 +449,42 @@ pub fn http_upload_pack_advertisements(
     remote: &RemoteUrl,
     format: ObjectFormat,
     credentials: &mut dyn CredentialProvider,
+    config: Option<&GitConfig>,
 ) -> Result<(Vec<RefAdvertisement>, UploadPackFeatures)> {
-    let discovered =
-        http_service_advertisements(client, remote, format, GitService::UploadPack, credentials)?;
-    let features = upload_pack_features_from_advertisements(&discovered.set.refs)?;
+    let discovered = http_service_advertisements(
+        client,
+        remote,
+        format,
+        GitService::UploadPack,
+        credentials,
+        config,
+    )?;
+    let features = http_upload_pack_features(&discovered.set.refs, discovered.handshake.as_ref())?;
     Ok((discovered.set.refs, features))
 }
 
-fn upload_pack_features_from_advertisements(
+/// Bridge protocol v2 handshake capabilities (filter/shallow/…) and v0/v1 ref
+/// advertisement capabilities into [`UploadPackFeatures`].
+pub fn http_upload_pack_features(
     advertisements: &[RefAdvertisement],
+    handshake: Option<&TransportHandshake>,
 ) -> Result<UploadPackFeatures> {
+    if let Some(handshake) = handshake {
+        let v2 = parse_protocol_v2_fetch_features(&handshake.capabilities)?.unwrap_or_default();
+        let mut features = UploadPackFeatures {
+            object_format: Some(protocol_v2_object_format(&handshake.capabilities)?),
+            shallow: v2.shallow,
+            deepen_since: v2.shallow,
+            deepen_not: v2.shallow,
+            filter: v2.filter,
+            ..UploadPackFeatures::default()
+        };
+        if let Some(first) = advertisements.first() {
+            let bridged = parse_upload_pack_features(&first.capabilities)?;
+            features.symrefs = bridged.symrefs;
+        }
+        return Ok(features);
+    }
     Ok(advertisements
         .first()
         .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
@@ -434,6 +502,7 @@ fn http_upload_pack_post(
     request: &UploadPackRequest,
     haves: Vec<ObjectId>,
     credentials: &mut dyn CredentialProvider,
+    git_protocol: Option<&str>,
 ) -> Result<HttpResponse> {
     let url = http_smart_rpc_url(remote, GitService::UploadPack)?;
     let mut body = Vec::new();
@@ -447,7 +516,7 @@ fn http_upload_pack_post(
         client.post(
             &url,
             &content_type,
-            &http_authorization_headers(auth),
+            &http_request_headers(auth, git_protocol),
             &body,
         )
     })?;
@@ -470,10 +539,19 @@ pub fn http_protocol_v2_fetch_response(
     handshake: &TransportHandshake,
     fetch: ProtocolV2FetchRequest,
     credentials: &mut dyn CredentialProvider,
+    config: Option<&GitConfig>,
 ) -> Result<Vec<ProtocolV2FetchResponseSection>> {
+    let git_protocol = http_git_protocol_header_value(config)?;
     let sideband_all = fetch.sideband_all;
-    let mut response =
-        http_protocol_v2_fetch_post(client, remote, format, handshake, fetch, credentials)?;
+    let mut response = http_protocol_v2_fetch_post(
+        client,
+        remote,
+        format,
+        handshake,
+        fetch,
+        credentials,
+        git_protocol.as_deref(),
+    )?;
     if sideband_all {
         Ok(read_protocol_v2_fetch_sideband_all_response(format, &mut response.body)?.sections)
     } else {
@@ -488,6 +566,7 @@ fn http_protocol_v2_fetch_post(
     handshake: &TransportHandshake,
     fetch: ProtocolV2FetchRequest,
     credentials: &mut dyn CredentialProvider,
+    git_protocol: Option<&str>,
 ) -> Result<HttpResponse> {
     let command = protocol_v2_fetch_command_request(format, handshake, &fetch)?;
     let url = http_smart_rpc_url(remote, GitService::UploadPack)?;
@@ -498,7 +577,7 @@ fn http_protocol_v2_fetch_post(
         client.post(
             &url,
             &content_type,
-            &http_authorization_headers(auth),
+            &http_request_headers(auth, git_protocol),
             &body,
         )
     })?;
@@ -544,6 +623,7 @@ pub struct HttpFetchPackRequest<'a> {
     pub deepen_since: Option<i64>,
     pub deepen_not: Vec<String>,
     pub deepen_relative: bool,
+    pub git_protocol: Option<&'a str>,
 }
 
 pub fn install_fetch_pack_via_http_upload_pack(
@@ -579,16 +659,17 @@ pub fn install_fetch_pack_via_http_upload_pack(
             &upload_request,
             haves,
             credentials,
+            request.git_protocol,
         )?;
         if request.promisor {
-            install_upload_pack_raw_promisor_response_from_reader(
+            install_upload_pack_packfile_promisor_response_from_reader(
                 request.format,
                 &mut response.body,
                 &local_db,
                 request.max_input_size,
             )?;
         } else {
-            install_upload_pack_raw_response_from_reader(
+            install_upload_pack_packfile_response_from_reader(
                 request.format,
                 &mut response.body,
                 &local_db,
@@ -604,9 +685,10 @@ pub fn install_fetch_pack_via_http_upload_pack(
         &upload_request,
         haves,
         credentials,
+        request.git_protocol,
     )?;
     let shallow_info = if request.promisor {
-        let (shallow_info, _) = install_upload_pack_shallow_raw_promisor_response_from_reader(
+        let (shallow_info, _) = install_upload_pack_shallow_packfile_promisor_response_from_reader(
             request.format,
             &mut response.body,
             &local_db,
@@ -614,7 +696,7 @@ pub fn install_fetch_pack_via_http_upload_pack(
         )?;
         shallow_info
     } else {
-        let (shallow_info, _) = install_upload_pack_shallow_raw_response_from_reader(
+        let (shallow_info, _) = install_upload_pack_shallow_packfile_response_from_reader(
             request.format,
             &mut response.body,
             &local_db,
@@ -660,6 +742,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
         handshake,
         fetch,
         credentials,
+        request.git_protocol,
     )?;
     let (header, _install) = if request.promisor {
         install_protocol_v2_fetch_promisor_response_from_reader(

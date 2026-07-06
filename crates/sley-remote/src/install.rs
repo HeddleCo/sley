@@ -7,8 +7,10 @@ use sley_core::Result;
 use sley_odb::{FileObjectDatabase, RawPackInstallOptions, RawPackInstallResult, RawPackInstaller};
 use sley_protocol::{
     PktLineFrame, ProtocolV2FetchResponseHeader, ProtocolV2FetchResponseSection,
-    ProtocolV2FetchShallowInfo, SideBandChannel, parse_sideband_packet, read_pkt_line_frame,
-    read_protocol_v2_fetch_response_header, read_upload_pack_raw_packfile_response_header,
+    ProtocolV2FetchShallowInfo, SideBandChannel, demux_upload_pack_packfile_response,
+    parse_sideband_packet, read_pkt_line_frame, read_protocol_v2_fetch_response_header,
+    read_upload_pack_packfile_response, read_upload_pack_raw_packfile_response_header,
+    read_upload_pack_shallow_info_section,
     read_upload_pack_shallow_info_and_raw_packfile_response_header,
 };
 use std::io::{Cursor, ErrorKind, Read};
@@ -39,6 +41,62 @@ where
         &mut pack_reader,
         raw_pack_install_options(false, max_input_size),
     )
+}
+
+/// Install an upload-pack packfile response that may use side-band-64k.
+///
+/// Smart HTTP always delivers the pack inside sideband channel 1 after any
+/// leading `ACK`/`NAK` pkt-lines (see `read_upload_pack_packfile_response`).
+pub fn install_upload_pack_packfile_response_from_reader<I, R>(
+    format: ObjectFormat,
+    reader: &mut R,
+    destination: &I,
+    max_input_size: Option<u64>,
+) -> Result<RawPackInstallResult>
+where
+    I: RawPackInstaller,
+    R: Read,
+{
+    install_upload_pack_sideband_response_from_reader(format, reader, destination, false, max_input_size)
+}
+
+pub fn install_upload_pack_packfile_promisor_response_from_reader<R>(
+    format: ObjectFormat,
+    reader: &mut R,
+    destination: &FileObjectDatabase,
+    max_input_size: Option<u64>,
+) -> Result<RawPackInstallResult>
+where
+    R: Read,
+{
+    install_upload_pack_sideband_response_from_reader(format, reader, destination, true, max_input_size)
+}
+
+fn install_upload_pack_sideband_response_from_reader<I, R>(
+    format: ObjectFormat,
+    reader: &mut R,
+    destination: &I,
+    promisor: bool,
+    max_input_size: Option<u64>,
+) -> Result<RawPackInstallResult>
+where
+    I: RawPackInstaller,
+    R: Read,
+{
+    let response = read_upload_pack_packfile_response(format, reader)?;
+    let demuxed = demux_upload_pack_packfile_response(&response)?;
+    let mut pack_reader = demuxed.data.as_slice();
+    let result = destination.install_raw_pack_from_reader_with_options(
+        &mut pack_reader,
+        raw_pack_install_options(promisor, max_input_size),
+    )?;
+    Ok(if promisor {
+        RawPackInstallResult {
+            object_ids: result.object_ids,
+        }
+    } else {
+        result
+    })
 }
 
 pub fn install_upload_pack_raw_promisor_response_from_reader<R>(
@@ -81,6 +139,43 @@ where
     Ok((shallow, result))
 }
 
+/// Shallow deepen over smart HTTP: shallow-info section then a sideband pack.
+pub fn install_upload_pack_shallow_packfile_response_from_reader<I, R>(
+    format: ObjectFormat,
+    reader: &mut R,
+    destination: &I,
+    max_input_size: Option<u64>,
+) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
+where
+    I: RawPackInstaller,
+    R: Read,
+{
+    install_upload_pack_shallow_sideband_response_from_reader(
+        format,
+        reader,
+        destination,
+        false,
+        max_input_size,
+    )
+}
+
+fn install_upload_pack_shallow_sideband_response_from_reader<I, R>(
+    format: ObjectFormat,
+    reader: &mut R,
+    destination: &I,
+    promisor: bool,
+    max_input_size: Option<u64>,
+) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
+where
+    I: RawPackInstaller,
+    R: Read,
+{
+    let shallow = read_upload_pack_shallow_info_section(format, reader)?;
+    let result =
+        install_upload_pack_sideband_response_from_reader(format, reader, destination, promisor, max_input_size)?;
+    Ok((shallow, result))
+}
+
 pub fn install_upload_pack_shallow_raw_promisor_response_from_reader<R>(
     format: ObjectFormat,
     reader: &mut R,
@@ -103,6 +198,24 @@ where
             object_ids: result.object_ids,
         },
     ))
+}
+
+pub fn install_upload_pack_shallow_packfile_promisor_response_from_reader<R>(
+    format: ObjectFormat,
+    reader: &mut R,
+    destination: &FileObjectDatabase,
+    max_input_size: Option<u64>,
+) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
+where
+    R: Read,
+{
+    install_upload_pack_shallow_sideband_response_from_reader(
+        format,
+        reader,
+        destination,
+        true,
+        max_input_size,
+    )
 }
 
 pub fn install_protocol_v2_fetch_response_from_reader<I, R>(

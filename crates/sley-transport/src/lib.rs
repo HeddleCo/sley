@@ -342,6 +342,20 @@ pub fn read_service_discovery_response(
     reader: &mut impl Read,
 ) -> Result<ServiceDiscoveryResponse> {
     let mut frames = read_pkt_line_frames_until_flush(reader)?;
+    // Smart HTTP with `Git-Protocol: version=2` omits the `# service=` preamble and
+    // flush that precede the v2 capability advertisement (upstream http-backend.c).
+    if let Some(PktLineFrame::Data(payload)) = frames.first() {
+        if trim_trailing_lf(payload) == b"version 2" {
+            return Ok(ServiceDiscoveryResponse {
+                announcement: ServiceAnnouncement {
+                    service: GitService::UploadPack,
+                },
+                payload: ServiceDiscoveryPayload::ProtocolV2(parse_protocol_v2_advertisement(
+                    &frames,
+                )?),
+            });
+        }
+    }
     frames.extend(read_pkt_line_frames_until_flush(reader)?);
     parse_service_discovery_response(format, &frames)
 }

@@ -89,6 +89,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         cloning: false,
         record_promisor_refs: true,
         update_shallow: false,
+        reject_shallow: false,
         deepen_relative: false,
         update_head_ok: false,
         deepen_since: None,
@@ -2190,6 +2191,25 @@ pub(super) fn fetch_http_repository_with_outcome(
     )
 }
 
+/// Pre-dispatch transport policy config for clone/fetch before a destination
+/// repository exists. Mirrors upstream `include_by_branch`: `onbranch:` must not
+/// match the cwd repository's checked-out branch while cloning into a new repo.
+pub(super) fn transport_policy_config_for_clone() -> Result<GitConfig> {
+    let cwd = env::current_dir()?;
+    let context = sley_config::ConfigIncludeContext::new(None, None);
+    let mut config =
+        sley_config::load_pre_dispatch_config(None, &context).map_err(report_config_setup_error)?;
+    let parameters = injected_config_parameters()?;
+    sley_config::append_injected_config_sections_with_includes(
+        &mut config,
+        &parameters,
+        &context,
+        &cwd,
+    )
+    .map_err(report_config_setup_error)?;
+    Ok(config)
+}
+
 /// Resolve `repository` to an HTTP(S) remote and list its advertisements via
 /// [`sley_remote::ls_remote`], returning `None` for non-HTTP transports. URL/
 /// config resolution and the ref-name pattern matching stay here; the
@@ -2217,6 +2237,13 @@ pub(super) fn transport_policy_config_for_cwd() -> Result<GitConfig> {
         &cwd,
     )
     .map_err(report_config_setup_error)?;
+    Ok(config)
+}
+
+pub(super) fn repo_config_with_clone_transport_policy(git_dir: &Path) -> Result<GitConfig> {
+    let mut config = transport_policy_config_for_clone()?;
+    let repo_config = read_repo_config(git_dir)?;
+    config.sections.extend(repo_config.sections);
     Ok(config)
 }
 

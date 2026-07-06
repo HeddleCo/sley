@@ -132,6 +132,8 @@ pub struct FetchOptions {
     /// `--update-shallow`: accept new shallow points from a shallow server
     /// (otherwise refs whose history needs them are rejected).
     pub update_shallow: bool,
+    /// `--reject-shallow` during clone: refuse a shallow source repository.
+    pub reject_shallow: bool,
     /// `--deepen=N`: `depth` is relative to the client's current boundary.
     /// Local-only today; HTTP and SSH treat `depth` as an absolute `--depth N`.
     pub deepen_relative: bool,
@@ -354,21 +356,21 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         FetchSource::Http(remote) => {
             let http_batch = crate::http::HttpOperationBatch::new();
             let client = http_batch.client();
+            let git_protocol =
+                crate::http::http_git_protocol_header_value(Some(request.config))?;
             let discovered = crate::http::http_service_advertisements(
                 client,
                 remote,
                 request.format,
                 sley_protocol::GitService::UploadPack,
                 services.credentials,
+                Some(request.config),
             )?;
             let advertisements = discovered.set.refs;
-            let features = advertisements
-                .first()
-                .map(|advertisement| {
-                    sley_protocol::parse_upload_pack_features(&advertisement.capabilities)
-                })
-                .transpose()?
-                .unwrap_or_default();
+            let features = crate::http::http_upload_pack_features(
+                &advertisements,
+                discovered.handshake.as_ref(),
+            )?;
             outcome.head_symref = head_symref_from_features(&features.symrefs);
             let (mut updates, opportunistic_dsts) = plan_and_adjust_updates(FetchPlanInput {
                 advertisements: &advertisements,
@@ -404,6 +406,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 deepen_since: options.deepen_since,
                 deepen_not,
                 deepen_relative: options.deepen_relative,
+                git_protocol: git_protocol.as_deref(),
             };
             let shallow_info = if discovered.set.protocol == ProtocolVersion::V2 {
                 let handshake = discovered.handshake.as_ref().ok_or_else(|| {
@@ -423,6 +426,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     services.credentials,
                 )?
             };
+            reject_shallow_clone_fetch(&options, &shallow_info)?;
             if !options.dry_run {
                 crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
             }
@@ -1546,6 +1550,21 @@ fn head_symref_from_features(symrefs: &[String]) -> Option<String> {
         .find_map(|entry| entry.strip_prefix("HEAD:").map(|target| target.to_string()))
 }
 
+fn reject_shallow_clone_fetch(
+    options: &FetchOptions,
+    shallow_info: &[sley_protocol::ProtocolV2FetchShallowInfo],
+) -> Result<()> {
+    if options.reject_shallow
+        && options.cloning
+        && options.depth.is_none()
+        && !shallow_info.is_empty()
+    {
+        eprintln!("fatal: source repository is shallow, reject to clone.");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
 /// Apply `remote.<name>.partialclonefilter` when `remote.<name>.promisor` is set.
 pub fn apply_configured_partial_clone_filter(
     config: &GitConfig,
@@ -2160,6 +2179,7 @@ mod tests {
             cloning: false,
             record_promisor_refs: true,
             update_shallow: false,
+            reject_shallow: false,
             deepen_relative: false,
             update_head_ok: false,
             deepen_since: None,

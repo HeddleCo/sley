@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const GIT_SH_I18N: &str = r#"# Git-compatible shell i18n fallback helpers for Sley.
 TEXTDOMAIN=git
@@ -48,6 +49,16 @@ const GIT_SH_I18N_ENVSUBST: &str = r#"#!/bin/sh
 exec git sh-i18n--envsubst "$@"
 "#;
 
+/// Git CGI/remote helpers that upstream expects under `GIT_EXEC_PATH` but that
+/// sley does not implement itself. Symlinked from the oracle/system git
+/// install when available so Apache `git-http-backend` and bundle-uri downloads
+/// via `git-remote-https` work under `GIT_TEST_INSTALLED`.
+const SYSTEM_GIT_EXEC_HELPERS: &[&str] = &[
+    "git-http-backend",
+    "git-remote-http",
+    "git-remote-https",
+];
+
 pub fn materialize_git_i18n_helpers() -> io::Result<PathBuf> {
     let dir = env::temp_dir().join(format!(
         "sley-git-compat-i18n-{}",
@@ -60,7 +71,107 @@ pub fn materialize_git_i18n_helpers() -> io::Result<PathBuf> {
         GIT_SH_I18N_ENVSUBST,
         0o755,
     )?;
+    link_system_git_exec_helpers(&dir)?;
     Ok(dir)
+}
+
+fn link_system_git_exec_helpers(dir: &Path) -> io::Result<()> {
+    let Some(system_exec_path) = discover_system_git_exec_path() else {
+        return Ok(());
+    };
+    for name in SYSTEM_GIT_EXEC_HELPERS {
+        let source = system_exec_path.join(name);
+        let dest = dir.join(name);
+        if !source.is_file() {
+            continue;
+        }
+        if dest.exists() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            if let Err(err) = symlink(&source, &dest) {
+                if err.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(err);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            fs::copy(&source, &dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn discover_system_git_exec_path() -> Option<PathBuf> {
+    if let Ok(path) = env::var("SLEY_TEST_GIT")
+        && !path.is_empty()
+        && let Some(exec_path) = git_exec_path_from_program(&path)
+    {
+        return Some(exec_path);
+    }
+    if let Ok(path) = env::var("GIT_TEST_GIT")
+        && !path.is_empty()
+        && let Some(exec_path) = git_exec_path_from_program(&path)
+    {
+        return Some(exec_path);
+    }
+    let current_exe = env::current_exe().ok();
+    if let Some(path_var) = env::var_os("PATH") {
+        for dir in env::split_paths(&path_var) {
+            let candidate = dir.join("git");
+            if !is_executable_file(&candidate) {
+                continue;
+            }
+            if current_exe.as_ref().is_some_and(|exe| exe == &candidate) {
+                continue;
+            }
+            if let Some(exec_path) = git_exec_path_from_program(candidate.to_string_lossy().as_ref())
+            {
+                return Some(exec_path);
+            }
+        }
+    }
+    for candidate in [
+        "/opt/homebrew/opt/git/libexec/git-core",
+        "/usr/local/libexec/git-core",
+        "/usr/lib/git-core",
+        "/usr/libexec/git-core",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.join("git-http-backend").is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn git_exec_path_from_program(program: &str) -> Option<PathBuf> {
+    let output = Command::new(program).arg("--exec-path").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path).map(|meta| meta.is_file()).unwrap_or(false)
 }
 
 fn write_helper(path: PathBuf, contents: &str, mode: u32) -> io::Result<()> {

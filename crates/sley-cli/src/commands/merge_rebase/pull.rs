@@ -994,6 +994,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         cloning: false,
         record_promisor_refs: true,
         update_shallow: false,
+        reject_shallow: false,
         deepen_relative: false,
         update_head_ok: true,
         deepen_since: None,

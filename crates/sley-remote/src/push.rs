@@ -446,6 +446,7 @@ pub fn plan_push(request: PushRequest<'_>, services: &mut PushServices<'_>) -> R
             git_dir: request.git_dir,
             common_git_dir: request.common_git_dir,
             format: request.format,
+            config: request.config,
             remote_url,
             refspecs: request.refspecs,
             options: request.options,
@@ -542,6 +543,7 @@ pub fn plan_push_actions(
                 request.format,
                 GitService::ReceivePack,
                 services.credentials,
+                Some(request.config),
             )?;
             let advertisement_set = discovered.set;
             let features = advertised_receive_pack_features(&advertisement_set.refs)?;
@@ -741,6 +743,7 @@ struct PushHttpRequest<'a> {
     git_dir: &'a Path,
     common_git_dir: &'a Path,
     format: ObjectFormat,
+    config: &'a GitConfig,
     remote_url: &'a RemoteUrl,
     refspecs: &'a [String],
     options: &'a PushOptions,
@@ -753,6 +756,7 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
         git_dir,
         common_git_dir,
         format,
+        config,
         remote_url,
         refspecs,
         options,
@@ -765,6 +769,7 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
         format,
         GitService::ReceivePack,
         credentials,
+        Some(config),
     )?;
     let advertisement_set = discovered.set;
     let features = advertised_receive_pack_features(&advertisement_set.refs)?;
@@ -826,8 +831,9 @@ fn execute_push_http(
     let url = http_smart_rpc_url(&remote_url, GitService::ReceivePack)?;
     let content_type = smart_http_rpc_request_content_type(GitService::ReceivePack)?;
     let post_buffer = http_post_buffer(request.config);
+    let git_protocol = crate::http::http_git_protocol_header_value(Some(request.config))?;
     let mut response = crate::http::http_send_with_auth(&remote_url, credentials, |auth| {
-        let headers = crate::http::http_authorization_headers(auth);
+        let headers = crate::http::http_request_headers(auth, git_protocol.as_deref());
         send_receive_pack_body(
             client,
             &url,

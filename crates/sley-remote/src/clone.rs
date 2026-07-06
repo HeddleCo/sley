@@ -124,6 +124,8 @@ pub struct CloneOptions<'a> {
     /// SSH command-line shape for the clone's internal fetch, used for
     /// clone-only flags like `-4`/`-6`.
     pub ssh_options: Option<crate::ssh::SshTransportOptions>,
+    /// Refuse cloning from a shallow source (`--reject-shallow`).
+    pub reject_shallow: bool,
 }
 
 /// The structured result of a [`clone`].
@@ -256,6 +258,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         request.options.deepen_not.clone(),
         request.options.filter.clone(),
         !request.options.checkout,
+        request.options.reject_shallow,
         request.options.ssh_options,
     );
     fetch(
@@ -532,6 +535,7 @@ fn clone_fetch_options(
     deepen_not: Vec<String>,
     filter: Option<sley_odb::PackObjectFilter>,
     record_promisor_refs: bool,
+    reject_shallow: bool,
     ssh_options: Option<crate::ssh::SshTransportOptions>,
 ) -> FetchOptions {
     FetchOptions {
@@ -555,6 +559,7 @@ fn clone_fetch_options(
         cloning: true,
         record_promisor_refs,
         update_shallow: false,
+        reject_shallow,
         deepen_relative: false,
         update_head_ok: false,
         deepen_since,

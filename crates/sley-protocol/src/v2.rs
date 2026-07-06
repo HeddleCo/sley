@@ -875,11 +875,65 @@ pub fn encode_protocol_v2_ls_refs_response(
     Ok(frames)
 }
 
+fn frames_start_with_protocol_v2_advertisement(frames: &[PktLineFrame]) -> bool {
+    matches!(
+        frames.first(),
+        Some(PktLineFrame::Data(payload)) if trim_trailing_lf(payload) == b"version 2"
+    )
+}
+
+/// Advance past a leading protocol v2 capability advertisement when present.
+/// Returns the first non-advertisement frame when the stream does not begin with
+/// `version 2`.
+fn skip_leading_protocol_v2_advertisement_if_present(
+    reader: &mut impl Read,
+) -> Result<Option<PktLineFrame>> {
+    let first = read_pkt_line_frame(reader)?.ok_or_else(|| {
+        GitError::InvalidFormat("protocol v2 response ended before first pkt-line".into())
+    })?;
+    let PktLineFrame::Data(payload) = &first else {
+        return Ok(Some(first));
+    };
+    if trim_trailing_lf(payload) != b"version 2" {
+        return Ok(Some(first));
+    }
+    loop {
+        match read_pkt_line_frame(reader)? {
+            Some(PktLineFrame::Flush) => return Ok(None),
+            Some(PktLineFrame::Data(_)) => {}
+            Some(_) => {
+                return Err(GitError::InvalidFormat(
+                    "protocol v2 capability advertisement contains a non-flush control packet"
+                        .into(),
+                ));
+            }
+            None => {
+                return Err(GitError::InvalidFormat(
+                    "protocol v2 capability advertisement missing flush".into(),
+                ));
+            }
+        }
+    }
+}
+
+/// Read the payload section of a stateless smart-HTTP v2 RPC response, skipping a
+/// leading capability advertisement when the server includes one before the
+/// command result.
+pub fn read_protocol_v2_stateless_rpc_payload_frames(
+    reader: &mut impl Read,
+) -> Result<Vec<PktLineFrame>> {
+    let mut frames = read_pkt_line_frames_until_flush(reader)?;
+    if frames_start_with_protocol_v2_advertisement(&frames) {
+        frames = read_pkt_line_frames_until_flush(reader)?;
+    }
+    Ok(frames)
+}
+
 pub fn read_protocol_v2_ls_refs_response(
     format: ObjectFormat,
     reader: &mut impl Read,
 ) -> Result<Vec<ProtocolV2LsRefsRecord>> {
-    let frames = read_pkt_line_frames_until_flush(reader)?;
+    let frames = read_protocol_v2_stateless_rpc_payload_frames(reader)?;
     parse_protocol_v2_ls_refs_response(format, &frames)
 }
 
@@ -1229,7 +1283,7 @@ pub fn read_protocol_v2_fetch_response(
     format: ObjectFormat,
     reader: &mut impl Read,
 ) -> Result<Vec<ProtocolV2FetchResponseSection>> {
-    let frames = read_pkt_line_frames_until_flush(reader)?;
+    let frames = read_protocol_v2_stateless_rpc_payload_frames(reader)?;
     parse_protocol_v2_fetch_response(format, &frames)
 }
 
@@ -1238,10 +1292,15 @@ pub fn read_protocol_v2_fetch_response_header(
     reader: &mut impl Read,
     sideband_all: bool,
 ) -> Result<ProtocolV2FetchResponseHeader> {
+    let mut pending = skip_leading_protocol_v2_advertisement_if_present(reader)?;
     let mut sections = Vec::new();
     let mut current: Option<(String, Vec<Vec<u8>>)> = None;
     loop {
-        let frame = read_protocol_v2_fetch_metadata_frame(reader, sideband_all)?;
+        let frame = if let Some(frame) = pending.take() {
+            frame
+        } else {
+            read_protocol_v2_fetch_metadata_frame(reader, sideband_all)?
+        };
         match frame {
             PktLineFrame::Data(payload) => {
                 if let Some((_name, lines)) = &mut current {
@@ -1318,7 +1377,7 @@ pub fn read_protocol_v2_fetch_sideband_all_response(
     format: ObjectFormat,
     reader: &mut impl Read,
 ) -> Result<ProtocolV2FetchSidebandAllResponse> {
-    let frames = read_pkt_line_frames_until_flush(reader)?;
+    let frames = read_protocol_v2_stateless_rpc_payload_frames(reader)?;
     parse_protocol_v2_fetch_sideband_all_response(format, &frames)
 }
 
@@ -2235,7 +2294,13 @@ fn append_protocol_v2_ls_refs_attributes(out: &mut String, attributes: &[String]
 
 fn parse_fetch_section_header(payload: &[u8]) -> Result<String> {
     let name = parse_protocol_v2_line_text("fetch response section", payload)?;
-    validate_capability_name(name)?;
+    validate_capability_name(name).map_err(|err| match err {
+        GitError::InvalidFormat(message) => GitError::InvalidFormat(format!(
+            "{message}: fetch response section line {:?}",
+            String::from_utf8_lossy(trim_trailing_lf(payload))
+        )),
+        other => other,
+    })?;
     Ok(name.to_string())
 }
 

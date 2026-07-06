@@ -29,8 +29,12 @@ mod install;
 pub use install::{
     install_protocol_v2_fetch_promisor_response_from_reader,
     install_protocol_v2_fetch_response_from_reader,
+    install_upload_pack_packfile_promisor_response_from_reader,
+    install_upload_pack_packfile_response_from_reader,
     install_upload_pack_raw_promisor_response_from_reader,
     install_upload_pack_raw_response_from_reader,
+    install_upload_pack_shallow_packfile_promisor_response_from_reader,
+    install_upload_pack_shallow_packfile_response_from_reader,
     install_upload_pack_shallow_raw_promisor_response_from_reader,
     install_upload_pack_shallow_raw_response_from_reader,
     shallow_info_from_protocol_v2_fetch_header,
@@ -49,8 +53,9 @@ pub use http::{
     HttpFetchPackRequest, HttpServiceAdvertisements, http_advertised_refs,
     http_authorization_headers, http_check_status, http_protocol_v2_fetch_response,
     http_send_with_auth, http_service_advertisements, http_upload_pack_advertisements,
-    http_validate_content_type, install_fetch_pack_via_http_protocol_v2_fetch,
-    install_fetch_pack_via_http_upload_pack, new_http_client, HttpOperationBatch,
+    http_upload_pack_features, http_validate_content_type,
+    install_fetch_pack_via_http_protocol_v2_fetch, install_fetch_pack_via_http_upload_pack,
+    new_http_client, HttpOperationBatch,
     remote_url_is_http,
 };
 
@@ -120,6 +125,12 @@ pub use clone::{CloneOptions, CloneOutcome, CloneRequest, CloneServices, CloneSo
 
 mod bundle;
 pub use bundle::{FetchBundleRequest, fetch_bundle};
+mod bundle_uri;
+pub use bundle_uri::{
+    BundleUriEntry, BundleUriList, bundle_uri_fetch_order, handshake_advertises_bundle_uri,
+    http_remote_bundle_uri_list, parse_bundle_uri_line, prefetch_advertised_bundle_uris,
+    transfer_bundle_uri_enabled,
+};
 
 mod shallow;
 pub use shallow::{apply_shallow_info, read_shallow, write_shallow};
@@ -291,6 +302,7 @@ mod tests {
             cloning: false,
             record_promisor_refs: true,
             update_shallow: false,
+            reject_shallow: false,
             deepen_relative: false,
             update_head_ok: false,
             deepen_since: None,
