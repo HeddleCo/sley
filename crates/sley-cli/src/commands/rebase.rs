@@ -936,6 +936,7 @@ fn read_populate_todo(ctx: &Ctx, db: &FileObjectDatabase) -> Result<TodoList> {
         })
         .unwrap_or(0);
     let total_nr = done_nr + count_commands(&items);
+    fs::write(ctx.state_path("end"), format!("{total_nr}\n"))?;
     Ok(TodoList {
         items,
         current: 0,
@@ -3120,11 +3121,17 @@ fn add_update_ref_commands(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<Vec<Re
 }
 
 fn write_rebase_update_refs_state(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<()> {
-    let refs = items
-        .iter()
-        .filter(|item| item.command == TodoCommand::UpdateRef)
-        .map(|item| item.arg.as_str())
-        .collect::<Vec<_>>();
+    let mut refs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in items {
+        if item.command != TodoCommand::UpdateRef {
+            continue;
+        }
+        let refname = todo_arg_before_comment(&item.arg).trim().to_string();
+        if seen.insert(refname.clone()) {
+            refs.push(refname);
+        }
+    }
     if refs.is_empty() {
         let _ = fs::remove_file(ctx.state_path("update-refs"));
         return Ok(());
@@ -3133,8 +3140,8 @@ fn write_rebase_update_refs_state(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result
     let zero = ObjectId::null(ctx.format);
     let mut text = String::new();
     for refname in refs {
-        let old = sley_refs::resolve_ref_peeled(&store, refname)?.unwrap_or(zero);
-        text.push_str(refname);
+        let old = sley_refs::resolve_ref_peeled(&store, &refname)?.unwrap_or(zero);
+        text.push_str(&refname);
         text.push('\n');
         text.push_str(&old.to_hex());
         text.push('\n');
@@ -3225,7 +3232,7 @@ fn do_update_refs(ctx: &Ctx, quiet: bool) -> Result<()> {
         return Ok(());
     }
     records.sort_by(|a, b| a.refname.cmp(&b.refname));
-    let refs = FileRefStore::new(&ctx.common_git_dir, ctx.format);
+    let mut refs = FileRefStore::new(&ctx.common_git_dir, ctx.format);
     let committer = committer_identity_for_reflog()?;
     let zero = ObjectId::null(ctx.format);
     let mut updated = Vec::new();
@@ -3241,18 +3248,23 @@ fn do_update_refs(ctx: &Ctx, quiet: bool) -> Result<()> {
             failed.push(rec.refname.clone());
             continue;
         }
+        let precondition = if rec.before == zero {
+            sley_refs::RefPrecondition::ExistingMustMatch(RefTarget::Direct(zero))
+        } else {
+            sley_refs::RefPrecondition::MustExistAndMatch(RefTarget::Direct(rec.before))
+        };
         let mut tx = refs.transaction();
-        tx.update(RefUpdate {
-            name: rec.refname.clone(),
-            expected: Some(RefTarget::Direct(rec.before)),
-            new: RefTarget::Direct(rec.after),
-            reflog: Some(ReflogEntry {
+        tx.update_to(
+            rec.refname.clone(),
+            RefTarget::Direct(rec.after),
+            precondition,
+            Some(ReflogEntry {
                 old_oid: rec.before,
                 new_oid: rec.after,
                 committer: committer.clone(),
                 message: b"rewritten during rebase".to_vec(),
             }),
-        });
+        );
         match tx.commit() {
             Ok(()) => updated.push(rec.refname.clone()),
             Err(_) => {
@@ -3286,9 +3298,6 @@ fn do_update_refs(ctx: &Ctx, quiet: bool) -> Result<()> {
 /// any new `update-ref` lines.
 fn filter_update_refs(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<()> {
     let mut records = read_update_refs_state(ctx)?;
-    if records.is_empty() {
-        return Ok(());
-    }
     let zero = ObjectId::null(ctx.format);
     let todo_refs: std::collections::HashSet<&str> = items
         .iter()
@@ -6581,6 +6590,20 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
     // update-ref lines, add new ones).
     filter_update_refs(ctx, &new_items)?;
     write_todo_file(ctx, &todo_path, &new_items, false, false, None, None, &db)?;
+    let done_nr = fs::read_to_string(ctx.state_path("done"))
+        .map(|text| {
+            let mut resolver = make_resolver(ctx, &db);
+            let (done_items, _) = seq::parse_todo_buffer(
+                &text,
+                true,
+                comment_char(&ctx.git_dir) as char,
+                &mut resolver,
+            );
+            count_commands(&done_items)
+        })
+        .unwrap_or(0);
+    let total_nr = done_nr + count_commands(&new_items);
+    fs::write(ctx.state_path("end"), format!("{total_nr}\n"))?;
     Ok(())
 }
 

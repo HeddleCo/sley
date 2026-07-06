@@ -550,7 +550,8 @@ declare -A FLOOR=(
     # t3403=16, t3406=32, t3420=40; sequencer t3501/t3510/t3502 held.
     # wave-40 (rebase sequencer + apply -3 incidental): t3404 120->123.
     # floor-91455a67 (finish-reflog fix): t3404 127->128.
-    [t3404-rebase-interactive.sh]=128
+    # headroom (update-refs edit-todo/continue): t3404 128->133.
+    [t3404-rebase-interactive.sh]=133
     [t3406-rebase-message.sh]=32
     [t3418-rebase-continue.sh]=30
     # wave-40 (rebase sequencer): t3420 40->41.

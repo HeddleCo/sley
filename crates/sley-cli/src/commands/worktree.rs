@@ -1557,7 +1557,13 @@ fn worktree_add_resolve_head(
         // (HEAD becomes a symref); otherwise detach. Resolve against the current
         // worktree so per-worktree revs (HEAD, @{-1}) are correct.
         if let Some(branch) = worktree_add_branch_for_commitish(store, &commitish)? {
-            let oid = resolve_revision(worktree_git_dir, format, &commitish)?;
+            // Resolve via the branch ref itself so a same-named tag (e.g. from
+            // test_commit) cannot disagree with refs/heads/<branch> during checkout.
+            let refname = branch_ref_name(&branch)?;
+            let oid = match store.read_ref(&refname)? {
+                Some(RefTarget::Direct(oid)) => oid,
+                _ => resolve_revision(worktree_git_dir, format, &commitish)?,
+            };
             return Ok(WorktreeAddHead {
                 branch_name: Some(branch),
                 oid,
@@ -2022,21 +2028,21 @@ pub(crate) fn branch_checked_out_worktree(
                 || normalize_lexical_path(path) == normalize_lexical_path(ignore)
         })
     };
-    if worktree_head_points_to(common_git_dir, refname)?
-        && let Ok(path) = worktree_root_for_git_dir(common_git_dir)
-        && !is_ignored(&path)
+    if let Some(worktree) =
+        sley_worktree::find_shared_symref(common_git_dir, "HEAD", refname)?
+        && !is_ignored(&worktree.path)
     {
-        return Ok(Some(fs::canonicalize(&path).unwrap_or(path)));
+        return Ok(Some(
+            fs::canonicalize(&worktree.path).unwrap_or(worktree.path),
+        ));
     }
-    for admin in collect_linked_worktree_admins(common_git_dir)? {
-        if is_ignored(&admin.path) {
-            continue;
-        }
-        if worktree_head_points_to(&admin.admin_dir, refname)? {
-            return Ok(Some(
-                fs::canonicalize(&admin.path).unwrap_or(admin.path.to_path_buf()),
-            ));
-        }
+    if let Some(worktree) =
+        sley_worktree::worktree_holding_rebase_update_ref(common_git_dir, refname)?
+        && !is_ignored(&worktree.path)
+    {
+        return Ok(Some(
+            fs::canonicalize(&worktree.path).unwrap_or(worktree.path),
+        ));
     }
     Ok(None)
 }

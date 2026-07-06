@@ -48,8 +48,13 @@ pub(super) fn branch_checked_out_worktree_path(
     _store: &FileRefStore,
     refname: &str,
 ) -> Result<Option<String>> {
-    Ok(sley_worktree::find_shared_symref(git_dir, "HEAD", refname)?
-        .map(|worktree| worktree.path.to_string_lossy().into_owned()))
+    if let Some(worktree) = sley_worktree::find_shared_symref(git_dir, "HEAD", refname)? {
+        return Ok(Some(worktree.path.to_string_lossy().into_owned()));
+    }
+    Ok(
+        sley_worktree::worktree_holding_rebase_update_ref(git_dir, refname)?
+            .map(|worktree| worktree.path.to_string_lossy().into_owned()),
+    )
 }
 
 pub(super) fn force_delete_branches(

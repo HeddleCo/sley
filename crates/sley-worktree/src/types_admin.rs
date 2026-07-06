@@ -876,6 +876,31 @@ pub(crate) struct WorktreeAdmin {
     path: Option<PathBuf>,
 }
 
+/// If `refname` is listed in any in-progress rebase's `update-refs` file,
+/// return the worktree that owns that rebase (mirrors git's treatment of those
+/// refs as checked-out for `branch -f` / `worktree add` guards).
+pub fn worktree_holding_rebase_update_ref(
+    git_dir: &Path,
+    refname: &str,
+) -> Result<Option<SharedSymrefWorktree>> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    for admin in worktree_admins(&common_git_dir)? {
+        let Some(path) = admin.path.clone() else {
+            continue;
+        };
+        if worktree_rebase_update_refs(&admin.git_dir)
+            .iter()
+            .any(|name| name == refname)
+        {
+            return Ok(Some(SharedSymrefWorktree {
+                refname: refname.to_string(),
+                path,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 pub fn find_shared_symref(
     git_dir: &Path,
     symref: &str,
