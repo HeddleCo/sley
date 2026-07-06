@@ -885,8 +885,23 @@ fn frames_start_with_protocol_v2_advertisement(frames: &[PktLineFrame]) -> bool 
 /// Advance past a leading protocol v2 capability advertisement when present.
 /// Returns the first non-advertisement frame when the stream does not begin with
 /// `version 2`.
+///
+/// A capability advertisement (`version 2` … flush) is never sideband-wrapped: it
+/// is emitted before the fetch command's response body, and sideband multiplexing
+/// only applies to the fetch response itself. The advertisement's leading pkt is a
+/// raw `version 2`, whose first byte (`v`, 0x76) can never collide with a sideband
+/// channel byte (0x01–0x03), so the advertisement check is unambiguous even under
+/// `sideband-all`.
+///
+/// When `sideband_all` is negotiated and the stream does *not* begin with an
+/// advertisement, the first fetch-response frame (a section header such as
+/// `acknowledgments`, or a leading channel-2 progress frame) arrives
+/// sideband-wrapped. We demux it here so the section-header reader in
+/// `read_protocol_v2_fetch_response_header` sees a plain payload rather than a raw
+/// control byte.
 fn skip_leading_protocol_v2_advertisement_if_present(
     reader: &mut impl Read,
+    sideband_all: bool,
 ) -> Result<Option<PktLineFrame>> {
     let first = read_pkt_line_frame(reader)?.ok_or_else(|| {
         GitError::InvalidFormat("protocol v2 response ended before first pkt-line".into())
@@ -895,6 +910,25 @@ fn skip_leading_protocol_v2_advertisement_if_present(
         return Ok(Some(first));
     };
     if trim_trailing_lf(payload) != b"version 2" {
+        if sideband_all {
+            // Not an advertisement: the first fetch-response frame is
+            // sideband-wrapped. Demux it, skipping a leading progress frame,
+            // so the caller receives the demultiplexed payload.
+            let packet = parse_sideband_packet(payload)?;
+            let demuxed = match packet.channel {
+                SideBandChannel::Data => PktLineFrame::Data(packet.data),
+                SideBandChannel::Progress => {
+                    read_protocol_v2_fetch_metadata_frame(reader, true)?
+                }
+                SideBandChannel::Fatal => {
+                    let message = String::from_utf8_lossy(&packet.data).into_owned();
+                    return Err(GitError::InvalidFormat(format!(
+                        "sideband fatal: {message}"
+                    )));
+                }
+            };
+            return Ok(Some(demuxed));
+        }
         return Ok(Some(first));
     }
     loop {
@@ -1292,7 +1326,7 @@ pub fn read_protocol_v2_fetch_response_header(
     reader: &mut impl Read,
     sideband_all: bool,
 ) -> Result<ProtocolV2FetchResponseHeader> {
-    let mut pending = skip_leading_protocol_v2_advertisement_if_present(reader)?;
+    let mut pending = skip_leading_protocol_v2_advertisement_if_present(reader, sideband_all)?;
     let mut sections = Vec::new();
     let mut current: Option<(String, Vec<Vec<u8>>)> = None;
     loop {

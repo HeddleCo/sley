@@ -10,7 +10,6 @@ use std::path::Path;
 
 use sley_config::GitConfig;
 
-use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use crate::install::{
     install_protocol_v2_fetch_promisor_response_from_reader,
     install_protocol_v2_fetch_response_from_reader,
@@ -20,21 +19,22 @@ use crate::install::{
     install_upload_pack_shallow_raw_response_from_reader,
     shallow_info_from_protocol_v2_fetch_header,
 };
+use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
-    GitService, ProtocolV2CommandOptions, ProtocolV2FetchRequest, ProtocolV2FetchShallowInfo,
-    ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand, ReceivePackFeatures,
-    ReceivePackPushRequestOptions, RefAdvertisement, TransportHandshake, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackRequest, parse_protocol_v2_fetch_features,
-    parse_receive_pack_features, parse_refspec, parse_upload_pack_features, plan_push_commands,
+    parse_protocol_v2_fetch_features, parse_receive_pack_features, parse_refspec,
+    parse_upload_pack_features, plan_push_commands,
     protocol_v2_ls_refs_records_to_ref_advertisement_set, protocol_v2_object_format,
     read_protocol_v2_advertisement, read_protocol_v2_ls_refs_response,
     read_receive_pack_report_status, read_ref_advertisement_set, write_protocol_v2_command_request,
     write_protocol_v2_fetch_request, write_upload_pack_negotiation_request,
-    write_upload_pack_request,
+    write_upload_pack_request, GitService, ProtocolV2CommandOptions, ProtocolV2FetchRequest,
+    ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand,
+    ReceivePackFeatures, ReceivePackPushRequestOptions, RefAdvertisement, TransportHandshake,
+    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRequest,
 };
 use sley_refs::FileRefStore;
-use sley_transport::{RemoteTransport, RemoteUrl, ServiceRequest, write_service_request};
+use sley_transport::{write_service_request, RemoteTransport, RemoteUrl, ServiceRequest};
 
 use crate::git_proxy::GitConnection;
 use crate::{PushOutcome, PushRequest};
@@ -224,12 +224,8 @@ pub fn install_fetch_pack_via_git_upload_pack(
         deepen: request.deepen,
         ..UploadPackRequest::default()
     };
-    let mut stream = connect_git_service(
-        request.remote,
-        GitService::UploadPack,
-        None,
-        request.config,
-    )?;
+    let mut stream =
+        connect_git_service(request.remote, GitService::UploadPack, None, request.config)?;
     read_ref_advertisement_set(request.format, &mut stream)?;
     write_upload_pack_request(&mut stream, Some(&upload_request))?;
     write_upload_pack_negotiation_request(
@@ -266,7 +262,12 @@ pub fn install_fetch_pack_via_git_upload_pack(
             request.max_input_size,
         )?;
     } else {
-        install_upload_pack_raw_response_from_reader(request.format, &mut stream, &local_db, request.max_input_size)?;
+        install_upload_pack_raw_response_from_reader(
+            request.format,
+            &mut stream,
+            &local_db,
+            request.max_input_size,
+        )?;
     }
     Ok(Vec::new())
 }
@@ -281,8 +282,7 @@ pub(crate) fn plan_push_git(request: GitPushRequest<'_>) -> Result<GitPushPlan> 
         refspecs,
         force,
     } = request;
-    let (stream, advertisements, features) =
-        receive_pack_advertisements(remote, format, config)?;
+    let (stream, advertisements, features) = receive_pack_advertisements(remote, format, config)?;
 
     let local_store = FileRefStore::new(git_dir, format);
     let local_refs = crate::push::local_push_source_refs(&local_store, format)?;
@@ -318,7 +318,12 @@ pub(crate) fn plan_push_git(request: GitPushRequest<'_>) -> Result<GitPushPlan> 
     }
 
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    crate::push::reject_non_fast_forward_pushes(common_git_dir, &local_db, format, &command_forces)?;
+    crate::push::reject_non_fast_forward_pushes(
+        common_git_dir,
+        &local_db,
+        format,
+        &command_forces,
+    )?;
     Ok(GitPushPlan {
         commands,
         pack_objects: Vec::new(),
@@ -337,8 +342,7 @@ pub(crate) fn plan_push_git_commands(request: GitPushCommandsRequest<'_>) -> Res
         command_forces,
         pack_objects,
     } = request;
-    let (stream, advertisements, features) =
-        receive_pack_advertisements(remote, format, config)?;
+    let (stream, advertisements, features) = receive_pack_advertisements(remote, format, config)?;
     let commands = command_forces
         .iter()
         .map(|(command, _)| command.clone())
@@ -356,7 +360,12 @@ pub(crate) fn plan_push_git_commands(request: GitPushCommandsRequest<'_>) -> Res
     }
 
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    crate::push::reject_non_fast_forward_pushes(common_git_dir, &local_db, format, &command_forces)?;
+    crate::push::reject_non_fast_forward_pushes(
+        common_git_dir,
+        &local_db,
+        format,
+        &command_forces,
+    )?;
     Ok(GitPushPlan {
         commands,
         pack_objects,
@@ -579,7 +588,7 @@ fn git_protocol_v2_fetch_into_repository(
         install_protocol_v2_fetch_promisor_response_from_reader(
             request.format,
             &mut stream,
-            false,
+            v2_features.sideband_all,
             local_db,
             request.max_input_size,
         )?
@@ -587,7 +596,7 @@ fn git_protocol_v2_fetch_into_repository(
         install_protocol_v2_fetch_response_from_reader(
             request.format,
             &mut stream,
-            false,
+            v2_features.sideband_all,
             local_db,
             request.max_input_size,
         )?
