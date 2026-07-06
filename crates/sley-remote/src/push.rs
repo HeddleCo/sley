@@ -481,6 +481,7 @@ pub fn plan_push(request: PushRequest<'_>, services: &mut PushServices<'_>) -> R
                 common_git_dir: request.common_git_dir,
                 format: request.format,
                 remote: remote_url,
+                config: Some(request.config),
                 refspecs: request.refspecs,
                 force: request.options.force,
             })?;
@@ -596,6 +597,7 @@ pub fn plan_push_actions(
                 common_git_dir: request.common_git_dir,
                 format: request.format,
                 remote: remote_url,
+                config: Some(request.config),
                 command_forces: command_forces.clone(),
                 pack_objects: request.plan.pack_objects.clone(),
             })?;

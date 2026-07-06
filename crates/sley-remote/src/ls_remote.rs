@@ -117,6 +117,7 @@ pub fn ls_remote(
             filter,
             matches,
             config.and_then(|config| config.get("protocol", None, "version")) == Some("2"),
+            config,
         ),
         LsRemoteSource::Local { git_dir } => {
             ls_remote_local(git_dir, format, filter, matches, config)

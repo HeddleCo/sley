@@ -1765,6 +1765,7 @@ fn clone_network_repository(
                 &remote,
                 ObjectFormat::Sha1,
                 configured_protocol_version(None) == Some(ProtocolVersion::V2),
+                None,
             )?;
             (discovered.refs, discovered.features)
         }

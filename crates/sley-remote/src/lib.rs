@@ -62,6 +62,7 @@ pub use ssh::{
 };
 
 mod git;
+mod git_proxy;
 pub use git::{
     GitFetchPackRequest, git_upload_pack_advertisements,
     git_upload_pack_advertisements_with_protocol, install_fetch_pack_via_git_upload_pack,

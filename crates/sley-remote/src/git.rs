@@ -5,8 +5,10 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::Shutdown;
 use std::path::Path;
+
+use sley_config::GitConfig;
 
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use crate::install::{
@@ -34,6 +36,7 @@ use sley_protocol::{
 use sley_refs::FileRefStore;
 use sley_transport::{RemoteTransport, RemoteUrl, ServiceRequest, write_service_request};
 
+use crate::git_proxy::GitConnection;
 use crate::{PushOutcome, PushRequest};
 
 const GIT_DAEMON_PORT: u16 = 9418;
@@ -43,6 +46,7 @@ pub(crate) struct GitPushRequest<'a> {
     pub common_git_dir: &'a Path,
     pub format: ObjectFormat,
     pub remote: &'a RemoteUrl,
+    pub config: Option<&'a GitConfig>,
     pub refspecs: &'a [String],
     pub force: bool,
 }
@@ -51,6 +55,7 @@ pub(crate) struct GitPushCommandsRequest<'a> {
     pub common_git_dir: &'a Path,
     pub format: ObjectFormat,
     pub remote: &'a RemoteUrl,
+    pub config: Option<&'a GitConfig>,
     pub command_forces: Vec<(ReceivePackCommand, bool)>,
     pub pack_objects: Vec<ObjectId>,
 }
@@ -58,7 +63,7 @@ pub(crate) struct GitPushCommandsRequest<'a> {
 pub(crate) struct GitPushPlan {
     pub(crate) commands: Vec<ReceivePackCommand>,
     pub(crate) pack_objects: Vec<ObjectId>,
-    stream: Option<TcpStream>,
+    stream: Option<GitConnection>,
     features: ReceivePackFeatures,
     advertisements: Vec<RefAdvertisement>,
 }
@@ -67,6 +72,7 @@ pub struct GitFetchPackRequest<'a> {
     pub git_dir: &'a Path,
     pub format: ObjectFormat,
     pub remote: &'a RemoteUrl,
+    pub config: Option<&'a GitConfig>,
     pub features: &'a UploadPackFeatures,
     pub wants: Vec<ObjectId>,
     pub shallow: Vec<ObjectId>,
@@ -89,11 +95,12 @@ pub(crate) fn ls_remote_git(
     filter: &crate::ls_remote::LsRemoteFilter,
     matches: &dyn Fn(&str) -> bool,
     protocol_v2: bool,
+    config: Option<&GitConfig>,
 ) -> Result<(Vec<crate::ls_remote::LsRemoteRecord>, ObjectFormat)> {
     let set = if protocol_v2 {
-        git_protocol_v2_ls_refs(remote, ObjectFormat::Sha1)?
+        git_protocol_v2_ls_refs(remote, ObjectFormat::Sha1, config)?
     } else {
-        let mut stream = connect_git_service(remote, GitService::UploadPack, None)?;
+        let mut stream = connect_git_service(remote, GitService::UploadPack, None, config)?;
         read_ref_advertisement_set(ObjectFormat::Sha1, &mut stream)?
     };
     let features = set
@@ -146,17 +153,22 @@ pub fn git_upload_pack_advertisements(
     remote: &RemoteUrl,
     format: ObjectFormat,
 ) -> Result<GitUploadPackAdvertisements> {
-    git_upload_pack_advertisements_with_protocol(remote, format, false)
+    git_upload_pack_advertisements_with_protocol(remote, format, false, None)
 }
 
 pub fn git_upload_pack_advertisements_with_protocol(
     remote: &RemoteUrl,
     format: ObjectFormat,
     protocol_v2: bool,
+    config: Option<&GitConfig>,
 ) -> Result<GitUploadPackAdvertisements> {
     if protocol_v2 {
-        let mut stream =
-            connect_git_service(remote, GitService::UploadPack, Some(ProtocolVersion::V2))?;
+        let mut stream = connect_git_service(
+            remote,
+            GitService::UploadPack,
+            Some(ProtocolVersion::V2),
+            config,
+        )?;
         let handshake = read_protocol_v2_advertisement(&mut stream)?;
         let object_format = protocol_v2_object_format(&handshake.capabilities)?;
         if object_format != format {
@@ -175,7 +187,7 @@ pub fn git_upload_pack_advertisements_with_protocol(
         });
     }
 
-    let mut stream = connect_git_service(remote, GitService::UploadPack, None)?;
+    let mut stream = connect_git_service(remote, GitService::UploadPack, None, config)?;
     let set = read_ref_advertisement_set(format, &mut stream)?;
     let features = set
         .refs
@@ -212,7 +224,12 @@ pub fn install_fetch_pack_via_git_upload_pack(
         deepen: request.deepen,
         ..UploadPackRequest::default()
     };
-    let mut stream = connect_git_service(request.remote, GitService::UploadPack, None)?;
+    let mut stream = connect_git_service(
+        request.remote,
+        GitService::UploadPack,
+        None,
+        request.config,
+    )?;
     read_ref_advertisement_set(request.format, &mut stream)?;
     write_upload_pack_request(&mut stream, Some(&upload_request))?;
     write_upload_pack_negotiation_request(
@@ -260,10 +277,12 @@ pub(crate) fn plan_push_git(request: GitPushRequest<'_>) -> Result<GitPushPlan> 
         common_git_dir,
         format,
         remote,
+        config,
         refspecs,
         force,
     } = request;
-    let (stream, advertisements, features) = receive_pack_advertisements(remote, format)?;
+    let (stream, advertisements, features) =
+        receive_pack_advertisements(remote, format, config)?;
 
     let local_store = FileRefStore::new(git_dir, format);
     let local_refs = crate::push::local_push_source_refs(&local_store, format)?;
@@ -287,6 +306,7 @@ pub(crate) fn plan_push_git(request: GitPushRequest<'_>) -> Result<GitPushPlan> 
         .map(|(command, _)| command.clone())
         .collect::<Vec<_>>();
     if commands.is_empty() {
+        let mut stream = stream;
         let _ = stream.shutdown(Shutdown::Both);
         return Ok(GitPushPlan {
             commands,
@@ -313,15 +333,18 @@ pub(crate) fn plan_push_git_commands(request: GitPushCommandsRequest<'_>) -> Res
         common_git_dir,
         format,
         remote,
+        config,
         command_forces,
         pack_objects,
     } = request;
-    let (stream, advertisements, features) = receive_pack_advertisements(remote, format)?;
+    let (stream, advertisements, features) =
+        receive_pack_advertisements(remote, format, config)?;
     let commands = command_forces
         .iter()
         .map(|(command, _)| command.clone())
         .collect::<Vec<_>>();
     if commands.is_empty() {
+        let mut stream = stream;
         let _ = stream.shutdown(Shutdown::Both);
         return Ok(GitPushPlan {
             commands,
@@ -396,8 +419,9 @@ pub(crate) fn execute_push_git_plan(
 fn receive_pack_advertisements(
     remote: &RemoteUrl,
     format: ObjectFormat,
-) -> Result<(TcpStream, Vec<RefAdvertisement>, ReceivePackFeatures)> {
-    let mut stream = connect_git_service(remote, GitService::ReceivePack, None)?;
+    config: Option<&GitConfig>,
+) -> Result<(GitConnection, Vec<RefAdvertisement>, ReceivePackFeatures)> {
+    let mut stream = connect_git_service(remote, GitService::ReceivePack, None, config)?;
     let advertisement_set = read_ref_advertisement_set(format, &mut stream)?;
     let features = advertisement_set
         .refs
@@ -426,7 +450,8 @@ fn connect_git_service(
     remote: &RemoteUrl,
     service: GitService,
     protocol: Option<ProtocolVersion>,
-) -> Result<TcpStream> {
+    config: Option<&GitConfig>,
+) -> Result<GitConnection> {
     if remote.transport != RemoteTransport::Git {
         return Err(GitError::InvalidFormat(
             "git:// service requires a git remote".into(),
@@ -437,7 +462,7 @@ fn connect_git_service(
         .as_deref()
         .ok_or_else(|| GitError::InvalidFormat("git:// remote is missing a host".into()))?;
     let port = remote.port.unwrap_or(GIT_DAEMON_PORT);
-    let mut stream = TcpStream::connect((host, port))?;
+    let mut stream = crate::git_proxy::connect_git_transport(config, host, port)?;
     let request = ServiceRequest {
         service,
         path: remote.path.clone(),
@@ -462,9 +487,14 @@ fn git_protocol_v2_command_options(format: ObjectFormat) -> Vec<Capability> {
 fn git_protocol_v2_ls_refs(
     remote: &RemoteUrl,
     format: ObjectFormat,
+    config: Option<&GitConfig>,
 ) -> Result<sley_protocol::RefAdvertisementSet> {
-    let mut stream =
-        connect_git_service(remote, GitService::UploadPack, Some(ProtocolVersion::V2))?;
+    let mut stream = connect_git_service(
+        remote,
+        GitService::UploadPack,
+        Some(ProtocolVersion::V2),
+        config,
+    )?;
     let handshake = read_protocol_v2_advertisement(&mut stream)?;
     let object_format = protocol_v2_object_format(&handshake.capabilities)?;
     if object_format != format {
@@ -479,7 +509,7 @@ fn git_protocol_v2_ls_refs(
 
 fn git_protocol_v2_ls_refs_on_stream(
     format: ObjectFormat,
-    stream: &mut TcpStream,
+    stream: &mut GitConnection,
 ) -> Result<sley_protocol::RefAdvertisementSet> {
     let mut request = ProtocolV2LsRefsRequest {
         peel: true,
@@ -524,6 +554,7 @@ fn git_protocol_v2_fetch_into_repository(
         request.remote,
         GitService::UploadPack,
         Some(ProtocolVersion::V2),
+        request.config,
     )?;
     let handshake = read_protocol_v2_advertisement(&mut stream)?;
     let v2_features =
@@ -653,6 +684,7 @@ mod tests {
             &crate::ls_remote::LsRemoteFilter::default(),
             &|_| true,
             false,
+            None,
         )
         .expect("ls-remote");
 

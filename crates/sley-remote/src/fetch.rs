@@ -532,6 +532,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 remote,
                 request.format,
                 protocol_v2,
+                Some(request.config),
             )?;
             let advertisements = discovered.refs;
             let features = discovered.features;
@@ -557,6 +558,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     git_dir: request.git_dir,
                     format: request.format,
                     remote,
+                    config: Some(request.config),
                     features: &features,
                     wants,
                     shallow: existing_shallow,

@@ -24,7 +24,8 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
+use std::thread::JoinHandle;
 
 use sley_config::GitConfig;
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
@@ -114,6 +115,27 @@ struct ServiceProcessCommand {
     args: Vec<String>,
     env: Vec<(String, String)>,
     git_request: Option<ExtGitRequest>,
+}
+
+struct StderrDrain {
+    handle: JoinHandle<Vec<u8>>,
+}
+
+impl StderrDrain {
+    fn start(stderr: ChildStderr) -> Self {
+        Self {
+            handle: std::thread::spawn(move || {
+                let mut sink = Vec::new();
+                let mut stderr = stderr;
+                let _ = stderr.read_to_end(&mut sink);
+                sink
+            }),
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.handle.join().unwrap_or_default()
+    }
 }
 
 struct ExtGitRequest {
@@ -387,7 +409,7 @@ fn spawn_service_process(
     service: GitService,
     keep_stdin: bool,
     options: SshTransportOptions,
-) -> Result<(Child, Option<ChildStdin>, ChildStdout)> {
+) -> Result<(Child, Option<ChildStdin>, ChildStdout, StderrDrain)> {
     let command = ssh_process_command_for_remote(remote, service, options)?;
     let mut process = ProcessCommand::new(&command.program);
     process
@@ -402,6 +424,11 @@ fn spawn_service_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = process.spawn()?;
+    let stderr_drain = child
+        .stderr
+        .take()
+        .map(StderrDrain::start)
+        .ok_or_else(|| GitError::Command("service stderr was not piped".into()))?;
     let mut stdin = child.stdin.take();
     if let Some(request) = &command.git_request {
         let Some(input) = stdin.as_mut() else {
@@ -416,7 +443,17 @@ fn spawn_service_process(
         .stdout
         .take()
         .ok_or_else(|| GitError::Command("service stdout was not piped".into()))?;
-    Ok((child, stdin, stdout))
+    Ok((child, stdin, stdout, stderr_drain))
+}
+
+fn ssh_command_failure_message(program: &str, stderr: &[u8]) -> String {
+    let message = String::from_utf8_lossy(stderr);
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        program.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn write_remote_ext_git_request(
@@ -470,6 +507,7 @@ pub(crate) struct SshPushPlan {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: ChildStdout,
+    stderr_drain: StderrDrain,
     features: ReceivePackFeatures,
     advertisements: Vec<RefAdvertisement>,
     remote: RemoteUrl,
@@ -492,7 +530,7 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
             "SSH receive-pack requires an SSH remote".into(),
         ));
     }
-    let (child, stdin, mut stdout) = spawn_service_process(
+    let (mut child, stdin, mut stdout, stderr_drain) = spawn_service_process(
         remote,
         GitService::ReceivePack,
         true,
@@ -545,6 +583,7 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
             child,
             stdin: None,
             stdout,
+            stderr_drain,
             features,
             advertisements: advertisement_set.refs,
             remote: remote.clone(),
@@ -559,6 +598,7 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
         child,
         stdin: Some(stdin),
         stdout,
+        stderr_drain,
         features,
         advertisements: advertisement_set.refs,
         remote: remote.clone(),
@@ -581,7 +621,7 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
             "SSH receive-pack requires an SSH remote".into(),
         ));
     }
-    let (child, stdin, mut stdout) = spawn_service_process(
+    let (mut child, stdin, mut stdout, stderr_drain) = spawn_service_process(
         remote,
         GitService::ReceivePack,
         true,
@@ -625,6 +665,7 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
             child,
             stdin: None,
             stdout,
+            stderr_drain,
             features,
             advertisements: advertisement_set.refs,
             remote: remote.clone(),
@@ -639,6 +680,7 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
         child,
         stdin: Some(stdin),
         stdout,
+        stderr_drain,
         features,
         advertisements: advertisement_set.refs,
         remote: remote.clone(),
@@ -691,12 +733,13 @@ pub(crate) fn execute_push_ssh_plan(
         plan.stdout.read_to_end(&mut sink)?;
         None
     };
-    let output = plan.child.wait_with_output()?;
-    if !output.status.success() {
+    let status = plan.child.wait()?; // Child::wait takes &mut self
+    let stderr = plan.stderr_drain.finish();
+    if !status.success() {
         return Err(GitError::Command(format!(
             "ssh receive-pack failed for {}: {}",
             ssh_remote_display(&plan.remote),
-            String::from_utf8_lossy(&output.stderr).trim()
+            ssh_command_failure_message("ssh receive-pack", &stderr)
         )));
     }
 
@@ -721,24 +764,25 @@ pub(crate) fn ls_remote_ssh(
             "SSH upload-pack requires an SSH remote".into(),
         ));
     }
-    let (child, _stdin, mut stdout) = spawn_service_process(
+    let (mut child, _stdin, mut stdout, stderr_drain) = spawn_service_process(
         remote,
         GitService::UploadPack,
         false,
         SshTransportOptions::default(),
     )?;
     let set_result = read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout);
-    let output = child.wait_with_output()?;
+    let status = child.wait()?;
+    let stderr = stderr_drain.finish();
     let set = match set_result {
         Ok(set) => set,
         Err(err) if is_ssh_protocol_v2_advertisement_error(&err) => {
             return Err(ssh_protocol_v2_unsupported_error());
         }
-        Err(_) if !output.status.success() => {
+        Err(_) if !status.success() => {
             return Err(GitError::Command(format!(
                 "ssh upload-pack failed for {}: {}",
                 ssh_remote_display(remote),
-                String::from_utf8_lossy(&output.stderr).trim()
+                ssh_command_failure_message("ssh upload-pack", &stderr)
             )));
         }
         Err(err) => return Err(err),
@@ -845,7 +889,7 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
         ..UploadPackRequest::default()
     };
     let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
-    let (child, stdin, mut stdout) = spawn_service_process(
+    let (mut child, stdin, mut stdout, stderr_drain) = spawn_service_process(
         request.remote,
         GitService::UploadPack,
         true,
@@ -893,12 +937,13 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
         }
         Vec::new()
     };
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
+    let status = child.wait()?;
+    let stderr = stderr_drain.finish();
+    if !status.success() {
         return Err(GitError::Command(format!(
             "ssh upload-pack failed for {}: {}",
             ssh_remote_display(request.remote),
-            String::from_utf8_lossy(&output.stderr).trim()
+            ssh_command_failure_message("ssh upload-pack", &stderr)
         )));
     }
     Ok(shallow_info)
@@ -948,20 +993,21 @@ pub fn ssh_upload_pack_advertisements_with_options(
             "SSH upload-pack requires an SSH remote".into(),
         ));
     }
-    let (child, _stdin, mut stdout) =
+    let (mut child, _stdin, mut stdout, stderr_drain) =
         spawn_service_process(remote, GitService::UploadPack, false, options)?;
     let set_result = read_ref_advertisement_set(format, &mut stdout);
-    let output = child.wait_with_output()?;
+    let status = child.wait()?;
+    let stderr = stderr_drain.finish();
     let set = match set_result {
         Ok(set) => set,
         Err(err) if is_ssh_protocol_v2_advertisement_error(&err) => {
             return Err(ssh_protocol_v2_unsupported_error());
         }
-        Err(_) if !output.status.success() => {
+        Err(_) if !status.success() => {
             return Err(GitError::Command(format!(
                 "ssh upload-pack failed for {}: {}",
                 ssh_remote_display(remote),
-                String::from_utf8_lossy(&output.stderr).trim()
+                ssh_command_failure_message("ssh upload-pack", &stderr)
             )));
         }
         Err(err) => return Err(err),
