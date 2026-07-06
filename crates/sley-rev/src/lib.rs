@@ -6471,12 +6471,23 @@ pub fn merge_bases<R: ObjectReader>(
     Ok(bases)
 }
 
-/// BFS the ancestry of `start`, recording the shortest distance to each commit,
-/// using a pre-loaded graph context for parent lookups so several walks can
-/// share one parsed commit-graph. The traversal is an unpruned BFS by design:
-/// the recorded depths feed the merge-base lowest-common-ancestor reduction,
-/// which depends on every reachable commit's shortest distance, so dropping
-/// nodes would change the result.
+/// BFS the ancestry of `start`, recording the shortest distance to each commit.
+/// Uses the commit-graph for parent lookups when available and honors shallow
+/// graft boundaries via [`ObjectReader::is_shallow_graft`]. The traversal is an
+/// unpruned BFS by design: the recorded depths feed merge-base and fast-forward
+/// checks that depend on every reachable commit's shortest distance.
+pub fn ancestor_depths<R: ObjectReader>(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    reader: &R,
+    start: &ObjectId,
+) -> Result<HashMap<ObjectId, usize>> {
+    let mut graph = CommitGraphContext::load(git_dir, format);
+    ancestor_depths_with_graph(&mut graph, reader, start)
+}
+
+/// Same as [`ancestor_depths`], but reuses a pre-loaded graph context so several
+/// walks can share one parsed commit-graph.
 fn ancestor_depths_with_graph<R: ObjectReader>(
     graph: &mut CommitGraphContext<'_>,
     reader: &R,

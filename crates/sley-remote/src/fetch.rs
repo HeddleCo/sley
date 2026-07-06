@@ -1323,7 +1323,7 @@ fn atomic_non_fast_forward_rejection(
             continue;
         }
         let db = db.get_or_insert_with(|| FileObjectDatabase::from_git_dir(git_dir, format));
-        if !crate::push::is_fast_forward(db, format, &old, &update.oid)? {
+        if !crate::push::is_fast_forward(git_dir, db, format, &old, &update.oid)? {
             return Ok(Some(format!(
                 "! [rejected]        {} -> {}  (non-fast-forward)",
                 update.src, dst

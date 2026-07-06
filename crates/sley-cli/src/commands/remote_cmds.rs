@@ -5080,7 +5080,7 @@ pub(crate) fn changed_gitlinks_for_fetch(
         if old == Some(update.oid) {
             continue;
         }
-        for gitlink in changed_gitlinks_for_commit_range(&db, format, old, &update.oid)? {
+        for gitlink in changed_gitlinks_for_commit_range(git_dir, &db, format, old, &update.oid)? {
             if !changed.iter().any(|existing| existing == &gitlink) {
                 changed.push(gitlink);
             }
@@ -5142,13 +5142,14 @@ fn submodule_name_for_path_at_commit(
 }
 
 fn changed_gitlinks_for_commit_range(
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     old: Option<ObjectId>,
     new: &ObjectId,
 ) -> Result<Vec<ChangedGitlink>> {
     let old_ancestors = match old {
-        Some(old) => ancestor_depths(db, format, &old)?,
+        Some(old) => sley_rev::ancestor_depths(git_dir, format, db, &old)?,
         None => std::collections::HashMap::new(),
     };
     let mut changed = Vec::new();
@@ -6539,7 +6540,9 @@ fn append_follow_tag_refspecs(
         };
         if pushed_tips
             .iter()
-            .any(|tip| commit_reaches(&db, format, tip, &target).unwrap_or(false))
+            .any(|tip| {
+                commit_reaches(common_git_dir, &db, format, tip, &target).unwrap_or(false)
+            })
         {
             additions.push(format!("refs/tags/{name}:refs/tags/{name}"));
         }
@@ -6611,6 +6614,7 @@ fn annotated_tag_commit_target(
 }
 
 fn commit_reaches(
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tip: &ObjectId,
@@ -6623,7 +6627,7 @@ fn commit_reaches(
     if object.object_type != sley_object::ObjectType::Commit {
         return Ok(false);
     }
-    Ok(ancestor_depths(db, format, tip)?.contains_key(target))
+    Ok(sley_rev::ancestor_depths(git_dir, format, db, tip)?.contains_key(target))
 }
 
 /// Resolve the remote argument for `--mirror`/`--all`/`--tags`: the lone
@@ -7277,7 +7281,15 @@ fn submodule_commit_needs_push_oid(
         let Some((remote_oid, _)) = resolve_for_each_ref_target(&store, &reference)? else {
             continue;
         };
-        if commit_reaches(&db, submodule.format, &remote_oid, oid).unwrap_or(false) {
+        if commit_reaches(
+            &submodule.common_git_dir,
+            &db,
+            submodule.format,
+            &remote_oid,
+            oid,
+        )
+        .unwrap_or(false)
+        {
             return Ok(false);
         }
     }
@@ -12531,6 +12543,7 @@ fn write_remote_show_query(
         let local_db = FileObjectDatabase::from_git_dir(git_dir, remote_format);
         write_remote_show_push_config(
             stdout,
+            git_dir,
             &push_rows,
             refs,
             &remote_refs,
@@ -12589,6 +12602,7 @@ fn write_remote_show_no_query(
     if !push_rows.is_empty() {
         write_remote_show_push_config(
             stdout,
+            Path::new("."),
             &push_rows,
             refs,
             &[],
@@ -12644,6 +12658,7 @@ fn write_remote_show_pull_config(
 
 fn write_remote_show_push_config(
     stdout: &mut impl Write,
+    git_dir: &Path,
     branches: &[RemotePushConfig],
     local_refs: &[sley_refs::Ref],
     remote_refs: &[sley_refs::Ref],
@@ -12696,6 +12711,7 @@ fn write_remote_show_push_config(
             )?;
         } else {
             let status = remote_show_push_status(
+                git_dir,
                 &config.src,
                 &config.dst,
                 local_refs,
@@ -12717,6 +12733,7 @@ fn write_remote_show_push_config(
 }
 
 fn remote_show_push_status(
+    git_dir: &Path,
     branch: &str,
     merge: &str,
     local_refs: &[sley_refs::Ref],
@@ -12735,7 +12752,7 @@ fn remote_show_push_status(
     if local_oid == remote_oid {
         return "up to date";
     }
-    match ancestor_depths(local_db, format, local_oid) {
+    match sley_rev::ancestor_depths(git_dir, format, local_db, local_oid) {
         Ok(depths) if depths.contains_key(remote_oid) => "fast-forwardable",
         Ok(_) | Err(_) => "local out of date",
     }

@@ -1144,7 +1144,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let ours_commit = sley_rev::peel_to_commit(&db, format, &ours_oid)?;
     let already_up_to_date = merge_oids.iter().all(|theirs_commit| {
         *theirs_commit == ours_commit
-            || ancestor_depths(&db, format, &ours_commit)
+            || sley_rev::ancestor_depths(&git_dir, format, &db, &ours_commit)
                 .is_ok_and(|ours_depths| ours_depths.contains_key(theirs_commit))
     });
     if already_up_to_date {
@@ -1159,7 +1159,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let fast_forward = if merge_oids.len() == 1 {
-        ancestor_depths(&db, format, &theirs_oid)?.contains_key(&ours_commit)
+        sley_rev::ancestor_depths(&git_dir, format, &db, &theirs_oid)?.contains_key(&ours_commit)
     } else {
         false
     };

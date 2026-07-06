@@ -552,7 +552,7 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
     }
 
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    crate::push::reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
+    crate::push::reject_non_fast_forward_pushes(common_git_dir, &local_db, format, &command_forces)?;
     Ok(SshPushPlan {
         commands,
         pack_objects: Vec::new(),
@@ -632,7 +632,7 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
     }
 
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    crate::push::reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
+    crate::push::reject_non_fast_forward_pushes(common_git_dir, &local_db, format, &command_forces)?;
     Ok(SshPushPlan {
         commands,
         pack_objects,

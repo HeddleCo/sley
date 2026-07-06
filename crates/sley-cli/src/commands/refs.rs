@@ -1119,7 +1119,7 @@ fn reflog_reachable_oids(
     let mut reachable = HashSet::new();
     for start in starts {
         if !context.reachable_by_tip.contains_key(&start) {
-            let tip_reachable = match ancestor_depths(db, format, &start) {
+            let tip_reachable = match sley_rev::ancestor_depths(git_dir, format, db, &start) {
                 Ok(depths) => depths.into_keys().collect(),
                 Err(_) => HashSet::new(),
             };

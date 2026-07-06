@@ -18,7 +18,6 @@
 //! push-planning helpers are shared (the CLI's SSH path calls the same `pub`
 //! functions) so there is a single implementation.
 
-use std::collections::HashMap;
 use std::fs;
 #[cfg(feature = "http")]
 use std::io::Read;
@@ -27,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result, redact_url_for_display};
-use sley_object::{Commit, ObjectType};
+use sley_object::ObjectType;
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
     collect_reachable_object_ids,
@@ -546,7 +545,12 @@ pub fn plan_push_actions(
             let features = advertised_receive_pack_features(&advertisement_set.refs)?;
             verify_remote_object_format(&features, request.format)?;
             let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
-            reject_non_fast_forward_pushes(&local_db, request.format, &command_forces)?;
+            reject_non_fast_forward_pushes(
+                request.common_git_dir,
+                &local_db,
+                request.format,
+                &command_forces,
+            )?;
             let execution = if commands.is_empty() {
                 PushExecution::Noop
             } else {
@@ -619,7 +623,12 @@ pub fn plan_push_actions(
             let remote_refs =
                 crate::local::local_fetch_advertisements(remote_git_dir, request.format)?;
             let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
-            reject_non_fast_forward_pushes(&local_db, request.format, &command_forces)?;
+            reject_non_fast_forward_pushes(
+                request.common_git_dir,
+                &local_db,
+                request.format,
+                &command_forces,
+            )?;
             let execution = if commands.is_empty() {
                 PushExecution::Noop
             } else {
@@ -766,7 +775,7 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
         options.force,
     )?;
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
+    reject_non_fast_forward_pushes(common_git_dir, &local_db, format, &command_forces)?;
     let commands = commands_from_forces(&command_forces);
     let execution = if commands.is_empty() {
         PushExecution::Noop
@@ -999,7 +1008,7 @@ fn plan_push_local(request: PushLocalRequest<'_>) -> Result<PushPlan> {
     let command_forces =
         plan_push_command_forces(format, &local_refs, &remote_refs, refspecs, options.force)?;
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
+    reject_non_fast_forward_pushes(common_git_dir, &local_db, format, &command_forces)?;
     let commands = commands_from_forces(&command_forces);
     let execution = if commands.is_empty() {
         PushExecution::Noop
@@ -1342,6 +1351,7 @@ pub fn push_local_with_report(
             && (stale_lease_overridden
                 || if plan.command.name.starts_with("refs/heads/") {
                     !is_fast_forward(
+                        request.common_git_dir,
                         &local_db,
                         format,
                         &plan.command.old_id,
@@ -1533,8 +1543,15 @@ fn classify_push_command(
         if request.force_if_includes
             && !command.old_id.is_null()
             && (command.new_id.is_null()
-                || !is_fast_forward(local_db, format, &command.old_id, &command.new_id)?)
+                || !is_fast_forward(
+                    request.common_git_dir,
+                    local_db,
+                    format,
+                    &command.old_id,
+                    &command.new_id,
+                )?)
             && force_if_includes_rejects(
+                request.common_git_dir,
                 local_db,
                 format,
                 request.git_dir,
@@ -1554,7 +1571,13 @@ fn classify_push_command(
     if command.name.starts_with("refs/heads/")
         && !command.old_id.is_null()
         && !command.new_id.is_null()
-        && !is_fast_forward(local_db, format, &command.old_id, &command.new_id)?
+        && !is_fast_forward(
+            request.common_git_dir,
+            local_db,
+            format,
+            &command.old_id,
+            &command.new_id,
+        )?
         && receive_config_bool(
             config,
             request.receive_config_overrides,
@@ -1586,7 +1609,13 @@ fn classify_push_command(
         if !local_db.contains(&command.old_id)? {
             return Ok(PushRefStatus::RejectFetchFirst);
         }
-        if !is_fast_forward(local_db, format, &command.old_id, &command.new_id)? {
+        if !is_fast_forward(
+            request.common_git_dir,
+            local_db,
+            format,
+            &command.old_id,
+            &command.new_id,
+        )? {
             return Ok(PushRefStatus::RejectNonFastForward);
         }
     }
@@ -1668,6 +1697,7 @@ fn lease_expectation_mismatch(request: &PushReportRequest<'_>, plan: &PlannedPus
 }
 
 fn force_if_includes_rejects(
+    common_git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     git_dir: &Path,
@@ -1696,7 +1726,7 @@ fn force_if_includes_rejects(
         if candidate == *remote_old {
             return Ok(false);
         }
-        if let Ok(ancestors) = ancestor_depths(db, format, &candidate)
+        if let Ok(ancestors) = sley_rev::ancestor_depths(common_git_dir, format, db, &candidate)
             && ancestors.contains_key(remote_old)
         {
             return Ok(false);
@@ -1795,12 +1825,13 @@ fn receive_denies_current_branch_delete(
 /// Whether `old` is an ancestor of `new` (a fast-forward). A walk from `new`;
 /// `old` reachable ⇒ fast-forward.
 pub(crate) fn is_fast_forward(
+    common_git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     old: &ObjectId,
     new: &ObjectId,
 ) -> Result<bool> {
-    let ancestors = ancestor_depths(db, format, new)?;
+    let ancestors = sley_rev::ancestor_depths(common_git_dir, format, db, new)?;
     Ok(ancestors.contains_key(old))
 }
 
@@ -2360,6 +2391,7 @@ pub fn normalize_push_refname(name: &str) -> String {
 /// new tip (a non-fast-forward). Forced updates, non-branch refs, and
 /// creations/deletions are skipped.
 pub fn reject_non_fast_forward_pushes(
+    common_git_dir: &Path,
     local_db: &FileObjectDatabase,
     format: ObjectFormat,
     command_forces: &[(ReceivePackCommand, bool)],
@@ -2372,7 +2404,7 @@ pub fn reject_non_fast_forward_pushes(
         {
             continue;
         }
-        let ancestors = ancestor_depths(local_db, format, &command.new_id)?;
+        let ancestors = sley_rev::ancestor_depths(common_git_dir, format, local_db, &command.new_id)?;
         if !ancestors.contains_key(&command.old_id) {
             let short = command.name.trim_start_matches("refs/heads/");
             return Err(GitError::Command(format!(
@@ -2381,36 +2413,6 @@ pub fn reject_non_fast_forward_pushes(
         }
     }
     Ok(())
-}
-
-/// The depth of every commit reachable from `start` (a breadth-first ancestry
-/// walk). Used to test fast-forwardness: `start`'s ancestors include `start`
-/// itself at depth zero. Errors if a reachable object is not a commit.
-fn ancestor_depths(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    start: &ObjectId,
-) -> Result<HashMap<ObjectId, usize>> {
-    let mut depths = HashMap::new();
-    let mut pending = std::collections::VecDeque::from([(start.clone(), 0usize)]);
-    while let Some((oid, depth)) = pending.pop_front() {
-        if depths.get(&oid).is_some_and(|existing| *existing <= depth) {
-            continue;
-        }
-        depths.insert(oid, depth);
-        let object = db.read_object(&oid)?;
-        if object.object_type != ObjectType::Commit {
-            return Err(GitError::InvalidObject(format!(
-                "expected commit {oid}, found {}",
-                object.object_type.as_str()
-            )));
-        }
-        let commit = Commit::parse_ref(format, &object.body)?;
-        for parent in commit.parents {
-            pending.push_back((parent, depth + 1));
-        }
-    }
-    Ok(depths)
 }
 
 /// Resolve a (possibly symbolic) ref target to its object id, following up to

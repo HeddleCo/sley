@@ -422,7 +422,7 @@ fn merge_octopus(
         }
         let mut base_args = vec![*oid];
         base_args.extend(merged_commits.iter().copied());
-        let common = merge_bases_default_many(&db, format, &base_args)?;
+        let common = merge_bases_default_many(common_git_dir, &db, format, &base_args)?;
         if common.len() == 1 && common[0] == *oid {
             // Already covered by the merges performed so far. git's octopus
             // prints "Already up to date with <name>" and moves on.
@@ -723,7 +723,7 @@ fn write_squash_message_multi(
 ) -> Result<()> {
     // Mark HEAD's ancestors uninteresting, then collect every `other`'s ancestors
     // that are not among them (the `^HEAD other...` range).
-    let uninteresting = ancestor_depths(db, format, head)?;
+    let uninteresting = sley_rev::ancestor_depths(git_dir, format, db, head)?;
     let mut records = Vec::new();
     let mut seen = HashSet::new();
     let mut pending: VecDeque<ObjectId> = others.iter().cloned().collect();
