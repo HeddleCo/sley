@@ -31,6 +31,9 @@ static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Number of deltifiable blob objects written into the benchmark pack fixture.
 pub const FIXTURE_OBJECT_COUNT: usize = 500;
 
+/// Larger pack fixture used by prefix-resolution benchmarks.
+pub const LARGE_FIXTURE_OBJECT_COUNT: usize = 1000;
+
 /// Number of commits written into the commit-graph benchmark fixture.
 pub const COMMIT_FIXTURE_COUNT: usize = 200;
 
@@ -64,15 +67,20 @@ impl BenchFixture {
 
 /// Build the deltified blob pack used by the pack and cat-file benchmarks.
 pub fn build_blob_pack() -> Result<PackWrite> {
+    build_blob_pack_with_count(FIXTURE_OBJECT_COUNT)
+}
+
+/// Build a deltified blob pack with `count` entries.
+pub fn build_blob_pack_with_count(count: usize) -> Result<PackWrite> {
     let format = ObjectFormat::Sha1;
-    let objects = (0..FIXTURE_OBJECT_COUNT)
+    let objects = (0..count)
         .map(|index| EncodedObject::new(ObjectType::Blob, deltifiable_blob_body(index)))
         .collect::<Vec<_>>();
     let options = PackWriteOptions::new().with_window(50);
     let written = PackFile::write_packed_with_options(&objects, format, &options)?;
-    if written.entries.len() != FIXTURE_OBJECT_COUNT {
+    if written.entries.len() != count {
         return Err(GitError::InvalidFormat(format!(
-            "expected {FIXTURE_OBJECT_COUNT} pack entries, got {}",
+            "expected {count} pack entries, got {}",
             written.entries.len()
         )));
     }
@@ -102,18 +110,23 @@ pub fn create_pack_install_target() -> Result<PackInstallTarget> {
 /// Build a temporary git repository containing one pack with
 /// [`FIXTURE_OBJECT_COUNT`] deltified blobs.
 pub fn create_fixture() -> Result<BenchFixture> {
+    create_fixture_with_count(FIXTURE_OBJECT_COUNT)
+}
+
+/// Build a temporary git repository containing one pack with `count` deltified blobs.
+pub fn create_fixture_with_count(count: usize) -> Result<BenchFixture> {
     let format = ObjectFormat::Sha1;
     let repo_root = unique_temp_dir("sley-bench-fixture");
     let git_dir = repo_root.join(".git");
     init_minimal_repo(&git_dir)?;
 
-    let written = build_blob_pack()?;
+    let written = build_blob_pack_with_count(count)?;
     let object_ids = written
         .entries
         .iter()
         .map(|entry| entry.oid.clone())
         .collect::<Vec<_>>();
-    let sample_oid = object_ids[FIXTURE_OBJECT_COUNT / 2].clone();
+    let sample_oid = object_ids[count / 2].clone();
 
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     db.install_pack(&written)?;

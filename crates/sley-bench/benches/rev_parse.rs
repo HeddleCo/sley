@@ -1,5 +1,8 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use sley_bench::{BenchFixture, FIXTURE_OBJECT_COUNT, create_fixture};
+use sley_bench::{
+    BenchFixture, FIXTURE_OBJECT_COUNT, LARGE_FIXTURE_OBJECT_COUNT, create_fixture,
+    create_fixture_with_count,
+};
 use sley_core::{GitError, Result};
 use sley_odb::ObjectPrefixResolution;
 use std::io::Write;
@@ -43,6 +46,14 @@ fn fixture() -> &'static BenchFixture {
     FIXTURE.get_or_init(|| match create_fixture() {
         Ok(fixture) => fixture,
         Err(err) => panic!("benchmark fixture setup failed: {err}"),
+    })
+}
+
+fn large_fixture() -> &'static BenchFixture {
+    static FIXTURE: OnceLock<BenchFixture> = OnceLock::new();
+    FIXTURE.get_or_init(|| match create_fixture_with_count(LARGE_FIXTURE_OBJECT_COUNT) {
+        Ok(fixture) => fixture,
+        Err(err) => panic!("large benchmark fixture setup failed: {err}"),
     })
 }
 
@@ -103,5 +114,43 @@ fn rev_parse_oid_resolve(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, rev_parse_oid_resolve);
+fn rev_parse_oid_resolve_1k(c: &mut Criterion) {
+    let fixture = large_fixture();
+    let count = LARGE_FIXTURE_OBJECT_COUNT.min(fixture.object_ids.len());
+    if count < LARGE_FIXTURE_OBJECT_COUNT {
+        return;
+    }
+    let input = fixture.batch_input(count);
+    let mut group = c.benchmark_group("rev_parse_oid_resolve_1k");
+    group.throughput(Throughput::Elements(count as u64));
+    group.bench_with_input(
+        BenchmarkId::new("odb_resolve_prefix", count),
+        &input,
+        |b, input| {
+            let db = fixture.database();
+            b.iter(|| {
+                let mut resolved = 0usize;
+                for line in std::str::from_utf8(input)
+                    .expect("benchmark input should be UTF-8")
+                    .lines()
+                {
+                    match db.resolve_prefix(black_box(line)) {
+                        Ok(ObjectPrefixResolution::Unique(_)) => resolved += 1,
+                        Ok(ObjectPrefixResolution::Ambiguous(_)) => {
+                            panic!("unexpected ambiguous oid prefix for {line}")
+                        }
+                        Ok(ObjectPrefixResolution::Missing) => {
+                            panic!("missing oid prefix for {line}")
+                        }
+                        Err(err) => panic!("resolve_prefix failed for {line}: {err}"),
+                    }
+                }
+                black_box(resolved)
+            });
+        },
+    );
+    group.finish();
+}
+
+criterion_group!(benches, rev_parse_oid_resolve, rev_parse_oid_resolve_1k);
 criterion_main!(benches);

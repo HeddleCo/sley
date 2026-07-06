@@ -5774,6 +5774,225 @@ fn collect_incremental_midx_object_ids(
     Ok(())
 }
 
+fn object_ids_with_prefix_in_objects_dir(
+    objects_dir: &Path,
+    format: ObjectFormat,
+    prefix: &[u8],
+) -> Result<Vec<ObjectId>> {
+    let mut matches = HashSet::new();
+    collect_loose_object_ids_with_prefix(objects_dir, format, prefix, &mut matches)?;
+    collect_packed_object_ids_with_prefix(&objects_dir.join("pack"), format, prefix, &mut matches)?;
+    let mut matches = matches.into_iter().collect::<Vec<_>>();
+    matches.sort_by_key(ObjectId::to_hex);
+    Ok(matches)
+}
+
+fn collect_loose_object_ids_with_prefix(
+    objects_dir: &Path,
+    format: ObjectFormat,
+    prefix: &[u8],
+    oids: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    if prefix.len() < 2 {
+        return Ok(());
+    }
+    let fanout_hex = std::str::from_utf8(&prefix[..2]).map_err(|_| {
+        GitError::InvalidObjectId("object id prefix must be ASCII hex".into())
+    })?;
+    let fanout_dir = objects_dir.join(fanout_hex);
+    let entries = match fs::read_dir(&fanout_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    let hex_len = format.hex_len();
+    for object_entry in entries {
+        let object_entry = object_entry?;
+        if !object_entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = object_entry.file_name();
+        let Some(suffix) = name.to_str() else {
+            continue;
+        };
+        if suffix.len() != hex_len - 2 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let oid = ObjectId::from_hex(format, &format!("{fanout_hex}{suffix}"))?;
+        if oid.hex_prefix_matches(prefix) {
+            oids.insert(oid);
+        }
+    }
+    Ok(())
+}
+
+fn collect_packed_object_ids_with_prefix(
+    pack_dir: &Path,
+    format: ObjectFormat,
+    prefix: &[u8],
+    oids: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    if !pack_dir.exists() {
+        return Ok(());
+    }
+    let floor = object_id_floor_for_hex_prefix(format, prefix)?;
+    let mut midx_pack_names = HashSet::new();
+    let midx_path = pack_dir.join("multi-pack-index");
+    if midx_path.exists() {
+        let midx = MultiPackIndex::parse_without_checksum(&fs::read(&midx_path)?, format)?;
+        midx_pack_names.extend(midx.pack_names.iter().cloned());
+        collect_multi_pack_index_prefix_matches(&midx, prefix, &floor, oids);
+    }
+    collect_incremental_midx_prefix_matches(pack_dir, format, prefix, &floor, oids)?;
+    for entry in fs::read_dir(pack_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+            continue;
+        }
+        if !path.with_extension("pack").exists() {
+            continue;
+        }
+        let index = match PackIndex::parse(&fs::read(&path)?, format) {
+            Ok(index) => index,
+            Err(_err)
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| midx_pack_names.contains(name)) =>
+            {
+                eprintln!(
+                    "error: packfile {} index unavailable",
+                    path.with_extension("pack").display()
+                );
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        collect_pack_index_prefix_matches(&index, prefix, &floor, oids);
+    }
+    Ok(())
+}
+
+fn collect_incremental_midx_prefix_matches(
+    pack_dir: &Path,
+    format: ObjectFormat,
+    prefix: &[u8],
+    floor: &ObjectId,
+    oids: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    let chain = read_incremental_midx_chain(pack_dir)?;
+    if chain.is_empty() {
+        return Ok(());
+    }
+    let midx_dir = pack_dir.join("multi-pack-index.d");
+    for checksum in chain {
+        let path = midx_dir.join(format!("multi-pack-index-{checksum}.midx"));
+        let midx = MultiPackIndex::parse_without_checksum(&fs::read(path)?, format)?;
+        collect_multi_pack_index_prefix_matches(&midx, prefix, floor, oids);
+    }
+    Ok(())
+}
+
+fn collect_multi_pack_index_prefix_matches(
+    midx: &MultiPackIndex,
+    prefix: &[u8],
+    floor: &ObjectId,
+    oids: &mut HashSet<ObjectId>,
+) {
+    if midx.objects.is_empty() {
+        return;
+    }
+    let (start, end) = pack_index_fanout_range(&midx.fanout, floor.as_bytes()[0]);
+    if start >= end || end > midx.objects.len() {
+        return;
+    }
+    let lower = lower_bound_pack_index_entries(
+        &midx.objects,
+        start,
+        end,
+        floor.as_bytes(),
+        |entry| &entry.oid,
+    );
+    for entry in &midx.objects[lower..end] {
+        if entry.oid.hex_prefix_matches(prefix) {
+            oids.insert(entry.oid.clone());
+        } else {
+            break;
+        }
+    }
+}
+
+fn collect_pack_index_prefix_matches(
+    index: &PackIndex,
+    prefix: &[u8],
+    floor: &ObjectId,
+    oids: &mut HashSet<ObjectId>,
+) {
+    if index.entries.is_empty() {
+        return;
+    }
+    let (start, end) = pack_index_fanout_range(&index.fanout, floor.as_bytes()[0]);
+    if start >= end || end > index.entries.len() {
+        return;
+    }
+    let lower = lower_bound_pack_index_entries(
+        &index.entries,
+        start,
+        end,
+        floor.as_bytes(),
+        |entry| &entry.oid,
+    );
+    for entry in &index.entries[lower..end] {
+        if entry.oid.hex_prefix_matches(prefix) {
+            oids.insert(entry.oid.clone());
+        } else {
+            break;
+        }
+    }
+}
+
+fn pack_index_fanout_range(fanout: &[u32; 256], first_byte: u8) -> (usize, usize) {
+    let bucket = usize::from(first_byte);
+    let start = if bucket == 0 {
+        0
+    } else {
+        fanout[bucket - 1] as usize
+    };
+    let end = fanout[bucket] as usize;
+    (start, end)
+}
+
+fn lower_bound_pack_index_entries<T>(
+    entries: &[T],
+    start: usize,
+    end: usize,
+    floor: &[u8],
+    oid: impl Fn(&T) -> &ObjectId,
+) -> usize {
+    let mut lo = start;
+    let mut hi = end;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if oid(&entries[mid]).as_bytes() < floor {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+fn object_id_floor_for_hex_prefix(format: ObjectFormat, prefix: &[u8]) -> Result<ObjectId> {
+    let mut hex = String::with_capacity(format.hex_len());
+    for &byte in prefix {
+        hex.push(char::from(byte.to_ascii_lowercase()));
+    }
+    while hex.len() < format.hex_len() {
+        hex.push('0');
+    }
+    ObjectId::from_hex(format, &hex)
+}
+
 impl FileObjectDatabase {
     /// The object-id format (hash algorithm) this database was opened with.
     pub fn object_format(&self) -> ObjectFormat {
@@ -6278,12 +6497,23 @@ impl FileObjectDatabase {
 
     pub fn object_ids_with_prefix(&self, prefix: &str) -> Result<Vec<ObjectId>> {
         validate_object_id_prefix(self.format, prefix)?;
-        let mut matches = Vec::new();
-        for oid in self.object_ids()? {
-            if object_id_matches_prefix(&oid, prefix) {
-                matches.push(oid);
+        let prefix_bytes = prefix.as_bytes();
+        let mut matches = object_ids_with_prefix_in_objects_dir(
+            &self.objects_dir,
+            self.format,
+            prefix_bytes,
+        )?
+        .into_iter()
+        .collect::<HashSet<_>>();
+        for alternate in &self.alternates {
+            for oid in Self::without_alternates(alternate, self.format)
+                .object_ids_with_prefix(prefix)?
+            {
+                matches.insert(oid);
             }
         }
+        let mut matches = matches.into_iter().collect::<Vec<_>>();
+        matches.sort_by_key(ObjectId::to_hex);
         Ok(matches)
     }
 
@@ -6976,14 +7206,6 @@ fn validate_object_id_prefix(format: ObjectFormat, prefix: &str) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn object_id_matches_prefix(oid: &ObjectId, prefix: &str) -> bool {
-    oid.to_hex()
-        .as_bytes()
-        .iter()
-        .zip(prefix.as_bytes())
-        .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
 }
 
 fn pack_dir_modified(pack_dir: &Path) -> Result<Option<std::time::SystemTime>> {
