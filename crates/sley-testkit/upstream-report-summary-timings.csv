@@ -1,2 +1,2 @@
 label,script,command,result,elapsed_ms,ok,notok,total,plan_total
-2026-07-06T16:46:44Z,t0001-init.sh,init,FAIL,82,0,0,0,
+2026-07-06T17:13:38Z,t0202-gettext-perl.sh,t0202-gettext-perl.sh,PASS,555,1,0,1,1
