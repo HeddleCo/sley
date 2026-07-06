@@ -7,23 +7,30 @@
     clippy::unwrap_used
 )]
 
-use sley_config::{ConfigBoolOrInt, ConfigEntry, ConfigSection, GitConfig};
-use sley_core::{BString, DateMode, GitError, ObjectFormat, ObjectId, Result};
-use sley_formats::{
+use sley::{
+    BString, GitConfig, GitError, Index, IndexEntry, ObjectFormat, ObjectId, RefPrecondition,
+    ReferenceTarget as RefTarget, Result,
+};
+use sley::plumbing::{
+    sley_config, sley_core, sley_formats, sley_index, sley_object, sley_odb, sley_pack, sley_pretty,
+    sley_refs, sley_rev, sley_remote, sley_worktree,
+};
+use sley::plumbing::sley_config::{ConfigBoolOrInt, ConfigEntry, ConfigSection};
+use sley::plumbing::sley_core::DateMode;
+use sley::plumbing::sley_formats::{
     Bundle, BundleCapability, BundlePrerequisite, BundleReference, CommitGraph,
     CommitGraphWriteEntry, InitOptions, RefStorageFormat, RepositoryBootstrap,
 };
-use sley_index::{Index, IndexEntry};
-use sley_object::{
+use sley::plumbing::sley_object::{
     Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntries, TreeEntry, TreeEntryRef,
     tree_entry_object_type,
 };
-use sley_odb::{
+use sley::plumbing::sley_odb::{
     FileObjectDatabase, LooseObjectIntegrity, ObjectPrefixResolution, ObjectReader, ObjectWriter,
     build_reachable_pack, collect_reachable_object_ids, grafted_parents, install_bundle_pack,
     install_reachable_pack, prune_unreachable_loose, repository_object_ids, repository_objects_dir,
 };
-use sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
+use sley::plumbing::sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
 use sley_pathspec::{
     LsFilesPathFilter, PathspecAttributeCheck, PathspecAttributeState,
     parse_normalized_pathspec_element, pathspec_attrs_match_with, pathspec_filters_have_include,
@@ -38,14 +45,13 @@ use sley_protocol::{
     write_upload_pack_packfile_response, write_upload_pack_raw_packfile_response,
 };
 pub(crate) use sley_ref_filter::*;
-use sley_refs::{
-    FileRefStore, PackRefDecision, Ref, RefPrecondition, RefTarget, RefTransactionHookUpdate,
-    RefTransactionPhase, RefUpdate, ReferenceTransactionHook, ReflogEntry, branch_ref_name,
-    check_refname_format, parse_packed_refs, resolve_ref_peeled, tag_ref_name, validate_ref_name,
-    validate_symref_name, validate_symref_target,
+use sley::plumbing::sley_refs::{
+    FileRefStore, PackRefDecision, Ref, RefTransactionHookUpdate, RefTransactionPhase, RefUpdate,
+    ReferenceTransactionHook, ReflogEntry, branch_ref_name, check_refname_format, parse_packed_refs,
+    resolve_ref_peeled, tag_ref_name, validate_ref_name, validate_symref_name, validate_symref_target,
 };
-use sley_remote::FetchOutcome;
-pub(crate) use sley_rev::revlist::*;
+use sley::plumbing::sley_remote::FetchOutcome;
+pub(crate) use sley::plumbing::sley_rev::revlist::*;
 use sley_transport::{RemoteTransport, RemoteUrl, parse_remote_url};
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -131,7 +137,7 @@ pub(crate) use discovery::{
     is_git_dir_candidate, paths_refer_to_same_dir, read_gitdir_file, resolve_cli_path,
 };
 
-pub(crate) use sley_pretty::{
+pub(crate) use sley::plumbing::sley_pretty::{
     CompiledLogFormat, FormatToken, LogFormatDialect, LogDescribeLookup, LogFormatContext,
     LogSignatureLookup, LogSignatureView, MailmapLookup, StashFormatContext, append_log_oid,
     commit_author_for_commit_encoding, commit_body, commit_encoding, commit_encoding_config,
@@ -147,7 +153,7 @@ pub(crate) use sley_pretty::{
     log_pick_utf8, log_reencode_message, log_rewrap, log_sanitized_subject, presets,
 };
 pub(crate) use sley_options::validators::*;
-pub(crate) use sley_rev::diff_options::{DiffFilter, DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleIgnoreMode, diff_stat_count_option, diff_stat_parse_width_option, parse_diff_filter, parse_diff_rename_limit, parse_similarity_threshold, parse_submodule_ignore_mode};
+pub(crate) use sley::plumbing::sley_rev::diff_options::{DiffFilter, DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleIgnoreMode, diff_stat_count_option, diff_stat_parse_width_option, parse_diff_filter, parse_diff_rename_limit, parse_similarity_threshold, parse_submodule_ignore_mode};
 
 pub(crate) use commands::args::{GitArgCursor, long_option_value};
 pub(crate) use commands::cat_file::{cat_file_all_object_ids, cat_file_object_storage};
