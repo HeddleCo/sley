@@ -108,10 +108,7 @@ mod shallow;
 pub use shallow::{apply_shallow_info, read_shallow, write_shallow};
 
 mod capabilities;
-pub use capabilities::{
-    BUNDLE_FETCH_SUPPORTED, HTTP_PROTOCOL_V2_FETCH, RemoteTransportKind, SSH_CLONE_SUPPORTED,
-    THIN_PACK_PUSH_SUPPORTED, TransportCapabilities,
-};
+pub use capabilities::{RemoteTransportKind, TransportCapabilities};
 
 mod protocol;
 pub use protocol::{

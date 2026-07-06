@@ -524,11 +524,11 @@ fn replay_one_commit_to(
                 }
                 None => MergeTreeMap::new(),
             };
-            let theirs = stash_tree_entry_map(&db, ctx.format, &commit.tree)?;
+            let theirs = sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree)?;
             (base, theirs)
         }
         ReplayAction::Revert => {
-            let base = stash_tree_entry_map(&db, ctx.format, &commit.tree)?;
+            let base = sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree)?;
             let theirs = match parent {
                 Some(parent) => {
                     tree_map_of_commit(ctx, &db, &parent).map_err(finish_replay_halt)?
@@ -539,7 +539,7 @@ fn replay_one_commit_to(
         }
     };
     let head_tree = commit_tree_oid(&db, ctx.format, head)?;
-    let ours_map = stash_tree_entry_map(&db, ctx.format, &head_tree)?;
+    let ours_map = sley_diff_merge::flatten_tree(&db, ctx.format, &head_tree)?;
     let (results, conflicts) = three_way_merge_trees_styled(
         &db,
         ctx.format,
@@ -1487,12 +1487,12 @@ fn do_pick_commit(
                 None => MergeTreeMap::new(),
             };
             let theirs =
-                stash_tree_entry_map(&db, ctx.format, &commit.tree).map_err(print_fatal_error)?;
+                sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree).map_err(print_fatal_error)?;
             (base, theirs, label.clone(), parent_label.clone())
         }
         ReplayAction::Revert => {
             let base =
-                stash_tree_entry_map(&db, ctx.format, &commit.tree).map_err(print_fatal_error)?;
+                sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree).map_err(print_fatal_error)?;
             let theirs = match &parent {
                 Some(parent) => tree_map_of_commit(ctx, &db, parent)?,
                 None => MergeTreeMap::new(),
@@ -1500,7 +1500,7 @@ fn do_pick_commit(
             (base, theirs, parent_label.clone(), label.clone())
         }
     };
-    let ours_map = stash_tree_entry_map(&db, ctx.format, &index_tree).map_err(print_fatal_error)?;
+    let ours_map = sley_diff_merge::flatten_tree(&db, ctx.format, &index_tree).map_err(print_fatal_error)?;
 
     let style = match config_value(&ctx.git_dir, "merge", "conflictstyle").as_deref() {
         Some("diff3") | Some("zdiff3") => sley_diff_merge::ConflictStyle::Diff3,
@@ -1721,7 +1721,7 @@ fn tree_map_of_commit(
     oid: &ObjectId,
 ) -> std::result::Result<MergeTreeMap, ReplayHalt> {
     let tree = commit_tree_oid(db, ctx.format, oid).map_err(print_fatal_error)?;
-    stash_tree_entry_map(db, ctx.format, &tree).map_err(print_fatal_error)
+    sley_diff_merge::flatten_tree(db, ctx.format, &tree).map_err(print_fatal_error)
 }
 
 /// Tree oid of the current index (the "are there staged changes" probe).
@@ -2673,7 +2673,7 @@ pub(crate) fn reset_merge_in(
     let target_map = match target {
         Some(target) => {
             let target_tree = commit_tree_oid(&db, format, target)?;
-            stash_tree_entry_map(&db, format, &target_tree)?
+            sley_diff_merge::flatten_tree(&db, format, &target_tree)?
         }
         None => MergeTreeMap::new(),
     };

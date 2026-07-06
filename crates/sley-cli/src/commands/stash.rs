@@ -660,14 +660,14 @@ fn apply_stash_via_merge(
     // skips this when the stash's base and index trees match (no staged changes) or
     // when the current index already equals the stash index tree.
     let reinstated_index_map = if reinstate_index && state.base_tree != state.index_tree {
-        let index_map = stash_tree_entry_map(db, format, state.index_tree)?;
+        let index_map = sley_diff_merge::flatten_tree(db, format, state.index_tree)?;
         if ours_map == index_map {
             None
         } else {
             let (idx_results, idx_conflicts) = three_way_merge_trees(
                 db,
                 format,
-                &stash_tree_entry_map(db, format, state.base_tree)?,
+                &sley_diff_merge::flatten_tree(db, format, state.base_tree)?,
                 &ours_map,
                 &index_map,
                 "Updated upstream",
@@ -689,8 +689,8 @@ fn apply_stash_via_merge(
         None
     };
 
-    let base_map = stash_tree_entry_map(db, format, state.base_tree)?;
-    let theirs_map = stash_tree_entry_map(db, format, state.stash_tree)?;
+    let base_map = sley_diff_merge::flatten_tree(db, format, state.base_tree)?;
+    let theirs_map = sley_diff_merge::flatten_tree(db, format, state.stash_tree)?;
     let (results, conflicts) = three_way_merge_trees(
         db,
         format,
@@ -1853,7 +1853,7 @@ fn create_stash_commit(
     } else {
         Some(LsFilesPathspec::new(&cwd, &worktree_root, true, pathspecs)?)
     };
-    let head_entries = stash_tree_entry_map(&db, format, &head_commit.tree)?;
+    let head_entries = sley_diff_merge::flatten_tree(&db, format, &head_commit.tree)?;
     let index_tree = stash_write_tree_from_entries(&mut db, &index_entries)?;
     let worktree_entries = stash_worktree_entries(
         &worktree_root,
@@ -4322,9 +4322,9 @@ fn write_stash_list_combined_patch(
     }
     let base = Commit::parse(format, &db.read_object(&commit.parents[0])?.body)?;
     let index = Commit::parse(format, &db.read_object(&commit.parents[1])?.body)?;
-    let base_map = stash_tree_entry_map(db, format, &base.tree)?;
-    let index_map = stash_tree_entry_map(db, format, &index.tree)?;
-    let result_map = stash_tree_entry_map(db, format, &commit.tree)?;
+    let base_map = sley_diff_merge::flatten_tree(db, format, &base.tree)?;
+    let index_map = sley_diff_merge::flatten_tree(db, format, &index.tree)?;
+    let result_map = sley_diff_merge::flatten_tree(db, format, &commit.tree)?;
     let mut paths = BTreeSet::new();
     paths.extend(base_map.keys().cloned());
     paths.extend(index_map.keys().cloned());

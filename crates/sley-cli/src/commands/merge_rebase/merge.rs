@@ -404,7 +404,7 @@ fn merge_octopus(
 
     // Iterative octopus: MRC tracks the commits the running tree stands for.
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
-    let mut merged_map = stash_tree_entry_map(&db, format, &head_tree)?;
+    let mut merged_map = sley_diff_merge::flatten_tree(&db, format, &head_tree)?;
     let mut merged_commits = vec![head_oid];
     let mut non_ff = false;
     // git-merge-octopus allows only the LAST head to leave a hand-resolvable
@@ -442,7 +442,7 @@ fn merge_octopus(
                 println!("Fast-forwarding to: {name}");
             }
             let tree = commit_tree_oid(&db, format, oid)?;
-            merged_map = stash_tree_entry_map(&db, format, &tree)?;
+            merged_map = sley_diff_merge::flatten_tree(&db, format, &tree)?;
             merged_commits = vec![*oid];
             continue;
         }
@@ -464,7 +464,7 @@ fn merge_octopus(
         }
         let base_map = virtual_ancestor_entry_map(&db, format, &common, common_git_dir)?;
         let theirs_tree = commit_tree_oid(&db, format, oid)?;
-        let theirs_map = stash_tree_entry_map(&db, format, &theirs_tree)?;
+        let theirs_map = sley_diff_merge::flatten_tree(&db, format, &theirs_tree)?;
         let (results, conflicts) = three_way_merge_trees_with_favor(
             &db,
             format,
@@ -577,7 +577,7 @@ fn merge_octopus(
 
     // Materialize the merged result into the worktree, touching only paths that
     // differ from HEAD (preserve untouched local mods, as in the two-parent path).
-    let head_map = &stash_tree_entry_map(&db, format, &head_tree)?;
+    let head_map = &sley_diff_merge::flatten_tree(&db, format, &head_tree)?;
     let sync_octopus_worktree = || -> Result<()> {
         for (path, entry) in &merged_map {
             if head_map.get(path) == Some(entry) {
@@ -3234,8 +3234,8 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     }
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
     let other_tree = commit_tree_oid(&db, format, &other_oid)?;
-    let ours_map = stash_tree_entry_map(&db, format, &head_tree)?;
-    let theirs_map = stash_tree_entry_map(&db, format, &other_tree)?;
+    let ours_map = sley_diff_merge::flatten_tree(&db, format, &head_tree)?;
+    let theirs_map = sley_diff_merge::flatten_tree(&db, format, &other_tree)?;
 
     let ours_label = "HEAD".to_string();
     let theirs_label = target.clone();
@@ -3851,8 +3851,8 @@ pub(crate) fn cmd_merge_recursive(args: &[String]) -> Result<()> {
     let remote_oid = resolve_revision(&git_dir, format, remote)?;
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
     let remote_tree = commit_tree_oid(&db, format, &remote_oid)?;
-    let ours_map = stash_tree_entry_map(&db, format, &head_tree)?;
-    let theirs_map = stash_tree_entry_map(&db, format, &remote_tree)?;
+    let ours_map = sley_diff_merge::flatten_tree(&db, format, &head_tree)?;
+    let theirs_map = sley_diff_merge::flatten_tree(&db, format, &remote_tree)?;
 
     let attribute_favor = MergeAttributeFavorResolver::from_worktree_root(&worktree_root);
     let path_favor = |path: &[u8]| attribute_favor.favor_for_path(path);
@@ -4631,8 +4631,8 @@ pub(crate) fn verify_fast_forward_untracked_safe(
     head_tree: &ObjectId,
     target_tree: &ObjectId,
 ) -> Result<()> {
-    let head_map = stash_tree_entry_map(db, format, head_tree)?;
-    let target_map = stash_tree_entry_map(db, format, target_tree)?;
+    let head_map = sley_diff_merge::flatten_tree(db, format, head_tree)?;
+    let target_map = sley_diff_merge::flatten_tree(db, format, target_tree)?;
     verify_no_populated_gitlink_directory_overwrite(
         worktree_root,
         &target_map,
@@ -4928,7 +4928,7 @@ fn reset_merge_to_head(git_dir: &Path, worktree_root: &Path, format: ObjectForma
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let head_oid = resolve_revision(git_dir, format, "HEAD")?;
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
-    let head_map = stash_tree_entry_map(&db, format, &head_tree)?;
+    let head_map = sley_diff_merge::flatten_tree(&db, format, &head_tree)?;
     let populated_head_gitlink_prefixes =
         populated_gitlink_directory_prefixes(worktree_root, &head_map)?;
 

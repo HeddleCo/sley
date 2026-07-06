@@ -3612,7 +3612,7 @@ fn checkout_would_overwrite_untracked(
     db: &FileObjectDatabase,
     target_tree: &ObjectId,
 ) -> Result<Vec<Vec<u8>>> {
-    let target = stash_tree_entry_map(db, ctx.format, target_tree)?;
+    let target = sley_diff_merge::flatten_tree(db, ctx.format, target_tree)?;
     let tracked: std::collections::BTreeSet<Vec<u8>> =
         match sley_worktree::read_repository_index(&ctx.git_dir, ctx.format)? {
             Some(index) => index
@@ -4145,9 +4145,9 @@ fn do_merge(
         None => ObjectId::empty_tree(ctx.format),
     };
     let head_tree = commit_tree_oid(db, ctx.format, &head)?;
-    let base_map = stash_tree_entry_map(db, ctx.format, &base_tree)?;
-    let ours_map = stash_tree_entry_map(db, ctx.format, &head_tree)?;
-    let theirs_map = stash_tree_entry_map(db, ctx.format, &merge_tree)?;
+    let base_map = sley_diff_merge::flatten_tree(db, ctx.format, &base_tree)?;
+    let ours_map = sley_diff_merge::flatten_tree(db, ctx.format, &head_tree)?;
+    let theirs_map = sley_diff_merge::flatten_tree(db, ctx.format, &merge_tree)?;
     let write_db = ctx.db();
     let (results, conflicts) = three_way_merge_trees_with_favor(
         &write_db,
@@ -4634,10 +4634,10 @@ fn do_octopus_merge_commit(
             .map(|base| commit_tree_oid(db, ctx.format, &base))
             .transpose()?
             .unwrap_or_else(|| ObjectId::empty_tree(ctx.format));
-        let base_map = stash_tree_entry_map(db, ctx.format, &base)?;
-        let ours_map = stash_tree_entry_map(db, ctx.format, &merged_tree)?;
+        let base_map = sley_diff_merge::flatten_tree(db, ctx.format, &base)?;
+        let ours_map = sley_diff_merge::flatten_tree(db, ctx.format, &merged_tree)?;
         let theirs_tree = commit_tree_oid(db, ctx.format, oid)?;
-        let theirs_map = stash_tree_entry_map(db, ctx.format, &theirs_tree)?;
+        let theirs_map = sley_diff_merge::flatten_tree(db, ctx.format, &theirs_tree)?;
         let write_db = ctx.db();
         let (results, conflicts) = three_way_merge_trees(
             &write_db,
@@ -4804,9 +4804,9 @@ fn pick_one_commit(
             strategy,
         );
     }
-    let base_map = stash_tree_entry_map(db, ctx.format, &parent_tree)?;
-    let ours_map = stash_tree_entry_map(db, ctx.format, &head_tree)?;
-    let theirs_map = stash_tree_entry_map(db, ctx.format, &theirs_tree)?;
+    let base_map = sley_diff_merge::flatten_tree(db, ctx.format, &parent_tree)?;
+    let ours_map = sley_diff_merge::flatten_tree(db, ctx.format, &head_tree)?;
+    let theirs_map = sley_diff_merge::flatten_tree(db, ctx.format, &theirs_tree)?;
     let write_db = ctx.db();
     // The conflict-marker label for the picked side is git's `msg.label`:
     // "<short-oid> (<subject>)" (sequencer.c get_message), not the bare subject.

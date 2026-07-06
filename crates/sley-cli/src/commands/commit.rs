@@ -1207,7 +1207,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         let tree_map = match &head {
             Some(oid) => {
                 let tree = commands::merge_rebase::commit_tree_oid(&commit_odb, format, oid)?;
-                stash_tree_entry_map(&commit_odb, format, &tree)?
+                sley_diff_merge::flatten_tree(&commit_odb, format, &tree)?
             }
             None => BTreeMap::new(),
         };

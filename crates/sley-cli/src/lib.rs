@@ -1993,19 +1993,6 @@ fn reflog_reference_name(value: Option<&str>) -> Result<String> {
     branch_ref_name(value)
 }
 
-/// Recursively map a tree's blob entries to `(mode, oid)` keyed by full path.
-/// Shared by the stash and merge/cherry-pick/revert replay machinery.
-///
-/// Thin wrapper over the canonical [`sley_diff_merge::flatten_tree`]; the local
-/// recursive flattener was a byte-identical copy.
-fn stash_tree_entry_map(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    tree_oid: &ObjectId,
-) -> Result<BTreeMap<Vec<u8>, (u32, ObjectId)>> {
-    sley_diff_merge::flatten_tree(db, format, tree_oid)
-}
-
 fn ancestor_depths(
     db: &FileObjectDatabase,
     format: ObjectFormat,

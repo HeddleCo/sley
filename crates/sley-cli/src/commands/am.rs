@@ -3734,7 +3734,7 @@ fn apply_three_way(
         Some(oid) => commit_tree_oid(&db, format, oid)?,
         None => ObjectId::empty_tree(format),
     };
-    let ours_map = stash_tree_entry_map(&db, format, &head_tree)?;
+    let ours_map = sley_diff_merge::flatten_tree(&db, format, &head_tree)?;
 
     // The merge base for each file is the patch's *pre-image* blob, named by the
     // old side of its `index <old>..<new>` line. Looking those blobs up in the

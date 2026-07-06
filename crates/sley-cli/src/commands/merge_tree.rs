@@ -1033,9 +1033,9 @@ fn run_trivial_merge(options: &MergeTreeOptions) -> Result<()> {
     let ours_tree = resolve_tree_ish(&git_dir, &db, format, &options.positionals[1])?;
     let theirs_tree = resolve_tree_ish(&git_dir, &db, format, &options.positionals[2])?;
 
-    let base_map = stash_tree_entry_map(&db, format, &base_tree)?;
-    let ours_map = stash_tree_entry_map(&db, format, &ours_tree)?;
-    let theirs_map = stash_tree_entry_map(&db, format, &theirs_tree)?;
+    let base_map = sley_diff_merge::flatten_tree(&db, format, &base_tree)?;
+    let ours_map = sley_diff_merge::flatten_tree(&db, format, &ours_tree)?;
+    let theirs_map = sley_diff_merge::flatten_tree(&db, format, &theirs_tree)?;
 
     let mut all_paths = BTreeSet::new();
     all_paths.extend(base_map.keys().cloned());

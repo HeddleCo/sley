@@ -1,6 +1,6 @@
 # Git Parity Tracker
 
-Target: upstream Git 2.54.0.
+Target: upstream Git 2.55.0.
 
 ## Implemented Initial Surface
 

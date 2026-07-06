@@ -1221,6 +1221,7 @@ dependencies = [
  "sley-index",
  "sley-object",
  "sley-odb",
+ "sley-pack",
  "sley-refs",
 ]
 

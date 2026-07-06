@@ -275,8 +275,8 @@ fn fetch_moved_head_would_clobber_worktree(
     orig_tree: &ObjectId,
     curr_tree: &ObjectId,
 ) -> Result<bool> {
-    let orig_map = stash_tree_entry_map(db, format, orig_tree)?;
-    let curr_map = stash_tree_entry_map(db, format, curr_tree)?;
+    let orig_map = sley_diff_merge::flatten_tree(db, format, orig_tree)?;
+    let curr_map = sley_diff_merge::flatten_tree(db, format, curr_tree)?;
     let changed = orig_map
         .keys()
         .chain(curr_map.keys())
@@ -695,7 +695,7 @@ fn pull_checkout_into_void(
 ) -> Result<()> {
     let object = db.read_object(commit_oid)?;
     let commit = Commit::parse_ref(format, &object.body)?;
-    let target_map = stash_tree_entry_map(db, format, &commit.tree)?;
+    let target_map = sley_diff_merge::flatten_tree(db, format, &commit.tree)?;
     let index_path = sley_worktree::repository_index_path(git_dir);
     let mut index_entries = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?.entries

@@ -2,7 +2,7 @@
 
   ## Summary
 
-  Create a Codex goal with objective: “Build a pure-Rust, minimal-dependency, drop-in-compatible Git replacement tracking latest stable upstream Git, currently Git 2.54.0, with complete format, protocol, plumbing, and porcelain parity.”
+  Create a Codex goal with objective: “Build a pure-Rust, minimal-dependency, drop-in-compatible Git replacement tracking latest stable upstream Git, currently Git 2.55.0, with complete format, protocol, plumbing, and porcelain parity.”
 
   Use a greenfield Rust workspace. Do not port C Git or depend on libgit2/gitoxide for implementation; use upstream Git docs/tests and gitoxide’s crate decomposition only as research input. Keep Git compatibility at the boundaries, but design
   internals around typed Rust APIs, streaming I/O, transactional filesystem updates, explicit trust/security policy, and testable crate boundaries.
@@ -43,7 +43,7 @@
 
   ## Assumptions
 
-  - Compatibility target is latest stable upstream Git, currently 2.54.0 released April 20, 2026.
+  - Compatibility target is latest stable upstream Git, currently 2.55.0 released April 20, 2026.
   - Public behavior must match Git even where internals are cleaner; deliberate incompatibilities require an explicit tracked decision.
   - Implementation must be pure Rust, but may use minimal audited Rust dependencies for non-Git primitives.
   - The first deliverable is a workspace plus conformance harness and storage-core milestone, not a thin CLI prototype.

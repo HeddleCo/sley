@@ -48,13 +48,14 @@ sley-rev.workspace = true
 sley-sequencer.workspace = true
 sley-strbuf-expand.workspace = true
 sley-submodule.workspace = true
-sley-testkit.workspace = true
+sley-testkit = { workspace = true, optional = true }
 sley-transport = { workspace = true, features = ["http-client", "tls-rustls"] }
 sley-unpack-trees.workspace = true
 sley-worktree.workspace = true
 
 [features]
-default = ["mmap", "fast-sha1"]
+default = ["mmap", "fast-sha1", "testkit"]
+testkit = ["dep:sley-testkit"]
 # The (de)compression backend is the default-on zlib-rs (pure Rust, ~zlib-ng
 # speed, no C). The `pure-rust` miniz_oxide fallback is a leaf-crate feature on
 # sley-odb / sley-pack: a no-C/wasm consumer that needs it depends on those

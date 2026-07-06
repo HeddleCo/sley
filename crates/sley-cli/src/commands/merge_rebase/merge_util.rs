@@ -467,14 +467,14 @@ pub(crate) fn virtual_ancestor_entry_map(
         .first()
         .ok_or_else(|| GitError::Command("virtual ancestor needs at least one base".into()))?;
     let acc_tree = commit_tree_oid(db, format, first)?;
-    let mut acc_map = stash_tree_entry_map(db, format, &acc_tree)?;
+    let mut acc_map = sley_diff_merge::flatten_tree(db, format, &acc_tree)?;
     // Track the commit(s) the running virtual ancestor stands in for, so the next
     // pairwise merge uses the correct sub-base.
     let mut acc_commits = vec![*first];
 
     for base in &bases[1..] {
         let other_tree = commit_tree_oid(db, format, base)?;
-        let other_map = stash_tree_entry_map(db, format, &other_tree)?;
+        let other_map = sley_diff_merge::flatten_tree(db, format, &other_tree)?;
 
         // Sub-base: the merge base(s) of the accumulated commits and this base.
         // Use the first acc commit as a representative (git folds pairwise).
@@ -485,7 +485,7 @@ pub(crate) fn virtual_ancestor_entry_map(
         let sub_base_map = match sub_bases.first() {
             Some(sb) => {
                 let sb_tree = commit_tree_oid(db, format, sb)?;
-                stash_tree_entry_map(db, format, &sb_tree)?
+                sley_diff_merge::flatten_tree(db, format, &sb_tree)?
             }
             None => MergeTreeMap::new(),
         };
