@@ -195,3 +195,166 @@ fn json_blob_matches_oracle() {
         |fixture| fixture.oracle(&["hash-object", "doc.json"]),
     );
 }
+
+#[test]
+fn written_blob_type_matches_oracle() {
+    EngineParityCase::new("hash-object-written-type").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("typed.txt", b"typed\n");
+            fixture.oracle_ok(&["hash-object", "-w", "typed.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let oid = repo.write_blob(b"typed\n").expect("write_blob");
+            let object = repo.read_object(&oid).expect("read_object");
+            let mut stdout = object.object_type.as_str().as_bytes().to_vec();
+            stdout.push(b'\n');
+            EngineOutput::stdout(stdout)
+        },
+        |fixture| {
+            let oid = String::from_utf8_lossy(
+                &fixture.oracle_ok(&["hash-object", "typed.txt"]),
+            )
+            .trim()
+            .to_string();
+            fixture.oracle(&["cat-file", "-t", &oid])
+        },
+    );
+}
+
+#[test]
+fn stdin_content_matches_oracle() {
+    EngineParityCase::new("hash-object-stdin").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("stdin.txt", b"from stdin\n");
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            blob_hash_output(&repo, b"from stdin\n")
+        },
+        |fixture| fixture.oracle(&["hash-object", "stdin.txt"]),
+    );
+}
+
+#[test]
+fn written_blob_exists_matches_oracle() {
+    EngineParityCase::new("hash-object-written-exists").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("persisted.txt", b"persisted\n");
+            fixture.oracle_ok(&["hash-object", "-w", "persisted.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let oid = repo.write_blob(b"persisted\n").expect("write_blob");
+            repo.read_object_header(&oid)
+                .expect("header")
+                .expect("exists");
+            EngineOutput::stdout(Vec::new())
+        },
+        |fixture| {
+            let oid = String::from_utf8_lossy(
+                &fixture.oracle_ok(&["hash-object", "persisted.txt"]),
+            )
+            .trim()
+            .to_string();
+            fixture.oracle(&["cat-file", "-e", &oid])
+        },
+    );
+}
+
+#[test]
+fn lf_only_blob_matches_oracle() {
+    EngineParityCase::new("hash-object-lf-only").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("lf.txt", b"\n");
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            blob_hash_output(&repo, b"\n")
+        },
+        |fixture| fixture.oracle(&["hash-object", "lf.txt"]),
+    );
+}
+
+#[test]
+fn long_line_blob_matches_oracle() {
+    EngineParityCase::new("hash-object-long-line").run(
+        |fixture| {
+            fixture.init_default();
+            let payload = format!("{}\n", "x".repeat(512));
+            fixture.write_file("long.txt", payload.as_bytes());
+        },
+        |fixture| {
+            let payload = format!("{}\n", "x".repeat(512));
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            blob_hash_output(&repo, payload.as_bytes())
+        },
+        |fixture| fixture.oracle(&["hash-object", "long.txt"]),
+    );
+}
+
+#[test]
+fn hash_object_w_matches_rev_parse() {
+    EngineParityCase::new("hash-object-write-roundtrip").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("round.txt", b"roundtrip\n");
+            fixture.oracle_ok(&["hash-object", "-w", "round.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let oid = repo.write_blob(b"roundtrip\n").expect("write_blob");
+            EngineOutput::stdout(git_oid_line(oid.to_hex()))
+        },
+        |fixture| {
+            let oid = fixture.oracle_ok(&["hash-object", "round.txt"]);
+            EngineOutput::stdout(oid)
+        },
+    );
+}
+
+#[test]
+fn blob_size_header_matches_oracle() {
+    EngineParityCase::new("hash-object-blob-size").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("sized.txt", b"12345\n");
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let oid = repo.write_blob(b"12345\n").expect("write_blob");
+            let (_, size) = repo
+                .read_object_header(&oid)
+                .expect("header")
+                .expect("exists");
+            EngineOutput::stdout(format!("{size}\n").into_bytes())
+        },
+        |fixture| {
+            let oid = String::from_utf8_lossy(
+                &fixture.oracle_ok(&["hash-object", "sized.txt"]),
+            )
+            .trim()
+            .to_string();
+            fixture.oracle(&["cat-file", "-s", &oid])
+        },
+    );
+}
+
+#[test]
+fn null_byte_blob_matches_oracle() {
+    EngineParityCase::new("hash-object-null-byte").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("null.bin", &[b'a', 0, b'b']);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            blob_hash_output(&repo, &[b'a', 0, b'b'])
+        },
+        |fixture| fixture.oracle(&["hash-object", "null.bin"]),
+    );
+}

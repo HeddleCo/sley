@@ -492,3 +492,177 @@ fn long_abbrev_resolution_matches_oracle() {
         },
     );
 }
+
+#[test]
+fn great_grandparent_head_tilde_three_matches_oracle() {
+    EngineParityCase::new("rev-parse-head-tilde-three").run(
+        |fixture| {
+            fixture.init_default();
+            for i in 0..4 {
+                fixture.write_file(&format!("f{i}.txt"), format!("v{i}\n").as_bytes());
+                fixture.commit_paths(&format!("c{i}"), &[&format!("f{i}.txt")]);
+            }
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let oid = repo.rev_parse("HEAD~3").expect("ancestor");
+            EngineOutput::stdout(git_oid_line(oid.to_hex()))
+        },
+        |fixture| fixture.oracle(&["rev-parse", "HEAD~3"]),
+    );
+}
+
+#[test]
+fn caret_two_generations_matches_oracle() {
+    EngineParityCase::new("rev-parse-head-caret-two").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("one.txt", b"one\n");
+            fixture.commit_paths("first", &["one.txt"]);
+            fixture.write_file("two.txt", b"two\n");
+            fixture.commit_paths("second", &["two.txt"]);
+            fixture.write_file("three.txt", b"three\n");
+            fixture.commit_paths("third", &["three.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let oid = repo.rev_parse("HEAD^^").expect("grandparent");
+            EngineOutput::stdout(git_oid_line(oid.to_hex()))
+        },
+        |fixture| fixture.oracle(&["rev-parse", "HEAD^^"]),
+    );
+}
+
+#[test]
+fn head_at_zero_matches_oracle() {
+    EngineParityCase::new("rev-parse-head-at-zero").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let oid = repo.rev_parse("HEAD@{0}").expect("HEAD@{0}");
+            EngineOutput::stdout(git_oid_line(oid.to_hex()))
+        },
+        |fixture| fixture.oracle(&["rev-parse", "HEAD@{0}"]),
+    );
+}
+
+#[test]
+fn upstream_ref_matches_oracle() {
+    EngineParityCase::new("rev-parse-upstream").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+            fixture.oracle_ok(&["config", "branch.main.remote", "."]);
+            fixture.oracle_ok(&["config", "branch.main.merge", "refs/heads/main"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let oid = repo.rev_parse("@{upstream}").expect("upstream");
+            EngineOutput::stdout(git_oid_line(oid.to_hex()))
+        },
+        |fixture| fixture.oracle(&["rev-parse", "@{upstream}"]),
+    );
+}
+
+#[test]
+fn branch_upstream_ref_matches_oracle() {
+    EngineParityCase::new("rev-parse-branch-upstream").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+            fixture.oracle_ok(&["config", "branch.main.remote", "."]);
+            fixture.oracle_ok(&["config", "branch.main.merge", "refs/heads/main"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let oid = repo.rev_parse("main@{upstream}").expect("branch upstream");
+            EngineOutput::stdout(git_oid_line(oid.to_hex()))
+        },
+        |fixture| fixture.oracle(&["rev-parse", "main@{upstream}"]),
+    );
+}
+
+#[test]
+fn merge_base_is_ancestor_matches_oracle() {
+    EngineParityCase::new("rev-parse-merge-base-is-ancestor").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("base.txt", b"base\n");
+            fixture.commit_paths("base", &["base.txt"]);
+            fixture.oracle_ok(&["branch", "feature"]);
+            fixture.write_file("feature.txt", b"feature\n");
+            fixture.commit_paths("feature", &["feature.txt"]);
+            fixture.oracle_ok(&["checkout", "main"]);
+            fixture.write_file("main.txt", b"main\n");
+            fixture.commit_paths("main", &["main.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let base = repo.rev_parse("main~1").expect("common base");
+            let main = repo.rev_parse("main").expect("main");
+            let is = repo
+                .rev_graph()
+                .is_ancestor(base, main)
+                .expect("is_ancestor");
+            EngineOutput {
+                exit_code: if is { 0 } else { 1 },
+                ..EngineOutput::default()
+            }
+        },
+        |fixture| {
+            let base = fixture.oracle_ok(&["merge-base", "main", "feature"]);
+            let base = String::from_utf8_lossy(&base).trim().to_string();
+            fixture.oracle(&["merge-base", "--is-ancestor", &base, "main"])
+        },
+    );
+}
+
+#[test]
+fn short_prefix_seven_matches_oracle() {
+    EngineParityCase::new("rev-parse-short-seven").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let head = repo.rev_parse("HEAD").expect("HEAD");
+            let prefix = &head.to_hex()[..7];
+            let oid = repo.rev_parse(prefix).expect("short");
+            EngineOutput::stdout(git_oid_line(oid.to_hex()))
+        },
+        |fixture| {
+            let head = fixture.oracle_ok(&["rev-parse", "HEAD"]);
+            let head = String::from_utf8_lossy(&head);
+            let prefix = &head.trim()[..7];
+            fixture.oracle(&["rev-parse", prefix])
+        },
+    );
+}
+
+#[test]
+fn topic_branch_tree_matches_oracle() {
+    EngineParityCase::new("rev-parse-topic-tree").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+            fixture.oracle_ok(&["branch", "topic"]);
+            fixture.write_file("topic.txt", b"topic\n");
+            fixture.commit_paths("topic", &["topic.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let oid = repo.rev_parse("topic^{tree}").expect("topic tree");
+            EngineOutput::stdout(git_oid_line(oid.to_hex()))
+        },
+        |fixture| fixture.oracle(&["rev-parse", "topic^{tree}"]),
+    );
+}

@@ -1,7 +1,7 @@
 //! Index read parity via [`Repository::read_index`].
 
 use sley::Repository;
-use sley_testkit::engine_parity::EngineParityCase;
+use sley_testkit::engine_parity::{EngineOutput, EngineParityCase};
 
 use super::common::index_stage_output;
 
@@ -191,6 +191,116 @@ fn sorted_paths_matches_oracle() {
             fixture.write_file("a-first.txt", b"a\n");
             fixture.write_file("m-middle.txt", b"m\n");
             fixture.oracle_ok(&["add", "z-last.txt", "a-first.txt", "m-middle.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            index_stage_output(&repo)
+        },
+        |fixture| fixture.index_stage_output(),
+    );
+}
+
+#[test]
+fn index_from_tree_matches_oracle() {
+    EngineParityCase::new("index-from-tree").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("alpha.txt", b"alpha\n");
+            fixture.write_file("beta.txt", b"beta\n");
+            fixture.commit_paths("initial", &["alpha.txt", "beta.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let tree = repo.rev_parse("HEAD^{tree}").expect("tree");
+            let index = repo.index_from_tree(&tree).expect("index_from_tree");
+            EngineOutput::stdout(super::common::format_index_stage(&index))
+        },
+        |fixture| {
+            let tree = fixture.oracle_ok(&["rev-parse", "HEAD^{tree}"]);
+            let tree = String::from_utf8_lossy(&tree).trim().to_string();
+            fixture.oracle_ok(&["read-tree", &tree]);
+            fixture.index_stage_output()
+        },
+    );
+}
+
+#[test]
+fn open_index_after_add_matches_oracle() {
+    EngineParityCase::new("index-open-after-add").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("solo.txt", b"solo\n");
+            fixture.oracle_ok(&["add", "solo.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let index = repo.open_index().expect("open_index").expect("index");
+            EngineOutput::stdout(super::common::format_index_stage(&index))
+        },
+        |fixture| fixture.index_stage_output(),
+    );
+}
+
+#[test]
+fn index_after_remove_matches_oracle() {
+    EngineParityCase::new("index-after-remove").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("one.txt", b"one\n");
+            fixture.write_file("two.txt", b"two\n");
+            fixture.oracle_ok(&["add", "one.txt", "two.txt"]);
+            fixture.oracle_ok(&["rm", "--cached", "one.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            index_stage_output(&repo)
+        },
+        |fixture| fixture.index_stage_output(),
+    );
+}
+
+#[test]
+fn index_after_chmod_matches_oracle() {
+    EngineParityCase::new("index-after-chmod").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("run.sh", b"#!/bin/sh\n");
+            fixture.oracle_ok(&["add", "run.sh"]);
+            fixture.oracle_ok(&["update-index", "--chmod=+x", "run.sh"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            index_stage_output(&repo)
+        },
+        |fixture| fixture.index_stage_output(),
+    );
+}
+
+#[test]
+fn index_nested_after_add_matches_oracle() {
+    EngineParityCase::new("index-nested-after-add").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("deep/nested/file.txt", b"deep\n");
+            fixture.oracle_ok(&["add", "deep/nested/file.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            index_stage_output(&repo)
+        },
+        |fixture| fixture.index_stage_output(),
+    );
+}
+
+#[test]
+fn index_three_files_sorted_matches_oracle() {
+    EngineParityCase::new("index-three-sorted").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("c.txt", b"c\n");
+            fixture.write_file("a.txt", b"a\n");
+            fixture.write_file("b.txt", b"b\n");
+            fixture.oracle_ok(&["add", "c.txt", "a.txt", "b.txt"]);
         },
         |fixture| {
             let repo = Repository::discover(fixture.path()).expect("discover");

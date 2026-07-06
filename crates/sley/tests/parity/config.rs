@@ -251,3 +251,159 @@ fn core_logallrefupdates_matches_oracle() {
         |fixture| fixture.oracle(&["config", "--get", "core.logallrefupdates"]),
     );
 }
+
+#[test]
+fn init_default_branch_matches_oracle() {
+    EngineParityCase::new("config-init-defaultbranch").run_with_compare(
+        |fixture| fixture.init_default(),
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let config = repo.config().expect("config");
+            let value = config.get("init", None, "defaultBranch");
+            EngineOutput::stdout(git_config_line(value))
+        },
+        |fixture| fixture.oracle(&["config", "--get", "init.defaultBranch"]),
+        |sley, oracle| {
+            assert_stdout_eq(
+                sley,
+                oracle,
+                "config-init-defaultbranch: stdout differed",
+            );
+            assert_eq!(sley.exit_code, 0);
+            assert_eq!(oracle.exit_code, 1);
+        },
+    );
+}
+
+#[test]
+fn core_abbrev_matches_oracle() {
+    EngineParityCase::new("config-core-abbrev").run_with_compare(
+        |fixture| fixture.init_default(),
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let config = repo.config().expect("config");
+            let value = config.get("core", None, "abbrev");
+            EngineOutput::stdout(git_config_line(value))
+        },
+        |fixture| fixture.oracle(&["config", "--get", "core.abbrev"]),
+        |sley, oracle| {
+            assert_stdout_eq(sley, oracle, "config-core-abbrev: stdout differed");
+            assert_eq!(sley.exit_code, 0);
+            assert_eq!(oracle.exit_code, 1);
+        },
+    );
+}
+
+#[test]
+fn set_user_email_matches_oracle() {
+    EngineParityCase::new("config-set-user-email").run(
+        |fixture| fixture.init_default(),
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let plan = repo
+                .plan_config_set("user.email", "ada@example.com", ConfigEditScope::Local)
+                .expect("plan set");
+            repo.apply_config_edit_plan(plan).expect("apply set");
+            let config = repo.config().expect("config");
+            let value = config.get("user", None, "email");
+            EngineOutput::stdout(git_config_line(value))
+        },
+        |fixture| {
+            fixture.oracle_ok(&["config", "user.email", "ada@example.com"]);
+            fixture.oracle(&["config", "--get", "user.email"])
+        },
+    );
+}
+
+#[test]
+fn branch_upstream_remote_matches_oracle() {
+    EngineParityCase::new("config-branch-upstream-remote").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+            fixture.oracle_ok(&["config", "branch.main.remote", "."]);
+            fixture.oracle_ok(&["config", "branch.main.merge", "refs/heads/main"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let config = repo.config().expect("config");
+            let value = config.get("branch", Some("main"), "remote");
+            EngineOutput::stdout(git_config_line(value))
+        },
+        |fixture| fixture.oracle(&["config", "--get", "branch.main.remote"]),
+    );
+}
+
+#[test]
+fn branch_upstream_merge_matches_oracle() {
+    EngineParityCase::new("config-branch-upstream-merge").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+            fixture.oracle_ok(&["config", "branch.main.remote", "."]);
+            fixture.oracle_ok(&["config", "branch.main.merge", "refs/heads/main"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let config = repo.config().expect("config");
+            let value = config.get("branch", Some("main"), "merge");
+            EngineOutput::stdout(git_config_line(value))
+        },
+        |fixture| fixture.oracle(&["config", "--get", "branch.main.merge"]),
+    );
+}
+
+#[test]
+fn config_string_api_matches_oracle() {
+    EngineParityCase::new("config-string-api").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.oracle_ok(&["config", "custom.value", "alpha"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let value = repo.config_string("custom", "value").expect("config_string");
+            EngineOutput::stdout(git_config_line(value.as_deref()))
+        },
+        |fixture| fixture.oracle(&["config", "--get", "custom.value"]),
+    );
+}
+
+#[test]
+fn core_autocrlf_matches_oracle() {
+    EngineParityCase::new("config-core-autocrlf").run_with_compare(
+        |fixture| fixture.init_default(),
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let config = repo.config().expect("config");
+            let value = config.get("core", None, "autocrlf");
+            EngineOutput::stdout(git_config_line(value))
+        },
+        |fixture| fixture.oracle(&["config", "--get", "core.autocrlf"]),
+        |sley, oracle| {
+            assert_stdout_eq(sley, oracle, "config-core-autocrlf: stdout differed");
+            assert_eq!(sley.exit_code, 0);
+            assert_eq!(oracle.exit_code, 1);
+        },
+    );
+}
+
+#[test]
+fn get_all_same_key_matches_oracle() {
+    EngineParityCase::new("config-get-all-same-key").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.oracle_ok(&["config", "--add", "test.var", "one"]);
+            fixture.oracle_ok(&["config", "--add", "test.var", "two"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let config = repo.config().expect("config");
+            let values = config.get_all("test", None, "var");
+            EngineOutput::stdout(git_config_get_all_lines(&values))
+        },
+        |fixture| fixture.oracle(&["config", "--get-all", "test.var"]),
+    );
+}

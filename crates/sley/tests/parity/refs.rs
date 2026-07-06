@@ -369,3 +369,206 @@ fn show_ref_main_line_matches_oracle() {
         |fixture| fixture.oracle(&["show-ref", "refs/heads/main"]),
     );
 }
+
+#[test]
+fn lightweight_tag_ref_matches_oracle() {
+    EngineParityCase::new("refs-lightweight-tag").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+            let head = fixture.oracle_ok(&["rev-parse", "HEAD"]);
+            let head = String::from_utf8_lossy(&head).trim().to_string();
+            fixture.oracle_ok(&["tag", "v-lite", &head]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            find_reference_peeled_output(&repo, "refs/tags/v-lite")
+        },
+        |fixture| fixture.oracle(&["rev-parse", "refs/tags/v-lite"]),
+    );
+}
+
+#[test]
+fn show_ref_heads_matches_oracle() {
+    EngineParityCase::new("refs-show-ref-heads").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let reference = repo
+                .find_reference("refs/heads/main")
+                .expect("find_reference")
+                .expect("main exists");
+            let oid = reference
+                .peeled_oid(&repo)
+                .expect("peel")
+                .expect("main oid");
+            let mut stdout = oid.to_hex().into_bytes();
+            stdout.extend_from_slice(b" refs/heads/main\n");
+            EngineOutput::stdout(stdout)
+        },
+        |fixture| fixture.oracle(&["show-ref", "--heads"]),
+    );
+}
+
+#[test]
+fn show_ref_tags_matches_oracle() {
+    EngineParityCase::new("refs-show-ref-tags").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+            fixture.oracle_ok_with_identity(&["tag", "-a", "v1", "-m", "release"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let reference = repo
+                .find_reference("refs/tags/v1")
+                .expect("find_reference")
+                .expect("tag exists");
+            let oid = reference.direct_target().expect("direct");
+            let mut stdout = oid.to_hex().into_bytes();
+            stdout.extend_from_slice(b" refs/tags/v1\n");
+            EngineOutput::stdout(stdout)
+        },
+        |fixture| fixture.oracle(&["show-ref", "--tags"]),
+    );
+}
+
+#[test]
+fn symbolic_ref_topic_branch_matches_oracle() {
+    EngineParityCase::new("refs-symbolic-topic").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.oracle_ok(&["checkout", "-b", "topic"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            head_symbolic_output(&repo)
+        },
+        |fixture| fixture.oracle(&["symbolic-ref", "HEAD"]),
+    );
+}
+
+#[test]
+fn reference_exists_head_matches_oracle() {
+    EngineParityCase::new("refs-exists-head").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            reference_exists_output(&repo, "HEAD")
+        },
+        |fixture| fixture.oracle(&["show-ref", "--verify", "--quiet", "HEAD"]),
+    );
+}
+
+#[test]
+fn head_after_checkout_branch_matches_oracle() {
+    EngineParityCase::new("refs-head-after-checkout").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+            fixture.oracle_ok(&["branch", "topic"]);
+            fixture.oracle_ok(&["checkout", "topic"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            head_symbolic_output(&repo)
+        },
+        |fixture| fixture.oracle(&["symbolic-ref", "HEAD"]),
+    );
+}
+
+#[test]
+fn find_reference_tag_direct_matches_oracle() {
+    EngineParityCase::new("refs-find-tag-direct").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+            fixture.oracle_ok_with_identity(&["tag", "-a", "v1", "-m", "release"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let reference = repo
+                .find_reference("refs/tags/v1")
+                .expect("find_reference")
+                .expect("tag exists");
+            let oid = reference.direct_target().expect("direct");
+            EngineOutput::stdout(git_oid_line(oid.to_hex()))
+        },
+        |fixture| fixture.oracle(&["rev-parse", "refs/tags/v1"]),
+    );
+}
+
+#[test]
+fn show_ref_verify_tag_matches_oracle() {
+    EngineParityCase::new("refs-show-ref-verify-tag").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+            fixture.oracle_ok_with_identity(&["tag", "-a", "v1", "-m", "release"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            reference_exists_output(&repo, "refs/tags/v1")
+        },
+        |fixture| fixture.oracle(&["show-ref", "--verify", "--quiet", "refs/tags/v1"]),
+    );
+}
+
+#[test]
+fn head_branch_name_after_commit_matches_oracle() {
+    EngineParityCase::new("refs-head-branch-attached").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            let head = repo.head().expect("head");
+            let branch = head.branch_name().expect("branch");
+            let mut stdout = branch.as_bytes().to_vec();
+            stdout.push(b'\n');
+            EngineOutput::stdout(stdout)
+        },
+        |fixture| {
+            let sym = fixture.oracle_ok(&["symbolic-ref", "HEAD"]);
+            let sym = String::from_utf8_lossy(&sym);
+            let branch = sym
+                .trim()
+                .strip_prefix("refs/heads/")
+                .expect("branch ref");
+            let mut stdout = branch.as_bytes().to_vec();
+            stdout.push(b'\n');
+            EngineOutput::stdout(stdout)
+        },
+    );
+}
+
+#[test]
+fn find_reference_head_after_commit_matches_oracle() {
+    EngineParityCase::new("refs-find-head-attached").run(
+        |fixture| {
+            fixture.init_default();
+            fixture.write_file("payload.txt", b"payload\n");
+            fixture.commit_paths("initial", &["payload.txt"]);
+        },
+        |fixture| {
+            let repo = Repository::discover(fixture.path()).expect("discover");
+            find_reference_peeled_output(&repo, "HEAD")
+        },
+        |fixture| fixture.oracle(&["rev-parse", "HEAD"]),
+    );
+}

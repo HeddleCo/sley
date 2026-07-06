@@ -20,7 +20,7 @@
 | W33 | ✅ done | 0 `parse_*_options` remaining |
 | W34 | ⚠️ partial | sley-rev diff_options module landed |
 | W40 | ✅ done | engine parity harness |
-| W41 | ⚠️ partial | 121 parity tests (target 200) |
+| W41 | ⚠️ partial | 203 parity tests (target 200) |
 | W50 | ✅ done | CliSession + discovery.rs; 0 `discover_git_dir` / `GLOBAL_*` |
 | W51–W52 | ⏳ pending | remote_cmds delete, facade-only deps |
 | W52a | ✅ done | hooks + env-aware OpenOptions in sley facade |
