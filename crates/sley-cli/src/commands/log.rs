@@ -2765,7 +2765,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     signature: None,
                     color: color_always,
                     output_encoding: &output_encoding,
-                    mailmap: &empty_mailmap,
+                    mailmap: &CliMailmapAdapter(&empty_mailmap),
                     use_mailmap,
                 },
                 &mut line,
@@ -2831,7 +2831,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             signature: None,
             color: color_always,
             output_encoding: &output_encoding,
-            mailmap: &empty_mailmap,
+            mailmap: &CliMailmapAdapter(&empty_mailmap),
             use_mailmap,
         };
         let metadata = sley_rev::walk_commit_metadata_date_ordered_limited(
@@ -3198,7 +3198,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         decorations.clear();
     }
     // Object access for `%(describe)`.
-    let describe_ctx = LogDescribeContext {
+    let describe_ctx = CliLogDescribeContext {
         git_dir: &git_dir,
         db: &db,
         format,
@@ -3217,7 +3217,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     } else {
         HashMap::new()
     };
-    let signature_ctx = LogSignatureContext {
+    let signature_ctx = CliLogSignatureContext {
         git_dir: &git_dir,
         db: &db,
         config: &config,
@@ -3312,11 +3312,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         source: log_format_source.as_deref(),
                         date_mode: &date_mode,
                         source_oid: source_labels.as_ref(),
-                        describe: Some(&describe_ctx),
-                        signature: Some(&signature_ctx),
+                        describe: Some(&CliLogDescribeAdapter(&describe_ctx)),
+                        signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
                         color: color_always,
                         output_encoding: &output_encoding,
-                        mailmap: output_mailmap,
+                        mailmap: &CliMailmapAdapter(output_mailmap),
                         use_mailmap,
                     };
                     let mut msg = Vec::with_capacity(compiled.estimated_line_capacity());
@@ -3771,11 +3771,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     source: log_format_source.as_deref(),
                     date_mode: &date_mode,
                     source_oid: source_labels.as_ref(),
-                    describe: Some(&describe_ctx),
-                    signature: Some(&signature_ctx),
+                    describe: Some(&CliLogDescribeAdapter(&describe_ctx)),
+                    signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
                     color: color_always,
                     output_encoding: &output_encoding,
-                    mailmap: output_mailmap,
+                    mailmap: &CliMailmapAdapter(output_mailmap),
                     use_mailmap,
                 };
                 let mut ended_with_newline = false;

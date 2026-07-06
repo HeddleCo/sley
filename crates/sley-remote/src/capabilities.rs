@@ -16,8 +16,11 @@ pub struct TransportCapabilities {
     pub http_protocol_v2_fetch: bool,
     /// Shallow clone/fetch via `--depth` / `deepen`.
     pub shallow_fetch: bool,
+    pub http_partial_clone: bool,
+    pub http_deepen_since_not: bool,
     /// `fetch` / `push` / `ls-remote` over SSH upload-pack/receive-pack.
     pub ssh_fetch: bool,
+    pub ssh_protocol_v2: bool,
     pub ssh_push: bool,
     /// `clone` over SSH (bare mirror / checkout destination).
     pub ssh_clone: bool,
@@ -49,7 +52,10 @@ impl TransportCapabilities {
             http_protocol_v2_discovery: cfg!(feature = "http"),
             http_protocol_v2_fetch: cfg!(feature = "http"),
             shallow_fetch: true,
+            http_partial_clone: cfg!(feature = "http"),
+            http_deepen_since_not: cfg!(feature = "http"),
             ssh_fetch: true,
+            ssh_protocol_v2: false,
             ssh_push: true,
             ssh_clone: true,
             git_fetch: true,

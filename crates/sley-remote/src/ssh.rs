@@ -28,7 +28,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, St
 
 use sley_config::GitConfig;
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
-use sley_fetch::{
+use crate::install::{
     install_upload_pack_raw_promisor_response_from_reader,
     install_upload_pack_raw_response_from_reader,
     install_upload_pack_shallow_raw_promisor_response_from_reader,
@@ -731,6 +731,9 @@ pub(crate) fn ls_remote_ssh(
     let output = child.wait_with_output()?;
     let set = match set_result {
         Ok(set) => set,
+        Err(err) if is_ssh_protocol_v2_advertisement_error(&err) => {
+            return Err(ssh_protocol_v2_unsupported_error());
+        }
         Err(_) if !output.status.success() => {
             return Err(GitError::Command(format!(
                 "ssh upload-pack failed for {}: {}",
@@ -951,6 +954,9 @@ pub fn ssh_upload_pack_advertisements_with_options(
     let output = child.wait_with_output()?;
     let set = match set_result {
         Ok(set) => set,
+        Err(err) if is_ssh_protocol_v2_advertisement_error(&err) => {
+            return Err(ssh_protocol_v2_unsupported_error());
+        }
         Err(_) if !output.status.success() => {
             return Err(GitError::Command(format!(
                 "ssh upload-pack failed for {}: {}",
@@ -967,6 +973,42 @@ pub fn ssh_upload_pack_advertisements_with_options(
         .transpose()?
         .unwrap_or_default();
     Ok((set.refs, features))
+}
+
+
+pub fn validate_ssh_fetch_options(
+    filter: Option<&sley_odb::PackObjectFilter>,
+    deepen_since: Option<i64>,
+    deepen_not: &[String],
+) -> Result<()> {
+    if filter.is_some() {
+        return Err(GitError::Unsupported(
+            "partial clone --filter over SSH is not supported; use HTTPS".into(),
+        ));
+    }
+    if deepen_since.is_some() {
+        return Err(GitError::Unsupported(
+            "shallow fetch --shallow-since over SSH is not supported; use HTTPS".into(),
+        ));
+    }
+    if !deepen_not.is_empty() {
+        return Err(GitError::Unsupported(
+            "shallow fetch --shallow-exclude over SSH is not supported; use HTTPS".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_ssh_protocol_v2_advertisement_error(err: &GitError) -> bool {
+    matches!(err, GitError::InvalidFormat(message)
+        if message.contains("unsupported advertised ref protocol version"))
+}
+
+fn ssh_protocol_v2_unsupported_error() -> GitError {
+    GitError::Unsupported(
+        "protocol v2 over SSH is not supported; use HTTPS or configure the remote for upload-pack v0/v1"
+            .into(),
+    )
 }
 
 /// A human-readable rendering of an SSH `remote` for error messages. The CLI built

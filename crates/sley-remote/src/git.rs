@@ -9,7 +9,7 @@ use std::net::{Shutdown, TcpStream};
 use std::path::Path;
 
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
-use sley_fetch::{
+use crate::install::{
     install_protocol_v2_fetch_promisor_response_from_reader,
     install_protocol_v2_fetch_response_from_reader,
     install_upload_pack_raw_promisor_response_from_reader,

@@ -819,11 +819,12 @@ fn archive_format_subst_for_commit(
     describe_available: &std::cell::Cell<bool>,
     fmt: &[u8],
 ) -> Result<Vec<u8>> {
-    let describe = LogDescribeContext {
+    let describe_ctx = CliLogDescribeContext {
         git_dir,
         db,
         format,
     };
+    let describe_adapter = CliLogDescribeAdapter(&describe_ctx);
     let Some(first) = archive_find_describe_atom(fmt, 0) else {
         return archive_render_commit_format(record, fmt, None);
     };
@@ -840,7 +841,7 @@ fn archive_format_subst_for_commit(
             out.extend(archive_render_commit_format(
                 record,
                 &fmt[start..end],
-                Some(&describe),
+                Some(&describe_adapter),
             )?);
         } else {
             out.extend_from_slice(&fmt[start..end]);
@@ -855,7 +856,7 @@ fn archive_format_subst_for_commit(
 fn archive_render_commit_format(
     record: &sley_rev::CommitRecord,
     fmt: &[u8],
-    describe: Option<&LogDescribeContext<'_>>,
+    describe: Option<&CliLogDescribeContext<'_>>,
 ) -> Result<Vec<u8>> {
     let fmt = String::from_utf8_lossy(fmt);
     let compiled = CompiledLogFormat::compile(&fmt, LogFormatDialect::Log)?;
@@ -870,11 +871,11 @@ fn archive_render_commit_format(
         source: None,
         date_mode: &date_mode,
         source_oid: None,
-        describe,
+        describe: describe.map(CliLogDescribeAdapter),
         signature: None,
         color: false,
         output_encoding: "UTF-8",
-        mailmap: &mailmap,
+        mailmap: &CliMailmapAdapter(&mailmap),
         use_mailmap: false,
     };
     let mut out = Vec::with_capacity(compiled.estimated_line_capacity());

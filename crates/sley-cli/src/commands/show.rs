@@ -922,7 +922,7 @@ fn show_commit(
         }
         ShowCommitFormat::Custom { compiled, .. } => {
             let source_tag_signatures = HashMap::new();
-            let signature_ctx = LogSignatureContext {
+            let signature_ctx = CliLogSignatureContext {
                 git_dir: context.git_dir,
                 db: context.db,
                 config: context.config,
@@ -945,7 +945,7 @@ fn show_commit(
                     date_mode: &options.date_mode,
                     source_oid: None,
                     describe: None,
-                    signature: Some(&signature_ctx),
+                    signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
                     mailmap: mailmap.unwrap_or(&empty_mailmap),
                     use_mailmap,
                     color: false,

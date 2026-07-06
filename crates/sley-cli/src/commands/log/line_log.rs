@@ -191,7 +191,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
         let filter = DecorationFilter::new(&include, &[], &[]);
         log_decoration_map(git_dir, db, format, decoration, &filter)?
     };
-    let describe_ctx = LogDescribeContext {
+    let describe_ctx = CliLogDescribeContext {
         git_dir,
         db,
         format,
@@ -342,11 +342,11 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                     source: None,
                     date_mode,
                     source_oid: None,
-                    describe: Some(&describe_ctx),
+                    describe: Some(&CliLogDescribeAdapter(&describe_ctx)),
                     signature: None,
                     color: false,
                     output_encoding,
-                    mailmap: &mailmap,
+                    mailmap: &CliMailmapAdapter(&mailmap),
                     use_mailmap,
                 };
                 let mut line = Vec::with_capacity(compiled.estimated_line_capacity());

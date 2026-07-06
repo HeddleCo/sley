@@ -25,7 +25,6 @@ sley-archive.workspace = true
 sley-config.workspace = true
 sley-core.workspace = true
 sley-diff-merge.workspace = true
-sley-fetch.workspace = true
 sley-formats.workspace = true
 sley-grep.workspace = true
 sley-i18n = { workspace = true, optional = true }

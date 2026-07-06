@@ -616,6 +616,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "lock_api"
+version = "0.4.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
 name = "log"
 version = "0.4.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -729,6 +738,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "parking_lot"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
+dependencies = [
+ "lock_api",
+ "parking_lot_core",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "redox_syscall",
+ "smallvec",
+ "windows-link",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -835,6 +867,15 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "redox_syscall"
+version = "0.5.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
+dependencies = [
+ "bitflags",
 ]
 
 [[package]]
@@ -990,6 +1031,12 @@ checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
 dependencies = [
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "scopeguard"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "security-framework"
@@ -1158,7 +1205,6 @@ dependencies = [
  "sley-config",
  "sley-core",
  "sley-diff-merge",
- "sley-fetch",
  "sley-formats",
  "sley-fsck",
  "sley-grep",
@@ -1213,19 +1259,6 @@ dependencies = [
  "sley-odb",
  "sley-pack",
  "sley-refs",
-]
-
-[[package]]
-name = "sley-fetch"
-version = "0.4.0"
-dependencies = [
- "sley-core",
- "sley-formats",
- "sley-object",
- "sley-odb",
- "sley-pack",
- "sley-protocol",
- "sley-transport",
 ]
 
 [[package]]
@@ -1302,6 +1335,7 @@ name = "sley-odb"
 version = "0.4.0"
 dependencies = [
  "flate2",
+ "parking_lot",
  "sley-core",
  "sley-formats",
  "sley-mmap",
@@ -1312,6 +1346,9 @@ dependencies = [
 [[package]]
 name = "sley-options"
 version = "0.4.0"
+dependencies = [
+ "sley-core",
+]
 
 [[package]]
 name = "sley-pack"
@@ -1335,7 +1372,14 @@ dependencies = [
 name = "sley-pretty"
 version = "0.4.0"
 dependencies = [
+ "encoding_rs",
+ "sley-config",
  "sley-core",
+ "sley-object",
+ "sley-odb",
+ "sley-ref-filter",
+ "sley-refs",
+ "sley-rev",
  "sley-strbuf-expand",
 ]
 
@@ -1376,7 +1420,6 @@ version = "0.4.0"
 dependencies = [
  "sley-config",
  "sley-core",
- "sley-fetch",
  "sley-formats",
  "sley-fsck",
  "sley-object",
@@ -1486,6 +1529,12 @@ dependencies = [
  "sley-refs",
  "sley-rev",
 ]
+
+[[package]]
+name = "smallvec"
+version = "1.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "subtle"

@@ -595,7 +595,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     } else {
         HashMap::new()
     };
-    let signature_ctx = LogSignatureContext {
+    let signature_ctx = CliLogSignatureContext {
         git_dir: &git_dir,
         db: &db,
         config: &config,
@@ -934,7 +934,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         signature: None,
                         color: want_color,
                         output_encoding: &output_encoding,
-                        mailmap: &mailmap,
+                        mailmap: &CliMailmapAdapter(&mailmap),
                         use_mailmap,
                     },
                     line,
@@ -1360,10 +1360,10 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                             date_mode: &date_mode,
                             source_oid: None,
                             describe: None,
-                            signature: Some(&signature_ctx),
+                            signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
                             color: want_color,
                             output_encoding: &output_encoding,
-                            mailmap: &mailmap,
+                            mailmap: &CliMailmapAdapter(&mailmap),
                             use_mailmap,
                         };
                         if children {
@@ -1454,10 +1454,10 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                             date_mode: &date_mode,
                             source_oid: None,
                             describe: None,
-                            signature: Some(&signature_ctx),
+                            signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
                             color: want_color,
                             output_encoding: &output_encoding,
-                            mailmap: &mailmap,
+                            mailmap: &CliMailmapAdapter(&mailmap),
                             use_mailmap,
                         },
                     )?;
@@ -1481,7 +1481,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                     decorations: &decorations,
                     date_mode: &date_mode,
                     output_encoding: &output_encoding,
-                    mailmap: &mailmap,
+                    mailmap: &CliMailmapAdapter(&mailmap),
                     use_mailmap,
                 },
             )?;
@@ -2062,7 +2062,7 @@ fn write_rev_list_boundary_record(
                         signature: None,
                         color: false,
                         output_encoding,
-                        mailmap,
+                        mailmap: &CliMailmapAdapter(mailmap),
                         use_mailmap,
                     },
                 )?;
@@ -2127,7 +2127,7 @@ fn write_rev_list_boundary_record(
                     signature: None,
                     color: false,
                     output_encoding,
-                    mailmap,
+                    mailmap: &CliMailmapAdapter(mailmap),
                     use_mailmap,
                 },
             )?;

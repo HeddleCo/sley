@@ -381,6 +381,7 @@ enum PushExecution {
     Noop,
     #[cfg(feature = "http")]
     Http {
+        http_batch: crate::http::HttpOperationBatch,
         remote_url: RemoteUrl,
         features: ReceivePackFeatures,
         advertisements: Vec<RefAdvertisement>,
@@ -533,9 +534,9 @@ pub fn plan_push_actions(
     match request.destination {
         #[cfg(feature = "http")]
         PushDestination::Http(remote_url) => {
-            let client = crate::http::new_http_client();
+            let http_batch = crate::http::HttpOperationBatch::new();
             let discovered = crate::http::http_service_advertisements(
-                &client,
+                http_batch.client(),
                 remote_url,
                 request.format,
                 GitService::ReceivePack,
@@ -555,6 +556,7 @@ pub fn plan_push_actions(
                 PushExecution::Noop
             } else {
                 PushExecution::Http {
+                    http_batch,
                     remote_url: remote_url.clone(),
                     features,
                     advertisements: advertisement_set.refs,
@@ -672,6 +674,7 @@ pub fn execute_push_plan(
         PushExecution::Noop => Ok(PushOutcome::default()),
         #[cfg(feature = "http")]
         PushExecution::Http {
+            http_batch,
             remote_url,
             features,
             advertisements,
@@ -679,6 +682,7 @@ pub fn execute_push_plan(
         } => execute_push_http(
             request,
             services.credentials,
+            http_batch,
             plan.commands,
             remote_url,
             features,
@@ -752,9 +756,9 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
         options,
         credentials,
     } = request;
-    let client = crate::http::new_http_client();
+    let http_batch = crate::http::HttpOperationBatch::new();
     let discovered = crate::http::http_service_advertisements(
-        &client,
+        http_batch.client(),
         remote_url,
         format,
         GitService::ReceivePack,
@@ -781,6 +785,7 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
         PushExecution::Noop
     } else {
         PushExecution::Http {
+            http_batch,
             remote_url: remote_url.clone(),
             features,
             advertisements: advertisement_set.refs,
@@ -797,13 +802,14 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
 fn execute_push_http(
     request: PushRequest<'_>,
     credentials: &mut dyn CredentialProvider,
+    http_batch: crate::http::HttpOperationBatch,
     commands: Vec<ReceivePackCommand>,
     remote_url: RemoteUrl,
     features: ReceivePackFeatures,
     advertisements: Vec<RefAdvertisement>,
     pack_objects: Vec<ObjectId>,
 ) -> Result<PushOutcome> {
-    let client = crate::http::new_http_client();
+    let client = http_batch.client();
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
     let pack_request = PushPackRequest {
         local_db: &local_db,

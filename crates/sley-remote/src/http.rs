@@ -17,7 +17,7 @@ use std::path::Path;
 use sley_core::{
     Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
 };
-use sley_fetch::{
+use crate::install::{
     install_protocol_v2_fetch_promisor_response_from_reader,
     install_protocol_v2_fetch_response_from_reader,
     install_upload_pack_raw_promisor_response_from_reader,
@@ -61,7 +61,26 @@ pub fn remote_url_is_http(url: &str) -> Result<bool> {
     ))
 }
 
-/// Construct the default HTTP client used for smart-HTTP transport.
+/// Reusable HTTP client for every smart-HTTP RPC in one remote operation.
+pub struct HttpOperationBatch {
+    client: UreqHttpClient,
+}
+
+impl HttpOperationBatch {
+    pub fn new() -> Self {
+        Self { client: UreqHttpClient::new() }
+    }
+    pub fn client(&self) -> &UreqHttpClient {
+        &self.client
+    }
+}
+
+impl Default for HttpOperationBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn new_http_client() -> UreqHttpClient {
     UreqHttpClient::new()
 }
@@ -249,6 +268,10 @@ fn protocol_v2_fetch_request_from_upload_pack_semantics(
     haves: Vec<ObjectId>,
     shallow: Vec<ObjectId>,
     deepen: Option<u32>,
+    deepen_since: Option<i64>,
+    deepen_not: Vec<String>,
+    deepen_relative: bool,
+    filter: Option<&sley_odb::PackObjectFilter>,
     handshake: &TransportHandshake,
 ) -> Result<ProtocolV2FetchRequest> {
     let sideband_all = parse_protocol_v2_fetch_features(&handshake.capabilities)?
@@ -259,10 +282,59 @@ fn protocol_v2_fetch_request_from_upload_pack_semantics(
         haves,
         shallow,
         deepen,
+        deepen_since: deepen_since_u64(deepen_since),
+        deepen_not,
+        deepen_relative,
+        filter: filter.and_then(crate::local::upload_pack_filter_protocol_spec),
         done: true,
         sideband_all,
         ..ProtocolV2FetchRequest::default()
     })
+}
+
+fn deepen_since_u64(deepen_since: Option<i64>) -> Option<u64> {
+    deepen_since.and_then(|value| u64::try_from(value).ok())
+}
+
+fn build_http_upload_pack_request(
+    wants: Vec<ObjectId>,
+    shallow: Vec<ObjectId>,
+    deepen: Option<u32>,
+    deepen_since: Option<i64>,
+    deepen_not: Vec<String>,
+    filter: Option<&sley_odb::PackObjectFilter>,
+) -> UploadPackRequest {
+    UploadPackRequest {
+        wants,
+        capabilities: upload_pack_request_capabilities(
+            deepen,
+            filter.and_then(crate::local::upload_pack_filter_protocol_spec).is_some(),
+        ),
+        shallow,
+        deepen,
+        deepen_since: deepen_since_u64(deepen_since),
+        deepen_not,
+        filter: filter.and_then(crate::local::upload_pack_filter_protocol_spec),
+    }
+}
+
+fn upload_pack_request_capabilities(deepen: Option<u32>, filter: bool) -> Vec<Capability> {
+    let mut capabilities = Vec::new();
+    if deepen.is_some() {
+        capabilities.push(Capability { name: "shallow".into(), value: None });
+    }
+    if filter {
+        capabilities.push(Capability { name: "filter".into(), value: None });
+    }
+    capabilities
+}
+
+fn request_replays_shallow_boundary(
+    deepen: Option<u32>,
+    deepen_since: Option<i64>,
+    deepen_not: &[String],
+) -> bool {
+    deepen.is_some() || deepen_since.is_some() || !deepen_not.is_empty()
 }
 
 fn http_protocol_v2_ls_refs_advertisements(
@@ -468,6 +540,10 @@ pub struct HttpFetchPackRequest<'a> {
     /// Maximum raw pack bytes to accept from the remote (`fetch.maxInputSize` /
     /// `transfer.maxSize`). `None` means unlimited.
     pub max_input_size: Option<u64>,
+    pub filter: Option<sley_odb::PackObjectFilter>,
+    pub deepen_since: Option<i64>,
+    pub deepen_not: Vec<String>,
+    pub deepen_relative: bool,
 }
 
 pub fn install_fetch_pack_via_http_upload_pack(
@@ -481,16 +557,20 @@ pub fn install_fetch_pack_via_http_upload_pack(
     // A deepen request must always reach the server (the shallow boundary may move
     // even when every wanted object is already present), so only the plain fetch
     // takes the "everything is local already" shortcut.
-    if request.deepen.is_none() && all_wants_present(&local_db, &request.wants)? {
+    if !request_replays_shallow_boundary(request.deepen, request.deepen_since, &request.deepen_not)
+        && request.filter.is_none()
+        && all_wants_present(&local_db, &request.wants)?
+    {
         return Ok(Vec::new());
     }
-    let upload_request = UploadPackRequest {
-        wants: request.wants,
-        capabilities: shallow_request_capabilities(request.deepen),
-        shallow: request.shallow,
-        deepen: request.deepen,
-        ..UploadPackRequest::default()
-    };
+    let upload_request = build_http_upload_pack_request(
+        request.wants,
+        request.shallow,
+        request.deepen,
+        request.deepen_since,
+        request.deepen_not,
+        request.filter.as_ref(),
+    );
     let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
     if request.deepen.is_none() {
         let mut response = http_upload_pack_post(
@@ -554,7 +634,10 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
         return Ok(Vec::new());
     }
     let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
-    if request.deepen.is_none() && all_wants_present(&local_db, &request.wants)? {
+    if !request_replays_shallow_boundary(request.deepen, request.deepen_since, &request.deepen_not)
+        && request.filter.is_none()
+        && all_wants_present(&local_db, &request.wants)?
+    {
         return Ok(Vec::new());
     }
     let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
@@ -563,6 +646,10 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
         haves,
         request.shallow,
         request.deepen,
+        request.deepen_since,
+        request.deepen_not,
+        request.deepen_relative,
+        request.filter.as_ref(),
         handshake,
     )?;
     let sideband_all = fetch.sideband_all;
@@ -601,21 +688,6 @@ fn all_wants_present(db: &FileObjectDatabase, wants: &[ObjectId]) -> Result<bool
         }
     }
     Ok(true)
-}
-
-/// The want-line capabilities to advertise for a fetch: the `shallow` capability
-/// when a deepen is requested (git's upload-pack expects clients sending deepen to
-/// negotiate shallow), otherwise none — preserving the existing plain-fetch wire
-/// form exactly.
-fn shallow_request_capabilities(deepen: Option<u32>) -> Vec<Capability> {
-    if deepen.is_some() {
-        vec![Capability {
-            name: "shallow".into(),
-            value: None,
-        }]
-    } else {
-        Vec::new()
-    }
 }
 
 #[cfg(test)]
@@ -838,6 +910,10 @@ mod tests {
             vec![have.clone()],
             vec![shallow.clone()],
             Some(3),
+            None,
+            Vec::new(),
+            false,
+            None,
             &handshake,
         )
         .expect("test operation should succeed");
@@ -892,6 +968,10 @@ mod tests {
             Vec::new(),
             vec![shallow.clone()],
             Some(1),
+            None,
+            Vec::new(),
+            false,
+            None,
             &handshake,
         )
         .expect("test operation should succeed");

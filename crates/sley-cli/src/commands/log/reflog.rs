@@ -59,7 +59,7 @@ pub(super) fn log_walk_reflogs(
                         full_reference: &target.reference,
                         date_mode: opts.date_mode,
                         decorations: &decorations,
-                        mailmap: &mailmap,
+                        mailmap: &CliMailmapAdapter(&mailmap),
                     };
                     if !emit_compiled_reflog_walk_format(&mut ctx, entry, index, &mut line)? {
                         false

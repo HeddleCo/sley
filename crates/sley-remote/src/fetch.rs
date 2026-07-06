@@ -352,9 +352,10 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         }
         #[cfg(feature = "http")]
         FetchSource::Http(remote) => {
-            let client = crate::http::new_http_client();
+            let http_batch = crate::http::HttpOperationBatch::new();
+            let client = http_batch.client();
             let discovered = crate::http::http_service_advertisements(
-                &client,
+                client,
                 remote,
                 request.format,
                 sley_protocol::GitService::UploadPack,
@@ -387,9 +388,10 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             // the server to deepen to `depth`, then fold the server's shallow-info
             // back into `$GIT_DIR/shallow`. A `None` depth keeps the full-fetch path.
             let existing_shallow =
-                shallow_boundary_for_request(request.git_dir, request.format, options.depth)?;
+                shallow_boundary_for_request(request.git_dir, request.format, options)?;
+            let deepen_not = resolve_deepen_not_refs(&advertisements, &options.deepen_not)?;
             let pack_request = crate::http::HttpFetchPackRequest {
-                client: &client,
+                client,
                 git_dir: request.git_dir,
                 format: request.format,
                 remote,
@@ -398,6 +400,10 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 deepen: options.depth,
                 promisor: promisor_remote,
                 max_input_size,
+                filter: options.filter.clone(),
+                deepen_since: options.deepen_since,
+                deepen_not,
+                deepen_relative: options.deepen_relative,
             };
             let shallow_info = if discovered.set.protocol == ProtocolVersion::V2 {
                 let handshake = discovered.handshake.as_ref().ok_or_else(|| {
@@ -438,6 +444,11 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             advertisements
         }
         FetchSource::Ssh(remote) => {
+            crate::ssh::validate_ssh_fetch_options(
+                options.filter.as_ref(),
+                options.deepen_since,
+                &options.deepen_not,
+            )?;
             // SSH advertises and pulls the pack by spawning `ssh` (no credential
             // seam — the `ssh` program authenticates), but the ref-map planning
             // and ref bookkeeping are the same shared flow as HTTP.
@@ -476,7 +487,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             // Shallow fetch over SSH mirrors the HTTP path: replay the current
             // boundary, deepen to `depth`, then apply the server's shallow-info.
             let existing_shallow =
-                shallow_boundary_for_request(request.git_dir, request.format, options.depth)?;
+                shallow_boundary_for_request(request.git_dir, request.format, options)?;
             let shallow_info = crate::ssh::install_fetch_pack_via_ssh_upload_pack(
                 crate::ssh::SshFetchPackRequest {
                     git_dir: request.git_dir,
@@ -540,7 +551,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             })?;
             let wants = updates.iter().map(|update| update.oid).collect();
             let existing_shallow =
-                shallow_boundary_for_request(request.git_dir, request.format, options.depth)?;
+                shallow_boundary_for_request(request.git_dir, request.format, options)?;
             let shallow_info = crate::git::install_fetch_pack_via_git_upload_pack(
                 crate::git::GitFetchPackRequest {
                     git_dir: request.git_dir,
@@ -894,12 +905,38 @@ fn tip_reaches_boundary<R: sley_odb::ObjectReader>(
 fn shallow_boundary_for_request(
     git_dir: &Path,
     format: ObjectFormat,
-    depth: Option<u32>,
+    options: &FetchOptions,
 ) -> Result<Vec<ObjectId>> {
-    if depth.is_none() {
+    if options.depth.is_none()
+        && options.deepen_since.is_none()
+        && options.deepen_not.is_empty()
+    {
         return Ok(Vec::new());
     }
     crate::shallow::read_shallow(git_dir, format)
+}
+
+fn resolve_deepen_not_refs(
+    advertisements: &[RefAdvertisement],
+    deepen_not: &[String],
+) -> Result<Vec<String>> {
+    let mut resolved = Vec::with_capacity(deepen_not.len());
+    for name in deepen_not {
+        let found = advertisements.iter().any(|advertisement| {
+            advertisement.name == *name
+                || advertisement.name == format!("refs/tags/{name}")
+                || advertisement.name == format!("refs/heads/{name}")
+                || advertisement.name == format!("refs/{name}")
+        });
+        if found {
+            resolved.push(name.clone());
+        } else {
+            return Err(GitError::Command(format!(
+                "git upload-pack: deepen-not is not a ref: {name}"
+            )));
+        }
+    }
+    Ok(resolved)
 }
 
 /// Plan the ref-map and apply the auto-follow-tag / not-for-merge adjustments

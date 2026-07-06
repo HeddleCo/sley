@@ -1066,7 +1066,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
         wants,
         filter: filter
             .as_ref()
-            .and_then(local_upload_pack_filter_protocol_spec),
+            .and_then(upload_pack_filter_protocol_spec),
         // The `shallow` capability accompanies a deepen request on the wire
         // (mirrors the SSH path); a plain fetch keeps its existing wire form.
         capabilities: deepen
@@ -1248,7 +1248,7 @@ fn trace_local_upload_pack_v2_capabilities(remote_git_dir: &Path, format: Object
     sley_protocol::trace_packet_read_payload(b"0000");
 }
 
-fn local_upload_pack_filter_protocol_spec(filter: &sley_odb::PackObjectFilter) -> Option<String> {
+pub(crate) fn upload_pack_filter_protocol_spec(filter: &sley_odb::PackObjectFilter) -> Option<String> {
     match filter {
         sley_odb::PackObjectFilter::BlobNone => Some("blob:none".to_string()),
         sley_odb::PackObjectFilter::BlobLimit(limit) => Some(format!("blob:limit={limit}")),

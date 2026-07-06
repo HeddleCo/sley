@@ -25,6 +25,17 @@ use sley_config::GitConfig;
 use sley_core::{ObjectFormat, Result};
 use sley_transport::GitCredential;
 
+mod install;
+pub use install::{
+    install_protocol_v2_fetch_promisor_response_from_reader,
+    install_protocol_v2_fetch_response_from_reader,
+    install_upload_pack_raw_promisor_response_from_reader,
+    install_upload_pack_raw_response_from_reader,
+    install_upload_pack_shallow_raw_promisor_response_from_reader,
+    install_upload_pack_shallow_raw_response_from_reader,
+    shallow_info_from_protocol_v2_fetch_header,
+};
+
 mod credentials;
 pub use credentials::{
     CredentialHelperProvider, credential_fill, credential_request_for_url, credential_store,
@@ -39,7 +50,7 @@ pub use http::{
     http_authorization_headers, http_check_status, http_protocol_v2_fetch_response,
     http_send_with_auth, http_service_advertisements, http_upload_pack_advertisements,
     http_validate_content_type, install_fetch_pack_via_http_protocol_v2_fetch,
-    install_fetch_pack_via_http_upload_pack, new_http_client, remote_url_is_http,
+    install_fetch_pack_via_http_upload_pack, HttpOperationBatch, remote_url_is_http,
 };
 
 mod ssh;
