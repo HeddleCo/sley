@@ -12,7 +12,9 @@
 // GitError/Result, std::* re-exports, …) from the crate root.
 // A submodule can see its ancestors' items, so the glob keeps this file in step
 // with whatever the root exposes without re-listing each name.
+use crate::commands::cli_options::{last_tri_state_bool, opt_bool, opt_str};
 use crate::*;
+use sley_options::{parse_options, OptionSpec, ParsedValue};
 
 /// Which index stage to copy out. Real `git` defaults to stage 0; `--stage=<n>`
 /// selects a single conflict stage and `--stage=all` (handled separately) is not
@@ -59,8 +61,91 @@ impl Default for CheckoutIndexOptions {
     }
 }
 
+const CHECKOUT_INDEX_USAGE_LINES: &[&str] =
+    &["git checkout-index [<options>] [--] [<file>...]"];
+
+fn checkout_index_option_specs() -> &'static [OptionSpec<'static>] {
+    static SPECS: &[OptionSpec<'static>] = &[
+        opt_bool(
+            Some('a'),
+            Some("all"),
+            sley_options::OptFlags::NONE,
+            "check out all files in the index",
+        ),
+        opt_bool(
+            None,
+            Some("ignore-skip-worktree-bits"),
+            sley_options::OptFlags::NONE,
+            "do not skip files with skip-worktree set",
+        ),
+        opt_bool(
+            Some('f'),
+            Some("force"),
+            sley_options::OptFlags::NONE,
+            "force overwrite of existing files",
+        ),
+        opt_bool(
+            Some('q'),
+            Some("quiet"),
+            sley_options::OptFlags::NONE,
+            "no warning for existing files and files not in index",
+        ),
+        opt_bool(
+            Some('n'),
+            Some("no-create"),
+            sley_options::OptFlags::NONE,
+            "don't checkout new files",
+        ),
+        opt_bool(
+            None,
+            Some("create"),
+            sley_options::OptFlags::NONE,
+            "opposite of --no-create",
+        ),
+        opt_bool(
+            Some('u'),
+            Some("index"),
+            sley_options::OptFlags::NONE,
+            "update stat information in the index file",
+        ),
+        opt_bool(
+            Some('z'),
+            None,
+            sley_options::OptFlags::NONE,
+            "paths are separated with NUL character",
+        ),
+        opt_bool(
+            None,
+            Some("stdin"),
+            sley_options::OptFlags::NONE,
+            "read list of paths from the standard input",
+        ),
+        opt_bool(
+            None,
+            Some("temp"),
+            sley_options::OptFlags::NONE,
+            "write the content to temporary files",
+        ),
+        opt_str(
+            None,
+            Some("prefix"),
+            "string",
+            sley_options::OptFlags::NONE,
+            "when creating files, prepend <string>",
+        ),
+        opt_str(
+            None,
+            Some("stage"),
+            "n",
+            sley_options::OptFlags::NONE,
+            "copy out the files from named stage",
+        ),
+    ];
+    SPECS
+}
+
 pub(crate) fn cmd_checkout_index(args: &[String]) -> Result<()> {
-    let options = parse_checkout_index_options(args)?;
+    let options = setup_checkout_index_options(args)?;
     run_checkout_index(options)
 }
 
@@ -78,80 +163,64 @@ fn checkout_index_entry_skip_worktree(entry: &IndexEntry) -> bool {
         && entry.flags_extended & INDEX_EXTENDED_FLAG_SKIP_WORKTREE != 0
 }
 
-fn parse_checkout_index_options(args: &[String]) -> Result<CheckoutIndexOptions> {
-    let mut options = CheckoutIndexOptions::default();
-    let mut positional_only = false;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if positional_only {
-            options.paths.push(arg.as_bytes().to_vec());
-            continue;
+fn setup_checkout_index_options(args: &[String]) -> Result<CheckoutIndexOptions> {
+    if args
+        .iter()
+        .any(|arg| arg == "-h" || arg == "--help")
+    {
+        return Err(checkout_index_help());
+    }
+    let parsed = match parse_options(
+        args,
+        checkout_index_option_specs(),
+        CHECKOUT_INDEX_USAGE_LINES,
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            if let Some(message) = error.message() {
+                eprintln!("error: {message}");
+            }
+            print_checkout_index_usage();
+            return Err(GitError::Exit(129));
         }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "-h" | "--help" => return Err(checkout_index_help()),
-            "-a" | "--all" => options.all = true,
-            "--no-all" => options.all = false,
-            "-f" | "--force" => options.force = true,
-            "--no-force" => options.force = false,
-            "-q" | "--quiet" => options.quiet = true,
-            "--no-quiet" => options.quiet = false,
-            "-n" | "--no-create" => options.create = false,
-            "--create" => options.create = true,
-            "-u" | "--index" => options.update_stat = true,
-            "--no-index" => options.update_stat = false,
-            "-z" => options.nul = true,
-            "--stdin" => options.stdin = true,
-            "--no-stdin" => options.stdin = false,
-            "--ignore-skip-worktree-bits" => options.ignore_skip_worktree_bits = true,
-            "--no-ignore-skip-worktree-bits" => options.ignore_skip_worktree_bits = false,
-            "--prefix" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| checkout_index_option_requires_value("prefix"))?;
-                options.prefix = value.clone();
-            }
-            "--temp" => options.temp = Some(true),
-            "--no-temp" => options.temp = Some(false),
-            "--stage" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| checkout_index_option_requires_value("stage"))?;
-                options.stage = parse_checkout_index_stage(value)?;
-            }
-            value if value.starts_with("--prefix=") => {
-                options.prefix = value["--prefix=".len()..].to_string();
-            }
-            value if value.starts_with("--stage=") => {
-                options.stage = parse_checkout_index_stage(&value["--stage=".len()..])?;
-            }
-            // Combined short flags, e.g. `-af` or `-afz`.
-            value
-                if value.starts_with('-')
-                    && !value.starts_with("--")
-                    && value.len() > 1
-                    && value[1..]
-                        .bytes()
-                        .all(|byte| matches!(byte, b'a' | b'f' | b'q' | b'n' | b'u' | b'z')) =>
-            {
-                for byte in value[1..].bytes() {
-                    match byte {
-                        b'a' => options.all = true,
-                        b'f' => options.force = true,
-                        b'q' => options.quiet = true,
-                        b'n' => options.create = false,
-                        b'u' => options.update_stat = true,
-                        b'z' => options.nul = true,
-                        _ => unreachable!("short-option group was pre-filtered"),
-                    }
+    };
+    let mut options = CheckoutIndexOptions::default();
+    options.all = parsed.last_bool("all", false);
+    options.force = parsed.last_bool("force", false);
+    options.quiet = parsed.last_bool("quiet", false);
+    options.update_stat = parsed.last_bool("index", false);
+    options.nul = parsed.options.iter().any(|option| option.short == Some('z'));
+    options.stdin = parsed.last_bool("stdin", false);
+    options.ignore_skip_worktree_bits = parsed.last_bool("ignore-skip-worktree-bits", false);
+    let mut create = true;
+    for option in &parsed.options {
+        match (option.short, option.long) {
+            (Some('n'), _) | (_, Some("no-create")) => {
+                if let ParsedValue::Bool(value) = option.value {
+                    create = !value;
                 }
             }
-            value if value.starts_with('-') && value != "-" => {
-                return Err(checkout_index_unknown_option(value));
+            (_, Some("create")) => {
+                if let ParsedValue::Bool(value) = option.value {
+                    create = value;
+                }
             }
-            value => options.paths.push(value.as_bytes().to_vec()),
+            _ => {}
         }
     }
+    options.create = create;
+    options.temp = last_tri_state_bool(&parsed, "temp");
+    if let Some(prefix) = parsed.last_str("prefix") {
+        options.prefix = prefix.to_string();
+    }
+    if let Some(stage) = parsed.last_str("stage") {
+        options.stage = parse_checkout_index_stage(stage)?;
+    }
+    options.paths = parsed
+        .positionals
+        .iter()
+        .map(|path| path.as_bytes().to_vec())
+        .collect();
     Ok(options)
 }
 

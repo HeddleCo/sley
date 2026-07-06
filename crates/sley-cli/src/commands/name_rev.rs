@@ -9,7 +9,9 @@
 //! real command's output and exit codes.
 
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
+use crate::commands::cli_options::opt_bool;
 use crate::*;
+use sley_options::{parse_options, OptionName, OptionSpec, ParsedValue};
 
 /// `MERGE_TRAVERSAL_WEIGHT` from upstream: crossing into a non-first parent is
 /// treated as a very long hop so first-parent ancestry is strongly preferred.
@@ -121,8 +123,73 @@ struct NameRevOptions {
     revs: Vec<String>,
 }
 
+const NAME_REV_USAGE_LINES: &[&str] = &["git name-rev [--tags] [--refs=<pattern>] [options] <commit>..."];
+
+fn name_rev_option_specs() -> &'static [OptionSpec<'static>] {
+    static SPECS: &[OptionSpec<'static>] = &[
+        opt_bool(
+            None,
+            Some("name-only"),
+            sley_options::OptFlags::NONE,
+            "print name only",
+        ),
+        opt_bool(
+            None,
+            Some("tags"),
+            sley_options::OptFlags::NONE,
+            "only use tags",
+        ),
+        opt_bool(None, Some("all"), sley_options::OptFlags::NONE, "list all commits"),
+        opt_bool(
+            None,
+            Some("annotate-stdin"),
+            sley_options::OptFlags::NONE,
+            "annotate stdin",
+        ),
+        opt_bool(
+            None,
+            Some("stdin"),
+            sley_options::OptFlags::NONEG,
+            "deprecated alias for --annotate-stdin",
+        ),
+        opt_bool(
+            None,
+            Some("undefined"),
+            sley_options::OptFlags::NONE,
+            "allow undefined names",
+        ),
+        opt_bool(
+            None,
+            Some("always"),
+            sley_options::OptFlags::NONE,
+            "abbreviate if no name found",
+        ),
+        opt_bool(
+            None,
+            Some("peel-tag"),
+            sley_options::OptFlags::NONE,
+            "peel tags",
+        ),
+        sley_options::OptionSpec {
+            short: None,
+            long: Some("refs"),
+            value: sley_options::OptValue::Str("pattern"),
+            flags: sley_options::OptFlags::NONE,
+            help: "only use refs matching pattern",
+        },
+        sley_options::OptionSpec {
+            short: None,
+            long: Some("exclude"),
+            value: sley_options::OptValue::Str("pattern"),
+            flags: sley_options::OptFlags::NONE,
+            help: "exclude refs matching pattern",
+        },
+    ];
+    SPECS
+}
+
 pub(crate) fn cmd_name_rev(args: &[String]) -> Result<()> {
-    let options = parse_name_rev_options(args)?;
+    let options = setup_name_rev_options(args)?;
 
     // Upstream rejects mixing an explicit list with the whole-graph modes.
     if (options.all || options.annotate_stdin) && !options.revs.is_empty() {
@@ -157,94 +224,81 @@ pub(crate) fn cmd_name_rev(args: &[String]) -> Result<()> {
     emit_positional(&repo, &tips, &rev_names, &options)
 }
 
-/// Parse `name-rev` flags into options, or an `Exit` error for `-h`/bad usage.
-fn parse_name_rev_options(args: &[String]) -> Result<NameRevOptions> {
-    let mut options = NameRevOptions {
-        name_only: false,
-        tags_only: false,
-        ref_filters: Vec::new(),
-        exclude_filters: Vec::new(),
-        all: false,
-        annotate_stdin: false,
-        stdin_deprecated: false,
-        allow_undefined: true,
-        always: false,
-        peel_tag: false,
-        revs: Vec::new(),
-    };
-    let mut positional_only = false;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if positional_only {
-            options.revs.push(arg.clone());
-            continue;
+fn setup_name_rev_options(args: &[String]) -> Result<NameRevOptions> {
+    if args
+        .iter()
+        .any(|arg| arg == "-h" || arg == "--help")
+    {
+        print_name_rev_help();
+        return Err(GitError::Exit(129));
+    }
+    let parsed = match parse_options(args, name_rev_option_specs(), NAME_REV_USAGE_LINES) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            if let Some(message) = error.message() {
+                if message.starts_with("unknown option `") {
+                    let option = message
+                        .strip_prefix("unknown option `")
+                        .and_then(|rest| rest.strip_suffix('\''))
+                        .unwrap_or(message);
+                    eprintln!("error: unknown option `{option}'");
+                } else if message.starts_with("unknown switch `") {
+                    let option = message
+                        .strip_prefix("unknown switch `")
+                        .and_then(|rest| rest.strip_suffix('\''))
+                        .unwrap_or(message);
+                    eprintln!("error: unknown switch `{option}'");
+                } else {
+                    eprintln!("error: {message}");
+                }
+            }
+            print_name_rev_usage();
+            return Err(GitError::Exit(129));
         }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "-h" | "--help" => {
-                // Upstream's parse-options prints the usage to stdout for `-h`
-                // and exits 129.
-                print_name_rev_help();
-                return Err(GitError::Exit(129));
-            }
-            "--name-only" => options.name_only = true,
-            "--no-name-only" => options.name_only = false,
-            "--tags" => options.tags_only = true,
-            "--no-tags" => options.tags_only = false,
-            "--all" => options.all = true,
-            "--no-all" => options.all = false,
-            "--annotate-stdin" => options.annotate_stdin = true,
-            "--no-annotate-stdin" => options.annotate_stdin = false,
-            "--stdin" => {
-                options.annotate_stdin = true;
-                options.stdin_deprecated = true;
-            }
-            "--undefined" => options.allow_undefined = true,
-            "--no-undefined" => options.allow_undefined = false,
-            "--always" => options.always = true,
-            "--no-always" => options.always = false,
-            "--peel-tag" => options.peel_tag = true,
-            "--no-peel-tag" => options.peel_tag = false,
-            "--no-refs" => options.ref_filters.clear(),
-            "--no-exclude" => options.exclude_filters.clear(),
-            "--refs" => {
-                let value = iter.next().ok_or_else(|| {
-                    eprintln!("error: option `refs' requires a value");
-                    GitError::Exit(129)
-                })?;
-                options.ref_filters.push(value.clone());
-            }
-            value if value.starts_with("--refs=") => {
-                options
-                    .ref_filters
-                    .push(value["--refs=".len()..].to_string());
-            }
-            "--exclude" => {
-                let value = iter.next().ok_or_else(|| {
-                    eprintln!("error: option `exclude' requires a value");
-                    GitError::Exit(129)
-                })?;
-                options.exclude_filters.push(value.clone());
-            }
-            value if value.starts_with("--exclude=") => {
-                options
-                    .exclude_filters
-                    .push(value["--exclude=".len()..].to_string());
-            }
-            value if value.starts_with("--") => {
-                eprintln!("error: unknown option `{}'", &value[2..]);
-                print_name_rev_usage();
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with('-') && value.len() > 1 => {
-                eprintln!("error: unknown switch `{}'", &value[1..]);
-                print_name_rev_usage();
-                return Err(GitError::Exit(129));
-            }
-            value => options.revs.push(value.to_string()),
+    };
+    let mut ref_filters = Vec::new();
+    let mut exclude_filters = Vec::new();
+    let mut stdin_deprecated = false;
+    for option in &parsed.options {
+        match option.long {
+            Some("refs") => match option.name {
+                OptionName::NegatedLong(_) => ref_filters.clear(),
+                _ => {
+                    if let ParsedValue::Str(value) = option.value {
+                        ref_filters.push(value.to_string());
+                    }
+                }
+            },
+            Some("exclude") => match option.name {
+                OptionName::NegatedLong(_) => exclude_filters.clear(),
+                _ => {
+                    if let ParsedValue::Str(value) = option.value {
+                        exclude_filters.push(value.to_string());
+                    }
+                }
+            },
+            Some("stdin") => stdin_deprecated = true,
+            _ => {}
         }
     }
-    Ok(options)
+    let annotate_stdin = parsed.last_bool("annotate-stdin", false) || stdin_deprecated;
+    Ok(NameRevOptions {
+        name_only: parsed.last_bool("name-only", false),
+        tags_only: parsed.last_bool("tags", false),
+        ref_filters,
+        exclude_filters,
+        all: parsed.last_bool("all", false),
+        annotate_stdin,
+        stdin_deprecated,
+        allow_undefined: parsed.last_bool("undefined", true),
+        always: parsed.last_bool("always", false),
+        peel_tag: parsed.last_bool("peel-tag", false),
+        revs: parsed
+            .positionals
+            .iter()
+            .map(|rev| (*rev).to_string())
+            .collect(),
+    })
 }
 
 /// Build the table of tips from the ref store, honoring `--tags`/`--refs`/`--exclude`.

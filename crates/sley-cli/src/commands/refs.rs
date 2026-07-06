@@ -1421,8 +1421,21 @@ fn reflog_show_pathspecs_match(cwd: &Path, pathspecs: &[String]) -> bool {
     pathspecs.iter().any(|pathspec| cwd.join(pathspec).exists())
 }
 
+const UPDATE_SERVER_INFO_USAGE: &[&str] = &["git update-server-info"];
+
+fn update_server_info_option_specs() -> &'static [OptionSpec<'static>] {
+    static SPECS: &[OptionSpec<'static>] = &[OptionSpec {
+        short: Some('f'),
+        long: Some("force"),
+        value: OptValue::Bool,
+        flags: OptFlags::NONE,
+        help: "force update",
+    }];
+    SPECS
+}
+
 pub(crate) fn cmd_update_server_info(args: &[String]) -> Result<()> {
-    let force = parse_update_server_info_options(args)?;
+    let force = setup_update_server_info_options(args)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
@@ -1450,42 +1463,40 @@ pub(crate) fn cmd_update_server_info(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn parse_update_server_info_options(args: &[String]) -> Result<bool> {
-    let mut after_delimiter = false;
-    let mut force = false;
-    for arg in args {
-        if after_delimiter {
-            return update_server_info_usage();
-        }
-        match arg.as_str() {
-            "-f" | "--force" => force = true,
-            "--no-force" => force = false,
-            "--" => after_delimiter = true,
-            value if value.starts_with("--force=") => {
-                eprintln!("error: option `force' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with("--no-force=") => {
-                eprintln!("error: option `no-force' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with("--") => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                return update_server_info_usage();
-            }
-            value if value.starts_with('-') && value.len() > 1 => {
-                for option in value[1..].chars() {
-                    if option != 'f' {
-                        eprintln!("error: unknown switch `{option}'");
-                        return update_server_info_usage();
-                    }
-                    force = true;
+fn setup_update_server_info_options(args: &[String]) -> Result<bool> {
+    let parsed = match parse_options(
+        args,
+        update_server_info_option_specs(),
+        UPDATE_SERVER_INFO_USAGE,
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            if let Some(message) = error.message() {
+                if message.contains("takes no value") {
+                    eprintln!("error: {message}");
+                    return Err(GitError::Exit(129));
+                }
+                if message.starts_with("unknown option `") {
+                    let option = message
+                        .strip_prefix("unknown option `")
+                        .and_then(|rest| rest.strip_suffix('\''))
+                        .unwrap_or(message);
+                    eprintln!("error: unknown option `{option}'");
+                } else if message.starts_with("unknown switch `") {
+                    let option = message
+                        .strip_prefix("unknown switch `")
+                        .and_then(|rest| rest.strip_suffix('\''))
+                        .unwrap_or(message);
+                    eprintln!("error: unknown switch `{option}'");
                 }
             }
-            _ => return update_server_info_usage(),
+            return update_server_info_usage();
         }
+    };
+    if !parsed.positionals.is_empty() {
+        return update_server_info_usage();
     }
-    Ok(force)
+    Ok(parsed.last_bool("force", false))
 }
 
 fn update_server_info_file(path: &Path, content: &[u8], force: bool) -> Result<()> {

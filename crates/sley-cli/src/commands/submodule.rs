@@ -4,6 +4,15 @@
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
 
+#[path = "submodule_options.rs"]
+mod submodule_options;
+use submodule_options::{
+    setup_submodule_absorbgitdirs_options, setup_submodule_add_options,
+    setup_submodule_deinit_options, setup_submodule_foreach_options, setup_submodule_init_options,
+    setup_submodule_set_branch_options, setup_submodule_set_url_options, setup_submodule_status_options,
+    setup_submodule_summary_options, setup_submodule_sync_options, setup_submodule_update_options,
+};
+
 pub(crate) fn cmd_submodule(args: &[String]) -> Result<()> {
     let mut index = 0;
     let mut quiet = false;
@@ -149,7 +158,7 @@ struct SubmoduleUpdateOptions<'a> {
 }
 
 fn cmd_submodule_status(args: &[String], quiet: bool) -> Result<()> {
-    let options = parse_submodule_status_options(args)?;
+    let options = setup_submodule_status_options(args)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
@@ -177,39 +186,8 @@ fn cmd_submodule_status(args: &[String], quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn parse_submodule_status_options(args: &[String]) -> Result<SubmoduleStatusOptions<'_>> {
-    let mut cached = false;
-    let mut quiet = false;
-    let mut recursive = false;
-    let mut paths = Vec::new();
-    let mut positional_only = false;
-    for arg in args {
-        if positional_only {
-            paths.push(arg.as_str());
-            continue;
-        }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "--cached" => cached = true,
-            "--quiet" | "-q" => quiet = true,
-            "--recursive" => recursive = true,
-            "--no-recursive" => return submodule_usage(),
-            value if value.starts_with('-') => {
-                return submodule_usage();
-            }
-            value => paths.push(value),
-        }
-    }
-    Ok(SubmoduleStatusOptions {
-        cached,
-        quiet,
-        recursive,
-        paths,
-    })
-}
-
 fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
-    let options = parse_submodule_add_options(args, quiet)?;
+    let options = setup_submodule_add_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
@@ -353,116 +331,8 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn parse_submodule_add_options(args: &[String], mut quiet: bool) -> Result<SubmoduleAddOptions> {
-    let mut branch = None;
-    let mut name = None;
-    let mut force = false;
-    let mut progress = false;
-    let mut depth = None;
-    let mut values = Vec::new();
-    let mut reference_args = Vec::new();
-    let mut positional_only = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if positional_only {
-            values.push(arg.clone());
-            index += 1;
-            continue;
-        }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "--quiet" | "-q" => quiet = true,
-            "--force" | "-f" => force = true,
-            "--progress" => progress = true,
-            "--no-progress" => progress = false,
-            "--depth" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return submodule_usage();
-                };
-                depth = Some(value.parse::<u32>().map_err(|_| {
-                    eprintln!("fatal: invalid depth '{value}'");
-                    GitError::Exit(128)
-                })?);
-            }
-            value if let Some(value) = value.strip_prefix("--depth=") => {
-                depth = Some(value.parse::<u32>().map_err(|_| {
-                    eprintln!("fatal: invalid depth '{value}'");
-                    GitError::Exit(128)
-                })?);
-            }
-            "--name" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return submodule_usage();
-                };
-                name = Some(value.clone());
-            }
-            // `--reference[-if-able] <repo>` / `--dissociate`: forward to the
-            // submodule clone, which sets up the alternates borrowing.
-            "--reference" | "--reference-if-able" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return submodule_usage();
-                };
-                reference_args.push(arg.clone());
-                reference_args.push(value.clone());
-            }
-            "--dissociate" => reference_args.push("--dissociate".to_string()),
-            "--branch" | "-b" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return submodule_usage();
-                };
-                branch = Some(value.clone());
-            }
-            value if let Some(value) = value.strip_prefix("--branch=") => {
-                branch = Some(value.to_string());
-            }
-            value if let Some(value) = value.strip_prefix("--name=") => {
-                name = Some(value.to_string());
-            }
-            value
-                if value.starts_with("--reference=")
-                    || value.starts_with("--reference-if-able=") =>
-            {
-                reference_args.push(value.to_string());
-            }
-            value if value.starts_with('-') => return submodule_usage(),
-            value => values.push(value.to_string()),
-        }
-        index += 1;
-    }
-    match values.as_slice() {
-        [repository] => Ok(SubmoduleAddOptions {
-            repository: repository.clone(),
-            path: None,
-            branch,
-            name,
-            force,
-            quiet,
-            progress,
-            depth,
-            reference_args,
-        }),
-        [repository, path] => Ok(SubmoduleAddOptions {
-            repository: repository.clone(),
-            path: Some(path.clone()),
-            branch,
-            name,
-            force,
-            quiet,
-            progress,
-            depth,
-            reference_args,
-        }),
-        _ => submodule_usage(),
-    }
-}
-
 fn cmd_submodule_update(args: &[String], quiet: bool) -> Result<()> {
-    let options = parse_submodule_update_options(args, quiet)?;
+    let options = setup_submodule_update_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
@@ -1174,133 +1044,6 @@ fn submodule_path_contains_symlink(worktree_root: &Path, path: &str) -> Result<b
     Ok(false)
 }
 
-fn parse_submodule_update_options(
-    args: &[String],
-    mut quiet: bool,
-) -> Result<SubmoduleUpdateOptions<'_>> {
-    use sley_submodule::UpdateType;
-    let mut init = false;
-    let mut recursive = false;
-    let mut force = false;
-    let mut remote = false;
-    let mut nofetch = false;
-    let mut cli_default = UpdateType::Unspecified;
-    let mut depth = None;
-    let mut filter = None;
-    let mut reference_args = Vec::new();
-    let mut super_prefix = String::new();
-    let mut paths = Vec::new();
-    let mut positional_only = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if positional_only {
-            paths.push(arg.as_str());
-            index += 1;
-            continue;
-        }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "--quiet" | "-q" => quiet = true,
-            "--init" => init = true,
-            "--recursive" => recursive = true,
-            "--force" | "-f" => force = true,
-            "--remote" => remote = true,
-            // `-N/--no-fetch` skips the fetch step of an update; only meaningful
-            // for `--remote` today (the non-remote path has no separate fetch).
-            "--no-fetch" | "-N" => nofetch = true,
-            // The three update-mode flags force the strategy (git's
-            // `update_default`). Last one wins, like git's option parsing.
-            "--checkout" => cli_default = UpdateType::Checkout,
-            "--merge" => cli_default = UpdateType::Merge,
-            "--rebase" => cli_default = UpdateType::Rebase,
-            "--recommend-shallow"
-            | "--no-recommend-shallow"
-            | "--single-branch"
-            | "--no-single-branch"
-            | "--progress"
-            | "--no-progress" => {}
-            "--depth" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return submodule_usage();
-                };
-                depth = Some(value.parse::<u32>().map_err(|_| {
-                    eprintln!("fatal: invalid depth '{value}'");
-                    GitError::Exit(128)
-                })?);
-            }
-            value if let Some(value) = value.strip_prefix("--depth=") => {
-                depth = Some(value.parse::<u32>().map_err(|_| {
-                    eprintln!("fatal: invalid depth '{value}'");
-                    GitError::Exit(128)
-                })?);
-            }
-            "--jobs" | "-j" => {
-                // Parallelism is accepted but ignored (sley updates serially).
-                index += 1;
-                if args.get(index).is_none() {
-                    return submodule_usage();
-                }
-            }
-            value if value.strip_prefix("--jobs=").is_some() => {}
-            "--filter" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return submodule_usage();
-                };
-                filter = Some(value.clone());
-            }
-            // `--reference[-if-able] <repo>` / `--dissociate`: forward to each
-            // submodule clone (alternates borrowing).
-            "--reference" | "--reference-if-able" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return submodule_usage();
-                };
-                reference_args.push(arg.clone());
-                reference_args.push(value.clone());
-            }
-            "--dissociate" => reference_args.push("--dissociate".to_string()),
-            value
-                if value.starts_with("--reference=")
-                    || value.starts_with("--reference-if-able=") =>
-            {
-                reference_args.push(value.to_string());
-            }
-            value if let Some(value) = value.strip_prefix("--filter=") => {
-                filter = Some(value.to_string());
-            }
-            // Internal: the recursion displaypath prefix (git's --super-prefix).
-            value if let Some(value) = value.strip_prefix("--super-prefix=") => {
-                super_prefix = value.to_string();
-            }
-            value if value.starts_with('-') => return submodule_usage(),
-            value => paths.push(value),
-        }
-        index += 1;
-    }
-    // git: `--filter` requires `--init` (exit code 129 — usage error).
-    if filter.is_some() && !init {
-        eprintln!("fatal: --filter can only be used with the --init option");
-        return Err(GitError::Exit(129));
-    }
-    Ok(SubmoduleUpdateOptions {
-        init,
-        recursive,
-        quiet,
-        force,
-        remote,
-        nofetch,
-        cli_default,
-        depth,
-        filter,
-        reference_args,
-        super_prefix,
-        paths,
-    })
-}
-
 fn submodule_usage_text() -> &'static str {
     "usage: git submodule [--quiet] [--cached]\n   or: git submodule [--quiet] add [-b <branch>] [-f|--force] [--name <name>] [--reference <repository>] [--] <repository> [<path>]\n   or: git submodule [--quiet] status [--cached] [--recursive] [--] [<path>...]\n   or: git submodule [--quiet] init [--] [<path>...]\n   or: git submodule [--quiet] deinit [-f|--force] (--all| [--] <path>...)\n   or: git submodule [--quiet] update [--init [--filter=<filter-spec>]] [--remote] [-N|--no-fetch] [-f|--force] [--checkout|--merge|--rebase] [--[no-]recommend-shallow] [--reference <repository>] [--recursive] [--[no-]single-branch] [--] [<path>...]\n   or: git submodule [--quiet] set-branch (--default|--branch <branch>) [--] <path>\n   or: git submodule [--quiet] set-url [--] <path> <newurl>\n   or: git submodule [--quiet] summary [--cached|--files] [--summary-limit <n>] [commit] [--] [<path>...]\n   or: git submodule [--quiet] foreach [--recursive] <command>\n   or: git submodule [--quiet] sync [--recursive] [--] [<path>...]\n   or: git submodule [--quiet] absorbgitdirs [--] [<path>...]"
 }
@@ -1499,7 +1242,7 @@ fn stage_submodule_paths(
 }
 
 fn cmd_submodule_init(args: &[String], quiet: bool) -> Result<()> {
-    let (paths, quiet, super_prefix) = parse_submodule_init_options(args, quiet)?;
+    let (paths, quiet, super_prefix) = setup_submodule_init_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
@@ -1606,7 +1349,7 @@ fn path_selected_by_specs(cwd: &Path, worktree_root: &Path, path: &str, specs: &
 }
 
 fn cmd_submodule_deinit(args: &[String], quiet: bool) -> Result<()> {
-    let options = parse_submodule_deinit_options(args, quiet)?;
+    let options = setup_submodule_deinit_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -1673,7 +1416,7 @@ fn cmd_submodule_deinit(args: &[String], quiet: bool) -> Result<()> {
 }
 
 fn cmd_submodule_sync(args: &[String], quiet: bool) -> Result<()> {
-    let (paths, quiet, recursive, super_prefix) = parse_submodule_sync_options(args, quiet)?;
+    let (paths, quiet, recursive, super_prefix) = setup_submodule_sync_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -1828,7 +1571,7 @@ fn recurse_submodule_sync(submodule_root: &Path, display: &str, quiet: bool) -> 
 }
 
 fn cmd_submodule_absorbgitdirs(args: &[String], quiet: bool) -> Result<()> {
-    let (paths, quiet, super_prefix) = parse_submodule_absorbgitdirs_options(args, quiet)?;
+    let (paths, quiet, super_prefix) = setup_submodule_absorbgitdirs_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
@@ -2038,7 +1781,7 @@ fn recurse_submodule_absorbgitdirs(sub_root: &Path, display: &str, quiet: bool) 
 }
 
 fn cmd_submodule_foreach(args: &[String], quiet: bool) -> Result<()> {
-    let options = parse_submodule_foreach_options(args, quiet)?;
+    let options = setup_submodule_foreach_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
@@ -2064,7 +1807,7 @@ struct SubmoduleSummaryEntry {
 }
 
 fn cmd_submodule_summary(args: &[String], quiet: bool) -> Result<()> {
-    let options = parse_submodule_summary_options(args, quiet)?;
+    let options = setup_submodule_summary_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
@@ -2434,7 +2177,7 @@ fn diff_gitlink_sides(
 }
 
 fn cmd_submodule_set_url(args: &[String], quiet: bool) -> Result<()> {
-    let (path, new_url, quiet) = parse_submodule_set_url_options(args, quiet)?;
+    let (path, new_url, quiet) = setup_submodule_set_url_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -2493,7 +2236,7 @@ enum SubmoduleSetBranchAction<'a> {
 }
 
 fn cmd_submodule_set_branch(args: &[String], quiet: bool) -> Result<()> {
-    let (path, action, _quiet) = parse_submodule_set_branch_options(args, quiet)?;
+    let (path, action, _quiet) = setup_submodule_set_branch_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -2513,32 +2256,6 @@ fn cmd_submodule_set_branch(args: &[String], quiet: bool) -> Result<()> {
     }
     fs::write(&gitmodules_path, gitmodules.to_canonical_bytes())?;
     Ok(())
-}
-
-fn parse_submodule_init_options(
-    args: &[String],
-    mut quiet: bool,
-) -> Result<(Vec<&str>, bool, String)> {
-    let mut paths = Vec::new();
-    let mut super_prefix = String::new();
-    let mut positional_only = false;
-    for arg in args {
-        if positional_only {
-            paths.push(arg.as_str());
-            continue;
-        }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "--quiet" | "-q" => quiet = true,
-            // Internal: the recursion displaypath prefix (git's --super-prefix).
-            value if let Some(value) = value.strip_prefix("--super-prefix=") => {
-                super_prefix = value.to_string();
-            }
-            value if value.starts_with('-') => return submodule_usage(),
-            value => paths.push(value),
-        }
-    }
-    Ok((paths, quiet, super_prefix))
 }
 
 struct SubmoduleDeinitOptions<'a> {
@@ -2568,116 +2285,11 @@ struct SubmoduleSummaryOptions {
     positionals: Vec<String>,
 }
 
-fn parse_submodule_deinit_options(
-    args: &[String],
-    mut quiet: bool,
-) -> Result<SubmoduleDeinitOptions<'_>> {
-    let mut all = false;
-    let mut force = false;
-    let mut paths = Vec::new();
-    let mut positional_only = false;
-    for arg in args {
-        if positional_only {
-            paths.push(arg.as_str());
-            continue;
-        }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "--all" => all = true,
-            "--quiet" | "-q" => quiet = true,
-            "-f" | "--force" => force = true,
-            value if value.starts_with('-') => return submodule_usage(),
-            value => paths.push(value),
-        }
-    }
-    Ok(SubmoduleDeinitOptions {
-        all,
-        force,
-        quiet,
-        paths,
-    })
-}
-
-fn parse_submodule_set_branch_options(
-    args: &[String],
-    mut quiet: bool,
-) -> Result<(&str, SubmoduleSetBranchAction<'_>, bool)> {
-    let mut branch = None;
-    let mut default = false;
-    let mut values = Vec::new();
-    let mut positional_only = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if positional_only {
-            values.push(arg.as_str());
-            index += 1;
-            continue;
-        }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "--quiet" | "-q" => quiet = true,
-            "--default" | "-d" => default = true,
-            "--branch" | "-b" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return submodule_usage();
-                };
-                branch = Some(value.as_str());
-            }
-            value if let Some(value) = value.strip_prefix("--branch=") => {
-                branch = Some(value);
-            }
-            "--no-default" | "--no-branch" => return submodule_usage(),
-            value if value.starts_with('-') => return submodule_usage(),
-            value => values.push(value),
-        }
-        index += 1;
-    }
-    if branch.is_none() && !default {
-        eprintln!("fatal: --branch or --default required");
-        return Err(GitError::Exit(128));
-    }
-    if branch.is_some() && default {
-        eprintln!("fatal: options '--branch' and '--default' cannot be used together");
-        return Err(GitError::Exit(128));
-    }
-    match (values.as_slice(), branch, default) {
-        ([path], Some(branch), false) => {
-            Ok((path, SubmoduleSetBranchAction::Branch(branch), quiet))
-        }
-        ([path], None, true) => Ok((path, SubmoduleSetBranchAction::Default, quiet)),
-        _ => submodule_set_branch_usage(),
-    }
-}
-
 fn submodule_set_branch_usage<T>() -> Result<T> {
     eprintln!(
         "usage: git submodule set-branch [-q|--quiet] (-d|--default) <path>\n   or: git submodule set-branch [-q|--quiet] (-b|--branch) <branch> <path>\n\n    -d, --[no-]default    set the default tracking branch to master\n    -b, --[no-]branch <branch>\n                          set the default tracking branch\n"
     );
     Err(GitError::Exit(129))
-}
-
-fn parse_submodule_set_url_options(args: &[String], mut quiet: bool) -> Result<(&str, &str, bool)> {
-    let mut values = Vec::new();
-    let mut positional_only = false;
-    for arg in args {
-        if positional_only {
-            values.push(arg.as_str());
-            continue;
-        }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "--quiet" | "-q" => quiet = true,
-            "--no-quiet" => quiet = false,
-            value if value.starts_with('-') => return submodule_set_url_usage(),
-            value => values.push(value),
-        }
-    }
-    match values.as_slice() {
-        [path, new_url] => Ok((path, new_url, quiet)),
-        _ => submodule_set_url_usage(),
-    }
 }
 
 fn submodule_set_url_usage<T>() -> Result<T> {
@@ -2687,165 +2299,7 @@ fn submodule_set_url_usage<T>() -> Result<T> {
     Err(GitError::Exit(129))
 }
 
-fn parse_submodule_sync_options(
-    args: &[String],
-    mut quiet: bool,
-) -> Result<(Vec<&str>, bool, bool, String)> {
-    let mut paths = Vec::new();
-    let mut positional_only = false;
-    let mut recursive = false;
-    let mut super_prefix = String::new();
-    for arg in args {
-        if positional_only {
-            paths.push(arg.as_str());
-            continue;
-        }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "--quiet" | "-q" => quiet = true,
-            "--recursive" => recursive = true,
-            "--no-recursive" => return submodule_usage(),
-            // Internal: git's `--super-prefix=<path>/`, carried by the recursive
-            // child so its nested displaypaths anchor at the recursion root.
-            value if value.starts_with("--super-prefix=") => {
-                super_prefix = value["--super-prefix=".len()..].to_string();
-            }
-            value if value.starts_with('-') => return submodule_usage(),
-            value => paths.push(value),
-        }
-    }
-    Ok((paths, quiet, recursive, super_prefix))
-}
-
-fn parse_submodule_absorbgitdirs_options(
-    args: &[String],
-    mut quiet: bool,
-) -> Result<(Vec<&str>, bool, String)> {
-    let mut paths = Vec::new();
-    let mut positional_only = false;
-    let mut super_prefix = String::new();
-    for arg in args {
-        if positional_only {
-            paths.push(arg.as_str());
-            continue;
-        }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "--quiet" | "-q" => quiet = true,
-            // Internal: git's `--super-prefix=<path>/`, carried by the recursive
-            // child so its migration messages anchor at the recursion root.
-            value if value.starts_with("--super-prefix=") => {
-                super_prefix = value["--super-prefix=".len()..].to_string();
-            }
-            value if value.starts_with('-') => return submodule_usage(),
-            value => paths.push(value),
-        }
-    }
-    Ok((paths, quiet, super_prefix))
-}
-
-fn parse_submodule_foreach_options(
-    args: &[String],
-    mut quiet: bool,
-) -> Result<SubmoduleForeachOptions> {
-    let mut recursive = false;
-    let mut index = 0;
-    while let Some(arg) = args.get(index) {
-        match arg.as_str() {
-            "--quiet" | "-q" => {
-                quiet = true;
-                index += 1;
-            }
-            "--recursive" => {
-                recursive = true;
-                index += 1;
-            }
-            // git's `cmd_foreach` has no `--` end-of-options arm: `--` matches
-            // the `-*) usage` case, so `foreach -- <anything>` is a usage error
-            // (exit 1). The command is the first non-option token onward.
-            value if value.starts_with('-') => return submodule_usage(),
-            _ => break,
-        }
-    }
-    Ok(SubmoduleForeachOptions {
-        args: args[index..].to_vec(),
-        quiet,
-        recursive,
-    })
-}
-
-fn parse_submodule_summary_options(
-    args: &[String],
-    mut quiet: bool,
-) -> Result<SubmoduleSummaryOptions> {
-    let mut cached = false;
-    let mut files = false;
-    let mut summary_limit = None;
-    // git collects all non-option args first, then peels the leading one off as
-    // the `<commit>` if it resolves; the rest are pathspecs.
-    let mut operands = Vec::new();
-    let mut positional_only = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if positional_only {
-            operands.push(arg.clone());
-            index += 1;
-            continue;
-        }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "--quiet" | "-q" => quiet = true,
-            "--cached" => cached = true,
-            "--files" => files = true,
-            // `--for-status` is accepted (it tweaks ignore=all skipping, which
-            // sley's diff-driven summary handles structurally) and otherwise
-            // behaves like a plain summary.
-            "--for-status" => {}
-            "--summary-limit" | "-n" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return submodule_usage();
-                };
-                summary_limit = Some(parse_submodule_summary_limit(value)?);
-            }
-            value if let Some(value) = value.strip_prefix("--summary-limit=") => {
-                summary_limit = Some(parse_submodule_summary_limit(value)?);
-            }
-            value if let Some(value) = value.strip_prefix("-n") => {
-                summary_limit = Some(parse_submodule_summary_limit(value)?);
-            }
-            value if value.starts_with('-') => return submodule_usage(),
-            value => operands.push(value.to_string()),
-        }
-        index += 1;
-    }
-    if cached && files {
-        eprintln!("fatal: options '--cached' and '--files' cannot be used together");
-        return Err(GitError::Exit(128));
-    }
-    // Peel the leading operand as the commit; the rest are pathspecs. A leading
-    // operand of "HEAD" is also consumed as the commit. (git resolves it with
-    // repo_get_oid; an unresolvable leading operand still consumes the slot and
-    // resolves to the empty tree, matching `nonexistent commit`.)
-    let (commit, positionals) = if operands.is_empty() {
-        (None, Vec::new())
-    } else {
-        let mut iter = operands.into_iter();
-        let commit = iter.next();
-        (commit, iter.collect())
-    };
-    Ok(SubmoduleSummaryOptions {
-        cached,
-        files,
-        quiet,
-        summary_limit,
-        commit,
-        positionals,
-    })
-}
-
-fn parse_submodule_summary_limit(value: &str) -> Result<isize> {
+pub(super) fn parse_submodule_summary_limit(value: &str) -> Result<isize> {
     value.parse::<isize>().map_err(|_| {
         eprintln!(
             "error: option `summary-limit' expects an integer value with an optional k/m/g suffix"

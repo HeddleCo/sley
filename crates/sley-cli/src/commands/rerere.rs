@@ -1,6 +1,8 @@
 //! Native `git rerere` support.
 
+use crate::commands::cli_options::opt_bool;
 use crate::*;
+use sley_options::{parse_options, OptionSpec};
 use std::time::{Duration, SystemTime};
 
 const RERERE_MARKER_SIZE: usize = 7;
@@ -31,8 +33,21 @@ struct RerereOptions {
     paths: Vec<String>,
 }
 
+const RERERE_USAGE: &[&str] =
+    &["git rerere [clear | forget <pathspec>... | diff | status | remaining | gc]"];
+
+fn rerere_option_specs() -> &'static [OptionSpec<'static>] {
+    static SPECS: &[OptionSpec<'static>] = &[opt_bool(
+        None,
+        Some("rerere-autoupdate"),
+        sley_options::OptFlags::NONE,
+        "register clean resolutions in index",
+    )];
+    SPECS
+}
+
 pub(crate) fn cmd_rerere(args: &[String]) -> Result<()> {
-    let options = parse_rerere_options(args)?;
+    let options = setup_rerere_options(args)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
@@ -48,33 +63,29 @@ pub(crate) fn cmd_rerere(args: &[String]) -> Result<()> {
     }
 }
 
-fn parse_rerere_options(args: &[String]) -> Result<RerereOptions> {
+fn setup_rerere_options(args: &[String]) -> Result<RerereOptions> {
+    if args
+        .iter()
+        .any(|arg| arg == "-h" || arg == "--help")
+    {
+        return rerere_usage_stdout();
+    }
+    let parsed = match parse_options(args, rerere_option_specs(), RERERE_USAGE) {
+        Ok(parsed) => parsed,
+        Err(_) => return rerere_usage(),
+    };
     let mut autoupdate = None;
+    for option in &parsed.options {
+        if option.long == Some("rerere-autoupdate") {
+            if let sley_options::ParsedValue::Bool(value) = option.value {
+                autoupdate = Some(value);
+            }
+        }
+    }
     let mut subcommand = None;
     let mut paths = Vec::new();
-    let mut positional_only = false;
-    for arg in args {
-        if positional_only {
-            paths.push(arg.clone());
-            continue;
-        }
-        match arg.as_str() {
-            "-h" | "--help" => return rerere_usage_stdout(),
-            "--" => positional_only = true,
-            "--rerere-autoupdate" => autoupdate = Some(true),
-            "--no-rerere-autoupdate" => autoupdate = Some(false),
-            value if value.starts_with("--no-rerere-autoupdate=") => {
-                eprintln!("error: option `no-rerere-autoupdate' takes no value");
-                return rerere_usage();
-            }
-            value if value.starts_with("--rerere-autoupdate=") => {
-                eprintln!("error: option `rerere-autoupdate' takes no value");
-                return rerere_usage();
-            }
-            value if value.starts_with("--") => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                return rerere_usage();
-            }
+    for arg in &parsed.positionals {
+        match *arg {
             "clear" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Clear),
             "diff" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Diff),
             "forget" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Forget),
