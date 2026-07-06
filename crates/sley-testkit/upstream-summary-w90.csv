@@ -324,7 +324,7 @@ t3407-rebase-abort.sh,t3407-rebase-abort.sh,PASS,17,0,17,17
 t3425-rebase-topology-merges.sh,t3425-rebase-topology-merges.sh,PASS,13,0,13,13
 t3436-rebase-more-options.sh,t3436-rebase-more-options.sh,PASS,19,0,19,19
 t3506-cherry-pick-ff.sh,t3506-cherry-pick-ff.sh,PASS,11,0,11,11
-t5532-fetch-proxy.sh,t5532-fetch-proxy.sh,TIMEOUT,3,0,3,
+t5532-fetch-proxy.sh,t5532-fetch-proxy.sh,FAIL,4,1,5,5
 t5731-protocol-v2-bundle-uri-git.sh,t5731-protocol-v2-bundle-uri-git.sh,FAIL,3,5,8,8
 t6421-merge-partial-clone.sh,t6421-merge-partial-clone.sh,FAIL,0,3,3,3
 t6435-merge-sparse.sh,t6435-merge-sparse.sh,PASS,6,0,6,6
@@ -403,7 +403,7 @@ t6415-merge-dir-to-symlink.sh,t6415-merge-dir-to-symlink.sh,FAIL,10,14,24,24
 t6600-test-reach.sh,t6600-test-reach.sh,FAIL,44,9,53,53
 t7106-reset-unborn-branch.sh,t7106-reset-unborn-branch.sh,FAIL,4,3,7,7
 t7426-submodule-get-default-remote.sh,t7426-submodule-get-default-remote.sh,FAIL,4,11,15,15
-t7814-grep-recurse-submodules.sh,t7814-grep-recurse-submodules.sh,FAIL,24,10,34,34
+t7814-grep-recurse-submodules.sh,t7814-grep-recurse-submodules.sh,FAIL,25,9,34,34
 t8011-blame-split-file.sh,t8011-blame-split-file.sh,PASS,10,0,10,10
 t0024-crlf-archive.sh,t0024-crlf-archive.sh,PASS,3,0,3,3
 t1412-reflog-loop.sh,t1412-reflog-loop.sh,PASS,3,0,3,3
@@ -539,7 +539,7 @@ t5538-push-shallow.sh,t5538-push-shallow.sh,FAIL,2,6,8,8
 t5582-fetch-negative-refspec.sh,t5582-fetch-negative-refspec.sh,FAIL,10,6,16,16
 t5613-info-alternate.sh,t5613-info-alternate.sh,FAIL,10,3,13,13
 t6408-merge-up-to-date.sh,t6408-merge-up-to-date.sh,FAIL,7,1,8,8
-t7816-grep-binary-pattern.sh,t7816-grep-binary-pattern.sh,FAIL,144,1,145,145
+t7816-grep-binary-pattern.sh,t7816-grep-binary-pattern.sh,PASS,145,0,145,145
 t0052-simple-ipc.sh,t0052-simple-ipc.sh,PASS,9,0,9,9
 t0212-trace2-event.sh,t0212-trace2-event.sh,PASS,11,0,11,11
 t0612-reftable-jgit-compatibility.sh,t0612-reftable-jgit-compatibility.sh,PASS,0,0,0,0
@@ -803,7 +803,7 @@ t5537-fetch-shallow.sh,t5537-fetch-shallow.sh,FAIL,13,4,17,17
 t6113-rev-list-bitmap-filters.sh,t6113-rev-list-bitmap-filters.sh,PASS,14,0,14,14
 t7510-signed-commit.sh,t7510-signed-commit.sh,PASS,29,0,29,29
 t7061-wtstatus-ignore.sh,t7061-wtstatus-ignore.sh,PASS,25,0,25,25
-t7810-grep.sh,t7810-grep.sh,FAIL,239,25,264,264
+t7810-grep.sh,t7810-grep.sh,FAIL,253,11,264,264
 t5302-pack-index.sh,t5302-pack-index.sh,FAIL,31,5,36,36
 t5810-proto-disable-local.sh,t5810-proto-disable-local.sh,PASS,54,0,54,54
 t5520-pull.sh,t5520-pull.sh,FAIL,75,5,80,80

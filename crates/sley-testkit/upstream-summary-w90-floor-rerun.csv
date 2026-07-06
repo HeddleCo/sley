@@ -1,0 +1,15 @@
+script,command,result,ok,notok,total,plan_total
+t2050-git-dir-relative.sh,t2050-git-dir-relative.sh,FAIL,3,1,4,4
+t3404-rebase-interactive.sh,t3404-rebase-interactive.sh,FAIL,126,7,133,133
+t3406-rebase-message.sh,t3406-rebase-message.sh,FAIL,28,4,32,32
+t3430-rebase-merges.sh,t3430-rebase-merges.sh,FAIL,33,1,34,34
+t4041-diff-submodule-option.sh,t4041-diff-submodule-option.sh,FAIL,42,5,47,47
+t4060-diff-submodule-option-diff-format.sh,t4060-diff-submodule-option-diff-format.sh,FAIL,50,1,51,51
+t4210-log-i18n.sh,t4210-log-i18n.sh,FAIL,19,2,21,21
+t5512-ls-remote.sh,t5512-ls-remote.sh,FAIL,39,1,40,40
+t5532-fetch-proxy.sh,t5532-fetch-proxy.sh,FAIL,4,1,5,5
+t5601-clone.sh,t5601-clone.sh,TIMEOUT,38,4,42,
+t7102-reset.sh,t7102-reset.sh,FAIL,34,4,38,38
+t7810-grep.sh,t7810-grep.sh,FAIL,253,11,264,264
+t7814-grep-recurse-submodules.sh,t7814-grep-recurse-submodules.sh,FAIL,25,9,34,34
+t7816-grep-binary-pattern.sh,t7816-grep-binary-pattern.sh,PASS,145,0,145,145

@@ -1,8 +1,8 @@
 sley upstream wave test report
-run label: w90-f8a7e32e-i18n
+run label: w90-34be785b
 waves: 8
 selected scripts: 891
-per-script timeout: 240s
+per-script timeout: 900s
 serial runner: /Users/lukethorne/dev/HeddleCo/sley/crates/sley-testkit/scripts/run-upstream-tests.sh
 
 
@@ -241,23 +241,23 @@ SUMMARY: 112 script(s): 72 passed, 40 failed, 0 timed out.
 
 ===== wave 1 stderr =====
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
-NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(900s) fallback.
 
 Running upstream scripts against sley...
 
 
-Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-1/report.txt
-Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-1/summary.csv
-Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-1/history.csv
-Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-1/timings.csv
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-1/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-1/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-1/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-1/timings.csv
 
 ===== wave 1 report =====
 sley upstream test report
-run label: w90-f8a7e32e-i18n-wave-1
+run label: w90-34be785b-wave-1
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
 upstream t/: /tmp/git-src/t
 default hash: sha1
-per-script timeout: 240s
+per-script timeout: 900s
 
 SCRIPT                       RESULT      OK  FAIL  DETAIL
 -------------------------------------------------------------------------
@@ -1941,7 +1941,7 @@ t8002-blame.sh               PASS       135     0  1..135
 t5304-prune.sh               PASS        32     0  1..32
 t5813-proto-disable-ssh.sh   PASS        81     0  1..81
 t4072-diff-max-depth.sh      PASS        76     0  1..76 (known breakage vanished)
-t5601-clone.sh               TIMEOUT     38     4  exceeded 240s (rc=142); ok=38 notok=4 so far
+t5601-clone.sh               TIMEOUT     38     4  exceeded 900s (rc=142); ok=38 notok=4 so far
 t7900-maintenance.sh         FAIL        72     3  rc=1 (1..75) ok 75 - maintenance aborts with existing lock file|# failed 3 among 75 test(s)|1..75
 t5404-tracking-branches.sh   PASS         7     0  1..7
 t3415-rebase-autosquash.sh   FAIL        24     4  rc=1 (1..28) #	|# failed 4 among 28 test(s)|1..28
@@ -2144,23 +2144,23 @@ SUMMARY: 112 script(s): 55 passed, 56 failed, 1 timed out.
 
 ===== wave 2 stderr =====
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
-NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(900s) fallback.
 
 Running upstream scripts against sley...
 
 
-Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-2/report.txt
-Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-2/summary.csv
-Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-2/history.csv
-Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-2/timings.csv
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-2/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-2/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-2/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-2/timings.csv
 
 ===== wave 2 report =====
 sley upstream test report
-run label: w90-f8a7e32e-i18n-wave-2
+run label: w90-34be785b-wave-2
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
 upstream t/: /tmp/git-src/t
 default hash: sha1
-per-script timeout: 240s
+per-script timeout: 900s
 
 SCRIPT                       RESULT      OK  FAIL  DETAIL
 -------------------------------------------------------------------------
@@ -2256,11 +2256,11 @@ t2407-worktree-heads.sh      PASS        12     0  1..12
 t1423-ref-backend.sh         FAIL        29     7  rc=1 (1..36) #	|# failed 7 among 36 test(s)|1..36
 
 ----- t1423-ref-backend.sh (FAIL): failing assertions -----
-  [#6] config: with worktree and reftable backend, /private/var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T/sley-upstream-run.2RjXYA/trash directory.t1423-ref-backend/repo/.git dir
+  [#6] config: with worktree and reftable backend, /private/var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T/sley-upstream-run.iQPE62/trash directory.t1423-ref-backend/repo/.git dir
   [#9] config: with worktree and reftable backend, . dir
-  [#13] config: with worktree and files backend, /private/var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T/sley-upstream-run.2RjXYA/trash directory.t1423-ref-backend/repo/.git dir
+  [#13] config: with worktree and files backend, /private/var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T/sley-upstream-run.iQPE62/trash directory.t1423-ref-backend/repo/.git dir
   [#16] config: with worktree and files backend, . dir
-  [#30] env: with worktree and files backend, /private/var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T/sley-upstream-run.2RjXYA/trash directory.t1423-ref-backend/repo/.git dir
+  [#30] env: with worktree and files backend, /private/var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T/sley-upstream-run.iQPE62/trash directory.t1423-ref-backend/repo/.git dir
   [#33] env: with worktree and files backend, . dir
   [#36] cloning repository with alt ref directory
 ----- t1423-ref-backend.sh (FAIL) last 25 lines -----
@@ -2526,7 +2526,7 @@ t8002-blame.sh               PASS       135     0  1..135
 t5304-prune.sh               PASS        32     0  1..32
 t5813-proto-disable-ssh.sh   PASS        81     0  1..81
 t4072-diff-max-depth.sh      PASS        76     0  1..76 (known breakage vanished)
-t5601-clone.sh               TIMEOUT     38     4  exceeded 240s (rc=142); ok=38 notok=4 so far
+t5601-clone.sh               TIMEOUT     38     4  exceeded 900s (rc=142); ok=38 notok=4 so far
 
 ----- t5601-clone.sh (TIMEOUT): failing assertions -----
   [#39] set up ssh wrapper
@@ -4585,7 +4585,7 @@ t3407-rebase-abort.sh        PASS        17     0  1..17
 t3425-rebase-topology-merges.sh PASS        13     0  1..13
 t3436-rebase-more-options.sh PASS        19     0  1..19
 t3506-cherry-pick-ff.sh      PASS        11     0  1..11
-t5532-fetch-proxy.sh         TIMEOUT      3     0  exceeded 240s (rc=142); ok=3 notok=0 so far
+t5532-fetch-proxy.sh         FAIL         4     1  rc=1 (1..5) ok 5 - funny hostnames are rejected before running proxy|# failed 1 among 5 test(s)|1..5
 t5731-protocol-v2-bundle-uri-git.sh FAIL         3     5  rc=1 (1..8) #	|# failed 5 among 8 test(s)|1..8
 t6421-merge-partial-clone.sh FAIL         0     3  rc=1 (1..3) #	|# failed 3 among 3 test(s)|1..3
 t6435-merge-sparse.sh        PASS         6     0  1..6
@@ -4700,7 +4700,7 @@ t3407-rebase-abort.sh PASS             17      0     17  100%
 t3425-rebase-topology-merges.sh PASS             13      0     13  100%
 t3436-rebase-more-options.sh PASS             19      0     19  100%
 t3506-cherry-pick-ff.sh PASS             11      0     11  100%
-t5532-fetch-proxy.sh TIMEOUT           3      0      3  100%
+t5532-fetch-proxy.sh FAIL              4      1      5  80%
 t5731-protocol-v2-bundle-uri-git.sh FAIL              3      5      8  37%
 t6421-merge-partial-clone.sh FAIL              0      3      3  0%
 t6435-merge-sparse.sh PASS              6      0      6  100%
@@ -4712,27 +4712,27 @@ t9002-column.sh FAIL              1     15     16  6%
 t9304-fast-import-marks.sh FAIL              3      5      8  37%
 t9903-bash-prompt.sh FAIL             54     13     67  80%
 
-SUMMARY: 112 script(s): 59 passed, 52 failed, 1 timed out.
+SUMMARY: 112 script(s): 59 passed, 53 failed, 0 timed out.
 
 ===== wave 3 stderr =====
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
-NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(900s) fallback.
 
 Running upstream scripts against sley...
 
 
-Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-3/report.txt
-Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-3/summary.csv
-Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-3/history.csv
-Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-3/timings.csv
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-3/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-3/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-3/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-3/timings.csv
 
 ===== wave 3 report =====
 sley upstream test report
-run label: w90-f8a7e32e-i18n-wave-3
+run label: w90-34be785b-wave-3
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
 upstream t/: /tmp/git-src/t
 default hash: sha1
-per-script timeout: 240s
+per-script timeout: 900s
 
 SCRIPT                       RESULT      OK  FAIL  DETAIL
 -------------------------------------------------------------------------
@@ -6306,13 +6306,24 @@ t3407-rebase-abort.sh        PASS        17     0  1..17
 t3425-rebase-topology-merges.sh PASS        13     0  1..13
 t3436-rebase-more-options.sh PASS        19     0  1..19
 t3506-cherry-pick-ff.sh      PASS        11     0  1..11
-t5532-fetch-proxy.sh         TIMEOUT      3     0  exceeded 240s (rc=142); ok=3 notok=0 so far
+t5532-fetch-proxy.sh         FAIL         4     1  rc=1 (1..5) ok 5 - funny hostnames are rejected before running proxy|# failed 1 among 5 test(s)|1..5
 
------ t5532-fetch-proxy.sh (TIMEOUT): failing assertions -----
------ t5532-fetch-proxy.sh (TIMEOUT) last 25 lines -----
+----- t5532-fetch-proxy.sh (FAIL): failing assertions -----
+  [#4] fetch through proxy works
+----- t5532-fetch-proxy.sh (FAIL) last 25 lines -----
 ok 1 - setup remote repo
 ok 2 - setup proxy script
 ok 3 - setup local repo
+not ok 4 - fetch through proxy works
+#	
+#		git fetch fake &&
+#		echo one >expect &&
+#		git log -1 --format=%s FETCH_HEAD >actual &&
+#		test_cmp expect actual
+#	
+ok 5 - funny hostnames are rejected before running proxy
+# failed 1 among 5 test(s)
+1..5
 ----- end t5532-fetch-proxy.sh -----
 
 t5731-protocol-v2-bundle-uri-git.sh FAIL         3     5  rc=1 (1..8) #	|# failed 5 among 8 test(s)|1..8
@@ -6667,7 +6678,7 @@ t3407-rebase-abort.sh PASS             17      0     17  100%
 t3425-rebase-topology-merges.sh PASS             13      0     13  100%
 t3436-rebase-more-options.sh PASS             19      0     19  100%
 t3506-cherry-pick-ff.sh PASS             11      0     11  100%
-t5532-fetch-proxy.sh TIMEOUT           3      0      3  100%
+t5532-fetch-proxy.sh FAIL              4      1      5  80%
 t5731-protocol-v2-bundle-uri-git.sh FAIL              3      5      8  37%
 t6421-merge-partial-clone.sh FAIL              0      3      3  0%
 t6435-merge-sparse.sh PASS              6      0      6  100%
@@ -6679,7 +6690,7 @@ t9002-column.sh FAIL              1     15     16  6%
 t9304-fast-import-marks.sh FAIL              3      5      8  37%
 t9903-bash-prompt.sh FAIL             54     13     67  80%
 
-SUMMARY: 112 script(s): 59 passed, 52 failed, 1 timed out.
+SUMMARY: 112 script(s): 59 passed, 53 failed, 0 timed out.
 
 ===== wave 4 stdout =====
 SCRIPT                       RESULT      OK  FAIL  DETAIL
@@ -6752,7 +6763,7 @@ t6415-merge-dir-to-symlink.sh FAIL        10    14  rc=1 (1..24) # still have 1 
 t6600-test-reach.sh          FAIL        44     9  rc=1 (1..53) ok 53 - merge-base without --all is one of --all results|# failed 9 among 53 test(s)|1..53
 t7106-reset-unborn-branch.sh FAIL         4     3  rc=1 (1..7) ok 7 - reset --hard|# failed 3 among 7 test(s)|1..7
 t7426-submodule-get-default-remote.sh FAIL         4    11  rc=1 (1..15) #	|# failed 11 among 15 test(s)|1..15
-t7814-grep-recurse-submodules.sh FAIL        24    10  rc=1 (1..34) # still have 7 known breakage(s)|# failed 3 among remaining 27 test(s)|1..34
+t7814-grep-recurse-submodules.sh FAIL        25     9  rc=1 (1..34) # still have 7 known breakage(s)|# failed 2 among remaining 27 test(s)|1..34
 t8011-blame-split-file.sh    PASS        10     0  1..10
 t0024-crlf-archive.sh        PASS         3     0  1..3
 t1412-reflog-loop.sh         PASS         3     0  1..3
@@ -6866,7 +6877,7 @@ t6415-merge-dir-to-symlink.sh FAIL             10     14     24  41%
 t6600-test-reach.sh FAIL             44      9     53  83%
 t7106-reset-unborn-branch.sh FAIL              4      3      7  57%
 t7426-submodule-get-default-remote.sh FAIL              4     11     15  26%
-t7814-grep-recurse-submodules.sh FAIL             24     10     34  70%
+t7814-grep-recurse-submodules.sh FAIL             25      9     34  73%
 t8011-blame-split-file.sh PASS             10      0     10  100%
 t0024-crlf-archive.sh PASS              3      0      3  100%
 t1412-reflog-loop.sh PASS              3      0      3  100%
@@ -6914,23 +6925,23 @@ SUMMARY: 111 script(s): 61 passed, 50 failed, 0 timed out.
 
 ===== wave 4 stderr =====
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
-NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(900s) fallback.
 
 Running upstream scripts against sley...
 
 
-Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-4/report.txt
-Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-4/summary.csv
-Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-4/history.csv
-Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-4/timings.csv
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-4/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-4/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-4/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-4/timings.csv
 
 ===== wave 4 report =====
 sley upstream test report
-run label: w90-f8a7e32e-i18n-wave-4
+run label: w90-34be785b-wave-4
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
 upstream t/: /tmp/git-src/t
 default hash: sha1
-per-script timeout: 240s
+per-script timeout: 900s
 
 SCRIPT                       RESULT      OK  FAIL  DETAIL
 -------------------------------------------------------------------------
@@ -7920,10 +7931,9 @@ t7426-submodule-get-default-remote.sh FAIL         4    11  rc=1 (1..15) #	|# fa
 1..15
 ----- end t7426-submodule-get-default-remote.sh -----
 
-t7814-grep-recurse-submodules.sh FAIL        24    10  rc=1 (1..34) # still have 7 known breakage(s)|# failed 3 among remaining 27 test(s)|1..34
+t7814-grep-recurse-submodules.sh FAIL        25     9  rc=1 (1..34) # still have 7 known breakage(s)|# failed 2 among remaining 27 test(s)|1..34
 
 ----- t7814-grep-recurse-submodules.sh (FAIL): failing assertions -----
-  [#22] grep --recurse-submodules should pass the pattern type along
   [#26] grep --textconv: superproject .gitattributes does not affect submodules # TODO known breakage
   [#27] grep --textconv: superproject .gitattributes (from index) does not affect submodules # TODO known breakage
   [#28] grep --textconv: superproject .git/info/attributes does not affect submodules # TODO known breakage
@@ -7957,7 +7967,7 @@ t7814-grep-recurse-submodules.sh FAIL        24    10  rc=1 (1..34) # still have
 #		git -C base grep --cached --recurse-submodules C
 #	
 # still have 7 known breakage(s)
-# failed 3 among remaining 27 test(s)
+# failed 2 among remaining 27 test(s)
 1..34
 ----- end t7814-grep-recurse-submodules.sh -----
 
@@ -8904,7 +8914,7 @@ t6415-merge-dir-to-symlink.sh FAIL             10     14     24  41%
 t6600-test-reach.sh FAIL             44      9     53  83%
 t7106-reset-unborn-branch.sh FAIL              4      3      7  57%
 t7426-submodule-get-default-remote.sh FAIL              4     11     15  26%
-t7814-grep-recurse-submodules.sh FAIL             24     10     34  70%
+t7814-grep-recurse-submodules.sh FAIL             25      9     34  73%
 t8011-blame-split-file.sh PASS             10      0     10  100%
 t0024-crlf-archive.sh PASS              3      0      3  100%
 t1412-reflog-loop.sh PASS              3      0      3  100%
@@ -9046,7 +9056,7 @@ t5538-push-shallow.sh        FAIL         2     6  rc=1 (1..8) #	|# failed 6 amo
 t5582-fetch-negative-refspec.sh FAIL        10     6  rc=1 (1..16) ok 16 - --prefetch succeeds with empty command line refspec|# failed 6 among 16 test(s)|1..16
 t5613-info-alternate.sh      FAIL        10     3  rc=1 (1..13) #	|# failed 3 among 13 test(s)|1..13
 t6408-merge-up-to-date.sh    FAIL         7     1  rc=1 (1..8) ok 8 - merge octopus already up to date|# failed 1 among 8 test(s)|1..8
-t7816-grep-binary-pattern.sh FAIL       144     1  rc=1 (1..145) ok 145 # skip LC_ALL='is_IS.UTF-8' git grep -P -f f -i '<NUL>NÓMATCH' a (missing GETTEXT_LOCALE of LIBPCRE2,GETTEXT_LOCALE)|# failed 1 among 145 test(s)|1..145
+t7816-grep-binary-pattern.sh PASS       145     0  1..145
 t0052-simple-ipc.sh          PASS         9     0  1..9
 t0212-trace2-event.sh        PASS        11     0  1..11
 t0612-reftable-jgit-compatibility.sh PASS         0     0  1..0 # SKIP skipping reftable JGit tests; JGit is not present in PATH
@@ -9160,7 +9170,7 @@ t5538-push-shallow.sh FAIL              2      6      8  25%
 t5582-fetch-negative-refspec.sh FAIL             10      6     16  62%
 t5613-info-alternate.sh FAIL             10      3     13  76%
 t6408-merge-up-to-date.sh FAIL              7      1      8  87%
-t7816-grep-binary-pattern.sh FAIL            144      1    145  99%
+t7816-grep-binary-pattern.sh PASS            145      0    145  100%
 t0052-simple-ipc.sh PASS              9      0      9  100%
 t0212-trace2-event.sh PASS             11      0     11  100%
 t0612-reftable-jgit-compatibility.sh PASS              0      0      0  0%
@@ -9179,27 +9189,27 @@ t7614-merge-signoff.sh PASS              4      0      4  100%
 t9210-scalar.sh FAIL              8     14     22  36%
 t9306-fast-import-signed-tags.sh FAIL             18      8     26  69%
 
-SUMMARY: 111 script(s): 59 passed, 52 failed, 0 timed out.
+SUMMARY: 111 script(s): 60 passed, 51 failed, 0 timed out.
 
 ===== wave 5 stderr =====
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
-NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(900s) fallback.
 
 Running upstream scripts against sley...
 
 
-Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-5/report.txt
-Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-5/summary.csv
-Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-5/history.csv
-Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-5/timings.csv
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-5/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-5/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-5/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-5/timings.csv
 
 ===== wave 5 report =====
 sley upstream test report
-run label: w90-f8a7e32e-i18n-wave-5
+run label: w90-34be785b-wave-5
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
 upstream t/: /tmp/git-src/t
 default hash: sha1
-per-script timeout: 240s
+per-script timeout: 900s
 
 SCRIPT                       RESULT      OK  FAIL  DETAIL
 -------------------------------------------------------------------------
@@ -10802,38 +10812,7 @@ ok 8 - merge octopus already up to date
 1..8
 ----- end t6408-merge-up-to-date.sh -----
 
-t7816-grep-binary-pattern.sh FAIL       144     1  rc=1 (1..145) ok 145 # skip LC_ALL='is_IS.UTF-8' git grep -P -f f -i '<NUL>NÓMATCH' a (missing GETTEXT_LOCALE of LIBPCRE2,GETTEXT_LOCALE)|# failed 1 among 145 test(s)|1..145
-
------ t7816-grep-binary-pattern.sh (FAIL): failing assertions -----
-  [#48] LC_ALL='C' git grep -P -f f -i '[æ]<NUL>ð' a
------ t7816-grep-binary-pattern.sh (FAIL) last 25 lines -----
-ok 123 - error, PCRE v2 only: LC_ALL='C' git grep -f f -i '<NUL>NOMATCH' a
-ok 124 # skip LC_ALL='is_IS.UTF-8' git grep -P -f f -i '<NUL>NOMATCH' a (missing GETTEXT_LOCALE of LIBPCRE2,GETTEXT_LOCALE)
-ok 125 - error, PCRE v2 only: LC_ALL='C' git grep -f f -F 'æ<NUL>[ð]' a
-ok 126 - error, PCRE v2 only: LC_ALL='C' git grep -f f -F 'æ<NUL>[ð]' a
-ok 127 # skip error, PCRE v2 only: LC_ALL='is_IS.UTF-8' git grep -f f -F 'æ<NUL>[ð]' a (missing GETTEXT_LOCALE of LIBPCRE2,GETTEXT_LOCALE)
-ok 128 - error, PCRE v2 only: LC_ALL='C' git grep -f f -Fi 'Æ<NUL>[Ð]' a
-ok 129 - error, PCRE v2 only: LC_ALL='C' git grep -f f -Fi 'Æ<NUL>[Ð]' a
-ok 130 # skip error, PCRE v2 only: LC_ALL='is_IS.UTF-8' git grep -f f -Fi 'Æ<NUL>[Ð]' a (missing GETTEXT_LOCALE of LIBPCRE2,GETTEXT_LOCALE)
-ok 131 - error, PCRE v2 only: LC_ALL='C' git grep -f f -i 'Æ<NUL>[Ð]' a
-ok 132 - error, PCRE v2 only: LC_ALL='C' git grep -f f -i 'Æ<NUL>[Ð]' a
-ok 133 # skip LC_ALL='is_IS.UTF-8' git grep -P -f f -i 'Æ<NUL>[Ð]' a (missing GETTEXT_LOCALE of LIBPCRE2,GETTEXT_LOCALE)
-ok 134 - error, PCRE v2 only: LC_ALL='C' git grep -f f  'y<NUL>NÓMATCH' a
-ok 135 - error, PCRE v2 only: LC_ALL='C' git grep -f f  'y<NUL>NÓMATCH' a
-ok 136 # skip LC_ALL='is_IS.UTF-8' git grep -P -f f  'y<NUL>NÓMATCH' a (missing GETTEXT_LOCALE of LIBPCRE2,GETTEXT_LOCALE)
-ok 137 - error, PCRE v2 only: LC_ALL='C' git grep -f f  '<NUL>NÓMATCH' a
-ok 138 - error, PCRE v2 only: LC_ALL='C' git grep -f f  '<NUL>NÓMATCH' a
-ok 139 # skip LC_ALL='is_IS.UTF-8' git grep -P -f f  '<NUL>NÓMATCH' a (missing GETTEXT_LOCALE of LIBPCRE2,GETTEXT_LOCALE)
-ok 140 - error, PCRE v2 only: LC_ALL='C' git grep -f f -i 'Y<NUL>NÓMATCH' a
-ok 141 - error, PCRE v2 only: LC_ALL='C' git grep -f f -i 'Y<NUL>NÓMATCH' a
-ok 142 # skip LC_ALL='is_IS.UTF-8' git grep -P -f f -i 'Y<NUL>NÓMATCH' a (missing GETTEXT_LOCALE of LIBPCRE2,GETTEXT_LOCALE)
-ok 143 - error, PCRE v2 only: LC_ALL='C' git grep -f f -i '<NUL>NÓMATCH' a
-ok 144 - error, PCRE v2 only: LC_ALL='C' git grep -f f -i '<NUL>NÓMATCH' a
-ok 145 # skip LC_ALL='is_IS.UTF-8' git grep -P -f f -i '<NUL>NÓMATCH' a (missing GETTEXT_LOCALE of LIBPCRE2,GETTEXT_LOCALE)
-# failed 1 among 145 test(s)
-1..145
------ end t7816-grep-binary-pattern.sh -----
-
+t7816-grep-binary-pattern.sh PASS       145     0  1..145
 t0052-simple-ipc.sh          PASS         9     0  1..9
 t0212-trace2-event.sh        PASS        11     0  1..11
 t0612-reftable-jgit-compatibility.sh PASS         0     0  1..0 # SKIP skipping reftable JGit tests; JGit is not present in PATH
@@ -11215,7 +11194,7 @@ t5538-push-shallow.sh FAIL              2      6      8  25%
 t5582-fetch-negative-refspec.sh FAIL             10      6     16  62%
 t5613-info-alternate.sh FAIL             10      3     13  76%
 t6408-merge-up-to-date.sh FAIL              7      1      8  87%
-t7816-grep-binary-pattern.sh FAIL            144      1    145  99%
+t7816-grep-binary-pattern.sh PASS            145      0    145  100%
 t0052-simple-ipc.sh PASS              9      0      9  100%
 t0212-trace2-event.sh PASS             11      0     11  100%
 t0612-reftable-jgit-compatibility.sh PASS              0      0      0  0%
@@ -11234,7 +11213,7 @@ t7614-merge-signoff.sh PASS              4      0      4  100%
 t9210-scalar.sh FAIL              8     14     22  36%
 t9306-fast-import-signed-tags.sh FAIL             18      8     26  69%
 
-SUMMARY: 111 script(s): 59 passed, 52 failed, 0 timed out.
+SUMMARY: 111 script(s): 60 passed, 51 failed, 0 timed out.
 
 ===== wave 6 stdout =====
 SCRIPT                       RESULT      OK  FAIL  DETAIL
@@ -11469,23 +11448,23 @@ SUMMARY: 111 script(s): 52 passed, 59 failed, 0 timed out.
 
 ===== wave 6 stderr =====
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
-NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(900s) fallback.
 
 Running upstream scripts against sley...
 
 
-Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-6/report.txt
-Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-6/summary.csv
-Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-6/history.csv
-Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-6/timings.csv
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-6/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-6/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-6/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-6/timings.csv
 
 ===== wave 6 report =====
 sley upstream test report
-run label: w90-f8a7e32e-i18n-wave-6
+run label: w90-34be785b-wave-6
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
 upstream t/: /tmp/git-src/t
 default hash: sha1
-per-script timeout: 240s
+per-script timeout: 900s
 
 SCRIPT                       RESULT      OK  FAIL  DETAIL
 -------------------------------------------------------------------------
@@ -14242,23 +14221,23 @@ SUMMARY: 111 script(s): 64 passed, 47 failed, 0 timed out.
 
 ===== wave 7 stderr =====
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
-NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(900s) fallback.
 
 Running upstream scripts against sley...
 
 
-Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-7/report.txt
-Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-7/summary.csv
-Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-7/history.csv
-Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-7/timings.csv
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-7/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-7/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-7/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-7/timings.csv
 
 ===== wave 7 report =====
 sley upstream test report
-run label: w90-f8a7e32e-i18n-wave-7
+run label: w90-34be785b-wave-7
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
 upstream t/: /tmp/git-src/t
 default hash: sha1
-per-script timeout: 240s
+per-script timeout: 900s
 
 SCRIPT                       RESULT      OK  FAIL  DETAIL
 -------------------------------------------------------------------------
@@ -16233,7 +16212,7 @@ t5537-fetch-shallow.sh       FAIL        13     4  rc=1 (1..17) #	|# failed 4 am
 t6113-rev-list-bitmap-filters.sh PASS        14     0  1..14
 t7510-signed-commit.sh       PASS        29     0  1..29
 t7061-wtstatus-ignore.sh     PASS        25     0  1..25
-t7810-grep.sh                FAIL       239    25  rc=1 (1..264) #	|# failed 25 among 264 test(s)|1..264
+t7810-grep.sh                FAIL       253    11  rc=1 (1..264) #	|# failed 11 among 264 test(s)|1..264
 t5302-pack-index.sh          FAIL        31     5  rc=1 (1..36) ok 36 - index-pack --fsck-objects outside of a repo|# failed 5 among 36 test(s)|1..36
 t5810-proto-disable-local.sh PASS        54     0  1..54
 t5520-pull.sh                FAIL        75     5  rc=1 (1..80) #	|# failed 5 among 80 test(s)|1..80
@@ -16347,7 +16326,7 @@ t5537-fetch-shallow.sh FAIL             13      4     17  76%
 t6113-rev-list-bitmap-filters.sh PASS             14      0     14  100%
 t7510-signed-commit.sh PASS             29      0     29  100%
 t7061-wtstatus-ignore.sh PASS             25      0     25  100%
-t7810-grep.sh  FAIL            239     25    264  90%
+t7810-grep.sh  FAIL            253     11    264  95%
 t5302-pack-index.sh FAIL             31      5     36  86%
 t5810-proto-disable-local.sh PASS             54      0     54  100%
 t5520-pull.sh  FAIL             75      5     80  93%
@@ -16439,23 +16418,23 @@ SUMMARY: 111 script(s): 61 passed, 50 failed, 0 timed out.
 
 ===== wave 8 stderr =====
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
-NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(240s) fallback.
+NOTE: no timeout(1)/gtimeout(1); using a Perl alarm(900s) fallback.
 
 Running upstream scripts against sley...
 
 
-Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-8/report.txt
-Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-8/summary.csv
-Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-8/history.csv
-Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.Tfddae/wave-8/timings.csv
+Full report written to: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-8/report.txt
+Machine-readable summary: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-8/summary.csv
+Pass-rate history (appended): /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-8/history.csv
+Per-script timings: /var/folders/pl/d2jk07gx0_z4w33h_k5ylhl80000gn/T//sley-upstream-waves.SBKLhS/wave-8/timings.csv
 
 ===== wave 8 report =====
 sley upstream test report
-run label: w90-f8a7e32e-i18n-wave-8
+run label: w90-34be785b-wave-8
 sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
 upstream t/: /tmp/git-src/t
 default hash: sha1
-per-script timeout: 240s
+per-script timeout: 900s
 
 SCRIPT                       RESULT      OK  FAIL  DETAIL
 -------------------------------------------------------------------------
@@ -16678,11 +16657,9 @@ t5537-fetch-shallow.sh       FAIL        13     4  rc=1 (1..17) #	|# failed 4 am
 t6113-rev-list-bitmap-filters.sh PASS        14     0  1..14
 t7510-signed-commit.sh       PASS        29     0  1..29
 t7061-wtstatus-ignore.sh     PASS        25     0  1..25
-t7810-grep.sh                FAIL       239    25  rc=1 (1..264) #	|# failed 25 among 264 test(s)|1..264
+t7810-grep.sh                FAIL       253    11  rc=1 (1..264) #	|# failed 11 among 264 test(s)|1..264
 
 ----- t7810-grep.sh (FAIL): failing assertions -----
-  [#38] grep HEAD with grep.patterntype=perl
-  [#96] grep in working tree with grep.patterntype=perl
   [#120] grep exactly one char in single-char multibyte file
   [#121] grep two chars in single-char multibyte file
   [#152] log grep (4)
@@ -16693,18 +16670,6 @@ t7810-grep.sh                FAIL       239    25  rc=1 (1..264) #	|# failed 25 
   [#158] log grep (9)
   [#169] log --author does not search in timestamp
   [#170] log --committer does not search in timestamp
-  [#216] grep --perl-regexp pattern
-  [#218] grep -P pattern
-  [#219] grep -P with (*NO_JIT) doesn't error out
-  [#222] grep -P pattern with grep.extendedRegexp=true
-  [#223] grep -P -v pattern
-  [#224] grep -P -i pattern
-  [#225] grep -P -w pattern
-  [#226] grep -P backreferences work (the PCRE NO_AUTO_CAPTURE flag is not set)
-  [#241] grep -G -F -E -P pattern
-  [#242] grep pattern with grep.patternType=fixed, =basic, =extended, =perl
-  [#243] grep -P pattern with grep.patternType=fixed
-  [#253] grep -P "^ "
   [#264] grep of revision in partial clone batches prefetch and honors pathspec
 ----- t7810-grep.sh (FAIL) last 25 lines -----
 #		test_trace2_data promisor fetch_count 2 <grep-trace-pathspec &&
@@ -16730,7 +16695,7 @@ t7810-grep.sh                FAIL       239    25  rc=1 (1..264) #	|# failed 25 
 #			--missing=print HEAD >missing &&
 #		test_line_count = 0 missing
 #	
-# failed 25 among 264 test(s)
+# failed 11 among 264 test(s)
 1..264
 ----- end t7810-grep.sh -----
 
@@ -18341,7 +18306,7 @@ t5537-fetch-shallow.sh FAIL             13      4     17  76%
 t6113-rev-list-bitmap-filters.sh PASS             14      0     14  100%
 t7510-signed-commit.sh PASS             29      0     29  100%
 t7061-wtstatus-ignore.sh PASS             25      0     25  100%
-t7810-grep.sh  FAIL            239     25    264  90%
+t7810-grep.sh  FAIL            253     11    264  95%
 t5302-pack-index.sh FAIL             31      5     36  86%
 t5810-proto-disable-local.sh PASS             54      0     54  100%
 t5520-pull.sh  FAIL             75      5     80  93%
@@ -18758,7 +18723,7 @@ t3407-rebase-abort.sh        PASS             17      0     17  100%
 t3425-rebase-topology-merges.sh PASS             13      0     13  100%
 t3436-rebase-more-options.sh PASS             19      0     19  100%
 t3506-cherry-pick-ff.sh      PASS             11      0     11  100%
-t5532-fetch-proxy.sh         TIMEOUT           3      0      3  100%
+t5532-fetch-proxy.sh         FAIL              4      1      5  80%
 t5731-protocol-v2-bundle-uri-git.sh FAIL              3      5      8  37%
 t6421-merge-partial-clone.sh FAIL              0      3      3  0%
 t6435-merge-sparse.sh        PASS              6      0      6  100%
@@ -18837,7 +18802,7 @@ t6415-merge-dir-to-symlink.sh FAIL             10     14     24  41%
 t6600-test-reach.sh          FAIL             44      9     53  83%
 t7106-reset-unborn-branch.sh FAIL              4      3      7  57%
 t7426-submodule-get-default-remote.sh FAIL              4     11     15  26%
-t7814-grep-recurse-submodules.sh FAIL             24     10     34  70%
+t7814-grep-recurse-submodules.sh FAIL             25      9     34  73%
 t8011-blame-split-file.sh    PASS             10      0     10  100%
 t0024-crlf-archive.sh        PASS              3      0      3  100%
 t1412-reflog-loop.sh         PASS              3      0      3  100%
@@ -18973,7 +18938,7 @@ t5538-push-shallow.sh        FAIL              2      6      8  25%
 t5582-fetch-negative-refspec.sh FAIL             10      6     16  62%
 t5613-info-alternate.sh      FAIL             10      3     13  76%
 t6408-merge-up-to-date.sh    FAIL              7      1      8  87%
-t7816-grep-binary-pattern.sh FAIL            144      1    145  99%
+t7816-grep-binary-pattern.sh PASS            145      0    145  100%
 t0052-simple-ipc.sh          PASS              9      0      9  100%
 t0212-trace2-event.sh        PASS             11      0     11  100%
 t0612-reftable-jgit-compatibility.sh PASS              0      0      0  0%
@@ -19237,7 +19202,7 @@ t5537-fetch-shallow.sh       FAIL             13      4     17  76%
 t6113-rev-list-bitmap-filters.sh PASS             14      0     14  100%
 t7510-signed-commit.sh       PASS             29      0     29  100%
 t7061-wtstatus-ignore.sh     PASS             25      0     25  100%
-t7810-grep.sh                FAIL            239     25    264  90%
+t7810-grep.sh                FAIL            253     11    264  95%
 t5302-pack-index.sh          FAIL             31      5     36  86%
 t5810-proto-disable-local.sh PASS             54      0     54  100%
 t5520-pull.sh                FAIL             75      5     80  93%
@@ -19325,6 +19290,6 @@ t7813-grep-icase-iso.sh      PASS              2      0      2  100%
 t9301-fast-import-notes.sh   FAIL             14      3     17  82%
 t9700-perl-git.sh            PASS              3      0      3  100%
 
-ASSERTION SUMMARY: ok=28668 fail=3073 total=31741 pass=90%
-SCRIPT SUMMARY: 891 script(s): 483 passed, 406 failed, 2 timed out.
+ASSERTION SUMMARY: ok=28685 fail=3058 total=31743 pass=90%
+SCRIPT SUMMARY: 891 script(s): 484 passed, 406 failed, 1 timed out.
 WAVE SUMMARY: 8 active wave(s), 8 wave(s) returned non-zero.

@@ -1,0 +1,15 @@
+label,script,command,result,elapsed_ms,ok,notok,total,plan_total
+floor-34be785b,t2050-git-dir-relative.sh,t2050-git-dir-relative.sh,FAIL,1583,3,1,4,4
+floor-34be785b,t3404-rebase-interactive.sh,t3404-rebase-interactive.sh,FAIL,36514,126,7,133,133
+floor-34be785b,t3406-rebase-message.sh,t3406-rebase-message.sh,FAIL,4552,28,4,32,32
+floor-34be785b,t3430-rebase-merges.sh,t3430-rebase-merges.sh,FAIL,12500,33,1,34,34
+floor-34be785b,t4041-diff-submodule-option.sh,t4041-diff-submodule-option.sh,FAIL,2431,42,5,47,47
+floor-34be785b,t4060-diff-submodule-option-diff-format.sh,t4060-diff-submodule-option-diff-format.sh,FAIL,3305,50,1,51,51
+floor-34be785b,t4210-log-i18n.sh,t4210-log-i18n.sh,FAIL,598,19,2,21,21
+floor-34be785b,t5512-ls-remote.sh,t5512-ls-remote.sh,FAIL,2201,39,1,40,40
+floor-34be785b,t5532-fetch-proxy.sh,t5532-fetch-proxy.sh,FAIL,835,4,1,5,5
+floor-34be785b,t5601-clone.sh,t5601-clone.sh,TIMEOUT,900061,38,4,42,
+floor-34be785b,t7102-reset.sh,t7102-reset.sh,FAIL,2975,34,4,38,38
+floor-34be785b,t7810-grep.sh,t7810-grep.sh,FAIL,5515,253,11,264,264
+floor-34be785b,t7814-grep-recurse-submodules.sh,t7814-grep-recurse-submodules.sh,FAIL,3246,25,9,34,34
+floor-34be785b,t7816-grep-binary-pattern.sh,t7816-grep-binary-pattern.sh,PASS,2579,145,0,145,145

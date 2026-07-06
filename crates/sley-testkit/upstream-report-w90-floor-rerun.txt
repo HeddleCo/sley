@@ -1,0 +1,458 @@
+sley upstream test report
+run label: floor-34be785b
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+upstream t/: /tmp/git-src/t
+default hash: sha1
+per-script timeout: 900s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t2050-git-dir-relative.sh    FAIL         3     1  rc=1 (1..4) ok 4 - post-commit-hook from sub dir|# failed 1 among 4 test(s)|1..4
+
+----- t2050-git-dir-relative.sh (FAIL): failing assertions -----
+  [#3] post-commit-hook created and used from top dir
+----- t2050-git-dir-relative.sh (FAIL) last 25 lines -----
+ok 1 - Setting up post-commit hook
+ok 2 - post-commit hook used ordinarily
+not ok 3 - post-commit-hook created and used from top dir
+#	
+#	echo changed >top &&
+#	git --git-dir subdir/.git add top &&
+#	git --git-dir subdir/.git commit -m topcommit &&
+#	test -r "${COMMIT_FILE}"
+#	
+ok 4 - post-commit-hook from sub dir
+# failed 1 among 4 test(s)
+1..4
+----- end t2050-git-dir-relative.sh -----
+
+t3404-rebase-interactive.sh  FAIL       126     7  rc=1 (1..133) ok 133 - $EDITOR and friends are unchanged|# failed 7 among 133 test(s)|1..133
+
+----- t3404-rebase-interactive.sh (FAIL): failing assertions -----
+  [#35] squash and fixup generate correct log messages
+  [#83] rebase -i produces readable reflog
+  [#126] respect user edits to update-ref steps
+  [#127] --update-refs: all update-ref lines removed
+  [#128] --update-refs: all update-ref lines removed, then some re-added
+  [#129] --update-refs: --edit-todo with no update-ref lines
+  [#130] --update-refs: check failed ref update
+----- t3404-rebase-interactive.sh (FAIL) last 25 lines -----
+#		# the lock in the update-refs file.
+#		git update-ref refs/heads/second third &&
+#	
+#		test_must_fail git rebase --continue 2>err &&
+#		grep "update_ref failed for ref 'refs/heads/second'" err &&
+#	
+#		q_to_tab >expect <<-\EOF &&
+#		Updated the following refs with --update-refs:
+#		Qrefs/heads/first
+#		Qrefs/heads/no-conflict-branch
+#		Qrefs/heads/third
+#		Failed to update the following refs with --update-refs:
+#		Qrefs/heads/second
+#		EOF
+#	
+#		# Clear "Rebasing (X/Y)" progress lines and drop leading tabs.
+#		tail -n 6 err >err.last &&
+#		sed "s/Rebasing.*Successfully/Successfully/g" <err.last >err.trimmed &&
+#		test_cmp expect err.trimmed
+#	
+ok 131 - bad labels and refs rejected when parsing todo list
+ok 132 - non-merge commands reject merge commits
+ok 133 - $EDITOR and friends are unchanged
+# failed 7 among 133 test(s)
+1..133
+----- end t3404-rebase-interactive.sh -----
+
+t3406-rebase-message.sh      FAIL        28     4  rc=1 (1..32) ok 32 - rebase -i onto unrelated history|# failed 4 among 32 test(s)|1..32
+
+----- t3406-rebase-message.sh (FAIL): failing assertions -----
+  [#12] rebase --merge reflog
+  [#14] rebase --merge --skip reflog
+  [#17] rebase --merge reflog GIT_REFLOG_ACTION=my-reflog-action
+  [#19] rebase --merge --skip reflog GIT_REFLOG_ACTION=my-reflog-action
+----- t3406-rebase-message.sh (FAIL) last 25 lines -----
+#	
+#		git log -g --format=%gs -4 >actual &&
+#		write_reflog_expect <<-EOF &&
+#		${reflog_action:-rebase} (finish): returning to refs/heads/conflicts
+#		${reflog_action:-rebase} (pick): Q
+#		${reflog_action:-rebase} (pick): P
+#		${reflog_action:-rebase} (start): checkout main
+#		EOF
+#		test_cmp expect actual
+#		
+ok 20 - rebase --merge --abort reflog GIT_REFLOG_ACTION=my-reflog-action
+ok 21 - rebase --merge --abort detached HEAD reflog GIT_REFLOG_ACTION=my-reflog-action
+ok 22 - rebase --apply reflog
+ok 23 - rebase --apply fast-forward reflog
+ok 24 - rebase --apply --skip reflog
+ok 25 - rebase --apply --abort reflog
+ok 26 - rebase --apply --abort detached HEAD reflog
+ok 27 - rebase --apply reflog GIT_REFLOG_ACTION=my-reflog-action
+ok 28 - rebase --apply fast-forward reflog GIT_REFLOG_ACTION=my-reflog-action
+ok 29 - rebase --apply --skip reflog GIT_REFLOG_ACTION=my-reflog-action
+ok 30 - rebase --apply --abort reflog GIT_REFLOG_ACTION=my-reflog-action
+ok 31 - rebase --apply --abort detached HEAD reflog GIT_REFLOG_ACTION=my-reflog-action
+ok 32 - rebase -i onto unrelated history
+# failed 4 among 32 test(s)
+1..32
+----- end t3406-rebase-message.sh -----
+
+t3430-rebase-merges.sh       FAIL        33     1  rc=1 (1..34) ok 34 - reword fast-forwarded empty merge commit|# failed 1 among 34 test(s)|1..34
+
+----- t3430-rebase-merges.sh (FAIL): failing assertions -----
+  [#2] create completely different structure
+----- t3430-rebase-merges.sh (FAIL) last 25 lines -----
+ok 12 - --no-rebase-merges countermands --rebase-merges
+ok 13 - do not rebase cousins unless asked for
+ok 14 - rebase.rebaseMerges=rebase-cousins is equivalent to --rebase-merges=rebase-cousins
+ok 15 - --no-rebase-merges overrides rebase.rebaseMerges=no-rebase-cousins
+ok 16 - --rebase-merges overrides rebase.rebaseMerges=rebase-cousins
+ok 17 - refs/rewritten/* is worktree-local
+ok 18 - --abort cleans up refs/rewritten
+ok 19 - --quit cleans up refs/rewritten
+ok 20 - post-rewrite hook and fixups work for merges
+ok 21 - refuse to merge ancestors of HEAD
+ok 22 - root commits
+ok 23 - a "merge" into a root commit is a fast-forward
+ok 24 - A root commit can be a cousin, treat it that way
+ok 25 - labels that are object IDs are rewritten
+ok 26 - octopus merges
+ok 27 - with --autosquash and --exec
+ok 28 - --continue after resolving conflicts after a merge
+ok 29 - --rebase-merges with strategies
+ok 30 - --rebase-merges with commit that can generate bad characters for filename
+ok 31 - --rebase-merges with message matched with onto label
+ok 32 - progress shows the correct total
+ok 33 - truncate label names
+ok 34 - reword fast-forwarded empty merge commit
+# failed 1 among 34 test(s)
+1..34
+----- end t3430-rebase-merges.sh -----
+
+t4041-diff-submodule-option.sh FAIL        42     5  rc=1 (1..47) ok 47 - diff --submodule with objects referenced by alternates|# failed 5 among 47 test(s)|1..47
+
+----- t4041-diff-submodule-option.sh (FAIL): failing assertions -----
+  [#6] modified submodule(forward)
+  [#7] modified submodule(forward)
+  [#8] modified submodule(forward) --submodule
+  [#10] modified submodule(backward)
+  [#11] modified submodule(backward and forward)
+----- t4041-diff-submodule-option.sh (FAIL) last 25 lines -----
+ok 25 - submodule contains untracked and modified content (dirty ignored)
+ok 26 - submodule contains untracked and modified content (all ignored)
+ok 27 - submodule contains modified content
+ok 28 - submodule is modified
+ok 29 - modified submodule contains untracked content
+ok 30 - modified submodule contains untracked content (untracked ignored)
+ok 31 - modified submodule contains untracked content (dirty ignored)
+ok 32 - modified submodule contains untracked content (all ignored)
+ok 33 - modified submodule contains untracked and modified content
+ok 34 - modified submodule contains untracked and modified content (untracked ignored)
+ok 35 - modified submodule contains untracked and modified content (dirty ignored)
+ok 36 - modified submodule contains untracked and modified content (all ignored)
+ok 37 - modified submodule contains modified content
+ok 38 - deleted submodule
+ok 39 - create second submodule
+ok 40 - multiple submodules
+ok 41 - path filter
+ok 42 - given commit
+ok 43 - given commit --submodule
+ok 44 - given commit --submodule=short
+ok 45 - setup .git file for sm2
+ok 46 - diff --submodule with .git file
+ok 47 - diff --submodule with objects referenced by alternates
+# failed 5 among 47 test(s)
+1..47
+----- end t4041-diff-submodule-option.sh -----
+
+t4060-diff-submodule-option-diff-format.sh FAIL        50     1  rc=1 (1..51) ok 51 - diff --submodule=diff recurses into deleted nested submodules|# failed 1 among 51 test(s)|1..51
+
+----- t4060-diff-submodule-option-diff-format.sh (FAIL): failing assertions -----
+  [#8] modified submodule(forward) --submodule
+----- t4060-diff-submodule-option-diff-format.sh (FAIL) last 25 lines -----
+ok 29 - modified submodule contains untracked content
+ok 30 - modified submodule contains untracked content (untracked ignored)
+ok 31 - modified submodule contains untracked content (dirty ignored)
+ok 32 - modified submodule contains untracked content (all ignored)
+ok 33 - modified submodule contains untracked and modified content
+ok 34 - modified submodule contains untracked and modified content (untracked ignored)
+ok 35 - modified submodule contains untracked and modified content (dirty ignored)
+ok 36 - modified submodule contains untracked and modified content (all ignored)
+ok 37 - modified submodule contains modified content
+ok 38 - deleted submodule
+ok 39 - create second submodule
+ok 40 - multiple submodules
+ok 41 - path filter
+ok 42 - given commit
+ok 43 - setup .git file for sm2
+ok 44 - diff --submodule=diff with .git file
+ok 45 - deleted submodule with .git file
+ok 46 - typechanged(submodule->blob) submodule with .git file
+ok 47 - setup nested submodule
+ok 48 - move nested submodule HEAD
+ok 49 - diff --submodule=diff with moved nested submodule HEAD
+ok 50 - diff --submodule=diff recurses into nested submodules
+ok 51 - diff --submodule=diff recurses into deleted nested submodules
+# failed 1 among 51 test(s)
+1..51
+----- end t4060-diff-submodule-option-diff-format.sh -----
+
+t4210-log-i18n.sh            FAIL        19     2  rc=1 (1..21) ok 21 # skip log --grep does not die on invalid UTF-8 value (latin1 + locale + invalid needle) (missing GETTEXT_LOCALE of GETTEXT_LOCALE,PCRE)|# failed 2 among 21 test(s)|1..21
+
+----- t4210-log-i18n.sh (FAIL): failing assertions -----
+  [#2] log --grep searches in log output encoding (utf8)
+  [#3] log --grep searches in log output encoding (latin1)
+----- t4210-log-i18n.sh (FAIL) last 25 lines -----
+#		utf8
+#		EOF
+#		git log --encoding=ISO-8859-1 --format=%s --grep=$latin1_e >actual &&
+#		test_cmp expect actual
+#	
+ok 4 - log --grep does not find non-reencoded values (utf8)
+ok 5 - log --grep does not find non-reencoded values (latin1)
+ok 6 - config grep.patternType=fixed
+ok 7 # skip log --grep does not find non-reencoded values (latin1 + locale) (missing GETTEXT_LOCALE of GETTEXT_LOCALE,)
+ok 8 # skip log --grep searches in log output encoding (latin1 + locale) (missing GETTEXT_LOCALE of !MINGW,GETTEXT_LOCALE,)
+ok 9 # skip log --grep does not die on invalid UTF-8 value (latin1 + locale + invalid needle) (missing GETTEXT_LOCALE of GETTEXT_LOCALE,)
+ok 10 - config grep.patternType=basic
+ok 11 # skip log --grep does not find non-reencoded values (latin1 + locale) (missing GETTEXT_LOCALE of GETTEXT_LOCALE,)
+ok 12 # skip log --grep searches in log output encoding (latin1 + locale) (missing GETTEXT_LOCALE of !MINGW,GETTEXT_LOCALE,)
+ok 13 # skip log --grep does not die on invalid UTF-8 value (latin1 + locale + invalid needle) (missing GETTEXT_LOCALE of GETTEXT_LOCALE,)
+ok 14 - config grep.patternType=extended
+ok 15 # skip log --grep does not find non-reencoded values (latin1 + locale) (missing GETTEXT_LOCALE of GETTEXT_LOCALE,)
+ok 16 # skip log --grep searches in log output encoding (latin1 + locale) (missing GETTEXT_LOCALE of !MINGW,GETTEXT_LOCALE,)
+ok 17 # skip log --grep does not die on invalid UTF-8 value (latin1 + locale + invalid needle) (missing GETTEXT_LOCALE of GETTEXT_LOCALE,)
+ok 18 - config grep.patternType=perl
+ok 19 # skip log --grep does not find non-reencoded values (latin1 + locale) (missing GETTEXT_LOCALE of GETTEXT_LOCALE,PCRE)
+ok 20 # skip log --grep searches in log output encoding (latin1 + locale) (missing GETTEXT_LOCALE of !MINGW,GETTEXT_LOCALE,PCRE)
+ok 21 # skip log --grep does not die on invalid UTF-8 value (latin1 + locale + invalid needle) (missing GETTEXT_LOCALE of GETTEXT_LOCALE,PCRE)
+# failed 2 among 21 test(s)
+1..21
+----- end t4210-log-i18n.sh -----
+
+t5512-ls-remote.sh           FAIL        39     1  rc=1 (1..40) ok 40 - helper with refspec capability fails gracefully|# failed 1 among 40 test(s)|1..40
+
+----- t5512-ls-remote.sh (FAIL): failing assertions -----
+  [#9] ls-remote -h is deprecated w/o warning
+----- t5512-ls-remote.sh (FAIL) last 25 lines -----
+ok 18 - use branch.<name>.remote if possible
+ok 19 - confuses pattern as remote when no remote specified
+ok 20 - die with non-2 for wrong repository even with --exit-code
+ok 21 - Report success even when nothing matches
+ok 22 - Report no-match with --exit-code
+ok 23 - Report match with --exit-code
+ok 24 - set up some extra tags for ref hiding
+ok 25 - Hide some refs with transfer.hiderefs
+ok 26 - Override hiding of transfer.hiderefs
+ok 27 - Hide some refs with uploadpack.hiderefs
+ok 28 - Override hiding of uploadpack.hiderefs
+ok 29 - overrides work between mixed transfer/upload-pack hideRefs
+ok 30 - protocol v2 supports hiderefs
+ok 31 - ls-remote --symref
+ok 32 - ls-remote with filtered symref (refname)
+ok 33 - ls-remote with filtered symref (--branches)
+ok 34 - indicate no refs in v0 standards-compliant empty remote
+ok 35 - ls-remote works outside repository
+ok 36 - ls-remote --sort fails gracefully outside repository
+ok 37 - ls-remote patterns work with all protocol versions
+ok 38 - ls-remote prefixes work with all protocol versions
+ok 39 - v0 clients can handle multiple symrefs
+ok 40 - helper with refspec capability fails gracefully
+# failed 1 among 40 test(s)
+1..40
+----- end t5512-ls-remote.sh -----
+
+t5532-fetch-proxy.sh         FAIL         4     1  rc=1 (1..5) ok 5 - funny hostnames are rejected before running proxy|# failed 1 among 5 test(s)|1..5
+
+----- t5532-fetch-proxy.sh (FAIL): failing assertions -----
+  [#4] fetch through proxy works
+----- t5532-fetch-proxy.sh (FAIL) last 25 lines -----
+ok 1 - setup remote repo
+ok 2 - setup proxy script
+ok 3 - setup local repo
+not ok 4 - fetch through proxy works
+#	
+#		git fetch fake &&
+#		echo one >expect &&
+#		git log -1 --format=%s FETCH_HEAD >actual &&
+#		test_cmp expect actual
+#	
+ok 5 - funny hostnames are rejected before running proxy
+# failed 1 among 5 test(s)
+1..5
+----- end t5532-fetch-proxy.sh -----
+
+t5601-clone.sh               TIMEOUT     38     4  exceeded 900s (rc=142); ok=38 notok=4 so far
+
+----- t5601-clone.sh (TIMEOUT): failing assertions -----
+  [#39] set up ssh wrapper
+  [#40] clone myhost:src uses ssh
+  [#41] clone local path foo:bar
+  [#42] bracketed hostnames are still ssh
+----- t5601-clone.sh (TIMEOUT) last 25 lines -----
+not ok 39 - set up ssh wrapper
+#	
+#		cp "$GIT_BUILD_DIR/t/helper/test-fake-ssh$X" \
+#			"$TRASH_DIRECTORY/ssh$X" &&
+#		GIT_SSH="$TRASH_DIRECTORY/ssh$X" &&
+#		export GIT_SSH &&
+#		export TRASH_DIRECTORY &&
+#		>"$TRASH_DIRECTORY"/ssh-output
+#	
+not ok 40 - clone myhost:src uses ssh
+#	
+#		GIT_TEST_PROTOCOL_VERSION=0 git clone myhost:src ssh-clone &&
+#		expect_ssh myhost src
+#	
+not ok 41 - clone local path foo:bar
+#	
+#		cp -R src "foo:bar" &&
+#		git clone "foo:bar" foobar &&
+#		expect_ssh none
+#	
+not ok 42 - bracketed hostnames are still ssh
+#	
+#		GIT_TEST_PROTOCOL_VERSION=0 git clone "[myhost:123]:src" ssh-bracket-clone &&
+#		expect_ssh "-p 123" myhost src
+#	
+----- end t5601-clone.sh -----
+
+t7102-reset.sh               FAIL        34     4  rc=1 (1..38) ok 38 - reset handles --end-of-options|# failed 4 among 38 test(s)|1..38
+
+----- t7102-reset.sh (FAIL): failing assertions -----
+  [#7] reset --hard message
+  [#8] reset --hard message (ISO8859-1 logoutputencoding)
+  [#14] trying to do reset --soft with pending checkout merge should fail
+  [#28] --mixed --[no-]refresh sets refresh behavior
+----- t7102-reset.sh (FAIL) last 25 lines -----
+ok 21 - redoing the last two commits should succeed
+ok 22 - --hard reset to HEAD should clear a failed merge
+ok 23 - --hard reset to ORIG_HEAD should clear a fast-forward merge
+ok 24 - test --mixed <paths>
+ok 25 - test resetting the index at give paths
+ok 26 - resetting an unmodified path is a no-op
+ok 27 - --mixed refreshes the index
+not ok 28 - --mixed --[no-]refresh sets refresh behavior
+#	
+#		# Verify that --[no-]refresh controls index refresh
+#		test_reset_refreshes_index "" --refresh &&
+#		! test_reset_refreshes_index "" --no-refresh
+#	
+ok 29 - --mixed preserves skip-worktree
+ok 30 - resetting specific path that is unmerged
+ok 31 - disambiguation (1)
+ok 32 - disambiguation (2)
+ok 33 - disambiguation (3)
+ok 34 - disambiguation (4)
+ok 35 - reset with paths accepts tree
+ok 36 - reset -N keeps removed files as intent-to-add
+ok 37 - reset --mixed sets up work tree
+ok 38 - reset handles --end-of-options
+# failed 4 among 38 test(s)
+1..38
+----- end t7102-reset.sh -----
+
+t7810-grep.sh                FAIL       253    11  rc=1 (1..264) #	|# failed 11 among 264 test(s)|1..264
+
+----- t7810-grep.sh (FAIL): failing assertions -----
+  [#120] grep exactly one char in single-char multibyte file
+  [#121] grep two chars in single-char multibyte file
+  [#152] log grep (4)
+  [#154] log grep (6)
+  [#155] log grep (7)
+  [#156] log grep (8)
+  [#157] log grep (9)
+  [#158] log grep (9)
+  [#169] log --author does not search in timestamp
+  [#170] log --committer does not search in timestamp
+  [#264] grep of revision in partial clone batches prefetch and honors pathspec
+----- t7810-grep.sh (FAIL) last 25 lines -----
+#		test_trace2_data promisor fetch_count 2 <grep-trace-pathspec &&
+#		test_trace2_data pack-objects written 2 <grep-trace-pathspec &&
+#	
+#		# b/matches.md should still be missing locally.
+#		git -C grep-partial rev-list --quiet --objects \
+#			--missing=print HEAD >missing &&
+#		test_line_count = 1 missing &&
+#	
+#		# A second grep without a pathspec must recurse into both
+#		# subdirectories, but should request only the still-missing blob
+#		# from the promisor.
+#		GIT_TRACE2_EVENT="$(pwd)/grep-trace-all" \
+#			git -C grep-partial grep -c "needle" HEAD >result &&
+#	
+#		test_line_count = 2 result &&
+#		test_trace2_data promisor fetch_count 1 <grep-trace-all &&
+#		test_trace2_data pack-objects written 1 <grep-trace-all &&
+#	
+#		# Everything is local now.
+#		git -C grep-partial rev-list --quiet --objects \
+#			--missing=print HEAD >missing &&
+#		test_line_count = 0 missing
+#	
+# failed 11 among 264 test(s)
+1..264
+----- end t7810-grep.sh -----
+
+t7814-grep-recurse-submodules.sh FAIL        25     9  rc=1 (1..34) # still have 7 known breakage(s)|# failed 2 among remaining 27 test(s)|1..34
+
+----- t7814-grep-recurse-submodules.sh (FAIL): failing assertions -----
+  [#26] grep --textconv: superproject .gitattributes does not affect submodules # TODO known breakage
+  [#27] grep --textconv: superproject .gitattributes (from index) does not affect submodules # TODO known breakage
+  [#28] grep --textconv: superproject .git/info/attributes does not affect submodules # TODO known breakage
+  [#29] grep --textconv correctly reads submodule .gitattributes # TODO known breakage
+  [#30] grep --textconv correctly reads submodule .gitattributes (from index) # TODO known breakage
+  [#31] grep --textconv correctly reads submodule .git/info/attributes # TODO known breakage
+  [#32] grep saves textconv cache in the appropriate repository # TODO known breakage
+  [#33] grep partially-cloned submodule
+  [#34] check scope of core.useReplaceRefs
+----- t7814-grep-recurse-submodules.sh (FAIL) last 25 lines -----
+#		B=$(git -C base rev-parse HEAD:b) &&
+#		C=$(git -C base/sub rev-parse HEAD:c) &&
+#		D=$(git -C base/sub rev-parse HEAD:d) &&
+#	
+#		git -C base replace $A $B &&
+#		git -C base/sub replace $C $D &&
+#	
+#		test_must_fail git -C base grep --cached --recurse-submodules A &&
+#		test_must_fail git -C base grep --cached --recurse-submodules C &&
+#	
+#		git -C base config core.useReplaceRefs false &&
+#		git -C base grep --recurse-submodules A &&
+#		test_must_fail git -C base grep --cached --recurse-submodules C &&
+#	
+#		git -C base/sub config core.useReplaceRefs false &&
+#		git -C base grep --cached --recurse-submodules A &&
+#		git -C base grep --cached --recurse-submodules C &&
+#	
+#		git -C base config --unset core.useReplaceRefs &&
+#		test_must_fail git -C base grep --cached --recurse-submodules A &&
+#		git -C base grep --cached --recurse-submodules C
+#	
+# still have 7 known breakage(s)
+# failed 2 among remaining 27 test(s)
+1..34
+----- end t7814-grep-recurse-submodules.sh -----
+
+t7816-grep-binary-pattern.sh PASS       145     0  1..145
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+t2050-git-dir-relative.sh FAIL              3      1      4  75%
+t3404-rebase-interactive.sh FAIL            126      7    133  94%
+t3406-rebase-message.sh FAIL             28      4     32  87%
+t3430-rebase-merges.sh FAIL             33      1     34  97%
+t4041-diff-submodule-option.sh FAIL             42      5     47  89%
+t4060-diff-submodule-option-diff-format.sh FAIL             50      1     51  98%
+t4210-log-i18n.sh FAIL             19      2     21  90%
+t5512-ls-remote.sh FAIL             39      1     40  97%
+t5532-fetch-proxy.sh FAIL              4      1      5  80%
+t5601-clone.sh TIMEOUT          38      4     42  90%
+t7102-reset.sh FAIL             34      4     38  89%
+t7810-grep.sh  FAIL            253     11    264  95%
+t7814-grep-recurse-submodules.sh FAIL             25      9     34  73%
+t7816-grep-binary-pattern.sh PASS            145      0    145  100%
+
+SUMMARY: 14 script(s): 1 passed, 12 failed, 1 timed out.
