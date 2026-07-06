@@ -159,7 +159,7 @@ pub(crate) use commands::merge_rebase::{
     merge_read_blob, merge_remove_worktree_file, merge_write_worktree_file,
     read_merge_message_from_file, rebase_in_progress, three_way_merge_trees,
 };
-pub(crate) use commands::remote_cmds::{
+pub(crate) use commands::remote::{
     read_repo_config, remote_exists, remote_names, repo_current_branch_name, write_repo_config,
 };
 pub(crate) use commands::status::cmd_status;
@@ -740,7 +740,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "check-mailmap" => commands::utility::cmd_check_mailmap(&args[1..]),
         "check-ref-format" => commands::utility::cmd_check_ref_format(&args[1..]),
         "clean" => commands::plumbing::cmd_clean(&args[1..]),
-        "clone" => commands::remote_cmds::cmd_clone(&args[1..]),
+        "clone" => commands::remote::cmd_clone(&args[1..]),
         "config" => commands::config_cmd::cmd_config(&args[1..]),
         "count-objects" => commands::pack::cmd_count_objects(&args[1..]),
         "gc" => commands::pack::cmd_gc(&args[1..]),
@@ -755,13 +755,13 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "diff" => commands::diff::cmd_diff(&args[1..]),
         "range-diff" => commands::range_diff::cmd_range_diff(&args[1..]),
         "difftool" => commands::difftool::cmd_difftool(&args[1..]),
-        "fetch" => commands::remote_cmds::cmd_fetch(&args[1..]),
+        "fetch" => commands::remote::cmd_fetch(&args[1..]),
         "for-each-ref" => commands::for_each_ref::cmd_for_each_ref(&args[1..]),
         "for-each-repo" => commands::for_each_repo::cmd_for_each_repo(&args[1..]),
         "refs" => commands::refs::cmd_refs(&args[1..]),
         "fsck" => commands::plumbing::cmd_fsck(&args[1..]),
         "get-tar-commit-id" => commands::utility::cmd_get_tar_commit_id(&args[1..]),
-        "ls-remote" => commands::remote_cmds::cmd_ls_remote(&args[1..]),
+        "ls-remote" => commands::remote::cmd_ls_remote(&args[1..]),
         "ls-files" => commands::index::cmd_ls_files(&args[1..]),
         "ls-tree" => commands::index::cmd_ls_tree(&args[1..]),
         "log" => commands::log::cmd_log(&args[1..]),
@@ -790,13 +790,13 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "pack-refs" => commands::pack::cmd_pack_refs(&args[1..]),
         "prune" => commands::pack::cmd_prune(&args[1..]),
         "prune-packed" => commands::plumbing::cmd_prune_packed(&args[1..]),
-        "push" => commands::remote_cmds::cmd_push(&args[1..]),
-        "send-pack" => commands::remote_cmds::cmd_send_pack(&args[1..]),
+        "push" => commands::remote::cmd_push(&args[1..]),
+        "send-pack" => commands::remote::cmd_send_pack(&args[1..]),
         "fetch-pack" => commands::fetch_pack::cmd_fetch_pack(&args[1..]),
         "filter-branch" => commands::filter_branch::cmd_filter_branch(&args[1..]),
         "unpack-objects" => commands::pack::cmd_unpack_objects(&args[1..]),
-        "receive-pack" => commands::remote_cmds::cmd_receive_pack(&args[1..]),
-        "upload-pack" => commands::remote_cmds::cmd_upload_pack(&args[1..]),
+        "receive-pack" => commands::remote::cmd_receive_pack(&args[1..]),
+        "upload-pack" => commands::remote::cmd_upload_pack(&args[1..]),
         "daemon" => commands::daemon::cmd_daemon(&args[1..]),
         "write-tree" => commands::trees::cmd_write_tree(&args[1..]),
         "worktree" => commands::worktree::cmd_worktree(&args[1..]),
@@ -805,7 +805,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "rev-parse" => commands::rev_parse::cmd_rev_parse(&args[1..]),
         "rev-list" => commands::rev_list::cmd_rev_list(&args[1..]),
         "reflog" => commands::refs::cmd_reflog(&args[1..]),
-        "remote" => commands::remote_cmds::cmd_remote(&args[1..]),
+        "remote" => commands::remote::cmd_remote(&args[1..]),
         "replace" => commands::plumbing::cmd_replace(&args[1..]),
         "rerere" => commands::rerere::cmd_rerere(&args[1..]),
         "reset" => commands::reset::cmd_reset(&args[1..]),
@@ -1588,7 +1588,7 @@ pub(crate) fn enable_submodule_path_config_extension(git_dir: &Path) -> Result<(
         "submodulePathConfig",
         "true",
     );
-    commands::remote_cmds::write_repo_config(git_dir, &config)
+    commands::remote::write_repo_config(git_dir, &config)
 }
 
 pub(crate) fn submodule_path_config_enabled(git_dir: &Path) -> bool {
@@ -4484,7 +4484,7 @@ fn write_diff_stat_materialized(
     let mut widths = DiffStatWidths::terminal();
     if let Ok(cwd) = env::current_dir()
         && let Ok(git_dir) = session::cli_git_dir_from(&cwd)
-        && let Ok(config) = commands::remote_cmds::read_repo_config(&git_dir)
+        && let Ok(config) = commands::remote::read_repo_config(&git_dir)
     {
         widths.resolve_config(&config);
     } else {
@@ -5797,7 +5797,7 @@ fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Re
         };
         let filter = config
             .get("remote", Some(&remote_name), "partialclonefilter")
-            .and_then(commands::remote_cmds::pack_filter_from_spec)
+            .and_then(commands::remote::pack_filter_from_spec)
             .or(Some(sley_odb::PackObjectFilter::BlobNone));
         let quiet = config.get_bool("promisor", None, "quiet").unwrap_or(false);
         trace2_promisor_fetch_child_start(&remote_name, quiet);
@@ -5809,7 +5809,7 @@ fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Re
             }
             return Ok(false);
         }
-        let Ok(remote_git_dir) = commands::remote_cmds::ls_remote_git_dir(url) else {
+        let Ok(remote_git_dir) = commands::remote::ls_remote_git_dir(url) else {
             continue;
         };
         if sley_remote::install_fetch_pack_via_local_upload_pack(

@@ -2112,7 +2112,7 @@ fn prefetch_local_promisor_checkout_blobs(
         let Some(url) = config.get("remote", Some(remote_name), "url") else {
             continue;
         };
-        let Ok(remote_git_dir) = commands::remote_cmds::ls_remote_git_dir(url) else {
+        let Ok(remote_git_dir) = commands::remote::ls_remote_git_dir(url) else {
             continue;
         };
         let _ = sley_remote::install_fetch_pack_via_local_upload_pack(

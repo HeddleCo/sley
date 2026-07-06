@@ -2012,7 +2012,7 @@ fn clone_submodule_for_checkout(
         resolved,
         sub_root.display().to_string(),
     ];
-    super::remote_cmds::cmd_clone(&args)?;
+    super::remote::cmd_clone(&args)?;
     connect_submodule_worktree(sub_root, sub_git_dir)?;
     Ok(())
 }

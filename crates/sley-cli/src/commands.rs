@@ -70,7 +70,7 @@ pub(crate) mod rebase;
 pub(crate) mod ref_command_stream;
 pub(crate) mod refs;
 pub(crate) mod refs_verify;
-pub(crate) mod remote_cmds;
+pub(crate) mod remote;
 pub(crate) mod replay;
 pub(crate) mod rerere;
 pub(crate) mod reset;

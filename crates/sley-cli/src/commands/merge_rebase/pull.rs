@@ -122,7 +122,7 @@ fn resolve_pull_remote_and_refspecs(
 }
 
 fn pull_default_remote_without_tracking(config: &GitConfig) -> Option<String> {
-    let remotes = crate::commands::remote_cmds::remote_names(config);
+    let remotes = crate::commands::remote::remote_names(config);
     match remotes.as_slice() {
         [] => None,
         [only] => Some(only.clone()),
@@ -803,7 +803,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     for arg in args {
         if expect_depth_value {
             expect_depth_value = false;
-            depth = Some(crate::commands::remote_cmds::parse_clone_depth(arg)?);
+            depth = Some(crate::commands::remote::parse_clone_depth(arg)?);
             continue;
         }
         match arg.as_str() {
@@ -883,7 +883,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             }
             "--depth" => expect_depth_value = true,
             value if value.starts_with("--depth=") => {
-                depth = Some(crate::commands::remote_cmds::parse_clone_depth(
+                depth = Some(crate::commands::remote::parse_clone_depth(
                     value.strip_prefix("--depth=").unwrap_or_default(),
                 )?);
             }
@@ -1029,7 +1029,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             }
         };
     if set_upstream {
-        crate::commands::remote_cmds::fetch_set_upstream_from_outcome(
+        crate::commands::remote::fetch_set_upstream_from_outcome(
             &git_dir,
             format,
             &remote,

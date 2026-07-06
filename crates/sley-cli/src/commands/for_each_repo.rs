@@ -18,7 +18,7 @@ use std::process::Command as ProcessCommand;
 use sley_config::ConfigIncludeContext;
 use sley_core::{GitError, Result};
 
-use crate::commands::remote_cmds::repo_current_branch_name;
+use crate::commands::remote::repo_current_branch_name;
 use crate::{common_git_dir_for_git_dir, injected_config_parameters};
 
 const USAGE: &str = "usage: git for-each-repo --config=<config> [--] <arguments>";

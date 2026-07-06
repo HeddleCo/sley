@@ -7234,7 +7234,7 @@ pub(crate) fn repo_has_promisor_remote(config: &GitConfig) -> bool {
     {
         return true;
     }
-    crate::commands::remote_cmds::remote_names(config)
+    crate::commands::remote::remote_names(config)
         .into_iter()
         .any(|name| config.get_bool("remote", Some(&name), "promisor") == Some(true))
 }

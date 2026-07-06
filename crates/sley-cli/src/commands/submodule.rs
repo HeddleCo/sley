@@ -296,7 +296,7 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
         clone_args.push(modules_git_dir.display().to_string());
         clone_args.push(real_repo.clone());
         clone_args.push(destination.display().to_string());
-        with_local_repo_env_hidden(|| super::remote_cmds::cmd_clone(&clone_args))?;
+        with_local_repo_env_hidden(|| super::remote::cmd_clone(&clone_args))?;
         if options.progress && !options.quiet {
             eprintln!("Receiving objects: 100% (done)");
         }
@@ -624,7 +624,7 @@ fn populate_submodule_worktree(
         clone_args.push(modules_git_dir.display().to_string());
         clone_args.push(url.to_string());
         clone_args.push(path.display().to_string());
-        with_local_repo_env_hidden(|| super::remote_cmds::cmd_clone(&clone_args))?;
+        with_local_repo_env_hidden(|| super::remote::cmd_clone(&clone_args))?;
         // Propagate the alternate config into the just-cloned submodule so its
         // OWN recursive update borrows for the next level down (nested case).
         propagate_submodule_alternate_config(git_dir, &modules_git_dir)?;
@@ -3127,7 +3127,7 @@ pub(crate) fn read_submodule_configs(worktree_root: &Path) -> Result<Vec<Submodu
     //
     // TODO(submodule): migrate the other 13 `.gitmodules` walk sites
     // (set-url / set-branch / sync / add via `submodule_name_for_exact_path`,
-    // and the scattered reads in sley-cli/{branch,workspace,remote_cmds}.rs,
+    // and the scattered reads in sley-cli/{branch,workspace,remote}.rs,
     // sley-worktree, sley-remote/clone.rs) onto `SubmoduleConfigSet`.
     let Some(config) = read_gitmodules_config(worktree_root)? else {
         return Ok(Vec::new());

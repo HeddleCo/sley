@@ -19,7 +19,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-use crate::commands::remote_cmds::repo_current_branch_name;
+use crate::commands::remote::repo_current_branch_name;
 use crate::{
     common_git_dir_for_git_dir, injected_config_parameters,
     worktree_root_for_git_dir,

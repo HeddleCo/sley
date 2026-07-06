@@ -1,3 +1,5 @@
+//! `git ls-remote` option parsing.
+
 use super::{LsRemoteOptions, LsRemoteSort};
 use crate::commands::cli_options::{last_tri_state_bool, opt_bool, opt_str, option_str};
 use crate::*;

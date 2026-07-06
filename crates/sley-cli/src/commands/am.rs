@@ -773,7 +773,7 @@ fn am_config_bool(git_dir: &Path, key: &str) -> Option<bool> {
     {
         value.to_string()
     } else {
-        commands::remote_cmds::read_repo_config(git_dir)
+        commands::remote::read_repo_config(git_dir)
             .ok()?
             .get("am", None, key)?
             .to_string()
@@ -3292,7 +3292,7 @@ fn apply_actions(
     format: ObjectFormat,
     actions: &[ApplyFileAction],
 ) -> Result<()> {
-    let config = commands::remote_cmds::read_repo_config(git_dir).unwrap_or_default();
+    let config = commands::remote::read_repo_config(git_dir).unwrap_or_default();
     // git's `write_out_results` materializes in two phases: every removal happens
     // before any write. This matters when a directory's tracked children are
     // removed and the directory is then (re)created as a gitlink — single-phase
@@ -4642,7 +4642,7 @@ fn am_clean_index(
         am_remove_worktree_path(worktree_root, p)?;
     }
     if !checkout_paths.is_empty() {
-        let config = commands::remote_cmds::read_repo_config(git_dir).unwrap_or_default();
+        let config = commands::remote::read_repo_config(git_dir).unwrap_or_default();
         sley_worktree::checkout_index_paths(
             worktree_root,
             git_dir,

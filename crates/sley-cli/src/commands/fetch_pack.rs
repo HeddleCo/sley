@@ -6,7 +6,7 @@
 //! per fetched ref. `--diag-url` is a faithful port of `connect.c`'s
 //! `parse_connect_url` diagnostics and never connects.
 
-use crate::commands::remote_cmds::ls_remote_git_dir;
+use crate::commands::remote::ls_remote_git_dir;
 use crate::*;
 use sley_remote::{apply_shallow_info, compute_local_deepen, read_shallow};
 
