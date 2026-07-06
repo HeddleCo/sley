@@ -114,6 +114,12 @@ fn link_system_git_exec_helpers(dir: &Path) -> io::Result<()> {
 #[cfg(unix)]
 fn link_exec_helper(dir: &Path, name: &str, source: &Path) -> io::Result<()> {
     use std::os::unix::fs::symlink;
+    // Apache's CGI handler rejects a symlinked ScriptAlias target (AH00037
+    // "Symbolic link not allowed"), and upstream lib-httpd points /smart/ at
+    // ${GIT_EXEC_PATH}/git-http-backend — that helper must be a real file.
+    if name == "git-http-backend" {
+        return copy_exec_helper(dir, name, source);
+    }
     let dest = dir.join(name);
     if dest.exists() {
         if dest
@@ -131,6 +137,26 @@ fn link_exec_helper(dir: &Path, name: &str, source: &Path) -> io::Result<()> {
             return Err(err);
         }
     }
+    Ok(())
+}
+
+/// Materialize `name` as a regular-file copy, replacing a stale symlink from
+/// an earlier shim build. Size equality is the freshness check so repeated
+/// sley invocations don't recopy on every run.
+fn copy_exec_helper(dir: &Path, name: &str, source: &Path) -> io::Result<()> {
+    let dest = dir.join(name);
+    if let Ok(metadata) = dest.symlink_metadata() {
+        if metadata.is_file()
+            && source
+                .metadata()
+                .map(|source_metadata| source_metadata.len() == metadata.len())
+                .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        fs::remove_file(&dest)?;
+    }
+    fs::copy(source, &dest)?;
     Ok(())
 }
 
