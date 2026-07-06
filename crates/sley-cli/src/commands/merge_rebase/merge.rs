@@ -599,6 +599,7 @@ fn merge_octopus(
     // `--squash`: stage the merged result + write SQUASH_MSG, record NO merge.
     if options.squash {
         sync_octopus_worktree()?;
+        refresh_merged_index_stat(git_dir, worktree_root, format)?;
         let other_oids: Vec<ObjectId> = reduced.iter().map(|(_, oid)| *oid).collect();
         write_squash_message_multi(git_dir, &db, format, &head_oid, &other_oids)?;
         if !options.quiet {
@@ -612,6 +613,7 @@ fn merge_octopus(
     // head) + MERGE_MSG, but do not create the commit or advance HEAD.
     if options.no_commit {
         sync_octopus_worktree()?;
+        refresh_merged_index_stat(git_dir, worktree_root, format)?;
         let other_oids = reduced.iter().map(|(_, oid)| *oid).collect::<Vec<_>>();
         write_merge_state(
             git_dir,
@@ -694,6 +696,45 @@ fn merge_octopus(
         &merged_oid,
         Some(vec![("treeish".to_string(), merged_oid.to_hex())]),
     )?;
+    Ok(())
+}
+
+/// After a clean `--squash`/`--no-commit` merge has materialized the merged
+/// result into the worktree, record the on-disk stat for the stage-0 entries our
+/// staging wrote with a zeroed stat. git's merge checks the merged result out and
+/// `fill_stat_cache_info` records each entry's stat; without it `git diff-files`
+/// (and `git status`) report every merged path as modified. Only zero-stat,
+/// non-gitlink stage-0 entries whose worktree file exists are touched; conflict
+/// stages never reach this path.
+fn refresh_merged_index_stat(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(());
+    }
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    let mut changed = false;
+    for entry in &mut index.entries {
+        if (entry.flags >> 12) & 0x3 != 0
+            || sley_index::is_gitlink(entry.mode)
+            || entry.mtime_seconds != 0
+            || entry.ctime_seconds != 0
+        {
+            continue;
+        }
+        if let Ok(rel) = std::str::from_utf8(entry.path.as_bytes())
+            && let Ok(metadata) = fs::symlink_metadata(worktree_root.join(rel))
+        {
+            sley_worktree::fill_index_entry_stat_cache(entry, &metadata);
+            changed = true;
+        }
+    }
+    if changed {
+        fs::write(&index_path, index.write(format)?)?;
+    }
     Ok(())
 }
 
@@ -3377,6 +3418,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         // move HEAD. git prints the clean-merge notice then the squash line.
         if options.squash {
             write_merged_worktree()?;
+            refresh_merged_index_stat(&git_dir, &worktree_root, format)?;
             write_squash_message(&git_dir, &db, format, &head_oid, &other_oid)?;
             if !options.quiet {
                 println!("Automatic merge went well; stopped before committing as requested");
@@ -3401,6 +3443,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 write_merge_autostash_marker(&git_dir)?;
             }
             write_merged_worktree()?;
+            refresh_merged_index_stat(&git_dir, &worktree_root, format)?;
             if !options.quiet {
                 println!("Automatic merge went well; stopped before committing as requested");
             }
@@ -3535,16 +3578,11 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             .cmp(&right.path)
             .then_with(|| (left.flags >> 12).cmp(&(right.flags >> 12)))
     });
-    let index = Index {
-        version: 2,
-        entries,
-        extensions: Vec::new(),
-        checksum: None,
-    };
-    fs::write(
-        sley_worktree::repository_index_path(&git_dir),
-        index.write(format)?,
-    )?;
+    // The index is written AFTER the worktree materialization below so freshly
+    // resolved stage-0 entries can record their on-disk stat (git refreshes
+    // cleanly-merged results via fill_stat_cache_info; a zeroed stat makes
+    // diff-files report the resolved path as modified). Conflict stages (1/2/3)
+    // keep zero stat, as git does.
 
     // Materialize merged/conflicted content into the worktree. Conflict entries
     // below a populated HEAD gitlink are superproject index state only: writing
@@ -3614,6 +3652,30 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             },
         }
     }
+
+    // Record the on-disk stat for cleanly-resolved stage-0 entries now that the
+    // worktree holds their content (git's fill_stat_cache_info). Conflict stages
+    // and gitlinks keep zero stat.
+    for entry in &mut entries {
+        if (entry.flags >> 12) & 0x3 != 0 || sley_index::is_gitlink(entry.mode) {
+            continue;
+        }
+        if let Ok(rel) = std::str::from_utf8(entry.path.as_bytes())
+            && let Ok(metadata) = fs::symlink_metadata(worktree_root.join(rel))
+        {
+            sley_worktree::fill_index_entry_stat_cache(entry, &metadata);
+        }
+    }
+    fs::write(
+        sley_worktree::repository_index_path(&git_dir),
+        Index {
+            version: 2,
+            entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write(format)?,
+    )?;
 
     // The `# Conflicts:` trailer git appends to MERGE_MSG / SQUASH_MSG.
     let conflicts_block = merge_conflicts_block(&conflicts, false);

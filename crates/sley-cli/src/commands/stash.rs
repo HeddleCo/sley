@@ -891,6 +891,33 @@ fn apply_stash_merge_results(
         }
     }
 
+    // Materialize the worktree BEFORE building the index so freshly-resolved
+    // stage-0 entries can record the on-disk stat (git refreshes cleanly-merged
+    // results via fill_stat_cache_info; a zeroed stat makes diff-files report the
+    // path as modified). Reused entries whose (mode, oid) match `ours` are not
+    // rewritten and keep their existing stat.
+    for (path, result) in results {
+        match result {
+            MergePathResult::Resolved(Some((mode, oid))) => {
+                if ours_map.get(path) != Some(&(*mode, *oid)) {
+                    let content = merge_read_blob(db, oid)?;
+                    merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+                }
+            }
+            MergePathResult::Resolved(None) => {
+                if ours_map.contains_key(path) {
+                    merge_remove_worktree_file(worktree_root, path)?;
+                }
+            }
+            MergePathResult::Conflict { worktree, .. } => match worktree {
+                Some((mode, content)) => {
+                    merge_write_worktree_file(worktree_root, path, content, *mode)?
+                }
+                None => merge_remove_worktree_file(worktree_root, path)?,
+            },
+        }
+    }
+
     let mut entries: Vec<IndexEntry> = Vec::new();
     for (path, result) in results {
         match result {
@@ -901,7 +928,14 @@ fn apply_stash_merge_results(
                 {
                     entries.push(old.clone());
                 } else {
-                    entries.push(merge_index_entry(path, *mode, *oid, 0));
+                    let mut entry = merge_index_entry(path, *mode, *oid, 0);
+                    if !sley_index::is_gitlink(*mode)
+                        && let Ok(rel) = std::str::from_utf8(path)
+                        && let Ok(metadata) = fs::symlink_metadata(worktree_root.join(rel))
+                    {
+                        sley_worktree::fill_index_entry_stat_cache(&mut entry, &metadata);
+                    }
+                    entries.push(entry);
                 }
             }
             MergePathResult::Resolved(None) => {}
@@ -941,28 +975,6 @@ fn apply_stash_merge_results(
         }
         .write(format)?,
     )?;
-
-    for (path, result) in results {
-        match result {
-            MergePathResult::Resolved(Some((mode, oid))) => {
-                if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = merge_read_blob(db, oid)?;
-                    merge_write_worktree_file(worktree_root, path, &content, *mode)?;
-                }
-            }
-            MergePathResult::Resolved(None) => {
-                if ours_map.contains_key(path) {
-                    merge_remove_worktree_file(worktree_root, path)?;
-                }
-            }
-            MergePathResult::Conflict { worktree, .. } => match worktree {
-                Some((mode, content)) => {
-                    merge_write_worktree_file(worktree_root, path, content, *mode)?
-                }
-                None => merge_remove_worktree_file(worktree_root, path)?,
-            },
-        }
-    }
     Ok(())
 }
 

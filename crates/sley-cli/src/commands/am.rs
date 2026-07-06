@@ -3385,7 +3385,7 @@ fn stage_and_commit(
                 } else {
                     db.write_object(EncodedObject::new(ObjectType::Blob, content.clone()))?
                 };
-                upsert_index_entry(&mut index, path, *mode, oid);
+                upsert_index_entry(&mut index, worktree_root, path, *mode, oid);
             }
             ApplyFileAction::Remove { path } => {
                 index.entries.retain(|entry| &entry.path != path);
@@ -3417,8 +3417,25 @@ fn stage_and_commit(
 }
 
 /// Insert or replace the stage-0 index entry for `path`.
-fn upsert_index_entry(index: &mut Index, path: &[u8], mode: u32, oid: ObjectId) {
-    let entry = merge_index_entry(path, mode, oid, 0);
+///
+/// `apply_actions` has already written the file to the worktree, so record its
+/// on-disk stat (git stages via add_file_to_index / fill_stat_cache_info); a
+/// zeroed stat would make `git diff-files` report the just-applied path as
+/// modified. Gitlinks keep zero stat, as git does.
+fn upsert_index_entry(
+    index: &mut Index,
+    worktree_root: &Path,
+    path: &[u8],
+    mode: u32,
+    oid: ObjectId,
+) {
+    let mut entry = merge_index_entry(path, mode, oid, 0);
+    if !sley_index::is_gitlink(mode)
+        && let Ok(rel) = std::str::from_utf8(path)
+        && let Ok(metadata) = fs::symlink_metadata(worktree_root.join(rel))
+    {
+        sley_worktree::fill_index_entry_stat_cache(&mut entry, &metadata);
+    }
     if let Some(existing) = index
         .entries
         .iter_mut()
