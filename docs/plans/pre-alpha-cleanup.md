@@ -23,7 +23,7 @@
 | W41 | ✅ done | 203 engine parity tests (target 200) |
 | W50 | ✅ done | CliSession + discovery.rs; 0 `discover_git_dir` / `GLOBAL_*` |
 | W51 | ⚠️ partial | `remote_cmds.rs` deleted → `commands/remote/` tree (~13k LOC); orchestration still CLI-resident |
-| W52 | ⚠️ partial | 12 engine deps removed; `dispatch.rs` (490); `lib.rs` **1,406** LOC (was 10.5k); 10+ helper modules |
+| W52 | ✅ done | 12 engine deps removed; `lib.rs` **322** LOC; `dispatch.rs` 490; 15+ helper modules |
 | W52a | ✅ done | hooks + env-aware OpenOptions in sley facade |
 | W60 | ⚠️ partial | `branch.rs` → `branch/` tree; `dispatch.rs` still 6k |
 | W61 | ✅ done | `plumbing.rs` → `plumbing/` tree (14 modules) |
