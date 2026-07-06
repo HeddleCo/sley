@@ -27,8 +27,11 @@ pub fn run_update_index(
 
 /// Format the repository index the way `git ls-files --stage` prints it.
 pub fn index_stage_output(repo: &Repository) -> EngineOutput {
-    let index = repo.read_index().expect("read index");
-    EngineOutput::stdout(format_index_stage(&index))
+    match repo.read_index() {
+        Ok(index) => EngineOutput::stdout(format_index_stage(&index)),
+        Err(sley::IndexError::NotFound) => EngineOutput::stdout(Vec::new()),
+        Err(err) => panic!("read index: {err:?}"),
+    }
 }
 
 pub fn format_index_stage(index: &Index) -> Vec<u8> {

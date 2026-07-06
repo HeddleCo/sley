@@ -5,6 +5,9 @@
 mod cat_file;
 mod common;
 mod config;
+mod hash_object;
+mod index;
 mod init;
+mod refs;
 mod rev_parse;
 mod update_index;
