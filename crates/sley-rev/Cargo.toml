@@ -16,6 +16,7 @@ sley-index.workspace = true
 sley-mmap.workspace = true
 sley-object.workspace = true
 sley-odb.workspace = true
+sley-options.workspace = true
 sley-pathspec.workspace = true
 sley-refs.workspace = true
 

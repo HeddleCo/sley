@@ -137,6 +137,7 @@ mod repository;
 mod setup;
 
 pub(crate) use sley_pretty::{CompiledLogFormat, FormatToken, LogFormatDialect, presets};
+pub(crate) use sley_rev::diff_options::{DiffFilter, DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleIgnoreMode, diff_stat_count_option, diff_stat_parse_width_option, parse_diff_filter, parse_diff_rename_limit, parse_similarity_threshold, parse_submodule_ignore_mode};
 
 pub(crate) use commands::args::{GitArgCursor, long_option_value};
 pub(crate) use commands::cat_file::{cat_file_all_object_ids, cat_file_object_storage};
@@ -2948,23 +2949,6 @@ fn read_reused_commit(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result
     }
 }
 
-/// Parse a git rename/copy similarity spec (`-M50`, `-M50%`, `-M0.5`, `--find-renames=75%`)
-/// into a 0..=100 threshold. A bare `-M` (no value) keeps the default.
-fn parse_similarity_threshold(spec: &str) -> u8 {
-    let spec = spec.strip_suffix('%').unwrap_or(spec);
-    match spec.parse::<f64>() {
-        Ok(value) => {
-            let pct = if value <= 1.0 && spec.contains('.') {
-                value * 100.0
-            } else {
-                value
-            };
-            pct.round().clamp(0.0, 100.0) as u8
-        }
-        Err(_) => sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-    }
-}
-
 /// Split `git diff`'s positional arguments into leading revisions (resolved to
 /// tree oids) and the remaining pathspec arguments.
 ///
@@ -3316,30 +3300,6 @@ fn write_diff_meta_line(
         _ => writeln!(stdout, "{line}")?,
     }
     Ok(())
-}
-
-/// The `--ignore-submodules` modes (upstream handle_ignore_submodules_arg).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubmoduleIgnoreMode {
-    /// Nothing is ignored: untracked content alone marks a submodule dirty.
-    None,
-    /// Untracked content in submodules is ignored (the implicit default for
-    /// porcelain diff: repo_diff_setup sets ignore_untracked_in_submodules).
-    Untracked,
-    /// All working-tree dirt is ignored; only commit changes show.
-    Dirty,
-    /// Submodules are ignored entirely.
-    All,
-}
-
-fn parse_submodule_ignore_mode(value: &str) -> Option<SubmoduleIgnoreMode> {
-    match value {
-        "none" => Some(SubmoduleIgnoreMode::None),
-        "untracked" => Some(SubmoduleIgnoreMode::Untracked),
-        "dirty" => Some(SubmoduleIgnoreMode::Dirty),
-        "all" => Some(SubmoduleIgnoreMode::All),
-        _ => None,
-    }
 }
 
 /// The resolved submodule-ignore configuration for a diff invocation.
@@ -4357,75 +4317,6 @@ fn write_diff_shortstat_materialized(
     )
 }
 
-/// The `--stat=<width>[,<name-width>[,<count>]]` / `--stat-*-width` knobs plus
-/// the surrounding layout context, mirroring git's `diff_options` fields.
-///
-/// Sentinels follow git exactly:
-///   * `stat_width`: `-1` = scale to the terminal (minus `line_prefix_width`),
-///     `0` = the fixed 80-column default, `>0` = explicit width.
-///   * `name_width` / `graph_width`: `-1` = take `diff.statNameWidth` /
-///     `diff.statGraphWidth` from config (resolved via `resolve_config`),
-///     `0` = unlimited, `>0` = explicit cap.
-#[derive(Debug, Clone, Copy)]
-struct DiffStatWidths {
-    stat_width: i64,
-    name_width: i64,
-    graph_width: i64,
-    /// Display width of the per-line prefix (e.g. `log --graph` edges),
-    /// subtracted from the terminal width when `stat_width == -1`.
-    line_prefix_width: i64,
-}
-
-impl DiffStatWidths {
-    /// Porcelain default: scale to the terminal, take name/graph caps from config.
-    fn terminal() -> Self {
-        DiffStatWidths {
-            stat_width: -1,
-            name_width: -1,
-            graph_width: -1,
-            line_prefix_width: 0,
-        }
-    }
-
-    /// Plumbing default (`diff-tree` & friends): fixed 80 columns, no caps.
-    /// git's plumbing never calls `init_diffstat_widths`, so the fields stay 0.
-    fn plumbing() -> Self {
-        DiffStatWidths {
-            stat_width: 0,
-            name_width: 0,
-            graph_width: 0,
-            line_prefix_width: 0,
-        }
-    }
-
-    /// Replace `-1` name/graph sentinels with `diff.statNameWidth` /
-    /// `diff.statGraphWidth` (0 when unset), like show_stats' config fallback.
-    fn resolve_config(&mut self, config: &GitConfig) {
-        if self.name_width == -1 {
-            self.name_width = config
-                .get("diff", None, "statnamewidth")
-                .and_then(|value| value.trim().parse::<i64>().ok())
-                .unwrap_or(0);
-        }
-        if self.graph_width == -1 {
-            self.graph_width = config
-                .get("diff", None, "statgraphwidth")
-                .and_then(|value| value.trim().parse::<i64>().ok())
-                .unwrap_or(0);
-        }
-    }
-
-    /// Like `resolve_config` with no config available: sentinels become 0.
-    fn resolve_config_defaults(&mut self) {
-        if self.name_width == -1 {
-            self.name_width = 0;
-        }
-        if self.graph_width == -1 {
-            self.graph_width = 0;
-        }
-    }
-}
-
 /// git `decimal_width()`: columns needed to print `number` in decimal.
 fn diff_stat_decimal_width(number: usize) -> i64 {
     let mut width = 1i64;
@@ -4666,37 +4557,6 @@ fn write_diff_stat_materialized(
         widths.resolve_config_defaults();
     }
     write_diff_stat_materialized_with_widths(stdout, entries, options, widths)
-}
-
-/// `--dirstat` damage accounting mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirstatMode {
-    /// Default: span-hash "damage" — bytes removed from the old blob plus
-    /// bytes literally added to the new one.
-    Changes,
-    /// `lines`: line-based diffstat damage (binary blobs count bytes/64).
-    Lines,
-    /// `files`: every changed file contributes equal damage 1.
-    Files,
-}
-
-/// Parsed `--dirstat`/`-X`/diff.dirstat parameters.
-#[derive(Debug, Clone, Copy)]
-struct DirstatOptions {
-    mode: DirstatMode,
-    cumulative: bool,
-    /// Cut-off in permille (default 30 = 3%).
-    permille: i64,
-}
-
-impl Default for DirstatOptions {
-    fn default() -> Self {
-        DirstatOptions {
-            mode: DirstatMode::Changes,
-            cumulative: false,
-            permille: 30,
-        }
-    }
 }
 
 /// git `parse_dirstat_params()`: comma-separated `changes|lines|files|
@@ -5195,61 +5055,6 @@ fn color_stat_deleted(value: &str, color: bool) -> String {
     } else {
         value.to_string()
     }
-}
-
-/// Parse one `--stat*` argument's width components into `widths`, mirroring
-/// git's `diff_opt_stat()`: `--stat=<w>[,<name-w>[,<count>]]` (count handled by
-/// `diff_stat_count_option`), `--stat-width=<w>`, `--stat-name-width=<w>`,
-/// `--stat-graph-width=<w>`. Unknown / non-stat options are left untouched;
-/// returns whether `value` was a stat option at all.
-fn diff_stat_parse_width_option(value: &str, widths: &mut DiffStatWidths) -> Result<bool> {
-    fn parse_number(option: &str, value: &str) -> Result<i64> {
-        value
-            .parse::<i64>()
-            .map_err(|_| GitError::Command(format!("{option} expects a numerical value")))
-    }
-    if let Some(spec) = value.strip_prefix("--stat=") {
-        let mut parts = spec.split(',');
-        if let Some(width) = parts.next()
-            && !width.is_empty()
-        {
-            widths.stat_width = parse_number("--stat", width)?;
-        }
-        if let Some(name_width) = parts.next()
-            && !name_width.is_empty()
-        {
-            widths.name_width = parse_number("--stat", name_width)?;
-        }
-        Ok(true)
-    } else if let Some(width) = value.strip_prefix("--stat-width=") {
-        widths.stat_width = parse_number("--stat-width", width)?;
-        Ok(true)
-    } else if let Some(width) = value.strip_prefix("--stat-name-width=") {
-        widths.name_width = parse_number("--stat-name-width", width)?;
-        Ok(true)
-    } else if let Some(width) = value.strip_prefix("--stat-graph-width=") {
-        widths.graph_width = parse_number("--stat-graph-width", width)?;
-        Ok(true)
-    } else {
-        Ok(value == "--stat" || value.starts_with("--stat-count="))
-    }
-}
-
-fn diff_stat_count_option(value: &str) -> Result<Option<Option<usize>>> {
-    let count = if let Some(count) = value.strip_prefix("--stat-count=") {
-        Some(count)
-    } else if let Some(spec) = value.strip_prefix("--stat=") {
-        spec.split(',').nth(2)
-    } else {
-        None
-    };
-    let Some(count) = count else {
-        return Ok(None);
-    };
-    let count = count
-        .parse::<usize>()
-        .map_err(|_| GitError::Command(format!("invalid stat count {count}")))?;
-    Ok(Some((count != 0).then_some(count)))
 }
 
 fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
@@ -5986,28 +5791,6 @@ fn validate_diff_rename_limit(value: &str) -> Result<()> {
     }
 }
 
-fn parse_diff_rename_limit(value: &str) -> usize {
-    let value = value.trim();
-    if value.starts_with('-') {
-        return 0;
-    }
-    let value = value.strip_prefix('+').unwrap_or(value);
-    let (digits, multiplier) = match value.as_bytes().last().copied() {
-        Some(b'k') => (&value[..value.len() - 1], 1024usize),
-        Some(b'm') => (&value[..value.len() - 1], 1024usize.saturating_mul(1024)),
-        Some(b'g') => (
-            &value[..value.len() - 1],
-            1024usize.saturating_mul(1024).saturating_mul(1024),
-        ),
-        _ => (value, 1),
-    };
-    digits
-        .parse::<usize>()
-        .ok()
-        .and_then(|limit| limit.checked_mul(multiplier))
-        .unwrap_or(usize::MAX)
-}
-
 fn diff_rename_limit_requires_integer_error() -> GitError {
     eprintln!("error: switch `l' expects an integer value with an optional k/m/g suffix");
     GitError::Exit(129)
@@ -6600,43 +6383,6 @@ fn diff_path_component_count(path: &[u8]) -> i64 {
     } else {
         diff_path_slash_depth(path) + 1
     }
-}
-
-#[derive(Debug, Clone, Default)]
-struct DiffFilter {
-    includes: HashSet<char>,
-    excludes: HashSet<char>,
-    all_or_none: bool,
-}
-
-impl DiffFilter {
-    fn matches_status(&self, status: char) -> bool {
-        (if self.includes.is_empty() {
-            true
-        } else {
-            self.includes.contains(&status)
-        }) && !self.excludes.contains(&status)
-    }
-}
-
-fn parse_diff_filter(value: &str) -> Result<DiffFilter> {
-    let mut filter = DiffFilter::default();
-    for ch in value.chars() {
-        match ch {
-            'A' | 'C' | 'D' | 'M' | 'R' | 'T' | 'U' | 'X' | 'B' => {
-                filter.includes.insert(ch);
-            }
-            'a' | 'c' | 'd' | 'm' | 'r' | 't' | 'u' | 'x' | 'b' => {
-                filter.excludes.insert(ch.to_ascii_uppercase());
-            }
-            '*' => filter.all_or_none = true,
-            other => {
-                eprintln!("error: unknown change class '{other}' in --diff-filter={value}");
-                return Err(GitError::Exit(129));
-            }
-        }
-    }
-    Ok(filter)
 }
 
 #[derive(Clone, Copy)]

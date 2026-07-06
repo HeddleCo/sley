@@ -5,9 +5,12 @@ pub mod graph;
 pub mod revlist;
 mod setup;
 
+pub mod diff_options;
+
 use sley_config::GitConfig;
 use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 
+pub use diff_options::{DiffFilter, DiffOptions, DiffOutputFormat, DiffRelativeMode, DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleDiffFormat, SubmoduleIgnoreMode, diff_pickaxe_requires_non_empty_error, diff_stat_count_option, diff_stat_parse_width_option, parse_color_moved_mode, parse_color_moved_ws, parse_diff_filter, parse_diff_rename_limit, parse_similarity_threshold, parse_submodule_ignore_mode, parse_unified_count, resolve_diff_context, setup_diff_options};
 pub use setup::{
     MatchedRef, NoWalkMode, PseudoRefResolver, RevisionOptions, RevisionOrder,
     RevisionSetupContext, RevisionSymmetricRange, RevisionTip, SetupRevisions,

@@ -1612,7 +1612,7 @@ fn write_commit_diff_patch(
                     colors: colors.as_ref(),
                     word_diff: word_request.as_ref(),
                     no_index_contents: None,
-                    submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                    submodule_format: sley_rev::diff_options::SubmoduleDiffFormat::Short,
                     submodule_dirt: None,
                     ws_error: None,
                     color_moved: None,

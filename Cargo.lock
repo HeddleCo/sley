@@ -1401,6 +1401,7 @@ dependencies = [
  "sley-mmap",
  "sley-object",
  "sley-odb",
+ "sley-options",
  "sley-pathspec",
  "sley-refs",
 ]

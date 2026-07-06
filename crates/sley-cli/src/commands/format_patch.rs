@@ -3880,7 +3880,7 @@ fn format_patch_diff_options<'a>(
         colors: None,
         word_diff: None,
         no_index_contents: None,
-        submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+        submodule_format: sley_rev::diff_options::SubmoduleDiffFormat::Short,
         submodule_dirt: None,
         ws_error: None,
         color_moved: None,

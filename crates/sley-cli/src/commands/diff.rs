@@ -1021,7 +1021,7 @@ fn diff_arg_looks_outside_worktree(path: &str) -> bool {
 }
 
 pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
-    let commands::diff_options::DiffOptions {
+    let sley_rev::diff_options::DiffOptions {
         output_format,
         cached,
         quiet,
@@ -1095,18 +1095,18 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         rotate_skip,
         mut path_args,
         explicit_paths,
-    } = commands::diff_options::setup_diff_options(args)?;
+    } = sley_rev::diff_options::setup_diff_options(args)?;
 
-    let name_status = output_format.contains(commands::diff_options::DiffOutputFormat::NAME_STATUS);
-    let name_only = output_format.contains(commands::diff_options::DiffOutputFormat::NAME_ONLY);
-    let check = output_format.contains(commands::diff_options::DiffOutputFormat::CHECK);
-    let summary = output_format.contains(commands::diff_options::DiffOutputFormat::SUMMARY);
-    let raw = output_format.contains(commands::diff_options::DiffOutputFormat::RAW);
-    let stat = output_format.contains(commands::diff_options::DiffOutputFormat::DIFFSTAT);
-    let numstat = output_format.contains(commands::diff_options::DiffOutputFormat::NUMSTAT);
-    let shortstat = output_format.contains(commands::diff_options::DiffOutputFormat::SHORTSTAT);
-    let patch = output_format.contains(commands::diff_options::DiffOutputFormat::PATCH);
-    let no_patch = output_format.contains(commands::diff_options::DiffOutputFormat::NO_OUTPUT);
+    let name_status = output_format.contains(sley_rev::diff_options::DiffOutputFormat::NAME_STATUS);
+    let name_only = output_format.contains(sley_rev::diff_options::DiffOutputFormat::NAME_ONLY);
+    let check = output_format.contains(sley_rev::diff_options::DiffOutputFormat::CHECK);
+    let summary = output_format.contains(sley_rev::diff_options::DiffOutputFormat::SUMMARY);
+    let raw = output_format.contains(sley_rev::diff_options::DiffOutputFormat::RAW);
+    let stat = output_format.contains(sley_rev::diff_options::DiffOutputFormat::DIFFSTAT);
+    let numstat = output_format.contains(sley_rev::diff_options::DiffOutputFormat::NUMSTAT);
+    let shortstat = output_format.contains(sley_rev::diff_options::DiffOutputFormat::SHORTSTAT);
+    let patch = output_format.contains(sley_rev::diff_options::DiffOutputFormat::PATCH);
+    let no_patch = output_format.contains(sley_rev::diff_options::DiffOutputFormat::NO_OUTPUT);
     if diff_algorithm_control && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff algorithm controls are not supported for this output mode".into(),
@@ -1222,7 +1222,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let repo_config = read_repo_config(&git_dir).ok();
     let resolved_context =
-        commands::diff_options::resolve_diff_context(context, repo_config.as_ref())?;
+        sley_rev::diff_options::resolve_diff_context(context, repo_config.as_ref())?;
     let patch_context = if diff_patch_context_control {
         sley_diff_merge::render::enable_function_context(resolved_context)
     } else {
@@ -1255,7 +1255,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .ok()
             .and_then(|config| config.get("diff", None, "colormoved").map(str::to_owned))
         {
-            Some(value) => commands::diff_options::parse_color_moved_mode(&value)?,
+            Some(value) => sley_rev::diff_options::parse_color_moved_mode(&value)?,
             None => None,
         },
     };
@@ -1265,7 +1265,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .ok()
             .and_then(|config| config.get("diff", None, "colormovedws").map(str::to_owned))
         {
-            Some(value) => commands::diff_options::parse_color_moved_ws(&value)?,
+            Some(value) => sley_rev::diff_options::parse_color_moved_ws(&value)?,
             None => sley_diff_merge::render::ColorMovedWs::default(),
         },
     };
@@ -1295,13 +1295,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .and_then(|config| config.get("diff", None, "submodule").map(str::to_owned))
             .and_then(|value| match value.as_str() {
                 "short" | "log" | "diff" => {
-                    Some(commands::diff_options::SubmoduleDiffFormat::parse(&value))
+                    Some(sley_rev::diff_options::SubmoduleDiffFormat::parse(&value))
                 }
                 _ => None,
             })
     });
     let submodule_format =
-        diff_submodule_format.unwrap_or(commands::diff_options::SubmoduleDiffFormat::Short);
+        diff_submodule_format.unwrap_or(sley_rev::diff_options::SubmoduleDiffFormat::Short);
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     if !head
         && !merge_base
@@ -1372,7 +1372,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         && let Some(config) = repo_config.as_ref()
         && config.get_bool("diff", None, "relative").unwrap_or(false)
     {
-        diff_relative = commands::diff_options::DiffRelativeMode::Cwd;
+        diff_relative = sley_rev::diff_options::DiffRelativeMode::Cwd;
     }
     // `--indent-heuristic` / `--no-indent-heuristic` (CLI) win over
     // `diff.indentHeuristic` config, which itself defaults to git's
@@ -1792,7 +1792,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     // keep resolving against the original location, so the effective worktree
     // root gains the stripped prefix.
     let mut worktree_root = worktree_root;
-    let entries = if matches!(diff_relative, commands::diff_options::DiffRelativeMode::Off) {
+    let entries = if matches!(diff_relative, sley_rev::diff_options::DiffRelativeMode::Off) {
         entries
     } else {
         let prefix = diff_relative_prefix(&diff_relative, &cwd, &git_dir)?;
@@ -2323,7 +2323,7 @@ fn reject_duplicate_tree_for_index_diff(
 
 struct CombinedDiffOptions<'a> {
     dense: bool,
-    output_format: commands::diff_options::DiffOutputFormat,
+    output_format: sley_rev::diff_options::DiffOutputFormat,
     patch_abbrev: usize,
     raw_abbrev: Option<usize>,
     z: bool,
@@ -2358,19 +2358,19 @@ fn write_diff_combined_three_tree(
 
     let name_status = options
         .output_format
-        .contains(commands::diff_options::DiffOutputFormat::NAME_STATUS);
+        .contains(sley_rev::diff_options::DiffOutputFormat::NAME_STATUS);
     let name_only = options
         .output_format
-        .contains(commands::diff_options::DiffOutputFormat::NAME_ONLY);
+        .contains(sley_rev::diff_options::DiffOutputFormat::NAME_ONLY);
     let raw = options
         .output_format
-        .contains(commands::diff_options::DiffOutputFormat::RAW);
+        .contains(sley_rev::diff_options::DiffOutputFormat::RAW);
     let patch = options
         .output_format
-        .contains(commands::diff_options::DiffOutputFormat::PATCH);
+        .contains(sley_rev::diff_options::DiffOutputFormat::PATCH);
     let no_output = options
         .output_format
-        .contains(commands::diff_options::DiffOutputFormat::NO_OUTPUT);
+        .contains(sley_rev::diff_options::DiffOutputFormat::NO_OUTPUT);
     let no_output_mode = !raw && !name_status && !name_only && !patch && !no_output;
     let show_patch = !name_status && !name_only && (patch || no_output_mode);
 
@@ -2753,17 +2753,17 @@ fn diff_find_object_pickaxe_all_conflict_error() -> Result<()> {
 }
 
 fn diff_relative_prefix(
-    mode: &commands::diff_options::DiffRelativeMode,
+    mode: &sley_rev::diff_options::DiffRelativeMode,
     cwd: &Path,
     git_dir: &Path,
 ) -> Result<Vec<u8>> {
     match mode {
-        commands::diff_options::DiffRelativeMode::Off => Ok(Vec::new()),
-        commands::diff_options::DiffRelativeMode::Cwd => Ok(worktree_prefix(cwd, git_dir)?
+        sley_rev::diff_options::DiffRelativeMode::Off => Ok(Vec::new()),
+        sley_rev::diff_options::DiffRelativeMode::Cwd => Ok(worktree_prefix(cwd, git_dir)?
             .trim_end_matches('/')
             .as_bytes()
             .to_vec()),
-        commands::diff_options::DiffRelativeMode::Prefix(prefix) => {
+        sley_rev::diff_options::DiffRelativeMode::Prefix(prefix) => {
             Ok(diff_relative_prefix_arg(prefix).into_bytes())
         }
     }
@@ -2997,7 +2997,7 @@ struct DiffNoIndexParams<'a> {
     color: bool,
     color_moved_cli: Option<Option<sley_diff_merge::render::ColorMovedMode>>,
     color_moved_ws_cli: Option<sley_diff_merge::render::ColorMovedWs>,
-    output_format: commands::diff_options::DiffOutputFormat,
+    output_format: sley_rev::diff_options::DiffOutputFormat,
     raw_abbrev: Option<Option<usize>>,
     patch_abbrev: Option<usize>,
     patch_full_index: bool,
@@ -3093,7 +3093,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             .as_ref()
             .and_then(|config| config.get("diff", None, "colormoved").map(str::to_owned))
         {
-            Some(value) => commands::diff_options::parse_color_moved_mode(&value)?,
+            Some(value) => sley_rev::diff_options::parse_color_moved_mode(&value)?,
             None => None,
         },
     };
@@ -3103,7 +3103,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             .as_ref()
             .and_then(|config| config.get("diff", None, "colormovedws").map(str::to_owned))
         {
-            Some(value) => commands::diff_options::parse_color_moved_ws(&value)?,
+            Some(value) => sley_rev::diff_options::parse_color_moved_ws(&value)?,
             None => sley_diff_merge::render::ColorMovedWs::default(),
         },
     };
@@ -3117,22 +3117,22 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
     let db = FileObjectDatabase::from_git_dir(&scratch_git_dir, format);
     let raw = params
         .output_format
-        .contains(commands::diff_options::DiffOutputFormat::RAW);
+        .contains(sley_rev::diff_options::DiffOutputFormat::RAW);
     let name_status = params
         .output_format
-        .contains(commands::diff_options::DiffOutputFormat::NAME_STATUS);
+        .contains(sley_rev::diff_options::DiffOutputFormat::NAME_STATUS);
     let name_only = params
         .output_format
-        .contains(commands::diff_options::DiffOutputFormat::NAME_ONLY);
+        .contains(sley_rev::diff_options::DiffOutputFormat::NAME_ONLY);
     let numstat = params
         .output_format
-        .contains(commands::diff_options::DiffOutputFormat::NUMSTAT);
+        .contains(sley_rev::diff_options::DiffOutputFormat::NUMSTAT);
     let patch = params
         .output_format
-        .contains(commands::diff_options::DiffOutputFormat::PATCH);
+        .contains(sley_rev::diff_options::DiffOutputFormat::PATCH);
     let no_output = params
         .output_format
-        .contains(commands::diff_options::DiffOutputFormat::NO_OUTPUT);
+        .contains(sley_rev::diff_options::DiffOutputFormat::NO_OUTPUT);
     let userdiff_attributes = worktree_root
         .as_ref()
         .map(|root| sley_worktree::StandardAttributeMatcher::from_worktree_root(root))
@@ -3235,7 +3235,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             return Err(GitError::Exit(1));
         }
         let show_patch =
-            patch || params.output_format == commands::diff_options::DiffOutputFormat::empty();
+            patch || params.output_format == sley_rev::diff_options::DiffOutputFormat::empty();
         if !show_patch {
             return Err(GitError::Exit(1));
         }
@@ -3260,7 +3260,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                     entry.old_content.as_deref(),
                     entry.new_content.as_deref(),
                 )),
-                submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                submodule_format: sley_rev::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,
                 // No-index has no attributes; the rule is core.whitespace (or the
                 // default), used only when color is on.

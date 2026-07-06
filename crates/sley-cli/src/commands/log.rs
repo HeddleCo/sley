@@ -1861,7 +1861,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             value if value.starts_with("-U") && value.len() > 2 => {
                 let raw = &value[2..];
                 patch_validate_unified_context(raw, true)?;
-                diff_opts.context = Some(commands::diff_options::parse_unified_count(raw));
+                diff_opts.context = Some(sley_rev::diff_options::parse_unified_count(raw));
                 diff_opts.patch = true;
                 diff_format_explicit = true;
             }
@@ -1871,7 +1871,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             value if value.starts_with("--unified=") => {
                 let raw = &value["--unified=".len()..];
                 patch_validate_unified_context(raw, false)?;
-                diff_opts.context = Some(commands::diff_options::parse_unified_count(raw));
+                diff_opts.context = Some(sley_rev::diff_options::parse_unified_count(raw));
                 diff_opts.patch = true;
                 diff_format_explicit = true;
             }
@@ -2225,7 +2225,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // diff_opt_ignore_regex, exit 129).
     diff_opts.ignore_regexes = crate::compile_ignore_matching_regexes(&ignore_regex_patterns)?;
     if diff_opts.any() || diff_opts.merges_imply_patch {
-        diff_opts.context = Some(commands::diff_options::resolve_diff_context(
+        diff_opts.context = Some(sley_rev::diff_options::resolve_diff_context(
             diff_opts.context,
             Some(&config),
         )?);
