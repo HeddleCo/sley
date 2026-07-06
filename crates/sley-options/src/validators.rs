@@ -93,11 +93,6 @@ pub fn log_validate_inter_hunk_context(value: &str) -> Result<()> {
     Err(GitError::Exit(129))
 }
 
-fn log_inter_hunk_context_requires_number_error() -> Result<()> {
-    eprintln!("error: option `inter-hunk-context' expects a numerical value");
-    Err(GitError::Exit(129))
-}
-
 pub fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
     // git's diff_opt_char (diff.c) requires exactly one byte; empty and multibyte
     // values are rejected.
