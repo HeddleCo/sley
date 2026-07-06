@@ -586,6 +586,7 @@ fn changed_paths_between_trees(
             detect_copies: false,
             find_copies_harder: false,
             rename_empty: true,
+            ..Default::default()
         },
     )?;
     for entry in changes {

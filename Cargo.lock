@@ -1098,7 +1098,6 @@ version = "0.4.0"
 dependencies = [
  "sley-config",
  "sley-core",
- "sley-diff-format",
  "sley-diff-merge",
  "sley-formats",
  "sley-grep",
@@ -1112,6 +1111,7 @@ dependencies = [
  "sley-remote",
  "sley-rev",
  "sley-sequencer",
+ "sley-testkit",
  "sley-worktree",
 ]
 
@@ -1157,7 +1157,6 @@ dependencies = [
  "sley-archive",
  "sley-config",
  "sley-core",
- "sley-diff-format",
  "sley-diff-merge",
  "sley-fetch",
  "sley-formats",
@@ -1202,22 +1201,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "sley-diff-format"
-version = "0.4.0"
-dependencies = [
- "sley-config",
- "sley-core",
- "sley-diff-merge",
- "sley-grep",
-]
-
-[[package]]
 name = "sley-diff-merge"
 version = "0.4.0"
 dependencies = [
  "sley-config",
  "sley-core",
  "sley-formats",
+ "sley-grep",
  "sley-index",
  "sley-object",
  "sley-odb",

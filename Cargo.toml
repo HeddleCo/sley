@@ -13,7 +13,7 @@ members = [
     "crates/sley-grep",
     "crates/sley-i18n",
     "crates/sley-pretty",
-    "crates/sley-diff-format",
+
     "crates/sley-rev",
     "crates/sley-worktree",
     "crates/sley-diff-merge",
@@ -44,7 +44,7 @@ sley-bench = { path = "crates/sley-bench", version = "0.4.0" }
 sley-cli = { path = "crates/sley-cli", version = "0.4.0" }
 sley-config = { path = "crates/sley-config", version = "0.4.0" }
 sley-core = { path = "crates/sley-core", version = "0.4.0" }
-sley-diff-format = { path = "crates/sley-diff-format", version = "0.4.0" }
+
 sley-diff-merge = { path = "crates/sley-diff-merge", version = "0.4.0" }
 sley-fetch = { path = "crates/sley-fetch", version = "0.4.0" }
 sley-formats = { path = "crates/sley-formats", version = "0.4.0" }

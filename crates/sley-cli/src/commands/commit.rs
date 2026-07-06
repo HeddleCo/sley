@@ -1630,12 +1630,12 @@ fn print_commit_summary(
         Some(p) => read_commit_tree_for_summary(db, format, p)?,
         None => ObjectId::empty_tree(format),
     };
-    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+    let entries = sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         &old_tree,
         &new_tree,
-        sley_diff_merge::RenameDetectionOptions::default(),
+        sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     if !entries.is_empty() {
         let stat_entries = collect_diff_stat_entries(&entries, db, None, false)?;

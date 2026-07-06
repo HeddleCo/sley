@@ -514,6 +514,7 @@ fn build_patch_text(
         detect_copies: false,
         find_copies_harder: false,
         rename_empty: true,
+        ..Default::default()
     };
     let entries = if record.parents.is_empty() {
         sley_diff_merge::diff_name_status_empty_tree_with_options(
@@ -523,17 +524,18 @@ fn build_patch_text(
             base,
         )?
     } else {
-        sley_diff_merge::diff_name_status_trees_with_rename_options(
+        sley_diff_merge::diff_name_status_trees_with_options(
             db,
             format,
             &parent_tree,
             &record.commit.tree,
-            sley_diff_merge::RenameDetectionOptions {
+            sley_diff_merge::DiffNameStatusOptions {
                 base,
                 detect_inexact: true,
                 rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 rename_limit: 0,
+                ..Default::default()
             },
         )?
     };

@@ -312,22 +312,24 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         detect_copies,
         find_copies_harder,
         rename_empty,
+        ..Default::default()
     };
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
+    let options = sley_diff_merge::DiffNameStatusOptions {
         base: base_options,
         detect_inexact: true,
         rename_threshold,
         copy_threshold,
         rename_limit: 0,
+        ..Default::default()
     };
 
     let entries = if cached {
         if inexact_renames {
-            sley_diff_merge::diff_name_status_tree_index_with_rename_options(
+            sley_diff_merge::diff_name_status_tree_index_with_options(
                 git_dir,
                 format,
                 &tree_oid,
-                rename_options,
+                options,
             )?
         } else {
             sley_diff_merge::diff_name_status_tree_index_with_options(
@@ -341,12 +343,12 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         let worktree_root = worktree_root
             .ok_or_else(|| GitError::Command("diff-index requires a worktree".into()))?;
         if inexact_renames {
-            sley_diff_merge::diff_name_status_tree_worktree_with_rename_options(
+            sley_diff_merge::diff_name_status_tree_worktree_with_options(
                 worktree_root,
                 git_dir,
                 format,
                 &tree_oid,
-                rename_options,
+                options,
             )?
         } else {
             sley_diff_merge::diff_name_status_tree_worktree_with_options(

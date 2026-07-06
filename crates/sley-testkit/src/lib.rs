@@ -4655,6 +4655,7 @@ pub fn diff_name_status_parity_for_format(format: ObjectFormat) -> Result<DiffNa
                 detect_copies: true,
                 find_copies_harder: true,
                 rename_empty: true,
+                ..Default::default()
             },
         )?;
         let rename_copy_rust = rename_copy_entries

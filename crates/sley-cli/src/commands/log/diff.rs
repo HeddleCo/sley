@@ -269,20 +269,22 @@ impl LogDiffContext<'_> {
             detect_copies: self.detect_copies,
             find_copies_harder: false,
             rename_empty: true,
+            ..Default::default()
         };
         let tree = &record.commit.tree;
         let entries = match (&parent_tree, self.detect_renames) {
-            (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+            (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_options(
                 self.db,
                 self.format,
                 parent,
                 tree,
-                sley_diff_merge::RenameDetectionOptions {
+                sley_diff_merge::DiffNameStatusOptions {
                     base,
                     detect_inexact: true,
                     rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                     copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                     rename_limit: 0,
+                    ..Default::default()
                 },
             )?,
             (Some(parent), false) => sley_diff_merge::diff_name_status_trees_with_options(
@@ -469,6 +471,7 @@ impl LogDiffContext<'_> {
                 detect_copies: self.detect_copies,
                 find_copies_harder: false,
                 rename_empty: true,
+                ..Default::default()
             };
             sley_diff_merge::diff_name_status_trees_with_options(
                 self.db,

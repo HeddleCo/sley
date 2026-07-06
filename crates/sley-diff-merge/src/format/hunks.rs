@@ -1,4 +1,4 @@
-use sley_diff_merge::render::{HunkWordDiff, RenderColors};
+use crate::render::{HunkWordDiff, RenderColors};
 
 use crate::{CompiledFuncname, DiffColors, WordDiffBuffers, WordDiffConfig};
 

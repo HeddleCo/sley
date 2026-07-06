@@ -2133,18 +2133,19 @@ fn find_parent_origin(
 
     let parent_tree = sley_rev::peel_to_tree(db, format, parent)?;
     let child_tree = sley_rev::peel_to_tree(db, format, &origin.commit)?;
-    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+    let entries = sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         &parent_tree,
         &child_tree,
-        sley_diff_merge::RenameDetectionOptions {
+        sley_diff_merge::DiffNameStatusOptions {
             base: sley_diff_merge::DiffNameStatusOptions {
                 detect_renames: true,
                 detect_copies: allow_whole_copy,
                 find_copies_harder: allow_whole_copy,
                 rename_empty: true,
-            },
+            ..Default::default()
+        },
             detect_inexact: true,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
@@ -2243,12 +2244,12 @@ fn copy_candidate_paths(
     }
 
     let child_tree = sley_rev::peel_to_tree(db, format, &origin.commit)?;
-    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+    let entries = sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         &parent_tree,
         &child_tree,
-        sley_diff_merge::RenameDetectionOptions::default(),
+        sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     let mut out = Vec::new();
     for entry in entries {

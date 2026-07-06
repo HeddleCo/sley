@@ -1422,31 +1422,33 @@ fn commit_diff_entries(
         detect_copies,
         find_copies_harder: options.find_copies_harder,
         rename_empty: true,
+        ..Default::default()
     };
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
+    let options = sley_diff_merge::DiffNameStatusOptions {
         base,
         detect_inexact: true,
         rename_threshold: options.rename_threshold,
         copy_threshold: options.copy_threshold,
         rename_limit: 0,
+        ..Default::default()
     };
     let entries = match commit.parents.first() {
         Some(parent_oid) => {
             let parent_object = db.read_object(parent_oid)?;
             let parent_commit = Commit::parse_ref(format, &parent_object.body)?;
-            sley_diff_merge::diff_name_status_trees_with_rename_options(
+            sley_diff_merge::diff_name_status_trees_with_options(
                 db,
                 format,
                 &parent_commit.tree,
                 &commit.tree,
-                rename_options,
+                options,
             )
         }
-        None => sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
+        None => sley_diff_merge::diff_name_status_empty_tree_with_options(
             db,
             format,
             &commit.tree,
-            rename_options,
+            options,
         ),
     }?;
     Ok(match pathspec {

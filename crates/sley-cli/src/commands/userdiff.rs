@@ -11,7 +11,7 @@
 //! content matches upstream exactly.
 
 use crate::*;
-pub(crate) use sley_diff_format::CompiledFuncname;
+pub(crate) use sley_diff_merge::format::CompiledFuncname;
 #[cfg(test)]
 use sley_grep::{Regex, RegexMode};
 use std::cell::RefCell;

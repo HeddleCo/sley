@@ -4048,10 +4048,10 @@ pub(crate) fn write_diff_patch_entry(
         }
         None => None,
     };
-    let mut heading = sley_diff_format::heading_classifier(funcname);
+    let mut heading = sley_diff_merge::format::heading_classifier(funcname);
     let mut word_diff_adapter = word_diff
         .as_ref()
-        .map(sley_diff_format::WordDiffAdapter::new);
+        .map(sley_diff_merge::format::WordDiffAdapter::new);
     let ws_error = colors.and(options.ws_error);
     let ignore_regexes = options.ignore_regexes;
     let regex_match = (!ignore_regexes.is_empty()).then_some(move |line: &[u8]| {
@@ -4069,7 +4069,7 @@ pub(crate) fn write_diff_patch_entry(
         context: options.context,
         interhunk: options.interhunk,
         heading: Some(&mut heading),
-        colors: colors.map(sley_diff_format::render_colors),
+        colors: colors.map(sley_diff_merge::format::render_colors),
         word_diff: word_diff_adapter
             .as_mut()
             .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),

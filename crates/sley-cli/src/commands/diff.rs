@@ -1541,11 +1541,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
-    let name_status_options = sley_diff_merge::DiffNameStatusOptions {
+    let options = sley_diff_merge::DiffNameStatusOptions {
         detect_renames,
         detect_copies,
         find_copies_harder,
         rename_empty,
+        ..Default::default()
     };
     // The new-side oid is real (shown, not zeroed) when it comes from a tree or the
     // index; it is zeroed only when the new side is the worktree.
@@ -1559,12 +1560,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     // tree and we're not diffing the index (`--cached`). A two-tree `diff A B` takes
     // its new content from tree B's blobs, never the worktree.
     let use_worktree_new = !cached && diff_trees.len() != 2;
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
-        base: name_status_options,
+    let options = sley_diff_merge::DiffNameStatusOptions {
+        base: options,
         detect_inexact: true,
         rename_threshold,
         copy_threshold,
         rename_limit,
+        ..Default::default()
     };
     let mut precomputed_staged_gitlinks = None;
     let mut rename_limit_diagnostics = sley_diff_merge::RenameLimitDiagnostics::default();
@@ -1576,11 +1578,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 if cached {
                     if inexact_renames {
                         let diff =
-                            sley_diff_merge::diff_name_status_tree_index_with_rename_options_and_diagnostics(
+                            sley_diff_merge::diff_name_status_tree_index_with_options_and_diagnostics(
                             &git_dir,
                             format,
                             tree,
-                            rename_options,
+                            options,
                         )?;
                         rename_limit_diagnostics = diff.rename_limit;
                         diff.entries
@@ -1589,7 +1591,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                             &git_dir,
                             format,
                             tree,
-                            name_status_options,
+                            options,
                         )?
                     }
                 } else {
@@ -1597,12 +1599,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         .as_ref()
                         .expect("worktree root set for diff <rev>");
                     if inexact_renames {
-                        sley_diff_merge::diff_name_status_tree_worktree_with_rename_options(
+                        sley_diff_merge::diff_name_status_tree_worktree_with_options(
                             worktree_root,
                             &git_dir,
                             format,
                             tree,
-                            rename_options,
+                            options,
                         )?
                     } else {
                         sley_diff_merge::diff_name_status_tree_worktree_with_options(
@@ -1610,7 +1612,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                             &git_dir,
                             format,
                             tree,
-                            name_status_options,
+                            options,
                         )?
                     }
                 }
@@ -1619,12 +1621,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             [left, right] => {
                 if inexact_renames {
                     let diff =
-                        sley_diff_merge::diff_name_status_trees_with_rename_options_and_diagnostics(
+                        sley_diff_merge::diff_name_status_trees_with_options_and_diagnostics(
                         &db,
                         format,
                         left,
                         right,
-                        rename_options,
+                        options,
                     )?;
                     rename_limit_diagnostics = diff.rename_limit;
                     diff.entries
@@ -1634,7 +1636,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         format,
                         left,
                         right,
-                        name_status_options,
+                        options,
                     )?
                 }
             }
@@ -1647,10 +1649,10 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     } else if cached {
         if inexact_renames {
             let diff =
-                sley_diff_merge::diff_name_status_head_index_with_rename_options_and_diagnostics(
+                sley_diff_merge::diff_name_status_head_index_with_options_and_diagnostics(
                     &git_dir,
                     format,
-                    rename_options,
+                    options,
                 )?;
             rename_limit_diagnostics = diff.rename_limit;
             diff.entries
@@ -1658,7 +1660,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             sley_diff_merge::diff_name_status_head_index_with_options(
                 &git_dir,
                 format,
-                name_status_options,
+                options,
             )?
         }
     } else if head {
@@ -1668,18 +1670,18 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .as_ref()
             .expect("worktree root set for diff HEAD");
         if inexact_renames {
-            sley_diff_merge::diff_name_status_head_worktree_with_rename_options(
+            sley_diff_merge::diff_name_status_head_worktree_with_options(
                 worktree_root,
                 &git_dir,
                 format,
-                rename_options,
+                options,
             )?
         } else {
             sley_diff_merge::diff_name_status_head_worktree_with_options(
                 worktree_root,
                 &git_dir,
                 format,
-                name_status_options,
+                options,
             )?
         }
     } else {
@@ -1706,7 +1708,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 worktree_root,
                 &git_dir,
                 format,
-                rename_options.base,
+                options.base,
                 &mut validate_stat_clean,
             )?
         } else {
@@ -1714,7 +1716,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 worktree_root,
                 &git_dir,
                 format,
-                name_status_options,
+                options,
                 &mut validate_stat_clean,
             )?
         };

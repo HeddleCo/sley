@@ -10733,6 +10733,7 @@ fn commit_graph_changed_paths_for_record(
         detect_copies: false,
         find_copies_harder: false,
         rename_empty: false,
+        ..Default::default()
     };
     let changes = if let Some(parent) = record.parents.first() {
         let parent_tree = if let Some(parent_record) = records.get(parent) {

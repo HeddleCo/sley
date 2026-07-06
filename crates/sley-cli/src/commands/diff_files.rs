@@ -551,18 +551,20 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         DiffPathspec::new(cwd, worktree_root, &o.path_args)?
     };
 
-    let name_status_options = sley_diff_merge::DiffNameStatusOptions {
+    let options = sley_diff_merge::DiffNameStatusOptions {
         detect_renames: o.detect_renames,
         detect_copies: o.detect_copies,
         find_copies_harder: o.find_copies_harder,
         rename_empty: o.rename_empty,
+        ..Default::default()
     };
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
-        base: name_status_options,
+    let options = sley_diff_merge::DiffNameStatusOptions {
+        base: options,
         detect_inexact: true,
         rename_threshold: o.rename_threshold,
         copy_threshold: o.copy_threshold,
         rename_limit: 0,
+        ..Default::default()
     };
 
     // `git diff-files` selects changed paths by the cached *stat*, not by content:
@@ -573,18 +575,18 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
     // content diff; porcelain `git diff` (which refreshes first) keeps the plain
     // content engine.
     let entries = if o.inexact_renames {
-        sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_rename_options(
+        sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_options(
             worktree_root,
             git_dir,
             format,
-            rename_options,
+            options,
         )?
     } else {
         sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_options(
             worktree_root,
             git_dir,
             format,
-            name_status_options,
+            options,
         )?
     };
 

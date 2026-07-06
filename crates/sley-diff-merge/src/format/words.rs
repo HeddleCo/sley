@@ -374,21 +374,21 @@ impl WordDiffBuffers {
         let minus_words = split_words(&self.minus, config.regex);
         let plus_words = split_words(&self.plus, config.regex);
         // Word-level diff: each word becomes one "line" for the line differ.
-        let minus_lines: Vec<sley_diff_merge::DiffLine<'_>> = minus_words
+        let minus_lines: Vec<crate::DiffLine<'_>> = minus_words
             .iter()
-            .map(|span| sley_diff_merge::DiffLine {
+            .map(|span| crate::DiffLine {
                 content: &self.minus[span.begin..span.end],
                 has_newline: true,
             })
             .collect();
-        let plus_lines: Vec<sley_diff_merge::DiffLine<'_>> = plus_words
+        let plus_lines: Vec<crate::DiffLine<'_>> = plus_words
             .iter()
-            .map(|span| sley_diff_merge::DiffLine {
+            .map(|span| crate::DiffLine {
                 content: &self.plus[span.begin..span.end],
                 has_newline: true,
             })
             .collect();
-        let ops = sley_diff_merge::myers_diff_lines(&minus_lines, &plus_lines);
+        let ops = crate::myers_diff_lines(&minus_lines, &plus_lines);
 
         // Walk the edit script as (minus_first, minus_len, plus_first,
         // plus_len) changes, mirroring fn_out_diff_words_aux.
@@ -457,9 +457,9 @@ impl WordDiffBuffers {
         };
         for op in ops {
             match op {
-                sley_diff_merge::DiffOp::Delete(n) => pending_del += n,
-                sley_diff_merge::DiffOp::Insert(n) => pending_ins += n,
-                sley_diff_merge::DiffOp::Equal(n) => {
+                crate::DiffOp::Delete(n) => pending_del += n,
+                crate::DiffOp::Insert(n) => pending_ins += n,
+                crate::DiffOp::Equal(n) => {
                     if pending_del > 0 || pending_ins > 0 {
                         emit_change(
                             out,

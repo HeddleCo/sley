@@ -1914,19 +1914,19 @@ fn bisect_show_commit(repo: &BisectRepo, oid: &ObjectId, out: &mut dyn Write) ->
         Some(parent) => {
             let parent_object = db.read_object(parent)?;
             let parent_commit = Commit::parse(repo.format, &parent_object.body)?;
-            sley_diff_merge::diff_name_status_trees_with_rename_options(
+            sley_diff_merge::diff_name_status_trees_with_options(
                 &db,
                 repo.format,
                 &parent_commit.tree,
                 &new_tree,
-                sley_diff_merge::RenameDetectionOptions::default(),
+                sley_diff_merge::DiffNameStatusOptions::default(),
             )?
         }
-        None => sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
+        None => sley_diff_merge::diff_name_status_empty_tree_with_options(
             &db,
             repo.format,
             &new_tree,
-            sley_diff_merge::RenameDetectionOptions::default(),
+            sley_diff_merge::DiffNameStatusOptions::default(),
         )?,
     };
     let stat_entries = collect_diff_stat_entries(&entries, &db, None, false)?;

@@ -1425,31 +1425,32 @@ fn compute_entries(
         return Ok(entries);
     }
     if recursive {
-        let rename_options = sley_diff_merge::RenameDetectionOptions {
+        let options = sley_diff_merge::DiffNameStatusOptions {
             base: sley_diff_merge::DiffNameStatusOptions {
                 detect_renames: options.detect_renames,
                 detect_copies: options.detect_copies,
                 find_copies_harder: options.find_copies_harder,
                 rename_empty: options.rename_empty,
-            },
+            ..Default::default()
+        },
             detect_inexact: options.detect_renames || options.detect_copies,
             rename_threshold: options.rename_threshold,
             copy_threshold: options.copy_threshold,
             rename_limit: 0,
         };
         let mut entries = match left {
-            Some(left) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+            Some(left) => sley_diff_merge::diff_name_status_trees_with_options(
                 db,
                 format,
                 left,
                 right,
-                rename_options,
+                options,
             )?,
-            None => sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
+            None => sley_diff_merge::diff_name_status_empty_tree_with_options(
                 db,
                 format,
                 right,
-                rename_options,
+                options,
             )?,
         };
         if options.show_trees {

@@ -4277,6 +4277,7 @@ fn tree_same_for_pathspec(
         detect_copies: false,
         find_copies_harder: false,
         rename_empty: false,
+        ..Default::default()
     };
     let changes = sley_diff_merge::diff_name_status_trees_with_options(
         db,
@@ -4307,6 +4308,7 @@ fn tree_same_as_empty_for_pathspec(
         detect_copies: false,
         find_copies_harder: false,
         rename_empty: false,
+        ..Default::default()
     };
     let changes = sley_diff_merge::diff_name_status_empty_tree_with_options(
         db,
