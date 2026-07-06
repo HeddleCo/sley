@@ -841,7 +841,7 @@ fn archive_format_subst_for_commit(
             out.extend(archive_render_commit_format(
                 record,
                 &fmt[start..end],
-                Some(&describe_adapter),
+                Some(&describe_adapter as &dyn LogDescribeLookup),
             )?);
         } else {
             out.extend_from_slice(&fmt[start..end]);
@@ -856,7 +856,7 @@ fn archive_format_subst_for_commit(
 fn archive_render_commit_format(
     record: &sley_rev::CommitRecord,
     fmt: &[u8],
-    describe: Option<&CliLogDescribeContext<'_>>,
+    describe: Option<&dyn LogDescribeLookup>,
 ) -> Result<Vec<u8>> {
     let fmt = String::from_utf8_lossy(fmt);
     let compiled = CompiledLogFormat::compile(&fmt, LogFormatDialect::Log)?;
@@ -871,7 +871,7 @@ fn archive_render_commit_format(
         source: None,
         date_mode: &date_mode,
         source_oid: None,
-        describe: describe.map(CliLogDescribeAdapter),
+        describe,
         signature: None,
         color: false,
         output_encoding: "UTF-8",

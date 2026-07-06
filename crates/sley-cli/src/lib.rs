@@ -138,8 +138,9 @@ mod setup;
 
 pub(crate) use sley_pretty::{
     CompiledLogFormat, FormatToken, LogFormatDialect, LogDescribeLookup, LogFormatContext,
-    LogSignatureLookup, LogSignatureView, MailmapLookup, StashFormatContext,
+    LogSignatureLookup, LogSignatureView, MailmapLookup, StashFormatContext, append_log_oid,
     commit_author_for_commit_encoding, commit_body, commit_encoding, commit_encoding_config,
+    commit_object_message_and_optional_encoding,
     commit_encoding_header_from_config, commit_identity_name_email, commit_message_for_commit_encoding,
     commit_message_for_output, commit_message_has_invalid_utf8, commit_message_has_nul,
     commit_message_lines, commit_subject, commit_subject_bytes, emit_compiled_log_format,

@@ -827,7 +827,7 @@ fn execute_push_http(
     let mut response = crate::http::http_send_with_auth(&remote_url, credentials, |auth| {
         let headers = crate::http::http_authorization_headers(auth);
         send_receive_pack_body(
-            &client,
+            client,
             &url,
             &content_type,
             &headers,

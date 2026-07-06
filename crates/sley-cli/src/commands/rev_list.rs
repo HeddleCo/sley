@@ -1481,7 +1481,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                     decorations: &decorations,
                     date_mode: &date_mode,
                     output_encoding: &output_encoding,
-                    mailmap: &CliMailmapAdapter(&mailmap),
+                    mailmap: &mailmap,
                     use_mailmap,
                 },
             )?;

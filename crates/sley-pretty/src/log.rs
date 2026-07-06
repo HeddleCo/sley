@@ -457,7 +457,7 @@ impl sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatAtomResolver<'_,
 }
 
 #[allow(clippy::too_many_arguments)]
-pub pub fn emit_log_one_token(
+pub fn emit_log_one_token(
     token: &FormatToken,
     record: &sley_rev::CommitRecord,
     context: &LogFormatContext<'_>,
@@ -1110,7 +1110,7 @@ fn commit_object_message_and_encoding(body: &[u8]) -> (&[u8], std::borrow::Cow<'
     (message, encoding.unwrap_or(std::borrow::Cow::Borrowed("")))
 }
 
-fn commit_object_message_and_optional_encoding(
+pub fn commit_object_message_and_optional_encoding(
     body: &[u8],
 ) -> (&[u8], Option<std::borrow::Cow<'_, str>>) {
     let mut encoding = None;

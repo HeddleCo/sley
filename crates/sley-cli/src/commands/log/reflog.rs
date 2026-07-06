@@ -59,7 +59,7 @@ pub(super) fn log_walk_reflogs(
                         full_reference: &target.reference,
                         date_mode: opts.date_mode,
                         decorations: &decorations,
-                        mailmap: &CliMailmapAdapter(&mailmap),
+                        mailmap: &mailmap,
                     };
                     if !emit_compiled_reflog_walk_format(&mut ctx, entry, index, &mut line)? {
                         false
@@ -403,7 +403,7 @@ fn emit_compiled_reflog_walk_format(
         signature: None,
         color: false,
         output_encoding: "UTF-8",
-        mailmap: ctx.mailmap,
+        mailmap: &CliMailmapAdapter(ctx.mailmap),
         use_mailmap: true,
     };
     for token in &ctx.compiled.tokens {

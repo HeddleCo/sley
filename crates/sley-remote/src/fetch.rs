@@ -388,7 +388,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             // the server to deepen to `depth`, then fold the server's shallow-info
             // back into `$GIT_DIR/shallow`. A `None` depth keeps the full-fetch path.
             let existing_shallow =
-                shallow_boundary_for_request(request.git_dir, request.format, options)?;
+                shallow_boundary_for_request(request.git_dir, request.format, &options)?;
             let deepen_not = resolve_deepen_not_refs(&advertisements, &options.deepen_not)?;
             let pack_request = crate::http::HttpFetchPackRequest {
                 client,
@@ -487,7 +487,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             // Shallow fetch over SSH mirrors the HTTP path: replay the current
             // boundary, deepen to `depth`, then apply the server's shallow-info.
             let existing_shallow =
-                shallow_boundary_for_request(request.git_dir, request.format, options)?;
+                shallow_boundary_for_request(request.git_dir, request.format, &options)?;
             let shallow_info = crate::ssh::install_fetch_pack_via_ssh_upload_pack(
                 crate::ssh::SshFetchPackRequest {
                     git_dir: request.git_dir,
@@ -551,7 +551,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             })?;
             let wants = updates.iter().map(|update| update.oid).collect();
             let existing_shallow =
-                shallow_boundary_for_request(request.git_dir, request.format, options)?;
+                shallow_boundary_for_request(request.git_dir, request.format, &options)?;
             let shallow_info = crate::git::install_fetch_pack_via_git_upload_pack(
                 crate::git::GitFetchPackRequest {
                     git_dir: request.git_dir,

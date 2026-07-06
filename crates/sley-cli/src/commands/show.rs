@@ -946,7 +946,7 @@ fn show_commit(
                     source_oid: None,
                     describe: None,
                     signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
-                    mailmap: mailmap.unwrap_or(&empty_mailmap),
+                    mailmap: &CliMailmapAdapter(mailmap.unwrap_or(&empty_mailmap)),
                     use_mailmap,
                     color: false,
                     output_encoding: &output_encoding,
