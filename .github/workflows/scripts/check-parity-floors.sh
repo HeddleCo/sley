@@ -630,7 +630,11 @@ declare -A FLOOR=(
     [t1512-rev-parse-disambiguation.sh]=35
     [t5000-tar-tree.sh]=86
     [t4027-diff-submodule.sh]=18
-    [t7102-reset.sh]=36
+    # t7102-reset 36->38 FULL (2026-07-06): cell 14 checkout -m autostash branch
+    # switch (checkout_merge_autostash_branch_switch) leaves unmerged index entries
+    # so reset --soft is blocked; cell 28 diff-files no longer filters stat-dirty
+    # entries via racy-clean-equivalent suppression when cached stat is invalid.
+    [t7102-reset.sh]=38
     # blame scoreboard wave (blame.c pass_blame/blame_chunk port + annotate-compat
     # output + -L /regex/ ranges + -b/--first-parent/^rev/abbrev parity): NEW floors.
     # t8002 54->117, t8001 44->99, t8012 44->98. Residual: :funcname ranges,

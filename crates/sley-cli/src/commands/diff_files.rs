@@ -954,6 +954,19 @@ fn diff_files_entry_is_racy_clean_equivalent(
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Ok(false);
     }
+    // `git diff-files` reports stat-dirty entries even when content is
+    // byte-identical (e.g. `reset --mixed --no-refresh` restores a zeroed cached
+    // stat). Only suppress entries that are racily clean *and* content-identical
+    // — the stat shortcut rescue for same-second edits, not invalid stats.
+    let index_mtime = fs::metadata(sley_worktree::repository_index_path(git_dir))
+        .ok()
+        .and_then(|metadata| sley_index::file_mtime_parts(&metadata));
+    let stat_cache = sley_index::IndexStatCache::from_index_mtime(index, index_mtime);
+    match stat_cache.index_entry_worktree_stat_verdict(index_entry, &metadata) {
+        sley_index::StatVerdict::Dirty => return Ok(false),
+        sley_index::StatVerdict::Clean => {}
+        sley_index::StatVerdict::RacyNeedsContentCheck => {}
+    }
     let body = fs::read(&absolute)?;
     let clean = sley_worktree::apply_clean_filter(worktree_root, git_dir, config, path, &body)?;
     let clean_oid = EncodedObject::new(ObjectType::Blob, clean).object_id(format)?;
