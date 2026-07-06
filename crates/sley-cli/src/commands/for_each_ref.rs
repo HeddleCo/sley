@@ -1,4 +1,5 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
+#![allow(clippy::expect_used)]
 
 use sley::plumbing::{sley_object, sley_refs, sley_rev};
 // A glob of the crate root brings every shared helper/type into scope via

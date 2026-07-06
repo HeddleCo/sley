@@ -6,6 +6,7 @@
 //! drive loop: option parsing, the rev walk that populates the instruction
 //! sheet, the per-commit 3-way replay, and `--continue` / `--abort` /
 //! `--skip` / `--quit`.
+#![allow(clippy::expect_used)]
 
 use crate::commands::merge_rebase::{
     MergePathResult, MergeTreeMap, commit_tree_oid, head_commit_oid,

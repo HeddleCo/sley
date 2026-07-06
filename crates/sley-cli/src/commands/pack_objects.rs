@@ -16,6 +16,7 @@
 //! copied as-is and only the remaining objects are encoded fresh. The
 //! `pack-reused` / `packs-reused` totals and trace2 data events report that
 //! reuse exactly like upstream.
+#![allow(clippy::expect_used)]
 
 use std::collections::BTreeMap;
 use std::io::BufRead;

@@ -27,6 +27,7 @@
 //! `00000000 (Not Committed Yet ...)` pseudo-commit; that working-tree overlay
 //! is not implemented here, so for a *clean* working tree this matches
 //! `git blame` exactly, and for explicit revisions it always matches.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use sley::plumbing::{sley_index, sley_rev, sley_worktree};
 // Glob the crate root for shared plumbing (RepositoryContext, repository_abbrev,

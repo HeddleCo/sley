@@ -1,4 +1,5 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
+#![allow(clippy::expect_used)]
 
 use crate::*;
 use sley::plumbing::{sley_refs, sley_rev, sley_worktree};

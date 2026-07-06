@@ -213,6 +213,7 @@ pub(crate) fn usage_error<T>(message: &str) -> Result<T> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

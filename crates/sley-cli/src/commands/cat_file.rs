@@ -1,4 +1,5 @@
 //! `git cat-file`: inspect objects and run the batch object-query protocol.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::fmt::Write as _;
 use std::io::{self, BufRead, BufWriter, Write};
@@ -2201,6 +2202,7 @@ fn cat_file_unknown_type<T>(exp_type: &str, _obj_name: &str) -> Result<T> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

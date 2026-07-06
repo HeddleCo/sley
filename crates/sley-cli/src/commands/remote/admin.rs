@@ -1,4 +1,5 @@
 //! `git remote` subcommands.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use super::config::{
     read_repo_config, read_repo_config_on_disk, remote_exists, remote_names,
@@ -324,7 +325,7 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RemoteAddMirror {
+pub(crate) enum RemoteAddMirror {
     None,
     Fetch,
     Push,

@@ -1,4 +1,5 @@
 //! `git config`: read and write repository configuration.
+#![allow(clippy::expect_used)]
 
 use crate::*;
 use sley::plumbing::{sley_config, sley_rev};

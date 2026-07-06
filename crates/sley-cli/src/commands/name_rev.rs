@@ -7,6 +7,7 @@
 //! tag-then-distance-then-date ordering, and the `--refs`/`--exclude`/`--tags`
 //! filters plus the `--all`/`--annotate-stdin`/positional input modes match the
 //! real command's output and exit codes.
+#![allow(clippy::expect_used)]
 
 use sley::plumbing::{sley_rev};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.

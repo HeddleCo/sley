@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used)]
 use super::{
     SubmoduleAddOptions, SubmoduleDeinitOptions, SubmoduleForeachOptions, SubmoduleSetBranchAction,
     SubmoduleStatusOptions, SubmoduleSummaryOptions, SubmoduleUpdateOptions,

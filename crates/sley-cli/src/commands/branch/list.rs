@@ -1,4 +1,5 @@
 //! Branch listing, sorting, formatting, and verbose output.
+#![allow(clippy::expect_used)]
 
 use crate::*;
 use sley::plumbing::{sley_refs, sley_rev};

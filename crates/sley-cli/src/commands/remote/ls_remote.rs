@@ -1,4 +1,5 @@
 //! `git ls-remote` command and formatting.
+#![allow(clippy::expect_used)]
 
 #[path = "ls_remote_options.rs"]
 mod ls_remote_options;

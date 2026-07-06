@@ -25,6 +25,7 @@
 //! revision resolution, the engine crates) come from the crate root via the
 //! `use crate::*;` glob, matching the `commands::stash` / `branch` / `tag`
 //! pattern.
+#![allow(clippy::expect_used)]
 
 use crate::*;
 use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_rev, sley_worktree};
@@ -2425,6 +2426,7 @@ fn path_to_git_bytes_lossy(path: &Path) -> Vec<u8> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod submodule_hook_tests {
     use super::*;
     use sley_submodule::{MoveHeadContext, MoveHeadVerdict, check_submodule_move_head};

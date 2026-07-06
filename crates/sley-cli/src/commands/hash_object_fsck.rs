@@ -34,6 +34,7 @@
 //!     (fsck.c).
 //!
 //! Blobs are never validated (any byte sequence is a valid blob), matching git.
+#![allow(clippy::expect_used)]
 
 use sley::{GitError, ObjectFormat, ObjectId, Result};
 use sley::plumbing::sley_object::ObjectType;
@@ -995,6 +996,7 @@ fn parse_object_type(value: &[u8]) -> Option<ObjectType> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

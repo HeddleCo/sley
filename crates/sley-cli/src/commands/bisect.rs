@@ -16,6 +16,7 @@
 //! * `refs/bisect/<term-bad>` -- the single known-bad commit.
 //! * `refs/bisect/<term-good>-<oid>` -- one ref per known-good commit.
 //! * `refs/bisect/skip-<oid>` -- one ref per skipped commit.
+#![allow(clippy::expect_used)]
 use crate::*;
 use sley::plumbing::{sley_diff_merge, sley_worktree};
 

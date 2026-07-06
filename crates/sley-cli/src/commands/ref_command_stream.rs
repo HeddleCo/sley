@@ -20,6 +20,7 @@
 //! `-z` path), with the same `parse_refname` / `parse_next_arg` /
 //! `parse_next_oid`-shaped primitives git uses, so the dispatch layer in
 //! `refs.rs` can walk arguments exactly as the C builtin does.
+#![allow(clippy::expect_used)]
 
 use sley::{GitError, Result};
 

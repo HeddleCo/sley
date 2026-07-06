@@ -16,6 +16,7 @@
 //! by a region walk built from the very same lower-level primitives
 //! `merge_blobs` is built on (`split_lines` + `myers_diff_lines`), so conflict
 //! detection and region boundaries stay consistent across every flag.
+#![allow(clippy::expect_used)]
 
 use sley::plumbing::{sley_diff_merge};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
@@ -876,6 +877,7 @@ fn emit_result(options: &MergeFileOptions, inputs: &MergeInputs, content: &[u8])
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

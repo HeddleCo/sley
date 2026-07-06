@@ -1,4 +1,5 @@
 //! Clone command and helpers.
+#![allow(clippy::expect_used)]
 
 use super::config::{
     clone_effective_config_value, read_repo_config, read_repo_config_on_disk, validate_remote_name,

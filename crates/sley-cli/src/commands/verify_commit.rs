@@ -26,6 +26,7 @@
 //! See `commands::tag::verify_tag` for the sibling tag-side logic; this module
 //! follows the same glob-import + private-helper structure as the other
 //! self-contained command modules (`commands::branch`, `commands::stash`).
+#![allow(clippy::expect_used)]
 
 // Glob the crate root for shared plumbing (RepositoryContext, the ObjectReader
 // trait, ObjectType, Commit, GitError, io, etc.); see commands::stash for the
@@ -324,6 +325,7 @@ usage: git verify-commit [-v | --verbose] [--raw] <commit>...
 ";
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

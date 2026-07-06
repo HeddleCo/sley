@@ -1,4 +1,5 @@
 //! `git worktree`: manage multiple working trees attached to one repository.
+#![allow(clippy::expect_used)]
 
 use crate::*;
 use sley::plumbing::{sley_config, sley_core, sley_index, sley_worktree};

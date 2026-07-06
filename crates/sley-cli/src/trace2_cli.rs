@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 use sley::{GitConfig, Result};
 use crate::sley_config::{ConfigEntry, ConfigSection};
 use std::env;

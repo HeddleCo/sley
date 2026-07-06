@@ -1,4 +1,5 @@
 //! receive-pack, upload-pack, send-pack, and push.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use super::config::{read_repo_config, write_repo_config};
 use super::clone::{
@@ -3861,6 +3862,7 @@ fn configure_push_upstreams_from_report(
 /// exists and the current branch is real, mirror `install_branch_config` by
 /// writing `branch.<current>.{remote,merge}`; the various ambiguous/unsupported
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod receive_max_input_size_tests {
     use super::*;
 

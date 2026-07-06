@@ -355,6 +355,7 @@ usage: git verify-tag [-v | --verbose] [--format=<format>] [--raw] <tag>...
 ";
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

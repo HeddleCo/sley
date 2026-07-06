@@ -3,6 +3,7 @@
 //! Commands should be able to say "open the repository" once and then reuse the
 //! resulting object database, refs, config, and format. This keeps Git discovery
 //! behavior in one place while preserving command-specific parsing and errors.
+#![allow(clippy::expect_used)]
 
 use std::env;
 use std::path::{Path, PathBuf};

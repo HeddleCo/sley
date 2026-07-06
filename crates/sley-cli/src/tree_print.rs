@@ -1,4 +1,5 @@
 //! `ls-tree` / `cat-file -t tree` tree listing and format placeholders.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::io::{self, BufWriter, Write};
 
@@ -24,7 +25,7 @@ pub(crate) struct TreePrintOptions<'a> {
     pub(crate) nul: bool,
 }
 
-trait TreeEntryView {
+pub(crate) trait TreeEntryView {
     fn mode(&self) -> u32;
     fn oid(&self) -> &ObjectId;
 }

@@ -1,4 +1,5 @@
 //! Diff output rendering helpers (`write_diff_*`, stat/dirstat, pathspec filtering).
+#![allow(clippy::expect_used)]
 
 use crate::commands;
 use crate::commands::remote::{read_repo_config, remote_names};

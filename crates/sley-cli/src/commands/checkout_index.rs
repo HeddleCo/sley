@@ -7,6 +7,7 @@
 //! `--ignore-skip-worktree-bits`, `--stage=<n>`, and explicit pathspecs. Output
 //! text, the streams it lands on, and exit codes match upstream so the command
 //! is a drop-in replacement.
+#![allow(clippy::expect_used)]
 
 use sley::plumbing::{sley_worktree};
 // Pull shared plumbing (RepositoryContext, ObjectReader, Index/IndexEntry,

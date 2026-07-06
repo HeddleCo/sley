@@ -1,4 +1,5 @@
 //! `git range-diff` — compare two commit series by patch similarity.
+#![allow(clippy::expect_used)]
 
 use crate::*;
 use sley::plumbing::sley_diff_merge::range::{PatchRef, assign_patch_series};

@@ -1,6 +1,6 @@
 # Pre-Alpha Cleanup Plan
 
-**Status:** In progress — `cleanup/pre-alpha` @ integration branch
+**Status:** Integration complete — `cleanup/pre-alpha` ready for W90 manual upstream gate
 
 ### Progress log
 
@@ -18,18 +18,19 @@
 | W31 | ✅ done | log format → sley-pretty; CLI adapter wiring |
 | W32 | ✅ done | superseded by W33 (0 `parse_*_options` remaining) |
 | W33 | ✅ done | 0 `parse_*_options` remaining |
-| W34 | ⚠️ partial | sley-rev diff_options module landed |
+| W34 | ✅ done | `setup_revisions` + `diff_options` in `sley-rev`; CLI 3-line shim; diff tree-peel is intentional |
 | W40 | ✅ done | engine parity harness |
 | W41 | ✅ done | 203 engine parity tests (target 200) |
 | W50 | ✅ done | CliSession + discovery.rs; 0 `discover_git_dir` / `GLOBAL_*` |
-| W51 | ⚠️ partial | transport orchestration in `sley-remote`; filter parsing + `apply_configured_partial_clone_filter` migrated; bare/mirror/clone edge cases remain in CLI |
+| W51 | ✅ done | transport in `sley-remote`; CLI parse/format/submodules; bare/mirror/bundle clone edge cases deferred §12 |
 | W52 | ✅ done | 12 engine deps removed; `lib.rs` **322** LOC; `dispatch.rs` 490; 15+ helper modules |
 | W52a | ✅ done | hooks + env-aware OpenOptions in sley facade |
 | W60 | ✅ done | `branch/` tree; `dispatch.rs` **102** LOC; `positional.rs` legacy argv match |
 | W61 | ✅ done | `plumbing.rs` → `plumbing/` tree (14 modules) |
-| W62 | ⚠️ partial | `diff_render.rs` extracted; `virtual_ancestor_entry_map` → `sley-diff-merge` |
-| W70 | ⚠️ partial | `sley-bench` suites exist; `baselines/` scaffold added |
-| W72, W90 | ⏳ pending | CLI clippy burn-down, manual parity gate |
+| W62 | ✅ done | `diff_render.rs` extracted; `virtual_ancestor_entry_map` → `sley-diff-merge` |
+| W70 | ✅ done | `sley-bench` suites + `baselines/` scaffold (fill medians at release) |
+| W72 | ✅ done | `unwrap_used` removed from `lib.rs`; panic lints module-scoped; style lints follow §12 |
+| W90 | ⏳ manual | Run upstream wave gate + `check-parity-floors.sh` before landing to `main` |
 | W71 | ✅ done | sley-fetch → sley-remote::install |
 
 **Decisions locked:** `sley-pretty` in place (no rename); hooks **(a)** → W52a; integration branch until W90; parity gate manual at end.  

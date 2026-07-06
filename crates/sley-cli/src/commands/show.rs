@@ -14,6 +14,7 @@
 //! `FileObjectDatabase`, `FileRefStore`, the `write_diff_*` writers, the
 //! `print_log_format` pretty-format engine, and so on — into scope without
 //! re-listing them.
+#![allow(clippy::expect_used)]
 
 use crate::*;
 use sley::plumbing::sley_object::TreeEntries;

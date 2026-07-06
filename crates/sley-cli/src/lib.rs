@@ -3,8 +3,10 @@
     unused_assignments,
     unused_mut,
     unused_variables,
-    clippy::all,
-    clippy::unwrap_used
+    unused_imports,
+    // W72 (partial): `clippy::unwrap_used` removed; `expect_used` module-scoped.
+    // Style lints (`clippy::all`) burn down post-integration — see plan §12.
+    clippy::all
 )]
 
 use sley::{

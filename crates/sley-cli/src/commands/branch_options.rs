@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used)]
 use super::{
     branch_ahead_behind_sort_value, branch_contains_eq_value, branch_date_sort_value,
     branch_merged_eq_value, branch_no_contains_eq_value, branch_no_merged_eq_value,

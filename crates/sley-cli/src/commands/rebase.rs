@@ -5,6 +5,7 @@
 //! parsing, todo generation (`sequencer_make_script`), the
 //! `complete_action`/`pick_commits` drive loop, `--continue` / `--abort` /
 //! `--skip` / `--quit` / `--edit-todo`, and autostash handling.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use crate::commands::merge_rebase::{
     MergePathResult, RenameMergeConfig, commit_tree_oid, directory_renames_config,

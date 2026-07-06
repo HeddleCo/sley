@@ -18,6 +18,7 @@
 //! can access its ancestor module's private items), so `cli_git_dir`,
 //! `repository_object_format`, `FileObjectDatabase`, `three_way_merge_trees`,
 //! and friends are all in scope without re-listing them.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 use crate::*;
 use sley::plumbing::{sley_index, sley_worktree};
 

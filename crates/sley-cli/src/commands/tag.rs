@@ -1,4 +1,5 @@
 //! `git tag` (create/list/delete/verify) and tag-message helpers.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use sley::plumbing::{sley_core, sley_refs, sley_rev};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
@@ -3367,6 +3368,7 @@ fn tag_points_at(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::expand_tag_bundle;
 

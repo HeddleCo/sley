@@ -9,6 +9,7 @@
 //! shared plumbing (`RepositoryContext`, `worktree_root_for_git_dir`,
 //! `FileObjectDatabase`, ...);
 //! see `commands::stash` for the rationale.
+#![allow(clippy::expect_used)]
 
 use crate::*;
 use sley_grep::{
@@ -2792,6 +2793,7 @@ fn grep_pathspec_match(spec: &sley_pathspec::PathspecElement, path: &[u8]) -> bo
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use sley_grep::{Regex, RegexMode, contains};

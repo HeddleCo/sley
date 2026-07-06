@@ -1,4 +1,5 @@
 //! Shared `for-each-ref` / `refs list` helpers (format rendering, sort keys, upstream tracking).
+#![allow(clippy::expect_used)]
 
 use crate::commands;
 use crate::{

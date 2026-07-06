@@ -31,6 +31,7 @@
 //!
 //! Native Rust only: objects are written straight to the loose object store and
 //! branch refs are updated through the ref transaction layer; no shell-out.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use crate::*;
 use std::io::{BufRead, Write};
@@ -2881,6 +2882,7 @@ fn validate_fast_import_path(path: &[u8], kind: FastImportPathKind) -> Result<()
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

@@ -510,6 +510,7 @@ fn parse_config_bool_like(value: &str) -> Option<bool> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

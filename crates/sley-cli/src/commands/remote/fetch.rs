@@ -1,4 +1,5 @@
 //! Fetch command, transport, and submodule recursion.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use super::clone::{normalize_clone_filter, parse_clone_depth, register_promisor_remote};
 use super::config::{clone_effective_config_value, read_repo_config, remote_exists, remote_names, write_repo_config};

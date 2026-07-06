@@ -1,4 +1,5 @@
 //! Byte-preserving repository-relative path helpers.
+#![allow(clippy::expect_used)]
 
 use std::ffi::OsStr;
 use std::path::{Component, Path};
@@ -54,6 +55,7 @@ fn os_str_bytes(value: &OsStr) -> Vec<u8> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

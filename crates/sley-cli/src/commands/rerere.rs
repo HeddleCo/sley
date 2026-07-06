@@ -1,4 +1,5 @@
 //! Native `git rerere` support.
+#![allow(clippy::expect_used)]
 
 use crate::commands::cli_options::opt_bool;
 use crate::*;

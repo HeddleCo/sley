@@ -1,4 +1,9 @@
 //! Positional / legacy argv patterns for `git branch`.
+//!
+//! Mechanical argv `match` with guard-then-`.expect()` after `is_some()` checks;
+//! isolated `expect_used` allow until the match is table-driven (post-W90).
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use super::create::{branch_create_set_tracking, create_branch_from_start};
 use super::delete::{delete_merged_branches, force_delete_branches, force_update_branch};

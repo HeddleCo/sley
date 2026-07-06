@@ -10,6 +10,7 @@
 //!   overall); without it the first failure stops the loop and propagates.
 //! - A syntactically bad `--config` key, or a key whose value is a bare boolean
 //!   (no value), is a usage error (exit 129); an unset key runs nothing (exit 0).
+#![allow(clippy::expect_used)]
 
 use std::env;
 use std::path::{Path, PathBuf};
