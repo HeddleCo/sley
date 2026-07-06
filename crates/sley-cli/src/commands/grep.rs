@@ -537,7 +537,6 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             PatternTypeOption::Pcre => PatternKind::Perl,
             _ => PatternKind::Basic,
         };
-        reject_pcre_without_support(&opts)?;
         reject_nul_pattern_without_pcre(&opts)?;
         let color_config = repo.as_ref().map(|repo| repo.config());
         let any = grep_no_index(
@@ -585,7 +584,6 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         PatternTypeOption::Pcre => PatternKind::Perl,
         _ => PatternKind::Basic,
     };
-    reject_pcre_without_support(&opts)?;
     reject_nul_pattern_without_pcre(&opts)?;
     // `grep.*` config sets the default; an explicit CLI flag (tracked by the
     // `_set` markers) overrides it. git applies config first, then CLI overrides.
@@ -859,14 +857,6 @@ fn reject_nul_pattern_without_pcre(opts: &GrepOptions) -> Result<()> {
         eprintln!(
             "fatal: given pattern contains NULL byte (This is only supported with -P under PCRE v2)"
         );
-        return Err(GitError::Exit(128));
-    }
-    Ok(())
-}
-
-fn reject_pcre_without_support(opts: &GrepOptions) -> Result<()> {
-    if opts.kind == PatternKind::Perl {
-        eprintln!("fatal: support for Perl-compatible regexes was not compiled in");
         return Err(GitError::Exit(128));
     }
     Ok(())
