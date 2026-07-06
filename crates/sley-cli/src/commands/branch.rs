@@ -4,9 +4,13 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley_options::{
-    CallbackValue, OptFlags, OptValue, OptionName, OptionSpec, Parsed, ParsedOption, ParsedValue,
-    UsageError, parse_options,
+
+#[path = "branch_options.rs"]
+mod branch_options;
+use branch_options::{
+    setup_branch_create_options, setup_branch_delete_options, setup_branch_format_list_options,
+    setup_branch_general_list_options, setup_branch_move_options, setup_branch_show_current_options,
+    setup_branch_upstream_options, setup_branch_verbose_list_options,
 };
 
 pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
@@ -28,10 +32,10 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         );
         return Err(GitError::Exit(129));
     }
-    if let Some(format_options) = parse_branch_format_list_options(git_dir, format, args)? {
+    if let Some(format_options) = setup_branch_format_list_options(git_dir, format, args)? {
         return run_branch_format_list_options(git_dir, format, store, format_options);
     }
-    if let Some(show_current) = parse_branch_show_current_options(args)? {
+    if let Some(show_current) = setup_branch_show_current_options(args)? {
         if show_current {
             if let Some(branch) = store.current_branch()? {
                 println!("{branch}");
@@ -40,20 +44,20 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         }
         return print_branch_list(store, BranchListMode::Local);
     }
-    if let Some(move_options) = parse_branch_move_options(args)? {
+    if let Some(move_options) = setup_branch_move_options(args)? {
         return run_branch_move_options(git_dir, store, move_options);
     }
-    if let Some(upstream) = parse_branch_upstream_options(args)? {
+    if let Some(upstream) = setup_branch_upstream_options(args)? {
         return run_branch_upstream_options(git_dir, store, upstream);
     }
     if branch_has_conflicting_action_modes(args) {
         eprintln!("fatal: options are incompatible");
         return Err(GitError::Exit(128));
     }
-    if let Some(verbose) = parse_branch_verbose_list_options(args)? {
+    if let Some(verbose) = setup_branch_verbose_list_options(args)? {
         return run_branch_verbose_list_options(git_dir, format, store, verbose);
     }
-    if let Some(delete) = parse_branch_delete_options(args)? {
+    if let Some(delete) = setup_branch_delete_options(args)? {
         let BranchDeleteOptions {
             force,
             quiet,
@@ -71,10 +75,10 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
             delete_merged_branches(git_dir, format, store, &branches, quiet)
         };
     }
-    if let Some(create) = parse_branch_create_options(args)? {
+    if let Some(create) = setup_branch_create_options(args)? {
         return run_branch_create_options(git_dir, format, store, create);
     }
-    if let Some(list) = parse_branch_general_list_options(git_dir, args)? {
+    if let Some(list) = setup_branch_general_list_options(git_dir, args)? {
         return run_branch_general_list_options(git_dir, format, store, list);
     }
     match args {
@@ -6057,221 +6061,6 @@ struct BranchFormatListOptions {
     omit_empty: bool,
 }
 
-const BRANCH_USAGE_LINES: [&str; 8] = [
-    "git branch [<options>] [-r | -a] [--merged] [--no-merged]",
-    "git branch [<options>] [-f] [--recurse-submodules] <branch-name> [<start-point>]",
-    "git branch [<options>] [-l] [<pattern>...]",
-    "git branch [<options>] [-r] (-d | -D) <branch-name>...",
-    "git branch [<options>] (-m | -M) [<old-branch>] <new-branch>",
-    "git branch [<options>] (-c | -C) [<old-branch>] <new-branch>",
-    "git branch [<options>] [-r | -a] [--points-at]",
-    "git branch [<options>] [-r | -a] [--format]",
-];
-
-fn branch_usage_error(error: UsageError) -> GitError {
-    eprint!("{}", error.render_stderr());
-    GitError::Exit(error.exit_code())
-}
-
-fn branch_error_is_unknown(error: &UsageError) -> bool {
-    error.message().is_some_and(|message| {
-        message.starts_with("unknown option `") || message.starts_with("unknown switch `")
-    })
-}
-
-fn parse_branch_options<'a>(
-    args: &'a [String],
-    specs: &'a [OptionSpec<'a>],
-) -> Result<Option<Parsed<'a>>> {
-    match parse_options(args, specs, &BRANCH_USAGE_LINES) {
-        Ok(parsed) => Ok(Some(parsed)),
-        Err(error) if branch_error_is_unknown(&error) => Ok(None),
-        Err(error) => Err(branch_usage_error(error)),
-    }
-}
-
-fn branch_option_bool(option: &ParsedOption<'_>) -> Option<bool> {
-    match option.value {
-        ParsedValue::Bool(value) => Some(value),
-        _ => None,
-    }
-}
-
-fn branch_positionals(parsed: &Parsed<'_>) -> Vec<String> {
-    parsed
-        .positionals
-        .iter()
-        .map(|value| (*value).to_string())
-        .collect()
-}
-
-fn parse_branch_list_filter_arg(
-    args: &[String],
-    idx: &mut usize,
-    filters: &mut BranchListFilters,
-) -> Result<bool> {
-    let Some(arg) = args.get(*idx).map(String::as_str) else {
-        return Ok(false);
-    };
-    let mut read_optional_rev = |name: &str| -> String {
-        if let Some(next) = args.get(*idx + 1)
-            && !next.starts_with('-')
-        {
-            *idx += 1;
-            return next.clone();
-        }
-        name.to_string()
-    };
-    match arg {
-        "--contains" => {
-            filters.contains.push(read_optional_rev("HEAD"));
-            Ok(true)
-        }
-        "--no-contains" => {
-            filters.no_contains.push(read_optional_rev("HEAD"));
-            Ok(true)
-        }
-        "--merged" => {
-            filters.merged.push(read_optional_rev("HEAD"));
-            Ok(true)
-        }
-        "--no-merged" => {
-            filters.no_merged.push(read_optional_rev("HEAD"));
-            Ok(true)
-        }
-        value if branch_contains_eq_value(value).is_some() => {
-            filters.contains.push(
-                branch_contains_eq_value(value)
-                    .expect("guard checked branch option")
-                    .to_string(),
-            );
-            Ok(true)
-        }
-        value if branch_no_contains_eq_value(value).is_some() => {
-            filters.no_contains.push(
-                branch_no_contains_eq_value(value)
-                    .expect("guard checked branch option")
-                    .to_string(),
-            );
-            Ok(true)
-        }
-        value if branch_merged_eq_value(value).is_some() => {
-            filters.merged.push(
-                branch_merged_eq_value(value)
-                    .expect("guard checked branch option")
-                    .to_string(),
-            );
-            Ok(true)
-        }
-        value if branch_no_merged_eq_value(value).is_some() => {
-            filters.no_merged.push(
-                branch_no_merged_eq_value(value)
-                    .expect("guard checked branch option")
-                    .to_string(),
-            );
-            Ok(true)
-        }
-        _ => Ok(false),
-    }
-}
-
-fn parse_branch_track_value(
-    value: CallbackValue<'_>,
-) -> std::result::Result<Option<String>, String> {
-    if value.unset {
-        return Ok(Some("never".into()));
-    }
-    match value.value.unwrap_or("direct") {
-        "direct" => Ok(Some("direct".into())),
-        "inherit" => Ok(Some("inherit".into())),
-        _ => {
-            let option = match value.option {
-                OptionName::Short(short) => format!("-{short}"),
-                OptionName::Long(long) | OptionName::NegatedLong(long) => format!("--{long}"),
-            };
-            Err(format!(
-                "option `{option}' expects \"direct\" or \"inherit\""
-            ))
-        }
-    }
-}
-
-fn branch_track_mode(value: &str) -> BranchTrackMode {
-    match value {
-        "inherit" => BranchTrackMode::Inherit,
-        "never" => BranchTrackMode::Never,
-        _ => BranchTrackMode::Direct,
-    }
-}
-
-#[rustfmt::skip]
-macro_rules! branch_bool_option {
-    ($short:expr, $long:expr, $flags:expr, $help:expr) => { OptionSpec { short: $short, long: $long, value: OptValue::Bool, flags: $flags, help: $help } };
-}
-
-#[rustfmt::skip]
-macro_rules! branch_str_option {
-    ($short:expr, $long:expr, $metavar:expr, $flags:expr, $help:expr) => { OptionSpec { short: $short, long: $long, value: OptValue::Str($metavar), flags: $flags, help: $help } };
-}
-
-#[rustfmt::skip]
-macro_rules! branch_track_option {
-    () => { OptionSpec { short: Some('t'), long: Some("track"), value: OptValue::Callback { metavar: Some("(direct|inherit)"), parse: parse_branch_track_value }, flags: OptFlags::OPTARG, help: "set branch tracking configuration" } };
-}
-
-#[rustfmt::skip]
-fn branch_option_specs() -> [OptionSpec<'static>; 25] {
-    [
-        branch_bool_option!(Some('v'), Some("verbose"), OptFlags::NONE, "show hash and subject, give twice for upstream branch"),
-        branch_bool_option!(Some('q'), Some("quiet"), OptFlags::NONE, "suppress informational messages"),
-        branch_track_option!(),
-        branch_bool_option!(None, Some("unset-upstream"), OptFlags::NONE, "unset the upstream info"),
-        branch_str_option!(None, Some("color"), "when", OptFlags::OPTARG, "use colored output"),
-        branch_bool_option!(Some('r'), Some("remotes"), OptFlags::NONEG, "act on remote-tracking branches"),
-        branch_str_option!(None, Some("abbrev"), "n", OptFlags::OPTARG, "use <n> digits to display object names"),
-        branch_bool_option!(Some('a'), Some("all"), OptFlags::NONEG, "list both remote-tracking and local branches"),
-        branch_bool_option!(Some('d'), Some("delete"), OptFlags::NONE, "delete fully merged branch"),
-        branch_bool_option!(Some('D'), None, OptFlags::NONE, "delete branch (even if not merged)"),
-        branch_bool_option!(Some('m'), Some("move"), OptFlags::NONE, "move/rename a branch and its reflog"),
-        branch_bool_option!(Some('M'), None, OptFlags::NONE, "move/rename a branch, even if target exists"),
-        branch_bool_option!(None, Some("omit-empty"), OptFlags::NONE, "do not output a newline after empty formatted refs"),
-        branch_bool_option!(Some('c'), Some("copy"), OptFlags::NONE, "copy a branch and its reflog"),
-        branch_bool_option!(Some('C'), None, OptFlags::NONE, "copy a branch, even if target exists"),
-        branch_bool_option!(Some('l'), Some("list"), OptFlags::NONE, "list branch names"),
-        branch_bool_option!(None, Some("show-current"), OptFlags::NONE, "show current branch name"),
-        branch_bool_option!(None, Some("create-reflog"), OptFlags::NONE, "create the branch's reflog"),
-        branch_bool_option!(None, Some("edit-description"), OptFlags::NONE, "edit the description for the branch"),
-        branch_bool_option!(Some('f'), Some("force"), OptFlags::NONE, "force creation, move/rename, deletion"),
-        branch_str_option!(None, Some("column"), "style", OptFlags::OPTARG, "list branches in columns"),
-        branch_str_option!(None, Some("sort"), "key", OptFlags::NONE, "field name to sort on"),
-        branch_bool_option!(Some('i'), Some("ignore-case"), OptFlags::NONE, "sorting and filtering are case insensitive"),
-        branch_bool_option!(None, Some("recurse-submodules"), OptFlags::NONE, "recurse through submodules"),
-        branch_str_option!(None, Some("format"), "format", OptFlags::NONE, "format to use for the output"),
-    ]
-}
-
-fn parse_branch_show_current_options(args: &[String]) -> Result<Option<bool>> {
-    let specs = branch_option_specs();
-    let Some(parsed) = parse_branch_options(args, &specs)? else {
-        return Ok(None);
-    };
-    let show_current = parsed
-        .options
-        .iter()
-        .filter(|option| option.long == Some("show-current"))
-        .filter_map(branch_option_bool)
-        .next_back();
-    let has_other_options = parsed
-        .options
-        .iter()
-        .any(|option| option.long != Some("show-current"));
-    match show_current {
-        Some(true) => Ok(Some(true)),
-        Some(false) if parsed.positionals.is_empty() && !has_other_options => Ok(Some(false)),
-        _ => Ok(None),
-    }
-}
-
 fn branch_has_conflicting_action_modes(args: &[String]) -> bool {
     let mut delete = false;
     let mut move_or_copy = false;
@@ -6285,422 +6074,6 @@ fn branch_has_conflicting_action_modes(args: &[String]) -> bool {
         }
     }
     (delete && move_or_copy) || (delete && list)
-}
-
-fn parse_branch_general_list_options(
-    git_dir: &Path,
-    args: &[String],
-) -> Result<Option<BranchGeneralListOptions>> {
-    let mut mode = BranchListMode::Local;
-    let mut patterns = Vec::new();
-    let mut filters = BranchListFilters::default();
-    let mut ignore_case = false;
-    let mut color = false;
-    let mut column = None;
-    let mut sort = None;
-    let mut explicit_no_sort = false;
-    let mut explicit_list = false;
-    let mut saw_list_control = args.is_empty();
-    let mut idx = 0;
-    while idx < args.len() {
-        if parse_branch_list_filter_arg(args, &mut idx, &mut filters)? {
-            saw_list_control = true;
-            idx += 1;
-            continue;
-        }
-        match args[idx].as_str() {
-            "-l" | "--list" => {
-                explicit_list = true;
-                saw_list_control = true;
-            }
-            "-r" | "--remotes" => {
-                mode = BranchListMode::Remote;
-                saw_list_control = true;
-            }
-            "-a" | "--all" => {
-                mode = BranchListMode::All;
-                saw_list_control = true;
-            }
-            "-i" | "--ignore-case" => {
-                ignore_case = true;
-                saw_list_control = true;
-            }
-            "--no-ignore-case" => {
-                ignore_case = false;
-                saw_list_control = true;
-            }
-            "--color" | "--color=always" => {
-                color = true;
-                saw_list_control = true;
-            }
-            "--no-color" | "--color=never" | "--color=auto" => {
-                color = false;
-                saw_list_control = true;
-            }
-            "--column" | "--column=column" => {
-                column = Some(BranchColumnStyle::Column);
-                saw_list_control = true;
-            }
-            "--column=dense" => {
-                column = Some(BranchColumnStyle::Dense);
-                saw_list_control = true;
-            }
-            "--no-column" | "--column=never" | "--column=plain" | "--column=auto" => {
-                column = None;
-                saw_list_control = true;
-            }
-            "--sort" => {
-                idx += 1;
-                let Some(value) = args.get(idx) else {
-                    return Err(GitError::Command("--sort requires a value".into()));
-                };
-                sort = Some(branch_sort_from_key(
-                    git_dir,
-                    repository_object_format(git_dir)?,
-                    value,
-                )?);
-                explicit_no_sort = false;
-                saw_list_control = true;
-            }
-            value if value.starts_with("--sort=") => {
-                let value = value
-                    .strip_prefix("--sort=")
-                    .expect("prefix checked by match guard");
-                sort = Some(branch_sort_from_key(
-                    git_dir,
-                    repository_object_format(git_dir)?,
-                    value,
-                )?);
-                explicit_no_sort = false;
-                saw_list_control = true;
-            }
-            "--no-sort" => {
-                sort = None;
-                explicit_no_sort = true;
-                saw_list_control = true;
-            }
-            value if value.starts_with('-') => return Ok(None),
-            value => patterns.push(value.to_string()),
-        }
-        idx += 1;
-    }
-
-    if !patterns.is_empty()
-        && !explicit_list
-        && filters.is_empty()
-        && !matches!(mode, BranchListMode::Remote | BranchListMode::All)
-    {
-        return Ok(None);
-    }
-
-    let config = read_repo_config(git_dir)?;
-    if sort.is_none()
-        && !explicit_no_sort
-        && let Some(config_sort) = config.get("branch", None, "sort")
-    {
-        sort = Some(branch_sort_from_key(
-            git_dir,
-            repository_object_format(git_dir)?,
-            config_sort,
-        )?);
-        saw_list_control = true;
-    }
-    if column.is_none()
-        && !args
-            .iter()
-            .any(|arg| arg.starts_with("--column") || arg == "--no-column")
-        && branch_config_enables_columns(&config)
-    {
-        column = Some(branch_config_column_style(&config));
-        saw_list_control = true;
-    }
-
-    Ok(saw_list_control.then_some(BranchGeneralListOptions {
-        mode,
-        patterns,
-        filters,
-        ignore_case,
-        color,
-        column,
-        sort,
-    }))
-}
-
-fn parse_branch_format_list_options(
-    git_dir: &Path,
-    format: ObjectFormat,
-    args: &[String],
-) -> Result<Option<BranchFormatListOptions>> {
-    if !args
-        .iter()
-        .any(|arg| arg == "--format" || arg.starts_with("--format="))
-    {
-        return Ok(None);
-    }
-
-    let mut mode = BranchListMode::Local;
-    let mut patterns = Vec::new();
-    let mut ignore_case = false;
-    let mut color = false;
-    let mut sort = None;
-    let mut format_spec = None;
-    let mut omit_empty = false;
-    let mut idx = 0;
-    while idx < args.len() {
-        match args[idx].as_str() {
-            "-l" | "--list" => {}
-            "-r" | "--remotes" => mode = BranchListMode::Remote,
-            "-a" | "--all" => mode = BranchListMode::All,
-            "-i" | "--ignore-case" => ignore_case = true,
-            "--no-ignore-case" => ignore_case = false,
-            "--color" | "--color=always" => color = true,
-            "--no-color" | "--color=never" | "--color=auto" => color = false,
-            "--omit-empty" => omit_empty = true,
-            "--no-omit-empty" => omit_empty = false,
-            "--no-format" => format_spec = None,
-            "--format" => {
-                idx += 1;
-                let Some(value) = args.get(idx) else {
-                    return Err(GitError::Command("branch --format requires a value".into()));
-                };
-                format_spec = Some(value.to_string());
-            }
-            value if value.starts_with("--format=") => {
-                format_spec = Some(
-                    value
-                        .strip_prefix("--format=")
-                        .expect("prefix checked by match guard")
-                        .to_string(),
-                );
-            }
-            "--sort" => {
-                idx += 1;
-                let Some(value) = args.get(idx) else {
-                    return Err(GitError::Command("--sort requires a value".into()));
-                };
-                sort = Some(branch_sort_from_key(git_dir, format, value)?);
-            }
-            value if value.starts_with("--sort=") => {
-                let value = value
-                    .strip_prefix("--sort=")
-                    .expect("prefix checked by match guard");
-                sort = Some(branch_sort_from_key(git_dir, format, value)?);
-            }
-            "--no-sort" => sort = None,
-            value if value.starts_with('-') => return Ok(None),
-            value => patterns.push(value.to_string()),
-        }
-        idx += 1;
-    }
-
-    Ok(format_spec.map(|format_spec| BranchFormatListOptions {
-        mode,
-        patterns,
-        ignore_case,
-        color,
-        sort,
-        format_spec,
-        omit_empty,
-    }))
-}
-
-fn branch_sort_from_key(git_dir: &Path, format: ObjectFormat, key: &str) -> Result<BranchSort> {
-    let key = key.strip_prefix("--sort=").unwrap_or(key);
-    match key {
-        "refname" => Ok(BranchSort::Refname(false)),
-        "-refname" => Ok(BranchSort::Refname(true)),
-        value if branch_version_sort_value(value).is_some() => Ok(BranchSort::Version(
-            branch_version_sort_value(value).expect("checked branch version sort"),
-        )),
-        value if branch_objectname_sort_value(value).is_some() => Ok(BranchSort::ObjectName(
-            branch_objectname_sort_value(value).expect("checked branch objectname sort"),
-        )),
-        value if branch_objecttype_sort_value(value).is_some() => Ok(BranchSort::ObjectType(
-            branch_objecttype_sort_value(value).expect("checked branch objecttype sort"),
-        )),
-        value if branch_objectsize_sort_value(value).is_some() => Ok(BranchSort::ObjectSize(
-            branch_objectsize_sort_value(value).expect("checked branch objectsize sort"),
-        )),
-        value if branch_date_sort_value(value).is_some() => {
-            let (field, descending) =
-                branch_date_sort_value(value).expect("checked branch date sort");
-            Ok(BranchSort::Date(field, descending))
-        }
-        value if branch_upstream_sort_value(value).is_some() => Ok(BranchSort::Upstream(
-            branch_upstream_sort_value(value).expect("checked branch upstream sort"),
-        )),
-        value if branch_push_sort_value(value).is_some() => Ok(BranchSort::Push(
-            branch_push_sort_value(value).expect("checked branch push sort"),
-        )),
-        value if branch_ahead_behind_sort_value(value).is_some() => {
-            let (rev, descending) =
-                branch_ahead_behind_sort_value(value).expect("checked ahead-behind sort");
-            let oid = resolve_revision(git_dir, format, rev)?;
-            Ok(BranchSort::AheadBehind(oid, descending))
-        }
-        _ => {
-            eprintln!("fatal: unknown field name: {key}");
-            Err(GitError::Exit(128))
-        }
-    }
-}
-
-fn branch_config_enables_columns(config: &GitConfig) -> bool {
-    config
-        .get("column", Some("branch"), "branch")
-        .or_else(|| config.get("column", None, "branch"))
-        .or_else(|| config.get("column", None, "ui"))
-        .is_some_and(|value| matches!(value, "column" | "dense" | "always"))
-}
-
-fn branch_config_column_style(config: &GitConfig) -> BranchColumnStyle {
-    match config
-        .get("column", Some("branch"), "branch")
-        .or_else(|| config.get("column", None, "branch"))
-    {
-        Some("dense") => BranchColumnStyle::Dense,
-        _ => BranchColumnStyle::Column,
-    }
-}
-
-#[rustfmt::skip]
-fn branch_verbose_list_option_specs() -> [OptionSpec<'static>; 15] {
-    [
-        branch_bool_option!(Some('v'), Some("verbose"), OptFlags::NONE, "show hash and subject, give twice for upstream branch"),
-        branch_bool_option!(Some('l'), Some("list"), OptFlags::NONE, "list branch names"),
-        branch_bool_option!(None, Some("no-delete"), OptFlags::NONEG, "do not delete branches"),
-        branch_bool_option!(None, Some("show-current"), OptFlags::NONE, "show current branch name"),
-        branch_bool_option!(Some('r'), Some("remotes"), OptFlags::NONEG, "act on remote-tracking branches"),
-        branch_bool_option!(Some('a'), Some("all"), OptFlags::NONEG, "list both remote-tracking and local branches"),
-        branch_bool_option!(Some('i'), Some("ignore-case"), OptFlags::NONE, "sorting and filtering are case insensitive"),
-        branch_str_option!(None, Some("color"), "when", OptFlags::OPTARG, "use colored output"),
-        branch_str_option!(None, Some("column"), "style", OptFlags::OPTARG, "list branches in columns"),
-        branch_str_option!(None, Some("abbrev"), "n", OptFlags::OPTARG, "use <n> digits to display object names"),
-        branch_str_option!(None, Some("sort"), "key", OptFlags::NONE, "field name to sort on"),
-        branch_str_option!(None, Some("contains"), "commit", OptFlags::OPTARG, "print only branches that contain the commit"),
-        branch_str_option!(None, Some("no-contains"), "commit", OptFlags::OPTARG, "print only branches that don't contain the commit"),
-        branch_str_option!(None, Some("merged"), "commit", OptFlags::OPTARG, "print only branches that are merged"),
-        branch_str_option!(None, Some("no-merged"), "commit", OptFlags::OPTARG, "print only branches that are not merged"),
-    ]
-}
-
-fn parse_branch_verbose_list_options(args: &[String]) -> Result<Option<BranchVerboseListOptions>> {
-    let mut verbosity = 0usize;
-    let mut explicit_list = false;
-    let mut mode = BranchListMode::Local;
-    let mut ignore_case = false;
-    let mut abbrev = None;
-    let mut color = false;
-    let mut saw_verbose = false;
-    let mut saw_column = false;
-    let specs = branch_verbose_list_option_specs();
-    let Some(parsed) = parse_branch_options(args, &specs)? else {
-        return Ok(None);
-    };
-    for option in &parsed.options {
-        match option.long {
-            Some("verbose") => {
-                saw_verbose = true;
-                if branch_option_bool(option).unwrap_or(true) {
-                    verbosity = verbosity.saturating_add(1);
-                } else {
-                    verbosity = 0;
-                }
-            }
-            Some("list") => {
-                if branch_option_bool(option).unwrap_or(true) {
-                    explicit_list = true;
-                }
-            }
-            Some("remotes") => mode = BranchListMode::Remote,
-            Some("all") => mode = BranchListMode::All,
-            Some("ignore-case") => ignore_case = branch_option_bool(option).unwrap_or(true),
-            Some("column") => saw_column = true,
-            _ => {}
-        }
-    }
-    for arg in args {
-        match arg.as_str() {
-            "--color" | "--color=always" => color = true,
-            "--no-color" | "--color=never" | "--color=auto" => color = false,
-            "--abbrev" => abbrev = None,
-            "--no-abbrev" => abbrev = Some(None),
-            value if value.starts_with("--abbrev=") => {
-                let value = value
-                    .strip_prefix("--abbrev=")
-                    .expect("prefix checked by match guard");
-                let width = value
-                    .parse::<usize>()
-                    .map_err(|_| GitError::Command(format!("invalid abbrev length {value}")))?;
-                abbrev = if width == 0 {
-                    Some(None)
-                } else {
-                    Some(Some(width))
-                };
-            }
-            _ => {}
-        }
-    }
-    if !saw_verbose {
-        return Ok(None);
-    }
-    if saw_column && verbosity > 0 {
-        eprintln!("fatal: options '--column' and '--verbose' cannot be used together");
-        return Err(GitError::Exit(128));
-    }
-    let (patterns, filters) = branch_verbose_patterns_and_filters(args)?;
-    if !explicit_list
-        && !matches!(mode, BranchListMode::Remote | BranchListMode::All)
-        && !patterns.is_empty()
-        && filters.is_empty()
-    {
-        return Ok(None);
-    }
-    Ok(Some(BranchVerboseListOptions {
-        mode,
-        patterns,
-        filters,
-        ignore_case,
-        verbosity,
-        abbrev,
-        color,
-    }))
-}
-
-fn branch_verbose_patterns_and_filters(
-    args: &[String],
-) -> Result<(Vec<String>, BranchListFilters)> {
-    let mut patterns = Vec::new();
-    let mut filters = BranchListFilters::default();
-    let mut idx = 0;
-    while idx < args.len() {
-        if parse_branch_list_filter_arg(args, &mut idx, &mut filters)? {
-            idx += 1;
-            continue;
-        }
-        match args[idx].as_str() {
-            "-v" | "--verbose" | "--no-verbose" | "-l" | "--list" | "--no-list" | "-r"
-            | "--remotes" | "-a" | "--all" | "-i" | "--ignore-case" | "--no-ignore-case"
-            | "--color" | "--no-color" | "--column" | "--no-column" | "--abbrev"
-            | "--no-abbrev" | "--show-current" | "--no-show-current" | "--no-delete" => {}
-            value
-                if value.starts_with('-')
-                    && value.len() > 2
-                    && value[1..].bytes().all(|byte| byte == b'v') => {}
-            value
-                if value.starts_with("--color=")
-                    || value.starts_with("--column=")
-                    || value.starts_with("--abbrev=")
-                    || value.starts_with("--sort=") => {}
-            "--sort" => {
-                idx += 1;
-            }
-            value if value.starts_with('-') => {}
-            value => patterns.push(value.to_string()),
-        }
-        idx += 1;
-    }
-    Ok((patterns, filters))
 }
 
 fn run_branch_verbose_list_options(
@@ -6732,60 +6105,6 @@ struct BranchMoveOptions {
 }
 
 #[rustfmt::skip]
-fn branch_move_option_specs() -> [OptionSpec<'static>; 7] {
-    [
-        branch_bool_option!(Some('m'), Some("move"), OptFlags::NONE, "move/rename a branch and its reflog"),
-        branch_bool_option!(Some('M'), None, OptFlags::NONE, "move/rename a branch, even if target exists"),
-        branch_bool_option!(Some('c'), Some("copy"), OptFlags::NONE, "copy a branch and its reflog"),
-        branch_bool_option!(Some('C'), None, OptFlags::NONE, "copy a branch, even if target exists"),
-        branch_bool_option!(Some('f'), Some("force"), OptFlags::NONE, "force creation, move/rename, deletion"),
-        branch_bool_option!(Some('q'), Some("quiet"), OptFlags::NONE, "suppress informational messages"),
-        branch_bool_option!(Some('v'), Some("verbose"), OptFlags::NONE, "show hash and subject, give twice for upstream branch"),
-    ]
-}
-
-fn parse_branch_move_options(args: &[String]) -> Result<Option<BranchMoveOptions>> {
-    let mut kind = None;
-    let mut force = false;
-    let specs = branch_move_option_specs();
-    let Some(parsed) = parse_branch_options(args, &specs)? else {
-        return Ok(None);
-    };
-    for option in &parsed.options {
-        match (option.short, option.long) {
-            (Some('m'), _) | (_, Some("move")) => {
-                if branch_option_bool(option).unwrap_or(true) {
-                    kind = Some(BranchMoveKind::Rename);
-                } else {
-                    kind = None;
-                }
-            }
-            (Some('M'), _) => {
-                kind = Some(BranchMoveKind::Rename);
-                force = true;
-            }
-            (Some('c'), _) | (_, Some("copy")) => {
-                if branch_option_bool(option).unwrap_or(true) {
-                    kind = Some(BranchMoveKind::Copy);
-                } else {
-                    kind = None;
-                }
-            }
-            (Some('C'), _) => {
-                kind = Some(BranchMoveKind::Copy);
-                force = true;
-            }
-            (_, Some("force")) => force = branch_option_bool(option).unwrap_or(true),
-            _ => {}
-        }
-    }
-    Ok(kind.map(|kind| BranchMoveOptions {
-        kind,
-        force,
-        branches: branch_positionals(&parsed),
-    }))
-}
-
 fn run_branch_move_options(
     git_dir: &Path,
     store: &FileRefStore,
@@ -7216,47 +6535,6 @@ struct BranchUpstreamOptions {
 }
 
 #[rustfmt::skip]
-fn branch_upstream_option_specs() -> [OptionSpec<'static>; 3] {
-    [
-        branch_bool_option!(None, Some("set-upstream"), OptFlags::NONE, "set upstream for git pull/status"),
-        branch_str_option!(Some('u'), Some("set-upstream-to"), "upstream", OptFlags::NONE, "change the upstream info"),
-        branch_bool_option!(None, Some("unset-upstream"), OptFlags::NONE, "unset the upstream info"),
-    ]
-}
-
-fn parse_branch_upstream_options(args: &[String]) -> Result<Option<BranchUpstreamOptions>> {
-    let mut action = None;
-    let specs = branch_upstream_option_specs();
-    let Some(parsed) = parse_branch_options(args, &specs)? else {
-        return Ok(None);
-    };
-    for option in &parsed.options {
-        match option.long {
-            Some("set-upstream-to") => match option.value {
-                ParsedValue::Str(_) if matches!(option.name, OptionName::NegatedLong(_)) => {
-                    action = None;
-                }
-                ParsedValue::Str(value) => {
-                    action = Some(BranchUpstreamAction::Set(value.to_string()));
-                }
-                _ => {}
-            },
-            Some("unset-upstream") => {
-                if branch_option_bool(option).unwrap_or(true) {
-                    action = Some(BranchUpstreamAction::Unset);
-                } else {
-                    action = None;
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(action.map(|action| BranchUpstreamOptions {
-        action,
-        branches: branch_positionals(&parsed),
-    }))
-}
-
 fn run_branch_upstream_options(
     git_dir: &Path,
     store: &FileRefStore,
@@ -7634,74 +6912,6 @@ fn remove_branch_config(git_dir: &Path, branch: &str) -> Result<()> {
         write_branch_repo_config(git_dir, &config)?;
     }
     Ok(())
-}
-
-fn parse_branch_create_options(args: &[String]) -> Result<Option<BranchCreateOptions>> {
-    let mut saw_create_option = false;
-    let mut force = false;
-    let mut quiet = false;
-    let mut track = None;
-    let mut recurse_submodules = false;
-    let mut legacy_set_upstream = false;
-    let mut edit_description = false;
-    let mut create_reflog = false;
-    let saw_separator = args.iter().any(|arg| arg == "--");
-    let specs = branch_create_option_specs();
-    let Some(parsed) = parse_branch_options(args, &specs)? else {
-        return Ok(None);
-    };
-    for option in &parsed.options {
-        saw_create_option = true;
-        match option.long {
-            Some("force") => force = branch_option_bool(option).unwrap_or(true),
-            Some("quiet") => quiet = branch_option_bool(option).unwrap_or(true),
-            Some("track") => {
-                if let ParsedValue::Callback(Some(value)) = &option.value {
-                    track = Some(branch_track_mode(value));
-                }
-            }
-            Some("recurse-submodules") => {
-                recurse_submodules = branch_option_bool(option).unwrap_or(true);
-            }
-            Some("set-upstream") => {
-                legacy_set_upstream = branch_option_bool(option).unwrap_or(true);
-            }
-            Some("edit-description") => {
-                edit_description = branch_option_bool(option).unwrap_or(true);
-            }
-            Some("create-reflog") => {
-                create_reflog = branch_option_bool(option).unwrap_or(true);
-            }
-            _ => {}
-        }
-    }
-
-    Ok(
-        (saw_create_option || saw_separator).then_some(BranchCreateOptions {
-            force,
-            quiet,
-            track,
-            recurse_submodules,
-            legacy_set_upstream,
-            edit_description,
-            create_reflog,
-            positionals: branch_positionals(&parsed),
-        }),
-    )
-}
-
-#[rustfmt::skip]
-fn branch_create_option_specs() -> [OptionSpec<'static>; 8] {
-    [
-        branch_bool_option!(Some('f'), Some("force"), OptFlags::NONE, "force creation, move/rename, deletion"),
-        branch_bool_option!(Some('q'), Some("quiet"), OptFlags::NONE, "suppress informational messages"),
-        branch_track_option!(),
-        branch_bool_option!(None, Some("recurse-submodules"), OptFlags::NONE, "recurse through submodules"),
-        branch_bool_option!(None, Some("set-upstream"), OptFlags::NONE, "set upstream for git pull/status"),
-        branch_bool_option!(None, Some("edit-description"), OptFlags::NONE, "edit the description for the branch"),
-        branch_bool_option!(None, Some("create-reflog"), OptFlags::NONE, "create the branch's reflog"),
-        branch_bool_option!(Some('v'), Some("verbose"), OptFlags::NONE, "show hash and subject, give twice for upstream branch"),
-    ]
 }
 
 fn run_branch_create_options(
@@ -8458,58 +7668,6 @@ enum BranchDeleteMode {
     Local,
     Remote,
     All,
-}
-
-fn parse_branch_delete_options(args: &[String]) -> Result<Option<BranchDeleteOptions>> {
-    let mut saw_delete_option = false;
-    let mut delete = false;
-    let mut force = false;
-    let mut quiet = false;
-    let mut mode = BranchDeleteMode::Local;
-    let specs = branch_delete_option_specs();
-    let Some(parsed) = parse_branch_options(args, &specs)? else {
-        return Ok(None);
-    };
-    for option in &parsed.options {
-        match (option.short, option.long) {
-            (Some('d'), _) | (_, Some("delete")) => {
-                saw_delete_option = true;
-                delete = branch_option_bool(option).unwrap_or(true);
-            }
-            (Some('D'), _) => {
-                saw_delete_option = true;
-                delete = true;
-                force = true;
-            }
-            (_, Some("force")) => force = branch_option_bool(option).unwrap_or(true),
-            (_, Some("quiet")) => quiet = branch_option_bool(option).unwrap_or(true),
-            (Some('r'), _) | (_, Some("remotes")) => mode = BranchDeleteMode::Remote,
-            (Some('a'), _) | (_, Some("all")) => mode = BranchDeleteMode::All,
-            _ => {}
-        }
-    }
-
-    Ok(
-        (saw_delete_option && delete).then_some(BranchDeleteOptions {
-            force,
-            quiet,
-            mode,
-            branches: branch_positionals(&parsed),
-        }),
-    )
-}
-
-#[rustfmt::skip]
-fn branch_delete_option_specs() -> [OptionSpec<'static>; 7] {
-    [
-        branch_bool_option!(Some('d'), Some("delete"), OptFlags::NONE, "delete fully merged branch"),
-        branch_bool_option!(Some('D'), None, OptFlags::NONE, "delete branch (even if not merged)"),
-        branch_bool_option!(Some('f'), Some("force"), OptFlags::NONE, "force creation, move/rename, deletion"),
-        branch_bool_option!(Some('q'), Some("quiet"), OptFlags::NONE, "suppress informational messages"),
-        branch_bool_option!(Some('v'), Some("verbose"), OptFlags::NONE, "show hash and subject, give twice for upstream branch"),
-        branch_bool_option!(Some('r'), Some("remotes"), OptFlags::NONEG, "act on remote-tracking branches"),
-        branch_bool_option!(Some('a'), Some("all"), OptFlags::NONEG, "list both remote-tracking and local branches"),
-    ]
 }
 
 /// If `name` is a symbolic ref, delete the symref itself (not its target),
