@@ -1,0 +1,11 @@
+label,script,command,result,elapsed_ms,ok,notok,total,plan_total
+floor-91455a67,t5601-clone.sh,t5601-clone.sh,FAIL,13611,109,6,115,115
+floor-91455a67,t3406-rebase-message.sh,t3406-rebase-message.sh,PASS,3950,32,0,32,32
+floor-91455a67,t4041-diff-submodule-option.sh,t4041-diff-submodule-option.sh,PASS,2298,47,0,47,47
+floor-91455a67,t7102-reset.sh,t7102-reset.sh,FAIL,3883,36,2,38,38
+floor-91455a67,t4210-log-i18n.sh,t4210-log-i18n.sh,PASS,656,21,0,21,21
+floor-91455a67,t3404-rebase-interactive.sh,t3404-rebase-interactive.sh,FAIL,27222,128,5,133,133
+floor-91455a67,t3430-rebase-merges.sh,t3430-rebase-merges.sh,PASS,8874,34,0,34,34
+floor-91455a67,t4060-diff-submodule-option-diff-format.sh,t4060-diff-submodule-option-diff-format.sh,PASS,2739,51,0,51,51
+floor-91455a67,t5512-ls-remote.sh,t5512-ls-remote.sh,PASS,2350,40,0,40,40
+floor-91455a67,t2050-git-dir-relative.sh,t2050-git-dir-relative.sh,PASS,626,4,0,4,4
