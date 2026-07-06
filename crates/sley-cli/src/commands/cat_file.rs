@@ -414,7 +414,7 @@ struct RepositoryObjectView {
 
 impl RepositoryObjectView {
     fn discover() -> Result<Self> {
-        let git_dir = discover_git_dir(env::current_dir()?)?;
+        let git_dir = crate::session::cli_git_dir()?;
         let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
         let format = repository_object_format(&common_git_dir)?;
         Ok(Self {
@@ -731,7 +731,7 @@ impl ObjectQuery<'_> {
     /// Load the mailmap when `--use-mailmap` is in effect (else an empty one).
     fn cat_file_mailmap(&self) -> Result<commands::utility::Mailmap> {
         if self.use_mailmap {
-            let git_dir = discover_git_dir(env::current_dir()?)?;
+            let git_dir = crate::session::cli_git_dir()?;
             let format = repository_object_format(&git_dir)?;
             commands::utility::Mailmap::load_default(&git_dir, format)
         } else {
@@ -881,7 +881,7 @@ impl CatFileObjectsFilter {
 /// Load the mailmap for the batch path when `--use-mailmap` is set (else empty).
 fn batch_record_mailmap(use_mailmap: bool) -> Result<commands::utility::Mailmap> {
     if use_mailmap {
-        let git_dir = discover_git_dir(env::current_dir()?)?;
+        let git_dir = crate::session::cli_git_dir()?;
         let format = repository_object_format(&git_dir)?;
         commands::utility::Mailmap::load_default(&git_dir, format)
     } else {

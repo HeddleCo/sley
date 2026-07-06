@@ -129,7 +129,7 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
     // Upstream fetch-pack is RUN_SETUP: repository discovery precedes
     // everything, including --diag-url.
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
 
     if flags.diag_url {

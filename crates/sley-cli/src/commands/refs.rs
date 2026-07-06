@@ -85,7 +85,7 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
     }
     let options = setup_reflog_show_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let abbrev_commit = options.abbrev_commit.unwrap_or(true);
@@ -181,7 +181,7 @@ fn reflog_show_message(entry: &ReflogEntry) -> std::borrow::Cow<'_, [u8]> {
 
 fn cmd_reflog_all() -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let abbrev_len = repository_abbrev(&git_dir, format)?;
     let store = FileRefStore::new(&git_dir, format);
@@ -258,7 +258,7 @@ fn cmd_reflog_exists(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(129));
     };
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     if reflog_path_for_ref(&git_dir, reference)?.is_file() {
         Ok(())
     } else {
@@ -290,7 +290,7 @@ fn cmd_reflog_list(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let mut names = BTreeSet::new();
     collect_repository_reflog_names(&git_dir, &mut names)?;
     for name in names {
@@ -486,7 +486,7 @@ fn cmd_reflog_delete(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let mut exit_code = 0;
@@ -640,7 +640,7 @@ fn cmd_reflog_drop(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let logs_dir = common_git_dir.join("logs");
     if options.all {
@@ -712,7 +712,7 @@ fn cmd_reflog_write(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let old_oid = parse_reflog_write_oid(format, &args[1], "old")?;
     let new_oid = parse_reflog_write_oid(format, &args[2], "new")?;
@@ -834,7 +834,7 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let config = load_reflog_expire_config(&git_dir)?;
@@ -1280,7 +1280,7 @@ fn update_server_info_option_specs() -> &'static [OptionSpec<'static>] {
 
 pub(crate) fn cmd_update_server_info(args: &[String]) -> Result<()> {
     let force = setup_update_server_info_options(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
@@ -1469,7 +1469,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             value => positional.push(value.to_string()),
         }
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format)
         .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?);
@@ -4617,7 +4617,7 @@ fn update_ref_delete_lock_failure(name: &str, reason: &str) -> Result<()> {
 }
 
 pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
@@ -4877,7 +4877,7 @@ fn print_show_ref_deref(
 }
 
 pub(crate) fn cmd_symbolic_ref(args: &[String]) -> Result<()> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let specs = symbolic_ref_option_specs();
@@ -5183,7 +5183,7 @@ fn cmd_refs_migrate(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(129));
     };
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let current_format = refs_migrate_current_format(&common_git_dir)?;
@@ -5476,7 +5476,7 @@ fn cmd_refs_exists(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     let name = refs[0];
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     if store.raw_ref_exists(name)? {

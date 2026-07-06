@@ -386,7 +386,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let author_filters = parse_log_filter_patterns(&author_patterns, regexp_mode)?;
     let committer_filters = parse_log_filter_patterns(&committer_patterns, regexp_mode)?;
     let grep_filters = parse_log_filter_patterns(&grep_patterns, regexp_mode)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let output_encoding = log_output_encoding(&config);

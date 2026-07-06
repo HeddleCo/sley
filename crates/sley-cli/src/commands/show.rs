@@ -9,7 +9,7 @@
 //!
 //! Output formatting is shared with the rest of the CLI through a glob of the
 //! crate root, which (because a submodule can reach its ancestor module's
-//! private items) brings every helper and type — `discover_git_dir`,
+//! private items) brings every helper and type — `cli_git_dir`,
 //! `repository_object_format`, `resolve_revision`, `read_repo_config`,
 //! `FileObjectDatabase`, `FileRefStore`, the `write_diff_*` writers, the
 //! `print_log_format` pretty-format engine, and so on — into scope without

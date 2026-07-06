@@ -311,7 +311,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         return Err(GitError::Exit(128));
     }
     let needs = ForEachRefNeeds::analyze(&format_spec);
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let objectname_abbrev = repository_abbrev(&git_dir, format)?;
     let points_at = points_at_revs

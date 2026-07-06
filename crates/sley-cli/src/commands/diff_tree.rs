@@ -224,7 +224,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
                 .collect();
             if setup_args.len() == 1 {
                 let cwd = env::current_dir()?;
-                let git_dir = discover_git_dir(&cwd)?;
+                let git_dir = crate::session::cli_git_dir_from(&cwd)?;
                 let format = repository_object_format(&git_dir)?;
                 let config = read_repo_config(&git_dir)?;
                 let db = FileObjectDatabase::from_git_dir(&git_dir, format);

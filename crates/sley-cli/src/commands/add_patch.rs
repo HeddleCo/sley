@@ -1469,7 +1469,7 @@ enum EditResult {
 fn edit_hunk_loop(fd: &mut FileDiff, hunk_index: usize, stdin: &mut impl BufRead) -> EditResult {
     let git_dir = match env::current_dir()
         .ok()
-        .and_then(|cwd| crate::discover_git_dir(cwd).ok())
+        .and_then(|cwd| crate::session::cli_git_dir_from(&cwd).ok())
     {
         Some(dir) => dir,
         None => return EditResult::Abandoned,

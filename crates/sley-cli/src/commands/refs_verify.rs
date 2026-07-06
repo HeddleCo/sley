@@ -898,7 +898,7 @@ pub(crate) fn cmd_refs_verify(args: &[String]) -> Result<()> {
         }
     }
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let opts = RefsVerifyOptions::from_repo(&git_dir, strict, verbose);

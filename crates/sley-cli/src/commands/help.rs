@@ -1,5 +1,5 @@
 use crate::{
-    common_git_dir_for_git_dir, discover_git_dir, global_config_value, injected_config_parameters,
+    common_git_dir_for_git_dir, global_config_value, injected_config_parameters,
     report_config_setup_error,
 };
 use sley_config::ConfigIncludeContext;
@@ -544,7 +544,7 @@ fn config_value(key: &str) -> Result<Option<String>> {
         return Ok(Some(value));
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd).ok();
+    let git_dir = crate::session::cli_git_dir_from(&cwd).ok();
     let common_git_dir = git_dir
         .as_ref()
         .and_then(|dir| common_git_dir_for_git_dir(dir).ok());

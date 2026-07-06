@@ -119,12 +119,17 @@ pub(crate) fn collect_short_status_with_options(
 }
 
 mod commands;
+mod discovery;
 mod ownership;
 mod remote;
 mod repo_path;
 mod repository;
 mod session;
 mod setup;
+
+pub(crate) use discovery::{
+    is_git_dir_candidate, paths_refer_to_same_dir, read_gitdir_file, resolve_cli_path,
+};
 
 pub(crate) use sley_pretty::{
     CompiledLogFormat, FormatToken, LogFormatDialect, LogDescribeLookup, LogFormatContext,
@@ -254,7 +259,7 @@ fn trace2_config_param_matches(pattern: &str, key: &str) -> bool {
 
 fn trace2_dispatch_config() -> Result<GitConfig> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd).ok();
+    let git_dir = session::cli_git_dir_from(&cwd).ok();
     let common_git_dir = git_dir
         .as_deref()
         .and_then(|git_dir| common_git_dir_for_git_dir(git_dir).ok());
@@ -1375,7 +1380,7 @@ fn environment_git_dir() -> Option<PathBuf> {
     env::var_os("GIT_DIR").map(PathBuf::from)
 }
 
-fn explicit_git_dir() -> Option<PathBuf> {
+pub(crate) fn explicit_git_dir() -> Option<PathBuf> {
     global_git_dir().or_else(environment_git_dir)
 }
 
@@ -1390,7 +1395,7 @@ fn explicit_work_tree() -> Option<PathBuf> {
     global_work_tree().or_else(environment_work_tree)
 }
 
-fn global_bare() -> bool {
+pub(crate) fn global_bare() -> bool {
     let Some(session) = session::cli_session() else {
         return false;
     };
@@ -1907,7 +1912,7 @@ fn reflog_reference_name(value: Option<&str>) -> Result<String> {
     if value == "HEAD" || value.starts_with("refs/") {
         return Ok(value.to_string());
     }
-    if let Ok(git_dir) = discover_git_dir(env::current_dir()?)
+    if let Ok(git_dir) = session::cli_git_dir()
         && let Ok(format) = repository_object_format(&git_dir)
     {
         if let Ok(Some(refname)) =
@@ -4478,7 +4483,7 @@ fn write_diff_stat_materialized(
 ) -> Result<()> {
     let mut widths = DiffStatWidths::terminal();
     if let Ok(cwd) = env::current_dir()
-        && let Ok(git_dir) = discover_git_dir(&cwd)
+        && let Ok(git_dir) = session::cli_git_dir_from(&cwd)
         && let Ok(config) = commands::remote_cmds::read_repo_config(&git_dir)
     {
         widths.resolve_config(&config);
@@ -9885,11 +9890,6 @@ fn worktree_prefix(cwd: &Path, git_dir: &Path) -> Result<String> {
     Ok(format!("{}/", prefix.to_string_lossy().replace('\\', "/")))
 }
 
-fn is_git_dir_candidate(path: &Path) -> bool {
-    path.join("HEAD").is_file()
-        && (path.join("objects").is_dir() || path.join("commondir").is_file())
-}
-
 fn relative_path_from_absolute(cwd: &Path, target: &Path) -> Result<String> {
     let cwd = fs::canonicalize(cwd)?;
     relative_path_from_absolute_components(&cwd, target)
@@ -10210,268 +10210,6 @@ fn match_refname_pattern_class(class: &[u8], name: Option<u8>) -> Option<(bool, 
 
 fn short_oid(hex: &str) -> &str {
     &hex[..hex.len().min(7)]
-}
-
-fn resolve_cli_path(cwd: &Path, value: &str) -> PathBuf {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        path
-    } else {
-        cwd.join(path)
-    }
-}
-
-fn discover_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
-    if let Some(git_dir) = explicit_git_dir() {
-        if git_dir.as_os_str().is_empty() {
-            return Err(GitError::repository_not_found("not a git repository"));
-        }
-        let resolved = resolve_cli_path(start.as_ref(), git_dir.to_string_lossy().as_ref());
-        // An explicit GIT_DIR / --git-dir that points at a `.git` *file*
-        // ("gitdir: <path>") is resolved to its target, exactly as git's
-        // `setup_explicit_git_dir` does via `read_gitfile`. Without this the
-        // ref store would be pointed at the gitfile itself (a regular file),
-        // so reads of HEAD/refs fail.
-        if resolved.is_file()
-            && let Some(target) = read_gitdir_file(&resolved)?
-            && is_git_dir_candidate(&target)
-        {
-            return fs::canonicalize(target).map_err(|err| GitError::Io(err.to_string()));
-        }
-        return Ok(resolved);
-    }
-    if global_bare() {
-        let cwd = env::current_dir()?;
-        if is_git_dir_candidate(&cwd) {
-            return fs::canonicalize(&cwd).map_err(|err| GitError::Io(err.to_string()));
-        }
-        return Err(GitError::repository_not_found("not a git repository"));
-    }
-    discover_git_dir_by_walk(start)
-}
-
-/// Discover the git directory of a *remote* repository named by a local path.
-///
-/// Upstream reaches a local-path remote by spawning `upload-pack` /
-/// `receive-pack` with the local-repository environment cleared
-/// (`local_repo_env` in environment.c), so an explicit `--git-dir` /
-/// `GIT_DIR` or `--bare` from the *local* invocation must never leak into the
-/// remote side's discovery — otherwise `git --git-dir=clone.git fetch origin`
-/// would resolve the remote as `<remote-url>/clone.git` (the local clone
-/// itself) instead of the remote repository.
-pub(crate) fn discover_remote_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
-    discover_git_dir_by_walk(start)
-}
-
-/// The walk-up portion of repository discovery (`setup_git_directory_gently`'s
-/// loop): examine `start` and each ancestor for a `.git` dir, a `.git` gitfile,
-/// or a bare-layout directory, honoring `GIT_CEILING_DIRECTORIES`.
-fn discover_git_dir_by_walk(start: impl AsRef<Path>) -> Result<PathBuf> {
-    let ceilings = discovery_ceiling_directories();
-    for candidate in start.as_ref().ancestors() {
-        // GIT_CEILING_DIRECTORIES: stop the upward walk before *entering* a
-        // listed directory. The starting directory itself is always examined
-        // (a ceiling only limits proper ancestors, like git's
-        // `longest_ancestor_length`).
-        if candidate != start.as_ref()
-            && ceilings
-                .iter()
-                .any(|ceiling| paths_refer_to_same_dir(ceiling, candidate))
-        {
-            break;
-        }
-        let dot_git = candidate.join(".git");
-        match probe_dot_git(&dot_git)? {
-            DotGitProbe::Repo {
-                git_dir,
-                via_gitfile,
-            } => {
-                let gitfile = via_gitfile.then(|| dot_git.as_path());
-                ownership::ensure_valid_ownership(Some(candidate), &git_dir, gitfile)?;
-                return Ok(git_dir);
-            }
-            DotGitProbe::Continue => {}
-        }
-        if candidate.join("HEAD").is_file() && candidate.join("objects").is_dir() {
-            ownership::note_implicit_bare_repository(candidate)?;
-            ownership::ensure_valid_ownership(None, candidate, None)?;
-            return Ok(candidate.to_path_buf());
-        }
-    }
-    Err(GitError::repository_not_found("not a git repository"))
-}
-
-/// The result of examining a `.git` entry during the discovery walk, mirroring
-/// git's `read_gitfile_gently` + the `setup_git_directory_gently_1` switch.
-enum DotGitProbe {
-    /// `.git` names a usable git directory (the resolved path); `via_gitfile`
-    /// records whether discovery went through a `.git` *file* (gitlink).
-    Repo { git_dir: PathBuf, via_gitfile: bool },
-    /// `.git` is absent or an invalid-but-non-fatal directory; keep walking up.
-    Continue,
-}
-
-/// Classify a `.git` entry like git's discovery loop. Fatal classifications
-/// (a non-regular-file `.git`, a malformed gitfile, or a gitfile pointing at a
-/// non-repository) surface as a `fatal:`-prefixed [`GitError::InvalidFormat`],
-/// which the top-level error reporter prints verbatim — while callers that probe
-/// repositories gently (`discover_git_dir(..).ok()`) simply observe "no repo".
-///
-/// `stat`-style metadata (symlinks followed) is used so a `.git` symlink to a
-/// directory is a repo, a symlink to a FIFO is rejected, etc.
-fn probe_dot_git(dot_git: &Path) -> Result<DotGitProbe> {
-    let metadata = match fs::metadata(dot_git) {
-        Ok(metadata) => metadata,
-        Err(err) => {
-            // ENOENT / ENOTDIR: no `.git` here (git's READ_GITFILE_ERR_MISSING).
-            if err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(libc_enotdir()) {
-                return Ok(DotGitProbe::Continue);
-            }
-            return Err(invalid_gitfile_error(&format!(
-                "error reading '{}'",
-                dot_git.display()
-            )));
-        }
-    };
-    let file_type = metadata.file_type();
-    if file_type.is_dir() {
-        // A `.git` directory is a repo only if it actually looks like one
-        // (`is_git_directory`); an empty or partial `.git` directory is ignored,
-        // and discovery continues upward.
-        if is_git_dir_candidate(dot_git) {
-            return Ok(DotGitProbe::Repo {
-                git_dir: dot_git.to_path_buf(),
-                via_gitfile: false,
-            });
-        }
-        return Ok(DotGitProbe::Continue);
-    }
-    if file_type.is_file() {
-        return classify_gitfile(dot_git, metadata.len());
-    }
-    // FIFO, socket, device, … — git dies with "not a regular file".
-    Err(invalid_gitfile_error(&format!(
-        "not a regular file: '{}'",
-        dot_git.display()
-    )))
-}
-
-/// Read and validate a `.git` *gitfile* (`gitdir: <path>`), mirroring the tail
-/// of git's `read_gitfile_gently`: oversize, a missing/blank `gitdir:` prefix,
-/// and a target that is not itself a repository are all fatal.
-fn classify_gitfile(dot_git: &Path, size: u64) -> Result<DotGitProbe> {
-    const MAX_GITFILE_SIZE: u64 = 1 << 20;
-    if size > MAX_GITFILE_SIZE {
-        return Err(invalid_gitfile_error(&format!(
-            "too large to be a .git file: '{}'",
-            dot_git.display()
-        )));
-    }
-    let contents = match fs::read(dot_git) {
-        Ok(contents) => contents,
-        Err(_) => {
-            return Err(invalid_gitfile_error(&format!(
-                "error reading {}",
-                dot_git.display()
-            )));
-        }
-    };
-    let Some(rest) = contents.strip_prefix(b"gitdir: ") else {
-        return Err(invalid_gitfile_error(&format!(
-            "invalid gitfile format: {}",
-            dot_git.display()
-        )));
-    };
-    let trimmed = trim_trailing_newlines(rest);
-    if trimmed.is_empty() {
-        return Err(invalid_gitfile_error(&format!(
-            "no path in gitfile: {}",
-            dot_git.display()
-        )));
-    }
-    let raw_target = PathBuf::from(os_string_from_bytes(trimmed));
-    let target = if raw_target.is_absolute() {
-        raw_target
-    } else {
-        match dot_git.parent() {
-            Some(parent) => parent.join(&raw_target),
-            None => raw_target,
-        }
-    };
-    if !is_git_dir_candidate(&target) {
-        return Err(invalid_gitfile_error(&format!(
-            "not a git repository: {}",
-            target.display()
-        )));
-    }
-    fs::canonicalize(&target)
-        .map(|git_dir| DotGitProbe::Repo {
-            git_dir,
-            via_gitfile: true,
-        })
-        .map_err(|err| GitError::Io(err.to_string()))
-}
-
-/// Build the non-eager fatal error for an invalid `.git`: a `fatal:`-prefixed
-/// [`GitError::InvalidFormat`] so the message is printed once, by the top-level
-/// reporter, only when the error actually propagates (not when a gentle prober
-/// swallows it with `.ok()`).
-fn invalid_gitfile_error(message: &str) -> GitError {
-    GitError::InvalidFormat(format!("fatal: {message}"))
-}
-
-/// Strip trailing `\n`/`\r` bytes, matching git's gitfile trim.
-fn trim_trailing_newlines(bytes: &[u8]) -> &[u8] {
-    let mut end = bytes.len();
-    while end > 0 && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
-        end -= 1;
-    }
-    &bytes[..end]
-}
-
-/// `ENOTDIR` for the running platform (a `.git` whose parent component is not a
-/// directory reports this rather than `ENOENT`).
-fn libc_enotdir() -> i32 {
-    20
-}
-
-/// Reconstruct an `OsString` from raw bytes (git stores paths as bytes; the
-/// gitfile target is reproduced byte-for-byte on unix).
-#[cfg(unix)]
-fn os_string_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
-    use std::os::unix::ffi::OsStringExt;
-    std::ffi::OsString::from_vec(bytes.to_vec())
-}
-
-#[cfg(not(unix))]
-fn os_string_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
-    std::ffi::OsString::from(String::from_utf8_lossy(bytes).into_owned())
-}
-
-/// The `GIT_CEILING_DIRECTORIES` list: colon-separated absolute paths that
-/// repository discovery must not walk up into. Empty entries (including the
-/// `""` no-canonicalization marker) are ignored.
-fn discovery_ceiling_directories() -> Vec<PathBuf> {
-    match env::var("GIT_CEILING_DIRECTORIES") {
-        Ok(value) if !value.is_empty() => value
-            .split(':')
-            .filter(|entry| !entry.is_empty())
-            .map(PathBuf::from)
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// Whether two paths name the same directory, tolerating symlink/relative
-/// differences via canonicalization.
-fn paths_refer_to_same_dir(left: &Path, right: &Path) -> bool {
-    if left == right {
-        return true;
-    }
-    match (fs::canonicalize(left), fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
-    }
 }
 
 fn repository_object_format(git_dir: &Path) -> Result<ObjectFormat> {
@@ -10910,9 +10648,9 @@ fn print_identity_unknown_hint(role: &str) {
 /// degrade to `None` so identity resolution can still fall through to env/`-c`
 /// values or the built-in default rather than aborting.
 fn identity_effective_config() -> Option<GitConfig> {
-    // `discover_git_dir` already honours `--git-dir`/`GIT_DIR` (via
+    // `cli_git_dir` already honours `--git-dir`/`GIT_DIR` (via
     // `explicit_git_dir`) before walking up from the current directory.
-    let git_dir = discover_git_dir(env::current_dir().ok()?).ok()?;
+    let git_dir = session::cli_git_dir().ok()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir).ok()?;
     let context = sley_config::ConfigIncludeContext::new(
         Some(common_git_dir.clone()),
@@ -11058,24 +10796,6 @@ fn require_work_tree(git_dir: &Path) -> Result<PathBuf> {
             eprintln!("fatal: this operation must be run in a work tree");
             Err(GitError::Exit(128))
         }
-    }
-}
-
-fn read_gitdir_file(path: &Path) -> Result<Option<PathBuf>> {
-    let contents = fs::read_to_string(path)?;
-    let Some(target) = contents.trim().strip_prefix("gitdir:") else {
-        return Ok(None);
-    };
-    let target = target.trim();
-    let target = PathBuf::from(target);
-    if target.is_absolute() {
-        Ok(Some(target))
-    } else {
-        let parent = match path.parent() {
-            Some(parent) => parent,
-            None => Path::new(""),
-        };
-        Ok(Some(parent.join(target)))
     }
 }
 

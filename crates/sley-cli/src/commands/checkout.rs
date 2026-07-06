@@ -257,7 +257,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         }
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let checkout_config = read_repo_config(&git_dir)?;
@@ -1630,7 +1630,7 @@ pub(crate) fn cmd_switch(args: &[String]) -> Result<()> {
             ));
         };
         let cwd = env::current_dir()?;
-        let git_dir = discover_git_dir(&cwd)?;
+        let git_dir = crate::session::cli_git_dir_from(&cwd)?;
         let worktree_root = worktree_root_for_git_dir(&git_dir)?;
         let format = repository_object_format(&git_dir)?;
         checkout_twoway_dirty(&git_dir, &worktree_root, format, None, false, false)?;
@@ -1919,7 +1919,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
     }
     if patch {
         let cwd = env::current_dir()?;
-        let git_dir = discover_git_dir(&cwd)?;
+        let git_dir = crate::session::cli_git_dir_from(&cwd)?;
         let format = repository_object_format(&git_dir)?;
         return restore_run_patch(
             &git_dir,
@@ -1938,7 +1938,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let resolved_paths = paths

@@ -52,7 +52,7 @@
 //! `commands::verify_commit`); see `commands::stash` for the rationale behind the
 //! wildcard import.
 
-// Glob the crate root for shared plumbing (discover_git_dir, read_repo_config,
+// Glob the crate root for shared plumbing (read_repo_config,
 // global_config_value, GitError, Result, io, fs, env, the Read/Write traits,
 // Path/PathBuf, etc.); see commands::stash for why this is a wildcard.
 use crate::*;
@@ -809,7 +809,7 @@ fn load_trailer_config() -> TrailerConfig {
 /// runs fine outside a repo).
 fn effective_config() -> Option<GitConfig> {
     let dir = env::current_dir().ok()?;
-    let git_dir = discover_git_dir(dir).ok()?;
+    let git_dir = crate::session::cli_git_dir_from(dir).ok()?;
     read_repo_config(&git_dir).ok()
 }
 

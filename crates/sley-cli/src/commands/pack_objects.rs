@@ -283,7 +283,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     }
     validate_pack_objects_options(&options)?;
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let database = FileObjectDatabase::from_git_dir(&common_git_dir, format);

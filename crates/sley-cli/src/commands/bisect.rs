@@ -75,7 +75,7 @@ struct BisectRepo {
 impl BisectRepo {
     fn open() -> Result<Self> {
         let cwd = env::current_dir()?;
-        let git_dir = discover_git_dir(&cwd)?;
+        let git_dir = crate::session::cli_git_dir_from(&cwd)?;
         let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?;
         let format = repository_object_format(&git_dir)?;
         Ok(Self {

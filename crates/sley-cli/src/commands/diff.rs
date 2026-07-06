@@ -1149,7 +1149,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff pickaxe controls are not supported for this output mode".into(),
         ));
     }
-    if !find_object_values.is_empty() && discover_git_dir(&env::current_dir()?).is_err() {
+    if !find_object_values.is_empty() && crate::session::cli_git_dir().is_err() {
         eprintln!("fatal: --find-object requires a git repository");
         return Err(GitError::Exit(128));
     }
@@ -1219,7 +1219,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             },
         );
     }
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let repo_config = read_repo_config(&git_dir).ok();
     let resolved_context =
         sley_rev::diff_options::resolve_diff_context(context, repo_config.as_ref())?;
@@ -3055,7 +3055,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
         eprintln!("usage: git diff --no-index [<options>] <path> <path>");
         return Err(GitError::Exit(129));
     }
-    let git_dir = discover_git_dir(cwd).ok();
+    let git_dir = crate::session::cli_git_dir_from(&cwd).ok();
     let format = git_dir
         .as_deref()
         .map(repository_object_format)

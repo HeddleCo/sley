@@ -141,7 +141,7 @@ struct WorktreeTrackedEntry {
 pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     let mut options = setup_worktree_add_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let path = resolve_cli_path(&cwd, &options.path);
@@ -344,7 +344,7 @@ fn write_linked_worktree_head(
 pub(crate) fn cmd_worktree_list(args: &[String]) -> Result<()> {
     let options = setup_worktree_list_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let entries = collect_worktree_list_entries(&common_git_dir, format, options.expire)?;
@@ -368,7 +368,7 @@ fn worktree_usage<T>() -> Result<T> {
 pub(crate) fn cmd_worktree_prune(args: &[String]) -> Result<()> {
     let options = setup_worktree_prune_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let mut kept = prune_worktree_admins(&common_git_dir, &options)?;
     let main_path = fs::canonicalize(&common_git_dir).unwrap_or_else(|_| common_git_dir.clone());
@@ -546,7 +546,7 @@ fn remove_empty_worktrees_dir(common_git_dir: &Path) {
 pub(crate) fn cmd_worktree_lock(args: &[String]) -> Result<()> {
     let options = setup_worktree_lock_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let admin = find_linked_worktree_admin(&common_git_dir, &cwd, &options.path)?;
     if admin.locked_reason.is_some() {
@@ -568,7 +568,7 @@ pub(crate) fn cmd_worktree_lock(args: &[String]) -> Result<()> {
 pub(crate) fn cmd_worktree_unlock(args: &[String]) -> Result<()> {
     let path = setup_worktree_unlock_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let admin = find_linked_worktree_admin(&common_git_dir, &cwd, &path)?;
     if admin.locked_reason.is_none() {
@@ -582,7 +582,7 @@ pub(crate) fn cmd_worktree_unlock(args: &[String]) -> Result<()> {
 pub(crate) fn cmd_worktree_remove(args: &[String]) -> Result<()> {
     let options = setup_worktree_remove_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let admin = find_linked_worktree_admin_for_remove(&common_git_dir, &cwd, &options.path)?;
@@ -616,7 +616,7 @@ pub(crate) fn cmd_worktree_remove(args: &[String]) -> Result<()> {
 pub(crate) fn cmd_worktree_move(args: &[String]) -> Result<()> {
     let options = setup_worktree_move_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let admin = find_linked_worktree_admin_for_move(&common_git_dir, &cwd, &options.source)?;
     if let Some(reason) = admin.locked_reason.as_ref()
@@ -650,7 +650,7 @@ pub(crate) fn cmd_worktree_move(args: &[String]) -> Result<()> {
 pub(crate) fn cmd_worktree_repair(args: &[String]) -> Result<()> {
     let options = setup_worktree_repair_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let relative_paths = options.relative_paths.unwrap_or_else(|| {
         GitConfig::read(common_git_dir.join("config"))

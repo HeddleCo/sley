@@ -100,7 +100,7 @@ pub(crate) fn cmd_bugreport(args: &[String]) -> Result<()> {
     writeln!(report, "compiler info: rustc")?;
     writeln!(report, "zlib: available")?;
     report.write_all(b"\n\n[Enabled Hooks]\n")?;
-    match discover_git_dir(env::current_dir()?) {
+    match crate::session::cli_git_dir() {
         Ok(_) => {
             for hook in commands::hooks::KNOWN_HOOKS {
                 if commands::hooks::hook_exists(hook)? {
@@ -184,7 +184,7 @@ fn cmd_repo_info(args: &[String]) -> Result<()> {
     } else {
         parsed.fields
     };
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let info = repo_info_collect(&git_dir, &common_git_dir)?;
     let mut had_error = false;
@@ -691,7 +691,7 @@ pub(crate) fn cmd_unpack_file(args: &[String]) -> Result<()> {
         eprintln!("usage: git unpack-file <blob>");
         return Err(GitError::Exit(129));
     };
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let oid = match resolve_revision(&git_dir, format, name) {
         Ok(oid) => oid,
@@ -856,7 +856,7 @@ pub(crate) fn cmd_check_mailmap(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let mailmap = Mailmap::load(&git_dir, format, &source_specs)?;
     for contact in contacts {
@@ -1269,7 +1269,7 @@ pub(crate) fn cmd_stripspace(args: &[String]) -> Result<()> {
 fn stripspace_comment_string() -> Result<Vec<u8>> {
     let mut comment = None;
     if let Ok(cwd) = env::current_dir()
-        && let Ok(git_dir) = discover_git_dir(cwd)
+        && let Ok(git_dir) = crate::session::cli_git_dir_from(&cwd)
         && let Ok(config) = read_repo_config(&git_dir)
         && let Some(value) = config.get("core", None, "commentchar")
         && value != "auto"

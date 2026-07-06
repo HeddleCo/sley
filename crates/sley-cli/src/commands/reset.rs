@@ -182,7 +182,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             ..commands::add_patch::PatchConfig::default()
         };
         cfg.reset_interactive =
-            sley_config::read_repo_config(&discover_git_dir(&env::current_dir()?)?, None)
+            sley_config::read_repo_config(&crate::session::cli_git_dir()?, None)
                 .ok()
                 .and_then(|config| {
                     config
@@ -199,7 +199,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         );
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     // git's `setup_work_tree()` (builtin/reset.c): every reset that touches the
     // working tree — `--hard`, `--merge`, `--keep` — must run in a work tree, so
     // a bare repository refuses with "this operation must be run in a work

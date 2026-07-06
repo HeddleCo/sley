@@ -1482,7 +1482,7 @@ struct FmtMergeMsgOptions {
 pub(crate) fn cmd_fmt_merge_msg(args: &[String]) -> Result<()> {
     let options = parse_fmt_merge_msg_args(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let refs = FileRefStore::new(&git_dir, format);
@@ -2165,7 +2165,7 @@ fn append_branch_desc(out: &mut String, name: &str) {
     let Ok(cwd) = env::current_dir() else {
         return;
     };
-    let Ok(git_dir) = discover_git_dir(&cwd) else {
+    let Ok(git_dir) = crate::session::cli_git_dir_from(&cwd) else {
         return;
     };
     let path = git_dir
@@ -2817,7 +2817,7 @@ fn merge_reflog_message(target: &str, suffix: &str) -> Vec<u8> {
 pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     let mut options = MergeOptions::default();
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -3763,7 +3763,7 @@ fn merge_recursive_renames_default() -> bool {
 /// falling back to `merge.renames`/`diff.renames` config when none is given.
 pub(crate) fn cmd_merge_recursive(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -4903,7 +4903,7 @@ fn reset_index_and_worktree_to_commit_for_merge(
 /// bookkeeping.
 pub(crate) fn cmd_merge_abort() -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let merge_head_path = git_dir.join("MERGE_HEAD");
     if !merge_head_path.is_file() {
         eprintln!("fatal: There is no merge to abort (MERGE_HEAD missing).");
@@ -4993,7 +4993,7 @@ fn reset_merge_to_head(git_dir: &Path, worktree_root: &Path, format: ObjectForma
 
 pub(crate) fn cmd_merge_continue() -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let merge_head_path = git_dir.join("MERGE_HEAD");
     if !merge_head_path.is_file() {
         eprintln!("fatal: There is no merge in progress (MERGE_HEAD missing).");

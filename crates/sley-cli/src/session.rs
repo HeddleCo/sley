@@ -9,8 +9,9 @@ use std::sync::Mutex;
 use sley_config::GitConfig;
 use sley_core::Result;
 
+use crate::discovery;
 use crate::repository::RepositoryContext;
-use crate::{PathspecFlags, discover_git_dir};
+use crate::PathspecFlags;
 
 /// Flags and env overrides applied before command dispatch (`--git-dir`,
 /// `--work-tree`, `--bare`, pathspec magic, etc.).
@@ -169,14 +170,32 @@ impl CliSession {
         RepositoryContext::discover(&self.cwd)
     }
 
-    /// Best-effort git dir for the current cwd (optional commands).
-    pub(crate) fn discover_git_dir(&self) -> Result<PathBuf> {
-        discover_git_dir(&self.cwd)
+    /// Resolved git directory for this session's cwd.
+    pub(crate) fn git_dir(&self) -> Result<PathBuf> {
+        cli_git_dir_from(&self.cwd)
     }
 
     pub(crate) fn cwd(&self) -> &Path {
         &self.cwd
     }
+}
+
+/// Resolve the git directory for the active session's cwd.
+pub(crate) fn cli_git_dir() -> Result<PathBuf> {
+    let cwd = cli_session()
+        .map(|session| session.cwd)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    cli_git_dir_from(cwd)
+}
+
+/// Resolve the git directory from `start`, honouring session overrides.
+pub(crate) fn cli_git_dir_from(start: impl AsRef<Path>) -> Result<PathBuf> {
+    discovery::resolve_git_dir(start)
+}
+
+/// Walk-up discovery without session overrides (local-path remotes).
+pub(crate) fn cli_remote_git_dir_from(start: impl AsRef<Path>) -> Result<PathBuf> {
+    discovery::resolve_git_dir_walk_only(start)
 }
 
 /// Convenience for commands that already have a loaded config snapshot.

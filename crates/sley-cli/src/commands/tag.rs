@@ -43,7 +43,7 @@ fn expand_tag_bundle(arg: &str) -> Option<Vec<String>> {
 }
 
 pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     if args.is_empty() {

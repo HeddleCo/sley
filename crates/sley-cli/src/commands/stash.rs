@@ -301,7 +301,7 @@ fn cmd_stash_branch(args: &[String]) -> Result<()> {
         .cloned()
         .unwrap_or_else(|| "refs/stash@{0}".to_string());
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
@@ -393,7 +393,7 @@ fn stash_apply_usage(command: &str) {
 
 fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
@@ -1052,7 +1052,7 @@ fn cmd_stash_clear(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
@@ -1097,7 +1097,7 @@ fn cmd_stash_drop(args: &[String]) -> Result<()> {
     };
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     drop_stash_entry(&common_git_dir, format, selector, &display, quiet)
@@ -1729,7 +1729,7 @@ fn create_stash_commit(
     quiet: bool,
 ) -> Result<Option<CreatedStash>> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
@@ -1966,7 +1966,7 @@ fn stash_index_config_default() -> Result<bool> {
         return Ok(sley_config::parse_config_bool(&value).unwrap_or(false));
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let context = sley_config::ConfigIncludeContext::new(
         Some(common_git_dir.clone()),
@@ -2380,7 +2380,7 @@ fn cmd_stash_store(args: &[String]) -> Result<()> {
     let commit = &commits[0];
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -2914,7 +2914,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
         show_patch = true;
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
@@ -3163,7 +3163,7 @@ fn stash_show_usage() {
 fn cmd_stash_list(args: &[String]) -> Result<()> {
     let options = setup_stash_list_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
@@ -3545,7 +3545,7 @@ fn write_stash_list_patch(
         sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     let abbrev = repository_abbrev(
-        &common_git_dir_for_git_dir(&discover_git_dir(&env::current_dir()?)?)?,
+        &common_git_dir_for_git_dir(&crate::session::cli_git_dir()?)?,
         format,
     )?
     .unwrap_or(7)
@@ -3682,7 +3682,7 @@ fn cmd_stash_export(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let mut db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -3794,7 +3794,7 @@ fn cmd_stash_import(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(129));
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -3890,7 +3890,7 @@ pub(crate) fn create_stash_for_autostash() -> Result<Option<ObjectId>> {
 /// `git stash store -m <message> -q <oid>` equivalent.
 pub(crate) fn store_stash_commit(stash_oid: &ObjectId, message: &str) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -3919,7 +3919,7 @@ pub(crate) fn store_stash_commit(stash_oid: &ObjectId, message: &str) -> Result<
 /// stash cannot be applied cleanly (the caller stores it instead).
 pub(crate) fn apply_stash_commit_quietly(stash_oid: &ObjectId) -> Result<bool> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;

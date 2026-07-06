@@ -47,7 +47,7 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
     // The hash algorithm is taken from `--object-format` when given, else from
     // the surrounding repository. A `<pack-file>` argument (not `--stdin`) can
     // run outside any repo, so only fall back to repo discovery when needed.
-    let repo = match discover_git_dir(env::current_dir()?) {
+    let repo = match crate::session::cli_git_dir() {
         Ok(git_dir) => match common_git_dir_for_git_dir(&git_dir) {
             Ok(common_git_dir) => {
                 let format = match options.object_format {
@@ -1290,7 +1290,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             }
         }
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
@@ -1842,7 +1842,7 @@ struct GcOptions {
 
 pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
     let options = setup_gc_options(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
@@ -2788,7 +2788,7 @@ fn cmd_maintenance_run(args: &[String]) -> Result<()> {
     }
 
     trace2_touch();
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
     let selected = maintenance_select_tasks(&config, &tasks, schedule.as_deref())?;
@@ -3229,7 +3229,7 @@ fn cmd_maintenance_is_needed(args: &[String]) -> Result<()> {
         }
         index += 1;
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
     let selected = maintenance_select_tasks(&config, &tasks, schedule.as_deref())?;
@@ -3667,7 +3667,7 @@ fn count_dir_entries(path: &Path) -> Result<usize> {
 
 fn cmd_maintenance_register(args: &[String]) -> Result<()> {
     let config_file = parse_maintenance_config_file(args, "register")?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let repo = env::current_dir()?.display().to_string();
 
@@ -3695,7 +3695,7 @@ fn cmd_maintenance_register(args: &[String]) -> Result<()> {
 
 fn cmd_maintenance_unregister(args: &[String]) -> Result<()> {
     let (config_file, force) = parse_maintenance_unregister_args(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let repo = env::current_dir()?.display().to_string();
     let missing_repo_value = report_missing_maintenance_repo(&common_git_dir);
@@ -3881,7 +3881,7 @@ enum MaintenanceScheduler {
 
 fn cmd_maintenance_start(args: &[String]) -> Result<()> {
     let scheduler = parse_maintenance_start_args(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let scheduler = scheduler.unwrap_or(MaintenanceScheduler::Systemd);
     update_background_schedule(&common_git_dir, Some(scheduler))?;
@@ -3892,7 +3892,7 @@ fn cmd_maintenance_stop(args: &[String]) -> Result<()> {
     if !args.is_empty() {
         return maintenance_subcommand_usage("stop");
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     update_background_schedule(&common_git_dir, None)
 }
@@ -4246,7 +4246,7 @@ pub(crate) fn cmd_unpack_objects(args: &[String]) -> Result<()> {
         }
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let mut pack_bytes = Vec::new();
     io::Read::read_to_end(&mut io::stdin().lock(), &mut pack_bytes)?;
@@ -4296,7 +4296,7 @@ pub(crate) fn cmd_count_objects(args: &[String]) -> Result<()> {
         }
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let stats = count_objects_stats(&git_dir, format)?;
     if verbose {
@@ -4346,7 +4346,7 @@ struct PackRefsOptions {
 pub(crate) fn cmd_pack_refs(args: &[String]) -> Result<()> {
     let options = setup_pack_refs_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&git_dir, format)
@@ -5120,7 +5120,7 @@ struct PruneOptions {
 
 pub(crate) fn cmd_prune(args: &[String]) -> Result<()> {
     let options = setup_prune_options(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -5925,7 +5925,7 @@ pub(crate) fn cmd_multi_pack_index(args: &[String]) -> Result<()> {
 
 fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     let mut stdin_packs = false;
@@ -6818,7 +6818,7 @@ fn clear_incremental_midx_sidecars(pack_dir: &Path, format: ObjectFormat) -> Res
 
 fn cmd_multi_pack_index_compact(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     let mut write_bitmap = false;
@@ -7184,7 +7184,7 @@ fn pack_is_cruft(pack_dir: &Path, idx_name: &str) -> bool {
 
 fn cmd_multi_pack_index_repack(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let (object_dir, progress, batch_size) =
         parse_midx_object_dir_and_progress(args, &cwd, &git_dir, "repack")?;
@@ -7341,7 +7341,7 @@ fn cmd_multi_pack_index_repack(args: &[String]) -> Result<()> {
 
 fn cmd_multi_pack_index_verify(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     // Upstream defaults progress to a tty heuristic; when stderr is not a tty
@@ -7712,7 +7712,7 @@ fn u64_be8(bytes: &[u8]) -> u64 {
 
 fn cmd_multi_pack_index_expire(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let (object_dir, progress, _) =
         parse_midx_object_dir_and_progress(args, &cwd, &git_dir, "expire")?;
@@ -7902,7 +7902,7 @@ pub(crate) fn cmd_pack_redundant(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(cwd.clone())?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let objects_dir = repository_objects_dir(&common_git_dir);

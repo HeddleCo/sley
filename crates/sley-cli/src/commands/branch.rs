@@ -9560,7 +9560,7 @@ fn branch_ref_push_sort_key(config: &GitConfig, reference: &sley_refs::Ref) -> S
 /// variants (bisect / rebase) taking precedence -- mirroring upstream
 /// `wt_status_get_state` + `get_head_description`.
 fn detached_head_branch_line() -> Option<String> {
-    let git_dir = discover_git_dir(env::current_dir().ok()?).ok()?;
+    let git_dir = crate::session::cli_git_dir().ok()?;
     let format = repository_object_format(&git_dir).ok()?;
     let store = FileRefStore::new(&git_dir, format);
     let RefTarget::Direct(oid) = store.read_ref("HEAD").ok()?? else {
@@ -9879,7 +9879,7 @@ impl BranchListColors {
 }
 
 fn branch_list_colors_from_current_repo() -> Result<BranchListColors> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let config = read_repo_config(&git_dir)?;
     Ok(BranchListColors::from_config(&config))
 }

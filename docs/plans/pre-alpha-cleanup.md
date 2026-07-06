@@ -21,7 +21,7 @@
 | W34 | ⚠️ partial | sley-rev diff_options module landed |
 | W40 | ✅ done | engine parity harness |
 | W41 | ⚠️ partial | 62 parity tests (target 200) |
-| W50 | ⚠️ partial | CliSession scaffold; `GLOBAL_*` statics removed |
+| W50 | ✅ done | CliSession + discovery.rs; 0 `discover_git_dir` / `GLOBAL_*` |
 | W51–W52 | ⏳ pending | remote_cmds delete, facade-only deps |
 | W52a | ✅ done | hooks + env-aware OpenOptions in sley facade |
 | W51, W60–W72, W90 | ⏳ pending | remote_cmds delete, CLI splits, manual parity gate |

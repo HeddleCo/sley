@@ -160,11 +160,11 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
 
     let treeish = treeish.ok_or_else(|| GitError::Command("archive requires a tree-ish".into()))?;
     let cwd = env::current_dir()?;
-    let local_git_dir = discover_git_dir(&cwd).ok();
+    let local_git_dir = crate::session::cli_git_dir_from(&cwd).ok();
     let git_dir = if let Some(remote) = remote.as_deref() {
         archive_remote_git_dir(remote, &cwd, local_git_dir.as_deref())?
     } else {
-        discover_git_dir(&cwd)?
+        crate::session::cli_git_dir_from(&cwd)?
     };
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
@@ -532,7 +532,7 @@ fn archive_match_extension(filename: &str, ext: &str) -> bool {
 }
 
 fn archive_config_for_list(remote: Option<&str>, cwd: &Path) -> Result<GitConfig> {
-    let local_git_dir = discover_git_dir(cwd).ok();
+    let local_git_dir = crate::session::cli_git_dir_from(&cwd).ok();
     let git_dir = if let Some(remote) = remote {
         archive_remote_git_dir(remote, cwd, local_git_dir.as_deref())?
     } else {
@@ -564,7 +564,7 @@ fn archive_remote_git_dir(
     } else {
         base.join(path)
     };
-    discover_git_dir(&repo)
+    crate::session::cli_git_dir_from(&repo)
 }
 
 fn archive_remote_looks_like_path(remote: &str) -> bool {
@@ -1984,7 +1984,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     // git refuses (with advice + exit 1) to update entries that the skip-worktree
@@ -3718,7 +3718,7 @@ pub(crate) fn cmd_clean(args: &[String]) -> Result<()> {
         }
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let config = read_repo_config(&git_dir)?;
     let require_force = config
         .get_bool("clean", None, "requireForce")
@@ -4057,7 +4057,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(cwd.clone())?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
@@ -6541,7 +6541,7 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
         }
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
 
     // Resolve `fsck.<msgid>` severity overrides from the repo config (folds in
@@ -7291,7 +7291,7 @@ pub(super) enum ReplaceListFormat {
 
 pub(crate) fn cmd_replace(args: &[String]) -> Result<()> {
     let options = setup_replace_options(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
@@ -7482,7 +7482,7 @@ pub(crate) fn cmd_prune_packed(args: &[String]) -> Result<()> {
         return prune_packed_usage();
     }
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let objects_dir = repository_objects_dir(&git_dir);
     let packed = prune_packed_object_ids(&objects_dir.join("pack"), format)?;
@@ -7557,7 +7557,7 @@ pub(super) struct RerereOptions {
 
 pub(crate) fn cmd_rerere(args: &[String]) -> Result<()> {
     let options = setup_rerere_options(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     match options.subcommand {
         None => Ok(()),
         Some(RerereSubcommand::Status) => rerere_status(&git_dir),
@@ -7932,7 +7932,7 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let path_base = match cwd.strip_prefix(&worktree_root) {
@@ -8030,7 +8030,7 @@ pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
         ));
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let destination = if paths[paths.len() - 1].is_absolute() {
@@ -8706,7 +8706,7 @@ impl CommitGraphSplitOptions {
 
 fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     let mut source = CommitGraphSource::AllPacks;
@@ -9561,7 +9561,7 @@ fn commit_graph_stdin_commits_starts(
 
 fn cmd_commit_graph_verify(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     // git: opts.progress defaults to isatty(2); --progress forces on,
@@ -10979,7 +10979,7 @@ fn cmd_bundle_create(args: &[String]) -> Result<()> {
         return bundle_usage_error(BUNDLE_CREATE_USAGE);
     };
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let options = parse_bundle_revision_args(&rev_args)?;
@@ -11064,7 +11064,7 @@ fn cmd_bundle_verify(args: &[String]) -> Result<()> {
         return bundle_usage_error(BUNDLE_VERIFY_USAGE);
     };
     let cwd = env::current_dir()?;
-    let git_dir = match discover_git_dir(&cwd) {
+    let git_dir = match crate::session::cli_git_dir_from(&cwd) {
         Ok(git_dir) => git_dir,
         Err(_) => {
             eprintln!("error: need a repository to verify a bundle");
@@ -11109,7 +11109,7 @@ fn cmd_bundle_unbundle(args: &[String]) -> Result<()> {
         return bundle_usage_error(BUNDLE_UNBUNDLE_USAGE);
     };
     let cwd = env::current_dir()?;
-    let git_dir = match discover_git_dir(&cwd) {
+    let git_dir = match crate::session::cli_git_dir_from(&cwd) {
         Ok(git_dir) => git_dir,
         Err(_) => {
             eprintln!("fatal: Need a repository to unbundle.");
@@ -11807,7 +11807,7 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
     let Some(tree) = tree else {
         return commit_tree_requires_one_tree_error();
     };
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     // git resolves the tree and each `-p` parent as a revision-ish (so a tag,
     // branch, `HEAD^`, abbreviated oid, or `<rev>^{tree}` all work), peeling the

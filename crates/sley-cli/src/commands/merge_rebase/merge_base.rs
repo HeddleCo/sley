@@ -86,7 +86,7 @@ pub(crate) fn cmd_merge_base(args: &[String]) -> Result<()> {
         ));
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     if fork_point {

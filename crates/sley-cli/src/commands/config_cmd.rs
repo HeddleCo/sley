@@ -687,7 +687,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         eprintln!("error: only one config file at a time");
         return Err(GitError::Exit(129));
     }
-    let repo_git_dir = discover_git_dir(env::current_dir()?);
+    let repo_git_dir = crate::session::cli_git_dir();
     if repo_git_dir.is_err() {
         if use_local {
             eprintln!("fatal: --local can only be used inside a git repository");
@@ -1669,7 +1669,7 @@ fn config_include_context() -> sley_config::ConfigIncludeContext {
         return sley_config::ConfigIncludeContext::default();
     };
     let start = logical_cwd_for_include_context(&cwd);
-    match discover_git_dir(&start) {
+    match crate::session::cli_git_dir_from(&start) {
         Ok(git_dir) => sley_config::ConfigIncludeContext::new(
             Some(sley_config::git_dir_for_include_context(&git_dir)),
             repo_current_branch_name(&git_dir),

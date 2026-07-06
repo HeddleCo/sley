@@ -15,7 +15,7 @@
 //!
 //! Command modules pull their shared plumbing from the crate root; the glob
 //! import reaches every helper, type, and re-export visible there (a submodule
-//! can access its ancestor module's private items), so `discover_git_dir`,
+//! can access its ancestor module's private items), so `cli_git_dir`,
 //! `repository_object_format`, `FileObjectDatabase`, `three_way_merge_trees`,
 //! and friends are all in scope without re-listing them.
 use crate::*;
@@ -199,7 +199,7 @@ struct AmPatch {
 /// Entry point for `git am`.
 pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -4361,7 +4361,7 @@ fn finish_rebase_apply(state_dir: &Path) -> Result<()> {
     // exists (the caller removes it after this returns).
     run_apply_post_rewrite_hook(state_dir);
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let refs = FileRefStore::new(&git_dir, format);

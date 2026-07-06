@@ -7,7 +7,7 @@ pub(crate) fn cmd_fast_export(args: &[String]) -> Result<()> {
         ));
     }
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let store = FileRefStore::new(&git_dir, format);

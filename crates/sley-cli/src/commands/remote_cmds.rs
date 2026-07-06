@@ -3091,7 +3091,7 @@ fn recurse_clone_submodules(
         } else {
             "die"
         };
-        let git_dir = discover_git_dir(destination)?;
+        let git_dir = crate::session::cli_git_dir_from(destination)?;
         let mut config = read_repo_config(&git_dir)?;
         set_config_value(
             &mut config,
@@ -4213,7 +4213,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         );
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     // A bare repo with no working tree never has a "checked out" branch, so the
     // current-branch fetch refusal is keyed off whether a *non-bare* worktree
@@ -5834,7 +5834,7 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
@@ -6046,7 +6046,7 @@ fn reject_duplicate_push_destinations(refspecs: &[String]) -> Result<()> {
 
 pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
@@ -8928,7 +8928,7 @@ fn pre_push_local_ref(
 }
 
 fn push_resolved_url(remote: &str) -> Result<String> {
-    if let Ok(git_dir) = discover_git_dir(&env::current_dir()?) {
+    if let Ok(git_dir) = crate::session::cli_git_dir() {
         let config = read_repo_config(&git_dir)?;
         return Ok(resolve_remote_push_url(&config, remote));
     }
@@ -9997,7 +9997,7 @@ fn ls_remote_http_records(
     ) {
         return Ok(None);
     }
-    let config = discover_git_dir(env::current_dir()?)
+    let config = crate::session::cli_git_dir()
         .ok()
         .and_then(|git_dir| read_repo_config(&git_dir).ok());
     let mut credentials = sley_remote::CredentialHelperProvider::new(config.as_ref());
@@ -10217,7 +10217,7 @@ fn configured_refspec_valid(refspec: &str, fetch: bool) -> bool {
 /// first invalid value). Only runs when `repository` names a configured remote.
 fn validate_configured_remote_refspecs(repository: &str) -> Result<()> {
     let cwd = env::current_dir()?;
-    let Ok(git_dir) = discover_git_dir(&cwd) else {
+    let Ok(git_dir) = crate::session::cli_git_dir_from(&cwd) else {
         return Ok(());
     };
     let Ok(config) = read_repo_config(&git_dir) else {
@@ -10237,7 +10237,7 @@ fn validate_configured_remote_refspecs(repository: &str) -> Result<()> {
 }
 
 fn default_ls_remote_remote() -> Result<String> {
-    let git_dir = discover_git_dir(&env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     default_fetch_remote(&git_dir, format)
@@ -10502,7 +10502,7 @@ fn validate_ls_remote_sort_context(sort: Option<LsRemoteSort>) -> Result<Option<
         Some(LsRemoteSort::CreatorDate | LsRemoteSort::CreatorDateDescending) => "creatordate",
         _ => unreachable!("guard checked object-data sort"),
     };
-    if let Ok(git_dir) = discover_git_dir(env::current_dir()?) {
+    if let Ok(git_dir) = crate::session::cli_git_dir() {
         return Ok(Some(git_dir));
     }
     eprintln!(
@@ -10561,7 +10561,7 @@ fn ls_remote_git_records(
 
 fn ls_remote_resolved_url(repository: &str) -> Result<String> {
     let cwd = env::current_dir()?;
-    if let Some(config) = discover_git_dir(&cwd)
+    if let Some(config) = crate::session::cli_git_dir_from(&cwd)
         .ok()
         .and_then(|git_dir| read_repo_config(&git_dir).ok())
     {
@@ -10583,7 +10583,7 @@ fn check_transport_allowed_url(url: &str, config: Option<&GitConfig>) -> Result<
 
 fn transport_policy_config_for_cwd() -> Result<GitConfig> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd).ok();
+    let git_dir = crate::session::cli_git_dir_from(&cwd).ok();
     let common_git_dir = git_dir
         .as_deref()
         .and_then(|git_dir| common_git_dir_for_git_dir(git_dir).ok());
@@ -10611,7 +10611,7 @@ fn repo_config_with_transport_policy(git_dir: &Path) -> Result<GitConfig> {
     let mut config = transport_policy_config_for_cwd()?;
     let repo_config = read_repo_config(git_dir)?;
     let cwd = env::current_dir()?;
-    if let Ok(current_git_dir) = discover_git_dir(&cwd) {
+    if let Ok(current_git_dir) = crate::session::cli_git_dir_from(&cwd) {
         let current_common = common_git_dir_for_git_dir(&current_git_dir)?;
         let requested_common = common_git_dir_for_git_dir(git_dir)?;
         if current_common == requested_common {
@@ -10632,7 +10632,7 @@ fn repo_config_with_transport_policy(git_dir: &Path) -> Result<GitConfig> {
 
 pub(crate) fn ls_remote_git_dir(repository: &str) -> Result<PathBuf> {
     let cwd = env::current_dir()?;
-    let local_git_dir = discover_git_dir(&cwd).ok();
+    let local_git_dir = crate::session::cli_git_dir_from(&cwd).ok();
     if let Some(git_dir) = local_git_dir.as_deref() {
         let config = read_repo_config(git_dir)?;
         if remote_exists(&config, repository) {
@@ -10751,7 +10751,7 @@ fn percent_hex_value(byte: u8) -> Option<u8> {
 
 fn ls_remote_display_url(repository: &str) -> Result<String> {
     let cwd = env::current_dir()?;
-    let config = discover_git_dir(&cwd)
+    let config = crate::session::cli_git_dir_from(&cwd)
         .ok()
         .and_then(|git_dir| read_repo_config(&git_dir).ok());
     let url = config
@@ -11081,7 +11081,7 @@ fn remote_seturl_usage_error() -> GitError {
 }
 
 fn remote_list(verbose: bool) -> Result<()> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let config = read_repo_config(&git_dir)?;
     let mut stdout = io::stdout();
     for name in remote_names(&config) {
@@ -11167,7 +11167,7 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
     let name = positional[0];
     let url = positional[1];
     validate_remote_name(name)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let mut config = read_repo_config_on_disk(&git_dir)?;
     if mirror != RemoteAddMirror::None && master.is_some() {
         eprintln!("fatal: specifying a master branch makes no sense with --mirror");
@@ -11322,7 +11322,7 @@ pub(crate) fn cmd_remote_get_url(args: &[String]) -> Result<()> {
     }
     let name = positional[0];
     validate_remote_name(name)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let config = read_repo_config(&git_dir)?;
     let mut urls = if push {
         remote_config_values(&config, name, "pushurl")
@@ -11356,7 +11356,7 @@ pub(crate) fn cmd_remote_remove(args: &[String]) -> Result<()> {
     }
     let name = &args[0];
     validate_remote_name(name)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let mut config = read_repo_config_on_disk(&git_dir)?;
     let warn_skipped_local_branches = remote_remove_maps_outside_remote_tracking(&config, name);
     match sley_config::remotes::remove_remote(&mut config, name) {
@@ -11405,7 +11405,7 @@ pub(crate) fn cmd_remote_update(args: &[String], verbose: bool) -> Result<()> {
         }
     }
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let config = read_repo_config(&git_dir)?;
 
     // Resolve the requested groups/remotes into a de-duplicated, order-preserving
@@ -11494,7 +11494,7 @@ pub(crate) fn cmd_remote_prune(args: &[String]) -> Result<()> {
     if names.is_empty() {
         return Err(GitError::Command("remote prune requires <name>".into()));
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let config = read_repo_config(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
@@ -11519,7 +11519,7 @@ pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
     }
     let old = positional[0];
     let new = positional[1];
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let mut config = read_repo_config_on_disk(&git_dir)?;
     sley_config::remotes::augment_with_legacy_remote_files(&mut config, &git_dir);
     // Upstream `builtin/remote.c::mv` order: the old remote's existence is
@@ -11945,7 +11945,7 @@ pub(crate) fn cmd_remote_set_branches(args: &[String]) -> Result<()> {
     for branch in branches {
         validate_remote_branch_name(branch)?;
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let mut config = read_repo_config_on_disk(&git_dir)?;
     let mirror_fetch = remote_config_values(&config, name, "fetch")
         .iter()
@@ -12007,7 +12007,7 @@ pub(crate) fn cmd_remote_set_head(args: &[String]) -> Result<()> {
         }
     };
     validate_remote_name(name)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let mut config = read_repo_config_on_disk(&git_dir)?;
     if !remote_exists(&config, name) {
         return Err(GitError::remote_not_found(name));
@@ -12229,7 +12229,7 @@ pub(crate) fn cmd_remote_set_url(args: &[String]) -> Result<()> {
     let url = positional[1];
     let old_url = positional.get(2).copied();
     validate_remote_name(name)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let mut config = read_repo_config_on_disk(&git_dir)?;
     let kind = if push {
         sley_config::remotes::SetUrlKind::Push
@@ -12320,7 +12320,7 @@ pub(crate) fn cmd_remote_show(args: &[String]) -> Result<()> {
     if names.is_empty() {
         return remote_list(false);
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let config = read_repo_config(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);

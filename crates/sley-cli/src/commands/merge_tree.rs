@@ -275,7 +275,7 @@ struct MergeOutcome {
 fn run_real_merge(options: &MergeTreeOptions) -> Result<()> {
     let _quiet_cleanup = if options.quiet {
         let cwd = env::current_dir()?;
-        let git_dir = discover_git_dir(&cwd)?;
+        let git_dir = crate::session::cli_git_dir_from(&cwd)?;
         Some(QuietLooseObjectCleanup::new(git_dir)?)
     } else {
         None
@@ -362,7 +362,7 @@ fn loose_object_files(git_dir: &Path) -> Result<BTreeSet<PathBuf>> {
 
 fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
@@ -1025,7 +1025,7 @@ type TrivialEntry = Option<(u32, ObjectId)>;
 
 fn run_trivial_merge(options: &MergeTreeOptions) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 

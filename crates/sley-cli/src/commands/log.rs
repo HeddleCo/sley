@@ -2043,7 +2043,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     if whatchanged && !diff_opts.any() {
         diff_opts.raw = true;
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);

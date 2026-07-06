@@ -20,7 +20,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
     }
     let cwd = env::current_dir()?;
     let setup = setup::setup_git_directory();
-    let git_dir = match discover_git_dir(&cwd) {
+    let git_dir = match crate::session::cli_git_dir_from(&cwd) {
         Ok(git_dir) => git_dir,
         Err(GitError::NotFound(_)) => {
             if args.is_empty() {

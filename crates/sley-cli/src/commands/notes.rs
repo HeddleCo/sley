@@ -52,7 +52,7 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
         None => ("list", &[][..]),
     };
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     // Resolve the notes ref against the effective config (includes + `-c` /
     // `GIT_CONFIG_*` overrides) so `core.notesRef` honours the same config the

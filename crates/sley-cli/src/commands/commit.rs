@@ -63,7 +63,7 @@ fn set_hook_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
 }
 
 fn refresh_commit_selection_cache_tree() -> Result<()> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let odb = FileObjectDatabase::from_git_dir(&git_dir, format);
     sley_worktree::refresh_repository_cache_tree(&git_dir, format, &odb)
@@ -937,7 +937,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             return Ok(());
         }
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let repo_config = read_repo_config(&git_dir).ok();
     if !gpg_sign && !no_gpg_sign {
@@ -2286,7 +2286,7 @@ fn cmd_commit_long_status_preview(
     untracked_override: Option<sley_worktree::StatusUntrackedMode>,
 ) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let config = read_repo_config(&git_dir).map_err(report_config_setup_error)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;

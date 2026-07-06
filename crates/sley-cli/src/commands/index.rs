@@ -22,7 +22,7 @@ pub(crate) fn cmd_mktree(args: &[String]) -> Result<()> {
             }
         }
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let mut input = Vec::new();
@@ -815,7 +815,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
         }
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     for path in &exclude_from {
@@ -2075,7 +2075,7 @@ pub(crate) fn cmd_ls_tree(args: &[String]) -> Result<()> {
     let Some(treeish) = treeish else {
         return ls_tree_usage();
     };
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let oid = resolve_revision(&git_dir, format, treeish)?;
@@ -2488,7 +2488,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             paths.extend(stdin_paths);
         } else {
             let cwd = env::current_dir()?;
-            let git_dir = discover_git_dir(&cwd)?;
+            let git_dir = crate::session::cli_git_dir_from(&cwd)?;
             let format = repository_object_format(&git_dir)?;
             let records = parse_update_index_index_info(&input)?
                 .into_iter()
@@ -2515,7 +2515,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             let git_dir =
                 if show_index_version || fsmonitor || split_index.is_some() || clear_resolve_undo {
                     let cwd = env::current_dir()?;
-                    Some(discover_git_dir(&cwd)?)
+                    Some(crate::session::cli_git_dir_from(&cwd)?)
                 } else {
                     None
                 };
@@ -2557,7 +2557,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree_required = refresh
         || again
