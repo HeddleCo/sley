@@ -469,7 +469,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     }
     if !filter_option_explicit {
         let config = read_repo_config(&git_dir)?;
-        apply_configured_partial_clone_filter(&config, &source, &mut options);
+        sley_remote::apply_configured_partial_clone_filter(&config, &source, &mut options);
     }
     let effective_refspecs = if prefetch {
         prefetch_refspecs(&config, &source, &refspecs)
@@ -585,7 +585,7 @@ fn fetch_multiple_remotes(req: FetchMultipleRequest<'_>) -> Result<()> {
         let mut remote_options = req.options.clone();
         remote_options.append = true;
         if !req.filter_option_explicit {
-            apply_configured_partial_clone_filter(req.config, &remote, &mut remote_options);
+            sley_remote::apply_configured_partial_clone_filter(req.config, &remote, &mut remote_options);
         }
         if req.refspecs.is_empty() && !req.prefetch {
             remote_options.merge_srcs =
@@ -724,7 +724,7 @@ fn trace_fetch_maintenance() {
 }
 
 fn fetch_pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
-    pack_filter_from_spec(spec)
+    sley_remote::pack_filter_from_spec(spec)
 }
 
 /// `git fetch <remote> :<dst>` is shorthand for fetching the remote's `HEAD`
@@ -1425,112 +1425,6 @@ fn prefetch_destination(dst: &str) -> String {
     match dst.strip_prefix("refs/") {
         Some(rest) => format!("refs/prefetch/{rest}"),
         None => format!("refs/prefetch/{dst}"),
-    }
-}
-
-pub(crate) fn pack_filter_from_spec(spec: &str) -> Option<sley_odb::PackObjectFilter> {
-    if let Some(parts) = spec.strip_prefix("combine:") {
-        return parts
-            .split('+')
-            .filter_map(pack_filter_from_spec)
-            .reduce(combine_pack_filters);
-    }
-    if spec == "blob:none" {
-        return Some(sley_odb::PackObjectFilter::BlobNone);
-    }
-    if let Some(depth) = spec.strip_prefix("tree:") {
-        return parse_rev_list_tree_depth(depth).ok().map(|depth| {
-            sley_odb::PackObjectFilter::TreeDepth(depth.min(u32::MAX as usize) as u32)
-        });
-    }
-    spec.strip_prefix("blob:limit=")
-        .and_then(git_parse_blob_limit)
-        .map(sley_odb::PackObjectFilter::BlobLimit)
-}
-
-pub(super) fn pack_filter_from_spec_for_clone(
-    spec: &str,
-    remote_git_dir: &Path,
-    format: ObjectFormat,
-) -> Result<Option<sley_odb::PackObjectFilter>> {
-    if let Some(body) = spec.strip_prefix("sparse:oid=") {
-        return sparse_filter_from_remote(body, remote_git_dir, format).map(Some);
-    }
-    Ok(pack_filter_from_spec(spec))
-}
-
-fn sparse_filter_from_remote(
-    body: &str,
-    remote_git_dir: &Path,
-    format: ObjectFormat,
-) -> Result<sley_odb::PackObjectFilter> {
-    let Some((rev, path)) = body.split_once(':') else {
-        eprintln!("fatal: unable to parse sparse filter data in .{body}");
-        return Err(GitError::Exit(128));
-    };
-    let db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
-    let oid = match sley_rev::resolve_rev_path(remote_git_dir, format, &db, rev, path) {
-        Ok(oid) => oid,
-        Err(_) => {
-            eprintln!("fatal: unable to access sparse blob in .{body}");
-            return Err(GitError::Exit(128));
-        }
-    };
-    let object = db.read_object(&oid)?;
-    if object.object_type != ObjectType::Blob {
-        eprintln!("fatal: unable to parse sparse filter data in .{body}");
-        return Err(GitError::Exit(128));
-    }
-    let contents = String::from_utf8_lossy(&object.body);
-    let paths = contents
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let line = line.strip_prefix('/').unwrap_or(line);
-            (!line.is_empty()).then(|| line.to_string())
-        })
-        .collect::<Vec<_>>();
-    if paths.is_empty() {
-        eprintln!("fatal: unable to parse sparse filter data in .{body}");
-        return Err(GitError::Exit(128));
-    }
-    Ok(sley_odb::PackObjectFilter::SparsePathSet(paths))
-}
-
-fn combine_pack_filters(
-    left: sley_odb::PackObjectFilter,
-    right: sley_odb::PackObjectFilter,
-) -> sley_odb::PackObjectFilter {
-    use sley::plumbing::sley_odb::PackObjectFilter;
-    match (left, right) {
-        (PackObjectFilter::TreeDepth(a), PackObjectFilter::TreeDepth(b)) => {
-            PackObjectFilter::TreeDepth(a.min(b))
-        }
-        (PackObjectFilter::TreeDepth(depth), _) | (_, PackObjectFilter::TreeDepth(depth)) => {
-            PackObjectFilter::TreeDepth(depth)
-        }
-        (PackObjectFilter::SparsePathSet(paths), _)
-        | (_, PackObjectFilter::SparsePathSet(paths)) => PackObjectFilter::SparsePathSet(paths),
-        (PackObjectFilter::BlobLimit(a), PackObjectFilter::BlobLimit(b)) => {
-            PackObjectFilter::BlobLimit(a.min(b))
-        }
-        (PackObjectFilter::BlobNone, _) | (_, PackObjectFilter::BlobNone) => {
-            PackObjectFilter::BlobNone
-        }
-    }
-}
-
-fn apply_configured_partial_clone_filter(
-    config: &GitConfig,
-    remote: &str,
-    options: &mut FetchOptions,
-) {
-    if config
-        .get_bool("remote", Some(remote), "promisor")
-        .unwrap_or(false)
-        && let Some(filter) = config.get("remote", Some(remote), "partialclonefilter")
-    {
-        options.filter = fetch_pack_filter_from_spec(filter);
     }
 }
 

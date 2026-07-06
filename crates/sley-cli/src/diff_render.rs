@@ -2934,7 +2934,7 @@ fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Re
         };
         let filter = config
             .get("remote", Some(&remote_name), "partialclonefilter")
-            .and_then(commands::remote::pack_filter_from_spec)
+            .and_then(sley_remote::pack_filter_from_spec)
             .or(Some(sley_odb::PackObjectFilter::BlobNone));
         let quiet = config.get_bool("promisor", None, "quiet").unwrap_or(false);
         trace2_promisor_fetch_child_start(&remote_name, quiet);

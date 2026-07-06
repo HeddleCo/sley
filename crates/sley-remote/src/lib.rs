@@ -79,11 +79,15 @@ pub use local::{
     upload_pack_sideband_response,
 };
 
+mod filter;
+pub use filter::{pack_filter_from_spec, pack_filter_from_spec_for_clone};
+
 mod fetch;
 pub use fetch::{
     FetchOptions, FetchOutcome, FetchRequest, FetchServices, FetchSource, PruneRefsInput,
     PrunedRef, append_reachable_auto_follow_tags, apply_configured_fetch_prune_option,
-    apply_configured_remote_tag_option, fetch, fetch_head_source_description,
+    apply_configured_partial_clone_filter, apply_configured_remote_tag_option, fetch,
+    fetch_head_source_description,
     fetch_refspec_excludes, fetch_refspecs_for_source, mark_tag_refspec_updates_not_for_merge,
     order_bundle_fetch_all_tags_updates, prune_refs_from_advertisements,
     retain_missing_auto_follow_tags, write_default_fetch_head, write_fetch_head,

@@ -16,19 +16,20 @@
 | W24 | ✅ done | lint burn-down non-CLI engines |
 | W30 | ✅ done | unified ancestor_depths on sley-rev |
 | W31 | ✅ done | log format → sley-pretty; CLI adapter wiring |
-| W32 | ⚠️ partial | worktree + pack parsers (13/47) |
+| W32 | ✅ done | superseded by W33 (0 `parse_*_options` remaining) |
 | W33 | ✅ done | 0 `parse_*_options` remaining |
 | W34 | ⚠️ partial | sley-rev diff_options module landed |
 | W40 | ✅ done | engine parity harness |
 | W41 | ✅ done | 203 engine parity tests (target 200) |
 | W50 | ✅ done | CliSession + discovery.rs; 0 `discover_git_dir` / `GLOBAL_*` |
-| W51 | ⚠️ partial | `remote_cmds.rs` deleted → `commands/remote/` tree (~13k LOC); orchestration still CLI-resident |
+| W51 | ⚠️ partial | transport orchestration in `sley-remote`; filter parsing + `apply_configured_partial_clone_filter` migrated; bare/mirror/clone edge cases remain in CLI |
 | W52 | ✅ done | 12 engine deps removed; `lib.rs` **322** LOC; `dispatch.rs` 490; 15+ helper modules |
 | W52a | ✅ done | hooks + env-aware OpenOptions in sley facade |
-| W60 | ⚠️ partial | `branch.rs` → `branch/` tree; `dispatch.rs` still 6k |
+| W60 | ✅ done | `branch/` tree; `dispatch.rs` **102** LOC; `positional.rs` legacy argv match |
 | W61 | ✅ done | `plumbing.rs` → `plumbing/` tree (14 modules) |
 | W62 | ⚠️ partial | `diff_render.rs` extracted (3.5k LOC) |
-| W70, W72, W90 | ⏳ pending | benches, clippy, manual parity gate |
+| W70 | ⚠️ partial | `sley-bench` suites exist; `baselines/` scaffold added |
+| W72, W90 | ⏳ pending | CLI clippy burn-down, manual parity gate |
 | W71 | ✅ done | sley-fetch → sley-remote::install |
 
 **Decisions locked:** `sley-pretty` in place (no rename); hooks **(a)** → W52a; integration branch until W90; parity gate manual at end.  

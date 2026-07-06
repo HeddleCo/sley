@@ -24,7 +24,7 @@ pub(crate) use fetch::{
     FetchSubmoduleRequest, StdoutProgress, changed_gitlinks_for_fetch,
     fetch_bundle, fetch_local_repository, fetch_populated_submodules_after_superproject,
     fetch_ref_snapshot, fetch_set_upstream_from_outcome, fetch_source_is_git,
-    fetch_source_is_ssh, fetch_git_repository, fetch_ssh_repository, pack_filter_from_spec,
+    fetch_source_is_ssh, fetch_git_repository, fetch_ssh_repository,
     resolve_fetch_recurse_submodules, cmd_fetch,
 };
 pub(crate) use ls_remote::cmd_ls_remote;

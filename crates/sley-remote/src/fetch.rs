@@ -1544,6 +1544,21 @@ fn head_symref_from_features(symrefs: &[String]) -> Option<String> {
         .find_map(|entry| entry.strip_prefix("HEAD:").map(|target| target.to_string()))
 }
 
+/// Apply `remote.<name>.partialclonefilter` when `remote.<name>.promisor` is set.
+pub fn apply_configured_partial_clone_filter(
+    config: &GitConfig,
+    remote: &str,
+    options: &mut FetchOptions,
+) {
+    if config
+        .get_bool("remote", Some(remote), "promisor")
+        .unwrap_or(false)
+        && let Some(filter) = config.get("remote", Some(remote), "partialclonefilter")
+    {
+        options.filter = crate::pack_filter_from_spec(filter);
+    }
+}
+
 /// Apply the configured `remote.<name>.tagopt` unless the tag option was set
 /// explicitly on the command line.
 pub fn apply_configured_remote_tag_option(

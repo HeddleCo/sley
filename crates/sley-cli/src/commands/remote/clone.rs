@@ -6,7 +6,7 @@ use super::config::{
 };
 use super::fetch::{
     configured_server_options, fetch_bundle, fetch_local_repository, fetch_source_is_git,
-    fetch_source_is_ssh, pack_filter_from_spec_for_clone, parse_shallow_since,
+    fetch_source_is_ssh, parse_shallow_since,
     repo_config_with_transport_policy, run_fetch, transport_policy_config_for_cwd, StdoutProgress,
 };
 use super::fetch::{check_transport_allowed_url, ls_remote_resolved_url};
@@ -910,7 +910,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 .and_then(|config| config.get_bool("uploadpack", None, "allowfilter"))
                 .unwrap_or(false);
             let parsed_filter =
-                pack_filter_from_spec_for_clone(filter, &remote_common_git_dir, format)?;
+                sley_remote::pack_filter_from_spec_for_clone(filter, &remote_common_git_dir, format)?;
             match (remote_allows_filter, remote_config.as_ref(), parsed_filter) {
                 (true, Some(config), Some(parsed)) => {
                     validate_server_filter_policy(config, filter)?;
