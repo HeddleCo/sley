@@ -3102,7 +3102,7 @@ fn is_binary_or_large_content(bytes: &[u8], big_file_threshold: u64) -> bool {
 /// Myers produces a shortest edit script, so the count of `Insert` lines is
 /// `new_len - lcs` and the count of `Delete` lines is `old_len - lcs` — exactly
 /// the values the removed local LCS counter returned.
-fn count_line_diff(old: &[u8], new: &[u8]) -> (usize, usize) {
+pub(crate) fn count_line_diff(old: &[u8], new: &[u8]) -> (usize, usize) {
     let old_lines = sley_diff_merge::split_lines(old);
     let new_lines = sley_diff_merge::split_lines(new);
     let mut prefix = 0usize;
