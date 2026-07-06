@@ -77,7 +77,11 @@ impl GitConnection {
 
 impl Drop for GitConnection {
     fn drop(&mut self) {
-        if let GitConnectionInner::Proxy { child, .. } = &mut self.inner {
+        if let GitConnectionInner::Proxy { child, stdin, .. } = &mut self.inner {
+            // Close our end of the proxy's stdin first: a proxy that relays
+            // until EOF never exits while we hold the pipe, and wait() would
+            // deadlock against it.
+            drop(stdin.take());
             let _ = child.wait();
         }
     }
