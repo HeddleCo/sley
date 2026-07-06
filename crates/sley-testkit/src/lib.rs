@@ -5550,6 +5550,8 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
     ))
 }
 
+pub mod engine_parity;
+
 /// Harness for running UPSTREAM git's own `t/*.sh` test suite against the
 /// sley binary.
 ///

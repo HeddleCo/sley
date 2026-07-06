@@ -48,5 +48,8 @@ tls-rustls = ["sley-remote/tls-rustls"]
 tls-native-tls = ["sley-remote/tls-native-tls"]
 tls-platform-verifier = ["sley-remote/tls-platform-verifier"]
 
+[dev-dependencies]
+sley-testkit = { workspace = true }
+
 [lints]
 workspace = true
