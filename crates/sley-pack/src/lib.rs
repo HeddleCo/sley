@@ -16,6 +16,8 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
+pub mod inflate;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackEntry {
     pub oid: ObjectId,
@@ -2753,7 +2755,10 @@ where
     INFLATE.with(|cell| {
         let mut decompress = cell.borrow_mut();
         decompress.reset(true);
-        let mut out = Vec::with_capacity(bounded_inflate_reserve(size_hint, STREAM_INFLATE_CHUNK));
+        let mut out = Vec::with_capacity(inflate::bounded_inflate_reserve(
+            size_hint,
+            STREAM_INFLATE_CHUNK,
+        ));
         let mut compressed_total = 0usize;
         let mut input = [0u8; STREAM_INFLATE_CHUNK];
         loop {
@@ -4144,32 +4149,11 @@ thread_local! {
 /// bounds the speculative allocation. git never pre-allocates an attacker's
 /// declared size beyond a streaming buffer either (see index-pack.c's
 /// `unpack_entry_data`).
-const MAX_INFLATE_EXPANSION: usize = 1032;
-
-/// An absolute ceiling on the speculative pre-reservation, independent of the
-/// input length, so even a large legitimate-looking compressed input can't be
-/// turned into a multi-gigabyte up-front allocation. Inflate still grows the
-/// output buffer organically past this when a real stream genuinely produces
-/// that much — this only caps the *speculative* reserve.
-const MAX_INFLATE_RESERVE: usize = 64 * 1024 * 1024;
-
-/// Bound a caller-supplied (possibly attacker-controlled) decompressed-size hint
-/// to something safe to reserve up front: no larger than what `compressed_len`
-/// input bytes could plausibly inflate to, and never above a fixed ceiling. The
-/// returned value is only used to size the initial allocation; the inflate loop
-/// grows the buffer as the real stream produces output, so legitimate large
-/// objects still decode correctly — they just don't get the whole allocation at
-/// once.
-fn bounded_inflate_reserve(size_hint: usize, compressed_len: usize) -> usize {
-    let input_ceiling = compressed_len.saturating_mul(MAX_INFLATE_EXPANSION);
-    // 64 (floor) <= MAX_INFLATE_RESERVE (ceiling) always, so `clamp` cannot panic.
-    size_hint.min(input_ceiling).clamp(64, MAX_INFLATE_RESERVE)
-}
 
 /// Inflate the entire zlib stream at the front of `compressed`, appending the
 /// decoded bytes to `out`, reusing the thread-local inflate state. `size_hint`
 /// is the caller's expectation for the decompressed length, but it is treated as
-/// untrusted: the up-front reservation is bounded by [`bounded_inflate_reserve`]
+/// untrusted: the up-front reservation is bounded by [`inflate::bounded_inflate_reserve`]
 /// so a crafted hint can never drive an out-of-memory pre-allocation. Returns the
 /// number of *compressed* bytes consumed (so callers stepping through a pack can
 /// advance to the next entry). Byte-for-byte equivalent to
@@ -4178,7 +4162,7 @@ fn inflate_into(compressed: &[u8], out: &mut Vec<u8>, size_hint: usize) -> Resul
     INFLATE.with(|cell| {
         let mut decompress = cell.borrow_mut();
         decompress.reset(true);
-        out.reserve(bounded_inflate_reserve(size_hint, compressed.len()));
+        out.reserve(inflate::bounded_inflate_reserve(size_hint, compressed.len()));
         let mut input = compressed;
         let mut consumed_total = 0usize;
         loop {
@@ -4830,7 +4814,10 @@ fn apply_pack_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     // still grows the buffer organically and the post-decode length check
     // (`result.len() != result_size`) rejects the lie cleanly.
     let result_size_hint = usize::try_from(result_size).unwrap_or(usize::MAX);
-    let mut result = Vec::with_capacity(bounded_inflate_reserve(result_size_hint, delta.len()));
+    let mut result = Vec::with_capacity(inflate::bounded_inflate_reserve(
+        result_size_hint,
+        delta.len(),
+    ));
     while cursor < delta.len() {
         let command = delta[cursor];
         cursor += 1;
@@ -7340,23 +7327,6 @@ mod tests {
             assert_eq!(parsed.entries[0].object.body, base);
             assert_eq!(parsed.entries[1].object.body, result);
         }
-    }
-
-    #[test]
-    fn bounded_inflate_reserve_caps_attacker_declared_size() {
-        // A tiny compressed input can't justify a multi-gigabyte reservation.
-        assert_eq!(bounded_inflate_reserve(u64::MAX as usize, 10), 10 * 1032);
-        // The absolute ceiling caps even a large input-justified hint.
-        assert_eq!(
-            bounded_inflate_reserve(usize::MAX, usize::MAX),
-            MAX_INFLATE_RESERVE
-        );
-        // A modest legitimate hint is preserved unchanged (no regression for real
-        // objects): 1000 bytes of output from 500 bytes of input is well within
-        // both bounds.
-        assert_eq!(bounded_inflate_reserve(1000, 500), 1000);
-        // Floor of 64 for tiny hints.
-        assert_eq!(bounded_inflate_reserve(0, 0), 64);
     }
 
     #[test]

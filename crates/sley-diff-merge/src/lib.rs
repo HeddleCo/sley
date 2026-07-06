@@ -6997,7 +6997,7 @@ impl<'a> PatchParser<'a> {
         } else {
             return Ok(None);
         };
-        let origlen = parse_leading_usize(num);
+        let origlen = parse_leading_usize(num).map_err(|()| self.corrupt_binary_error())?;
         self.index += 1;
 
         let mut deflated = Vec::new();
@@ -7368,16 +7368,18 @@ fn apply_is_binary_files_differ(line: &[u8]) -> bool {
 }
 
 /// Parse leading decimal digits (git uses `strtoul`, which ignores trailing
-/// junk). Returns 0 when there are no leading digits.
-fn parse_leading_usize(bytes: &[u8]) -> usize {
+/// junk). Returns `Ok(0)` when there are no leading digits. Returns `Err(())`
+/// when the decimal value overflows `usize`.
+fn parse_leading_usize(bytes: &[u8]) -> std::result::Result<usize, ()> {
     let mut value = 0usize;
     for &b in bytes {
         if !b.is_ascii_digit() {
             break;
         }
-        value = value.saturating_mul(10).saturating_add((b - b'0') as usize);
+        value = value.checked_mul(10).ok_or(())?;
+        value = value.checked_add((b - b'0') as usize).ok_or(())?;
     }
-    value
+    Ok(value)
 }
 
 /// git's base85 alphabet (`base85.c` `en85`).
@@ -7452,7 +7454,10 @@ pub fn git_patch_delta(base: &[u8], delta: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let result_size = read_hdr_size(&mut data)?;
-    let mut out = Vec::with_capacity(result_size);
+    let mut out = Vec::with_capacity(sley_pack::inflate::bounded_inflate_reserve(
+        result_size,
+        delta.len(),
+    ));
 
     while data < delta.len() {
         let cmd = delta[data];
@@ -13401,5 +13406,81 @@ new mode 100755
             "expected a 75% inexact rename"
         );
         fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    fn write_delta_varint(out: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let mut byte = (value as u8) & 0x7f;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Delta whose result-size varint lies while carrying a tiny real instruction
+    /// stream (sley#35 regression shape).
+    fn lying_result_size_delta(declared_result_size: usize) -> (Vec<u8>, Vec<u8>) {
+        let base = b"hello";
+        let result = b"hello world";
+        let mut delta = Vec::new();
+        write_delta_varint(&mut delta, base.len() as u64);
+        write_delta_varint(&mut delta, declared_result_size as u64);
+        let suffix = &result[base.len()..];
+        delta.push(0x90);
+        delta.push(base.len() as u8);
+        delta.push(suffix.len() as u8);
+        delta.extend_from_slice(suffix);
+        (base.to_vec(), delta)
+    }
+
+    #[test]
+    fn bounded_inflate_reserve_caps_attacker_declared_size() {
+        use sley_pack::inflate::{bounded_inflate_reserve, MAX_INFLATE_RESERVE};
+        assert_eq!(bounded_inflate_reserve(u64::MAX as usize, 10), 10 * 1032);
+        assert_eq!(
+            bounded_inflate_reserve(usize::MAX, usize::MAX),
+            MAX_INFLATE_RESERVE
+        );
+        assert_eq!(bounded_inflate_reserve(1000, 500), 1000);
+        assert_eq!(bounded_inflate_reserve(0, 0), 64);
+    }
+
+    #[test]
+    fn parse_leading_usize_errors_on_overflow() {
+        assert_eq!(parse_leading_usize(b""), Ok(0));
+        assert_eq!(parse_leading_usize(b"42 junk"), Ok(42));
+        assert!(parse_leading_usize(b"999999999999999999999999999999999999999999").is_err());
+    }
+
+    /// Regression (sley#35): `git_patch_delta` must not OOM on a lying result-size
+    /// varint; the post-decode length check rejects the bomb cleanly.
+    #[test]
+    fn git_patch_delta_rejects_result_size_bomb_without_oom() {
+        let bombs = [usize::MAX, 1024 * 1024 * 1024 * 1024];
+        for declared in bombs {
+            let (base, delta) = lying_result_size_delta(declared);
+            let handle = std::thread::spawn(move || git_patch_delta(&base, &delta));
+            let join_result = handle.join();
+            assert!(
+                join_result.is_ok(),
+                "delta bomb (declared={declared}) panicked/aborted instead of erroring cleanly"
+            );
+            assert!(
+                join_result.expect("parse thread should not panic on a delta bomb").is_none(),
+                "delta bomb (declared={declared}) should be rejected as invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn git_patch_delta_applies_legitimate_delta_after_result_size_bound() {
+        let (base, delta) = lying_result_size_delta(b"hello world".len());
+        let patched = git_patch_delta(&base, &delta).expect("legitimate delta should resolve");
+        assert_eq!(patched, b"hello world");
     }
 }
