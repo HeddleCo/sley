@@ -1,6 +1,5 @@
-use super::{
-    ReplaceListFormat, ReplaceMode, ReplaceOptions, RerereOptions, RerereSubcommand,
-};
+use super::replace::{ReplaceListFormat, ReplaceMode, ReplaceOptions};
+use super::rerere::{RerereOptions, RerereSubcommand};
 use crate::commands::cli_options::opt_bool;
 use crate::*;
 use sley_options::{parse_options, OptionSpec, ParsedValue};
