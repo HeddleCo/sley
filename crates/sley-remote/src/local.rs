@@ -170,11 +170,14 @@ pub fn upload_pack_from_local_repository(
 pub fn receive_pack_features(format: ObjectFormat) -> ReceivePackFeatures {
     ReceivePackFeatures {
         report_status: true,
+        report_status_v2: true,
         delete_refs: true,
         ofs_delta: true,
         push_options: true,
         quiet: true,
         no_thin: true,
+        atomic: true,
+        side_band_64k: true,
         object_format: Some(format),
         ..ReceivePackFeatures::default()
     }

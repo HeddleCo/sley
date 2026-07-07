@@ -73,6 +73,20 @@ pub use git::{
     git_upload_pack_advertisements_with_protocol, install_fetch_pack_via_git_upload_pack,
 };
 
+mod proc_receive;
+mod receive_hooks;
+mod receive_pack_server;
+
+pub use proc_receive::{
+    ProcReceiveRefPattern, ReceivePackCommandState, parse_proc_receive_refs,
+    proc_receive_ref_matches,
+};
+pub use receive_pack_server::{
+    ReceivePackServerOptions, ReceivePackServerOutcome, ReceivePackServerReport,
+    ReceivePackServerRequest, request_uses_sideband, run_receive_pack_post_hooks,
+    serve_receive_pack, write_receive_pack_server_report,
+};
+
 mod local;
 pub use local::{
     INFINITE_DEPTH, LocalDeepenPlan, attach_receive_pack_capabilities,

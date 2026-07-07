@@ -66,13 +66,36 @@ fn read_capped_packfile<R: Read>(reader: &mut R, max_input_size: Option<u64>) ->
 }
 
 pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
-    let repository = match args {
-        [repository] => repository,
-        _ => {
-            return Err(GitError::Command(
-                "receive-pack currently supports: receive-pack <repository>".into(),
-            ));
+    let mut repository: Option<&String> = None;
+    let mut stateless_rpc = false;
+    let mut advertise_refs = false;
+    let mut quiet = false;
+    for arg in args {
+        match arg.as_str() {
+            "--stateless-rpc" => stateless_rpc = true,
+            "--http-backend-info-refs" | "--advertise-refs" => advertise_refs = true,
+            "--quiet" | "-q" => quiet = true,
+            "--reject-thin-pack-for-testing" => {}
+            value if value.starts_with('-') => {
+                return Err(GitError::Command(format!(
+                    "receive-pack: unknown option {value}"
+                )));
+            }
+            value => {
+                if repository.is_some() {
+                    return Err(GitError::Command(
+                        "receive-pack currently supports: receive-pack <repository>".into(),
+                    ));
+                }
+                repository = Some(arg);
+                let _ = value;
+            }
         }
+    }
+    let Some(repository) = repository else {
+        return Err(GitError::Command(
+            "receive-pack currently supports: receive-pack <repository>".into(),
+        ));
     };
     let git_dir = common_git_dir_for_git_dir(&ls_remote_git_dir(repository)?)?;
     let format = repository_object_format(&git_dir)?;
@@ -80,7 +103,7 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
     let mut advertisements = sley_remote::local_fetch_advertisements(&git_dir, format)?;
     sley_remote::attach_receive_pack_capabilities(&mut advertisements, format, &features)?;
 
-    {
+    if advertise_refs || !stateless_rpc {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
         write_ref_advertisement_set(
@@ -96,6 +119,9 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
         )?;
         stdout.flush()?;
     }
+    if advertise_refs {
+        return Ok(());
+    }
 
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
@@ -108,32 +134,32 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
         push_options,
     };
     let config = read_repo_config(&git_dir)?;
-    let report = if config
-        .get_bool("transfer", None, "fsckObjects")
-        .unwrap_or(false)
-    {
-        let packfile = read_capped_packfile(&mut stdin, receive_max_input_size(&config))?;
-        let request = ReceivePackPushRequest {
-            commands: header.commands.clone(),
-            push_options: header.push_options.clone(),
-            packfile,
-        };
-        if !request.packfile.is_empty() {
-            let exit = crate::commands::pack::fsck_pack_objects(&request.packfile, format, &[])?;
-            if exit != 0 {
-                return Err(GitError::Exit(exit));
-            }
-        }
-        sley_remote::receive_pack_into_local_repository(&git_dir, format, &request)?
-    } else {
-        sley_remote::receive_pack_stream_into_local_repository(
-            &git_dir, format, &header, &mut stdin,
-        )?
-    };
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-    write_receive_pack_report_status(&mut stdout, &report)?;
-    stdout.flush()?;
+    let use_sideband = sley_remote::request_uses_sideband(&header);
+    let wants_report = header
+        .commands
+        .capabilities
+        .iter()
+        .any(|cap| cap.name == "report-status" || cap.name == "report-status-v2");
+    let outcome = sley_remote::serve_receive_pack(sley_remote::ReceivePackServerRequest {
+        git_dir: &git_dir,
+        format,
+        header: &header,
+        pack_reader: &mut stdin,
+        config: &config,
+        options: sley_remote::ReceivePackServerOptions { quiet },
+    })?;
+    if wants_report {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        sley_remote::write_receive_pack_server_report(
+            &mut stdout,
+            &outcome.report,
+            use_sideband,
+        )?;
+        stdout.flush()?;
+    }
+    let push_options = header.push_options.as_deref().unwrap_or(&[]);
+    sley_remote::run_receive_pack_post_hooks(&git_dir, &outcome.command_states, push_options);
     Ok(())
 }
 
