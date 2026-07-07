@@ -163,7 +163,13 @@ fn spawn_hook(
     remote_stderr: &mut Vec<u8>,
     capture_stderr: bool,
 ) -> Result<()> {
-    let mut command = Command::new(path);
+    // git's receive-pack execs a hook by a path relative to the repo it chdir'd
+    // into, so the hook's `$0` is `hooks/<name>` — not an absolute path
+    // (t1416 #8 compares the update hook's `$0`). We already set the cwd to
+    // git_dir, so strip that prefix; a path containing a slash still execs
+    // relative to cwd rather than searching PATH.
+    let exec_path = path.strip_prefix(git_dir).unwrap_or(path);
+    let mut command = Command::new(exec_path);
     command
         .current_dir(git_dir)
         .env("GIT_DIR", git_dir)
