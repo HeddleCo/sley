@@ -5,6 +5,7 @@ use crate::{
 use crate::sley_config;
 use sley::plumbing::sley_config::ConfigIncludeContext;
 use sley::{GitError, Result};
+use sley_options::{OptFlags, OptValue, OptionSpec, completion_helper_options};
 use std::collections::BTreeSet;
 use std::env;
 use std::path::Path;
@@ -146,6 +147,57 @@ pub(crate) const BUILTIN_COMMANDS: &[&str] = &[
     "write-tree",
 ];
 
+const MAIN_PORCELAIN_COMMANDS: &[&str] = &[
+    "add",
+    "am",
+    "bisect",
+    "branch",
+    "checkout",
+    "cherry",
+    "cherry-pick",
+    "clean",
+    "clone",
+    "commit",
+    "describe",
+    "diff",
+    "fetch",
+    "format-patch",
+    "gitk",
+    "grep",
+    "log",
+    "merge",
+    "mergetool",
+    "mv",
+    "pull",
+    "push",
+    "rebase",
+    "reset",
+    "restore",
+    "revert",
+    "rm",
+    "shortlog",
+    "show",
+    "sparse-checkout",
+    "stash",
+    "status",
+    "submodule",
+    "switch",
+    "tag",
+    "worktree",
+];
+
+const PARSEOPT_HELPER_COMMANDS: &[&str] = &[
+    "checkout",
+    "clone",
+    "config",
+    "help",
+    "ls-remote",
+    "notes",
+    "remote",
+    "symbolic-ref",
+    "version",
+];
+
 const GUIDE_PAGES: &[(&str, &str)] = &[
     ("core-tutorial", "A Git core tutorial for developers"),
     ("credentials", "Providing usernames and passwords to Git"),
@@ -205,13 +257,19 @@ const CONFIG_VARIABLES: &[&str] = &[
     "advice.statusHints",
     "am.keepcr",
     "apply.whitespace",
+    "branch.",
     "branch.autoSetupMerge",
+    "branch.autoSetupRebase",
+    "branch.sort",
+    "browser.",
     "checkout.defaultRemote",
     "clean.requireForce",
     "clone.defaultRemoteName",
+    "color.pager",
     "color.ui",
     "column.ui",
     "commit.gpgSign",
+    "completion.commands",
     "core.abbrev",
     "core.autocrlf",
     "core.bare",
@@ -229,17 +287,70 @@ const CONFIG_VARIABLES: &[&str] = &[
     "help.browser",
     "help.format",
     "help.htmlpath",
+    "include.path",
+    "includeIf.",
     "init.defaultBranch",
     "log.date",
+    "log.decorate",
+    "log.diffMerges",
     "merge.conflictStyle",
     "pull.rebase",
     "push.default",
     "rebase.autoSquash",
+    "remote.",
+    "remote.pushDefault",
     "rerere.enabled",
     "status.showUntrackedFiles",
+    "submodule.",
+    "submodule.active",
+    "submodule.alternateErrorStrategy",
+    "submodule.alternateLocation",
+    "submodule.fetchJobs",
+    "submodule.propagateBranches",
+    "submodule.recurse",
     "tag.gpgSign",
     "user.email",
     "user.name",
+];
+
+const CONFIG_ALL_VARIABLES: &[&str] = &[
+    "branch.<name>.description",
+    "branch.<name>.merge",
+    "branch.<name>.mergeOptions",
+    "branch.<name>.pushRemote",
+    "branch.<name>.rebase",
+    "branch.<name>.remote",
+    "browser.<tool>.cmd",
+    "browser.<tool>.path",
+    "includeIf.<condition>.path",
+    "remote.<name>.fetch",
+    "remote.<name>.followRemoteHEAD",
+    "remote.<name>.mirror",
+    "remote.<name>.negotiationInclude",
+    "remote.<name>.negotiationRestrict",
+    "remote.<name>.partialclonefilter",
+    "remote.<name>.promisor",
+    "remote.<name>.proxy",
+    "remote.<name>.proxyAuthMethod",
+    "remote.<name>.prune",
+    "remote.<name>.pruneTags",
+    "remote.<name>.push",
+    "remote.<name>.pushurl",
+    "remote.<name>.receivepack",
+    "remote.<name>.serverOption",
+    "remote.<name>.skipDefaultUpdate",
+    "remote.<name>.skipFetchAll",
+    "remote.<name>.tagOpt",
+    "remote.<name>.uploadpack",
+    "remote.<name>.url",
+    "remote.<name>.vcs",
+    "submodule.<name>.active",
+    "submodule.<name>.branch",
+    "submodule.<name>.fetchRecurseSubmodules",
+    "submodule.<name>.gitdir",
+    "submodule.<name>.ignore",
+    "submodule.<name>.update",
+    "submodule.<name>.url",
 ];
 
 pub(crate) fn is_builtin_command(command: &str) -> bool {
@@ -463,6 +574,134 @@ pub(crate) fn print_builtin_commands() {
         println!("{command}");
     }
 }
+
+pub(crate) fn print_list_cmds(groups: &str) -> Result<()> {
+    if groups == "parseopt" {
+        println!("{}", PARSEOPT_HELPER_COMMANDS.join(" "));
+        return Ok(());
+    }
+
+    let mut commands = BTreeSet::new();
+    for group in groups.split(',') {
+        match group {
+            "builtins" => {
+                commands.extend(BUILTIN_COMMANDS.iter().map(|command| (*command).to_string()));
+            }
+            "main" | "mainporcelain" | "list-mainporcelain" => {
+                commands.extend(
+                    MAIN_PORCELAIN_COMMANDS
+                        .iter()
+                        .map(|command| (*command).to_string()),
+                );
+            }
+            "list-guide" => {
+                commands.extend(GUIDE_PAGES.iter().map(|(name, _)| (*name).to_string()));
+            }
+            "alias" => {
+                for (name, _) in crate::commands::alias::list_aliases()? {
+                    commands.insert(name);
+                }
+            }
+            "others" | "nohelpers" | "list-complete" | "config" => {}
+            "" => {}
+            _ => {}
+        }
+    }
+
+    apply_completion_command_config(&mut commands)?;
+    for command in commands {
+        println!("{command}");
+    }
+    Ok(())
+}
+
+pub(crate) fn print_completion_helper(args: &[String]) -> bool {
+    let Some((helper_index, helper)) = args.iter().enumerate().find(|(_, arg)| {
+        matches!(
+            arg.as_str(),
+            "--git-completion-helper" | "--git-completion-helper-all"
+        )
+    }) else {
+        return false;
+    };
+    let show_all = helper == "--git-completion-helper-all";
+    let key = args[..helper_index]
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let output = match key.as_str() {
+        "checkout" | "switch" => Some(CHECKOUT_COMPLETION_HELPER),
+        "clone" if show_all => Some(CLONE_COMPLETION_HELPER_ALL),
+        "clone" => Some(CLONE_COMPLETION_HELPER),
+        "config" => Some(CONFIG_COMPLETION_HELPER),
+        "config get" => Some(CONFIG_GET_COMPLETION_HELPER),
+        "config set" => Some(CONFIG_SET_COMPLETION_HELPER),
+        "help" => Some(HELP_COMPLETION_HELPER),
+        "ls-remote" => Some(LS_REMOTE_COMPLETION_HELPER),
+        "notes edit" => Some(NOTES_EDIT_COMPLETION_HELPER),
+        "reflog" => Some(REFLOG_COMPLETION_HELPER),
+        "remote" => Some(REMOTE_COMPLETION_HELPER),
+        "send-email" => Some(SEND_EMAIL_COMPLETION_HELPER),
+        "symbolic-ref" => Some(SYMBOLIC_REF_COMPLETION_HELPER),
+        "version" => {
+            println!("{}", version_completion_helper());
+            return true;
+        }
+        _ => Some(""),
+    };
+    if let Some(output) = output {
+        println!("{output}");
+        true
+    } else {
+        false
+    }
+}
+
+fn apply_completion_command_config(commands: &mut BTreeSet<String>) -> Result<()> {
+    let Some(value) = config_value("completion.commands")? else {
+        return Ok(());
+    };
+    for token in value.split_whitespace() {
+        if let Some(remove) = token.strip_prefix('-') {
+            commands.remove(remove);
+        } else if !token.is_empty() {
+            commands.insert(token.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn version_completion_helper() -> String {
+    static SPECS: &[OptionSpec<'static>] = &[OptionSpec {
+        short: None,
+        long: Some("build-options"),
+        value: OptValue::Bool,
+        flags: OptFlags::NONE,
+        help: "",
+    }];
+    completion_helper_options(SPECS, false)
+}
+
+const CHECKOUT_COMPLETION_HELPER: &str = "--guess --overlay --auto-advance --quiet --recurse-submodules --progress --merge --conflict= --detach --track --orphan= --ignore-other-worktrees --ours --theirs --patch --unified= --inter-hunk-context= --ignore-skip-worktree-bits --pathspec-from-file= --pathspec-file-nul --no-guess -- --no-overlay --no-auto-advance --no-quiet --no-recurse-submodules --no-progress --no-merge --no-conflict --no-detach --no-track --no-orphan --no-ignore-other-worktrees --no-patch --no-ignore-skip-worktree-bits --no-pathspec-from-file --no-pathspec-file-nul";
+
+const CLONE_COMPLETION_HELPER: &str = "--verbose --quiet --progress --reject-shallow --no-checkout --bare --mirror --local --no-hardlinks --shared --recurse-submodules --jobs= --template= --reference= --reference-if-able= --dissociate --origin= --branch= --revision= --upload-pack= --depth= --shallow-since= --shallow-exclude= --single-branch --tags --shallow-submodules --separate-git-dir= --ref-format= --config= --server-option= --ipv4 --ipv6 --filter= --also-filter-submodules --remote-submodules --sparse --bundle-uri= --checkout --hardlinks -- --no-verbose --no-quiet --no-progress --no-reject-shallow --no-bare --no-mirror --no-local --no-shared --no-recurse-submodules --no-recursive --no-jobs --no-template --no-reference --no-reference-if-able --no-dissociate --no-origin --no-branch --no-revision --no-upload-pack --no-depth --no-shallow-since --no-shallow-exclude --no-single-branch --no-tags --no-shallow-submodules --no-separate-git-dir --no-ref-format --no-config --no-server-option --no-filter --no-also-filter-submodules --no-remote-submodules --no-sparse --no-bundle-uri";
+
+const CLONE_COMPLETION_HELPER_ALL: &str = "--verbose --quiet --progress --reject-shallow --no-checkout --bare --naked --mirror --local --no-hardlinks --shared --recurse-submodules --recursive --jobs= --template= --reference= --reference-if-able= --dissociate --origin= --branch= --revision= --upload-pack= --depth= --shallow-since= --shallow-exclude= --single-branch --tags --shallow-submodules --separate-git-dir= --ref-format= --config= --server-option= --ipv4 --ipv6 --filter= --also-filter-submodules --remote-submodules --sparse --bundle-uri= --checkout --hardlinks -- --no-verbose --no-quiet --no-progress --no-reject-shallow --no-bare --no-naked --no-mirror --no-local --no-shared --no-recurse-submodules --no-recursive --no-jobs --no-template --no-reference --no-reference-if-able --no-dissociate --no-origin --no-branch --no-revision --no-upload-pack --no-depth --no-shallow-since --no-shallow-exclude --no-single-branch --no-tags --no-shallow-submodules --no-separate-git-dir --no-ref-format --no-config --no-server-option --no-filter --no-also-filter-submodules --no-remote-submodules --no-sparse --no-bundle-uri";
+
+const CONFIG_COMPLETION_HELPER: &str =
+    "list get set unset rename-section remove-section edit";
+const CONFIG_GET_COMPLETION_HELPER: &str = "--global --system --local --worktree --file= --blob= --all --regexp --value= --fixed-value --url= --null --name-only --show-origin --show-scope --show-names --type= --bool --int --bool-or-int --bool-or-str --path --expiry-date --includes --default= --no-global -- --no-system --no-local --no-worktree --no-file --no-blob --no-all --no-regexp --no-value --no-fixed-value --no-url --no-null --no-name-only --no-show-origin --no-show-scope --no-show-names --no-type --no-includes --no-default";
+const CONFIG_SET_COMPLETION_HELPER: &str = "--global --system --local --worktree --file= --blob= --type= --bool --int --bool-or-int --bool-or-str --path --expiry-date --all --value= --fixed-value --comment= --append --no-global -- --no-system --no-local --no-worktree --no-file --no-blob --no-type --no-all --no-value --no-fixed-value --no-comment --no-append";
+const HELP_COMPLETION_HELPER: &str = "--all --external-commands --aliases --man --web --info --verbose --guides --user-interfaces --developer-interfaces --config --no-external-commands -- --no-aliases --no-man --no-web --no-info --no-verbose";
+const LS_REMOTE_COMPLETION_HELPER: &str = "--quiet --upload-pack= --tags --branches --refs --get-url --sort= --symref --server-option= --no-quiet -- --no-upload-pack --no-tags --no-branches --no-refs --no-get-url --no-sort --no-symref --no-server-option";
+const NOTES_EDIT_COMPLETION_HELPER: &str = "--message= --file= --reedit-message= --reuse-message= --edit --allow-empty --separator --stripspace --no-edit -- --no-allow-empty --no-separator --no-stripspace";
+const REFLOG_COMPLETION_HELPER: &str = "show list exists write delete drop expire";
+const REMOTE_COMPLETION_HELPER: &str =
+    "--verbose add rename remove set-head set-branches get-url set-url show prune update --no-verbose";
+const SEND_EMAIL_COMPLETION_HELPER: &str = "--cover-from-description= --cover-letter --validate --full-index --not --all --no-prefix --src-prefix= --dst-prefix= --notes";
+const SYMBOLIC_REF_COMPLETION_HELPER: &str =
+    "--quiet --delete --short --recurse --no-quiet -- --no-delete --no-short --no-recurse";
 
 pub(crate) fn unknown_command(command: &str, code: i32) -> Result<()> {
     eprintln!("git: '{command}' is not a git command. See 'git --help'.");
@@ -940,7 +1179,17 @@ fn print_interface_section(title: &str, rows: &[(&str, &str)]) {
 }
 
 fn print_config_human() {
-    for name in CONFIG_VARIABLES {
+    let mut names = CONFIG_VARIABLES
+        .iter()
+        .chain(CONFIG_ALL_VARIABLES.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        if name.ends_with('.') {
+            continue;
+        }
         println!("{name}");
     }
     println!("\n'git help config' for more information");

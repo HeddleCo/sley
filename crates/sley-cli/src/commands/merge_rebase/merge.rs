@@ -2324,6 +2324,11 @@ pub(crate) fn parse_maybe_bool(value: &str) -> Option<bool> {
 /// sticks even if `resolve` appears later.
 fn accept_merge_strategy(value: &str, options: &mut MergeOptions) -> Result<()> {
     match value {
+        "help" => {
+            eprintln!("Could not find merge strategy 'help'.");
+            eprintln!("Available strategies are: ours recursive subtree.");
+            Err(GitError::Exit(1))
+        }
         "recursive" | "ort" => {
             options.ours_strategy = false;
             options.explicit_twohead_strategy = true;

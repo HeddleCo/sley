@@ -1862,6 +1862,15 @@ fn for_each_ref_pattern_glob_matches(name: &str, pattern: &str, ignore_case: boo
     fn matches_from(pattern: &[u8], name: &[u8]) -> bool {
         match pattern {
             [] => name.is_empty(),
+            // `**` (git's WM_PATHNAME double-star) matches any run of bytes
+            // INCLUDING '/', so paired patterns like `refs/heads/*/**` reach
+            // nested refs (`refs/heads/feature/topic`) that a single `*` cannot.
+            [b'*', b'*', rest @ ..] => {
+                matches_from(rest, name)
+                    || (!name.is_empty() && matches_from(pattern, &name[1..]))
+            }
+            // A single `*` matches within one path segment only: it never
+            // consumes '/', matching git's per-segment wildmatch.
             [b'*', rest @ ..] => {
                 matches_from(rest, name)
                     || (!name.is_empty() && name[0] != b'/' && matches_from(pattern, &name[1..]))
@@ -1877,6 +1886,10 @@ fn for_each_ref_pattern_glob_matches(name: &str, pattern: &str, ignore_case: boo
     fn matches_from_ignore_case(pattern: &[u8], name: &[u8]) -> bool {
         match pattern {
             [] => name.is_empty(),
+            [b'*', b'*', rest @ ..] => {
+                matches_from_ignore_case(rest, name)
+                    || (!name.is_empty() && matches_from_ignore_case(pattern, &name[1..]))
+            }
             [b'*', rest @ ..] => {
                 matches_from_ignore_case(rest, name)
                     || (!name.is_empty()
