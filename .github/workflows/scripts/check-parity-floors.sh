@@ -1608,7 +1608,9 @@ declare -A FLOOR=(
     [t5401-update-hooks.sh]=11
     [t5409-colorize-remote-messages.sh]=2
     [t5410-receive-pack.sh]=1
-    [t5411-proc-receive-hook.sh]=198
+    # t5411 198->230 (2026-07-07): local push routed through serve_receive_pack
+    # (ea4977df); remaining 124 = report-option/rewrite cells + HTTP push routing.
+    [t5411-proc-receive-hook.sh]=230
     [t5501-fetch-push-alternates.sh]=3
     [t5502-quickfetch.sh]=2
     [t5503-tagfollow.sh]=6
@@ -1676,9 +1678,8 @@ declare -A FLOOR=(
     [t0212-trace2-event.sh]=11
     [t0213-trace2-ancestry.sh]=5
     [t0300-credentials.sh]=52
-    # t0301 15 observed (2026-07-07, credential-cache daemon); spawn_daemon read race may
-    # oscillate isolated runs — banked at stable-low 13 until the retry-loop fix lands.
-    [t0301-credential-cache.sh]=13
+    # t0301 FULL 52 (2026-07-07): spawn_daemon retry loop + SUN_LEN chdir bind fix (142e31a6).
+    [t0301-credential-cache.sh]=52
     [t0303-credential-external.sh]=10
     [t0450-txt-doc-vs-help.sh]=643
     [t0500-progress-display.sh]=16
