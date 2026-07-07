@@ -94,12 +94,16 @@ pub fn log_validate_inter_hunk_context(value: &str) -> Result<()> {
 }
 
 pub fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
-    // git's diff_opt_char (diff.c) accepts an empty value to suppress the marker;
-    // multi-byte values are rejected.
-    if value.len() <= 1 {
+    // git's diff_opt_char (diff.c) requires exactly one byte; empty and multibyte
+    // values are rejected.
+    if value.len() == 1 {
         return Ok(());
     }
-    eprintln!("error: {option} expects a character, got '{value}'");
+    if value.is_empty() {
+        eprintln!("error: {option} expects a character, got ''");
+    } else {
+        eprintln!("error: {option} expects a character, got '{value}'");
+    }
     Err(GitError::Exit(129))
 }
 
