@@ -6,7 +6,10 @@ use sley_config::GitConfig;
 use sley_core::Result;
 use sley_transport::{
     GitCredential, RemoteTransport, RemoteUrl,
-    credential::{credential_approve, credential_fill_simple, credential_reject},
+    credential::{
+        credential_approve, credential_fill as transport_credential_fill, credential_fill_simple,
+        credential_reject,
+    },
 };
 
 use crate::CredentialProvider;
@@ -50,12 +53,23 @@ pub fn credential_request_for_url(remote: &RemoteUrl) -> GitCredential {
     }
 }
 
-/// Fill `request` using configured credential helpers.
+/// Fill `request` using credential helpers and, when needed, `GIT_ASKPASS` /
+/// `core.askPass` (matching upstream git's HTTP auth retry path).
 pub fn credential_fill(
     config: Option<&GitConfig>,
-    request: GitCredential,
+    mut request: GitCredential,
 ) -> Result<Option<GitCredential>> {
-    credential_fill_simple(config, request)
+    if let Err(err) = transport_credential_fill(config, None, &mut request, true) {
+        if request.username.is_some() && request.password.is_some() {
+            return Ok(Some(request));
+        }
+        return Err(err);
+    }
+    if request.username.is_some() && request.password.is_some() {
+        Ok(Some(request))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Tell configured helpers to store (`approve = true`) or erase a credential.

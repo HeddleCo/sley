@@ -891,7 +891,10 @@ fn execute_push_http(
     let url = http_smart_rpc_url(&remote_url, GitService::ReceivePack)?;
     let content_type = smart_http_rpc_request_content_type(GitService::ReceivePack)?;
     let post_buffer = http_post_buffer(request.config);
-    let git_protocol = crate::http::http_git_protocol_header_value(Some(request.config))?;
+    let git_protocol = crate::http::http_git_protocol_header_value_for_service(
+        Some(request.config),
+        GitService::ReceivePack,
+    )?;
     let mut response = crate::http::http_send_with_auth(&remote_url, credentials, |auth| {
         let headers = crate::http::http_request_headers(auth, git_protocol.as_deref());
         send_receive_pack_body(

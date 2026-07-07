@@ -139,7 +139,22 @@ pub fn http_protocol_version_from_config(config: Option<&GitConfig>) -> Option<P
 
 /// Encode the `Git-Protocol` request header value, if any (`None` for protocol v0).
 pub fn http_git_protocol_header_value(config: Option<&GitConfig>) -> Result<Option<String>> {
-    match http_protocol_version_from_config(config) {
+    http_git_protocol_header_value_for_service(config, GitService::UploadPack)
+}
+
+/// Encode the `Git-Protocol` header for a specific smart-HTTP service.
+///
+/// Upstream `remote-curl.c` only negotiates protocol v2 for `git-upload-pack`;
+/// push (`git-receive-pack`) and other RPCs fall back to v0.
+pub fn http_git_protocol_header_value_for_service(
+    config: Option<&GitConfig>,
+    service: GitService,
+) -> Result<Option<String>> {
+    let mut version = http_protocol_version_from_config(config);
+    if matches!(version, Some(ProtocolVersion::V2)) && service != GitService::UploadPack {
+        version = Some(ProtocolVersion::V0);
+    }
+    match version {
         Some(ProtocolVersion::V0) => Ok(None),
         Some(version) => encode_git_protocol_header(&GitProtocolHeader {
             protocol: Some(version),
@@ -423,7 +438,7 @@ pub fn http_service_advertisements(
     credentials: &mut dyn CredentialProvider,
     config: Option<&GitConfig>,
 ) -> Result<HttpServiceAdvertisements> {
-    let git_protocol = http_git_protocol_header_value(config)?;
+    let git_protocol = http_git_protocol_header_value_for_service(config, service)?;
     let url = http_smart_info_refs_url(remote, service)?;
     let mut response = http_send_with_auth(remote, credentials, |auth| {
         client.get(&url, &http_request_headers(auth, git_protocol.as_deref()))
