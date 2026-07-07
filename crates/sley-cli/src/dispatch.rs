@@ -233,10 +233,11 @@ fn trace2_external_child_metadata(command: &str) {
 fn locate_external_in_path(name: &str) -> Option<PathBuf> {
     let path_var = env::var_os("PATH")?;
     for dir in env::split_paths(&path_var) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let candidate = dir.join(name);
+        let candidate = if dir.as_os_str().is_empty() {
+            PathBuf::from(name)
+        } else {
+            dir.join(name)
+        };
         if is_executable_file(&candidate) {
             return Some(candidate);
         }
@@ -321,6 +322,12 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "clean" => commands::plumbing::cmd_clean(&args[1..]),
         "clone" => commands::remote::cmd_clone(&args[1..]),
         "config" => commands::config_cmd::cmd_config(&args[1..]),
+        "credential" => commands::credential::cmd_credential(&args[1..]),
+        "credential-store" => commands::credential::cmd_credential_store(&args[1..]),
+        "credential-cache" => commands::credential::cmd_credential_cache(&args[1..]),
+        "credential-cache--daemon" => {
+            commands::credential::cmd_credential_cache_daemon(&args[1..])
+        }
         "count-objects" => commands::pack::cmd_count_objects(&args[1..]),
         "gc" => commands::pack::cmd_gc(&args[1..]),
         "maintenance" => commands::pack::cmd_maintenance(&args[1..]),
@@ -442,6 +449,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "mktag" => commands::mktag::cmd_mktag(&args[1..]),
         "patch-id" => commands::patch_id::cmd_patch_id(&args[1..]),
         "interpret-trailers" => commands::interpret_trailers::cmd_interpret_trailers(&args[1..]),
+        other if other.starts_with("credential-") => run_external_or_unknown(other, args),
         _ => commands::help::unknown_command(command, 1),
     }
 }

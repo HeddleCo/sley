@@ -22,6 +22,7 @@ pub(crate) mod cli_options;
 pub(crate) mod combined;
 pub(crate) mod commit;
 pub(crate) mod config_cmd;
+pub(crate) mod credential;
 pub(crate) mod daemon;
 pub(crate) mod describe;
 pub(crate) mod diagnose;

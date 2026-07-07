@@ -1488,6 +1488,7 @@ dependencies = [
 name = "sley-transport"
 version = "0.4.0"
 dependencies = [
+ "sley-config",
  "sley-core",
  "sley-protocol",
  "ureq",
