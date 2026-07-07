@@ -529,7 +529,7 @@ pub fn receive_pack_reachable_pack_into_local_repository(
     )
 }
 
-fn apply_receive_pack_ref_transaction(
+pub(crate) fn apply_receive_pack_ref_transaction(
     remote_git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,

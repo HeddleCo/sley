@@ -16,7 +16,7 @@ use sley_protocol::{
 };
 use sley_refs::FileRefStore;
 
-use crate::local::receive_pack_features;
+use crate::local::{apply_receive_pack_ref_transaction, receive_pack_features};
 use crate::push::stage_local_push_quarantine;
 use crate::proc_receive::{
     ProcReceiveHookInput, ReceivePackCommandState, apply_proc_receive_hook_failure,
@@ -27,8 +27,14 @@ use crate::receive_hooks::{
 };
 
 
-pub struct ReceivePackServerOptions {
+pub struct ReceivePackServerOptions<'a> {
     pub quiet: bool,
+    /// When set, traditional receive-pack hook stderr is captured for the push
+    /// client to print as `remote:` lines (in-process local transport).
+    pub remote_stderr: Option<&'a mut Vec<u8>>,
+    /// Run post-receive/post-update after ref updates. The local push client
+    /// runs these itself so hook stdin matches send-pack ordering.
+    pub run_post_hooks: bool,
 }
 
 pub struct ReceivePackServerRequest<'a> {
@@ -37,7 +43,7 @@ pub struct ReceivePackServerRequest<'a> {
     pub header: &'a ReceivePackPushRequestHeader,
     pub pack_reader: &'a mut dyn Read,
     pub config: &'a GitConfig,
-    pub options: ReceivePackServerOptions,
+    pub options: ReceivePackServerOptions<'a>,
 }
 
 pub enum ReceivePackServerReport {
@@ -51,6 +57,13 @@ pub struct ReceivePackServerOutcome {
 }
 
 pub fn serve_receive_pack(request: ReceivePackServerRequest<'_>) -> Result<ReceivePackServerOutcome> {
+    let mut discard_stderr = Vec::new();
+    let capture_stderr = request.options.remote_stderr.is_some();
+    let remote_stderr = request
+        .options
+        .remote_stderr
+        .unwrap_or(&mut discard_stderr);
+
     validate_receive_pack_push_request_features(
         &receive_pack_features(request.format),
         &ReceivePackPushRequest {
@@ -103,9 +116,10 @@ pub fn serve_receive_pack(request: ReceivePackServerRequest<'_>) -> Result<Recei
         && receive_pre_hooks_may_run(request.git_dir)
     {
         let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
+        let common_git_dir = repository_common_dir(request.git_dir);
         stage_local_push_quarantine(
             request.git_dir,
-            request.git_dir,
+            &common_git_dir,
             request.format,
             &local_db,
             &ok_commands,
@@ -119,14 +133,29 @@ pub fn serve_receive_pack(request: ReceivePackServerRequest<'_>) -> Result<Recei
         .unwrap_or_default();
 
     if unpack_error.is_none() && !ok_commands.is_empty() {
-        if run_pre_receive(request.git_dir, &ok_commands, push_options, &quarantine_env).is_err() {
+        if run_pre_receive(
+            request.git_dir,
+            &ok_commands,
+            push_options,
+            &quarantine_env,
+            remote_stderr,
+            capture_stderr,
+        )
+        .is_err()
+        {
             for state in &mut command_states {
                 if state.error_string.is_none() {
                     state.error_string = Some("pre-receive hook declined".into());
                 }
             }
         } else if let Some(name) =
-            run_update_hooks(request.git_dir, &ok_commands, &quarantine_env)?
+            run_update_hooks(
+                request.git_dir,
+                &ok_commands,
+                &quarantine_env,
+                remote_stderr,
+                capture_stderr,
+            )?
         {
             for state in &mut command_states {
                 if state.error_string.is_none() {
@@ -148,6 +177,8 @@ pub fn serve_receive_pack(request: ReceivePackServerRequest<'_>) -> Result<Recei
             push_options,
             use_atomic,
             use_push_options: request_uses_push_options(request.header),
+            remote_stderr,
+            capture_stderr,
         })?;
         command_states = output.commands;
         apply_proc_receive_hook_failure(&mut command_states, use_atomic, output.hook_failed);
@@ -164,6 +195,16 @@ pub fn serve_receive_pack(request: ReceivePackServerRequest<'_>) -> Result<Recei
         }
     }
 
+    if request.options.run_post_hooks {
+        run_receive_pack_post_hooks(
+            request.git_dir,
+            &command_states,
+            push_options,
+            remote_stderr,
+            capture_stderr,
+        );
+    }
+
     let report = build_report(&command_states, unpack_error, use_report_v2)?;
     Ok(ReceivePackServerOutcome {
         report,
@@ -175,17 +216,51 @@ pub fn run_receive_pack_post_hooks(
     git_dir: &Path,
     command_states: &[ReceivePackCommandState],
     push_options: &[String],
+    remote_stderr: &mut Vec<u8>,
+    capture_stderr: bool,
 ) {
     let landed: Vec<ReceivePackCommandState> = command_states
         .iter()
-        .filter(|state| state.error_string.is_none())
+        .filter(|state| {
+            state.error_string.is_none() && state.command.old_id != state.command.new_id
+        })
         .cloned()
         .collect();
     if landed.is_empty() {
         return;
     }
-    let _ = run_post_receive(git_dir, &landed, push_options);
-    let _ = run_post_update(git_dir, &landed);
+    let _ = run_post_receive(
+        git_dir,
+        &landed,
+        push_options,
+        remote_stderr,
+        capture_stderr,
+    );
+    let _ = run_post_update(git_dir, &landed, remote_stderr, capture_stderr);
+}
+
+pub fn receive_pack_server_report_v1(report: &ReceivePackServerReport) -> ReceivePackReportStatus {
+    match report {
+        ReceivePackServerReport::V1(status) => status.clone(),
+        ReceivePackServerReport::V2(status) => ReceivePackReportStatus {
+            unpack: status.unpack.clone(),
+            commands: status
+                .commands
+                .iter()
+                .map(|command| match command {
+                    ReceivePackCommandStatusV2::Ok { name, .. } => {
+                        ReceivePackCommandStatus::Ok { name: name.clone() }
+                    }
+                    ReceivePackCommandStatusV2::Ng { name, message } => {
+                        ReceivePackCommandStatus::Ng {
+                            name: name.clone(),
+                            message: message.clone(),
+                        }
+                    }
+                })
+                .collect(),
+        },
+    }
 }
 
 pub fn write_receive_pack_server_report(
@@ -357,39 +432,7 @@ fn apply_command_updates(
         .filter(|c| !c.new_id.is_null())
         .cloned()
         .collect();
-    let deletes: Vec<ReceivePackCommand> = applicable
-        .iter()
-        .filter(|c| c.new_id.is_null())
-        .cloned()
-        .collect();
-
-    let mut tx = store.transaction();
-    for command in &deletes {
-        tx.delete_with_precondition(
-            command.name.clone(),
-            sley_refs::RefDeletePrecondition::Direct(
-                (!command.old_id.is_null()).then_some(command.old_id.clone()),
-            ),
-            None,
-        );
-    }
-    for command in &updates {
-        let precondition = if command.old_id.is_null() {
-            sley_refs::RefPrecondition::MustNotExist
-        } else {
-            sley_refs::RefPrecondition::MustExistAndMatch(sley_refs::RefTarget::Direct(
-                command.old_id.clone(),
-            ))
-        };
-        tx.update_to(
-            command.name.clone(),
-            sley_refs::RefTarget::Direct(command.new_id.clone()),
-            precondition,
-            None,
-        );
-    }
-    tx.commit()?;
-    let _applied: HashSet<String> = deletes.iter().map(|c| c.name.clone()).collect();
+    apply_receive_pack_ref_transaction(git_dir, format, &store, &updates, &applicable)?;
     Ok(())
 }
 

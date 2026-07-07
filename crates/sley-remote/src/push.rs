@@ -19,8 +19,7 @@
 //! functions) so there is a single implementation.
 
 use std::fs;
-#[cfg(feature = "http")]
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,19 +32,26 @@ use sley_odb::{
 };
 #[cfg(feature = "http")]
 use sley_protocol::{
-    GitService, ReceivePackFeatures, ReceivePackPushRequestOptions, parse_receive_pack_features,
-    read_receive_pack_report_status, smart_http_rpc_request_content_type,
-    smart_http_rpc_result_content_type,
+    GitService, parse_receive_pack_features, read_receive_pack_report_status,
+    smart_http_rpc_request_content_type, smart_http_rpc_result_content_type,
 };
 use sley_protocol::{
-    PushSourceRef, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackPushRequest,
+    PushSourceRef, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures,
+    ReceivePackPushRequest, ReceivePackPushRequestHeader, ReceivePackPushRequestOptions,
     ReceivePackReportStatus, ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement,
     RefSpec, parse_refspec, plan_push_commands,
 };
 
 use crate::pack::push_pack_roots;
+use crate::pack::{PushPackRequest, write_push_packfile};
 #[cfg(feature = "http")]
-use crate::pack::{PushPackRequest, write_receive_pack_body};
+use crate::pack::write_receive_pack_body;
+use crate::proc_receive::{ReceivePackCommandState, parse_proc_receive_refs, proc_receive_ref_matches};
+
+use crate::receive_pack_server::{
+    ReceivePackServerOptions, ReceivePackServerRequest, receive_pack_server_report_v1,
+    serve_receive_pack,
+};
 use sley_refs::{FileRefStore, Ref, RefTarget};
 use sley_transport::RemoteUrl;
 #[cfg(feature = "http")]
@@ -825,7 +831,13 @@ fn execute_push_http(
         pack_objects: &pack_objects,
         remote_advertisements: &advertisements,
         features: &features,
-        options: receive_pack_push_options(&features, request.format, request.options.quiet),
+        options: receive_pack_push_options(
+            &features,
+            request.format,
+            request.options.quiet,
+            false,
+            &[],
+        ),
         thin: request.options.thin.wants_thin(),
     };
     let url = http_smart_rpc_url(&remote_url, GitService::ReceivePack)?;
@@ -1065,28 +1077,47 @@ fn execute_push_local(
     if remote_transfer_fsck_objects(&remote_common_git_dir) {
         fsck_pushed_objects(&local_db, request.format, &starts, &remote_excluded)?;
     }
-    let packfile = if starts.is_empty() {
-        Vec::new()
-    } else {
-        b"PACK".to_vec()
-    };
-    let receive_request = ReceivePackPushRequest {
-        commands: ReceivePackRequest {
-            shallow: Vec::new(),
-            commands: commands.clone(),
-            capabilities: Vec::new(),
-        },
-        push_options: None,
-        packfile,
-    };
-    let report = crate::local::receive_pack_reachable_pack_into_local_repository(
+    let remote_config =
+        sley_config::read_repo_config(&remote_git_dir, None).unwrap_or_default();
+    let report = if push_local_uses_receive_pack_server(
+        &remote_config,
         &remote_git_dir,
-        request.format,
-        &receive_request,
-        &local_db,
-        starts,
-        remote_excluded,
-    )?;
+        &commands,
+    ) {
+        local_push_via_receive_pack_server(LocalPushViaReceivePackRequest {
+            remote_git_dir: &remote_git_dir,
+            source_common_git_dir: request.common_git_dir,
+            format: request.format,
+            commands: &commands,
+            push_options: &[],
+            atomic: false,
+            quiet: request.options.quiet,
+            remote_advertisements: &remote_refs,
+            remote_stderr: None,
+        })?
+    } else {
+        let receive_request = ReceivePackPushRequest {
+            commands: ReceivePackRequest {
+                shallow: Vec::new(),
+                commands: commands.clone(),
+                capabilities: Vec::new(),
+            },
+            push_options: None,
+            packfile: if starts.is_empty() {
+                Vec::new()
+            } else {
+                b"PACK".to_vec()
+            },
+        };
+        crate::local::receive_pack_reachable_pack_into_local_repository(
+            &remote_git_dir,
+            request.format,
+            &receive_request,
+            &local_db,
+            starts,
+            remote_excluded,
+        )?
+    };
     validate_receive_pack_report(&report)?;
     Ok(PushOutcome {
         commands,
@@ -1307,6 +1338,12 @@ pub struct PushReportRequest<'a> {
     /// Receive-pack-side config values supplied by the invoked receive-pack
     /// command, e.g. `--receive-pack="git -c receive.denyDeletes=false receive-pack"`.
     pub receive_config_overrides: &'a [(String, String)],
+    /// Push options negotiated with receive-pack (`--push-option` / config).
+    pub push_options: &'a [String],
+    /// When set, receive-side hook stderr is captured for `remote:` output.
+    pub remote_stderr: Option<&'a mut Vec<u8>>,
+    /// Suppress receive-pack `quiet` capability negotiation.
+    pub quiet: bool,
 }
 
 /// Push to a local repository, returning git's per-ref status report instead of
@@ -1438,28 +1475,47 @@ pub fn push_local_with_report(
         if remote_transfer_fsck_objects(request.remote_common_git_dir) {
             fsck_pushed_objects(&local_db, format, &starts, &remote_excluded)?;
         }
-        let packfile = if starts.is_empty() {
-            Vec::new()
-        } else {
-            b"PACK".to_vec()
-        };
-        let receive_request = ReceivePackPushRequest {
-            commands: ReceivePackRequest {
-                shallow: Vec::new(),
-                commands: send.clone(),
-                capabilities: Vec::new(),
-            },
-            push_options: None,
-            packfile,
-        };
-        let report = crate::local::receive_pack_reachable_pack_into_local_repository(
+        let remote_config =
+            sley_config::read_repo_config(request.remote_git_dir, None).unwrap_or_default();
+        let report = if push_local_uses_receive_pack_server(
+            &remote_config,
             request.remote_git_dir,
-            format,
-            &receive_request,
-            &local_db,
-            starts,
-            remote_excluded,
-        )?;
+            &send,
+        ) {
+            local_push_via_receive_pack_server(LocalPushViaReceivePackRequest {
+                remote_git_dir: request.remote_git_dir,
+                source_common_git_dir: request.common_git_dir,
+                format,
+                commands: &send,
+                push_options: request.push_options,
+                atomic: request.atomic,
+                quiet: request.quiet,
+                remote_advertisements: &remote_refs,
+                remote_stderr: request.remote_stderr,
+            })?
+        } else {
+            let receive_request = ReceivePackPushRequest {
+                commands: ReceivePackRequest {
+                    shallow: Vec::new(),
+                    commands: send.clone(),
+                    capabilities: Vec::new(),
+                },
+                push_options: None,
+                packfile: if starts.is_empty() {
+                    Vec::new()
+                } else {
+                    b"PACK".to_vec()
+                },
+            };
+            crate::local::receive_pack_reachable_pack_into_local_repository(
+                request.remote_git_dir,
+                format,
+                &receive_request,
+                &local_db,
+                starts,
+                remote_excluded,
+            )?
+        };
         // Fold the receive-pack ng reports back onto the matching refs.
         if let ReceivePackUnpackStatus::Error(message) = &report.unpack {
             for reference in &mut refs {
@@ -1887,21 +1943,147 @@ fn verify_remote_object_format(features: &ReceivePackFeatures, format: ObjectFor
 /// git: report-status when advertised, ofs-delta when advertised, `quiet` only
 /// when both requested and advertised, and the advertised object-format only when
 /// the local repository's `format` is not SHA-1.
-#[cfg(feature = "http")]
 fn receive_pack_push_options(
     features: &ReceivePackFeatures,
     format: ObjectFormat,
     quiet: bool,
+    atomic: bool,
+    push_options: &[String],
 ) -> ReceivePackPushRequestOptions {
     ReceivePackPushRequestOptions {
         report_status: features.report_status,
         ofs_delta: features.ofs_delta,
         quiet: quiet && features.quiet,
+        atomic: atomic && features.atomic,
+        push_options: push_options.to_vec(),
         object_format: features
             .object_format
             .filter(|_| format != ObjectFormat::Sha1),
         ..ReceivePackPushRequestOptions::default()
     }
+}
+
+/// Whether a local push should use the full receive-pack server (proc-receive).
+pub fn push_local_uses_receive_pack_server(
+    config: &GitConfig,
+    remote_git_dir: &Path,
+    commands: &[ReceivePackCommand],
+) -> bool {
+    let _ = remote_git_dir;
+    let patterns = parse_proc_receive_refs(config);
+    if patterns.is_empty() {
+        return false;
+    }
+    commands
+        .iter()
+        .any(|command| proc_receive_ref_matches(&patterns, command))
+}
+
+struct LocalPushViaReceivePackRequest<'a> {
+    remote_git_dir: &'a Path,
+    source_common_git_dir: &'a Path,
+    format: ObjectFormat,
+    commands: &'a [ReceivePackCommand],
+    push_options: &'a [String],
+    atomic: bool,
+    quiet: bool,
+    remote_advertisements: &'a [RefAdvertisement],
+    remote_stderr: Option<&'a mut Vec<u8>>,
+}
+
+fn local_push_via_receive_pack_server(
+    request: LocalPushViaReceivePackRequest<'_>,
+) -> Result<ReceivePackReportStatus> {
+    let features = crate::local::receive_pack_features(request.format);
+    let local_db = FileObjectDatabase::from_git_dir(request.source_common_git_dir, request.format);
+    let pack_request = PushPackRequest {
+        local_db: &local_db,
+        format: request.format,
+        commands: request.commands,
+        pack_objects: &[],
+        remote_advertisements: request.remote_advertisements,
+        features: &features,
+        options: receive_pack_push_options(
+            &features,
+            request.format,
+            request.quiet,
+            request.atomic,
+            request.push_options,
+        ),
+        thin: false,
+    };
+    let header = sley_protocol::build_receive_pack_push_request_header(
+        &features,
+        request.commands.to_vec(),
+        pack_request.options.clone(),
+    )?;
+    let mut packfile = Vec::new();
+    write_push_packfile(&pack_request, &mut packfile)?;
+    let config =
+        sley_config::read_repo_config(request.remote_git_dir, None).unwrap_or_default();
+    let mut pack_reader = Cursor::new(packfile);
+    let mut discard_stderr = Vec::new();
+    let capture_stderr = request.remote_stderr.is_some();
+    let remote_stderr = request
+        .remote_stderr
+        .unwrap_or(&mut discard_stderr);
+    let outcome = serve_receive_pack(ReceivePackServerRequest {
+        git_dir: request.remote_git_dir,
+        format: request.format,
+        header: &ReceivePackPushRequestHeader {
+            commands: header.commands,
+            push_options: header.push_options,
+        },
+        pack_reader: &mut pack_reader,
+        config: &config,
+        options: ReceivePackServerOptions {
+            quiet: request.quiet,
+            remote_stderr: if capture_stderr {
+                Some(remote_stderr)
+            } else {
+                None
+            },
+            run_post_hooks: false,
+        },
+    })?;
+    Ok(receive_pack_server_report_v1(&outcome.report))
+}
+
+pub fn run_local_push_post_hooks(
+    remote_git_dir: &Path,
+    commands: &[ReceivePackCommand],
+    push_options: &[String],
+    remote_stderr: &mut Vec<u8>,
+    capture_stderr: bool,
+) -> Result<()> {
+    let landed: Vec<ReceivePackCommand> = commands
+        .iter()
+        .filter(|command| command.old_id != command.new_id)
+        .cloned()
+        .collect();
+    if landed.is_empty() {
+        return Ok(());
+    }
+    crate::receive_hooks::run_post_receive(
+        remote_git_dir,
+        &landed
+            .iter()
+            .map(|command| ReceivePackCommandState::new(command.clone()))
+            .collect::<Vec<_>>(),
+        push_options,
+        remote_stderr,
+        capture_stderr,
+    )?;
+    crate::receive_hooks::run_post_update(
+        remote_git_dir,
+        &landed
+            .iter()
+            .map(|command| ReceivePackCommandState::new(command.clone()))
+            .collect::<Vec<_>>(),
+        remote_stderr,
+        capture_stderr,
+    )?;
+    Ok(())
 }
 
 /// Plan the receive-pack commands for `refspecs`, pairing each with whether it is

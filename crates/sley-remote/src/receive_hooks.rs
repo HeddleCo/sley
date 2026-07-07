@@ -19,6 +19,8 @@ pub fn run_pre_receive(
     commands: &[ReceivePackCommand],
     push_options: &[String],
     quarantine_env: &[(String, String)],
+    remote_stderr: &mut Vec<u8>,
+    capture_stderr: bool,
 ) -> Result<()> {
     let Some(path) = find_hook_path(git_dir, "pre-receive") else {
         return Ok(());
@@ -30,6 +32,8 @@ pub fn run_pre_receive(
         &[],
         Some(&stdin),
         &receive_hook_env(push_options, quarantine_env),
+        remote_stderr,
+        capture_stderr,
     )
 }
 
@@ -37,6 +41,8 @@ pub fn run_update_hooks(
     git_dir: &Path,
     commands: &[ReceivePackCommand],
     quarantine_env: &[(String, String)],
+    remote_stderr: &mut Vec<u8>,
+    capture_stderr: bool,
 ) -> Result<Option<String>> {
     let env = receive_hook_env(&[], quarantine_env);
     for command in receive_update_hook_order(commands) {
@@ -48,7 +54,15 @@ pub fn run_update_hooks(
             &command.old_id.to_string(),
             &command.new_id.to_string(),
         ];
-        if let Err(err) = spawn_hook(git_dir, &path, &args, None, &env) {
+        if let Err(err) = spawn_hook(
+            git_dir,
+            &path,
+            &args,
+            None,
+            &env,
+            remote_stderr,
+            capture_stderr,
+        ) {
             if matches!(err, GitError::Exit(_)) {
                 return Ok(Some(command.name.clone()));
             }
@@ -62,6 +76,8 @@ pub fn run_post_receive(
     git_dir: &Path,
     commands: &[ReceivePackCommandState],
     push_options: &[String],
+    remote_stderr: &mut Vec<u8>,
+    capture_stderr: bool,
 ) -> Result<()> {
     let Some(path) = find_hook_path(git_dir, "post-receive") else {
         return Ok(());
@@ -73,10 +89,17 @@ pub fn run_post_receive(
         &[],
         Some(&stdin),
         &receive_hook_env(push_options, &[]),
+        remote_stderr,
+        capture_stderr,
     )
 }
 
-pub fn run_post_update(git_dir: &Path, commands: &[ReceivePackCommandState]) -> Result<()> {
+pub fn run_post_update(
+    git_dir: &Path,
+    commands: &[ReceivePackCommandState],
+    remote_stderr: &mut Vec<u8>,
+    capture_stderr: bool,
+) -> Result<()> {
     let Some(path) = find_hook_path(git_dir, "post-update") else {
         return Ok(());
     };
@@ -85,7 +108,15 @@ pub fn run_post_update(git_dir: &Path, commands: &[ReceivePackCommandState]) -> 
         .map(|state| state.command.name.clone())
         .collect();
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    spawn_hook(git_dir, &path, &arg_refs, None, &[])
+    spawn_hook(
+        git_dir,
+        &path,
+        &arg_refs,
+        None,
+        &[],
+        remote_stderr,
+        capture_stderr,
+    )
 }
 
 fn find_hook_path(git_dir: &Path, hook_name: &str) -> Option<PathBuf> {
@@ -100,6 +131,8 @@ fn spawn_hook(
     args: &[&str],
     stdin: Option<&[u8]>,
     env: &[(String, String)],
+    remote_stderr: &mut Vec<u8>,
+    capture_stderr: bool,
 ) -> Result<()> {
     let mut command = Command::new(path);
     command
@@ -112,7 +145,11 @@ fn spawn_hook(
             Stdio::null()
         })
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        .stderr(if capture_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        });
     for (key, value) in env {
         command.env(key, value);
     }
@@ -125,6 +162,11 @@ fn spawn_hook(
         }
     }
     let status = child.wait().map_err(|err| GitError::Io(err.to_string()))?;
+    if capture_stderr {
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = std::io::copy(&mut stderr, remote_stderr);
+        }
+    }
     if status.success() {
         Ok(())
     } else {

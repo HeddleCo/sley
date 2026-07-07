@@ -178,6 +178,8 @@ pub struct ProcReceiveHookInput<'a> {
     pub push_options: &'a [String],
     pub use_atomic: bool,
     pub use_push_options: bool,
+    pub remote_stderr: &'a mut Vec<u8>,
+    pub capture_stderr: bool,
 }
 
 pub struct ProcReceiveHookOutput {
@@ -188,7 +190,13 @@ pub struct ProcReceiveHookOutput {
 pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcReceiveHookOutput> {
     let hook_path = find_proc_receive_hook(input.git_dir)?;
     let Some(hook_path) = hook_path else {
-        eprintln!("error: cannot find hook 'proc-receive'");
+        if input.capture_stderr {
+            input
+                .remote_stderr
+                .extend_from_slice(b"error: cannot find hook 'proc-receive'\n");
+        } else {
+            eprintln!("error: cannot find hook 'proc-receive'");
+        }
         let mut commands = input.commands.to_vec();
         for state in &mut commands {
             if state.scheduled_for_proc_receive() {
@@ -201,13 +209,18 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
         });
     };
 
+    let capture_stderr = input.capture_stderr;
     let mut child = Command::new(&hook_path);
     child
         .current_dir(input.git_dir)
         .env("GIT_DIR", input.git_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(if capture_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        });
 
     for (index, option) in input.push_options.iter().enumerate() {
         if index == 0 {
@@ -281,7 +294,13 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
         let mut reader = stdout;
         let outcome = read_proc_receive_report(input.format, &mut reader, &mut commands);
         for message in &outcome.protocol_messages {
-            eprintln!("error: {message}");
+            if input.capture_stderr {
+                input
+                    .remote_stderr
+                    .extend_from_slice(format!("error: {message}\n").as_bytes());
+            } else {
+                eprintln!("error: {message}");
+            }
         }
         if outcome.hook_failed {
             hook_failed = true;
@@ -289,6 +308,11 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
     }
 
     let status = child.wait().map_err(|err| GitError::Io(err.to_string()))?;
+    if capture_stderr {
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = std::io::copy(&mut stderr, input.remote_stderr);
+        }
+    }
     if !status.success() {
         hook_failed = true;
     }
