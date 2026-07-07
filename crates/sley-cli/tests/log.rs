@@ -121,7 +121,6 @@ fn expected_log_medium(cwd: &Path, rev: &str) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "sley#122: pre-alpha cleanup output-parity regression"]
 fn log_minimal_format_matches_upstream_git() {
     let root = unique_temp_dir("log-minimal-format");
     fs::create_dir_all(&root).expect("create temp repo");
