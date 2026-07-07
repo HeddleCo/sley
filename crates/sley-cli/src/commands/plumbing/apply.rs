@@ -850,6 +850,26 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             sley_worktree::repository_index_path(&git_dir),
             index.write(format)?,
         )?;
+        // git's `apply --index`/`--3way` runs `refresh_index` before writing, so
+        // an entry it staged (or one left unchanged since the worktree was reset)
+        // carries the on-disk stat, not a zeroed/stale one. Without this a
+        // freshly-staged path's cached stat is zeroed and `git diff-files` reports
+        // a phantom modification (`ie_match_stat` compares size+mtime, not
+        // content). Refresh whenever the worktree was materialized (anything but
+        // `--cached`, which is index-only and must NOT stat against the worktree).
+        // Covers `--3way` with a gitlink patch, which reaches this direct-apply
+        // block via `touch_index` without setting `update_index`.
+        if !cached {
+            sley_worktree::refresh_index_paths(
+                &worktree_root,
+                &git_dir,
+                format,
+                &[],
+                /* quiet */ true,
+                /* ignore_missing */ true,
+                /* really_refresh */ false,
+            )?;
+        }
     } else if intent_to_add && !index_paths.is_empty() {
         add_intent_to_add(
             &worktree_root,
@@ -2467,6 +2487,20 @@ fn apply_write_three_way(
             },
         }
     }
+    // git's `apply --3way` refreshes the index after materializing the worktree,
+    // so a cleanly-resolved stage-0 entry records the on-disk stat rather than the
+    // zeroed one written above; otherwise `git diff-files` reports a phantom
+    // modification (`ie_match_stat` compares size+mtime, not content). Conflict
+    // stages (1/2/3) and gitlinks are left untouched by refresh.
+    sley_worktree::refresh_index_paths(
+        worktree_root,
+        git_dir,
+        format,
+        &[],
+        /* quiet */ true,
+        /* ignore_missing */ true,
+        /* really_refresh */ false,
+    )?;
     Ok(())
 }
 

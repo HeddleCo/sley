@@ -2292,14 +2292,23 @@ fn checkout_merge_autostash_branch_switch(
             &head,
         )?;
     }
-    checkout_twoway_dirty(
+    // Retry the switch WITHOUT clobbering untracked files. The autostash above
+    // only removed *tracked* local modifications; if the switch still fails now,
+    // an UNTRACKED file (or dir) in the target's way is the blocker, and git's
+    // `checkout -m` fails atomically rather than nuking it (t2500 "checkout -m
+    // does not nuke untracked file"). Restore the stashed changes to the worktree
+    // and propagate the error, leaving HEAD and the untracked file untouched.
+    if let Err(err) = checkout_twoway_dirty(
         git_dir,
         worktree_root,
         format,
         Some(target),
         recurse_submodules,
-        true,
-    )?;
+        false,
+    ) {
+        let _ = commands::stash::apply_stash_commit_quietly(&stash_oid);
+        return Err(err);
+    }
     let applied =
         commands::stash::apply_stash_commit_quietly(&stash_oid).unwrap_or(false);
     if applied {

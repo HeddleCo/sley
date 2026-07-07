@@ -2257,6 +2257,25 @@ fn apply_merge_results_to_index_and_worktree(
         }
         .write(ctx.format)?,
     )?;
+    // git's sequencer runs `read_and_refresh_cache` around each pick, so a
+    // stage-0 entry reused from the old index (its content unchanged by the
+    // merge, so its worktree file was not rewritten above) is re-stat'd against
+    // the worktree and its cached stat updated when the file's stat drifted but
+    // its content still hashes to the entry oid (e.g. an out-of-band `tar xf`
+    // rewrote the file with a fresh mtime between picks). Without this the stale
+    // cached stat makes `git diff-files` report a phantom modification
+    // (`ie_match_stat` compares size+mtime, not content). Quiet + ignore-missing
+    // so a genuinely dirty/absent path is left for status to report, never an
+    // error here.
+    sley_worktree::refresh_index_paths(
+        &ctx.worktree_root,
+        &ctx.git_dir,
+        ctx.format,
+        &[],
+        /* quiet */ true,
+        /* ignore_missing */ true,
+        /* really_refresh */ false,
+    )?;
     Ok(())
 }
 

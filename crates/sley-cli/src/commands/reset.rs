@@ -419,13 +419,30 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         }
         write_reset_orig_head(&git_dir, &old_head, format)?;
         if recurse_submodules {
-            commands::read_tree::reset_index_and_worktree_to_commit(
+            let reset_result = commands::read_tree::reset_index_and_worktree_to_commit(
                 &worktree_root,
                 &git_dir,
                 format,
                 &target_commit,
                 true,
-            )?;
+            );
+            // A failed `--recurse-submodules` reset (e.g. the target records a
+            // missing submodule commit) has already materialized the superproject
+            // worktree with fresh mtimes; git leaves the index refreshed/rolled
+            // back so `git diff-files` stays clean. Without a refresh the index
+            // keeps the pre-reset stat and reports every rewritten superproject
+            // path as a phantom modification (`ie_match_stat` compares size+mtime,
+            // not content). Refresh regardless of outcome, then propagate.
+            let _ = sley_worktree::refresh_index_paths(
+                &worktree_root,
+                &git_dir,
+                format,
+                &[],
+                /* quiet */ true,
+                /* ignore_missing */ true,
+                /* really_refresh */ false,
+            );
+            reset_result?;
         } else {
             sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
                 worktree_root.clone(),

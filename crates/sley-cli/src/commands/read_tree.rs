@@ -139,7 +139,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             let mut entries = read_tree_overlay(db, format, repo.config(), &tree_oids)?;
             if apply_worktree {
                 let worktree_root = worktree_root_for_git_dir(git_dir)?;
-                reset_worktree_to_entries(
+                let reset_result = reset_worktree_to_entries(
                     &worktree_root,
                     git_dir,
                     format,
@@ -148,7 +148,27 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                     None,
                     &mut entries,
                     recurse_submodules,
-                )?;
+                );
+                if reset_result.is_err() {
+                    // A `-u --reset --recurse-submodules` that fails on a missing
+                    // submodule commit has already rewritten the superproject
+                    // worktree with fresh mtimes but never persisted the new index
+                    // stat; git leaves the index refreshed so `git diff-files`
+                    // stays clean. Refresh the on-disk index against the worktree
+                    // before propagating so a rewritten superproject path is not
+                    // reported as a phantom modification (`ie_match_stat` compares
+                    // size+mtime, not content).
+                    let _ = sley_worktree::refresh_index_paths(
+                        &worktree_root,
+                        git_dir,
+                        format,
+                        &[],
+                        /* quiet */ true,
+                        /* ignore_missing */ true,
+                        /* really_refresh */ false,
+                    );
+                }
+                reset_result?;
             }
             if !parsed.dry_run {
                 write_paired_entries(git_dir, format, entries)?;
