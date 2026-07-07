@@ -599,7 +599,9 @@ declare -A FLOOR=(
     [t4017-diff-retval.sh]=38
     [t4034-diff-words.sh]=64
     [t5407-post-rewrite-hook.sh]=17
-    [t5500-fetch-pack.sh]=353
+    # 2026-07-06: 366 observed post gitproxy/sideband/partial-clone fixes; banked
+    # at stable-low 365 (agent runs saw 365/366).
+    [t5500-fetch-pack.sh]=365
     [t5571-pre-push-hook.sh]=11
     [t5537-fetch-shallow.sh]=12
     [t0008-ignores.sh]=398
@@ -689,7 +691,9 @@ declare -A FLOOR=(
     [t5516-fetch-push.sh]=111
     [t5520-pull.sh]=75
     # headroom (clone includeIf): t5601 109->110 (cell 110 onbranch guard during clone).
-    [t5601-clone.sh]=110
+    # 2026-07-06: 110->115 FULL — bundle-uri auto-discovery + HTTP partial clone +
+    # reject-shallow (c9e6e33b/140335fa); http-backend shim copy fix (00fe8250).
+    [t5601-clone.sh]=115
     # codex-wave-11 (partial clone): --filter=blob:none/blob:limit/tree/sparse:oid,
     # remote.origin.promisor + partialclonefilter config, promisor-pack + lazy
     # object fetch-on-read, filter+depth. t5616 14->36. MERGE-RESOLUTION: clone's
