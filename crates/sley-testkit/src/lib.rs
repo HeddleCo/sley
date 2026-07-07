@@ -4655,6 +4655,7 @@ pub fn diff_name_status_parity_for_format(format: ObjectFormat) -> Result<DiffNa
                 detect_copies: true,
                 find_copies_harder: true,
                 rename_empty: true,
+                ..Default::default()
             },
         )?;
         let rename_copy_rust = rename_copy_entries
@@ -5549,6 +5550,8 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
 }
+
+pub mod engine_parity;
 
 /// Harness for running UPSTREAM git's own `t/*.sh` test suite against the
 /// sley binary.

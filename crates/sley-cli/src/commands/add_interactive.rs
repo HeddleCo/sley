@@ -14,11 +14,12 @@ use std::env;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use sley::plumbing::{sley_config};
 
-use sley_config::GitConfig;
-use sley_core::{GitError, Result};
+use sley::GitConfig;
+use sley::{GitError, Result};
 
-use crate::{discover_git_dir, worktree_root_for_git_dir};
+use crate::{worktree_root_for_git_dir};
 
 /// Resolve the path to the running sley binary so the engine can re-invoke
 /// data-producing subcommands (diff, add, reset, apply) the same way git
@@ -865,7 +866,7 @@ fn run_patch_menu(
         _ => return Ok(()),
     };
     let selected_paths: Vec<String> = chosen.iter().map(|&i| items[i].path.clone()).collect();
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let cfg = resolve_patch_config(&git_dir, None, None, true)?;
     super::add_patch::run_add_patch(
         super::add_patch::PatchMode::Add,
@@ -883,7 +884,7 @@ fn run_patch_menu(
 /// `git add --interactive` / `git add -i [-- <pathspec>...]`.
 pub(crate) fn cmd_add_interactive(paths: &[String]) -> Result<()> {
     // Ensure we are inside a repo (git errors otherwise via discover).
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let _ = worktree_root_for_git_dir(&git_dir)?;
     let style = InteractiveStyle::load(&git_dir);
     run_main_loop(paths, &style)
@@ -900,7 +901,7 @@ pub(crate) fn cmd_add_patch(
     interhunk: Option<i64>,
     auto_advance: bool,
 ) -> Result<()> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let _ = worktree_root_for_git_dir(&git_dir)?;
     let cfg = resolve_patch_config(&git_dir, context, interhunk, auto_advance)?;
     let stdin = io::stdin();

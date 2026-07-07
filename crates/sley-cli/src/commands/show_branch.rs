@@ -16,13 +16,14 @@
 //! `--sha1-name`/`--no-name`/`--topics`/`--sparse`/`--merge-base`/
 //! `--independent`/`--topo-order`/`--date-order` are supported.
 //!
-//! Shared CLI helpers (`discover_git_dir`, `repository_object_format`,
+//! Shared CLI helpers (`cli_git_dir`, `repository_object_format`,
 //! `read_repo_config`, `resolve_revision`, `FileObjectDatabase`,
 //! `FileRefStore`, ...) are brought into scope through a glob of the crate
 //! root, the same pattern the other `commands::*` submodules use; a submodule
 //! can see its ancestor module's private items, so nothing has to be re-listed.
 
 use crate::*;
+use sley::plumbing::{sley_rev};
 
 /// git's `REV_SHIFT`: the two low flag bits are reserved (`UNINTERESTING`
 /// occupies bit 0), so ref `i` is tracked by bit `i + REV_SHIFT`.
@@ -112,7 +113,7 @@ pub(crate) fn cmd_show_branch(args: &[String]) -> Result<()> {
     let options = parse_args(args)?;
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let refs = FileRefStore::new(git_dir.clone(), format);

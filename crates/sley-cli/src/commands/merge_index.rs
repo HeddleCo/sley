@@ -50,7 +50,7 @@ pub(crate) fn cmd_merge_index(args: &[String]) -> Result<()> {
     };
     idx += 1;
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let mut index = read_worktree_index(&git_dir, format)?;

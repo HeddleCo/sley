@@ -1,7 +1,11 @@
 //! Native `git rerere` support.
+#![allow(clippy::expect_used)]
 
+use crate::commands::cli_options::opt_bool;
 use crate::*;
+use sley_options::{parse_options, OptionSpec};
 use std::time::{Duration, SystemTime};
+use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_worktree};
 
 const RERERE_MARKER_SIZE: usize = 7;
 const RERERE_RESOLVED_DAYS: u64 = 60;
@@ -31,10 +35,23 @@ struct RerereOptions {
     paths: Vec<String>,
 }
 
+const RERERE_USAGE: &[&str] =
+    &["git rerere [clear | forget <pathspec>... | diff | status | remaining | gc]"];
+
+fn rerere_option_specs() -> &'static [OptionSpec<'static>] {
+    static SPECS: &[OptionSpec<'static>] = &[opt_bool(
+        None,
+        Some("rerere-autoupdate"),
+        sley_options::OptFlags::NONE,
+        "register clean resolutions in index",
+    )];
+    SPECS
+}
+
 pub(crate) fn cmd_rerere(args: &[String]) -> Result<()> {
-    let options = parse_rerere_options(args)?;
+    let options = setup_rerere_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     match options.subcommand {
@@ -48,33 +65,47 @@ pub(crate) fn cmd_rerere(args: &[String]) -> Result<()> {
     }
 }
 
-fn parse_rerere_options(args: &[String]) -> Result<RerereOptions> {
+fn setup_rerere_options(args: &[String]) -> Result<RerereOptions> {
+    if args
+        .iter()
+        .any(|arg| arg == "-h" || arg == "--help")
+    {
+        return rerere_usage_stdout();
+    }
+    let parsed = match parse_options(args, rerere_option_specs(), RERERE_USAGE) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            // git prints the `error: unknown option ...` line before the usage.
+            if let Some(message) = error.message() {
+                if let Some(option) = message
+                    .strip_prefix("unknown option `")
+                    .and_then(|rest| rest.strip_suffix('\''))
+                {
+                    eprintln!("error: unknown option `{option}'");
+                } else if let Some(option) = message
+                    .strip_prefix("unknown switch `")
+                    .and_then(|rest| rest.strip_suffix('\''))
+                {
+                    eprintln!("error: unknown switch `{option}'");
+                } else {
+                    eprintln!("error: {message}");
+                }
+            }
+            return rerere_usage();
+        }
+    };
     let mut autoupdate = None;
+    for option in &parsed.options {
+        if option.long == Some("rerere-autoupdate") {
+            if let sley_options::ParsedValue::Bool(value) = option.value {
+                autoupdate = Some(value);
+            }
+        }
+    }
     let mut subcommand = None;
     let mut paths = Vec::new();
-    let mut positional_only = false;
-    for arg in args {
-        if positional_only {
-            paths.push(arg.clone());
-            continue;
-        }
-        match arg.as_str() {
-            "-h" | "--help" => return rerere_usage_stdout(),
-            "--" => positional_only = true,
-            "--rerere-autoupdate" => autoupdate = Some(true),
-            "--no-rerere-autoupdate" => autoupdate = Some(false),
-            value if value.starts_with("--no-rerere-autoupdate=") => {
-                eprintln!("error: option `no-rerere-autoupdate' takes no value");
-                return rerere_usage();
-            }
-            value if value.starts_with("--rerere-autoupdate=") => {
-                eprintln!("error: option `rerere-autoupdate' takes no value");
-                return rerere_usage();
-            }
-            value if value.starts_with("--") => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                return rerere_usage();
-            }
+    for arg in &parsed.positionals {
+        match *arg {
             "clear" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Clear),
             "diff" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Diff),
             "forget" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Forget),
@@ -797,12 +828,14 @@ fn stage_resolved_path(
         .into_iter()
         .filter(|entry| entry.path.as_bytes() != path.as_bytes())
         .collect();
-    entries.push(commands::merge_rebase::merge_index_entry(
-        path.as_bytes(),
-        mode,
-        oid,
-        0,
-    ));
+    let mut staged = commands::merge_rebase::merge_index_entry(path.as_bytes(), mode, oid, 0);
+    // git's update_paths stages via add_file_to_index, which records the
+    // file's stat (fill_stat_cache_info); a zeroed stat would make diff-files
+    // report the freshly staged path as modified.
+    if let Ok(metadata) = fs::metadata(&full) {
+        sley_worktree::fill_index_entry_stat_cache(&mut staged, &metadata);
+    }
+    entries.push(staged);
     entries.sort_by(|left, right| {
         left.path
             .cmp(&right.path)

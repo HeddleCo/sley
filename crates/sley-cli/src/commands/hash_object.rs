@@ -6,11 +6,12 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use sley::plumbing::{sley_worktree};
 
-use sley_config::GitConfig;
-use sley_core::{GitError, ObjectFormat, Result};
-use sley_object::ObjectType;
-use sley_odb::LooseObjectStore;
+use sley::GitConfig;
+use sley::{GitError, ObjectFormat, Result};
+use sley::plumbing::sley_object::ObjectType;
+use sley::plumbing::sley_odb::LooseObjectStore;
 
 use super::args::{
     GitArgCursor, LongOption, Terminator, option_takes_no_value, switch_requires_value, usage_error,
@@ -264,7 +265,7 @@ impl HashObjectInvocation {
             return Ok(());
         }
         let cwd = env::current_dir()?;
-        let repo_git_dir = discover_git_dir(&cwd).ok();
+        let repo_git_dir = crate::session::cli_git_dir_from(&cwd).ok();
         let _big_file_threshold = core_big_file_threshold(repo_git_dir.as_deref())?;
         let mut store = None;
         if self.write {

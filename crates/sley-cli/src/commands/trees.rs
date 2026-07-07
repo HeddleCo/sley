@@ -1,10 +1,11 @@
 //! Tree-construction plumbing commands.
 
 use std::env;
+use sley::plumbing::{sley_worktree};
 
-use sley_core::{GitError, Result};
+use sley::{GitError, Result};
 
-use crate::{discover_git_dir, repository_object_format};
+use crate::{repository_object_format};
 
 pub(crate) fn cmd_write_tree(args: &[String]) -> Result<()> {
     let mut missing_ok = false;
@@ -35,7 +36,7 @@ pub(crate) fn cmd_write_tree(args: &[String]) -> Result<()> {
         }
         idx += 1;
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let oid = sley_worktree::write_tree_from_index_with_options(
         git_dir,

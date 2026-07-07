@@ -10,6 +10,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use sley::plumbing::{sley_config, sley_core};
 
 use sley_archive::{ArchiveExtraEntry, ArchiveExtras, ZipArchiveOptions};
 
@@ -118,7 +119,7 @@ fn parse_mode(value: &str) -> Result<DiagnoseMode> {
 /// stdout and also captured as the `diagnostics.log` virtual file.
 fn create_diagnostics_archive(zip_path: &Path, mode: DiagnoseMode) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree = worktree_root_for_git_dir(&git_dir)
         .ok()

@@ -27,15 +27,17 @@
 //! `00000000 (Not Committed Yet ...)` pseudo-commit; that working-tree overlay
 //! is not implemented here, so for a *clean* working tree this matches
 //! `git blame` exactly, and for explicit revisions it always matches.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use sley::plumbing::{sley_index, sley_rev, sley_worktree};
 // Glob the crate root for shared plumbing (RepositoryContext, repository_abbrev,
 // FileObjectDatabase, FileRefStore, Commit, Tree, the identity/date formatting
 // helpers, and so on). See commands::stash for the rationale: a submodule can
 // reach its ancestor module's private items, so everything visible at the crate
 // root is in scope here without re-listing it.
 use crate::*;
-use sley_core::Signature;
-use sley_object::TreeEntries;
+use sley::Signature;
+use sley::plumbing::sley_object::TreeEntries;
 
 /// What to print in the metadata column for each line's author.
 #[derive(Clone, Copy)]
@@ -828,7 +830,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
 /// Parse a `--diff-algorithm <value>` argument to a [`DiffAlgorithm`]. An
 /// unknown value is the same fatal git reports.
 fn parse_blame_diff_algorithm(value: &str) -> Result<sley_diff_merge::DiffAlgorithm> {
-    use sley_diff_merge::DiffAlgorithm;
+    use sley::plumbing::sley_diff_merge::DiffAlgorithm;
     Ok(match value {
         "myers" | "default" => DiffAlgorithm::Myers,
         "minimal" => DiffAlgorithm::Minimal,
@@ -2133,22 +2135,21 @@ fn find_parent_origin(
 
     let parent_tree = sley_rev::peel_to_tree(db, format, parent)?;
     let child_tree = sley_rev::peel_to_tree(db, format, &origin.commit)?;
-    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+    let entries = sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         &parent_tree,
         &child_tree,
-        sley_diff_merge::RenameDetectionOptions {
-            base: sley_diff_merge::DiffNameStatusOptions {
-                detect_renames: true,
-                detect_copies: allow_whole_copy,
-                find_copies_harder: allow_whole_copy,
-                rename_empty: true,
-            },
+        sley_diff_merge::DiffNameStatusOptions {
+            detect_renames: true,
+            detect_copies: allow_whole_copy,
+            find_copies_harder: allow_whole_copy,
+            rename_empty: true,
             detect_inexact: true,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             rename_limit: 0,
+            ..Default::default()
         },
     )?;
 
@@ -2243,12 +2244,12 @@ fn copy_candidate_paths(
     }
 
     let child_tree = sley_rev::peel_to_tree(db, format, &origin.commit)?;
-    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+    let entries = sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         &parent_tree,
         &child_tree,
-        sley_diff_merge::RenameDetectionOptions::default(),
+        sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     let mut out = Vec::new();
     for entry in entries {

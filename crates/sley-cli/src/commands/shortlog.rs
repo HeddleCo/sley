@@ -7,6 +7,7 @@
 //! unless `--summary` is requested, the folded subject of every commit indented
 //! beneath a `Name (count):` header.
 
+use sley::plumbing::{sley_rev};
 // Command modules pull their shared plumbing from the crate root. A glob import
 // works because a submodule can access its ancestor module's items (including
 // private ones), so every helper, type, and re-export visible at the crate root
@@ -732,7 +733,7 @@ fn shortlog_render_format(
         signature: None,
         color: false,
         output_encoding: "UTF-8",
-        mailmap,
+        mailmap: &CliMailmapAdapter(mailmap),
         use_mailmap: false,
     };
     let mut out = Vec::with_capacity(compiled.estimated_line_capacity());
@@ -756,7 +757,7 @@ fn shortlog_trailer_group_keys(
         "key={token},valueonly,only,unfold"
     ))
     .map_err(|_| GitError::Command(format!("invalid trailer group {token}")))?;
-    let rendered = commands::for_each_ref::for_each_ref_format_trailers(message, &opts);
+    let rendered = sley_pretty::format_trailers_from_commit(message, &opts);
     let text = String::from_utf8_lossy(&rendered);
     let mut keys = Vec::new();
     let mut seen = HashSet::new();

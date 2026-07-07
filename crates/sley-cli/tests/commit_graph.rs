@@ -122,6 +122,16 @@ fn create_commit_graph_fixture_with_env(root: &Path, envs: &[(&str, &str)]) {
         root,
         &["init", "-q", "-b", "main"],
     );
+    // When GIT_OBJECT_DIRECTORY is a relative path it lives inside the worktree,
+    // so `git add .` would descend into the object database — and race the
+    // transient `maintenance.lock` git's auto-maintenance drops there
+    // ("unable to stat '<objdir>/maintenance.lock'"). Ignore the object dir so
+    // the fixture never stages it.
+    for (key, value) in envs {
+        if *key == "GIT_OBJECT_DIRECTORY" && !Path::new(value).is_absolute() {
+            fs::write(root.join(".gitignore"), format!("/{value}/\n")).expect("write gitignore");
+        }
+    }
     run_success(
         sley_testkit::oracle_git(),
         root,

@@ -1,11 +1,16 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod bisect;
 pub mod graph;
 pub mod revlist;
 mod setup;
 
+pub mod diff_options;
+
 use sley_config::GitConfig;
 use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 
+pub use diff_options::{DiffFilter, DiffOptions, DiffOutputFormat, DiffRelativeMode, DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleDiffFormat, SubmoduleIgnoreMode, diff_pickaxe_requires_non_empty_error, diff_stat_count_option, diff_stat_parse_width_option, parse_color_moved_mode, parse_color_moved_ws, parse_diff_filter, parse_diff_rename_limit, parse_similarity_threshold, parse_submodule_ignore_mode, parse_unified_count, resolve_diff_context, setup_diff_options};
 pub use setup::{
     MatchedRef, NoWalkMode, PseudoRefResolver, RevisionOptions, RevisionOrder,
     RevisionSetupContext, RevisionSymmetricRange, RevisionTip, SetupRevisions,
@@ -2561,12 +2566,8 @@ impl<'a> CommitGraphContext<'a> {
     }
 
     fn direct_graph(&mut self) -> &DirectCommitGraph {
-        if self.direct_graph.is_none() {
-            self.direct_graph = Some(load_direct_commit_graph(self.git_dir, self.format));
-        }
         self.direct_graph
-            .as_ref()
-            .expect("direct commit graph load state initialized")
+            .get_or_insert_with(|| load_direct_commit_graph(self.git_dir, self.format))
     }
 
     fn count_reachable_direct(
@@ -2619,16 +2620,10 @@ impl<'a> CommitGraphContext<'a> {
     /// Resolve `oid`'s graph metadata, loading and parsing the graph on first
     /// use. Returns `None` when the commit is not in the graph.
     fn lookup(&mut self, oid: &ObjectId) -> Result<Option<&GraphCommit>> {
-        if self.commits.is_none() {
-            self.commits = Some(
-                load_commit_graph_map(self.git_dir, self.format).map_err(|err| err.to_string()),
-            );
-        }
-        match self
-            .commits
-            .as_ref()
-            .expect("commit graph map load state initialized")
-        {
+        let commits = self.commits.get_or_insert_with(|| {
+            load_commit_graph_map(self.git_dir, self.format).map_err(|err| err.to_string())
+        });
+        match commits {
             Ok(map) => Ok(map.get(oid)),
             Err(message) => Err(GitError::InvalidFormat(message.clone())),
         }
@@ -4285,6 +4280,7 @@ fn tree_same_for_pathspec(
         detect_copies: false,
         find_copies_harder: false,
         rename_empty: false,
+        ..Default::default()
     };
     let changes = sley_diff_merge::diff_name_status_trees_with_options(
         db,
@@ -4315,6 +4311,7 @@ fn tree_same_as_empty_for_pathspec(
         detect_copies: false,
         find_copies_harder: false,
         rename_empty: false,
+        ..Default::default()
     };
     let changes = sley_diff_merge::diff_name_status_empty_tree_with_options(
         db,
@@ -6477,12 +6474,23 @@ pub fn merge_bases<R: ObjectReader>(
     Ok(bases)
 }
 
-/// BFS the ancestry of `start`, recording the shortest distance to each commit,
-/// using a pre-loaded graph context for parent lookups so several walks can
-/// share one parsed commit-graph. The traversal is an unpruned BFS by design:
-/// the recorded depths feed the merge-base lowest-common-ancestor reduction,
-/// which depends on every reachable commit's shortest distance, so dropping
-/// nodes would change the result.
+/// BFS the ancestry of `start`, recording the shortest distance to each commit.
+/// Uses the commit-graph for parent lookups when available and honors shallow
+/// graft boundaries via [`ObjectReader::is_shallow_graft`]. The traversal is an
+/// unpruned BFS by design: the recorded depths feed merge-base and fast-forward
+/// checks that depend on every reachable commit's shortest distance.
+pub fn ancestor_depths<R: ObjectReader>(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    reader: &R,
+    start: &ObjectId,
+) -> Result<HashMap<ObjectId, usize>> {
+    let mut graph = CommitGraphContext::load(git_dir, format);
+    ancestor_depths_with_graph(&mut graph, reader, start)
+}
+
+/// Same as [`ancestor_depths`], but reuses a pre-loaded graph context so several
+/// walks can share one parsed commit-graph.
 fn ancestor_depths_with_graph<R: ObjectReader>(
     graph: &mut CommitGraphContext<'_>,
     reader: &R,

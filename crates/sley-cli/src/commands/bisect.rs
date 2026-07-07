@@ -16,7 +16,9 @@
 //! * `refs/bisect/<term-bad>` -- the single known-bad commit.
 //! * `refs/bisect/<term-good>-<oid>` -- one ref per known-good commit.
 //! * `refs/bisect/skip-<oid>` -- one ref per skipped commit.
+#![allow(clippy::expect_used)]
 use crate::*;
+use sley::plumbing::{sley_diff_merge, sley_worktree};
 
 // Upstream `enum bisect_error` values; the process exit code is the negation.
 const BISECT_OK: i32 = 0;
@@ -75,7 +77,7 @@ struct BisectRepo {
 impl BisectRepo {
     fn open() -> Result<Self> {
         let cwd = env::current_dir()?;
-        let git_dir = discover_git_dir(&cwd)?;
+        let git_dir = crate::session::cli_git_dir_from(&cwd)?;
         let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?;
         let format = repository_object_format(&git_dir)?;
         Ok(Self {
@@ -1498,7 +1500,7 @@ fn bisect_pathspec(repo: &BisectRepo) -> Result<Option<sley_rev::Pathspec>> {
 /// the `approx_halfway` early exit, and the `filter_skipped` + `skip_away` skip
 /// machinery) lives in [`sley_rev::bisect`] — a shared primitive used both here
 /// and by `rev-list --bisect`.
-use sley_rev::bisect::{SkipFilter, do_find_bisection, estimate_bisect_steps, managed_skipped};
+use sley::plumbing::sley_rev::bisect::{SkipFilter, do_find_bisection, estimate_bisect_steps, managed_skipped};
 
 fn error_if_skipped_commits(
     repo: &BisectRepo,
@@ -1914,19 +1916,19 @@ fn bisect_show_commit(repo: &BisectRepo, oid: &ObjectId, out: &mut dyn Write) ->
         Some(parent) => {
             let parent_object = db.read_object(parent)?;
             let parent_commit = Commit::parse(repo.format, &parent_object.body)?;
-            sley_diff_merge::diff_name_status_trees_with_rename_options(
+            sley_diff_merge::diff_name_status_trees_with_options(
                 &db,
                 repo.format,
                 &parent_commit.tree,
                 &new_tree,
-                sley_diff_merge::RenameDetectionOptions::default(),
+                sley_diff_merge::DiffNameStatusOptions::default(),
             )?
         }
-        None => sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
+        None => sley_diff_merge::diff_name_status_empty_tree_with_options(
             &db,
             repo.format,
             &new_tree,
-            sley_diff_merge::RenameDetectionOptions::default(),
+            sley_diff_merge::DiffNameStatusOptions::default(),
         )?,
     };
     let stat_entries = collect_diff_stat_entries(&entries, &db, None, false)?;

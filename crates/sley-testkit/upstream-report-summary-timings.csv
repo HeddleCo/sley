@@ -1,5 +1,4 @@
 label,script,command,result,elapsed_ms,ok,notok,total,plan_total
-2026-07-02T05:20:13Z,t5324-split-commit-graph.sh,t5324-split-commit-graph.sh,FAIL,30090,27,15,42,42
-2026-07-02T05:20:13Z,t5304-prune.sh,t5304-prune.sh,PASS,3328,32,0,32,32
-2026-07-02T05:20:13Z,t6500-gc.sh,t6500-gc.sh,PASS,7045,35,0,35,35
-2026-07-02T05:20:13Z,t5334-incremental-multi-pack-index.sh,t5334-incremental-multi-pack-index.sh,FAIL,2602,21,1,22,22
+2026-07-06T21:12:48Z,t5601-clone.sh,t5601-clone.sh,FAIL,51526,109,6,115,115
+2026-07-06T21:12:55Z,t5601-clone.sh,t5601-clone.sh,FAIL,83951,110,5,115,115
+2026-07-06T21:12:35Z,t5601-clone.sh,t5601-clone.sh,FAIL,173765,110,5,115,115

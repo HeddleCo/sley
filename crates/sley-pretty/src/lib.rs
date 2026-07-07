@@ -1250,6 +1250,25 @@ pub mod presets {
     }
 }
 
+mod log;
+mod trailers;
+
+pub use log::{
+    LogDescribeLookup, LogFormatContext, LogSignatureLookup, LogSignatureView, MailmapLookup,
+    StashFormatContext, append_log_oid, commit_author_for_commit_encoding, commit_body,
+    commit_encoding, commit_object_message_and_optional_encoding,
+    commit_encoding_config, commit_encoding_header_from_config, commit_identity_name_email,
+    commit_message_for_commit_encoding, commit_message_for_output, commit_message_has_invalid_utf8,
+    commit_message_has_nul, commit_message_lines, commit_subject, commit_subject_bytes,
+    emit_compiled_log_format, emit_compiled_log_format_limited_commit, emit_compiled_log_format_metadata,
+    emit_compiled_log_format_metadata_with_message, emit_compiled_stash_format, emit_log_one_token,
+    encoding_for_name, encoding_is_none, encoding_is_utf8, format_log_abbrev_oid,
+    format_log_commit_header_oid, format_log_oid, format_subst_for_commit, git_color_name_to_ansi,
+    git_color_spec_to_ansi, log_email_local_part, log_output_encoding, log_pick_utf8,
+    log_reencode_message, log_rewrap, log_sanitized_subject,
+};
+pub use trailers::format_trailers_from_commit;
+
 #[cfg(test)]
 mod tests {
     use super::*;

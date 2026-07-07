@@ -21,7 +21,7 @@
 use crate::*;
 
 use crate::commands::ref_command_stream::unquote_c_style;
-use sley_worktree::{
+use sley::plumbing::sley_worktree::{
     SparseCheckout, SparseCheckoutMode, apply_sparse_checkout_with_mode, path_in_sparse_checkout,
 };
 
@@ -1203,7 +1203,7 @@ fn clean_pattern_line(raw: &[u8]) -> &[u8] {
 /// work tree".
 fn sparse_context() -> Result<SparseContext> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = require_work_tree(&git_dir)?;
     let prefix = sparse_prefix(&worktree_root)?;
@@ -1239,7 +1239,7 @@ fn sparse_prefix(worktree_root: &Path) -> Result<Vec<u8>> {
 /// directory's parent (it is never read for `check-rules`).
 fn sparse_context_no_worktree() -> Result<SparseContext> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?
         .unwrap_or_else(|| git_dir.parent().unwrap_or(&git_dir).to_path_buf());

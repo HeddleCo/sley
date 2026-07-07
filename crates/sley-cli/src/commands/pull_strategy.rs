@@ -14,6 +14,7 @@
 //! the same kind of "unsupported" error the general pull path produces, so
 //! behaviour only *grows* for the `-s ours` case.
 use crate::*;
+use sley::plumbing::{sley_rev};
 
 /// Returns `Some(index)` when `args` carries a `-s`/`--strategy` option, with
 /// `index` pointing at the option itself (its value may live in the same token
@@ -78,7 +79,7 @@ pub(crate) fn cmd_pull_with_strategy(args: &[String]) -> Result<()> {
     };
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);

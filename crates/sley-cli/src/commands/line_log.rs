@@ -19,9 +19,9 @@
 //! the per-line diff that drives range mapping uses sley's Myers diff.
 
 use crate::*;
-use sley_diff_merge::render::LineRange;
-use sley_odb::FileObjectDatabase;
-use sley_rev::{CommitRecord, resolve_tree_path_entry};
+use sley::plumbing::sley_diff_merge::render::LineRange;
+use sley::ObjectDatabase as FileObjectDatabase;
+use sley::plumbing::sley_rev::{CommitRecord, resolve_tree_path_entry};
 use std::collections::HashMap;
 
 /// One `-L` argument before resolution: the raw `<range>:<file>` string.
@@ -847,19 +847,24 @@ fn commit_name_status(
         detect_copies: false,
         find_copies_harder: false,
         rename_empty: true,
+        ..Default::default()
     };
     let entries = match (parent_tree, detect_renames) {
-        (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+        (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_options(
             db,
             format,
             parent,
             tree,
-            sley_diff_merge::RenameDetectionOptions {
-                base,
+            sley_diff_merge::DiffNameStatusOptions {
+                detect_renames,
+                detect_copies: false,
+                find_copies_harder: false,
+                rename_empty: true,
                 detect_inexact: true,
                 rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 rename_limit: 0,
+                ..Default::default()
             },
         )?,
         (Some(parent), false) => {

@@ -27,9 +27,9 @@
 //! markers, color spans) here — the part every diff-emitting command used to
 //! re-derive — while leaving the repository-coupled concerns in the consumer.
 
-use crate::{
-    DiffAlgorithm, DiffLine, DiffOp, WsIgnore, line_is_blank, myers_diff_lines_ws,
-    patience_diff_lines_anchored, split_lines,
+use crate::line_diff::{
+    line_is_blank, myers_diff_lines_ws, patience_diff_lines_anchored, split_lines, DiffAlgorithm,
+    DiffLine, DiffOp, WsIgnore,
 };
 use std::collections::HashMap;
 

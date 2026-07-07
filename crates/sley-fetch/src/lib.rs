@@ -13,10 +13,21 @@ use sley_protocol::{
 };
 use std::io::{Cursor, ErrorKind, Read};
 
+fn raw_pack_install_options(
+    promisor: bool,
+    max_input_size: Option<u64>,
+) -> RawPackInstallOptions {
+    RawPackInstallOptions {
+        promisor,
+        max_input_size,
+    }
+}
+
 pub fn install_upload_pack_raw_response_from_reader<I, R>(
     format: ObjectFormat,
     reader: &mut R,
     destination: &I,
+    max_input_size: Option<u64>,
 ) -> Result<RawPackInstallResult>
 where
     I: RawPackInstaller,
@@ -24,13 +35,17 @@ where
 {
     let header = read_upload_pack_raw_packfile_response_header(format, reader)?;
     let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
-    destination.install_raw_pack_from_reader(&mut pack_reader)
+    destination.install_raw_pack_from_reader_with_options(
+        &mut pack_reader,
+        raw_pack_install_options(false, max_input_size),
+    )
 }
 
 pub fn install_upload_pack_raw_promisor_response_from_reader<R>(
     format: ObjectFormat,
     reader: &mut R,
     destination: &FileObjectDatabase,
+    max_input_size: Option<u64>,
 ) -> Result<RawPackInstallResult>
 where
     R: Read,
@@ -39,7 +54,7 @@ where
     let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
     let result = destination.install_raw_pack_from_reader_with_options(
         &mut pack_reader,
-        RawPackInstallOptions { promisor: true },
+        raw_pack_install_options(true, max_input_size),
     )?;
     Ok(RawPackInstallResult {
         object_ids: result.object_ids,
@@ -50,6 +65,7 @@ pub fn install_upload_pack_shallow_raw_response_from_reader<I, R>(
     format: ObjectFormat,
     reader: &mut R,
     destination: &I,
+    max_input_size: Option<u64>,
 ) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
 where
     I: RawPackInstaller,
@@ -58,7 +74,10 @@ where
     let (shallow, header) =
         read_upload_pack_shallow_info_and_raw_packfile_response_header(format, reader)?;
     let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
-    let result = destination.install_raw_pack_from_reader(&mut pack_reader)?;
+    let result = destination.install_raw_pack_from_reader_with_options(
+        &mut pack_reader,
+        raw_pack_install_options(false, max_input_size),
+    )?;
     Ok((shallow, result))
 }
 
@@ -66,6 +85,7 @@ pub fn install_upload_pack_shallow_raw_promisor_response_from_reader<R>(
     format: ObjectFormat,
     reader: &mut R,
     destination: &FileObjectDatabase,
+    max_input_size: Option<u64>,
 ) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
 where
     R: Read,
@@ -75,7 +95,7 @@ where
     let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
     let result = destination.install_raw_pack_from_reader_with_options(
         &mut pack_reader,
-        RawPackInstallOptions { promisor: true },
+        raw_pack_install_options(true, max_input_size),
     )?;
     Ok((
         shallow,
@@ -90,6 +110,7 @@ pub fn install_protocol_v2_fetch_response_from_reader<I, R>(
     reader: &mut R,
     sideband_all: bool,
     destination: &I,
+    max_input_size: Option<u64>,
 ) -> Result<(ProtocolV2FetchResponseHeader, Option<RawPackInstallResult>)>
 where
     I: RawPackInstaller,
@@ -100,7 +121,10 @@ where
         return Ok((header, None));
     }
     let mut pack_reader = ProtocolV2PackfileReader::new(reader);
-    let result = destination.install_raw_pack_from_reader(&mut pack_reader)?;
+    let result = destination.install_raw_pack_from_reader_with_options(
+        &mut pack_reader,
+        raw_pack_install_options(false, max_input_size),
+    )?;
     Ok((header, Some(result)))
 }
 
@@ -109,6 +133,7 @@ pub fn install_protocol_v2_fetch_promisor_response_from_reader<R>(
     reader: &mut R,
     sideband_all: bool,
     destination: &FileObjectDatabase,
+    max_input_size: Option<u64>,
 ) -> Result<(ProtocolV2FetchResponseHeader, Option<RawPackInstallResult>)>
 where
     R: Read,
@@ -120,7 +145,7 @@ where
     let mut pack_reader = ProtocolV2PackfileReader::new(reader);
     let result = destination.install_raw_pack_from_reader_with_options(
         &mut pack_reader,
-        RawPackInstallOptions { promisor: true },
+        raw_pack_install_options(true, max_input_size),
     )?;
     Ok((
         header,
@@ -282,7 +307,7 @@ mod tests {
         let mut reader = encoded.as_slice();
 
         let result =
-            install_upload_pack_raw_response_from_reader(format, &mut reader, &destination)
+            install_upload_pack_raw_response_from_reader(format, &mut reader, &destination, None)
                 .expect("test operation should succeed");
 
         assert_eq!(result.object_ids, vec![oid]);
@@ -318,7 +343,7 @@ mod tests {
         let mut reader = encoded.as_slice();
 
         let (shallow, result) =
-            install_upload_pack_shallow_raw_response_from_reader(format, &mut reader, &destination)
+            install_upload_pack_shallow_raw_response_from_reader(format, &mut reader, &destination, None)
                 .expect("test operation should succeed");
 
         assert_eq!(
@@ -354,6 +379,7 @@ mod tests {
             format,
             &mut reader,
             &destination,
+            None,
         )
         .expect("test operation should succeed");
 
@@ -396,6 +422,7 @@ mod tests {
             &mut reader,
             false,
             &destination,
+            None,
         )
         .expect("test operation should succeed");
         let result = result.expect("packfile should be installed");
@@ -435,6 +462,7 @@ mod tests {
             &mut reader,
             false,
             &destination,
+            None,
         )
         .expect("test operation should succeed");
         let result = result.expect("packfile should be installed");
@@ -461,12 +489,61 @@ mod tests {
             &mut reader,
             false,
             &destination,
+            None,
         )
         .expect("test operation should succeed");
 
         assert!(!header.has_packfile);
         assert!(result.is_none());
         assert!(!root.join("objects").join("pack").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn raw_upload_pack_response_rejects_pack_exceeding_max_input_size() {
+        let root = test_temp_root("sley-fetch-upload-pack-max-size");
+        let format = ObjectFormat::Sha1;
+        let object = EncodedObject::new(ObjectType::Blob, b"oversized fetch pack\n".to_vec());
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format)
+            .expect("test operation should succeed");
+        let response = UploadPackRawPackfileResponse {
+            acknowledgments: Vec::new(),
+            packfile: pack.pack,
+        };
+        let encoded =
+            encode_upload_pack_raw_packfile_response(&response).expect("response should encode");
+        let destination = FileObjectDatabase::new(root.join("objects"), format);
+        let mut reader = encoded.as_slice();
+        let limit = 32u64;
+
+        let err = install_upload_pack_raw_response_from_reader(
+            format,
+            &mut reader,
+            &destination,
+            Some(limit),
+        )
+        .expect_err("oversized pack should be rejected");
+
+        assert!(
+            err.to_string().contains("pack exceeds maximum allowed size"),
+            "unexpected error: {err}"
+        );
+        let pack_dir = root.join("objects").join("pack");
+        let installed = fs::read_dir(&pack_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            == Some("pack")
+                    })
+                    .count()
+            })
+            .unwrap_or_default();
+        assert_eq!(installed, 0);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -478,9 +555,10 @@ mod tests {
         }
 
         impl RawPackInstaller for RecordingInstaller {
-            fn install_raw_pack_from_reader<R>(
+            fn install_raw_pack_from_reader_with_options<R>(
                 &self,
                 reader: &mut R,
+                _options: RawPackInstallOptions,
             ) -> Result<RawPackInstallResult>
             where
                 R: Read,
@@ -505,9 +583,7 @@ mod tests {
 
         let result = install_upload_pack_raw_response_from_reader(
             ObjectFormat::Sha1,
-            &mut reader,
-            &installer,
-        )
+            &mut reader, &installer, None)
         .expect("test operation should succeed");
 
         assert!(result.object_ids.is_empty());
@@ -533,7 +609,7 @@ mod tests {
         let mut reader = encoded.as_slice();
 
         let result =
-            install_upload_pack_raw_response_from_reader(format, &mut reader, &destination)
+            install_upload_pack_raw_response_from_reader(format, &mut reader, &destination, None)
                 .expect("test operation should succeed");
 
         assert_eq!(result.object_ids, vec![oid]);

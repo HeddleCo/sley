@@ -1,9 +1,10 @@
 //! Byte-preserving repository-relative path helpers.
+#![allow(clippy::expect_used)]
 
 use std::ffi::OsStr;
 use std::path::{Component, Path};
 
-use sley_core::{GitError, Result};
+use sley::{GitError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RepoPathBuf(Vec<u8>);
@@ -54,6 +55,7 @@ fn os_str_bytes(value: &OsStr) -> Vec<u8> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

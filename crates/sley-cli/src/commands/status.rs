@@ -1,5 +1,7 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
+#![allow(clippy::expect_used)]
 
+use sley::plumbing::{sley_diff_merge, sley_index, sley_object, sley_refs, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -327,7 +329,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let config = read_repo_config(&git_dir).map_err(report_config_setup_error)?;
     // Config-derived display defaults. The command line wins where it set a
     // value explicitly; otherwise `status.*` config supplies the default, as

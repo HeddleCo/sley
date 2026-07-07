@@ -1,5 +1,7 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
+#![allow(clippy::expect_used)]
 
+use sley::plumbing::{sley_diff_merge, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -168,7 +170,7 @@ fn push_unique(refs: &mut Vec<String>, value: String) {
 
 /// Expand a single notes-ref spec: a `*`-containing glob matches existing refs
 /// by prefix (ref-name sorted); an exact ref is returned as-is.
-fn expand_notes_glob(store: &FileRefStore, glob: &str) -> Result<Vec<String>> {
+pub(crate) fn expand_notes_glob(store: &FileRefStore, glob: &str) -> Result<Vec<String>> {
     if !glob.contains('*') {
         return Ok(vec![glob.to_string()]);
     }
@@ -389,6 +391,47 @@ fn emit_encoded_compiled_log_format_no_notes(
     Ok(())
 }
 
+/// Render a user (`--format=`) spec, expanding `%N` from the given or standard
+/// notes display refs when `show_notes` is set.
+pub(crate) fn format_commit_pretty_with_notes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    record: &sley_rev::CommitRecord,
+    compiled: &CompiledLogFormat,
+    context: &LogFormatContext<'_>,
+    show_notes: bool,
+    notes_refs: &[String],
+) -> Result<Vec<u8>> {
+    let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+    if show_notes && compiled_format_uses_notes(compiled) {
+        let store = FileRefStore::new(git_dir, format);
+        let display_refs = if notes_refs.is_empty() {
+            resolve_standard_notes_refs(git_dir, format)?
+        } else {
+            notes_refs.to_vec()
+        };
+        emit_compiled_log_format_with_notes(
+            git_dir,
+            format,
+            &store,
+            &display_refs,
+            record,
+            compiled,
+            context,
+            &mut line,
+        )?;
+    } else {
+        emit_compiled_log_format(
+            record,
+            compiled,
+            context,
+            &mut line,
+            0..compiled.tokens.len(),
+        )?;
+    }
+    Ok(log_reencode_message(&line, "UTF-8", context.output_encoding).into_owned())
+}
+
 /// Render a user (`--format=`) spec to stdout for `git show`, expanding `%N`
 /// from the standard notes display refs when `show_notes` is set. git computes
 /// `ctx.notes_message` (raw) for userformats and `%N` injects it; the plain
@@ -575,7 +618,7 @@ fn log_config_color_is_always(value: &str) -> bool {
     )
 }
 
-fn compiled_format_uses_notes(compiled: &CompiledLogFormat) -> bool {
+pub(crate) fn compiled_format_uses_notes(compiled: &CompiledLogFormat) -> bool {
     compiled
         .tokens
         .iter()
@@ -1861,7 +1904,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             value if value.starts_with("-U") && value.len() > 2 => {
                 let raw = &value[2..];
                 patch_validate_unified_context(raw, true)?;
-                diff_opts.context = Some(commands::diff_options::parse_unified_count(raw));
+                diff_opts.context = Some(sley_rev::diff_options::parse_unified_count(raw));
                 diff_opts.patch = true;
                 diff_format_explicit = true;
             }
@@ -1871,7 +1914,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             value if value.starts_with("--unified=") => {
                 let raw = &value["--unified=".len()..];
                 patch_validate_unified_context(raw, false)?;
-                diff_opts.context = Some(commands::diff_options::parse_unified_count(raw));
+                diff_opts.context = Some(sley_rev::diff_options::parse_unified_count(raw));
                 diff_opts.patch = true;
                 diff_format_explicit = true;
             }
@@ -2043,7 +2086,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     if whatchanged && !diff_opts.any() {
         diff_opts.raw = true;
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
@@ -2225,7 +2268,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // diff_opt_ignore_regex, exit 129).
     diff_opts.ignore_regexes = crate::compile_ignore_matching_regexes(&ignore_regex_patterns)?;
     if diff_opts.any() || diff_opts.merges_imply_patch {
-        diff_opts.context = Some(commands::diff_options::resolve_diff_context(
+        diff_opts.context = Some(sley_rev::diff_options::resolve_diff_context(
             diff_opts.context,
             Some(&config),
         )?);
@@ -2765,7 +2808,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     signature: None,
                     color: color_always,
                     output_encoding: &output_encoding,
-                    mailmap: &empty_mailmap,
+                    mailmap: &CliMailmapAdapter(&empty_mailmap),
                     use_mailmap,
                 },
                 &mut line,
@@ -2831,7 +2874,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             signature: None,
             color: color_always,
             output_encoding: &output_encoding,
-            mailmap: &empty_mailmap,
+            mailmap: &CliMailmapAdapter(&empty_mailmap),
             use_mailmap,
         };
         let metadata = sley_rev::walk_commit_metadata_date_ordered_limited(
@@ -3198,7 +3241,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         decorations.clear();
     }
     // Object access for `%(describe)`.
-    let describe_ctx = LogDescribeContext {
+    let describe_ctx = CliLogDescribeContext {
         git_dir: &git_dir,
         db: &db,
         format,
@@ -3217,7 +3260,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     } else {
         HashMap::new()
     };
-    let signature_ctx = LogSignatureContext {
+    let signature_ctx = CliLogSignatureContext {
         git_dir: &git_dir,
         db: &db,
         config: &config,
@@ -3312,11 +3355,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         source: log_format_source.as_deref(),
                         date_mode: &date_mode,
                         source_oid: source_labels.as_ref(),
-                        describe: Some(&describe_ctx),
-                        signature: Some(&signature_ctx),
+                        describe: Some(&CliLogDescribeAdapter(&describe_ctx)),
+                        signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
                         color: color_always,
                         output_encoding: &output_encoding,
-                        mailmap: output_mailmap,
+                        mailmap: &CliMailmapAdapter(output_mailmap),
                         use_mailmap,
                     };
                     let mut msg = Vec::with_capacity(compiled.estimated_line_capacity());
@@ -3771,11 +3814,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     source: log_format_source.as_deref(),
                     date_mode: &date_mode,
                     source_oid: source_labels.as_ref(),
-                    describe: Some(&describe_ctx),
-                    signature: Some(&signature_ctx),
+                    describe: Some(&CliLogDescribeAdapter(&describe_ctx)),
+                    signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
                     color: color_always,
                     output_encoding: &output_encoding,
-                    mailmap: output_mailmap,
+                    mailmap: &CliMailmapAdapter(output_mailmap),
                     use_mailmap,
                 };
                 let mut ended_with_newline = false;
@@ -3893,7 +3936,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
 }
 
 /// The outcome of resolving a `--pretty=`/`--format=` spec.
-enum ResolvedPretty {
+pub(crate) enum ResolvedPretty {
     Oneline,
     Default,
     Short,
@@ -3913,7 +3956,7 @@ enum ResolvedPretty {
 /// Resolve a `--pretty=`/`--format=` spec into a compiled format, mirroring
 /// git's `get_commit_format` + `pretty.<name>` alias chain. `format_kind` is the
 /// `--format=`/`tformat:` flag (terminator semantics → `final_newline: true`).
-fn resolve_pretty_spec(
+pub(crate) fn resolve_pretty_spec(
     spec: &str,
     format_kind: bool,
     config: &GitConfig,

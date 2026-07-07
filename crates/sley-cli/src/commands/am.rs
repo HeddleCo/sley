@@ -15,10 +15,12 @@
 //!
 //! Command modules pull their shared plumbing from the crate root; the glob
 //! import reaches every helper, type, and re-export visible there (a submodule
-//! can access its ancestor module's private items), so `discover_git_dir`,
+//! can access its ancestor module's private items), so `cli_git_dir`,
 //! `repository_object_format`, `FileObjectDatabase`, `three_way_merge_trees`,
 //! and friends are all in scope without re-listing them.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 use crate::*;
+use sley::plumbing::{sley_index, sley_worktree};
 
 /// Parsed command-line configuration for a fresh `git am` invocation.
 struct AmOptions {
@@ -199,7 +201,7 @@ struct AmPatch {
 /// Entry point for `git am`.
 pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -288,7 +290,7 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         };
     }
 
-    let mut options = parse_am_options(&option_args)?;
+    let mut options = setup_am_options(&option_args)?;
 
     if allow_empty_resume && options.mboxes.is_empty() && state_dir.exists() {
         return am_continue_allow_empty(
@@ -301,7 +303,7 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
     }
 
     // git seeds am.messageid / am.threeWay from config, then lets the
-    // command-line flag (handled in parse_am_options) override. parse_am_options
+    // command-line flag (handled in setup_am_options) override. setup_am_options
     // leaves an unspecified flag at false, so OR the config default in only when
     // the user did not pass an explicit `--[no-]…` form.
     apply_am_config_defaults(&git_dir, &option_args, &mut options);
@@ -589,7 +591,7 @@ pub(crate) fn rebase_apply_abort(
 }
 
 /// Parse the non-resume flags of `git am`.
-fn parse_am_options(args: &[String]) -> Result<AmOptions> {
+fn setup_am_options(args: &[String]) -> Result<AmOptions> {
     let mut options = AmOptions {
         mboxes: Vec::new(),
         quiet: false,
@@ -773,7 +775,7 @@ fn am_config_bool(git_dir: &Path, key: &str) -> Option<bool> {
     {
         value.to_string()
     } else {
-        commands::remote_cmds::read_repo_config(git_dir)
+        commands::remote::read_repo_config(git_dir)
             .ok()?
             .get("am", None, key)?
             .to_string()
@@ -2484,7 +2486,7 @@ fn am_do_interactive(message: &[u8]) -> Result<AmInteractiveDecision> {
 
 /// Parse the option overrides a resume verb (`--retry`/`--continue`) may carry.
 /// Only options that change saved session state are tracked; others are ignored
-/// (the resume path does not run the full `parse_am_options`).
+/// (the resume path does not run the full `setup_am_options`).
 fn parse_am_resume_overrides(option_args: &[String]) -> AmResumeOverrides {
     let mut overrides = AmResumeOverrides::default();
     for arg in option_args {
@@ -2960,7 +2962,7 @@ fn try_straight_apply(
 /// "Six"). Context and deleted lines are left untouched, so hunk matching is
 /// unaffected.
 fn am_whitespace_fix_patch(patch: &sley_diff_merge::FilePatch) -> sley_diff_merge::FilePatch {
-    use sley_diff_merge::HunkLine;
+    use sley::plumbing::sley_diff_merge::HunkLine;
     let mut fixed = patch.clone();
     for hunk in &mut fixed.hunks {
         for line in &mut hunk.lines {
@@ -2985,7 +2987,7 @@ fn am_apply_context_fuzz(
     patch: &sley_diff_merge::FilePatch,
     p_context: usize,
 ) -> Option<Vec<u8>> {
-    use sley_diff_merge::HunkLine;
+    use sley::plumbing::sley_diff_merge::HunkLine;
     if patch.is_delete && patch.hunks.is_empty() {
         return Some(Vec::new());
     }
@@ -3143,7 +3145,7 @@ fn am_find_pos(
 /// hunk's *new* lines while context lines keep the base's existing whitespace.
 /// Returns `None` if any hunk cannot be located even with whitespace ignored.
 fn apply_file_patch_ignore_ws(base: &[u8], patch: &sley_diff_merge::FilePatch) -> Option<Vec<u8>> {
-    use sley_diff_merge::HunkLine;
+    use sley::plumbing::sley_diff_merge::HunkLine;
 
     if patch.is_delete && patch.hunks.is_empty() {
         return Some(Vec::new());
@@ -3292,7 +3294,7 @@ fn apply_actions(
     format: ObjectFormat,
     actions: &[ApplyFileAction],
 ) -> Result<()> {
-    let config = commands::remote_cmds::read_repo_config(git_dir).unwrap_or_default();
+    let config = commands::remote::read_repo_config(git_dir).unwrap_or_default();
     // git's `write_out_results` materializes in two phases: every removal happens
     // before any write. This matters when a directory's tracked children are
     // removed and the directory is then (re)created as a gitlink — single-phase
@@ -3383,7 +3385,7 @@ fn stage_and_commit(
                 } else {
                     db.write_object(EncodedObject::new(ObjectType::Blob, content.clone()))?
                 };
-                upsert_index_entry(&mut index, path, *mode, oid);
+                upsert_index_entry(&mut index, worktree_root, path, *mode, oid);
             }
             ApplyFileAction::Remove { path } => {
                 index.entries.retain(|entry| &entry.path != path);
@@ -3415,8 +3417,25 @@ fn stage_and_commit(
 }
 
 /// Insert or replace the stage-0 index entry for `path`.
-fn upsert_index_entry(index: &mut Index, path: &[u8], mode: u32, oid: ObjectId) {
-    let entry = merge_index_entry(path, mode, oid, 0);
+///
+/// `apply_actions` has already written the file to the worktree, so record its
+/// on-disk stat (git stages via add_file_to_index / fill_stat_cache_info); a
+/// zeroed stat would make `git diff-files` report the just-applied path as
+/// modified. Gitlinks keep zero stat, as git does.
+fn upsert_index_entry(
+    index: &mut Index,
+    worktree_root: &Path,
+    path: &[u8],
+    mode: u32,
+    oid: ObjectId,
+) {
+    let mut entry = merge_index_entry(path, mode, oid, 0);
+    if !sley_index::is_gitlink(mode)
+        && let Ok(rel) = std::str::from_utf8(path)
+        && let Ok(metadata) = fs::symlink_metadata(worktree_root.join(rel))
+    {
+        sley_worktree::fill_index_entry_stat_cache(&mut entry, &metadata);
+    }
     if let Some(existing) = index
         .entries
         .iter_mut()
@@ -3734,7 +3753,7 @@ fn apply_three_way(
         Some(oid) => commit_tree_oid(&db, format, oid)?,
         None => ObjectId::empty_tree(format),
     };
-    let ours_map = stash_tree_entry_map(&db, format, &head_tree)?;
+    let ours_map = sley_diff_merge::flatten_tree(&db, format, &head_tree)?;
 
     // The merge base for each file is the patch's *pre-image* blob, named by the
     // old side of its `index <old>..<new>` line. Looking those blobs up in the
@@ -4152,11 +4171,43 @@ fn write_merge_index_and_worktree(
     ours_map: &MergeTreeMap,
     results: &BTreeMap<Vec<u8>, MergePathResult>,
 ) -> Result<()> {
+    // Materialize the worktree BEFORE building the index so resolved stage-0
+    // entries can record the on-disk stat (git refreshes merged results via
+    // fill_stat_cache_info; a zeroed stat makes diff-files report them dirty).
+    for (path, result) in results {
+        match result {
+            MergePathResult::Resolved(Some((mode, oid))) => {
+                if ours_map.get(path) != Some(&(*mode, *oid)) {
+                    let content = if sley_index::is_gitlink(*mode) {
+                        Vec::new()
+                    } else {
+                        merge_read_blob(db, oid)?
+                    };
+                    merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+                }
+            }
+            MergePathResult::Resolved(None) => merge_remove_worktree_file(worktree_root, path)?,
+            MergePathResult::Conflict { worktree, .. } => match worktree {
+                Some((mode, content)) => {
+                    merge_write_worktree_file(worktree_root, path, content, *mode)?
+                }
+                None => merge_remove_worktree_file(worktree_root, path)?,
+            },
+        }
+    }
+
     let mut entries = Vec::new();
     for (path, result) in results {
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
-                entries.push(merge_index_entry(path, *mode, *oid, 0));
+                let mut entry = merge_index_entry(path, *mode, *oid, 0);
+                if !sley_index::is_gitlink(*mode)
+                    && let Ok(rel) = std::str::from_utf8(path)
+                    && let Ok(metadata) = fs::symlink_metadata(worktree_root.join(rel))
+                {
+                    sley_worktree::fill_index_entry_stat_cache(&mut entry, &metadata);
+                }
+                entries.push(entry);
             }
             MergePathResult::Resolved(None) => {}
             MergePathResult::Conflict {
@@ -4189,28 +4240,6 @@ fn write_merge_index_and_worktree(
         sley_worktree::repository_index_path(git_dir),
         index.write(format)?,
     )?;
-
-    for (path, result) in results {
-        match result {
-            MergePathResult::Resolved(Some((mode, oid))) => {
-                if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = if sley_index::is_gitlink(*mode) {
-                        Vec::new()
-                    } else {
-                        merge_read_blob(db, oid)?
-                    };
-                    merge_write_worktree_file(worktree_root, path, &content, *mode)?;
-                }
-            }
-            MergePathResult::Resolved(None) => merge_remove_worktree_file(worktree_root, path)?,
-            MergePathResult::Conflict { worktree, .. } => match worktree {
-                Some((mode, content)) => {
-                    merge_write_worktree_file(worktree_root, path, content, *mode)?
-                }
-                None => merge_remove_worktree_file(worktree_root, path)?,
-            },
-        }
-    }
     Ok(())
 }
 
@@ -4361,7 +4390,7 @@ fn finish_rebase_apply(state_dir: &Path) -> Result<()> {
     // exists (the caller removes it after this returns).
     run_apply_post_rewrite_hook(state_dir);
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let refs = FileRefStore::new(&git_dir, format);
@@ -4642,7 +4671,7 @@ fn am_clean_index(
         am_remove_worktree_path(worktree_root, p)?;
     }
     if !checkout_paths.is_empty() {
-        let config = commands::remote_cmds::read_repo_config(git_dir).unwrap_or_default();
+        let config = commands::remote::read_repo_config(git_dir).unwrap_or_default();
         sley_worktree::checkout_index_paths(
             worktree_root,
             git_dir,

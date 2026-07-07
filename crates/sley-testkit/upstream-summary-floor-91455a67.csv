@@ -1,0 +1,11 @@
+script,command,result,ok,notok,total,plan_total
+t5601-clone.sh,t5601-clone.sh,FAIL,109,6,115,115
+t3406-rebase-message.sh,t3406-rebase-message.sh,PASS,32,0,32,32
+t4041-diff-submodule-option.sh,t4041-diff-submodule-option.sh,PASS,47,0,47,47
+t7102-reset.sh,t7102-reset.sh,FAIL,36,2,38,38
+t4210-log-i18n.sh,t4210-log-i18n.sh,PASS,21,0,21,21
+t3404-rebase-interactive.sh,t3404-rebase-interactive.sh,FAIL,128,5,133,133
+t3430-rebase-merges.sh,t3430-rebase-merges.sh,PASS,34,0,34,34
+t4060-diff-submodule-option-diff-format.sh,t4060-diff-submodule-option-diff-format.sh,PASS,51,0,51,51
+t5512-ls-remote.sh,t5512-ls-remote.sh,PASS,40,0,40,40
+t2050-git-dir-relative.sh,t2050-git-dir-relative.sh,PASS,4,0,4,4

@@ -13,6 +13,7 @@
 //! the `diff-files`-specific argument parser and dispatch. Shared plumbing is
 //! pulled in via the crate-root glob; see `commands::stash` for the rationale.
 use crate::*;
+use sley::plumbing::{sley_diff_merge, sley_index, sley_worktree};
 
 /// Usage text emitted for `-h` (to stdout) and on a parse error (to stderr),
 /// matching `git diff-files`'s built-in usage. Kept as a single block so both
@@ -551,18 +552,16 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         DiffPathspec::new(cwd, worktree_root, &o.path_args)?
     };
 
-    let name_status_options = sley_diff_merge::DiffNameStatusOptions {
+    let options = sley_diff_merge::DiffNameStatusOptions {
         detect_renames: o.detect_renames,
         detect_copies: o.detect_copies,
         find_copies_harder: o.find_copies_harder,
         rename_empty: o.rename_empty,
-    };
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
-        base: name_status_options,
         detect_inexact: true,
         rename_threshold: o.rename_threshold,
         copy_threshold: o.copy_threshold,
         rename_limit: 0,
+        ..Default::default()
     };
 
     // `git diff-files` selects changed paths by the cached *stat*, not by content:
@@ -573,18 +572,18 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
     // content diff; porcelain `git diff` (which refreshes first) keeps the plain
     // content engine.
     let entries = if o.inexact_renames {
-        sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_rename_options(
+        sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_options(
             worktree_root,
             git_dir,
             format,
-            rename_options,
+            options,
         )?
     } else {
         sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_options(
             worktree_root,
             git_dir,
             format,
-            name_status_options,
+            options,
         )?
     };
 
@@ -954,6 +953,19 @@ fn diff_files_entry_is_racy_clean_equivalent(
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Ok(false);
+    }
+    // `git diff-files` reports stat-dirty entries even when content is
+    // byte-identical (e.g. `reset --mixed --no-refresh` restores a zeroed cached
+    // stat). Only suppress entries that are racily clean *and* content-identical
+    // — the stat shortcut rescue for same-second edits, not invalid stats.
+    let index_mtime = fs::metadata(sley_worktree::repository_index_path(git_dir))
+        .ok()
+        .and_then(|metadata| sley_index::file_mtime_parts(&metadata));
+    let stat_cache = sley_index::IndexStatCache::from_index_mtime(index, index_mtime);
+    match stat_cache.index_entry_worktree_stat_verdict(index_entry, &metadata) {
+        sley_index::StatVerdict::Dirty => return Ok(false),
+        sley_index::StatVerdict::Clean => {}
+        sley_index::StatVerdict::RacyNeedsContentCheck => {}
     }
     let body = fs::read(&absolute)?;
     let clean = sley_worktree::apply_clean_filter(worktree_root, git_dir, config, path, &body)?;

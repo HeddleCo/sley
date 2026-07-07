@@ -1,4 +1,5 @@
 use super::*;
+use sley::plumbing::{sley_diff_merge, sley_object, sley_rev};
 
 pub(super) enum PickaxeSpec {
     /// `-S<string>`: count occurrences of the needle in the old vs new blob; a
@@ -142,19 +143,24 @@ pub(super) fn diff_filter_commit_matches(
         detect_copies: opts.detect_copies,
         find_copies_harder: opts.find_copies_harder,
         rename_empty: true,
+        ..Default::default()
     };
     let entries = match (&parent_tree, opts.detect_renames) {
-        (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+        (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_options(
             db,
             format,
             parent,
             tree,
-            sley_diff_merge::RenameDetectionOptions {
-                base,
+            sley_diff_merge::DiffNameStatusOptions {
+                detect_renames: opts.detect_renames,
+                detect_copies: opts.detect_copies,
+                find_copies_harder: opts.find_copies_harder,
+                rename_empty: true,
                 detect_inexact: true,
                 rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 rename_limit: 0,
+                ..Default::default()
             },
         )?,
         (Some(parent), false) => {
@@ -199,19 +205,24 @@ pub(super) fn log_follow_single_path<'a>(
             detect_copies: false,
             find_copies_harder: false,
             rename_empty: true,
+            ..Default::default()
         };
         let entries = match (&parent_tree, detect_renames) {
-            (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+            (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_options(
                 db,
                 format,
                 parent,
                 &record.commit.tree,
-                sley_diff_merge::RenameDetectionOptions {
-                    base,
+                sley_diff_merge::DiffNameStatusOptions {
+                    detect_renames,
+                    detect_copies: false,
+                    find_copies_harder: false,
+                    rename_empty: true,
                     detect_inexact: true,
                     rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                     copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                     rename_limit: 0,
+                    ..Default::default()
                 },
             )?,
             (Some(parent), false) => sley_diff_merge::diff_name_status_trees_with_options(
@@ -277,19 +288,24 @@ pub(super) fn pickaxe_commit_matches(
         detect_copies: false,
         find_copies_harder: false,
         rename_empty: true,
+        ..Default::default()
     };
     let entries = match (&parent_tree, detect_renames) {
-        (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+        (Some(parent), true) => sley_diff_merge::diff_name_status_trees_with_options(
             db,
             format,
             parent,
             tree,
-            sley_diff_merge::RenameDetectionOptions {
-                base,
+            sley_diff_merge::DiffNameStatusOptions {
+                detect_renames,
+                detect_copies: false,
+                find_copies_harder: false,
+                rename_empty: true,
                 detect_inexact: true,
                 rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 rename_limit: 0,
+                ..Default::default()
             },
         )?,
         (Some(parent), false) => {

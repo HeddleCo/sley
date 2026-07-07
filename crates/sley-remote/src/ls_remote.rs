@@ -105,7 +105,7 @@ pub fn ls_remote(
     match source {
         #[cfg(feature = "http")]
         LsRemoteSource::Http(remote) => {
-            ls_remote_http(remote, format, filter, matches, credentials)
+            ls_remote_http(remote, format, filter, matches, credentials, config)
         }
         #[cfg(not(feature = "http"))]
         LsRemoteSource::Http(_) => Err(GitError::Unsupported(
@@ -117,6 +117,7 @@ pub fn ls_remote(
             filter,
             matches,
             config.and_then(|config| config.get("protocol", None, "version")) == Some("2"),
+            config,
         ),
         LsRemoteSource::Local { git_dir } => {
             ls_remote_local(git_dir, format, filter, matches, config)
@@ -143,10 +144,16 @@ fn ls_remote_http(
     filter: &LsRemoteFilter,
     matches: &dyn Fn(&str) -> bool,
     credentials: &mut dyn CredentialProvider,
+    config: Option<&GitConfig>,
 ) -> Result<(Vec<LsRemoteRecord>, ObjectFormat)> {
-    let client = crate::http::new_http_client();
-    let (refs, features) =
-        crate::http::http_upload_pack_advertisements(&client, remote, format, credentials)?;
+    let http_batch = crate::http::HttpOperationBatch::new();
+    let (refs, features) = crate::http::http_upload_pack_advertisements(
+        http_batch.client(),
+        remote,
+        format,
+        credentials,
+        config,
+    )?;
     let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
     if format != ObjectFormat::Sha1 {
         return Err(GitError::Unsupported(format!(

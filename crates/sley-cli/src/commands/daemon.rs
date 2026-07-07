@@ -17,8 +17,9 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use sley::plumbing::{sley_config};
 
-use sley_core::{GitError, Result};
+use sley::{GitError, Result};
 use sley_protocol::{PktLineFrame, read_pkt_line_frame};
 
 /// Parsed `git daemon` invocation.

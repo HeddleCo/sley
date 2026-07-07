@@ -1,4 +1,5 @@
 use super::*;
+use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_remote, sley_rev, sley_worktree};
 
 pub(crate) fn read_commit_tree(
     db: &FileObjectDatabase,
@@ -122,7 +123,7 @@ fn resolve_pull_remote_and_refspecs(
 }
 
 fn pull_default_remote_without_tracking(config: &GitConfig) -> Option<String> {
-    let remotes = crate::commands::remote_cmds::remote_names(config);
+    let remotes = crate::commands::remote::remote_names(config);
     match remotes.as_slice() {
         [] => None,
         [only] => Some(only.clone()),
@@ -275,8 +276,8 @@ fn fetch_moved_head_would_clobber_worktree(
     orig_tree: &ObjectId,
     curr_tree: &ObjectId,
 ) -> Result<bool> {
-    let orig_map = stash_tree_entry_map(db, format, orig_tree)?;
-    let curr_map = stash_tree_entry_map(db, format, curr_tree)?;
+    let orig_map = sley_diff_merge::flatten_tree(db, format, orig_tree)?;
+    let curr_map = sley_diff_merge::flatten_tree(db, format, curr_tree)?;
     let changed = orig_map
         .keys()
         .chain(curr_map.keys())
@@ -695,7 +696,7 @@ fn pull_checkout_into_void(
 ) -> Result<()> {
     let object = db.read_object(commit_oid)?;
     let commit = Commit::parse_ref(format, &object.body)?;
-    let target_map = stash_tree_entry_map(db, format, &commit.tree)?;
+    let target_map = sley_diff_merge::flatten_tree(db, format, &commit.tree)?;
     let index_path = sley_worktree::repository_index_path(git_dir);
     let mut index_entries = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?.entries
@@ -803,7 +804,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     for arg in args {
         if expect_depth_value {
             expect_depth_value = false;
-            depth = Some(crate::commands::remote_cmds::parse_clone_depth(arg)?);
+            depth = Some(crate::commands::remote::parse_clone_depth(arg)?);
             continue;
         }
         match arg.as_str() {
@@ -883,7 +884,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             }
             "--depth" => expect_depth_value = true,
             value if value.starts_with("--depth=") => {
-                depth = Some(crate::commands::remote_cmds::parse_clone_depth(
+                depth = Some(crate::commands::remote::parse_clone_depth(
                     value.strip_prefix("--depth=").unwrap_or_default(),
                 )?);
             }
@@ -902,7 +903,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         }
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
@@ -993,6 +994,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         cloning: false,
         record_promisor_refs: true,
         update_shallow: false,
+        reject_shallow: false,
         deepen_relative: false,
         update_head_ok: true,
         deepen_since: None,
@@ -1029,7 +1031,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             }
         };
     if set_upstream {
-        crate::commands::remote_cmds::fetch_set_upstream_from_outcome(
+        crate::commands::remote::fetch_set_upstream_from_outcome(
             &git_dir,
             format,
             &remote,
@@ -1144,7 +1146,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let ours_commit = sley_rev::peel_to_commit(&db, format, &ours_oid)?;
     let already_up_to_date = merge_oids.iter().all(|theirs_commit| {
         *theirs_commit == ours_commit
-            || ancestor_depths(&db, format, &ours_commit)
+            || sley_rev::ancestor_depths(&git_dir, format, &db, &ours_commit)
                 .is_ok_and(|ours_depths| ours_depths.contains_key(theirs_commit))
     });
     if already_up_to_date {
@@ -1159,7 +1161,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let fast_forward = if merge_oids.len() == 1 {
-        ancestor_depths(&db, format, &theirs_oid)?.contains_key(&ours_commit)
+        sley_rev::ancestor_depths(&git_dir, format, &db, &theirs_oid)?.contains_key(&ours_commit)
     } else {
         false
     };

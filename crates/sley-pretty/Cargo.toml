@@ -10,6 +10,13 @@ license.workspace = true
 [dependencies]
 sley-core.workspace = true
 sley-strbuf-expand.workspace = true
+sley-rev.workspace = true
+sley-refs.workspace = true
+sley-ref-filter.workspace = true
+sley-odb.workspace = true
+sley-object.workspace = true
+sley-config.workspace = true
+encoding_rs = "0.8"
 
 [lints]
 workspace = true

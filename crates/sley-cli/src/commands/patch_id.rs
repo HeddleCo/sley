@@ -49,9 +49,10 @@
 //! This module follows the same glob-import + private-helper structure as the
 //! other self-contained command modules (`commands::stash`, `commands::branch`,
 //! `commands::verify_commit`); the wildcard pulls in shared crate-root plumbing
-//! such as `discover_git_dir`, `repository_object_format`, `read_repo_config`,
+//! such as `cli_git_dir`, `repository_object_format`, `read_repo_config`,
 //! `global_config_value`, and `sley_config::parse_config_bool`.
 use crate::*;
+use sley::plumbing::{sley_config, sley_core};
 
 /// Exact usage text git's `patch-id` prints for `-h` and on option errors. A raw
 /// string is used so the four-space indentation on the option lines (and the
@@ -301,7 +302,7 @@ fn patch_id_unknown_switch_error(switch: char) -> Result<PatchIdInvocation> {
 fn patch_id_config_defaults() -> Result<PatchIdOptions> {
     let mut stable = false;
     let mut verbatim = false;
-    if let Ok(git_dir) = discover_git_dir(env::current_dir()?)
+    if let Ok(git_dir) = crate::session::cli_git_dir()
         && let Ok(config) = read_repo_config(&git_dir)
     {
         if let Some(value) = config.get_entry("patchid", None, "stable") {
@@ -343,7 +344,7 @@ fn interpret_patch_id_bool(key: &str, value: Option<&str>) -> Result<bool> {
 /// a repository, else SHA-1 (git's choice with no repository to consult). A
 /// repository whose config cannot be read falls back to SHA-1 as well.
 fn patch_id_object_format() -> Result<ObjectFormat> {
-    match discover_git_dir(env::current_dir()?) {
+    match crate::session::cli_git_dir() {
         Ok(git_dir) => Ok(repository_object_format(&git_dir).unwrap_or(ObjectFormat::Sha1)),
         Err(_) => Ok(ObjectFormat::Sha1),
     }

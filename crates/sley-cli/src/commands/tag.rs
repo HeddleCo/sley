@@ -1,5 +1,7 @@
 //! `git tag` (create/list/delete/verify) and tag-message helpers.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use sley::plumbing::{sley_core, sley_refs, sley_rev};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 use std::borrow::Cow;
@@ -43,7 +45,7 @@ fn expand_tag_bundle(arg: &str) -> Option<Vec<String>> {
 }
 
 pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     if args.is_empty() {
@@ -3366,6 +3368,7 @@ fn tag_points_at(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::expand_tag_bundle;
 

@@ -5,14 +5,19 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use sley::plumbing::{sley_config, sley_refs, sley_rev};
 
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
 use sley_options::{OptFlags, OptValue, OptionSpec, ParsedValue, UsageError, parse_options};
 
+#[path = "refs_options.rs"]
+mod refs_options;
+use refs_options::{setup_reflog_show_options, setup_show_ref_short_options};
+
 #[derive(Debug)]
-struct ReflogShowOptions {
+pub(super) struct ReflogShowOptions {
     reference: String,
     display: String,
     format: ReflogFormat,
@@ -28,7 +33,7 @@ struct ReflogShowOptions {
 }
 
 #[derive(Debug)]
-enum ReflogFormat {
+pub(super) enum ReflogFormat {
     Default,
     NewOid { final_newline: bool },
     Message { final_newline: bool },
@@ -79,9 +84,9 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
     if args.len() == 1 && args[0] == "--all" {
         return cmd_reflog_all();
     }
-    let options = parse_reflog_show_options(args)?;
+    let options = setup_reflog_show_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let abbrev_commit = options.abbrev_commit.unwrap_or(true);
@@ -177,7 +182,7 @@ fn reflog_show_message(entry: &ReflogEntry) -> std::borrow::Cow<'_, [u8]> {
 
 fn cmd_reflog_all() -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let abbrev_len = repository_abbrev(&git_dir, format)?;
     let store = FileRefStore::new(&git_dir, format);
@@ -254,7 +259,7 @@ fn cmd_reflog_exists(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(129));
     };
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     if reflog_path_for_ref(&git_dir, reference)?.is_file() {
         Ok(())
     } else {
@@ -286,7 +291,7 @@ fn cmd_reflog_list(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let mut names = BTreeSet::new();
     collect_repository_reflog_names(&git_dir, &mut names)?;
     for name in names {
@@ -482,7 +487,7 @@ fn cmd_reflog_delete(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let mut exit_code = 0;
@@ -636,7 +641,7 @@ fn cmd_reflog_drop(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let logs_dir = common_git_dir.join("logs");
     if options.all {
@@ -708,7 +713,7 @@ fn cmd_reflog_write(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let old_oid = parse_reflog_write_oid(format, &args[1], "old")?;
     let new_oid = parse_reflog_write_oid(format, &args[2], "new")?;
@@ -830,7 +835,7 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let config = load_reflog_expire_config(&git_dir)?;
@@ -1119,7 +1124,7 @@ fn reflog_reachable_oids(
     let mut reachable = HashSet::new();
     for start in starts {
         if !context.reachable_by_tip.contains_key(&start) {
-            let tip_reachable = match ancestor_depths(db, format, &start) {
+            let tip_reachable = match sley_rev::ancestor_depths(git_dir, format, db, &start) {
                 Ok(depths) => depths.into_keys().collect(),
                 Err(_) => HashSet::new(),
             };
@@ -1256,174 +1261,27 @@ fn reflog_expire_usage<T>() -> Result<T> {
     Err(GitError::Exit(129))
 }
 
-fn parse_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
-    let mut args = args;
-    if args.first().is_some_and(|arg| arg == "show") {
-        args = &args[1..];
-    }
-    let mut format = ReflogFormat::Default;
-    let mut max_count = None;
-    let mut abbrev_commit = None;
-    let mut refs = Vec::new();
-    let mut pathspecs = Vec::new();
-    let mut grep_patterns = Vec::new();
-    let mut grep_pattern_kind = sley_grep::PatternKind::Basic;
-    let mut grep_pattern_kind_explicit = false;
-    let mut grep_ignore_case = false;
-    let mut grep_all_match = false;
-    let mut grep_invert = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        match arg.as_str() {
-            "--" => {
-                pathspecs.extend(args[index + 1..].iter().cloned());
-                break;
-            }
-            "--oneline" => format = ReflogFormat::Default,
-            "--abbrev-commit" => abbrev_commit = Some(true),
-            "--no-abbrev-commit" => abbrev_commit = Some(false),
-            "--format=%H" | "--pretty=%H" => {
-                format = ReflogFormat::NewOid {
-                    final_newline: true,
-                };
-            }
-            "--format=%gs" | "--pretty=%gs" => {
-                format = ReflogFormat::Message {
-                    final_newline: true,
-                };
-            }
-            "--pretty=format:%H" | "--format=format:%H" => {
-                format = ReflogFormat::NewOid {
-                    final_newline: false,
-                };
-            }
-            "--pretty=format:%gs" | "--format=format:%gs" => {
-                format = ReflogFormat::Message {
-                    final_newline: false,
-                };
-            }
-            "--format" | "--pretty" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(GitError::Command(format!("{arg} requires a value")));
-                };
-                match value.as_str() {
-                    "%H" => {
-                        format = ReflogFormat::NewOid {
-                            final_newline: true,
-                        };
-                    }
-                    "%gs" => {
-                        format = ReflogFormat::Message {
-                            final_newline: true,
-                        };
-                    }
-                    "format:%H" => {
-                        format = ReflogFormat::NewOid {
-                            final_newline: false,
-                        };
-                    }
-                    "format:%gs" => {
-                        format = ReflogFormat::Message {
-                            final_newline: false,
-                        };
-                    }
-                    "oneline" => format = ReflogFormat::Default,
-                    _ => {
-                        return Err(GitError::Unsupported(
-                            "reflog currently supports only --format=%gs".into(),
-                        ));
-                    }
-                }
-            }
-            value if let Some(count) = value.strip_prefix("--max-count=") => {
-                max_count = Some(parse_reflog_count(count)?);
-            }
-            "--max-count" | "-n" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(GitError::Command(format!("{arg} requires a value")));
-                };
-                max_count = Some(parse_reflog_count(value)?);
-            }
-            value if value.starts_with("-n") && value.len() > 2 => {
-                max_count = Some(parse_reflog_count(&value[2..])?);
-            }
-            "--grep" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(GitError::Command("--grep requires a value".into()));
-                };
-                grep_patterns.push(value.clone());
-            }
-            value if let Some(pattern) = value.strip_prefix("--grep=") => {
-                grep_patterns.push(pattern.to_string());
-            }
-            "--all-match" => grep_all_match = true,
-            "--invert-grep" => grep_invert = true,
-            "-i" | "--regexp-ignore-case" => grep_ignore_case = true,
-            "-F" | "--fixed-strings" => {
-                grep_pattern_kind = sley_grep::PatternKind::Fixed;
-                grep_pattern_kind_explicit = true;
-            }
-            "--basic-regexp" => {
-                grep_pattern_kind = sley_grep::PatternKind::Basic;
-                grep_pattern_kind_explicit = true;
-            }
-            "-E" | "--extended-regexp" => {
-                grep_pattern_kind = sley_grep::PatternKind::Extended;
-                grep_pattern_kind_explicit = true;
-            }
-            "-P" | "--perl-regexp" => {
-                grep_pattern_kind = sley_grep::PatternKind::Perl;
-                grep_pattern_kind_explicit = true;
-            }
-            value
-                if value.starts_with('-')
-                    && value[1..].bytes().all(|byte| byte.is_ascii_digit()) =>
-            {
-                max_count = Some(parse_reflog_count(&value[1..])?);
-            }
-            value if value.starts_with('-') => {
-                return Err(GitError::Unsupported(format!(
-                    "unsupported reflog option {value}"
-                )));
-            }
-            value => refs.push(value.to_string()),
-        }
-        index += 1;
-    }
-    if refs.len() > 1 {
-        return Err(GitError::Command(
-            "reflog show currently accepts at most one ref".into(),
-        ));
-    }
-    let display = refs.first().cloned().unwrap_or_else(|| "HEAD".to_string());
-    let reference = reflog_reference_name(refs.first().map(String::as_str))?;
-    Ok(ReflogShowOptions {
-        reference,
-        display,
-        format,
-        max_count,
-        abbrev_commit,
-        pathspecs,
-        grep_patterns,
-        grep_pattern_kind,
-        grep_pattern_kind_explicit,
-        grep_ignore_case,
-        grep_all_match,
-        grep_invert,
-    })
-}
 
 fn reflog_show_pathspecs_match(cwd: &Path, pathspecs: &[String]) -> bool {
     pathspecs.iter().any(|pathspec| cwd.join(pathspec).exists())
 }
 
+const UPDATE_SERVER_INFO_USAGE: &[&str] = &["git update-server-info"];
+
+fn update_server_info_option_specs() -> &'static [OptionSpec<'static>] {
+    static SPECS: &[OptionSpec<'static>] = &[OptionSpec {
+        short: Some('f'),
+        long: Some("force"),
+        value: OptValue::Bool,
+        flags: OptFlags::NONE,
+        help: "force update",
+    }];
+    SPECS
+}
+
 pub(crate) fn cmd_update_server_info(args: &[String]) -> Result<()> {
-    let force = parse_update_server_info_options(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let force = setup_update_server_info_options(args)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
@@ -1450,42 +1308,40 @@ pub(crate) fn cmd_update_server_info(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn parse_update_server_info_options(args: &[String]) -> Result<bool> {
-    let mut after_delimiter = false;
-    let mut force = false;
-    for arg in args {
-        if after_delimiter {
-            return update_server_info_usage();
-        }
-        match arg.as_str() {
-            "-f" | "--force" => force = true,
-            "--no-force" => force = false,
-            "--" => after_delimiter = true,
-            value if value.starts_with("--force=") => {
-                eprintln!("error: option `force' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with("--no-force=") => {
-                eprintln!("error: option `no-force' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with("--") => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                return update_server_info_usage();
-            }
-            value if value.starts_with('-') && value.len() > 1 => {
-                for option in value[1..].chars() {
-                    if option != 'f' {
-                        eprintln!("error: unknown switch `{option}'");
-                        return update_server_info_usage();
-                    }
-                    force = true;
+fn setup_update_server_info_options(args: &[String]) -> Result<bool> {
+    let parsed = match parse_options(
+        args,
+        update_server_info_option_specs(),
+        UPDATE_SERVER_INFO_USAGE,
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            if let Some(message) = error.message() {
+                if message.contains("takes no value") {
+                    eprintln!("error: {message}");
+                    return Err(GitError::Exit(129));
+                }
+                if message.starts_with("unknown option `") {
+                    let option = message
+                        .strip_prefix("unknown option `")
+                        .and_then(|rest| rest.strip_suffix('\''))
+                        .unwrap_or(message);
+                    eprintln!("error: unknown option `{option}'");
+                } else if message.starts_with("unknown switch `") {
+                    let option = message
+                        .strip_prefix("unknown switch `")
+                        .and_then(|rest| rest.strip_suffix('\''))
+                        .unwrap_or(message);
+                    eprintln!("error: unknown switch `{option}'");
                 }
             }
-            _ => return update_server_info_usage(),
+            return update_server_info_usage();
         }
+    };
+    if !parsed.positionals.is_empty() {
+        return update_server_info_usage();
     }
-    Ok(force)
+    Ok(parsed.last_bool("force", false))
 }
 
 fn update_server_info_file(path: &Path, content: &[u8], force: bool) -> Result<()> {
@@ -1614,7 +1470,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             value => positional.push(value.to_string()),
         }
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format)
         .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?);
@@ -4762,7 +4618,7 @@ fn update_ref_delete_lock_failure(name: &str, reason: &str) -> Result<()> {
 }
 
 pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
@@ -4804,7 +4660,7 @@ pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
             "--abbrev" => abbrev = Some(7),
             "--no-abbrev" => abbrev = None,
             value if value.starts_with('-') => {
-                if parse_show_ref_short_options(
+                if setup_show_ref_short_options(
                     value,
                     &mut quiet,
                     &mut hash_only,
@@ -4936,36 +4792,6 @@ pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn parse_show_ref_short_options(
-    value: &str,
-    quiet: &mut bool,
-    hash_only: &mut bool,
-    dereference: &mut bool,
-    abbrev: &mut Option<usize>,
-) -> Result<bool> {
-    let Some(flags) = value.strip_prefix('-') else {
-        return Ok(false);
-    };
-    if flags.is_empty() || flags.starts_with('s') {
-        return Ok(false);
-    }
-    for (index, flag) in flags.char_indices() {
-        match flag {
-            'd' => *dereference = true,
-            'q' => *quiet = true,
-            's' => {
-                *hash_only = true;
-                let width = &flags[index + flag.len_utf8()..];
-                if !width.is_empty() {
-                    *abbrev = Some(parse_abbrev(width)?);
-                }
-                return Ok(true);
-            }
-            _ => return Ok(false),
-        }
-    }
-    Ok(true)
-}
 
 fn show_ref_exists(store: &FileRefStore, name: &str) -> Result<bool> {
     store.raw_ref_exists(name)
@@ -5052,7 +4878,7 @@ fn print_show_ref_deref(
 }
 
 pub(crate) fn cmd_symbolic_ref(args: &[String]) -> Result<()> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let specs = symbolic_ref_option_specs();
@@ -5358,7 +5184,7 @@ fn cmd_refs_migrate(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(129));
     };
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let current_format = refs_migrate_current_format(&common_git_dir)?;
@@ -5651,7 +5477,7 @@ fn cmd_refs_exists(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     let name = refs[0];
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     if store.raw_ref_exists(name)? {

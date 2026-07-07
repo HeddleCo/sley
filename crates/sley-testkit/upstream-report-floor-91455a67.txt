@@ -1,0 +1,137 @@
+sley upstream test report
+run label: floor-91455a67
+sley binary: /Users/lukethorne/dev/HeddleCo/sley/target/release/sley
+upstream t/: /tmp/git-src/t
+default hash: sha1
+per-script timeout: 900s
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t5601-clone.sh               FAIL       109     6  rc=1 (1..115) #	|# failed 6 among 115 test(s)|1..115
+
+----- t5601-clone.sh (FAIL): failing assertions -----
+  [#110] clone with includeIf
+  [#111] partial clone using HTTP
+  [#112] reject cloning shallow repository using HTTP
+  [#113] auto-discover bundle URI from HTTP clone
+  [#114] auto-discover multiple bundles from HTTP clone
+  [#115] auto-discover multiple bundles from HTTP clone: creationToken heuristic
+----- t5601-clone.sh (FAIL) last 25 lines -----
+#			uri = $HTTPD_URL/new.bundle
+#			creationtoken = 2
+#	
+#		[bundle "newest"]
+#			uri = $HTTPD_URL/newest.bundle
+#			creationtoken = 3
+#		EOF
+#	
+#		GIT_TRACE2_EVENT="$(pwd)/trace-clone.txt" \
+#			git -c protocol.version=2 \
+#			    -c transfer.bundleURI=true clone \
+#			"$HTTPD_URL/smart/repo4.git" clone-heuristic &&
+#	
+#		cat >expect <<-EOF &&
+#		$HTTPD_URL/newest.bundle
+#		$HTTPD_URL/new.bundle
+#		$HTTPD_URL/everything.bundle
+#		EOF
+#	
+#		# We should fetch all bundles in the expected order.
+#		test_remote_https_urls <trace-clone.txt >actual &&
+#		test_cmp expect actual
+#	
+# failed 6 among 115 test(s)
+1..115
+----- end t5601-clone.sh -----
+
+t3406-rebase-message.sh      PASS        32     0  1..32
+t4041-diff-submodule-option.sh PASS        47     0  1..47
+t7102-reset.sh               FAIL        36     2  rc=1 (1..38) ok 38 - reset handles --end-of-options|# failed 2 among 38 test(s)|1..38
+
+----- t7102-reset.sh (FAIL): failing assertions -----
+  [#14] trying to do reset --soft with pending checkout merge should fail
+  [#28] --mixed --[no-]refresh sets refresh behavior
+----- t7102-reset.sh (FAIL) last 25 lines -----
+ok 21 - redoing the last two commits should succeed
+ok 22 - --hard reset to HEAD should clear a failed merge
+ok 23 - --hard reset to ORIG_HEAD should clear a fast-forward merge
+ok 24 - test --mixed <paths>
+ok 25 - test resetting the index at give paths
+ok 26 - resetting an unmodified path is a no-op
+ok 27 - --mixed refreshes the index
+not ok 28 - --mixed --[no-]refresh sets refresh behavior
+#	
+#		# Verify that --[no-]refresh controls index refresh
+#		test_reset_refreshes_index "" --refresh &&
+#		! test_reset_refreshes_index "" --no-refresh
+#	
+ok 29 - --mixed preserves skip-worktree
+ok 30 - resetting specific path that is unmerged
+ok 31 - disambiguation (1)
+ok 32 - disambiguation (2)
+ok 33 - disambiguation (3)
+ok 34 - disambiguation (4)
+ok 35 - reset with paths accepts tree
+ok 36 - reset -N keeps removed files as intent-to-add
+ok 37 - reset --mixed sets up work tree
+ok 38 - reset handles --end-of-options
+# failed 2 among 38 test(s)
+1..38
+----- end t7102-reset.sh -----
+
+t4210-log-i18n.sh            PASS        21     0  1..21
+t3404-rebase-interactive.sh  FAIL       128     5  rc=1 (1..133) ok 133 - $EDITOR and friends are unchanged|# failed 5 among 133 test(s)|1..133
+
+----- t3404-rebase-interactive.sh (FAIL): failing assertions -----
+  [#126] respect user edits to update-ref steps
+  [#127] --update-refs: all update-ref lines removed
+  [#128] --update-refs: all update-ref lines removed, then some re-added
+  [#129] --update-refs: --edit-todo with no update-ref lines
+  [#130] --update-refs: check failed ref update
+----- t3404-rebase-interactive.sh (FAIL) last 25 lines -----
+#		# the lock in the update-refs file.
+#		git update-ref refs/heads/second third &&
+#	
+#		test_must_fail git rebase --continue 2>err &&
+#		grep "update_ref failed for ref 'refs/heads/second'" err &&
+#	
+#		q_to_tab >expect <<-\EOF &&
+#		Updated the following refs with --update-refs:
+#		Qrefs/heads/first
+#		Qrefs/heads/no-conflict-branch
+#		Qrefs/heads/third
+#		Failed to update the following refs with --update-refs:
+#		Qrefs/heads/second
+#		EOF
+#	
+#		# Clear "Rebasing (X/Y)" progress lines and drop leading tabs.
+#		tail -n 6 err >err.last &&
+#		sed "s/Rebasing.*Successfully/Successfully/g" <err.last >err.trimmed &&
+#		test_cmp expect err.trimmed
+#	
+ok 131 - bad labels and refs rejected when parsing todo list
+ok 132 - non-merge commands reject merge commits
+ok 133 - $EDITOR and friends are unchanged
+# failed 5 among 133 test(s)
+1..133
+----- end t3404-rebase-interactive.sh -----
+
+t3430-rebase-merges.sh       PASS        34     0  1..34
+t4060-diff-submodule-option-diff-format.sh PASS        51     0  1..51
+t5512-ls-remote.sh           PASS        40     0  1..40
+t2050-git-dir-relative.sh    PASS         4     0  1..4
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+t5601-clone.sh FAIL            109      6    115  94%
+t3406-rebase-message.sh PASS             32      0     32  100%
+t4041-diff-submodule-option.sh PASS             47      0     47  100%
+t7102-reset.sh FAIL             36      2     38  94%
+t4210-log-i18n.sh PASS             21      0     21  100%
+t3404-rebase-interactive.sh FAIL            128      5    133  96%
+t3430-rebase-merges.sh PASS             34      0     34  100%
+t4060-diff-submodule-option-diff-format.sh PASS             51      0     51  100%
+t5512-ls-remote.sh PASS             40      0     40  100%
+t2050-git-dir-relative.sh PASS              4      0      4  100%
+
+SUMMARY: 10 script(s): 7 passed, 3 failed, 0 timed out.

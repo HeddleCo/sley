@@ -21,40 +21,28 @@ filetime = "0.2"
 # the backend is unified to zlib-rs by the transitive sley-odb default feature.
 flate2 = { version = "1", default-features = false }
 regex = "1"
+sley.workspace = true
 sley-archive.workspace = true
-sley-config.workspace = true
-sley-core.workspace = true
-sley-diff-format.workspace = true
-sley-diff-merge.workspace = true
-sley-fetch.workspace = true
-sley-formats.workspace = true
 sley-grep.workspace = true
 sley-i18n = { workspace = true, optional = true }
 sley-fsck.workspace = true
-sley-index.workspace = true
 sley-notes.workspace = true
-sley-object.workspace = true
-sley-odb.workspace = true
 sley-options.workspace = true
-sley-pack.workspace = true
 sley-pathspec.workspace = true
 sley-pretty.workspace = true
 sley-procinfo.workspace = true
 sley-protocol.workspace = true
 sley-ref-filter.workspace = true
-sley-refs.workspace = true
-sley-remote.workspace = true
-sley-rev.workspace = true
 sley-sequencer.workspace = true
 sley-strbuf-expand.workspace = true
 sley-submodule.workspace = true
-sley-testkit.workspace = true
+sley-testkit = { workspace = true, optional = true }
 sley-transport = { workspace = true, features = ["http-client", "tls-rustls"] }
 sley-unpack-trees.workspace = true
-sley-worktree.workspace = true
 
 [features]
-default = ["mmap", "fast-sha1"]
+default = ["mmap", "fast-sha1", "testkit"]
+testkit = ["dep:sley-testkit"]
 # The (de)compression backend is the default-on zlib-rs (pure Rust, ~zlib-ng
 # speed, no C). The `pure-rust` miniz_oxide fallback is a leaf-crate feature on
 # sley-odb / sley-pack: a no-C/wasm consumer that needs it depends on those
@@ -65,15 +53,24 @@ default = ["mmap", "fast-sha1"]
 #
 # Build the sley binary with the hardware-accelerated SHA-1 backend (forwarded to
 # sley-core). Default-on for CLI builds; OIDs are byte-identical either way.
-fast-sha1 = ["sley-core/fast-sha1", "sley-odb/fast-sha1", "sley-pack/fast-sha1"]
+fast-sha1 = ["sley/fast-sha1"]
 # Build the sley binary with memory-mapped pack reads (forwarded to sley-odb).
 # Pulls in sley-mmap (the only unsafe); default-on for CLI/facade builds.
-mmap = ["sley-odb/mmap"]
+mmap = ["sley/mmap"]
 # TLS backend for HTTPS remotes (forwarded to sley-transport via sley-remote).
 tls-rustls = ["sley-transport/tls-rustls"]
 tls-native-tls = ["sley-transport/tls-native-tls"]
 tls-platform-verifier = ["sley-transport/tls-platform-verifier"]
 git-compat-i18n = ["dep:sley-i18n"]
+
+# Integration tests build low-level fixtures (commit-graph parsing, raw ODB
+# writes, object-format constants) directly. These are dev-only and do NOT
+# widen the shipped facade dependency surface (`[dependencies]` stays
+# sley + sley-options + the small facade set).
+[dev-dependencies]
+sley-core.workspace = true
+sley-formats.workspace = true
+sley-odb.workspace = true
 
 [lints]
 workspace = true

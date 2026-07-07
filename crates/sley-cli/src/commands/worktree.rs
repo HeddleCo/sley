@@ -1,6 +1,16 @@
 //! `git worktree`: manage multiple working trees attached to one repository.
+#![allow(clippy::expect_used)]
 
 use crate::*;
+use sley::plumbing::{sley_config, sley_core, sley_index, sley_worktree};
+
+#[path = "worktree_options.rs"]
+mod worktree_options;
+use worktree_options::{
+    setup_worktree_add_options, setup_worktree_list_options, setup_worktree_lock_options,
+    setup_worktree_move_options, setup_worktree_prune_options, setup_worktree_remove_options,
+    setup_worktree_repair_options, setup_worktree_unlock_options,
+};
 
 pub(crate) fn cmd_worktree(args: &[String]) -> Result<()> {
     let Some(subcommand) = args.first().map(String::as_str) else {
@@ -131,9 +141,9 @@ struct WorktreeTrackedEntry {
 }
 
 pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
-    let mut options = parse_worktree_add_options(args)?;
+    let mut options = setup_worktree_add_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let path = resolve_cli_path(&cwd, &options.path);
@@ -334,9 +344,9 @@ fn write_linked_worktree_head(
 }
 
 pub(crate) fn cmd_worktree_list(args: &[String]) -> Result<()> {
-    let options = parse_worktree_list_options(args)?;
+    let options = setup_worktree_list_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let entries = collect_worktree_list_entries(&common_git_dir, format, options.expire)?;
@@ -348,53 +358,6 @@ pub(crate) fn cmd_worktree_list(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn parse_worktree_list_options(args: &[String]) -> Result<WorktreeListOptions> {
-    let mut porcelain = false;
-    let mut verbose = false;
-    let mut z = false;
-    let mut expire = true;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        match arg.as_str() {
-            "--porcelain" => porcelain = true,
-            "--no-porcelain" => porcelain = false,
-            "-z" => z = true,
-            "-v" | "--verbose" => verbose = true,
-            "--no-verbose" => verbose = false,
-            "--expire" => {
-                index += 1;
-                if args.get(index).is_none() {
-                    eprintln!("error: option `expire' requires a value");
-                    return Err(GitError::Exit(129));
-                }
-                expire = true;
-            }
-            value if value.starts_with("--expire=") => expire = true,
-            "--no-expire" => expire = false,
-            value if value.starts_with('-') => {
-                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
-                return worktree_list_usage();
-            }
-            _ => return worktree_list_usage(),
-        }
-        index += 1;
-    }
-    if z && !porcelain {
-        eprintln!("fatal: the option '-z' requires '--porcelain'");
-        return Err(GitError::Exit(128));
-    }
-    if verbose && porcelain {
-        eprintln!("fatal: options '--verbose' and '--porcelain' cannot be used together");
-        return Err(GitError::Exit(128));
-    }
-    Ok(WorktreeListOptions {
-        porcelain,
-        verbose,
-        z,
-        expire,
-    })
-}
 
 fn worktree_usage<T>() -> Result<T> {
     eprintln!(
@@ -403,22 +366,11 @@ fn worktree_usage<T>() -> Result<T> {
     Err(GitError::Exit(129))
 }
 
-fn worktree_list_usage<T>() -> Result<T> {
-    eprintln!("usage: git worktree list [-v | --porcelain [-z]]");
-    eprintln!();
-    eprintln!("    --[no-]porcelain      machine-readable output");
-    eprintln!("    -v, --[no-]verbose    show extended annotations and reasons, if available");
-    eprintln!(
-        "    --[no-]expire <expiry-date>\n                          add 'prunable' annotation to missing worktrees older than <time>"
-    );
-    eprintln!("    -z                    terminate records with a NUL character");
-    Err(GitError::Exit(129))
-}
 
 pub(crate) fn cmd_worktree_prune(args: &[String]) -> Result<()> {
-    let options = parse_worktree_prune_options(args)?;
+    let options = setup_worktree_prune_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let mut kept = prune_worktree_admins(&common_git_dir, &options)?;
     let main_path = fs::canonicalize(&common_git_dir).unwrap_or_else(|_| common_git_dir.clone());
@@ -594,9 +546,9 @@ fn remove_empty_worktrees_dir(common_git_dir: &Path) {
 }
 
 pub(crate) fn cmd_worktree_lock(args: &[String]) -> Result<()> {
-    let options = parse_worktree_lock_options(args)?;
+    let options = setup_worktree_lock_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let admin = find_linked_worktree_admin(&common_git_dir, &cwd, &options.path)?;
     if admin.locked_reason.is_some() {
@@ -616,9 +568,9 @@ pub(crate) fn cmd_worktree_lock(args: &[String]) -> Result<()> {
 }
 
 pub(crate) fn cmd_worktree_unlock(args: &[String]) -> Result<()> {
-    let path = parse_worktree_unlock_options(args)?;
+    let path = setup_worktree_unlock_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let admin = find_linked_worktree_admin(&common_git_dir, &cwd, &path)?;
     if admin.locked_reason.is_none() {
@@ -630,9 +582,9 @@ pub(crate) fn cmd_worktree_unlock(args: &[String]) -> Result<()> {
 }
 
 pub(crate) fn cmd_worktree_remove(args: &[String]) -> Result<()> {
-    let options = parse_worktree_remove_options(args)?;
+    let options = setup_worktree_remove_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let admin = find_linked_worktree_admin_for_remove(&common_git_dir, &cwd, &options.path)?;
@@ -664,9 +616,9 @@ pub(crate) fn cmd_worktree_remove(args: &[String]) -> Result<()> {
 }
 
 pub(crate) fn cmd_worktree_move(args: &[String]) -> Result<()> {
-    let options = parse_worktree_move_options(args)?;
+    let options = setup_worktree_move_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let admin = find_linked_worktree_admin_for_move(&common_git_dir, &cwd, &options.source)?;
     if let Some(reason) = admin.locked_reason.as_ref()
@@ -698,9 +650,9 @@ pub(crate) fn cmd_worktree_move(args: &[String]) -> Result<()> {
 }
 
 pub(crate) fn cmd_worktree_repair(args: &[String]) -> Result<()> {
-    let options = parse_worktree_repair_options(args)?;
+    let options = setup_worktree_repair_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let relative_paths = options.relative_paths.unwrap_or_else(|| {
         GitConfig::read(common_git_dir.join("config"))
@@ -729,388 +681,20 @@ pub(crate) fn cmd_worktree_repair(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn parse_worktree_prune_options(args: &[String]) -> Result<WorktreePruneOptions> {
-    let mut dry_run = false;
-    let mut verbose = false;
-    let mut expire = i64::MAX;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        match arg.as_str() {
-            "-n" | "--dry-run" => dry_run = true,
-            "--no-dry-run" => dry_run = false,
-            "-v" | "--verbose" => verbose = true,
-            "--no-verbose" => verbose = false,
-            "--expire" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    eprintln!("error: option `expire' requires a value");
-                    return Err(GitError::Exit(129));
-                };
-                expire = parse_worktree_prune_expire(value)?;
-            }
-            value if value.starts_with("--expire=") => {
-                expire = parse_worktree_prune_expire(&value["--expire=".len()..])?;
-            }
-            "--no-expire" => expire = 0,
-            value if value.starts_with('-') => {
-                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
-                return worktree_prune_usage();
-            }
-            _ => return worktree_prune_usage(),
-        }
-        index += 1;
-    }
-    Ok(WorktreePruneOptions {
-        dry_run,
-        verbose,
-        expire,
-    })
-}
 
-fn parse_worktree_prune_expire(value: &str) -> Result<i64> {
-    let Some(timestamp) = crate::commands::approxidate::parse_expiry_date(value) else {
-        eprintln!("fatal: invalid approxidate value: '{value}'");
-        return Err(GitError::Exit(128));
-    };
-    let timestamp = timestamp as u64;
-    Ok(if timestamp >= i64::MAX as u64 {
-        i64::MAX
-    } else {
-        timestamp as i64
-    })
-}
 
-fn worktree_prune_usage<T>() -> Result<T> {
-    eprintln!("usage: git worktree prune [-n] [-v] [--expire <expire>]");
-    eprintln!();
-    eprintln!("    -n, --[no-]dry-run    do not remove, show only");
-    eprintln!("    -v, --[no-]verbose    report pruned working trees");
-    eprintln!(
-        "    --[no-]expire <expiry-date>\n                          prune missing working trees older than <time>"
-    );
-    Err(GitError::Exit(129))
-}
 
-fn parse_worktree_lock_options(args: &[String]) -> Result<WorktreeLockOptions> {
-    let mut reason = None;
-    let mut paths = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        match arg.as_str() {
-            "--reason" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    eprintln!("error: option `reason' requires a value");
-                    return Err(GitError::Exit(129));
-                };
-                reason = Some(value.clone());
-            }
-            value if let Some(value) = value.strip_prefix("--reason=") => {
-                reason = Some(value.to_string());
-            }
-            "--no-reason" => reason = Some("(null)".to_string()),
-            value if value.starts_with('-') => {
-                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
-                return worktree_lock_usage();
-            }
-            value => paths.push(value.to_string()),
-        }
-        index += 1;
-    }
-    if paths.len() != 1 {
-        return worktree_lock_usage();
-    }
-    Ok(WorktreeLockOptions {
-        reason,
-        path: paths.remove(0),
-    })
-}
 
-fn parse_worktree_remove_options(args: &[String]) -> Result<WorktreeRemoveOptions> {
-    let mut force = 0usize;
-    let mut paths = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "-f" | "--force" => force += 1,
-            "--no-force" => force = 0,
-            value if value.starts_with('-') => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                return worktree_remove_usage();
-            }
-            value => paths.push(value.to_string()),
-        }
-    }
-    if paths.len() != 1 {
-        return worktree_remove_usage();
-    }
-    Ok(WorktreeRemoveOptions {
-        force,
-        path: paths.remove(0),
-    })
-}
 
-fn parse_worktree_move_options(args: &[String]) -> Result<WorktreeMoveOptions> {
-    let mut force = 0usize;
-    let mut relative_paths = None;
-    let mut paths = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "-f" | "--force" => force += 1,
-            "--no-force" => force = 0,
-            "--relative-paths" => relative_paths = Some(true),
-            "--no-relative-paths" => relative_paths = Some(false),
-            value if value.starts_with('-') => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                return worktree_move_usage();
-            }
-            value => paths.push(value.to_string()),
-        }
-    }
-    if paths.len() != 2 {
-        return worktree_move_usage();
-    }
-    Ok(WorktreeMoveOptions {
-        force,
-        relative_paths,
-        source: paths.remove(0),
-        destination: paths.remove(0),
-    })
-}
 
-fn parse_worktree_repair_options(args: &[String]) -> Result<WorktreeRepairOptions> {
-    let mut relative_paths = None;
-    let mut paths = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "--relative-paths" => relative_paths = Some(true),
-            "--no-relative-paths" => relative_paths = Some(false),
-            value if value.starts_with('-') => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                return worktree_repair_usage();
-            }
-            value => paths.push(value.to_string()),
-        }
-    }
-    Ok(WorktreeRepairOptions {
-        relative_paths,
-        paths,
-    })
-}
 
-fn parse_worktree_unlock_options(args: &[String]) -> Result<String> {
-    if args.len() != 1 || args[0].starts_with('-') {
-        return worktree_unlock_usage();
-    }
-    Ok(args[0].clone())
-}
 
-fn worktree_lock_usage<T>() -> Result<T> {
-    eprintln!("usage: git worktree lock [--reason <string>] <worktree>");
-    eprintln!();
-    eprintln!("    --[no-]reason <string>");
-    eprintln!("                          reason for locking");
-    eprintln!();
-    Err(GitError::Exit(129))
-}
 
-fn worktree_unlock_usage<T>() -> Result<T> {
-    eprintln!("usage: git worktree unlock <worktree>");
-    eprintln!();
-    Err(GitError::Exit(129))
-}
 
-fn worktree_remove_usage<T>() -> Result<T> {
-    eprintln!("usage: git worktree remove [-f] <worktree>");
-    eprintln!();
-    eprintln!("    -f, --[no-]force      force removal even if worktree is dirty or locked");
-    eprintln!();
-    Err(GitError::Exit(129))
-}
 
-fn worktree_move_usage<T>() -> Result<T> {
-    eprintln!("usage: git worktree move <worktree> <new-path>");
-    eprintln!();
-    eprintln!("    -f, --[no-]force      force move even if worktree is dirty or locked");
-    eprintln!("    --[no-]relative-paths use relative paths for worktrees");
-    eprintln!();
-    Err(GitError::Exit(129))
-}
 
-fn worktree_repair_usage<T>() -> Result<T> {
-    eprintln!("usage: git worktree repair [<path>...]");
-    eprintln!();
-    eprintln!("    --[no-]relative-paths use relative paths for worktrees");
-    eprintln!();
-    Err(GitError::Exit(129))
-}
 
-fn parse_worktree_add_options(args: &[String]) -> Result<WorktreeAddOptions> {
-    let mut force = 0usize;
-    let mut quiet = false;
-    let mut detach = false;
-    let mut checkout = true;
-    let mut keep_locked = false;
-    let mut lock_reason: Option<String> = None;
-    // `-b` and `-B` are tracked separately so their simultaneous use (and use
-    // alongside `--detach`) is a "mutually exclusive options" error, matching
-    // git's `!!opts.detach + !!new_branch + !!new_branch_force > 1` check.
-    let mut new_branch: Option<String> = None;
-    let mut new_branch_force: Option<String> = None;
-    let mut orphan = false;
-    // `None` = no `--[no-]guess-remote` flag, so `worktree.guessRemote` config
-    // (resolved later, once the git dir is known) supplies the default.
-    let mut guess_remote: Option<bool> = None;
-    let mut track: Option<bool> = None;
-    let mut relative_paths: Option<bool> = None;
-    let mut paths = Vec::new();
-    let mut saw_double_dash = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if saw_double_dash {
-            paths.push(arg.clone());
-            index += 1;
-            continue;
-        }
-        match arg.as_str() {
-            "--" => saw_double_dash = true,
-            "-f" | "--force" => force += 1,
-            "--no-force" => force = 0,
-            "-q" | "--quiet" => quiet = true,
-            "--no-quiet" => quiet = false,
-            "-d" | "--detach" => detach = true,
-            "--no-detach" => detach = false,
-            "--checkout" => checkout = true,
-            "--no-checkout" => checkout = false,
-            "--orphan" => orphan = true,
-            "--no-orphan" => orphan = false,
-            "--lock" => keep_locked = true,
-            "--no-lock" => keep_locked = false,
-            "--reason" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    eprintln!("error: option `reason' requires a value");
-                    return Err(GitError::Exit(129));
-                };
-                lock_reason = Some(value.clone());
-            }
-            value if let Some(value) = value.strip_prefix("--reason=") => {
-                lock_reason = Some(value.to_string());
-            }
-            "--no-reason" => lock_reason = None,
-            "-b" | "-B" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return worktree_add_usage();
-                };
-                if arg == "-B" {
-                    new_branch_force = Some(value.clone());
-                } else {
-                    new_branch = Some(value.clone());
-                }
-            }
-            value if value.starts_with("-b") && value.len() > 2 => {
-                new_branch = Some(value[2..].to_string());
-            }
-            value if value.starts_with("-B") && value.len() > 2 => {
-                new_branch_force = Some(value[2..].to_string());
-            }
-            "--guess-remote" => guess_remote = Some(true),
-            "--no-guess-remote" => guess_remote = Some(false),
-            "--track" => track = Some(true),
-            value if value.starts_with("--track=") => track = Some(true),
-            "--no-track" => track = Some(false),
-            "--relative-paths" => relative_paths = Some(true),
-            "--no-relative-paths" => relative_paths = Some(false),
-            value if value.starts_with('-') && value != "-" => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                return worktree_add_usage();
-            }
-            value => paths.push(value.to_string()),
-        }
-        index += 1;
-    }
 
-    // Mirror git's argument-validation order exactly (builtin/worktree.c add()).
-    if (detach as usize) + (new_branch.is_some() as usize) + (new_branch_force.is_some() as usize)
-        > 1
-    {
-        eprintln!("fatal: options '-b', '-B', and '--detach' cannot be used together");
-        return Err(GitError::Exit(128));
-    }
-    if detach && orphan {
-        eprintln!("fatal: options '--orphan' and '--detach' cannot be used together");
-        return Err(GitError::Exit(128));
-    }
-    if orphan && track.is_some() {
-        eprintln!("fatal: options '--orphan' and '--track' cannot be used together");
-        return Err(GitError::Exit(128));
-    }
-    if orphan && !checkout {
-        eprintln!("fatal: options '--orphan' and '--no-checkout' cannot be used together");
-        return Err(GitError::Exit(128));
-    }
-    // `--orphan` with an explicit commit-ish (two positionals) is illegal.
-    if orphan && paths.len() == 2 {
-        eprintln!("fatal: option '--orphan' and commit-ish cannot be used together");
-        return Err(GitError::Exit(128));
-    }
-    if lock_reason.is_some() && !keep_locked {
-        eprintln!("fatal: the option '--reason' requires '--lock'");
-        return Err(GitError::Exit(128));
-    }
-
-    if paths.is_empty() || paths.len() > 2 {
-        return worktree_add_usage();
-    }
-
-    let force_branch = new_branch_force.is_some();
-    let branch = new_branch_force.or(new_branch);
-    Ok(WorktreeAddOptions {
-        force,
-        quiet,
-        detach,
-        checkout,
-        lock: keep_locked,
-        lock_reason,
-        branch,
-        force_branch,
-        orphan,
-        guess_remote_flag: guess_remote,
-        track,
-        relative_paths,
-        path: paths.remove(0),
-        start: paths.pop(),
-    })
-}
-
-fn worktree_add_usage<T>() -> Result<T> {
-    eprintln!(
-        "usage: git worktree add [-f] [--detach] [--checkout] [--lock [--reason <string>]]\n                        [--orphan] [(-b | -B) <new-branch>] <path> [<commit-ish>]"
-    );
-    eprintln!();
-    eprintln!(
-        "    -f, --[no-]force      checkout <branch> even if already checked out in other worktree"
-    );
-    eprintln!("    -b <branch>           create a new branch");
-    eprintln!("    -B <branch>           create or reset a branch");
-    eprintln!("    --[no-]orphan         create unborn branch");
-    eprintln!("    -d, --[no-]detach     detach HEAD at named commit");
-    eprintln!("    --[no-]checkout       populate the new working tree");
-    eprintln!("    --[no-]lock           keep the new working tree locked");
-    eprintln!("    --[no-]reason <string>");
-    eprintln!("                          reason for locking");
-    eprintln!("    -q, --[no-]quiet      suppress progress reporting");
-    eprintln!("    --[no-]track          set up tracking mode (see git-branch(1))");
-    eprintln!(
-        "    --[no-]guess-remote   try to match the new branch name with a remote-tracking branch"
-    );
-    eprintln!("    --[no-]relative-paths use relative paths for worktrees");
-    eprintln!();
-    Err(GitError::Exit(129))
-}
 
 fn collect_worktree_list_entries(
     common_git_dir: &Path,
@@ -1973,7 +1557,13 @@ fn worktree_add_resolve_head(
         // (HEAD becomes a symref); otherwise detach. Resolve against the current
         // worktree so per-worktree revs (HEAD, @{-1}) are correct.
         if let Some(branch) = worktree_add_branch_for_commitish(store, &commitish)? {
-            let oid = resolve_revision(worktree_git_dir, format, &commitish)?;
+            // Resolve via the branch ref itself so a same-named tag (e.g. from
+            // test_commit) cannot disagree with refs/heads/<branch> during checkout.
+            let refname = branch_ref_name(&branch)?;
+            let oid = match store.read_ref(&refname)? {
+                Some(RefTarget::Direct(oid)) => oid,
+                _ => resolve_revision(worktree_git_dir, format, &commitish)?,
+            };
             return Ok(WorktreeAddHead {
                 branch_name: Some(branch),
                 oid,
@@ -2438,21 +2028,21 @@ pub(crate) fn branch_checked_out_worktree(
                 || normalize_lexical_path(path) == normalize_lexical_path(ignore)
         })
     };
-    if worktree_head_points_to(common_git_dir, refname)?
-        && let Ok(path) = worktree_root_for_git_dir(common_git_dir)
-        && !is_ignored(&path)
+    if let Some(worktree) =
+        sley_worktree::find_shared_symref(common_git_dir, "HEAD", refname)?
+        && !is_ignored(&worktree.path)
     {
-        return Ok(Some(fs::canonicalize(&path).unwrap_or(path)));
+        return Ok(Some(
+            fs::canonicalize(&worktree.path).unwrap_or(worktree.path),
+        ));
     }
-    for admin in collect_linked_worktree_admins(common_git_dir)? {
-        if is_ignored(&admin.path) {
-            continue;
-        }
-        if worktree_head_points_to(&admin.admin_dir, refname)? {
-            return Ok(Some(
-                fs::canonicalize(&admin.path).unwrap_or(admin.path.to_path_buf()),
-            ));
-        }
+    if let Some(worktree) =
+        sley_worktree::worktree_holding_rebase_update_ref(common_git_dir, refname)?
+        && !is_ignored(&worktree.path)
+    {
+        return Ok(Some(
+            fs::canonicalize(&worktree.path).unwrap_or(worktree.path),
+        ));
     }
     Ok(None)
 }

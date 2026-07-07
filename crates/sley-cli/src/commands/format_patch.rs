@@ -18,7 +18,9 @@
 //! diff/stat rendering in the shared crate writes to generic `Write` sinks, so
 //! format-patch keeps only the mbox framing here and delegates patch/summary
 //! rendering to the unified diff path.
+#![allow(clippy::expect_used)]
 
+use sley::plumbing::{sley_core, sley_diff_merge, sley_object, sley_rev};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 use sley_notes::{NotesRef, read_note_bytes};
@@ -1674,25 +1676,23 @@ fn cover_diff_entries(
     origin_tree: &ObjectId,
     head_tree: &ObjectId,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
-    let base = sley_diff_merge::DiffNameStatusOptions {
+    let name_status_options = sley_diff_merge::DiffNameStatusOptions {
         detect_renames: options.detect_renames,
         detect_copies: options.detect_copies,
         find_copies_harder: options.find_copies_harder,
         rename_empty: true,
-    };
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
-        base,
         detect_inexact: true,
         rename_threshold: options.rename_threshold,
         copy_threshold: options.copy_threshold,
         rename_limit: 0,
+        ..Default::default()
     };
-    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+    let entries = sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         origin_tree,
         head_tree,
-        rename_options,
+        name_status_options,
     )?;
     let entries = match diff_pathspec {
         Some(pathspec) => apply_diff_pathspec(entries, pathspec),
@@ -3254,36 +3254,34 @@ fn first_parent_diff_entries(
     diff_pathspec: Option<&DiffPathspec>,
     commit: &Commit,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
-    let base = sley_diff_merge::DiffNameStatusOptions {
+    let name_status_options = sley_diff_merge::DiffNameStatusOptions {
         detect_renames: options.detect_renames,
         detect_copies: options.detect_copies,
         find_copies_harder: options.find_copies_harder,
         rename_empty: true,
-    };
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
-        base,
         detect_inexact: true,
         rename_threshold: options.rename_threshold,
         copy_threshold: options.copy_threshold,
         rename_limit: 0,
+        ..Default::default()
     };
     let entries = match commit.parents.first() {
         Some(parent_oid) => {
             let parent_object = db.read_object(parent_oid)?;
             let parent_commit = Commit::parse_ref(format, &parent_object.body)?;
-            sley_diff_merge::diff_name_status_trees_with_rename_options(
+            sley_diff_merge::diff_name_status_trees_with_options(
                 db,
                 format,
                 &parent_commit.tree,
                 &commit.tree,
-                rename_options,
+                name_status_options,
             )
         }
-        None => sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
+        None => sley_diff_merge::diff_name_status_empty_tree_with_options(
             db,
             format,
             &commit.tree,
-            rename_options,
+            name_status_options,
         ),
     }?;
     let entries = match diff_pathspec {
@@ -3884,7 +3882,7 @@ fn format_patch_diff_options<'a>(
         colors: None,
         word_diff: None,
         no_index_contents: None,
-        submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+        submodule_format: sley_rev::diff_options::SubmoduleDiffFormat::Short,
         submodule_dirt: None,
         ws_error: None,
         color_moved: None,
@@ -3925,8 +3923,8 @@ pub(crate) fn write_patch_hunks_with(
     new_content: Option<&[u8]>,
     options: &crate::DiffRenderOptions<'_>,
 ) {
-    let mut heading = sley_diff_format::heading_classifier(options.funcname);
-    let mut word_diff: Option<sley_diff_format::WordDiffAdapter> = None;
+    let mut heading = sley_diff_merge::format::heading_classifier(options.funcname);
+    let mut word_diff: Option<sley_diff_merge::format::WordDiffAdapter> = None;
     let default_colors = commands::diff_words::DiffColors::default();
     let mut word_diff_config: Option<commands::diff_words::WordDiffConfig> = None;
     if let Some(word_request) = options.word_diff {
@@ -3938,12 +3936,12 @@ pub(crate) fn write_patch_hunks_with(
     }
     word_diff = word_diff_config
         .as_ref()
-        .map(sley_diff_format::WordDiffAdapter::new);
+        .map(sley_diff_merge::format::WordDiffAdapter::new);
     let mut render_options = sley_diff_merge::render::HunkRenderOptions {
         context: options.context,
         interhunk: options.interhunk,
         heading: Some(&mut heading),
-        colors: options.colors.map(sley_diff_format::render_colors),
+        colors: options.colors.map(sley_diff_merge::format::render_colors),
         word_diff: word_diff
             .as_mut()
             .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),

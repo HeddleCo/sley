@@ -27,7 +27,8 @@
 //! A glob of the crate root brings every shared helper/type into scope via
 //! descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley_object::TreeEntries;
+use sley::plumbing::sley_object::TreeEntries;
+use sley::plumbing::{sley_diff_merge, sley_rev, sley_worktree};
 
 /// Which output formats to produce, mirroring git's `output_format` bitmask:
 /// the explicit format options accumulate (`--stat --summary` prints both, and
@@ -224,7 +225,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
                 .collect();
             if setup_args.len() == 1 {
                 let cwd = env::current_dir()?;
-                let git_dir = discover_git_dir(&cwd)?;
+                let git_dir = crate::session::cli_git_dir_from(&cwd)?;
                 let format = repository_object_format(&git_dir)?;
                 let config = read_repo_config(&git_dir)?;
                 let db = FileObjectDatabase::from_git_dir(&git_dir, format);
@@ -1425,31 +1426,30 @@ fn compute_entries(
         return Ok(entries);
     }
     if recursive {
-        let rename_options = sley_diff_merge::RenameDetectionOptions {
-            base: sley_diff_merge::DiffNameStatusOptions {
-                detect_renames: options.detect_renames,
-                detect_copies: options.detect_copies,
-                find_copies_harder: options.find_copies_harder,
-                rename_empty: options.rename_empty,
-            },
+        let name_status_options = sley_diff_merge::DiffNameStatusOptions {
+            detect_renames: options.detect_renames,
+            detect_copies: options.detect_copies,
+            find_copies_harder: options.find_copies_harder,
+            rename_empty: options.rename_empty,
             detect_inexact: options.detect_renames || options.detect_copies,
             rename_threshold: options.rename_threshold,
             copy_threshold: options.copy_threshold,
             rename_limit: 0,
+            ..Default::default()
         };
         let mut entries = match left {
-            Some(left) => sley_diff_merge::diff_name_status_trees_with_rename_options(
+            Some(left) => sley_diff_merge::diff_name_status_trees_with_options(
                 db,
                 format,
                 left,
                 right,
-                rename_options,
+                name_status_options,
             )?,
-            None => sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
+            None => sley_diff_merge::diff_name_status_empty_tree_with_options(
                 db,
                 format,
                 right,
-                rename_options,
+                name_status_options,
             )?,
         };
         if options.show_trees {

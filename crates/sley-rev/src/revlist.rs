@@ -181,12 +181,14 @@ fn rev_list_prio_emit<'a>(
     while !ready.is_empty() {
         // Newest priority first; ties broken by the *smallest* insertion counter
         // (earlier into the queue), matching git's prio_queue compare-on-ctr.
-        let pos = ready
+        let Some(pos) = ready
             .iter()
             .enumerate()
             .max_by_key(|(_, idx)| (priority[**idx], Reverse(ctr[**idx])))
             .map(|(pos, _)| pos)
-            .expect("ready is not empty");
+        else {
+            break;
+        };
         let idx = ready.swap_remove(pos);
         let record = records[idx];
         for parent in &record.parents {
@@ -310,12 +312,14 @@ pub fn rev_list_ready_order<K: Ord>(
     let mut emitted = vec![false; records.len()];
     let mut out = Vec::with_capacity(records.len());
     while !ready.is_empty() {
-        let ready_pos = ready
+        let Some(ready_pos) = ready
             .iter()
             .enumerate()
             .max_by_key(|(_, idx)| ready_key(**idx))
             .map(|(pos, _)| pos)
-            .expect("ready is not empty");
+        else {
+            break;
+        };
         let idx = ready.swap_remove(ready_pos);
         if emitted[idx] {
             continue;
@@ -367,12 +371,14 @@ pub fn rev_list_metadata_date_order(records: Vec<CommitMetadata>) -> Vec<CommitM
     let mut emitted = vec![false; records.len()];
     let mut order = Vec::with_capacity(records.len());
     while !ready.is_empty() {
-        let ready_pos = ready
+        let Some(ready_pos) = ready
             .iter()
             .enumerate()
             .max_by_key(|(_, idx)| (records[**idx].commit_time, Reverse(**idx)))
             .map(|(pos, _)| pos)
-            .expect("ready is not empty");
+        else {
+            break;
+        };
         let idx = ready.swap_remove(ready_pos);
         if emitted[idx] {
             continue;

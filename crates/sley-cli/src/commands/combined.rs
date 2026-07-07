@@ -12,6 +12,7 @@
 //! A glob of the crate root brings every shared helper/type into scope via
 //! descendant-privacy; see commands::stash for the rationale.
 use crate::*;
+use sley::plumbing::{sley_diff_merge};
 
 /// One path of a combined merge diff: the merge result plus each parent's state
 /// for that path (mirrors git's `struct combine_diff_path`).
@@ -45,25 +46,24 @@ pub(crate) fn combined_paths(
     let Some(first_parent_tree) = parent_trees.first() else {
         return Ok(Vec::new());
     };
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
-        base: sley_diff_merge::DiffNameStatusOptions {
-            detect_renames: false,
-            detect_copies: false,
-            find_copies_harder: false,
-            rename_empty: true,
-        },
+    let options = sley_diff_merge::DiffNameStatusOptions {
+        detect_renames: false,
+        detect_copies: false,
+        find_copies_harder: false,
+        rename_empty: true,
         detect_inexact: false,
         rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
         copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
         rename_limit: 0,
+        ..Default::default()
     };
 
-    let mut first_parent_entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+    let mut first_parent_entries = sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         first_parent_tree,
         result_tree,
-        rename_options,
+        options,
     )?;
     first_parent_entries.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
     let mut paths = Vec::new();

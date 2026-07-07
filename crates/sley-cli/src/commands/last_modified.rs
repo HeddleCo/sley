@@ -1,6 +1,7 @@
 //! `git last-modified`: report the commit that last touched each selected path.
 
 use crate::*;
+use sley::plumbing::{sley_diff_merge, sley_rev};
 
 #[derive(Clone)]
 struct LastModifiedOptions {
@@ -586,6 +587,7 @@ fn changed_paths_between_trees(
             detect_copies: false,
             find_copies_harder: false,
             rename_empty: true,
+            ..Default::default()
         },
     )?;
     for entry in changes {

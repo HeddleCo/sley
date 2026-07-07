@@ -34,9 +34,10 @@
 //!     (fsck.c).
 //!
 //! Blobs are never validated (any byte sequence is a valid blob), matching git.
+#![allow(clippy::expect_used)]
 
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use sley_object::ObjectType;
+use sley::{GitError, ObjectFormat, ObjectId, Result};
+use sley::plumbing::sley_object::ObjectType;
 
 /// The fatal line git prints (via `die()`) once an object fails fsck.
 const REFUSING_MALFORMED: &str = "fatal: refusing to create malformed object";
@@ -995,6 +996,7 @@ fn parse_object_type(value: &[u8]) -> Option<ObjectType> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

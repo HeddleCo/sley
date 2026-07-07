@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, Write};
 
-use sley_core::Result;
+use sley::Result;
 
 pub(crate) struct StdinRecordReader<R> {
     reader: R,

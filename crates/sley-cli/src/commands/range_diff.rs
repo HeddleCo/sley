@@ -1,8 +1,10 @@
 //! `git range-diff` — compare two commit series by patch similarity.
+#![allow(clippy::expect_used)]
 
 use crate::*;
-use sley_diff_merge::range::{PatchRef, assign_patch_series};
+use sley::plumbing::sley_diff_merge::range::{PatchRef, assign_patch_series};
 use sley_notes::{NotesRef, read_note_bytes};
+use sley::plumbing::{sley_rev};
 
 const DEFAULT_CREATION_FACTOR: i32 = 60;
 
@@ -514,6 +516,7 @@ fn build_patch_text(
         detect_copies: false,
         find_copies_harder: false,
         rename_empty: true,
+        ..Default::default()
     };
     let entries = if record.parents.is_empty() {
         sley_diff_merge::diff_name_status_empty_tree_with_options(
@@ -523,17 +526,21 @@ fn build_patch_text(
             base,
         )?
     } else {
-        sley_diff_merge::diff_name_status_trees_with_rename_options(
+        sley_diff_merge::diff_name_status_trees_with_options(
             db,
             format,
             &parent_tree,
             &record.commit.tree,
-            sley_diff_merge::RenameDetectionOptions {
-                base,
+            sley_diff_merge::DiffNameStatusOptions {
+                detect_renames: true,
+                detect_copies: false,
+                find_copies_harder: false,
+                rename_empty: true,
                 detect_inexact: true,
                 rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 rename_limit: 0,
+                ..Default::default()
             },
         )?
     };

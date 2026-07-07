@@ -1,13 +1,20 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
+#![allow(clippy::expect_used)]
 
+use sley::plumbing::{sley_config, sley_core, sley_index, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
+use crate::commands::cli_options::{
+    cli_usage_error, last_tri_state_bool, opt_bool, opt_str,
+};
 use regex::Regex;
-use sley_object::EncodedObject;
-use sley_odb::{ObjectReader, ObjectWriter};
-use sley_pack::{
-    PackBitmapWriter, PackInput, PackReverseIndex, PackWriteOptions, pack_order_index_positions,
+use sley_options::{OptFlags, OptionName, parse_options, ParsedValue};
+use sley::plumbing::sley_object::EncodedObject;
+use sley::plumbing::sley_odb::{ObjectReader, ObjectWriter};
+use sley::PackWriteOptions;
+use sley::plumbing::sley_pack::{
+    PackBitmapWriter, PackInput, PackReverseIndex, pack_order_index_positions,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -39,11 +46,11 @@ struct IndexPackOptions {
 }
 
 pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
-    let options = parse_index_pack_options(args)?;
+    let options = setup_index_pack_options(args)?;
     // The hash algorithm is taken from `--object-format` when given, else from
     // the surrounding repository. A `<pack-file>` argument (not `--stdin`) can
     // run outside any repo, so only fall back to repo discovery when needed.
-    let repo = match discover_git_dir(env::current_dir()?) {
+    let repo = match crate::session::cli_git_dir() {
         Ok(git_dir) => match common_git_dir_for_git_dir(&git_dir) {
             Ok(common_git_dir) => {
                 let format = match options.object_format {
@@ -176,7 +183,9 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
+fn setup_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
+    let parsed = parse_options(args, index_pack_option_specs(), &INDEX_PACK_USAGE)
+        .map_err(cli_usage_error)?;
     let mut options = IndexPackOptions {
         verbose: false,
         output: None,
@@ -192,74 +201,71 @@ fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
         object_format: None,
         max_input_size: None,
     };
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--" => {
-                for value in iter {
-                    index_pack_add_pack_file(&mut options, value)?;
+    if parsed
+        .options
+        .iter()
+        .any(|option| option.short == Some('v'))
+    {
+        options.verbose = true;
+    }
+    for option in &parsed.options {
+        match (option.short, option.long) {
+            (Some('o'), _) => {
+                if let ParsedValue::Str(value) = &option.value {
+                    options.output = Some(PathBuf::from(value.to_string()));
                 }
-                break;
             }
-            "-v" => options.verbose = true,
-            "-o" => {
-                let Some(value) = iter.next() else {
-                    return index_pack_usage();
-                };
-                options.output = Some(PathBuf::from(value));
+            (_, Some("stdin")) => options.stdin = true,
+            (_, Some("fix-thin")) => options.fix_thin = true,
+            (_, Some("keep")) if !matches!(option.name, OptionName::NegatedLong("keep")) => {
+                options.keep = true;
             }
-            "--stdin" => options.stdin = true,
-            "--fix-thin" => options.fix_thin = true,
-            "--keep" => options.keep = true,
-            value if value.starts_with("--keep=") => options.keep = true,
-            "--rev-index" => options.rev_index = true,
-            "--no-rev-index" => options.rev_index = false,
-            "--verify" => options.verify = true,
-            value if value.starts_with("--index-version=") => {
-                let spec = &value["--index-version=".len()..];
-                let version_part = spec.split(',').next().unwrap_or(spec);
-                let version: u32 = version_part
-                    .parse()
-                    .map_err(|_| GitError::Command(format!("bad index version '{spec}'")))?;
-                if version != 1 && version != 2 {
-                    eprintln!("fatal: bad index version '{spec}'");
-                    return Err(GitError::Exit(128));
+            (_, Some("rev-index")) => {
+                options.rev_index = !matches!(option.name, OptionName::NegatedLong("rev-index"));
+            }
+            (_, Some("verify")) => options.verify = true,
+            (_, Some("index-version")) => {
+                if let ParsedValue::Str(spec) = &option.value {
+                    let version_part = spec.split(',').next().unwrap_or(spec);
+                    let version: u32 = version_part
+                        .parse()
+                        .map_err(|_| GitError::Command(format!("bad index version '{spec}'")))?;
+                    if version != 1 && version != 2 {
+                        eprintln!("fatal: bad index version '{spec}'");
+                        return Err(GitError::Exit(128));
+                    }
+                    options.index_version = Some(version);
                 }
-                options.index_version = Some(version);
             }
-            "--threads" => {
-                let _ = iter.next();
-            }
-            "--strict" | "--fsck-objects" => options.fsck = true,
-            value if value.starts_with("--strict=") || value.starts_with("--fsck-objects=") => {
+            (_, Some("strict")) | (_, Some("fsck-objects")) => {
                 options.fsck = true;
-                let spec = value.split_once('=').map(|(_, rest)| rest).unwrap_or("");
-                for token in spec.split(',') {
-                    if !token.is_empty() {
-                        options.fsck_overrides.push(token.to_string());
+                if let ParsedValue::Str(spec) = &option.value {
+                    for token in spec.split(',') {
+                        if !token.is_empty() {
+                            options.fsck_overrides.push(token.to_string());
+                        }
                     }
                 }
             }
-            "--object-format" => {
-                let Some(value) = iter.next() else {
-                    return index_pack_usage();
-                };
-                options.object_format = Some(parse_verify_pack_object_format(value)?);
+            (_, Some("object-format")) => {
+                if let ParsedValue::Str(value) = &option.value {
+                    options.object_format = Some(parse_verify_pack_object_format(value)?);
+                }
             }
-            value if let Some(value) = long_option_value(value, "object-format") => {
-                options.object_format = Some(parse_verify_pack_object_format(value)?);
+            (_, Some("max-input-size")) => {
+                if let ParsedValue::Str(spec) = &option.value {
+                    options.max_input_size = Some(
+                        spec.parse().map_err(|_| {
+                            GitError::Command(format!("bad max-input-size '{spec}'"))
+                        })?,
+                    );
+                }
             }
-            value if value.starts_with("--max-input-size=") => {
-                let spec = &value["--max-input-size=".len()..];
-                options.max_input_size = Some(
-                    spec.parse()
-                        .map_err(|_| GitError::Command(format!("bad max-input-size '{spec}'")))?,
-                );
-            }
-            value if value.starts_with("--threads=") || value.starts_with("--pack_header=") => {}
-            value if value.starts_with('-') => return index_pack_usage(),
-            value => index_pack_add_pack_file(&mut options, value)?,
+            _ => {}
         }
+    }
+    for positional in parsed.positionals {
+        index_pack_add_pack_file(&mut options, positional)?;
     }
     if options.output.is_some() && options.verify {
         return Err(GitError::Exit(128));
@@ -268,6 +274,70 @@ fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
         return index_pack_usage();
     }
     Ok(options)
+}
+
+const INDEX_PACK_USAGE: &[&str] = &["git index-pack [-v] [-o <index-file>] [--keep | --keep=<msg>] [--[no-]rev-index] [--verify] [--strict[=<msg-id>=<severity>...]] [--fsck-objects[=<msg-id>=<severity>...]] (<pack-file> | --stdin [--fix-thin] [<pack-file>])"];
+
+fn index_pack_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
+    static SPECS: &[sley_options::OptionSpec<'static>] = &[
+        opt_bool(Some('v'), None, OptFlags::NONEG, "verbose"),
+        opt_str(Some('o'), None, "<index-file>", OptFlags::NONE, "write index to <index-file>"),
+        opt_bool(None, Some("stdin"), OptFlags::NONEG, "read from stdin"),
+        opt_bool(None, Some("fix-thin"), OptFlags::NONEG, "fix thin pack"),
+        opt_str(
+            None,
+            Some("keep"),
+            "<msg>",
+            OptFlags::OPTARG.union(OptFlags::NONEG),
+            "create .keep file",
+        ),
+        opt_bool(None, Some("rev-index"), OptFlags::NONE, "generate reverse index"),
+        opt_bool(None, Some("verify"), OptFlags::NONEG, "verify pack"),
+        opt_str(
+            None,
+            Some("index-version"),
+            "<version>",
+            OptFlags::NONEG,
+            "index version",
+        ),
+        opt_str(
+            None,
+            Some("strict"),
+            "<msg-id>=<severity>...",
+            OptFlags::OPTARG.union(OptFlags::NONEG),
+            "fsck objects",
+        ),
+        opt_str(
+            None,
+            Some("fsck-objects"),
+            "<msg-id>=<severity>...",
+            OptFlags::OPTARG.union(OptFlags::NONEG),
+            "fsck objects",
+        ),
+        opt_str(
+            None,
+            Some("object-format"),
+            "<format>",
+            OptFlags::NONE,
+            "specify the hash algorithm to use",
+        ),
+        opt_str(
+            None,
+            Some("max-input-size"),
+            "<n>",
+            OptFlags::NONEG,
+            "maximum input size",
+        ),
+        opt_str(None, Some("threads"), "<n>", OptFlags::OPTARG.union(OptFlags::HIDDEN), ""),
+        opt_str(
+            None,
+            Some("pack_header"),
+            "<hdr>",
+            OptFlags::OPTARG.union(OptFlags::HIDDEN),
+            "",
+        ),
+    ];
+    SPECS
 }
 
 fn index_pack_add_pack_file(options: &mut IndexPackOptions, value: &str) -> Result<()> {
@@ -517,7 +587,7 @@ struct VerifyPackOptions {
 }
 
 pub(crate) fn cmd_verify_pack(args: &[String]) -> Result<()> {
-    let options = parse_verify_pack_options(args)?;
+    let options = setup_verify_pack_options(args)?;
     // verify-pack inspects the named pack files directly, so it works outside a
     // repository (git resolves the hash from `--object-format`, else SHA-1).
     for index_path in &options.index_paths {
@@ -531,61 +601,51 @@ pub(crate) fn cmd_verify_pack(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn parse_verify_pack_options(args: &[String]) -> Result<VerifyPackOptions> {
-    let mut verbose = false;
-    let mut stat_only = false;
+fn setup_verify_pack_options(args: &[String]) -> Result<VerifyPackOptions> {
+    let parsed = parse_options(args, verify_pack_option_specs(), &VERIFY_PACK_USAGE)
+        .map_err(cli_usage_error)?;
     let mut format = ObjectFormat::Sha1;
-    let mut index_paths = Vec::new();
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--" => {
-                index_paths.extend(iter.map(PathBuf::from));
-                break;
-            }
-            "-v" | "--verbose" => verbose = true,
-            "--no-verbose" => verbose = false,
-            "-s" | "--stat-only" => stat_only = true,
-            "--no-stat-only" => stat_only = false,
-            "--object-format" => {
-                let Some(value) = iter.next() else {
-                    eprintln!("error: option `object-format' requires a value");
-                    return Err(GitError::Exit(129));
-                };
-                format = parse_verify_pack_object_format(value)?;
-            }
-            "--no-object-format" => format = ObjectFormat::Sha1,
-            value if let Some(value) = long_option_value(value, "object-format") => {
-                format = parse_verify_pack_object_format(value)?;
-            }
-            value if value.starts_with("--") => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                return verify_pack_usage();
-            }
-            value if value.starts_with('-') && value.len() > 1 => {
-                for option in value[1..].chars() {
-                    match option {
-                        'v' => verbose = true,
-                        's' => stat_only = true,
-                        other => {
-                            eprintln!("error: unknown switch `{other}'");
-                            return verify_pack_usage();
-                        }
-                    }
-                }
-            }
-            value => index_paths.push(PathBuf::from(value)),
+    for option in &parsed.options {
+        if option.long != Some("object-format") {
+            continue;
+        }
+        if matches!(option.name, OptionName::NegatedLong("object-format")) {
+            format = ObjectFormat::Sha1;
+        } else if let ParsedValue::Str(value) = &option.value {
+            format = parse_verify_pack_object_format(value)?;
         }
     }
+    let index_paths = parsed
+        .positionals
+        .iter()
+        .map(|path| PathBuf::from(*path))
+        .collect::<Vec<_>>();
     if index_paths.is_empty() {
         return verify_pack_usage();
     }
     Ok(VerifyPackOptions {
-        verbose,
-        stat_only,
+        verbose: parsed.last_bool("verbose", false),
+        stat_only: parsed.last_bool("stat-only", false),
         format,
         index_paths,
     })
+}
+
+const VERIFY_PACK_USAGE: &[&str] = &["git verify-pack [-v | --verbose | -s | --stat-only] [--] <pack>..."];
+
+fn verify_pack_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
+    static SPECS: &[sley_options::OptionSpec<'static>] = &[
+        opt_bool(Some('v'), Some("verbose"), OptFlags::NONE, "verbose"),
+        opt_bool(Some('s'), Some("stat-only"), OptFlags::NONE, "show statistics only"),
+        opt_str(
+            None,
+            Some("object-format"),
+            "<format>",
+            OptFlags::NONE,
+            "specify the hash algorithm to use",
+        ),
+    ];
+    SPECS
 }
 
 fn verify_pack_one(
@@ -1233,7 +1293,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             }
         }
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
@@ -1784,8 +1844,8 @@ struct GcOptions {
 }
 
 pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
-    let options = parse_gc_options(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let options = setup_gc_options(args)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
@@ -2065,60 +2125,92 @@ fn gc_run_locked(
     Ok(())
 }
 
-fn parse_gc_options(args: &[String]) -> Result<GcOptions> {
+fn setup_gc_options(args: &[String]) -> Result<GcOptions> {
+    let parsed = parse_options(args, gc_option_specs(), &GC_USAGE).map_err(cli_usage_error)?;
+    if !parsed.positionals.is_empty() {
+        return gc_usage();
+    }
     let mut options = GcOptions::default();
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-q" | "--quiet" => options.quiet = true,
-            "--no-quiet" => options.quiet = false,
-            "--auto" => options.auto = true,
-            "--no-auto" => options.auto = false,
-            "--detach" => options.detach = Some(true),
-            "--no-detach" => options.detach = Some(false),
-            "--force" => options.force = true,
-            "--no-force" => options.force = false,
-            "--skip-foreground-tasks" => options.skip_foreground_tasks = true,
-            "--aggressive" => options.aggressive = true,
-            "--no-aggressive" => options.aggressive = false,
-            "--keep-largest-pack" => options.keep_largest_pack = Some(true),
-            "--no-keep-largest-pack" => options.keep_largest_pack = Some(false),
-            "--cruft" => options.cruft_flag = Some(true),
-            "--no-cruft" => options.cruft_flag = Some(false),
-            "--prune" => options.prune_override = Some(Some("2.weeks.ago".to_string())),
-            "--no-prune" => options.prune_override = Some(None),
-            "--max-cruft-size" => {
-                let Some(value) = iter.next() else {
-                    eprintln!("error: option `max-cruft-size' requires a value");
-                    return gc_usage();
-                };
-                options.max_cruft_size = Some(parse_gc_size(value)?);
+    options.quiet = parsed.last_bool("quiet", false);
+    options.auto = parsed.last_bool("auto", false);
+    options.force = parsed.last_bool("force", false);
+    options.skip_foreground_tasks = parsed
+        .options
+        .iter()
+        .any(|option| option.long == Some("skip-foreground-tasks"));
+    options.aggressive = parsed.last_bool("aggressive", false);
+    options.detach = last_tri_state_bool(&parsed, "detach");
+    options.keep_largest_pack = last_tri_state_bool(&parsed, "keep-largest-pack");
+    options.cruft_flag = last_tri_state_bool(&parsed, "cruft");
+    for option in &parsed.options {
+        match option.long {
+            Some("prune") => match &option.name {
+                OptionName::NegatedLong(_) => options.prune_override = Some(None),
+                OptionName::Long(_) => match &option.value {
+                    ParsedValue::Str(value) if !value.is_empty() => {
+                        options.prune_override = Some(Some(value.to_string()));
+                    }
+                    _ => options.prune_override = Some(Some("2.weeks.ago".to_string())),
+                },
+                _ => {}
+            },
+            Some("max-cruft-size") => {
+                if let ParsedValue::Str(value) = &option.value {
+                    options.max_cruft_size = Some(parse_gc_size(value)?);
+                }
             }
-            "--expire-to" => {
-                let Some(value) = iter.next() else {
-                    eprintln!("error: option `expire-to' requires a value");
-                    return gc_usage();
-                };
-                options.expire_to = Some(value.to_string());
+            Some("expire-to") => {
+                if let ParsedValue::Str(value) = &option.value {
+                    options.expire_to = Some(value.to_string());
+                }
             }
-            "--progress" | "--no-progress" => {}
-            value if let Some(value) = long_option_value(value, "prune") => {
-                options.prune_override = Some(Some(value.to_string()));
-            }
-            value if let Some(value) = long_option_value(value, "max-cruft-size") => {
-                options.max_cruft_size = Some(parse_gc_size(value)?);
-            }
-            value if let Some(value) = long_option_value(value, "expire-to") => {
-                options.expire_to = Some(value.to_string());
-            }
-            value if value.starts_with('-') => {
-                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
-                return gc_usage();
-            }
-            _ => return gc_usage(),
+            _ => {}
         }
     }
     Ok(options)
+}
+
+const GC_USAGE: &[&str] = &["git gc [<options>]"];
+
+fn gc_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
+    static SPECS: &[sley_options::OptionSpec<'static>] = &[
+        opt_bool(Some('q'), Some("quiet"), OptFlags::NONE, "suppress progress reporting"),
+        opt_str(
+            None,
+            Some("prune"),
+            "<date>",
+            OptFlags::OPTARG.union(OptFlags::NONE),
+            "prune unreferenced objects",
+        ),
+        opt_bool(None, Some("cruft"), OptFlags::NONE, "pack unreferenced objects separately"),
+        opt_bool(None, Some("aggressive"), OptFlags::NONE, "be more thorough (increased runtime)"),
+        opt_bool(None, Some("auto"), OptFlags::NONE, "enable auto-gc mode"),
+        opt_bool(None, Some("detach"), OptFlags::NONE, "perform garbage collection in the background"),
+        opt_bool(None, Some("force"), OptFlags::NONE, "force running gc even if there may be another gc running"),
+        opt_bool(
+            None,
+            Some("keep-largest-pack"),
+            OptFlags::NONE,
+            "repack all other packs except the largest pack",
+        ),
+        opt_str(
+            None,
+            Some("max-cruft-size"),
+            "<size>",
+            OptFlags::NONE,
+            "maximum cruft pack size",
+        ),
+        opt_str(
+            None,
+            Some("expire-to"),
+            "<dir>",
+            OptFlags::NONE,
+            "pack prefix to store a cruft pack",
+        ),
+        opt_bool(None, Some("skip-foreground-tasks"), OptFlags::NONEG, ""),
+        opt_bool(None, Some("progress"), OptFlags::HIDDEN, ""),
+    ];
+    SPECS
 }
 
 fn gc_usage<T>() -> Result<T> {
@@ -2699,7 +2791,7 @@ fn cmd_maintenance_run(args: &[String]) -> Result<()> {
     }
 
     trace2_touch();
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
     let selected = maintenance_select_tasks(&config, &tasks, schedule.as_deref())?;
@@ -3140,7 +3232,7 @@ fn cmd_maintenance_is_needed(args: &[String]) -> Result<()> {
         }
         index += 1;
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
     let selected = maintenance_select_tasks(&config, &tasks, schedule.as_deref())?;
@@ -3578,7 +3670,7 @@ fn count_dir_entries(path: &Path) -> Result<usize> {
 
 fn cmd_maintenance_register(args: &[String]) -> Result<()> {
     let config_file = parse_maintenance_config_file(args, "register")?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let repo = env::current_dir()?.display().to_string();
 
@@ -3606,7 +3698,7 @@ fn cmd_maintenance_register(args: &[String]) -> Result<()> {
 
 fn cmd_maintenance_unregister(args: &[String]) -> Result<()> {
     let (config_file, force) = parse_maintenance_unregister_args(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let repo = env::current_dir()?.display().to_string();
     let missing_repo_value = report_missing_maintenance_repo(&common_git_dir);
@@ -3792,7 +3884,7 @@ enum MaintenanceScheduler {
 
 fn cmd_maintenance_start(args: &[String]) -> Result<()> {
     let scheduler = parse_maintenance_start_args(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let scheduler = scheduler.unwrap_or(MaintenanceScheduler::Systemd);
     update_background_schedule(&common_git_dir, Some(scheduler))?;
@@ -3803,7 +3895,7 @@ fn cmd_maintenance_stop(args: &[String]) -> Result<()> {
     if !args.is_empty() {
         return maintenance_subcommand_usage("stop");
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     update_background_schedule(&common_git_dir, None)
 }
@@ -4157,7 +4249,7 @@ pub(crate) fn cmd_unpack_objects(args: &[String]) -> Result<()> {
         }
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let mut pack_bytes = Vec::new();
     io::Read::read_to_end(&mut io::stdin().lock(), &mut pack_bytes)?;
@@ -4207,7 +4299,7 @@ pub(crate) fn cmd_count_objects(args: &[String]) -> Result<()> {
         }
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let stats = count_objects_stats(&git_dir, format)?;
     if verbose {
@@ -4255,9 +4347,9 @@ struct PackRefsOptions {
 }
 
 pub(crate) fn cmd_pack_refs(args: &[String]) -> Result<()> {
-    let options = parse_pack_refs_options(args)?;
+    let options = setup_pack_refs_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&git_dir, format)
@@ -4332,62 +4424,68 @@ fn parse_reftable_config_ulong(value: &str) -> Option<u64> {
     digits.trim().parse::<u64>().ok().map(|n| n * scale)
 }
 
-fn parse_pack_refs_options(args: &[String]) -> Result<PackRefsOptions> {
-    let mut all = false;
-    let mut prune = true;
-    let mut auto = false;
+fn setup_pack_refs_options(args: &[String]) -> Result<PackRefsOptions> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        return pack_refs_help();
+    }
+    let parsed = parse_options(args, pack_refs_option_specs(), &PACK_REFS_USAGE)
+        .map_err(cli_usage_error)?;
+    if !parsed.positionals.is_empty() {
+        return pack_refs_usage();
+    }
     let mut include = Vec::new();
     let mut exclude = Vec::new();
-    let mut args = GitArgCursor::new(args);
-    while let Some(arg) = args.next() {
-        match arg {
-            "-h" | "--help" => return pack_refs_help(),
-            "--all" => all = true,
-            "--no-all" => all = false,
-            "--prune" => prune = true,
-            "--no-prune" => prune = false,
-            "--auto" => auto = true,
-            "--no-auto" => auto = false,
-            "--include" | "--exclude" => {
-                let Some(pattern) = args.next_value() else {
-                    return pack_refs_usage();
-                };
-                if arg == "--include" {
+    for option in &parsed.options {
+        match option.long {
+            Some("include") => {
+                if matches!(option.name, OptionName::NegatedLong("include")) {
+                    include.clear();
+                } else if let ParsedValue::Str(pattern) = &option.value {
                     include.push(pattern.to_string());
-                } else {
+                }
+            }
+            Some("exclude") => {
+                if matches!(option.name, OptionName::NegatedLong("exclude")) {
+                    exclude.clear();
+                } else if let ParsedValue::Str(pattern) = &option.value {
                     exclude.push(pattern.to_string());
                 }
             }
-            "--no-include" => include.clear(),
-            "--no-exclude" => exclude.clear(),
-            value if let Some(pattern) = long_option_value(value, "include") => {
-                include.push(pattern.to_string());
-            }
-            value if let Some(pattern) = long_option_value(value, "exclude") => {
-                exclude.push(pattern.to_string());
-            }
-            value if value.starts_with("--no-include=") => {
-                eprintln!("error: option `no-include' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with("--no-exclude=") => {
-                eprintln!("error: option `no-exclude' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with('-') => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                return pack_refs_usage();
-            }
-            _ => return pack_refs_usage(),
+            _ => {}
         }
     }
     Ok(PackRefsOptions {
-        all,
-        prune,
-        auto,
+        all: parsed.last_bool("all", false),
+        prune: parsed.last_bool("prune", true),
+        auto: parsed.last_bool("auto", false),
         include,
         exclude,
     })
+}
+
+const PACK_REFS_USAGE: &[&str] = &["git pack-refs [--all] [--no-prune] [--auto] [--include <pattern>] [--exclude <pattern>]"];
+
+fn pack_refs_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
+    static SPECS: &[sley_options::OptionSpec<'static>] = &[
+        opt_bool(None, Some("all"), OptFlags::NONE, "pack everything"),
+        opt_bool(None, Some("prune"), OptFlags::NONE, "prune loose refs (default)"),
+        opt_bool(None, Some("auto"), OptFlags::NONE, "auto-pack refs as needed"),
+        opt_str(
+            None,
+            Some("include"),
+            "<pattern>",
+            OptFlags::NONE,
+            "references to include",
+        ),
+        opt_str(
+            None,
+            Some("exclude"),
+            "<pattern>",
+            OptFlags::NONE,
+            "references to exclude",
+        ),
+    ];
+    SPECS
 }
 
 fn pack_refs_usage<T>() -> Result<T> {
@@ -5024,8 +5122,8 @@ struct PruneOptions {
 }
 
 pub(crate) fn cmd_prune(args: &[String]) -> Result<()> {
-    let options = parse_prune_options(args)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let options = setup_prune_options(args)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -5091,67 +5189,67 @@ pub(crate) fn cmd_prune(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn parse_prune_options(args: &[String]) -> Result<PruneOptions> {
-    let mut dry_run = false;
-    let mut verbose = false;
+fn setup_prune_options(args: &[String]) -> Result<PruneOptions> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        return prune_help();
+    }
+    let parsed = parse_options(args, prune_option_specs(), &PRUNE_USAGE).map_err(cli_usage_error)?;
     let mut expire = i64::MAX;
-    let mut heads = Vec::new();
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--" => {
-                heads.extend(iter.cloned());
-                break;
-            }
-            "-h" | "--help" => return prune_help(),
-            "-n" | "--dry-run" => dry_run = true,
-            "--no-dry-run" => dry_run = false,
-            "-v" | "--verbose" => verbose = true,
-            "--no-verbose" => verbose = false,
-            "--progress"
-            | "--no-progress"
-            | "--exclude-promisor-objects"
-            | "--no-exclude-promisor-objects" => {}
-            "--expire" => {
-                let Some(value) = iter.next() else {
-                    eprintln!("error: option `expire' requires a value");
-                    return Err(GitError::Exit(129));
-                };
-                expire = parse_prune_expire(value, "--expire")?;
-            }
-            "--no-expire" => expire = i64::MIN,
-            value if let Some(value) = long_option_value(value, "expire") => {
-                expire = parse_prune_expire(value, "--expire")?;
-            }
-            value if value.starts_with("--no-expire=") => {
-                eprintln!("error: option `no-expire' takes no value");
-                return Err(GitError::Exit(129));
-            }
-            value if value.starts_with("--") => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                return prune_usage();
-            }
-            value if value.starts_with('-') && value.len() > 1 => {
-                for option in value[1..].chars() {
-                    match option {
-                        'n' => dry_run = true,
-                        'v' => verbose = true,
-                        other => {
-                            eprintln!("error: unknown switch `{other}'");
-                            return prune_usage();
-                        }
-                    }
-                }
-            }
-            value => heads.push(value.to_string()),
+    for option in &parsed.options {
+        if option.long != Some("expire") {
+            continue;
+        }
+        if matches!(option.name, OptionName::NegatedLong("expire")) {
+            expire = i64::MIN;
+        } else if let ParsedValue::Str(value) = &option.value {
+            expire = parse_prune_expire(value, "--expire")?;
         }
     }
     Ok(PruneOptions {
-        dry_run,
-        verbose,
+        dry_run: parsed.last_bool("dry-run", false),
+        verbose: parsed.last_bool("verbose", false),
         expire,
-        heads,
+        heads: parsed
+            .positionals
+            .iter()
+            .map(|head| (*head).to_string())
+            .collect(),
     })
+}
+
+const PRUNE_USAGE: &[&str] =
+    &["git prune [-n] [-v] [--progress] [--expire <time>] [--] [<head>...]"];
+
+fn prune_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
+    static SPECS: &[sley_options::OptionSpec<'static>] = &[
+        opt_bool(
+            Some('n'),
+            Some("dry-run"),
+            OptFlags::NONE,
+            "do not remove, show only",
+        ),
+        opt_bool(
+            Some('v'),
+            Some("verbose"),
+            OptFlags::NONE,
+            "report pruned objects",
+        ),
+        opt_bool(None, Some("progress"), OptFlags::NONE, "show progress"),
+        opt_str(
+            None,
+            Some("expire"),
+            "<expiry-date>",
+            OptFlags::NONE,
+            "expire objects older than <time>",
+        ),
+        opt_bool(
+            None,
+            Some("exclude-promisor-objects"),
+            OptFlags::NONE,
+            "limit traversal to objects outside promisor packfiles",
+        ),
+    ];
+    SPECS
 }
 
 fn parse_prune_expire(value: &str, option: &str) -> Result<i64> {
@@ -5847,7 +5945,7 @@ pub(crate) fn cmd_multi_pack_index(args: &[String]) -> Result<()> {
 
 fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     let mut stdin_packs = false;
@@ -6740,7 +6838,7 @@ fn clear_incremental_midx_sidecars(pack_dir: &Path, format: ObjectFormat) -> Res
 
 fn cmd_multi_pack_index_compact(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     let mut write_bitmap = false;
@@ -7106,7 +7204,7 @@ fn pack_is_cruft(pack_dir: &Path, idx_name: &str) -> bool {
 
 fn cmd_multi_pack_index_repack(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let (object_dir, progress, batch_size) =
         parse_midx_object_dir_and_progress(args, &cwd, &git_dir, "repack")?;
@@ -7263,7 +7361,7 @@ fn cmd_multi_pack_index_repack(args: &[String]) -> Result<()> {
 
 fn cmd_multi_pack_index_verify(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     // Upstream defaults progress to a tty heuristic; when stderr is not a tty
@@ -7634,7 +7732,7 @@ fn u64_be8(bytes: &[u8]) -> u64 {
 
 fn cmd_multi_pack_index_expire(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let (object_dir, progress, _) =
         parse_midx_object_dir_and_progress(args, &cwd, &git_dir, "expire")?;
@@ -7824,7 +7922,7 @@ pub(crate) fn cmd_pack_redundant(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(cwd.clone())?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let objects_dir = repository_objects_dir(&common_git_dir);

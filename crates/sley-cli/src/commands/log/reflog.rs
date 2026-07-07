@@ -1,4 +1,5 @@
 use super::*;
+use sley::plumbing::sley_rev;
 
 pub(super) struct ReflogWalkOptions<'a> {
     pub(super) max_count: Option<usize>,
@@ -32,10 +33,19 @@ pub(super) fn log_walk_reflogs(
     for target in references {
         let mut entries = store.read_reflog(&target.reference)?;
         entries.reverse();
+        // Honor the `@{N}` selector: the walk starts at reflog entry `N`. Select
+        // the entries at index >= start_offset while preserving each entry's true
+        // index (so the `HEAD@{index}` selector shown is correct), then apply
+        // `--reverse` to the selected range only, matching git.
+        let mut selected: Vec<(usize, &ReflogEntry)> = entries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index >= target.start_offset)
+            .collect();
         if opts.reverse {
-            entries.reverse();
+            selected.reverse();
         }
-        for (index, entry) in entries.iter().enumerate() {
+        for (index, entry) in selected {
             if skipped < opts.skip {
                 skipped += 1;
                 continue;
@@ -98,6 +108,10 @@ struct ReflogWalkTarget {
     reference: String,
     display_reference: String,
     date_selector: bool,
+    /// The numeric `@{N}` selector: the walk starts at reflog entry `N`
+    /// (`HEAD@{1}` skips the most-recent entry and starts one older). Zero for a
+    /// bare ref or a non-numeric selector (date / `@{upstream}`).
+    start_offset: usize,
 }
 
 impl ReflogWalkTarget {
@@ -108,6 +122,7 @@ impl ReflogWalkTarget {
             display_reference: reflog_walk_display_reference(&reference),
             reference,
             date_selector: original.is_some_and(reflog_revision_uses_date_selector),
+            start_offset: original.map(reflog_revision_start_offset).unwrap_or(0),
         })
     }
 
@@ -118,6 +133,20 @@ impl ReflogWalkTarget {
             index.to_string()
         }
     }
+}
+
+/// The numeric `@{N}` offset in a reflog selector (`HEAD@{2}` -> 2), or 0 when
+/// there is no `@{...}`, the selector is non-numeric (a date or `@{upstream}`),
+/// or it does not parse. Mirrors git, where `git log -g <ref>@{N}` begins the
+/// reflog walk at entry `N` rather than the most-recent entry.
+fn reflog_revision_start_offset(revision: &str) -> usize {
+    let Some(open) = revision.rfind("@{") else {
+        return 0;
+    };
+    let Some(inner) = revision.strip_suffix('}') else {
+        return 0;
+    };
+    inner[open + 2..].parse::<usize>().unwrap_or(0)
 }
 
 fn reflog_revision_uses_date_selector(revision: &str) -> bool {
@@ -403,7 +432,7 @@ fn emit_compiled_reflog_walk_format(
         signature: None,
         color: false,
         output_encoding: "UTF-8",
-        mailmap: ctx.mailmap,
+        mailmap: &CliMailmapAdapter(ctx.mailmap),
         use_mailmap: true,
     };
     for token in &ctx.compiled.tokens {

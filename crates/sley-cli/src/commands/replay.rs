@@ -6,6 +6,7 @@
 //! drive loop: option parsing, the rev walk that populates the instruction
 //! sheet, the per-commit 3-way replay, and `--continue` / `--abort` /
 //! `--skip` / `--quit`.
+#![allow(clippy::expect_used)]
 
 use crate::commands::merge_rebase::{
     MergePathResult, MergeTreeMap, commit_tree_oid, head_commit_oid,
@@ -179,7 +180,7 @@ fn run_git_replay(args: &[String]) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root =
@@ -524,11 +525,11 @@ fn replay_one_commit_to(
                 }
                 None => MergeTreeMap::new(),
             };
-            let theirs = stash_tree_entry_map(&db, ctx.format, &commit.tree)?;
+            let theirs = sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree)?;
             (base, theirs)
         }
         ReplayAction::Revert => {
-            let base = stash_tree_entry_map(&db, ctx.format, &commit.tree)?;
+            let base = sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree)?;
             let theirs = match parent {
                 Some(parent) => {
                     tree_map_of_commit(ctx, &db, &parent).map_err(finish_replay_halt)?
@@ -539,7 +540,7 @@ fn replay_one_commit_to(
         }
     };
     let head_tree = commit_tree_oid(&db, ctx.format, head)?;
-    let ours_map = stash_tree_entry_map(&db, ctx.format, &head_tree)?;
+    let ours_map = sley_diff_merge::flatten_tree(&db, ctx.format, &head_tree)?;
     let (results, conflicts) = three_way_merge_trees_styled(
         &db,
         ctx.format,
@@ -936,7 +937,7 @@ impl ReplayCtx {
 fn run_replay(action: ReplayAction, args: &[String]) -> Result<()> {
     let parsed = parse_replay_args(action, args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -1487,12 +1488,12 @@ fn do_pick_commit(
                 None => MergeTreeMap::new(),
             };
             let theirs =
-                stash_tree_entry_map(&db, ctx.format, &commit.tree).map_err(print_fatal_error)?;
+                sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree).map_err(print_fatal_error)?;
             (base, theirs, label.clone(), parent_label.clone())
         }
         ReplayAction::Revert => {
             let base =
-                stash_tree_entry_map(&db, ctx.format, &commit.tree).map_err(print_fatal_error)?;
+                sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree).map_err(print_fatal_error)?;
             let theirs = match &parent {
                 Some(parent) => tree_map_of_commit(ctx, &db, parent)?,
                 None => MergeTreeMap::new(),
@@ -1500,7 +1501,7 @@ fn do_pick_commit(
             (base, theirs, parent_label.clone(), label.clone())
         }
     };
-    let ours_map = stash_tree_entry_map(&db, ctx.format, &index_tree).map_err(print_fatal_error)?;
+    let ours_map = sley_diff_merge::flatten_tree(&db, ctx.format, &index_tree).map_err(print_fatal_error)?;
 
     let style = match config_value(&ctx.git_dir, "merge", "conflictstyle").as_deref() {
         Some("diff3") | Some("zdiff3") => sley_diff_merge::ConflictStyle::Diff3,
@@ -1721,7 +1722,7 @@ fn tree_map_of_commit(
     oid: &ObjectId,
 ) -> std::result::Result<MergeTreeMap, ReplayHalt> {
     let tree = commit_tree_oid(db, ctx.format, oid).map_err(print_fatal_error)?;
-    stash_tree_entry_map(db, ctx.format, &tree).map_err(print_fatal_error)
+    sley_diff_merge::flatten_tree(db, ctx.format, &tree).map_err(print_fatal_error)
 }
 
 /// Tree oid of the current index (the "are there staged changes" probe).
@@ -2174,16 +2175,10 @@ fn apply_merge_results_to_index_and_worktree(
             .cmp(&right.path)
             .then_with(|| index_entry_stage(left).cmp(&index_entry_stage(right)))
     });
-    fs::write(
-        &index_path,
-        Index {
-            version: 2,
-            entries,
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(ctx.format)?,
-    )?;
+    // The index is written AFTER the worktree phases below so freshly resolved
+    // stage-0 entries can record the on-disk stat (git refreshes merged results
+    // via fill_stat_cache_info; a zeroed stat makes diff-files report them
+    // dirty). Entries reused from the old index keep their existing stat.
 
     // git's unpack-trees materializes removals before creations. This matters
     // when a directory's tracked children are removed and the directory is then
@@ -2237,6 +2232,50 @@ fn apply_merge_results_to_index_and_worktree(
             }
         }
     }
+
+    for entry in &mut entries {
+        if index_entry_stage(entry) != 0
+            || sley_index::is_gitlink(entry.mode)
+            || entry.mtime_seconds != 0
+            || entry.ctime_seconds != 0
+        {
+            continue;
+        }
+        if let Ok(rel) = std::str::from_utf8(entry.path.as_bytes())
+            && let Ok(metadata) = fs::symlink_metadata(ctx.worktree_root.join(rel))
+        {
+            sley_worktree::fill_index_entry_stat_cache(entry, &metadata);
+        }
+    }
+    fs::write(
+        &index_path,
+        Index {
+            version: 2,
+            entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write(ctx.format)?,
+    )?;
+    // git's sequencer runs `read_and_refresh_cache` around each pick, so a
+    // stage-0 entry reused from the old index (its content unchanged by the
+    // merge, so its worktree file was not rewritten above) is re-stat'd against
+    // the worktree and its cached stat updated when the file's stat drifted but
+    // its content still hashes to the entry oid (e.g. an out-of-band `tar xf`
+    // rewrote the file with a fresh mtime between picks). Without this the stale
+    // cached stat makes `git diff-files` report a phantom modification
+    // (`ie_match_stat` compares size+mtime, not content). Quiet + ignore-missing
+    // so a genuinely dirty/absent path is left for status to report, never an
+    // error here.
+    sley_worktree::refresh_index_paths(
+        &ctx.worktree_root,
+        &ctx.git_dir,
+        ctx.format,
+        &[],
+        /* quiet */ true,
+        /* ignore_missing */ true,
+        /* really_refresh */ false,
+    )?;
     Ok(())
 }
 
@@ -2673,7 +2712,7 @@ pub(crate) fn reset_merge_in(
     let target_map = match target {
         Some(target) => {
             let target_tree = commit_tree_oid(&db, format, target)?;
-            stash_tree_entry_map(&db, format, &target_tree)?
+            sley_diff_merge::flatten_tree(&db, format, &target_tree)?
         }
         None => MergeTreeMap::new(),
     };

@@ -1,5 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
+use sley::plumbing::{sley_config, sley_diff_merge, sley_index, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -182,7 +183,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             ..commands::add_patch::PatchConfig::default()
         };
         cfg.reset_interactive =
-            sley_config::read_repo_config(&discover_git_dir(&env::current_dir()?)?, None)
+            sley_config::read_repo_config(&crate::session::cli_git_dir()?, None)
                 .ok()
                 .and_then(|config| {
                     config
@@ -199,7 +200,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         );
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     // git's `setup_work_tree()` (builtin/reset.c): every reset that touches the
     // working tree — `--hard`, `--merge`, `--keep` — must run in a work tree, so
     // a bare repository refuses with "this operation must be run in a work
@@ -418,13 +419,30 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         }
         write_reset_orig_head(&git_dir, &old_head, format)?;
         if recurse_submodules {
-            commands::read_tree::reset_index_and_worktree_to_commit(
+            let reset_result = commands::read_tree::reset_index_and_worktree_to_commit(
                 &worktree_root,
                 &git_dir,
                 format,
                 &target_commit,
                 true,
-            )?;
+            );
+            // A failed `--recurse-submodules` reset (e.g. the target records a
+            // missing submodule commit) has already materialized the superproject
+            // worktree with fresh mtimes; git leaves the index refreshed/rolled
+            // back so `git diff-files` stays clean. Without a refresh the index
+            // keeps the pre-reset stat and reports every rewritten superproject
+            // path as a phantom modification (`ie_match_stat` compares size+mtime,
+            // not content). Refresh regardless of outcome, then propagate.
+            let _ = sley_worktree::refresh_index_paths(
+                &worktree_root,
+                &git_dir,
+                format,
+                &[],
+                /* quiet */ true,
+                /* ignore_missing */ true,
+                /* really_refresh */ false,
+            );
+            reset_result?;
         } else {
             sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
                 worktree_root.clone(),

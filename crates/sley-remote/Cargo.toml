@@ -19,7 +19,6 @@ tls-platform-verifier = ["sley-transport/tls-platform-verifier"]
 [dependencies]
 sley-config.workspace = true
 sley-core.workspace = true
-sley-fetch.workspace = true
 sley-formats.workspace = true
 sley-fsck.workspace = true
 sley-object.workspace = true

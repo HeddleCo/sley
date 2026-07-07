@@ -14,7 +14,9 @@ sley-formats.workspace = true
 sley-index.workspace = true
 sley-object.workspace = true
 sley-odb.workspace = true
+sley-pack.workspace = true
 sley-refs.workspace = true
+sley-grep.workspace = true
 
 [lints]
 workspace = true

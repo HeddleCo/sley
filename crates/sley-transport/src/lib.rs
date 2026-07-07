@@ -6,6 +6,15 @@ use sley_core::{GitError, ObjectFormat, Result};
 use sley_protocol::*;
 use std::io::{Read, Write};
 
+pub mod credential;
+
+pub use credential::{
+    cmd_credential_cache, cmd_credential_cache_daemon, cmd_credential_store,
+    credential_announce_capabilities, credential_approve, credential_fill, credential_next_state,
+    credential_read, credential_reject, credential_set_all_capabilities, credential_write,
+    CredentialOpType, GitCredential, TIME_MAX,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceRequest {
     pub service: GitService,
@@ -78,21 +87,6 @@ pub enum SshIpVersion {
 pub struct SshProcessCommand {
     pub program: String,
     pub args: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct GitCredential {
-    pub protocol: Option<String>,
-    pub host: Option<String>,
-    pub path: Option<String>,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub password_expiry_utc: Option<String>,
-    pub oauth_refresh_token: Option<String>,
-    pub url: Option<String>,
-    pub wwwauth: Vec<String>,
-    pub quit: Option<String>,
-    pub extra: Vec<(String, String)>,
 }
 
 pub fn parse_service_request(payload: &[u8]) -> Result<ServiceRequest> {
@@ -342,6 +336,20 @@ pub fn read_service_discovery_response(
     reader: &mut impl Read,
 ) -> Result<ServiceDiscoveryResponse> {
     let mut frames = read_pkt_line_frames_until_flush(reader)?;
+    // Smart HTTP with `Git-Protocol: version=2` omits the `# service=` preamble and
+    // flush that precede the v2 capability advertisement (upstream http-backend.c).
+    if let Some(PktLineFrame::Data(payload)) = frames.first() {
+        if trim_trailing_lf(payload) == b"version 2" {
+            return Ok(ServiceDiscoveryResponse {
+                announcement: ServiceAnnouncement {
+                    service: GitService::UploadPack,
+                },
+                payload: ServiceDiscoveryPayload::ProtocolV2(parse_protocol_v2_advertisement(
+                    &frames,
+                )?),
+            });
+        }
+    }
     frames.extend(read_pkt_line_frames_until_flush(reader)?);
     parse_service_discovery_response(format, &frames)
 }
@@ -406,27 +414,30 @@ pub fn parse_remote_url(value: &str) -> Result<RemoteUrl> {
 }
 
 pub fn parse_git_credential(input: &[u8]) -> Result<GitCredential> {
+    parse_legacy_git_credential_impl(input)
+}
+
+pub fn encode_git_credential(credential: &GitCredential) -> Result<Vec<u8>> {
+    encode_legacy_git_credential_impl(credential)
+}
+
+pub(crate) fn parse_legacy_git_credential_impl(input: &[u8]) -> Result<GitCredential> {
     let mut credential = GitCredential::default();
     let mut lines = input.split(|byte| *byte == b'\n');
-    while let Some(raw_line) = lines.next() {
-        if raw_line.is_empty() {
-            if lines.any(|line| !line.is_empty()) {
-                return Err(GitError::InvalidFormat(
-                    "credential input contains data after terminator".into(),
-                ));
-            }
+    let mut finished = false;
+    while let Some(line) = lines.next() {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            finished = true;
             break;
         }
-        if raw_line.ends_with(b"\r") {
-            return Err(GitError::InvalidFormat(
-                "credential line contains a delimiter byte".into(),
-            ));
+        let line = std::str::from_utf8(line).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(GitError::InvalidFormat("credential line is missing = delimiter".into()));
+        };
+        if key.is_empty() {
+            return Err(GitError::InvalidFormat("credential key is empty".into()));
         }
-        let line = std::str::from_utf8(raw_line)
-            .map_err(|_| GitError::InvalidFormat("credential line is not UTF-8".into()))?;
-        let (key, value) = line.split_once('=').ok_or_else(|| {
-            GitError::InvalidFormat("credential line is missing = delimiter".into())
-        })?;
         validate_credential_key(key)?;
         validate_credential_value("credential value", value)?;
         match key {
@@ -436,32 +447,58 @@ pub fn parse_git_credential(input: &[u8]) -> Result<GitCredential> {
             "username" => set_credential_field(&mut credential.username, key, value)?,
             "password" => set_credential_field(&mut credential.password, key, value)?,
             "password_expiry_utc" => {
-                set_credential_field(&mut credential.password_expiry_utc, key, value)?
+                if credential.password_expiry_utc != TIME_MAX {
+                    return Err(GitError::InvalidFormat(format!(
+                        "credential key {key} appears more than once"
+                    )));
+                }
+                credential.password_expiry_utc = value.parse().unwrap_or(TIME_MAX);
             }
             "oauth_refresh_token" => {
                 set_credential_field(&mut credential.oauth_refresh_token, key, value)?
             }
             "url" => set_credential_field(&mut credential.url, key, value)?,
             "wwwauth[]" => credential.wwwauth.push(value.to_string()),
-            "quit" => set_credential_field(&mut credential.quit, key, value)?,
-            _ => credential.extra.push((key.to_string(), value.to_string())),
+            "quit" => credential.quit = !value.is_empty() && value != "0" && value != "false",
+            _ => {
+                if is_known_credential_key(key) {
+                    return Err(GitError::InvalidFormat(format!(
+                        "credential key {key} appears more than once"
+                    )));
+                }
+                credential.extra.push((key.to_string(), value.to_string()));
+            }
         }
+    }
+    if !finished {
+        return Err(GitError::InvalidFormat(
+            "credential payload must end with a blank line".into(),
+        ));
+    }
+    if let Some(rest) = lines.next()
+        && (!rest.is_empty() || lines.next().is_some())
+    {
+        return Err(GitError::InvalidFormat(
+            "credential payload has trailing data after blank line".into(),
+        ));
     }
     Ok(credential)
 }
 
-pub fn encode_git_credential(credential: &GitCredential) -> Result<Vec<u8>> {
+pub(crate) fn encode_legacy_git_credential_impl(credential: &GitCredential) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     encode_credential_field(&mut out, "protocol", credential.protocol.as_deref())?;
     encode_credential_field(&mut out, "host", credential.host.as_deref())?;
     encode_credential_field(&mut out, "path", credential.path.as_deref())?;
     encode_credential_field(&mut out, "username", credential.username.as_deref())?;
     encode_credential_field(&mut out, "password", credential.password.as_deref())?;
-    encode_credential_field(
-        &mut out,
-        "password_expiry_utc",
-        credential.password_expiry_utc.as_deref(),
-    )?;
+    if credential.password_expiry_utc != TIME_MAX {
+        encode_credential_field(
+            &mut out,
+            "password_expiry_utc",
+            Some(&credential.password_expiry_utc.to_string()),
+        )?;
+    }
     encode_credential_field(
         &mut out,
         "oauth_refresh_token",
@@ -469,74 +506,41 @@ pub fn encode_git_credential(credential: &GitCredential) -> Result<Vec<u8>> {
     )?;
     encode_credential_field(&mut out, "url", credential.url.as_deref())?;
     for value in &credential.wwwauth {
-        validate_credential_value("credential wwwauth[] value", value)?;
-        out.extend_from_slice(b"wwwauth[]=");
-        out.extend_from_slice(value.as_bytes());
-        out.push(b'\n');
+        encode_credential_field(&mut out, "wwwauth[]", Some(value.as_str()))?;
     }
-    encode_credential_field(&mut out, "quit", credential.quit.as_deref())?;
+    if credential.quit {
+        encode_credential_field(&mut out, "quit", Some("true"))?;
+    }
     for (key, value) in &credential.extra {
-        validate_credential_key(key)?;
         if is_known_credential_key(key) {
             return Err(GitError::InvalidFormat(format!(
-                "credential extra key duplicates known key {key}"
+                "credential extra key {key} conflicts with a known field"
             )));
         }
-        validate_credential_value("credential extra value", value)?;
-        out.extend_from_slice(key.as_bytes());
-        out.push(b'=');
-        out.extend_from_slice(value.as_bytes());
-        out.push(b'\n');
+        encode_credential_field(&mut out, key, Some(value.as_str()))?;
     }
     out.push(b'\n');
     Ok(out)
 }
 
+const MAX_GIT_CREDENTIAL_RESPONSE_BYTES: usize = 64 * 1024;
+
 pub fn read_git_credential(reader: &mut impl Read) -> Result<GitCredential> {
     let mut input = Vec::new();
-    reader.read_to_end(&mut input)?;
+    reader
+        .take((MAX_GIT_CREDENTIAL_RESPONSE_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut input)?;
+    if input.len() > MAX_GIT_CREDENTIAL_RESPONSE_BYTES {
+        return Err(GitError::InvalidFormat(format!(
+            "credential helper response exceeds maximum size of {} bytes (64 KiB)",
+            MAX_GIT_CREDENTIAL_RESPONSE_BYTES
+        )));
+    }
     parse_git_credential(&input)
 }
 
 pub fn write_git_credential(writer: &mut impl Write, credential: &GitCredential) -> Result<()> {
-    encode_credential_field(writer, "protocol", credential.protocol.as_deref())?;
-    encode_credential_field(writer, "host", credential.host.as_deref())?;
-    encode_credential_field(writer, "path", credential.path.as_deref())?;
-    encode_credential_field(writer, "username", credential.username.as_deref())?;
-    encode_credential_field(writer, "password", credential.password.as_deref())?;
-    encode_credential_field(
-        writer,
-        "password_expiry_utc",
-        credential.password_expiry_utc.as_deref(),
-    )?;
-    encode_credential_field(
-        writer,
-        "oauth_refresh_token",
-        credential.oauth_refresh_token.as_deref(),
-    )?;
-    encode_credential_field(writer, "url", credential.url.as_deref())?;
-    for value in &credential.wwwauth {
-        validate_credential_value("credential wwwauth[] value", value)?;
-        writer.write_all(b"wwwauth[]=")?;
-        writer.write_all(value.as_bytes())?;
-        writer.write_all(b"\n")?;
-    }
-    encode_credential_field(writer, "quit", credential.quit.as_deref())?;
-    for (key, value) in &credential.extra {
-        validate_credential_key(key)?;
-        if is_known_credential_key(key) {
-            return Err(GitError::InvalidFormat(format!(
-                "credential extra key duplicates known key {key}"
-            )));
-        }
-        validate_credential_value("credential extra value", value)?;
-        writer.write_all(key.as_bytes())?;
-        writer.write_all(b"=")?;
-        writer.write_all(value.as_bytes())?;
-        writer.write_all(b"\n")?;
-    }
-    writer.write_all(b"\n")?;
-    Ok(())
+    credential_write(credential, writer, CredentialOpType::Response)
 }
 
 pub fn git_credential_basic_authorization(credential: &GitCredential) -> Result<Option<String>> {
@@ -2174,12 +2178,13 @@ mod tests {
                 path: Some("org/repo.git".into()),
                 username: Some("alice".into()),
                 password: Some("secret".into()),
-                password_expiry_utc: Some("1700000000".into()),
+                password_expiry_utc: 1_700_000_000,
                 oauth_refresh_token: Some("refresh".into()),
                 url: Some("https://example.com/org/repo.git".into()),
                 wwwauth: vec!["Bearer realm=one".into(), "Basic realm=two".into()],
-                quit: Some("true".into()),
+                quit: true,
                 extra: vec![("helper-state".into(), "opaque".into())],
+                ..GitCredential::default()
             }
         );
         assert_eq!(
@@ -2204,6 +2209,44 @@ mod tests {
         assert_eq!(
             read_git_credential(&mut input).expect("test operation should succeed"),
             credential
+        );
+    }
+
+    #[test]
+    fn git_credentials_reject_oversized_helper_responses() {
+        let oversized = vec![b'x'; MAX_GIT_CREDENTIAL_RESPONSE_BYTES + 1];
+        let mut input = oversized.as_slice();
+        let err = read_git_credential(&mut input).expect_err("oversized response should fail");
+        assert!(
+            matches!(
+                err,
+                GitError::InvalidFormat(ref message)
+                    if message.contains("credential helper response exceeds maximum size")
+                        && message.contains("65536")
+                        && message.contains("64 KiB")
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn git_credentials_accept_responses_at_size_limit() {
+        let prefix = b"protocol=https\npadding=";
+        let suffix = b"\n\n";
+        let padding_len =
+            MAX_GIT_CREDENTIAL_RESPONSE_BYTES - prefix.len() - suffix.len();
+        let mut input = Vec::with_capacity(MAX_GIT_CREDENTIAL_RESPONSE_BYTES);
+        input.extend_from_slice(prefix);
+        input.extend(std::iter::repeat_n(b'x', padding_len));
+        input.extend_from_slice(suffix);
+        assert_eq!(input.len(), MAX_GIT_CREDENTIAL_RESPONSE_BYTES);
+
+        let mut reader = input.as_slice();
+        let credential = read_git_credential(&mut reader).expect("at-limit response should succeed");
+        assert_eq!(credential.protocol.as_deref(), Some("https"));
+        assert_eq!(
+            credential.extra,
+            vec![("padding".into(), "x".repeat(padding_len))]
         );
     }
 
@@ -2239,7 +2282,7 @@ mod tests {
         assert!(parse_git_credential(b"=https\n\n").is_err());
         assert!(parse_git_credential(b"pro\0tocol=https\n\n").is_err());
         assert!(parse_git_credential(b"protocol=ht\0tps\n\n").is_err());
-        assert!(parse_git_credential(b"protocol=http\r\n\n").is_err());
+        assert!(parse_git_credential(b"protocol=http\rlive\n\n").is_err());
         assert!(parse_git_credential(b"protocol=http\nhost=example.com\n\ntrailing").is_err());
         assert!(parse_git_credential(b"protocol=http\nprotocol=https\n\n").is_err());
         assert!(

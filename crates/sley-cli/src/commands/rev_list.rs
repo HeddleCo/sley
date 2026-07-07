@@ -1,5 +1,7 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use sley::plumbing::{sley_core, sley_diff_merge, sley_object, sley_odb, sley_rev};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -386,7 +388,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let author_filters = parse_log_filter_patterns(&author_patterns, regexp_mode)?;
     let committer_filters = parse_log_filter_patterns(&committer_patterns, regexp_mode)?;
     let grep_filters = parse_log_filter_patterns(&grep_patterns, regexp_mode)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let output_encoding = log_output_encoding(&config);
@@ -595,7 +597,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     } else {
         HashMap::new()
     };
-    let signature_ctx = LogSignatureContext {
+    let signature_ctx = CliLogSignatureContext {
         git_dir: &git_dir,
         db: &db,
         config: &config,
@@ -934,7 +936,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         signature: None,
                         color: want_color,
                         output_encoding: &output_encoding,
-                        mailmap: &mailmap,
+                        mailmap: &CliMailmapAdapter(&mailmap),
                         use_mailmap,
                     },
                     line,
@@ -1360,10 +1362,10 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                             date_mode: &date_mode,
                             source_oid: None,
                             describe: None,
-                            signature: Some(&signature_ctx),
+                            signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
                             color: want_color,
                             output_encoding: &output_encoding,
-                            mailmap: &mailmap,
+                            mailmap: &CliMailmapAdapter(&mailmap),
                             use_mailmap,
                         };
                         if children {
@@ -1454,10 +1456,10 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                             date_mode: &date_mode,
                             source_oid: None,
                             describe: None,
-                            signature: Some(&signature_ctx),
+                            signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
                             color: want_color,
                             output_encoding: &output_encoding,
-                            mailmap: &mailmap,
+                            mailmap: &CliMailmapAdapter(&mailmap),
                             use_mailmap,
                         },
                     )?;
@@ -2062,7 +2064,7 @@ fn write_rev_list_boundary_record(
                         signature: None,
                         color: false,
                         output_encoding,
-                        mailmap,
+                        mailmap: &CliMailmapAdapter(mailmap),
                         use_mailmap,
                     },
                 )?;
@@ -2127,7 +2129,7 @@ fn write_rev_list_boundary_record(
                     signature: None,
                     color: false,
                     output_encoding,
-                    mailmap,
+                    mailmap: &CliMailmapAdapter(mailmap),
                     use_mailmap,
                 },
             )?;

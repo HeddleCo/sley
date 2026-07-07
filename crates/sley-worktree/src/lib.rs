@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![allow(
     clippy::collapsible_if,
     clippy::if_same_then_else,
@@ -53,7 +54,7 @@ pub use checkout::*;
 pub use filter::*;
 pub use ignore::*;
 pub use index::*;
-pub use index_io::StatCleanFilterValidator;
+pub use index_io::{StatCleanFilterValidator, fill_index_entry_stat_cache};
 pub use move_remove::*;
 pub use status::*;
 pub use types_admin::*;

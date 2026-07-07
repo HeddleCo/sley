@@ -16,14 +16,16 @@
 //! copied as-is and only the remaining objects are encoded fresh. The
 //! `pack-reused` / `packs-reused` totals and trace2 data events report that
 //! reuse exactly like upstream.
+#![allow(clippy::expect_used)]
 
 use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::io::IsTerminal;
 use std::sync::Arc;
+use sley::plumbing::{sley_config, sley_core, sley_odb, sley_rev};
 
-use sley_pack::{PackInput, PackReverseIndex, PackWriteOptions, pack_order_index_positions};
-
+use sley::{PackWriteOptions};
+use sley::plumbing::sley_pack::{PackInput, PackReverseIndex, pack_order_index_positions};
 use crate::*;
 
 #[derive(Default)]
@@ -283,7 +285,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     }
     validate_pack_objects_options(&options)?;
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let database = FileObjectDatabase::from_git_dir(&common_git_dir, format);

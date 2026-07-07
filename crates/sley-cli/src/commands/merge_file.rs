@@ -16,7 +16,9 @@
 //! by a region walk built from the very same lower-level primitives
 //! `merge_blobs` is built on (`split_lines` + `myers_diff_lines`), so conflict
 //! detection and region boundaries stay consistent across every flag.
+#![allow(clippy::expect_used)]
 
+use sley::plumbing::{sley_diff_merge};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 
@@ -397,7 +399,7 @@ fn stat_error_text(err: &std::io::Error) -> String {
 /// object database to resolve and load each blob. Output labels default to the
 /// resolved (full) object ids, as git does in `--object-id` mode.
 fn read_object_id_inputs(operands: &[String]) -> Result<MergeInputs> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
@@ -862,7 +864,7 @@ fn emit_result(options: &MergeFileOptions, inputs: &MergeInputs, content: &[u8])
         return Ok(());
     }
     if options.object_id {
-        let git_dir = discover_git_dir(env::current_dir()?)?;
+        let git_dir = crate::session::cli_git_dir()?;
         let format = repository_object_format(&git_dir)?;
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let oid = db.write_object(EncodedObject::new(ObjectType::Blob, content.to_vec()))?;
@@ -875,6 +877,7 @@ fn emit_result(options: &MergeFileOptions, inputs: &MergeInputs, content: &[u8])
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

@@ -6,7 +6,7 @@
 //! shared while leaving command-specific compatibility decisions close to each
 //! command parser.
 
-use sley_core::{GitError, Result};
+use sley::{GitError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LongOption<'a> {
@@ -213,6 +213,7 @@ pub(crate) fn usage_error<T>(message: &str) -> Result<T> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

@@ -1,5 +1,7 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
+#![allow(clippy::expect_used)]
 
+use sley::plumbing::{sley_index, sley_odb, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -20,7 +22,7 @@ pub(crate) fn cmd_rev_parse(args: &[String]) -> Result<()> {
     }
     let cwd = env::current_dir()?;
     let setup = setup::setup_git_directory();
-    let git_dir = match discover_git_dir(&cwd) {
+    let git_dir = match crate::session::cli_git_dir_from(&cwd) {
         Ok(git_dir) => git_dir,
         Err(GitError::NotFound(_)) => {
             if args.is_empty() {

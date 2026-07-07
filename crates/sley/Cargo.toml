@@ -11,7 +11,6 @@ license.workspace = true
 sley-core.workspace = true
 sley-object.workspace = true
 sley-config.workspace = true
-sley-diff-format.workspace = true
 sley-diff-merge.workspace = true
 sley-formats.workspace = true
 sley-grep.workspace = true
@@ -47,6 +46,9 @@ mmap = ["sley-odb/mmap"]
 tls-rustls = ["sley-remote/tls-rustls"]
 tls-native-tls = ["sley-remote/tls-native-tls"]
 tls-platform-verifier = ["sley-remote/tls-platform-verifier"]
+
+[dev-dependencies]
+sley-testkit = { workspace = true }
 
 [lints]
 workspace = true

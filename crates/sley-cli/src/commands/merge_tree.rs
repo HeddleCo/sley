@@ -21,6 +21,7 @@
 //! private ones), so every helper, type, and re-export visible at the crate root
 //! is in scope here without re-listing it.
 use crate::*;
+use sley::plumbing::{sley_config, sley_core, sley_rev};
 
 /// Which top-level mode `git merge-tree` runs in. Selected explicitly via
 /// `--write-tree` / `--trivial-merge`, otherwise inferred from the positional
@@ -275,7 +276,7 @@ struct MergeOutcome {
 fn run_real_merge(options: &MergeTreeOptions) -> Result<()> {
     let _quiet_cleanup = if options.quiet {
         let cwd = env::current_dir()?;
-        let git_dir = discover_git_dir(&cwd)?;
+        let git_dir = crate::session::cli_git_dir_from(&cwd)?;
         Some(QuietLooseObjectCleanup::new(git_dir)?)
     } else {
         None
@@ -362,7 +363,7 @@ fn loose_object_files(git_dir: &Path) -> Result<BTreeSet<PathBuf>> {
 
 fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
@@ -575,7 +576,7 @@ fn stdin_record_options(
 /// favouring options affect merge-tree output; everything else is ignored, as
 /// upstream tolerates (and largely ignores) most strategy options here.
 fn parse_strategy_favor(options: &[String]) -> Result<sley_diff_merge::MergeFavor> {
-    use sley_diff_merge::MergeFavor;
+    use sley::plumbing::sley_diff_merge::MergeFavor;
     let mut favor = MergeFavor::None;
     for option in options {
         match option.as_str() {
@@ -1025,7 +1026,7 @@ type TrivialEntry = Option<(u32, ObjectId)>;
 
 fn run_trivial_merge(options: &MergeTreeOptions) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
@@ -1033,9 +1034,9 @@ fn run_trivial_merge(options: &MergeTreeOptions) -> Result<()> {
     let ours_tree = resolve_tree_ish(&git_dir, &db, format, &options.positionals[1])?;
     let theirs_tree = resolve_tree_ish(&git_dir, &db, format, &options.positionals[2])?;
 
-    let base_map = stash_tree_entry_map(&db, format, &base_tree)?;
-    let ours_map = stash_tree_entry_map(&db, format, &ours_tree)?;
-    let theirs_map = stash_tree_entry_map(&db, format, &theirs_tree)?;
+    let base_map = sley_diff_merge::flatten_tree(&db, format, &base_tree)?;
+    let ours_map = sley_diff_merge::flatten_tree(&db, format, &ours_tree)?;
+    let theirs_map = sley_diff_merge::flatten_tree(&db, format, &theirs_tree)?;
 
     let mut all_paths = BTreeSet::new();
     all_paths.extend(base_map.keys().cloned());

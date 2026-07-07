@@ -3,19 +3,22 @@
 //! Commands should be able to say "open the repository" once and then reuse the
 //! resulting object database, refs, config, and format. This keeps Git discovery
 //! behavior in one place while preserving command-specific parsing and errors.
+#![allow(clippy::expect_used)]
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use sley::plumbing::{sley_core, sley_rev};
 
-use sley_config::GitConfig;
-use sley_core::{ObjectFormat, Result};
-use sley_odb::FileObjectDatabase;
-use sley_refs::FileRefStore;
+use sley::GitConfig;
+use sley::{ObjectFormat, Result};
+use sley::ObjectDatabase as FileObjectDatabase;
+use sley::RefStore as FileRefStore;
 
 use crate::{
-    common_git_dir_for_git_dir, discover_git_dir, read_repo_config, repository_abbrev,
-    repository_object_format, warn_ambiguous_refname_for_object_prefix, worktree_root_for_git_dir,
+    common_git_dir_for_git_dir, read_repo_config, repository_abbrev,
+    repository_object_format, session, warn_ambiguous_refname_for_object_prefix,
+    worktree_root_for_git_dir,
 };
 
 pub(crate) struct RepositoryContext {
@@ -31,12 +34,15 @@ pub(crate) struct RepositoryContext {
 
 impl RepositoryContext {
     pub(crate) fn discover_current() -> Result<Self> {
-        Self::discover(env::current_dir()?)
+        let cwd = session::cli_session()
+            .map(|session| session.cwd)
+            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        Self::discover(cwd)
     }
 
     pub(crate) fn discover(cwd: impl AsRef<Path>) -> Result<Self> {
         let cwd = cwd.as_ref().to_path_buf();
-        let git_dir = discover_git_dir(&cwd)?;
+        let git_dir = session::cli_git_dir_from(&cwd)?;
         Self::from_git_dir_and_cwd(git_dir, cwd)
     }
 

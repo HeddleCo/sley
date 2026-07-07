@@ -1,4 +1,5 @@
 use super::*;
+use sley::plumbing::{sley_refs, sley_rev};
 
 pub(crate) fn commit_tree_oid(
     db: &FileObjectDatabase,
@@ -86,7 +87,7 @@ pub(crate) fn cmd_merge_base(args: &[String]) -> Result<()> {
         ));
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     if fork_point {
@@ -117,15 +118,15 @@ pub(crate) fn cmd_merge_base(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     if independent {
-        for commit in merge_base_independent(&db, format, &commits)? {
+        for commit in merge_base_independent(&git_dir, &db, format, &commits)? {
             println!("{commit}");
         }
         return Ok(());
     }
     let bases = if octopus {
-        merge_bases_many(&db, format, &commits)?
+        merge_bases_many(&git_dir, &db, format, &commits)?
     } else if commits.len() > 2 {
-        merge_bases_default_many(&db, format, &commits)?
+        merge_bases_default_many(&git_dir, &db, format, &commits)?
     } else {
         // Two-commit merge base via the commit-graph (parents + generation numbers
         // from the graph) rather than the object-reading ancestor walk.
@@ -163,15 +164,16 @@ pub(crate) fn merge_bases(
 }
 
 pub(crate) fn merge_bases_default_many(
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     commits: &[ObjectId],
 ) -> Result<Vec<ObjectId>> {
-    let left_depths = ancestor_depths(db, format, &commits[0])?;
+    let left_depths = sley_rev::ancestor_depths(git_dir, format, db, &commits[0])?;
     let other_depths = commits
         .iter()
         .skip(1)
-        .map(|commit| ancestor_depths(db, format, commit))
+        .map(|commit| sley_rev::ancestor_depths(git_dir, format, db, commit))
         .collect::<Result<Vec<_>>>()?;
     let mut common = left_depths
         .keys()
@@ -181,7 +183,10 @@ pub(crate) fn merge_bases_default_many(
     let candidates = common.clone();
     let candidate_depths = candidates
         .iter()
-        .map(|candidate| Ok((candidate.clone(), ancestor_depths(db, format, candidate)?)))
+        .map(|candidate| Ok((
+            candidate.clone(),
+            sley_rev::ancestor_depths(git_dir, format, db, candidate)?,
+        )))
         .collect::<Result<HashMap<_, _>>>()?;
     common.retain(|candidate| {
         !candidates.iter().any(|other| {
@@ -215,6 +220,7 @@ pub(crate) fn merge_bases_default_many(
 }
 
 fn merge_bases_many(
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     commits: &[ObjectId],
@@ -224,7 +230,7 @@ fn merge_bases_many(
     }
     let depths = commits
         .iter()
-        .map(|commit| ancestor_depths(db, format, commit))
+        .map(|commit| sley_rev::ancestor_depths(git_dir, format, db, commit))
         .collect::<Result<Vec<_>>>()?;
     let mut common = depths[0]
         .keys()
@@ -263,6 +269,7 @@ fn merge_bases_many(
 }
 
 fn merge_base_independent(
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     commits: &[ObjectId],
@@ -276,7 +283,7 @@ fn merge_base_independent(
     }
     let depths = unique
         .iter()
-        .map(|commit| ancestor_depths(db, format, commit))
+        .map(|commit| sley_rev::ancestor_depths(git_dir, format, db, commit))
         .collect::<Result<Vec<_>>>()?;
     let mut independent = Vec::new();
     for (idx, commit) in unique.iter().enumerate() {
@@ -303,7 +310,7 @@ pub(crate) fn merge_base_fork_point(
     };
     let store = FileRefStore::new(git_dir, format);
     let reflog = store.read_reflog(&refname)?;
-    let commit_depths = ancestor_depths(db, format, commit)?;
+    let commit_depths = sley_rev::ancestor_depths(git_dir, format, db, commit)?;
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
     if reflog.is_empty() {
@@ -325,7 +332,10 @@ pub(crate) fn merge_base_fork_point(
     }
     let candidate_depths = candidates
         .iter()
-        .map(|candidate| Ok((candidate.clone(), ancestor_depths(db, format, candidate)?)))
+        .map(|candidate| Ok((
+            candidate.clone(),
+            sley_rev::ancestor_depths(git_dir, format, db, candidate)?,
+        )))
         .collect::<Result<HashMap<_, _>>>()?;
     let all_candidates = candidates.clone();
     candidates.retain(|candidate| {

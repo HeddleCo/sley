@@ -5,6 +5,7 @@
 //! parsing, todo generation (`sequencer_make_script`), the
 //! `complete_action`/`pick_commits` drive loop, `--continue` / `--abort` /
 //! `--skip` / `--quit` / `--edit-todo`, and autostash handling.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use crate::commands::merge_rebase::{
     MergePathResult, RenameMergeConfig, commit_tree_oid, directory_renames_config,
@@ -420,7 +421,7 @@ struct Ctx {
 impl Ctx {
     fn discover() -> Result<Ctx> {
         let cwd = env::current_dir()?;
-        let git_dir = discover_git_dir(&cwd)?;
+        let git_dir = crate::session::cli_git_dir_from(&cwd)?;
         let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
         let worktree_root = worktree_root_for_git_dir(&git_dir)?;
         let format = repository_object_format(&common_git_dir)?;
@@ -935,6 +936,7 @@ fn read_populate_todo(ctx: &Ctx, db: &FileObjectDatabase) -> Result<TodoList> {
         })
         .unwrap_or(0);
     let total_nr = done_nr + count_commands(&items);
+    fs::write(ctx.state_path("end"), format!("{total_nr}\n"))?;
     Ok(TodoList {
         items,
         current: 0,
@@ -3119,11 +3121,17 @@ fn add_update_ref_commands(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<Vec<Re
 }
 
 fn write_rebase_update_refs_state(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<()> {
-    let refs = items
-        .iter()
-        .filter(|item| item.command == TodoCommand::UpdateRef)
-        .map(|item| item.arg.as_str())
-        .collect::<Vec<_>>();
+    let mut refs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in items {
+        if item.command != TodoCommand::UpdateRef {
+            continue;
+        }
+        let refname = todo_arg_before_comment(&item.arg).trim().to_string();
+        if seen.insert(refname.clone()) {
+            refs.push(refname);
+        }
+    }
     if refs.is_empty() {
         let _ = fs::remove_file(ctx.state_path("update-refs"));
         return Ok(());
@@ -3132,8 +3140,8 @@ fn write_rebase_update_refs_state(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result
     let zero = ObjectId::null(ctx.format);
     let mut text = String::new();
     for refname in refs {
-        let old = sley_refs::resolve_ref_peeled(&store, refname)?.unwrap_or(zero);
-        text.push_str(refname);
+        let old = sley_refs::resolve_ref_peeled(&store, &refname)?.unwrap_or(zero);
+        text.push_str(&refname);
         text.push('\n');
         text.push_str(&old.to_hex());
         text.push('\n');
@@ -3224,7 +3232,7 @@ fn do_update_refs(ctx: &Ctx, quiet: bool) -> Result<()> {
         return Ok(());
     }
     records.sort_by(|a, b| a.refname.cmp(&b.refname));
-    let refs = FileRefStore::new(&ctx.common_git_dir, ctx.format);
+    let mut refs = FileRefStore::new(&ctx.common_git_dir, ctx.format);
     let committer = committer_identity_for_reflog()?;
     let zero = ObjectId::null(ctx.format);
     let mut updated = Vec::new();
@@ -3240,18 +3248,23 @@ fn do_update_refs(ctx: &Ctx, quiet: bool) -> Result<()> {
             failed.push(rec.refname.clone());
             continue;
         }
+        let precondition = if rec.before == zero {
+            sley_refs::RefPrecondition::ExistingMustMatch(RefTarget::Direct(zero))
+        } else {
+            sley_refs::RefPrecondition::MustExistAndMatch(RefTarget::Direct(rec.before))
+        };
         let mut tx = refs.transaction();
-        tx.update(RefUpdate {
-            name: rec.refname.clone(),
-            expected: Some(RefTarget::Direct(rec.before)),
-            new: RefTarget::Direct(rec.after),
-            reflog: Some(ReflogEntry {
+        tx.update_to(
+            rec.refname.clone(),
+            RefTarget::Direct(rec.after),
+            precondition,
+            Some(ReflogEntry {
                 old_oid: rec.before,
                 new_oid: rec.after,
                 committer: committer.clone(),
                 message: b"rewritten during rebase".to_vec(),
             }),
-        });
+        );
         match tx.commit() {
             Ok(()) => updated.push(rec.refname.clone()),
             Err(_) => {
@@ -3285,9 +3298,6 @@ fn do_update_refs(ctx: &Ctx, quiet: bool) -> Result<()> {
 /// any new `update-ref` lines.
 fn filter_update_refs(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<()> {
     let mut records = read_update_refs_state(ctx)?;
-    if records.is_empty() {
-        return Ok(());
-    }
     let zero = ObjectId::null(ctx.format);
     let todo_refs: std::collections::HashSet<&str> = items
         .iter()
@@ -3612,7 +3622,7 @@ fn checkout_would_overwrite_untracked(
     db: &FileObjectDatabase,
     target_tree: &ObjectId,
 ) -> Result<Vec<Vec<u8>>> {
-    let target = stash_tree_entry_map(db, ctx.format, target_tree)?;
+    let target = sley_diff_merge::flatten_tree(db, ctx.format, target_tree)?;
     let tracked: std::collections::BTreeSet<Vec<u8>> =
         match sley_worktree::read_repository_index(&ctx.git_dir, ctx.format)? {
             Some(index) => index
@@ -4145,9 +4155,9 @@ fn do_merge(
         None => ObjectId::empty_tree(ctx.format),
     };
     let head_tree = commit_tree_oid(db, ctx.format, &head)?;
-    let base_map = stash_tree_entry_map(db, ctx.format, &base_tree)?;
-    let ours_map = stash_tree_entry_map(db, ctx.format, &head_tree)?;
-    let theirs_map = stash_tree_entry_map(db, ctx.format, &merge_tree)?;
+    let base_map = sley_diff_merge::flatten_tree(db, ctx.format, &base_tree)?;
+    let ours_map = sley_diff_merge::flatten_tree(db, ctx.format, &head_tree)?;
+    let theirs_map = sley_diff_merge::flatten_tree(db, ctx.format, &merge_tree)?;
     let write_db = ctx.db();
     let (results, conflicts) = three_way_merge_trees_with_favor(
         &write_db,
@@ -4634,10 +4644,10 @@ fn do_octopus_merge_commit(
             .map(|base| commit_tree_oid(db, ctx.format, &base))
             .transpose()?
             .unwrap_or_else(|| ObjectId::empty_tree(ctx.format));
-        let base_map = stash_tree_entry_map(db, ctx.format, &base)?;
-        let ours_map = stash_tree_entry_map(db, ctx.format, &merged_tree)?;
+        let base_map = sley_diff_merge::flatten_tree(db, ctx.format, &base)?;
+        let ours_map = sley_diff_merge::flatten_tree(db, ctx.format, &merged_tree)?;
         let theirs_tree = commit_tree_oid(db, ctx.format, oid)?;
-        let theirs_map = stash_tree_entry_map(db, ctx.format, &theirs_tree)?;
+        let theirs_map = sley_diff_merge::flatten_tree(db, ctx.format, &theirs_tree)?;
         let write_db = ctx.db();
         let (results, conflicts) = three_way_merge_trees(
             &write_db,
@@ -4804,9 +4814,9 @@ fn pick_one_commit(
             strategy,
         );
     }
-    let base_map = stash_tree_entry_map(db, ctx.format, &parent_tree)?;
-    let ours_map = stash_tree_entry_map(db, ctx.format, &head_tree)?;
-    let theirs_map = stash_tree_entry_map(db, ctx.format, &theirs_tree)?;
+    let base_map = sley_diff_merge::flatten_tree(db, ctx.format, &parent_tree)?;
+    let ours_map = sley_diff_merge::flatten_tree(db, ctx.format, &head_tree)?;
+    let theirs_map = sley_diff_merge::flatten_tree(db, ctx.format, &theirs_tree)?;
     let write_db = ctx.db();
     // The conflict-marker label for the picked side is git's `msg.label`:
     // "<short-oid> (<subject>)" (sequencer.c get_message), not the bare subject.
@@ -5177,11 +5187,51 @@ fn apply_merge_results(
     ours_map: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
     with_conflicts: bool,
 ) -> Result<()> {
+    // Materialize the worktree BEFORE building the index so resolved stage-0
+    // entries can record the on-disk stat (git refreshes merged results via
+    // fill_stat_cache_info; a zeroed stat makes diff-files report them dirty).
+    for (path, result) in results {
+        match result {
+            MergePathResult::Resolved(Some((mode, oid))) => {
+                if ours_map.get(path) != Some(&(*mode, *oid)) {
+                    let content = if sley_index::is_gitlink(*mode) {
+                        Vec::new()
+                    } else {
+                        merge_read_blob(db, oid)?
+                    };
+                    merge_write_worktree_file(&ctx.worktree_root, path, &content, *mode)?;
+                }
+            }
+            MergePathResult::Resolved(None) => {
+                if ours_map.contains_key(path) {
+                    merge_remove_worktree_file(&ctx.worktree_root, path)?;
+                }
+            }
+            MergePathResult::Conflict { worktree, .. } => {
+                if with_conflicts {
+                    match worktree {
+                        Some((mode, content)) => {
+                            merge_write_worktree_file(&ctx.worktree_root, path, content, *mode)?
+                        }
+                        None => merge_remove_worktree_file(&ctx.worktree_root, path)?,
+                    }
+                }
+            }
+        }
+    }
+
     let mut entries = Vec::new();
     for (path, result) in results {
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
-                entries.push(merge_index_entry(path, *mode, *oid, 0));
+                let mut entry = merge_index_entry(path, *mode, *oid, 0);
+                if !sley_index::is_gitlink(*mode)
+                    && let Ok(rel) = std::str::from_utf8(path)
+                    && let Ok(metadata) = fs::symlink_metadata(ctx.worktree_root.join(rel))
+                {
+                    sley_worktree::fill_index_entry_stat_cache(&mut entry, &metadata);
+                }
+                entries.push(entry);
             }
             MergePathResult::Resolved(None) => {}
             MergePathResult::Conflict {
@@ -5214,35 +5264,6 @@ fn apply_merge_results(
         }
         .write(ctx.format)?,
     )?;
-    for (path, result) in results {
-        match result {
-            MergePathResult::Resolved(Some((mode, oid))) => {
-                if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = if sley_index::is_gitlink(*mode) {
-                        Vec::new()
-                    } else {
-                        merge_read_blob(db, oid)?
-                    };
-                    merge_write_worktree_file(&ctx.worktree_root, path, &content, *mode)?;
-                }
-            }
-            MergePathResult::Resolved(None) => {
-                if ours_map.contains_key(path) {
-                    merge_remove_worktree_file(&ctx.worktree_root, path)?;
-                }
-            }
-            MergePathResult::Conflict { worktree, .. } => {
-                if with_conflicts {
-                    match worktree {
-                        Some((mode, content)) => {
-                            merge_write_worktree_file(&ctx.worktree_root, path, content, *mode)?
-                        }
-                        None => merge_remove_worktree_file(&ctx.worktree_root, path)?,
-                    }
-                }
-            }
-        }
-    }
     Ok(())
 }
 
@@ -5970,7 +5991,12 @@ fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
             name: "HEAD".into(),
             expected: None,
             new: RefTarget::Symbolic(head_name.clone()),
-            reflog: None,
+            reflog: Some(ReflogEntry {
+                old_oid: head,
+                new_oid: head,
+                committer: committer.clone(),
+                message: ctx.reflog("finish", Some(&format!("returning to {head_name}"))),
+            }),
         });
         tx.commit()?;
         head_name_display = head_name.clone();
@@ -6575,6 +6601,20 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
     // update-ref lines, add new ones).
     filter_update_refs(ctx, &new_items)?;
     write_todo_file(ctx, &todo_path, &new_items, false, false, None, None, &db)?;
+    let done_nr = fs::read_to_string(ctx.state_path("done"))
+        .map(|text| {
+            let mut resolver = make_resolver(ctx, &db);
+            let (done_items, _) = seq::parse_todo_buffer(
+                &text,
+                true,
+                comment_char(&ctx.git_dir) as char,
+                &mut resolver,
+            );
+            count_commands(&done_items)
+        })
+        .unwrap_or(0);
+    let total_nr = done_nr + count_commands(&new_items);
+    fs::write(ctx.state_path("end"), format!("{total_nr}\n"))?;
     Ok(())
 }
 

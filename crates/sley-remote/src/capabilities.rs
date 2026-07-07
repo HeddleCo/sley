@@ -16,8 +16,11 @@ pub struct TransportCapabilities {
     pub http_protocol_v2_fetch: bool,
     /// Shallow clone/fetch via `--depth` / `deepen`.
     pub shallow_fetch: bool,
+    pub http_partial_clone: bool,
+    pub http_deepen_since_not: bool,
     /// `fetch` / `push` / `ls-remote` over SSH upload-pack/receive-pack.
     pub ssh_fetch: bool,
+    pub ssh_protocol_v2: bool,
     pub ssh_push: bool,
     /// `clone` over SSH (bare mirror / checkout destination).
     pub ssh_clone: bool,
@@ -40,15 +43,6 @@ pub struct TransportCapabilities {
     pub sha256_ssh: bool,
 }
 
-/// Flip to `true` once HTTP v2 `fetch` RPC is wired (see `http.rs`).
-pub const HTTP_PROTOCOL_V2_FETCH: bool = true;
-/// Flip to `true` once `CloneSource::Ssh` lands.
-pub const SSH_CLONE_SUPPORTED: bool = true;
-/// Flip to `true` once bundle fetch is lifted from the CLI.
-pub const BUNDLE_FETCH_SUPPORTED: bool = true;
-/// Thin-pack push via [`crate::pack::build_push_packfile`] (`PushPackRequest::thin`).
-pub const THIN_PACK_PUSH_SUPPORTED: bool = true;
-
 impl TransportCapabilities {
     /// Capabilities of the currently linked `sley-remote` build.
     pub const fn current() -> Self {
@@ -56,19 +50,22 @@ impl TransportCapabilities {
             http_fetch: cfg!(feature = "http"),
             http_push: cfg!(feature = "http"),
             http_protocol_v2_discovery: cfg!(feature = "http"),
-            http_protocol_v2_fetch: cfg!(feature = "http") && HTTP_PROTOCOL_V2_FETCH,
+            http_protocol_v2_fetch: cfg!(feature = "http"),
             shallow_fetch: true,
+            http_partial_clone: cfg!(feature = "http"),
+            http_deepen_since_not: cfg!(feature = "http"),
             ssh_fetch: true,
+            ssh_protocol_v2: false,
             ssh_push: true,
-            ssh_clone: SSH_CLONE_SUPPORTED,
+            ssh_clone: true,
             git_fetch: true,
             git_push: true,
             git_clone: true,
-            bundle_fetch: BUNDLE_FETCH_SUPPORTED,
+            bundle_fetch: true,
             local_fetch: true,
             local_push: true,
             credential_helper: true,
-            thin_pack_push: THIN_PACK_PUSH_SUPPORTED,
+            thin_pack_push: true,
             sha256_http: cfg!(feature = "http"),
             sha256_ssh: true,
         }

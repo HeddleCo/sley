@@ -1,4 +1,5 @@
 use super::*;
+use sley::plumbing::{sley_config, sley_core, sley_index, sley_refs, sley_rev, sley_worktree};
 
 /// Render git merge's post-merge `--stat`/`--compact-summary` block.
 ///
@@ -404,7 +405,7 @@ fn merge_octopus(
 
     // Iterative octopus: MRC tracks the commits the running tree stands for.
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
-    let mut merged_map = stash_tree_entry_map(&db, format, &head_tree)?;
+    let mut merged_map = sley_diff_merge::flatten_tree(&db, format, &head_tree)?;
     let mut merged_commits = vec![head_oid];
     let mut non_ff = false;
     // git-merge-octopus allows only the LAST head to leave a hand-resolvable
@@ -422,7 +423,7 @@ fn merge_octopus(
         }
         let mut base_args = vec![*oid];
         base_args.extend(merged_commits.iter().copied());
-        let common = merge_bases_default_many(&db, format, &base_args)?;
+        let common = merge_bases_default_many(common_git_dir, &db, format, &base_args)?;
         if common.len() == 1 && common[0] == *oid {
             // Already covered by the merges performed so far. git's octopus
             // prints "Already up to date with <name>" and moves on.
@@ -442,7 +443,7 @@ fn merge_octopus(
                 println!("Fast-forwarding to: {name}");
             }
             let tree = commit_tree_oid(&db, format, oid)?;
-            merged_map = stash_tree_entry_map(&db, format, &tree)?;
+            merged_map = sley_diff_merge::flatten_tree(&db, format, &tree)?;
             merged_commits = vec![*oid];
             continue;
         }
@@ -464,7 +465,7 @@ fn merge_octopus(
         }
         let base_map = virtual_ancestor_entry_map(&db, format, &common, common_git_dir)?;
         let theirs_tree = commit_tree_oid(&db, format, oid)?;
-        let theirs_map = stash_tree_entry_map(&db, format, &theirs_tree)?;
+        let theirs_map = sley_diff_merge::flatten_tree(&db, format, &theirs_tree)?;
         let (results, conflicts) = three_way_merge_trees_with_favor(
             &db,
             format,
@@ -577,7 +578,7 @@ fn merge_octopus(
 
     // Materialize the merged result into the worktree, touching only paths that
     // differ from HEAD (preserve untouched local mods, as in the two-parent path).
-    let head_map = &stash_tree_entry_map(&db, format, &head_tree)?;
+    let head_map = &sley_diff_merge::flatten_tree(&db, format, &head_tree)?;
     let sync_octopus_worktree = || -> Result<()> {
         for (path, entry) in &merged_map {
             if head_map.get(path) == Some(entry) {
@@ -598,6 +599,7 @@ fn merge_octopus(
     // `--squash`: stage the merged result + write SQUASH_MSG, record NO merge.
     if options.squash {
         sync_octopus_worktree()?;
+        refresh_merged_index_stat(git_dir, worktree_root, format)?;
         let other_oids: Vec<ObjectId> = reduced.iter().map(|(_, oid)| *oid).collect();
         write_squash_message_multi(git_dir, &db, format, &head_oid, &other_oids)?;
         if !options.quiet {
@@ -611,6 +613,7 @@ fn merge_octopus(
     // head) + MERGE_MSG, but do not create the commit or advance HEAD.
     if options.no_commit {
         sync_octopus_worktree()?;
+        refresh_merged_index_stat(git_dir, worktree_root, format)?;
         let other_oids = reduced.iter().map(|(_, oid)| *oid).collect::<Vec<_>>();
         write_merge_state(
             git_dir,
@@ -696,6 +699,45 @@ fn merge_octopus(
     Ok(())
 }
 
+/// After a clean `--squash`/`--no-commit` merge has materialized the merged
+/// result into the worktree, record the on-disk stat for the stage-0 entries our
+/// staging wrote with a zeroed stat. git's merge checks the merged result out and
+/// `fill_stat_cache_info` records each entry's stat; without it `git diff-files`
+/// (and `git status`) report every merged path as modified. Only zero-stat,
+/// non-gitlink stage-0 entries whose worktree file exists are touched; conflict
+/// stages never reach this path.
+fn refresh_merged_index_stat(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(());
+    }
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    let mut changed = false;
+    for entry in &mut index.entries {
+        if (entry.flags >> 12) & 0x3 != 0
+            || sley_index::is_gitlink(entry.mode)
+            || entry.mtime_seconds != 0
+            || entry.ctime_seconds != 0
+        {
+            continue;
+        }
+        if let Ok(rel) = std::str::from_utf8(entry.path.as_bytes())
+            && let Ok(metadata) = fs::symlink_metadata(worktree_root.join(rel))
+        {
+            sley_worktree::fill_index_entry_stat_cache(entry, &metadata);
+            changed = true;
+        }
+    }
+    if changed {
+        fs::write(&index_path, index.write(format)?)?;
+    }
+    Ok(())
+}
+
 /// Build and write `.git/SQUASH_MSG` for a `--squash` merge of `other` onto
 /// `head`, mirroring git's `squash_message` (builtin/merge.c): the literal
 /// header `Squashed commit of the following:` then, for each commit reachable
@@ -723,7 +765,7 @@ fn write_squash_message_multi(
 ) -> Result<()> {
     // Mark HEAD's ancestors uninteresting, then collect every `other`'s ancestors
     // that are not among them (the `^HEAD other...` range).
-    let uninteresting = ancestor_depths(db, format, head)?;
+    let uninteresting = sley_rev::ancestor_depths(git_dir, format, db, head)?;
     let mut records = Vec::new();
     let mut seen = HashSet::new();
     let mut pending: VecDeque<ObjectId> = others.iter().cloned().collect();
@@ -1482,7 +1524,7 @@ struct FmtMergeMsgOptions {
 pub(crate) fn cmd_fmt_merge_msg(args: &[String]) -> Result<()> {
     let options = parse_fmt_merge_msg_args(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let refs = FileRefStore::new(&git_dir, format);
@@ -2165,7 +2207,7 @@ fn append_branch_desc(out: &mut String, name: &str) {
     let Ok(cwd) = env::current_dir() else {
         return;
     };
-    let Ok(git_dir) = discover_git_dir(&cwd) else {
+    let Ok(git_dir) = crate::session::cli_git_dir_from(&cwd) else {
         return;
     };
     let path = git_dir
@@ -2444,7 +2486,7 @@ pub(crate) fn effective_config_with_overrides() -> Option<GitConfig> {
 /// unrecognised) is `conflict`: directory renames are detected but each re-homed
 /// path is flagged rather than applied silently.
 pub(crate) fn directory_renames_config() -> sley_diff_merge::DirectoryRenames {
-    use sley_diff_merge::DirectoryRenames;
+    use sley::plumbing::sley_diff_merge::DirectoryRenames;
     let value = effective_config_with_overrides().and_then(|config| {
         config
             .get("merge", None, "directoryRenames")
@@ -2817,7 +2859,7 @@ fn merge_reflog_message(target: &str, suffix: &str) -> Vec<u8> {
 pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     let mut options = MergeOptions::default();
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -3234,8 +3276,8 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     }
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
     let other_tree = commit_tree_oid(&db, format, &other_oid)?;
-    let ours_map = stash_tree_entry_map(&db, format, &head_tree)?;
-    let theirs_map = stash_tree_entry_map(&db, format, &other_tree)?;
+    let ours_map = sley_diff_merge::flatten_tree(&db, format, &head_tree)?;
+    let theirs_map = sley_diff_merge::flatten_tree(&db, format, &other_tree)?;
 
     let ours_label = "HEAD".to_string();
     let theirs_label = target.clone();
@@ -3376,6 +3418,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         // move HEAD. git prints the clean-merge notice then the squash line.
         if options.squash {
             write_merged_worktree()?;
+            refresh_merged_index_stat(&git_dir, &worktree_root, format)?;
             write_squash_message(&git_dir, &db, format, &head_oid, &other_oid)?;
             if !options.quiet {
                 println!("Automatic merge went well; stopped before committing as requested");
@@ -3400,6 +3443,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 write_merge_autostash_marker(&git_dir)?;
             }
             write_merged_worktree()?;
+            refresh_merged_index_stat(&git_dir, &worktree_root, format)?;
             if !options.quiet {
                 println!("Automatic merge went well; stopped before committing as requested");
             }
@@ -3534,16 +3578,11 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             .cmp(&right.path)
             .then_with(|| (left.flags >> 12).cmp(&(right.flags >> 12)))
     });
-    let index = Index {
-        version: 2,
-        entries,
-        extensions: Vec::new(),
-        checksum: None,
-    };
-    fs::write(
-        sley_worktree::repository_index_path(&git_dir),
-        index.write(format)?,
-    )?;
+    // The index is written AFTER the worktree materialization below so freshly
+    // resolved stage-0 entries can record their on-disk stat (git refreshes
+    // cleanly-merged results via fill_stat_cache_info; a zeroed stat makes
+    // diff-files report the resolved path as modified). Conflict stages (1/2/3)
+    // keep zero stat, as git does.
 
     // Materialize merged/conflicted content into the worktree. Conflict entries
     // below a populated HEAD gitlink are superproject index state only: writing
@@ -3613,6 +3652,30 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             },
         }
     }
+
+    // Record the on-disk stat for cleanly-resolved stage-0 entries now that the
+    // worktree holds their content (git's fill_stat_cache_info). Conflict stages
+    // and gitlinks keep zero stat.
+    for entry in &mut entries {
+        if (entry.flags >> 12) & 0x3 != 0 || sley_index::is_gitlink(entry.mode) {
+            continue;
+        }
+        if let Ok(rel) = std::str::from_utf8(entry.path.as_bytes())
+            && let Ok(metadata) = fs::symlink_metadata(worktree_root.join(rel))
+        {
+            sley_worktree::fill_index_entry_stat_cache(entry, &metadata);
+        }
+    }
+    fs::write(
+        sley_worktree::repository_index_path(&git_dir),
+        Index {
+            version: 2,
+            entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write(format)?,
+    )?;
 
     // The `# Conflicts:` trailer git appends to MERGE_MSG / SQUASH_MSG.
     let conflicts_block = merge_conflicts_block(&conflicts, false);
@@ -3763,7 +3826,7 @@ fn merge_recursive_renames_default() -> bool {
 /// falling back to `merge.renames`/`diff.renames` config when none is given.
 pub(crate) fn cmd_merge_recursive(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
@@ -3851,8 +3914,8 @@ pub(crate) fn cmd_merge_recursive(args: &[String]) -> Result<()> {
     let remote_oid = resolve_revision(&git_dir, format, remote)?;
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
     let remote_tree = commit_tree_oid(&db, format, &remote_oid)?;
-    let ours_map = stash_tree_entry_map(&db, format, &head_tree)?;
-    let theirs_map = stash_tree_entry_map(&db, format, &remote_tree)?;
+    let ours_map = sley_diff_merge::flatten_tree(&db, format, &head_tree)?;
+    let theirs_map = sley_diff_merge::flatten_tree(&db, format, &remote_tree)?;
 
     let attribute_favor = MergeAttributeFavorResolver::from_worktree_root(&worktree_root);
     let path_favor = |path: &[u8]| attribute_favor.favor_for_path(path);
@@ -4631,8 +4694,8 @@ pub(crate) fn verify_fast_forward_untracked_safe(
     head_tree: &ObjectId,
     target_tree: &ObjectId,
 ) -> Result<()> {
-    let head_map = stash_tree_entry_map(db, format, head_tree)?;
-    let target_map = stash_tree_entry_map(db, format, target_tree)?;
+    let head_map = sley_diff_merge::flatten_tree(db, format, head_tree)?;
+    let target_map = sley_diff_merge::flatten_tree(db, format, target_tree)?;
     verify_no_populated_gitlink_directory_overwrite(
         worktree_root,
         &target_map,
@@ -4903,7 +4966,7 @@ fn reset_index_and_worktree_to_commit_for_merge(
 /// bookkeeping.
 pub(crate) fn cmd_merge_abort() -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let merge_head_path = git_dir.join("MERGE_HEAD");
     if !merge_head_path.is_file() {
         eprintln!("fatal: There is no merge to abort (MERGE_HEAD missing).");
@@ -4928,7 +4991,7 @@ fn reset_merge_to_head(git_dir: &Path, worktree_root: &Path, format: ObjectForma
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let head_oid = resolve_revision(git_dir, format, "HEAD")?;
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
-    let head_map = stash_tree_entry_map(&db, format, &head_tree)?;
+    let head_map = sley_diff_merge::flatten_tree(&db, format, &head_tree)?;
     let populated_head_gitlink_prefixes =
         populated_gitlink_directory_prefixes(worktree_root, &head_map)?;
 
@@ -4993,7 +5056,7 @@ fn reset_merge_to_head(git_dir: &Path, worktree_root: &Path, format: ObjectForma
 
 pub(crate) fn cmd_merge_continue() -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let merge_head_path = git_dir.join("MERGE_HEAD");
     if !merge_head_path.is_file() {
         eprintln!("fatal: There is no merge in progress (MERGE_HEAD missing).");

@@ -25,6 +25,21 @@ use sley_config::GitConfig;
 use sley_core::{ObjectFormat, Result};
 use sley_transport::GitCredential;
 
+mod install;
+pub use install::{
+    install_protocol_v2_fetch_promisor_response_from_reader,
+    install_protocol_v2_fetch_response_from_reader,
+    install_upload_pack_packfile_promisor_response_from_reader,
+    install_upload_pack_packfile_response_from_reader,
+    install_upload_pack_raw_promisor_response_from_reader,
+    install_upload_pack_raw_response_from_reader,
+    install_upload_pack_shallow_packfile_promisor_response_from_reader,
+    install_upload_pack_shallow_packfile_response_from_reader,
+    install_upload_pack_shallow_raw_promisor_response_from_reader,
+    install_upload_pack_shallow_raw_response_from_reader,
+    shallow_info_from_protocol_v2_fetch_header,
+};
+
 mod credentials;
 pub use credentials::{
     CredentialHelperProvider, credential_fill, credential_request_for_url, credential_store,
@@ -38,8 +53,10 @@ pub use http::{
     HttpFetchPackRequest, HttpServiceAdvertisements, http_advertised_refs,
     http_authorization_headers, http_check_status, http_protocol_v2_fetch_response,
     http_send_with_auth, http_service_advertisements, http_upload_pack_advertisements,
-    http_validate_content_type, install_fetch_pack_via_http_protocol_v2_fetch,
-    install_fetch_pack_via_http_upload_pack, new_http_client, remote_url_is_http,
+    http_upload_pack_features, http_validate_content_type,
+    install_fetch_pack_via_http_protocol_v2_fetch, install_fetch_pack_via_http_upload_pack,
+    new_http_client, HttpOperationBatch,
+    remote_url_is_http,
 };
 
 mod ssh;
@@ -50,9 +67,26 @@ pub use ssh::{
 };
 
 mod git;
+mod git_proxy;
 pub use git::{
     GitFetchPackRequest, git_upload_pack_advertisements,
     git_upload_pack_advertisements_with_protocol, install_fetch_pack_via_git_upload_pack,
+};
+
+mod proc_receive;
+mod receive_hooks;
+pub use receive_hooks::{run_pre_receive, run_update_hooks};
+mod receive_pack_server;
+
+pub use proc_receive::{
+    ProcReceiveRefPattern, ProcReceiveReport, ReceivePackCommandState, parse_proc_receive_refs,
+    proc_receive_ref_matches,
+};
+pub use receive_pack_server::{
+    ReceivePackServerOptions, ReceivePackServerOutcome, ReceivePackServerReport,
+    ReceivePackServerRequest, flush_receive_pack_sideband, receive_pack_server_report_v1,
+    request_uses_sideband, run_receive_pack_post_hooks, serve_receive_pack,
+    write_receive_pack_server_report, write_receive_pack_sideband_stderr,
 };
 
 mod local;
@@ -67,11 +101,15 @@ pub use local::{
     upload_pack_sideband_response,
 };
 
+mod filter;
+pub use filter::{pack_filter_from_spec, pack_filter_from_spec_for_clone};
+
 mod fetch;
 pub use fetch::{
     FetchOptions, FetchOutcome, FetchRequest, FetchServices, FetchSource, PruneRefsInput,
     PrunedRef, append_reachable_auto_follow_tags, apply_configured_fetch_prune_option,
-    apply_configured_remote_tag_option, fetch, fetch_head_source_description,
+    apply_configured_partial_clone_filter, apply_configured_remote_tag_option, fetch,
+    fetch_head_source_description,
     fetch_refspec_excludes, fetch_refspecs_for_source, mark_tag_refspec_updates_not_for_merge,
     order_bundle_fetch_all_tags_updates, prune_refs_from_advertisements,
     retain_missing_auto_follow_tags, write_default_fetch_head, write_fetch_head,
@@ -88,10 +126,13 @@ mod push;
 pub use push::{
     PushAction, PushActionPlan, PushActionRequest, PushCommand, PushDestination, PushOptions,
     PushOutcome, PushPlan, PushQuarantine, PushRefStatus, PushReportRef, PushReportRequest,
-    PushRequest, PushServices, PushStatusReport, PushThinMode, execute_push_action_plan,
-    execute_push_plan, local_push_source_refs, normalize_push_refname, normalize_push_refspec,
-    plan_push, plan_push_actions, push, push_actions, push_local_with_report,
-    reject_non_fast_forward_pushes, stage_local_push_quarantine, validate_receive_pack_report,
+    PushRequest, PushServices, PushStatusReport, PushThinMode, ReceivePackPushReport,
+    apply_receive_pack_report_to_push_refs, execute_push_action_plan, execute_push_plan,
+    local_push_source_refs, normalize_push_refname, normalize_push_refspec, plan_push,
+    plan_push_actions, push, push_actions, push_local_uses_receive_pack_server,
+    push_local_with_report, run_local_push_post_hooks, push_url_for_display,
+    read_receive_pack_push_report, reject_non_fast_forward_pushes, stage_local_push_quarantine,
+    validate_receive_pack_report, validate_receive_pack_unpack,
 };
 
 mod ls_remote;
@@ -102,15 +143,18 @@ pub use clone::{CloneOptions, CloneOutcome, CloneRequest, CloneServices, CloneSo
 
 mod bundle;
 pub use bundle::{FetchBundleRequest, fetch_bundle};
+mod bundle_uri;
+pub use bundle_uri::{
+    BundleUriEntry, BundleUriList, bundle_uri_fetch_order, handshake_advertises_bundle_uri,
+    http_remote_bundle_uri_list, parse_bundle_uri_line, prefetch_advertised_bundle_uris,
+    transfer_bundle_uri_enabled,
+};
 
 mod shallow;
 pub use shallow::{apply_shallow_info, read_shallow, write_shallow};
 
 mod capabilities;
-pub use capabilities::{
-    BUNDLE_FETCH_SUPPORTED, HTTP_PROTOCOL_V2_FETCH, RemoteTransportKind, SSH_CLONE_SUPPORTED,
-    THIN_PACK_PUSH_SUPPORTED, TransportCapabilities,
-};
+pub use capabilities::{RemoteTransportKind, TransportCapabilities};
 
 mod protocol;
 pub use protocol::{
@@ -276,6 +320,7 @@ mod tests {
             cloning: false,
             record_promisor_refs: true,
             update_shallow: false,
+            reject_shallow: false,
             deepen_relative: false,
             update_head_ok: false,
             deepen_since: None,
@@ -571,6 +616,7 @@ mod tests {
             branch_explicit: true,
             ref_storage: sley_formats::RefStorageFormat::Files,
             ssh_options: None,
+            reject_shallow: false,
         };
         let mut clone_credentials = NoCredentials;
         let mut progress = SilentProgress;

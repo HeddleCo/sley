@@ -2314,11 +2314,11 @@ impl IgnorePatternBuckets {
             IgnoreBucketKind::GlobDirectoryPrefixBasename => {
                 self.glob_directory_prefix_basename.push(index)
             }
-            IgnoreBucketKind::SuffixBasename => self
-                .suffix_basename
-                .entry(*pattern.pattern.last().expect("suffix literal is non-empty"))
-                .or_default()
-                .push(index),
+            IgnoreBucketKind::SuffixBasename => {
+                if let Some(last) = pattern.pattern.last() {
+                    self.suffix_basename.entry(*last).or_default().push(index);
+                }
+            }
             IgnoreBucketKind::PrefixBasename => self
                 .prefix_basename
                 .entry(pattern.pattern[0])

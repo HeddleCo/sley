@@ -9,15 +9,17 @@
 //!
 //! Output formatting is shared with the rest of the CLI through a glob of the
 //! crate root, which (because a submodule can reach its ancestor module's
-//! private items) brings every helper and type — `discover_git_dir`,
+//! private items) brings every helper and type — `cli_git_dir`,
 //! `repository_object_format`, `resolve_revision`, `read_repo_config`,
 //! `FileObjectDatabase`, `FileRefStore`, the `write_diff_*` writers, the
 //! `print_log_format` pretty-format engine, and so on — into scope without
 //! re-listing them.
+#![allow(clippy::expect_used)]
 
 use crate::*;
-use sley_object::TreeEntries;
+use sley::plumbing::sley_object::TreeEntries;
 use std::cell::{Ref, RefCell};
+use sley::plumbing::{sley_diff_merge, sley_rev, sley_worktree};
 
 /// How the per-object diff (for commits) is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -922,7 +924,7 @@ fn show_commit(
         }
         ShowCommitFormat::Custom { compiled, .. } => {
             let source_tag_signatures = HashMap::new();
-            let signature_ctx = LogSignatureContext {
+            let signature_ctx = CliLogSignatureContext {
                 git_dir: context.git_dir,
                 db: context.db,
                 config: context.config,
@@ -945,8 +947,8 @@ fn show_commit(
                     date_mode: &options.date_mode,
                     source_oid: None,
                     describe: None,
-                    signature: Some(&signature_ctx),
-                    mailmap: mailmap.unwrap_or(&empty_mailmap),
+                    signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
+                    mailmap: &CliMailmapAdapter(mailmap.unwrap_or(&empty_mailmap)),
                     use_mailmap,
                     color: false,
                     output_encoding: &output_encoding,
@@ -1417,36 +1419,34 @@ fn commit_diff_entries(
     commit: &Commit,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
     let (detect_renames, detect_copies) = show_effective_rename_detection(options, config);
-    let base = sley_diff_merge::DiffNameStatusOptions {
+    let options = sley_diff_merge::DiffNameStatusOptions {
         detect_renames,
         detect_copies,
         find_copies_harder: options.find_copies_harder,
         rename_empty: true,
-    };
-    let rename_options = sley_diff_merge::RenameDetectionOptions {
-        base,
         detect_inexact: true,
         rename_threshold: options.rename_threshold,
         copy_threshold: options.copy_threshold,
         rename_limit: 0,
+        ..Default::default()
     };
     let entries = match commit.parents.first() {
         Some(parent_oid) => {
             let parent_object = db.read_object(parent_oid)?;
             let parent_commit = Commit::parse_ref(format, &parent_object.body)?;
-            sley_diff_merge::diff_name_status_trees_with_rename_options(
+            sley_diff_merge::diff_name_status_trees_with_options(
                 db,
                 format,
                 &parent_commit.tree,
                 &commit.tree,
-                rename_options,
+                options,
             )
         }
-        None => sley_diff_merge::diff_name_status_empty_tree_with_rename_options(
+        None => sley_diff_merge::diff_name_status_empty_tree_with_options(
             db,
             format,
             &commit.tree,
-            rename_options,
+            options,
         ),
     }?;
     Ok(match pathspec {
@@ -1614,7 +1614,7 @@ fn write_commit_diff_patch(
                     colors: colors.as_ref(),
                     word_diff: word_request.as_ref(),
                     no_index_contents: None,
-                    submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                    submodule_format: sley_rev::diff_options::SubmoduleDiffFormat::Short,
                     submodule_dirt: None,
                     ws_error: None,
                     color_moved: None,

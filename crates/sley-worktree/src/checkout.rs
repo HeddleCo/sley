@@ -732,8 +732,12 @@ pub(crate) fn materialize_tree_entry_with_optional_smudge(
     {
         return materialize_tree_entry(db, worktree_root, path, entry);
     }
-    let config = smudge_config.expect("checked above");
-    let matcher = attributes.expect("attributes are built when smudge_config is set");
+    let Some(config) = smudge_config else {
+        return materialize_tree_entry(db, worktree_root, path, entry);
+    };
+    let Some(matcher) = attributes else {
+        return materialize_tree_entry(db, worktree_root, path, entry);
+    };
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
     let body = match apply_smudge_filter_with_attributes_maybe_delayed(
@@ -746,11 +750,13 @@ pub(crate) fn materialize_tree_entry_with_optional_smudge(
     )? {
         SmudgeFilterResult::Content(body) => body,
         SmudgeFilterResult::Delayed { process } => {
-            let queue = delayed
-                .as_deref_mut()
-                .expect("delay is only reported when a queue is available");
-            queue.enqueue(process, path, entry);
-            return Ok(unmaterialized_index_entry(path, entry));
+            if let Some(queue) = delayed.as_deref_mut() {
+                queue.enqueue(process, path, entry);
+                return Ok(unmaterialized_index_entry(path, entry));
+            }
+            return Err(GitError::InvalidFormat(
+                "smudge filter requested delay without a checkout queue".into(),
+            ));
         }
     };
     let file_path = worktree_path(worktree_root, path)?;

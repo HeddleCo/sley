@@ -1,9 +1,10 @@
 use crate::{
-    common_git_dir_for_git_dir, discover_git_dir, global_config_value, injected_config_parameters,
+    common_git_dir_for_git_dir, global_config_value, injected_config_parameters,
     report_config_setup_error,
 };
-use sley_config::ConfigIncludeContext;
-use sley_core::{GitError, Result};
+use crate::sley_config;
+use sley::plumbing::sley_config::ConfigIncludeContext;
+use sley::{GitError, Result};
 use std::collections::BTreeSet;
 use std::env;
 use std::path::Path;
@@ -35,6 +36,10 @@ pub(crate) const BUILTIN_COMMANDS: &[&str] = &[
     "commit-tree",
     "config",
     "count-objects",
+    "credential",
+    "credential-cache",
+    "credential-cache--daemon",
+    "credential-store",
     "daemon",
     "describe",
     "diagnose",
@@ -52,6 +57,7 @@ pub(crate) const BUILTIN_COMMANDS: &[&str] = &[
     "for-each-ref",
     "for-each-repo",
     "format-patch",
+    "format-rev",
     "fsck",
     "gc",
     "get-tar-commit-id",
@@ -464,7 +470,7 @@ pub(crate) fn unknown_command(command: &str, code: i32) -> Result<()> {
 }
 
 pub(crate) fn print_command_usage(command: &str) {
-    println!("usage: git {command} [<options>]");
+    crate::command_synopsis::print_command_synopsis(command);
 }
 
 fn set_mode(current: HelpMode, next: HelpMode) -> Result<HelpMode> {
@@ -544,7 +550,7 @@ fn config_value(key: &str) -> Result<Option<String>> {
         return Ok(Some(value));
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd).ok();
+    let git_dir = crate::session::cli_git_dir_from(&cwd).ok();
     let common_git_dir = git_dir
         .as_ref()
         .and_then(|dir| common_git_dir_for_git_dir(dir).ok());

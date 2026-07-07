@@ -14,40 +14,42 @@
 
 use std::path::Path;
 
+use crate::install::{
+    install_protocol_v2_fetch_promisor_response_from_reader,
+    install_protocol_v2_fetch_response_from_reader,
+    install_upload_pack_packfile_promisor_response_from_reader,
+    install_upload_pack_packfile_response_from_reader,
+    install_upload_pack_shallow_packfile_promisor_response_from_reader,
+    install_upload_pack_shallow_packfile_response_from_reader,
+    shallow_info_from_protocol_v2_fetch_header,
+};
+use sley_config::GitConfig;
 use sley_core::{
     Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
 };
-use sley_fetch::{
-    install_protocol_v2_fetch_promisor_response_from_reader,
-    install_protocol_v2_fetch_response_from_reader,
-    install_upload_pack_raw_promisor_response_from_reader,
-    install_upload_pack_raw_response_from_reader,
-    install_upload_pack_shallow_raw_promisor_response_from_reader,
-    install_upload_pack_shallow_raw_response_from_reader,
-    shallow_info_from_protocol_v2_fetch_header,
-};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
-    GitService, ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchRequest,
-    ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRequest,
-    RefAdvertisement, RefAdvertisementSet, TransportHandshake, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackRequest, encode_protocol_v2_command_options,
-    parse_protocol_v2_fetch_features, parse_upload_pack_features, protocol_v2_object_format,
-    read_protocol_v2_fetch_response, read_protocol_v2_fetch_sideband_all_response,
+    encode_protocol_v2_command_options, parse_protocol_v2_fetch_features,
+    parse_upload_pack_features, protocol_v2_object_format, read_protocol_v2_fetch_response,
+    read_protocol_v2_fetch_sideband_all_response,
     read_protocol_v2_ls_refs_response_as_ref_advertisement_set,
     smart_http_advertisement_content_type, smart_http_rpc_request_content_type,
     smart_http_rpc_result_content_type, validate_protocol_v2_fetch_command_request,
     validate_protocol_v2_ls_refs_command_request, write_protocol_v2_command_request,
-    write_upload_pack_negotiation_request, write_upload_pack_request,
+    write_upload_pack_negotiation_request, write_upload_pack_request, GitService,
+    ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchRequest,
+    ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRequest,
+    ProtocolVersion, RefAdvertisement, RefAdvertisementSet, TransportHandshake, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackRequest,
 };
 use sley_transport::{
+    encode_git_protocol_header, git_credential_basic_authorization, http_smart_info_refs_url,
+    http_smart_rpc_url, parse_remote_url, read_service_discovery_response, GitProtocolHeader,
     HttpClient, HttpResponse, RemoteTransport, RemoteUrl, ServiceDiscoveryPayload, UreqHttpClient,
-    git_credential_basic_authorization, http_smart_info_refs_url, http_smart_rpc_url,
-    parse_remote_url, read_service_discovery_response,
 };
 
-use crate::CredentialProvider;
 use crate::credentials::{credential_request_for_url, http_url_credential};
+use crate::CredentialProvider;
 
 /// Whether an already-resolved remote `url` uses HTTP(S) transport.
 ///
@@ -61,7 +63,28 @@ pub fn remote_url_is_http(url: &str) -> Result<bool> {
     ))
 }
 
-/// Construct the default HTTP client used for smart-HTTP transport.
+/// Reusable HTTP client for every smart-HTTP RPC in one remote operation.
+pub struct HttpOperationBatch {
+    client: UreqHttpClient,
+}
+
+impl HttpOperationBatch {
+    pub fn new() -> Self {
+        Self {
+            client: UreqHttpClient::new(),
+        }
+    }
+    pub fn client(&self) -> &UreqHttpClient {
+        &self.client
+    }
+}
+
+impl Default for HttpOperationBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn new_http_client() -> UreqHttpClient {
     UreqHttpClient::new()
 }
@@ -104,12 +127,61 @@ pub fn http_send_with_auth(
     Ok(retry)
 }
 
+/// Resolve the client protocol version for smart HTTP, defaulting to v2 like upstream git.
+pub fn http_protocol_version_from_config(config: Option<&GitConfig>) -> Option<ProtocolVersion> {
+    match config.and_then(|config| config.get("protocol", None, "version")) {
+        Some("0") => Some(ProtocolVersion::V0),
+        Some("1") => Some(ProtocolVersion::V1),
+        Some("2") => Some(ProtocolVersion::V2),
+        _ => Some(ProtocolVersion::V2),
+    }
+}
+
+/// Encode the `Git-Protocol` request header value, if any (`None` for protocol v0).
+pub fn http_git_protocol_header_value(config: Option<&GitConfig>) -> Result<Option<String>> {
+    http_git_protocol_header_value_for_service(config, GitService::UploadPack)
+}
+
+/// Encode the `Git-Protocol` header for a specific smart-HTTP service.
+///
+/// Upstream `remote-curl.c` only negotiates protocol v2 for `git-upload-pack`;
+/// push (`git-receive-pack`) and other RPCs fall back to v0.
+pub fn http_git_protocol_header_value_for_service(
+    config: Option<&GitConfig>,
+    service: GitService,
+) -> Result<Option<String>> {
+    let mut version = http_protocol_version_from_config(config);
+    if matches!(version, Some(ProtocolVersion::V2)) && service != GitService::UploadPack {
+        version = Some(ProtocolVersion::V0);
+    }
+    match version {
+        Some(ProtocolVersion::V0) => Ok(None),
+        Some(version) => encode_git_protocol_header(&GitProtocolHeader {
+            protocol: Some(version),
+            extra_parameters: Vec::new(),
+        }),
+        None => Ok(None),
+    }
+}
+
+/// Build smart-HTTP request headers for an optional credential and `Git-Protocol` value.
+pub fn http_request_headers<'a>(
+    auth: Option<&'a str>,
+    git_protocol: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut headers = Vec::with_capacity(2);
+    if let Some(value) = git_protocol {
+        headers.push(("Git-Protocol", value));
+    }
+    if let Some(value) = auth {
+        headers.push(("Authorization", value));
+    }
+    headers
+}
+
 /// Build the `Authorization` header list for an optional credential header value.
 pub fn http_authorization_headers(auth: Option<&str>) -> Vec<(&str, &str)> {
-    match auth {
-        Some(value) => vec![("Authorization", value)],
-        None => Vec::new(),
-    }
+    http_request_headers(auth, None)
 }
 
 /// Map an HTTP response status to success or a descriptive error for `url`.
@@ -249,20 +321,97 @@ fn protocol_v2_fetch_request_from_upload_pack_semantics(
     haves: Vec<ObjectId>,
     shallow: Vec<ObjectId>,
     deepen: Option<u32>,
+    deepen_since: Option<i64>,
+    deepen_not: Vec<String>,
+    deepen_relative: bool,
+    filter: Option<&sley_odb::PackObjectFilter>,
     handshake: &TransportHandshake,
 ) -> Result<ProtocolV2FetchRequest> {
-    let sideband_all = parse_protocol_v2_fetch_features(&handshake.capabilities)?
-        .map(|features| features.sideband_all)
-        .unwrap_or(false);
+    let v2_features =
+        parse_protocol_v2_fetch_features(&handshake.capabilities)?.unwrap_or_default();
     Ok(ProtocolV2FetchRequest {
         wants,
         haves,
         shallow,
         deepen,
+        deepen_since: deepen_since_u64(deepen_since),
+        deepen_not,
+        deepen_relative,
+        filter: filter.and_then(crate::local::upload_pack_filter_protocol_spec),
+        thin_pack: true,
+        include_tag: true,
+        ofs_delta: true,
         done: true,
-        sideband_all,
+        wait_for_done: v2_features.wait_for_done,
+        sideband_all: v2_features.sideband_all,
         ..ProtocolV2FetchRequest::default()
     })
+}
+
+fn deepen_since_u64(deepen_since: Option<i64>) -> Option<u64> {
+    deepen_since.and_then(|value| u64::try_from(value).ok())
+}
+
+fn build_http_upload_pack_request(
+    wants: Vec<ObjectId>,
+    shallow: Vec<ObjectId>,
+    deepen: Option<u32>,
+    deepen_since: Option<i64>,
+    deepen_not: Vec<String>,
+    filter: Option<&sley_odb::PackObjectFilter>,
+) -> UploadPackRequest {
+    UploadPackRequest {
+        wants,
+        capabilities: upload_pack_request_capabilities(
+            deepen,
+            filter
+                .and_then(crate::local::upload_pack_filter_protocol_spec)
+                .is_some(),
+        ),
+        shallow,
+        deepen,
+        deepen_since: deepen_since_u64(deepen_since),
+        deepen_not,
+        filter: filter.and_then(crate::local::upload_pack_filter_protocol_spec),
+    }
+}
+
+fn upload_pack_request_capabilities(deepen: Option<u32>, filter: bool) -> Vec<Capability> {
+    let mut capabilities = Vec::new();
+    // The v0 upload-pack response reader demuxes a side-band-64k stream, so the
+    // request must negotiate it; otherwise the server streams a bare packfile
+    // and the reader mis-parses the leading `PACK` signature as a pkt-line
+    // length ("invalid pkt-line length byte 0x50"). ofs-delta matches git's
+    // default fetch capabilities.
+    capabilities.push(Capability {
+        name: "side-band-64k".into(),
+        value: None,
+    });
+    capabilities.push(Capability {
+        name: "ofs-delta".into(),
+        value: None,
+    });
+    if deepen.is_some() {
+        capabilities.push(Capability {
+            name: "shallow".into(),
+            value: None,
+        });
+    }
+    if filter {
+        capabilities.push(Capability {
+            name: "filter".into(),
+            value: None,
+        });
+    }
+    capabilities
+}
+
+fn request_replays_shallow_boundary(
+    deepen: Option<u32>,
+    deepen_since: Option<i64>,
+    deepen_not: &[String],
+) -> bool {
+    deepen.is_some() || deepen_since.is_some() || !deepen_not.is_empty()
 }
 
 fn http_protocol_v2_ls_refs_advertisements(
@@ -272,6 +421,7 @@ fn http_protocol_v2_ls_refs_advertisements(
     service: GitService,
     handshake: TransportHandshake,
     credentials: &mut dyn CredentialProvider,
+    git_protocol: Option<&str>,
 ) -> Result<RefAdvertisementSet> {
     let command = protocol_v2_ls_refs_command_request(format, &handshake)?;
     let url = http_smart_rpc_url(remote, service)?;
@@ -282,7 +432,7 @@ fn http_protocol_v2_ls_refs_advertisements(
         client.post(
             &url,
             &content_type,
-            &http_authorization_headers(auth),
+            &http_request_headers(auth, git_protocol),
             &body,
         )
     })?;
@@ -299,10 +449,12 @@ pub fn http_service_advertisements(
     format: ObjectFormat,
     service: GitService,
     credentials: &mut dyn CredentialProvider,
+    config: Option<&GitConfig>,
 ) -> Result<HttpServiceAdvertisements> {
+    let git_protocol = http_git_protocol_header_value_for_service(config, service)?;
     let url = http_smart_info_refs_url(remote, service)?;
     let mut response = http_send_with_auth(remote, credentials, |auth| {
-        client.get(&url, &http_authorization_headers(auth))
+        client.get(&url, &http_request_headers(auth, git_protocol.as_deref()))
     })?;
     http_check_status(&response, &url)?;
     http_validate_content_type(&response, &smart_http_advertisement_content_type(service)?)?;
@@ -320,6 +472,7 @@ pub fn http_service_advertisements(
                 service,
                 handshake.clone(),
                 credentials,
+                git_protocol.as_deref(),
             )?;
             Ok(HttpServiceAdvertisements {
                 set,
@@ -335,16 +488,42 @@ pub fn http_upload_pack_advertisements(
     remote: &RemoteUrl,
     format: ObjectFormat,
     credentials: &mut dyn CredentialProvider,
+    config: Option<&GitConfig>,
 ) -> Result<(Vec<RefAdvertisement>, UploadPackFeatures)> {
-    let discovered =
-        http_service_advertisements(client, remote, format, GitService::UploadPack, credentials)?;
-    let features = upload_pack_features_from_advertisements(&discovered.set.refs)?;
+    let discovered = http_service_advertisements(
+        client,
+        remote,
+        format,
+        GitService::UploadPack,
+        credentials,
+        config,
+    )?;
+    let features = http_upload_pack_features(&discovered.set.refs, discovered.handshake.as_ref())?;
     Ok((discovered.set.refs, features))
 }
 
-fn upload_pack_features_from_advertisements(
+/// Bridge protocol v2 handshake capabilities (filter/shallow/…) and v0/v1 ref
+/// advertisement capabilities into [`UploadPackFeatures`].
+pub fn http_upload_pack_features(
     advertisements: &[RefAdvertisement],
+    handshake: Option<&TransportHandshake>,
 ) -> Result<UploadPackFeatures> {
+    if let Some(handshake) = handshake {
+        let v2 = parse_protocol_v2_fetch_features(&handshake.capabilities)?.unwrap_or_default();
+        let mut features = UploadPackFeatures {
+            object_format: Some(protocol_v2_object_format(&handshake.capabilities)?),
+            shallow: v2.shallow,
+            deepen_since: v2.shallow,
+            deepen_not: v2.shallow,
+            filter: v2.filter,
+            ..UploadPackFeatures::default()
+        };
+        if let Some(first) = advertisements.first() {
+            let bridged = parse_upload_pack_features(&first.capabilities)?;
+            features.symrefs = bridged.symrefs;
+        }
+        return Ok(features);
+    }
     Ok(advertisements
         .first()
         .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
@@ -362,6 +541,7 @@ fn http_upload_pack_post(
     request: &UploadPackRequest,
     haves: Vec<ObjectId>,
     credentials: &mut dyn CredentialProvider,
+    git_protocol: Option<&str>,
 ) -> Result<HttpResponse> {
     let url = http_smart_rpc_url(remote, GitService::UploadPack)?;
     let mut body = Vec::new();
@@ -375,7 +555,7 @@ fn http_upload_pack_post(
         client.post(
             &url,
             &content_type,
-            &http_authorization_headers(auth),
+            &http_request_headers(auth, git_protocol),
             &body,
         )
     })?;
@@ -398,10 +578,19 @@ pub fn http_protocol_v2_fetch_response(
     handshake: &TransportHandshake,
     fetch: ProtocolV2FetchRequest,
     credentials: &mut dyn CredentialProvider,
+    config: Option<&GitConfig>,
 ) -> Result<Vec<ProtocolV2FetchResponseSection>> {
+    let git_protocol = http_git_protocol_header_value(config)?;
     let sideband_all = fetch.sideband_all;
-    let mut response =
-        http_protocol_v2_fetch_post(client, remote, format, handshake, fetch, credentials)?;
+    let mut response = http_protocol_v2_fetch_post(
+        client,
+        remote,
+        format,
+        handshake,
+        fetch,
+        credentials,
+        git_protocol.as_deref(),
+    )?;
     if sideband_all {
         Ok(read_protocol_v2_fetch_sideband_all_response(format, &mut response.body)?.sections)
     } else {
@@ -416,6 +605,7 @@ fn http_protocol_v2_fetch_post(
     handshake: &TransportHandshake,
     fetch: ProtocolV2FetchRequest,
     credentials: &mut dyn CredentialProvider,
+    git_protocol: Option<&str>,
 ) -> Result<HttpResponse> {
     let command = protocol_v2_fetch_command_request(format, handshake, &fetch)?;
     let url = http_smart_rpc_url(remote, GitService::UploadPack)?;
@@ -426,7 +616,7 @@ fn http_protocol_v2_fetch_post(
         client.post(
             &url,
             &content_type,
-            &http_authorization_headers(auth),
+            &http_request_headers(auth, git_protocol),
             &body,
         )
     })?;
@@ -465,6 +655,20 @@ pub struct HttpFetchPackRequest<'a> {
     pub deepen: Option<u32>,
     /// Whether to install the response as a promisor pack.
     pub promisor: bool,
+    /// Maximum raw pack bytes to accept from the remote (`fetch.maxInputSize` /
+    /// `transfer.maxSize`). `None` means unlimited.
+    pub max_input_size: Option<u64>,
+    pub filter: Option<sley_odb::PackObjectFilter>,
+    pub deepen_since: Option<i64>,
+    pub deepen_not: Vec<String>,
+    pub deepen_relative: bool,
+    pub git_protocol: Option<&'a str>,
+    /// Send no `have` lines. Used by a partial clone's checkout-blob top-up
+    /// fetch: the client already has the commit whose tree references the wanted
+    /// blob, so advertising it as a `have` would make the server treat the blob
+    /// as already transferred (reachable from the have) and omit it. Suppressing
+    /// haves forces the server to send the explicitly wanted objects.
+    pub omit_haves: bool,
 }
 
 pub fn install_fetch_pack_via_http_upload_pack(
@@ -478,17 +682,25 @@ pub fn install_fetch_pack_via_http_upload_pack(
     // A deepen request must always reach the server (the shallow boundary may move
     // even when every wanted object is already present), so only the plain fetch
     // takes the "everything is local already" shortcut.
-    if request.deepen.is_none() && all_wants_present(&local_db, &request.wants)? {
+    if !request_replays_shallow_boundary(request.deepen, request.deepen_since, &request.deepen_not)
+        && request.filter.is_none()
+        && all_wants_present(&local_db, &request.wants)?
+    {
         return Ok(Vec::new());
     }
-    let upload_request = UploadPackRequest {
-        wants: request.wants,
-        capabilities: shallow_request_capabilities(request.deepen),
-        shallow: request.shallow,
-        deepen: request.deepen,
-        ..UploadPackRequest::default()
+    let upload_request = build_http_upload_pack_request(
+        request.wants,
+        request.shallow,
+        request.deepen,
+        request.deepen_since,
+        request.deepen_not,
+        request.filter.as_ref(),
+    );
+    let haves = if request.omit_haves {
+        Vec::new()
+    } else {
+        crate::local::local_have_oids(request.git_dir, request.format)?
     };
-    let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
     if request.deepen.is_none() {
         let mut response = http_upload_pack_post(
             request.client,
@@ -496,18 +708,21 @@ pub fn install_fetch_pack_via_http_upload_pack(
             &upload_request,
             haves,
             credentials,
+            request.git_protocol,
         )?;
         if request.promisor {
-            install_upload_pack_raw_promisor_response_from_reader(
+            install_upload_pack_packfile_promisor_response_from_reader(
                 request.format,
                 &mut response.body,
                 &local_db,
+                request.max_input_size,
             )?;
         } else {
-            install_upload_pack_raw_response_from_reader(
+            install_upload_pack_packfile_response_from_reader(
                 request.format,
                 &mut response.body,
                 &local_db,
+                request.max_input_size,
             )?;
         }
         return Ok(Vec::new());
@@ -519,19 +734,22 @@ pub fn install_fetch_pack_via_http_upload_pack(
         &upload_request,
         haves,
         credentials,
+        request.git_protocol,
     )?;
     let shallow_info = if request.promisor {
-        let (shallow_info, _) = install_upload_pack_shallow_raw_promisor_response_from_reader(
+        let (shallow_info, _) = install_upload_pack_shallow_packfile_promisor_response_from_reader(
             request.format,
             &mut response.body,
             &local_db,
+            request.max_input_size,
         )?;
         shallow_info
     } else {
-        let (shallow_info, _) = install_upload_pack_shallow_raw_response_from_reader(
+        let (shallow_info, _) = install_upload_pack_shallow_packfile_response_from_reader(
             request.format,
             &mut response.body,
             &local_db,
+            request.max_input_size,
         )?;
         shallow_info
     };
@@ -547,15 +765,26 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
         return Ok(Vec::new());
     }
     let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
-    if request.deepen.is_none() && all_wants_present(&local_db, &request.wants)? {
+    if !request_replays_shallow_boundary(request.deepen, request.deepen_since, &request.deepen_not)
+        && request.filter.is_none()
+        && all_wants_present(&local_db, &request.wants)?
+    {
         return Ok(Vec::new());
     }
-    let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
+    let haves = if request.omit_haves {
+        Vec::new()
+    } else {
+        crate::local::local_have_oids(request.git_dir, request.format)?
+    };
     let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
         request.wants,
         haves,
         request.shallow,
         request.deepen,
+        request.deepen_since,
+        request.deepen_not,
+        request.deepen_relative,
+        request.filter.as_ref(),
         handshake,
     )?;
     let sideband_all = fetch.sideband_all;
@@ -566,6 +795,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
         handshake,
         fetch,
         credentials,
+        request.git_protocol,
     )?;
     let (header, _install) = if request.promisor {
         install_protocol_v2_fetch_promisor_response_from_reader(
@@ -573,6 +803,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
             &mut response.body,
             sideband_all,
             &local_db,
+            request.max_input_size,
         )?
     } else {
         install_protocol_v2_fetch_response_from_reader(
@@ -580,6 +811,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
             &mut response.body,
             sideband_all,
             &local_db,
+            request.max_input_size,
         )?
     };
     Ok(shallow_info_from_protocol_v2_fetch_header(&header))
@@ -594,28 +826,13 @@ fn all_wants_present(db: &FileObjectDatabase, wants: &[ObjectId]) -> Result<bool
     Ok(true)
 }
 
-/// The want-line capabilities to advertise for a fetch: the `shallow` capability
-/// when a deepen is requested (git's upload-pack expects clients sending deepen to
-/// negotiate shallow), otherwise none — preserving the existing plain-fetch wire
-/// form exactly.
-fn shallow_request_capabilities(deepen: Option<u32>) -> Vec<Capability> {
-    if deepen.is_some() {
-        vec![Capability {
-            name: "shallow".into(),
-            value: None,
-        }]
-    } else {
-        Vec::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use sley_protocol::{
-        ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRecord,
-        ProtocolVersion, RefAdvertisement, read_protocol_v2_fetch_response,
-        write_protocol_v2_fetch_response, write_protocol_v2_ls_refs_response,
+        read_protocol_v2_fetch_response, write_protocol_v2_fetch_response,
+        write_protocol_v2_ls_refs_response, ProtocolV2FetchResponseSection,
+        ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRecord, ProtocolVersion, RefAdvertisement,
     };
 
     fn sample_v2_handshake() -> TransportHandshake {
@@ -829,6 +1046,10 @@ mod tests {
             vec![have.clone()],
             vec![shallow.clone()],
             Some(3),
+            None,
+            Vec::new(),
+            false,
+            None,
             &handshake,
         )
         .expect("test operation should succeed");
@@ -858,6 +1079,9 @@ mod tests {
                 haves: vec![have],
                 shallow: vec![shallow],
                 deepen: Some(3),
+                thin_pack: true,
+                include_tag: true,
+                ofs_delta: true,
                 done: true,
                 sideband_all: true,
                 ..ProtocolV2FetchRequest::default()
@@ -883,6 +1107,10 @@ mod tests {
             Vec::new(),
             vec![shallow.clone()],
             Some(1),
+            None,
+            Vec::new(),
+            false,
+            None,
             &handshake,
         )
         .expect("test operation should succeed");

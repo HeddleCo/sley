@@ -1,5 +1,6 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
+use sley::plumbing::{sley_refs, sley_remote, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use super::status::{StatusLineSink, status_long_tracking_lines};
@@ -257,7 +258,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         }
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let checkout_config = read_repo_config(&git_dir)?;
@@ -1027,7 +1028,27 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
-    if recurse_submodules || (branch_update_rollback.is_some() && !force) {
+    if path_merge && !force {
+        let from = checkout_reflog_from.clone();
+        let target = branch_target.ok_or_else(|| GitError::reference_not_found("branch"))?;
+        if let Err(err) = checkout_merge_autostash_branch_switch(
+            &git_dir,
+            &worktree_root,
+            format,
+            branch,
+            &target,
+            recurse_submodules,
+            quiet,
+        ) {
+            checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+            return Err(err);
+        }
+        if let Err(err) = switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from)
+        {
+            checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+            return Err(err);
+        }
+    } else if recurse_submodules || (branch_update_rollback.is_some() && !force) {
         let from = checkout_reflog_from.clone();
         let target = branch_target.ok_or_else(|| GitError::reference_not_found("branch"))?;
         if let Err(err) = checkout_twoway_dirty(
@@ -1630,7 +1651,7 @@ pub(crate) fn cmd_switch(args: &[String]) -> Result<()> {
             ));
         };
         let cwd = env::current_dir()?;
-        let git_dir = discover_git_dir(&cwd)?;
+        let git_dir = crate::session::cli_git_dir_from(&cwd)?;
         let worktree_root = worktree_root_for_git_dir(&git_dir)?;
         let format = repository_object_format(&git_dir)?;
         checkout_twoway_dirty(&git_dir, &worktree_root, format, None, false, false)?;
@@ -1919,7 +1940,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
     }
     if patch {
         let cwd = env::current_dir()?;
-        let git_dir = discover_git_dir(&cwd)?;
+        let git_dir = crate::session::cli_git_dir_from(&cwd)?;
         let format = repository_object_format(&git_dir)?;
         return restore_run_patch(
             &git_dir,
@@ -1938,7 +1959,7 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let resolved_paths = paths
@@ -2112,7 +2133,7 @@ fn prefetch_local_promisor_checkout_blobs(
         let Some(url) = config.get("remote", Some(remote_name), "url") else {
             continue;
         };
-        let Ok(remote_git_dir) = commands::remote_cmds::ls_remote_git_dir(url) else {
+        let Ok(remote_git_dir) = commands::remote::ls_remote_git_dir(url) else {
             continue;
         };
         let _ = sley_remote::install_fetch_pack_via_local_upload_pack(
@@ -2217,6 +2238,104 @@ fn checkout_show_branch_tracking(
     }
     io::stdout().lock().write_all(&buf)?;
     Ok(())
+}
+
+/// `git checkout -m <branch>`: two-way merge switch with autostash fallback.
+///
+/// git's `switch_branches` (`builtin/checkout.c`): try `merge_working_tree`
+/// with `opts->merge`; on `MERGE_WORKING_TREE_UNPACK_FAILED`, stash local
+/// changes, force-switch to the target tree, then re-apply the stash (which may
+/// leave unmerged index entries that block `reset --soft`).
+fn checkout_merge_autostash_branch_switch(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    _branch: &str,
+    target: &ObjectId,
+    recurse_submodules: bool,
+    quiet: bool,
+) -> Result<()> {
+    if checkout_twoway_dirty(
+        git_dir,
+        worktree_root,
+        format,
+        Some(target),
+        recurse_submodules,
+        false,
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+
+    let stash_oid = match commands::stash::create_stash_for_autostash()? {
+        Some(oid) => oid,
+        None => {
+            eprintln!("fatal: Cannot autostash");
+            return Err(GitError::Exit(128));
+        }
+    };
+    let head = resolve_revision(git_dir, format, "HEAD")?;
+    if recurse_submodules {
+        commands::read_tree::reset_index_and_worktree_to_commit(
+            worktree_root,
+            git_dir,
+            format,
+            &head,
+            true,
+        )?;
+    } else {
+        sley_worktree::reset_index_and_worktree_to_commit(
+            worktree_root,
+            git_dir,
+            format,
+            &head,
+        )?;
+    }
+    // Retry the switch WITHOUT clobbering untracked files. The autostash above
+    // only removed *tracked* local modifications; if the switch still fails now,
+    // an UNTRACKED file (or dir) in the target's way is the blocker, and git's
+    // `checkout -m` fails atomically rather than nuking it (t2500 "checkout -m
+    // does not nuke untracked file"). Restore the stashed changes to the worktree
+    // and propagate the error, leaving HEAD and the untracked file untouched.
+    if let Err(err) = checkout_twoway_dirty(
+        git_dir,
+        worktree_root,
+        format,
+        Some(target),
+        recurse_submodules,
+        false,
+    ) {
+        let _ = commands::stash::apply_stash_commit_quietly(&stash_oid);
+        return Err(err);
+    }
+    let applied =
+        commands::stash::apply_stash_commit_quietly(&stash_oid).unwrap_or(false);
+    if applied {
+        if !quiet {
+            eprintln!("Applied autostash.");
+        }
+        return Ok(());
+    }
+    if commands::stash::store_stash_commit(&stash_oid, "autostash").is_ok() {
+        checkout_print_autostash_conflict_advice();
+        if !quiet {
+            eprintln!("The following paths have local changes:");
+            checkout_show_local_changes(git_dir, target, false, false)?;
+        }
+    } else {
+        eprintln!("error: cannot store {}", stash_oid.to_hex());
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+fn checkout_print_autostash_conflict_advice() {
+    eprintln!("Your local changes are stashed, however applying them");
+    eprintln!("resulted in conflicts.  You can either resolve the conflicts");
+    eprintln!("and then discard the stash with \"git stash drop\", or, if you");
+    eprintln!("do not want to resolve them now, run \"git reset --hard\" and");
+    eprintln!("apply the local changes later by running \"git stash pop\".");
 }
 
 fn checkout_twoway_dirty(

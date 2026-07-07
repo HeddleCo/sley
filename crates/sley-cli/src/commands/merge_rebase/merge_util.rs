@@ -1,4 +1,5 @@
 use super::*;
+use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_worktree};
 
 // ===== git merge (3-way) =====
 
@@ -446,104 +447,16 @@ pub(crate) fn three_way_merge_trees_styled(
     )
 }
 
-/// Build the flattened entry map of the *virtual ancestor* for a 3-way merge,
-/// recursively merging the merge bases together (merge-recursive's "virtual
-/// ancestor" construction for criss-cross histories).
-///
-/// With a single merge base this is exactly that base commit's tree. With more
-/// than one (a criss-cross history) the bases are folded left-to-right: merge
-/// the running virtual ancestor with the next base, using *their* merge bases as
-/// the ancestor of that sub-merge (recursing). Conflicts in the virtual merge are
-/// resolved by writing the conflicted blob content (git keeps the conflicted
-/// state in the virtual tree, which then feeds the outer 3-way merge) — this
-/// matches merge-recursive, which does not stop on virtual-ancestor conflicts.
+/// Delegates to [`sley_diff_merge::virtual_ancestor_entry_map`].
 pub(crate) fn virtual_ancestor_entry_map(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     bases: &[ObjectId],
     git_dir: &Path,
 ) -> Result<MergeTreeMap> {
-    let first = bases
-        .first()
-        .ok_or_else(|| GitError::Command("virtual ancestor needs at least one base".into()))?;
-    let acc_tree = commit_tree_oid(db, format, first)?;
-    let mut acc_map = stash_tree_entry_map(db, format, &acc_tree)?;
-    // Track the commit(s) the running virtual ancestor stands in for, so the next
-    // pairwise merge uses the correct sub-base.
-    let mut acc_commits = vec![*first];
-
-    for base in &bases[1..] {
-        let other_tree = commit_tree_oid(db, format, base)?;
-        let other_map = stash_tree_entry_map(db, format, &other_tree)?;
-
-        // Sub-base: the merge base(s) of the accumulated commits and this base.
-        // Use the first acc commit as a representative (git folds pairwise).
-        // `db` now serves both the reads here and the writes below — with
-        // `ObjectWriter::write_object` taking `&self`, no second read-only handle
-        // (which re-warmed the pack caches) is needed.
-        let sub_bases = merge_bases(git_dir, db, format, &acc_commits[0], base)?;
-        let sub_base_map = match sub_bases.first() {
-            Some(sb) => {
-                let sb_tree = commit_tree_oid(db, format, sb)?;
-                stash_tree_entry_map(db, format, &sb_tree)?
-            }
-            None => MergeTreeMap::new(),
-        };
-
-        // Merge the two bases into a new virtual ancestor tree. Conflicts are
-        // folded into the tree (the merged blob with markers is written), never
-        // surfaced — the outer merge owns conflict reporting.
-        let (results, _conflicts) = three_way_merge_trees(
-            db,
-            format,
-            &sub_base_map,
-            &acc_map,
-            &other_map,
-            "Temporary merge branch 1",
-            "Temporary merge branch 2",
-        )?;
-
-        let mut next: MergeTreeMap = BTreeMap::new();
-        for (path, result) in results {
-            match result {
-                MergePathResult::Resolved(Some(entry)) => {
-                    next.insert(path, entry);
-                }
-                MergePathResult::Resolved(None) => {}
-                MergePathResult::Conflict {
-                    base,
-                    worktree,
-                    ours,
-                    theirs,
-                    ..
-                } => {
-                    // Keep the conflicted content in the virtual tree, mirroring
-                    // merge-recursive (it writes the marker blob at stage 0).
-                    if let Some((mode, _)) = worktree
-                        && sley_index::is_symlink_mode(mode)
-                    {
-                        if let Some(entry) = base {
-                            next.insert(path, entry);
-                        }
-                    } else if let Some((mode, _)) = worktree
-                        && sley_index::is_gitlink(mode)
-                    {
-                        if let Some(entry) = theirs.or(ours) {
-                            next.insert(path, entry);
-                        }
-                    } else if let Some((mode, bytes)) = worktree {
-                        let oid = db.write_object(EncodedObject::new(ObjectType::Blob, bytes))?;
-                        next.insert(path, (mode, oid));
-                    } else if let Some(entry) = ours.or(theirs) {
-                        next.insert(path, entry);
-                    }
-                }
-            }
-        }
-        acc_map = next;
-        acc_commits = vec![*base];
-    }
-    Ok(acc_map)
+    sley_diff_merge::virtual_ancestor_entry_map(db, format, bases, |left, right| {
+        merge_bases(git_dir, db, format, left, right)
+    })
 }
 
 /// Like [`three_way_merge_trees`] but with an explicit `-Xours`/`-Xtheirs`

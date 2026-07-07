@@ -33,6 +33,7 @@
 //! follows the same glob-import + private-helper structure as the other
 //! self-contained command modules (`commands::branch`, `commands::stash`).
 
+use sley::plumbing::{sley_core};
 // Glob the crate root for shared plumbing (RepositoryContext, the ObjectReader
 // trait, ObjectType, GitError, io, etc.); see commands::stash for the rationale
 // behind the wildcard import.
@@ -354,6 +355,7 @@ usage: git verify-tag [-v | --verbose] [--format=<format>] [--raw] <tag>...
 ";
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

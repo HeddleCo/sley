@@ -11,17 +11,19 @@
 //! - `[alias "<name>"] command = <value>` — subsection, case-*sensitive* name.
 //!   An empty subsection (`alias..<key>`) is treated as the plain form.
 
-use sley_config::{ConfigIncludeContext, GitConfig};
-use sley_core::{GitError, Result};
+use sley::plumbing::sley_config::ConfigIncludeContext;
+use sley::{GitConfig, GitError, Result};
 use std::env;
 use std::fs;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use crate::sley_config;
+use sley::plumbing::sley_core;
 
-use crate::commands::remote_cmds::repo_current_branch_name;
+use crate::commands::remote::repo_current_branch_name;
 use crate::{
-    common_git_dir_for_git_dir, discover_git_dir, injected_config_parameters,
+    common_git_dir_for_git_dir, injected_config_parameters,
     worktree_root_for_git_dir,
 };
 
@@ -155,7 +157,7 @@ pub(crate) fn list_aliases() -> Result<Vec<(String, String)>> {
 /// lookups see `git -c alias.x=… x` just like file-defined aliases.
 fn load_alias_config() -> Result<GitConfig> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd).ok();
+    let git_dir = crate::session::cli_git_dir_from(&cwd).ok();
     let common_git_dir = git_dir
         .as_ref()
         .and_then(|dir| common_git_dir_for_git_dir(dir).ok());
@@ -239,7 +241,7 @@ pub(crate) fn run_shell_alias(command: &str, extra_args: &[String]) -> Result<()
 
 fn configure_shell_alias_worktree_env(process: &mut ProcessCommand) -> Result<()> {
     let cwd = env::current_dir()?;
-    let Ok(git_dir) = discover_git_dir(&cwd) else {
+    let Ok(git_dir) = crate::session::cli_git_dir_from(&cwd) else {
         return Ok(());
     };
     let Ok(root) = worktree_root_for_git_dir(&git_dir) else {

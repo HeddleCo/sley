@@ -25,8 +25,10 @@
 //! revision resolution, the engine crates) come from the crate root via the
 //! `use crate::*;` glob, matching the `commands::stash` / `branch` / `tag`
 //! pattern.
+#![allow(clippy::expect_used)]
 
 use crate::*;
+use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_rev, sley_worktree};
 
 /// A flat map from a repository-relative path to a tree leaf's `(mode, oid)`.
 type LeafMap = BTreeMap<Vec<u8>, (u32, ObjectId)>;
@@ -137,7 +139,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             let mut entries = read_tree_overlay(db, format, repo.config(), &tree_oids)?;
             if apply_worktree {
                 let worktree_root = worktree_root_for_git_dir(git_dir)?;
-                reset_worktree_to_entries(
+                let reset_result = reset_worktree_to_entries(
                     &worktree_root,
                     git_dir,
                     format,
@@ -146,7 +148,27 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                     None,
                     &mut entries,
                     recurse_submodules,
-                )?;
+                );
+                if reset_result.is_err() {
+                    // A `-u --reset --recurse-submodules` that fails on a missing
+                    // submodule commit has already rewritten the superproject
+                    // worktree with fresh mtimes but never persisted the new index
+                    // stat; git leaves the index refreshed so `git diff-files`
+                    // stays clean. Refresh the on-disk index against the worktree
+                    // before propagating so a rewritten superproject path is not
+                    // reported as a phantom modification (`ie_match_stat` compares
+                    // size+mtime, not content).
+                    let _ = sley_worktree::refresh_index_paths(
+                        &worktree_root,
+                        git_dir,
+                        format,
+                        &[],
+                        /* quiet */ true,
+                        /* ignore_missing */ true,
+                        /* really_refresh */ false,
+                    );
+                }
+                reset_result?;
             }
             if !parsed.dry_run {
                 write_paired_entries(git_dir, format, entries)?;
@@ -462,19 +484,6 @@ fn resolve_tree_ish(repo: &RepositoryContext, spec: &str) -> Result<ObjectId> {
     }
 }
 
-/// Read one tree into a flat path -> (mode, oid) map.
-///
-/// Thin wrapper over the canonical [`sley_diff_merge::flatten_tree`], which
-/// already short-circuits the (possibly unstored) empty tree and descends
-/// subtrees identically to the local flattener it replaced.
-fn tree_leaf_map(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    tree_oid: &ObjectId,
-) -> Result<LeafMap> {
-    sley_diff_merge::flatten_tree(db, format, tree_oid)
-}
-
 fn read_tree_check_cache_tree() -> bool {
     !matches!(
         std::env::var("GIT_TEST_CHECK_CACHE_TREE").as_deref(),
@@ -501,7 +510,7 @@ fn read_tree_overlay(
     let path_rules = ReadTreePathRules::from_config(config);
     let mut merged: LeafMap = BTreeMap::new();
     for tree_oid in tree_oids {
-        for (path, value) in tree_leaf_map(db, format, tree_oid)? {
+        for (path, value) in sley_diff_merge::flatten_tree(db, format, tree_oid)? {
             verify_read_tree_path(&path, value.0, path_rules)?;
             merged.insert(path, value);
         }
@@ -528,7 +537,7 @@ fn read_tree_prefix(
     let real_prefix: &[u8] = if prefix == b"/" { b"" } else { prefix };
 
     for tree_oid in tree_oids {
-        for (path, value) in tree_leaf_map(db, format, tree_oid)? {
+        for (path, value) in sley_diff_merge::flatten_tree(db, format, tree_oid)? {
             let mut full = real_prefix.to_vec();
             full.extend_from_slice(&path);
             verify_read_tree_path(&full, value.0, path_rules)?;
@@ -1140,10 +1149,10 @@ pub(crate) fn checkout_two_way_engine(
     // git's `merge_working_tree`: `trees[0]` = the tree of the HEAD being left
     // (empty when HEAD is unborn), `trees[1]` = the tree being checked out.
     let old_leaves = match old_tree {
-        Some(oid) => tree_leaf_map(db, format, oid)?,
+        Some(oid) => sley_diff_merge::flatten_tree(db, format, oid)?,
         None => sley_unpack_trees::FlatTree::new(),
     };
-    let new_leaves = tree_leaf_map(db, format, new_tree)?;
+    let new_leaves = sley_diff_merge::flatten_tree(db, format, new_tree)?;
     let trees = vec![old_leaves, new_leaves];
 
     let mut opts = UnpackTreesOptions::new(format);
@@ -1273,7 +1282,7 @@ fn merge_trees(
     let trees: Vec<sley_unpack_trees::FlatTree> = tree_oids
         .iter()
         .map(|oid| {
-            let tree = tree_leaf_map(db, format, oid)?;
+            let tree = sley_diff_merge::flatten_tree(db, format, oid)?;
             for (path, (mode, _)) in &tree {
                 verify_read_tree_path(path, *mode, path_rules)?;
             }
@@ -2025,7 +2034,7 @@ fn clone_submodule_for_checkout(
         resolved,
         sub_root.display().to_string(),
     ];
-    super::remote_cmds::cmd_clone(&args)?;
+    super::remote::cmd_clone(&args)?;
     connect_submodule_worktree(sub_root, sub_git_dir)?;
     Ok(())
 }
@@ -2437,6 +2446,7 @@ fn path_to_git_bytes_lossy(path: &Path) -> Vec<u8> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod submodule_hook_tests {
     use super::*;
     use sley_submodule::{MoveHeadContext, MoveHeadVerdict, check_submodule_move_head};

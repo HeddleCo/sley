@@ -1,12 +1,12 @@
 //! Merge, rebase, pull, cherry-pick, revert, and merge-base commands.
 
-use crate::commands::remote_cmds::{
+use crate::commands::remote::{
     FetchRecurseSubmodules, FetchSubmoduleRequest, StdoutProgress, changed_gitlinks_for_fetch,
     fetch_bundle, fetch_populated_submodules_after_superproject, fetch_ref_snapshot,
     fetch_source_is_ssh, fetch_ssh_repository, ls_remote_git_dir, resolve_fetch_recurse_submodules,
 };
 use crate::*;
-use sley_remote::FetchOptions;
+use sley::plumbing::sley_remote::FetchOptions;
 
 mod merge;
 mod merge_base;

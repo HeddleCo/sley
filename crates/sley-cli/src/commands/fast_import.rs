@@ -31,9 +31,11 @@
 //!
 //! Native Rust only: objects are written straight to the loose object store and
 //! branch refs are updated through the ref transaction layer; no shell-out.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use crate::*;
 use std::io::{BufRead, Write};
+use sley::plumbing::{sley_config, sley_pack, sley_refs, sley_rev};
 
 #[derive(Default)]
 struct FastImportOptions {
@@ -236,7 +238,7 @@ pub(crate) fn cmd_fast_import(args: &[String]) -> Result<()> {
         }
     }
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let store = FileRefStore::new(&git_dir, format);
@@ -2880,6 +2882,7 @@ fn validate_fast_import_path(path: &[u8], kind: FastImportPathKind) -> Result<()
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

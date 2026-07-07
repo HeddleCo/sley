@@ -1,5 +1,7 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
+#![allow(clippy::expect_used)]
 
+use sley::plumbing::{sley_diff_merge, sley_object, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use super::status::{
@@ -63,7 +65,7 @@ fn set_hook_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
 }
 
 fn refresh_commit_selection_cache_tree() -> Result<()> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let odb = FileObjectDatabase::from_git_dir(&git_dir, format);
     sley_worktree::refresh_repository_cache_tree(&git_dir, format, &odb)
@@ -937,7 +939,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             return Ok(());
         }
     }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let repo_config = read_repo_config(&git_dir).ok();
     if !gpg_sign && !no_gpg_sign {
@@ -1001,8 +1003,12 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     }
     // `i18n.commitEncoding` is recorded as the commit's `encoding` header so that
     // `git log` can re-encode the message to the log output encoding (UTF-8 by
-    // default). git omits the header for UTF-8.
-    let commit_encoding = commit_encoding_config(&git_dir);
+    // default). git omits the header for UTF-8. Use the `-c`-aware config loaded
+    // above — `commit_encoding_config` reads disk-only and drops CLI overrides.
+    let commit_encoding = repo_config
+        .as_ref()
+        .and_then(|config| config.get("i18n", None, "commitEncoding").map(str::to_string))
+        .unwrap_or_else(|| "UTF-8".to_string());
     let commit_encoding_header =
         (!encoding_is_utf8(&commit_encoding)).then(|| commit_encoding.clone().into_bytes());
     let committer = commit_identity_from_env("COMMITTER")?;
@@ -1207,7 +1213,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         let tree_map = match &head {
             Some(oid) => {
                 let tree = commands::merge_rebase::commit_tree_oid(&commit_odb, format, oid)?;
-                stash_tree_entry_map(&commit_odb, format, &tree)?
+                sley_diff_merge::flatten_tree(&commit_odb, format, &tree)?
             }
             None => BTreeMap::new(),
         };
@@ -1630,12 +1636,12 @@ fn print_commit_summary(
         Some(p) => read_commit_tree_for_summary(db, format, p)?,
         None => ObjectId::empty_tree(format),
     };
-    let entries = sley_diff_merge::diff_name_status_trees_with_rename_options(
+    let entries = sley_diff_merge::diff_name_status_trees_with_options(
         db,
         format,
         &old_tree,
         &new_tree,
-        sley_diff_merge::RenameDetectionOptions::default(),
+        sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     if !entries.is_empty() {
         let stat_entries = collect_diff_stat_entries(&entries, db, None, false)?;
@@ -2286,7 +2292,7 @@ fn cmd_commit_long_status_preview(
     untracked_override: Option<sley_worktree::StatusUntrackedMode>,
 ) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let config = read_repo_config(&git_dir).map_err(report_config_setup_error)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;

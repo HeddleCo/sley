@@ -177,10 +177,22 @@ if [ ! -f "$upstream_t/test-lib.sh" ]; then
 fi
 
 build_dir=$(dirname -- "$upstream_t")
+# Expose the upstream git build dir so sley's --exec-path can symlink its
+# git-upload-pack (bundle-uri + fetch filter) while keeping system git-http-backend.
+export GIT_BUILD_DIR="$build_dir"
+export GIT_SRC_DIR="${GIT_SRC_DIR:-$build_dir}"
 if [ ! -f "$build_dir/GIT-BUILD-OPTIONS" ]; then
     log "WARNING: $build_dir/GIT-BUILD-OPTIONS is missing."
     log "         Upstream test-lib.sh requires it and will abort each script."
     log "         Run 'make GIT-BUILD-OPTIONS' in $build_dir first."
+fi
+
+fake_ssh="$build_dir/t/helper/test-fake-ssh"
+if [ ! -x "$fake_ssh" ]; then
+    log "WARNING: test helper missing: $fake_ssh"
+    log "         Upstream SSH transport tests copy this to GIT_SSH; without it"
+    log "         they hang on the real /usr/bin/ssh (e.g. t5601-clone @ 900s)."
+    log "         Fix: cd $build_dir && make t/helper/test-fake-ssh"
 fi
 
 # --- Resolve the sley binary ----------------------------------------------
@@ -190,14 +202,17 @@ if [ -n "${SLEY_BIN:-}" ]; then
     sley_bin=$SLEY_BIN
 elif [ -n "$cargo_bin_exe" ]; then
     sley_bin=$cargo_bin_exe
+elif [ -x "$repo_root/target/release/sley" ]; then
+    sley_bin=$repo_root/target/release/sley
 elif [ -x "$repo_root/target/debug/sley" ]; then
     sley_bin=$repo_root/target/debug/sley
 fi
 
 if [ -z "$sley_bin" ] || [ ! -x "$sley_bin" ]; then
-    log "sley binary not found; building with 'cargo build -p sley-cli --bin sley'..."
-    ( cd "$repo_root" && cargo build -p sley-cli --bin sley ) || die "cargo build -p sley-cli --bin sley failed"
-    sley_bin=$repo_root/target/debug/sley
+    log "sley binary not found; building with 'cargo build -p sley-cli --release --bin sley --features git-compat-i18n'..."
+    ( cd "$repo_root" && cargo build -p sley-cli --release --bin sley --features git-compat-i18n ) \
+        || die "cargo build -p sley-cli --release --bin sley --features git-compat-i18n failed"
+    sley_bin=$repo_root/target/release/sley
 fi
 [ -x "$sley_bin" ] || die "sley binary still not executable: $sley_bin"
 # Absolutize.
@@ -285,6 +300,20 @@ if [ -n "$missing" ]; then
 fi
 if [ -z "$scripts" ]; then
     die "no upstream scripts selected (looked in $upstream_t)"
+fi
+
+# SSH/git transport scripts copy test-fake-ssh to GIT_SSH; without the helper
+# they fall through to real ssh and hang (t5601-clone is the canonical example).
+if [ ! -x "$fake_ssh" ]; then
+    needs_fake_ssh=""
+    for script in $scripts; do
+        case $script in
+            t55*|t56*) needs_fake_ssh=1; break ;;
+        esac
+    done
+    if [ -n "$needs_fake_ssh" ]; then
+        die "test-fake-ssh is required for selected transport scripts but missing: $fake_ssh (run: cd $build_dir && make t/helper/test-fake-ssh)"
+    fi
 fi
 
 # --- Timeout helper -------------------------------------------------------
@@ -434,8 +463,32 @@ now_millis() {
     fi
 }
 
+# Stale Apache instances from a prior upstream run can keep serving an old
+# document root on LIB_HTTPD_PORT (default 18081), which makes every smart-HTTP
+# clone in t5601 return 404 even though the trash repo.git exists.
+stop_stale_httpd() {
+    # Smart-HTTP tests bind LIB_HTTPD_PORT (often 18080); upstream defaults to
+    # 18081. Kill listeners on every port we might reuse so a prior run cannot
+    # serve the wrong document root and flake clone cells #110–#115.
+    ports=""
+    for port in "${LIB_HTTPD_PORT:-}" 18080 18081; do
+        [ -n "$port" ] || continue
+        case " $ports " in
+            *" $port "*) continue ;;
+        esac
+        ports="$ports $port"
+        if command -v lsof >/dev/null 2>&1; then
+            pids=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+                kill $pids 2>/dev/null || true
+            fi
+        fi
+    done
+}
+
 run_one() {
     script=$1
+    stop_stale_httpd
     workdir=$(mktemp -d "${TMPDIR:-/tmp}/sley-upstream-run.XXXXXX")
     out_file="$workdir/output.txt"
     start_ms=$(now_millis)
@@ -451,6 +504,8 @@ run_one() {
         # prefixes on a shell-function invocation.
         export GIT_TEST_INSTALLED="$bindir"
         export SLEY_BIN="$sley_bin"
+        export GIT_BUILD_DIR="$build_dir"
+        export GIT_SRC_DIR="${GIT_SRC_DIR:-$build_dir}"
         export GIT_TEST_DEFAULT_HASH="$default_hash"
         # Daemon-capable scripts should fail loudly when the environment cannot
         # bind a loopback listener; otherwise upstream marks them SKIP and the

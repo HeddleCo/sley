@@ -9,6 +9,7 @@ license.workspace = true
 
 [dependencies]
 sley-core.workspace = true
+sley-mmap.workspace = true
 
 [lints]
 workspace = true

@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_config::GitConfig;
 use sley_config::remotes::{remote_config_values, remote_exists, rewrite_url_with_config};
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result, redact_url_for_display};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, collect_reachable_object_ids,
     collect_reachable_object_ids_excluding,
@@ -132,6 +132,8 @@ pub struct FetchOptions {
     /// `--update-shallow`: accept new shallow points from a shallow server
     /// (otherwise refs whose history needs them are rejected).
     pub update_shallow: bool,
+    /// `--reject-shallow` during clone: refuse a shallow source repository.
+    pub reject_shallow: bool,
     /// `--deepen=N`: `depth` is relative to the client's current boundary.
     /// Local-only today; HTTP and SSH treat `depth` as an absolute `--depth N`.
     pub deepen_relative: bool,
@@ -246,6 +248,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         .get_bool("remote", Some(request.remote_name), "promisor")
         .unwrap_or(false)
         || request.options.filter.is_some();
+    let max_input_size = fetch_max_input_size(request.config);
     let configured_refspecs = if request.refspecs.is_empty() {
         remote_config_values(request.config, request.remote_name, "fetch")
     } else {
@@ -351,22 +354,23 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         }
         #[cfg(feature = "http")]
         FetchSource::Http(remote) => {
-            let client = crate::http::new_http_client();
+            let http_batch = crate::http::HttpOperationBatch::new();
+            let client = http_batch.client();
+            let git_protocol =
+                crate::http::http_git_protocol_header_value(Some(request.config))?;
             let discovered = crate::http::http_service_advertisements(
-                &client,
+                client,
                 remote,
                 request.format,
                 sley_protocol::GitService::UploadPack,
                 services.credentials,
+                Some(request.config),
             )?;
             let advertisements = discovered.set.refs;
-            let features = advertisements
-                .first()
-                .map(|advertisement| {
-                    sley_protocol::parse_upload_pack_features(&advertisement.capabilities)
-                })
-                .transpose()?
-                .unwrap_or_default();
+            let features = crate::http::http_upload_pack_features(
+                &advertisements,
+                discovered.handshake.as_ref(),
+            )?;
             outcome.head_symref = head_symref_from_features(&features.symrefs);
             let (mut updates, opportunistic_dsts) = plan_and_adjust_updates(FetchPlanInput {
                 advertisements: &advertisements,
@@ -386,9 +390,10 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             // the server to deepen to `depth`, then fold the server's shallow-info
             // back into `$GIT_DIR/shallow`. A `None` depth keeps the full-fetch path.
             let existing_shallow =
-                shallow_boundary_for_request(request.git_dir, request.format, options.depth)?;
+                shallow_boundary_for_request(request.git_dir, request.format, &options)?;
+            let deepen_not = resolve_deepen_not_refs(&advertisements, &options.deepen_not)?;
             let pack_request = crate::http::HttpFetchPackRequest {
-                client: &client,
+                client,
                 git_dir: request.git_dir,
                 format: request.format,
                 remote,
@@ -396,6 +401,13 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 shallow: existing_shallow,
                 deepen: options.depth,
                 promisor: promisor_remote,
+                max_input_size,
+                filter: options.filter.clone(),
+                deepen_since: options.deepen_since,
+                deepen_not,
+                deepen_relative: options.deepen_relative,
+                git_protocol: git_protocol.as_deref(),
+                omit_haves: false,
             };
             let shallow_info = if discovered.set.protocol == ProtocolVersion::V2 {
                 let handshake = discovered.handshake.as_ref().ok_or_else(|| {
@@ -415,6 +427,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     services.credentials,
                 )?
             };
+            reject_shallow_clone_fetch(&options, &shallow_info)?;
             if !options.dry_run {
                 crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
             }
@@ -436,6 +449,11 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             advertisements
         }
         FetchSource::Ssh(remote) => {
+            crate::ssh::validate_ssh_fetch_options(
+                options.filter.as_ref(),
+                options.deepen_since,
+                &options.deepen_not,
+            )?;
             // SSH advertises and pulls the pack by spawning `ssh` (no credential
             // seam — the `ssh` program authenticates), but the ref-map planning
             // and ref bookkeeping are the same shared flow as HTTP.
@@ -474,7 +492,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             // Shallow fetch over SSH mirrors the HTTP path: replay the current
             // boundary, deepen to `depth`, then apply the server's shallow-info.
             let existing_shallow =
-                shallow_boundary_for_request(request.git_dir, request.format, options.depth)?;
+                shallow_boundary_for_request(request.git_dir, request.format, &options)?;
             let shallow_info = crate::ssh::install_fetch_pack_via_ssh_upload_pack(
                 crate::ssh::SshFetchPackRequest {
                     git_dir: request.git_dir,
@@ -486,8 +504,10 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     deepen: options.depth,
                     promisor: promisor_remote,
                     command_options: ssh_options,
+                    max_input_size,
                 },
             )?;
+            reject_shallow_clone_fetch(&options, &shallow_info)?;
             if !options.dry_run {
                 crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
             }
@@ -518,6 +538,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 remote,
                 request.format,
                 protocol_v2,
+                Some(request.config),
             )?;
             let advertisements = discovered.refs;
             let features = discovered.features;
@@ -537,20 +558,23 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             })?;
             let wants = updates.iter().map(|update| update.oid).collect();
             let existing_shallow =
-                shallow_boundary_for_request(request.git_dir, request.format, options.depth)?;
+                shallow_boundary_for_request(request.git_dir, request.format, &options)?;
             let shallow_info = crate::git::install_fetch_pack_via_git_upload_pack(
                 crate::git::GitFetchPackRequest {
                     git_dir: request.git_dir,
                     format: request.format,
                     remote,
+                    config: Some(request.config),
                     features: &features,
                     wants,
                     shallow: existing_shallow,
                     deepen: options.depth,
                     promisor: promisor_remote,
                     protocol_v2: discovered.protocol_v2,
+                    max_input_size,
                 },
             )?;
+            reject_shallow_clone_fetch(&options, &shallow_info)?;
             if !options.dry_run {
                 crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
             }
@@ -890,12 +914,38 @@ fn tip_reaches_boundary<R: sley_odb::ObjectReader>(
 fn shallow_boundary_for_request(
     git_dir: &Path,
     format: ObjectFormat,
-    depth: Option<u32>,
+    options: &FetchOptions,
 ) -> Result<Vec<ObjectId>> {
-    if depth.is_none() {
+    if options.depth.is_none()
+        && options.deepen_since.is_none()
+        && options.deepen_not.is_empty()
+    {
         return Ok(Vec::new());
     }
     crate::shallow::read_shallow(git_dir, format)
+}
+
+fn resolve_deepen_not_refs(
+    advertisements: &[RefAdvertisement],
+    deepen_not: &[String],
+) -> Result<Vec<String>> {
+    let mut resolved = Vec::with_capacity(deepen_not.len());
+    for name in deepen_not {
+        let found = advertisements.iter().any(|advertisement| {
+            advertisement.name == *name
+                || advertisement.name == format!("refs/tags/{name}")
+                || advertisement.name == format!("refs/heads/{name}")
+                || advertisement.name == format!("refs/{name}")
+        });
+        if found {
+            resolved.push(name.clone());
+        } else {
+            return Err(GitError::Command(format!(
+                "git upload-pack: deepen-not is not a ref: {name}"
+            )));
+        }
+    }
+    Ok(resolved)
 }
 
 /// Plan the ref-map and apply the auto-follow-tag / not-for-merge adjustments
@@ -1319,7 +1369,7 @@ fn atomic_non_fast_forward_rejection(
             continue;
         }
         let db = db.get_or_insert_with(|| FileObjectDatabase::from_git_dir(git_dir, format));
-        if !crate::push::is_fast_forward(db, format, &old, &update.oid)? {
+        if !crate::push::is_fast_forward(git_dir, db, format, &old, &update.oid)? {
             return Ok(Some(format!(
                 "! [rejected]        {} -> {}  (non-fast-forward)",
                 update.src, dst
@@ -1376,6 +1426,21 @@ fn apply_fetch_ref_updates(
         });
     }
     tx.commit()
+}
+
+/// Effective fetch pack input cap, mirroring git's `fetch.maxInputSize` with
+/// `transfer.maxSize` as the fallback when the fetch-specific key is unset.
+pub fn fetch_max_input_size(config: &GitConfig) -> Option<u64> {
+    config_max_input_size(config, "fetch", "maxInputSize")
+        .or_else(|| config_max_input_size(config, "transfer", "maxSize"))
+}
+
+fn config_max_input_size(config: &GitConfig, section: &str, key: &str) -> Option<u64> {
+    let raw = config.get(section, None, key)?;
+    match sley_config::parse_config_int(raw) {
+        Some(limit) if limit > 0 => Some(limit as u64),
+        _ => None,
+    }
 }
 
 fn fetch_log_all_ref_updates(config: &GitConfig) -> bool {
@@ -1486,6 +1551,39 @@ fn head_symref_from_features(symrefs: &[String]) -> Option<String> {
     symrefs
         .iter()
         .find_map(|entry| entry.strip_prefix("HEAD:").map(|target| target.to_string()))
+}
+
+fn reject_shallow_clone_fetch(
+    options: &FetchOptions,
+    shallow_info: &[sley_protocol::ProtocolV2FetchShallowInfo],
+) -> Result<()> {
+    // Upstream fetch-pack sets `args->deepen` when ANY deepen argument is present
+    // (depth, deepen-since, or deepen-not) and only dies on a shallow source when
+    // no deepen was requested (the shallow lines are then attributed to the remote
+    // being shallow, not to our own depth request). Mirror that gate here.
+    let deepening = options.depth.is_some()
+        || options.deepen_since.is_some()
+        || !options.deepen_not.is_empty();
+    if options.reject_shallow && options.cloning && !deepening && !shallow_info.is_empty() {
+        eprintln!("fatal: source repository is shallow, reject to clone.");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+/// Apply `remote.<name>.partialclonefilter` when `remote.<name>.promisor` is set.
+pub fn apply_configured_partial_clone_filter(
+    config: &GitConfig,
+    remote: &str,
+    options: &mut FetchOptions,
+) {
+    if config
+        .get_bool("remote", Some(remote), "promisor")
+        .unwrap_or(false)
+        && let Some(filter) = config.get("remote", Some(remote), "partialclonefilter")
+    {
+        options.filter = crate::pack_filter_from_spec(filter);
+    }
 }
 
 /// Apply the configured `remote.<name>.tagopt` unless the tag option was set
@@ -1841,7 +1939,7 @@ pub fn fetch_head_source_description(config: &GitConfig, source: &str) -> String
         .next()
         .map(|url| rewrite_url_with_config(config, &url, false))
         .unwrap_or_else(|| rewrite_url_with_config(config, source, false));
-    trim_fetch_head_display_url(&url)
+    redact_url_for_display(&trim_fetch_head_display_url(&url))
 }
 
 /// Mirror git's `display_state` URL trimming (builtin/fetch.c): strip trailing
@@ -1895,10 +1993,12 @@ pub fn prune_refs_from_advertisements(
             progress.message(line);
         }
     };
-    let display_url = remote_config_values(input.config, input.remote, "url")
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| input.remote.into());
+    let display_url = redact_url_for_display(
+        &remote_config_values(input.config, input.remote, "url")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| input.remote.into()),
+    );
     emit(&format!("Pruning {}", input.remote));
     emit(&format!("URL: {display_url}"));
     let mut pruned = Vec::new();
@@ -1999,6 +2099,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use sley_config::{ConfigEntry, ConfigSection};
     use sley_formats::RepositoryLayout;
     use sley_object::{Commit, EncodedObject, ObjectType, Tree};
     use sley_odb::{FileObjectDatabase, ObjectWriter};
@@ -2084,6 +2185,7 @@ mod tests {
             cloning: false,
             record_promisor_refs: true,
             update_shallow: false,
+            reject_shallow: false,
             deepen_relative: false,
             update_head_ok: false,
             deepen_since: None,
@@ -2251,6 +2353,25 @@ mod tests {
     }
 
     #[test]
+    fn fetch_head_source_description_redacts_embedded_credentials() {
+        let config = GitConfig {
+            sections: vec![ConfigSection::new(
+                "remote",
+                Some("origin".into()),
+                vec![ConfigEntry::new(
+                    "url",
+                    Some("https://user:pass@host/repo.git".into()),
+                )],
+            )],
+            ..GitConfig::default()
+        };
+        assert_eq!(
+            fetch_head_source_description(&config, "origin"),
+            "https://<redacted>@host/repo"
+        );
+    }
+
+    #[test]
     fn failed_local_fetch_does_not_partially_mutate_refs_or_fetch_head() {
         let remote = temp_repo("remote-missing");
         let local = temp_repo("local-missing");
@@ -2315,5 +2436,40 @@ mod tests {
             Some(RefTarget::Direct(old))
         );
         assert!(!local.join("FETCH_HEAD").exists());
+    }
+
+    fn config_from_ini(ini: &str) -> GitConfig {
+        GitConfig::parse(ini.as_bytes()).expect("config should parse")
+    }
+
+    #[test]
+    fn fetch_max_input_size_unset_means_unlimited() {
+        assert_eq!(fetch_max_input_size(&GitConfig::default()), None);
+    }
+
+    #[test]
+    fn fetch_max_input_size_honors_fetch_section() {
+        let cfg = config_from_ini("[fetch]\n\tmaxInputSize = 64\n");
+        assert_eq!(fetch_max_input_size(&cfg), Some(64));
+    }
+
+    #[test]
+    fn fetch_max_input_size_falls_back_to_transfer_max_size() {
+        let cfg = config_from_ini("[transfer]\n\tmaxSize = 1k\n");
+        assert_eq!(fetch_max_input_size(&cfg), Some(1024));
+    }
+
+    #[test]
+    fn fetch_max_input_size_prefers_fetch_over_transfer() {
+        let cfg = config_from_ini(
+            "[fetch]\n\tmaxInputSize = 64\n[transfer]\n\tmaxSize = 1k\n",
+        );
+        assert_eq!(fetch_max_input_size(&cfg), Some(64));
+    }
+
+    #[test]
+    fn fetch_max_input_size_non_positive_means_unlimited() {
+        let cfg = config_from_ini("[fetch]\n\tmaxInputSize = 0\n");
+        assert_eq!(fetch_max_input_size(&cfg), None);
     }
 }

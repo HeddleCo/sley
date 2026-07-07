@@ -10,6 +10,7 @@ use sley_fsck::SeverityConfig;
 use sley_fsck::content::{MsgId, Severity};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use sley::plumbing::{sley_formats};
 
 /// Resolved options for a verify run (severity table + verbosity).
 pub(crate) struct RefsVerifyOptions {
@@ -898,7 +899,7 @@ pub(crate) fn cmd_refs_verify(args: &[String]) -> Result<()> {
         }
     }
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let git_dir = crate::session::cli_git_dir()?;
     let common_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let opts = RefsVerifyOptions::from_repo(&git_dir, strict, verbose);

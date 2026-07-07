@@ -31,6 +31,12 @@ static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Number of deltifiable blob objects written into the benchmark pack fixture.
 pub const FIXTURE_OBJECT_COUNT: usize = 500;
 
+/// Medium pack fixture for the 1k `resolve_prefix` benchmark (W23a).
+pub const MEDIUM_FIXTURE_OBJECT_COUNT: usize = 1000;
+
+/// Large pack fixture for the 100k `resolve_prefix` benchmark (W23a acceptance).
+pub const LARGE_FIXTURE_OBJECT_COUNT: usize = 100_000;
+
 /// Number of commits written into the commit-graph benchmark fixture.
 pub const COMMIT_FIXTURE_COUNT: usize = 200;
 
@@ -64,15 +70,33 @@ impl BenchFixture {
 
 /// Build the deltified blob pack used by the pack and cat-file benchmarks.
 pub fn build_blob_pack() -> Result<PackWrite> {
+    build_blob_pack_with_count(FIXTURE_OBJECT_COUNT)
+}
+
+/// Build a deltified blob pack with `count` entries.
+pub fn build_blob_pack_with_count(count: usize) -> Result<PackWrite> {
     let format = ObjectFormat::Sha1;
-    let objects = (0..FIXTURE_OBJECT_COUNT)
-        .map(|index| EncodedObject::new(ObjectType::Blob, deltifiable_blob_body(index)))
+    let objects = (0..count)
+        .map(|index| {
+            let body = if count >= 10_000 {
+                minimal_blob_body(index)
+            } else {
+                deltifiable_blob_body(index)
+            };
+            EncodedObject::new(ObjectType::Blob, body)
+        })
         .collect::<Vec<_>>();
-    let options = PackWriteOptions::new().with_window(50);
+    // Large fixtures skip delta search — 100k×window-50 pack-write is multi-minute;
+    // prefix-resolution benches only need fanout index scale, not delta density.
+    let options = if count >= 10_000 {
+        PackWriteOptions::new().with_depth(0).with_reorder(false)
+    } else {
+        PackWriteOptions::new().with_window(50)
+    };
     let written = PackFile::write_packed_with_options(&objects, format, &options)?;
-    if written.entries.len() != FIXTURE_OBJECT_COUNT {
+    if written.entries.len() != count {
         return Err(GitError::InvalidFormat(format!(
-            "expected {FIXTURE_OBJECT_COUNT} pack entries, got {}",
+            "expected {count} pack entries, got {}",
             written.entries.len()
         )));
     }
@@ -102,18 +126,23 @@ pub fn create_pack_install_target() -> Result<PackInstallTarget> {
 /// Build a temporary git repository containing one pack with
 /// [`FIXTURE_OBJECT_COUNT`] deltified blobs.
 pub fn create_fixture() -> Result<BenchFixture> {
+    create_fixture_with_count(FIXTURE_OBJECT_COUNT)
+}
+
+/// Build a temporary git repository containing one pack with `count` deltified blobs.
+pub fn create_fixture_with_count(count: usize) -> Result<BenchFixture> {
     let format = ObjectFormat::Sha1;
     let repo_root = unique_temp_dir("sley-bench-fixture");
     let git_dir = repo_root.join(".git");
     init_minimal_repo(&git_dir)?;
 
-    let written = build_blob_pack()?;
+    let written = build_blob_pack_with_count(count)?;
     let object_ids = written
         .entries
         .iter()
         .map(|entry| entry.oid.clone())
         .collect::<Vec<_>>();
-    let sample_oid = object_ids[FIXTURE_OBJECT_COUNT / 2].clone();
+    let sample_oid = object_ids[count / 2].clone();
 
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     db.install_pack(&written)?;
@@ -317,6 +346,10 @@ fn init_minimal_repo(git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn minimal_blob_body(index: usize) -> Vec<u8> {
+    format!("bench-blob-{index:08}\n").into_bytes()
+}
+
 fn deltifiable_blob_body(index: usize) -> Vec<u8> {
     let mut body = Vec::new();
     for _ in 0..400 {
@@ -395,6 +428,34 @@ pub fn run_git(cwd: &Path, args: &[&str], stdin: &[u8]) -> Result<Vec<u8>> {
         )));
     }
     Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sley_odb::ObjectPrefixResolution;
+    use std::time::Instant;
+
+    /// One-shot median helper for `rev_parse.csv` baseline capture.
+    #[test]
+    #[ignore = "manual: cargo test -p sley-bench large_fixture_resolve_prefix -- --ignored --nocapture"]
+    fn large_fixture_resolve_prefix() {
+        let fixture = create_fixture_with_count(LARGE_FIXTURE_OBJECT_COUNT).expect("fixture");
+        let db = fixture.database();
+        let input = fixture.batch_input(LARGE_FIXTURE_OBJECT_COUNT);
+        let start = Instant::now();
+        let mut resolved = 0usize;
+        for line in std::str::from_utf8(&input).expect("utf8").lines() {
+            match db.resolve_prefix(line).expect("resolve") {
+                ObjectPrefixResolution::Unique(_) => resolved += 1,
+                other => panic!("unexpected resolution for {line}: {other:?}"),
+            }
+        }
+        let elapsed_ns = start.elapsed().as_nanos();
+        println!(
+            "odb_resolve_prefix/100000: {resolved} prefixes in {elapsed_ns} ns"
+        );
+    }
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {

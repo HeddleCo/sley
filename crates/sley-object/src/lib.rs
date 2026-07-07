@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 //! git-object — Git's object model: commits, trees, tags, and the raw encoded
 //! object framing they share.
 //!

@@ -16,7 +16,7 @@ use sley_object::{
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry};
 use sley_sequencer::{CommitCreate, create_commit};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 /// Default notes ref when none is selected via `GIT_NOTES_REF` or `core.notesRef`.
@@ -416,7 +416,7 @@ pub fn merge_notes(
         ));
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let bases = merge_base_oids(&db, format, &local_oid, &remote_oid)?;
+    let bases = sley_rev::merge_bases(git_dir, format, &db, &local_oid, &remote_oid)?;
     let base_oid = bases.first().copied();
 
     if base_oid == Some(remote_oid) {
@@ -835,60 +835,6 @@ fn commit_tree_oid(
     oid: &ObjectId,
 ) -> Result<ObjectId> {
     Ok(read_commit(db, format, oid)?.tree)
-}
-
-fn merge_base_oids(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    left: &ObjectId,
-    right: &ObjectId,
-) -> Result<Vec<ObjectId>> {
-    let left_depths = ancestor_depths(db, format, left)?;
-    let right_depths = ancestor_depths(db, format, right)?;
-    let candidates: Vec<ObjectId> = left_depths
-        .keys()
-        .filter(|oid| right_depths.contains_key(*oid))
-        .copied()
-        .collect();
-    let mut bases: Vec<ObjectId> = candidates
-        .iter()
-        .filter(|candidate| {
-            !candidates.iter().any(|other| {
-                other != *candidate
-                    && depth_lt(&left_depths, other, candidate)
-                    && depth_lt(&right_depths, other, candidate)
-            })
-        })
-        .copied()
-        .collect();
-    bases.sort_by_key(|oid| oid.to_hex());
-    Ok(bases)
-}
-
-fn ancestor_depths(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    start: &ObjectId,
-) -> Result<HashMap<ObjectId, usize>> {
-    let mut depths = HashMap::new();
-    let mut pending = VecDeque::from([(*start, 0usize)]);
-    while let Some((oid, depth)) = pending.pop_front() {
-        if depths.get(&oid).is_some_and(|seen| *seen <= depth) {
-            continue;
-        }
-        depths.insert(oid, depth);
-        for parent in read_commit(db, format, &oid)?.parents {
-            pending.push_back((parent, depth + 1));
-        }
-    }
-    Ok(depths)
-}
-
-fn depth_lt(depths: &HashMap<ObjectId, usize>, left: &ObjectId, right: &ObjectId) -> bool {
-    match (depths.get(left), depths.get(right)) {
-        (Some(left), Some(right)) => left < right,
-        _ => false,
-    }
 }
 
 fn notes_head_oid(store: &FileRefStore, notes_ref: &NotesRef) -> Result<Option<ObjectId>> {
