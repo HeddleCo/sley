@@ -273,6 +273,7 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
             false,
             false,
             None,
+            None,
             false,
             None,
         )?;

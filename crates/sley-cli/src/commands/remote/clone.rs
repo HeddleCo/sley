@@ -1380,6 +1380,8 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
             deepen_not: Vec::new(),
             ssh_options: None,
             atomic: false,
+            negotiation_restrict: None,
+            negotiation_include: None,
         },
     )?;
     if let Some(branch) = head_branch {
@@ -1999,6 +2001,8 @@ fn clone_bare_network_repository(
             refetch: false,
             ssh_options: None,
             atomic: false,
+            negotiation_restrict: None,
+            negotiation_include: None,
         },
         &[],
     )
@@ -2463,6 +2467,8 @@ fn clone_bare_or_mirror_local_repository(
             deepen_not: Vec::new(),
             ssh_options: None,
             atomic: false,
+            negotiation_restrict: None,
+            negotiation_include: None,
         },
     );
     env::set_current_dir(previous_cwd)?;
@@ -3848,4 +3854,3 @@ fn configure_clone_branch(git_dir: &Path, branch: &str, remote: &str) -> Result<
     ));
     write_repo_config(git_dir, &config)
 }
-

@@ -866,6 +866,9 @@ pub struct SshFetchPackRequest<'a> {
     pub features: &'a UploadPackFeatures,
     /// Wanted object ids.
     pub wants: Vec<ObjectId>,
+    /// Caller-selected negotiation haves. `None` means advertise the default
+    /// local haves.
+    pub haves: Option<Vec<ObjectId>>,
     /// Existing shallow boundary to replay.
     pub shallow: Vec<ObjectId>,
     /// Requested deepen depth, if this is a shallow fetch.
@@ -900,7 +903,11 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
         deepen: request.deepen,
         ..UploadPackRequest::default()
     };
-    let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
+    let haves = request
+        .haves
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| crate::local::local_have_oids(request.git_dir, request.format))?;
     let (mut child, stdin, mut stdout, stderr_drain) = spawn_service_process(
         request.remote,
         GitService::UploadPack,

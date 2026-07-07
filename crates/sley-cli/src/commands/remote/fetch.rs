@@ -96,6 +96,8 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         deepen_not: Vec::new(),
         ssh_options: None,
         atomic: false,
+        negotiation_restrict: None,
+        negotiation_include: None,
     };
     let mut unshallow = false;
     let mut filter_option_explicit = false;
@@ -259,6 +261,31 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--jobs=") => {
                 jobs = parse_fetch_jobs(value.strip_prefix("--jobs=").unwrap_or_default())?;
+            }
+            "--negotiation-tip" | "--negotiation-restrict" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command(format!("fetch {} requires a value", arg.as_str()))
+                })?;
+                push_negotiation_value(&mut options.negotiation_restrict, value);
+            }
+            value
+                if value.starts_with("--negotiation-tip=")
+                    || value.starts_with("--negotiation-restrict=") =>
+            {
+                let (_, value) = value.split_once('=').unwrap_or((value, ""));
+                push_negotiation_value(&mut options.negotiation_restrict, value);
+            }
+            "--negotiation-include" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("fetch --negotiation-include requires a value".into())
+                })?;
+                push_negotiation_value(&mut options.negotiation_include, value);
+            }
+            value if value.starts_with("--negotiation-include=") => {
+                let value = value
+                    .strip_prefix("--negotiation-include=")
+                    .unwrap_or_default();
+                push_negotiation_value(&mut options.negotiation_include, value);
             }
             "--upload-pack" | "--exec" => {
                 upload_pack_command = Some(
@@ -750,6 +777,15 @@ fn push_fetch_refmap(options: &mut FetchOptions, value: &str) {
     let refmap = options.refmap.get_or_insert_with(Vec::new);
     if !value.is_empty() {
         refmap.push(value.to_string());
+    }
+}
+
+fn push_negotiation_value(values: &mut Option<Vec<String>>, value: &str) {
+    let values = values.get_or_insert_with(Vec::new);
+    if value.is_empty() {
+        values.clear();
+    } else {
+        values.push(value.to_string());
     }
 }
 
@@ -1468,6 +1504,7 @@ fn fetch_raw_oid_refspecs(
         promisor,
         false,
         options.filter.clone(),
+        None,
         false,
         None,
     )?;

@@ -157,6 +157,14 @@ pub struct FetchOptions {
     /// each ref is updated independently and a per-ref failure is reported but
     /// does not block the others.
     pub atomic: bool,
+    /// Command-line `--negotiation-tip`/`--negotiation-restrict` values. `None`
+    /// means use `remote.<name>.negotiationRestrict`; `Some` means the CLI list
+    /// overrides remote config.
+    pub negotiation_restrict: Option<Vec<String>>,
+    /// Command-line `--negotiation-include` values. `None` means use
+    /// `remote.<name>.negotiationInclude`; `Some` means the CLI list overrides
+    /// remote config.
+    pub negotiation_include: Option<Vec<String>>,
 }
 
 /// A remote-tracking ref removed by a prune pass.
@@ -340,6 +348,13 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         .collect::<Result<Vec<_>>>()?;
 
     let store = FileRefStore::new(request.git_dir, request.format);
+    let negotiation_haves = custom_negotiation_haves(
+        request.git_dir,
+        request.format,
+        request.config,
+        request.remote_name,
+        &options,
+    )?;
     let mut outcome = FetchOutcome::default();
 
     // Advertise refs, plan the ref-map, install the pack, then update refs/prune.
@@ -398,6 +413,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 format: request.format,
                 remote,
                 wants,
+                haves: negotiation_haves.clone(),
                 shallow: existing_shallow,
                 deepen: options.depth,
                 promisor: promisor_remote,
@@ -500,6 +516,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     remote,
                     features: &features,
                     wants,
+                    haves: negotiation_haves.clone(),
                     shallow: existing_shallow,
                     deepen: options.depth,
                     promisor: promisor_remote,
@@ -567,6 +584,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     config: Some(request.config),
                     features: &features,
                     wants,
+                    haves: negotiation_haves.clone(),
                     shallow: existing_shallow,
                     deepen: options.depth,
                     promisor: promisor_remote,
@@ -807,6 +825,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     promisor_remote,
                     options.record_promisor_refs,
                     options.filter.clone(),
+                    negotiation_haves.clone(),
                     options.refetch,
                     local_fetch_unpack_limit(request.git_dir, promisor_remote),
                 )?
@@ -1571,6 +1590,152 @@ fn reject_shallow_clone_fetch(
     Ok(())
 }
 
+fn custom_negotiation_haves(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    remote: &str,
+    options: &FetchOptions,
+) -> Result<Option<Vec<ObjectId>>> {
+    let restrict = match &options.negotiation_restrict {
+        Some(values) => values.clone(),
+        None => configured_negotiation_values(config, remote, "negotiationrestrict"),
+    };
+    let include = match &options.negotiation_include {
+        Some(values) => values.clone(),
+        None => configured_negotiation_values(config, remote, "negotiationinclude"),
+    };
+    if restrict.is_empty() && include.is_empty() {
+        return Ok(None);
+    }
+
+    let store = FileRefStore::new(git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut seen = HashSet::new();
+    let mut haves = Vec::new();
+    if restrict.is_empty() {
+        for oid in crate::local::local_have_oids(git_dir, format)? {
+            push_have_oid(&mut haves, &mut seen, oid);
+        }
+    } else {
+        for value in &restrict {
+            for oid in resolve_negotiation_have_value(git_dir, format, &store, &db, value)? {
+                push_have_oid(&mut haves, &mut seen, oid);
+            }
+        }
+    }
+    for value in &include {
+        for oid in resolve_negotiation_have_value(git_dir, format, &store, &db, value)? {
+            push_have_oid(&mut haves, &mut seen, oid);
+        }
+    }
+    Ok(Some(haves))
+}
+
+fn configured_negotiation_values(config: &GitConfig, remote: &str, key: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    if !remote_exists(config, remote) {
+        return values;
+    }
+    for value in remote_config_values(config, remote, key) {
+        if value.is_empty() {
+            values.clear();
+        } else {
+            values.push(value);
+        }
+    }
+    values
+}
+
+fn push_have_oid(haves: &mut Vec<ObjectId>, seen: &mut HashSet<ObjectId>, oid: ObjectId) {
+    if seen.insert(oid) {
+        haves.push(oid);
+    }
+}
+
+fn resolve_negotiation_have_value(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    value: &str,
+) -> Result<Vec<ObjectId>> {
+    if has_glob(value) {
+        let mut out = Vec::new();
+        for reference in store.list_refs()? {
+            let RefTarget::Direct(oid) = reference.target else {
+                continue;
+            };
+            if negotiation_pattern_matches(value, &reference.name) {
+                out.push(oid);
+            }
+        }
+        out.sort();
+        out.dedup();
+        return Ok(out);
+    }
+    if is_full_hex_oid(format, value) {
+        let oid = ObjectId::from_hex(format, value)?;
+        return if db.contains(&oid)? {
+            Ok(vec![oid])
+        } else {
+            Err(GitError::InvalidFormat(format!(
+                "fatal: the object {oid} does not exist"
+            )))
+        };
+    }
+    match sley_rev::resolve_revision(git_dir, format, value) {
+        Ok(oid) => Ok(vec![oid]),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+fn has_glob(value: &str) -> bool {
+    value.as_bytes().iter().any(|byte| matches!(byte, b'*' | b'?'))
+}
+
+fn is_full_hex_oid(format: ObjectFormat, value: &str) -> bool {
+    value.len() == format.hex_len() && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
+}
+
+fn negotiation_pattern_matches(pattern: &str, refname: &str) -> bool {
+    glob_match(pattern, refname)
+        || ["refs/heads/", "refs/tags/", "refs/remotes/"]
+            .iter()
+            .filter_map(|prefix| refname.strip_prefix(prefix))
+            .any(|short| glob_match(pattern, short))
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    glob_match_bytes(pattern.as_bytes(), text.as_bytes())
+}
+
+fn glob_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0, 0);
+    let mut star = None;
+    let mut match_after_star = 0;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            match_after_star = t;
+        } else if let Some(star_pos) = star {
+            p = star_pos + 1;
+            match_after_star += 1;
+            t = match_after_star;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
 /// Apply `remote.<name>.partialclonefilter` when `remote.<name>.promisor` is set.
 pub fn apply_configured_partial_clone_filter(
     config: &GitConfig,
@@ -2192,6 +2357,8 @@ mod tests {
             deepen_not: Vec::new(),
             ssh_options: None,
             atomic: false,
+            negotiation_restrict: None,
+            negotiation_include: None,
         }
     }
 
