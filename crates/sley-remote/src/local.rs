@@ -22,10 +22,11 @@ use sley_core::{
 use sley_object::{Commit, ObjectType, Tag};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
-    build_and_install_reachable_pack_filtered, build_reachable_pack, collect_reachable_object_ids,
+    build_and_install_reachable_pack_filtered, build_reachable_pack, build_reachable_pack_filtered,
+    collect_reachable_object_ids,
 };
 use sley_protocol::{
-    PKT_LINE_MAX_PAYLOAD_LEN, ProtocolV2FetchAcknowledgment, ProtocolV2FetchFeatures,
+    PKT_LINE_MAX_PAYLOAD_LEN, PktLineFrame, ProtocolV2FetchAcknowledgment, ProtocolV2FetchFeatures,
     ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
     ProtocolV2LsRefsFeatures, ProtocolV2LsRefsRecord, ProtocolV2LsRefsRef, ProtocolV2LsRefsRequest,
     ProtocolVersion, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures,
@@ -38,9 +39,10 @@ use sley_protocol::{
     encode_protocol_v2_ls_refs_capability, encode_receive_pack_features,
     encode_upload_pack_features, read_protocol_v2_command_request,
     read_upload_pack_negotiation_request, read_upload_pack_request,
-    validate_receive_pack_push_request_features, write_protocol_v2_advertisement,
-    write_protocol_v2_fetch_response, write_protocol_v2_ls_refs_response,
-    write_upload_pack_negotiation_request, write_upload_pack_request,
+    validate_receive_pack_push_request_features, write_pkt_line_frame, write_pkt_line_payload,
+    write_protocol_v2_advertisement, write_protocol_v2_fetch_response,
+    write_protocol_v2_ls_refs_response, write_upload_pack_negotiation_request,
+    write_upload_pack_request,
 };
 use sley_refs::{
     DeleteRef, FileRefStore, Ref, RefDeletePrecondition, RefPrecondition, RefTarget, ReflogEntry,
@@ -1420,6 +1422,19 @@ fn upload_pack_v2_capabilities(
             value: Some("sley".into()),
         });
     }
+    // Advertise the `bundle-uri` command when the server is configured to hand
+    // out bundle URIs (upstream `bundle_uri_advertise` reads
+    // `uploadpack.advertisebundleuris`). The client then issues `command=bundle-uri`
+    // to learn the `bundle.*` list before negotiating the pack.
+    if config
+        .get_bool("uploadpack", None, "advertisebundleuris")
+        .unwrap_or(false)
+    {
+        capabilities.push(Capability {
+            name: "bundle-uri".into(),
+            value: None,
+        });
+    }
     Ok(capabilities)
 }
 
@@ -1607,6 +1622,30 @@ fn local_fetch_v2_sections(
         }
     }
 
+    // Shallow-info: when the served repository is itself shallow and the client
+    // did not request any deepening, report the shallow boundary commits that are
+    // reachable from the wants (upstream `send_shallow_info`, which does an
+    // implicit infinite-depth deepen on any fetch from a shallow repository). The
+    // client uses these `shallow` lines to detect a shallow source — in
+    // particular `git clone --reject-shallow` dies when they are present. The
+    // section must precede the packfile section per gitprotocol-v2.
+    let request_is_deepening =
+        request.deepen.is_some() || request.deepen_since.is_some() || !request.deepen_not.is_empty();
+    if !request_is_deepening {
+        let server_shallow = crate::shallow::read_shallow(git_dir, format)?;
+        if !server_shallow.is_empty() {
+            let reachable = collect_reachable_object_ids(&db, format, wants.clone())?;
+            let shallow_lines: Vec<ProtocolV2FetchShallowInfo> = server_shallow
+                .iter()
+                .filter(|oid| reachable.contains(*oid))
+                .map(|oid| ProtocolV2FetchShallowInfo::Shallow(*oid))
+                .collect();
+            if !shallow_lines.is_empty() {
+                sections.push(ProtocolV2FetchResponseSection::ShallowInfo(shallow_lines));
+            }
+        }
+    }
+
     // Packfile section: build the reachable pack excluding the client's haves.
     let mut known_haves: Vec<ObjectId> = Vec::new();
     for have in &request.haves {
@@ -1615,9 +1654,21 @@ fn local_fetch_v2_sections(
         }
     }
     let excluded = collect_reachable_object_ids(&db, format, known_haves)?;
-    let pack = build_reachable_pack(&db, format, wants, &excluded)?
-        .map(|pack| pack.pack)
-        .unwrap_or_default();
+    // Honor a partial-clone `filter` (blob:none / blob:limit=<n> / tree:<depth>):
+    // upstream upload-pack applies the filter to the objects it packs. Without
+    // this, a `--filter=blob:limit=0` clone would receive every blob and the
+    // resulting "partial" clone would not actually be partial.
+    let filter = request
+        .filter
+        .as_deref()
+        .and_then(crate::pack_filter_from_spec);
+    let pack = if filter.is_some() {
+        build_reachable_pack_filtered(&db, format, wants, &excluded, filter)?
+    } else {
+        build_reachable_pack(&db, format, wants, &excluded)?
+    }
+    .map(|pack| pack.pack)
+    .unwrap_or_default();
 
     sections.push(ProtocolV2FetchResponseSection::Packfile(
         packfile_section_lines(&pack),
@@ -1630,6 +1681,36 @@ fn local_fetch_v2_sections(
 /// reading `command=` requests (`ls-refs` / `fetch`) until the client closes
 /// the connection (EOF). Mirrors `upload-pack.c::upload_pack_v2` driven by
 /// `serve.c`.
+/// Respond to a `command=bundle-uri` request by writing every `bundle.*` config
+/// variable as a `key=value` packet line, terminated by a flush. Mirrors
+/// upstream `bundle_uri_command` / `config_to_packet_line`: the section name is
+/// lowercased, the subsection keeps its case, and the variable name is lowercased
+/// (git's config normalization), e.g. `bundle.everything.uri=<uri>`.
+fn write_bundle_uri_command_response(
+    config: &GitConfig,
+    writer: &mut impl std::io::Write,
+) -> Result<()> {
+    for section in &config.sections {
+        if !section.name.eq_ignore_ascii_case("bundle") {
+            continue;
+        }
+        for entry in &section.entries {
+            let Some(value) = entry.value.as_deref() else {
+                continue;
+            };
+            let key = match &section.subsection {
+                Some(subsection) => {
+                    format!("bundle.{subsection}.{}", entry.key.to_ascii_lowercase())
+                }
+                None => format!("bundle.{}", entry.key.to_ascii_lowercase()),
+            };
+            write_pkt_line_payload(writer, format!("{key}={value}").as_bytes())?;
+        }
+    }
+    write_pkt_line_frame(writer, &PktLineFrame::Flush)?;
+    Ok(())
+}
+
 pub fn serve_upload_pack_v2(
     git_dir: &Path,
     format: ObjectFormat,
@@ -1669,6 +1750,14 @@ pub fn serve_upload_pack_v2_with_config(
             }
             Err(err) => return Err(err),
         };
+        // `command=bundle-uri` is not part of the fetch/ls-refs classification;
+        // handle it directly by streaming the repository's `bundle.*` config as
+        // `key=value` packet lines (upstream `bundle_uri_command`).
+        if request.command == "bundle-uri" {
+            write_bundle_uri_command_response(config, writer)?;
+            writer.flush()?;
+            continue;
+        }
         match classify_protocol_v2_command_request(&handshake, format, &request)? {
             sley_protocol::ProtocolV2Command::LsRefs(ls_refs) => {
                 let records = local_ls_refs_v2_records(git_dir, format, &ls_refs, config)?;

@@ -489,6 +489,90 @@ pub enum PackObjectFilter {
 /// `filter`. With `Some(BlobNone)`, blobs are dropped from the pack unless
 /// they are directly wanted (named in `starts`).
 #[allow(clippy::too_many_arguments)]
+/// Apply a partial-clone object `filter` to a collected reachable pack in place,
+/// dropping the objects the filter omits. Explicitly-`wanted` objects (the tips
+/// the client asked for) are always retained even when the filter would drop
+/// them. Shared by the in-process fetch pack builders and the upload-pack server.
+fn retain_filtered_pack_objects<R>(
+    objects: &mut Vec<ReachablePackObject>,
+    filter: Option<&PackObjectFilter>,
+    wanted: &HashSet<ObjectId>,
+    source: &R,
+    format: ObjectFormat,
+) -> Result<()>
+where
+    R: ObjectReader,
+{
+    match filter {
+        Some(PackObjectFilter::BlobNone) => {
+            objects.retain(|entry| {
+                entry.object.object_type != ObjectType::Blob || wanted.contains(&entry.oid)
+            });
+        }
+        Some(PackObjectFilter::BlobLimit(limit)) => {
+            let limit = *limit;
+            objects.retain(|entry| {
+                entry.object.object_type != ObjectType::Blob
+                    || wanted.contains(&entry.oid)
+                    || (entry.object.body.len() as u64) < limit
+            });
+        }
+        Some(PackObjectFilter::TreeDepth(depth)) => {
+            let depth = *depth;
+            let tree_depths = collect_tree_filter_depths(source, format, objects)?;
+            objects.retain(|entry| {
+                if wanted.contains(&entry.oid) {
+                    return true;
+                }
+                match entry.object.object_type {
+                    ObjectType::Blob => false,
+                    ObjectType::Tree => tree_depths
+                        .get(&entry.oid)
+                        .is_some_and(|tree_depth| *tree_depth < depth),
+                    _ => true,
+                }
+            });
+        }
+        Some(PackObjectFilter::SparsePathSet(paths)) => {
+            let allowed_blobs = collect_sparse_filter_blobs(source, format, objects, paths)?;
+            objects.retain(|entry| {
+                entry.object.object_type != ObjectType::Blob
+                    || wanted.contains(&entry.oid)
+                    || allowed_blobs.contains(&entry.oid)
+            });
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// Build a self-contained pack of the objects reachable from `starts` (excluding
+/// `excluded`) with a partial-clone `filter` applied, returning the packed bytes
+/// without installing them. This is the upload-pack server's counterpart to
+/// [`build_reachable_pack`]: it honors `filter blob:none` / `blob:limit=<n>` /
+/// `tree:<depth>` requests so a filtered fetch omits the corresponding objects.
+pub fn build_reachable_pack_filtered<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    filter: Option<PackObjectFilter>,
+) -> Result<Option<PackWrite>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    let starts: Vec<ObjectId> = starts.into_iter().collect();
+    let wanted: HashSet<ObjectId> = starts.iter().copied().collect();
+    let mut objects = collect_reachable_pack_objects(reader, format, starts, excluded)?;
+    retain_filtered_pack_objects(&mut objects, filter.as_ref(), &wanted, reader, format)?;
+    if objects.is_empty() {
+        return Ok(None);
+    }
+    let inputs = pack_inputs(&objects);
+    PackFile::write_packed_with_known_ids(&inputs, format).map(Some)
+}
+
 pub fn build_and_install_reachable_pack_filtered<R, I>(
     source: &R,
     destination: &FileObjectDatabase,
@@ -506,44 +590,7 @@ where
     let starts: Vec<ObjectId> = starts.into_iter().collect();
     let wanted: HashSet<ObjectId> = starts.iter().copied().collect();
     let mut objects = collect_reachable_pack_objects(source, format, starts, excluded)?;
-    match filter {
-        Some(PackObjectFilter::BlobNone) => {
-            objects.retain(|entry| {
-                entry.object.object_type != ObjectType::Blob || wanted.contains(&entry.oid)
-            });
-        }
-        Some(PackObjectFilter::BlobLimit(limit)) => {
-            objects.retain(|entry| {
-                entry.object.object_type != ObjectType::Blob
-                    || wanted.contains(&entry.oid)
-                    || (entry.object.body.len() as u64) < limit
-            });
-        }
-        Some(PackObjectFilter::TreeDepth(depth)) => {
-            let tree_depths = collect_tree_filter_depths(source, format, &objects)?;
-            objects.retain(|entry| {
-                if wanted.contains(&entry.oid) {
-                    return true;
-                }
-                match entry.object.object_type {
-                    ObjectType::Blob => false,
-                    ObjectType::Tree => tree_depths
-                        .get(&entry.oid)
-                        .is_some_and(|tree_depth| *tree_depth < depth),
-                    _ => true,
-                }
-            });
-        }
-        Some(PackObjectFilter::SparsePathSet(paths)) => {
-            let allowed_blobs = collect_sparse_filter_blobs(source, format, &objects, &paths)?;
-            objects.retain(|entry| {
-                entry.object.object_type != ObjectType::Blob
-                    || wanted.contains(&entry.oid)
-                    || allowed_blobs.contains(&entry.oid)
-            });
-        }
-        None => {}
-    }
+    retain_filtered_pack_objects(&mut objects, filter.as_ref(), &wanted, source, format)?;
     if objects.is_empty() {
         return Ok(None);
     }
