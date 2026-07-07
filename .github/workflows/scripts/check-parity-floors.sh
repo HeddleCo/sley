@@ -1087,7 +1087,11 @@ declare -A FLOOR=(
     # FETCH_HEAD truncate-on-abort), and a latent FETCH_HEAD opportunistic-tracking dup
     # fix. 167->184. Guards held: t5516=111 t5601=109 t5505=127 t5500=363. cargo test
     # --workspace green; clippy -p sley-remote -p sley-cli clean.
-    [t5510-fetch.sh]=184
+    # round5 fetch (2026-07-07, off main f312ed0d; sley-remote fetch lane): negotiation
+    # -tip/-restrict/-include handling threaded through local/HTTP/SSH/git transports.
+    # 184->203. Guards held: t5516=111 t5601=115 t5520=75. sley-remote unit tests green;
+    # measured against /tmp/git-src 2.55.0 source oracle (verify on next scheduled Linux run).
+    [t5510-fetch.sh]=203
     [t2205-add-worktree-config.sh]=13
     [t1050-large.sh]=29
     # wave-36 (2026-06-21, off main 5dfe861a; t_fetch/worktree): fetch-multiple, unresolve-info,
