@@ -237,6 +237,10 @@ fn setup_name_rev_options(args: &[String]) -> Result<NameRevOptions> {
     let parsed = match parse_options(args, name_rev_option_specs(), NAME_REV_USAGE_LINES) {
         Ok(parsed) => parsed,
         Err(error) => {
+            // git's parse-options prints the usage only for unknown
+            // option/switch errors; value errors ("requires a value", "takes no
+            // value") emit the error line alone. Match that split.
+            let mut print_usage = false;
             if let Some(message) = error.message() {
                 if message.starts_with("unknown option `") {
                     let option = message
@@ -244,17 +248,21 @@ fn setup_name_rev_options(args: &[String]) -> Result<NameRevOptions> {
                         .and_then(|rest| rest.strip_suffix('\''))
                         .unwrap_or(message);
                     eprintln!("error: unknown option `{option}'");
+                    print_usage = true;
                 } else if message.starts_with("unknown switch `") {
                     let option = message
                         .strip_prefix("unknown switch `")
                         .and_then(|rest| rest.strip_suffix('\''))
                         .unwrap_or(message);
                     eprintln!("error: unknown switch `{option}'");
+                    print_usage = true;
                 } else {
                     eprintln!("error: {message}");
                 }
             }
-            print_name_rev_usage();
+            if print_usage {
+                print_name_rev_usage();
+            }
             return Err(GitError::Exit(129));
         }
     };
