@@ -94,9 +94,21 @@ pub fn log_validate_inter_hunk_context(value: &str) -> Result<()> {
 }
 
 pub fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
-    // git's diff_opt_char (diff.c) requires exactly one byte; empty and multibyte
-    // values are rejected.
-    if value.len() == 1 {
+    // git's diff_opt_char (diff.c) requires a single byte; multibyte values are
+    // always rejected. An empty value is accepted by the BSD-libc git build
+    // (macOS / *BSD) but rejected as a usage error by the glibc build (Linux,
+    // what CI builds), so gate empty on the platform to keep
+    // `*_matches_upstream_git` holding on both.
+    if value.len() == 1
+        || (value.is_empty()
+            && cfg!(any(
+                target_vendor = "apple",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly",
+            )))
+    {
         return Ok(());
     }
     if value.is_empty() {
