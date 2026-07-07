@@ -5217,19 +5217,36 @@ fn setup_prune_options(args: &[String]) -> Result<PruneOptions> {
     })
 }
 
-const PRUNE_USAGE: &[&str] = &["git prune [-n] [-v] [--expire <time>] [--] [<head>...]"];
+const PRUNE_USAGE: &[&str] =
+    &["git prune [-n] [-v] [--progress] [--expire <time>] [--] [<head>...]"];
 
 fn prune_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
     static SPECS: &[sley_options::OptionSpec<'static>] = &[
-        opt_bool(Some('n'), Some("dry-run"), OptFlags::NONE, "dry run"),
-        opt_bool(Some('v'), Some("verbose"), OptFlags::NONE, "be verbose"),
-        opt_str(None, Some("expire"), "<time>", OptFlags::NONE, "prune older than <time>"),
-        opt_bool(None, Some("progress"), OptFlags::HIDDEN, ""),
+        opt_bool(
+            Some('n'),
+            Some("dry-run"),
+            OptFlags::NONE,
+            "do not remove, show only",
+        ),
+        opt_bool(
+            Some('v'),
+            Some("verbose"),
+            OptFlags::NONE,
+            "report pruned objects",
+        ),
+        opt_bool(None, Some("progress"), OptFlags::NONE, "show progress"),
+        opt_str(
+            None,
+            Some("expire"),
+            "<expiry-date>",
+            OptFlags::NONE,
+            "expire objects older than <time>",
+        ),
         opt_bool(
             None,
             Some("exclude-promisor-objects"),
-            OptFlags::HIDDEN,
-            "",
+            OptFlags::NONE,
+            "limit traversal to objects outside promisor packfiles",
         ),
     ];
     SPECS
