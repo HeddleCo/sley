@@ -74,7 +74,25 @@ fn setup_rerere_options(args: &[String]) -> Result<RerereOptions> {
     }
     let parsed = match parse_options(args, rerere_option_specs(), RERERE_USAGE) {
         Ok(parsed) => parsed,
-        Err(_) => return rerere_usage(),
+        Err(error) => {
+            // git prints the `error: unknown option ...` line before the usage.
+            if let Some(message) = error.message() {
+                if let Some(option) = message
+                    .strip_prefix("unknown option `")
+                    .and_then(|rest| rest.strip_suffix('\''))
+                {
+                    eprintln!("error: unknown option `{option}'");
+                } else if let Some(option) = message
+                    .strip_prefix("unknown switch `")
+                    .and_then(|rest| rest.strip_suffix('\''))
+                {
+                    eprintln!("error: unknown switch `{option}'");
+                } else {
+                    eprintln!("error: {message}");
+                }
+            }
+            return rerere_usage();
+        }
     };
     let mut autoupdate = None;
     for option in &parsed.options {
