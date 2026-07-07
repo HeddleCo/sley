@@ -1760,6 +1760,16 @@ fn clone_network_repository(
     let http_client = matches!(transport, CloneNetworkTransport::Http)
         .then(sley_remote::new_http_client);
     let prefetch_handshake = v2_handshake.clone();
+    // Junk-directory cleanup: upstream builtin/clone.c registers `remove_junk`
+    // (atexit + signal) that removes the working tree / gitdir it created when the
+    // clone dies, unless the destination pre-existed (in which case only its
+    // contents are cleared, keeping the toplevel). A failed network clone must not
+    // leave a partially populated destination behind — t5601's reject-shallow test
+    // reruns the clone into the same path and would otherwise hit "destination path
+    // already exists". Record what existed before we create anything.
+    let dest_pre_existed = options.destination.exists();
+    let git_dir_override_pre_existed = options.git_dir_override.map(Path::exists);
+    let clone_result = (|| -> Result<()> {
     let outcome = sley_remote::clone(
         sley_remote::CloneRequest {
             destination: options.destination,
@@ -1798,15 +1808,25 @@ fn clone_network_repository(
                     && sley_remote::transfer_bundle_uri_enabled(&config)
                     && sley_remote::handshake_advertises_bundle_uri(handshake)
                 {
+                    // Bundle-URI auto-discovery is best-effort: upstream
+                    // builtin/clone.c ignores the return value of
+                    // `fetch_bundle_uri()` and at most warns, continuing the clone
+                    // with the normal negotiation. Any discovery/prefetch failure
+                    // here must therefore never abort the clone.
                     let mut bundle_credentials = sley_remote::NoCredentials;
-                    let list = sley_remote::http_remote_bundle_uri_list(
+                    let prefetch = sley_remote::http_remote_bundle_uri_list(
                         client,
                         remote,
                         handshake,
                         &mut bundle_credentials,
                         Some(&config),
-                    )?;
-                    sley_remote::prefetch_advertised_bundle_uris(git_dir, format, &list)?;
+                    )
+                    .and_then(|list| {
+                        sley_remote::prefetch_advertised_bundle_uris(git_dir, format, &list)
+                    });
+                    if let Err(err) = prefetch {
+                        eprintln!("warning: failed to fetch bundle URIs: {err}");
+                    }
                 }
                 Ok(config)
             },
@@ -1845,6 +1865,39 @@ fn clone_network_repository(
         eprintln!("done.");
     }
     Ok(())
+    })();
+    if clone_result.is_err() {
+        remove_clone_junk_directory(options.destination, dest_pre_existed);
+        if let (Some(git_dir_override), Some(false)) =
+            (options.git_dir_override, git_dir_override_pre_existed)
+        {
+            remove_clone_junk_directory(git_dir_override, false);
+        }
+    }
+    clone_result
+}
+
+/// Remove the working tree / gitdir a failed clone created, mirroring upstream
+/// `builtin/clone.c::remove_junk`. When the destination pre-existed (git only
+/// permits an empty pre-existing directory), its contents are cleared but the
+/// toplevel is kept (`REMOVE_DIR_KEEP_TOPLEVEL`); otherwise the directory the
+/// clone created is removed entirely.
+fn remove_clone_junk_directory(path: &Path, pre_existed: bool) {
+    if !pre_existed {
+        let _ = fs::remove_dir_all(path);
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            let _ = fs::remove_dir_all(&entry_path);
+        } else {
+            let _ = fs::remove_file(&entry_path);
+        }
+    }
 }
 
 fn emit_explicit_clone_progress(progress: Option<bool>, quiet: bool, empty: bool) {

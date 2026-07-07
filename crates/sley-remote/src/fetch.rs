@@ -407,6 +407,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 deepen_not,
                 deepen_relative: options.deepen_relative,
                 git_protocol: git_protocol.as_deref(),
+                omit_haves: false,
             };
             let shallow_info = if discovered.set.protocol == ProtocolVersion::V2 {
                 let handshake = discovered.handshake.as_ref().ok_or_else(|| {
@@ -506,6 +507,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     max_input_size,
                 },
             )?;
+            reject_shallow_clone_fetch(&options, &shallow_info)?;
             if !options.dry_run {
                 crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
             }
@@ -572,6 +574,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     max_input_size,
                 },
             )?;
+            reject_shallow_clone_fetch(&options, &shallow_info)?;
             if !options.dry_run {
                 crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
             }
@@ -1554,11 +1557,14 @@ fn reject_shallow_clone_fetch(
     options: &FetchOptions,
     shallow_info: &[sley_protocol::ProtocolV2FetchShallowInfo],
 ) -> Result<()> {
-    if options.reject_shallow
-        && options.cloning
-        && options.depth.is_none()
-        && !shallow_info.is_empty()
-    {
+    // Upstream fetch-pack sets `args->deepen` when ANY deepen argument is present
+    // (depth, deepen-since, or deepen-not) and only dies on a shallow source when
+    // no deepen was requested (the shallow lines are then attributed to the remote
+    // being shallow, not to our own depth request). Mirror that gate here.
+    let deepening = options.depth.is_some()
+        || options.deepen_since.is_some()
+        || !options.deepen_not.is_empty();
+    if options.reject_shallow && options.cloning && !deepening && !shallow_info.is_empty() {
         eprintln!("fatal: source repository is shallow, reject to clone.");
         return Err(GitError::Exit(128));
     }

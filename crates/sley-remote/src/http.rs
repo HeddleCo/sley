@@ -635,6 +635,12 @@ pub struct HttpFetchPackRequest<'a> {
     pub deepen_not: Vec<String>,
     pub deepen_relative: bool,
     pub git_protocol: Option<&'a str>,
+    /// Send no `have` lines. Used by a partial clone's checkout-blob top-up
+    /// fetch: the client already has the commit whose tree references the wanted
+    /// blob, so advertising it as a `have` would make the server treat the blob
+    /// as already transferred (reachable from the have) and omit it. Suppressing
+    /// haves forces the server to send the explicitly wanted objects.
+    pub omit_haves: bool,
 }
 
 pub fn install_fetch_pack_via_http_upload_pack(
@@ -662,7 +668,11 @@ pub fn install_fetch_pack_via_http_upload_pack(
         request.deepen_not,
         request.filter.as_ref(),
     );
-    let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
+    let haves = if request.omit_haves {
+        Vec::new()
+    } else {
+        crate::local::local_have_oids(request.git_dir, request.format)?
+    };
     if request.deepen.is_none() {
         let mut response = http_upload_pack_post(
             request.client,
@@ -733,7 +743,11 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
     {
         return Ok(Vec::new());
     }
-    let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
+    let haves = if request.omit_haves {
+        Vec::new()
+    } else {
+        crate::local::local_have_oids(request.git_dir, request.format)?
+    };
     let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
         request.wants,
         haves,

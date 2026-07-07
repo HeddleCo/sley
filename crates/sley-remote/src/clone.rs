@@ -42,7 +42,7 @@ use sley_odb::{FileObjectDatabase, ObjectReader};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate};
 use sley_transport::RemoteUrl;
 
-use crate::fetch::{FetchOptions, FetchSource, fetch};
+use crate::fetch::{fetch, FetchOptions, FetchSource};
 use crate::{CredentialProvider, ProgressSink};
 
 /// Internal placeholder branch used while clone initializes before it knows
@@ -369,7 +369,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
     // not change the config `configure_branch` returns.
     let checkout_config = (services.configure_branch)(&git_dir, request.options.checkout_branch)?;
     if request.options.checkout {
-        fetch_local_partial_clone_checkout_blobs(&request, &git_dir, branch_oid)?;
+        fetch_partial_clone_checkout_blobs(&request, &git_dir, branch_oid, services.credentials)?;
     } else {
         let mut tx = store.transaction();
         tx.update(RefUpdate {
@@ -428,46 +428,139 @@ fn scheme_for_clone_source(source: &CloneSource) -> &'static str {
     }
 }
 
-fn fetch_local_partial_clone_checkout_blobs(
+/// Materialize the blobs needed to check out `commit_oid` for a partial clone
+/// that filtered them out of the initial fetch.
+///
+/// A `--filter=blob:limit=…`/`blob:none` clone omits blobs from the initial pack,
+/// but the working-tree checkout still needs the blobs reachable from the checked
+/// out commit's tree. Upstream lazily fetches those blobs from the promisor
+/// remote during checkout; sley fetches them up front here (only the exact
+/// checkout blobs, so unreachable filtered blobs stay absent). The trees are
+/// already present locally (a blob filter keeps trees), so the wanted blob ids
+/// are computed by walking the local copy of the commit's tree.
+fn fetch_partial_clone_checkout_blobs(
     request: &CloneRequest<'_>,
     git_dir: &Path,
     commit_oid: ObjectId,
+    credentials: &mut dyn CredentialProvider,
 ) -> Result<()> {
     if request.options.filter.is_none() {
         return Ok(());
     }
-    let CloneSource::Local {
-        git_dir: remote_git_dir,
-        common_git_dir: remote_common_git_dir,
-    } = request.source
-    else {
-        return Ok(());
-    };
+    match request.source {
+        CloneSource::Local {
+            git_dir: remote_git_dir,
+            common_git_dir: remote_common_git_dir,
+        } => {
+            let local_db = FileObjectDatabase::from_git_dir(git_dir, request.format);
+            let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, request.format);
+            let mut wants = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            collect_checkout_materialization_wants(
+                &remote_db,
+                &local_db,
+                request.format,
+                commit_oid,
+                &mut seen,
+                &mut wants,
+            )?;
+            crate::local::install_fetch_pack_via_local_upload_pack(
+                git_dir,
+                remote_git_dir,
+                request.format,
+                wants,
+                None,
+                true,
+                false,
+                None,
+                false,
+                None,
+            )?;
+            Ok(())
+        }
+        #[cfg(feature = "http")]
+        CloneSource::Http(remote) => fetch_http_partial_clone_checkout_blobs(
+            request,
+            git_dir,
+            commit_oid,
+            remote,
+            credentials,
+        ),
+        // SSH/git:// partial clones are gated out by the CLI (the in-process
+        // local server is the only transport that advertises object filtering
+        // aside from HTTP), so there is nothing to materialize here.
+        _ => Ok(()),
+    }
+}
 
+/// HTTP arm of [`fetch_partial_clone_checkout_blobs`]: fetch the checkout blobs
+/// from the smart-HTTP promisor remote as a second, targeted fetch (requesting
+/// the exact blob ids via `want <oid>`, which the server permits under
+/// `uploadpack.allowanysha1inwant`). Installed as a `.promisor` pack.
+#[cfg(feature = "http")]
+fn fetch_http_partial_clone_checkout_blobs(
+    request: &CloneRequest<'_>,
+    git_dir: &Path,
+    commit_oid: ObjectId,
+    remote: &RemoteUrl,
+    credentials: &mut dyn CredentialProvider,
+) -> Result<()> {
     let local_db = FileObjectDatabase::from_git_dir(git_dir, request.format);
-    let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, request.format);
     let mut wants = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    // The commit and its trees are present locally (only blobs were filtered),
+    // so the local db serves as both the tree source and the presence check.
     collect_checkout_materialization_wants(
-        &remote_db,
+        &local_db,
         &local_db,
         request.format,
         commit_oid,
         &mut seen,
         &mut wants,
     )?;
-    crate::local::install_fetch_pack_via_local_upload_pack(
-        git_dir,
-        remote_git_dir,
+    if wants.is_empty() {
+        return Ok(());
+    }
+    let http_batch = crate::http::HttpOperationBatch::new();
+    let client = http_batch.client();
+    let discovered = crate::http::http_service_advertisements(
+        client,
+        remote,
         request.format,
-        wants,
-        None,
-        true,
-        false,
-        None,
-        false,
+        sley_protocol::GitService::UploadPack,
+        credentials,
         None,
     )?;
+    let git_protocol = crate::http::http_git_protocol_header_value(None)?;
+    let pack_request = crate::http::HttpFetchPackRequest {
+        client,
+        git_dir,
+        format: request.format,
+        remote,
+        wants,
+        shallow: Vec::new(),
+        deepen: None,
+        promisor: true,
+        max_input_size: None,
+        filter: None,
+        deepen_since: None,
+        deepen_not: Vec::new(),
+        deepen_relative: false,
+        git_protocol: git_protocol.as_deref(),
+        // The client already has the checkout commit and its trees; advertising
+        // them as haves would make the server omit the (filtered-out) blobs we
+        // are explicitly requesting, so suppress haves for this top-up fetch.
+        omit_haves: true,
+    };
+    if let Some(handshake) = discovered.handshake.as_ref() {
+        crate::http::install_fetch_pack_via_http_protocol_v2_fetch(
+            pack_request,
+            handshake,
+            credentials,
+        )?;
+    } else {
+        crate::http::install_fetch_pack_via_http_upload_pack(pack_request, credentials)?;
+    }
     Ok(())
 }
 
