@@ -240,8 +240,20 @@ fn git_exec_helper_dir(path: &Path) -> Option<()> {
     path.join("git-http-backend").is_file().then_some(())
 }
 
+/// Env sentinel set on the `git --exec-path` probe child. If the program we
+/// probe is itself a sley shim (upstream's `GIT_TEST_INSTALLED` bindir points
+/// `git` at sley), it must NOT re-run `materialize` — that would probe PATH,
+/// find the shim again, and recurse without bound (a fork bomb) while also
+/// symlinking the exec helpers to themselves. A probed sley sees this variable
+/// and refuses to answer, so we treat it as "not a system git" and move on.
+pub const EXEC_PATH_PROBE_ENV: &str = "SLEY_EXEC_PATH_PROBE";
+
 fn git_exec_path_from_program(program: &str) -> Option<PathBuf> {
-    let output = Command::new(program).arg("--exec-path").output().ok()?;
+    let output = Command::new(program)
+        .arg("--exec-path")
+        .env(EXEC_PATH_PROBE_ENV, "1")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }

@@ -458,6 +458,14 @@ fn cmd_info_path() -> Result<()> {
 fn git_exec_path() -> Result<PathBuf> {
     #[cfg(feature = "git-compat-i18n")]
     {
+        // When another sley process probes us via `git --exec-path` to discover
+        // a *system* git's exec dir, refuse to answer instead of materializing
+        // (which itself probes PATH and would recurse without bound). Exiting
+        // non-zero here makes the probing parent reject this candidate — sley is
+        // not a system git worth borrowing exec helpers from.
+        if env::var_os(sley_i18n::EXEC_PATH_PROBE_ENV).is_some() {
+            return Err(GitError::Exit(1));
+        }
         sley_i18n::materialize_git_i18n_helpers().map_err(|err| GitError::Io(err.to_string()))
     }
     #[cfg(not(feature = "git-compat-i18n"))]
