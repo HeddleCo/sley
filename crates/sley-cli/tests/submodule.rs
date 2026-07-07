@@ -1353,7 +1353,6 @@ fn submodule_foreach_recursive_matches_upstream_git() {
 }
 
 #[test]
-#[ignore = "sley#122: pre-alpha cleanup output-parity regression"]
 fn submodule_summary_clean_cases_match_upstream_git() {
     let root = unique_temp_dir("submodule-summary-clean");
     fs::create_dir_all(&root).expect("create temp root");
