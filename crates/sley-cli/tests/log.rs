@@ -924,7 +924,6 @@ fn log_first_parent_matches_upstream_git() {
 }
 
 #[test]
-#[ignore = "sley#122: pre-alpha cleanup output-parity regression"]
 fn log_author_filter_matches_upstream_git() {
     let root = unique_temp_dir("log-author-filter");
     fs::create_dir_all(&root).expect("create temp repo");
@@ -981,7 +980,6 @@ fn log_author_filter_matches_upstream_git() {
 }
 
 #[test]
-#[ignore = "sley#122: pre-alpha cleanup output-parity regression"]
 fn log_committer_filter_matches_upstream_git() {
     let root = unique_temp_dir("log-committer-filter");
     fs::create_dir_all(&root).expect("create temp repo");
@@ -1331,7 +1329,6 @@ fn log_fixed_string_filters_match_upstream_git() {
 }
 
 #[test]
-#[ignore = "sley#122: pre-alpha cleanup output-parity regression"]
 fn log_grep_filter_matches_upstream_git() {
     let root = unique_temp_dir("log-grep-filter");
     fs::create_dir_all(&root).expect("create temp repo");
