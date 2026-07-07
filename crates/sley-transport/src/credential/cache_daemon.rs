@@ -1,13 +1,15 @@
 //! `git credential-cache--daemon` server.
 
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sley_core::{GitError, Result};
 
 #[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
+
+use super::unix_socket::unix_stream_listen;
 
 use super::url::credential_match;
 use super::{
@@ -57,53 +59,84 @@ fn cmd_credential_cache_daemon_unix(args: &[String]) -> Result<()> {
             "socket directory must be an absolute path".into(),
         ));
     }
-    init_socket_directory(socket_path)?;
-    let _ = std::fs::remove_file(socket_path);
-    serve_cache(socket_path, debug)
+    let socket_file = init_socket_directory(socket_path)?;
+    serve_cache(&socket_file, debug)
 }
 
 #[cfg(unix)]
-fn init_socket_directory(socket_path: &str) -> Result<()> {
+fn init_socket_directory(socket_path: &str) -> Result<PathBuf> {
+    use std::fs::DirBuilder;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
     let path = Path::new(socket_path);
     let Some(parent) = path.parent() else {
-        return Ok(());
+        return Err(GitError::Command(
+            "socket directory must be an absolute path".into(),
+        ));
+    };
+    let Some(socket_file) = path.file_name() else {
+        return Err(GitError::Command(
+            "socket directory must be an absolute path".into(),
+        ));
     };
     if parent.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(parent) {
-                if meta.permissions().mode() & 0o077 != 0 {
-                    return Err(GitError::Command(
-                        "socket directory permissions are too loose".into(),
-                    ));
-                }
+        if let Ok(meta) = std::fs::metadata(parent) {
+            if meta.permissions().mode() & 0o077 != 0 {
+                return Err(GitError::Command(format!(
+                    "The permissions on your socket directory are too loose; other\n\
+                     users may be able to read your cached credentials. Consider running:\n\
+                     \n\
+                     \tchmod 0700 {}",
+                    parent.display()
+                )));
             }
         }
     } else {
-        std::fs::create_dir_all(parent).map_err(|err| GitError::Io(err.to_string()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                .map_err(|err| GitError::Io(err.to_string()))?;
+        if let Some(grandparent) = parent.parent() {
+            std::fs::create_dir_all(grandparent).map_err(|err| GitError::Io(err.to_string()))?;
         }
+        DirBuilder::new()
+            .mode(0o700)
+            .create(parent)
+            .map_err(|err| GitError::Io(err.to_string()))?;
     }
     let _ = std::env::set_current_dir(parent);
-    Ok(())
+    Ok(PathBuf::from(socket_file))
 }
 
 #[cfg(unix)]
-fn serve_cache(socket_path: &str, _debug: bool) -> Result<()> {
+struct SocketCleanup<'a> {
+    socket_file: &'a Path,
+}
+
+#[cfg(unix)]
+impl Drop for SocketCleanup<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.socket_file);
+    }
+}
+
+#[cfg(unix)]
+fn unlink_socket(socket_file: &Path) {
+    let _ = std::fs::remove_file(socket_file);
+}
+
+#[cfg(unix)]
+fn serve_cache(socket_file: &Path, _debug: bool) -> Result<()> {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    let listener = UnixListener::bind(socket_path).map_err(|err| GitError::Io(err.to_string()))?;
+    let _socket_cleanup = SocketCleanup { socket_file };
+    let listener =
+        unix_stream_listen(socket_file).map_err(|err| GitError::Io(err.to_string()))?;
     listener
         .set_nonblocking(true)
         .map_err(|err| GitError::Io(err.to_string()))?;
-    writeln!(io::stdout(), "ok").map_err(|err| GitError::Io(err.to_string()))?;
-    let _ = io::stdout().flush();
+    {
+        let mut out = io::stdout().lock();
+        writeln!(out, "ok").map_err(|err| GitError::Io(err.to_string()))?;
+        out.flush().map_err(|err| GitError::Io(err.to_string()))?;
+    }
     let mut entries: Vec<CacheEntry> = Vec::new();
     let mut wait_for_entry_until = 0_i64;
     loop {
@@ -115,7 +148,7 @@ fn serve_cache(socket_path: &str, _debug: bool) -> Result<()> {
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    serve_one_client(stream, &mut entries)?;
+                    serve_one_client(stream, socket_file, &mut entries)?;
                     break;
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -172,7 +205,11 @@ fn check_expirations(entries: &mut Vec<CacheEntry>, wait_for_entry_until: &mut i
 }
 
 #[cfg(unix)]
-fn serve_one_client(stream: UnixStream, entries: &mut Vec<CacheEntry>) -> Result<()> {
+fn serve_one_client(
+    stream: UnixStream,
+    socket_file: &Path,
+    entries: &mut Vec<CacheEntry>,
+) -> Result<()> {
     let mut reader = io::BufReader::new(
         stream
             .try_clone()
@@ -191,20 +228,18 @@ fn serve_one_client(stream: UnixStream, entries: &mut Vec<CacheEntry>) -> Result
                 write_get_response(&credential, entry, &mut writer)?;
             }
         }
-        "exit" => std::process::exit(0),
+        "exit" => {
+            unlink_socket(socket_file);
+            std::process::exit(0);
+        }
         "erase" => remove_credential(entries, &credential, true),
         "store" => {
             if timeout < 0 {
                 eprintln!("warning: cache client didn't specify a timeout");
-            } else if !credential.username.is_some() || !credential.password.is_some() {
-                if !credential.authtype.is_some() || !credential.credential.is_some() {
-                    eprintln!("warning: cache client gave us a partial credential");
-                } else if credential.ephemeral {
-                    eprintln!("warning: not storing ephemeral credential");
-                } else {
-                    remove_credential(entries, &credential, false);
-                    cache_credential(entries, credential, timeout);
-                }
+            } else if (!credential.username.is_some() || !credential.password.is_some())
+                && (!credential.authtype.is_some() || !credential.credential.is_some())
+            {
+                eprintln!("warning: cache client gave us a partial credential");
             } else if credential.ephemeral {
                 eprintln!("warning: not storing ephemeral credential");
             } else {

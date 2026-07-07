@@ -1,13 +1,15 @@
 //! `git credential-cache` client.
 
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use sley_core::{GitError, Result};
 
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
+use super::unix_socket::unix_stream_connect;
 
 use super::{credential_announce_capabilities, credential_set_all_capabilities, CredentialOpType, GitCredential};
 
@@ -142,8 +144,18 @@ fn do_cache(socket: &PathBuf, action: &str, timeout: i32, flags: u8) -> Result<(
         }
         if flags & FLAG_SPAWN != 0 {
             spawn_daemon(socket)?;
-            if send_request(socket, buf.as_bytes()).is_err() {
-                return Err(GitError::Io("unable to connect to cache daemon".into()));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if send_request(socket, buf.as_bytes()).is_ok() {
+                    break;
+                }
+                if connection_fatally_broken() {
+                    return Err(GitError::Io("unable to connect to cache daemon".into()));
+                }
+                if Instant::now() >= deadline {
+                    return Err(GitError::Io("unable to connect to cache daemon".into()));
+                }
+                thread::sleep(Duration::from_millis(25));
             }
         }
     }
@@ -157,8 +169,8 @@ fn connection_fatally_broken() -> bool {
 }
 
 #[cfg(unix)]
-fn send_request(socket: &PathBuf, out: &[u8]) -> Result<bool> {
-    let mut stream = UnixStream::connect(socket).map_err(|err| {
+fn send_request(socket: &Path, out: &[u8]) -> Result<bool> {
+    let mut stream = unix_stream_connect(socket).map_err(|err| {
         let _ = err;
         io::Error::last_os_error()
     })?;
@@ -195,7 +207,12 @@ fn connection_closed(err: &io::Error) -> bool {
 }
 
 #[cfg(unix)]
-fn spawn_daemon(socket: &PathBuf) -> Result<()> {
+fn daemon_started(buf: &[u8]) -> bool {
+    buf.windows(3).any(|window| window == b"ok\n")
+}
+
+#[cfg(unix)]
+fn spawn_daemon(socket: &Path) -> Result<()> {
     let exe = std::env::current_exe().map_err(|err| GitError::Io(err.to_string()))?;
     let mut command = Command::new(exe);
     command
@@ -208,16 +225,36 @@ fn spawn_daemon(socket: &PathBuf) -> Result<()> {
         .spawn()
         .map_err(|err| GitError::Io(err.to_string()))?;
     let mut stdout = child.stdout.take().expect("piped");
-    let mut buf = [0_u8; 128];
-    let n = stdout
-        .read(&mut buf)
-        .map_err(|err| GitError::Io(err.to_string()))?;
-    if n < 3 || &buf[..3] != b"ok\n" {
-        return Err(GitError::Command(format!(
-            "cache daemon did not start: {}",
-            String::from_utf8_lossy(&buf[..n])
-        )));
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = [0_u8; 128];
+        let n = stdout.read(&mut buf).unwrap_or(0);
+        let _ = tx.send(buf[..n].to_vec());
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut acc = Vec::new();
+    loop {
+        match rx.try_recv() {
+            Ok(chunk) => acc.extend_from_slice(&chunk),
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+        if daemon_started(&acc) {
+            return Ok(());
+        }
+        if !acc.is_empty() {
+            return Err(GitError::Command(format!(
+                "cache daemon did not start: {}",
+                String::from_utf8_lossy(&acc)
+            )));
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            return Err(GitError::Command("cache daemon did not start: ".into()));
+        }
+        if Instant::now() >= deadline {
+            return Err(GitError::Command("cache daemon did not start: ".into()));
+        }
+        thread::sleep(Duration::from_millis(25));
     }
-    // Leave the daemon running in the background (git's child_process_clear).
-    Ok(())
+    Err(GitError::Command("cache daemon did not start: ".into()))
 }

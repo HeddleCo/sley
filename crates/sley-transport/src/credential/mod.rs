@@ -4,6 +4,7 @@ mod cache;
 mod cache_daemon;
 mod prompt;
 mod store;
+mod unix_socket;
 mod url;
 
 use std::io::{self, BufRead, Read, Write};
@@ -95,19 +96,7 @@ impl Default for GitCredential {
 
 impl GitCredential {
     pub fn is_full(&self) -> bool {
-        let user_pass = self
-            .username
-            .as_deref()
-            .is_some_and(|value| !value.is_empty())
-            && self
-                .password
-                .as_deref()
-                .is_some_and(|value| !value.is_empty());
-        user_pass
-            || self
-                .credential
-                .as_deref()
-                .is_some_and(|value| !value.is_empty())
+        (self.username.is_some() && self.password.is_some()) || self.credential.is_some()
     }
 }
 
