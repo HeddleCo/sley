@@ -141,6 +141,7 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
         .iter()
         .any(|cap| cap.name == "report-status" || cap.name == "report-status-v2");
     let mut hook_stderr = Vec::new();
+    let push_options = header.push_options.as_deref().unwrap_or(&[]);
     let outcome = sley_remote::serve_receive_pack(sley_remote::ReceivePackServerRequest {
         git_dir: &git_dir,
         format,
@@ -150,33 +151,67 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
         options: sley_remote::ReceivePackServerOptions {
             quiet,
             remote_stderr: Some(&mut hook_stderr),
-            run_post_hooks: true,
+            run_post_hooks: false,
         },
     })?;
-    if !hook_stderr.is_empty() {
-        let suffix = if std::io::stderr().is_terminal() {
-            ""
-        } else {
-            "        "
-        };
-        let text = String::from_utf8_lossy(&hook_stderr);
-        for line in text.lines() {
-            eprintln!("{line}{suffix}");
-        }
-    }
-    if wants_report {
+    if use_sideband {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
-        sley_remote::write_receive_pack_server_report(
-            &mut stdout,
-            &outcome.report,
-            use_sideband,
-        )?;
+        sley_remote::write_receive_pack_sideband_stderr(&mut stdout, &hook_stderr)?;
+        if wants_report {
+            sley_remote::write_receive_pack_server_report(
+                &mut stdout,
+                &outcome.report,
+                true,
+                false,
+            )?;
+        }
+        let mut post_stderr = Vec::new();
+        sley_remote::run_receive_pack_post_hooks(
+            &git_dir,
+            &outcome.command_states,
+            push_options,
+            &mut post_stderr,
+            true,
+        );
+        sley_remote::write_receive_pack_sideband_stderr(&mut stdout, &post_stderr)?;
+        sley_remote::flush_receive_pack_sideband(&mut stdout)?;
         stdout.flush()?;
+    } else {
+        print_receive_pack_hook_stderr(&hook_stderr);
+        if wants_report {
+            let stdout = io::stdout();
+            let mut stdout = stdout.lock();
+            sley_remote::write_receive_pack_server_report(
+                &mut stdout,
+                &outcome.report,
+                false,
+                false,
+            )?;
+            stdout.flush()?;
+        }
+        let mut post_stderr = Vec::new();
+        sley_remote::run_receive_pack_post_hooks(
+            &git_dir,
+            &outcome.command_states,
+            push_options,
+            &mut post_stderr,
+            true,
+        );
+        print_receive_pack_hook_stderr(&post_stderr);
     }
-    let push_options = header.push_options.as_deref().unwrap_or(&[]);
 
     Ok(())
+}
+
+fn print_receive_pack_hook_stderr(hook_stderr: &[u8]) {
+    if hook_stderr.is_empty() {
+        return;
+    }
+    let text = String::from_utf8_lossy(hook_stderr);
+    for line in text.lines() {
+        eprintln!("{line}");
+    }
 }
 
 /// Protocol requested by the connecting client via `GIT_PROTOCOL`
@@ -3097,32 +3132,48 @@ fn update_push_remote_tracking_refs(
     if config.get("remote", Some(remote), "url").is_none() {
         return Ok(());
     }
+    let fetch_refspecs = remote_config_values(config, remote, "fetch")
+        .into_iter()
+        .filter_map(|spec| sley_protocol::parse_refspec(&spec).ok())
+        .collect::<Vec<_>>();
     let refs = FileRefStore::new(git_dir, format);
     let mut tx = refs.transaction();
     for command in commands {
-        let Some(branch) = command.name.strip_prefix("refs/heads/") else {
-            continue;
-        };
-        let name = format!("refs/remotes/{remote}/{branch}");
-        if command.new_id.is_null() {
-            let _ = refs.delete_ref(&name);
-        } else if refs.read_ref(&name)? == Some(RefTarget::Direct(command.new_id)) {
-            let packed_name = name.clone();
-            refs.pack_refs_selected_with_timeout(
-                true,
-                false,
-                0,
-                |candidate| candidate == packed_name,
-                |_, _| Ok(PackRefDecision::Pack { peeled: None }),
-            )?;
-            continue;
-        } else {
-            tx.update(RefUpdate {
-                name,
-                expected: None,
-                new: RefTarget::Direct(command.new_id),
-                reflog: None,
-            });
+        let mut tracking_names = Vec::new();
+        for refspec in &fetch_refspecs {
+            if refspec.negative {
+                continue;
+            }
+            if let Some(name) = sley_protocol::refspec_map_source(refspec, &command.name)? {
+                tracking_names.push(name);
+            }
+        }
+        if tracking_names.is_empty() {
+            if let Some(branch) = command.name.strip_prefix("refs/heads/") {
+                tracking_names.push(format!("refs/remotes/{remote}/{branch}"));
+            }
+        }
+        for name in tracking_names {
+            if command.new_id.is_null() {
+                let _ = refs.delete_ref(&name);
+            } else if refs.read_ref(&name)? == Some(RefTarget::Direct(command.new_id)) {
+                let packed_name = name.clone();
+                refs.pack_refs_selected_with_timeout(
+                    true,
+                    false,
+                    0,
+                    |candidate| candidate == packed_name,
+                    |_, _| Ok(PackRefDecision::Pack { peeled: None }),
+                )?;
+                continue;
+            } else {
+                tx.update(RefUpdate {
+                    name,
+                    expected: None,
+                    new: RefTarget::Direct(command.new_id),
+                    reflog: None,
+                });
+            }
         }
     }
     tx.commit()
