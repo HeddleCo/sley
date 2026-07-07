@@ -4390,12 +4390,9 @@ fn update_ref_should_write_reflog(git_dir: &Path, name: &str, create_reflog: boo
     if reflog_path_for_ref(git_dir, name)?.exists() || create_reflog {
         return Ok(true);
     }
-    // git resolves reflog autocreation from the repository's persistent
-    // `core.logAllRefUpdates` (the config *files*), NOT from a command-line
-    // `-c core.logAllRefUpdates=...` override: `git -c …=false update-ref
-    // refs/heads/x` still writes the reflog when the repo config says true, and
-    // `-c …=true` in a bare repo does not. So read the file config below and do
-    // not consult the injected `-c` parameters here.
+    if let Some(value) = global_config_value("core.logAllRefUpdates")? {
+        return Ok(update_ref_log_all_ref_updates_matches(name, &value));
+    }
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let Ok(config) = GitConfig::read(common_git_dir.join("config")) else {
         return Ok(false);
