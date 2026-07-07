@@ -711,7 +711,7 @@ declare -A FLOOR=(
     # disjoint files, combined t7600 44->49 (stable 49x3). describe enrolled at 84 (74->84).
     # codex-wave-3 (2026-06-17): merge --no-edit acceptance + rename cleanup 49->50.
     [t7600-merge.sh]=83
-    [t6120-describe.sh]=107
+    [t6120-describe.sh]=131
     # wave-1 integration (2026-06-18, integ/wave1): codex/parity-maintenance lifted
     # t7900-maintenance 12->37 (cmd_maintenance gain in pack.rs). Stable 37x3 on the
     # integrated binary.
@@ -1534,7 +1534,7 @@ declare -A FLOOR=(
     [t0100-previous.sh]=5
     [t0200-gettext-basic.sh]=16
     [t0201-gettext-fallbacks.sh]=8
-    [t0302-credential-store.sh]=2
+    [t0302-credential-store.sh]=59
     [t1016-compatObjectFormat.sh]=0
     [t1301-shared-repo.sh]=7
     [t1302-repo-version.sh]=14
@@ -1608,7 +1608,7 @@ declare -A FLOOR=(
     [t5401-update-hooks.sh]=11
     [t5409-colorize-remote-messages.sh]=2
     [t5410-receive-pack.sh]=1
-    [t5411-proc-receive-hook.sh]=197
+    [t5411-proc-receive-hook.sh]=198
     [t5501-fetch-push-alternates.sh]=3
     [t5502-quickfetch.sh]=2
     [t5503-tagfollow.sh]=6
@@ -1675,8 +1675,10 @@ declare -A FLOOR=(
     [t0211-trace2-perf.sh]=17
     [t0212-trace2-event.sh]=11
     [t0213-trace2-ancestry.sh]=5
-    [t0300-credentials.sh]=1
-    [t0301-credential-cache.sh]=0
+    [t0300-credentials.sh]=52
+    # t0301 15 observed (2026-07-07, credential-cache daemon); spawn_daemon read race may
+    # oscillate isolated runs — banked at stable-low 13 until the retry-loop fix lands.
+    [t0301-credential-cache.sh]=13
     [t0303-credential-external.sh]=10
     [t0450-txt-doc-vs-help.sh]=643
     [t0500-progress-display.sh]=16
