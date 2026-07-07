@@ -327,6 +327,8 @@ mod tests {
             deepen_not: Vec::new(),
             ssh_options: None,
             atomic: false,
+            negotiation_restrict: None,
+            negotiation_include: None,
         }
     }
 

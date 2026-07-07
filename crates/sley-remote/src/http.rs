@@ -649,6 +649,9 @@ pub struct HttpFetchPackRequest<'a> {
     pub remote: &'a RemoteUrl,
     /// Wanted object ids.
     pub wants: Vec<ObjectId>,
+    /// Caller-selected negotiation haves. `None` means advertise the default
+    /// local haves.
+    pub haves: Option<Vec<ObjectId>>,
     /// Existing shallow boundary to replay.
     pub shallow: Vec<ObjectId>,
     /// Requested deepen depth, if this is a shallow fetch.
@@ -696,11 +699,12 @@ pub fn install_fetch_pack_via_http_upload_pack(
         request.deepen_not,
         request.filter.as_ref(),
     );
-    let haves = if request.omit_haves {
-        Vec::new()
-    } else {
-        crate::local::local_have_oids(request.git_dir, request.format)?
-    };
+    let haves = request_haves(
+        request.git_dir,
+        request.format,
+        request.omit_haves,
+        request.haves.clone(),
+    )?;
     if request.deepen.is_none() {
         let mut response = http_upload_pack_post(
             request.client,
@@ -771,11 +775,12 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
     {
         return Ok(Vec::new());
     }
-    let haves = if request.omit_haves {
-        Vec::new()
-    } else {
-        crate::local::local_have_oids(request.git_dir, request.format)?
-    };
+    let haves = request_haves(
+        request.git_dir,
+        request.format,
+        request.omit_haves,
+        request.haves.clone(),
+    )?;
     let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
         request.wants,
         haves,
@@ -824,6 +829,21 @@ fn all_wants_present(db: &FileObjectDatabase, wants: &[ObjectId]) -> Result<bool
         }
     }
     Ok(true)
+}
+
+fn request_haves(
+    git_dir: &Path,
+    format: ObjectFormat,
+    omit_haves: bool,
+    custom_haves: Option<Vec<ObjectId>>,
+) -> Result<Vec<ObjectId>> {
+    if omit_haves {
+        Ok(Vec::new())
+    } else if let Some(haves) = custom_haves {
+        Ok(haves)
+    } else {
+        crate::local::local_have_oids(git_dir, format)
+    }
 }
 
 #[cfg(test)]

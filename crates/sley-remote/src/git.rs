@@ -75,6 +75,7 @@ pub struct GitFetchPackRequest<'a> {
     pub config: Option<&'a GitConfig>,
     pub features: &'a UploadPackFeatures,
     pub wants: Vec<ObjectId>,
+    pub haves: Option<Vec<ObjectId>>,
     pub shallow: Vec<ObjectId>,
     pub deepen: Option<u32>,
     pub promisor: bool,
@@ -212,7 +213,11 @@ pub fn install_fetch_pack_via_git_upload_pack(
     if request.deepen.is_none() && all_wants_present(&local_db, &request.wants)? {
         return Ok(Vec::new());
     }
-    let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
+    let haves = request
+        .haves
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| crate::local::local_have_oids(request.git_dir, request.format))?;
     if request.protocol_v2 {
         return git_protocol_v2_fetch_into_repository(&request, haves, &local_db);
     }

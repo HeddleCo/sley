@@ -1044,6 +1044,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
     promisor: bool,
     record_promisor_refs: bool,
     filter: Option<sley_odb::PackObjectFilter>,
+    custom_haves: Option<Vec<ObjectId>>,
     refetch: bool,
     unpack_limit: Option<usize>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
@@ -1101,6 +1102,8 @@ pub fn install_fetch_pack_via_local_upload_pack(
     }
     let haves = if refetch || direct_promisor_object_fetch {
         Vec::new()
+    } else if let Some(haves) = custom_haves {
+        haves
     } else {
         local_have_oids(git_dir, format)?
     };
@@ -1874,6 +1877,7 @@ mod tests {
             false,
             false,
             None,
+            None,
             false,
             None,
         )
@@ -1894,6 +1898,7 @@ mod tests {
             false,
             false,
             None,
+            None,
             false,
             None,
         )
@@ -1912,6 +1917,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             None,
             false,
             None,
@@ -1963,6 +1969,7 @@ mod tests {
             None,
             true,
             false,
+            None,
             None,
             false,
             None,

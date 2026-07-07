@@ -473,6 +473,7 @@ fn fetch_partial_clone_checkout_blobs(
                 true,
                 false,
                 None,
+                None,
                 false,
                 None,
             )?;
@@ -538,6 +539,7 @@ fn fetch_http_partial_clone_checkout_blobs(
         format: request.format,
         remote,
         wants,
+        haves: None,
         shallow: Vec::new(),
         deepen: None,
         promisor: true,
@@ -659,5 +661,7 @@ fn clone_fetch_options(
         deepen_not,
         ssh_options,
         atomic: false,
+        negotiation_restrict: None,
+        negotiation_include: None,
     }
 }
