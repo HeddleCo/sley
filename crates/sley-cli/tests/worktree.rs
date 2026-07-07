@@ -676,7 +676,6 @@ fn sha256_linked_worktree_commands_use_common_git_dir() {
 }
 
 #[test]
-#[ignore = "sley#122: pre-alpha cleanup output-parity regression"]
 fn worktree_add_error_paths_match_upstream_git() {
     let root = unique_temp_dir("worktree-add-errors");
     fs::create_dir_all(&root).expect("create temp root");
