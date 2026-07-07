@@ -208,74 +208,8 @@ fn paths_refer_to_same_dir(left: &Path, right: &Path) -> bool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Repository;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    struct TempDir {
-        path: PathBuf,
-    }
-
-    impl TempDir {
-        fn new() -> Self {
-            let path = env::temp_dir().join(format!(
-                "sley-open-env-{}-{}",
-                std::process::id(),
-                TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&path).expect("create temp dir");
-            Self { path }
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
-    #[test]
-    fn open_from_environment_honors_git_dir_and_work_tree() {
-        let temp = TempDir::new();
-        let repo = Repository::init(temp.path()).expect("init");
-        let sub = temp.path().join("sub");
-        fs::create_dir_all(&sub).expect("create subdir");
-
-        let previous_git_dir = env::var_os("GIT_DIR");
-        let previous_work_tree = env::var_os("GIT_WORK_TREE");
-        env::set_var("GIT_DIR", "../.git");
-        env::set_var("GIT_WORK_TREE", "..");
-
-        let opened = std::env::set_current_dir(&sub)
-            .and_then(|_| Repository::open_from_environment("."))
-            .expect("open from environment");
-
-        if let Some(value) = previous_git_dir {
-            env::set_var("GIT_DIR", value);
-        } else {
-            env::remove_var("GIT_DIR");
-        }
-        if let Some(value) = previous_work_tree {
-            env::set_var("GIT_WORK_TREE", value);
-        } else {
-            env::remove_var("GIT_WORK_TREE");
-        }
-
-        assert_eq!(
-            fs::canonicalize(opened.git_dir()).expect("canon git dir"),
-            fs::canonicalize(repo.git_dir()).expect("canon expected git dir")
-        );
-        assert_eq!(
-            opened.workdir(),
-            Some(fs::canonicalize(temp.path()).expect("canon worktree"))
-        );
-    }
-}
+// `open_from_environment_honors_git_dir_and_work_tree` lived here but required
+// in-process `env::set_var`, which edition 2024 makes `unsafe` and the workspace
+// forbids (`unsafe_code = "forbid"`). GIT_DIR / GIT_WORK_TREE override discovery
+// is covered end-to-end instead: `crates/sley-cli/tests/{global_options,rev_parse}.rs`
+// and upstream parity t1500-rev-parse / t1510-repo-setup / t2050-git-dir-relative.

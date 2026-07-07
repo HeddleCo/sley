@@ -63,5 +63,14 @@ tls-native-tls = ["sley-transport/tls-native-tls"]
 tls-platform-verifier = ["sley-transport/tls-platform-verifier"]
 git-compat-i18n = ["dep:sley-i18n"]
 
+# Integration tests build low-level fixtures (commit-graph parsing, raw ODB
+# writes, object-format constants) directly. These are dev-only and do NOT
+# widen the shipped facade dependency surface (`[dependencies]` stays
+# sley + sley-options + the small facade set).
+[dev-dependencies]
+sley-core.workspace = true
+sley-formats.workspace = true
+sley-odb.workspace = true
+
 [lints]
 workspace = true
