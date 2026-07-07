@@ -63,6 +63,32 @@ impl RegexDiagnosticVerbosity {
             _ => Self::Default,
         }
     }
+
+    /// The verbosity that matches the platform's libc `regerror` strings, so
+    /// `*_matches_upstream_git` parity holds against a git built on the same
+    /// platform. git prints the C library's `regerror` text for a bad pattern:
+    /// BSD libc (macOS / *BSD) yields the detailed `brackets ([ ]) not
+    /// balanced` (Verbose); glibc (Linux, what CI builds) yields the generic
+    /// `Invalid regular expression` (Default).
+    pub const fn platform_default() -> Self {
+        if platform_uses_bsd_libc_diagnostics() {
+            Self::Verbose
+        } else {
+            Self::Default
+        }
+    }
+}
+
+/// Whether the target platform's C library emits the detailed BSD-style regex
+/// and option diagnostics (macOS and the BSDs) rather than glibc's terser forms.
+pub const fn platform_uses_bsd_libc_diagnostics() -> bool {
+    cfg!(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -631,7 +631,8 @@ fn setup_verify_pack_options(args: &[String]) -> Result<VerifyPackOptions> {
     })
 }
 
-const VERIFY_PACK_USAGE: &[&str] = &["git verify-pack [-v | --verbose | -s | --stat-only] [--] <pack>..."];
+const VERIFY_PACK_USAGE: &[&str] =
+    &["git verify-pack [-v | --verbose] [-s | --stat-only] [--] <pack>.idx..."];
 
 fn verify_pack_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
     static SPECS: &[sley_options::OptionSpec<'static>] = &[
@@ -640,7 +641,7 @@ fn verify_pack_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
         opt_str(
             None,
             Some("object-format"),
-            "<format>",
+            "<hash>",
             OptFlags::NONE,
             "specify the hash algorithm to use",
         ),

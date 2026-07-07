@@ -246,7 +246,9 @@ const WORKTREE_REMOVE_USAGE: &[&str] = &["git worktree remove [-f] <worktree>"];
 const WORKTREE_MOVE_USAGE: &[&str] = &["git worktree move <worktree> <new-path>"];
 const WORKTREE_REPAIR_USAGE: &[&str] = &["git worktree repair [<path>...]"];
 const WORKTREE_UNLOCK_USAGE: &[&str] = &["git worktree unlock <worktree>"];
-const WORKTREE_ADD_USAGE: &[&str] = &["git worktree add [-f] [--detach] [--checkout] [--lock [--reason <string>]] [--orphan] [(-b | -B) <new-branch>] <path> [<commit-ish>]"];
+const WORKTREE_ADD_USAGE: &[&str] = &[
+    "git worktree add [-f] [--detach] [--checkout] [--lock [--reason <string>]]\n                        [--orphan] [(-b | -B) <new-branch>] <path> [<commit-ish>]",
+];
 
 fn worktree_list_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
     static SPECS: &[sley_options::OptionSpec<'static>] = &[

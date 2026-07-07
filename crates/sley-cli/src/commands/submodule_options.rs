@@ -424,9 +424,9 @@ pub(super) fn setup_submodule_summary_options(
 ) -> Result<SubmoduleSummaryOptions> {
     static SPECS: &[OptionSpec<'static>] = &[
         SUBMODULE_QUIET_SPEC,
-        opt_bool(None, Some("cached"), OptFlags::NONE, "show cached values"),
-        opt_bool(None, Some("files"), OptFlags::NONE, "show files"),
-        opt_bool(None, Some("for-status"), OptFlags::NONE, "for status"),
+        opt_bool(None, Some("cached"), OptFlags::NONEG, "show cached values"),
+        opt_bool(None, Some("files"), OptFlags::NONEG, "show files"),
+        opt_bool(None, Some("for-status"), OptFlags::NONEG, "for status"),
         OptionSpec {
             short: Some('n'),
             long: Some("summary-limit"),
