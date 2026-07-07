@@ -378,6 +378,19 @@ fn build_http_upload_pack_request(
 
 fn upload_pack_request_capabilities(deepen: Option<u32>, filter: bool) -> Vec<Capability> {
     let mut capabilities = Vec::new();
+    // The v0 upload-pack response reader demuxes a side-band-64k stream, so the
+    // request must negotiate it; otherwise the server streams a bare packfile
+    // and the reader mis-parses the leading `PACK` signature as a pkt-line
+    // length ("invalid pkt-line length byte 0x50"). ofs-delta matches git's
+    // default fetch capabilities.
+    capabilities.push(Capability {
+        name: "side-band-64k".into(),
+        value: None,
+    });
+    capabilities.push(Capability {
+        name: "ofs-delta".into(),
+        value: None,
+    });
     if deepen.is_some() {
         capabilities.push(Capability {
             name: "shallow".into(),
