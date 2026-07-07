@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 
 use crate::pktline::{
     PktLineFrame, PKT_LINE_MAX_PAYLOAD_LEN, line_from_str, parse_protocol_v2_line_text,
-    pkt_line_header, read_pkt_line_frames_until_flush, trim_trailing_lf, validate_protocol_v2_token,
+    pkt_line_header, read_pkt_line_frames_until_flush,
     write_pkt_line_payload,
 };
 

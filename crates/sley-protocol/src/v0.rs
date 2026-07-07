@@ -2,10 +2,10 @@ use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use std::io::{Read, Write};
 
 use crate::pktline::{
-    FetchHeadRecord, FetchRefUpdate, GitService, PktLineFrame, ProtocolVersion, RefSpec, line,
-    line_from_str, non_empty, parse_oid_argument, parse_protocol_v2_line_text,
+    FetchHeadRecord, FetchRefUpdate, PktLineFrame, ProtocolVersion, RefSpec,
+    line_from_str, parse_oid_argument, parse_protocol_v2_line_text,
     read_pkt_line_frames_until_flush, refspec_map_source, refspec_matches_source, trim_trailing_lf,
-    validate_capability_field, validate_capability_name, validate_fetch_head_description_field,
+    validate_capability_field, validate_fetch_head_description_field,
     validate_fetch_head_line, validate_protocol_v2_token, validate_refspec_shape,
     write_pkt_line_payload,
 };

@@ -2,7 +2,7 @@ use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use std::io::{Read, Write};
 
 use crate::pktline::{
-    PushSourceRef, RefSpec, PktLineFrame, line, line_from_str, parse_protocol_v2_line_text,
+    PushSourceRef, RefSpec, PktLineFrame, line_from_str, parse_protocol_v2_line_text,
     parse_pkt_line_frames_until_flush_from, read_pkt_line_frames_until_flush, trim_trailing_lf,
     validate_capability_field,
     validate_protocol_v2_token, validate_refspec_endpoint, validate_refspec_shape,

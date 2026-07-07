@@ -4,18 +4,14 @@ use std::io::{Read, Write};
 use crate::pktline::{
     PktLineFrame, ProtocolVersion, line, line_from_str, parse_oid_argument, parse_protocol_v2_line_text,
     read_pkt_line_frame, read_pkt_line_frames_until_flush, read_pkt_line_frames_until_response_end,
-    trim_trailing_lf, validate_capability_field, validate_capability_name, validate_protocol_v2_line,
-    validate_protocol_v2_token, write_pkt_line_frame, write_pkt_line_frames, write_pkt_line_payload,
+    trim_trailing_lf, validate_capability_name, validate_protocol_v2_line,
+    validate_protocol_v2_token, write_pkt_line_frame, write_pkt_line_payload,
 };
-use crate::receive_pack::reject_capability_value;
 use crate::sideband::{
-    SideBandChannel, SideBandDemux, SideBandPacket, demux_sideband_packets, encode_sideband_packet,
-    encode_sideband_stream, parse_and_demux_sideband_packets, parse_sideband_packet,
-    parse_sideband_stream, write_sideband_packet, write_sideband_payload, write_sideband_stream,
+    SideBandChannel, SideBandDemux, SideBandPacket, encode_sideband_packet, parse_and_demux_sideband_packets, parse_sideband_packet, write_sideband_payload,
 };
 use crate::v0::{
-    RefAdvertisement, RefAdvertisementSet, TransportHandshake, encode_capabilities, parse_capabilities,
-    parse_ref_advertisement,
+    RefAdvertisement, RefAdvertisementSet, TransportHandshake,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

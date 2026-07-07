@@ -1,7 +1,6 @@
 use super::*;
 use crate::receive_pack::zero_object_id;
-use sley_core::{Capability, GitError, ObjectFormat, ObjectId};
-use std::io::{Cursor, Read, Write};
+use sley_core::{Capability, ObjectFormat, ObjectId};
 
 #[test]
 fn pkt_line_frame_encodes_data_and_control_frames() {

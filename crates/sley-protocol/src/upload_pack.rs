@@ -2,15 +2,14 @@ use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use std::io::{Read, Write};
 
 use crate::pktline::{
-    PKT_LINE_MAX_LEN, PktLineFrame, line, line_from_str, parse_oid_argument, parse_pkt_len,
-    parse_pkt_line_stream, parse_protocol_v2_line_text, parse_pkt_line_frames_until_flush_from,
+    PKT_LINE_MAX_LEN, PktLineFrame, line_from_str, parse_oid_argument, parse_pkt_len, parse_protocol_v2_line_text,
     read_pkt_line_frame, read_pkt_line_frames_until_flush, trace_packet_read_payload, trim_trailing_lf,
     validate_capability_field, validate_protocol_v2_token, write_pkt_line_payload,
 };
 use crate::receive_pack::reject_capability_value;
 use crate::sideband::{
-    SideBandDemux, SideBandPacket, demux_sideband_packets, encode_sideband_packet, encode_sideband_stream,
-    parse_sideband_packet, write_sideband_packet, write_sideband_stream,
+    SideBandDemux, SideBandPacket, demux_sideband_packets, encode_sideband_packet,
+    parse_sideband_packet, write_sideband_packet,
 };
 use crate::v0::{encode_capabilities, parse_capabilities};
 use crate::v2::{

@@ -1,4 +1,4 @@
-use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use std::io::{ErrorKind, Read, Write};
 use std::sync::RwLock;
 

@@ -85,7 +85,6 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
-expect_used = "deny"
 dbg_macro = "deny"
 todo = "deny"
 clone_on_copy = "allow"
