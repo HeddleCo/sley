@@ -470,7 +470,7 @@ pub(crate) fn unknown_command(command: &str, code: i32) -> Result<()> {
 }
 
 pub(crate) fn print_command_usage(command: &str) {
-    println!("usage: git {command} [<options>]");
+    crate::command_synopsis::print_command_synopsis(command);
 }
 
 fn set_mode(current: HelpMode, next: HelpMode) -> Result<HelpMode> {

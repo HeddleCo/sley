@@ -62,6 +62,7 @@ use std::sync::{Arc, Mutex};
 
 mod checkout_reset;
 mod cli_misc;
+mod command_synopsis;
 mod commands;
 mod commit_identity;
 mod commit_message;
