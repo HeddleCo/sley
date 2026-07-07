@@ -2083,6 +2083,7 @@ pub fn run_local_push_post_hooks(
         remote_stderr,
         capture_stderr,
     )?;
+    crate::receive_hooks::run_push_to_checkout(remote_git_dir, remote_stderr, capture_stderr)?;
     Ok(())
 }
 

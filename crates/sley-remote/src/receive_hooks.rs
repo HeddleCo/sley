@@ -119,10 +119,39 @@ pub fn run_post_update(
     )
 }
 
+/// Mirrors the legacy local-push path: push-to-checkout runs after post-update
+/// for local destinations. Faithful gating (only on a push to the checked-out
+/// branch under receive.denyCurrentBranch=updateInstead, with the new commit
+/// as argv[1] — receive-pack.c update_worktree) is still to be implemented;
+/// sley has no denyCurrentBranch handling yet (t1800 #56 asserts the
+/// stdout-to-stderr redirection of this hook).
+pub fn run_push_to_checkout(
+    git_dir: &Path,
+    remote_stderr: &mut Vec<u8>,
+    capture_stderr: bool,
+) -> Result<()> {
+    let Some(path) = find_hook_path(git_dir, "push-to-checkout") else {
+        return Ok(());
+    };
+    spawn_hook(
+        git_dir,
+        &path,
+        &[],
+        None,
+        &[],
+        remote_stderr,
+        capture_stderr,
+    )
+}
+
 fn find_hook_path(git_dir: &Path, hook_name: &str) -> Option<PathBuf> {
     let common = repository_common_dir(git_dir);
     let path = common.join("hooks").join(hook_name);
-    if path.is_file() { Some(path) } else { None }
+    if path.is_file() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 fn spawn_hook(
@@ -144,7 +173,14 @@ fn spawn_hook(
         } else {
             Stdio::null()
         })
-        .stdout(Stdio::null())
+        // git's receive-pack runs every server hook with stdout_to_stderr=1 so
+        // hook stdout reaches the client on the same channel as stderr
+        // (t1800 #55/#56); it must never leak onto the push's stdout.
+        .stdout(if capture_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::from(std::io::stderr())
+        })
         .stderr(if capture_stderr {
             Stdio::piped()
         } else {
@@ -163,6 +199,9 @@ fn spawn_hook(
     }
     let status = child.wait().map_err(|err| GitError::Io(err.to_string()))?;
     if capture_stderr {
+        if let Some(mut stdout) = child.stdout.take() {
+            let _ = std::io::copy(&mut stdout, remote_stderr);
+        }
         if let Some(mut stderr) = child.stderr.take() {
             let _ = std::io::copy(&mut stderr, remote_stderr);
         }
@@ -207,14 +246,8 @@ fn post_receive_hook_stdin(commands: &[ReceivePackCommandState]) -> Vec<u8> {
         let mut report = report_iter.next();
         loop {
             let (old_id, new_id, name) = if let Some(rep) = report {
-                let old_id = rep
-                    .old_oid
-                    .as_ref()
-                    .unwrap_or(&state.command.old_id);
-                let new_id = rep
-                    .new_oid
-                    .as_ref()
-                    .unwrap_or(&state.command.new_id);
+                let old_id = rep.old_oid.as_ref().unwrap_or(&state.command.old_id);
+                let new_id = rep.new_oid.as_ref().unwrap_or(&state.command.new_id);
                 let name = rep
                     .refname
                     .as_deref()

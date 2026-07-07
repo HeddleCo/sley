@@ -6,26 +6,26 @@ use std::path::Path;
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, Result};
-use sley_odb::{FileObjectDatabase, repository_common_dir};
+use sley_odb::{repository_common_dir, FileObjectDatabase};
 use sley_protocol::{
-    ReceivePackCommand, ReceivePackCommandStatus, ReceivePackCommandStatusV2,
-    ReceivePackCommandStatusV2Options, ReceivePackPushRequest, ReceivePackPushRequestHeader,
-    ReceivePackReportStatus, ReceivePackReportStatusV2, ReceivePackUnpackStatus, SideBandChannel,
-    SideBandPacket, validate_receive_pack_push_request_features, write_receive_pack_report_status,
-    write_receive_pack_report_status_v2, write_sideband_packet,
+    validate_receive_pack_push_request_features, write_receive_pack_report_status,
+    write_receive_pack_report_status_v2, write_sideband_packet, ReceivePackCommand,
+    ReceivePackCommandStatus, ReceivePackCommandStatusV2, ReceivePackCommandStatusV2Options,
+    ReceivePackPushRequest, ReceivePackPushRequestHeader, ReceivePackReportStatus,
+    ReceivePackReportStatusV2, ReceivePackUnpackStatus, SideBandChannel, SideBandPacket,
 };
 use sley_refs::FileRefStore;
 
 use crate::local::{apply_receive_pack_ref_transaction, receive_pack_features};
-use crate::push::stage_local_push_quarantine;
 use crate::proc_receive::{
-    ProcReceiveHookInput, ReceivePackCommandState, apply_proc_receive_hook_failure,
-    mark_proc_receive_commands, parse_proc_receive_refs, run_proc_receive_hook,
+    apply_proc_receive_hook_failure, mark_proc_receive_commands, parse_proc_receive_refs,
+    run_proc_receive_hook, ProcReceiveHookInput, ReceivePackCommandState,
 };
+use crate::push::stage_local_push_quarantine;
 use crate::receive_hooks::{
-    hook_exists, run_post_receive, run_post_update, run_pre_receive, run_update_hooks,
+    hook_exists, run_post_receive, run_post_update, run_pre_receive, run_push_to_checkout,
+    run_update_hooks,
 };
-
 
 pub struct ReceivePackServerOptions<'a> {
     pub quiet: bool,
@@ -56,13 +56,12 @@ pub struct ReceivePackServerOutcome {
     pub command_states: Vec<ReceivePackCommandState>,
 }
 
-pub fn serve_receive_pack(request: ReceivePackServerRequest<'_>) -> Result<ReceivePackServerOutcome> {
+pub fn serve_receive_pack(
+    request: ReceivePackServerRequest<'_>,
+) -> Result<ReceivePackServerOutcome> {
     let mut discard_stderr = Vec::new();
     let capture_stderr = request.options.remote_stderr.is_some();
-    let remote_stderr = request
-        .options
-        .remote_stderr
-        .unwrap_or(&mut discard_stderr);
+    let remote_stderr = request.options.remote_stderr.unwrap_or(&mut discard_stderr);
 
     validate_receive_pack_push_request_features(
         &receive_pack_features(request.format),
@@ -148,15 +147,13 @@ pub fn serve_receive_pack(request: ReceivePackServerRequest<'_>) -> Result<Recei
                     state.error_string = Some("pre-receive hook declined".into());
                 }
             }
-        } else if let Some(name) =
-            run_update_hooks(
-                request.git_dir,
-                &ok_commands,
-                &quarantine_env,
-                remote_stderr,
-                capture_stderr,
-            )?
-        {
+        } else if let Some(name) = run_update_hooks(
+            request.git_dir,
+            &ok_commands,
+            &quarantine_env,
+            remote_stderr,
+            capture_stderr,
+        )? {
             for state in &mut command_states {
                 if state.error_string.is_none() {
                     if use_atomic {
@@ -237,6 +234,7 @@ pub fn run_receive_pack_post_hooks(
         capture_stderr,
     );
     let _ = run_post_update(git_dir, &landed, remote_stderr, capture_stderr);
+    let _ = run_push_to_checkout(git_dir, remote_stderr, capture_stderr);
 }
 
 pub fn receive_pack_server_report_v1(report: &ReceivePackServerReport) -> ReceivePackReportStatus {
@@ -357,9 +355,9 @@ fn quarantine_hook_env(git_dir: &Path, object_dir: &Path) -> Vec<(String, String
 }
 
 fn needs_pack_data(states: &[ReceivePackCommandState]) -> bool {
-    states.iter().any(|state| {
-        state.error_string.is_none() && !state.command.new_id.is_null()
-    })
+    states
+        .iter()
+        .any(|state| state.error_string.is_none() && !state.command.new_id.is_null())
 }
 
 fn install_pack_from_reader(
@@ -474,7 +472,10 @@ fn build_report(
                 }
             }
         }
-        Ok(ReceivePackServerReport::V2(ReceivePackReportStatusV2 { unpack, commands }))
+        Ok(ReceivePackServerReport::V2(ReceivePackReportStatusV2 {
+            unpack,
+            commands,
+        }))
     } else {
         let commands = command_states
             .iter()
@@ -491,6 +492,9 @@ fn build_report(
                 }
             })
             .collect();
-        Ok(ReceivePackServerReport::V1(ReceivePackReportStatus { unpack, commands }))
+        Ok(ReceivePackServerReport::V1(ReceivePackReportStatus {
+            unpack,
+            commands,
+        }))
     }
 }
