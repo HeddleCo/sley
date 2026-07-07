@@ -261,24 +261,57 @@ pub fn receive_pack_server_report_v1(report: &ReceivePackServerReport) -> Receiv
     }
 }
 
+/// Write hook stderr captured during receive-pack as sideband-64k progress packets.
+pub fn write_receive_pack_sideband_stderr(
+    writer: &mut impl Write,
+    stderr: &[u8],
+) -> Result<()> {
+    if stderr.is_empty() {
+        return Ok(());
+    }
+    for chunk in stderr.chunks(SIDEBAND_PAYLOAD_CHUNK) {
+        write_sideband_packet(
+            writer,
+            &SideBandPacket {
+                channel: SideBandChannel::Progress,
+                data: chunk.to_vec(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Flush a sideband-64k receive-pack response stream (after progress + report packets).
+pub fn flush_receive_pack_sideband(writer: &mut impl Write) -> Result<()> {
+    writer.write_all(b"0000")?;
+    Ok(())
+}
+
 pub fn write_receive_pack_server_report(
     writer: &mut impl Write,
     report: &ReceivePackServerReport,
     use_sideband: bool,
+    flush_stream: bool,
 ) -> Result<()> {
     match report {
         ReceivePackServerReport::V1(status) => {
             if use_sideband {
-                write_report_sideband(writer, |buf| write_receive_pack_report_status(buf, status))
+                write_report_sideband(
+                    writer,
+                    |buf| write_receive_pack_report_status(buf, status),
+                    flush_stream,
+                )
             } else {
                 write_receive_pack_report_status(writer, status)
             }
         }
         ReceivePackServerReport::V2(status) => {
             if use_sideband {
-                write_report_sideband(writer, |buf| {
-                    write_receive_pack_report_status_v2(buf, status)
-                })
+                write_report_sideband(
+                    writer,
+                    |buf| write_receive_pack_report_status_v2(buf, status),
+                    flush_stream,
+                )
             } else {
                 write_receive_pack_report_status_v2(writer, status)
             }
@@ -294,13 +327,17 @@ pub fn request_uses_sideband(header: &ReceivePackPushRequestHeader) -> bool {
         .any(|cap| cap.name == "side-band-64k")
 }
 
+/// Maximum sideband payload bytes per packet (git `LARGE_PACKET_MAX - 5`).
+const SIDEBAND_PAYLOAD_CHUNK: usize = 65_515;
+
 fn write_report_sideband(
     writer: &mut impl Write,
     write_report: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+    flush_stream: bool,
 ) -> Result<()> {
     let mut payload = Vec::new();
     write_report(&mut payload)?;
-    for chunk in payload.chunks(65516) {
+    for chunk in payload.chunks(SIDEBAND_PAYLOAD_CHUNK) {
         write_sideband_packet(
             writer,
             &SideBandPacket {
@@ -309,7 +346,9 @@ fn write_report_sideband(
             },
         )?;
     }
-    writer.write_all(b"0000")?;
+    if flush_stream {
+        writer.write_all(b"0000")?;
+    }
     Ok(())
 }
 

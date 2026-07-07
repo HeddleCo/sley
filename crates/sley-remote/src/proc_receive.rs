@@ -247,7 +247,7 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
         input.use_push_options,
     ) {
         hook_failed = true;
-        eprintln!("error: {err}");
+        eprintln!("error: {}", proc_receive_remote_error_message(&err));
     }
 
     if !hook_failed {
@@ -274,7 +274,7 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
             Ok(use_push_options) => hook_use_push_options = use_push_options,
             Err(err) => {
                 hook_failed = true;
-                let message = err.to_string();
+                let message = proc_receive_remote_error_message(&err);
                 if input.capture_stderr {
                     input
                         .remote_stderr
@@ -307,6 +307,7 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
         let mut reader = stdout;
         let outcome = read_proc_receive_report(input.format, &mut reader, &mut commands);
         for message in &outcome.protocol_messages {
+            let message = proc_receive_remote_error_message(message);
             if input.capture_stderr {
                 input
                     .remote_stderr
@@ -396,7 +397,7 @@ fn read_proc_receive_version_response(reader: &mut impl Read) -> Result<bool> {
                         })?;
                     if version != 0 && version != 1 {
                         return Err(GitError::InvalidFormat(format!(
-                            "proc-receive version \"{version}\" is not supported"
+                            "proc-receive version '{version}' is not supported"
                         )));
                     }
                     if text.contains('\0') {
@@ -436,7 +437,9 @@ fn read_proc_receive_report(
         Ok(frames) => frames,
         Err(err) => {
             outcome.hook_failed = true;
-            outcome.protocol_messages.push(err.to_string());
+            outcome
+                .protocol_messages
+                .push(proc_receive_remote_error_message(&err));
             return outcome;
         }
     };
@@ -592,6 +595,14 @@ fn pkt_line_bytes(payload: &[u8]) -> &[u8] {
 
 fn pkt_line_text(payload: &[u8]) -> Result<&str> {
     std::str::from_utf8(pkt_line_bytes(payload)).map_err(|err| GitError::InvalidFormat(err.to_string()))
+}
+
+fn proc_receive_remote_error_message(err: impl std::fmt::Display) -> String {
+    let message = err.to_string();
+    message
+        .strip_prefix("invalid format: ")
+        .unwrap_or(&message)
+        .to_string()
 }
 
 pub fn apply_proc_receive_hook_failure(

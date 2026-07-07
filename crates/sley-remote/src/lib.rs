@@ -84,8 +84,9 @@ pub use proc_receive::{
 };
 pub use receive_pack_server::{
     ReceivePackServerOptions, ReceivePackServerOutcome, ReceivePackServerReport,
-    ReceivePackServerRequest, receive_pack_server_report_v1, request_uses_sideband,
-    run_receive_pack_post_hooks, serve_receive_pack, write_receive_pack_server_report,
+    ReceivePackServerRequest, flush_receive_pack_sideband, receive_pack_server_report_v1,
+    request_uses_sideband, run_receive_pack_post_hooks, serve_receive_pack,
+    write_receive_pack_server_report, write_receive_pack_sideband_stderr,
 };
 
 mod local;
