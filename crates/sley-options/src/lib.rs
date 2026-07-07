@@ -630,14 +630,21 @@ impl<'a> OptValue<'a> {
         let Some(metavar) = self.metavar() else {
             return String::new();
         };
+        // git renders a bare metavar wrapped in a single `<>`. Some specs already
+        // supply the angle brackets (`"<pattern>"`); don't wrap those again or the
+        // option list shows `<<pattern>>` where git shows `<pattern>`.
+        let inner = metavar
+            .strip_prefix('<')
+            .and_then(|rest| rest.strip_suffix('>'))
+            .unwrap_or(metavar);
         if flags.contains(OptFlags::OPTARG) {
             if has_long {
-                format!("[=<{metavar}>]")
+                format!("[=<{inner}>]")
             } else {
-                format!("[<{metavar}>]")
+                format!("[<{inner}>]")
             }
         } else {
-            format!(" <{metavar}>")
+            format!(" <{inner}>")
         }
     }
 
