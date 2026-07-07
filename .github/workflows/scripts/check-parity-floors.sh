@@ -1610,7 +1610,7 @@ declare -A FLOOR=(
     [t5410-receive-pack.sh]=1
     # t5411 198->230 (2026-07-07): local push routed through serve_receive_pack
     # (ea4977df); remaining 124 = report-option/rewrite cells + HTTP push routing.
-    [t5411-proc-receive-hook.sh]=241
+    [t5411-proc-receive-hook.sh]=271
     [t5501-fetch-push-alternates.sh]=3
     [t5502-quickfetch.sh]=2
     [t5503-tagfollow.sh]=6
@@ -1797,7 +1797,7 @@ declare -A FLOOR=(
     [t9304-fast-import-marks.sh]=3
     [t9305-fast-import-signatures.sh]=21
     [t9306-fast-import-signed-tags.sh]=18
-    [t9350-fast-export.sh]=26
+    [t9350-fast-export.sh]=44
     [t9351-fast-export-anonymize.sh]=7
     [t9700-perl-git.sh]=3
     [t9901-git-web--browse.sh]=0
