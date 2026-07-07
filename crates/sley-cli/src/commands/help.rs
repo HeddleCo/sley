@@ -53,6 +53,7 @@ pub(crate) const BUILTIN_COMMANDS: &[&str] = &[
     "for-each-ref",
     "for-each-repo",
     "format-patch",
+    "format-rev",
     "fsck",
     "gc",
     "get-tar-commit-id",

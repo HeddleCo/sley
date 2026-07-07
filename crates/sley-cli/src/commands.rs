@@ -40,6 +40,7 @@ pub(crate) mod filter_branch;
 pub(crate) mod for_each_ref;
 pub(crate) mod for_each_repo;
 pub(crate) mod format_patch;
+pub(crate) mod format_rev;
 pub(crate) mod grep;
 pub(crate) mod grep_args;
 pub(crate) mod hash_object;

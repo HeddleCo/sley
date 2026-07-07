@@ -421,6 +421,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "bisect" => commands::bisect::cmd_bisect(&args[1..]),
         "sparse-checkout" => commands::sparse_checkout::cmd_sparse_checkout(&args[1..]),
         "format-patch" => commands::format_patch::cmd_format_patch(&args[1..]),
+        "format-rev" => commands::format_rev::cmd_format_rev(&args[1..]),
         "am" => commands::am::cmd_am(&args[1..]),
         "read-tree" => commands::read_tree::cmd_read_tree(&args[1..]),
         "checkout-index" => commands::checkout_index::cmd_checkout_index(&args[1..]),

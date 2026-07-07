@@ -170,7 +170,7 @@ fn push_unique(refs: &mut Vec<String>, value: String) {
 
 /// Expand a single notes-ref spec: a `*`-containing glob matches existing refs
 /// by prefix (ref-name sorted); an exact ref is returned as-is.
-fn expand_notes_glob(store: &FileRefStore, glob: &str) -> Result<Vec<String>> {
+pub(crate) fn expand_notes_glob(store: &FileRefStore, glob: &str) -> Result<Vec<String>> {
     if !glob.contains('*') {
         return Ok(vec![glob.to_string()]);
     }
@@ -391,6 +391,47 @@ fn emit_encoded_compiled_log_format_no_notes(
     Ok(())
 }
 
+/// Render a user (`--format=`) spec, expanding `%N` from the given or standard
+/// notes display refs when `show_notes` is set.
+pub(crate) fn format_commit_pretty_with_notes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    record: &sley_rev::CommitRecord,
+    compiled: &CompiledLogFormat,
+    context: &LogFormatContext<'_>,
+    show_notes: bool,
+    notes_refs: &[String],
+) -> Result<Vec<u8>> {
+    let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+    if show_notes && compiled_format_uses_notes(compiled) {
+        let store = FileRefStore::new(git_dir, format);
+        let display_refs = if notes_refs.is_empty() {
+            resolve_standard_notes_refs(git_dir, format)?
+        } else {
+            notes_refs.to_vec()
+        };
+        emit_compiled_log_format_with_notes(
+            git_dir,
+            format,
+            &store,
+            &display_refs,
+            record,
+            compiled,
+            context,
+            &mut line,
+        )?;
+    } else {
+        emit_compiled_log_format(
+            record,
+            compiled,
+            context,
+            &mut line,
+            0..compiled.tokens.len(),
+        )?;
+    }
+    Ok(log_reencode_message(&line, "UTF-8", context.output_encoding).into_owned())
+}
+
 /// Render a user (`--format=`) spec to stdout for `git show`, expanding `%N`
 /// from the standard notes display refs when `show_notes` is set. git computes
 /// `ctx.notes_message` (raw) for userformats and `%N` injects it; the plain
@@ -577,7 +618,7 @@ fn log_config_color_is_always(value: &str) -> bool {
     )
 }
 
-fn compiled_format_uses_notes(compiled: &CompiledLogFormat) -> bool {
+pub(crate) fn compiled_format_uses_notes(compiled: &CompiledLogFormat) -> bool {
     compiled
         .tokens
         .iter()
@@ -3895,7 +3936,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
 }
 
 /// The outcome of resolving a `--pretty=`/`--format=` spec.
-enum ResolvedPretty {
+pub(crate) enum ResolvedPretty {
     Oneline,
     Default,
     Short,
@@ -3915,7 +3956,7 @@ enum ResolvedPretty {
 /// Resolve a `--pretty=`/`--format=` spec into a compiled format, mirroring
 /// git's `get_commit_format` + `pretty.<name>` alias chain. `format_kind` is the
 /// `--format=`/`tformat:` flag (terminator semantics → `final_newline: true`).
-fn resolve_pretty_spec(
+pub(crate) fn resolve_pretty_spec(
     spec: &str,
     format_kind: bool,
     config: &GitConfig,
