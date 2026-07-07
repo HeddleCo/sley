@@ -24,7 +24,30 @@ pub fn diff_stat_parse_width_option(value:&str,widths:&mut DiffStatWidths)->Resu
 pub fn diff_stat_count_option(value:&str)->Result<Option<Option<usize>>>{let c=value.strip_prefix("--stat-count=").or_else(||value.strip_prefix("--stat=").and_then(|s|s.split(',').nth(2)));let Some(c)=c else{return Ok(None)};let c=c.parse::<usize>().map_err(|_|GitError::Command(format!("invalid stat count {c}")))?;Ok(Some((c!=0).then_some(c)))}
 pub fn parse_similarity_threshold(spec:&str)->u8{let s=spec.strip_suffix('%').unwrap_or(spec);match s.parse::<f64>(){Ok(v)=>{let p=if v<=1.0&&s.contains('.'){v*100.0}else{v};p.round().clamp(0.0,100.0) as u8}Err(_)=>sley_diff_merge::DEFAULT_RENAME_THRESHOLD}}
 pub fn parse_diff_rename_limit(value:&str)->usize{let v=value.trim();if v.starts_with('-'){return 0;}let v=v.strip_prefix('+').unwrap_or(v);let(d,m)=match v.as_bytes().last().copied(){Some(b'k')=>(&v[..v.len()-1],1024usize),Some(b'm')=>(&v[..v.len()-1],1024*1024),Some(b'g')=>(&v[..v.len()-1],1024*1024*1024),_=>(v,1)};d.parse().ok().and_then(|l:usize|l.checked_mul(m)).unwrap_or(usize::MAX)}
-fn validate_diff_rename_limit(value:&str)->Result<()>{let v=value.strip_prefix('+').or_else(||value.strip_prefix('-')).filter(|r|!r.is_empty()).unwrap_or(value).strip_suffix('k').or_else(||value.strip_suffix('m')).or_else(||value.strip_suffix('g')).unwrap_or(value);if !v.is_empty()&&v.bytes().all(|b|b.is_ascii_digit()){Ok(())}else{eprintln!("error: switch `l' expects an integer value with an optional k/m/g suffix");Err(GitError::Exit(129))}}
+fn validate_diff_rename_limit(value: &str) -> Result<()> {
+    // git's `-l<n>` is OPT_INTEGER: a leading sign is accepted (a negative or
+    // zero limit means "unlimited"). Strip an optional sign, then an optional
+    // k/m/g magnitude suffix — as two separate steps: a single chained
+    // `.strip_suffix(..).unwrap_or(value)` would fall back to the ORIGINAL
+    // signed value, re-introducing the sign and failing the digit check
+    // (the `-l-1` regression).
+    let unsigned = value
+        .strip_prefix('+')
+        .or_else(|| value.strip_prefix('-'))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(value);
+    let digits = unsigned
+        .strip_suffix('k')
+        .or_else(|| unsigned.strip_suffix('m'))
+        .or_else(|| unsigned.strip_suffix('g'))
+        .unwrap_or(unsigned);
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(())
+    } else {
+        eprintln!("error: switch `l' expects an integer value with an optional k/m/g suffix");
+        Err(GitError::Exit(129))
+    }
+}
 fn parse_abbrev(value:&str)->Result<usize>{value.parse().map_err(|_|GitError::Command(format!("invalid abbrev length {value}")))}
 fn git_count_value_is_valid(value:&str)->bool{let n=match value.as_bytes().last(){Some(b'k'|b'K'|b'm'|b'M'|b'g'|b'G')=>&value[..value.len()-1],_=>value};let d=match n.as_bytes().first(){Some(b'+'|b'-') if n.len()>1=>&n[1..],_=>n};!d.is_empty()&&d.bytes().all(|b|b.is_ascii_digit())}
 fn commit_validate_unified_context(value:&str,short:bool)->Result<()>{if value.is_empty(){eprintln!("error: {} expects a numerical value",if short{"switch `U'"}else{"option `unified'"});return Err(GitError::Exit(129));}if git_count_value_is_valid(value){return Ok(());}eprintln!("error: {} expects an integer value with an optional k/m/g suffix",if short{"switch `U'"}else{"option `unified'"});Err(GitError::Exit(129))}
