@@ -146,7 +146,11 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
         header: &header,
         pack_reader: &mut stdin,
         config: &config,
-        options: sley_remote::ReceivePackServerOptions { quiet },
+        options: sley_remote::ReceivePackServerOptions {
+            quiet,
+            remote_stderr: None,
+            run_post_hooks: true,
+        },
     })?;
     if wants_report {
         let stdout = io::stdout();
@@ -159,7 +163,7 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
         stdout.flush()?;
     }
     let push_options = header.push_options.as_deref().unwrap_or(&[]);
-    sley_remote::run_receive_pack_post_hooks(&git_dir, &outcome.command_states, push_options);
+
     Ok(())
 }
 
@@ -1181,6 +1185,9 @@ fn expand_default_force_with_lease(
             force_with_lease_default: false,
             force_if_includes,
             receive_config_overrides,
+            push_options: &[],
+            remote_stderr: None,
+            quiet: false,
         },
         config,
     )?;
@@ -2103,6 +2110,9 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             force_with_lease_default: req.force_with_lease_default,
             force_if_includes: req.force_if_includes,
             receive_config_overrides: req.receive_config_overrides,
+            push_options: req.push_options,
+            remote_stderr: None,
+            quiet: req.options.quiet,
         },
         &config,
     )?;
@@ -2144,7 +2154,14 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         git_dir: req.remote_git_dir.to_path_buf(),
         common_git_dir: req.remote_common_git_dir.to_path_buf(),
     };
+    let uses_proc_server = sley_remote::push_local_uses_receive_pack_server(
+        &remote_config,
+        req.remote_git_dir,
+        &ok_commands,
+    );
+    let mut remote_stderr = Vec::new();
     let quarantine = if !req.options.dry_run
+        && !uses_proc_server
         && !ok_commands.is_empty()
         && receive_pre_hooks_may_run(req.remote_git_dir)
     {
@@ -2163,22 +2180,17 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         .as_ref()
         .map(|quarantine| receive_quarantine_hook_env(req.remote_common_git_dir, quarantine))
         .unwrap_or_default();
-
-    // Run the receive-side pre-receive + update hooks. A failure declines the
-    // whole push (git's receive-pack rejects every ref with "pre-receive hook
-    // declined"). Skipped under --dry-run.
-    let hook_decline = if !req.options.dry_run && !ok_commands.is_empty() {
+    let hook_decline = if !req.options.dry_run && !uses_proc_server && !ok_commands.is_empty() {
         run_local_receive_pre_hooks_report(
             &destination,
             &ok_commands,
             req.push_options,
             &quarantine_env,
+            Some(&mut remote_stderr),
         )
     } else {
         None
     };
-
-    // Second pass: actually apply (unless dry-run or the hook declined).
     if !req.options.dry_run && hook_decline.is_none() && !ok_commands.is_empty() {
         run_local_receive_reference_transaction_hook_phase(
             &destination,
@@ -2191,7 +2203,6 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             sley_refs::RefTransactionPhase::Prepared,
         )?;
     }
-
     let mut report = if req.options.dry_run || hook_decline.is_some() {
         plan
     } else {
@@ -2210,6 +2221,13 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
                 force_with_lease_default: req.force_with_lease_default,
                 force_if_includes: req.force_if_includes,
                 receive_config_overrides: req.receive_config_overrides,
+                push_options: req.push_options,
+                remote_stderr: if uses_proc_server {
+                    Some(&mut remote_stderr)
+                } else {
+                    None
+                },
+                quiet: req.options.quiet,
             },
             &config,
         )?
@@ -2221,7 +2239,26 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             sley_refs::RefTransactionPhase::Committed,
         )?;
     }
-    if !req.options.dry_run && hook_decline.is_none() {
+    if let Some(decline) = hook_decline {
+        for reference in &mut report.refs {
+            if !matches!(reference.status, sley_remote::PushRefStatus::Ok) {
+                continue;
+            }
+            reference.status = match &decline {
+                ReceiveHookDecline::PreReceive => sley_remote::PushRefStatus::RemoteReject(
+                    "pre-receive hook declined".to_string(),
+                ),
+                ReceiveHookDecline::Update(name) if reference.dst == *name => {
+                    sley_remote::PushRefStatus::RemoteReject("hook declined".to_string())
+                }
+                ReceiveHookDecline::Update(_) if req.atomic => {
+                    sley_remote::PushRefStatus::RemoteReject("atomic push failure".to_string())
+                }
+                ReceiveHookDecline::Update(_) => sley_remote::PushRefStatus::Ok,
+            }
+        }
+    }
+    if !req.options.dry_run {
         trace2_push_pack_objects(
             req.options.quiet,
             config.get_bool("push", None, "usebitmaps"),
@@ -2245,26 +2282,6 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
             eprintln!("Writing objects: 100% (1/1), done.");
         }
         run_local_receive_pack_auto_gc(req.remote_git_dir);
-    }
-
-    if let Some(decline) = hook_decline {
-        for reference in &mut report.refs {
-            if !matches!(reference.status, sley_remote::PushRefStatus::Ok) {
-                continue;
-            }
-            reference.status = match &decline {
-                ReceiveHookDecline::PreReceive => sley_remote::PushRefStatus::RemoteReject(
-                    "pre-receive hook declined".to_string(),
-                ),
-                ReceiveHookDecline::Update(name) if reference.dst == *name => {
-                    sley_remote::PushRefStatus::RemoteReject("hook declined".to_string())
-                }
-                ReceiveHookDecline::Update(_) if req.atomic => {
-                    sley_remote::PushRefStatus::RemoteReject("atomic push failure".to_string())
-                }
-                ReceiveHookDecline::Update(_) => sley_remote::PushRefStatus::Ok,
-            }
-        }
     }
 
     if !req.options.dry_run
@@ -2299,7 +2316,13 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
                 .cloned()
                 .collect();
             if !landed.is_empty() {
-                run_local_receive_post_hooks(&destination, &landed, req.push_options)?;
+                sley_remote::run_local_push_post_hooks(
+                    req.remote_git_dir,
+                    &landed,
+                    req.push_options,
+                    &mut remote_stderr,
+                    true,
+                )?;
             }
             update_push_remote_tracking_refs(
                 req.git_dir,
@@ -2312,6 +2335,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
                 configure_push_upstreams_from_report(req.git_dir, req.remote, &report.refs)?;
             }
         }
+        print_remote_hook_stderr(&remote_stderr);
     }
 
     // git's status header and the trailing error use the *resolved* push URL
@@ -2344,6 +2368,21 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn print_remote_hook_stderr(remote_stderr: &[u8]) {
+    // Upstream `sideband.c` appends `DUMB_SUFFIX` (8 spaces) to each remote
+    // progress/error line when stderr is not a tty — the t5411 expect text
+    // includes those trailing spaces.
+    let suffix = if std::io::stderr().is_terminal() {
+        ""
+    } else {
+        "        "
+    };
+    let text = String::from_utf8_lossy(remote_stderr);
+    for line in text.lines() {
+        eprintln!("remote: {line}{suffix}");
+    }
 }
 
 fn custom_receive_pack_command_is_native_git(command: &str) -> bool {
@@ -3038,6 +3077,7 @@ fn run_local_receive_pre_hooks_report(
     push_commands: &[ReceivePackCommand],
     push_options: &[String],
     quarantine_env: &[(String, String)],
+    remote_stderr: Option<&mut Vec<u8>>,
 ) -> Option<ReceiveHookDecline> {
     let sley_remote::PushDestination::Local {
         git_dir: remote_git_dir,
@@ -3046,43 +3086,32 @@ fn run_local_receive_pre_hooks_report(
     else {
         return None;
     };
-    let stdin = receive_hook_stdin(push_commands);
-    let hook_env = receive_hook_env(push_options, quarantine_env);
-    if commands::hooks::run_traditional_hook_at(
+    let mut discard_stderr = Vec::new();
+    let capture_stderr = remote_stderr.is_some();
+    let stderr = remote_stderr.unwrap_or(&mut discard_stderr);
+    if sley_remote::run_pre_receive(
         remote_git_dir,
-        "pre-receive",
-        commands::hooks::HookRun {
-            stdin: Some(stdin),
-            env: hook_env.clone(),
-            cwd: Some(remote_git_dir.to_path_buf()),
-            ..commands::hooks::HookRun::default()
-        },
+        push_commands,
+        push_options,
+        quarantine_env,
+        stderr,
+        capture_stderr,
     )
     .is_err()
     {
         return Some(ReceiveHookDecline::PreReceive);
     }
-    for command in receive_update_hook_order(push_commands) {
-        if commands::hooks::run_traditional_hook_at(
-            remote_git_dir,
-            "update",
-            commands::hooks::HookRun {
-                args: vec![
-                    command.name.clone(),
-                    command.old_id.to_string(),
-                    command.new_id.to_string(),
-                ],
-                env: hook_env.clone(),
-                cwd: Some(remote_git_dir.to_path_buf()),
-                ..commands::hooks::HookRun::default()
-            },
-        )
-        .is_err()
-        {
-            return Some(ReceiveHookDecline::Update(command.name.clone()));
-        }
+    match sley_remote::run_update_hooks(
+        remote_git_dir,
+        push_commands,
+        quarantine_env,
+        stderr,
+        capture_stderr,
+    ) {
+        Ok(Some(name)) => Some(ReceiveHookDecline::Update(name)),
+        Ok(None) => None,
+        Err(_) => Some(ReceiveHookDecline::PreReceive),
     }
-    None
 }
 
 fn run_local_receive_reference_transaction_hook_phase(
