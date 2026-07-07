@@ -140,6 +140,7 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
         .capabilities
         .iter()
         .any(|cap| cap.name == "report-status" || cap.name == "report-status-v2");
+    let mut hook_stderr = Vec::new();
     let outcome = sley_remote::serve_receive_pack(sley_remote::ReceivePackServerRequest {
         git_dir: &git_dir,
         format,
@@ -148,10 +149,21 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
         config: &config,
         options: sley_remote::ReceivePackServerOptions {
             quiet,
-            remote_stderr: None,
+            remote_stderr: Some(&mut hook_stderr),
             run_post_hooks: true,
         },
     })?;
+    if !hook_stderr.is_empty() {
+        let suffix = if std::io::stderr().is_terminal() {
+            ""
+        } else {
+            "        "
+        };
+        let text = String::from_utf8_lossy(&hook_stderr);
+        for line in text.lines() {
+            eprintln!("{line}{suffix}");
+        }
+    }
     if wants_report {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
@@ -1961,6 +1973,29 @@ fn resolve_push_recurse_submodules(
 /// "To <remote>" summary on stderr. Repository/URL resolution, the set-upstream
 /// config, and output formatting stay here; the push orchestration lives in the
 /// library.
+fn push_source_name_for_command(
+    refspecs: &[String],
+    command: &ReceivePackCommand,
+) -> Option<String> {
+    for refspec in refspecs {
+        let body = refspec.strip_prefix('+').unwrap_or(refspec.as_str());
+        let Some((src, dst)) = body.split_once(':') else {
+            continue;
+        };
+        if dst.is_empty() {
+            continue;
+        }
+        if command.name == dst {
+            return Some(if src.is_empty() {
+                command.name.clone()
+            } else {
+                src.to_string()
+            });
+        }
+    }
+    None
+}
+
 fn run_push(
     git_dir: &Path,
     common_git_dir: &Path,
@@ -2031,15 +2066,55 @@ fn run_push(
         sley_refs::RefTransactionPhase::Committed,
     )?;
     run_local_receive_post_hooks(destination, &outcome.commands, &[])?;
-    update_push_remote_tracking_refs(git_dir, format, &config, remote, &outcome.commands)?;
-    if options.set_upstream {
-        configure_push_upstreams(git_dir, remote, &outcome.commands)?;
+    let mut refs: Vec<sley_remote::PushReportRef> = outcome
+        .commands
+        .iter()
+        .map(|command| sley_remote::PushReportRef {
+            src: push_source_name_for_command(refspecs, command),
+            dst: command.name.clone(),
+            old_id: command.old_id,
+            new_id: command.new_id,
+            forced: false,
+            status: sley_remote::PushRefStatus::Ok,
+            reports: Vec::new(),
+        })
+        .collect();
+    if let Some(report) = &outcome.report {
+        sley_remote::apply_receive_pack_report_to_push_refs(&mut refs, report);
     }
-    if !options.quiet {
-        eprintln!("To {}", push_display_remote(remote));
-        for command in &outcome.commands {
-            eprintln!("   {}  {}", command.new_id, command.name);
-        }
+    let applied: Vec<ReceivePackCommand> = refs
+        .iter()
+        .filter(|reference| matches!(reference.status, sley_remote::PushRefStatus::Ok))
+        .flat_map(|reference| reference.tracking_commands())
+        .collect();
+    update_push_remote_tracking_refs(git_dir, format, &config, remote, &applied)?;
+    if options.set_upstream {
+        configure_push_upstreams_from_report(git_dir, remote, &refs)?;
+    }
+    print_remote_hook_stderr(&outcome.remote_progress);
+    let url = push_display_url(remote);
+    let had_errors = refs.iter().any(|reference| reference.had_error());
+    if !options.quiet || had_errors {
+        let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+        let remote_db = match destination {
+            sley_remote::PushDestination::Local {
+                common_git_dir: remote_common,
+                ..
+            } => FileObjectDatabase::from_git_dir(remote_common, format),
+            _ => local_db.clone(),
+        };
+        render_push_status(
+            &sley_remote::PushStatusReport { refs },
+            &url,
+            false,
+            false,
+            &local_db,
+            &remote_db,
+        )?;
+    }
+    if had_errors {
+        eprintln!("error: failed to push some refs to '{url}'");
+        return Err(GitError::Exit(1));
     }
     Ok(())
 }
@@ -2303,11 +2378,7 @@ fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
                     sley_remote::PushRefStatus::Ok | sley_remote::PushRefStatus::UpToDate
                 )
             })
-            .map(|reference| ReceivePackCommand {
-                old_id: reference.old_id,
-                new_id: reference.new_id,
-                name: reference.dst.clone(),
-            })
+            .flat_map(|reference| reference.tracking_commands())
             .collect();
         if !applied.is_empty() {
             let landed: Vec<ReceivePackCommand> = applied
@@ -2775,13 +2846,13 @@ fn render_push_status(
     if porcelain {
         for reference in &ordered {
             if matches!(reference.status, sley_remote::PushRefStatus::UpToDate) {
-                emit(reference);
+                emit_with_reports(reference, &mut emit);
             }
         }
     }
     for reference in &ordered {
         if matches!(reference.status, sley_remote::PushRefStatus::Ok) {
-            emit(reference);
+            emit_with_reports(reference, &mut emit);
         }
     }
     for reference in &ordered {
@@ -2789,7 +2860,7 @@ fn render_push_status(
             reference.status,
             sley_remote::PushRefStatus::Ok | sley_remote::PushRefStatus::UpToDate
         ) {
-            emit(reference);
+            emit_with_reports(reference, &mut emit);
         }
     }
     for reference in &ordered {
@@ -2833,6 +2904,40 @@ fn push_summary_width(report: &sley_remote::PushStatusReport) -> usize {
         maxw = maxw.max(7);
     }
     2 * maxw + 3
+}
+
+fn emit_with_reports(
+    reference: &sley_remote::PushReportRef,
+    emit: &mut dyn FnMut(&sley_remote::PushReportRef),
+) {
+    if reference.reports.is_empty() {
+        emit(reference);
+        return;
+    }
+    for report in &reference.reports {
+        emit(&push_report_with_proc_receive(reference, report));
+    }
+}
+
+fn push_report_with_proc_receive(
+    reference: &sley_remote::PushReportRef,
+    report: &sley_remote::ProcReceiveReport,
+) -> sley_remote::PushReportRef {
+    let mut rewritten = reference.clone();
+    if let Some(refname) = &report.refname {
+        rewritten.dst = refname.clone();
+    }
+    if let Some(old_oid) = &report.old_oid {
+        rewritten.old_id = *old_oid;
+    }
+    if let Some(new_oid) = &report.new_oid {
+        rewritten.new_id = *new_oid;
+    }
+    if report.forced_update {
+        rewritten.forced = true;
+    }
+    rewritten.reports = Vec::new();
+    rewritten
 }
 
 /// Render one ref's status line. Mirrors git's `print_one_push_report` +

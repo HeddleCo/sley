@@ -32,15 +32,18 @@ use sley_odb::{
 };
 #[cfg(feature = "http")]
 use sley_protocol::{
-    GitService, parse_receive_pack_features, read_receive_pack_report_status,
-    smart_http_rpc_request_content_type, smart_http_rpc_result_content_type,
+    GitService, parse_receive_pack_features, smart_http_rpc_request_content_type,
+    smart_http_rpc_result_content_type,
 };
 use sley_protocol::{
-    PushSourceRef, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures,
-    ReceivePackPushRequest, ReceivePackPushRequestHeader, ReceivePackPushRequestOptions,
-    ReceivePackReportStatus, ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement,
-    RefSpec, parse_refspec, plan_push_commands,
+    PushSourceRef, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackCommandStatusV2,
+    ReceivePackCommandStatusV2Options, ReceivePackFeatures, ReceivePackPushRequest,
+    ReceivePackPushRequestHeader, ReceivePackPushRequestOptions, ReceivePackReportStatus,
+    ReceivePackReportStatusV2, ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement,
+    RefSpec, parse_refspec, plan_push_commands, read_and_demux_sideband_stream,
+    read_receive_pack_report_status, read_receive_pack_report_status_v2,
 };
+use crate::proc_receive::ProcReceiveReport;
 
 use crate::pack::push_pack_roots;
 use crate::pack::{PushPackRequest, write_push_packfile};
@@ -49,8 +52,7 @@ use crate::pack::write_receive_pack_body;
 use crate::proc_receive::{ReceivePackCommandState, parse_proc_receive_refs, proc_receive_ref_matches};
 
 use crate::receive_pack_server::{
-    ReceivePackServerOptions, ReceivePackServerRequest, receive_pack_server_report_v1,
-    serve_receive_pack,
+    ReceivePackServerOptions, ReceivePackServerReport, ReceivePackServerRequest, serve_receive_pack,
 };
 use sley_refs::{FileRefStore, Ref, RefTarget};
 use sley_transport::RemoteUrl;
@@ -228,6 +230,28 @@ impl PushActionPlan {
     }
 }
 
+/// Receive-pack report-status in either wire format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceivePackPushReport {
+    V1(ReceivePackReportStatus),
+    V2(ReceivePackReportStatusV2),
+}
+
+impl ReceivePackPushReport {
+    pub fn unpack_failed(&self) -> Option<&str> {
+        match self {
+            Self::V1(report) => match &report.unpack {
+                ReceivePackUnpackStatus::Ok => None,
+                ReceivePackUnpackStatus::Error(message) => Some(message.as_str()),
+            },
+            Self::V2(report) => match &report.unpack {
+                ReceivePackUnpackStatus::Ok => None,
+                ReceivePackUnpackStatus::Error(message) => Some(message.as_str()),
+            },
+        }
+    }
+}
+
 /// The structured result of a [`push`].
 #[derive(Debug, Clone, Default)]
 pub struct PushOutcome {
@@ -236,11 +260,10 @@ pub struct PushOutcome {
     /// into git's "To <remote>" summary and uses them to drive set-upstream.
     /// Empty when nothing matched the refspecs (a no-op push).
     pub commands: Vec<ReceivePackCommand>,
-    /// The remote's report-status, when one was requested and received (i.e. the
-    /// remote advertised `report-status`). `None` when report-status was not
-    /// negotiated. Already validated: a failed unpack or a rejected ref is
-    /// surfaced as an `Err` from [`push`], not returned here.
-    pub report: Option<ReceivePackReportStatus>,
+    /// The remote's report-status, when one was requested and received.
+    pub report: Option<ReceivePackPushReport>,
+    /// Hook/progress bytes from a sideband receive-pack response.
+    pub remote_progress: Vec<u8>,
 }
 
 /// Per-ref outcome of a push, mirroring git's `enum ref_status` so the CLI can
@@ -288,9 +311,34 @@ pub struct PushReportRef {
     pub forced: bool,
     /// The classified outcome.
     pub status: PushRefStatus,
+    /// Proc-receive `report-status-v2` rewrites for this ref (one line per report).
+    pub reports: Vec<ProcReceiveReport>,
 }
 
 impl PushReportRef {
+    /// Receive-pack commands for remote-tracking updates, honouring proc-receive
+    /// rewrites when present.
+    pub fn tracking_commands(&self) -> Vec<ReceivePackCommand> {
+        if self.reports.is_empty() {
+            return vec![ReceivePackCommand {
+                old_id: self.old_id,
+                new_id: self.new_id,
+                name: self.dst.clone(),
+            }];
+        }
+        self.reports
+            .iter()
+            .map(|report| ReceivePackCommand {
+                old_id: report.old_oid.unwrap_or(self.old_id),
+                new_id: report.new_oid.unwrap_or(self.new_id),
+                name: report
+                    .refname
+                    .clone()
+                    .unwrap_or_else(|| self.dst.clone()),
+            })
+            .collect()
+    }
+
     /// Whether this ref is a deletion (new id is the zero oid).
     pub fn is_deletion(&self) -> bool {
         self.new_id.is_null()
@@ -861,16 +909,27 @@ fn execute_push_http(
         &smart_http_rpc_result_content_type(GitService::ReceivePack)?,
     )?;
 
-    let report = if features.report_status {
-        let report = read_receive_pack_report_status(&mut response.body)?;
-        validate_receive_pack_report(&report)?;
+    let mut remote_progress = Vec::new();
+    let report = if features.report_status || features.report_status_v2 {
+        let report = read_receive_pack_push_report_with_progress(
+            request.format,
+            &mut response.body,
+            features.report_status_v2,
+            features.side_band_64k,
+            Some(&mut remote_progress),
+        )?;
+        validate_receive_pack_unpack(&report)?;
         Some(report)
     } else {
         let mut sink = Vec::new();
         response.body.read_to_end(&mut sink)?;
         None
     };
-    Ok(PushOutcome { commands, report })
+    Ok(PushOutcome {
+        commands,
+        report,
+        remote_progress,
+    })
 }
 
 /// git's `http.postBuffer` (default 1 MiB): a receive-pack request body that
@@ -1109,19 +1168,20 @@ fn execute_push_local(
                 b"PACK".to_vec()
             },
         };
-        crate::local::receive_pack_reachable_pack_into_local_repository(
+        ReceivePackPushReport::V1(crate::local::receive_pack_reachable_pack_into_local_repository(
             &remote_git_dir,
             request.format,
             &receive_request,
             &local_db,
             starts,
             remote_excluded,
-        )?
+        )?)
     };
-    validate_receive_pack_report(&report)?;
+    validate_receive_pack_unpack(&report)?;
     Ok(PushOutcome {
         commands,
         report: Some(report),
+        remote_progress: Vec::new(),
     })
 }
 
@@ -1418,6 +1478,7 @@ pub fn push_local_with_report(
             new_id: plan.command.new_id,
             forced,
             status,
+            reports: Vec::new(),
         });
     }
 
@@ -1507,33 +1568,16 @@ pub fn push_local_with_report(
                     b"PACK".to_vec()
                 },
             };
-            crate::local::receive_pack_reachable_pack_into_local_repository(
+            ReceivePackPushReport::V1(crate::local::receive_pack_reachable_pack_into_local_repository(
                 request.remote_git_dir,
                 format,
                 &receive_request,
                 &local_db,
                 starts,
                 remote_excluded,
-            )?
+            )?)
         };
-        // Fold the receive-pack ng reports back onto the matching refs.
-        if let ReceivePackUnpackStatus::Error(message) = &report.unpack {
-            for reference in &mut refs {
-                if matches!(reference.status, PushRefStatus::Ok) {
-                    reference.status =
-                        PushRefStatus::RemoteReject(format!("unpacker error: {message}"));
-                }
-            }
-        }
-        for command_status in &report.commands {
-            if let ReceivePackCommandStatus::Ng { name, message } = command_status {
-                for reference in &mut refs {
-                    if reference.dst == *name && matches!(reference.status, PushRefStatus::Ok) {
-                        reference.status = PushRefStatus::RemoteReject(message.clone());
-                    }
-                }
-            }
-        }
+        apply_receive_pack_report_to_push_refs(&mut refs, &report);
     }
 
     Ok(PushStatusReport { refs })
@@ -1943,7 +1987,7 @@ fn verify_remote_object_format(features: &ReceivePackFeatures, format: ObjectFor
 /// git: report-status when advertised, ofs-delta when advertised, `quiet` only
 /// when both requested and advertised, and the advertised object-format only when
 /// the local repository's `format` is not SHA-1.
-fn receive_pack_push_options(
+pub(crate) fn receive_pack_push_options(
     features: &ReceivePackFeatures,
     format: ObjectFormat,
     quiet: bool,
@@ -1951,8 +1995,10 @@ fn receive_pack_push_options(
     push_options: &[String],
 ) -> ReceivePackPushRequestOptions {
     ReceivePackPushRequestOptions {
-        report_status: features.report_status,
+        report_status_v2: features.report_status_v2,
+        report_status: features.report_status && !features.report_status_v2,
         ofs_delta: features.ofs_delta,
+        side_band_64k: features.side_band_64k,
         quiet: quiet && features.quiet,
         atomic: atomic && features.atomic,
         push_options: push_options.to_vec(),
@@ -1993,7 +2039,7 @@ struct LocalPushViaReceivePackRequest<'a> {
 
 fn local_push_via_receive_pack_server(
     request: LocalPushViaReceivePackRequest<'_>,
-) -> Result<ReceivePackReportStatus> {
+) -> Result<ReceivePackPushReport> {
     let features = crate::local::receive_pack_features(request.format);
     let local_db = FileObjectDatabase::from_git_dir(request.source_common_git_dir, request.format);
     let pack_request = PushPackRequest {
@@ -2046,7 +2092,10 @@ fn local_push_via_receive_pack_server(
             run_post_hooks: false,
         },
     })?;
-    Ok(receive_pack_server_report_v1(&outcome.report))
+    Ok(match outcome.report {
+        ReceivePackServerReport::V1(status) => ReceivePackPushReport::V1(status),
+        ReceivePackServerReport::V2(status) => ReceivePackPushReport::V2(status),
+    })
 }
 
 pub fn run_local_push_post_hooks(
@@ -2478,6 +2527,151 @@ fn receive_pack_commands_from_action_plan(
 /// user-visible diagnostics.
 pub fn push_url_for_display(url: &str) -> String {
     redact_url_for_display(url)
+}
+
+/// Read a receive-pack report from `reader`, demuxing sideband when negotiated.
+pub fn read_receive_pack_push_report(
+    format: ObjectFormat,
+    reader: &mut impl Read,
+    use_report_v2: bool,
+    use_sideband: bool,
+) -> Result<ReceivePackPushReport> {
+    read_receive_pack_push_report_with_progress(format, reader, use_report_v2, use_sideband, None)
+}
+
+pub fn read_receive_pack_push_report_with_progress(
+    format: ObjectFormat,
+    reader: &mut impl Read,
+    use_report_v2: bool,
+    use_sideband: bool,
+    mut remote_progress: Option<&mut Vec<u8>>,
+) -> Result<ReceivePackPushReport> {
+    if use_sideband {
+        let demuxed = read_and_demux_sideband_stream(reader)?;
+        for line in demuxed.progress {
+            if let Some(buf) = remote_progress.as_mut() {
+                buf.extend_from_slice(&line);
+                if !line.ends_with(b"\n") {
+                    buf.push(b'\n');
+                }
+            } else {
+                eprint!("{}", String::from_utf8_lossy(&line));
+            }
+        }
+        let mut payload = demuxed.data.as_slice();
+        if use_report_v2 {
+            Ok(ReceivePackPushReport::V2(read_receive_pack_report_status_v2(
+                format, &mut payload,
+            )?))
+        } else {
+            Ok(ReceivePackPushReport::V1(read_receive_pack_report_status(
+                &mut payload,
+            )?))
+        }
+    } else if use_report_v2 {
+        Ok(ReceivePackPushReport::V2(read_receive_pack_report_status_v2(
+            format, reader,
+        )?))
+    } else {
+        Ok(ReceivePackPushReport::V1(read_receive_pack_report_status(
+            reader,
+        )?))
+    }
+}
+
+/// Fold a receive-pack report onto the per-ref [`PushStatusReport::refs`] entries.
+pub fn apply_receive_pack_report_to_push_refs(
+    refs: &mut [PushReportRef],
+    report: &ReceivePackPushReport,
+) {
+    if let Some(message) = report.unpack_failed() {
+        for reference in refs.iter_mut() {
+            if matches!(reference.status, PushRefStatus::Ok) {
+                reference.status =
+                    PushRefStatus::RemoteReject(format!("unpacker error: {message}"));
+            }
+        }
+        return;
+    }
+    match report {
+        ReceivePackPushReport::V1(status) => {
+            for command_status in &status.commands {
+                if let ReceivePackCommandStatus::Ng { name, message } = command_status {
+                    for reference in refs.iter_mut() {
+                        if reference.dst == *name && matches!(reference.status, PushRefStatus::Ok)
+                        {
+                            reference.status = PushRefStatus::RemoteReject(message.clone());
+                        }
+                    }
+                }
+            }
+        }
+        ReceivePackPushReport::V2(status) => {
+            let mut hint: Option<usize> = None;
+            for command in &status.commands {
+                match command {
+                    ReceivePackCommandStatusV2::Ng { name, message } => {
+                        if let Some(idx) = find_push_report_ref_index(refs, name, hint) {
+                            hint = Some(idx);
+                            if matches!(refs[idx].status, PushRefStatus::Ok) {
+                                refs[idx].status = PushRefStatus::RemoteReject(message.clone());
+                            }
+                        }
+                    }
+                    ReceivePackCommandStatusV2::Ok { name, options } => {
+                        let Some(idx) = find_push_report_ref_index(refs, name, hint) else {
+                            continue;
+                        };
+                        hint = Some(idx);
+                        if proc_receive_options_are_nontrivial(options) {
+                            refs[idx]
+                                .reports
+                                .push(proc_receive_report_from_options(options));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn find_push_report_ref_index(
+    refs: &[PushReportRef],
+    name: &str,
+    hint: Option<usize>,
+) -> Option<usize> {
+    if let Some(hint) = hint {
+        if refs.get(hint).is_some_and(|reference| reference.dst == name) {
+            return Some(hint);
+        }
+    }
+    refs.iter().position(|reference| reference.dst == name)
+}
+
+fn proc_receive_report_from_options(options: &ReceivePackCommandStatusV2Options) -> ProcReceiveReport {
+    ProcReceiveReport {
+        refname: options.refname.clone(),
+        old_oid: options.old_oid.clone(),
+        new_oid: options.new_oid.clone(),
+        forced_update: options.forced_update,
+    }
+}
+
+fn proc_receive_options_are_nontrivial(options: &ReceivePackCommandStatusV2Options) -> bool {
+    options.refname.is_some()
+        || options.old_oid.is_some()
+        || options.new_oid.is_some()
+        || options.forced_update
+}
+
+/// Validate only the receive-pack unpack line (per-ref `ng` is folded into status).
+pub fn validate_receive_pack_unpack(report: &ReceivePackPushReport) -> Result<()> {
+    if let Some(message) = report.unpack_failed() {
+        return Err(GitError::Command(format!(
+            "failed to push some refs: unpack failed: {message}"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate a receive-pack report-status, surfacing a failed unpack or any
@@ -3021,11 +3215,22 @@ mod tests {
 
         assert_eq!(outcome.commands.len(), 1);
         let report = outcome.report.expect("local receive-pack reports status");
-        assert!(matches!(report.unpack, ReceivePackUnpackStatus::Ok));
-        assert!(matches!(
-            report.commands.as_slice(),
-            [ReceivePackCommandStatus::Ok { name }] if name == "refs/heads/main"
-        ));
+        match report {
+            ReceivePackPushReport::V1(report) => {
+                assert!(matches!(report.unpack, ReceivePackUnpackStatus::Ok));
+                assert!(matches!(
+                    report.commands.as_slice(),
+                    [ReceivePackCommandStatus::Ok { name }] if name == "refs/heads/main"
+                ));
+            }
+            ReceivePackPushReport::V2(report) => {
+                assert!(matches!(report.unpack, ReceivePackUnpackStatus::Ok));
+                assert!(matches!(
+                    report.commands.as_slice(),
+                    [ReceivePackCommandStatusV2::Ok { name, .. }] if name == "refs/heads/main"
+                ));
+            }
+        }
         let remote_refs = FileRefStore::new(&remote, ObjectFormat::Sha1);
         assert_eq!(
             remote_refs

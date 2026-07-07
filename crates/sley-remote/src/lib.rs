@@ -79,7 +79,7 @@ pub use receive_hooks::{run_pre_receive, run_update_hooks};
 mod receive_pack_server;
 
 pub use proc_receive::{
-    ProcReceiveRefPattern, ReceivePackCommandState, parse_proc_receive_refs,
+    ProcReceiveRefPattern, ProcReceiveReport, ReceivePackCommandState, parse_proc_receive_refs,
     proc_receive_ref_matches,
 };
 pub use receive_pack_server::{
@@ -125,12 +125,13 @@ mod push;
 pub use push::{
     PushAction, PushActionPlan, PushActionRequest, PushCommand, PushDestination, PushOptions,
     PushOutcome, PushPlan, PushQuarantine, PushRefStatus, PushReportRef, PushReportRequest,
-    PushRequest, PushServices, PushStatusReport, PushThinMode, execute_push_action_plan,
-    execute_push_plan, local_push_source_refs, normalize_push_refname, normalize_push_refspec,
-    plan_push, plan_push_actions, push, push_actions, push_local_uses_receive_pack_server,
-    push_local_with_report, run_local_push_post_hooks,
-    push_url_for_display, reject_non_fast_forward_pushes, stage_local_push_quarantine,
-    validate_receive_pack_report,
+    PushRequest, PushServices, PushStatusReport, PushThinMode, ReceivePackPushReport,
+    apply_receive_pack_report_to_push_refs, execute_push_action_plan, execute_push_plan,
+    local_push_source_refs, normalize_push_refname, normalize_push_refspec, plan_push,
+    plan_push_actions, push, push_actions, push_local_uses_receive_pack_server,
+    push_local_with_report, run_local_push_post_hooks, push_url_for_display,
+    read_receive_pack_push_report, reject_non_fast_forward_pushes, stage_local_push_quarantine,
+    validate_receive_pack_report, validate_receive_pack_unpack,
 };
 
 mod ls_remote;

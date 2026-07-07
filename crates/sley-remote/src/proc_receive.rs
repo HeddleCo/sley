@@ -270,7 +270,20 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
 
     let mut hook_use_push_options = false;
     if !hook_failed {
-        hook_use_push_options = read_proc_receive_version_response(&mut stdout)?;
+        match read_proc_receive_version_response(&mut stdout) {
+            Ok(use_push_options) => hook_use_push_options = use_push_options,
+            Err(err) => {
+                hook_failed = true;
+                let message = err.to_string();
+                if input.capture_stderr {
+                    input
+                        .remote_stderr
+                        .extend_from_slice(format!("error: {message}\n").as_bytes());
+                } else {
+                    eprintln!("error: {message}");
+                }
+            }
+        }
         if hook_use_push_options && input.use_push_options {
             for option in input.push_options {
                 let mut line = option.as_bytes().to_vec();
@@ -383,7 +396,7 @@ fn read_proc_receive_version_response(reader: &mut impl Read) -> Result<bool> {
                         })?;
                     if version != 0 && version != 1 {
                         return Err(GitError::InvalidFormat(format!(
-                            "proc-receive version '{version}' is not supported"
+                            "proc-receive version \"{version}\" is not supported"
                         )));
                     }
                     if text.contains('\0') {

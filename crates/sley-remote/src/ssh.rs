@@ -714,25 +714,27 @@ pub(crate) fn execute_push_ssh_plan(
             pack_objects: &plan.pack_objects,
             remote_advertisements: &plan.advertisements,
             features: &plan.features,
-            options: ReceivePackPushRequestOptions {
-                report_status: plan.features.report_status,
-                ofs_delta: plan.features.ofs_delta,
-                quiet: request.options.quiet && plan.features.quiet,
-                object_format: plan
-                    .features
-                    .object_format
-                    .filter(|_| request.format != ObjectFormat::Sha1),
-                ..ReceivePackPushRequestOptions::default()
-            },
+            options: crate::push::receive_pack_push_options(
+                &plan.features,
+                request.format,
+                request.options.quiet,
+                false,
+                &[],
+            ),
             thin: request.options.thin.wants_thin(),
         },
         &mut stdin,
     )?;
     drop(stdin);
 
-    let report = if plan.features.report_status {
-        let report = read_receive_pack_report_status(&mut plan.stdout)?;
-        crate::push::validate_receive_pack_report(&report)?;
+    let report = if plan.features.report_status || plan.features.report_status_v2 {
+        let report = crate::push::read_receive_pack_push_report(
+            request.format,
+            &mut plan.stdout,
+            plan.features.report_status_v2,
+            plan.features.side_band_64k,
+        )?;
+        crate::push::validate_receive_pack_unpack(&report)?;
         Some(report)
     } else {
         let mut sink = Vec::new();
@@ -749,7 +751,11 @@ pub(crate) fn execute_push_ssh_plan(
         )));
     }
 
-    Ok(PushOutcome { commands, report })
+    Ok(PushOutcome {
+        commands,
+        report,
+        remote_progress: Vec::new(),
+    })
 }
 
 /// List the advertised refs for a resolved SSH `remote`, mirroring the records the
