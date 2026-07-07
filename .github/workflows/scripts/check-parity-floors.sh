@@ -610,7 +610,7 @@ declare -A FLOOR=(
     # script*, which costs the sley-only cell #135 (generated only because sley
     # lists `submodule` in --list-cmds=builtins where git lists `submodule--helper`;
     # the cell's 129 expectation conflicts with git's exit-0). Net +2.
-    [t0012-help.sh]=158
+    [t0012-help.sh]=163
     # wave-2 submodule (2026-06-18, integ/submodule): t7400 87->88.
     # codex-wave-11 (submodule verbs): add/init/status/sync/deinit/update/foreach/
     # set-url/set-branch, relative-URL resolution, .gitmodules+config writes. t7400
@@ -1610,7 +1610,7 @@ declare -A FLOOR=(
     [t5410-receive-pack.sh]=1
     # t5411 198->230 (2026-07-07): local push routed through serve_receive_pack
     # (ea4977df); remaining 124 = report-option/rewrite cells + HTTP push routing.
-    [t5411-proc-receive-hook.sh]=230
+    [t5411-proc-receive-hook.sh]=241
     [t5501-fetch-push-alternates.sh]=3
     [t5502-quickfetch.sh]=2
     [t5503-tagfollow.sh]=6
@@ -1681,7 +1681,7 @@ declare -A FLOOR=(
     # t0301 FULL 52 (2026-07-07): spawn_daemon retry loop + SUN_LEN chdir bind fix (142e31a6).
     [t0301-credential-cache.sh]=52
     [t0303-credential-external.sh]=10
-    [t0450-txt-doc-vs-help.sh]=643
+    [t0450-txt-doc-vs-help.sh]=788
     [t0500-progress-display.sh]=16
     [t0611-reftable-httpd.sh]=1
     [t0612-reftable-jgit-compatibility.sh]=0
