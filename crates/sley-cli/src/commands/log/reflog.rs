@@ -230,15 +230,6 @@ pub(super) fn compile_log_filter_matcher(
     if patterns.is_empty() {
         return Ok(None);
     }
-    // git rejects an empty --grep/--author/--committer pattern up front, before
-    // any mode-specific compilation, for every pattern mode:
-    //   fatal: <context>, '': empty (sub)expression
-    // (`command line` for --grep, `header` for the identity filters). The regex
-    // engine would otherwise accept `""` and match every commit.
-    if patterns.iter().any(|pattern| pattern.is_empty()) {
-        eprintln!("fatal: {error_context}, '': empty (sub)expression");
-        return Err(GitError::Exit(128));
-    }
     sley_grep::GrepMatcher::compile_with_error_context(
         sley_grep::GrepCompileConfig {
             patterns,
