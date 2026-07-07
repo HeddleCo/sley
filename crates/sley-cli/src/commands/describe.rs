@@ -497,11 +497,21 @@ fn describe_contains(options: &DescribeOptions, commits: &[String]) -> Result<()
     }
     if !options.all {
         args.push("--tags".to_string());
+    }
+    for pattern in &options.patterns {
+        args.push(format!("--refs=refs/tags/{pattern}"));
+    }
+    for pattern in &options.exclude_patterns {
+        args.push(format!("--exclude=refs/tags/{pattern}"));
+    }
+    if options.all {
         for pattern in &options.patterns {
-            args.push(format!("--refs=refs/tags/{pattern}"));
+            args.push(format!("--refs=refs/heads/{pattern}"));
+            args.push(format!("--refs=refs/remotes/{pattern}"));
         }
         for pattern in &options.exclude_patterns {
-            args.push(format!("--exclude=refs/tags/{pattern}"));
+            args.push(format!("--exclude=refs/heads/{pattern}"));
+            args.push(format!("--exclude=refs/remotes/{pattern}"));
         }
     }
     if commits.is_empty() {
