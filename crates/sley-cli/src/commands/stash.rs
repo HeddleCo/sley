@@ -3434,7 +3434,7 @@ fn parse_stash_list_filter_patterns(
     parse_log_filter_patterns_with_diagnostic_verbosity(
         patterns,
         mode,
-        sley_grep::RegexDiagnosticVerbosity::Default,
+        sley_grep::RegexDiagnosticVerbosity::Verbose,
     )
     .map_err(|err| match err {
         GitError::Exit(128) => GitError::Exit(1),
