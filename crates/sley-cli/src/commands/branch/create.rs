@@ -566,8 +566,16 @@ pub(super) fn resolve_branch_start(
     store: &FileRefStore,
     start: &str,
 ) -> Result<ObjectId> {
+    let peel_branch_start = |oid: ObjectId| -> Result<ObjectId> {
+        // git stores the peeled commit when branching from an annotated tag
+        // (e.g. `git branch topic v1.0`), not the tag object itself.
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        sley_rev::peel_to_commit(&db, format, &oid).map_err(|_| {
+            GitError::InvalidObject(format!("branch start '{start}' does not resolve to a commit"))
+        })
+    };
     match resolve_revision(git_dir, format, start) {
-        Ok(oid) => Ok(oid),
+        Ok(oid) => peel_branch_start(oid),
         Err(err) => {
             // A trailing range operator with an empty other side (`main..`,
             // `main...`) resolves to the named committish, exactly as git's
@@ -579,11 +587,11 @@ pub(super) fn resolve_branch_start(
                 && !base.contains("..")
                 && let Ok(oid) = resolve_revision(git_dir, format, base)
             {
-                return Ok(oid);
+                return peel_branch_start(oid);
             }
             let remote_ref = format!("refs/remotes/{start}");
             match store.read_ref(&remote_ref)? {
-                Some(RefTarget::Direct(oid)) => Ok(oid),
+                Some(RefTarget::Direct(oid)) => peel_branch_start(oid),
                 _ => {
                     let remote_head = format!("{remote_ref}/HEAD");
                     if let Some(RefTarget::Symbolic(target)) = store.read_ref(&remote_head)?
