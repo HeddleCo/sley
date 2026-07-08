@@ -1598,6 +1598,7 @@ fn write_commit_diff_patch(
             |_| false,
             |stdout, entry| {
                 let patch_options = DiffRenderOptions {
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
                     binary: false,
                     anchors: &options.anchored,
                     allow_textconv: options.textconv != Some(false),

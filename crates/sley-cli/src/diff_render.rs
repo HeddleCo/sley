@@ -3,23 +3,21 @@
 
 use crate::commands;
 use crate::commands::remote::{read_repo_config, remote_names};
+use crate::session;
 use crate::{
+    BString, DEFAULT_BIG_FILE_THRESHOLD, GitConfig, GitError, ObjectFormat, ObjectId, Result,
     commit_encoding, commit_subject, core_big_file_threshold, effective_pathspec_flags,
     global_lazy_fetch_enabled, log_reencode_message, normalize_absolute_cli_pathspec,
-    repository_object_format, status_quote_path, status_quote_path_full, sley_config,
-    sley_core, sley_diff_merge, sley_odb, sley_pretty, sley_remote, sley_rev, sley_worktree,
-    BString, GitConfig, GitError, ObjectFormat, ObjectId, Result, DEFAULT_BIG_FILE_THRESHOLD,
+    repository_object_format, sley_config, sley_core, sley_diff_merge, sley_odb, sley_pretty,
+    sley_remote, sley_rev, sley_worktree, status_quote_path, status_quote_path_full,
 };
-use crate::session;
 use sley::plumbing::sley_object::{Commit, EncodedObject, ObjectType};
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
 use sley::plumbing::sley_rev::diff_options::{
     DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleIgnoreMode, parse_submodule_ignore_mode,
 };
-use sley_pathspec::{
-    LsFilesPathFilter, parse_normalized_pathspec_element, pathspec_filters_match,
-};
 use sley_grep;
+use sley_pathspec::{LsFilesPathFilter, parse_normalized_pathspec_element, pathspec_filters_match};
 use sley_strbuf_expand;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -171,6 +169,8 @@ pub(crate) struct DiffRenderOptions<'a> {
     pub(crate) colors: Option<&'a commands::diff_words::DiffColors>,
     /// Word-diff rendering request (mode + the command-line regex override).
     pub(crate) word_diff: Option<&'a WordDiffRequest<'a>>,
+    /// Hunk body line indicators (` `, `-`, `+` by default).
+    pub(crate) line_indicators: sley_diff_merge::render::LineIndicators,
     /// Preloaded file contents for `diff --no-index` (old, new), bypassing
     /// the object database / worktree reads.
     pub(crate) no_index_contents: Option<(Option<&'a [u8]>, Option<&'a [u8]>)>,
@@ -585,6 +585,7 @@ pub(crate) fn render_tree_to_tree_patch(
                 funcname: None,
                 colors: None,
                 word_diff: None,
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
                 no_index_contents: None,
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,
@@ -1073,6 +1074,7 @@ pub(crate) fn write_diff_patch_entry(
         word_diff: word_diff_adapter
             .as_mut()
             .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
+        line_indicators: options.line_indicators,
         ws_error,
         color_moved: colors
             .and(options.color_moved)
@@ -1634,7 +1636,11 @@ pub(crate) fn write_diff_stat_materialized(
 /// git `parse_dirstat_params()`: comma-separated `changes|lines|files|
 /// cumulative|noncumulative|<limit>` parameters. Unknown parameters append to
 /// `errors` (one line each) and are counted in the returned error total.
-pub(crate) fn parse_dirstat_params(params: &str, options: &mut DirstatOptions, errors: &mut String) -> usize {
+pub(crate) fn parse_dirstat_params(
+    params: &str,
+    options: &mut DirstatOptions,
+    errors: &mut String,
+) -> usize {
     let mut error_count = 0usize;
     if params.is_empty() {
         return 0;
@@ -2538,6 +2544,7 @@ fn write_submodule_inline_diff(
                     funcname: None,
                     colors: options.colors,
                     word_diff: None,
+                    line_indicators: sley_diff_merge::render::LineIndicators::default(),
                     no_index_contents: None,
                     submodule_format: commands::diff_options::SubmoduleDiffFormat::Diff,
                     submodule_dirt: Some(&submodule_dirt),
@@ -2585,6 +2592,7 @@ fn write_submodule_inline_diff(
                 funcname: None,
                 colors: options.colors,
                 word_diff: None,
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
                 no_index_contents: None,
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Diff,
                 submodule_dirt: Some(&nested_dirt),
@@ -3297,7 +3305,9 @@ pub(crate) fn reverse_diff_entries(
     reversed
 }
 
-pub(crate) fn reverse_diff_entry(entry: sley_diff_merge::NameStatusEntry) -> sley_diff_merge::NameStatusEntry {
+pub(crate) fn reverse_diff_entry(
+    entry: sley_diff_merge::NameStatusEntry,
+) -> sley_diff_merge::NameStatusEntry {
     match entry.status {
         sley_diff_merge::NameStatus::Added => sley_diff_merge::NameStatusEntry {
             status: sley_diff_merge::NameStatus::Deleted,

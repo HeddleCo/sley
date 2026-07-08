@@ -19,8 +19,8 @@
 //! the per-line diff that drives range mapping uses sley's Myers diff.
 
 use crate::*;
-use sley::plumbing::sley_diff_merge::render::LineRange;
 use sley::ObjectDatabase as FileObjectDatabase;
+use sley::plumbing::sley_diff_merge::render::LineRange;
 use sley::plumbing::sley_rev::{CommitRecord, resolve_tree_path_entry};
 use std::collections::HashMap;
 
@@ -1119,7 +1119,6 @@ fn process_ranges_merge(
     detect_renames: bool,
 ) -> Result<MergeResult> {
     let mut cands: Vec<(ObjectId, RangeList)> = Vec::new();
-    let mut printed: RangeList = range.clone();
     for parent in &record.parents {
         let parent_tree = parent_tree_oid(db, format, parent)?;
         let entries = commit_name_status(
@@ -1130,7 +1129,6 @@ fn process_ranges_merge(
             detect_renames,
         )?;
         let mut parent_ranges: RangeList = range.clone();
-        let mut local_printed: RangeList = range.clone();
         let mut changed = false;
         for fr in &mut parent_ranges {
             let entry = match find_entry(&entries, &fr.path) {
@@ -1144,20 +1142,8 @@ fn process_ranges_merge(
                 .as_ref()
                 .map(|p| String::from_utf8_lossy(p.as_bytes()).into_owned())
                 .unwrap_or_else(|| fr.path.clone());
-            let printed_path = fr.path.clone();
             if process_file_diff(&parent_blob, &target_blob, fr).is_some() {
                 changed = true;
-                if let Some(prf) = local_printed.iter_mut().find(|f| f.path == printed_path) {
-                    prf.pair = Some(DiffPair {
-                        old_path: old_path.clone(),
-                        new_path: entry_path_string(entry),
-                        old_oid: entry.old_oid,
-                        new_oid: entry.new_oid,
-                        old_mode: entry.old_mode,
-                        new_mode: entry.new_mode,
-                        status: entry.status,
-                    });
-                }
             }
             fr.path = old_path;
         }
@@ -1170,14 +1156,13 @@ fn process_ranges_merge(
                 printed: range.clone(),
             });
         }
-        printed = local_printed;
         cands.push((*parent, parent_ranges));
     }
     // No single parent explained it — every parent gets its candidate ranges.
     Ok(MergeResult {
         changed: true,
         merge_parent_ranges: cands,
-        printed,
+        printed: range.clone(),
     })
 }
 

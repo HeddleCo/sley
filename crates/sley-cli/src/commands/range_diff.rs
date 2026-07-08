@@ -560,6 +560,7 @@ fn build_patch_text(
             &mut raw,
             entry,
             DiffRenderOptions {
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
                 binary: false,
                 anchors: &[],
                 allow_textconv: false,

@@ -28,8 +28,8 @@
 //! re-derive — while leaving the repository-coupled concerns in the consumer.
 
 use crate::line_diff::{
-    line_is_blank, myers_diff_lines_ws, patience_diff_lines_anchored, split_lines, DiffAlgorithm,
-    DiffLine, DiffOp, WsIgnore,
+    DiffAlgorithm, DiffLine, DiffOp, WsIgnore, line_is_blank, myers_diff_lines_ws,
+    patience_diff_lines_anchored, split_lines,
 };
 use std::collections::HashMap;
 
@@ -196,6 +196,8 @@ pub struct HunkRenderOptions<'a, 'h> {
     pub colors: Option<RenderColors<'a>>,
     /// Word-diff body hook (replaces the `+`/`-` line bodies of each hunk).
     pub word_diff: Option<&'a mut dyn HunkWordDiff>,
+    /// Hunk body line indicators (` `, `-`, `+` by default).
+    pub line_indicators: LineIndicators,
     /// `--ws-error-highlight` configuration: when set and colors are on, the
     /// renderer paints whitespace errors on the selected line kinds with
     /// `colors.whitespace` (git's `emit_line_ws_markup`). `None` disables it.
@@ -235,6 +237,23 @@ pub struct HunkRenderOptions<'a, 'h> {
     /// `algorithm` is [`DiffAlgorithm::Patience`]; empty (the default) is plain
     /// patience. Forces the matching unique lines to stay aligned.
     pub anchors: &'a [Vec<u8>],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineIndicators {
+    pub context: u8,
+    pub old: u8,
+    pub new: u8,
+}
+
+impl Default for LineIndicators {
+    fn default() -> Self {
+        Self {
+            context: b' ',
+            old: b'-',
+            new: b'+',
+        }
+    }
 }
 
 /// A half-open `[start, end)` line range (0-based) for `log -L` hunk
@@ -286,6 +305,7 @@ impl Default for HunkRenderOptions<'_, '_> {
             heading: None,
             colors: None,
             word_diff: None,
+            line_indicators: LineIndicators::default(),
             ws_error: None,
             ws_ignore: WsIgnore::default(),
             algorithm: DiffAlgorithm::Myers,
@@ -329,13 +349,15 @@ pub fn render_hunks(
             .unwrap_or(0)
             .max(0) as usize;
         let saved_context = options.context;
+        let line_indicators = options.line_indicators;
+        let word_diff = options.word_diff.is_some();
         options.context = replace_context_value(saved_context, context.max(max_span));
         options.line_ranges = None;
         let mut full = Vec::new();
         render_hunks(&mut full, old_content, new_content, options);
         options.context = saved_context;
         options.line_ranges = Some(ranges);
-        filter_hunks_to_ranges(out, &full, ranges);
+        filter_hunks_to_ranges(out, &full, ranges, line_indicators, word_diff);
         return;
     }
     let old = split_lines(old_content.unwrap_or_default());
@@ -1010,6 +1032,9 @@ struct RangeFilter<'r> {
     /// Post/pre-image 1-based line counters seeded from each `@@` header.
     lno_post: i64,
     lno_pre: i64,
+    /// The old/new line counts from the current xdiff hunk header.
+    hunk_old_count: i64,
+    hunk_new_count: i64,
     /// Function-name heading carried from the current `@@` header (the suffix
     /// after `@@ ... @@ `), reused verbatim on every emitted range hunk.
     func: Vec<u8>,
@@ -1025,6 +1050,15 @@ struct RangeFilter<'r> {
     pending_rm: Vec<u8>,
     pending_rm_count: i64,
     pending_rm_pre_begin: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RangeBodyKind {
+    Context,
+    Delete,
+    Insert,
+    Change,
+    NoNewline,
 }
 
 impl RangeFilter<'_> {
@@ -1073,10 +1107,11 @@ impl RangeFilter<'_> {
         self.rhunk.clear();
     }
 
-    /// Port of diff.c:line_range_line_fn for one rendered body line. `marker`
-    /// is the first byte (`' '`/`'+'`/`'-'`/`'\\'`), `line` the full bytes.
-    fn body_line(&mut self, out: &mut Vec<u8>, marker: u8, line: &[u8]) {
-        if marker == b'-' {
+    /// Port of diff.c:line_range_line_fn for one rendered body line. `kind`
+    /// is the logical role of the rendered line after accounting for custom
+    /// output indicators, ANSI color, and word-diff body rendering.
+    fn body_line(&mut self, out: &mut Vec<u8>, kind: RangeBodyKind, line: &[u8]) {
+        if kind == RangeBodyKind::Delete {
             if self.pending_rm_count == 0 {
                 self.pending_rm_pre_begin = self.lno_pre;
             }
@@ -1085,7 +1120,7 @@ impl RangeFilter<'_> {
             self.pending_rm_count += 1;
             return;
         }
-        if marker == b'\\' {
+        if kind == RangeBodyKind::NoNewline {
             if self.pending_rm_count != 0 {
                 self.pending_rm.extend_from_slice(line);
             } else if self.rhunk_active {
@@ -1093,11 +1128,13 @@ impl RangeFilter<'_> {
             }
             return;
         }
-        // marker is '+' or ' '
+        // Context, insertion, and word-diff replacement lines all consume a
+        // post-image line. Context/replacement lines also consume a pre-image
+        // line; insertions do not.
         let lno_0 = self.lno_post - 1;
         let cur_pre = self.lno_pre;
         self.lno_post += 1;
-        if marker == b' ' {
+        if matches!(kind, RangeBodyKind::Context | RangeBodyKind::Change) {
             self.lno_pre += 1;
         }
 
@@ -1138,11 +1175,91 @@ impl RangeFilter<'_> {
         }
         self.rhunk.extend_from_slice(line);
         self.rhunk_new_count += 1;
-        if marker == b'+' {
+        if matches!(kind, RangeBodyKind::Insert | RangeBodyKind::Change) {
             self.rhunk_has_changes = true;
-        } else {
+        }
+        if matches!(kind, RangeBodyKind::Context | RangeBodyKind::Change) {
             self.rhunk_old_count += 1;
         }
+    }
+}
+
+fn skip_ansi_prefix(mut line: &[u8]) -> &[u8] {
+    loop {
+        let Some(rest) = line.strip_prefix(b"\x1b[") else {
+            return line;
+        };
+        let Some(end) = rest.iter().position(|&b| (0x40..=0x7e).contains(&b)) else {
+            return line;
+        };
+        line = &rest[end + 1..];
+    }
+}
+
+fn strip_ansi(line: &[u8]) -> Vec<u8> {
+    let mut stripped = Vec::with_capacity(line.len());
+    let mut idx = 0usize;
+    while idx < line.len() {
+        if line[idx] == b'\x1b'
+            && line.get(idx + 1) == Some(&b'[')
+            && let Some(end) = line[idx + 2..]
+                .iter()
+                .position(|&b| (0x40..=0x7e).contains(&b))
+        {
+            idx += end + 3;
+            continue;
+        }
+        stripped.push(line[idx]);
+        idx += 1;
+    }
+    stripped
+}
+
+fn classify_word_diff_line(visible: &[u8]) -> RangeBodyKind {
+    if visible.starts_with(b"\\") {
+        return RangeBodyKind::NoNewline;
+    }
+    let has_old = find_subslice(visible, b"[-").is_some();
+    let has_new = find_subslice(visible, b"{+").is_some();
+    match (has_old, has_new) {
+        (true, false) if visible.starts_with(b"[-") => return RangeBodyKind::Delete,
+        (false, true) if visible.starts_with(b"{+") => return RangeBodyKind::Insert,
+        (true, _) | (_, true) => return RangeBodyKind::Change,
+        _ => {}
+    }
+    // Porcelain word-diff keeps line-level markers.
+    match visible.first().copied() {
+        Some(b'-') => RangeBodyKind::Delete,
+        Some(b'+') => RangeBodyKind::Insert,
+        Some(b' ') => RangeBodyKind::Context,
+        Some(b'~') => RangeBodyKind::NoNewline,
+        _ => RangeBodyKind::Context,
+    }
+}
+
+fn classify_range_body_line(
+    line: &[u8],
+    indicators: LineIndicators,
+    word_diff: bool,
+    hunk_old_count: i64,
+    hunk_new_count: i64,
+) -> RangeBodyKind {
+    let visible = skip_ansi_prefix(line);
+    if word_diff {
+        if hunk_old_count == 0 {
+            return RangeBodyKind::Insert;
+        }
+        if hunk_new_count == 0 {
+            return RangeBodyKind::Delete;
+        }
+        return classify_word_diff_line(visible);
+    }
+    match visible.first().copied() {
+        Some(b'\\') => RangeBodyKind::NoNewline,
+        Some(marker) if marker == indicators.old => RangeBodyKind::Delete,
+        Some(marker) if marker == indicators.new => RangeBodyKind::Insert,
+        Some(marker) if marker == indicators.context => RangeBodyKind::Context,
+        _ => RangeBodyKind::Context,
     }
 }
 
@@ -1150,9 +1267,14 @@ impl RangeFilter<'_> {
 /// inflated context) down to the tracked `ranges`, mirroring diff.c's
 /// `line_range_hunk_fn` / `line_range_line_fn` / `flush_rhunk`. The renderer's
 /// `@@` header already carries the funcname suffix; we parse it back out and
-/// reuse it on every emitted range hunk. No-color path only (`log -L` test
-/// output is uncolored).
-fn filter_hunks_to_ranges(out: &mut Vec<u8>, full: &[u8], ranges: &[LineRange]) {
+/// reuse it on every emitted range hunk.
+fn filter_hunks_to_ranges(
+    out: &mut Vec<u8>,
+    full: &[u8],
+    ranges: &[LineRange],
+    line_indicators: LineIndicators,
+    word_diff: bool,
+) {
     if ranges.is_empty() {
         return;
     }
@@ -1161,6 +1283,8 @@ fn filter_hunks_to_ranges(out: &mut Vec<u8>, full: &[u8], ranges: &[LineRange]) 
         cur_range: 0,
         lno_post: 0,
         lno_pre: 0,
+        hunk_old_count: 0,
+        hunk_new_count: 0,
         func: Vec::new(),
         rhunk: Vec::new(),
         rhunk_old_begin: 0,
@@ -1174,20 +1298,35 @@ fn filter_hunks_to_ranges(out: &mut Vec<u8>, full: &[u8], ranges: &[LineRange]) 
         pending_rm_pre_begin: 0,
     };
     for line in split_keep_newline(full) {
-        if line.starts_with(b"@@ ") {
+        let parse_line = if line.starts_with(b"@@ ") {
+            line.to_vec()
+        } else {
+            strip_ansi(line)
+        };
+        if parse_line.starts_with(b"@@ ") {
             // New xdiff hunk: any pending removals from the previous hunk are
             // left in place (diff.c does the same — the next body line decides
             // their fate), and the range hunk cursor is NOT reset across xdiff
             // hunks. Parse the begin line numbers + funcname suffix.
-            if let Some((old_begin, new_begin, func)) = parse_hunk_header(line) {
+            if let Some((old_begin, old_count, new_begin, new_count, func)) =
+                parse_hunk_header(&parse_line)
+            {
                 filter.lno_post = new_begin;
                 filter.lno_pre = old_begin;
+                filter.hunk_old_count = old_count;
+                filter.hunk_new_count = new_count;
                 filter.func = func;
             }
             continue;
         }
-        let marker = line.first().copied().unwrap_or(b' ');
-        filter.body_line(out, marker, line);
+        let kind = classify_range_body_line(
+            line,
+            line_indicators,
+            word_diff,
+            filter.hunk_old_count,
+            filter.hunk_new_count,
+        );
+        filter.body_line(out, kind, line);
     }
     filter.flush_rhunk(out);
 }
@@ -1212,10 +1351,10 @@ fn split_keep_newline(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// Parse a rendered `@@ -o[,c] +n[,c] @@[ func]` header, returning the 1-based
-/// old/new begin line numbers and the trailing funcname bytes (without the
-/// leading space, without a trailing newline). Begin is the value xdiff emits:
-/// 1-based when the count is non-zero, one-less when zero (unused in that case).
-fn parse_hunk_header(line: &[u8]) -> Option<(i64, i64, Vec<u8>)> {
+/// old/new begin line numbers, old/new counts, and the trailing funcname bytes
+/// (without the leading space, without a trailing newline). Begin is the value
+/// xdiff emits: 1-based when the count is non-zero, one-less when zero.
+fn parse_hunk_header(line: &[u8]) -> Option<(i64, i64, i64, i64, Vec<u8>)> {
     // line = "@@ -A,B +C,D @@ func\n" (or "@@ -A +C @@\n", etc.)
     let rest = line.strip_prefix(b"@@ -")?;
     let plus = rest.iter().position(|&b| b == b'+')?;
@@ -1224,8 +1363,8 @@ fn parse_hunk_header(line: &[u8]) -> Option<(i64, i64, Vec<u8>)> {
     let after_plus = &rest[plus + 1..];
     let close = find_subslice(after_plus, b" @@")?;
     let new_part = &after_plus[..close];
-    let old_begin = parse_range_begin(old_part.split(|&b| b == b' ').next().unwrap_or(old_part))?;
-    let new_begin = parse_range_begin(new_part)?;
+    let (old_begin, old_count) = parse_range_side(old_part)?;
+    let (new_begin, new_count) = parse_range_side(new_part)?;
     // Funcname suffix: everything after " @@ " (a single space separates it).
     let tail = &after_plus[close + 3..];
     let func = if let Some(f) = tail.strip_prefix(b" ") {
@@ -1237,13 +1376,28 @@ fn parse_hunk_header(line: &[u8]) -> Option<(i64, i64, Vec<u8>)> {
     } else {
         Vec::new()
     };
-    Some((old_begin, new_begin, func))
+    Some((old_begin, old_count, new_begin, new_count, func))
 }
 
-/// Parse the "A" or "A,B" begin field of an `@@` range side into A.
-fn parse_range_begin(field: &[u8]) -> Option<i64> {
-    let begin = field.split(|&b| b == b',').next().unwrap_or(field);
-    std::str::from_utf8(begin).ok()?.trim().parse::<i64>().ok()
+/// Parse an `@@` range side field, `A` or `A,B`, into `(A, B)`. A missing
+/// count means one line.
+fn parse_range_side(field: &[u8]) -> Option<(i64, i64)> {
+    let field = field.split(|&b| b == b' ').next().unwrap_or(field);
+    let mut parts = field.splitn(2, |&b| b == b',');
+    let begin = std::str::from_utf8(parts.next()?)
+        .ok()?
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    let count = match parts.next() {
+        Some(count) => std::str::from_utf8(count)
+            .ok()?
+            .trim()
+            .parse::<i64>()
+            .ok()?,
+        None => 1,
+    };
+    Some((begin, count))
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2113,9 +2267,9 @@ fn render_one_hunk(
 
     for (offset, line) in slice.iter().enumerate() {
         let prefix = match line.kind {
-            LineKind::Context => b' ',
-            LineKind::Delete => b'-',
-            LineKind::Insert => b'+',
+            LineKind::Context => options.line_indicators.context,
+            LineKind::Delete => options.line_indicators.old,
+            LineKind::Insert => options.line_indicators.new,
         };
         match options.colors {
             Some(colors) => {

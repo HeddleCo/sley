@@ -45,6 +45,13 @@ pub(super) struct LineLogOutputCtx<'a> {
     pub(super) pickaxe_ignore_case: bool,
     pub(super) pickaxe_text: bool,
     pub(super) pickaxe_detect_renames: bool,
+    pub(super) diff_filter_mask: Option<u32>,
+    pub(super) reverse_diff: bool,
+    pub(super) graph: bool,
+    pub(super) color_always: bool,
+    pub(super) color_moved: Option<sley_diff_merge::render::ColorMoved>,
+    pub(super) userdiff: Option<&'a commands::userdiff::UserdiffResolver>,
+    pub(super) output_path: Option<&'a str>,
 }
 
 /// `git log -L`: walk history with the line-log engine and emit each commit that
@@ -81,6 +88,13 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
         pickaxe_ignore_case,
         pickaxe_text,
         pickaxe_detect_renames,
+        diff_filter_mask,
+        reverse_diff,
+        graph,
+        color_always,
+        color_moved,
+        userdiff,
+        output_path,
     } = ctx;
 
     // `-L` line-log shares git's `log.mailmap` default (true) and the default
@@ -124,6 +138,33 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
     if max_age.is_some() || min_age.is_some() {
         selected.retain(|record| log_age_filters_match(record, max_age, min_age).unwrap_or(true));
     }
+    if let Some(pickaxe) = pickaxe {
+        let mut kept = Vec::with_capacity(selected.len());
+        for record in selected {
+            if pickaxe_commit_matches(
+                db,
+                format,
+                record,
+                pickaxe,
+                pickaxe_ignore_case,
+                pickaxe_text,
+                pickaxe_detect_renames,
+                None,
+                userdiff,
+            )? {
+                kept.push(record);
+            }
+        }
+        selected = kept;
+    }
+    if let Some(mask) = diff_filter_mask {
+        selected.retain(|record| {
+            result
+                .printed
+                .get(&record.oid)
+                .is_some_and(|files| line_log_files_match_diff_filter(files, mask))
+        });
+    }
     if let Some(max_count) = max_count {
         selected.truncate(max_count);
     }
@@ -136,7 +177,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
     // history). An uninteresting parent is replaced by the union of *its*
     // nearest-interesting ancestors, so commits that did not touch the tracked
     // range collapse out of the displayed parent chain.
-    let rewritten_parents: Option<HashMap<ObjectId, Vec<ObjectId>>> = if show_parents {
+    let rewritten_parents: Option<HashMap<ObjectId, Vec<ObjectId>>> = if show_parents || graph {
         let interesting_set: HashSet<ObjectId> = result.interesting.iter().copied().collect();
         let by_oid: HashMap<ObjectId, &sley_rev::CommitRecord> =
             ordered.iter().map(|r| (r.oid, r)).collect();
@@ -214,33 +255,105 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
     let eff_src_prefix = src_prefix.unwrap_or("a/");
     let eff_dst_prefix = dst_prefix.unwrap_or("b/");
 
-    let mut stdout = io::stdout();
+    let diff_colors = color_always.then(|| commands::diff_words::DiffColors::enabled(Some(config)));
+    let mut output_file;
+    let mut stdout;
+    let stdout: &mut dyn Write = if let Some(path) = output_path {
+        output_file = fs::File::create(path)?;
+        &mut output_file
+    } else {
+        stdout = io::stdout();
+        &mut stdout
+    };
     let mut patch_block = Vec::new();
     let mut printed_entries = 0usize;
-    for record in &selected {
-        // `-S`/`-G`/`--find-object`: suppress this commit's diff pairs when its
-        // whole-file diff does not match the pickaxe (the header still prints,
-        // matching git's show_log-before-diffcore_std pipeline). Computed on the
-        // ORIGINAL record so the real parent edge drives the diff.
-        let pickaxe_suppresses = match pickaxe {
-            Some(pickaxe) => !pickaxe_commit_matches(
+    if graph {
+        let palette = log_graph_color_palette(config);
+        let mut graph_state = sley_rev::graph::Graph::new(palette, color_always);
+        let shown: HashSet<ObjectId> = selected.iter().map(|record| record.oid).collect();
+        for record in &selected {
+            let rewritten = rewritten_parents
+                .as_ref()
+                .and_then(|map| map.get(&record.oid));
+            let owned_record;
+            let record: &sley_rev::CommitRecord = match rewritten {
+                Some(parents) if parents.as_slice() != record.parents.as_slice() => {
+                    let mut clone = (*record).clone();
+                    clone.parents = parents.clone();
+                    owned_record = clone;
+                    &owned_record
+                }
+                _ => record,
+            };
+            let interesting = record
+                .parents
+                .iter()
+                .filter(|parent| shown.contains(*parent))
+                .copied()
+                .collect::<Vec<_>>();
+            graph_state.update(record.oid, &interesting);
+            graph_show_commit(&mut graph_state, "", stdout)?;
+            let mut msg = Vec::new();
+            match output {
+                LogOutput::Compiled { compiled, .. } => {
+                    let format_context = LogFormatContext {
+                        abbrev_len,
+                        decorations: &decorations,
+                        marker: '>',
+                        dialect: LogFormatDialect::Log,
+                        source: None,
+                        date_mode,
+                        source_oid: None,
+                        describe: Some(&CliLogDescribeAdapter(&describe_ctx)),
+                        signature: None,
+                        color: color_always,
+                        output_encoding,
+                        mailmap: &CliMailmapAdapter(&mailmap),
+                        use_mailmap,
+                    };
+                    emit_compiled_log_format(
+                        record,
+                        compiled,
+                        &format_context,
+                        &mut msg,
+                        0..compiled.tokens.len(),
+                    )?;
+                    msg = log_reencode_message(&msg, "UTF-8", output_encoding).into_owned();
+                    msg.push(b'\n');
+                }
+                LogOutput::Default(_) => {
+                    writeln!(
+                        msg,
+                        "commit {}",
+                        format_log_commit_header_oid(&record.oid, abbrev_commit, abbrev_len)
+                    )?;
+                }
+            }
+            patch_block.clear();
+            render_line_log_diff(
+                &mut patch_block,
                 db,
                 format,
-                record,
-                pickaxe,
-                pickaxe_ignore_case,
-                pickaxe_text,
-                pickaxe_detect_renames,
-                None,
-                None,
-            )?,
-            None => false,
-        };
-        let files = if pickaxe_suppresses {
-            None
-        } else {
-            result.printed.get(&record.oid)
-        };
+                result.printed.get(&record.oid),
+                diff_opts,
+                patch_abbrev,
+                eff_src_prefix,
+                eff_dst_prefix,
+                reverse_diff,
+                diff_colors.as_ref(),
+                color_moved,
+                userdiff,
+            )?;
+            if !patch_block.is_empty() {
+                msg.extend_from_slice(&patch_block);
+            }
+            graph_show_commit_msg(&mut graph_state, "", &msg, stdout)?;
+        }
+        stdout.flush()?;
+        return Ok(());
+    }
+    for record in &selected {
+        let files = result.printed.get(&record.oid);
         // Under `--parents`, render the rewritten parent set (collapsing
         // commits that did not touch the tracked range) for both the inline
         // parent list and any `%p`/`%P` format placeholders.
@@ -308,9 +421,9 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                         writeln!(stdout, "    {line}")?;
                     }
                 }
-                if diff_opts.patch {
+                if diff_opts.any() {
                     patch_block.clear();
-                    render_line_log_patch(
+                    render_line_log_diff(
                         &mut patch_block,
                         db,
                         format,
@@ -319,6 +432,10 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                         patch_abbrev,
                         eff_src_prefix,
                         eff_dst_prefix,
+                        reverse_diff,
+                        diff_colors.as_ref(),
+                        color_moved,
+                        userdiff,
                     )?;
                     if !patch_block.is_empty() {
                         stdout.write_all(diff_opts.block_separator())?;
@@ -359,13 +476,10 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                     0..compiled.tokens.len(),
                 )?;
                 let line = log_reencode_message(&line, "UTF-8", output_encoding);
-                stdout.write_all(&line)?;
-                if *final_newline {
-                    stdout.write_all(b"\n")?;
-                }
-                if diff_opts.patch {
+                let mut patch_block_nonempty = false;
+                if diff_opts.any() {
                     patch_block.clear();
-                    render_line_log_patch(
+                    render_line_log_diff(
                         &mut patch_block,
                         db,
                         format,
@@ -374,13 +488,24 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                         patch_abbrev,
                         eff_src_prefix,
                         eff_dst_prefix,
+                        reverse_diff,
+                        diff_colors.as_ref(),
+                        color_moved,
+                        userdiff,
                     )?;
-                    if !patch_block.is_empty() {
-                        if !*final_newline {
-                            stdout.write_all(b"\n")?;
-                        }
-                        stdout.write_all(&patch_block)?;
+                    patch_block_nonempty = !patch_block.is_empty();
+                }
+                let suppress_empty_format_newline =
+                    line.is_empty() && *final_newline && patch_block_nonempty;
+                stdout.write_all(&line)?;
+                if *final_newline && !suppress_empty_format_newline {
+                    stdout.write_all(b"\n")?;
+                }
+                if patch_block_nonempty {
+                    if !*final_newline && !line.is_empty() {
+                        stdout.write_all(b"\n")?;
                     }
+                    stdout.write_all(&patch_block)?;
                 }
             }
         }
@@ -389,11 +514,39 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Render the restricted patch block for one line-log commit: each printed file
+fn line_log_file_entry(
+    file: &crate::commands::line_log::PrintedFile,
+) -> sley_diff_merge::NameStatusEntry {
+    sley_diff_merge::NameStatusEntry {
+        status: file.status,
+        path: sley_rev::BString::from(file.new_path.as_bytes().to_vec()),
+        old_path: if file.old_path != file.new_path {
+            Some(sley_rev::BString::from(file.old_path.as_bytes().to_vec()))
+        } else {
+            None
+        },
+        old_mode: file.old_mode,
+        new_mode: file.new_mode,
+        old_oid: file.old_oid,
+        new_oid: file.new_oid,
+    }
+}
+
+fn line_log_files_match_diff_filter(
+    files: &[crate::commands::line_log::PrintedFile],
+    mask: u32,
+) -> bool {
+    files
+        .iter()
+        .map(line_log_file_entry)
+        .any(|entry| diff_filter_entry_matches(&entry, mask))
+}
+
+/// Render the requested diff-format block for one line-log commit. Patch output
 /// is emitted via the shared patch writer with its hunks clipped to the tracked
 /// post-image line ranges.
 #[allow(clippy::too_many_arguments)]
-fn render_line_log_patch(
+fn render_line_log_diff(
     out: &mut Vec<u8>,
     db: &FileObjectDatabase,
     format: ObjectFormat,
@@ -402,58 +555,79 @@ fn render_line_log_patch(
     patch_abbrev: usize,
     src_prefix: &str,
     dst_prefix: &str,
+    reverse_diff: bool,
+    colors: Option<&commands::diff_words::DiffColors>,
+    color_moved: Option<sley_diff_merge::render::ColorMoved>,
+    userdiff: Option<&commands::userdiff::UserdiffResolver>,
 ) -> Result<()> {
     let files = match files {
         Some(f) if !f.is_empty() => f,
         _ => return Ok(()),
     };
+    let word_request = diff_opts.word_diff_mode.map(|mode| WordDiffRequest {
+        mode,
+        cli_regex: diff_opts.word_diff_regex.as_deref(),
+    });
     for file in files {
-        let entry = sley_diff_merge::NameStatusEntry {
-            status: file.status,
-            path: sley_rev::BString::from(file.new_path.as_bytes().to_vec()),
-            old_path: if file.old_path != file.new_path {
-                Some(sley_rev::BString::from(file.old_path.as_bytes().to_vec()))
-            } else {
-                None
-            },
-            old_mode: file.old_mode,
-            new_mode: file.new_mode,
-            old_oid: file.old_oid,
-            new_oid: file.new_oid,
+        let mut entry = line_log_file_entry(file);
+        let line_ranges = std::borrow::Cow::Borrowed(file.line_ranges.as_slice());
+        let (src_prefix, dst_prefix) = if reverse_diff {
+            entry = reverse_diff_entry(entry);
+            (dst_prefix, src_prefix)
+        } else {
+            (src_prefix, dst_prefix)
         };
-        crate::write_diff_patch_entry(
-            out,
-            &entry,
-            crate::DiffRenderOptions {
-                binary: false,
-                anchors: &[],
-                allow_textconv: false,
-                db,
-                worktree_root: None,
-                use_worktree_new: false,
-                format,
-                abbrev: patch_abbrev,
-                src_prefix,
-                dst_prefix,
-                context: 3,
-                userdiff: None,
-                colors: None,
-                word_diff: None,
-                no_index_contents: None,
-                submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
-                submodule_dirt: None,
-                ws_error: None,
-                color_moved: None,
-                funcname: None,
-                interhunk: 0,
-                ws_ignore: diff_opts.ws_ignore,
-                diff_algorithm: diff_opts.diff_algorithm,
-                ignore_blank_lines: diff_opts.ignore_blank_lines,
-                ignore_regexes: &diff_opts.ignore_regexes,
-                line_ranges: Some(&file.line_ranges),
-                indent_heuristic: diff_opts.indent_heuristic,
-            },
-        )?;
+        if diff_opts.raw {
+            write_diff_raw_entry(out, &entry, false, false, Some(patch_abbrev), format)?;
+        }
+        if diff_opts.name_status {
+            writeln!(out, "{}", entry.line())?;
+        }
+        if diff_opts.name_only {
+            writeln!(out, "{}", String::from_utf8_lossy(entry.path.as_bytes()))?;
+        }
+        if diff_opts.summary {
+            write_diff_summary_entry(out, &entry)?;
+        }
+        if diff_opts.patch {
+            if diff_opts.raw || diff_opts.name_status || diff_opts.name_only || diff_opts.summary {
+                out.push(b'\n');
+            }
+            crate::write_diff_patch_entry(
+                out,
+                &entry,
+                crate::DiffRenderOptions {
+                    binary: false,
+                    anchors: &[],
+                    allow_textconv: false,
+                    db,
+                    worktree_root: None,
+                    use_worktree_new: false,
+                    format,
+                    abbrev: patch_abbrev,
+                    src_prefix,
+                    dst_prefix,
+                    context: diff_opts.context.unwrap_or(3),
+                    userdiff,
+                    colors,
+                    word_diff: word_request.as_ref(),
+                    line_indicators: diff_opts.line_indicators,
+                    no_index_contents: None,
+                    submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                    submodule_dirt: None,
+                    ws_error: None,
+                    color_moved,
+                    funcname: None,
+                    interhunk: 0,
+                    ws_ignore: diff_opts.ws_ignore,
+                    diff_algorithm: diff_opts.diff_algorithm,
+                    ignore_blank_lines: diff_opts.ignore_blank_lines,
+                    ignore_regexes: &diff_opts.ignore_regexes,
+                    line_ranges: Some(line_ranges.as_ref()),
+                    indent_heuristic: diff_opts.indent_heuristic,
+                },
+            )?;
+        }
     }
     Ok(())
 }

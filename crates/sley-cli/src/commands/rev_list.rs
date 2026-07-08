@@ -1934,6 +1934,7 @@ fn rev_list_render_tree_to_tree_patch(
             &mut out,
             entry,
             DiffRenderOptions {
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
                 binary: false,
                 anchors: &[],
                 allow_textconv: false,

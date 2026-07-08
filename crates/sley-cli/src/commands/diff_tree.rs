@@ -351,7 +351,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             value if let Some(rest) = value.strip_prefix("--find-object=") => {
                 options.find_object_values.push(rest.to_string());
             }
-            "-a" | "--text" | "--no-ext-diff" | "--no-textconv" => {}
+            "-a" | "--text" | "--no-ext-diff" | "--no-textconv" | "--graph" => {}
             // Rename / copy detection. diff-tree leaves these off unless asked.
             "-M" | "--find-renames" => options.detect_renames = true,
             "-C" | "--find-copies" => options.detect_copies = true,
@@ -1249,6 +1249,7 @@ fn run_diff_request(
                 funcname: None,
                 colors: None,
                 word_diff: None,
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
                 no_index_contents: None,
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,

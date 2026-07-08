@@ -943,6 +943,7 @@ fn rerere_diff(git_dir: &Path, format: ObjectFormat) -> Result<()> {
             &mut rendered,
             &diff_entry,
             DiffRenderOptions {
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
                 binary: false,
                 anchors: &[],
                 allow_textconv: false,

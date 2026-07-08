@@ -593,6 +593,7 @@ fn render(
         }
         for entry in entries {
             let options = DiffRenderOptions {
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
                 binary: false,
                 anchors: &[],
                 allow_textconv: false,

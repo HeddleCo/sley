@@ -54,7 +54,7 @@ pub(super) fn log_parse_diff_merges_config(value: &str) -> Result<LogDiffMerges>
 }
 
 /// Diff-output options accepted by `git log` (`-p`, `--stat`, `--raw`, ...).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct LogDiffOptions {
     pub(super) patch: bool,
     pub(super) stat: bool,
@@ -80,6 +80,12 @@ pub(super) struct LogDiffOptions {
     pub(super) ignore_blank_lines: bool,
     /// Compiled `-I<regex>` (`--ignore-matching-lines`) patterns.
     pub(super) ignore_regexes: Vec<sley_grep::Regex>,
+    /// `--word-diff[=<mode>]` rendering request.
+    pub(super) word_diff_mode: Option<commands::diff_words::WordDiffMode>,
+    /// `--word-diff-regex=<regex>` override.
+    pub(super) word_diff_regex: Option<String>,
+    /// Hunk body line indicators (` `, `-`, `+` by default).
+    pub(super) line_indicators: sley_diff_merge::render::LineIndicators,
     /// Unified diff context (`-U<n>` / `diff.context`), resolved before render.
     pub(super) context: Option<usize>,
     /// `-a`/`--text`: treat all files as text (affects `-G` binary skipping).
@@ -119,6 +125,9 @@ impl Default for LogDiffOptions {
             diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             ignore_blank_lines: false,
             ignore_regexes: Vec::new(),
+            word_diff_mode: None,
+            word_diff_regex: None,
+            line_indicators: sley_diff_merge::render::LineIndicators::default(),
             context: None,
             text: false,
             order_file: None,
@@ -389,6 +398,10 @@ impl LogDiffContext<'_> {
             }
         }
         if patch {
+            let word_request = opts.word_diff_mode.map(|mode| WordDiffRequest {
+                mode,
+                cli_regex: opts.word_diff_regex.as_deref(),
+            });
             if opts.raw
                 || opts.name_status
                 || opts.name_only
@@ -419,7 +432,8 @@ impl LogDiffContext<'_> {
                         userdiff: Some(self.userdiff),
                         funcname: None,
                         colors: None,
-                        word_diff: None,
+                        word_diff: word_request.as_ref(),
+                        line_indicators: opts.line_indicators,
                         no_index_contents: None,
                         submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                         submodule_dirt: None,
