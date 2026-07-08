@@ -1520,10 +1520,13 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     } else {
         None
     };
+    let initial_commit = !amend
+        && commands::merge_rebase::head_commit_oid(&FileRefStore::new(&git_dir, format))?
+            .is_none();
     let options = sley_sequencer::CommitIndexOptions {
         author,
         committer,
-        reflog_message: commit_reflog_message(&message, amend),
+        reflog_message: commit_reflog_message_with_initial(&message, amend, initial_commit),
         message,
         encoding: commit_encoding_header,
         signature,
@@ -1853,7 +1856,7 @@ fn conclude_replay_via_commit(
             old_oid,
             new_oid,
             committer,
-            message: commit_reflog_message(&message, false),
+            message: commit_reflog_message_with_initial(&message, false, head.is_none()),
         }),
     });
     tx.commit()?;
@@ -1932,7 +1935,7 @@ fn commit_partial_paths(
             old_oid,
             new_oid,
             committer,
-            message: commit_reflog_message(&message, false),
+            message: commit_reflog_message_with_initial(&message, false, head.is_none()),
         }),
     });
     tx.commit()?;

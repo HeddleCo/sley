@@ -306,6 +306,10 @@ pub(crate) fn commit_signoff_from_env() -> Result<Vec<u8>> {
 }
 
 pub(crate) fn commit_reflog_message(message: &[u8], amend: bool) -> Vec<u8> {
+    commit_reflog_message_with_initial(message, amend, false)
+}
+
+pub(crate) fn commit_reflog_message_with_initial(message: &[u8], amend: bool, initial: bool) -> Vec<u8> {
     let subject = String::from_utf8_lossy(message)
         .lines()
         .next()
@@ -313,6 +317,8 @@ pub(crate) fn commit_reflog_message(message: &[u8], amend: bool) -> Vec<u8> {
         .to_string();
     if amend {
         format!("commit (amend): {subject}").into_bytes()
+    } else if initial {
+        format!("commit (initial): {subject}").into_bytes()
     } else {
         format!("commit: {subject}").into_bytes()
     }

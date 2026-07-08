@@ -381,7 +381,8 @@ declare -A FLOOR=(
     # 271->275 RESTORED 2026-06-20 (wave-23 fixes): the wave-4 (eb1f4dfd) floor of 275
     # was silently regressed to 271 by a later reftable-migration commit; the badrefname
     # fix-slice restores the 4 cells. CI-reproducible (local plumbing, no transport).
-    [t1400-update-ref.sh]=298  # wave-52 refs: 275->296 (symref no-deref, batch-update symref/conflict rejections, empty default reflog msg, HEAD reflog on branch delete, packed+loose delete)
+    # 2026-07-08 off main 1136760b: t1400-update-ref.sh 298->315 by matching dangling symref creation/deletion, reflog date selector warnings, initial commit reflog messages, per-worktree refs/bisect, reftable sentinel conflict checks, and ref namespace delete pruning; guards held t1401-symbolic-ref.sh=25/25 and t1405-main-ref-store.sh=16/16; measured against /tmp/git-src 2.55.0 oracle.
+    [t1400-update-ref.sh]=315
     [t1401-symbolic-ref.sh]=25
     # t1430 + t7450 NEW 2026-06-20 (wave-23): bad-ref-name validation + bad-git-dotfiles
     # security hardening. Enrolled in SLEY_TESTS below.

@@ -866,10 +866,10 @@ impl FileRefStore {
             }
             return Ok(false);
         }
-        // git routes root-ref-syntax names (HEAD, FETCH_HEAD, MERGE_HEAD, …) to
-        // the per-worktree gitdir and everything else to the common dir; mirror
+        // git routes root-ref-syntax names (HEAD, FETCH_HEAD, MERGE_HEAD, …) and
+        // per-worktree namespaces to the per-worktree gitdir; mirror
         // files_ref_path's REF_WORKTREE_CURRENT vs REF_WORKTREE_SHARED split.
-        let base = if is_root_ref_syntax(name) {
+        let base = if current_worktree_ref(name) {
             &self.git_dir
         } else {
             &self.common_dir
@@ -1129,6 +1129,7 @@ impl FileRefStore {
         }
         let mut loose_refs = BTreeMap::new();
         self.collect_loose_refs_with_prefix(prefix, &mut loose_refs)?;
+        self.collect_current_worktree_loose_refs_with_prefix(prefix, &mut loose_refs)?;
         if !loose_refs.is_empty() {
             refs.retain(|reference| !loose_refs.contains_key(&reference.name));
             refs.extend(loose_refs.into_values());
@@ -1167,6 +1168,7 @@ impl FileRefStore {
         }
         let mut loose_names = BTreeSet::new();
         self.collect_loose_ref_names_with_prefix(prefix, &mut loose_names)?;
+        self.collect_current_worktree_loose_ref_names_with_prefix(prefix, &mut loose_names)?;
         if !loose_names.is_empty() {
             names.retain(|name| !loose_names.contains(name));
             names.extend(loose_names);
@@ -1208,6 +1210,7 @@ impl FileRefStore {
         }
         let mut loose_full_names = BTreeSet::new();
         self.collect_loose_ref_names_with_prefix(prefix, &mut loose_full_names)?;
+        self.collect_current_worktree_loose_ref_names_with_prefix(prefix, &mut loose_full_names)?;
         let loose_names = loose_full_names
             .into_iter()
             .filter_map(|name| {
@@ -2492,18 +2495,40 @@ impl FileRefStore {
         Ok(())
     }
 
-    fn collect_loose_refs_with_prefix(
+    fn collect_loose_refs_with_prefix(&self, prefix: &str, refs: &mut BTreeMap<String, Ref>) -> Result<()> {
+        self.collect_loose_refs_with_prefix_from_base(&self.storage_dir, prefix, refs)
+    }
+
+    fn collect_current_worktree_loose_refs_with_prefix(
         &self,
         prefix: &str,
         refs: &mut BTreeMap<String, Ref>,
     ) -> Result<()> {
+        if self.git_dir == self.common_dir {
+            return Ok(());
+        }
+        for namespace in CURRENT_WORKTREE_REF_PREFIXES {
+            if ref_prefixes_overlap(prefix, namespace) {
+                let scan_prefix = if prefix.starts_with(namespace) { prefix } else { namespace };
+                self.collect_loose_refs_with_prefix_from_base(&self.git_dir, scan_prefix, refs)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_loose_refs_with_prefix_from_base(
+        &self,
+        base: &Path,
+        prefix: &str,
+        refs: &mut BTreeMap<String, Ref>,
+    ) -> Result<()> {
         if !safe_ref_prefix_for_directory_scan(prefix) {
-            return self.collect_all_loose_refs(refs);
+            return self.collect_all_loose_refs_from_base(base, refs);
         }
 
         let trimmed = prefix.trim_end_matches('/');
         if prefix.ends_with('/') {
-            let candidate = self.storage_dir.join(trimmed);
+            let candidate = base.join(trimmed);
             match fs::metadata(&candidate) {
                 Ok(meta) if meta.is_dir() => {
                     self.collect_loose_refs(&candidate, trimmed, refs)?;
@@ -2516,9 +2541,9 @@ impl FileRefStore {
         }
 
         let Some((parent_prefix, _)) = trimmed.rsplit_once('/') else {
-            return self.collect_all_loose_refs(refs);
+            return self.collect_all_loose_refs_from_base(base, refs);
         };
-        let parent = self.storage_dir.join(parent_prefix);
+        let parent = base.join(parent_prefix);
         match fs::metadata(&parent) {
             Ok(meta) if meta.is_dir() => self.collect_loose_refs(&parent, parent_prefix, refs),
             Ok(_) => Ok(()),
@@ -2546,18 +2571,40 @@ impl FileRefStore {
         Ok(())
     }
 
-    fn collect_loose_ref_names_with_prefix(
+    fn collect_loose_ref_names_with_prefix(&self, prefix: &str, names: &mut BTreeSet<String>) -> Result<()> {
+        self.collect_loose_ref_names_with_prefix_from_base(&self.storage_dir, prefix, names)
+    }
+
+    fn collect_current_worktree_loose_ref_names_with_prefix(
         &self,
         prefix: &str,
         names: &mut BTreeSet<String>,
     ) -> Result<()> {
+        if self.git_dir == self.common_dir {
+            return Ok(());
+        }
+        for namespace in CURRENT_WORKTREE_REF_PREFIXES {
+            if ref_prefixes_overlap(prefix, namespace) {
+                let scan_prefix = if prefix.starts_with(namespace) { prefix } else { namespace };
+                self.collect_loose_ref_names_with_prefix_from_base(&self.git_dir, scan_prefix, names)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_loose_ref_names_with_prefix_from_base(
+        &self,
+        base: &Path,
+        prefix: &str,
+        names: &mut BTreeSet<String>,
+    ) -> Result<()> {
         if !safe_ref_prefix_for_directory_scan(prefix) {
-            return self.collect_all_loose_ref_names(names);
+            return self.collect_all_loose_ref_names_from_base(base, names);
         }
 
         let trimmed = prefix.trim_end_matches('/');
         if prefix.ends_with('/') {
-            let candidate = self.storage_dir.join(trimmed);
+            let candidate = base.join(trimmed);
             match fs::metadata(&candidate) {
                 Ok(meta) if meta.is_dir() => {
                     self.collect_loose_ref_names(&candidate, trimmed, names)?;
@@ -2570,9 +2617,9 @@ impl FileRefStore {
         }
 
         let Some((parent_prefix, _)) = trimmed.rsplit_once('/') else {
-            return self.collect_all_loose_ref_names(names);
+            return self.collect_all_loose_ref_names_from_base(base, names);
         };
-        let parent = self.storage_dir.join(parent_prefix);
+        let parent = base.join(parent_prefix);
         match fs::metadata(&parent) {
             Ok(meta) if meta.is_dir() => {
                 self.collect_loose_ref_names(&parent, parent_prefix, names)
@@ -2583,16 +2630,24 @@ impl FileRefStore {
         }
     }
 
-    fn collect_all_loose_ref_names(&self, names: &mut BTreeSet<String>) -> Result<()> {
-        let refs_dir = self.storage_dir.join("refs");
+    fn collect_all_loose_ref_names_from_base(
+        &self,
+        base: &Path,
+        names: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let refs_dir = base.join("refs");
         if refs_dir.exists() {
             self.collect_loose_ref_names(&refs_dir, "refs", names)?;
         }
         Ok(())
     }
 
-    fn collect_all_loose_refs(&self, refs: &mut BTreeMap<String, Ref>) -> Result<()> {
-        let refs_dir = self.storage_dir.join("refs");
+    fn collect_all_loose_refs_from_base(
+        &self,
+        base: &Path,
+        refs: &mut BTreeMap<String, Ref>,
+    ) -> Result<()> {
+        let refs_dir = base.join("refs");
         if refs_dir.exists() {
             self.collect_loose_refs(&refs_dir, "refs", refs)?;
         }
@@ -2685,16 +2740,26 @@ impl FileRefStore {
     }
 
     /// Remove now-empty parent directories left after deleting a loose ref,
-    /// stopping at the `refs/` boundary. git does this so that, e.g., deleting
-    /// `refs/heads/l/m` lets `refs/heads/l` be created as a file afterwards
-    /// (t3200 #14). Pruning stops at the first non-empty directory and never
-    /// removes the `refs` directory itself.
+    /// stopping at the first-level namespace under `refs/`. git does this so
+    /// that, e.g., deleting `refs/heads/l/m` lets `refs/heads/l` be created as a
+    /// file afterwards (t3200 #14), but it keeps `refs/heads` itself around
+    /// (t1400 #30).
     fn prune_empty_ref_dirs(&self, name: &str) {
-        let base = self.ref_base_dir(name).to_path_buf();
-        let refs_root = base.join("refs");
+        let boundary = self.ref_prune_boundary(name);
         if let Some(parent) = self.ref_path(name).parent() {
-            prune_empty_dirs_up_to(parent, &refs_root);
+            prune_empty_dirs_up_to(parent, &boundary);
         }
+    }
+
+    fn ref_prune_boundary(&self, name: &str) -> PathBuf {
+        let base = self.ref_base_dir(name).to_path_buf();
+        let mut components = name.split('/');
+        if components.next() == Some("refs")
+            && let Some(namespace) = components.next()
+        {
+            return base.join("refs").join(namespace);
+        }
+        base
     }
 
     /// Remove a ref's reflog file and prune any empty parent directories it
@@ -2941,10 +3006,7 @@ impl FileRefStore {
         if self.storage_dir != self.common_dir {
             return &self.storage_dir;
         }
-        if is_root_ref_syntax(name)
-            || name.starts_with("refs/worktree/")
-            || name.starts_with("refs/rewritten/")
-        {
+        if current_worktree_ref(name) {
             &self.git_dir
         } else {
             &self.common_dir
@@ -2988,7 +3050,16 @@ impl FileRefStore {
     fn loose_ref_file_exists_for_conflict(&self, name: &str) -> Result<bool> {
         let path = self.ref_path(name);
         match fs::symlink_metadata(path) {
-            Ok(meta) => Ok(!meta.is_dir()),
+            Ok(meta) if meta.is_dir() => Ok(false),
+            Ok(_) => {
+                let path = self.ref_path(name);
+                if let Ok(bytes) = fs::read(path)
+                    && loose_ref_bytes_are_reftable_sentinel(name, &bytes)
+                {
+                    return Ok(false);
+                }
+                Ok(true)
+            }
             Err(err)
                 if err.kind() == std::io::ErrorKind::NotFound
                     || err.kind() == std::io::ErrorKind::NotADirectory =>
@@ -5425,11 +5496,29 @@ fn is_root_ref_syntax(name: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b == b'-' || b == b'_')
 }
 
-fn reftable_current_worktree_ref(name: &str) -> bool {
+const CURRENT_WORKTREE_REF_PREFIXES: &[&str] = &[
+    "refs/bisect/",
+    "refs/worktree/",
+    "refs/rewritten/",
+];
+
+fn current_worktree_ref(name: &str) -> bool {
     is_root_ref_syntax(name)
-        || name.starts_with("refs/bisect/")
-        || name.starts_with("refs/worktree/")
-        || name.starts_with("refs/rewritten/")
+        || CURRENT_WORKTREE_REF_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+fn ref_prefixes_overlap(prefix: &str, namespace: &str) -> bool {
+    let namespace = namespace.trim_end_matches('/');
+    prefix == "refs/"
+        || prefix == namespace
+        || prefix.starts_with(&format!("{namespace}/"))
+        || namespace.starts_with(prefix.trim_end_matches('/'))
+}
+
+fn reftable_current_worktree_ref(name: &str) -> bool {
+    current_worktree_ref(name)
 }
 
 fn reftable_other_worktree_ref(name: &str) -> Option<(&str, &str)> {
@@ -6300,6 +6389,33 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 .join("topic")
                 .exists()
         );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_store_delete_prunes_below_namespace_only() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        for name in ["refs/heads/l/m", "refs/foo/bar"] {
+            let mut tx = store.transaction();
+            tx.update(RefUpdate {
+                name: name.into(),
+                expected: None,
+                new: RefTarget::Direct(oid),
+                reflog: None,
+            });
+            tx.commit().expect("test operation should succeed");
+            store.delete_ref(name).expect("test operation should succeed");
+        }
+        assert!(!git_dir.join("refs").join("heads").join("l").exists());
+        assert!(git_dir.join("refs").join("heads").exists());
+        assert!(!git_dir.join("refs").join("foo").join("bar").exists());
+        assert!(git_dir.join("refs").join("foo").exists());
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
