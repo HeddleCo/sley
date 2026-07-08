@@ -3025,6 +3025,7 @@ fn append_commit_diff_index_patch(
             out,
             &entry,
             DiffRenderOptions {
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
                 binary: false,
                 anchors: &[],
                 allow_textconv: true,

@@ -652,9 +652,12 @@ declare -A FLOOR=(
     [t3903-stash.sh]=132
     [t3900-i18n-commit.sh]=38
     [t4209-log-pickaxe.sh]=45
-    # codex-wave-3 (2026-06-17): merge --no-edit/--edit accepted + merge cleans up renamed-away source;
-    # unmasks the line-log merge+rename cells #61-64 (no crash on -G/-S/--find-object). 69->70.
-    [t4211-line-log.sh]=72
+    # 2026-07-08, off main c0bf80c7: line-log diff output reached full parity,
+    # including word-diff/range filtering, custom output indicators, reverse
+    # diffs, color-moved handling, graph/output routing, raw/name/status/summary
+    # modes, and pickaxe/diff-filter selection. Guards held at t4202-log=142/155
+    # and t4013-diff-various=230/230, measured against /tmp/git-src 2.55.0 oracle.
+    [t4211-line-log.sh]=95
     [t5300-pack-object.sh]=55
     [t5317-pack-objects-filter-objects.sh]=38
     [t5302-pack-index.sh]=31

@@ -112,6 +112,14 @@ fn diff_filter_entry_bit(entry: &sley_diff_merge::NameStatusEntry) -> u32 {
     diff_filter_letter_bit(entry.status.code())
 }
 
+pub(super) fn diff_filter_entry_matches(
+    entry: &sley_diff_merge::NameStatusEntry,
+    mask: u32,
+) -> bool {
+    let status_mask = mask & !DIFF_FILTER_AON;
+    diff_filter_entry_bit(entry) & status_mask != 0
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct DiffFilterMatchOptions<'a> {
     pub(super) mask: u32,
@@ -177,10 +185,9 @@ pub(super) fn diff_filter_commit_matches(
     // The `*` (all-or-none) bit doesn't change the "is any filepair a match"
     // question for commit selection (it only affects which filepairs are kept
     // for output), so test the status bits directly.
-    let status_mask = opts.mask & !DIFF_FILTER_AON;
     Ok(entries
         .iter()
-        .any(|entry| diff_filter_entry_bit(entry) & status_mask != 0))
+        .any(|entry| diff_filter_entry_matches(entry, opts.mask)))
 }
 
 pub(super) fn log_follow_single_path<'a>(

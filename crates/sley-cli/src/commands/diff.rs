@@ -2172,6 +2172,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         .as_ref()
                         .map(|(old, new)| (old.as_deref(), new.as_deref()));
                     let options = DiffRenderOptions {
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
                         binary: patch_binary,
                         db: &db,
                         worktree_root: worktree_root.as_deref(),
@@ -3243,6 +3244,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
         }
         for entry in &entries {
             let options = DiffRenderOptions {
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
                 binary: false,
                 anchors: params.anchored,
                 allow_textconv: true,

@@ -3866,6 +3866,7 @@ fn format_patch_diff_options<'a>(
     abbrev: usize,
 ) -> crate::DiffRenderOptions<'a> {
     crate::DiffRenderOptions {
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
         binary: options.binary,
         anchors: &[],
         allow_textconv: false,

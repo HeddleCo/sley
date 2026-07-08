@@ -22,8 +22,9 @@ use graph::{graph_show_commit, graph_show_commit_msg, graph_show_oneline, graph_
 use line_log::{LineLogOutputCtx, run_line_log_output};
 use pickaxe::{
     CompiledPickaxe, DiffFilterMatchOptions, PickaxeSpec, compile_pickaxe_regex,
-    diff_filter_commit_matches, log_follow_single_path, parse_diff_filter_arg,
-    pickaxe_commit_matches, pickaxe_filter_entries, resolve_diff_filter_mask,
+    diff_filter_commit_matches, diff_filter_entry_matches, log_follow_single_path,
+    parse_diff_filter_arg, pickaxe_commit_matches, pickaxe_filter_entries,
+    resolve_diff_filter_mask,
 };
 use reflog::{
     LogGrepColors, ReflogWalkOptions, compile_log_filter_matcher, log_author_matcher_matches,
@@ -166,6 +167,10 @@ fn push_unique(refs: &mut Vec<String>, value: String) {
     if !refs.contains(&value) {
         refs.push(value);
     }
+}
+
+fn log_output_indicator_byte(value: &str, fallback: u8) -> u8 {
+    value.as_bytes().first().copied().unwrap_or(fallback)
 }
 
 /// Expand a single notes-ref spec: a `*`-containing glob matches existing refs
@@ -952,6 +957,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut line_log_src_prefix: Option<String> = None;
     let mut line_log_dst_prefix: Option<String> = None;
     let mut line_log_full_index = false;
+    let mut log_output_path: Option<String> = None;
+    let mut diff_reverse = false;
+    let mut line_log_dirstat_requested = false;
+    let mut line_log_full_diff_requested = false;
+    let mut line_log_color_moved_mode: Option<Option<sley_diff_merge::render::ColorMovedMode>> =
+        None;
+    let mut line_log_color_moved_ws: Option<sley_diff_merge::render::ColorMovedWs> = None;
     // Raw `-I<regex>` (`--ignore-matching-lines`) patterns, compiled after the
     // option scan so a malformed regex fails like git's diff_opt_ignore_regex.
     let mut ignore_regex_patterns: Vec<String> = Vec::new();
@@ -1267,7 +1279,6 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--quiet"
             | "--no-quiet"
             | "--unpacked"
-            | "--full-diff"
             | "--relative"
             | "--no-relative"
             | "--ext-diff"
@@ -1283,13 +1294,12 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             | "--no-textconv"
             | "--submodule"
             | "--ignore-submodules"
-            | "--color-moved"
-            | "--no-color-moved"
             | "--ita-visible-in-index"
             | "--ita-invisible-in-index"
             | "-B"
             | "-D"
             | "-W" => {}
+            "--full-diff" => line_log_full_diff_requested = true,
             "--source" => show_source = true,
             "--no-source" => show_source = false,
             "--no-renames" => {
@@ -1323,6 +1333,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             "--ignore-all-space" | "-w" => diff_opts.ws_ignore.all_space = true,
             "--ignore-space-change" | "-b" => diff_opts.ws_ignore.space_change = true,
             "-bw" | "-wb" => diff_opts.ws_ignore.all_space = true,
+            "-R" => diff_reverse = true,
             "--ignore-space-at-eol" => diff_opts.ws_ignore.space_at_eol = true,
             "--ignore-cr-at-eol" => diff_opts.ws_ignore.cr_at_eol = true,
             "--ignore-blank-lines" => diff_opts.ignore_blank_lines = true,
@@ -1573,7 +1584,17 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 log_validate_ignore_submodules(&value["--ignore-submodules=".len()..])?;
             }
             value if value.starts_with("--color-moved=") => {
-                log_validate_color_moved(&value["--color-moved=".len()..])?;
+                let mode = &value["--color-moved=".len()..];
+                log_validate_color_moved(mode)?;
+                line_log_color_moved_mode =
+                    Some(sley_rev::diff_options::parse_color_moved_mode(mode)?);
+            }
+            "--color-moved" => {
+                line_log_color_moved_mode =
+                    Some(sley_rev::diff_options::parse_color_moved_mode("")?);
+            }
+            "--no-color-moved" => {
+                line_log_color_moved_mode = Some(None);
             }
             "--graph" => graph = true,
             "--no-graph" => graph = false,
@@ -1601,14 +1622,27 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 color_always = value["--color=".len()..].eq_ignore_ascii_case("always");
                 color_explicit = true;
             }
+            "--output" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| log_option_requires_value_error("output"))?;
+                log_output_path = Some(value.to_string());
+            }
+            value if let Some(path) = value.strip_prefix("--output=") => {
+                log_output_path = Some(path.to_string());
+            }
             "--color-moved-ws" => {
                 let value = iter
                     .next()
                     .ok_or_else(|| log_option_requires_value_error("color-moved-ws"))?;
                 log_validate_color_moved_ws(value)?;
+                line_log_color_moved_ws =
+                    Some(sley_rev::diff_options::parse_color_moved_ws(value)?);
             }
             value if value.starts_with("--color-moved-ws=") => {
-                log_validate_color_moved_ws(&value["--color-moved-ws=".len()..])?;
+                let mode = &value["--color-moved-ws=".len()..];
+                log_validate_color_moved_ws(mode)?;
+                line_log_color_moved_ws = Some(sley_rev::diff_options::parse_color_moved_ws(mode)?);
             }
             "--ws-error-highlight" => {
                 let value = iter
@@ -1624,36 +1658,42 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     .next()
                     .ok_or_else(|| log_option_requires_value_error("output-indicator-new"))?;
                 log_validate_output_indicator_for_log("output-indicator-new", value)?;
+                diff_opts.line_indicators.new =
+                    log_output_indicator_byte(value, diff_opts.line_indicators.new);
             }
             "--output-indicator-old" => {
                 let value = iter
                     .next()
                     .ok_or_else(|| log_option_requires_value_error("output-indicator-old"))?;
                 log_validate_output_indicator_for_log("output-indicator-old", value)?;
+                diff_opts.line_indicators.old =
+                    log_output_indicator_byte(value, diff_opts.line_indicators.old);
             }
             "--output-indicator-context" => {
                 let value = iter
                     .next()
                     .ok_or_else(|| log_option_requires_value_error("output-indicator-context"))?;
                 log_validate_output_indicator_for_log("output-indicator-context", value)?;
+                diff_opts.line_indicators.context =
+                    log_output_indicator_byte(value, diff_opts.line_indicators.context);
             }
             value if value.starts_with("--output-indicator-new=") => {
-                log_validate_output_indicator_for_log(
-                    "output-indicator-new",
-                    &value["--output-indicator-new=".len()..],
-                )?;
+                let indicator = &value["--output-indicator-new=".len()..];
+                log_validate_output_indicator_for_log("output-indicator-new", indicator)?;
+                diff_opts.line_indicators.new =
+                    log_output_indicator_byte(indicator, diff_opts.line_indicators.new);
             }
             value if value.starts_with("--output-indicator-old=") => {
-                log_validate_output_indicator_for_log(
-                    "output-indicator-old",
-                    &value["--output-indicator-old=".len()..],
-                )?;
+                let indicator = &value["--output-indicator-old=".len()..];
+                log_validate_output_indicator_for_log("output-indicator-old", indicator)?;
+                diff_opts.line_indicators.old =
+                    log_output_indicator_byte(indicator, diff_opts.line_indicators.old);
             }
             value if value.starts_with("--output-indicator-context=") => {
-                log_validate_output_indicator_for_log(
-                    "output-indicator-context",
-                    &value["--output-indicator-context=".len()..],
-                )?;
+                let indicator = &value["--output-indicator-context=".len()..];
+                log_validate_output_indicator_for_log("output-indicator-context", indicator)?;
+                diff_opts.line_indicators.context =
+                    log_output_indicator_byte(indicator, diff_opts.line_indicators.context);
             }
             value if value.starts_with("--no-renames=") => {
                 return log_option_takes_no_value_error("no-renames");
@@ -1896,6 +1936,46 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 diff_opts.patch = true;
                 diff_format_explicit = true;
             }
+            "--word-diff" => {
+                if diff_opts.word_diff_mode.is_none() {
+                    diff_opts.word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
+                }
+                diff_opts.patch = true;
+                diff_format_explicit = true;
+            }
+            value if let Some(mode) = value.strip_prefix("--word-diff=") => {
+                diff_opts.word_diff_mode = match mode {
+                    "plain" => Some(commands::diff_words::WordDiffMode::Plain),
+                    "color" => Some(commands::diff_words::WordDiffMode::Color),
+                    "porcelain" => Some(commands::diff_words::WordDiffMode::Porcelain),
+                    "none" => None,
+                    _ => {
+                        eprintln!("error: bad --word-diff argument: {mode}");
+                        return Err(GitError::Exit(129));
+                    }
+                };
+                diff_opts.patch = true;
+                diff_format_explicit = true;
+            }
+            "--word-diff-regex" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| log_option_requires_value_error("word-diff-regex"))?;
+                diff_opts.word_diff_regex = Some(value.clone());
+                if diff_opts.word_diff_mode.is_none() {
+                    diff_opts.word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
+                }
+                diff_opts.patch = true;
+                diff_format_explicit = true;
+            }
+            value if let Some(regex) = value.strip_prefix("--word-diff-regex=") => {
+                diff_opts.word_diff_regex = Some(regex.to_string());
+                if diff_opts.word_diff_mode.is_none() {
+                    diff_opts.word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
+                }
+                diff_opts.patch = true;
+                diff_format_explicit = true;
+            }
             "-U" | "--unified" => {
                 diff_opts.context = Some(3);
                 diff_opts.patch = true;
@@ -1950,6 +2030,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             }
             "--shortstat" => {
                 diff_opts.shortstat = true;
+                diff_format_explicit = true;
+            }
+            "--dirstat" => {
+                line_log_dirstat_requested = true;
+                diff_format_explicit = true;
+            }
+            value if value.starts_with("--dirstat=") => {
+                line_log_dirstat_requested = true;
                 diff_format_explicit = true;
             }
             "--summary" => {
@@ -2153,6 +2241,25 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     {
         color_always = true;
     }
+    let line_log_color_moved_mode = match line_log_color_moved_mode {
+        Some(mode) => mode,
+        None => match config.get("diff", None, "colormoved").map(str::to_string) {
+            Some(value) => sley_rev::diff_options::parse_color_moved_mode(&value)?,
+            None => None,
+        },
+    };
+    let line_log_color_moved_ws = match line_log_color_moved_ws {
+        Some(ws) => ws,
+        None => match config.get("diff", None, "colormovedws").map(str::to_string) {
+            Some(value) => sley_rev::diff_options::parse_color_moved_ws(&value)?,
+            None => sley_diff_merge::render::ColorMovedWs::default(),
+        },
+    };
+    let line_log_color_moved =
+        line_log_color_moved_mode.map(|mode| sley_diff_merge::render::ColorMoved {
+            mode,
+            ws: line_log_color_moved_ws,
+        });
     if !abbrev_commit_explicit
         && config
             .get_bool("log", None, "abbrevcommit")
@@ -2620,9 +2727,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             eprintln!("fatal: only one rev expected with -L");
             return Err(GitError::Exit(128));
         }
-        // `--raw` is forbidden with `-L`.
-        if diff_opts.raw {
-            eprintln!("fatal: -L does not yet support diff formats besides -p and -s");
+        if diff_opts.stat
+            || diff_opts.numstat
+            || diff_opts.shortstat
+            || diff_opts.compact_summary
+            || line_log_dirstat_requested
+            || line_log_full_diff_requested
+        {
+            eprintln!("fatal: -L does not yet support the requested diff format");
             return Err(GitError::Exit(128));
         }
         return run_line_log_output(LineLogOutputCtx {
@@ -2654,7 +2766,22 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             pickaxe_ignore_case,
             pickaxe_text,
             pickaxe_detect_renames,
+            diff_filter_mask,
+            reverse_diff: diff_reverse,
+            graph,
+            color_always,
+            color_moved: line_log_color_moved,
+            userdiff: log_userdiff.as_ref(),
+            output_path: log_output_path.as_deref(),
         });
+    }
+    if let Some(path) = log_output_path {
+        return Err(GitError::Command(format!(
+            "unsupported log option --output={path}"
+        )));
+    }
+    if line_log_dirstat_requested {
+        return Err(GitError::Command("unsupported log option --dirstat".into()));
     }
     if plain_oneline
         && walk

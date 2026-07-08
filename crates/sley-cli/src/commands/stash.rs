@@ -3089,6 +3089,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 }
                 for entry in &entries {
                     let options = DiffRenderOptions {
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
                         binary: false,
                         anchors: &[],
                         allow_textconv: false,
@@ -3565,6 +3566,7 @@ fn write_stash_list_patch(
     .min(format.hex_len());
     for entry in &entries {
         let options = DiffRenderOptions {
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
             binary: false,
             anchors: &[],
             allow_textconv: false,
