@@ -1,6 +1,6 @@
 [package]
 name = "sley-ref-filter"
-publish = false
+description = "Git ref-filter primitives (commit identity and date formatting) for the sley engine."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
