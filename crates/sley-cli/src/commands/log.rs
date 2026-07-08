@@ -2178,6 +2178,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let has_commit_grafts = !sley_rev::revlist::load_commit_grafts(&db, format).is_empty();
     let cwd = env::current_dir()?;
     let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
     for rev in end_of_options_revs {
@@ -2819,6 +2820,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         && max_parents.is_none()
         && !null_terminate
         && !abbrev_len_explicit
+        && !has_commit_grafts
         && let Some(max_count) = max_count
         && max_count > 0
     {
@@ -2870,6 +2872,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         && min_age.is_none()
         && min_parents.is_none()
         && max_parents.is_none()
+        && !has_commit_grafts
     {
         let limit = max_count.map(|max| skip.saturating_add(max));
         let metadata = if let Some(limit) = limit.filter(|limit| *limit > 0) {
@@ -2975,6 +2978,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         && min_age.is_none()
         && min_parents.is_none()
         && max_parents.is_none()
+        && !has_commit_grafts
         && let Some(limit) = max_count.map(|max| skip.saturating_add(max))
         && limit > 0
     {

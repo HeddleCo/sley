@@ -409,7 +409,8 @@ declare -A FLOOR=(
     [t1500-rev-parse.sh]=82
     [t1501-work-tree.sh]=39
     [t1506-rev-parse-diagnosis.sh]=30
-    [t2400-worktree-add.sh]=220  # wave-36: 215->219 measured (wtheads ref-in-use protection), banked 218
+    # 2026-07-08 off main deddae6d: worktree add reached 232/232 by matching linked-worktree git-path routing for per-worktree HEAD/index/admin refs, symlinked HEAD handling, current-worktree checkout guards during rebase, graft-aware log walking, worktree config copy filtering, bare-current branch deletion, and post-checkout hooks; guards t2401/t2402/t2403 held, measured against /tmp/git-src 2.55.0 oracle.
+    [t2400-worktree-add.sh]=232
     # codex-wave-11 (worktree repair): re-link .git file + worktrees/<id>/gitdir
     # back-pointer after a move, broken-link detection + repair messages, repair
     # both-moved + specific-path. t2406 7->24 FULL; side gain t2403 25->27.

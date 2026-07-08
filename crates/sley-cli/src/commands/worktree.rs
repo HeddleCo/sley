@@ -230,6 +230,7 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     fs::create_dir_all(&path)?;
     write_worktree_linking_files(&common_git_dir, &admin_dir, &path, relative_paths)?;
     fs::write(admin_dir.join("commondir"), "../..\n")?;
+    copy_worktree_config_for_new_worktree(&common_git_dir, &git_dir, &admin_dir)?;
     let reftable_refs = FileRefStore::new(&common_git_dir, format).uses_reftable()?;
     // git's files backend creates the per-worktree `refs/` directory when a
     // worktree is added (the reftable path writes its own `refs/heads` stub
@@ -281,6 +282,9 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     // the post-checkout "HEAD is now at ..." reset line remains.
     if !options.quiet && options.checkout {
         print_reset_hard_head(&common_git_dir, format, &add_head.oid)?;
+    }
+    if options.checkout {
+        run_worktree_add_post_checkout_hook(&admin_dir, &path, format, &add_head.oid)?;
     }
     Ok(())
 }
@@ -1862,6 +1866,61 @@ fn upgrade_repo_for_relative_worktrees(common_git_dir: &Path) -> Result<()> {
     set_config_simple(&mut config, "core", "repositoryformatversion", "1");
     set_config_simple(&mut config, "extensions", "relativeWorktrees", "true");
     fs::write(&config_path, config.to_canonical_bytes())?;
+    Ok(())
+}
+
+fn copy_worktree_config_for_new_worktree(
+    common_git_dir: &Path,
+    source_git_dir: &Path,
+    admin_dir: &Path,
+) -> Result<()> {
+    let repo_config = GitConfig::read(common_git_dir.join("config")).unwrap_or_default();
+    if !repo_config
+        .get_bool("extensions", None, "worktreeConfig")
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let source = source_git_dir.join("config.worktree");
+    if !source.is_file() {
+        return Ok(());
+    }
+    let mut config = GitConfig::read(source)?;
+    for section in &mut config.sections {
+        if section.name.eq_ignore_ascii_case("core") && section.subsection.is_none() {
+            section.entries.retain(|entry| {
+                !entry.key.eq_ignore_ascii_case("bare")
+                    && !entry.key.eq_ignore_ascii_case("worktree")
+            });
+        }
+    }
+    config.sections.retain(|section| !section.entries.is_empty());
+    if !config.sections.is_empty() {
+        fs::write(admin_dir.join("config.worktree"), config.to_canonical_bytes())?;
+    }
+    Ok(())
+}
+
+fn run_worktree_add_post_checkout_hook(
+    admin_dir: &Path,
+    worktree_path: &Path,
+    format: ObjectFormat,
+    new_head: &ObjectId,
+) -> Result<()> {
+    let old = ObjectId::null(format).to_hex();
+    let new = new_head.to_hex();
+    let hook_cwd = fs::canonicalize(worktree_path)
+        .unwrap_or_else(|_| normalize_lexical_path(worktree_path));
+    commands::hooks::run_traditional_hook_at(
+        admin_dir,
+        "post-checkout",
+        commands::hooks::HookRun {
+            args: vec![old, new, "1".to_string()],
+            cwd: Some(hook_cwd),
+            git_dir: Some(admin_dir.to_path_buf()),
+            ..commands::hooks::HookRun::default()
+        },
+    )?;
     Ok(())
 }
 

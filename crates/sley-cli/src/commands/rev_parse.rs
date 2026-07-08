@@ -1962,19 +1962,66 @@ fn display_git_path(
     if let Some(path) = display_git_path_env_override(cwd, path_format, path)? {
         return Ok(path);
     }
+    let base = git_path_base_dir(git_dir, path)?;
     match path_format {
         RevParsePathFormat::Default => Ok(join_display_path(
-            &display_git_common_dir_default(cwd, git_dir)?,
+            &display_git_path_default_base(cwd, git_dir, path)?,
             path,
         )),
-        RevParsePathFormat::Absolute => {
-            Ok(fs::canonicalize(git_dir)?.join(path).display().to_string())
-        }
+        RevParsePathFormat::Absolute => Ok(base.join(path).display().to_string()),
         RevParsePathFormat::Relative => {
-            let target = fs::canonicalize(git_dir)?.join(path);
+            let target = base.join(path);
             relative_path_from_absolute(cwd, &target)
         }
     }
+}
+
+fn display_git_path_default_base(cwd: &Path, git_dir: &Path, path: &str) -> Result<String> {
+    if git_dir.join("commondir").is_file() && !git_path_is_common(path) {
+        return Ok(fs::canonicalize(git_dir)?.display().to_string());
+    }
+    display_git_common_dir_default(cwd, git_dir)
+}
+
+fn git_path_base_dir(git_dir: &Path, path: &str) -> Result<PathBuf> {
+    if !git_dir.join("commondir").is_file() || !git_path_is_common(path) {
+        return fs::canonicalize(git_dir).map_err(|err| GitError::Io(err.to_string()));
+    }
+    common_git_dir_for_git_dir(git_dir)
+}
+
+fn git_path_is_common(path: &str) -> bool {
+    if path == "config" || path == "packed-refs" || path == "shallow" {
+        return true;
+    }
+    if git_path_component_is(path, "branches")
+        || git_path_component_is(path, "hooks")
+        || git_path_component_is(path, "info")
+        || git_path_component_is(path, "objects")
+        || git_path_component_is(path, "worktrees")
+    {
+        return true;
+    }
+    if let Some(refname) = path.strip_prefix("refs/") {
+        return !git_path_is_per_worktree_ref(refname);
+    }
+    if let Some(logged) = path.strip_prefix("logs/") {
+        return logged != "HEAD"
+            && !logged
+                .strip_prefix("refs/")
+                .is_some_and(git_path_is_per_worktree_ref);
+    }
+    false
+}
+
+fn git_path_component_is(path: &str, component: &str) -> bool {
+    path == component || path.starts_with(&format!("{component}/"))
+}
+
+fn git_path_is_per_worktree_ref(refname: &str) -> bool {
+    refname.starts_with("bisect/")
+        || refname.starts_with("worktree/")
+        || refname.starts_with("rewritten/")
 }
 
 fn display_git_path_env_override(

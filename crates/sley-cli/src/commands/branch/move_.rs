@@ -75,6 +75,26 @@ pub(super) fn run_branch_move_options(
     // A dangling symref destination does not "exist" for the purposes of the
     // rename collision check (git's validate_branchname uses RESOLVE_REF_READING),
     // so `branch -m m broken_symref` overwrites it without --force (t3200 #16).
+    if matches!(options.kind, BranchMoveKind::Rename)
+        && !any_worktree_head_points_at(git_dir, &old_ref)?
+        && let Some(worktree) = sley_worktree::find_shared_symref(git_dir, "HEAD", &old_ref)?
+    {
+        let operation = if worktree
+            .path
+            .join(".git")
+            .is_file()
+            && worktree_has_bisect_start(&worktree.path)
+        {
+            "bisected"
+        } else {
+            "rebased"
+        };
+        eprintln!(
+            "fatal: branch {old_ref} is being {operation} at {}",
+            worktree.path.display()
+        );
+        return Err(GitError::Exit(128));
+    }
     if !options.force && sley_refs::resolve_ref_peeled(store, &new_ref)?.is_some() {
         eprintln!("fatal: a branch named '{new_branch}' already exists");
         return Err(GitError::Exit(128));
@@ -141,6 +161,23 @@ pub(super) fn run_branch_move_options(
         }
     }
     Ok(())
+}
+
+fn worktree_has_bisect_start(worktree_path: &Path) -> bool {
+    let dotgit = worktree_path.join(".git");
+    let Ok(contents) = fs::read_to_string(dotgit) else {
+        return false;
+    };
+    let Some(target) = contents.trim().strip_prefix("gitdir:") else {
+        return false;
+    };
+    let target = PathBuf::from(target.trim());
+    let admin_dir = if target.is_absolute() {
+        target
+    } else {
+        worktree_path.join(target)
+    };
+    admin_dir.join("BISECT_START").is_file()
 }
 
 pub(super) fn branch_move_failed(err: GitError, operation: &str) -> Result<()> {

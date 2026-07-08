@@ -969,6 +969,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             Ok(Some(RefTarget::Symbolic(current))) if current == branch_ref
         )
         && let Some(worktree) = sley_worktree::find_shared_symref(&git_dir, "HEAD", &branch_ref)?
+        && !checkout_worktree_is_current(&worktree.path, &worktree_root)
     {
         eprintln!(
             "fatal: '{}' is already used by worktree at '{}'",
@@ -1218,6 +1219,16 @@ fn checkout_print_detached_head_advice(config: &GitConfig, target: &str) {
     eprintln!();
     eprintln!("Turn off this advice by setting config variable advice.detachedHead to false");
     eprintln!();
+}
+
+fn checkout_worktree_is_current(worktree: &Path, current: &Path) -> bool {
+    if worktree == current {
+        return true;
+    }
+    match (fs::canonicalize(worktree), fs::canonicalize(current)) {
+        (Ok(worktree), Ok(current)) => worktree == current,
+        _ => false,
+    }
 }
 
 fn checkout_direct_head(store: &FileRefStore) -> Result<Option<ObjectId>> {
