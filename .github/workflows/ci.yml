@@ -25,6 +25,25 @@ env:
   SCCACHE_GHA_ENABLED: "false"
 
 jobs:
+  windows-transport-check:
+    name: Windows transport check
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-tests-${{ runner.os }}-transport
+
+      - name: Check sley-transport on Windows
+        run: cargo check -p sley-transport --locked --target x86_64-pc-windows-msvc
+
   # Build once, then clippy + test + format checks reuse the same target/ directory.
   # Avoids 4 separate cold builds; total compute time is ~70% lower at modest
   # parallelism cost.
