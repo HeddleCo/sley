@@ -1806,7 +1806,15 @@ declare -A FLOOR=(
     [t9304-fast-import-marks.sh]=7
     [t9305-fast-import-signatures.sh]=21
     [t9306-fast-import-signed-tags.sh]=19
-    [t9350-fast-export.sh]=44
+    # fast-export parity wave (2026-07-08, off main c0bf80c7): t9350-fast-export.sh
+    # 44->60 by preserving commit encoding through partial commits, accepting original-oid
+    # in fast-import round-trips, keeping asymmetric range source refs, matching
+    # fast-export commit-message reencoding fallback/abort behavior, normalizing/refspec-
+    # mapping exported refs, tolerating tag fsck warnings, supporting delete-only refspec
+    # output, and rewriting path-limited filtered tags to exported marks; guards
+    # t9300-fast-import.sh and t9351-fast-export-anonymize.sh held, measured against
+    # /tmp/git-src 2.55.0 oracle.
+    [t9350-fast-export.sh]=60
     [t9351-fast-export-anonymize.sh]=7
     [t9700-perl-git.sh]=3
     [t9901-git-web--browse.sh]=0

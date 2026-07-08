@@ -34,8 +34,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use crate::*;
-use std::io::{BufRead, Write};
 use sley::plumbing::{sley_config, sley_pack, sley_refs, sley_rev};
+use std::io::{BufRead, Write};
 
 #[derive(Default)]
 struct FastImportOptions {
@@ -994,6 +994,8 @@ fn handle_commit(
         } else if let Some(rest) = line_after(&line, b"mark :") {
             commit_mark = Some(parse_mark(rest)?);
             parser.next_command_line()?;
+        } else if line_after(&line, b"original-oid ").is_some() {
+            parser.next_command_line()?;
         } else if let Some(rest) = line_after(&line, b"author ") {
             author = Some(parse_fast_import_ident(rest, options.date_format)?);
             parser.next_command_line()?;
@@ -1386,6 +1388,8 @@ fn handle_blob(
         } else if let Some(rest) = line_after(&line, b"mark :") {
             blob_mark = Some(parse_mark(rest)?);
             parser.next_command_line()?;
+        } else if line_after(&line, b"original-oid ").is_some() {
+            parser.next_command_line()?;
         } else if line_after(&line, b"data").is_some() {
             parser.next_command_line()?;
             data = parser.read_data(&line)?;
@@ -1443,6 +1447,8 @@ fn handle_tag(
                 ));
             }
             target = Some(oid);
+        } else if line_after(&line, b"original-oid ").is_some() {
+            parser.next_command_line()?;
         } else if let Some(rest) = line_after(&line, b"tagger ") {
             tagger = Some(parse_fast_import_ident(rest, date_format)?);
             parser.next_command_line()?;

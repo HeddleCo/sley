@@ -5,12 +5,10 @@ use sley::plumbing::sley_diff_merge::{
     DiffNameStatusOptions, NameStatus, NameStatusEntry, diff_name_status_empty_tree_with_options,
     diff_name_status_trees_with_options,
 };
+use sley::plumbing::sley_rev::revlist::{rev_list_topo_order, rev_list_walk_commits_with_missing};
 use sley::plumbing::sley_rev::{
     CommitRecord, SimplifyOptions, ancestry_path_on_set, peel_to_commit,
     simplify_history_with_bottoms,
-};
-use sley::plumbing::sley_rev::revlist::{
-    rev_list_topo_order, rev_list_walk_commits_with_missing,
 };
 use sley_pathspec::normalized_revwalk_pathspec;
 
@@ -108,6 +106,11 @@ struct PendingRef {
     target: PendingRefTarget,
 }
 
+struct ExportedCommitMessage {
+    bytes: Vec<u8>,
+    preserve_encoding: bool,
+}
+
 pub(crate) fn cmd_fast_export(args: &[String]) -> Result<()> {
     let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
@@ -119,7 +122,9 @@ pub(crate) fn cmd_fast_export(args: &[String]) -> Result<()> {
 
     let (options, setup_args) = parse_fast_export_args(args)?;
     if options.import_marks.is_some() && options.import_marks_if_exists.is_some() {
-        eprintln!("fatal: options '--import-marks' and '--import-marks-if-exists' cannot be used together");
+        eprintln!(
+            "fatal: options '--import-marks' and '--import-marks-if-exists' cannot be used together"
+        );
         return Err(GitError::Exit(128));
     }
 
@@ -143,6 +148,18 @@ pub(crate) fn cmd_fast_export(args: &[String]) -> Result<()> {
     let mut revision_options = setup.options;
     revision_options.order = sley_rev::RevisionOrder::Topo;
     if !revision_options.has_revisions() {
+        if has_delete_refspec(&options) {
+            let mut out = io::BufWriter::new(io::stdout());
+            if options.use_done_feature {
+                writeln!(out, "feature done")?;
+            }
+            emit_delete_refspecs(&mut out, &options.refspecs, format)?;
+            if options.use_done_feature {
+                writeln!(out, "done")?;
+            }
+            out.flush()?;
+            return Ok(());
+        }
         return Err(GitError::Command(
             "fast-export requires at least one revision".into(),
         ));
@@ -172,6 +189,9 @@ pub(crate) fn cmd_fast_export(args: &[String]) -> Result<()> {
         tag_marks: HashMap::new(),
         shown,
         revision_sources: HashMap::new(),
+        default_ref_name: None,
+        initialized_refs: HashSet::new(),
+        path_limited: !setup.pathspecs.is_empty(),
         pending_refs: Vec::new(),
         nested_tag_refs: Vec::new(),
         progress_counter: 0,
@@ -184,18 +204,16 @@ pub(crate) fn cmd_fast_export(args: &[String]) -> Result<()> {
 
     exporter.seed_pending_refs(&revision_options.positives)?;
 
-    let commits = exporter.collect_commits(
-        &revision_options,
-        &setup.pathspecs,
-        &worktree_root,
-        &cwd,
-    )?;
+    let commits =
+        exporter.collect_commits(&revision_options, &setup.pathspecs, &worktree_root, &cwd)?;
 
     for record in commits {
         exporter.export_commit(&record)?;
     }
 
-    exporter.pending_refs.sort_by(|left, right| left.name.cmp(&right.name));
+    exporter
+        .pending_refs
+        .sort_by(|left, right| left.name.cmp(&right.name));
     for pending in exporter.pending_refs.clone() {
         exporter.emit_pending_ref(&pending)?;
     }
@@ -228,6 +246,9 @@ struct FastExporter {
     tag_marks: HashMap<ObjectId, u64>,
     shown: HashSet<ObjectId>,
     revision_sources: HashMap<ObjectId, String>,
+    default_ref_name: Option<String>,
+    initialized_refs: HashSet<String>,
+    path_limited: bool,
     pending_refs: Vec<PendingRef>,
     nested_tag_refs: Vec<(String, ObjectId)>,
     progress_counter: usize,
@@ -243,16 +264,24 @@ impl FastExporter {
             let object = self.db.read_object(&tip.oid)?;
             match object.object_type {
                 ObjectType::Commit => {
-                    self.note_revision_source(tip.oid, source_name.clone());
+                    let ref_name = self.export_ref_name_for_source(source_name)?;
+                    if self.default_ref_name.is_none() {
+                        self.default_ref_name = Some(ref_name.clone());
+                    }
+                    self.note_revision_source(tip.oid, ref_name.clone());
                     self.pending_refs.push(PendingRef {
-                        name: source_name.clone(),
+                        name: ref_name,
                         target: PendingRefTarget::Commit(tip.oid),
                     });
                 }
                 ObjectType::Tag => {
                     let commit = peel_to_commit(&self.db, self.format, &tip.oid)?;
-                    self.note_revision_source(commit, source_name.clone());
-                    self.nested_tag_refs.push((source_name.clone(), tip.oid));
+                    let ref_name = self.export_ref_name_for_source(source_name)?;
+                    if self.default_ref_name.is_none() {
+                        self.default_ref_name = Some(ref_name.clone());
+                    }
+                    self.note_revision_source(commit, ref_name.clone());
+                    self.nested_tag_refs.push((ref_name, tip.oid));
                 }
                 ObjectType::Blob => {
                     self.export_blob(tip.oid)?;
@@ -266,6 +295,50 @@ impl FastExporter {
 
     fn note_revision_source(&mut self, commit: ObjectId, source_name: String) {
         self.revision_sources.entry(commit).or_insert(source_name);
+    }
+
+    fn export_ref_name_for_source(&self, source_name: &str) -> Result<String> {
+        let ref_name = self.normalize_source_ref(source_name)?;
+        Ok(self.apply_refspecs(&ref_name))
+    }
+
+    fn normalize_source_ref(&self, source_name: &str) -> Result<String> {
+        if source_name == "HEAD" {
+            if let Some(branch) = self.store.current_branch_ref()? {
+                return Ok(branch);
+            }
+            return Ok(source_name.to_string());
+        }
+        if source_name.starts_with("refs/") {
+            return Ok(source_name.to_string());
+        }
+        for candidate in [
+            format!("refs/{source_name}"),
+            format!("refs/tags/{source_name}"),
+            format!("refs/heads/{source_name}"),
+            format!("refs/remotes/{source_name}"),
+            format!("refs/remotes/{source_name}/HEAD"),
+        ] {
+            if self.store.read_ref(&candidate)?.is_some() {
+                return Ok(candidate);
+            }
+        }
+        Ok(source_name.to_string())
+    }
+
+    fn apply_refspecs(&self, ref_name: &str) -> String {
+        for refspec in &self.options.refspecs {
+            let Some((src, dst)) = refspec.split_once(':') else {
+                continue;
+            };
+            if src.is_empty() || dst.is_empty() {
+                continue;
+            }
+            if src == ref_name {
+                return dst.to_string();
+            }
+        }
+        ref_name.to_string()
     }
 
     fn collect_commits(
@@ -315,7 +388,9 @@ impl FastExporter {
 
         if revision_options.ancestry_path && !revision_options.negatives.is_empty() {
             let on_path = ancestry_path_on_set(
-                selected.iter().map(|record| (record.oid, record.parents.clone())),
+                selected
+                    .iter()
+                    .map(|record| (record.oid, record.parents.clone())),
                 &revision_options.negatives,
             );
             selected.retain(|record| on_path.contains(&record.oid));
@@ -366,6 +441,7 @@ impl FastExporter {
             .revision_sources
             .get(&record.oid)
             .cloned()
+            .or_else(|| self.default_ref_name.clone())
             .unwrap_or_else(|| "refs/heads/main".to_string());
         self.pending_refs.retain(|pending| pending.name != ref_name);
 
@@ -383,7 +459,10 @@ impl FastExporter {
 
         let changes = if use_parent_diff {
             let parent_tree = parent_tree.ok_or_else(|| {
-                GitError::Command(format!("fast-export: missing parent tree for {}", record.oid))
+                GitError::Command(format!(
+                    "fast-export: missing parent tree for {}",
+                    record.oid
+                ))
             })?;
             diff_name_status_trees_with_options(
                 &self.db,
@@ -403,14 +482,20 @@ impl FastExporter {
 
         for entry in &changes {
             if let Some(oid) = entry.new_oid {
-                if entry.new_mode.is_some_and(|mode| mode & 0o170000 == 0o160000) {
+                if entry
+                    .new_mode
+                    .is_some_and(|mode| mode & 0o170000 == 0o160000)
+                {
                     continue;
                 }
                 self.export_blob(oid)?;
             }
         }
 
-        if record.parents.is_empty() {
+        let first_commit_on_ref = self.initialized_refs.insert(ref_name.clone());
+        if first_commit_on_ref && self.commit_ref_needs_reset(&ref_name)? {
+            writeln!(self.out, "reset {ref_name}")?;
+        } else if record.parents.is_empty() {
             writeln!(self.out, "reset {ref_name}")?;
         }
 
@@ -423,8 +508,9 @@ impl FastExporter {
             writeln!(self.out, "original-oid {}", record.oid.to_hex())?;
         }
 
-        self.write_commit_identities(&record.commit)?;
-        self.write_commit_message(&record.commit)?;
+        let message = self.exported_commit_message(&record.commit, record.oid)?;
+        self.write_commit_identities(&record.commit, message.preserve_encoding)?;
+        self.write_commit_message(&message.bytes)?;
 
         for (index, parent) in record.parents.iter().enumerate() {
             let prefix = if index == 0 { "from" } else { "merge" };
@@ -446,40 +532,61 @@ impl FastExporter {
         Ok(())
     }
 
-    fn write_commit_identities(&mut self, commit: &Commit) -> Result<()> {
+    fn write_commit_identities(&mut self, commit: &Commit, preserve_encoding: bool) -> Result<()> {
         self.out.write_all(b"author ")?;
         self.out.write_all(&commit.author)?;
         self.out.write_all(b"\ncommitter ")?;
         self.out.write_all(&commit.committer)?;
         self.out.write_all(b"\n")?;
-        if let Some(encoding) = &commit.encoding {
-            if self.options.reencode == ReencodeMode::No {
-                self.out.write_all(b"encoding ")?;
-                self.out.write_all(encoding)?;
-                self.out.write_all(b"\n")?;
-            }
+        if preserve_encoding && let Some(encoding) = &commit.encoding {
+            self.out.write_all(b"encoding ")?;
+            self.out.write_all(encoding)?;
+            self.out.write_all(b"\n")?;
         }
         Ok(())
     }
 
-    fn write_commit_message(&mut self, commit: &Commit) -> Result<()> {
-        let message = match (&commit.encoding, self.options.reencode) {
+    fn commit_ref_needs_reset(&self, ref_name: &str) -> Result<bool> {
+        let Some(RefTarget::Direct(oid)) = self.store.read_ref(ref_name)? else {
+            return Ok(false);
+        };
+        let object = self.db.read_object(&oid)?;
+        Ok(object.object_type != ObjectType::Commit)
+    }
+
+    fn exported_commit_message(
+        &self,
+        commit: &Commit,
+        commit_oid: ObjectId,
+    ) -> Result<ExportedCommitMessage> {
+        let (bytes, preserve_encoding) = match (&commit.encoding, self.options.reencode) {
             (Some(encoding), ReencodeMode::Yes) => {
                 let from = String::from_utf8_lossy(encoding);
-                log_reencode_message(&commit.message, from.as_ref(), "UTF-8").into_owned()
+                match reencode_commit_message(&commit.message, from.as_ref(), "UTF-8") {
+                    Some(reencoded) => (reencoded, false),
+                    None => (commit.message.clone(), true),
+                }
             }
             (Some(encoding), ReencodeMode::Abort) => {
                 eprintln!(
                     "fatal: encountered commit-specific encoding {} in commit {}; use --reencode=[yes|no] to handle it",
                     String::from_utf8_lossy(encoding),
-                    "?",
+                    commit_oid,
                 );
                 return Err(GitError::Exit(128));
             }
-            _ => commit.message.clone(),
+            (Some(_), ReencodeMode::No) => (commit.message.clone(), true),
+            _ => (commit.message.clone(), false),
         };
+        Ok(ExportedCommitMessage {
+            bytes,
+            preserve_encoding,
+        })
+    }
+
+    fn write_commit_message(&mut self, message: &[u8]) -> Result<()> {
         writeln!(self.out, "data {}", message.len())?;
-        self.out.write_all(&message)?;
+        self.out.write_all(message)?;
         Ok(())
     }
 
@@ -534,18 +641,16 @@ impl FastExporter {
         changed_paths: &mut HashSet<Vec<u8>>,
     ) -> Result<()> {
         let mode = entry.new_mode.unwrap_or(0o100644);
-        let oid = entry.new_oid.ok_or_else(|| {
-            GitError::Command("fast-export: file change missing new oid".into())
-        })?;
+        let oid = entry
+            .new_oid
+            .ok_or_else(|| GitError::Command("fast-export: file change missing new oid".into()))?;
         write!(self.out, "M {:o} ", mode)?;
         if self.options.no_data || mode & 0o170000 == 0o160000 {
             write!(self.out, "{} ", oid.to_hex())?;
         } else {
-            let mark = self
-                .blob_marks
-                .get(&oid)
-                .copied()
-                .ok_or_else(|| GitError::Command(format!("fast-export: missing blob mark for {oid}")))?;
+            let mark = self.blob_marks.get(&oid).copied().ok_or_else(|| {
+                GitError::Command(format!("fast-export: missing blob mark for {oid}"))
+            })?;
             write!(self.out, ":{mark} ")?;
         }
         write_fast_export_path(&mut self.out, entry.path.as_bytes())?;
@@ -565,7 +670,9 @@ impl FastExporter {
         }
         let object = self.db.read_object(&oid)?;
         if object.object_type != ObjectType::Blob {
-            return Err(GitError::Command(format!("fast-export: {oid} is not a blob")));
+            return Err(GitError::Command(format!(
+                "fast-export: {oid} is not a blob"
+            )));
         }
         let mark = self.alloc_mark();
         self.blob_marks.insert(oid, mark);
@@ -586,7 +693,7 @@ impl FastExporter {
             PendingRefTarget::Commit(commit) => {
                 let rewritten = self.rewrite_commit_for_ref(*commit)?;
                 let Some(commit) = rewritten else {
-                    writeln!(
+                    write!(
                         self.out,
                         "reset {}\nfrom {}\n\n",
                         pending.name,
@@ -598,9 +705,14 @@ impl FastExporter {
                     write!(self.out, "reset {}\nfrom :{mark}\n\n", pending.name)?;
                     self.show_progress();
                 } else if self.options.reference_excluded_parents {
-                    writeln!(self.out, "reset {}\nfrom {}\n\n", pending.name, commit.to_hex())?;
+                    write!(
+                        self.out,
+                        "reset {}\nfrom {}\n\n",
+                        pending.name,
+                        commit.to_hex()
+                    )?;
                 } else {
-                    writeln!(
+                    write!(
                         self.out,
                         "reset {}\nfrom {}\n\n",
                         pending.name,
@@ -696,7 +808,11 @@ impl FastExporter {
             TagOfFilteredMode::Drop => Ok(()),
             TagOfFilteredMode::Rewrite => match tagged_type {
                 ObjectType::Commit => {
-                    let rewritten = self.rewrite_commit_for_ref(tagged_oid)?;
+                    let rewritten = if self.path_limited {
+                        self.rewrite_filtered_tag_commit(tagged_oid)?
+                    } else {
+                        self.rewrite_commit_for_ref(tagged_oid)?
+                    };
                     let Some(commit) = rewritten else {
                         let display_name =
                             full_name.strip_prefix("refs/tags/").unwrap_or(full_name);
@@ -820,6 +936,20 @@ impl FastExporter {
         }
     }
 
+    fn rewrite_filtered_tag_commit(&self, mut commit: ObjectId) -> Result<Option<ObjectId>> {
+        loop {
+            if self.commit_marks.contains_key(&commit) {
+                return Ok(Some(commit));
+            }
+            let object = self.db.read_object(&commit)?;
+            let parsed = Commit::parse(self.format, &object.body)?;
+            let Some(parent) = parsed.parents.first() else {
+                return Ok(None);
+            };
+            commit = *parent;
+        }
+    }
+
     fn rewrite_commit_for_ref(&self, mut commit: ObjectId) -> Result<Option<ObjectId>> {
         loop {
             let object = self.db.read_object(&commit)?;
@@ -863,19 +993,7 @@ impl FastExporter {
     }
 
     fn emit_deletes(&mut self) -> Result<()> {
-        for refspec in &self.options.refspecs {
-            if let Some((src, dst)) = refspec.split_once(':') {
-                if src.is_empty() {
-                    writeln!(
-                        self.out,
-                        "reset {}\nfrom {}\n\n",
-                        dst,
-                        ObjectId::null(self.format).to_hex()
-                    )?;
-                }
-            }
-        }
-        Ok(())
+        emit_delete_refspecs(&mut self.out, &self.options.refspecs, self.format)
     }
 
     fn alloc_mark(&mut self) -> u64 {
@@ -920,20 +1038,22 @@ fn parse_fast_export_args(args: &[String]) -> Result<(FastExportOptions, Vec<Str
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command("--progress requires a value".into()))?;
-                options.progress = Some(value.parse().map_err(|_| {
-                    GitError::Command(format!("invalid --progress value {value}"))
-                })?);
+                options.progress =
+                    Some(value.parse().map_err(|_| {
+                        GitError::Command(format!("invalid --progress value {value}"))
+                    })?);
             }
             value if value.starts_with("--progress=") => {
                 let rest = &value["--progress=".len()..];
-                options.progress = Some(rest.parse().map_err(|_| {
-                    GitError::Command(format!("invalid --progress value {rest}"))
-                })?);
+                options.progress =
+                    Some(rest.parse().map_err(|_| {
+                        GitError::Command(format!("invalid --progress value {rest}"))
+                    })?);
             }
             "--signed-tags" => {
-                let value = iter.next().ok_or_else(|| {
-                    GitError::Command("--signed-tags requires a value".into())
-                })?;
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--signed-tags requires a value".into()))?;
                 options.signed_tags = parse_sign_mode(value, "signed-tags")?;
             }
             value if value.starts_with("--signed-tags=") => {
@@ -941,9 +1061,9 @@ fn parse_fast_export_args(args: &[String]) -> Result<(FastExportOptions, Vec<Str
                     parse_sign_mode(&value["--signed-tags=".len()..], "signed-tags")?;
             }
             "--signed-commits" => {
-                let value = iter.next().ok_or_else(|| {
-                    GitError::Command("--signed-commits requires a value".into())
-                })?;
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--signed-commits requires a value".into()))?;
                 options.signed_commits = parse_sign_mode(value, "signed-commits")?;
             }
             value if value.starts_with("--signed-commits=") => {
@@ -970,29 +1090,28 @@ fn parse_fast_export_args(args: &[String]) -> Result<(FastExportOptions, Vec<Str
                 options.reencode = parse_reencode_mode(&value["--reencode=".len()..])?;
             }
             "--export-marks" => {
-                options.export_marks = Some(PathBuf::from(
-                    iter.next()
-                        .ok_or_else(|| GitError::Command("--export-marks requires a value".into()))?,
-                ));
+                options.export_marks =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        GitError::Command("--export-marks requires a value".into())
+                    })?));
             }
             value if value.starts_with("--export-marks=") => {
                 options.export_marks = Some(PathBuf::from(&value["--export-marks=".len()..]));
             }
             "--import-marks" => {
-                options.import_marks = Some(PathBuf::from(
-                    iter.next()
-                        .ok_or_else(|| GitError::Command("--import-marks requires a value".into()))?,
-                ));
+                options.import_marks =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        GitError::Command("--import-marks requires a value".into())
+                    })?));
             }
             value if value.starts_with("--import-marks=") => {
                 options.import_marks = Some(PathBuf::from(&value["--import-marks=".len()..]));
             }
             "--import-marks-if-exists" => {
-                options.import_marks_if_exists = Some(PathBuf::from(
-                    iter.next().ok_or_else(|| {
+                options.import_marks_if_exists =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
                         GitError::Command("--import-marks-if-exists requires a value".into())
-                    })?,
-                ));
+                    })?));
             }
             value if value.starts_with("--import-marks-if-exists=") => {
                 options.import_marks_if_exists =
@@ -1027,7 +1146,9 @@ fn parse_fast_export_args(args: &[String]) -> Result<(FastExportOptions, Vec<Str
                 options.refspecs.push(value.clone());
             }
             value if value.starts_with("--refspec=") => {
-                options.refspecs.push(value["--refspec=".len()..].to_string());
+                options
+                    .refspecs
+                    .push(value["--refspec=".len()..].to_string());
             }
             "--all"
             | "--branches"
@@ -1130,7 +1251,8 @@ fn import_marks_from_str(
 ) -> Result<u64> {
     let mut last = 0u64;
     for line in contents.lines() {
-        let Some((mark_text, oid_text)) = line.strip_prefix(':').and_then(|rest| rest.split_once(' '))
+        let Some((mark_text, oid_text)) =
+            line.strip_prefix(':').and_then(|rest| rest.split_once(' '))
         else {
             eprintln!("fatal: corrupt mark line: {line}");
             return Err(GitError::Exit(128));
@@ -1220,9 +1342,13 @@ fn validate_fast_export_tag_refs(
             }
             continue;
         }
+        let mut has_error = false;
         for finding in findings {
             let prefix = match finding.severity {
-                sley_fsck::content::Severity::Error => "error in",
+                sley_fsck::content::Severity::Error => {
+                    has_error = true;
+                    "error in"
+                }
                 sley_fsck::content::Severity::Warn => "warning in",
                 sley_fsck::content::Severity::Ignore => continue,
             };
@@ -1235,7 +1361,38 @@ fn validate_fast_export_tag_refs(
                 finding.detail
             );
         }
-        return Err(GitError::Exit(128));
+        if has_error {
+            return Err(GitError::Exit(128));
+        }
+    }
+    Ok(())
+}
+
+fn has_delete_refspec(options: &FastExportOptions) -> bool {
+    options.refspecs.iter().any(|refspec| {
+        refspec
+            .split_once(':')
+            .is_some_and(|(src, dst)| src.is_empty() && !dst.is_empty())
+    })
+}
+
+fn emit_delete_refspecs(
+    out: &mut impl Write,
+    refspecs: &[String],
+    format: ObjectFormat,
+) -> Result<()> {
+    for refspec in refspecs {
+        let Some((src, dst)) = refspec.split_once(':') else {
+            continue;
+        };
+        if src.is_empty() && !dst.is_empty() {
+            writeln!(
+                out,
+                "reset {}\nfrom {}\n",
+                dst,
+                ObjectId::null(format).to_hex()
+            )?;
+        }
     }
     Ok(())
 }
@@ -1276,6 +1433,26 @@ fn same_blob_and_mode(entry: &NameStatusEntry) -> bool {
         && entry.new_oid.is_some()
         && entry.old_oid == entry.new_oid
         && entry.old_mode == entry.new_mode
+}
+
+fn reencode_commit_message(message: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
+    if encoding_is_none(to) || from.trim().eq_ignore_ascii_case(to.trim()) {
+        return Some(message.to_vec());
+    }
+    let from_encoding = encoding_for_name(from)?;
+    let to_encoding = encoding_for_name(to)?;
+    if from_encoding == to_encoding {
+        return Some(message.to_vec());
+    }
+    let (decoded, _, had_decode_errors) = from_encoding.decode(message);
+    if had_decode_errors {
+        return None;
+    }
+    let (encoded, _, had_encode_errors) = to_encoding.encode(&decoded);
+    if had_encode_errors {
+        return None;
+    }
+    Some(encoded.into_owned())
 }
 
 fn tag_signature_start(message: &[u8]) -> usize {

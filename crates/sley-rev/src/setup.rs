@@ -587,8 +587,8 @@ where
                 if negated {
                     self.setup.options.positives.push(RevisionTip {
                         oid: start_oid,
-                        rev: start,
-                        source_name: None,
+                        rev: start.clone(),
+                        source_name: Some(start),
                         from_ref_selector: false,
                     });
                     self.setup.options.negatives.push(end_oid);
@@ -596,8 +596,8 @@ where
                     self.setup.options.negatives.push(start_oid);
                     self.setup.options.positives.push(RevisionTip {
                         oid: end_oid,
-                        rev: end,
-                        source_name: None,
+                        rev: end.clone(),
+                        source_name: Some(end),
                         from_ref_selector: false,
                     });
                 }

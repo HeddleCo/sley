@@ -1008,7 +1008,11 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     // above — `commit_encoding_config` reads disk-only and drops CLI overrides.
     let commit_encoding = repo_config
         .as_ref()
-        .and_then(|config| config.get("i18n", None, "commitEncoding").map(str::to_string))
+        .and_then(|config| {
+            config
+                .get("i18n", None, "commitEncoding")
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| "UTF-8".to_string());
     let commit_encoding_header =
         (!encoding_is_utf8(&commit_encoding)).then(|| commit_encoding.clone().into_bytes());
@@ -1456,6 +1460,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             author,
             committer,
             message,
+            commit_encoding_header,
             quiet,
         );
     }
@@ -1875,6 +1880,7 @@ fn commit_partial_paths(
     author: Vec<u8>,
     committer: Vec<u8>,
     message: Vec<u8>,
+    encoding: Option<Vec<u8>>,
     quiet: bool,
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -1908,7 +1914,7 @@ fn commit_partial_paths(
             author,
             committer: committer.clone(),
             message: message.clone(),
-            encoding: None,
+            encoding,
             signature: None,
         },
     )?;
