@@ -60,15 +60,15 @@ jobs:
           CRATES=(
             sley-core
             sley-config
+            sley-mmap
             sley-index
             sley-object
             sley-formats
-            sley-mmap
             sley-pack
             sley-odb
             sley-refs
-            sley-diff-merge
             sley-grep
+            sley-diff-merge
             sley-diff-format
             sley-pathspec
             sley-rev
