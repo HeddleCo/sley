@@ -1585,7 +1585,12 @@ declare -A FLOOR=(
     [t3901-i18n-patch.sh]=20
     [t3902-quoted.sh]=8
     [t3904-stash-patch.sh]=4
-    [t3905-stash-include-untracked.sh]=28
+    # 2026-07-08, off main 5506be15: t3905 29->34 FULL. stash -u pathspec
+    # cleanup preserves unrelated tracked work and unmatched -u pathspecs report
+    # no changes; stash show honors stash.showIncludeUntracked and rejects
+    # duplicate worktree/untracked entries. Guards held: t3903=143/145,
+    # t3904=4/10. Oracle: /tmp/git-src/git 2.55.0.
+    [t3905-stash-include-untracked.sh]=34
     [t3906-stash-submodule.sh]=5
     [t3907-stash-show-config.sh]=5
     [t3909-stash-pathspec-file.sh]=4
