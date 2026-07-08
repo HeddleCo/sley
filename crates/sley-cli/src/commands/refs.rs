@@ -4995,9 +4995,10 @@ fn resolve_symbolic_ref_oid(
     format: ObjectFormat,
     name: &str,
 ) -> Result<ObjectId> {
-    match resolve_ref_peeled(store, name)? {
-        Some(oid) => Ok(oid),
-        None => zero_oid(format),
+    match resolve_ref_peeled(store, name) {
+        Err(_) => zero_oid(format),
+        Ok(None) => zero_oid(format),
+        Ok(Some(oid)) => Ok(oid),
     }
 }
 

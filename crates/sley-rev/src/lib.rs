@@ -8,7 +8,7 @@ mod setup;
 pub mod diff_options;
 
 use sley_config::GitConfig;
-use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
+use sley_core::{DateMode, GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 
 pub use diff_options::{DiffFilter, DiffOptions, DiffOutputFormat, DiffRelativeMode, DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleDiffFormat, SubmoduleIgnoreMode, diff_pickaxe_requires_non_empty_error, diff_stat_count_option, diff_stat_parse_width_option, parse_color_moved_mode, parse_color_moved_ws, parse_diff_filter, parse_diff_rename_limit, parse_similarity_threshold, parse_submodule_ignore_mode, parse_unified_count, resolve_diff_context, setup_diff_options};
 pub use setup::{
@@ -1243,8 +1243,38 @@ fn resolve_reflog_date(
             display_name
         )));
     }
-    for entry in entries.iter().rev() {
-        if reflog_entry_timestamp(entry)? <= cutoff {
+    let first_time = reflog_entry_timestamp(&entries[0])?;
+    if cutoff < first_time {
+        eprintln!(
+            "warning: log for '{}' only goes back to {}",
+            display_name,
+            reflog_entry_rfc2822_date(&entries[0])?
+        );
+        return Ok(entries[0].new_oid);
+    }
+    for index in (0..entries.len()).rev() {
+        let entry = &entries[index];
+        let entry_time = reflog_entry_timestamp(entry)?;
+        if entry_time <= cutoff {
+            if let Some(next) = entries.get(index + 1) {
+                if next.old_oid != entry.new_oid {
+                    eprintln!(
+                        "warning: log for ref {} has gap after {}",
+                        ref_name,
+                        reflog_entry_rfc2822_date(entry)?
+                    );
+                }
+            } else if cutoff > entry_time
+                && let Some(current) = resolve_revision_ref_candidate(&refs, &ref_name)?
+                && current != entry.new_oid
+            {
+                eprintln!(
+                    "warning: log for ref {} unexpectedly ended on {}",
+                    ref_name,
+                    reflog_entry_rfc2822_date(entry)?
+                );
+                return Ok(current);
+            }
             return Ok(entry.new_oid);
         }
     }
@@ -1253,6 +1283,21 @@ fn resolve_reflog_date(
 
 fn reflog_entry_timestamp(entry: &ReflogEntry) -> Result<i64> {
     entry.timestamp_seconds()
+}
+
+fn reflog_entry_timezone(entry: &ReflogEntry) -> Result<&str> {
+    let committer = std::str::from_utf8(&entry.committer)
+        .map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    committer
+        .rsplit_once(' ')
+        .map(|(_, tz)| tz)
+        .ok_or_else(|| GitError::InvalidFormat("reflog committer is missing timezone".into()))
+}
+
+fn reflog_entry_rfc2822_date(entry: &ReflogEntry) -> Result<String> {
+    DateMode::Rfc2822
+        .render(reflog_entry_timestamp(entry)?, reflog_entry_timezone(entry)?)
+        .ok_or_else(|| GitError::InvalidFormat("invalid reflog timestamp".into()))
 }
 
 fn object_id_is_null(oid: &ObjectId) -> bool {
@@ -1275,24 +1320,107 @@ fn parse_reflog_selector_date(value: &str) -> Option<i64> {
         let now = i64::try_from(now).ok()?;
         return Some(now.saturating_sub(years.saturating_mul(365 * 86_400)));
     }
+    parse_reflog_iso_selector_date(value)
+        .or_else(|| parse_reflog_month_selector_date(value))
+        .or_else(|| parse_reflog_rfc_selector_date(value))
+        .or_else(|| parse_reflog_legacy_selector_date(value))
+}
+
+fn parse_reflog_iso_selector_date(value: &str) -> Option<i64> {
+    let mut parts = value.split_ascii_whitespace();
+    let date = parts.next()?;
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse::<i64>().ok()?;
+    let month = date_parts.next()?.parse::<u32>().ok()?;
+    let day = date_parts.next()?.parse::<u32>().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    let (hour, minute, second) = match parts.next() {
+        Some(time) => parse_reflog_time(time)?,
+        None => (0, 0, 0),
+    };
+    let offset = match parts.next() {
+        Some(tz) => parse_reflog_timezone(tz)?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    timestamp_from_reflog_parts(year, month, day, hour, minute, second, offset)
+}
+
+fn parse_reflog_month_selector_date(value: &str) -> Option<i64> {
+    let mut parts = value.split_ascii_whitespace();
+    let month = parse_reflog_month(parts.next()?)?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    let year = parts.next()?.parse::<i64>().ok()?;
+    let (hour, minute, second) = match parts.next() {
+        Some(time) => parse_reflog_time(time)?,
+        None => (0, 0, 0),
+    };
+    let offset = match parts.next() {
+        Some(tz) => parse_reflog_timezone(tz)?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    timestamp_from_reflog_parts(year, month, day, hour, minute, second, offset)
+}
+
+fn parse_reflog_rfc_selector_date(value: &str) -> Option<i64> {
+    let normalized = value.replace(',', "");
+    let mut parts = normalized.split_ascii_whitespace();
+    let _weekday = parts.next()?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    let month = parse_reflog_month(parts.next()?)?;
+    let year = parts.next()?.parse::<i64>().ok()?;
+    let (hour, minute, second) = parse_reflog_time(parts.next()?)?;
+    let offset = parse_reflog_timezone(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    timestamp_from_reflog_parts(year, month, day, hour, minute, second, offset)
+}
+
+fn parse_reflog_legacy_selector_date(value: &str) -> Option<i64> {
     let mut parts = value.split_ascii_whitespace();
     let _weekday = parts.next()?;
     let month = parse_reflog_month(parts.next()?)?;
     let day = parts.next()?.parse::<u32>().ok()?;
-    let time = parts.next()?;
+    let (hour, minute, second) = parse_reflog_time(parts.next()?)?;
     let year = parts.next()?.parse::<i64>().ok()?;
-    let tz = parts.next()?;
+    let offset = parse_reflog_timezone(parts.next()?)?;
     if parts.next().is_some() {
         return None;
     }
-    let mut time_parts = time.split(':');
+    timestamp_from_reflog_parts(year, month, day, hour, minute, second, offset)
+}
+
+fn parse_reflog_time(value: &str) -> Option<(i64, i64, i64)> {
+    let mut time_parts = value.split(':');
     let hour = time_parts.next()?.parse::<i64>().ok()?;
     let minute = time_parts.next()?.parse::<i64>().ok()?;
-    let second = time_parts.next()?.parse::<i64>().ok()?;
+    let second = match time_parts.next() {
+        Some(second) => second.parse::<i64>().ok()?,
+        None => 0,
+    };
     if time_parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
         return None;
     }
-    let offset = parse_reflog_timezone(tz)?;
+    Some((hour, minute, second))
+}
+
+fn timestamp_from_reflog_parts(
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    offset: i64,
+) -> Option<i64> {
     Some(days_from_civil(year, month, day)? * 86_400 + hour * 3_600 + minute * 60 + second - offset)
 }
 
