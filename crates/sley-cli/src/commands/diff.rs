@@ -709,6 +709,7 @@ fn global_external_diff_command(config: Option<&GitConfig>) -> Option<ExternalDi
 
 fn run_external_diff_entries(
     entries: &[sley_diff_merge::NameStatusEntry],
+    lookup_entries: &DiffRelativeLookupMap,
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
@@ -731,7 +732,8 @@ fn run_external_diff_entries(
     };
 
     for (idx, entry) in entries.iter().enumerate() {
-        let command = external_diff_for_entry(entry, userdiff, global)?;
+        let lookup_entry = diff_relative_lookup_entry(entry, lookup_entries);
+        let command = external_diff_for_entry(lookup_entry, userdiff, global)?;
         let Some(command) = command else {
             continue;
         };
@@ -749,7 +751,14 @@ fn run_external_diff_entries(
             quiet: options.quiet,
             output_file: output_file.as_mut(),
         };
-        let rc = run_one_external_diff(entry, &command, idx + 1, entries.len(), &mut context)?;
+        let rc = run_one_external_diff(
+            entry,
+            lookup_entry,
+            &command,
+            idx + 1,
+            entries.len(),
+            &mut context,
+        )?;
         match (command.trust_exit_code, rc) {
             (false, 0) => found_changes = true,
             (true, 0) => {}
@@ -802,6 +811,7 @@ struct ExternalDiffProcessContext<'a> {
 
 fn run_one_external_diff(
     entry: &sley_diff_merge::NameStatusEntry,
+    lookup_entry: &sley_diff_merge::NameStatusEntry,
     command: &ExternalDiffCommand,
     counter: usize,
     total: usize,
@@ -809,6 +819,7 @@ fn run_one_external_diff(
 ) -> Result<i32> {
     let old_file = prepare_external_diff_file(
         entry,
+        lookup_entry,
         context.db,
         context.worktree_root,
         context.use_worktree_new,
@@ -817,6 +828,7 @@ fn run_one_external_diff(
     )?;
     let new_file = prepare_external_diff_file(
         entry,
+        lookup_entry,
         context.db,
         context.worktree_root,
         context.use_worktree_new,
@@ -824,14 +836,18 @@ fn run_one_external_diff(
         context.autocrlf,
     )?;
     let path = String::from_utf8_lossy(&entry.path).into_owned();
-    let old_hex = external_diff_oid(entry.old_oid.as_ref(), context.db.object_format(), false);
+    let old_hex = external_diff_oid(
+        lookup_entry.old_oid.as_ref(),
+        context.db.object_format(),
+        false,
+    );
     let new_hex = external_diff_oid(
-        entry.new_oid.as_ref(),
+        lookup_entry.new_oid.as_ref(),
         context.db.object_format(),
         context.use_worktree_new,
     );
-    let old_mode = external_diff_mode(entry.old_mode);
-    let new_mode = external_diff_mode(entry.new_mode);
+    let old_mode = external_diff_mode(lookup_entry.old_mode);
+    let new_mode = external_diff_mode(lookup_entry.new_mode);
     let args = [
         path,
         old_file.path.to_string_lossy().into_owned(),
@@ -909,6 +925,7 @@ impl Drop for ExternalDiffFile {
 
 fn prepare_external_diff_file(
     entry: &sley_diff_merge::NameStatusEntry,
+    lookup_entry: &sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
@@ -917,21 +934,21 @@ fn prepare_external_diff_file(
 ) -> Result<ExternalDiffFile> {
     if new_side
         && use_worktree_new
-        && entry.new_mode != Some(0o160000)
+        && lookup_entry.new_mode != Some(0o160000)
         && let Some(root) = worktree_root
     {
-        let absolute = root.join(repo_path_to_path(&entry.path));
+        let absolute = root.join(repo_path_to_path(&lookup_entry.path));
         if absolute.exists() {
             return Ok(ExternalDiffFile {
-                path: repo_path_to_path(&entry.path),
+                path: repo_path_to_path(&lookup_entry.path),
                 temp_dir: None,
             });
         }
     }
     let content = if new_side {
-        diff_entry_new_content(entry, db, worktree_root, use_worktree_new, None)?
+        diff_entry_new_content(lookup_entry, db, worktree_root, use_worktree_new, None)?
     } else {
-        diff_entry_old_content(entry, db)?
+        diff_entry_old_content(lookup_entry, db)?
     };
     let Some(content) = content else {
         return Ok(ExternalDiffFile {
@@ -1790,21 +1807,16 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     };
     let use_worktree_old = reverse && use_worktree_new;
     let use_worktree_new = use_worktree_new && !reverse;
-    // `--relative` rewrites the displayed paths; worktree content reads must
-    // keep resolving against the original location, so the effective worktree
-    // root gains the stripped prefix.
-    let mut worktree_root = worktree_root;
+    // `--relative` rewrites displayed paths only; content, raw oid, and
+    // external-diff worktree lookups still resolve against the original paths.
+    let worktree_root = worktree_root;
+    let mut relative_lookup_entries = DiffRelativeLookupMap::new();
     let entries = if matches!(diff_relative, sley_rev::diff_options::DiffRelativeMode::Off) {
         entries
     } else {
         let prefix = diff_relative_prefix(&diff_relative, &cwd, &git_dir)?;
-        let entries = apply_diff_relative(entries, &prefix);
-        if !prefix.is_empty()
-            && !entries.is_empty()
-            && let Some(root) = worktree_root.as_mut()
-        {
-            root.push(repo_path_to_path(&prefix));
-        }
+        let (entries, lookups) = apply_diff_relative(entries, &prefix);
+        relative_lookup_entries = lookups;
         entries
     };
     let worktree_clean_attributes = if use_worktree_new || use_worktree_old {
@@ -1846,8 +1858,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let entries = if ignore_active {
         let mut visible = Vec::with_capacity(entries.len());
         for entry in entries {
+            let lookup_entry = diff_relative_lookup_entry(&entry, &relative_lookup_entries);
             if diff_entry_produces_output(
-                &entry,
+                lookup_entry,
                 &db,
                 worktree_root.as_deref(),
                 use_worktree_new,
@@ -1924,6 +1937,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         let global_external = global_external_diff_command(repo_config.as_ref());
         if let Some(code) = run_external_diff_entries(
             &entries,
+            &relative_lookup_entries,
             &db,
             worktree_root.as_deref(),
             use_worktree_new,
@@ -1957,6 +1971,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             let mut stat_entries = if ignore_active {
                 collect_diff_stat_entries_with_ignore(
                     &entries,
+                    &relative_lookup_entries,
                     &db,
                     worktree_root.as_deref(),
                     use_worktree_new,
@@ -1968,6 +1983,15 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         diff_algorithm,
                         indent_heuristic,
                     },
+                )?
+            } else if !relative_lookup_entries.is_empty() {
+                collect_diff_stat_entries_with_lookup(
+                    &entries,
+                    &relative_lookup_entries,
+                    &db,
+                    worktree_root.as_deref(),
+                    use_worktree_new,
+                    worktree_clean.as_ref(),
                 )?
             } else {
                 collect_diff_stat_entries_with_worktree_clean(
@@ -1981,6 +2005,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             if diff_rewrite_control {
                 apply_diff_break_rewrite_stats(
                     &mut stat_entries,
+                    &relative_lookup_entries,
                     &db,
                     worktree_root.as_deref(),
                     use_worktree_new,
@@ -2114,12 +2139,16 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     prefix_already_written: false,
                 },
                 |entry| {
+                    let lookup_entry =
+                        diff_relative_lookup_entry(entry, &relative_lookup_entries);
                     zero_all_worktree_oids
                         || (zero_worktree_oids
-                            && entry
+                            && lookup_entry
                                 .new_oid
                                 .as_ref()
-                                .is_none_or(|oid| index_oids.get(&entry.path[..]) != Some(oid)))
+                                .is_none_or(|oid| {
+                                    index_oids.get(&lookup_entry.path[..]) != Some(oid)
+                                }))
                 },
                 |stdout, entry| {
                     if cached_unmerged_paths.contains(entry.path.as_bytes()) {
@@ -2156,19 +2185,24 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         }
                         _ => None,
                     };
-                    let materialized_contents = if !is_gitlink_pair(entry)
-                        && (use_worktree_old || worktree_clean.is_some())
+                    let lookup_entry =
+                        diff_relative_lookup_entry(entry, &relative_lookup_entries);
+                    let relative_materialized = !relative_lookup_entries.is_empty();
+                    let materialized_contents = if !is_gitlink_pair(lookup_entry)
+                        && (relative_materialized
+                            || use_worktree_old
+                            || worktree_clean.is_some())
                     {
                         Some((
                             diff_entry_old_content_for_diff(
-                                entry,
+                                lookup_entry,
                                 &db,
                                 worktree_root.as_deref(),
                                 use_worktree_old,
                                 worktree_clean.as_ref(),
                             )?,
                             diff_entry_new_content(
-                                entry,
+                                lookup_entry,
                                 &db,
                                 worktree_root.as_deref(),
                                 use_worktree_new,
@@ -2182,7 +2216,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         .as_ref()
                         .map(|(old, new)| (old.as_deref(), new.as_deref()));
                     let options = DiffRenderOptions {
-                line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                        line_indicators: sley_diff_merge::render::LineIndicators::default(),
                         binary: patch_binary,
                         db: &db,
                         worktree_root: worktree_root.as_deref(),
@@ -2249,12 +2283,16 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     prefix_already_written: false,
                 },
                 |entry| {
+                    let lookup_entry =
+                        diff_relative_lookup_entry(entry, &relative_lookup_entries);
                     zero_all_worktree_oids
                         || (zero_worktree_oids
-                            && entry
+                            && lookup_entry
                                 .new_oid
                                 .as_ref()
-                                .is_none_or(|oid| index_oids.get(&entry.path[..]) != Some(oid)))
+                                .is_none_or(|oid| {
+                                    index_oids.get(&lookup_entry.path[..]) != Some(oid)
+                                }))
                 },
                 |_, _| Ok(()),
             )?;
@@ -2807,11 +2845,18 @@ fn diff_relative_prefix_arg(prefix: &str) -> String {
     }
 }
 
+type DiffRelativeLookupKey = (Vec<u8>, Option<Vec<u8>>, String);
+type DiffRelativeLookupMap = BTreeMap<DiffRelativeLookupKey, sley_diff_merge::NameStatusEntry>;
+
 fn apply_diff_relative(
     entries: Vec<sley_diff_merge::NameStatusEntry>,
     prefix: &[u8],
-) -> Vec<sley_diff_merge::NameStatusEntry> {
+) -> (Vec<sley_diff_merge::NameStatusEntry>, DiffRelativeLookupMap) {
+    if prefix.is_empty() {
+        return (entries, DiffRelativeLookupMap::new());
+    }
     let mut filtered = Vec::new();
+    let mut lookup_entries = DiffRelativeLookupMap::new();
     for entry in entries {
         if let Some(old_path) = &entry.old_path {
             let old_display = diff_relative_display_path(old_path, prefix);
@@ -2819,58 +2864,115 @@ fn apply_diff_relative(
             if matches!(entry.status, sley_diff_merge::NameStatus::Copied(_)) {
                 match (old_display, new_display) {
                     (Some(old_path), Some(path)) => {
-                        filtered.push(sley_diff_merge::NameStatusEntry {
+                        let lookup_entry = entry.clone();
+                        let display_entry = sley_diff_merge::NameStatusEntry {
                             path: BString::from(path),
                             old_path: Some(BString::from(old_path)),
                             ..entry
-                        })
+                        };
+                        diff_relative_push_entry(
+                            &mut filtered,
+                            &mut lookup_entries,
+                            display_entry,
+                            lookup_entry,
+                        );
                     }
-                    (None, Some(path)) => filtered.push(sley_diff_merge::NameStatusEntry {
-                        status: sley_diff_merge::NameStatus::Added,
-                        path: BString::from(path),
-                        old_path: None,
-                        old_mode: None,
-                        new_mode: entry.new_mode,
-                        old_oid: None,
-                        new_oid: entry.new_oid,
-                    }),
+                    (None, Some(path)) => {
+                        let display_entry = sley_diff_merge::NameStatusEntry {
+                            status: sley_diff_merge::NameStatus::Added,
+                            path: BString::from(path),
+                            old_path: None,
+                            old_mode: None,
+                            new_mode: entry.new_mode,
+                            old_oid: None,
+                            new_oid: entry.new_oid,
+                        };
+                        let lookup_entry = sley_diff_merge::NameStatusEntry {
+                            path: entry.path,
+                            ..display_entry.clone()
+                        };
+                        diff_relative_push_entry(
+                            &mut filtered,
+                            &mut lookup_entries,
+                            display_entry,
+                            lookup_entry,
+                        );
+                    }
                     (Some(_), None) | (None, None) => {}
                 }
             } else {
                 match (old_display, new_display) {
                     (Some(old_path), Some(path)) => {
-                        filtered.push(sley_diff_merge::NameStatusEntry {
+                        let lookup_entry = entry.clone();
+                        let display_entry = sley_diff_merge::NameStatusEntry {
                             path: BString::from(path),
                             old_path: Some(BString::from(old_path)),
                             ..entry
-                        });
+                        };
+                        diff_relative_push_entry(
+                            &mut filtered,
+                            &mut lookup_entries,
+                            display_entry,
+                            lookup_entry,
+                        );
                     }
-                    (Some(path), None) => filtered.push(sley_diff_merge::NameStatusEntry {
-                        status: sley_diff_merge::NameStatus::Deleted,
-                        path: BString::from(path),
-                        old_path: None,
-                        old_mode: entry.old_mode,
-                        new_mode: None,
-                        old_oid: entry.old_oid,
-                        new_oid: None,
-                    }),
-                    (None, Some(path)) => filtered.push(sley_diff_merge::NameStatusEntry {
-                        status: sley_diff_merge::NameStatus::Added,
-                        path: BString::from(path),
-                        old_path: None,
-                        old_mode: None,
-                        new_mode: entry.new_mode,
-                        old_oid: None,
-                        new_oid: entry.new_oid,
-                    }),
+                    (Some(path), None) => {
+                        let display_entry = sley_diff_merge::NameStatusEntry {
+                            status: sley_diff_merge::NameStatus::Deleted,
+                            path: BString::from(path),
+                            old_path: None,
+                            old_mode: entry.old_mode,
+                            new_mode: None,
+                            old_oid: entry.old_oid,
+                            new_oid: None,
+                        };
+                        let lookup_entry = sley_diff_merge::NameStatusEntry {
+                            path: old_path.clone(),
+                            ..display_entry.clone()
+                        };
+                        diff_relative_push_entry(
+                            &mut filtered,
+                            &mut lookup_entries,
+                            display_entry,
+                            lookup_entry,
+                        );
+                    }
+                    (None, Some(path)) => {
+                        let display_entry = sley_diff_merge::NameStatusEntry {
+                            status: sley_diff_merge::NameStatus::Added,
+                            path: BString::from(path),
+                            old_path: None,
+                            old_mode: None,
+                            new_mode: entry.new_mode,
+                            old_oid: None,
+                            new_oid: entry.new_oid,
+                        };
+                        let lookup_entry = sley_diff_merge::NameStatusEntry {
+                            path: entry.path,
+                            ..display_entry.clone()
+                        };
+                        diff_relative_push_entry(
+                            &mut filtered,
+                            &mut lookup_entries,
+                            display_entry,
+                            lookup_entry,
+                        );
+                    }
                     (None, None) => {}
                 }
             }
         } else if let Some(path) = diff_relative_display_path(&entry.path, prefix) {
-            filtered.push(sley_diff_merge::NameStatusEntry {
+            let lookup_entry = entry.clone();
+            let display_entry = sley_diff_merge::NameStatusEntry {
                 path: BString::from(path),
                 ..entry
-            });
+            };
+            diff_relative_push_entry(
+                &mut filtered,
+                &mut lookup_entries,
+                display_entry,
+                lookup_entry,
+            );
         }
     }
     filtered.sort_by(|left, right| {
@@ -2879,7 +2981,34 @@ fn apply_diff_relative(
             .then_with(|| left.old_path.cmp(&right.old_path))
             .then_with(|| left.status.code().cmp(&right.status.code()))
     });
-    filtered
+    (filtered, lookup_entries)
+}
+
+fn diff_relative_push_entry(
+    filtered: &mut Vec<sley_diff_merge::NameStatusEntry>,
+    lookup_entries: &mut DiffRelativeLookupMap,
+    display_entry: sley_diff_merge::NameStatusEntry,
+    lookup_entry: sley_diff_merge::NameStatusEntry,
+) {
+    lookup_entries.insert(diff_relative_lookup_key(&display_entry), lookup_entry);
+    filtered.push(display_entry);
+}
+
+fn diff_relative_lookup_entry<'a>(
+    entry: &'a sley_diff_merge::NameStatusEntry,
+    lookup_entries: &'a DiffRelativeLookupMap,
+) -> &'a sley_diff_merge::NameStatusEntry {
+    lookup_entries
+        .get(&diff_relative_lookup_key(entry))
+        .unwrap_or(entry)
+}
+
+fn diff_relative_lookup_key(entry: &sley_diff_merge::NameStatusEntry) -> DiffRelativeLookupKey {
+    (
+        entry.path.as_bytes().to_vec(),
+        entry.old_path.as_ref().map(|path| path.as_bytes().to_vec()),
+        entry.status.label(),
+    )
 }
 
 struct DiffStatIgnoreOptions<'a> {
@@ -2906,6 +3035,7 @@ fn diff_relative_display_path(path: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
 
 fn collect_diff_stat_entries_with_ignore<'a>(
     entries: &'a [sley_diff_merge::NameStatusEntry],
+    lookup_entries: &DiffRelativeLookupMap,
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
@@ -2914,9 +3044,15 @@ fn collect_diff_stat_entries_with_ignore<'a>(
 ) -> Result<Vec<DiffStatEntryData<'a>>> {
     let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
-        let old_content = diff_entry_old_content(entry, db)?;
-        let new_content =
-            diff_entry_new_content(entry, db, worktree_root, use_worktree_new, worktree_clean)?;
+        let lookup_entry = diff_relative_lookup_entry(entry, lookup_entries);
+        let old_content = diff_entry_old_content(lookup_entry, db)?;
+        let new_content = diff_entry_new_content(
+            lookup_entry,
+            db,
+            worktree_root,
+            use_worktree_new,
+            worktree_clean,
+        )?;
         let stats = if old_content.as_deref().is_some_and(is_binary_content)
             || new_content.as_deref().is_some_and(is_binary_content)
         {
@@ -2937,8 +3073,34 @@ fn collect_diff_stat_entries_with_ignore<'a>(
     Ok(stat_entries)
 }
 
+fn collect_diff_stat_entries_with_lookup<'a>(
+    entries: &'a [sley_diff_merge::NameStatusEntry],
+    lookup_entries: &DiffRelativeLookupMap,
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+    worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+) -> Result<Vec<DiffStatEntryData<'a>>> {
+    let mut stat_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let lookup_entry = diff_relative_lookup_entry(entry, lookup_entries);
+        let old_content = diff_entry_old_content(lookup_entry, db)?;
+        let new_content = diff_entry_new_content(
+            lookup_entry,
+            db,
+            worktree_root,
+            use_worktree_new,
+            worktree_clean,
+        )?;
+        let stats = diff_line_stats(old_content.as_deref(), new_content.as_deref());
+        stat_entries.push(DiffStatEntryData { entry, stats });
+    }
+    Ok(stat_entries)
+}
+
 fn apply_diff_break_rewrite_stats(
     entries: &mut [DiffStatEntryData<'_>],
+    lookup_entries: &DiffRelativeLookupMap,
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
@@ -2948,9 +3110,10 @@ fn apply_diff_break_rewrite_stats(
         if !matches!(data.entry.status, sley_diff_merge::NameStatus::Modified) {
             continue;
         }
-        let old_content = diff_entry_old_content(data.entry, db)?;
+        let lookup_entry = diff_relative_lookup_entry(data.entry, lookup_entries);
+        let old_content = diff_entry_old_content(lookup_entry, db)?;
         let new_content = diff_entry_new_content(
-            data.entry,
+            lookup_entry,
             db,
             worktree_root,
             use_worktree_new,
