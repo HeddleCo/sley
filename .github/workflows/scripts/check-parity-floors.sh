@@ -377,7 +377,11 @@ declare -A FLOOR=(
     [t0001-init.sh]=102
     [t1006-cat-file.sh]=290
     [t1007-hash-object.sh]=40
-    [t1300-config.sh]=500
+    # 2026-07-08 off main 1136760b: config parity now reaches full t1300 by matching
+    # git's one-arg `config set` missing-value diagnostics and value-less --path
+    # line reporting; guards held at t1308=37 and t1309=8, measured against
+    # /tmp/git-src 2.55.0 oracle.
+    [t1300-config.sh]=516
     # 271->275 RESTORED 2026-06-20 (wave-23 fixes): the wave-4 (eb1f4dfd) floor of 275
     # was silently regressed to 271 by a later reftable-migration commit; the badrefname
     # fix-slice restores the 4 cells. CI-reproducible (local plumbing, no transport).
