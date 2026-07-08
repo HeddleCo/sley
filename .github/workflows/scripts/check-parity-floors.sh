@@ -664,12 +664,13 @@ declare -A FLOOR=(
     [t8002-blame.sh]=135
     [t8001-annotate.sh]=117
     [t8012-blame-colors.sh]=120
-    # t3903-stash FLAKY: cell #46 "stash symlink to file (stage rm)" oscillates 82/83
-    # (symlink<->file type-change race, independent of any wave — flips on a pristine
-    # origin/main binary). Floor lowered 83->82 (safe lower bound) — banking 83 from a
-    # gitlink-rm-wave flaky read silently reddened the gate. Same class as t0020 27/28.
-    # 2026-06-26: still oscillates 132/133 isolated (tasks #22/#28). Floor at stable-low 132.
-    [t3903-stash.sh]=132
+    # 2026-07-08, off main 088584b6: t3903-stash 134->143 ceiling (#52/#53
+    # test_expect_failure remain). Stash patch now records selected hunks,
+    # apply honors custom conflict labels, skip-worktree entries stay from the
+    # index, tree writes use Git ordering, and include-untracked cleanup skips
+    # embedded repositories. Guards held: t3904=4/10, t3905=29/34. Oracle:
+    # /tmp/git-src git 2.55.0.
+    [t3903-stash.sh]=143
     [t3900-i18n-commit.sh]=38
     [t4209-log-pickaxe.sh]=45
     # 2026-07-08, off main c0bf80c7: line-log diff output reached full parity,

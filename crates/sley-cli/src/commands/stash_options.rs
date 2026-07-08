@@ -6,6 +6,9 @@ use sley_grep::PatternKind;
 pub(super) fn setup_stash_apply_options(args: &[String], command: &str) -> Result<StashApplyOptions> {
     let mut quiet = false;
     let mut reinstate_index = None;
+    let mut label_ours = None;
+    let mut label_theirs = None;
+    let mut label_base = None;
     let mut specs = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -30,13 +33,30 @@ pub(super) fn setup_stash_apply_options(args: &[String], command: &str) -> Resul
                     return Err(GitError::Exit(129));
                 }
                 index += 1;
+                match arg.as_str() {
+                    "--label-ours" => label_ours = args.get(index).cloned(),
+                    "--label-theirs" => label_theirs = args.get(index).cloned(),
+                    "--label-base" => label_base = args.get(index).cloned(),
+                    _ => {}
+                }
             }
-            "--no-label-ours" | "--no-label-theirs" | "--no-label-base" if command == "apply" => {}
+            "--no-label-ours" if command == "apply" => label_ours = None,
+            "--no-label-theirs" if command == "apply" => label_theirs = None,
+            "--no-label-base" if command == "apply" => label_base = None,
             value
                 if command == "apply"
                     && (value.starts_with("--label-ours=")
                         || value.starts_with("--label-theirs=")
-                        || value.starts_with("--label-base=")) => {}
+                        || value.starts_with("--label-base=")) =>
+            {
+                let (name, label) = value.split_once('=').unwrap();
+                match name {
+                    "--label-ours" => label_ours = Some(label.to_string()),
+                    "--label-theirs" => label_theirs = Some(label.to_string()),
+                    "--label-base" => label_base = Some(label.to_string()),
+                    _ => {}
+                }
+            }
             value
                 if command == "apply"
                     && (value.starts_with("--no-label-ours=")
@@ -93,6 +113,9 @@ pub(super) fn setup_stash_apply_options(args: &[String], command: &str) -> Resul
         spec: specs.first().cloned(),
         display,
         direct_oid: None,
+        label_ours,
+        label_theirs,
+        label_base,
     })
 }
 
