@@ -1,9 +1,12 @@
 //! Git credential protocol engine (`credential.c` parity).
 
+#[cfg(unix)]
 mod cache;
+#[cfg(unix)]
 mod cache_daemon;
 mod prompt;
 mod store;
+#[cfg(unix)]
 mod unix_socket;
 mod url;
 
@@ -14,12 +17,59 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sley_config::{ConfigStack, GitConfig};
 use sley_core::{GitError, Result};
 
+#[cfg(unix)]
 pub use cache::cmd_credential_cache;
+#[cfg(unix)]
 pub use cache_daemon::cmd_credential_cache_daemon;
 pub use store::cmd_credential_store;
 
 pub const TIME_MAX: i64 = i64::MAX;
 const MAX_GIT_CREDENTIAL_RESPONSE_BYTES: usize = 64 * 1024;
+
+#[cfg(not(unix))]
+pub fn cmd_credential_cache(args: &[String]) -> Result<()> {
+    let _ = args;
+    Err(GitError::Command(credential_cache_unsupported_message(
+        "credential-cache",
+    )))
+}
+
+#[cfg(not(unix))]
+pub fn cmd_credential_cache_daemon(args: &[String]) -> Result<()> {
+    let _ = args;
+    Err(GitError::Command(credential_cache_unsupported_message(
+        "credential-cache--daemon",
+    )))
+}
+
+#[cfg(all(not(unix), windows))]
+fn credential_cache_unsupported_message(command: &str) -> String {
+    format!("{command} is unsupported on Windows")
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn credential_cache_unsupported_message(command: &str) -> String {
+    format!("{command} unavailable; no unix socket support")
+}
+
+#[cfg(all(test, not(unix)))]
+mod non_unix_cache_tests {
+    use super::*;
+
+    #[test]
+    fn credential_cache_reports_platform_unsupported() {
+        #[cfg(windows)]
+        assert_eq!(
+            cmd_credential_cache(&[]).unwrap_err(),
+            GitError::Command("credential-cache is unsupported on Windows".into())
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            cmd_credential_cache(&[]).unwrap_err(),
+            GitError::Command("credential-cache unavailable; no unix socket support".into())
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialOpType { Initial, Helper, Response }
