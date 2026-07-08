@@ -1647,6 +1647,7 @@ fn stash_record_selected_patch(
         worktree_root: worktree_root.to_path_buf(),
         untracked_paths: Vec::new(),
         pathspec_paths: Vec::new(),
+        has_pathspec: false,
         staged_worktree_conflicts: Vec::new(),
         format,
     };
@@ -1939,17 +1940,19 @@ fn cleanup_stored_stash(created: CreatedStash, quiet: bool, keep_index: bool) ->
     prune_empty_untracked_dirs_preserving_cwd(&created.worktree_root)?;
 
     if created.pathspec_paths.is_empty() {
-        let reset_oid = if keep_index {
-            &created.index_oid
-        } else {
-            &created.head_oid
-        };
-        sley_worktree::reset_index_and_worktree_to_commit(
-            &created.worktree_root,
-            &created.git_dir,
-            created.format,
-            reset_oid,
-        )?;
+        if !created.has_pathspec {
+            let reset_oid = if keep_index {
+                &created.index_oid
+            } else {
+                &created.head_oid
+            };
+            sley_worktree::reset_index_and_worktree_to_commit(
+                &created.worktree_root,
+                &created.git_dir,
+                created.format,
+                reset_oid,
+            )?;
+        }
     } else if keep_index {
         sley_worktree::restore_worktree_paths(
             &created.worktree_root,
@@ -1991,6 +1994,7 @@ struct CreatedStash {
     worktree_root: PathBuf,
     untracked_paths: Vec<Vec<u8>>,
     pathspec_paths: Vec<PathBuf>,
+    has_pathspec: bool,
     staged_worktree_conflicts: Vec<Vec<u8>>,
     format: ObjectFormat,
 }
@@ -2089,7 +2093,9 @@ fn create_stash_commit(
             &index_entry_map,
             &worktree_entry_map,
         )?;
-        pathspec.exit_if_unmatched()?;
+        if !include_untracked {
+            pathspec.exit_if_unmatched()?;
+        }
         if tracked_change_paths.is_empty() && untracked_tree.is_none() {
             return Ok(None);
         }
@@ -2193,6 +2199,7 @@ fn create_stash_commit(
         worktree_root,
         untracked_paths,
         pathspec_paths,
+        has_pathspec: !pathspecs.is_empty(),
         staged_worktree_conflicts,
         format,
     }))
@@ -2260,6 +2267,35 @@ fn stash_index_config_default() -> Result<bool> {
         );
     }
     Ok(config.get_bool("stash", None, "index").unwrap_or(false))
+}
+
+fn stash_show_include_untracked_config_default(
+    git_dir: &Path,
+    common_git_dir: &Path,
+) -> Result<bool> {
+    if let Some(value) = global_config_value("stash.showIncludeUntracked")? {
+        return Ok(sley_config::parse_config_bool(&value).unwrap_or(false));
+    }
+    let cwd = env::current_dir()?;
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(common_git_dir.to_path_buf()),
+        repo_current_branch_name(git_dir),
+    );
+    let Ok(mut config) = sley_config::load_effective_config(common_git_dir, &context) else {
+        return Ok(false);
+    };
+    let parameters_env = effective_config_parameters_env();
+    if let Ok(parameters) = sley_config::injected_config_parameters(parameters_env.as_deref()) {
+        let _ = sley_config::append_injected_config_sections_with_includes(
+            &mut config,
+            &parameters,
+            &context,
+            &cwd,
+        );
+    }
+    Ok(config
+        .get_bool("stash", None, "showIncludeUntracked")
+        .unwrap_or(false))
 }
 
 fn stash_argument_names_stash_ref(spec: &str) -> bool {
@@ -2846,6 +2882,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
     let mut patch_full_index = false;
     let mut include_untracked = false;
     let mut only_untracked = false;
+    let mut untracked_option_seen = false;
     let mut diff_filter = DiffFilter::default();
     let mut diff_filter_seen = false;
     let mut specs = Vec::new();
@@ -3148,6 +3185,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 stash_option_takes_no_value_error("no-textconv")?
             }
             "-u" | "--include-untracked" => {
+                untracked_option_seen = true;
                 include_untracked = true;
                 only_untracked = false;
             }
@@ -3155,6 +3193,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 stash_option_takes_no_value_error("include-untracked")?
             }
             "--no-include-untracked" => {
+                untracked_option_seen = true;
                 include_untracked = false;
                 only_untracked = false;
             }
@@ -3162,6 +3201,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 stash_option_takes_no_value_error("no-include-untracked")?
             }
             "--only-untracked" => {
+                untracked_option_seen = true;
                 include_untracked = true;
                 only_untracked = true;
             }
@@ -3229,6 +3269,10 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
     let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
+    if !untracked_option_seen {
+        include_untracked =
+            stash_show_include_untracked_config_default(&git_dir, &common_git_dir)?;
+    }
     let store = FileRefStore::new(&common_git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     // git's `stash show` accepts any stash-like argument (a `stash@{n}` ref, a
@@ -3279,6 +3323,23 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
             )));
         }
         let untracked_commit = Commit::parse(format, &untracked_object.body)?;
+        if !only_untracked {
+            let worktree_tree_entries =
+                sley_diff_merge::flatten_tree(&db, format, &stash_commit.tree)?;
+            let untracked_tree_entries =
+                sley_diff_merge::flatten_tree(&db, format, &untracked_commit.tree)?;
+            if let Some(path) = untracked_tree_entries
+                .keys()
+                .find(|path| worktree_tree_entries.contains_key(*path))
+            {
+                eprintln!(
+                    "error: worktree and untracked commit have duplicate entries: {}",
+                    String::from_utf8_lossy(path)
+                );
+                eprintln!("fatal: failed to unpack trees");
+                return Err(GitError::Exit(128));
+            }
+        }
         entries.extend(sley_diff_merge::diff_name_status_empty_tree_with_options(
             &db,
             format,
