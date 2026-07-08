@@ -47,8 +47,10 @@ tls-rustls = ["sley-remote/tls-rustls"]
 tls-native-tls = ["sley-remote/tls-native-tls"]
 tls-platform-verifier = ["sley-remote/tls-platform-verifier"]
 
+# Path-only (no version) so `cargo publish` strips this test-only helper from the
+# published manifest — sley-testkit is publish=false and not on crates.io.
 [dev-dependencies]
-sley-testkit = { workspace = true }
+sley-testkit = { path = "../sley-testkit" }
 
 [lints]
 workspace = true
