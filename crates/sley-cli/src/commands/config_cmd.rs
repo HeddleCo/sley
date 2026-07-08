@@ -471,6 +471,9 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 eprintln!("error: no action specified");
                 return Err(GitError::Exit(129));
             }
+            1 if positional[0].contains('=') && !config_key_is_valid(positional[0]) => {
+                ConfigAction::Set
+            }
             1 => ConfigAction::Get,
             2 => ConfigAction::Set,
             // Legacy `git config <key> <value> <value-pattern>` (git's
@@ -543,6 +546,9 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             return Err(GitError::Command(
                 "config action requires <key> [<value-pattern>]".into(),
             ));
+        }
+        ConfigAction::Set if positional.len() == 1 => {
+            return config_missing_set_value(positional[0]);
         }
         ConfigAction::Set | ConfigAction::Add if positional.len() != 2 => {
             return Err(GitError::Command(
@@ -1004,12 +1010,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 .filter(|entry| entry.matches(&key.section, key.subsection.as_deref(), &key.key))
             {
                 let meta = ConfigValueMeta::of(entry);
-                let Some(value) = format_config_entry_value(
-                    entry.value.as_deref(),
-                    value_type,
-                    &name,
-                    Some(&entry.origin),
-                )?
+                let Some(value) = format_config_entry_value(entry, value_type, &name)?
                 else {
                     continue;
                 };
@@ -1147,12 +1148,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             let mut stdout = io::stdout();
             let mut wrote = false;
             for entry in values {
-                let Some(formatted) = format_config_entry_value(
-                    entry.value.as_deref(),
-                    value_type,
-                    &name,
-                    Some(&entry.origin),
-                )?
+                let Some(formatted) = format_config_entry_value(entry, value_type, &name)?
                 else {
                     continue;
                 };
@@ -2380,6 +2376,50 @@ pub(crate) fn parse_config_key(value: &str) -> Result<ConfigKey> {
     })
 }
 
+fn config_key_is_valid(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return false;
+    }
+    let section = parts[0];
+    let key = parts[parts.len() - 1];
+    if key.is_empty()
+        || validate_config_name(section).is_err()
+        || validate_config_key_name(key).is_err()
+    {
+        return false;
+    }
+    if parts.len() > 2 {
+        let subsection = parts[1..parts.len() - 1].join(".");
+        if subsection
+            .bytes()
+            .any(|byte| matches!(byte, b'\n' | b'\r' | 0))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn config_missing_set_value(value: &str) -> Result<()> {
+    let split = value.split_once('=');
+    let valid_name = match split {
+        Some((name, _)) => config_key_is_valid(name),
+        None => config_key_is_valid(value),
+    };
+    if valid_name {
+        eprintln!("error: missing value to set to the variable '{value}'");
+    } else {
+        eprintln!("error: missing value to set to a variable with an invalid name '{value}'");
+    }
+    if let Some((name, suggested_value)) = split
+        && valid_name
+    {
+        eprintln!("hint: did you mean \"git config set {name} {suggested_value}\"?");
+    }
+    Err(GitError::Exit(129))
+}
+
 fn parse_config_urlmatch_target(value: &str) -> Result<ConfigUrlMatchTarget> {
     let mut parts = value.splitn(2, '.');
     let section = parts.next().unwrap_or_default().to_string();
@@ -2838,12 +2878,7 @@ fn config_subcommand_get(
         {
             continue;
         }
-        let Some(value) = format_config_entry_value(
-            entry.value.as_deref(),
-            value_type,
-            &name,
-            Some(&entry.origin),
-        )?
+        let Some(value) = format_config_entry_value(entry, value_type, &name)?
         else {
             continue;
         };
@@ -3105,11 +3140,11 @@ enum ConfigFormattedValue {
 }
 
 fn format_config_entry_value(
-    value: Option<&str>,
+    entry: &sley_config::ConfigStackEntry,
     value_type: ConfigValueType,
     name: &str,
-    origin: Option<&sley_config::ConfigOrigin>,
 ) -> Result<Option<ConfigFormattedValue>> {
+    let value = entry.value.as_deref();
     match value {
         None if matches!(
             value_type,
@@ -3118,10 +3153,7 @@ fn format_config_entry_value(
         {
             Ok(Some(ConfigFormattedValue::Value("true".to_string())))
         }
-        None if value_type == ConfigValueType::Path => {
-            eprintln!("error: missing value for '{name}'");
-            Err(GitError::Exit(128))
-        }
+        None if value_type == ConfigValueType::Path => config_missing_path_value(name, entry),
         None => Ok(Some(ConfigFormattedValue::NoValue)),
         Some(value) if value_type == ConfigValueType::Path => {
             let Some(formatted) = format_config_path_output_value(value)? else {
@@ -3133,7 +3165,7 @@ fn format_config_entry_value(
             value,
             value_type,
             Some(name),
-            origin,
+            Some(&entry.origin),
         )?))),
     }
 }
