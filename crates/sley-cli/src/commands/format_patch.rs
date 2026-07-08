@@ -131,6 +131,8 @@ struct FormatPatchOptions {
     /// Whether to include the diffstat after the `---` line. On by default;
     /// cleared by `--no-stat`.
     stat: bool,
+    /// Prefix patch output with the revision graph (`--graph`).
+    graph: bool,
     /// `--stat=<w>[,<n>[,<c>]]` / `--stat-*-width` knobs. format-patch never
     /// calls git's `init_diffstat_widths`, so the fields start at 0 (and a
     /// zero stat-width becomes the 72-column mail wrap at render time); the
@@ -347,6 +349,7 @@ impl Default for FormatPatchOptions {
             start_number: None,
             signoff: false,
             stat: true,
+            graph: false,
             stat_widths: DiffStatWidths::plumbing(),
             stat_count: None,
             context_lines: HUNK_CONTEXT,
@@ -635,9 +638,13 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
             // blank line on top of each patch's own trailing blank. The cover →
             // first-patch boundary gets no such separator (idx 0 is skipped).
             if idx > 0 {
-                stdout.write_all(b"\n")?;
+                if options.graph {
+                    stdout.write_all(b"| \n")?;
+                } else {
+                    stdout.write_all(b"\n")?;
+                }
             }
-            let buffer = render_patch(RenderContext {
+            let mut buffer = render_patch(RenderContext {
                 db,
                 format,
                 options: &options,
@@ -658,6 +665,10 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
                 range_diff: range_diff.as_deref().filter(|_| count == 1),
                 base_info: base_info.as_ref(),
             })?;
+            if options.graph {
+                buffer =
+                    format_patch_graph_prefix(&buffer, idx == 0, resolved.signature.as_deref());
+            }
             stdout.write_all(&buffer)?;
         }
         stdout.flush()?;
@@ -672,9 +683,13 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
         }
         for (idx, record) in commits.iter().enumerate() {
             if idx > 0 {
-                stream.write_all(b"\n")?;
+                if options.graph {
+                    stream.write_all(b"| \n")?;
+                } else {
+                    stream.write_all(b"\n")?;
+                }
             }
-            let buffer = render_patch(RenderContext {
+            let mut buffer = render_patch(RenderContext {
                 db,
                 format,
                 options: &options,
@@ -695,6 +710,10 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
                 range_diff: range_diff.as_deref().filter(|_| count == 1),
                 base_info: base_info.as_ref(),
             })?;
+            if options.graph {
+                buffer =
+                    format_patch_graph_prefix(&buffer, idx == 0, resolved.signature.as_deref());
+            }
             stream.write_all(&buffer)?;
         }
         stream.flush()?;
@@ -744,7 +763,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     }
     for (idx, record) in commits.iter().enumerate() {
         let seq = start_number + idx;
-        let buffer = render_patch(RenderContext {
+        let mut buffer = render_patch(RenderContext {
             db,
             format,
             options: &options,
@@ -765,6 +784,10 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
             range_diff: range_diff.as_deref().filter(|_| count == 1),
             base_info: base_info.as_ref(),
         })?;
+        if options.graph {
+            buffer =
+                format_patch_graph_prefix(&buffer, idx == 0, resolved.signature.as_deref());
+        }
         let file_name = if options.numbered_files {
             seq.to_string()
         } else {
@@ -780,6 +803,50 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     }
     stdout.flush()?;
     Ok(())
+}
+
+fn format_patch_graph_prefix(
+    buffer: &[u8],
+    first_patch: bool,
+    signature: Option<&[u8]>,
+) -> Vec<u8> {
+    let (graph_body, signature_block) = format_patch_split_signature(buffer, signature);
+    let line_prefix_bytes = graph_body.iter().filter(|byte| **byte == b'\n').count() * 2 + 4;
+    let mut out = Vec::with_capacity(buffer.len() + line_prefix_bytes);
+    if first_patch {
+        out.extend_from_slice(b"...\n");
+    }
+    let mut first_line = true;
+    for line in graph_body.split_inclusive(|byte| *byte == b'\n') {
+        if first_patch && first_line {
+            out.extend_from_slice(b"o ");
+        } else {
+            out.extend_from_slice(b"| ");
+        }
+        out.extend_from_slice(line);
+        first_line = false;
+    }
+    out.extend_from_slice(signature_block);
+    out
+}
+
+fn format_patch_split_signature<'a>(
+    buffer: &'a [u8],
+    signature: Option<&[u8]>,
+) -> (&'a [u8], &'a [u8]) {
+    let Some(signature) = signature else {
+        return (buffer, &[]);
+    };
+    let mut suffix = Vec::with_capacity(signature.len() + 6);
+    suffix.extend_from_slice(b"-- \n");
+    suffix.extend_from_slice(signature);
+    suffix.extend_from_slice(b"\n\n");
+    if buffer.ends_with(&suffix) {
+        let split = buffer.len() - suffix.len();
+        (&buffer[..split], &buffer[split..])
+    } else {
+        (buffer, &[])
+    }
 }
 
 /// Resolve whether a cover letter is emitted: `--cover-letter`/`--no-cover-letter`
@@ -4050,6 +4117,8 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
                 options.start_number = Some(parse_format_patch_number(n, "--start-number")?);
             }
             "--numbered-files" => options.numbered_files = true,
+            "--graph" => options.graph = true,
+            "--no-graph" => options.graph = false,
             value if let Some(suffix) = value.strip_prefix("--suffix=") => {
                 options.suffix = Some(suffix.to_string());
             }
