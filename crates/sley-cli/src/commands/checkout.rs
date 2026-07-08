@@ -12,8 +12,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut recurse_submodules = None;
     let mut patch = false;
     let mut no_auto_advance = false;
-    let mut unified_context = false;
-    let mut inter_hunk_context = false;
+    let mut unified_context: Option<i64> = None;
+    let mut inter_hunk_context: Option<i64> = None;
     let mut guess = None::<bool>;
     let mut create_reflog = false;
     let mut path_merge = false;
@@ -69,39 +69,42 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     return commit_unified_requires_value_error(true);
                 };
                 patch_validate_unified_context(value, true)?;
-                unified_context = true;
+                unified_context = value.parse::<i64>().ok();
             }
             value if value.starts_with("-U") && value.len() > 2 => {
-                patch_validate_unified_context(&value[2..], true)?;
-                unified_context = true;
+                let value = &value[2..];
+                patch_validate_unified_context(value, true)?;
+                unified_context = value.parse::<i64>().ok();
             }
             "--unified" => {
                 let Some(value) = iter.next() else {
                     return commit_unified_requires_value_error(false);
                 };
                 patch_validate_unified_context(value, false)?;
-                unified_context = true;
+                unified_context = value.parse::<i64>().ok();
             }
             "--unified=" => {
                 return commit_unified_expects_numerical_value_error(false);
             }
             value if value.starts_with("--unified=") => {
-                patch_validate_unified_context(&value["--unified=".len()..], false)?;
-                unified_context = true;
+                let value = &value["--unified=".len()..];
+                patch_validate_unified_context(value, false)?;
+                unified_context = value.parse::<i64>().ok();
             }
             "--inter-hunk-context" => {
                 let Some(value) = iter.next() else {
                     return commit_inter_hunk_context_requires_value_error();
                 };
                 patch_validate_inter_hunk_context(value)?;
-                inter_hunk_context = true;
+                inter_hunk_context = value.parse::<i64>().ok();
             }
             "--inter-hunk-context=" => {
                 return commit_inter_hunk_context_expects_numerical_value_error();
             }
             value if value.starts_with("--inter-hunk-context=") => {
-                patch_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
-                inter_hunk_context = true;
+                let value = &value["--inter-hunk-context=".len()..];
+                patch_validate_inter_hunk_context(value)?;
+                inter_hunk_context = value.parse::<i64>().ok();
             }
             "--progress" | "--no-progress" => {}
             // `-l`/`--log` forces a reflog for the newly created branch.
@@ -210,11 +213,11 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         eprintln!("fatal: the option '--no-auto-advance' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
-    if unified_context && !patch {
+    if unified_context.is_some() && !patch {
         eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
-    if inter_hunk_context && !patch {
+    if inter_hunk_context.is_some() && !patch {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
@@ -269,6 +272,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             &positional,
             dashdash_index,
             no_auto_advance,
+            unified_context,
+            inter_hunk_context,
         );
     }
     let recurse_submodules = recurse_submodules.unwrap_or_else(|| {
@@ -1732,8 +1737,8 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
     let mut conflict_style = None::<sley_worktree::CheckoutConflictStyle>;
     let mut checkout_stage = None::<sley_worktree::CheckoutStage>;
     let mut patch = false;
-    let mut unified_context = false;
-    let mut inter_hunk_context = false;
+    let mut unified_context: Option<i64> = None;
+    let mut inter_hunk_context: Option<i64> = None;
     let mut source = None::<String>;
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
@@ -1787,39 +1792,42 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
                     return commit_unified_requires_value_error(true);
                 };
                 patch_validate_unified_context(value, true)?;
-                unified_context = true;
+                unified_context = value.parse::<i64>().ok();
             }
             value if value.starts_with("-U") && value.len() > 2 => {
-                patch_validate_unified_context(&value[2..], true)?;
-                unified_context = true;
+                let value = &value[2..];
+                patch_validate_unified_context(value, true)?;
+                unified_context = value.parse::<i64>().ok();
             }
             "--unified" => {
                 let Some(value) = iter.next() else {
                     return commit_unified_requires_value_error(false);
                 };
                 patch_validate_unified_context(value, false)?;
-                unified_context = true;
+                unified_context = value.parse::<i64>().ok();
             }
             "--unified=" => {
                 return commit_unified_expects_numerical_value_error(false);
             }
             value if value.starts_with("--unified=") => {
-                patch_validate_unified_context(&value["--unified=".len()..], false)?;
-                unified_context = true;
+                let value = &value["--unified=".len()..];
+                patch_validate_unified_context(value, false)?;
+                unified_context = value.parse::<i64>().ok();
             }
             "--inter-hunk-context" => {
                 let Some(value) = iter.next() else {
                     return commit_inter_hunk_context_requires_value_error();
                 };
                 patch_validate_inter_hunk_context(value)?;
-                inter_hunk_context = true;
+                inter_hunk_context = value.parse::<i64>().ok();
             }
             "--inter-hunk-context=" => {
                 return commit_inter_hunk_context_expects_numerical_value_error();
             }
             value if value.starts_with("--inter-hunk-context=") => {
-                patch_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
-                inter_hunk_context = true;
+                let value = &value["--inter-hunk-context=".len()..];
+                patch_validate_inter_hunk_context(value)?;
+                inter_hunk_context = value.parse::<i64>().ok();
             }
             "--progress"
             | "--no-progress"
@@ -1913,11 +1921,11 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
         return Err(GitError::Exit(128));
     }
-    if unified_context && !patch {
+    if unified_context.is_some() && !patch {
         eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
-    if inter_hunk_context && !patch {
+    if inter_hunk_context.is_some() && !patch {
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
@@ -1960,6 +1968,8 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
             source.as_deref(),
             staged,
             worktree,
+            unified_context,
+            inter_hunk_context,
         );
     }
     if let Some(pathspec_file) = pathspec_from_file {
@@ -2553,6 +2563,8 @@ fn checkout_run_patch(
     positional: &[String],
     dashdash_index: Option<usize>,
     no_auto_advance: bool,
+    context: Option<i64>,
+    interhunk: Option<i64>,
 ) -> Result<()> {
     let (rev, pathspecs): (Option<&str>, &[String]) = match dashdash_index {
         Some(index) => {
@@ -2590,8 +2602,12 @@ fn checkout_run_patch(
         ),
     };
 
-    let cfg =
-        commands::add_interactive::resolve_patch_config(git_dir, None, None, !no_auto_advance)?;
+    let cfg = commands::add_interactive::resolve_patch_config(
+        git_dir,
+        context,
+        interhunk,
+        !no_auto_advance,
+    )?;
     let stdin = io::stdin();
     let mut handle = stdin.lock();
     commands::add_patch::run_add_patch(mode, pathspecs, revision.as_deref(), &mut handle, cfg)
@@ -2608,6 +2624,8 @@ fn restore_run_patch(
     source: Option<&str>,
     staged: bool,
     worktree: bool,
+    context: Option<i64>,
+    interhunk: Option<i64>,
 ) -> Result<()> {
     let pathspecs: Vec<String> = paths
         .iter()
@@ -2642,7 +2660,8 @@ fn restore_run_patch(
             }
         }
     };
-    let cfg = commands::add_interactive::resolve_patch_config(git_dir, None, None, true)?;
+    let cfg =
+        commands::add_interactive::resolve_patch_config(git_dir, context, interhunk, true)?;
     let stdin = io::stdin();
     let mut handle = stdin.lock();
     commands::add_patch::run_add_patch(mode, &pathspecs, revision.as_deref(), &mut handle, cfg)
