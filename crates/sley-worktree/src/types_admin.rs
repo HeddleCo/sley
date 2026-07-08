@@ -988,11 +988,7 @@ pub(crate) fn worktree_uses_symref(git_dir: &Path, symref: &str, target: &str) -
     if symref != "HEAD" {
         return Ok(false);
     }
-    let Ok(head) = fs::read_to_string(git_dir.join(symref)) else {
-        return Ok(false);
-    };
-    let head = head.trim();
-    if head.strip_prefix("ref: ") == Some(target) {
+    if worktree_head_symref_target(&git_dir.join(symref)).as_deref() == Some(target) {
         return Ok(true);
     }
     if worktree_rebase_update_refs(git_dir)
@@ -1005,6 +1001,20 @@ pub(crate) fn worktree_uses_symref(git_dir: &Path, symref: &str, target: &str) -
         return Ok(true);
     }
     Ok(false)
+}
+
+fn worktree_head_symref_target(path: &Path) -> Option<String> {
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+        && let Ok(target) = fs::read_link(path)
+    {
+        let target = target.to_string_lossy();
+        if target.starts_with("refs/") {
+            return Some(target.into_owned());
+        }
+    }
+    let head = fs::read_to_string(path).ok()?;
+    head.trim().strip_prefix("ref: ").map(str::to_string)
 }
 
 pub(crate) fn worktree_detached_operation_uses_ref(git_dir: &Path, target: &str) -> bool {

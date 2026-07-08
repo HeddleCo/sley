@@ -22,8 +22,15 @@ pub(crate) fn resolve_cli_path(cwd: &Path, value: &str) -> PathBuf {
 }
 
 pub(crate) fn is_git_dir_candidate(path: &Path) -> bool {
-    path.join("HEAD").is_file()
+    git_head_path_is_file_or_symlink(&path.join("HEAD"))
         && (path.join("objects").is_dir() || path.join("commondir").is_file())
+}
+
+fn git_head_path_is_file_or_symlink(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.is_file() || metadata.file_type().is_symlink(),
+        Err(_) => false,
+    }
 }
 
 pub(crate) fn read_gitdir_file(path: &Path) -> Result<Option<PathBuf>> {

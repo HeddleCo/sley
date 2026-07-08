@@ -1915,11 +1915,29 @@ impl FileRefStore {
 
     fn read_loose_ref(&self, name: &str) -> Result<Option<Ref>> {
         let path = self.ref_path(name);
-        if !path.exists() {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    || err.raw_os_error() == Some(20) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if metadata.is_dir() {
             return Ok(None);
         }
-        if path.is_dir() {
-            return Ok(None);
+        if metadata.file_type().is_symlink()
+            && let Ok(target) = fs::read_link(&path)
+        {
+            let target = target.to_string_lossy();
+            if target.starts_with("refs/") {
+                return Ok(Some(Ref {
+                    name: name.to_string(),
+                    target: RefTarget::Symbolic(target.into_owned()),
+                }));
+            }
         }
         let bytes = fs::read(path)?;
         if loose_ref_bytes_are_reftable_sentinel(name, &bytes) {

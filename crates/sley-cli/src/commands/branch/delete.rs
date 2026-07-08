@@ -88,10 +88,10 @@ pub(super) fn force_delete_branches(
         if try_delete_symref_branch(store, &name, &branch, quiet)?.is_some() {
             continue;
         }
-        let deleted = store.delete_branch(&branch)?;
+        let deleted_oid = delete_branch_ref(git_dir, store, &branch, &name)?;
         remove_branch_config(git_dir, &branch)?;
         if !quiet {
-            let deleted_display = branch_delete_display(&branch, &name, &deleted.oid);
+            let deleted_display = branch_delete_display(&branch, &name, &deleted_oid);
             println!("Deleted branch {branch} (was {deleted_display}).");
         }
     }
@@ -300,10 +300,10 @@ pub(super) fn delete_merged_branches(
             failed = true;
             continue;
         }
-        let deleted = store.delete_branch(&branch)?;
+        let deleted_oid = delete_branch_ref(git_dir, store, &branch, &name)?;
         remove_branch_config(git_dir, &branch)?;
         if !quiet {
-            let deleted_display = branch_delete_display(&branch, &name, &deleted.oid);
+            let deleted_display = branch_delete_display(&branch, &name, &deleted_oid);
             println!("Deleted branch {branch} (was {deleted_display}).");
         }
     }
@@ -312,6 +312,20 @@ pub(super) fn delete_merged_branches(
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn delete_branch_ref(
+    git_dir: &Path,
+    store: &FileRefStore,
+    branch: &str,
+    name: &str,
+) -> Result<ObjectId> {
+    if sley_worktree::worktree_root_for_git_dir(git_dir)?.is_none()
+        && store.current_branch_ref()?.as_deref() == Some(name)
+    {
+        return Ok(store.delete_ref(name)?.oid);
+    }
+    Ok(store.delete_branch(branch)?.oid)
 }
 
 pub(super) fn branch_delete_display(branch: &str, refname: &str, oid: &ObjectId) -> String {
