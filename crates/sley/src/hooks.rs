@@ -4,19 +4,22 @@
 //! from git config are both supported. Callers that inject `-c` / `GIT_CONFIG_*`
 //! overrides (as the CLI does) should supply them via [`HookEnvironment`].
 
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 
 use sley_config::{ConfigParameter, ConfigSection};
 use sley_core::GitError;
 use sley_odb::repository_common_dir;
 use sley_worktree::worktree_root_for_git_dir;
 
-use crate::open_env::{discover_git_dir_respecting_environment, environment_work_tree, resolve_path_from_cwd};
 use crate::Result;
+use crate::open_env::{
+    discover_git_dir_respecting_environment, environment_work_tree, resolve_path_from_cwd,
+};
 
 #[derive(Clone)]
 enum HookCommand {
@@ -25,6 +28,8 @@ enum HookCommand {
         name: String,
         command: String,
         disabled: bool,
+        event_disabled: bool,
+        parallel: bool,
         scope: &'static str,
     },
 }
@@ -68,6 +73,8 @@ pub struct HookRun {
     pub cwd: Option<PathBuf>,
     pub git_dir: Option<PathBuf>,
     pub normalize_failure: bool,
+    pub jobs: Option<usize>,
+    pub force_serial: bool,
 }
 
 impl Default for HookRun {
@@ -81,6 +88,8 @@ impl Default for HookRun {
             cwd: None,
             git_dir: None,
             normalize_failure: true,
+            jobs: None,
+            force_serial: false,
         }
     }
 }
@@ -114,9 +123,14 @@ pub const KNOWN_HOOKS: &[&str] = &[
 
 /// Run `git hook` (`list` / `run` subcommands).
 pub fn cmd_hook(args: &[String]) -> Result<()> {
+    cmd_hook_with_env(args, &HookEnvironment::from_process())
+}
+
+/// Run `git hook` with caller-provided CLI/environment overrides.
+pub fn cmd_hook_with_env(args: &[String], hook_env: &HookEnvironment) -> Result<()> {
     match args.first().map(String::as_str) {
-        Some("list") => cmd_hook_list(&args[1..], &HookEnvironment::from_process()),
-        Some("run") => cmd_hook_run(&args[1..], &HookEnvironment::from_process()),
+        Some("list") => cmd_hook_list(&args[1..], hook_env),
+        Some("run") => cmd_hook_run(&args[1..], hook_env),
         _ => {
             hook_usage();
             Err(GitError::Exit(129))
@@ -126,12 +140,9 @@ pub fn cmd_hook(args: &[String]) -> Result<()> {
 
 /// Run all hooks registered for `hook_name`.
 pub fn run_hook(hook_name: &str, options: HookRun, hook_env: &HookEnvironment) -> Result<bool> {
-    let hooks = list_hook_commands(hook_name, hook_env)?;
-    let runnable = hooks
-        .into_iter()
-        .filter(|hook| !matches!(hook, HookCommand::Configured { disabled: true, .. }))
-        .collect::<Vec<_>>();
-    if runnable.is_empty() {
+    let config = hook_config(hook_env);
+    let hooks = list_hook_commands_with_config(hook_name, hook_env, &config)?;
+    if hooks.is_empty() {
         if options.error_if_missing {
             eprintln!("error: cannot find a hook named {hook_name}");
             return Err(GitError::Exit(1));
@@ -148,6 +159,27 @@ pub fn run_hook(hook_name: &str, options: HookRun, hook_env: &HookEnvironment) -
             options.git_dir = Some(git_dir);
         }
     }
+    let runnable = hooks
+        .into_iter()
+        .filter(|hook| {
+            !matches!(
+                hook,
+                HookCommand::Configured { disabled: true, .. }
+                    | HookCommand::Configured {
+                        event_disabled: true,
+                        ..
+                    }
+            )
+        })
+        .collect::<Vec<_>>();
+    if runnable.is_empty() {
+        return Ok(false);
+    }
+    let jobs = resolve_hook_jobs(hook_name, &options, &config, &runnable);
+    if jobs > 1 {
+        return run_hooks_parallel(hook_name, &runnable, &mut options, jobs);
+    }
+    trace_hook_region(hook_name, jobs);
     for hook in runnable {
         let status = spawn_hook(&hook, &options)?;
         if !status.success() {
@@ -158,11 +190,7 @@ pub fn run_hook(hook_name: &str, options: HookRun, hook_env: &HookEnvironment) -
 }
 
 /// Convenience wrapper around [`run_hook`] with string-slice arguments.
-pub fn run_hook_l(
-    hook_name: &str,
-    args: &[&str],
-    hook_env: &HookEnvironment,
-) -> Result<bool> {
+pub fn run_hook_l(hook_name: &str, args: &[&str], hook_env: &HookEnvironment) -> Result<bool> {
     run_hook(
         hook_name,
         HookRun {
@@ -191,9 +219,22 @@ pub fn run_post_index_change_hook(
 
 /// Return whether any runnable hook is configured for `hook_name`.
 pub fn hook_exists(hook_name: &str, hook_env: &HookEnvironment) -> Result<bool> {
-    Ok(list_hook_commands(hook_name, hook_env)?
-        .into_iter()
-        .any(|hook| !matches!(hook, HookCommand::Configured { disabled: true, .. })))
+    let config = hook_config(hook_env);
+    Ok(
+        list_hook_commands_with_config(hook_name, hook_env, &config)?
+            .into_iter()
+            .any(|hook| {
+                matches!(hook, HookCommand::Traditional(_))
+                    || matches!(
+                        hook,
+                        HookCommand::Configured {
+                            disabled: false,
+                            event_disabled: false,
+                            ..
+                        }
+                    )
+            }),
+    )
 }
 
 /// Run the traditional `$GIT_DIR/hooks/reference-transaction` hook for one
@@ -221,17 +262,15 @@ pub fn run_reference_transaction_hook_at(
         cwd: Some(hook_cwd_for_git_dir(git_dir)?),
         git_dir: Some(git_dir.to_path_buf()),
         normalize_failure: false,
+        jobs: Some(1),
+        force_serial: true,
     };
     let status = spawn_hook(&HookCommand::Traditional(path), &options)?;
     Ok(!status.success())
 }
 
 /// Run a traditional hook script at `$GIT_DIR/hooks/<hook_name>`.
-pub fn run_traditional_hook_at(
-    git_dir: &Path,
-    hook_name: &str,
-    options: HookRun,
-) -> Result<bool> {
+pub fn run_traditional_hook_at(git_dir: &Path, hook_name: &str, options: HookRun) -> Result<bool> {
     let common_git_dir = repository_common_dir(git_dir);
     let path = common_git_dir.join("hooks").join(hook_name);
     if !is_executable_file(&path) {
@@ -300,15 +339,25 @@ fn cmd_hook_list(args: &[String], hook_env: &HookEnvironment) -> Result<()> {
             HookCommand::Configured {
                 name,
                 disabled,
+                event_disabled,
                 scope,
                 ..
             } => {
-                if show_scope && disabled {
-                    write!(stdout, "{scope}\tdisabled\t{name}{terminator}")?;
-                } else if show_scope {
-                    write!(stdout, "{scope}\t{name}{terminator}")?;
+                let disability = if event_disabled {
+                    Some("event-disabled")
                 } else if disabled {
-                    write!(stdout, "disabled\t{name}{terminator}")?;
+                    Some("disabled")
+                } else {
+                    None
+                };
+                if show_scope {
+                    write!(stdout, "{scope}\t")?;
+                    if let Some(disability) = disability {
+                        write!(stdout, "{disability}\t")?;
+                    }
+                    write!(stdout, "{name}{terminator}")?;
+                } else if let Some(disability) = disability {
+                    write!(stdout, "{disability}\t{name}{terminator}")?;
                 } else {
                     write!(stdout, "{name}{terminator}")?;
                 }
@@ -322,6 +371,7 @@ fn cmd_hook_run(args: &[String], hook_env: &HookEnvironment) -> Result<()> {
     let mut allow_unknown = false;
     let mut ignore_missing = false;
     let mut stdin_path = None::<String>;
+    let mut jobs = None::<usize>;
     let mut hook_name = None::<String>;
     let mut hook_args = Vec::new();
     let mut index = 0;
@@ -340,6 +390,20 @@ fn cmd_hook_run(args: &[String], hook_env: &HookEnvironment) -> Result<()> {
             }
             value if value.starts_with("--to-stdin=") => {
                 stdin_path = Some(value["--to-stdin=".len()..].to_string());
+            }
+            "-j" | "--jobs" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    hook_run_usage();
+                    return Err(GitError::Exit(129));
+                };
+                jobs = Some(parse_hook_jobs_arg(value)?);
+            }
+            value if value.starts_with("--jobs=") => {
+                jobs = Some(parse_hook_jobs_arg(&value["--jobs=".len()..])?);
+            }
+            value if value.starts_with("-j") && value.len() > 2 && hook_name.is_none() => {
+                jobs = Some(parse_hook_jobs_arg(&value[2..])?);
             }
             "-h" | "--help" => {
                 hook_run_usage();
@@ -384,19 +448,48 @@ fn cmd_hook_run(args: &[String], hook_env: &HookEnvironment) -> Result<()> {
             cwd: None,
             git_dir: None,
             normalize_failure: false,
+            jobs,
+            force_serial: false,
         },
         hook_env,
     )?;
     Ok(())
 }
 
+fn parse_hook_jobs_arg(value: &str) -> Result<usize> {
+    let Ok(parsed) = value.parse::<isize>() else {
+        eprintln!(
+            "fatal: invalid value for -j: {value} (use -1 for CPU count or a positive integer)"
+        );
+        return Err(GitError::Exit(128));
+    };
+    if parsed == -1 {
+        Ok(online_cpus())
+    } else if parsed > 0 {
+        Ok(parsed as usize)
+    } else {
+        eprintln!(
+            "fatal: invalid value for -j: {parsed} (use -1 for CPU count or a positive integer)"
+        );
+        Err(GitError::Exit(128))
+    }
+}
+
 fn list_hook_commands(hook_name: &str, hook_env: &HookEnvironment) -> Result<Vec<HookCommand>> {
-    let mut hooks = Vec::new();
     let config = hook_config(hook_env);
-    for hook in configured_hooks(&config, hook_name)? {
+    list_hook_commands_with_config(hook_name, hook_env, &config)
+}
+
+fn list_hook_commands_with_config(
+    hook_name: &str,
+    hook_env: &HookEnvironment,
+    config: &[ScopedSection],
+) -> Result<Vec<HookCommand>> {
+    let mut hooks = Vec::new();
+    for hook in configured_hooks(config, hook_name)? {
         hooks.push(hook);
     }
-    if let Some(path) = find_hook(&config, hook_name, hook_env)? {
+    if let Some(path) = find_hook(config, hook_name, hook_env)? {
         hooks.push(HookCommand::Traditional(path));
     }
     Ok(hooks)
@@ -411,7 +504,8 @@ fn resolve_hook_git_dir(hook_env: &HookEnvironment) -> Option<PathBuf> {
 }
 
 fn hook_config(hook_env: &HookEnvironment) -> Vec<ScopedSection> {
-    let common_git_dir = resolve_hook_git_dir(hook_env).map(|git_dir| repository_common_dir(&git_dir));
+    let common_git_dir =
+        resolve_hook_git_dir(hook_env).map(|git_dir| repository_common_dir(&git_dir));
     let context = sley_config::ConfigIncludeContext::new(common_git_dir.clone(), None);
     let mut out = Vec::new();
     if let Ok(config) = sley_config::load_pre_dispatch_config(None, &context) {
@@ -447,96 +541,212 @@ fn hook_config(hook_env: &HookEnvironment) -> Vec<ScopedSection> {
     out
 }
 
+#[derive(Default)]
+struct HookConfigState {
+    commands: HashMap<String, String>,
+    event_hooks: Vec<(String, Vec<EventHookEntry>)>,
+    disabled_names: Vec<String>,
+    parallel: HashMap<String, bool>,
+    global_jobs: Option<usize>,
+    event_jobs: HashMap<String, usize>,
+}
+
+#[derive(Clone)]
+struct EventHookEntry {
+    name: String,
+    scope: &'static str,
+}
+
 fn configured_hooks(config: &[ScopedSection], hook_name: &str) -> Result<Vec<HookCommand>> {
-    #[derive(Default)]
-    struct State {
-        events: Vec<String>,
-        command: Option<String>,
-        disabled: bool,
-        scope: &'static str,
-    }
-    let mut states: Vec<(String, State)> = Vec::new();
-    let state_for = |states: &mut Vec<(String, State)>, name: &str| -> usize {
-        if let Some(pos) = states.iter().position(|(existing, _)| existing == name) {
-            pos
-        } else {
-            states.push((name.to_string(), State::default()));
-            states.len() - 1
-        }
+    let state = parse_hook_config(config)?;
+    let friendly_names = friendly_name_set(&state);
+    let event_disabled =
+        name_is_disabled(&state.disabled_names, hook_name) && !friendly_names.contains(hook_name);
+    warn_jobs_on_friendly_names(&state, &friendly_names);
+    let mut out = Vec::new();
+    let Some((_, hooks)) = state
+        .event_hooks
+        .iter()
+        .find(|(event, _)| event == hook_name)
+    else {
+        return Ok(out);
     };
+    for event_hook in hooks {
+        let name = &event_hook.name;
+        let disabled = name_is_disabled(&state.disabled_names, name);
+        let command = match state.commands.get(name) {
+            Some(command) => command.clone(),
+            None if disabled => {
+                eprintln!("warning: disabled hook '{name}' has no command configured");
+                String::new()
+            }
+            None => {
+                eprintln!(
+                    "fatal: 'hook.{name}.command' must be configured or 'hook.{name}.event' must be removed; aborting."
+                );
+                return Err(GitError::Exit(128));
+            }
+        };
+        out.push(HookCommand::Configured {
+            name: name.clone(),
+            command,
+            disabled,
+            event_disabled,
+            parallel: state.parallel.get(name).copied().unwrap_or(false),
+            scope: event_hook.scope,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_hook_config(config: &[ScopedSection]) -> Result<HookConfigState> {
+    let mut state = HookConfigState::default();
     for scoped in config {
         let section = &scoped.section;
         if !section.name.eq_ignore_ascii_case("hook") {
             continue;
         }
-        let Some(name) = section.subsection.as_deref() else {
-            continue;
-        };
         for entry in &section.entries {
-            if entry.key.eq_ignore_ascii_case("event") {
-                if let Some(value) = &entry.value {
-                    let mut pos = state_for(&mut states, name);
-                    if value.is_empty() {
-                        states[pos].1.events.clear();
-                    } else {
-                        states[pos].1.events.retain(|existing| existing != value);
-                        if states[pos].1.events.iter().any(|event| event == value)
-                            || states[pos].1.command.is_some()
-                        {
-                            let item = states.remove(pos);
-                            states.push(item);
-                            pos = states.len() - 1;
-                        }
-                        states[pos].1.events.push(value.clone());
-                    }
-                    states[pos].1.scope = scoped.scope;
+            let Some(name) = section.subsection.as_deref() else {
+                if entry.key.eq_ignore_ascii_case("jobs")
+                    && let Some(value) = entry.value.as_deref()
+                    && let Some(jobs) = parse_hook_jobs_config("hook.jobs", value)
+                {
+                    state.global_jobs = Some(jobs);
                 }
+                continue;
+            };
+            if entry.key.eq_ignore_ascii_case("event") {
+                let Some(value) = entry.value.as_deref() else {
+                    continue;
+                };
+                if value.is_empty() {
+                    remove_event_hook_from_all(&mut state.event_hooks, name);
+                    continue;
+                }
+                if KNOWN_HOOKS.contains(&name) {
+                    eprintln!(
+                        "fatal: hook friendly-name '{name}' collides with a known event name; please choose a different friendly-name"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                if name == value {
+                    eprintln!(
+                        "warning: hook friendly-name '{name}' is the same as its event; this may cause ambiguity with hook.{name}.enabled"
+                    );
+                }
+                push_event_hook(&mut state.event_hooks, value, name, scoped.scope);
             } else if entry.key.eq_ignore_ascii_case("command") {
-                let pos = state_for(&mut states, name);
-                let state = &mut states[pos].1;
-                state.command = entry.value.clone();
-                state.scope = scoped.scope;
+                if let Some(value) = entry.value.clone() {
+                    state.commands.insert(name.to_string(), value);
+                }
             } else if entry.key.eq_ignore_ascii_case("enabled") {
-                let pos = state_for(&mut states, name);
-                let state = &mut states[pos].1;
                 match entry
                     .value
                     .as_deref()
                     .and_then(sley_config::parse_config_bool)
                 {
-                    Some(false) => state.disabled = true,
-                    Some(true) => state.disabled = false,
+                    Some(false) => add_disabled_name(&mut state.disabled_names, name),
+                    Some(true) => remove_disabled_name(&mut state.disabled_names, name),
                     None => {}
                 }
-                state.scope = scoped.scope;
+            } else if entry.key.eq_ignore_ascii_case("parallel") {
+                if let Some(value) = entry.value.as_deref() {
+                    if let Some(value) = sley_config::parse_config_bool(value) {
+                        state.parallel.insert(name.to_string(), value);
+                    } else {
+                        eprintln!(
+                            "warning: hook.{name}.parallel must be a boolean, ignoring: '{value}'"
+                        );
+                    }
+                }
+            } else if entry.key.eq_ignore_ascii_case("jobs")
+                && let Some(value) = entry.value.as_deref()
+                && let Some(jobs) = parse_hook_jobs_config(&format!("hook.{name}.jobs"), value)
+            {
+                state.event_jobs.insert(name.to_string(), jobs);
             }
         }
     }
-    let mut out = Vec::new();
-    for (name, state) in states {
-        if state.events.iter().any(|event| event == hook_name) {
-            let command = match state.command {
-                Some(command) => command,
-                None if state.disabled => {
-                    eprintln!("warning: disabled hook '{name}' has no command configured");
-                    String::new()
-                }
-                None => {
-                    eprintln!(
-                        "fatal: 'hook.{name}.command' must be configured or 'hook.{name}.event' must be removed; aborting."
-                    );
-                    return Err(GitError::Exit(128));
-                }
-            };
-            out.push(HookCommand::Configured {
-                name,
-                command,
-                disabled: state.disabled,
-                scope: state.scope,
-            });
+    Ok(state)
+}
+
+fn push_event_hook(
+    event_hooks: &mut Vec<(String, Vec<EventHookEntry>)>,
+    event: &str,
+    name: &str,
+    scope: &'static str,
+) {
+    let pos = match event_hooks
+        .iter()
+        .position(|(existing, _)| existing == event)
+    {
+        Some(pos) => pos,
+        None => {
+            event_hooks.push((event.to_string(), Vec::new()));
+            event_hooks.len() - 1
+        }
+    };
+    event_hooks[pos].1.retain(|entry| entry.name != name);
+    event_hooks[pos].1.push(EventHookEntry {
+        name: name.to_string(),
+        scope,
+    });
+}
+
+fn remove_event_hook_from_all(event_hooks: &mut Vec<(String, Vec<EventHookEntry>)>, name: &str) {
+    for (_, hooks) in event_hooks {
+        hooks.retain(|entry| entry.name != name);
+    }
+}
+
+fn add_disabled_name(disabled_names: &mut Vec<String>, name: &str) {
+    if !name_is_disabled(disabled_names, name) {
+        disabled_names.push(name.to_string());
+    }
+}
+
+fn remove_disabled_name(disabled_names: &mut Vec<String>, name: &str) {
+    disabled_names.retain(|existing| existing != name);
+}
+
+fn name_is_disabled(disabled_names: &[String], name: &str) -> bool {
+    disabled_names.iter().any(|existing| existing == name)
+}
+
+fn friendly_name_set(state: &HookConfigState) -> HashSet<String> {
+    let mut names = HashSet::new();
+    names.extend(state.commands.keys().cloned());
+    names.extend(state.parallel.keys().cloned());
+    for (_, hooks) in &state.event_hooks {
+        names.extend(hooks.iter().map(|entry| entry.name.clone()));
+    }
+    names
+}
+
+fn warn_jobs_on_friendly_names(state: &HookConfigState, friendly_names: &HashSet<String>) {
+    for name in state.event_jobs.keys() {
+        if friendly_names.contains(name) {
+            eprintln!(
+                "warning: hook.{name}.jobs is set but '{name}' looks like a hook friendly-name, not an event name; hook.<event>.jobs uses the event name (e.g. hook.post-receive.jobs), so this setting will be ignored"
+            );
         }
     }
-    Ok(out)
+}
+
+fn parse_hook_jobs_config(key: &str, value: &str) -> Option<usize> {
+    match sley_config::parse_config_int(value) {
+        Some(-1) => Some(online_cpus()),
+        Some(v) if v > 0 => Some(v as usize),
+        Some(v) => {
+            eprintln!("warning: {key} must be a positive integer or -1, ignoring: {v}");
+            None
+        }
+        None => {
+            eprintln!("warning: {key} must be an integer, ignoring: '{value}'");
+            None
+        }
+    }
 }
 
 fn find_hook(
@@ -615,6 +825,107 @@ fn hook_failure_code(code: Option<i32>, options: &HookRun) -> i32 {
     }
 }
 
+fn resolve_hook_jobs(
+    hook_name: &str,
+    options: &HookRun,
+    config: &[ScopedSection],
+    hooks: &[HookCommand],
+) -> usize {
+    if let Some(jobs) = options.jobs {
+        warn_non_parallel_hooks_override(jobs, hooks);
+        return jobs.max(1);
+    }
+    if options.force_serial {
+        return 1;
+    }
+    let mut jobs = 1;
+    if let Ok(state) = parse_hook_config(config) {
+        if let Some(config_jobs) = state.global_jobs {
+            jobs = config_jobs;
+        }
+        if let Some(event_jobs) = state.event_jobs.get(hook_name) {
+            jobs = *event_jobs;
+        }
+    }
+    if hooks.iter().any(|hook| {
+        matches!(
+            hook,
+            HookCommand::Configured {
+                parallel: false,
+                ..
+            }
+        )
+    }) {
+        jobs = 1;
+    }
+    jobs.max(1)
+}
+
+fn warn_non_parallel_hooks_override(jobs: usize, hooks: &[HookCommand]) {
+    if jobs <= 1 {
+        return;
+    }
+    for hook in hooks {
+        if let HookCommand::Configured {
+            name,
+            parallel: false,
+            ..
+        } = hook
+        {
+            eprintln!(
+                "warning: hook '{name}' is not marked as parallel=true, running in parallel anyway due to -j{jobs}"
+            );
+        }
+    }
+}
+
+fn online_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+}
+
+fn trace_hook_region(hook_name: &str, jobs: usize) {
+    let Some(target) = env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    let target = target.to_string_lossy();
+    if !target.starts_with('/') {
+        return;
+    }
+    let label = escape_json(hook_name);
+    let msg = escape_json(&format!("max:{jobs}"));
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(target.as_ref())
+    {
+        let _ = writeln!(
+            file,
+            "{{\"event\":\"region_enter\",\"sid\":\"sley\",\"thread\":\"main\",\"nesting\":1,\"category\":\"hook\",\"label\":\"{label}\",\"msg\":\"{msg}\"}}"
+        );
+        let _ = writeln!(
+            file,
+            "{{\"event\":\"region_leave\",\"sid\":\"sley\",\"thread\":\"main\",\"nesting\":1,\"category\":\"hook\",\"label\":\"{label}\"}}"
+        );
+    }
+}
+
+fn escape_json(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
 fn advise_ignored_hook(path: &Path, config: &[ScopedSection]) {
     let advice_enabled = scoped_config_get(config, "advice", None, "ignoredHook")
         .and_then(|value| sley_config::parse_config_bool(&value))
@@ -665,7 +976,71 @@ fn hook_git_prefix(git_dir: &Path) -> Option<String> {
     Some(prefix)
 }
 
-fn spawn_hook(hook: &HookCommand, options: &HookRun) -> Result<std::process::ExitStatus> {
+fn run_hooks_parallel(
+    hook_name: &str,
+    hooks: &[HookCommand],
+    options: &mut HookRun,
+    jobs: usize,
+) -> Result<bool> {
+    options.stdout_to_stderr = true;
+    trace_hook_region(hook_name, jobs);
+    let mut first_failure = None;
+    let chunk_size = jobs.max(1);
+    for chunk in hooks.chunks(chunk_size) {
+        let mut children = Vec::with_capacity(chunk.len());
+        for hook in chunk {
+            children.push(spawn_hook_child(
+                hook,
+                options,
+                Stdio::piped(),
+                Stdio::piped(),
+            )?);
+        }
+        for running in children {
+            let output = running.child.wait_with_output()?;
+            let mut merged = output.stdout;
+            merged.extend_from_slice(&output.stderr);
+            let status = output.status;
+            if !merged.is_empty() {
+                io::stderr().write_all(&merged)?;
+                io::stderr().flush()?;
+            }
+            if !status.success() && first_failure.is_none() {
+                first_failure = Some(status.code());
+            }
+        }
+    }
+    if let Some(code) = first_failure {
+        return Err(GitError::Exit(hook_failure_code(code, options)));
+    }
+    Ok(true)
+}
+
+struct RunningHook {
+    child: Child,
+}
+
+fn spawn_hook(hook: &HookCommand, options: &HookRun) -> Result<ExitStatus> {
+    let stdout = if options.stdout_to_stderr {
+        Stdio::piped()
+    } else {
+        Stdio::inherit()
+    };
+    let running = spawn_hook_child(hook, options, stdout, Stdio::inherit())?;
+    let output = running.child.wait_with_output()?;
+    if options.stdout_to_stderr {
+        io::stderr().write_all(&output.stdout)?;
+        io::stderr().flush()?;
+    }
+    Ok(output.status)
+}
+
+fn spawn_hook_child(
+    hook: &HookCommand,
+    options: &HookRun,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> Result<RunningHook> {
     let cwd = options.cwd.clone().or_else(default_hook_cwd);
     let mut command = match hook {
         HookCommand::Traditional(path) => {
@@ -701,9 +1076,8 @@ fn spawn_hook(hook: &HookCommand, options: &HookRun) -> Result<std::process::Exi
     } else {
         command.stdin(Stdio::null());
     }
-    if options.stdout_to_stderr {
-        command.stdout(Stdio::piped());
-    }
+    command.stdout(stdout);
+    command.stderr(stderr);
     let mut child = command.spawn().map_err(|err| {
         eprintln!("fatal: cannot spawn {}: {err}", hook.display_name());
         GitError::Exit(1)
@@ -717,12 +1091,7 @@ fn spawn_hook(hook: &HookCommand, options: &HookRun) -> Result<std::process::Exi
             Err(err) => return Err(err.into()),
         }
     }
-    let output = child.wait_with_output()?;
-    if options.stdout_to_stderr {
-        io::stderr().write_all(&output.stdout)?;
-        io::stderr().flush()?;
-    }
-    Ok(output.status)
+    Ok(RunningHook { child })
 }
 
 impl HookCommand {
