@@ -606,7 +606,11 @@ declare -A FLOOR=(
     # accepts --graph and prefixes patch lines, lifting t4052 83->91. Guards
     # held: t4013=230/230, t4015=130/136. Oracle: /tmp/git-src git 2.55.0.
     [t4052-stat-output.sh]=91
-    [t4045-diff-relative.sh]=30
+    # 2026-07-08, off main 5506be15: diff --relative keeps original lookup
+    # paths for patch/stat/raw/external-diff while rendering stripped display
+    # paths, lifting t4045 30->38. Guards held: t4013/t4052. Oracle:
+    # /tmp/git-src git 2.55.0.
+    [t4045-diff-relative.sh]=38
     [t4047-diff-dirstat.sh]=41
     # recov-wave (2026-06-20): diff whitespace --ignore-* modes 114->119 (guard t4013 +1->206).
     [t4015-diff-whitespace.sh]=130
