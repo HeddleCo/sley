@@ -612,7 +612,7 @@ pub fn local_fetch_advertisements(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<Vec<RefAdvertisement>> {
-    let store = FileRefStore::new(git_dir, format);
+    let store = FileRefStore::new_without_reference_backend_env(git_dir, format);
     let mut advertisements = Vec::new();
     if let Some(target) = store.read_ref("HEAD")? {
         let reference = Ref {

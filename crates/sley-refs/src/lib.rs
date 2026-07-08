@@ -684,6 +684,7 @@ pub struct FileRefStore {
     common_dir: PathBuf,
     storage_dir: PathBuf,
     format: ObjectFormat,
+    honor_reference_backend_env: bool,
     reftable_lock_timeout_millis: Option<u64>,
     combine_reftable_logs: bool,
 }
@@ -731,8 +732,12 @@ pub struct AppliedBundleRefUpdate {
     pub new_oid: ObjectId,
 }
 
-fn configured_ref_storage_backend(common_dir: &Path) -> Option<(RefBackendKind, Option<PathBuf>)> {
-    if let Ok(value) = env::var("GIT_REFERENCE_BACKEND")
+fn configured_ref_storage_backend(
+    common_dir: &Path,
+    honor_env: bool,
+) -> Option<(RefBackendKind, Option<PathBuf>)> {
+    if honor_env
+        && let Ok(value) = env::var("GIT_REFERENCE_BACKEND")
         && let Ok((kind, path)) = parse_ref_storage_backend_value(&value)
     {
         return Some((
@@ -791,9 +796,24 @@ enum RefBackendKind {
 
 impl FileRefStore {
     pub fn new(git_dir: impl Into<PathBuf>, format: ObjectFormat) -> Self {
+        Self::new_with_reference_backend_env(git_dir, format, true)
+    }
+
+    pub fn new_without_reference_backend_env(
+        git_dir: impl Into<PathBuf>,
+        format: ObjectFormat,
+    ) -> Self {
+        Self::new_with_reference_backend_env(git_dir, format, false)
+    }
+
+    fn new_with_reference_backend_env(
+        git_dir: impl Into<PathBuf>,
+        format: ObjectFormat,
+        honor_reference_backend_env: bool,
+    ) -> Self {
         let git_dir = git_dir.into();
         let common_dir = repository_common_dir(&git_dir);
-        let configured = configured_ref_storage_backend(&common_dir);
+        let configured = configured_ref_storage_backend(&common_dir, honor_reference_backend_env);
         let storage_dir = match configured {
             Some((_, Some(path))) => path,
             Some((RefBackendKind::Reftable, None)) if git_dir != common_dir => git_dir.clone(),
@@ -804,6 +824,7 @@ impl FileRefStore {
             common_dir,
             storage_dir,
             format,
+            honor_reference_backend_env,
             reftable_lock_timeout_millis: None,
             combine_reftable_logs: false,
         }
@@ -870,9 +891,9 @@ impl FileRefStore {
         // per-worktree namespaces to the per-worktree gitdir; mirror
         // files_ref_path's REF_WORKTREE_CURRENT vs REF_WORKTREE_SHARED split.
         let base = if current_worktree_ref(name) {
-            &self.git_dir
+            self.current_worktree_storage_dir()
         } else {
-            &self.common_dir
+            self.storage_dir.clone()
         };
         let path = base.join(name);
         match fs::symlink_metadata(&path) {
@@ -1452,6 +1473,14 @@ impl FileRefStore {
             changes: Vec::new(),
             hook: None,
         }
+    }
+
+    pub fn uses_alternate_ref_storage(&self) -> bool {
+        self.storage_dir != self.common_dir
+    }
+
+    pub fn current_worktree_ref_storage_dir(&self) -> PathBuf {
+        self.current_worktree_storage_dir()
     }
 
     pub fn create_branch(
@@ -2110,6 +2139,7 @@ impl FileRefStore {
             common_dir: self.common_dir.clone(),
             storage_dir,
             format: self.format,
+            honor_reference_backend_env: self.honor_reference_backend_env,
             reftable_lock_timeout_millis: self.reftable_lock_timeout_millis,
             combine_reftable_logs: self.combine_reftable_logs,
         }
@@ -2126,15 +2156,30 @@ impl FileRefStore {
     /// resolution in `FileRefStore::new`. (Without this, shared refs under an
     /// alternate-path backend are looked up in the empty default `reftable/`.)
     fn shared_reftable_storage_dir(&self) -> PathBuf {
-        match configured_ref_storage_backend(&self.common_dir) {
+        match configured_ref_storage_backend(&self.common_dir, self.honor_reference_backend_env) {
             Some((_, Some(path))) => path,
             _ => self.common_dir.clone(),
         }
     }
 
+    fn current_worktree_storage_dir(&self) -> PathBuf {
+        if self.storage_dir != self.common_dir {
+            if self.git_dir != self.common_dir
+                && let Some(worktree) = self.git_dir.file_name()
+            {
+                return self.storage_dir.join("worktrees").join(worktree);
+            }
+            return self.storage_dir.clone();
+        }
+        self.git_dir.clone()
+    }
+
     fn reftable_store_for_ref(&self, name: &str) -> Result<(FileRefStore, String)> {
         if let Some((worktree, rewritten)) = reftable_other_worktree_ref(name) {
-            let storage_dir = self.common_dir.join("worktrees").join(worktree);
+            let storage_dir = self
+                .shared_reftable_storage_dir()
+                .join("worktrees")
+                .join(worktree);
             return Ok((
                 self.reftable_store_with_storage(storage_dir),
                 rewritten.to_string(),
@@ -2142,7 +2187,7 @@ impl FileRefStore {
         }
         if reftable_current_worktree_ref(name) {
             return Ok((
-                self.reftable_store_with_storage(self.git_dir.clone()),
+                self.reftable_store_with_storage(self.current_worktree_storage_dir()),
                 name.to_string(),
             ));
         }
@@ -2153,7 +2198,9 @@ impl FileRefStore {
     }
 
     pub fn uses_reftable(&self) -> Result<bool> {
-        if let Ok(value) = env::var("GIT_REFERENCE_BACKEND") {
+        if self.honor_reference_backend_env
+            && let Ok(value) = env::var("GIT_REFERENCE_BACKEND")
+        {
             return Ok(parse_ref_storage_backend_value(&value)?.0 == RefBackendKind::Reftable);
         }
         let config_path = self.common_dir.join("config");
@@ -2522,13 +2569,14 @@ impl FileRefStore {
         prefix: &str,
         refs: &mut BTreeMap<String, Ref>,
     ) -> Result<()> {
-        if self.git_dir == self.common_dir {
+        let base = self.current_worktree_storage_dir();
+        if base == self.storage_dir {
             return Ok(());
         }
         for namespace in CURRENT_WORKTREE_REF_PREFIXES {
             if ref_prefixes_overlap(prefix, namespace) {
                 let scan_prefix = if prefix.starts_with(namespace) { prefix } else { namespace };
-                self.collect_loose_refs_with_prefix_from_base(&self.git_dir, scan_prefix, refs)?;
+                self.collect_loose_refs_with_prefix_from_base(&base, scan_prefix, refs)?;
             }
         }
         Ok(())
@@ -2598,13 +2646,14 @@ impl FileRefStore {
         prefix: &str,
         names: &mut BTreeSet<String>,
     ) -> Result<()> {
-        if self.git_dir == self.common_dir {
+        let base = self.current_worktree_storage_dir();
+        if base == self.storage_dir {
             return Ok(());
         }
         for namespace in CURRENT_WORKTREE_REF_PREFIXES {
             if ref_prefixes_overlap(prefix, namespace) {
                 let scan_prefix = if prefix.starts_with(namespace) { prefix } else { namespace };
-                self.collect_loose_ref_names_with_prefix_from_base(&self.git_dir, scan_prefix, names)?;
+                self.collect_loose_ref_names_with_prefix_from_base(&base, scan_prefix, names)?;
             }
         }
         Ok(())
@@ -3020,14 +3069,11 @@ impl FileRefStore {
         self.ref_base_dir(name).join("logs").join(name)
     }
 
-    fn ref_base_dir(&self, name: &str) -> &Path {
-        if self.storage_dir != self.common_dir {
-            return &self.storage_dir;
-        }
+    fn ref_base_dir(&self, name: &str) -> PathBuf {
         if current_worktree_ref(name) {
-            &self.git_dir
+            self.current_worktree_storage_dir()
         } else {
-            &self.common_dir
+            self.storage_dir.clone()
         }
     }
 
@@ -3886,7 +3932,7 @@ impl FileRefStore {
                 if err.kind() == std::io::ErrorKind::NotADirectory {
                     return Err(ref_directory_conflict_error(
                         name,
-                        &parent_to_ref_name(self.ref_base_dir(name), parent),
+                        &parent_to_ref_name(&self.ref_base_dir(name), parent),
                     ));
                 }
                 return Err(GitError::Io(err.to_string()));
