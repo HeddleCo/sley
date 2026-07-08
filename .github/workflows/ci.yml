@@ -37,6 +37,8 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust-tests-${{ runner.os }}-transport
