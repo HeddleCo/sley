@@ -602,7 +602,10 @@ declare -A FLOOR=(
     # t4202=101 t3903=134 t4013=191 t4014=202 t7508=114).
     [t4060-diff-submodule-option-diff-format.sh]=51
     [t4041-diff-submodule-option.sh]=47
-    [t4052-stat-output.sh]=83
+    # 2026-07-08, off main 088584b6: format-patch --graph stat output now
+    # accepts --graph and prefixes patch lines, lifting t4052 83->91. Guards
+    # held: t4013=230/230, t4015=130/136. Oracle: /tmp/git-src git 2.55.0.
+    [t4052-stat-output.sh]=91
     [t4045-diff-relative.sh]=30
     [t4047-diff-dirstat.sh]=41
     # recov-wave (2026-06-20): diff whitespace --ignore-* modes 114->119 (guard t4013 +1->206).
