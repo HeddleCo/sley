@@ -17,7 +17,7 @@
 
 use std::io::{self, Write};
 use std::path::Path;
-use sley::plumbing::{sley_core, sley_diff_merge, sley_rev};
+use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_rev};
 
 use sley::{GitError, ObjectFormat, ObjectId, Result};
 
@@ -407,6 +407,11 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     } else {
         entries
     };
+    let entries = if cached {
+        mark_diff_index_unmerged_entries(entries, git_dir, format)?
+    } else {
+        entries
+    };
     let entries = apply_diff_index_filter(entries, &diff_filter, &pathspec);
 
     // `-R` swaps the patch prefixes in addition to the file pairs: the source
@@ -508,6 +513,38 @@ fn apply_diff_index_filter(
             .filter(|entry| diff_filter.matches_status(entry.status.code()))
             .collect()
     }
+}
+
+fn mark_diff_index_unmerged_entries(
+    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+    let index_path = sley_index::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(entries);
+    }
+    let index = Index::parse(&std::fs::read(index_path)?, format)?;
+    let unmerged: std::collections::BTreeSet<Vec<u8>> = index
+        .entries
+        .into_iter()
+        .filter(|entry| entry.stage() != sley_index::Stage::Normal)
+        .map(|entry| entry.path.into_bytes())
+        .collect();
+    if unmerged.is_empty() {
+        return Ok(entries);
+    }
+    Ok(entries
+        .into_iter()
+        .map(|mut entry| {
+            if unmerged.contains(entry.path.as_bytes()) {
+                entry.status = sley_diff_merge::NameStatus::Unmerged;
+                entry.new_mode = None;
+                entry.new_oid = None;
+            }
+            entry
+        })
+        .collect())
 }
 
 /// Shared rendering parameters threaded into the format writers.

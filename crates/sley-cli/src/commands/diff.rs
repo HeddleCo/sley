@@ -2025,6 +2025,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 resolved_stat_widths.resolve_config_defaults();
             }
         }
+        let cached_unmerged_paths = if cached && show_patch {
+            diff_unmerged_index_paths(&git_dir, format)?
+        } else {
+            BTreeSet::new()
+        };
         let mut render_dirstat = |stdout: &mut dyn Write| {
             if let Some(dirstat_options) = dirstat
                 && !name_only
@@ -2117,6 +2122,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                                 .is_none_or(|oid| index_oids.get(&entry.path[..]) != Some(oid)))
                 },
                 |stdout, entry| {
+                    if cached_unmerged_paths.contains(entry.path.as_bytes()) {
+                        let path = status_quote_path(&entry.path, false);
+                        writeln!(stdout, "* Unmerged path {path}")?;
+                        return Ok(());
+                    }
                     if let Some(combined) = combined_unmerged.get(entry.path.as_bytes()) {
                         if wrote_combined_unmerged.insert(entry.path.as_bytes().to_vec()) {
                             write_diff_unmerged_worktree_combined(
@@ -2427,6 +2437,23 @@ fn write_diff_combined_three_tree(
         stdout.write_all(&out)?;
     }
     Ok(!out.is_empty())
+}
+
+fn diff_unmerged_index_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<BTreeSet<Vec<u8>>> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let index = Index::parse(&fs::read(index_path)?, format)?;
+    Ok(index
+        .entries
+        .into_iter()
+        .filter(|entry| entry.stage() != sley_index::Stage::Normal)
+        .map(|entry| entry.path.into_bytes())
+        .collect())
 }
 
 struct UnmergedWorktreeCombinedPath {

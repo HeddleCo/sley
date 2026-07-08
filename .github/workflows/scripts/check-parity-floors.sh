@@ -772,7 +772,10 @@ declare -A FLOOR=(
     [t1060-object-corruption.sh]=15
     [t2203-add-intent.sh]=19  # wave-32: 11->19 (intent-to-add consumers)
     [t3650-replay-basics.sh]=43
-    [t3701-add-interactive.sh]=122
+    # r9 add-interactive (2026-07-08, off main 088584b6): 122->130 via add-p
+    # reverse checkout, reset/add gitlink and unmerged cached-diff parity; guards
+    # t3700-add/t2016-checkout-patch held; oracle /tmp/git-src git 2.55.0.
+    [t3701-add-interactive.sh]=130
     [t4011-diff-symlink.sh]=5
     # codex-wave-3: merge --no-edit rename-cleanup lifted merge-rename 30->34 (stable 3x).
     # codex-wave-9 dir-rename engine side-gain: 34->35.

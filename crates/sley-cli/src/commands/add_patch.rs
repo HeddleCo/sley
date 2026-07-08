@@ -8,6 +8,7 @@
 //! This mirrors how git spawns `git diff-files` / `git apply --cached` from
 //! add-patch.c rather than re-implementing the diff/apply core.
 
+use std::collections::BTreeSet;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -31,14 +32,14 @@ pub(crate) enum PatchMode {
     /// `checkout -p HEAD`: `diff-index HEAD`, discard from index and worktree.
     CheckoutHead,
     /// `checkout -p <rev>`: apply to index and worktree. git diffs with
-    /// `diff-index -R <rev>` and applies forward; sley instead diffs forward
-    /// (`diff-index <rev>`) and reverse-applies — net-identical, and it sidesteps
+    /// `diff-index -R <rev>` and applies forward; sley still spawns the forward
+    /// `diff-index <rev>` and reverses the parsed diff model locally, sidestepping
     /// `diff-index -R`'s broken worktree-side rendering.
     CheckoutNothead,
     /// `restore -p --source=HEAD`: `diff-index HEAD`, discard from worktree only.
     WorktreeHead,
-    /// `restore -p --source=<rev>`: apply to worktree only. Same forward-diff +
-    /// reverse-apply substitution as [`PatchMode::CheckoutNothead`].
+    /// `restore -p --source=<rev>`: apply to worktree only. Same local diff
+    /// reversal as [`PatchMode::CheckoutNothead`].
     WorktreeNothead,
 }
 
@@ -52,18 +53,14 @@ enum PromptKind {
 }
 
 impl PatchMode {
-    /// True for the modes that reverse-apply their (forward) diff. Every
-    /// checkout/worktree mode does: the index/head modes discard worktree
-    /// changes, and the not-head modes substitute a reverse-apply for git's
-    /// `diff-index -R` (see [`PatchMode::CheckoutNothead`]).
+    /// True for modes whose displayed diff is the opposite of the patch applied
+    /// to the worktree/index. We keep the display matching git's prompt view, but
+    /// feed a reversed selected patch to `apply` instead of using `apply -R`; that
+    /// keeps split-hunk offsets aligned with upstream add-patch.
     fn is_reverse(self) -> bool {
         matches!(
             self,
-            PatchMode::CheckoutIndex
-                | PatchMode::CheckoutHead
-                | PatchMode::CheckoutNothead
-                | PatchMode::WorktreeHead
-                | PatchMode::WorktreeNothead
+            PatchMode::CheckoutIndex | PatchMode::CheckoutHead | PatchMode::WorktreeHead
         )
     }
 
@@ -84,7 +81,7 @@ impl PatchMode {
 /// mirroring add-patch.c's per-mode `prompt_mode` tables.
 fn prompt_text(mode: PatchMode, kind: PromptKind) -> &'static str {
     match mode {
-        PatchMode::Add | PatchMode::Reset => match kind {
+        PatchMode::Add => match kind {
             PromptKind::ModeChange => "Stage mode change",
             PromptKind::Deletion => "Stage deletion",
             PromptKind::Addition => "Stage addition",
@@ -95,6 +92,12 @@ fn prompt_text(mode: PatchMode, kind: PromptKind) -> &'static str {
             PromptKind::Deletion => "Stash deletion",
             PromptKind::Addition => "Stash addition",
             PromptKind::Hunk => "Stash this hunk",
+        },
+        PatchMode::Reset => match kind {
+            PromptKind::ModeChange => "Unstage mode change",
+            PromptKind::Deletion => "Unstage deletion",
+            PromptKind::Addition => "Unstage addition",
+            PromptKind::Hunk => "Unstage this hunk",
         },
         PatchMode::CheckoutIndex | PatchMode::WorktreeHead => match kind {
             PromptKind::ModeChange => "Discard mode change from worktree",
@@ -191,6 +194,7 @@ fn run_capture_status(args: &[&str], stdin_bytes: Option<&[u8]>) -> io::Result<(
 
 /// A parsed hunk: the `@@` header counts plus the body lines (each with its
 /// leading marker: ' ', '+', '-', '\\').
+#[derive(Clone)]
 struct Hunk {
     old_offset: i64,
     old_count: i64,
@@ -222,6 +226,7 @@ enum HunkUse {
 
 /// One file's diff: the header lines (everything before the first `@@`) plus
 /// its hunks.
+#[derive(Clone)]
 struct FileDiff {
     /// Path used to read the index blob and stage the result.
     path: String,
@@ -240,6 +245,8 @@ struct FileDiff {
     /// represents this as a "mode change" pseudo-hunk at index 0 (decided
     /// separately from the content hunks), staged via `update-index --chmod`.
     mode_change: Option<u32>,
+    old_oid: Option<String>,
+    new_oid: Option<String>,
 }
 
 /// Parse a multi-file unified diff (as produced by `diff-files -p`) into
@@ -258,6 +265,8 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
             let mut added = false;
             let mut deleted = false;
             let mut is_binary = false;
+            let mut old_oid = None;
+            let mut new_oid = None;
             // git's add-patch pulls `old mode`/`new mode` OUT of the diff header
             // and renders them as the body of a "mode change" pseudo-hunk that sits
             // at index 0, decided independently of the content hunks. Collect them
@@ -299,6 +308,11 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
                     header.push(h.to_string());
                 } else if let Some(rest) = h.strip_prefix("index ") {
                     // index <a>..<b> <mode>
+                    if let Some((old, after_old)) = rest.split_once("..") {
+                        let new = after_old.split_whitespace().next().unwrap_or(after_old);
+                        old_oid = Some(old.to_string());
+                        new_oid = Some(new.to_string());
+                    }
                     if let Some(sp) = rest.rfind(' ') {
                         if let Ok(m) = u32::from_str_radix(rest[sp + 1..].trim(), 8) {
                             mode = m;
@@ -329,6 +343,8 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
                 deleted,
                 is_binary,
                 mode_change,
+                old_oid,
+                new_oid,
             };
             // A mode change becomes the pseudo-hunk at index 0: its body is the
             // `old mode`/`new mode` lines, with zero `@@` offsets so render_hunk
@@ -587,6 +603,87 @@ fn parse_git_header_path(line: &str) -> String {
     String::new()
 }
 
+fn reverse_file_diff(fd: &FileDiff) -> FileDiff {
+    let mut reversed = fd.clone();
+    reversed.header = reverse_file_header(fd);
+    reversed.hunks = fd.hunks.iter().map(reverse_hunk).collect();
+    reversed.added = fd.deleted;
+    reversed.deleted = fd.added;
+    reversed.old_oid = fd.new_oid.clone();
+    reversed.new_oid = fd.old_oid.clone();
+    reversed
+}
+
+fn reverse_file_header(fd: &FileDiff) -> Vec<String> {
+    let mut out = Vec::with_capacity(fd.header.len());
+    for line in &fd.header {
+        if line.starts_with("diff --git ") {
+            out.push(format!("diff --git b/{} a/{}", fd.path, fd.path));
+        } else if let Some(rest) = line.strip_prefix("new file mode ") {
+            out.push(format!("deleted file mode {rest}"));
+        } else if let Some(rest) = line.strip_prefix("deleted file mode ") {
+            out.push(format!("new file mode {rest}"));
+        } else if let Some(rest) = line.strip_prefix("index ") {
+            out.push(format!("index {}", reverse_index_line(rest)));
+        } else if line.starts_with("--- ") {
+            if fd.deleted {
+                out.push("--- /dev/null".to_string());
+            } else if fd.added {
+                out.push(format!("--- b/{}", fd.path));
+            } else {
+                out.push(line.replacen("--- a/", "--- b/", 1));
+            }
+        } else if line.starts_with("+++ ") {
+            if fd.deleted {
+                out.push(format!("+++ a/{}", fd.path));
+            } else if fd.added {
+                out.push("+++ /dev/null".to_string());
+            } else {
+                out.push(line.replacen("+++ b/", "+++ a/", 1));
+            }
+        } else if let Some(rest) = line.strip_prefix("old mode ") {
+            out.push(format!("new mode {rest}"));
+        } else if let Some(rest) = line.strip_prefix("new mode ") {
+            out.push(format!("old mode {rest}"));
+        } else {
+            out.push(line.clone());
+        }
+    }
+    out
+}
+
+fn reverse_index_line(rest: &str) -> String {
+    let Some((old, after_old)) = rest.split_once("..") else {
+        return rest.to_string();
+    };
+    let (new, suffix) = match after_old.find(char::is_whitespace) {
+        Some(index) => (&after_old[..index], &after_old[index..]),
+        None => (after_old, ""),
+    };
+    format!("{new}..{old}{suffix}")
+}
+
+fn reverse_hunk(hunk: &Hunk) -> Hunk {
+    let mut reversed = hunk.clone();
+    reversed.old_offset = hunk.new_offset;
+    reversed.old_count = hunk.new_count;
+    reversed.new_offset = hunk.old_offset;
+    reversed.new_count = hunk.old_count;
+    reversed.body = hunk
+        .body
+        .iter()
+        .map(|line| match line.as_bytes().first().copied() {
+            Some(b'+') => format!("-{}", &line[1..]),
+            Some(b'-') => format!("+{}", &line[1..]),
+            _ => line.clone(),
+        })
+        .collect();
+    reversed.display_header = None;
+    reversed.display_body = Vec::new();
+    reversed.splittable_into = count_splittable(&reversed.body);
+    reversed
+}
+
 /// Parse a hunk starting at `lines[start]` (the `@@` line). Returns the hunk
 /// and the index of the line after it.
 fn parse_hunk(lines: &[&str], start: usize) -> (Hunk, usize) {
@@ -790,6 +887,15 @@ fn run_add_patch_with_result(
     }
     let diff_text = String::from_utf8_lossy(&diff).into_owned();
     let mut files = parse_diff(&diff_text);
+    if matches!(mode, PatchMode::CheckoutNothead | PatchMode::WorktreeNothead) {
+        files = files.iter().map(reverse_file_diff).collect();
+    }
+    if matches!(mode, PatchMode::Add | PatchMode::Reset) {
+        let unmerged = unmerged_paths();
+        if !unmerged.is_empty() {
+            files.retain(|file| !unmerged.contains(&file.path));
+        }
+    }
     if cfg.colors.is_some() {
         let mut display = render_display_diff_text(&files, &cfg);
         if let Some(filter) = cfg.diff_filter.as_deref() {
@@ -846,7 +952,7 @@ fn run_add_patch_with_result(
     // Apply: for each file, reconstruct the index blob with USE_HUNK hunks and
     // stage it. Reset mode applies the selected cached-diff hunks in reverse,
     // which unstages them back to HEAD.
-    let mut applied_any = false;
+    let mut applied_paths = Vec::new();
     for fd in &files {
         if fd.hunks.iter().any(|h| h.use_hunk == HunkUse::Use) {
             match mode {
@@ -854,13 +960,26 @@ fn run_add_patch_with_result(
                 PatchMode::Reset => apply_file_to_index_reverse(fd)?,
                 _ => apply_file_via_patch(fd, mode, stdin)?,
             }
-            applied_any = true;
+            applied_paths.push(fd.path.clone());
         }
     }
-    if applied_any {
-        refresh_index();
+    if !applied_paths.is_empty() {
+        refresh_index(&applied_paths);
     }
-    Ok(applied_any)
+    Ok(!applied_paths.is_empty())
+}
+
+fn unmerged_paths() -> BTreeSet<String> {
+    let out = run_capture(&["ls-files", "-u", "-z"], None).unwrap_or_default();
+    out.split(|byte| *byte == 0)
+        .filter_map(|record| {
+            if record.is_empty() {
+                return None;
+            }
+            let tab = record.iter().position(|byte| *byte == b'\t')?;
+            Some(String::from_utf8_lossy(&record[tab + 1..]).into_owned())
+        })
+        .collect()
 }
 
 /// Build the `[y,n,q,a,d<extra>,?]` command suffix and the permitted set.
@@ -1934,17 +2053,19 @@ fn reassemble_patch(fd: &FileDiff) -> String {
 /// modes: reassemble a patch and pipe it to `apply` (to the index and/or the
 /// working tree, forward or reversed, per the mode).
 fn apply_file_via_patch(fd: &FileDiff, mode: PatchMode, stdin: &mut impl BufRead) -> Result<()> {
-    let patch = reassemble_patch(fd);
+    let reversed;
+    let patch = if mode.is_reverse() {
+        reversed = reverse_file_diff(fd);
+        reassemble_patch(&reversed)
+    } else {
+        reassemble_patch(fd)
+    };
     let patch = patch.as_bytes();
-    let reverse = mode.is_reverse();
     if mode.applies_for_checkout() {
-        return apply_for_checkout(patch, reverse, stdin);
+        return apply_for_checkout(patch, false, stdin);
     }
-    // Worktree-only modes: a single `apply [-R]` against the working tree.
+    // Worktree-only modes: a single forward `apply` against the working tree.
     let mut args: Vec<&str> = vec!["apply"];
-    if reverse {
-        args.push("-R");
-    }
     let (_out, ok) =
         run_capture_status(&args, Some(patch)).map_err(|e| GitError::Io(e.to_string()))?;
     if !ok {
@@ -2066,6 +2187,21 @@ fn apply_file_to_index(fd: &FileDiff) -> Result<()> {
         return Ok(());
     }
 
+    if fd.mode == 0o160000
+        && content_used
+        && let Some(oid) = gitlink_selected_oid(fd, b'+', fd.new_oid.as_deref())
+    {
+        let status = Command::new(self_bin())
+            .args(["update-index", "--cacheinfo", "160000", oid, &fd.path])
+            .stdin(Stdio::null())
+            .status()
+            .map_err(|e| GitError::Io(e.to_string()))?;
+        if !status.success() {
+            return Err(GitError::Exit(1));
+        }
+        return Ok(());
+    }
+
     // Read the index version of the file (stage 0). For a brand-new addition the
     // index entry is empty (intent-to-add), so a failed read means empty base.
     let spec = format!(":{}", fd.path);
@@ -2106,10 +2242,33 @@ fn apply_file_to_index_reverse(fd: &FileDiff) -> Result<()> {
         return Ok(());
     }
 
+    if fd.mode == 0o160000
+        && let Some(oid) = gitlink_selected_oid(fd, b'-', fd.old_oid.as_deref())
+    {
+        let args = ["update-index", "--cacheinfo", "160000", oid, &fd.path];
+        let (_out, ok) =
+            run_capture_status(&args, None).map_err(|e| GitError::Io(e.to_string()))?;
+        if !ok {
+            return Err(GitError::Exit(1));
+        }
+        return Ok(());
+    }
+
     let spec = format!(":{}", fd.path);
     let base = run_capture(&["cat-file", "blob", &spec], None).unwrap_or_default();
     let base_text = String::from_utf8_lossy(&base).into_owned();
     let new_content = apply_hunks_reverse(&base_text, fd);
+    if fd.added && (new_content.is_empty() || new_content == "\n") {
+        let status = Command::new(self_bin())
+            .args(["update-index", "--force-remove", &fd.path])
+            .stdin(Stdio::null())
+            .status()
+            .map_err(|e| GitError::Io(e.to_string()))?;
+        if !status.success() {
+            return Err(GitError::Exit(1));
+        }
+        return Ok(());
+    }
     let oid = run_capture(
         &["hash-object", "-w", "--stdin"],
         Some(new_content.as_bytes()),
@@ -2125,16 +2284,43 @@ fn apply_file_to_index_reverse(fd: &FileDiff) -> Result<()> {
     Ok(())
 }
 
+fn gitlink_selected_oid<'a>(
+    fd: &'a FileDiff,
+    marker: u8,
+    fallback: Option<&'a str>,
+) -> Option<&'a str> {
+    for hunk in &fd.hunks {
+        if hunk.use_hunk != HunkUse::Use {
+            continue;
+        }
+        for line in &hunk.body {
+            let bytes = line.as_bytes();
+            if bytes.first().copied() != Some(marker) {
+                continue;
+            }
+            if let Some(rest) = line[1..].strip_prefix("Subproject commit ") {
+                let oid = rest.split_whitespace().next().unwrap_or(rest);
+                if oid.len() >= 40 && oid.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+                    return Some(oid);
+                }
+            }
+        }
+    }
+    fallback.filter(|oid| oid.len() >= 40)
+}
+
 /// After staging hunks, refresh the index stat cache so `git diff-files` stays
 /// clean for paths whose worktree now matches the freshly-staged blob (t3701
 /// "index is refreshed after applying patch").
-fn refresh_index() {
-    let _ = Command::new(self_bin())
-        .args(["update-index", "--refresh", "-q"])
+fn refresh_index(paths: &[String]) {
+    let mut command = Command::new(self_bin());
+    command
+        .args(["update-index", "--refresh", "-q", "--"])
+        .args(paths)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::null());
+    let _ = command.status();
 }
 
 /// Apply the selected hunks to the index base text, line by line.
