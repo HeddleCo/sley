@@ -529,7 +529,13 @@ declare -A FLOOR=(
     # transport-flake margin); diff-whitespace ignore-modes 119->129; add modes 41->50 (NEW floor).
     # Guards neutral: t5510=7 t5601=109 t5526=39 t4013=216 t4014=208 t4012=4 t4202=131 t3600=81 t7508=119.
     [t3600-rm.sh]=81
-    [t3700-add.sh]=50
+    # 2026-07-08 off main deddae6d: add parity 50->57 by matching add.ignore-errors
+    # partial staging, ignored unmerged-path resolution, and dry-run ignored-missing
+    # output. (The final case-insensitive-pathspec cell needs a path-scoped refresh
+    # that conflicts with update-index --refresh's index-wide semantics, so it is
+    # deferred rather than regress update_index_refresh parity.) Guards held:
+    # t2200-add-update=18, t3701-add-interactive=122; measured vs /tmp/git-src 2.55.0.
+    [t3700-add.sh]=57
     # codex-wave-2 (2026-06-17): log --graph/--source/--end-of-options/follow-pathspec 80->96 (stable 3x).
     # signed-commit slice (2026-06-20): ssh/x509 signature cells (log --show-signature %G?) 124->131 (stable 3x).
     [t4202-log.sh]=142

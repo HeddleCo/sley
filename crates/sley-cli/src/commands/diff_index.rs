@@ -364,6 +364,17 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             )?
         }
     };
+    let entries = if cached {
+        entries
+    } else {
+        sley_diff_merge::augment_with_stat_dirty_entries(
+            worktree_root
+                .ok_or_else(|| GitError::Command("diff-index requires a worktree".into()))?,
+            git_dir,
+            format,
+            entries,
+        )?
+    };
     // diff-index's implicit default ignores untracked content in submodules
     // (`repo_diff_setup` sets `ignore_untracked_in_submodules`) but still
     // reports modified tracked content — i.e. `Untracked`, NOT `Dirty`. An

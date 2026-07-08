@@ -1207,7 +1207,7 @@ pub fn diff_name_status_index_worktree_for_diff_files_with_options(
 /// the merged set keeps git's diff-queue ordering. New-side oids on the added
 /// entries are left `None` (rendered as zeros in raw output), matching git, which
 /// reports the worktree blob oid only for entries it has hashed.
-fn augment_with_stat_dirty_entries(
+pub fn augment_with_stat_dirty_entries(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
