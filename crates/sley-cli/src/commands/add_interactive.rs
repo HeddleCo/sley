@@ -915,6 +915,21 @@ pub(crate) fn cmd_add_patch(
     )
 }
 
+pub(crate) fn cmd_stash_patch(
+    paths: &[String],
+    context: Option<i64>,
+    interhunk: Option<i64>,
+    auto_advance: bool,
+    quiet: bool,
+) -> Result<bool> {
+    let git_dir = crate::session::cli_git_dir()?;
+    let _ = worktree_root_for_git_dir(&git_dir)?;
+    let cfg = resolve_patch_config(&git_dir, context, interhunk, auto_advance)?;
+    let stdin = io::stdin();
+    let mut handle = stdin.lock();
+    super::add_patch::run_stash_patch(paths, None, &mut handle, cfg, quiet)
+}
+
 /// Resolve the diff-tuning [`PatchConfig`] the way add-patch.c's
 /// `init_interactive_config` does: read `diff.context` / `diff.interHunkContext`
 /// / `diff.algorithm` config (rejecting negative context), then let an explicit

@@ -23,6 +23,7 @@ use sley::{GitError, Result};
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum PatchMode {
     Add,
+    Stash,
     Reset,
     /// `checkout -p` / `restore -p` with no tree-ish: `diff-files`, discard the
     /// selected hunks from the working tree (`apply -R`).
@@ -75,7 +76,7 @@ impl PatchMode {
     /// True for the new patch modes that reassemble a patch and pipe it to
     /// `apply`, rather than reconstructing the index blob directly.
     fn applies_via_patch(self) -> bool {
-        !matches!(self, PatchMode::Add | PatchMode::Reset)
+        !matches!(self, PatchMode::Add | PatchMode::Stash | PatchMode::Reset)
     }
 }
 
@@ -88,6 +89,12 @@ fn prompt_text(mode: PatchMode, kind: PromptKind) -> &'static str {
             PromptKind::Deletion => "Stage deletion",
             PromptKind::Addition => "Stage addition",
             PromptKind::Hunk => "Stage this hunk",
+        },
+        PatchMode::Stash => match kind {
+            PromptKind::ModeChange => "Stash mode change",
+            PromptKind::Deletion => "Stash deletion",
+            PromptKind::Addition => "Stash addition",
+            PromptKind::Hunk => "Stash this hunk",
         },
         PatchMode::CheckoutIndex | PatchMode::WorktreeHead => match kind {
             PromptKind::ModeChange => "Discard mode change from worktree",
@@ -708,12 +715,35 @@ pub(crate) fn run_add_patch(
     stdin: &mut impl BufRead,
     cfg: PatchConfig,
 ) -> Result<()> {
+    run_add_patch_with_result(mode, paths, revision, stdin, cfg, false).map(|_| ())
+}
+
+pub(crate) fn run_stash_patch(
+    paths: &[String],
+    revision: Option<&str>,
+    stdin: &mut impl BufRead,
+    cfg: PatchConfig,
+    quiet: bool,
+) -> Result<bool> {
+    run_add_patch_with_result(PatchMode::Stash, paths, revision, stdin, cfg, quiet)
+}
+
+fn run_add_patch_with_result(
+    mode: PatchMode,
+    paths: &[String],
+    revision: Option<&str>,
+    stdin: &mut impl BufRead,
+    cfg: PatchConfig,
+    quiet: bool,
+) -> Result<bool> {
     // Produce the diff for the requested paths, mirroring add-patch.c's
     // `parse_diff` command build: `<diff_cmd> [--unified=<n>]
     // [--inter-hunk-context=<n>] [--diff-algorithm=<algo>] [<revision>]
     // --no-color --ignore-submodules=dirty -p -- <pathspec>...`.
     let mut owned: Vec<String> = match mode {
-        PatchMode::Add | PatchMode::CheckoutIndex => vec!["diff-files".to_string()],
+        PatchMode::Add | PatchMode::Stash | PatchMode::CheckoutIndex => {
+            vec!["diff-files".to_string()]
+        }
         PatchMode::Reset => vec!["diff".to_string(), "--cached".to_string()],
         PatchMode::CheckoutHead
         | PatchMode::WorktreeHead
@@ -773,11 +803,17 @@ pub(crate) fn run_add_patch(
         // files changed.") to STDOUT; t3701 redirects only stdout and greps it.
         let only_binary = !files.is_empty() && files.iter().all(|f| f.is_binary);
         if only_binary {
-            println!("Only binary files changed.");
+            if !quiet {
+                println!("Only binary files changed.");
+            }
+        } else if mode == PatchMode::Stash {
+            if !quiet {
+                println!("No local changes to save");
+            }
         } else {
             println!("No changes.");
         }
-        return Ok(());
+        return Ok(false);
     }
 
     let nfiles = files.len();
@@ -814,7 +850,7 @@ pub(crate) fn run_add_patch(
     for fd in &files {
         if fd.hunks.iter().any(|h| h.use_hunk == HunkUse::Use) {
             match mode {
-                PatchMode::Add => apply_file_to_index(fd)?,
+                PatchMode::Add | PatchMode::Stash => apply_file_to_index(fd)?,
                 PatchMode::Reset => apply_file_to_index_reverse(fd)?,
                 _ => apply_file_via_patch(fd, mode, stdin)?,
             }
@@ -824,7 +860,7 @@ pub(crate) fn run_add_patch(
     if applied_any {
         refresh_index();
     }
-    Ok(())
+    Ok(applied_any)
 }
 
 /// Build the `[y,n,q,a,d<extra>,?]` command suffix and the permitted set.

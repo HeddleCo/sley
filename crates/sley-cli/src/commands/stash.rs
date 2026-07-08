@@ -7,11 +7,14 @@ use sley::plumbing::{sley_config, sley_core, sley_diff_merge, sley_rev, sley_wor
 // private ones), so every helper, type, and re-export visible at the crate root
 // is in scope here without re-listing it.
 use crate::*;
+use crate::commands::merge_rebase::three_way_merge_trees_styled;
 
 #[path = "stash_options.rs"]
 mod stash_options;
 use stash_options::{setup_stash_apply_options, setup_stash_list_options};
-use sley::plumbing::sley_object::TreeEntries;
+use sley::plumbing::sley_object::{tree_entry_cmp, TreeEntries};
+use std::io::Write;
+use std::process::{Command, Stdio};
 #[derive(Debug)]
 pub(super) struct StashListOptions {
     format: StashListFormat,
@@ -245,6 +248,9 @@ pub(super) struct StashApplyOptions {
     spec: Option<String>,
     display: String,
     direct_oid: Option<ObjectId>,
+    label_ours: Option<String>,
+    label_theirs: Option<String>,
+    label_base: Option<String>,
 }
 
 struct AppliedStash {
@@ -332,6 +338,9 @@ fn cmd_stash_branch(args: &[String]) -> Result<()> {
         spec: args.get(1).cloned(),
         display,
         direct_oid: Some(stash_oid),
+        label_ours: None,
+        label_theirs: None,
+        label_base: None,
     })?;
     if args
         .get(1)
@@ -484,7 +493,13 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
         index_tree: &index_commit.tree,
     };
     let reinstate_index = options.reinstate_index.unwrap_or(false);
-    let outcome = apply_stash_via_merge(&db, format, &stash_state, reinstate_index)?;
+    let labels = StashApplyMergeLabels {
+        ours: options.label_ours.as_deref().unwrap_or("Updated upstream"),
+        theirs: options.label_theirs.as_deref().unwrap_or("Stashed changes"),
+        base: options.label_base.as_deref().unwrap_or("Stash base"),
+        style: stash_apply_conflict_style(&git_dir),
+    };
+    let outcome = apply_stash_via_merge(&db, format, &stash_state, reinstate_index, &labels)?;
 
     if let Some(untracked_oid) = stash_commit.parents.get(2) {
         let untracked_object = db.read_object(untracked_oid)?;
@@ -528,9 +543,27 @@ struct StashApplyState<'a> {
     index_tree: &'a ObjectId,
 }
 
+struct StashApplyMergeLabels<'a> {
+    ours: &'a str,
+    theirs: &'a str,
+    base: &'a str,
+    style: sley_diff_merge::ConflictStyle,
+}
+
 enum StashApplyOutcome {
     Clean,
     Conflict,
+}
+
+fn stash_apply_conflict_style(git_dir: &Path) -> sley_diff_merge::ConflictStyle {
+    crate::read_repo_config(git_dir)
+        .ok()
+        .and_then(|config| config.get("merge", None, "conflictstyle").map(str::to_string))
+        .map(|value| match value.as_str() {
+            "diff3" | "zdiff3" => sley_diff_merge::ConflictStyle::Diff3,
+            _ => sley_diff_merge::ConflictStyle::Merge,
+        })
+        .unwrap_or(sley_diff_merge::ConflictStyle::Merge)
 }
 
 /// Run the 3-way merge that applies a stash onto the current index + worktree and
@@ -540,6 +573,7 @@ fn apply_stash_via_merge(
     format: ObjectFormat,
     state: &StashApplyState<'_>,
     reinstate_index: bool,
+    labels: &StashApplyMergeLabels<'_>,
 ) -> Result<StashApplyOutcome> {
     stash_check_index_lock(state.git_dir)?;
     // `ours` (git's `c_tree`) is the current index written as a tree. Reject a
@@ -604,14 +638,16 @@ fn apply_stash_via_merge(
 
     let base_map = sley_diff_merge::flatten_tree(db, format, state.base_tree)?;
     let theirs_map = sley_diff_merge::flatten_tree(db, format, state.stash_tree)?;
-    let (results, conflicts) = three_way_merge_trees(
+    let (results, conflicts) = three_way_merge_trees_styled(
         db,
         format,
         &base_map,
         &ours_map,
         &theirs_map,
-        "Updated upstream",
-        "Stashed changes",
+        labels.ours,
+        labels.theirs,
+        labels.base,
+        labels.style,
     )?;
 
     // Refuse to clobber local worktree modifications or untracked files that lie
@@ -1040,15 +1076,7 @@ fn restore_stash_tree_entries_to_worktree(
                 object.object_type.as_str()
             )));
         }
-        let path = worktree_root.join(stash_repo_path_to_os_path(&path)?);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        // Route through the shared type-by-mode primitive so a stashed *untracked*
-        // symlink (mode 0o120000) restores as a real symlink, not a regular file
-        // holding the link target as content. This is the last site of the
-        // symlink-write bug class the W46 keystone closed for checkout/restore.
-        sley_worktree::write_blob_body_or_symlink(&path, entry.mode, &object.body, &object.body)?;
+        merge_write_worktree_file(worktree_root, &path, &object.body, entry.mode)?;
     }
     Ok(())
 }
@@ -1413,11 +1441,13 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
             eprintln!("Can't use --patch and --include-untracked or --all at the same time");
             return Err(GitError::Exit(1));
         }
-        return commands::add_interactive::cmd_add_patch(
+        return stash_push_patch(
+            &message_args,
             &pathspecs,
+            quiet,
             unified_context,
             inter_hunk_context,
-            true,
+            !no_auto_advance,
         );
     }
     let Some(created) = create_stash_commit(
@@ -1456,6 +1486,228 @@ fn stash_option_takes_no_value_error<T>(option: &str) -> Result<T> {
 fn stash_patch_option_requires_patch_error<T>(option: &str) -> Result<T> {
     eprintln!("fatal: the option '--{option}' requires '--patch'");
     Err(GitError::Exit(128))
+}
+
+fn stash_push_patch(
+    message_args: &[String],
+    pathspecs: &[String],
+    quiet: bool,
+    unified_context: Option<i64>,
+    inter_hunk_context: Option<i64>,
+    auto_advance: bool,
+) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    stash_check_index_lock_quiet(&git_dir, quiet)?;
+    let index_path = sley_worktree::repository_index_path(&git_dir);
+    let original_index_bytes = fs::read(&index_path).ok();
+    let original_index = read_repository_index(&git_dir, format)?.unwrap_or(Index {
+        version: 2,
+        entries: Vec::new(),
+        extensions: Vec::new(),
+        checksum: None,
+    });
+    let original_entries = original_index
+        .entries
+        .iter()
+        .filter(|entry| index_entry_stage(entry) == 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    if original_entries.iter().any(IndexEntry::is_intent_to_add) {
+        if !quiet {
+            eprintln!("Cannot save the current index state");
+        }
+        return Err(GitError::Exit(1));
+    }
+
+    let applied = match commands::add_interactive::cmd_stash_patch(
+        pathspecs,
+        unified_context,
+        inter_hunk_context,
+        auto_advance,
+        quiet,
+    ) {
+        Ok(applied) => applied,
+        Err(err) => {
+            stash_restore_index_bytes(&index_path, original_index_bytes.as_deref())?;
+            return Err(err);
+        }
+    };
+    if !applied {
+        stash_restore_index_bytes(&index_path, original_index_bytes.as_deref())?;
+        return Ok(());
+    }
+
+    let result = stash_record_selected_patch(
+        message_args,
+        quiet,
+        &git_dir,
+        &common_git_dir,
+        &worktree_root,
+        format,
+        &original_entries,
+        pathspecs,
+    );
+    let restore_result = stash_restore_index_bytes(&index_path, original_index_bytes.as_deref());
+    match (result, restore_result) {
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stash_record_selected_patch(
+    message_args: &[String],
+    quiet: bool,
+    git_dir: &Path,
+    common_git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    original_entries: &[IndexEntry],
+    pathspecs: &[String],
+) -> Result<()> {
+    let mut db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let store = FileRefStore::new(git_dir, format);
+    let Some((head_oid, head_commit)) = stash_head_commit(&store, &db, format)? else {
+        if !quiet {
+            eprintln!("You do not have the initial commit yet");
+        }
+        return Err(GitError::Exit(1));
+    };
+    let selected_index = read_repository_index(git_dir, format)?.unwrap_or(Index {
+        version: 2,
+        entries: Vec::new(),
+        extensions: Vec::new(),
+        checksum: None,
+    });
+    let selected_entries = selected_index
+        .entries
+        .iter()
+        .filter(|entry| index_entry_stage(entry) == 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    let original_tree = stash_write_tree_from_entries(&mut db, original_entries)?;
+    let selected_tree = stash_write_tree_from_entries(&mut db, &selected_entries)?;
+    if original_tree == selected_tree {
+        if !quiet {
+            println!("No local changes to save");
+        }
+        return Ok(());
+    }
+
+    let reverse_patch = stash_selected_patch(pathspecs)?;
+    let branch = store
+        .current_branch()?
+        .unwrap_or_else(|| "(no branch)".to_string());
+    let head_name = format_log_oid(&head_oid, Some(7));
+    let head_subject = commit_subject(&head_commit.message);
+    let author = stash_identity_from_env("AUTHOR")?;
+    let committer = stash_identity_from_env("COMMITTER")?;
+    let index_commit = sley_sequencer::create_commit(
+        &mut db,
+        sley_sequencer::CommitCreate {
+            tree: original_tree,
+            parents: vec![head_oid],
+            author: author.clone(),
+            committer: committer.clone(),
+            message: format!("index on {branch}: {head_name} {head_subject}\n").into_bytes(),
+            encoding: None,
+            signature: None,
+        },
+    )?;
+    let message = if message_args.is_empty() {
+        format!("WIP on {branch}: {head_name} {head_subject}")
+    } else {
+        format!("On {branch}: {}", message_args.join(" "))
+    };
+    let stash_oid = sley_sequencer::create_commit(
+        &mut db,
+        sley_sequencer::CommitCreate {
+            tree: selected_tree,
+            parents: vec![head_oid, index_commit],
+            author,
+            committer: committer.clone(),
+            message: message.as_bytes().to_vec(),
+            encoding: None,
+            signature: None,
+        },
+    )?;
+    let created = CreatedStash {
+        oid: stash_oid,
+        message,
+        committer,
+        head_oid,
+        index_oid: index_commit,
+        git_dir: git_dir.to_path_buf(),
+        common_git_dir: common_git_dir.to_path_buf(),
+        worktree_root: worktree_root.to_path_buf(),
+        untracked_paths: Vec::new(),
+        pathspec_paths: Vec::new(),
+        staged_worktree_conflicts: Vec::new(),
+        format,
+    };
+    record_created_stash(&created)?;
+    stash_reverse_apply_selected_patch(&reverse_patch)?;
+    if !quiet {
+        println!(
+            "Saved working directory and index state {}",
+            created.message
+        );
+    }
+    Ok(())
+}
+
+fn stash_selected_patch(pathspecs: &[String]) -> Result<Vec<u8>> {
+    let mut args = vec!["diff".to_string(), "--cached".to_string(), "-p".to_string()];
+    if !pathspecs.is_empty() {
+        args.push("--".to_string());
+        args.extend(pathspecs.iter().cloned());
+    }
+    let output = Command::new(env::current_exe().unwrap_or_else(|_| PathBuf::from("sley")))
+        .args(args)
+        .output()
+        .map_err(|err| GitError::Io(err.to_string()))?;
+    if !output.status.success() {
+        return Err(GitError::Exit(output.status.code().unwrap_or(1)));
+    }
+    Ok(output.stdout)
+}
+
+fn stash_reverse_apply_selected_patch(patch: &[u8]) -> Result<()> {
+    let mut child = Command::new(env::current_exe().unwrap_or_else(|_| PathBuf::from("sley")))
+        .args(["apply", "-R"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|err| GitError::Io(err.to_string()))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(patch)
+            .map_err(|err| GitError::Io(err.to_string()))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|err| GitError::Io(err.to_string()))?;
+    if !status.success() {
+        return Err(GitError::Exit(status.code().unwrap_or(1)));
+    }
+    Ok(())
+}
+
+fn stash_restore_index_bytes(index_path: &Path, original: Option<&[u8]>) -> Result<()> {
+    if let Some(bytes) = original {
+        fs::write(index_path, bytes)?;
+    } else {
+        match fs::remove_file(index_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
 }
 
 fn cmd_stash_save(args: &[String]) -> Result<()> {
@@ -1617,11 +1869,13 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
             eprintln!("Can't use --patch and --include-untracked or --all at the same time");
             return Err(GitError::Exit(1));
         }
-        return commands::add_interactive::cmd_add_patch(
+        return stash_push_patch(
+            &message_args,
             &[],
+            quiet,
             unified_context,
             inter_hunk_context,
-            true,
+            !no_auto_advance,
         );
     }
     let Some(created) = create_stash_commit(
@@ -1642,6 +1896,17 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
 }
 
 fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> Result<()> {
+    record_created_stash(&created)?;
+    if !quiet {
+        println!(
+            "Saved working directory and index state {}",
+            created.message
+        );
+    }
+    cleanup_stored_stash(created, quiet, keep_index)
+}
+
+fn record_created_stash(created: &CreatedStash) -> Result<()> {
     let store = FileRefStore::new(&created.common_git_dir, created.format);
     let old_oid = match store.read_ref("refs/stash")? {
         Some(RefTarget::Direct(oid)) => oid,
@@ -1659,18 +1924,19 @@ fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> 
             message: created.message.as_bytes().to_vec(),
         }),
     });
-    tx.commit()?;
+    tx.commit()
+}
 
-    if !quiet {
-        println!(
-            "Saved working directory and index state {}",
-            created.message
-        );
-    }
+fn cleanup_stored_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> Result<()> {
     if !created.staged_worktree_conflicts.is_empty() {
         report_stash_staged_worktree_conflicts(&created.staged_worktree_conflicts, quiet);
         return Err(GitError::Exit(1));
     }
+
+    for path in &created.untracked_paths {
+        remove_stashed_untracked_path(&created.worktree_root, path)?;
+    }
+    prune_empty_untracked_dirs_preserving_cwd(&created.worktree_root)?;
 
     if created.pathspec_paths.is_empty() {
         let reset_oid = if keep_index {
@@ -1700,10 +1966,6 @@ fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> 
             false,
         )?;
     }
-    for path in &created.untracked_paths {
-        remove_stashed_untracked_path(&created.worktree_root, path)?;
-    }
-    prune_empty_untracked_dirs_preserving_cwd(&created.worktree_root)?;
     Ok(())
 }
 
@@ -2090,6 +2352,14 @@ fn stash_write_tree_node(db: &mut FileObjectDatabase, node: &StashTreeNode) -> R
             oid: stash_write_tree_node(db, child)?,
         });
     }
+    entries.sort_by(|left, right| {
+        tree_entry_cmp(
+            left.name.as_bytes(),
+            left.mode,
+            right.name.as_bytes(),
+            right.mode,
+        )
+    });
     db.write_object(EncodedObject::new(
         ObjectType::Tree,
         Tree { entries }.write(),
@@ -2137,6 +2407,10 @@ fn stash_worktree_entries(
     for entry in index_entries {
         seen.insert(entry.path.as_bytes().to_vec());
         if pathspec.is_some_and(|pathspec| !pathspec.matches(&entry.path)) {
+            entries.push(entry.clone());
+            continue;
+        }
+        if entry.is_skip_worktree() {
             entries.push(entry.clone());
             continue;
         }
@@ -2233,10 +2507,28 @@ fn stash_untracked_entries(
 
 fn remove_stashed_untracked_path(worktree_root: &Path, path: &[u8]) -> Result<()> {
     let path = worktree_root.join(stash_repo_path_to_os_path(path)?);
-    match fs::remove_file(&path) {
-        Ok(()) => {}
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err.into()),
+    };
+    if metadata.file_type().is_dir() {
+        if path.join(".git").exists() {
+            eprintln!("Ignoring path {}/", stash_untracked_display_path(worktree_root, &path));
+            return Ok(());
+        }
+        match fs::remove_dir(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => return Ok(()),
+            Err(err) => return Err(err.into()),
+        }
+    } else {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        }
     }
     let mut parent = path.parent();
     while let Some(directory) = parent {
@@ -2260,6 +2552,13 @@ fn remove_stashed_untracked_path(worktree_root: &Path, path: &[u8]) -> Result<()
         }
     }
     Ok(())
+}
+
+fn stash_untracked_display_path(worktree_root: &Path, path: &Path) -> String {
+    path.strip_prefix(worktree_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn stash_path_is_original_cwd(path: &Path) -> bool {
@@ -3980,7 +4279,13 @@ pub(crate) fn apply_stash_commit_quietly(stash_oid: &ObjectId) -> Result<bool> {
     };
     // Autostash apply must be clean; on conflict (or any error) the caller keeps
     // the stash entry and lets the user recover it manually.
-    match apply_stash_via_merge(&db, format, &stash_state, false) {
+    let labels = StashApplyMergeLabels {
+        ours: "Updated upstream",
+        theirs: "Stashed changes",
+        base: "Stash base",
+        style: stash_apply_conflict_style(&git_dir),
+    };
+    match apply_stash_via_merge(&db, format, &stash_state, false, &labels) {
         Ok(StashApplyOutcome::Clean) => {}
         Ok(StashApplyOutcome::Conflict) => return Ok(false),
         Err(_) => return Ok(false),
