@@ -499,7 +499,12 @@ declare -A FLOOR=(
     [t6007-rev-list-cherry-pick-file.sh]=23
     [t6112-rev-list-filters-objects.sh]=54
     [t6113-rev-list-bitmap-filters.sh]=14
-    [t1800-hook.sh]=66
+    # 2026-07-08 off main c0bf80c7: hook command/config parity completed
+    # for t1800 (core.hooksPath injection, configured hook jobs/parallel,
+    # event-disabled hooks, friendly-name validation, and hook trace max),
+    # moving 66->92. Guards held: t7503=22, t7505=23. Measured against
+    # /tmp/git-src 2.55.0 oracle.
+    [t1800-hook.sh]=92
     # wave-27 (2026-06-21, core): pack-object option/split 46->55 (+bonus t5303 21->31); restore modes
     # 5->15/15 (NEW full pass); describe misplaced-tags/blob/abbrev0 84->98. Guards neutral.
     [t2020-checkout-detach.sh]=26

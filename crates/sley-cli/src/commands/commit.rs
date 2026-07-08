@@ -45,6 +45,7 @@ pub(crate) fn run_prepare_commit_msg_hook(
         commands::hooks::HookRun {
             args,
             env,
+            force_serial: true,
             ..commands::hooks::HookRun::default()
         },
     ) {
@@ -1240,6 +1241,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             "pre-commit",
             commands::hooks::HookRun {
                 env: author_hook_env.clone(),
+                force_serial: true,
                 ..commands::hooks::HookRun::default()
             },
         )
@@ -1346,6 +1348,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             commands::hooks::HookRun {
                 args: vec![editmsg_arg.clone()],
                 env: author_hook_env,
+                force_serial: true,
                 ..commands::hooks::HookRun::default()
             },
         )?;

@@ -2,7 +2,7 @@
 
 use crate::Result;
 pub(crate) use sley::hooks::{
-    HookRun, KNOWN_HOOKS, cmd_hook, run_reference_transaction_hook_at, run_traditional_hook_at,
+    HookRun, KNOWN_HOOKS, run_reference_transaction_hook_at, run_traditional_hook_at,
 };
 
 fn hook_environment() -> sley::hooks::HookEnvironment {
@@ -14,6 +14,10 @@ fn hook_environment() -> sley::hooks::HookEnvironment {
 
 pub(crate) fn run_hook(hook_name: &str, options: HookRun) -> Result<bool> {
     sley::hooks::run_hook(hook_name, options, &hook_environment())
+}
+
+pub(crate) fn cmd_hook(args: &[String]) -> Result<()> {
+    sley::hooks::cmd_hook_with_env(args, &hook_environment())
 }
 
 pub(crate) fn run_hook_l(hook_name: &str, args: &[&str]) -> Result<bool> {
