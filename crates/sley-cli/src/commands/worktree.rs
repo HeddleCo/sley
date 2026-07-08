@@ -231,7 +231,9 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     write_worktree_linking_files(&common_git_dir, &admin_dir, &path, relative_paths)?;
     fs::write(admin_dir.join("commondir"), "../..\n")?;
     copy_worktree_config_for_new_worktree(&common_git_dir, &git_dir, &admin_dir)?;
-    let reftable_refs = FileRefStore::new(&common_git_dir, format).uses_reftable()?;
+    let common_store = FileRefStore::new(&common_git_dir, format);
+    let reftable_refs = common_store.uses_reftable()?;
+    let alternate_refs = common_store.uses_alternate_ref_storage();
     // git's files backend creates the per-worktree `refs/` directory when a
     // worktree is added (the reftable path writes its own `refs/heads` stub
     // below). Tools that probe `$(git rev-parse --git-dir)/refs` rely on it.
@@ -240,7 +242,7 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     }
     // An inferred-orphan worktree has no source commit, so — matching git — it
     // writes no ORIG_HEAD and points HEAD at the unborn branch.
-    if !add_head.orphan && !reftable_refs {
+    if !add_head.orphan && !reftable_refs && !alternate_refs {
         fs::write(admin_dir.join("ORIG_HEAD"), format!("{}\n", add_head.oid))?;
     }
     write_linked_worktree_head(
@@ -248,6 +250,7 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
         format,
         &add_head,
         reftable_refs,
+        alternate_refs,
         committer.clone(),
     )?;
     if options.lock {
@@ -294,9 +297,10 @@ fn write_linked_worktree_head(
     format: ObjectFormat,
     add_head: &WorktreeAddHead,
     reftable_refs: bool,
+    alternate_refs: bool,
     committer: Vec<u8>,
 ) -> Result<()> {
-    if reftable_refs {
+    if alternate_refs || reftable_refs {
         let target = match add_head.branch_name.as_ref() {
             Some(branch) => RefTarget::Symbolic(branch_ref_name(branch)?),
             None => RefTarget::Direct(add_head.oid),
@@ -331,10 +335,20 @@ fn write_linked_worktree_head(
         }
         fs::write(admin_dir.join("HEAD"), b"ref: refs/heads/.invalid\n")?;
         fs::create_dir_all(admin_dir.join("refs"))?;
-        fs::write(
-            admin_dir.join("refs").join("heads"),
-            b"this repository uses the reftable format\n",
-        )?;
+        if alternate_refs {
+            fs::write(
+                admin_dir.join("refs").join("heads"),
+                format!(
+                    "this worktree stores references in {}\n",
+                    worktree_store.current_worktree_ref_storage_dir().display()
+                ),
+            )?;
+        } else {
+            fs::write(
+                admin_dir.join("refs").join("heads"),
+                b"this repository uses the reftable format\n",
+            )?;
+        }
         return Ok(());
     }
     match add_head.branch_name.as_ref() {

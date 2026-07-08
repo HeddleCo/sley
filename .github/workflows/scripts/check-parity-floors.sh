@@ -913,7 +913,11 @@ declare -A FLOOR=(
     # filtered bundles / --since thin bundles / bare-repo bundle clone.
     [t6020-bundle-misc.sh]=27
     [t4068-diff-symmetric-merge-base.sh]=36
-    [t1423-ref-backend.sh]=29
+    # 2026-07-08 off main 5506be15: 29->36 via alternate ref backend worktree
+    # storage parity, local-clone source ref isolation from GIT_REFERENCE_BACKEND,
+    # and linked-worktree local config writes; guards held t1400=315/315,
+    # t1401=25/25; oracle /tmp/git-src git 2.55.0.
+    [t1423-ref-backend.sh]=36
     # consolidation round 1 (2026-06-19, integ/consol1 onto 9d28b991): behavior-neutral
     # refactors (rev-list engine lib.rs->sley_rev::revlist -521 lines; range-diff/rebase
     # alloc cleanups) held floors EXACTLY (t4202=110 t6022=13 t3206=45 t3404=89 t3430=19).

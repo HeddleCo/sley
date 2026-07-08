@@ -1396,7 +1396,11 @@ fn parse_blob_config_bytes(
 /// unsupported Blob/Stdin sources (the caller already rejects those).
 fn config_write_path(source: &ConfigSource) -> Option<PathBuf> {
     match source {
-        ConfigSource::Repository(git_dir) => Some(git_dir.join("config")),
+        ConfigSource::Repository(git_dir) => Some(
+            common_git_dir_for_git_dir(git_dir)
+                .unwrap_or_else(|_| git_dir.clone())
+                .join("config"),
+        ),
         ConfigSource::ScopedFile { path, .. } | ConfigSource::File(path) => Some(path.clone()),
         ConfigSource::Blob(_) | ConfigSource::Stdin => None,
     }

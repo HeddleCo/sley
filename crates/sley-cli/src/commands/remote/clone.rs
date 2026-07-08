@@ -3484,7 +3484,7 @@ fn clone_source_tag_commit(
     format: ObjectFormat,
     name: &str,
 ) -> Option<ObjectId> {
-    let store = FileRefStore::new(remote_common_git_dir, format);
+    let store = FileRefStore::new_without_reference_backend_env(remote_common_git_dir, format);
     if store
         .read_ref(&format!("refs/heads/{name}"))
         .ok()?
@@ -3509,7 +3509,7 @@ fn resolve_clone_revision(
     let oid = if rev.len() == format.hex_len() && rev.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         ObjectId::from_hex(format, rev).map_err(|_| clone_revision_not_found(rev, origin))?
     } else if rev == "HEAD" || rev.starts_with("refs/") {
-        let store = FileRefStore::new(remote_common_git_dir, format);
+        let store = FileRefStore::new_without_reference_backend_env(remote_common_git_dir, format);
         let target = store
             .read_ref(rev)?
             .ok_or_else(|| clone_revision_not_found(rev, origin))?;
@@ -3546,7 +3546,7 @@ fn peel_clone_revision_to_commit<R: ObjectReader>(
 }
 
 fn remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<String> {
-    let remote_store = FileRefStore::new(remote_git_dir, format);
+    let remote_store = FileRefStore::new_without_reference_backend_env(remote_git_dir, format);
     match remote_store.read_ref("HEAD")? {
         Some(RefTarget::Symbolic(target)) => target
             .strip_prefix("refs/heads/")
@@ -3559,7 +3559,7 @@ fn remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<Str
 }
 
 fn clone_remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<Option<String>> {
-    let remote_store = FileRefStore::new(remote_git_dir, format);
+    let remote_store = FileRefStore::new_without_reference_backend_env(remote_git_dir, format);
     let Some(RefTarget::Symbolic(target)) = remote_store.read_ref("HEAD")? else {
         return Ok(None);
     };
@@ -3584,7 +3584,7 @@ fn clone_branch_pointing_at(
     format: ObjectFormat,
     oid: &ObjectId,
 ) -> Result<Option<String>> {
-    let remote_store = FileRefStore::new(remote_git_dir, format);
+    let remote_store = FileRefStore::new_without_reference_backend_env(remote_git_dir, format);
     let preferred = clone_default_branch_name();
     let mut first_match = None;
     for reference in remote_store.list_refs()? {
@@ -3610,7 +3610,7 @@ fn clone_branch_pointing_at(
 
 /// The remote `HEAD` commit when it is detached (no default branch).
 pub(super) fn remote_head_detached(remote_git_dir: &Path, format: ObjectFormat) -> Option<ObjectId> {
-    let remote_store = FileRefStore::new(remote_git_dir, format);
+    let remote_store = FileRefStore::new_without_reference_backend_env(remote_git_dir, format);
     match remote_store.read_ref("HEAD").ok()? {
         Some(RefTarget::Direct(oid)) => Some(oid),
         _ => None,

@@ -634,7 +634,8 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 .iter()
                 .any(|advertisement| advertisement.name == "HEAD")
                 && let Some(RefTarget::Symbolic(target)) =
-                    FileRefStore::new(remote_git_dir, request.format).read_ref("HEAD")?
+                    FileRefStore::new_without_reference_backend_env(remote_git_dir, request.format)
+                        .read_ref("HEAD")?
             {
                 outcome.head_symref = Some(target);
             }
