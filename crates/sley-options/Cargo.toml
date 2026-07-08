@@ -1,6 +1,6 @@
 [package]
 name = "sley-options"
-publish = false
+description = "Byte-faithful port of Git's parse-options command-line option parser for the sley engine."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
