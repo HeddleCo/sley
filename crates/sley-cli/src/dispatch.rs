@@ -31,6 +31,14 @@ pub(crate) fn dispatch_with_aliases(
         if command.starts_with('-') {
             return dispatch_command(&args, global_config);
         }
+        if args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--git-completion-helper" | "--git-completion-helper-all"
+            )
+        }) {
+            return dispatch_command(&args, global_config);
+        }
         // A name is alias-expandable when it is not a built-in, or it is a
         // *deprecated* built-in (which an alias is allowed to override).
         let try_alias = !commands::alias::is_builtin_command(&command)
@@ -281,13 +289,15 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
     // `fetch`, `upload-pack`).
     set_packet_trace_identity(command);
     let trace2_command_name = match command {
-        "--exec-path" | "--html-path" | "--man-path" | "--info-path" | "--list-cmds=builtins" => {
-            "_query_"
-        }
+        "--exec-path" | "--html-path" | "--man-path" | "--info-path" => "_query_",
+        value if value.starts_with("--list-cmds=") => "_query_",
         "-v" | "--version" => "version",
         _ => command,
     };
     sley_core::trace2::cmd_name(trace2_command_name, None);
+    if commands::help::print_completion_helper(args) {
+        return Ok(());
+    }
     if command != "help"
         && args.len() == 2
         && args.get(1).is_some_and(|arg| arg == "-h")
@@ -301,10 +311,9 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "help" => commands::help::cmd_help(&args[1..]),
         "--exec-path" => cmd_exec_path(),
         "--html-path" | "--man-path" | "--info-path" => cmd_info_path(),
-        "--list-cmds=builtins" => {
-            commands::help::print_builtin_commands();
-            Ok(())
-        }
+        value if value.starts_with("--list-cmds=") => commands::help::print_list_cmds(
+            value.strip_prefix("--list-cmds=").unwrap_or_default(),
+        ),
         "init" => commands::plumbing::cmd_init(&args[1..], global_config),
         "add" => commands::plumbing::cmd_add(&args[1..]),
         "archive" => commands::plumbing::cmd_archive(&args[1..]),

@@ -1805,7 +1805,15 @@ declare -A FLOOR=(
     [t9351-fast-export-anonymize.sh]=7
     [t9700-perl-git.sh]=3
     [t9901-git-web--browse.sh]=0
-    [t9902-completion.sh]=185
+    # round5 completion (2026-07-07, off main f312ed0d): machine-readable helper
+    # surfaces for bash completion (parse-options rendering, config/ref helpers,
+    # helper-only command routing) + a `**` double-star fix in for-each-ref glob
+    # matching (paired `refs/heads/*`/`refs/heads/*/**` patterns from __git_refs
+    # now reach nested refs while single `*` still stays within a segment).
+    # 185->258. Guards held: t0012-help 164/164, t0450-txt-doc-vs-help 794/794;
+    # for_each_ref standalone parity tests green. Measured against /tmp/git-src
+    # 2.55.0 source oracle (verify on next scheduled Linux run).
+    [t9902-completion.sh]=258
     [t9903-bash-prompt.sh]=54
 
 )

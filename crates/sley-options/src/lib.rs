@@ -268,6 +268,29 @@ pub fn usage_with_options(specs: &[OptionSpec<'_>], usage: &[&str]) -> String {
     out
 }
 
+pub fn completion_helper_options(specs: &[OptionSpec<'_>], show_hidden: bool) -> String {
+    let mut options = Vec::new();
+    let mut negated = Vec::new();
+    for spec in specs {
+        if spec.flags.contains(OptFlags::HIDDEN) && !show_hidden {
+            continue;
+        }
+        let Some(long) = spec.long else {
+            continue;
+        };
+        options.push(format!(
+            "--{long}{}",
+            spec.value.completion_suffix(spec.flags)
+        ));
+        if spec.value.allows_negation() && !spec.flags.contains(OptFlags::NONEG) {
+            negated.push(format!("--no-{long}"));
+        }
+    }
+
+    options.extend(negated);
+    options.join(" ")
+}
+
 struct Parser<'a> {
     args: &'a [String],
     specs: &'a [OptionSpec<'a>],
@@ -654,6 +677,15 @@ impl<'a> OptValue<'a> {
             Self::Int(metavar) | Self::Magnitude(metavar) | Self::Str(metavar) => Some(metavar),
             Self::Enum { metavar, .. } => Some(metavar),
             Self::Callback { metavar, .. } => metavar,
+        }
+    }
+
+    const fn completion_suffix(self, flags: OptFlags) -> &'static str {
+        match self {
+            Self::Bool => "",
+            Self::Str(_) | Self::Int(_) | Self::Magnitude(_) | Self::Enum { .. } => "=",
+            Self::Callback { .. } if flags.contains(OptFlags::OPTARG) => "",
+            Self::Callback { .. } => "=",
         }
     }
 }
@@ -1046,5 +1078,40 @@ mod tests {
         let argv = args(&["--mode=three"]);
         let err = parse(&argv, &specs).expect_err("invalid enum");
         assert_eq!(err.message(), Some("invalid value for '--mode'"));
+    }
+
+    #[test]
+    fn completion_helper_renders_long_options_values_and_hidden_aliases() {
+        let specs = [
+            OptionSpec {
+                short: Some('q'),
+                long: Some("quiet"),
+                value: OptValue::Bool,
+                flags: OptFlags::NONE,
+                help: "quiet",
+            },
+            OptionSpec {
+                short: None,
+                long: Some("message"),
+                value: OptValue::Str("msg"),
+                flags: OptFlags::NONEG,
+                help: "message",
+            },
+            OptionSpec {
+                short: None,
+                long: Some("recursive"),
+                value: OptValue::Bool,
+                flags: OptFlags::HIDDEN,
+                help: "alias",
+            },
+        ];
+        assert_eq!(
+            completion_helper_options(&specs, false),
+            "--quiet --message= --no-quiet"
+        );
+        assert_eq!(
+            completion_helper_options(&specs, true),
+            "--quiet --message= --recursive --no-quiet --no-recursive"
+        );
     }
 }
