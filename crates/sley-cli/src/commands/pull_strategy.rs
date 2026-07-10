@@ -84,6 +84,7 @@ pub(crate) fn cmd_pull_with_strategy(
     let cwd = cli_session.cwd();
     let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
+    let config = read_repo_config(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
@@ -117,8 +118,8 @@ pub(crate) fn cmd_pull_with_strategy(
     fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
 
     let tree = pull_commit_tree_oid(&db, format, &head_oid)?;
-    let author = commit_identity_from_env("AUTHOR")?;
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let author = commit_identity_from_env("AUTHOR", &config)?;
+    let committer = commit_identity_from_env("COMMITTER", &config)?;
     let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let merge_oid = sley_sequencer::create_commit(
         &mut db,

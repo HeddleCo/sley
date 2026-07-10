@@ -149,7 +149,8 @@ pub(crate) fn cmd_worktree_add(
     );
     validate_worktree_add_destination(&path, &options.path)?;
     let store = FileRefStore::new(&common_git_dir, format).with_reftable_combined_logs(true);
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let identity_config = identity_effective_config_for(cli_session).unwrap_or_default();
+    let committer = commit_identity_from_env("COMMITTER", &identity_config)?;
 
     // `--orphan` with no explicit `-b`/`-B` names the new unborn branch after
     // the worktree basename (git: `opts.orphan && !new_branch`).
@@ -1584,7 +1585,7 @@ fn worktree_add_resolve_head(
     store.create_branch(
         &branch,
         head_oid,
-        commit_identity_from_env("COMMITTER")?,
+        committer,
         b"branch: Created from HEAD".to_vec(),
     )?;
     let oid = resolve_revision(common_git_dir, format, &branch)?;

@@ -241,8 +241,11 @@ pub(crate) fn resolve_checkout_merge_base_start_oid(
     }
 }
 
-pub(crate) fn require_work_tree(git_dir: &Path) -> Result<PathBuf> {
-    if let Some(result) = setup::setup_git_directory() {
+pub(crate) fn require_work_tree(
+    cli_session: &crate::session::CliSession,
+    git_dir: &Path,
+) -> Result<PathBuf> {
+    if let Some(result) = setup::setup_git_directory(cli_session) {
         if result.worktree_config_bogus {
             eprintln!("warning: core.bare and core.worktree do not make sense");
             eprintln!("fatal: unable to set up work tree using invalid config");

@@ -308,7 +308,7 @@ pub(crate) fn cmd_diff_index(
             Some(worktree_root) => worktree_root,
             None => repo.worktree_root()?,
         };
-        DiffPathspec::new(cwd, worktree_root, &setup.pathspecs)?
+        DiffPathspec::new(cwd, worktree_root, &setup.pathspecs, repo.pathspec_magic())?
     };
 
     let base_options = sley_diff_merge::DiffNameStatusOptions {
@@ -446,6 +446,7 @@ pub(crate) fn cmd_diff_index(
             !cached,
             None,
             &resolver,
+            cli_session.lazy_fetch(),
         )?;
         let mut code = 0;
         if check_failed {
@@ -483,6 +484,8 @@ pub(crate) fn cmd_diff_index(
                 indent_heuristic,
                 submodule_format,
                 submodule_dirt: &submodule_dirt,
+                config: repo.config(),
+                lazy_fetch: cli_session.lazy_fetch(),
             },
         )?;
     }
@@ -569,6 +572,8 @@ struct RenderContext<'a> {
     indent_heuristic: bool,
     submodule_format: commands::diff_options::SubmoduleDiffFormat,
     submodule_dirt: &'a HashMap<Vec<u8>, u8>,
+    config: &'a GitConfig,
+    lazy_fetch: bool,
 }
 
 fn render(
@@ -593,7 +598,13 @@ fn render(
         },
     );
     let stat_entries = if selection.needs_line_stats() {
-        collect_diff_stat_entries(entries, ctx.db, ctx.worktree_root, ctx.use_worktree_new)?
+        collect_diff_stat_entries(
+            entries,
+            ctx.db,
+            ctx.worktree_root,
+            ctx.use_worktree_new,
+            ctx.lazy_fetch,
+        )?
     } else {
         Vec::new()
     };
@@ -628,6 +639,7 @@ fn render(
                 color: false,
                 quote_path_fully: true,
             },
+            Some(ctx.config),
         )?;
     }
     if selection.shortstat {
@@ -652,6 +664,7 @@ fn render(
                 anchors: &[],
                 allow_textconv: false,
                 db: ctx.db,
+                lazy_fetch: ctx.lazy_fetch,
                 worktree_root: ctx.worktree_root,
                 use_worktree_new: ctx.use_worktree_new,
                 format: ctx.format,

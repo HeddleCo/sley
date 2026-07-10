@@ -14,6 +14,64 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// User-requested history-editing action after CLI option parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryEditAction {
+    Start,
+    Continue,
+    Abort,
+    Skip,
+    Quit,
+    EditTodo,
+    ShowCurrentPatch,
+}
+
+/// On-disk backend selected for a resumed history edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryEditBackend {
+    Apply,
+    Merge,
+}
+
+/// Inputs for choosing the backend that owns a history-editing invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryEditPlanOptions {
+    pub action: HistoryEditAction,
+    pub apply_in_progress: bool,
+    pub merge_in_progress: bool,
+}
+
+/// Backend-selection outcome before porcelain execution begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryEditPlan {
+    Start,
+    Resume {
+        backend: HistoryEditBackend,
+        action: HistoryEditAction,
+    },
+    MissingState,
+}
+
+/// Select the history-editing backend from explicit action and on-disk state.
+#[must_use]
+pub fn plan_history_edit(options: HistoryEditPlanOptions) -> HistoryEditPlan {
+    let backend = if options.apply_in_progress {
+        Some(HistoryEditBackend::Apply)
+    } else if options.merge_in_progress {
+        Some(HistoryEditBackend::Merge)
+    } else {
+        None
+    };
+    match backend {
+        Some(backend) => HistoryEditPlan::Resume {
+            backend,
+            action: options.action,
+        },
+        None if options.action == HistoryEditAction::Start => HistoryEditPlan::Start,
+        None => HistoryEditPlan::MissingState,
+    }
+}
+
 /// `todo_command_info` order matters: parsing tries commands in this order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TodoCommand {
@@ -1421,5 +1479,39 @@ mod tests {
             ]
         );
         assert!(!state_path(root.path(), "end").exists());
+    }
+
+    #[test]
+    fn history_edit_plan_prefers_apply_state_and_reports_missing_state() {
+        assert_eq!(
+            plan_history_edit(HistoryEditPlanOptions {
+                action: HistoryEditAction::Continue,
+                apply_in_progress: true,
+                merge_in_progress: true,
+            }),
+            HistoryEditPlan::Resume {
+                backend: HistoryEditBackend::Apply,
+                action: HistoryEditAction::Continue,
+            }
+        );
+        assert_eq!(
+            plan_history_edit(HistoryEditPlanOptions {
+                action: HistoryEditAction::Abort,
+                apply_in_progress: false,
+                merge_in_progress: false,
+            }),
+            HistoryEditPlan::MissingState
+        );
+        assert_eq!(
+            plan_history_edit(HistoryEditPlanOptions {
+                action: HistoryEditAction::Start,
+                apply_in_progress: true,
+                merge_in_progress: false,
+            }),
+            HistoryEditPlan::Resume {
+                backend: HistoryEditBackend::Apply,
+                action: HistoryEditAction::Start,
+            }
+        );
     }
 }

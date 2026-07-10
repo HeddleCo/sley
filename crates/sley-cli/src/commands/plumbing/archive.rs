@@ -177,7 +177,11 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
             None => Vec::new(),
         }
     };
-    let pathspecs = match archive_pathspecs_for_current_prefix(&current_prefix, pathspecs) {
+    let pathspecs = match archive_pathspecs_for_current_prefix(
+        &current_prefix,
+        pathspecs,
+        effective_pathspec_flags(cli_session),
+    ) {
         Ok(pathspecs) => pathspecs,
         Err(GitError::InvalidPath(message))
             if message.contains("outside the current directory") =>
@@ -938,6 +942,7 @@ fn handle_archive_result(result: Result<()>) -> Result<()> {
 fn archive_pathspecs_for_current_prefix(
     current_prefix: &[u8],
     pathspecs: Vec<Vec<u8>>,
+    magic: sley_worktree::PathspecMatchMagic,
 ) -> Result<Vec<Vec<u8>>> {
     if current_prefix.is_empty() {
         return Ok(pathspecs);
@@ -958,10 +963,9 @@ fn archive_pathspecs_for_current_prefix(
             if pathspec.starts_with(b":") {
                 let normalized = archive_normalize_magic_pathspec(current_prefix, &pathspec)?;
                 let element =
-                    sley_pathspec::PathspecElement::parse(&normalized, effective_pathspec_flags())
-                        .map_err(|err| {
-                            GitError::InvalidPath(format!("invalid archive pathspec: {err}"))
-                        })?;
+                    sley_pathspec::PathspecElement::parse(&normalized, magic).map_err(|err| {
+                        GitError::InvalidPath(format!("invalid archive pathspec: {err}"))
+                    })?;
                 have_include |= !element.is_exclude();
                 return Ok(normalized);
             }

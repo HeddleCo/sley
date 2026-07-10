@@ -409,6 +409,10 @@ fn print_rebase_usage() {
 // ---------------------------------------------------------------------------
 
 struct Ctx {
+    repository: sley::Repository,
+    config: GitConfig,
+    refs: FileRefStore,
+    common_refs: FileRefStore,
     git_dir: PathBuf,
     common_git_dir: PathBuf,
     worktree_root: PathBuf,
@@ -416,32 +420,41 @@ struct Ctx {
     /// `GIT_REFLOG_ACTION` or `"rebase"`.
     reflog_action: String,
     recurse_submodules: bool,
+    lazy_fetch: bool,
 }
 
 impl Ctx {
-    fn discover() -> Result<Ctx> {
-        let cwd = env::current_dir()?;
-        let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-        let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    fn from_session(cli_session: &crate::session::CliSession) -> Result<Ctx> {
+        let repository = cli_session.open_repository()?;
+        let git_dir = repository.git_dir().to_path_buf();
+        let common_git_dir = repository.common_dir().to_path_buf();
         let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-        let format = repository_object_format(&common_git_dir)?;
+        let format = repository.object_format();
+        let config = read_repo_config(&git_dir)?;
+        let refs = repository.references();
+        let common_refs = FileRefStore::new(&common_git_dir, format);
         let reflog_action = env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "rebase".to_string());
         Ok(Ctx {
+            repository,
+            config,
+            refs,
+            common_refs,
             git_dir,
             common_git_dir,
             worktree_root,
             format,
             reflog_action,
             recurse_submodules: false,
+            lazy_fetch: cli_session.lazy_fetch(),
         })
     }
 
     fn db(&self) -> FileObjectDatabase {
-        FileObjectDatabase::from_git_dir(&self.common_git_dir, self.format)
+        self.repository.objects_mut()
     }
 
-    fn refs(&self) -> FileRefStore {
-        FileRefStore::new(&self.git_dir, self.format)
+    fn refs(&self) -> &FileRefStore {
+        &self.refs
     }
 
     fn state_path(&self, name: &str) -> PathBuf {
@@ -537,13 +550,10 @@ fn find_unique_abbrev_hex(ctx: &Ctx, db: &FileObjectDatabase, oid: &ObjectId) ->
 /// `merge.conflictStyle` for a rebase pick's 3-way merge (honouring `-c`
 /// overrides). diff3 and zdiff3 both add the `|||||||` base section; sley does
 /// not yet distinguish the zealous variant.
-fn rebase_merge_conflict_style() -> sley_diff_merge::ConflictStyle {
-    effective_config_with_overrides()
-        .and_then(|config| {
-            config
-                .get("merge", None, "conflictstyle")
-                .map(str::to_string)
-        })
+fn rebase_merge_conflict_style(config: &GitConfig) -> sley_diff_merge::ConflictStyle {
+    effective_config_with_overrides(config)
+        .get("merge", None, "conflictstyle")
+        .map(str::to_string)
         .map(|value| match value.as_str() {
             "diff3" | "zdiff3" => sley_diff_merge::ConflictStyle::Diff3,
             _ => sley_diff_merge::ConflictStyle::Merge,
@@ -643,8 +653,7 @@ fn rebase_config_value(ctx: &Ctx, section: &str, key: &str) -> Option<String> {
     // Reading `<worktrees/name>/config` silently loses settings such as
     // sequence.editor, causing an interactive rebase in a linked worktree to
     // ignore its configured todo editor entirely.
-    let config = read_repo_config(&ctx.common_git_dir).ok()?;
-    config.get(section, None, key).map(str::to_string)
+    ctx.config.get(section, None, key).map(str::to_string)
 }
 
 fn rebase_config_bool(ctx: &Ctx, section: &str, key: &str) -> Option<bool> {
@@ -693,9 +702,9 @@ fn rebase_merges_config(ctx: &Ctx) -> Option<RebaseMergesMode> {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let parsed = parse_rebase_args(args)?;
-    let mut ctx = Ctx::discover()?;
+    let mut ctx = Ctx::from_session(cli_session)?;
     ctx.recurse_submodules = parsed.recurse_submodules;
 
     if parsed.action != RebaseAction::None && parsed.total_args != 1 {
@@ -713,13 +722,38 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
     // The apply backend keeps its state in `.git/rebase-apply/` (marked by a
     // `head-name` file). When such a rebase is in progress, the resume verbs
     // route to the am-based driver instead of the merge sequencer.
-    let apply_in_progress = commands::am::rebase_apply_in_progress(&ctx.git_dir);
-    let merge_in_progress = seq::in_progress(&ctx.git_dir);
-    let in_progress = apply_in_progress || merge_in_progress;
-    if parsed.action != RebaseAction::None && !in_progress {
+    let history_action = match parsed.action {
+        RebaseAction::None => seq::HistoryEditAction::Start,
+        RebaseAction::Continue => seq::HistoryEditAction::Continue,
+        RebaseAction::Skip => seq::HistoryEditAction::Skip,
+        RebaseAction::Abort => seq::HistoryEditAction::Abort,
+        RebaseAction::Quit => seq::HistoryEditAction::Quit,
+        RebaseAction::EditTodo => seq::HistoryEditAction::EditTodo,
+        RebaseAction::ShowCurrentPatch => seq::HistoryEditAction::ShowCurrentPatch,
+    };
+    let history_plan = seq::plan_history_edit(seq::HistoryEditPlanOptions {
+        action: history_action,
+        apply_in_progress: commands::am::rebase_apply_in_progress(&ctx.git_dir),
+        merge_in_progress: seq::in_progress(&ctx.git_dir),
+    });
+    if history_plan == seq::HistoryEditPlan::MissingState {
         eprintln!("fatal: no rebase in progress");
         return Err(GitError::Exit(128));
     }
+    let apply_in_progress = matches!(
+        history_plan,
+        seq::HistoryEditPlan::Resume {
+            backend: seq::HistoryEditBackend::Apply,
+            ..
+        }
+    );
+    let merge_in_progress = matches!(
+        history_plan,
+        seq::HistoryEditPlan::Resume {
+            backend: seq::HistoryEditBackend::Merge,
+            ..
+        }
+    );
 
     if apply_in_progress {
         match parsed.action {
@@ -729,6 +763,8 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
                     &ctx.common_git_dir,
                     &ctx.worktree_root,
                     ctx.format,
+                    &ctx.config,
+                    ctx.lazy_fetch,
                 );
                 // Ok iff the whole series completed; restore the autostash then
                 // (a fresh conflict returns Err and keeps it for the next step).
@@ -743,6 +779,8 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
                     &ctx.common_git_dir,
                     &ctx.worktree_root,
                     ctx.format,
+                    &ctx.config,
+                    ctx.lazy_fetch,
                 );
                 if result.is_ok() {
                     finish_apply_autostash(&ctx);
@@ -751,8 +789,13 @@ pub(crate) fn cmd_rebase(args: &[String]) -> Result<()> {
             }
             RebaseAction::Abort => {
                 let autostash = read_apply_autostash(&ctx);
-                let result =
-                    commands::am::rebase_apply_abort(&ctx.git_dir, &ctx.worktree_root, ctx.format);
+                let result = commands::am::rebase_apply_abort(
+                    &ctx.git_dir,
+                    &ctx.worktree_root,
+                    ctx.format,
+                    &ctx.config,
+                    ctx.lazy_fetch,
+                );
                 // Abort always ends the rebase; restore the autostash on top of
                 // the restored orig_head (git applies it after reset).
                 if result.is_ok() {
@@ -1031,7 +1074,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         if args.positional.get(branch_index).is_some() {
             hook_args.push(branch_name.as_str());
         }
-        if let Err(err) = commands::hooks::run_hook_l("pre-rebase", &hook_args) {
+        if let Err(err) = commands::hooks::run_hook_l_at(&ctx.git_dir, "pre-rebase", &hook_args) {
             // The hook refused the rebase: restore the autostash and drop any
             // state so no rebase is left in progress (t3420 #18).
             apply_autostash(ctx);
@@ -1175,7 +1218,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                     reset_index_and_worktree_to_commit_for_rebase(ctx, &orig_head)?;
                     let refs = ctx.refs();
                     let old = head_commit_oid(&refs)?.unwrap_or_else(|| ObjectId::null(ctx.format));
-                    let committer = committer_identity_for_reflog()?;
+                    let committer = committer_identity_for_reflog(&ctx.config)?;
                     detach_head_with_reflog(
                         ctx,
                         old,
@@ -1183,7 +1226,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                         ctx.reflog("start", Some(&format!("checkout {switch_to}"))),
                         committer,
                     )?;
-                    run_rebase_post_checkout_hook(&old, &orig_head)?;
+                    run_rebase_post_checkout_hook(ctx, &old, &orig_head)?;
                 }
             }
             if !args.quiet {
@@ -1217,14 +1260,22 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         };
         let new_tree = commit_tree_oid(&db, ctx.format, &onto)?;
         // Start "Changes from … to …" diffstat: includes the summary lines.
-        print_rebase_diffstat(&db, ctx.format, &old_tree, &new_tree, true)?;
+        print_rebase_diffstat(
+            &db,
+            ctx.format,
+            &old_tree,
+            &new_tree,
+            &ctx.config,
+            ctx.lazy_fetch,
+            true,
+        )?;
     }
 
     // The apply backend's explicit fast-forward case.
     if allow_preemptive_ff && !force && branch_base.as_ref() == Some(&orig_head) {
         // onto is a descendant of orig_head: fast-forward.
         reset_index_and_worktree_to_commit_for_rebase(&ctx, &onto)?;
-        let committer = committer_identity_for_reflog()?;
+        let committer = committer_identity_for_reflog(&ctx.config)?;
         detach_head_with_reflog(
             ctx,
             orig_head,
@@ -1232,7 +1283,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             ctx.reflog("start", Some(&format!("checkout {onto_name}"))),
             committer.clone(),
         )?;
-        run_rebase_post_checkout_hook(&orig_head, &onto)?;
+        run_rebase_post_checkout_hook(ctx, &orig_head, &onto)?;
         if !args.quiet {
             println!("Fast-forwarded {branch_name} to {onto_name}.");
         }
@@ -1446,7 +1497,7 @@ fn run_apply_backend(
         if let Some(head_name) = head_name
             && head_name.starts_with("refs/heads/")
         {
-            let committer = committer_identity_for_reflog()?;
+            let committer = committer_identity_for_reflog(&ctx.config)?;
             move_to_original_branch(ctx, head_name, *orig_head, *onto, committer)?;
         }
         // A noop rebase still finishes, so restore any autostash now.
@@ -1469,7 +1520,13 @@ fn run_apply_backend(
             Some(parent) => commit_tree_oid(db, ctx.format, parent)?,
             None => ObjectId::empty_tree(ctx.format),
         };
-        let diff = render_tree_to_tree_patch(db, ctx.format, &parent_tree, &record.commit.tree)?;
+        let diff = render_tree_to_tree_patch(
+            db,
+            ctx.format,
+            &parent_tree,
+            &record.commit.tree,
+            ctx.lazy_fetch,
+        )?;
         let source_encoding = commit_encoding(&record.commit);
         let author =
             log_reencode_message(&record.commit.author, &source_encoding, &target_encoding);
@@ -1524,6 +1581,8 @@ fn run_apply_backend(
             orig_head: *orig_head,
             onto: *onto,
         },
+        &ctx.config,
+        ctx.lazy_fetch,
     );
     // The series finished cleanly (Ok) iff the whole rebase completed; restore
     // the autostash then. A conflict returns Err and leaves the stash in place
@@ -1569,7 +1628,7 @@ fn checkout_onto_for_apply(
         return Err(GitError::Exit(1));
     }
     reset_index_and_worktree_to_commit_for_rebase(ctx, base)?;
-    let committer = committer_identity_for_reflog()?;
+    let committer = committer_identity_for_reflog(&ctx.config)?;
     detach_head_with_reflog(
         ctx,
         old,
@@ -1578,7 +1637,7 @@ fn checkout_onto_for_apply(
         committer,
     )?;
     fs::write(ctx.git_dir.join("ORIG_HEAD"), format!("{orig_head}\n"))?;
-    run_rebase_post_checkout_hook(&old, base)?;
+    run_rebase_post_checkout_hook(ctx, &old, base)?;
     Ok(())
 }
 
@@ -1587,11 +1646,12 @@ fn default_upstream_name(ctx: &Ctx, refs: &FileRefStore) -> Option<String> {
         RefTarget::Symbolic(name) => name.strip_prefix("refs/heads/")?.to_string(),
         RefTarget::Direct(_) => return None,
     };
-    let config = read_repo_config(&ctx.git_dir).ok()?;
-    let merge = config
+    let merge = ctx
+        .config
         .get("branch", Some(branch.as_str()), "merge")
         .map(str::to_string)?;
-    let remote = config
+    let remote = ctx
+        .config
         .get("branch", Some(branch.as_str()), "remote")
         .map(str::to_string)
         .unwrap_or_else(|| ".".to_string());
@@ -1718,7 +1778,7 @@ fn checkout_up_to_date(
         ]),
     )?;
     let refs = ctx.refs();
-    let committer = committer_identity_for_reflog()?;
+    let committer = committer_identity_for_reflog(&ctx.config)?;
     let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
@@ -1733,7 +1793,7 @@ fn checkout_up_to_date(
         }),
     });
     tx.commit()?;
-    run_rebase_post_checkout_hook(&old, oid)
+    run_rebase_post_checkout_hook(ctx, &old, oid)
 }
 
 fn move_to_original_branch(
@@ -1775,6 +1835,8 @@ fn print_rebase_diffstat(
     format: ObjectFormat,
     old_tree: &ObjectId,
     new_tree: &ObjectId,
+    config: &GitConfig,
+    lazy_fetch: bool,
     with_summary: bool,
 ) -> Result<()> {
     let entries = sley_diff_merge::diff_name_status_trees_with_options(
@@ -1791,7 +1853,7 @@ fn print_rebase_diffstat(
         return Ok(());
     }
     let mut stdout = io::stdout();
-    let stat_entries = collect_diff_stat_entries(entries.as_slice(), db, None, false)?;
+    let stat_entries = collect_diff_stat_entries(entries.as_slice(), db, None, false, lazy_fetch)?;
     // The diffstat rows + the "N file changed …" trailer (already emitted by
     // `write_diff_stat`). It is NOT followed by a separate shortstat — emitting
     // one double-printed the "N file changed" line (t3404 "verbose flag is
@@ -1806,6 +1868,7 @@ fn print_rebase_diffstat(
             color: false,
             quote_path_fully: true,
         },
+        Some(config),
     )?;
     // The "Changes from … to …" start diffstat sets
     // `DIFF_FORMAT_SUMMARY | DIFF_FORMAT_DIFFSTAT` (builtin/rebase.c), so it
@@ -1821,7 +1884,7 @@ fn print_rebase_diffstat(
 }
 
 fn create_squash_onto(ctx: &Ctx) -> Result<ObjectId> {
-    let ident = commit_identity_from_env("COMMITTER")?;
+    let ident = commit_identity_from_env("COMMITTER", &ctx.config)?;
     let mut writer = ctx.db();
     sley_sequencer::create_commit(
         &mut writer,
@@ -1847,14 +1910,13 @@ fn rebase_commit_signature(
     message: &[u8],
     encoding: Option<Vec<u8>>,
 ) -> Result<Option<Vec<u8>>> {
-    let config = read_repo_config(&ctx.common_git_dir).ok();
     let sign = if opts.no_gpg_sign {
         false
     } else {
         opts.gpg_sign.is_some()
-            || config
-                .as_ref()
-                .and_then(|config| config.get_bool("commit", None, "gpgsign"))
+            || ctx
+                .config
+                .get_bool("commit", None, "gpgsign")
                 .unwrap_or(false)
     };
     if !sign {
@@ -1868,8 +1930,9 @@ fn rebase_commit_signature(
         encoding,
         message: message.to_vec(),
     };
-    let key = commands::signing::signing_key(config.as_ref(), opts.gpg_sign.as_deref(), committer);
-    commands::signing::sign_payload(config.as_ref(), &unsigned.write(), key.as_deref()).map(Some)
+    let key =
+        commands::signing::signing_key(Some(&ctx.config), opts.gpg_sign.as_deref(), committer);
+    commands::signing::sign_payload(Some(&ctx.config), &unsigned.write(), key.as_deref()).map(Some)
 }
 
 // ---------------------------------------------------------------------------
@@ -1948,7 +2011,7 @@ fn make_script_commits(
             if record.parents.len() > 1 {
                 continue; // merges carry no single-parent patch-id
             }
-            if let Some(id) = commit_patch_id(db, ctx.format, &record)? {
+            if let Some(id) = commit_patch_id(db, ctx.format, &record, ctx.lazy_fetch)? {
                 ids.insert(id);
             }
         }
@@ -2031,7 +2094,7 @@ fn make_script_commits(
         // are eligible — matching `!is_empty && (flags & PATCHSAME)`.
         if !upstream_patch_ids.is_empty()
             && record.commit.tree != parent_tree
-            && let Some(id) = commit_patch_id(db, ctx.format, &record)?
+            && let Some(id) = commit_patch_id(db, ctx.format, &record, ctx.lazy_fetch)?
             && upstream_patch_ids.contains(&id)
         {
             continue;
@@ -2088,7 +2151,7 @@ fn make_script_with_merges(
             if record.parents.len() > 1 {
                 continue;
             }
-            if let Some(id) = commit_patch_id(db, ctx.format, &record)? {
+            if let Some(id) = commit_patch_id(db, ctx.format, &record, ctx.lazy_fetch)? {
                 ids.insert(id);
             }
         }
@@ -2177,7 +2240,7 @@ fn make_script_with_merges(
         if record.parents.len() <= 1
             && !upstream_patch_ids.is_empty()
             && !is_empty
-            && let Some(id) = commit_patch_id(db, ctx.format, record)?
+            && let Some(id) = commit_patch_id(db, ctx.format, record, ctx.lazy_fetch)?
             && upstream_patch_ids.contains(&id)
         {
             continue;
@@ -2546,6 +2609,7 @@ fn commit_patch_id(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     record: &sley_rev::CommitRecord,
+    lazy_fetch: bool,
 ) -> Result<Option<Vec<u8>>> {
     if record.parents.len() > 1 {
         return Ok(None);
@@ -2554,7 +2618,7 @@ fn commit_patch_id(
         Some(parent) => commit_tree_oid(db, format, parent)?,
         None => ObjectId::empty_tree(format),
     };
-    let diff = render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree)
+    let diff = render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree, lazy_fetch)
         .unwrap_or_default();
     Ok(commands::patch_id::patch_id_for_diff(&diff, format))
 }
@@ -2756,7 +2820,7 @@ fn add_update_ref_commands(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<Vec<Re
         return Ok(items.to_vec());
     }
 
-    let store = FileRefStore::new(&ctx.common_git_dir, ctx.format);
+    let store = &ctx.common_refs;
     let mut refs_by_oid = BTreeMap::<ObjectId, Vec<String>>::new();
     for reference in store.list_refs_with_prefix("refs/heads/")? {
         if protected.contains(&reference.name) {
@@ -2818,7 +2882,7 @@ fn write_rebase_update_refs_state(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result
         let _ = fs::remove_file(ctx.state_path("update-refs"));
         return Ok(());
     }
-    let store = FileRefStore::new(&ctx.common_git_dir, ctx.format);
+    let store = &ctx.common_refs;
     let zero = ObjectId::null(ctx.format);
     let mut text = String::new();
     for refname in refs {
@@ -2914,8 +2978,8 @@ fn do_update_refs(ctx: &Ctx, quiet: bool) -> Result<()> {
         return Ok(());
     }
     records.sort_by(|a, b| a.refname.cmp(&b.refname));
-    let mut refs = FileRefStore::new(&ctx.common_git_dir, ctx.format);
-    let committer = committer_identity_for_reflog()?;
+    let refs = &ctx.common_refs;
+    let committer = committer_identity_for_reflog(&ctx.config)?;
     let zero = ObjectId::null(ctx.format);
     let mut updated = Vec::new();
     let mut failed = Vec::new();
@@ -2992,7 +3056,7 @@ fn filter_update_refs(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<()> {
     if records.len() != before_len {
         updated = true;
     }
-    let store = FileRefStore::new(&ctx.common_git_dir, ctx.format);
+    let store = &ctx.common_refs;
     for refname in &todo_refs {
         if !records.iter().any(|rec| rec.refname == *refname) {
             let before = sley_refs::resolve_ref_peeled(&store, refname)?.unwrap_or(zero);
@@ -3385,7 +3449,7 @@ fn checkout_onto_base(
         let _ = err;
         return Err(GitError::Exit(1));
     }
-    let committer = committer_identity_for_reflog()?;
+    let committer = committer_identity_for_reflog(&ctx.config)?;
     detach_head_with_reflog(
         ctx,
         old,
@@ -3397,12 +3461,17 @@ fn checkout_onto_base(
         ctx.git_dir.join("ORIG_HEAD"),
         format!("{}\n", opts.orig_head),
     )?;
-    run_rebase_post_checkout_hook(&old, base)?;
+    run_rebase_post_checkout_hook(ctx, &old, base)?;
     Ok(())
 }
 
-fn run_rebase_post_checkout_hook(old_head: &ObjectId, new_head: &ObjectId) -> Result<()> {
-    commands::hooks::run_hook(
+fn run_rebase_post_checkout_hook(
+    ctx: &Ctx,
+    old_head: &ObjectId,
+    new_head: &ObjectId,
+) -> Result<()> {
+    commands::hooks::run_hook_at(
+        &ctx.git_dir,
         "post-checkout",
         commands::hooks::HookRun {
             args: vec![old_head.to_hex(), new_head.to_hex(), "1".to_string()],
@@ -3629,7 +3698,7 @@ fn do_label(ctx: &Ctx, name: &str) -> Result<()> {
     let head =
         head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("could not read HEAD".into()))?;
     let refname = format!("refs/rewritten/{name}");
-    let committer = committer_identity_for_reflog()?;
+    let committer = committer_identity_for_reflog(&ctx.config)?;
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
         name: refname.clone(),
@@ -3690,7 +3759,7 @@ fn do_reset(ctx: &Ctx, db: &FileObjectDatabase, opts: &MachineOpts, name: &str) 
     reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
     let refs = ctx.refs();
     let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
-    let committer = committer_identity_for_reflog()?;
+    let committer = committer_identity_for_reflog(&ctx.config)?;
     detach_head_with_reflog(ctx, old, target, ctx.reflog("reset", Some(name)), committer)
 }
 
@@ -3748,7 +3817,7 @@ fn do_merge(
         }
         let target = merge_heads[0].1;
         reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
-        let committer = committer_identity_for_reflog()?;
+        let committer = committer_identity_for_reflog(&ctx.config)?;
         detach_head_with_reflog(ctx, head, target, ctx.reflog("merge", None), committer)?;
         return Ok(PickOutcome::Continue);
     }
@@ -3762,7 +3831,7 @@ fn do_merge(
             .eq(merge_heads.iter().map(|(_, oid)| *oid))
     {
         reset_index_and_worktree_to_commit_for_rebase(ctx, &record.oid)?;
-        let committer = committer_identity_for_reflog()?;
+        let committer = committer_identity_for_reflog(&ctx.config)?;
         detach_head_with_reflog(
             ctx,
             head,
@@ -3854,6 +3923,8 @@ fn do_merge(
     let write_db = ctx.db();
     let (results, conflicts) = three_way_merge_trees_with_favor(
         &write_db,
+        &ctx.config,
+        ctx.lazy_fetch,
         ctx.format,
         &base_map,
         &ours_map,
@@ -4008,8 +4079,10 @@ fn pick_one_commit_with_custom_strategy(
     let mut message =
         commit_message_for_commit_encoding(&record.commit, &target_encoding).into_owned();
     if opts.signoff && !is_fixup {
-        message =
-            commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env()?);
+        message = commands::replay::append_signoff_before_comments(
+            message,
+            &commit_signoff_from_env(&ctx.config)?,
+        );
     }
     if is_fixup {
         update_squash_messages(ctx, db, item, record)?;
@@ -4288,10 +4361,10 @@ fn create_merge_commit_from_index(
             Some(record) => {
                 commit_author_for_commit_encoding(&record.commit, &target_encoding).into_owned()
             }
-            None => commit_identity_from_env("AUTHOR")?,
+            None => commit_identity_from_env("AUTHOR", &ctx.config)?,
         },
     };
-    let (author, committer) = rebase_commit_identities(opts, author)?;
+    let (author, committer) = rebase_commit_identities(opts, author, &ctx.config)?;
     let encoding = commit_encoding_header_from_config(&ctx.git_dir);
     let mut writer = ctx.db();
     let new_oid = sley_sequencer::create_commit(
@@ -4317,7 +4390,11 @@ fn create_merge_commit_from_index(
     let _ = fs::remove_file(ctx.git_dir.join("MERGE_HEAD"));
     let _ = fs::remove_file(ctx.git_dir.join("MERGE_MODE"));
     let _ = fs::remove_file(ctx.git_dir.join("MERGE_MSG"));
-    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
+    commands::hooks::run_hook_at(
+        &ctx.git_dir,
+        "post-commit",
+        commands::hooks::HookRun::default(),
+    )?;
     Ok(())
 }
 
@@ -4353,6 +4430,8 @@ fn do_octopus_merge_commit(
         let write_db = ctx.db();
         let (results, conflicts) = three_way_merge_trees(
             &write_db,
+            &ctx.config,
+            ctx.lazy_fetch,
             ctx.format,
             &base_map,
             &ours_map,
@@ -4437,7 +4516,7 @@ fn pick_one_commit(
             return Ok(PickOutcome::Fail(1));
         }
         reset_index_and_worktree_to_commit_for_rebase(ctx, &oid)?;
-        let committer = committer_identity_for_reflog()?;
+        let committer = committer_identity_for_reflog(&ctx.config)?;
         detach_head_with_reflog(
             ctx,
             head,
@@ -4541,13 +4620,14 @@ fn pick_one_commit(
         &theirs_label,
         &ancestor_label,
         merge_favor_from_strategy_opts(&opts.strategy_opts),
-        rebase_merge_conflict_style(),
+        rebase_merge_conflict_style(&ctx.config),
         rebase_ws_ignore_from_strategy_opts(&opts.strategy_opts),
         RenameMergeConfig {
             detect_renames: true,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            rename_limit: merge_rename_limit_config(),
-            directory_renames: directory_renames_config(),
+            rename_limit: merge_rename_limit_config(&ctx.config),
+            directory_renames: directory_renames_config(&ctx.config),
+            lazy_fetch: ctx.lazy_fetch,
         },
         None,
     )?;
@@ -4556,8 +4636,10 @@ fn pick_one_commit(
     let mut message =
         commit_message_for_commit_encoding(&record.commit, &target_encoding).into_owned();
     if opts.signoff && !is_fixup {
-        message =
-            commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env()?);
+        message = commands::replay::append_signoff_before_comments(
+            message,
+            &commit_signoff_from_env(&ctx.config)?,
+        );
     }
     if is_fixup {
         update_squash_messages(ctx, db, item, &record)?;
@@ -4899,7 +4981,7 @@ fn apply_merge_results(
                     let content = if sley_index::is_gitlink(*mode) {
                         Vec::new()
                     } else {
-                        merge_read_blob(db, oid)?
+                        merge_read_blob(db, oid, ctx.lazy_fetch)?
                     };
                     merge_write_worktree_file(&ctx.worktree_root, path, &content, *mode)?;
                 }
@@ -5005,8 +5087,14 @@ fn stop_with_patch(
         Some(parent) => commit_tree_oid(db, ctx.format, parent)?,
         None => ObjectId::empty_tree(ctx.format),
     };
-    let patch = render_tree_to_tree_patch(db, ctx.format, &parent_tree, &record.commit.tree)
-        .unwrap_or_default();
+    let patch = render_tree_to_tree_patch(
+        db,
+        ctx.format,
+        &parent_tree,
+        &record.commit.tree,
+        ctx.lazy_fetch,
+    )
+    .unwrap_or_default();
     fs::write(ctx.state_path("patch"), patch)?;
 
     if to_amend {
@@ -5467,6 +5555,7 @@ fn machine_commit(
         commands::commit::PrepareCommitMsgSource::Message
     };
     commands::commit::run_prepare_commit_msg_hook(
+        &ctx.git_dir,
         &editmsg,
         prepare_source,
         Vec::new(),
@@ -5475,7 +5564,7 @@ fn machine_commit(
     if commit.edit {
         launch_editor(&ctx.git_dir, &editmsg)?;
         let path_arg = editmsg.to_string_lossy().into_owned();
-        commands::hooks::run_hook_l("commit-msg", &[path_arg.as_str()])?;
+        commands::hooks::run_hook_l_at(&ctx.git_dir, "commit-msg", &[path_arg.as_str()])?;
         message = fs::read(&editmsg)?;
     } else {
         message = fs::read(&editmsg)?;
@@ -5510,7 +5599,7 @@ fn machine_commit(
                 Some(record) => {
                     commit_author_for_commit_encoding(&record.commit, &target_encoding).into_owned()
                 }
-                None => commit_identity_from_env("AUTHOR")?,
+                None => commit_identity_from_env("AUTHOR", &ctx.config)?,
             },
         };
         (Vec::new(), author)
@@ -5524,7 +5613,7 @@ fn machine_commit(
                 Some(record) => {
                     commit_author_for_commit_encoding(&record.commit, &target_encoding).into_owned()
                 }
-                None => commit_identity_from_env("AUTHOR")?,
+                None => commit_identity_from_env("AUTHOR", &ctx.config)?,
             },
         };
         (vec![head], author)
@@ -5543,7 +5632,7 @@ fn machine_commit(
     // committer date is then either "now" (`ignore_date`), the author's date
     // (`committer_date_is_author_date` without `ignore_date`), or the
     // environment's committer date.
-    let (author, committer) = rebase_commit_identities(opts, author)?;
+    let (author, committer) = rebase_commit_identities(opts, author, &ctx.config)?;
     let encoding = commit_encoding_header_from_config(&ctx.git_dir);
     let signature = rebase_commit_signature(
         ctx,
@@ -5585,18 +5674,26 @@ fn machine_commit(
     let _ = fs::remove_file(ctx.git_dir.join("CHERRY_PICK_HEAD"));
     let _ = fs::remove_file(ctx.git_dir.join("MERGE_MSG"));
     let _ = fs::remove_file(ctx.git_dir.join("AUTO_MERGE"));
-    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
+    commands::hooks::run_hook_at(
+        &ctx.git_dir,
+        "post-commit",
+        commands::hooks::HookRun::default(),
+    )?;
 
     if let Some(old_tree) = old_tree_for_summary {
         print_branch_commit_summary(db, &ctx.git_dir, ctx.format, &new_oid, &message)?;
-        print_commit_shortstat_between_trees(db, ctx.format, &old_tree, &tree)?;
+        print_commit_shortstat_between_trees(db, ctx.format, &old_tree, &tree, ctx.lazy_fetch)?;
     }
 
     let _ = opts;
     Ok(CommitOutcome::Committed)
 }
 
-fn rebase_commit_identities(opts: &MachineOpts, author: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>)> {
+fn rebase_commit_identities(
+    opts: &MachineOpts,
+    author: Vec<u8>,
+    config: &GitConfig,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let now = opts.ignore_date.then(rebase_now_date);
     let author = match &now {
         Some(now) => reset_identity_date(&author, now),
@@ -5604,13 +5701,13 @@ fn rebase_commit_identities(opts: &MachineOpts, author: Vec<u8>) -> Result<(Vec<
     };
     let committer = match (opts.committer_date_is_author_date, now.as_deref()) {
         (true, Some(now)) | (false, Some(now)) => {
-            reset_identity_date(&commit_identity_from_env("COMMITTER")?, now)
+            reset_identity_date(&commit_identity_from_env("COMMITTER", config)?, now)
         }
         (true, None) => {
             let author_date = identity_date(&author).unwrap_or_else(rebase_now_date);
-            commit_identity_from_env_with_date("COMMITTER", &author_date)?
+            commit_identity_from_env_with_date("COMMITTER", &author_date, config)?
         }
-        (false, None) => commit_identity_from_env("COMMITTER")?,
+        (false, None) => commit_identity_from_env("COMMITTER", config)?,
     };
     Ok((author, committer))
 }
@@ -5689,7 +5786,7 @@ fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
         head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     let head_name_display;
     if let Some(head_name) = &opts.head_name {
-        let committer = committer_identity_for_reflog()?;
+        let committer = committer_identity_for_reflog(&ctx.config)?;
         let mut tx = refs.transaction();
         let branch_already_at_head = matches!(refs.read_ref(head_name)?, Some(RefTarget::Direct(current)) if current == head);
         if !branch_already_at_head {
@@ -5727,7 +5824,15 @@ fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
         let old_tree = commit_tree_oid(&db, ctx.format, &opts.orig_head)?;
         let new_tree = commit_tree_oid(&db, ctx.format, &head)?;
         // Finish (orig-head..HEAD) diffstat: DIFFSTAT only, no summary lines.
-        print_rebase_diffstat(&db, ctx.format, &old_tree, &new_tree, false)?;
+        print_rebase_diffstat(
+            &db,
+            ctx.format,
+            &old_tree,
+            &new_tree,
+            &ctx.config,
+            ctx.lazy_fetch,
+            false,
+        )?;
     }
 
     run_post_rewrite_hook(ctx)?;
@@ -5805,7 +5910,8 @@ fn run_post_rewrite_hook(ctx: &Ctx) -> Result<()> {
     if let Err(err) = copy_notes_for_rewrite(ctx, &pairs) {
         eprintln!("warning: failed to copy notes: {err}");
     }
-    let _ = commands::hooks::run_hook(
+    let _ = commands::hooks::run_hook_at(
+        &ctx.git_dir,
         "post-rewrite",
         commands::hooks::HookRun {
             args: vec!["rebase".to_string()],
@@ -5854,9 +5960,7 @@ fn copy_notes_for_rewrite(ctx: &Ctx, rewritten: &[(ObjectId, ObjectId)]) -> Resu
     if rewritten.is_empty() {
         return Ok(());
     }
-    let Ok(config) = read_repo_config(&ctx.git_dir) else {
-        return Ok(());
-    };
+    let config = &ctx.config;
     // notes.rewrite.rebase defaults to true; an explicit false disables copying.
     if config.get_bool("notes", Some("rewrite"), "rebase") == Some(false) {
         return Ok(());
@@ -5887,8 +5991,8 @@ fn copy_notes_for_rewrite(ctx: &Ctx, rewritten: &[(ObjectId, ObjectId)]) -> Resu
     }
     let store = ctx.refs();
     let identity = sley_notes::NotesCommitIdentity {
-        author: commit_identity_from_env("AUTHOR")?,
-        committer: commit_identity_from_env("COMMITTER")?,
+        author: commit_identity_from_env("AUTHOR", &ctx.config)?,
+        committer: commit_identity_from_env("COMMITTER", &ctx.config)?,
     };
     for reference in store.list_refs()? {
         if !reference.name.starts_with("refs/notes/")
@@ -6194,7 +6298,7 @@ fn rebase_abort(ctx: &Ctx) -> Result<()> {
     let target = sley_rev::peel_to_commit(&db, ctx.format, &opts.orig_head)?;
     reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
     let refs = ctx.refs();
-    let committer = committer_identity_for_reflog()?;
+    let committer = committer_identity_for_reflog(&ctx.config)?;
     let old_head = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
     let returning_to = match &opts.head_name {
         Some(head_name) => head_name.clone(),
@@ -6419,7 +6523,8 @@ fn apply_save_autostash_text(ctx: &Ctx, text: &str, attempt_apply: bool) {
         return;
     };
     let applied = attempt_apply
-        && commands::stash::apply_stash_commit_quietly_at(&ctx.git_dir, &oid).unwrap_or(false);
+        && commands::stash::apply_stash_commit_quietly_at(&ctx.git_dir, &oid, ctx.lazy_fetch)
+            .unwrap_or(false);
     if applied {
         eprintln!("Applied autostash.");
         return;

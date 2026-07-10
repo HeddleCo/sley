@@ -168,7 +168,13 @@ pub(crate) fn cmd_fast_export(
         ));
     }
 
-    validate_fast_export_tag_refs(&db, &store, format, &list_all_tag_refs(&store)?)?;
+    validate_fast_export_tag_refs(
+        &db,
+        &store,
+        format,
+        cli_session.replace_objects(),
+        &list_all_tag_refs(&store)?,
+    )?;
 
     let mut imported_commit_marks = HashMap::new();
     let mut import_mark_start = 0u64;
@@ -195,6 +201,7 @@ pub(crate) fn cmd_fast_export(
         default_ref_name: None,
         initialized_refs: HashSet::new(),
         path_limited: !setup.pathspecs.is_empty(),
+        pathspec_magic: effective_pathspec_flags(cli_session),
         pending_refs: Vec::new(),
         nested_tag_refs: Vec::new(),
         progress_counter: 0,
@@ -252,6 +259,7 @@ struct FastExporter {
     default_ref_name: Option<String>,
     initialized_refs: HashSet<String>,
     path_limited: bool,
+    pathspec_magic: sley_worktree::PathspecMatchMagic,
     pending_refs: Vec<PendingRef>,
     nested_tag_refs: Vec<(String, ObjectId)>,
     progress_counter: usize,
@@ -406,7 +414,7 @@ impl FastExporter {
                 cwd,
                 worktree_root.as_deref(),
                 pathspecs,
-                effective_pathspec_flags(),
+                self.pathspec_magic,
             )?;
             let simplify = SimplifyOptions {
                 full_history: revision_options.full_history,
@@ -1307,6 +1315,7 @@ fn validate_fast_export_tag_refs(
     db: &FileObjectDatabase,
     store: &FileRefStore,
     format: ObjectFormat,
+    replace_objects: bool,
     refs: &[Ref],
 ) -> Result<()> {
     let mut severity = sley_fsck::content::SeverityConfig::new(true);
@@ -1325,7 +1334,7 @@ fn validate_fast_export_tag_refs(
             sley_fsck::content::check_object_content(ObjectType::Tag, &object.body, &severity);
         if findings.is_empty() {
             let tag = Tag::parse_ref(format, &object.body)?;
-            let read_oid = apply_replace_object(store, &tag.object)?;
+            let read_oid = apply_replace_object(replace_objects, store, &tag.object)?;
             let target = match db.read_object(&read_oid) {
                 Ok(target) => target,
                 Err(_) => {

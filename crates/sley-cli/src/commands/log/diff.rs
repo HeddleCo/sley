@@ -195,6 +195,7 @@ pub(super) struct LogDiffContext<'a> {
     pub(super) pickaxe_ignore_case: bool,
     pub(super) pickaxe_text: bool,
     pub(super) pickaxe_all: bool,
+    pub(super) lazy_fetch: bool,
 }
 
 impl LogDiffContext<'_> {
@@ -348,7 +349,7 @@ impl LogDiffContext<'_> {
 
         let opts = self.opts;
         let stat_entries = if opts.numstat || opts.stat || opts.compact_summary || opts.shortstat {
-            collect_diff_stat_entries(&entries, self.db, None, false)?
+            collect_diff_stat_entries(&entries, self.db, None, false, self.lazy_fetch)?
         } else {
             Vec::new()
         };
@@ -422,6 +423,7 @@ impl LogDiffContext<'_> {
                         anchors: &[],
                         allow_textconv: true,
                         db: self.db,
+                        lazy_fetch: self.lazy_fetch,
                         worktree_root: None,
                         use_worktree_new: false,
                         format: self.format,
@@ -531,7 +533,7 @@ impl LogDiffContext<'_> {
             }
         }
         let stat_entries = if opts.numstat || opts.stat || opts.compact_summary || opts.shortstat {
-            collect_diff_stat_entries(&first_parent_entries, self.db, None, false)?
+            collect_diff_stat_entries(&first_parent_entries, self.db, None, false, self.lazy_fetch)?
         } else {
             Vec::new()
         };
@@ -590,6 +592,7 @@ impl LogDiffContext<'_> {
             dst_prefix: "b/",
             patch_abbrev: self.patch_abbrev,
             raw_abbrev: self.raw_abbrev,
+            lazy_fetch: self.lazy_fetch,
         }
     }
 

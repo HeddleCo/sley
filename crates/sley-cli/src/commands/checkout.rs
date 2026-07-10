@@ -309,6 +309,7 @@ pub(crate) fn cmd_checkout(
     let db = context.objects();
     if patch {
         return checkout_run_patch(
+            cli_session,
             &git_dir,
             format,
             &positional,
@@ -518,8 +519,8 @@ pub(crate) fn cmd_checkout(
                     }
                 }
             }
-            commands::hooks::run_post_index_change_hook(false, false)?;
-            run_post_checkout_hook(&checkout_old_head, &checkout_old_head, false)?;
+            commands::hooks::run_post_index_change_hook(cli_session, false, false)?;
+            run_post_checkout_hook(cli_session, &checkout_old_head, &checkout_old_head, false)?;
             return Ok(());
         }
     }
@@ -637,14 +638,14 @@ pub(crate) fn cmd_checkout(
             let message = format!("checkout: moving from {from} to {target}").into_bytes();
             if recurse_submodules {
                 checkout_twoway_dirty(&context, Some(&target_oid), recurse_submodules, force)?;
-                detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
+                detach_head_with_reflog(&git_dir, format, &target_oid, message, checkout_config)?;
             } else {
                 match sley_worktree::checkout_detached_filtered(
                     &worktree_root,
                     &git_dir,
                     format,
                     &target_oid,
-                    committer_identity_for_reflog()?,
+                    committer_identity_for_reflog(config)?,
                     message.clone(),
                     config,
                 ) {
@@ -656,12 +657,18 @@ pub(crate) fn cmd_checkout(
                             recurse_submodules,
                             force,
                         )?;
-                        detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
+                        detach_head_with_reflog(
+                            &git_dir,
+                            format,
+                            &target_oid,
+                            message,
+                            checkout_config,
+                        )?;
                     }
                     Err(err) => return Err(err),
                 }
             }
-            commands::hooks::run_post_index_change_hook(true, false)?;
+            commands::hooks::run_post_index_change_hook(cli_session, true, false)?;
             sley_sequencer::replay::remove_branch_state(&git_dir);
             if !quiet {
                 checkout_print_previous_detached_head(
@@ -678,8 +685,9 @@ pub(crate) fn cmd_checkout(
                     subject
                 );
             }
-            run_post_checkout_hook(&checkout_old_head, &target_oid, true)?;
+            run_post_checkout_hook(cli_session, &checkout_old_head, &target_oid, true)?;
             commands::hooks::run_hook(
+                cli_session,
                 "reference-transaction",
                 commands::hooks::HookRun::default(),
             )?;
@@ -762,14 +770,20 @@ pub(crate) fn cmd_checkout(
                 let message = format!("checkout: moving from {from} to {branch}").into_bytes();
                 if recurse_submodules {
                     checkout_twoway_dirty(&context, Some(&target_oid), recurse_submodules, force)?;
-                    detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
+                    detach_head_with_reflog(
+                        &git_dir,
+                        format,
+                        &target_oid,
+                        message,
+                        checkout_config,
+                    )?;
                 } else {
                     match sley_worktree::checkout_detached_filtered(
                         &worktree_root,
                         &git_dir,
                         format,
                         &target_oid,
-                        committer_identity_for_reflog()?,
+                        committer_identity_for_reflog(checkout_config)?,
                         message.clone(),
                         config,
                     ) {
@@ -781,7 +795,13 @@ pub(crate) fn cmd_checkout(
                                 recurse_submodules,
                                 force,
                             )?;
-                            detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
+                            detach_head_with_reflog(
+                                &git_dir,
+                                format,
+                                &target_oid,
+                                message,
+                                checkout_config,
+                            )?;
                         }
                         Err(err) => return Err(err),
                     }
@@ -806,9 +826,10 @@ pub(crate) fn cmd_checkout(
                         subject
                     );
                 }
-                commands::hooks::run_post_index_change_hook(true, false)?;
-                run_post_checkout_hook(&checkout_old_head, &target_oid, true)?;
+                commands::hooks::run_post_index_change_hook(cli_session, true, false)?;
+                run_post_checkout_hook(cli_session, &checkout_old_head, &target_oid, true)?;
                 commands::hooks::run_hook(
+                    cli_session,
                     "reference-transaction",
                     commands::hooks::HookRun::default(),
                 )?;
@@ -837,7 +858,7 @@ pub(crate) fn cmd_checkout(
                         &dwim.remote_ref,
                         false,
                         create_reflog,
-                        committer_identity_for_reflog()?,
+                        committer_identity_for_reflog(checkout_config)?,
                     )?;
                     let tracking_start = Some(dwim.remote_ref);
                     crate::commands::branch::branch_create_set_tracking(
@@ -945,7 +966,7 @@ pub(crate) fn cmd_checkout(
                 start,
                 force,
                 create_reflog,
-                committer_identity_for_reflog()?,
+                committer_identity_for_reflog(checkout_config)?,
             )?;
             let tracking_start = positional.first().map(|start| {
                 if start.contains("@{") {
@@ -1056,7 +1077,8 @@ pub(crate) fn cmd_checkout(
             checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
             return Err(err);
         }
-        if let Err(err) = switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from)
+        if let Err(err) =
+            switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from, &config)
         {
             checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
             return Err(err);
@@ -1074,7 +1096,8 @@ pub(crate) fn cmd_checkout(
             checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
             return Err(err);
         }
-        if let Err(err) = switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from)
+        if let Err(err) =
+            switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from, &config)
         {
             checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
             return Err(err);
@@ -1085,7 +1108,7 @@ pub(crate) fn cmd_checkout(
             git_dir.clone(),
             format,
             branch,
-            committer_identity_for_reflog()?,
+            committer_identity_for_reflog(&config)?,
             &config,
         ) {
             Ok(_) => {}
@@ -1099,9 +1122,9 @@ pub(crate) fn cmd_checkout(
                     checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
                     return Err(err);
                 }
-                if let Err(err) =
-                    switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from)
-                {
+                if let Err(err) = switch_head_symbolic_with_reflog(
+                    &git_dir, format, branch, &target, &from, &config,
+                ) {
                     checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
                     return Err(err);
                 }
@@ -1118,12 +1141,17 @@ pub(crate) fn cmd_checkout(
         format,
         &branch_target,
         format!("checkout: moving from {checkout_reflog_from} to {branch}").into_bytes(),
+        &config,
     )?;
     sley_sequencer::replay::remove_branch_state(&git_dir);
     let checkout_new_head = resolve_ref_peeled(store, "HEAD")?.unwrap_or(checkout_old_head);
-    commands::hooks::run_post_index_change_hook(true, false)?;
-    run_post_checkout_hook(&checkout_old_head, &checkout_new_head, true)?;
-    commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
+    commands::hooks::run_post_index_change_hook(cli_session, true, false)?;
+    run_post_checkout_hook(cli_session, &checkout_old_head, &checkout_new_head, true)?;
+    commands::hooks::run_hook(
+        cli_session,
+        "reference-transaction",
+        commands::hooks::HookRun::default(),
+    )?;
     if !quiet {
         checkout_print_previous_detached_head(
             &git_dir,
@@ -1145,6 +1173,7 @@ pub(crate) fn cmd_checkout(
 }
 
 fn run_post_checkout_hook(
+    cli_session: &crate::session::CliSession,
     old_head: &ObjectId,
     new_head: &ObjectId,
     branch_checkout: bool,
@@ -1152,6 +1181,7 @@ fn run_post_checkout_hook(
     let old = old_head.to_hex();
     let new = new_head.to_hex();
     commands::hooks::run_hook_l(
+        cli_session,
         "post-checkout",
         &[
             old.as_str(),
@@ -1960,6 +1990,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
     if patch {
         let context = CheckoutContext::open(cli_session)?;
         return restore_run_patch(
+            cli_session,
             &context.git_dir,
             context.format,
             &paths,
@@ -2320,11 +2351,19 @@ fn checkout_merge_autostash_branch_switch(
     // does not nuke untracked file"). Restore the stashed changes to the worktree
     // and propagate the error, leaving HEAD and the untracked file untouched.
     if let Err(err) = checkout_twoway_dirty(context, Some(target), recurse_submodules, false) {
-        let _ = commands::stash::apply_stash_commit_quietly_at(git_dir, &stash_oid);
+        let _ = commands::stash::apply_stash_commit_quietly_at(
+            git_dir,
+            &stash_oid,
+            cli_session.lazy_fetch(),
+        );
         return Err(err);
     }
-    let applied =
-        commands::stash::apply_stash_commit_quietly_at(git_dir, &stash_oid).unwrap_or(false);
+    let applied = commands::stash::apply_stash_commit_quietly_at(
+        git_dir,
+        &stash_oid,
+        cli_session.lazy_fetch(),
+    )
+    .unwrap_or(false);
     if applied {
         if !quiet {
             eprintln!("Applied autostash.");
@@ -2399,6 +2438,7 @@ fn detach_head_with_reflog(
     format: ObjectFormat,
     target: &ObjectId,
     message: Vec<u8>,
+    config: &GitConfig,
 ) -> Result<()> {
     let refs = FileRefStore::new(git_dir, format);
     let mut tx = refs.transaction();
@@ -2409,7 +2449,7 @@ fn detach_head_with_reflog(
         reflog: Some(ReflogEntry {
             old_oid: ObjectId::null(format),
             new_oid: *target,
-            committer: committer_identity_for_reflog()?,
+            committer: committer_identity_for_reflog(config)?,
             message,
         }),
     });
@@ -2422,6 +2462,7 @@ fn switch_head_symbolic_with_reflog(
     branch: &str,
     target: &ObjectId,
     from: &str,
+    config: &GitConfig,
 ) -> Result<()> {
     let refs = FileRefStore::new(git_dir, format);
     let mut tx = refs.transaction();
@@ -2433,12 +2474,12 @@ fn switch_head_symbolic_with_reflog(
         reflog: Some(ReflogEntry {
             old_oid: *target,
             new_oid: *target,
-            committer: committer_identity_for_reflog()?,
+            committer: committer_identity_for_reflog(config)?,
             message: message.clone(),
         }),
     });
     tx.commit()?;
-    ensure_head_checkout_reflog_entry(&refs, format, target, message)
+    ensure_head_checkout_reflog_entry(&refs, format, target, message, config)
 }
 
 fn ensure_head_checkout_reflog_entry(
@@ -2446,6 +2487,7 @@ fn ensure_head_checkout_reflog_entry(
     format: ObjectFormat,
     target: &ObjectId,
     message: Vec<u8>,
+    config: &GitConfig,
 ) -> Result<()> {
     if let Ok(entries) = refs.read_reflog("HEAD")
         && entries
@@ -2459,7 +2501,7 @@ fn ensure_head_checkout_reflog_entry(
         &ReflogEntry {
             old_oid: *target,
             new_oid: *target,
-            committer: committer_identity_for_reflog()?,
+            committer: committer_identity_for_reflog(config)?,
             message,
         },
     )
@@ -2550,6 +2592,7 @@ fn checkout_patch_arg_is_revision(git_dir: &Path, format: ObjectFormat, arg: &st
 /// `git checkout -p [<tree-ish>] [--] [<pathspec>...]`: pick the patch mode from
 /// the tree-ish (none / HEAD / other) and run the shared interactive engine.
 fn checkout_run_patch(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     format: ObjectFormat,
     positional: &[String],
@@ -2594,8 +2637,8 @@ fn checkout_run_patch(
         ),
     };
 
-    let cfg = commands::add_interactive::resolve_patch_config(
-        git_dir,
+    let cfg = commands::add_interactive::resolve_patch_config_for_session(
+        cli_session,
         context,
         interhunk,
         !no_auto_advance,
@@ -2610,6 +2653,7 @@ fn checkout_run_patch(
 /// shared interactive engine. Default restore (worktree only) discards from the
 /// working tree; `--staged --worktree` touches both like `checkout -p`.
 fn restore_run_patch(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     format: ObjectFormat,
     paths: &[PathBuf],
@@ -2652,7 +2696,12 @@ fn restore_run_patch(
             }
         }
     };
-    let cfg = commands::add_interactive::resolve_patch_config(git_dir, context, interhunk, true)?;
+    let cfg = commands::add_interactive::resolve_patch_config_for_session(
+        cli_session,
+        context,
+        interhunk,
+        true,
+    )?;
     let stdin = io::stdin();
     let mut handle = stdin.lock();
     commands::add_patch::run_add_patch(mode, &pathspecs, revision.as_deref(), &mut handle, cfg)

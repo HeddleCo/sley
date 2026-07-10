@@ -24,6 +24,7 @@ pub(crate) fn cmd_difftool(
     args: &[String],
 ) -> Result<()> {
     let options = parse_difftool_args(args)?;
+    let lazy_fetch = cli_session.lazy_fetch();
     if options.extcmd.is_some() && (options.cli_tool.is_some() || options.gui == Some(true)) {
         return Err(GitError::Command(
             "difftool --gui, --tool and --extcmd are mutually exclusive".into(),
@@ -57,14 +58,19 @@ pub(crate) fn cmd_difftool(
     let tool = resolve_difftool_tool(config, &options, gui)?;
     let prompt = should_prompt(config, &options);
     if options.dir_diff {
-        return run_dir_difftool(&repo, &options, &tool, &diffs);
+        return run_dir_difftool(&repo, &options, &tool, &diffs, lazy_fetch);
     }
 
     let temp = TempDir::new("sley-difftool")?;
     let total = diffs.len();
     for (idx, entry) in diffs.iter().enumerate() {
-        let materialized =
-            materialize_difftool_entry(repo.objects(), worktree_root, entry, &temp.path)?;
+        let materialized = materialize_difftool_entry(
+            repo.objects(),
+            worktree_root,
+            entry,
+            &temp.path,
+            lazy_fetch,
+        )?;
         if prompt {
             let path = String::from_utf8_lossy(&entry.path);
             println!();
@@ -207,7 +213,7 @@ fn collect_difftool_entries(
     let pathspec = if paths.is_empty() {
         DiffPathspec::default()
     } else {
-        DiffPathspec::new(cwd, worktree_root, &paths)?
+        DiffPathspec::new(cwd, worktree_root, &paths, repo.pathspec_magic())?
     };
     let base_options = sley_diff_merge::DiffNameStatusOptions::default();
     let mut entries = match (options.cached, revs.as_slice()) {
@@ -305,13 +311,14 @@ fn materialize_difftool_entry(
     worktree_root: &Path,
     entry: &sley_diff_merge::NameStatusEntry,
     temp: &Path,
+    lazy_fetch: bool,
 ) -> Result<ToolEnvironment> {
     let rel = repo_path_to_path(&entry.path);
     let local = temp.join("left").join(&rel);
     let remote = temp.join("right").join(&rel);
     write_materialized(
         &local,
-        diff_entry_old_content(entry, db)?.as_deref(),
+        diff_entry_old_content(entry, db, lazy_fetch)?.as_deref(),
         entry.old_mode,
     )?;
     write_materialized(
@@ -322,6 +329,7 @@ fn materialize_difftool_entry(
             Some(worktree_root),
             entry.new_oid.is_none(),
             None,
+            lazy_fetch,
         )?
         .as_deref(),
         entry.new_mode,
@@ -380,6 +388,7 @@ fn run_dir_difftool(
     options: &DifftoolOptions,
     tool: &ToolCommand,
     entries: &[sley_diff_merge::NameStatusEntry],
+    lazy_fetch: bool,
 ) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
@@ -394,18 +403,18 @@ fn run_dir_difftool(
         let rel = repo_path_to_path(&entry.path);
         write_dir_materialized(
             &left.join(&rel),
-            diff_entry_old_content(entry, repo.objects())?.as_deref(),
+            diff_entry_old_content(entry, repo.objects(), lazy_fetch)?.as_deref(),
             entry.old_mode,
         )?;
         let right_path = right.join(&rel);
         let mut right_was_symlink = false;
-        if options.symlinks && can_symlink_right_side(repo, entry)? {
+        if options.symlinks && can_symlink_right_side(repo, entry, lazy_fetch)? {
             symlink_worktree_file(repo.worktree_root()?.join(&rel), &right_path)?;
             right_was_symlink = true;
         } else {
             write_dir_materialized(
                 &right_path,
-                dir_diff_new_content(repo, entry)?.as_deref(),
+                dir_diff_new_content(repo, entry, lazy_fetch)?.as_deref(),
                 entry.new_mode,
             )?;
         }
@@ -497,6 +506,7 @@ fn write_dir_materialized(path: &Path, content: Option<&[u8]>, mode: Option<u32>
 fn dir_diff_new_content(
     repo: &RepositoryContext,
     entry: &sley_diff_merge::NameStatusEntry,
+    lazy_fetch: bool,
 ) -> Result<Option<Vec<u8>>> {
     if entry.new_mode == Some(0o120000) && entry.new_oid.is_none() {
         let path = repo.worktree_root()?.join(repo_path_to_path(&entry.path));
@@ -510,12 +520,14 @@ fn dir_diff_new_content(
         Some(repo.worktree_root()?),
         entry.new_oid.is_none(),
         None,
+        lazy_fetch,
     )
 }
 
 fn can_symlink_right_side(
     repo: &RepositoryContext,
     entry: &sley_diff_merge::NameStatusEntry,
+    lazy_fetch: bool,
 ) -> Result<bool> {
     if !is_regular_file_mode(entry.new_mode) {
         return Ok(false);
@@ -530,7 +542,7 @@ fn can_symlink_right_side(
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Ok(false);
     }
-    Ok(read_blob(repo.objects(), oid)? == fs::read(worktree_path)?)
+    Ok(read_blob(repo.objects(), oid, lazy_fetch)? == fs::read(worktree_path)?)
 }
 
 fn is_regular_file_mode(mode: Option<u32>) -> bool {

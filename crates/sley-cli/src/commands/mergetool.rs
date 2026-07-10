@@ -26,6 +26,7 @@ pub(crate) fn cmd_mergetool(
     args: &[String],
 ) -> Result<()> {
     let options = parse_mergetool_args(args)?;
+    let lazy_fetch = cli_session.lazy_fetch();
     let repo = RepositoryContext::from_session(cli_session)?;
     let config = repo.config();
     let gui = options
@@ -52,7 +53,7 @@ pub(crate) fn cmd_mergetool(
 
     let mut failed = false;
     for conflict in conflicts {
-        if !run_one_mergetool_path(&repo, config, &options, &tool, &conflict)? {
+        if !run_one_mergetool_path(&repo, config, &options, &tool, &conflict, lazy_fetch)? {
             failed = true;
         }
     }
@@ -214,6 +215,7 @@ fn run_one_mergetool_path(
     options: &MergetoolOptions,
     tool: &ToolCommand,
     conflict: &UnmergedPath,
+    lazy_fetch: bool,
 ) -> Result<bool> {
     let worktree_root = repo.worktree_root()?;
     let merged = worktree_root.join(repo_path_to_path(&conflict.path));
@@ -224,7 +226,7 @@ fn run_one_mergetool_path(
         return resolve_gitlink_conflict(repo, conflict, &merged);
     }
 
-    let materialized = materialize_mergetool_files(repo, config, conflict, &merged)?;
+    let materialized = materialize_mergetool_files(repo, config, conflict, &merged, lazy_fetch)?;
     if should_prompt(config, options) {
         print!(
             "Hit return to start merge resolution tool ({}) for '{}': ",
@@ -252,6 +254,7 @@ fn materialize_mergetool_files(
     config: &GitConfig,
     conflict: &UnmergedPath,
     merged: &Path,
+    lazy_fetch: bool,
 ) -> Result<ToolEnvironment> {
     let write_to_temp = config
         .get_bool("mergetool", None, "writetotemp")
@@ -275,9 +278,27 @@ fn materialize_mergetool_files(
     let local = parent.join(format!("{stem}_LOCAL_{}", std::process::id()));
     let remote = parent.join(format!("{stem}_REMOTE_{}", std::process::id()));
     let base = parent.join(format!("{stem}_BASE_{}", std::process::id()));
-    write_stage_file(config, repo.objects(), conflict.local.as_ref(), &local)?;
-    write_stage_file(config, repo.objects(), conflict.remote.as_ref(), &remote)?;
-    write_stage_file(config, repo.objects(), conflict.base.as_ref(), &base)?;
+    write_stage_file(
+        config,
+        repo.objects(),
+        conflict.local.as_ref(),
+        &local,
+        lazy_fetch,
+    )?;
+    write_stage_file(
+        config,
+        repo.objects(),
+        conflict.remote.as_ref(),
+        &remote,
+        lazy_fetch,
+    )?;
+    write_stage_file(
+        config,
+        repo.objects(),
+        conflict.base.as_ref(),
+        &base,
+        lazy_fetch,
+    )?;
     let local = display_mergetool_temp_path(&local, repo.worktree_root()?, write_to_temp);
     let remote = display_mergetool_temp_path(&remote, repo.worktree_root()?, write_to_temp);
     let base = display_mergetool_temp_path(&base, repo.worktree_root()?, write_to_temp);
@@ -294,10 +315,11 @@ fn write_stage_file(
     db: &FileObjectDatabase,
     entry: Option<&IndexEntry>,
     path: &Path,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let mut content = match entry {
         Some(entry) if entry.mode == 0o160000 => entry.oid.to_string().into_bytes(),
-        Some(entry) => read_blob(db, &entry.oid)?,
+        Some(entry) => read_blob(db, &entry.oid, lazy_fetch)?,
         None => Vec::new(),
     };
     if entry.is_some_and(|entry| entry.mode & sley_index::GIT_MODE_TYPE_MASK == 0o100000)

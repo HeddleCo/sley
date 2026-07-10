@@ -53,7 +53,7 @@ pub(crate) fn cmd_branch(cli_session: &crate::session::CliSession, args: &[Strin
         return print_branch_list(store, BranchListMode::Local);
     }
     if let Some(move_options) = setup_branch_move_options(args)? {
-        return run_branch_move_options(git_dir, store, move_options);
+        return run_branch_move_options(git_dir, store, &context.config, move_options);
     }
     if let Some(upstream) = setup_branch_upstream_options(args)? {
         return run_branch_upstream_options(git_dir, store, upstream);
@@ -84,7 +84,7 @@ pub(crate) fn cmd_branch(cli_session: &crate::session::CliSession, args: &[Strin
         };
     }
     if let Some(create) = setup_branch_create_options(args)? {
-        return run_branch_create_options(git_dir, format, store, create);
+        return run_branch_create_options(git_dir, format, store, &context.config, create);
     }
     if let Some(list) = setup_branch_general_list_options(git_dir, args)? {
         return run_branch_general_list_options(git_dir, format, store, list);

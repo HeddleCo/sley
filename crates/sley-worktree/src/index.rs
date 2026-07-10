@@ -14,6 +14,158 @@ use crate::types_admin::*;
 /// git's `INDEX_FORMAT_DEFAULT` (read-cache.c).
 const INDEX_FORMAT_DEFAULT: u32 = 3;
 
+/// One index-row mutation produced by an apply-like worktree operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApplyIndexMutation {
+    /// Replace every stage of `path` with one fresh stage-zero entry.
+    Upsert {
+        path: Vec<u8>,
+        mode: u32,
+        oid: ObjectId,
+    },
+    /// Remove every index entry at `path`.
+    Remove { path: Vec<u8> },
+}
+
+impl ApplyIndexMutation {
+    /// Repository-relative path affected by this mutation.
+    pub fn path(&self) -> &[u8] {
+        match self {
+            Self::Upsert { path, .. } | Self::Remove { path } => path,
+        }
+    }
+}
+
+/// Controls for applying a batch of patch-driven index mutations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApplyIndexOptions {
+    /// Invalidate the cache-tree extension after changing index rows.
+    pub invalidate_cache_tree: bool,
+}
+
+impl Default for ApplyIndexOptions {
+    fn default() -> Self {
+        Self {
+            invalidate_cache_tree: true,
+        }
+    }
+}
+
+/// Deterministic outcome of an index-mutation batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplyIndexOutcome {
+    /// Paths touched, in caller mutation order.
+    pub touched_paths: Vec<Vec<u8>>,
+    /// Number of mutations applied.
+    pub mutation_count: usize,
+}
+
+/// Apply patch-driven upserts/removals and restore canonical index ordering.
+///
+/// This is the reusable index half of `apply --index`/`--cached`: all stages at
+/// an affected path are replaced or removed, fresh entries carry zero stat
+/// data until the caller's worktree refresh, and stale cache-tree data is
+/// invalidated once after the complete batch.
+pub fn apply_index_mutations(
+    index: &mut Index,
+    mutations: &[ApplyIndexMutation],
+    options: ApplyIndexOptions,
+) -> Result<ApplyIndexOutcome> {
+    for mutation in mutations {
+        index
+            .entries
+            .retain(|entry| entry.path.as_bytes() != mutation.path());
+        if let ApplyIndexMutation::Upsert { path, mode, oid } = mutation {
+            index.entries.push(IndexEntry {
+                ctime_seconds: 0,
+                ctime_nanoseconds: 0,
+                mtime_seconds: 0,
+                mtime_nanoseconds: 0,
+                dev: 0,
+                ino: 0,
+                mode: *mode,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                oid: *oid,
+                flags: (path.len().min(0x0fff)) as u16,
+                flags_extended: 0,
+                path: BString::from(path.as_slice()),
+            });
+        }
+    }
+    index
+        .entries
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    if options.invalidate_cache_tree && !mutations.is_empty() {
+        index.set_cache_tree(None)?;
+    }
+    Ok(ApplyIndexOutcome {
+        touched_paths: mutations
+            .iter()
+            .map(|mutation| mutation.path().to_vec())
+            .collect(),
+        mutation_count: mutations.len(),
+    })
+}
+
+#[cfg(test)]
+mod apply_index_mutation_tests {
+    use super::*;
+
+    fn oid(byte: u8) -> ObjectId {
+        ObjectId::from_raw(ObjectFormat::Sha1, &[byte; 20]).expect("valid sha1")
+    }
+
+    fn entry(path: &[u8], stage: u16, byte: u8) -> IndexEntry {
+        IndexEntry {
+            ctime_seconds: 1,
+            ctime_nanoseconds: 2,
+            mtime_seconds: 3,
+            mtime_nanoseconds: 4,
+            dev: 5,
+            ino: 6,
+            mode: 0o100644,
+            uid: 7,
+            gid: 8,
+            size: 9,
+            oid: oid(byte),
+            flags: (path.len() as u16) | (stage << 12),
+            flags_extended: 0,
+            path: BString::from(path),
+        }
+    }
+
+    #[test]
+    fn batch_replaces_all_stages_sorts_and_reports_paths() {
+        let mut index = Index {
+            version: 2,
+            entries: vec![entry(b"z", 0, 1), entry(b"a", 2, 2), entry(b"a", 3, 3)],
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        let mutations = vec![
+            ApplyIndexMutation::Upsert {
+                path: b"a".to_vec(),
+                mode: 0o100755,
+                oid: oid(4),
+            },
+            ApplyIndexMutation::Remove {
+                path: b"z".to_vec(),
+            },
+        ];
+        let outcome = apply_index_mutations(&mut index, &mutations, ApplyIndexOptions::default())
+            .expect("apply mutations");
+        assert_eq!(outcome.mutation_count, 2);
+        assert_eq!(outcome.touched_paths, vec![b"a".to_vec(), b"z".to_vec()]);
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].path.as_bytes(), b"a");
+        assert_eq!(index.entries[0].mode, 0o100755);
+        assert_eq!(index.entries[0].oid, oid(4));
+        assert_eq!(index.entries[0].mtime_seconds, 0);
+    }
+}
+
 /// Pick the base version for a freshly-created index, mirroring git's
 /// `get_index_format_default`: `GIT_INDEX_VERSION` wins when set (warning +
 /// default on a malformed / out-of-range value), otherwise `feature.manyFiles`

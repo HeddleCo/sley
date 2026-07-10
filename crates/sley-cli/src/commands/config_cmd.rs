@@ -191,7 +191,7 @@ impl ConfigModeTracker {
     }
 }
 
-pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut action = None;
     let mut subcommand = None;
     let mut modes = ConfigModeTracker::default();
@@ -695,7 +695,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         eprintln!("error: only one config file at a time");
         return Err(GitError::Exit(129));
     }
-    let repo_git_dir = crate::session::cli_git_dir();
+    let repo_git_dir = cli_session.git_dir();
     if repo_git_dir.is_err() {
         if use_local {
             eprintln!("fatal: --local can only be used inside a git repository");
@@ -728,7 +728,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         let git_dir = repo_git_dir?;
         let common = common_git_dir_for_git_dir(&git_dir).unwrap_or_else(|_| git_dir.clone());
         ConfigSource::ScopedFile {
-            path: config_display_path(common.join("config")),
+            path: config_display_path(cli_session.cwd(), common.join("config")),
             scope: sley_config::ConfigScope::Local,
         }
     } else if use_worktree {
@@ -749,7 +749,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             common.join("config")
         };
         ConfigSource::ScopedFile {
-            path: config_display_path(path),
+            path: config_display_path(cli_session.cwd(), path),
             scope: sley_config::ConfigScope::Local,
         }
     } else if let Some(value) = effective_file {
@@ -765,7 +765,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     };
 
     if action == ConfigAction::Edit {
-        config_edit(&source, editor_repo_git_dir.as_deref())?;
+        config_edit(cli_session, &source, editor_repo_git_dir.as_deref())?;
         return Ok(());
     }
 
@@ -887,7 +887,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     // scope. Explicit sources contribute exactly their own entries. Reads also
     // validate the injection stream here, surfacing a bogus `-c`/env entry the
     // same way git does.
-    let loaded = load_read_entries(&source, action, respect_includes_opt)?;
+    let loaded = load_read_entries(cli_session, &source, action, respect_includes_opt)?;
     let mut entries = loaded.entries;
     if matches!(source, ConfigSource::Repository(_)) {
         let parameters = crate::injected_config_parameters()?;
@@ -895,7 +895,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         if respect_includes_opt == Some(false) {
             stack.push_parameters(&parameters);
         } else {
-            let context = config_include_context();
+            let context = config_include_context(cli_session);
             stack
                 .push_parameters_with_includes(&parameters, &context)
                 .map_err(|err| report_config_parse_error(err, None))?;
@@ -1208,11 +1208,12 @@ struct LoadedEntries {
 /// sources (git's `respect_includes = !source.file`), but by default for
 /// stdin and blob sources.
 fn load_read_entries(
+    cli_session: &crate::session::CliSession,
     source: &ConfigSource,
     action: ConfigAction,
     respect_includes_opt: Option<bool>,
 ) -> Result<LoadedEntries> {
-    let context = config_include_context();
+    let context = config_include_context(cli_session);
     let respect_repository_includes = respect_includes_opt.unwrap_or(true);
     let mut stack = sley_config::ConfigStack::new();
     let mut tail_error = None;
@@ -1229,7 +1230,7 @@ fn load_read_entries(
                 Ok(common) => common,
                 Err(_) => git_dir.clone(),
             };
-            let local_path = config_display_path(common.join("config"));
+            let local_path = config_display_path(cli_session.cwd(), common.join("config"));
             stack
                 .push_file(
                     &local_path,
@@ -1239,7 +1240,8 @@ fn load_read_entries(
                 )
                 .map_err(|err| report_config_parse_error(err, Some(&local_path)))?;
             if worktree_config_extension_enabled(&common) {
-                let worktree_path = config_display_path(git_dir.join("config.worktree"));
+                let worktree_path =
+                    config_display_path(cli_session.cwd(), git_dir.join("config.worktree"));
                 stack
                     .push_file(
                         &worktree_path,
@@ -1286,7 +1288,7 @@ fn load_read_entries(
                 .map_err(|err| report_config_parse_error(err, None))?;
         }
         ConfigSource::Blob(spec) => {
-            let bytes = read_config_blob(spec)?;
+            let bytes = read_config_blob(cli_session, spec)?;
             let (parsed, tail) = parse_blob_config_bytes(&bytes, action, spec)?;
             tail_error = tail;
             stack
@@ -1407,7 +1409,11 @@ fn config_write_path(source: &ConfigSource) -> Option<PathBuf> {
 /// Open the selected config file in the user's editor. The edited path comes
 /// from the command's file/scope source, while `core.editor` is resolved from
 /// the ambient repository config, matching git's `git config --edit -f <file>`.
-fn config_edit(source: &ConfigSource, repo_git_dir: Option<&Path>) -> Result<()> {
+fn config_edit(
+    cli_session: &crate::session::CliSession,
+    source: &ConfigSource,
+    repo_git_dir: Option<&Path>,
+) -> Result<()> {
     let Some(path) = config_write_path(source) else {
         match source {
             ConfigSource::Stdin => eprintln!("fatal: editing stdin is not supported"),
@@ -1415,7 +1421,7 @@ fn config_edit(source: &ConfigSource, repo_git_dir: Option<&Path>) -> Result<()>
         }
         return Err(GitError::Exit(128));
     };
-    let editor = config_editor_command(repo_git_dir)?;
+    let editor = config_editor_command(cli_session, repo_git_dir)?;
     if editor == ":" {
         return Ok(());
     }
@@ -1439,14 +1445,17 @@ fn config_edit(source: &ConfigSource, repo_git_dir: Option<&Path>) -> Result<()>
     Ok(())
 }
 
-fn config_editor_command(repo_git_dir: Option<&Path>) -> Result<String> {
+fn config_editor_command(
+    cli_session: &crate::session::CliSession,
+    repo_git_dir: Option<&Path>,
+) -> Result<String> {
     if let Ok(editor) = env::var("GIT_EDITOR") {
         return Ok(editor);
     }
     if let Some(editor) = global_config_value("core.editor")? {
         return Ok(editor);
     }
-    if let Some(editor) = config_core_editor(repo_git_dir)? {
+    if let Some(editor) = config_core_editor(cli_session, repo_git_dir)? {
         return Ok(editor);
     }
     if let Ok(editor) = env::var("VISUAL")
@@ -1468,19 +1477,24 @@ fn config_terminal_allows_visual() -> bool {
     }
 }
 
-fn config_core_editor(repo_git_dir: Option<&Path>) -> Result<Option<String>> {
+fn config_core_editor(
+    cli_session: &crate::session::CliSession,
+    repo_git_dir: Option<&Path>,
+) -> Result<Option<String>> {
     match repo_git_dir {
         Some(git_dir) => {
             let source = ConfigSource::Repository(git_dir.to_path_buf());
-            let loaded = load_read_entries(&source, ConfigAction::Get, None)?;
+            let loaded = load_read_entries(cli_session, &source, ConfigAction::Get, None)?;
             Ok(config_core_editor_from_entries(&loaded.entries))
         }
-        None => config_core_editor_from_default_layers(),
+        None => config_core_editor_from_default_layers(cli_session),
     }
 }
 
-fn config_core_editor_from_default_layers() -> Result<Option<String>> {
-    let context = config_include_context();
+fn config_core_editor_from_default_layers(
+    cli_session: &crate::session::CliSession,
+) -> Result<Option<String>> {
+    let context = config_include_context(cli_session);
     let mut stack = sley_config::ConfigStack::new();
     for (path, scope) in sley_config::default_config_layer_paths() {
         stack
@@ -1664,12 +1678,10 @@ fn config_source_display_name(source: &ConfigSource, path: &Path) -> String {
 
 /// Include-condition context shared by every layer: the repository (when one
 /// is discoverable) supplies `gitdir:` and `onbranch:`.
-fn config_include_context() -> sley_config::ConfigIncludeContext {
-    let Ok(cwd) = env::current_dir() else {
-        return sley_config::ConfigIncludeContext::default();
-    };
-    let start = logical_cwd_for_include_context(&cwd);
-    match crate::session::cli_git_dir_from(&start) {
+fn config_include_context(
+    cli_session: &crate::session::CliSession,
+) -> sley_config::ConfigIncludeContext {
+    match cli_session.git_dir() {
         Ok(git_dir) => sley_config::ConfigIncludeContext::new(
             Some(sley_config::git_dir_for_include_context(&git_dir)),
             repo_current_branch_name(&git_dir),
@@ -1678,26 +1690,11 @@ fn config_include_context() -> sley_config::ConfigIncludeContext {
     }
 }
 
-fn logical_cwd_for_include_context(cwd: &Path) -> PathBuf {
-    let Some(pwd) = env::var_os("PWD").map(PathBuf::from) else {
-        return cwd.to_path_buf();
-    };
-    if !pwd.is_absolute() {
-        return cwd.to_path_buf();
-    }
-    match (fs::canonicalize(&pwd), fs::canonicalize(cwd)) {
-        (Ok(pwd_real), Ok(cwd_real)) if pwd_real == cwd_real => pwd,
-        _ => cwd.to_path_buf(),
-    }
-}
-
 /// Display a config path the way git reports it: relative to the working
 /// directory when it lies underneath (git's repo paths are themselves
 /// relative, e.g. `.git/config` at the worktree root).
-fn config_display_path(path: PathBuf) -> PathBuf {
-    if let Ok(cwd) = env::current_dir()
-        && let Ok(relative) = path.strip_prefix(&cwd)
-    {
+fn config_display_path(cwd: &Path, path: PathBuf) -> PathBuf {
+    if let Ok(relative) = path.strip_prefix(cwd) {
         return relative.to_path_buf();
     }
     path
@@ -1764,8 +1761,8 @@ fn has_multiple_worktrees(common_git_dir: &Path) -> bool {
 }
 
 /// Read the config blob for `--blob=<spec>` (a blob id or `<rev>:<path>`).
-fn read_config_blob(spec: &str) -> Result<Vec<u8>> {
-    let repo = crate::repository::RepositoryContext::discover_current()?;
+fn read_config_blob(cli_session: &crate::session::CliSession, spec: &str) -> Result<Vec<u8>> {
+    let repo = crate::repository::RepositoryContext::from_session(cli_session)?;
     let oid = if let Some((rev, path)) = sley_rev::split_rev_path_spec(spec) {
         match repo.resolve_path(rev, path) {
             Ok(resolved) => resolved.oid,

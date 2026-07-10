@@ -890,6 +890,7 @@ fn cmd_log_impl(
     args: &[String],
     whatchanged: bool,
 ) -> Result<()> {
+    let lazy_fetch = cli_session.lazy_fetch();
     let mut setup_args = Vec::new();
     let mut setup_not = false;
     let mut default_revision_given = false;
@@ -2518,11 +2519,17 @@ fn cmd_log_impl(
             None
         } else {
             let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-            Some(DiffPathspec::new(&cwd, &worktree_root, &pathspecs)?)
+            Some(DiffPathspec::new(
+                &cwd,
+                &worktree_root,
+                &pathspecs,
+                effective_pathspec_flags(cli_session),
+            )?)
         };
         let repo_abbrev = repository_abbrev_from_config(&git_dir, format, &config)?;
         Some(LogDiffContext {
             db: &db,
+            lazy_fetch,
             format,
             config: &config,
             userdiff: log_userdiff
@@ -2775,6 +2782,7 @@ fn cmd_log_impl(
         return run_line_log_output(LineLogOutputCtx {
             git_dir: &git_dir,
             db: &db,
+            lazy_fetch,
             format,
             config: &config,
             tip: starts[0],
@@ -3129,7 +3137,12 @@ fn cmd_log_impl(
             None
         } else {
             let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-            Some(DiffPathspec::new(&cwd, &worktree_root, &pathspecs)?)
+            Some(DiffPathspec::new(
+                &cwd,
+                &worktree_root,
+                &pathspecs,
+                effective_pathspec_flags(cli_session),
+            )?)
         };
         let mut kept = Vec::with_capacity(selected.len());
         for record in selected {
@@ -3156,7 +3169,12 @@ fn cmd_log_impl(
             None
         } else {
             let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-            Some(DiffPathspec::new(&cwd, &worktree_root, &pathspecs)?)
+            Some(DiffPathspec::new(
+                &cwd,
+                &worktree_root,
+                &pathspecs,
+                effective_pathspec_flags(cli_session),
+            )?)
         };
         let mut kept = Vec::with_capacity(selected.len());
         for record in selected {
@@ -3215,7 +3233,7 @@ fn cmd_log_impl(
             &cwd,
             worktree_root.as_deref(),
             &pathspecs,
-            effective_pathspec_flags(),
+            effective_pathspec_flags(cli_session),
         )?;
         let ordered_owned: Vec<sley_rev::CommitRecord> = commits.clone();
         let bottoms: HashSet<ObjectId> = revision_options.negatives.iter().copied().collect();
@@ -3254,7 +3272,7 @@ fn cmd_log_impl(
             &cwd,
             worktree_root.as_deref(),
             &pathspecs,
-            effective_pathspec_flags(),
+            effective_pathspec_flags(cli_session),
         )?;
         let ordered_owned: Vec<sley_rev::CommitRecord> =
             selected.iter().map(|r| (*r).clone()).collect();

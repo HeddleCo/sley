@@ -322,12 +322,23 @@ pub(crate) fn cmd_pack_objects(
             collect_stdin_packs_objects(&common_git_dir, &database, format, &options)?;
         (oids, objects, Vec::new())
     } else if traversal {
-        collect_traversal_objects(&git_dir, &common_git_dir, &database, format, &options)?
+        collect_traversal_objects(
+            &git_dir,
+            &common_git_dir,
+            &database,
+            format,
+            &options,
+            cli_session.lazy_fetch(),
+        )?
     } else {
         let oids = read_pack_objects_stdin(format)?;
         let mut objects = Vec::with_capacity(oids.len());
         for oid in &oids {
-            match crate::read_object_maybe_prefetch_promisor(&database, oid) {
+            match crate::read_object_maybe_prefetch_promisor(
+                &database,
+                oid,
+                cli_session.lazy_fetch(),
+            ) {
                 Ok(object) => objects.push(object),
                 Err(GitError::NotFound(_)) => {
                     eprintln!("fatal: unable to read {oid}");
@@ -1170,6 +1181,7 @@ fn collect_traversal_objects(
     database: &FileObjectDatabase,
     format: ObjectFormat,
     options: &PackObjectsOptions,
+    lazy_fetch: bool,
 ) -> Result<TraversalPackObjects> {
     let mut wants: Vec<ObjectId> = Vec::new();
     let mut haves: Vec<ObjectId> = Vec::new();
@@ -1266,6 +1278,7 @@ fn collect_traversal_objects(
             filter: &options.object_filter,
             missing_action: options.missing_action,
             excluded: &excluded,
+            lazy_fetch,
         };
         for oid in wants.iter().rev() {
             walk.visit_oid(*oid, Vec::new(), 0, true, &mut traversal_state)?;
@@ -1481,6 +1494,7 @@ struct FilteredPackTraversal<'a> {
     filter: &'a PackObjectFilter,
     missing_action: PackObjectsMissingAction,
     excluded: &'a HashSet<ObjectId>,
+    lazy_fetch: bool,
 }
 
 #[derive(Default)]
@@ -1506,7 +1520,8 @@ impl FilteredPackTraversal<'_> {
         if self.excluded.contains(&oid) {
             return Ok(());
         }
-        let object = crate::read_object_maybe_prefetch_promisor(self.database, &oid)?;
+        let object =
+            crate::read_object_maybe_prefetch_promisor(self.database, &oid, self.lazy_fetch)?;
         match object.object_type {
             ObjectType::Commit => self.visit_commit(oid, object, provided, state),
             ObjectType::Tree => self.visit_tree(oid, object, path, depth, provided, state),
@@ -1572,7 +1587,11 @@ impl FilteredPackTraversal<'_> {
         if self.excluded.contains(&oid) {
             return Ok(());
         }
-        let object = match crate::read_object_maybe_prefetch_promisor(self.database, &oid) {
+        let object = match crate::read_object_maybe_prefetch_promisor(
+            self.database,
+            &oid,
+            self.lazy_fetch,
+        ) {
             Ok(object) => object,
             Err(GitError::NotFound(_)) => {
                 eprintln!("fatal: bad tree object {oid}");
@@ -1644,7 +1663,11 @@ impl FilteredPackTraversal<'_> {
         let size = if self.filter.needs_blob_size() {
             match object {
                 Some(ref object) => Some(object.body.len()),
-                None => match crate::read_object_maybe_prefetch_promisor(self.database, &oid) {
+                None => match crate::read_object_maybe_prefetch_promisor(
+                    self.database,
+                    &oid,
+                    self.lazy_fetch,
+                ) {
                     Ok(read) => {
                         let len = read.body.len();
                         object = Some(read);
@@ -1668,7 +1691,11 @@ impl FilteredPackTraversal<'_> {
         if include {
             let object = match object {
                 Some(object) => object,
-                None => match crate::read_object_maybe_prefetch_promisor(self.database, &oid) {
+                None => match crate::read_object_maybe_prefetch_promisor(
+                    self.database,
+                    &oid,
+                    self.lazy_fetch,
+                ) {
                     Ok(object) => object,
                     Err(GitError::NotFound(_))
                         if self.missing_action == PackObjectsMissingAction::AllowAny =>

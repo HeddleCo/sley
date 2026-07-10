@@ -9,14 +9,18 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAX_DIRECT_ODB_OPENINGS: usize = 179;
-const MAX_DIRECT_REF_STORE_OPENINGS: usize = 177;
-const MAX_REPOSITORY_CONTEXT_DISCOVERIES: usize = 1;
-const MAX_COMPAT_SESSION_READS: usize = 13;
-const MAX_COMPAT_GIT_DIR_DISCOVERIES: usize = 9;
-const MAX_COMPAT_GIT_DIR_FROM_DISCOVERIES: usize = 19;
+const MAX_DIRECT_ODB_OPENINGS: usize = 178;
+const MAX_DIRECT_REF_STORE_OPENINGS: usize = 171;
+const MAX_REPOSITORY_CONTEXT_DISCOVERIES: usize = 0;
+const MAX_COMPAT_SESSION_READS: usize = 12;
+const MAX_COMPAT_GIT_DIR_DISCOVERIES: usize = 0;
+const MAX_COMPAT_GIT_DIR_FROM_DISCOVERIES: usize = 0;
 
 const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
+    "add_interactive.rs",
+    "add_patch.rs",
+    "alias.rs",
+    "am.rs",
     "attrs.rs",
     "bisect.rs",
     "blame.rs",
@@ -24,6 +28,7 @@ const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
     "checkout.rs",
     "checkout_index.rs",
     "commit.rs",
+    "config_cmd.rs",
     "credential.rs",
     "describe.rs",
     "diff.rs",
@@ -35,6 +40,7 @@ const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
     "format_patch.rs",
     "format_rev.rs",
     "grep.rs",
+    "help.rs",
     "for_each_ref.rs",
     "for_each_repo.rs",
     "fast_export.rs",
@@ -42,6 +48,7 @@ const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
     "fetch_pack.rs",
     "hash_object.rs",
     "index.rs",
+    "interpret_trailers.rs",
     "last_modified.rs",
     "log.rs",
     "merge_index.rs",
@@ -60,6 +67,7 @@ const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
     "pull_strategy.rs",
     "range_diff.rs",
     "read_tree.rs",
+    "rebase.rs",
     "refs.rs",
     "refs_verify.rs",
     "reset.rs",
@@ -74,6 +82,7 @@ const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
     "replay.rs",
     "rerere.rs",
     "rev_list.rs",
+    "rev_parse.rs",
     "show.rs",
     "show_branch.rs",
     "shortlog.rs",
@@ -89,10 +98,13 @@ const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
 ];
 
 const EXPLICIT_SESSION_PLUMBING_COMMANDS: &[&str] = &[
+    "add.rs",
+    "apply.rs",
     "archive.rs",
     "bundle.rs",
     "clean.rs",
     "commit_tree.rs",
+    "commit_graph.rs",
     "fsck.rs",
     "prune_packed.rs",
     "replace.rs",

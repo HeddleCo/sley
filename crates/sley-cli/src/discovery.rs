@@ -1,7 +1,6 @@
 //! Repository discovery for the CLI layer (walk-up, explicit `--git-dir`, bare mode).
 //!
-//! Callers should use [`crate::session::cli_git_dir`] / [`crate::session::cli_git_dir_from`]
-//! rather than invoking this module directly.
+//! Invocation repository discovery is owned by [`crate::session::CliSession`].
 
 use std::env;
 use std::fs;
@@ -49,32 +48,6 @@ pub(crate) fn read_gitdir_file(path: &Path) -> Result<Option<PathBuf>> {
         };
         Ok(Some(parent.join(target)))
     }
-}
-
-/// Resolve the git directory for `start`, honouring CLI/env overrides from the
-/// active [`crate::session::CliSession`].
-pub(crate) fn resolve_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
-    if let Some(git_dir) = crate::explicit_git_dir() {
-        if git_dir.as_os_str().is_empty() {
-            return Err(GitError::repository_not_found("not a git repository"));
-        }
-        let resolved = resolve_cli_path(start.as_ref(), git_dir.to_string_lossy().as_ref());
-        if resolved.is_file()
-            && let Some(target) = read_gitdir_file(&resolved)?
-            && is_git_dir_candidate(&target)
-        {
-            return fs::canonicalize(target).map_err(|err| GitError::Io(err.to_string()));
-        }
-        return Ok(resolved);
-    }
-    if crate::global_bare() {
-        let cwd = env::current_dir()?;
-        if is_git_dir_candidate(&cwd) {
-            return fs::canonicalize(&cwd).map_err(|err| GitError::Io(err.to_string()));
-        }
-        return Err(GitError::repository_not_found("not a git repository"));
-    }
-    resolve_git_dir_by_walk(start)
 }
 
 /// Walk-up discovery only — no `--git-dir` / `GIT_DIR` / `--bare` overrides.

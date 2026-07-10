@@ -93,7 +93,16 @@ pub(crate) fn cmd_merge_index(
 
     let mut errors = 0u32;
     for path in &paths {
-        if !run_merge_program(&program, &db, &git_dir, format, &mut index, path, quiet)? {
+        if !run_merge_program(
+            &program,
+            &db,
+            &git_dir,
+            format,
+            &mut index,
+            path,
+            quiet,
+            cli_session.lazy_fetch(),
+        )? {
             errors += 1;
             if !one_shot {
                 if !quiet {
@@ -162,11 +171,12 @@ fn run_merge_program(
     index: &mut sley_index::Index,
     path: &[u8],
     quiet: bool,
+    lazy_fetch: bool,
 ) -> Result<bool> {
     let stages = collect_stages(index, path);
     let basename = program.rsplit(['/', '\\']).next().unwrap_or(program);
     if matches!(basename, "git-merge-one-file" | "merge-one-file") {
-        merge_one_file(db, git_dir, format, index, path, &stages)
+        merge_one_file(db, git_dir, format, index, path, &stages, lazy_fetch)
     } else {
         run_external_merge_program(program, path, &stages, quiet)
     }
@@ -182,6 +192,7 @@ fn merge_one_file(
     index: &mut sley_index::Index,
     path: &[u8],
     stages: &MergeIndexStages,
+    lazy_fetch: bool,
 ) -> Result<bool> {
     let worktree_root = worktree_root_for_git_dir(git_dir)?;
     let path_str = String::from_utf8_lossy(path).into_owned();
@@ -195,7 +206,7 @@ fn merge_one_file(
         // Added in their branch only: stage and materialise it.
         (None, None, Some((mode, oid))) => {
             println!("Adding {path_str}");
-            let content = merge_read_blob(db, &oid)?;
+            let content = merge_read_blob(db, &oid, lazy_fetch)?;
             merge_write_worktree_file(&worktree_root, path, &content, mode)?;
             set_stage0(index, path, mode, oid);
             Ok(true)
@@ -210,7 +221,7 @@ fn merge_one_file(
                 return Ok(false);
             }
             println!("Adding {path_str}");
-            let content = merge_read_blob(db, &our_oid)?;
+            let content = merge_read_blob(db, &our_oid, lazy_fetch)?;
             merge_write_worktree_file(&worktree_root, path, &content, our_mode)?;
             set_stage0(index, path, our_mode, our_oid);
             Ok(true)
@@ -235,11 +246,11 @@ fn merge_one_file(
                 return Ok(false);
             }
             let base_content = match base {
-                Some((_, oid)) => merge_read_blob(db, &oid)?,
+                Some((_, oid)) => merge_read_blob(db, &oid, lazy_fetch)?,
                 None => Vec::new(),
             };
-            let our_content = merge_read_blob(db, &our_oid)?;
-            let their_content = merge_read_blob(db, &their_oid)?;
+            let our_content = merge_read_blob(db, &our_oid, lazy_fetch)?;
+            let their_content = merge_read_blob(db, &their_oid, lazy_fetch)?;
             if base.is_some() {
                 println!("Auto-merging {path_str}");
             } else {

@@ -1109,7 +1109,7 @@ pub(crate) fn cmd_rev_list(
             &cwd,
             worktree_root.as_deref(),
             &pathspecs,
-            effective_pathspec_flags(),
+            effective_pathspec_flags(cli_session),
         )?;
         let ordered_owned: Vec<sley_rev::CommitRecord> =
             selected.iter().map(|r| (*r).clone()).collect();
@@ -1145,6 +1145,8 @@ pub(crate) fn cmd_rev_list(
             &cwd,
             worktree_root.as_deref(),
             &pathspecs,
+            effective_pathspec_flags(cli_session),
+            cli_session.lazy_fetch(),
         )?
     } else {
         HashSet::new()
@@ -1203,6 +1205,7 @@ pub(crate) fn cmd_rev_list(
                 &object_filter,
                 filter_print_omitted,
                 traversal_missing_action,
+                cli_session.lazy_fetch(),
             )?
         } else {
             (Vec::new(), Vec::new(), Vec::new(), HashMap::new())
@@ -1903,6 +1906,8 @@ fn rev_list_patchsame_oids(
     cwd: &Path,
     worktree_root: Option<&Path>,
     pathspecs: &[String],
+    pathspec_magic: sley_worktree::PathspecMatchMagic,
+    lazy_fetch: bool,
 ) -> Result<HashSet<ObjectId>> {
     let left_count = selected
         .iter()
@@ -1919,7 +1924,7 @@ fn rev_list_patchsame_oids(
         let Some(root) = worktree_root else {
             return Ok(HashSet::new());
         };
-        Some(DiffPathspec::new(cwd, root, pathspecs)?)
+        Some(DiffPathspec::new(cwd, root, pathspecs, pathspec_magic)?)
     };
 
     let left_first = left_count < right_count;
@@ -1929,7 +1934,9 @@ fn rev_list_patchsame_oids(
         if left_first != on_left {
             continue;
         }
-        if let Some(id) = rev_list_commit_patch_id(db, format, record, diff_pathspec.as_ref())? {
+        if let Some(id) =
+            rev_list_commit_patch_id(db, format, record, diff_pathspec.as_ref(), lazy_fetch)?
+        {
             ids.entry(id).or_default().push(record.oid);
         }
     }
@@ -1940,7 +1947,9 @@ fn rev_list_patchsame_oids(
         if left_first == on_left {
             continue;
         }
-        let Some(id) = rev_list_commit_patch_id(db, format, record, diff_pathspec.as_ref())? else {
+        let Some(id) =
+            rev_list_commit_patch_id(db, format, record, diff_pathspec.as_ref(), lazy_fetch)?
+        else {
             continue;
         };
         let Some(matches) = ids.get(&id) else {
@@ -1958,6 +1967,7 @@ fn rev_list_commit_patch_id(
     format: ObjectFormat,
     record: &sley_rev::CommitRecord,
     diff_pathspec: Option<&DiffPathspec>,
+    lazy_fetch: bool,
 ) -> Result<Option<Vec<u8>>> {
     if record.parents.len() > 1 {
         return Ok(None);
@@ -1973,9 +1983,12 @@ fn rev_list_commit_patch_id(
             &parent_tree,
             &record.commit.tree,
             pathspec,
+            lazy_fetch,
         )?,
-        None => render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree)
-            .unwrap_or_default(),
+        None => {
+            render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree, lazy_fetch)
+                .unwrap_or_default()
+        }
     };
     Ok(commands::patch_id::patch_id_for_diff(&diff, format))
 }
@@ -1986,6 +1999,7 @@ fn rev_list_render_tree_to_tree_patch(
     old_tree: &ObjectId,
     new_tree: &ObjectId,
     pathspec: &DiffPathspec,
+    lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
     let entries = sley_diff_merge::diff_name_status_trees_with_options(
         db,
@@ -2007,6 +2021,7 @@ fn rev_list_render_tree_to_tree_patch(
                 anchors: &[],
                 allow_textconv: false,
                 db,
+                lazy_fetch,
                 worktree_root: None,
                 use_worktree_new: false,
                 format,
@@ -2802,6 +2817,7 @@ fn rev_list_objects(
     filter: &RevListObjectFilter,
     collect_omitted: bool,
     missing_action: RevListMissingAction,
+    lazy_fetch: bool,
 ) -> Result<(
     Vec<RevListObject>,
     Vec<RevListObject>,
@@ -2834,6 +2850,7 @@ fn rev_list_objects(
         filter,
         collect_omitted,
         missing_action,
+        lazy_fetch,
     };
     for record in records {
         state.current_commit = Some(record.oid);
@@ -2873,6 +2890,7 @@ struct RevListObjectWalk<'a> {
     filter: &'a RevListObjectFilter,
     collect_omitted: bool,
     missing_action: RevListMissingAction,
+    lazy_fetch: bool,
 }
 
 #[derive(Default)]
@@ -3074,7 +3092,7 @@ fn rev_list_read_object(
     oid: &ObjectId,
 ) -> Result<Arc<EncodedObject>> {
     if matches!(walk.missing_action, RevListMissingAction::Error) {
-        crate::read_object_maybe_prefetch_promisor(walk.db, oid)
+        crate::read_object_maybe_prefetch_promisor(walk.db, oid, walk.lazy_fetch)
     } else {
         walk.db.read_object(oid)
     }

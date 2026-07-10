@@ -475,7 +475,8 @@ fn compute_real_merge(
     let strategy = parse_strategy_favor(&options.strategy_options)?;
     let detect_renames = merge_tree_detect_renames(&git_dir);
     let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
-    let explicit_attr_source = global_attr_source().or_else(|| env::var("GIT_ATTR_SOURCE").ok());
+    let explicit_attr_source =
+        global_attr_source(cli_session).or_else(|| env::var("GIT_ATTR_SOURCE").ok());
     let attr_source_tree = explicit_attr_source
         .as_deref()
         .map(|source| resolve_tree_ish(&git_dir, &db, format, source))
@@ -1309,7 +1310,15 @@ fn run_trivial_merge(
             continue;
         }
 
-        emit_trivial_path(&mut out, &db, &path, &base, &ours, &theirs)?;
+        emit_trivial_path(
+            &mut out,
+            &db,
+            &path,
+            &base,
+            &ours,
+            &theirs,
+            cli_session.lazy_fetch(),
+        )?;
     }
 
     out.flush()?;
@@ -1348,8 +1357,9 @@ fn emit_trivial_path(
     base: &TrivialEntry,
     ours: &TrivialEntry,
     theirs: &TrivialEntry,
+    lazy_fetch: bool,
 ) -> Result<()> {
-    let (header, lines, result_bytes) = trivial_resolution(db, base, ours, theirs)?;
+    let (header, lines, result_bytes) = trivial_resolution(db, base, ours, theirs, lazy_fetch)?;
 
     writeln!(out, "{header}")?;
     for line in &lines {
@@ -1365,7 +1375,7 @@ fn emit_trivial_path(
 
     // The diff is from ours (branch1) to the merged result.
     if let Some(result_bytes) = result_bytes {
-        let ours_bytes = blob_bytes(db, ours)?;
+        let ours_bytes = blob_bytes(db, ours, lazy_fetch)?;
         write_unified_hunks(out, &ours_bytes, &result_bytes)?;
     }
     Ok(())
@@ -1380,6 +1390,7 @@ fn trivial_resolution(
     base: &TrivialEntry,
     ours: &TrivialEntry,
     theirs: &TrivialEntry,
+    lazy_fetch: bool,
 ) -> Result<(&'static str, Vec<TrivialStageLine>, Option<Vec<u8>>)> {
     // Helper to build a stage line from a present entry.
     let line = |label: &'static str, entry: &TrivialEntry| -> Option<TrivialStageLine> {
@@ -1405,13 +1416,13 @@ fn trivial_resolution(
             Ok((
                 "added in remote",
                 lines,
-                Some(merge_read_blob(db, their_oid)?),
+                Some(merge_read_blob(db, their_oid, lazy_fetch)?),
             ))
         }
         // Both sides added the file (with differing content): a content merge with
         // `.our` / `.their` markers.
         (None, Some(_), Some(_)) => {
-            let result = trivial_content_merge(db, &Vec::new(), ours, theirs)?;
+            let result = trivial_content_merge(db, &Vec::new(), ours, theirs, lazy_fetch)?;
             let lines = [line("our", ours), line("their", theirs)]
                 .into_iter()
                 .flatten()
@@ -1419,12 +1430,12 @@ fn trivial_resolution(
             Ok(("added in both", lines, Some(result)))
         }
         (Some((_, base_oid)), our_entry, their_entry) => {
-            let base_bytes = merge_read_blob(db, base_oid)?;
+            let base_bytes = merge_read_blob(db, base_oid, lazy_fetch)?;
             match (our_entry, their_entry) {
                 // Changed only on the remote side: auto-resolves to their version,
                 // reported as a clean `merged` with a `result` line.
                 (Some((our_mode, _)), Some((_, their_oid))) if ours == base => {
-                    let their_bytes = merge_read_blob(db, their_oid)?;
+                    let their_bytes = merge_read_blob(db, their_oid, lazy_fetch)?;
                     let lines = vec![
                         TrivialStageLine {
                             label: "result",
@@ -1441,7 +1452,7 @@ fn trivial_resolution(
                 }
                 // Changed on both sides: a content merge with `.our` / `.their`.
                 (Some(_), Some(_)) => {
-                    let result = trivial_content_merge(db, &base_bytes, ours, theirs)?;
+                    let result = trivial_content_merge(db, &base_bytes, ours, theirs, lazy_fetch)?;
                     let lines = [line("base", base), line("our", ours), line("their", theirs)]
                         .into_iter()
                         .flatten()
@@ -1458,12 +1469,20 @@ fn trivial_resolution(
                 }
                 // Any remaining shape resolves to ours and is filtered out before
                 // reaching here; emit nothing meaningful.
-                _ => Ok(("merged", Vec::new(), Some(blob_bytes(db, ours)?))),
+                _ => Ok((
+                    "merged",
+                    Vec::new(),
+                    Some(blob_bytes(db, ours, lazy_fetch)?),
+                )),
             }
         }
         // Cases that resolve to `ours` (added locally only, or no entry at all)
         // are filtered out before reaching here.
-        _ => Ok(("merged", Vec::new(), Some(blob_bytes(db, ours)?))),
+        _ => Ok((
+            "merged",
+            Vec::new(),
+            Some(blob_bytes(db, ours, lazy_fetch)?),
+        )),
     }
 }
 
@@ -1474,9 +1493,10 @@ fn trivial_content_merge(
     base_bytes: &[u8],
     ours: &TrivialEntry,
     theirs: &TrivialEntry,
+    lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
-    let ours_bytes = blob_bytes(db, ours)?;
-    let theirs_bytes = blob_bytes(db, theirs)?;
+    let ours_bytes = blob_bytes(db, ours, lazy_fetch)?;
+    let theirs_bytes = blob_bytes(db, theirs, lazy_fetch)?;
     let result = sley_diff_merge::merge_blobs(
         base_bytes,
         &ours_bytes,
@@ -1495,9 +1515,9 @@ fn trivial_content_merge(
 }
 
 /// Read the blob bytes for a present entry, or the empty slice for an absent one.
-fn blob_bytes(db: &FileObjectDatabase, entry: &TrivialEntry) -> Result<Vec<u8>> {
+fn blob_bytes(db: &FileObjectDatabase, entry: &TrivialEntry, lazy_fetch: bool) -> Result<Vec<u8>> {
     match entry {
-        Some((_, oid)) => merge_read_blob(db, oid),
+        Some((_, oid)) => merge_read_blob(db, oid, lazy_fetch),
         None => Ok(Vec::new()),
     }
 }

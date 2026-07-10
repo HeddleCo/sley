@@ -31,6 +31,16 @@ use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord};
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 
+fn clone_explicit_work_tree(cli_session: &crate::session::CliSession) -> Option<PathBuf> {
+    cli_session.work_tree_override().or_else(|| {
+        if cli_session.local_repo_env_hidden() {
+            None
+        } else {
+            env::var_os("GIT_WORK_TREE").map(PathBuf::from)
+        }
+    })
+}
+
 pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut explicit_bare = None::<bool>;
@@ -551,7 +561,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
     let env_worktree = if bare {
         None
     } else {
-        explicit_work_tree().and_then(|value| {
+        clone_explicit_work_tree(cli_session).and_then(|value| {
             if value.as_os_str().is_empty() {
                 None
             } else {
@@ -619,6 +629,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
 
     if let Some(bundle_path) = bundle_source_path.as_deref() {
         clone_bundle_repository(CloneBundleOptions {
+            cli_session,
             repository: &repository,
             remote_url: &remote_config_url,
             bundle_path,
@@ -643,6 +654,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
 
     if remote_helper.is_some() {
         clone_remote_helper_repository(CloneRemoteHelperOptions {
+            cli_session,
             context: &remote_context,
             repository: &repository,
             remote_url: &remote_config_url,
@@ -706,6 +718,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
             reject_shallow: reject_shallow_config.unwrap_or(false),
         })?;
         return recurse_clone_submodules(
+            cli_session,
             &checkout_destination,
             &submodule_active,
             bare,
@@ -750,6 +763,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
             reject_shallow: reject_shallow_config.unwrap_or(false),
         })?;
         return recurse_clone_submodules(
+            cli_session,
             &checkout_destination,
             &submodule_active,
             bare,
@@ -794,6 +808,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
             reject_shallow: reject_shallow_config.unwrap_or(false),
         })?;
         return recurse_clone_submodules(
+            cli_session,
             &checkout_destination,
             &submodule_active,
             bare,
@@ -810,13 +825,13 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
     // The source is identified by its git directory (a clone needs no worktree),
     // so an exception is added as `<source>/.git`.
     crate::ownership::ensure_valid_ownership(None, &remote_git_dir, None)?;
-    let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
+    let remote_common_git_dir = cli_session.common_git_dir(&remote_git_dir)?;
     let format = repository_object_format(&remote_common_git_dir)?;
     validate_local_clone_source_refs(&remote_common_git_dir, format)?;
     let source_has_promisor = source_repository_has_promisor_remote(&remote_common_git_dir)?;
     if source_has_promisor {
-        let clone_lazy_fetch_reenabled = env::var("GIT_NO_LAZY_FETCH").ok().as_deref() == Some("0")
-            && crate::global_lazy_fetch_enabled();
+        let clone_lazy_fetch_reenabled =
+            env::var("GIT_NO_LAZY_FETCH").ok().as_deref() == Some("0") && cli_session.lazy_fetch();
         if !clone_lazy_fetch_reenabled {
             eprintln!("fatal: lazy fetching disabled; some objects may be missing");
             return Err(GitError::Exit(128));
@@ -870,6 +885,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         _ => clone_remote_head_branch(&remote_common_git_dir, format)?.unwrap_or_default(),
     };
     let alternates = clone_alternates(
+        cli_session,
         remote_context.resolution(),
         &remote_git_dir,
         shared,
@@ -1012,6 +1028,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         clone_bare_or_mirror_local_repository(
             &destination,
             CloneLocalOptions {
+                cli_session,
                 context: &remote_context,
                 format,
                 origin: &origin,
@@ -1123,7 +1140,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
                 &git_dir,
                 format,
                 revision_oid,
-                committer_identity_for_reflog()?,
+                committer_identity_for_reflog(&transport_config)?,
                 format!("clone: from {repository}").into_bytes(),
                 &config,
             )?;
@@ -1135,7 +1152,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
                 &git_dir,
                 format,
                 revision_oid,
-                committer_identity_for_reflog()?,
+                committer_identity_for_reflog(&transport_config)?,
                 format!("clone: from {repository}").into_bytes(),
             )?;
             remove_clone_worktree_files(&checkout_destination, &git_dir, format)?;
@@ -1165,7 +1182,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         depth,
         deepen_since,
         deepen_not,
-        committer: committer_identity_for_reflog()?,
+        committer: committer_identity_for_reflog(&transport_config)?,
         // `--branch=<tag>` checks the tag's commit out detached; otherwise a
         // detached source HEAD is honored only for the default (no `--branch`)
         // case.
@@ -1274,6 +1291,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         eprintln!("done.");
     }
     recurse_clone_submodules(
+        cli_session,
         &checkout_destination,
         &submodule_active,
         bare,
@@ -1285,6 +1303,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
 }
 
 struct CloneBundleOptions<'a> {
+    cli_session: &'a crate::session::CliSession,
     repository: &'a str,
     remote_url: &'a str,
     bundle_path: &'a Path,
@@ -1332,6 +1351,7 @@ fn clone_remote_helper_spec(
 }
 
 struct CloneRemoteHelperOptions<'a> {
+    cli_session: &'a crate::session::CliSession,
     context: &'a RemoteCommandContext,
     repository: &'a str,
     remote_url: &'a str,
@@ -1400,6 +1420,7 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
         ref_storage_explicit: options.ref_storage != RefStorageFormat::Files,
     })?;
     let git_dir = layout.git_dir;
+    let identity_config = read_repo_config(&git_dir)?;
     apply_clone_template(&git_dir, options.template, options.template_config)?;
     let configured_fetch = if options.bare {
         None
@@ -1505,7 +1526,7 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
                     store.create_branch(
                         &branch,
                         oid,
-                        committer_identity_for_reflog()?,
+                        committer_identity_for_reflog(&identity_config)?,
                         format!("branch: Created from {}/{branch}", options.origin).into_bytes(),
                     )?;
                 }
@@ -1525,7 +1546,7 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
                         &git_dir,
                         ObjectFormat::Sha1,
                         &branch,
-                        committer_identity_for_reflog()?,
+                        committer_identity_for_reflog(&identity_config)?,
                         &config,
                     )?;
                     run_clone_post_checkout_hook(&git_dir, &oid)?;
@@ -1547,6 +1568,7 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
         eprintln!("done.");
     }
     recurse_clone_submodules(
+        options.cli_session,
         options.destination,
         options.submodule_active,
         options.bare,
@@ -1632,6 +1654,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
         ref_storage_explicit: options.ref_storage != RefStorageFormat::Files,
     })?;
     let git_dir = layout.git_dir;
+    let identity_config = read_repo_config(&git_dir)?;
     apply_clone_template(&git_dir, options.template, options.template_config)?;
     configure_clone_remote(
         &git_dir,
@@ -1693,7 +1716,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
             store.create_branch(
                 &branch,
                 oid,
-                committer_identity_for_reflog()?,
+                committer_identity_for_reflog(&identity_config)?,
                 format!("branch: Created from {}/{branch}", options.origin).into_bytes(),
             )?;
             configure_clone_branch(&git_dir, &branch, options.origin)?;
@@ -1704,7 +1727,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
                     &git_dir,
                     format,
                     &branch,
-                    committer_identity_for_reflog()?,
+                    committer_identity_for_reflog(&identity_config)?,
                     &config,
                 )?;
                 run_clone_post_checkout_hook(&git_dir, &oid)?;
@@ -2056,7 +2079,7 @@ fn clone_network_repository(
         depth: options.depth,
         deepen_since: None,
         deepen_not: Vec::new(),
-        committer: committer_identity_for_reflog()?,
+        committer: committer_identity_for_reflog(&transport_config)?,
         detached_head: None,
         checkout: options.checkout,
         filter: fetch_filter,
@@ -2613,6 +2636,7 @@ impl CloneBundleUri {
 }
 
 struct CloneLocalOptions<'a> {
+    cli_session: &'a crate::session::CliSession,
     context: &'a RemoteCommandContext,
     format: ObjectFormat,
     ref_storage: RefStorageFormat,
@@ -2689,10 +2713,12 @@ fn clone_bare_or_mirror_local_repository(
     apply_clone_alternates(&git_dir, options.alternates, options.dissociate)?;
     if options.copy_source_alternates {
         let source_git_dir =
-            common_git_dir_for_git_dir(&sley_remote::resolve_local_remote_git_dir(
-                options.context.resolution(),
-                options.repository,
-            )?)?;
+            options
+                .cli_session
+                .common_git_dir(&sley_remote::resolve_local_remote_git_dir(
+                    options.context.resolution(),
+                    options.repository,
+                )?)?;
         apply_clone_source_alternates(&git_dir, &source_git_dir)?;
     }
     let remote_refspec = options.mirror.then(|| "+refs/*:refs/*".to_string());
@@ -2715,10 +2741,12 @@ fn clone_bare_or_mirror_local_repository(
 
     if let Some(revision_oid) = options.revision_oid {
         copy_local_revision_objects(
-            &common_git_dir_for_git_dir(&sley_remote::resolve_local_remote_git_dir(
-                options.context.resolution(),
-                options.repository,
-            )?)?,
+            &options
+                .cli_session
+                .common_git_dir(&sley_remote::resolve_local_remote_git_dir(
+                    options.context.resolution(),
+                    options.repository,
+                )?)?,
             &git_dir,
             options.format,
             revision_oid,
@@ -2802,10 +2830,12 @@ fn clone_bare_or_mirror_local_repository(
     fetch_result?;
     if options.copy_source_alternates {
         let source_git_dir =
-            common_git_dir_for_git_dir(&sley_remote::resolve_local_remote_git_dir(
-                options.context.resolution(),
-                options.repository,
-            )?)?;
+            options
+                .cli_session
+                .common_git_dir(&sley_remote::resolve_local_remote_git_dir(
+                    options.context.resolution(),
+                    options.repository,
+                )?)?;
         install_local_clone_objects(&source_git_dir, &git_dir, options.local_object_install)?;
     }
     if options.dissociate {
@@ -2970,6 +3000,7 @@ fn copy_clone_template_entries(source: &Path, destination: &Path) -> Result<()> 
 }
 
 fn clone_alternates(
+    cli_session: &crate::session::CliSession,
     resolution: sley_remote::RemoteResolutionContext<'_>,
     remote_git_dir: &Path,
     shared: bool,
@@ -2981,7 +3012,7 @@ fn clone_alternates(
     }
     for reference in references {
         match sley_remote::resolve_local_remote_git_dir(resolution, &reference.path)
-            .and_then(|git_dir| common_git_dir_for_git_dir(&git_dir))
+            .and_then(|git_dir| cli_session.common_git_dir(&git_dir))
         {
             Ok(reference_git_dir) => {
                 push_unique_alternate(&mut alternates, reference_git_dir.join("objects"));
@@ -3385,6 +3416,7 @@ fn apply_clone_default_submodule_path_config(git_dir: &Path) -> Result<()> {
 /// half-cloned. `active` carries the `--recurse-submodules[=<pathspec>]` values
 /// (`.` = all); a `bare`/no-checkout clone has no worktree to populate.
 fn recurse_clone_submodules(
+    cli_session: &crate::session::CliSession,
     destination: &Path,
     active: &[String],
     bare: bool,
@@ -3406,7 +3438,9 @@ fn recurse_clone_submodules(
         } else {
             "die"
         };
+        let child_session = cli_session.local_repo_env_hidden_child();
         let git_dir = sley_remote::discover_local_git_dir(destination)?;
+        let git_dir = child_session.common_git_dir(&git_dir)?;
         let mut config = read_repo_config(&git_dir)?;
         set_config_value(
             &mut config,
@@ -3479,6 +3513,7 @@ fn recurse_clone_submodules(
         command.arg(value);
     }
     let status = command
+        .env_remove("GIT_COMMON_DIR")
         .current_dir(destination)
         .status()
         .map_err(|err| GitError::Io(err.to_string()))?;

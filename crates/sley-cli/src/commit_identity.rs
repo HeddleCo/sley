@@ -1,7 +1,6 @@
 //! Author/committer identity resolution from env and config.
 
 use std::env;
-use std::path::PathBuf;
 
 use sley::{GitConfig, GitError, Result};
 
@@ -14,7 +13,10 @@ use crate::session;
 use crate::sley_config;
 use sley_sequencer;
 
-pub(crate) fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {
+pub(crate) fn commit_identity_from_env(
+    role: &str,
+    effective_config: &GitConfig,
+) -> Result<Vec<u8>> {
     // git's identity precedence for the name/email of an author or committer:
     //   GIT_{role}_NAME/EMAIL env var
     //     -> `-c {author,committer}.name=` / GIT_CONFIG_* command-line overrides
@@ -28,7 +30,7 @@ pub(crate) fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {
     let env_name = env::var_os(format!("GIT_{role}_NAME")).map(argv_bytes_from_os);
     let env_email = env::var_os(format!("GIT_{role}_EMAIL")).map(argv_bytes_from_os);
     let mut config = if env_name.is_none() || env_email.is_none() {
-        IdentityConfig::Lazy(None)
+        IdentityConfig::Loaded(effective_config)
     } else {
         IdentityConfig::Skip
     };
@@ -61,11 +63,12 @@ pub(crate) fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {
 pub(crate) fn commit_identity_from_env_with_date(
     role: &str,
     date_override: &str,
+    effective_config: &GitConfig,
 ) -> Result<Vec<u8>> {
     let env_name = env::var_os(format!("GIT_{role}_NAME")).map(argv_bytes_from_os);
     let env_email = env::var_os(format!("GIT_{role}_EMAIL")).map(argv_bytes_from_os);
     let mut config = if env_name.is_none() || env_email.is_none() {
-        IdentityConfig::Lazy(None)
+        IdentityConfig::Loaded(effective_config)
     } else {
         IdentityConfig::Skip
     };
@@ -89,11 +92,11 @@ pub(crate) fn commit_identity_from_env_with_date(
     sley_sequencer::format_commit_identity_bytes(&name, &email, &date)
 }
 
-pub(crate) fn committer_identity_for_reflog() -> Result<Vec<u8>> {
+pub(crate) fn committer_identity_for_reflog(effective_config: &GitConfig) -> Result<Vec<u8>> {
     let env_name = env::var_os("GIT_COMMITTER_NAME").map(argv_bytes_from_os);
     let env_email = env::var_os("GIT_COMMITTER_EMAIL").map(argv_bytes_from_os);
     let mut config = if env_name.is_none() || env_email.is_none() {
-        IdentityConfig::Lazy(None)
+        IdentityConfig::Loaded(effective_config)
     } else {
         IdentityConfig::Skip
     };
@@ -143,36 +146,33 @@ pub(crate) fn default_commit_date() -> String {
     format!("{seconds} +0000")
 }
 
-/// Lazily-loaded effective config used as the identity fallback. `Skip` means
-/// the caller already has both fields from the environment and the config files
-/// must not be touched; `Lazy` caches the (optional) loaded config so multiple
-/// key lookups share a single load.
-pub(crate) enum IdentityConfig {
+/// Explicit effective config used as the identity fallback. `Skip` means the
+/// caller already has both fields from the environment, so config lookup is
+/// unnecessary; `Loaded` borrows the invocation's already-resolved snapshot.
+pub(crate) enum IdentityConfig<'a> {
     Skip,
-    Lazy(Option<Option<GitConfig>>),
+    Loaded(&'a GitConfig),
 }
 
 /// Resolve an identity config key (`user.name`/`user.email`) following git's
 /// precedence below the environment: `-c`/`GIT_CONFIG_*` command-line overrides
 /// first, then the effective config (repository, then global, then system).
-pub(crate) fn identity_config_value(key: &str, config: &mut IdentityConfig) -> Option<String> {
+pub(crate) fn identity_config_value(key: &str, config: &mut IdentityConfig<'_>) -> Option<String> {
     if let Ok(Some(value)) = global_config_value(key) {
         return Some(value);
     }
     let (section, name) = key.split_once('.')?;
     let loaded = match config {
         IdentityConfig::Skip => return None,
-        IdentityConfig::Lazy(slot) => slot.get_or_insert_with(identity_effective_config),
+        IdentityConfig::Loaded(config) => *config,
     };
-    loaded
-        .as_ref()
-        .and_then(|config| config.get(section, None, name).map(str::to_string))
+    loaded.get(section, None, name).map(str::to_string)
 }
 
 pub(crate) fn identity_config_value_for_role(
     role: &str,
     field: &str,
-    config: &mut IdentityConfig,
+    config: &mut IdentityConfig<'_>,
 ) -> Option<String> {
     let role_key = match role {
         "AUTHOR" => Some(format!("author.{field}")),
@@ -185,7 +185,10 @@ pub(crate) fn identity_config_value_for_role(
         .or_else(|| identity_config_value(&format!("user.{field}"), config))
 }
 
-pub(crate) fn identity_default_value(value: &str, config: &mut IdentityConfig) -> Option<String> {
+pub(crate) fn identity_default_value(
+    value: &str,
+    config: &mut IdentityConfig<'_>,
+) -> Option<String> {
     if identity_use_config_only(config) {
         None
     } else {
@@ -193,7 +196,7 @@ pub(crate) fn identity_default_value(value: &str, config: &mut IdentityConfig) -
     }
 }
 
-pub(crate) fn identity_use_config_only(config: &mut IdentityConfig) -> bool {
+pub(crate) fn identity_use_config_only(config: &mut IdentityConfig<'_>) -> bool {
     identity_config_value("user.useconfigonly", config)
         .as_deref()
         .and_then(sley_config::parse_config_bool)
@@ -239,14 +242,11 @@ pub(crate) fn print_identity_unknown_hint(role: &str) {
     }
 }
 
-/// Load the effective config (repository + global + system, with includes) for
-/// identity fallback, or `None` when there is no repository in scope. Failures
-/// degrade to `None` so identity resolution can still fall through to env/`-c`
-/// values or the built-in default rather than aborting.
-pub(crate) fn identity_effective_config() -> Option<GitConfig> {
-    // `cli_git_dir` already honours `--git-dir`/`GIT_DIR` (via
-    // `explicit_git_dir`) before walking up from the current directory.
-    let git_dir = session::cli_git_dir().ok()?;
+/// Load identity/config fallback using an explicit invocation session.
+pub(crate) fn identity_effective_config_for(
+    cli_session: &session::CliSession,
+) -> Option<GitConfig> {
+    let git_dir = cli_session.git_dir().ok()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir).ok()?;
     let context = sley_config::ConfigIncludeContext::new(
         Some(common_git_dir.clone()),
@@ -258,7 +258,7 @@ pub(crate) fn identity_effective_config() -> Option<GitConfig> {
     // CLI cannot push `-c` into the process env, so reconstruct it here).
     let parameters_env = effective_config_parameters_env();
     if let Ok(parameters) = sley_config::injected_config_parameters(parameters_env.as_deref()) {
-        let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let base = cli_session.cwd().to_path_buf();
         let _ = sley_config::append_injected_config_sections_with_includes(
             &mut config,
             &parameters,
@@ -269,13 +269,13 @@ pub(crate) fn identity_effective_config() -> Option<GitConfig> {
     Some(config)
 }
 
-pub(crate) fn commit_signoff_from_env() -> Result<Vec<u8>> {
+pub(crate) fn commit_signoff_from_env(effective_config: &GitConfig) -> Result<Vec<u8>> {
     // git's `--signoff` uses the committer identity, so resolve it with the same
     // precedence as `commit_identity_from_env("COMMITTER")`.
     let env_name = env::var_os("GIT_COMMITTER_NAME").map(argv_bytes_from_os);
     let env_email = env::var_os("GIT_COMMITTER_EMAIL").map(argv_bytes_from_os);
     let mut config = if env_name.is_none() || env_email.is_none() {
-        IdentityConfig::Lazy(None)
+        IdentityConfig::Loaded(effective_config)
     } else {
         IdentityConfig::Skip
     };

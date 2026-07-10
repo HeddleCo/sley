@@ -116,9 +116,9 @@ pub(crate) fn cmd_commit_tree(
     } else {
         commit_message_from_prepared_chunks(&message_chunks)
     };
-    let author = commit_identity_from_env("AUTHOR")?;
-    let committer = commit_identity_from_env("COMMITTER")?;
-    let config = read_repo_config(&git_dir).ok();
+    let config = read_repo_config(&git_dir).unwrap_or_default();
+    let author = commit_identity_from_env("AUTHOR", &config)?;
+    let committer = commit_identity_from_env("COMMITTER", &config)?;
     let signature = if gpg_sign {
         let unsigned = Commit {
             tree,
@@ -129,9 +129,9 @@ pub(crate) fn cmd_commit_tree(
             message: message.clone(),
         };
         let key =
-            commands::signing::signing_key(config.as_ref(), gpg_sign_key.as_deref(), &committer);
+            commands::signing::signing_key(Some(&config), gpg_sign_key.as_deref(), &committer);
         Some(commands::signing::sign_payload(
-            config.as_ref(),
+            Some(&config),
             &unsigned.write(),
             key.as_deref(),
         )?)

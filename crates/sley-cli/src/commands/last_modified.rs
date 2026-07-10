@@ -92,7 +92,7 @@ pub(crate) fn cmd_last_modified(
         repo.cwd(),
         Some(repo.worktree_root()?),
         &options.pathspecs,
-        effective_pathspec_flags(),
+        effective_pathspec_flags(cli_session),
     )?;
     let start_info = read_commit_info(db, format, &start_commit)?;
     let paths = collect_last_modified_paths(

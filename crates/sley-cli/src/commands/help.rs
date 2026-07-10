@@ -1,8 +1,5 @@
 use crate::sley_config;
-use crate::{
-    common_git_dir_for_git_dir, global_config_value, injected_config_parameters,
-    report_config_setup_error,
-};
+use crate::{common_git_dir_for_git_dir, injected_config_parameters, report_config_setup_error};
 use sley::plumbing::sley_config::ConfigIncludeContext;
 use sley::{GitError, Result};
 use sley_options::{
@@ -10,7 +7,6 @@ use sley_options::{
     completion_helper_options,
 };
 use std::collections::BTreeSet;
-use std::env;
 use std::path::Path;
 use std::process::Command;
 
@@ -419,7 +415,7 @@ pub(crate) fn has_command_specific_help(command: &str) -> bool {
     )
 }
 
-pub(crate) fn cmd_help(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_help(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut mode = HelpMode::Default;
     let mut format = HelpFormat::Default;
     let mut command = None;
@@ -510,13 +506,13 @@ pub(crate) fn cmd_help(args: &[String]) -> Result<()> {
     }
 
     match (mode, command.as_deref()) {
-        (HelpMode::Default, Some(name)) => show_doc(name, format),
+        (HelpMode::Default, Some(name)) => show_doc(cli_session, name, format),
         (HelpMode::Default, None) => {
             print_common_help();
             Ok(())
         }
         (HelpMode::All, None) => {
-            print_all_commands();
+            print_all_commands(cli_session);
             Ok(())
         }
         (HelpMode::Guides, None) => {
@@ -609,7 +605,10 @@ pub(crate) fn print_builtin_commands() {
     }
 }
 
-pub(crate) fn print_list_cmds(groups: &str) -> Result<()> {
+pub(crate) fn print_list_cmds(
+    cli_session: &crate::session::CliSession,
+    groups: &str,
+) -> Result<()> {
     if groups == "parseopt" {
         println!(
             "{}",
@@ -647,7 +646,7 @@ pub(crate) fn print_list_cmds(groups: &str) -> Result<()> {
                 commands.extend(GUIDE_PAGES.iter().map(|(name, _)| (*name).to_string()));
             }
             "alias" => {
-                for (name, _) in crate::commands::alias::list_aliases()? {
+                for (name, _) in crate::commands::alias::list_aliases(cli_session)? {
                     commands.insert(name);
                 }
             }
@@ -657,7 +656,7 @@ pub(crate) fn print_list_cmds(groups: &str) -> Result<()> {
         }
     }
 
-    apply_completion_command_config(&mut commands)?;
+    apply_completion_command_config(cli_session, &mut commands)?;
     for command in commands {
         println!("{command}");
     }
@@ -708,8 +707,11 @@ pub(crate) fn print_completion_helper(args: &[String]) -> bool {
     }
 }
 
-fn apply_completion_command_config(commands: &mut BTreeSet<String>) -> Result<()> {
-    let Some(value) = config_value("completion.commands")? else {
+fn apply_completion_command_config(
+    cli_session: &crate::session::CliSession,
+    commands: &mut BTreeSet<String>,
+) -> Result<()> {
+    let Some(value) = config_value(cli_session, "completion.commands")? else {
         return Ok(());
     };
     for token in value.split_whitespace() {
@@ -769,25 +771,29 @@ fn set_mode(current: HelpMode, next: HelpMode) -> Result<HelpMode> {
     Ok(next)
 }
 
-fn show_doc(name: &str, format: HelpFormat) -> Result<()> {
+fn show_doc(
+    cli_session: &crate::session::CliSession,
+    name: &str,
+    format: HelpFormat,
+) -> Result<()> {
     if !is_builtin_command(name) && !is_guide(name) && !is_interface(name) && name != "git" {
         return unknown_command(name, 1);
     }
     let format = match format {
-        HelpFormat::Default => config_value("help.format")?
+        HelpFormat::Default => config_value(cli_session, "help.format")?
             .as_deref()
             .map(HelpFormat::from_config)
             .unwrap_or(HelpFormat::Man),
         other => other,
     };
     match format {
-        HelpFormat::Web => open_html_doc(name),
+        HelpFormat::Web => open_html_doc(cli_session, name),
         HelpFormat::Man | HelpFormat::Info | HelpFormat::Default => Ok(()),
     }
 }
 
-fn open_html_doc(name: &str) -> Result<()> {
-    let html_path = config_value("help.htmlpath")?.unwrap_or_else(|| ".".to_string());
+fn open_html_doc(cli_session: &crate::session::CliSession, name: &str) -> Result<()> {
+    let html_path = config_value(cli_session, "help.htmlpath")?.unwrap_or_else(|| ".".to_string());
     let page = html_page_for(name);
     let target = if html_path.contains("://") {
         format!("{}/{}", html_path.trim_end_matches('/'), page)
@@ -798,11 +804,11 @@ fn open_html_doc(name: &str) -> Result<()> {
         }
         path.to_string_lossy().into_owned()
     };
-    let browser = config_value("help.browser")?.unwrap_or_default();
+    let browser = config_value(cli_session, "help.browser")?.unwrap_or_default();
     let browser_cmd = if browser.is_empty() {
-        config_value("browser.test.cmd")?.unwrap_or_else(|| "true".to_string())
+        config_value(cli_session, "browser.test.cmd")?.unwrap_or_else(|| "true".to_string())
     } else {
-        config_value(&format!("browser.{browser}.cmd"))?.unwrap_or(browser)
+        config_value(cli_session, &format!("browser.{browser}.cmd"))?.unwrap_or(browser)
     };
     let status = Command::new(&browser_cmd)
         .arg(&target)
@@ -834,12 +840,9 @@ fn html_page_for(name: &str) -> String {
     }
 }
 
-fn config_value(key: &str) -> Result<Option<String>> {
-    if let Some(value) = global_config_value(key)? {
-        return Ok(Some(value));
-    }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd).ok();
+fn config_value(cli_session: &crate::session::CliSession, key: &str) -> Result<Option<String>> {
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir().ok();
     let common_git_dir = git_dir
         .as_ref()
         .and_then(|dir| common_git_dir_for_git_dir(dir).ok());
@@ -851,7 +854,7 @@ fn config_value(key: &str) -> Result<Option<String>> {
         &mut config,
         &parameters,
         &context,
-        &cwd,
+        cwd,
     )
     .map_err(report_config_setup_error)?;
     let Some((section, rest)) = key.split_once('.') else {
@@ -877,7 +880,7 @@ fn is_interface(name: &str) -> bool {
         .any(|(page, _)| *page == name)
 }
 
-fn print_all_commands() {
+fn print_all_commands(cli_session: &crate::session::CliSession) {
     println!("See 'git help <command>' to read about a specific subcommand");
     print_command_section(
         "Main Porcelain Commands",
@@ -1165,13 +1168,13 @@ fn print_all_commands() {
         "Developer-facing file formats, protocols and other interfaces",
         DEVELOPER_INTERFACES,
     );
-    print_alias_section();
+    print_alias_section(cli_session);
 }
 
 /// List configured `alias.*` entries under git's "Command aliases" heading
 /// (omitted entirely when no aliases are defined).
-fn print_alias_section() {
-    let Ok(aliases) = crate::commands::alias::list_aliases() else {
+fn print_alias_section(cli_session: &crate::session::CliSession) {
+    let Ok(aliases) = crate::commands::alias::list_aliases(cli_session) else {
         return;
     };
     if aliases.is_empty() {

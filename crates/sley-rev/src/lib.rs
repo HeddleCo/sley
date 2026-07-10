@@ -329,7 +329,22 @@ pub fn resolve_revision_with_disambiguation(
 ) -> Result<ObjectId> {
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    resolve_revision_inner(git_dir, format, &db, rev, None, disambiguation)
+    resolve_revision_with_reader_and_disambiguation(git_dir, format, &db, rev, disambiguation)
+}
+
+/// Resolve a revision with a caller-owned object reader and short-object
+/// disambiguation policy.
+///
+/// Commands that resolve several revision arguments can retain one repository
+/// object database instead of reopening it for every argument.
+pub fn resolve_revision_with_reader_and_disambiguation<R: ObjectReader>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &R,
+    rev: &str,
+    disambiguation: ObjectDisambiguation,
+) -> Result<ObjectId> {
+    resolve_revision_inner(git_dir, format, reader, rev, None, disambiguation)
 }
 
 /// `commit-ish` variant of [`resolve_revision_with_reader`]: a ref still wins

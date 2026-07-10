@@ -29,7 +29,7 @@ impl SuperprojectContext {
         let repo = cli_session.open_repository()?;
         let git_dir = repo.git_dir().to_path_buf();
         let format = repo.object_format();
-        let worktree_root = require_work_tree(&git_dir)?;
+        let worktree_root = require_work_tree(cli_session, &git_dir)?;
         Ok(Self {
             session: cli_session.clone(),
             cwd: cli_session.cwd().to_path_buf(),
@@ -380,7 +380,14 @@ fn cmd_submodule_add(
         &add_name,
         &modules_git_dir,
     )?;
-    stage_submodule_paths(&git_dir, format, &worktree_root, &normalized_path, head_oid)?;
+    stage_submodule_paths(
+        cli_session,
+        &git_dir,
+        format,
+        &worktree_root,
+        &normalized_path,
+        head_oid,
+    )?;
     Ok(())
 }
 
@@ -1276,6 +1283,7 @@ fn record_submodule_gitdir_config_if_enabled(
 }
 
 fn stage_submodule_paths(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     format: ObjectFormat,
     worktree_root: &Path,
@@ -1287,11 +1295,14 @@ fn stage_submodule_paths(
     // gitignores `.gitmodules` (or the whole submodule path under `--force`)
     // still registers the new submodule rather than tripping the ignored-file
     // guard. Mirror that force exactly.
-    super::plumbing::cmd_add(&[
-        "--force".to_string(),
-        "--".to_string(),
-        worktree_root.join(".gitmodules").display().to_string(),
-    ])?;
+    super::plumbing::cmd_add(
+        cli_session,
+        &[
+            "--force".to_string(),
+            "--".to_string(),
+            worktree_root.join(".gitmodules").display().to_string(),
+        ],
+    )?;
     sley_worktree::update_index_cacheinfo(
         git_dir,
         format,

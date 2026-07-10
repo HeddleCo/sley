@@ -104,7 +104,13 @@ pub(crate) fn cmd_clean(cli_session: &crate::session::CliSession, args: &[String
     }
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
-    let pathspec = LsFilesPathspec::new(&cwd, &worktree_root, false, &path_args)?;
+    let pathspec = LsFilesPathspec::new(
+        &cwd,
+        &worktree_root,
+        false,
+        &path_args,
+        effective_pathspec_flags(cli_session),
+    )?;
     let paths = clean_targets(
         &worktree_root,
         &git_dir,

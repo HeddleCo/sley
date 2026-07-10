@@ -478,6 +478,7 @@ pub(crate) fn run_diff_check(
     use_worktree_new: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
     resolver: &WhitespaceRuleResolver,
+    lazy_fetch: bool,
 ) -> Result<bool> {
     let mut stdout = io::stdout();
     let mut status = false;
@@ -488,8 +489,14 @@ pub(crate) fn run_diff_check(
         if entry.new_mode == Some(0o160000) {
             continue;
         }
-        let new_content =
-            diff_entry_new_content(entry, db, worktree_root, use_worktree_new, worktree_clean)?;
+        let new_content = diff_entry_new_content(
+            entry,
+            db,
+            worktree_root,
+            use_worktree_new,
+            worktree_clean,
+            lazy_fetch,
+        )?;
         let Some(new_content) = new_content else {
             continue;
         };
@@ -499,6 +506,7 @@ pub(crate) fn run_diff_check(
             worktree_root,
             use_worktree_old,
             worktree_clean,
+            lazy_fetch,
         )?
         .unwrap_or_default();
         let path = status_quote_path(&entry.path, false);
@@ -531,9 +539,10 @@ fn diff_entry_old_content_for_diff(
     worktree_root: Option<&Path>,
     use_worktree_old: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+    lazy_fetch: bool,
 ) -> Result<Option<Vec<u8>>> {
     if !use_worktree_old {
-        return diff_entry_old_content(entry, db);
+        return diff_entry_old_content(entry, db, lazy_fetch);
     }
     let Some(mode) = entry.old_mode else {
         return Ok(None);
@@ -717,6 +726,7 @@ fn run_external_diff_entries(
     userdiff: &commands::userdiff::UserdiffResolver,
     global: Option<&ExternalDiffCommand>,
     options: ExternalDiffRunOptions<'_>,
+    lazy_fetch: bool,
 ) -> Result<Option<i32>> {
     let mut handled = false;
     let mut found_changes = false;
@@ -751,6 +761,7 @@ fn run_external_diff_entries(
             autocrlf: options.autocrlf,
             quiet: options.quiet,
             output_file: output_file.as_mut(),
+            lazy_fetch,
         };
         let rc = run_one_external_diff(
             entry,
@@ -808,6 +819,7 @@ struct ExternalDiffProcessContext<'a> {
     autocrlf: bool,
     quiet: bool,
     output_file: Option<&'a mut fs::File>,
+    lazy_fetch: bool,
 }
 
 fn run_one_external_diff(
@@ -826,6 +838,7 @@ fn run_one_external_diff(
         context.use_worktree_new,
         false,
         context.autocrlf,
+        context.lazy_fetch,
     )?;
     let new_file = prepare_external_diff_file(
         entry,
@@ -835,6 +848,7 @@ fn run_one_external_diff(
         context.use_worktree_new,
         true,
         context.autocrlf,
+        context.lazy_fetch,
     )?;
     let path = String::from_utf8_lossy(&entry.path).into_owned();
     let old_hex = external_diff_oid(
@@ -931,6 +945,7 @@ fn prepare_external_diff_file(
     use_worktree_new: bool,
     new_side: bool,
     autocrlf: bool,
+    lazy_fetch: bool,
 ) -> Result<ExternalDiffFile> {
     if new_side
         && use_worktree_new
@@ -946,9 +961,16 @@ fn prepare_external_diff_file(
         }
     }
     let content = if new_side {
-        diff_entry_new_content(lookup_entry, db, worktree_root, use_worktree_new, None)?
+        diff_entry_new_content(
+            lookup_entry,
+            db,
+            worktree_root,
+            use_worktree_new,
+            None,
+            lazy_fetch,
+        )?
     } else {
-        diff_entry_old_content(lookup_entry, db)?
+        diff_entry_old_content(lookup_entry, db, lazy_fetch)?
     };
     let Some(content) = content else {
         return Ok(ExternalDiffFile {
@@ -1045,6 +1067,7 @@ fn diff_arg_looks_outside_worktree(path: &str) -> bool {
 }
 
 pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    let lazy_fetch = cli_session.lazy_fetch();
     let sley_rev::diff_options::DiffOptions {
         output_format,
         cached,
@@ -1245,6 +1268,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                 // to git's enabled-by-default behavior absent an explicit flag.
                 indent_heuristic: indent_heuristic.unwrap_or(true),
                 anchored: &anchored,
+                lazy_fetch,
             },
             repository.as_ref().ok(),
         );
@@ -1559,7 +1583,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
             Some(root) => root,
             None => repo.worktree_root()?,
         };
-        DiffPathspec::new(&cwd, worktree_root, &path_args)?
+        DiffPathspec::new(&cwd, worktree_root, &path_args, repo.pathspec_magic())?
     };
     if diff_trees.len() == 3 {
         let has_differences = write_diff_combined_three_tree(
@@ -1580,6 +1604,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                 diff_algorithm,
                 line_prefix: line_prefix.as_deref(),
                 orderfile: resolved_orderfile.as_deref(),
+                lazy_fetch,
             },
         )?;
         if (quiet || exit_code) && has_differences {
@@ -1806,6 +1831,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
             worktree_root.as_deref(),
             use_worktree_new,
             worktree_clean.as_ref(),
+            lazy_fetch,
         )?
     } else if pickaxe_all || pickaxe_regex {
         sort_diff_entries_by_path(entries)
@@ -1883,6 +1909,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                 ws_ignore,
                 ignore_blank_lines,
                 &ignore_regexes,
+                lazy_fetch,
             )? {
                 visible.push(entry);
             }
@@ -1924,6 +1951,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
             use_worktree_new,
             worktree_clean.as_ref(),
             &resolver,
+            lazy_fetch,
         )?;
         let mut code = 0;
         if check_failed {
@@ -1966,6 +1994,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                     .and_then(|config| config.get_bool("core", None, "autocrlf"))
                     .unwrap_or(false),
             },
+            lazy_fetch,
         )? {
             if code != 0 {
                 return Err(GitError::Exit(code));
@@ -1997,6 +2026,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                         diff_algorithm,
                         indent_heuristic,
                     },
+                    lazy_fetch,
                 )?
             } else if !relative_lookup_entries.is_empty() {
                 collect_diff_stat_entries_with_lookup(
@@ -2006,6 +2036,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                     worktree_root.as_deref(),
                     use_worktree_new,
                     worktree_clean.as_ref(),
+                    lazy_fetch,
                 )?
             } else {
                 collect_diff_stat_entries_with_worktree_clean(
@@ -2014,6 +2045,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                     worktree_root.as_deref(),
                     use_worktree_new,
                     worktree_clean.as_ref(),
+                    lazy_fetch,
                 )?
             };
             if diff_rewrite_control {
@@ -2024,6 +2056,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                     worktree_root.as_deref(),
                     use_worktree_new,
                     worktree_clean.as_ref(),
+                    lazy_fetch,
                 )?;
             }
             Some(stat_entries)
@@ -2082,6 +2115,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                     use_worktree_new,
                     worktree_clean.as_ref(),
                     dirstat_options,
+                    lazy_fetch,
                 )?;
             }
             Ok(())
@@ -2148,6 +2182,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                             quote_path_fully,
                         },
                         widths: Some(resolved_stat_widths),
+                        config: None,
                     },
                     after_stat: Some(&mut render_dirstat),
                     prefix_already_written: false,
@@ -2175,6 +2210,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                                 patch_abbrev,
                                 &src_prefix,
                                 &dst_prefix,
+                                lazy_fetch,
                             )?;
                         }
                         return Ok(());
@@ -2207,6 +2243,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                                 worktree_root.as_deref(),
                                 use_worktree_old,
                                 worktree_clean.as_ref(),
+                                lazy_fetch,
                             )?,
                             diff_entry_new_content(
                                 lookup_entry,
@@ -2214,6 +2251,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                                 worktree_root.as_deref(),
                                 use_worktree_new,
                                 worktree_clean.as_ref(),
+                                lazy_fetch,
                             )?,
                         ))
                     } else {
@@ -2227,6 +2265,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                         suppress_blank_empty,
                         binary: patch_binary,
                         db: &db,
+                        lazy_fetch,
                         worktree_root: worktree_root.as_deref(),
                         use_worktree_new,
                         format,
@@ -2286,6 +2325,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                             quote_path_fully,
                         },
                         widths: Some(resolved_stat_widths),
+                        config: None,
                     },
                     after_stat: Some(&mut render_dirstat),
                     prefix_already_written: false,
@@ -2391,6 +2431,7 @@ struct CombinedDiffOptions<'a> {
     /// `-O<orderfile>` / `diff.orderfile`: reorder the combined paths by the
     /// orderfile patterns (`diffcore_order` runs for combined diffs too).
     orderfile: Option<&'a str>,
+    lazy_fetch: bool,
 }
 
 fn write_diff_combined_three_tree(
@@ -2455,6 +2496,7 @@ fn write_diff_combined_three_tree(
         dst_prefix: options.dst_prefix,
         patch_abbrev: options.patch_abbrev,
         raw_abbrev: options.raw_abbrev,
+        lazy_fetch: options.lazy_fetch,
     };
     let mut out = Vec::new();
     if selection.raw {
@@ -2569,9 +2611,10 @@ fn write_diff_unmerged_worktree_combined(
     abbrev: usize,
     src_prefix: &str,
     dst_prefix: &str,
+    lazy_fetch: bool,
 ) -> Result<()> {
-    let ours = read_blob(db, &path.ours)?;
-    let theirs = read_blob(db, &path.theirs)?;
+    let ours = read_blob(db, &path.ours, lazy_fetch)?;
+    let theirs = read_blob(db, &path.theirs, lazy_fetch)?;
     let ours_lines = diff_split_lines(&ours);
     let theirs_lines = diff_split_lines(&theirs);
     let worktree_lines = diff_split_lines(&path.worktree);
@@ -2699,6 +2742,7 @@ pub(crate) fn apply_diff_pickaxe(
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+    lazy_fetch: bool,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
     if needle.is_empty() {
         return Ok(Vec::new());
@@ -2712,6 +2756,7 @@ pub(crate) fn apply_diff_pickaxe(
                 worktree_root,
                 use_worktree_new,
                 worktree_clean,
+                lazy_fetch,
             )? {
                 return Ok(sort_diff_entries_by_path(entries));
             }
@@ -2728,6 +2773,7 @@ pub(crate) fn apply_diff_pickaxe(
             worktree_root,
             use_worktree_new,
             worktree_clean,
+            lazy_fetch,
         )? {
             matches.push(entry.clone());
         }
@@ -2742,10 +2788,17 @@ fn diff_entry_matches_pickaxe(
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+    lazy_fetch: bool,
 ) -> Result<bool> {
-    let old_content = diff_entry_old_content(entry, db)?;
-    let new_content =
-        diff_entry_new_content(entry, db, worktree_root, use_worktree_new, worktree_clean)?;
+    let old_content = diff_entry_old_content(entry, db, lazy_fetch)?;
+    let new_content = diff_entry_new_content(
+        entry,
+        db,
+        worktree_root,
+        use_worktree_new,
+        worktree_clean,
+        lazy_fetch,
+    )?;
     Ok(
         count_non_overlapping_occurrences(old_content.as_deref().unwrap_or_default(), needle)
             != count_non_overlapping_occurrences(
@@ -3056,17 +3109,19 @@ fn collect_diff_stat_entries_with_ignore<'a>(
     use_worktree_new: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
     ignore: DiffStatIgnoreOptions<'_>,
+    lazy_fetch: bool,
 ) -> Result<Vec<DiffStatEntryData<'a>>> {
     let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         let lookup_entry = diff_relative_lookup_entry(entry, lookup_entries);
-        let old_content = diff_entry_old_content(lookup_entry, db)?;
+        let old_content = diff_entry_old_content(lookup_entry, db, lazy_fetch)?;
         let new_content = diff_entry_new_content(
             lookup_entry,
             db,
             worktree_root,
             use_worktree_new,
             worktree_clean,
+            lazy_fetch,
         )?;
         let stats = if old_content.as_deref().is_some_and(is_binary_content)
             || new_content.as_deref().is_some_and(is_binary_content)
@@ -3095,17 +3150,19 @@ fn collect_diff_stat_entries_with_lookup<'a>(
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+    lazy_fetch: bool,
 ) -> Result<Vec<DiffStatEntryData<'a>>> {
     let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         let lookup_entry = diff_relative_lookup_entry(entry, lookup_entries);
-        let old_content = diff_entry_old_content(lookup_entry, db)?;
+        let old_content = diff_entry_old_content(lookup_entry, db, lazy_fetch)?;
         let new_content = diff_entry_new_content(
             lookup_entry,
             db,
             worktree_root,
             use_worktree_new,
             worktree_clean,
+            lazy_fetch,
         )?;
         let stats = diff_line_stats(old_content.as_deref(), new_content.as_deref());
         stat_entries.push(DiffStatEntryData { entry, stats });
@@ -3120,19 +3177,21 @@ fn apply_diff_break_rewrite_stats(
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+    lazy_fetch: bool,
 ) -> Result<()> {
     for data in entries {
         if !matches!(data.entry.status, sley_diff_merge::NameStatus::Modified) {
             continue;
         }
         let lookup_entry = diff_relative_lookup_entry(data.entry, lookup_entries);
-        let old_content = diff_entry_old_content(lookup_entry, db)?;
+        let old_content = diff_entry_old_content(lookup_entry, db, lazy_fetch)?;
         let new_content = diff_entry_new_content(
             lookup_entry,
             db,
             worktree_root,
             use_worktree_new,
             worktree_clean,
+            lazy_fetch,
         )?;
         let (Some(old), Some(new)) = (old_content.as_deref(), new_content.as_deref()) else {
             continue;
@@ -3231,6 +3290,7 @@ struct DiffNoIndexParams<'a> {
     ignore_regexes: &'a [sley_grep::Regex],
     indent_heuristic: bool,
     anchored: &'a [Vec<u8>],
+    lazy_fetch: bool,
 }
 
 struct NoIndexSide {
@@ -3476,6 +3536,7 @@ fn cmd_diff_no_index(
                 anchors: params.anchored,
                 allow_textconv: true,
                 db,
+                lazy_fetch: params.lazy_fetch,
                 worktree_root: None,
                 use_worktree_new: false,
                 format,

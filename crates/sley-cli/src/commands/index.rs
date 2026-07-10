@@ -932,7 +932,13 @@ pub(crate) fn cmd_ls_files(
         return Ok(());
     }
     let mut stdout = io::stdout();
-    let pathspec = LsFilesPathspec::new(&cwd, &worktree_root, full_name, &path_args)?;
+    let pathspec = LsFilesPathspec::new(
+        &cwd,
+        &worktree_root,
+        full_name,
+        &path_args,
+        effective_pathspec_flags(cli_session),
+    )?;
     let eol_context = if show_eol {
         Some(EolContext {
             worktree_root: worktree_root.clone(),
@@ -2717,7 +2723,7 @@ pub(crate) fn cmd_update_index(
     if fsmonitor && !suppress_after_unresolve {
         print_update_index_fsmonitor_unset_warning();
     }
-    crate::commands::hooks::run_post_index_change_hook(false, true)?;
+    crate::commands::hooks::run_post_index_change_hook(cli_session, false, true)?;
     Ok(())
 }
 

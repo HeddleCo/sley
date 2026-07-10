@@ -21,11 +21,11 @@ pub(super) fn log_walk_reflogs(
     let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
     let mut stdout = io::stdout();
     let references = if revisions.is_empty() {
-        vec![ReflogWalkTarget::new(None)?]
+        vec![ReflogWalkTarget::new(&store, git_dir, format, None)?]
     } else {
         revisions
             .iter()
-            .map(|revision| ReflogWalkTarget::new(Some(revision)))
+            .map(|revision| ReflogWalkTarget::new(&store, git_dir, format, Some(revision)))
             .collect::<Result<Vec<_>>>()?
     };
     let mut skipped = 0usize;
@@ -116,9 +116,14 @@ struct ReflogWalkTarget {
 }
 
 impl ReflogWalkTarget {
-    fn new(revision: Option<&(String, bool)>) -> Result<Self> {
+    fn new(
+        store: &FileRefStore,
+        git_dir: &Path,
+        format: ObjectFormat,
+        revision: Option<&(String, bool)>,
+    ) -> Result<Self> {
         let original = revision.map(|(revision, _)| revision.as_str());
-        let reference = reflog_reference_name(original)?;
+        let reference = reflog_reference_name(store, git_dir, format, original)?;
         let display_reference = reflog_walk_display_reference(&reference);
         // `%gD` normally preserves the full spelling supplied by the caller,
         // while `%gd` shortens a branch name. A pseudo-ref selector such as

@@ -540,6 +540,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
         reject_nul_pattern_without_pcre(&opts)?;
         let color_config = repo.as_ref().map(|repo| repo.config());
         let any = grep_no_index(
+            cli_session,
             &opts,
             color_config,
             repo.as_ref(),
@@ -657,6 +658,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
         cwd,
         opts.full_name,
         &opts.pathspecs,
+        effective_pathspec_flags(cli_session),
     )?;
     let userdiff_attributes = worktree_root
         .as_deref()
@@ -690,6 +692,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
                 format,
                 db,
                 config: repo.config(),
+                lazy_fetch: cli_session.lazy_fetch(),
             },
             b"",
             &plan,
@@ -708,6 +711,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
                     config: repo.config(),
                     common_dir: repo.git_dir(),
                     worktree_root: worktree_root.as_deref(),
+                    lazy_fetch: cli_session.lazy_fetch(),
                 },
                 b"",
                 &plan,
@@ -1146,6 +1150,7 @@ fn run_open_pager(_pager: &str, _opts: &GrepOptions, _files: &[Vec<u8>]) -> Resu
 }
 
 fn grep_no_index(
+    cli_session: &crate::session::CliSession,
     opts: &GrepOptions,
     color_config: Option<&GitConfig>,
     repo: Option<&RepositoryContext>,
@@ -1167,6 +1172,7 @@ fn grep_no_index(
         &cwd,
         opts.full_name,
         pathspec_args,
+        effective_pathspec_flags(cli_session),
     )?;
     let matcher = GrepMatcher::compile(GrepCompileConfig {
         patterns: &opts.patterns,
@@ -1582,6 +1588,7 @@ struct GrepIndexSource<'a> {
     format: ObjectFormat,
     db: &'a FileObjectDatabase,
     config: &'a GitConfig,
+    lazy_fetch: bool,
 }
 
 fn grep_index_source(
@@ -1678,6 +1685,7 @@ fn grep_index_level(
                     format: sub.format,
                     db: &sub.db,
                     config: &sub.config,
+                    lazy_fetch: source.lazy_fetch,
                 };
                 let sub_prefix = submodule_prefix(prefix, &path);
                 let matched = grep_index_level(&sub_source, &sub_prefix, plan, out, printed_file)?;
@@ -1725,7 +1733,7 @@ fn grep_index_level(
                 i = next(false, i);
                 continue;
             }
-            let object = read_object_maybe_prefetch_promisor(source.db, &oid)?;
+            let object = read_object_maybe_prefetch_promisor(source.db, &oid, source.lazy_fetch)?;
             Cow::Owned(object.body.to_vec())
         } else {
             let absolute = source.worktree_root.join(bytes_to_path(&path));
@@ -1762,6 +1770,7 @@ struct GrepTreeSource<'a> {
     /// submodule's in-place gitlink. For a nested level this is the parent
     /// submodule's worktree.
     worktree_root: Option<&'a Path>,
+    lazy_fetch: bool,
 }
 
 fn grep_tree_source(
@@ -1810,6 +1819,7 @@ fn grep_tree_level(
                     config: &sub.config,
                     common_dir: &sub.git_dir,
                     worktree_root: sub.worktree_root.as_deref(),
+                    lazy_fetch: source.lazy_fetch,
                 };
                 let sub_prefix = submodule_prefix(prefix, path);
                 let matched = grep_tree_level(&sub_source, &sub_prefix, plan, out, printed_file)?;
@@ -1827,7 +1837,7 @@ fn grep_tree_level(
             continue;
         }
         let display = plan.pathspec.display(&full);
-        let object = read_object_maybe_prefetch_promisor(source.db, oid)?;
+        let object = read_object_maybe_prefetch_promisor(source.db, oid, source.lazy_fetch)?;
         let driver = grep_userdiff_driver(plan, &full)?;
         let funcname = driver.as_ref().and_then(|driver| driver.funcname.as_ref());
         let matched = grep_buffer(
@@ -2554,6 +2564,7 @@ impl GrepPathspec {
         cwd: &Path,
         full_name: bool,
         pathspecs: &[String],
+        magic: sley_worktree::PathspecMatchMagic,
     ) -> Result<Self> {
         let prefix = if let Some(root) = worktree_root {
             let root = fs::canonicalize(root)?;
@@ -2570,7 +2581,6 @@ impl GrepPathspec {
             .filter(|component| !component.is_empty())
             .count();
         let mut filters = Vec::new();
-        let magic = effective_pathspec_flags();
         for spec in pathspecs {
             let element = parse_normalized_pathspec_element(&prefix, spec, magic)?;
             let is_dir_spec = !element

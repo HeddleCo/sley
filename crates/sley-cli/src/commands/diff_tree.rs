@@ -637,6 +637,7 @@ pub(crate) fn cmd_diff_tree(
             repo.cwd(),
             worktree_root,
             &setup.pathspecs,
+            repo.pathspec_magic(),
         )?)
     } else {
         None
@@ -653,6 +654,7 @@ pub(crate) fn cmd_diff_tree(
         indent_heuristic,
         ws_resolver,
         check_failed: std::cell::Cell::new(false),
+        lazy_fetch: cli_session.lazy_fetch(),
     };
 
     let mut has_differences = false;
@@ -1069,6 +1071,7 @@ struct DiffRequestContext<'a> {
     ws_resolver: Option<commands::diff::WhitespaceRuleResolver>,
     /// Accumulated `--check` failure status across all requests.
     check_failed: std::cell::Cell<bool>,
+    lazy_fetch: bool,
 }
 
 fn run_diff_request(
@@ -1132,6 +1135,7 @@ fn run_diff_request(
             None,
             false,
             None,
+            context.lazy_fetch,
         )?
     } else {
         entries
@@ -1143,7 +1147,14 @@ fn run_diff_request(
     if context.options.check {
         if let Some(resolver) = &context.ws_resolver {
             let failed = commands::diff::run_diff_check(
-                &entries, context.db, None, false, false, None, resolver,
+                &entries,
+                context.db,
+                None,
+                false,
+                false,
+                None,
+                resolver,
+                context.lazy_fetch,
             )?;
             if failed {
                 context.check_failed.set(true);
@@ -1190,7 +1201,7 @@ fn run_diff_request(
         wrote_block = true;
     }
     let stat_entries_for_render = if output.numstat || output.stat || output.shortstat {
-        collect_diff_stat_entries(&entries, context.db, None, false)?
+        collect_diff_stat_entries(&entries, context.db, None, false, context.lazy_fetch)?
     } else {
         Vec::new()
     };
@@ -1230,6 +1241,7 @@ fn run_diff_request(
                 },
                 // diff-tree is plumbing: fixed 80 columns, no config caps.
                 widths: Some(DiffStatWidths::plumbing()),
+                config: None,
             },
             after_stat: None,
             prefix_already_written: wrote_block,
@@ -1241,6 +1253,7 @@ fn run_diff_request(
                 anchors: &[],
                 allow_textconv: false,
                 db: context.db,
+                lazy_fetch: context.lazy_fetch,
                 worktree_root: None,
                 use_worktree_new: false,
                 format: context.format,
@@ -1313,6 +1326,7 @@ fn run_combined_request(
         dst_prefix: &context.options.dst_prefix,
         patch_abbrev: context.patch_abbrev,
         raw_abbrev: context.raw_abbrev,
+        lazy_fetch: context.lazy_fetch,
     };
 
     if output.name_only {
@@ -1354,7 +1368,7 @@ fn run_combined_request(
         )?;
         has_differences |= !first_parent_entries.is_empty();
         let stat_entries = if output.numstat || output.stat || output.shortstat {
-            collect_diff_stat_entries(&first_parent_entries, db, None, false)?
+            collect_diff_stat_entries(&first_parent_entries, db, None, false, context.lazy_fetch)?
         } else {
             Vec::new()
         };

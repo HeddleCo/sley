@@ -6,10 +6,10 @@ use crate::commands::remote::{read_repo_config, remote_names};
 use crate::session;
 use crate::{
     BString, DEFAULT_BIG_FILE_THRESHOLD, GitConfig, GitError, ObjectFormat, ObjectId, Result,
-    commit_encoding, commit_subject, core_big_file_threshold, effective_pathspec_flags,
-    global_lazy_fetch_enabled, log_reencode_message, normalize_absolute_cli_pathspec,
-    repository_object_format, sley_config, sley_core, sley_diff_merge, sley_odb, sley_pretty,
-    sley_remote, sley_rev, sley_worktree, status_quote_path, worktree_root_for_git_dir,
+    commit_encoding, commit_subject, core_big_file_threshold, log_reencode_message,
+    normalize_absolute_cli_pathspec, repository_object_format, sley_config, sley_core,
+    sley_diff_merge, sley_odb, sley_pretty, sley_remote, sley_rev, sley_worktree,
+    status_quote_path, worktree_root_for_git_dir,
 };
 use sley::plumbing::sley_object::{Commit, EncodedObject, ObjectType};
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
@@ -91,6 +91,7 @@ pub(crate) struct DiffWorktreeCleanContext<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct DiffRenderOptions<'a> {
     pub(crate) db: &'a FileObjectDatabase,
+    pub(crate) lazy_fetch: bool,
     pub(crate) worktree_root: Option<&'a Path>,
     pub(crate) use_worktree_new: bool,
     pub(crate) format: ObjectFormat,
@@ -188,6 +189,7 @@ pub(crate) struct DiffEntryStatRenderOptions<'a> {
     pub(crate) z: bool,
     pub(crate) options: DiffStatOptions,
     pub(crate) widths: Option<DiffStatWidths>,
+    pub(crate) config: Option<&'a GitConfig>,
 }
 
 pub(crate) struct DiffEntryRenderContext<'a> {
@@ -257,7 +259,12 @@ where
                     context.stat.options,
                     widths,
                 )?,
-                None => write_diff_stat_materialized(stdout, stat_entries, context.stat.options)?,
+                None => write_diff_stat_materialized(
+                    stdout,
+                    stat_entries,
+                    context.stat.options,
+                    context.stat.config,
+                )?,
             },
         }
         wrote_prefix = true;
@@ -510,6 +517,7 @@ pub(crate) fn render_tree_to_tree_patch(
     format: ObjectFormat,
     old_tree: &ObjectId,
     new_tree: &ObjectId,
+    lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
     let entries = sley_diff_merge::diff_name_status_trees_with_options(
         db,
@@ -528,6 +536,7 @@ pub(crate) fn render_tree_to_tree_patch(
                 anchors: &[],
                 allow_textconv: false,
                 db,
+                lazy_fetch,
                 worktree_root: None,
                 use_worktree_new: false,
                 format,
@@ -723,13 +732,14 @@ pub(crate) fn write_diff_patch_entry(
     let (mut old_content, mut new_content) = match options.no_index_contents {
         Some((old, new)) => (old.map(<[u8]>::to_vec), new.map(<[u8]>::to_vec)),
         None => (
-            diff_entry_old_content(entry, options.db)?,
+            diff_entry_old_content(entry, options.db, options.lazy_fetch)?,
             diff_entry_new_content(
                 entry,
                 options.db,
                 options.worktree_root,
                 options.use_worktree_new,
                 None,
+                options.lazy_fetch,
             )?,
         ),
     };
@@ -1353,13 +1363,11 @@ pub(crate) fn write_diff_stat_materialized(
     stdout: &mut dyn Write,
     entries: &[DiffStatEntryData<'_>],
     options: DiffStatOptions,
+    config: Option<&GitConfig>,
 ) -> Result<()> {
     let mut widths = DiffStatWidths::terminal();
-    if let Ok(cwd) = env::current_dir()
-        && let Ok(git_dir) = session::cli_git_dir_from(&cwd)
-        && let Ok(config) = commands::remote::read_repo_config(&git_dir)
-    {
-        widths.resolve_config(&config);
+    if let Some(config) = config {
+        widths.resolve_config(config);
     } else {
         widths.resolve_config_defaults();
     }
@@ -1434,6 +1442,7 @@ pub(crate) fn write_diff_dirstat(
     use_worktree_new: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
     options: DirstatOptions,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let mut files = Vec::with_capacity(entries.len());
     let mut changed_total: u64 = 0;
@@ -1448,13 +1457,14 @@ pub(crate) fn write_diff_dirstat(
             match options.mode {
                 DirstatMode::Files => 1,
                 DirstatMode::Lines => {
-                    let old_content = diff_entry_old_content(entry, db)?;
+                    let old_content = diff_entry_old_content(entry, db, lazy_fetch)?;
                     let new_content = diff_entry_new_content(
                         entry,
                         db,
                         worktree_root,
                         use_worktree_new,
                         worktree_clean,
+                        lazy_fetch,
                     )?;
                     match diff_line_stats(old_content.as_deref(), new_content.as_deref()) {
                         DiffLineStats::Binary { .. } => {
@@ -1466,13 +1476,14 @@ pub(crate) fn write_diff_dirstat(
                     }
                 }
                 DirstatMode::Changes => {
-                    let old_content = diff_entry_old_content(entry, db)?;
+                    let old_content = diff_entry_old_content(entry, db, lazy_fetch)?;
                     let new_content = diff_entry_new_content(
                         entry,
                         db,
                         worktree_root,
                         use_worktree_new,
                         worktree_clean,
+                        lazy_fetch,
                     )?;
                     let damage = match (old_content.as_deref(), new_content.as_deref()) {
                         (Some(old), Some(new)) => {
@@ -1588,6 +1599,7 @@ pub(crate) fn collect_diff_stat_entries<'a>(
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
+    lazy_fetch: bool,
 ) -> Result<Vec<DiffStatEntryData<'a>>> {
     collect_diff_stat_entries_with_worktree_clean(
         entries,
@@ -1595,6 +1607,7 @@ pub(crate) fn collect_diff_stat_entries<'a>(
         worktree_root,
         use_worktree_new,
         None,
+        lazy_fetch,
     )
 }
 
@@ -1604,10 +1617,11 @@ pub(crate) fn collect_diff_stat_entries_with_worktree_clean<'a>(
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+    lazy_fetch: bool,
 ) -> Result<Vec<DiffStatEntryData<'a>>> {
     let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
-        let old_content = diff_entry_old_stat_content(entry, db)?;
+        let old_content = diff_entry_old_stat_content(entry, db, lazy_fetch)?;
         let stats = if entry.old_oid.is_some() && entry.old_oid == entry.new_oid {
             let old_bytes = old_content.as_ref().map(DiffBlobContent::as_slice);
             diff_line_stats(old_bytes, old_bytes)
@@ -1618,6 +1632,7 @@ pub(crate) fn collect_diff_stat_entries_with_worktree_clean<'a>(
                 worktree_root,
                 use_worktree_new,
                 worktree_clean,
+                lazy_fetch,
             )?;
             diff_line_stats(
                 old_content.as_ref().map(DiffBlobContent::as_slice),
@@ -2035,6 +2050,7 @@ fn write_submodule_inline_diff(
                     anchors: &[],
                     allow_textconv: false,
                     db: sub_db,
+                    lazy_fetch: options.lazy_fetch,
                     worktree_root: Some(sub_root),
                     use_worktree_new: true,
                     format: sub_format,
@@ -2084,6 +2100,7 @@ fn write_submodule_inline_diff(
                 anchors: &[],
                 allow_textconv: false,
                 db: sub_db,
+                lazy_fetch: options.lazy_fetch,
                 worktree_root: nested_worktree_root.as_deref(),
                 use_worktree_new: false,
                 format: sub_format,
@@ -2153,6 +2170,7 @@ pub(crate) fn diff_entry_produces_output(
     ws_ignore: sley_diff_merge::WsIgnore,
     ignore_blank_lines: bool,
     ignore_regexes: &[sley_grep::Regex],
+    lazy_fetch: bool,
 ) -> Result<bool> {
     // Non-modification statuses, mode changes, and renames/copies always show.
     let mode_unchanged = match (entry.old_mode, entry.new_mode) {
@@ -2162,9 +2180,15 @@ pub(crate) fn diff_entry_produces_output(
     if !matches!(entry.status, sley_diff_merge::NameStatus::Modified) || !mode_unchanged {
         return Ok(true);
     }
-    let old_content = diff_entry_old_content(entry, db)?;
-    let new_content =
-        diff_entry_new_content(entry, db, worktree_root, use_worktree_new, worktree_clean)?;
+    let old_content = diff_entry_old_content(entry, db, lazy_fetch)?;
+    let new_content = diff_entry_new_content(
+        entry,
+        db,
+        worktree_root,
+        use_worktree_new,
+        worktree_clean,
+        lazy_fetch,
+    )?;
     if old_content.as_deref() == new_content.as_deref() {
         return Ok(false);
     }
@@ -2206,6 +2230,7 @@ pub(crate) fn diff_entry_produces_output(
 fn diff_entry_old_stat_content(
     entry: &sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
+    lazy_fetch: bool,
 ) -> Result<Option<DiffBlobContent>> {
     if entry.old_mode == Some(0o160000) {
         return Ok(entry
@@ -2216,7 +2241,7 @@ fn diff_entry_old_stat_content(
     entry
         .old_oid
         .as_ref()
-        .map(|oid| read_blob_content(db, oid))
+        .map(|oid| read_blob_content(db, oid, lazy_fetch))
         .transpose()
 }
 
@@ -2226,6 +2251,7 @@ fn diff_entry_new_stat_content(
     worktree_root: Option<&Path>,
     use_worktree: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+    lazy_fetch: bool,
 ) -> Result<Option<DiffBlobContent>> {
     if entry.new_mode.is_none() {
         return Ok(None);
@@ -2249,19 +2275,20 @@ fn diff_entry_new_stat_content(
         return Ok(oid.map(|oid| DiffBlobContent::Owned(gitlink_diff_content(&oid, false))));
     }
     if use_worktree {
-        return diff_entry_new_content(entry, db, worktree_root, true, worktree_clean)
+        return diff_entry_new_content(entry, db, worktree_root, true, worktree_clean, lazy_fetch)
             .map(|content| content.map(DiffBlobContent::Owned));
     }
     entry
         .new_oid
         .as_ref()
-        .map(|oid| read_blob_content(db, oid))
+        .map(|oid| read_blob_content(db, oid, lazy_fetch))
         .transpose()
 }
 
 pub(crate) fn diff_entry_old_content(
     entry: &sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
+    lazy_fetch: bool,
 ) -> Result<Option<Vec<u8>>> {
     if entry.old_mode == Some(0o160000) {
         return Ok(entry
@@ -2272,7 +2299,7 @@ pub(crate) fn diff_entry_old_content(
     entry
         .old_oid
         .as_ref()
-        .map(|oid| read_blob(db, oid))
+        .map(|oid| read_blob(db, oid, lazy_fetch))
         .transpose()
 }
 
@@ -2282,6 +2309,7 @@ pub(crate) fn diff_entry_new_content(
     worktree_root: Option<&Path>,
     use_worktree: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+    lazy_fetch: bool,
 ) -> Result<Option<Vec<u8>>> {
     if entry.new_mode.is_none() {
         return Ok(None);
@@ -2332,7 +2360,7 @@ pub(crate) fn diff_entry_new_content(
     entry
         .new_oid
         .as_ref()
-        .map(|oid| read_blob(db, oid))
+        .map(|oid| read_blob(db, oid, lazy_fetch))
         .transpose()
 }
 
@@ -2380,8 +2408,12 @@ pub(crate) fn diff_rename_limit_requires_integer_error() -> GitError {
     GitError::Exit(129)
 }
 
-fn read_blob_content(db: &FileObjectDatabase, oid: &ObjectId) -> Result<DiffBlobContent> {
-    let object = read_object_maybe_prefetch_promisor(db, oid)?;
+fn read_blob_content(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+    lazy_fetch: bool,
+) -> Result<DiffBlobContent> {
+    let object = read_object_maybe_prefetch_promisor(db, oid, lazy_fetch)?;
     if object.object_type != ObjectType::Blob {
         return Err(GitError::InvalidObject(format!(
             "diff expected blob object {oid}"
@@ -2393,11 +2425,12 @@ fn read_blob_content(db: &FileObjectDatabase, oid: &ObjectId) -> Result<DiffBlob
 pub(crate) fn read_object_maybe_prefetch_promisor(
     db: &FileObjectDatabase,
     oid: &ObjectId,
+    lazy_fetch: bool,
 ) -> Result<Arc<EncodedObject>> {
     let object = match db.read_object(oid) {
         Ok(object) => object,
         Err(err @ GitError::NotFound(_)) => {
-            if !prefetch_local_promisor_object(db, oid)? {
+            if !prefetch_local_promisor_object(db, oid, lazy_fetch)? {
                 return Err(err);
             }
             db.read_object(oid)?
@@ -2428,8 +2461,12 @@ pub(crate) fn promisor_remote_names(config: &GitConfig) -> Vec<String> {
     names
 }
 
-fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Result<bool> {
-    if !global_lazy_fetch_enabled() {
+fn prefetch_local_promisor_object(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+    lazy_fetch: bool,
+) -> Result<bool> {
+    if !lazy_fetch {
         return Ok(false);
     }
     let Some(git_dir) = database_git_dir(db) else {
@@ -2554,8 +2591,12 @@ pub(crate) fn prefetch_via_configured_upload_pack(command: &str, repository: &st
     Ok(output.status.success())
 }
 
-pub(crate) fn read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
-    match read_blob_content(db, oid)? {
+pub(crate) fn read_blob(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+    lazy_fetch: bool,
+) -> Result<Vec<u8>> {
+    match read_blob_content(db, oid, lazy_fetch)? {
         DiffBlobContent::Owned(bytes) => Ok(bytes),
         DiffBlobContent::Object(object) => match Arc::try_unwrap(object) {
             Ok(object) => Ok(object.body),
@@ -2870,7 +2911,12 @@ pub(crate) struct DiffPathspec {
 }
 
 impl DiffPathspec {
-    pub(crate) fn new(cwd: &Path, worktree_root: &Path, path_args: &[String]) -> Result<Self> {
+    pub(crate) fn new(
+        cwd: &Path,
+        worktree_root: &Path,
+        path_args: &[String],
+        magic: sley_worktree::PathspecMatchMagic,
+    ) -> Result<Self> {
         let root = fs::canonicalize(worktree_root)?;
         let cwd = fs::canonicalize(cwd)?;
         let relative = cwd.strip_prefix(&root).map_err(|_| {
@@ -2878,7 +2924,6 @@ impl DiffPathspec {
         })?;
         let prefix = relative.to_string_lossy().replace('\\', "/").into_bytes();
         let mut filters = Vec::new();
-        let magic = effective_pathspec_flags();
         for arg in path_args {
             let parse_arg = normalize_absolute_cli_pathspec(&root, &cwd, arg)?;
             let element = parse_normalized_pathspec_element(&prefix, &parse_arg, magic)?;

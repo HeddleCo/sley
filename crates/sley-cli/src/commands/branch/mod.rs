@@ -18,13 +18,19 @@ mod upstream;
 pub(super) struct BranchCommandContext {
     pub(super) repository: sley::Repository,
     pub(super) refs: crate::FileRefStore,
+    pub(super) config: crate::GitConfig,
 }
 
 impl BranchCommandContext {
     pub(super) fn open(session: &crate::session::CliSession) -> crate::Result<Self> {
         let repository = session.open_repository()?;
         let refs = repository.references();
-        Ok(Self { repository, refs })
+        let config = repository.config_snapshot()?;
+        Ok(Self {
+            repository,
+            refs,
+            config,
+        })
     }
 
     pub(super) fn git_dir(&self) -> &std::path::Path {

@@ -472,6 +472,7 @@ impl sley_rev::format_patch::FormatPatchRevisionResolver for CliFormatPatchRevis
 struct CliFormatPatchPatchIds<'a> {
     objects: &'a FileObjectDatabase,
     format: ObjectFormat,
+    lazy_fetch: bool,
 }
 
 impl sley_rev::format_patch::FormatPatchPatchId for CliFormatPatchPatchIds<'_> {
@@ -490,9 +491,14 @@ impl sley_rev::format_patch::FormatPatchPatchId for CliFormatPatchPatchIds<'_> {
             }
             None => ObjectId::empty_tree(self.format),
         };
-        let diff =
-            render_tree_to_tree_patch(self.objects, self.format, &parent_tree, &record.commit.tree)
-                .unwrap_or_default();
+        let diff = render_tree_to_tree_patch(
+            self.objects,
+            self.format,
+            &parent_tree,
+            &record.commit.tree,
+            self.lazy_fetch,
+        )
+        .unwrap_or_default();
         Ok(if stable {
             commands::patch_id::stable_patch_id_for_diff(&diff, self.format)
         } else {
@@ -617,6 +623,7 @@ pub(crate) fn cmd_format_patch(
     let mut patch_ids = CliFormatPatchPatchIds {
         objects: db,
         format,
+        lazy_fetch: cli_session.lazy_fetch(),
     };
     let plan = sley_rev::format_patch::plan_format_patch_series(
         sley_rev::format_patch::FormatPatchPlanRequest {
@@ -650,6 +657,7 @@ pub(crate) fn cmd_format_patch(
             cwd,
             repo.worktree_root()?,
             &plan.pathspecs,
+            repo.pathspec_magic(),
         )?)
     };
 
@@ -697,6 +705,7 @@ pub(crate) fn cmd_format_patch(
             &range_diff_setup_args,
             &plan.pathspecs,
             &notes_refs,
+            cli_session.lazy_fetch(),
         )?),
         None => None,
     };
@@ -755,6 +764,7 @@ pub(crate) fn cmd_format_patch(
             abbrev,
             &cover_thread,
             range_diff.as_deref(),
+            cli_session.lazy_fetch(),
         )?)
     } else {
         None
@@ -798,6 +808,7 @@ pub(crate) fn cmd_format_patch(
                 notes_refs: &notes_refs,
                 range_diff: range_diff.as_deref().filter(|_| count == 1),
                 base_info: base_info.as_ref(),
+                lazy_fetch: cli_session.lazy_fetch(),
             })?;
             if options.graph {
                 buffer =
@@ -843,6 +854,7 @@ pub(crate) fn cmd_format_patch(
                 notes_refs: &notes_refs,
                 range_diff: range_diff.as_deref().filter(|_| count == 1),
                 base_info: base_info.as_ref(),
+                lazy_fetch: cli_session.lazy_fetch(),
             })?;
             if options.graph {
                 buffer =
@@ -917,6 +929,7 @@ pub(crate) fn cmd_format_patch(
             notes_refs: &notes_refs,
             range_diff: range_diff.as_deref().filter(|_| count == 1),
             base_info: base_info.as_ref(),
+            lazy_fetch: cli_session.lazy_fetch(),
         })?;
         if options.graph {
             buffer = format_patch_graph_prefix(&buffer, idx == 0, resolved.signature.as_deref());
@@ -1024,6 +1037,7 @@ fn build_cover_letter(
     abbrev: usize,
     thread: &MailThreadHeaders,
     range_diff: Option<&[u8]>,
+    lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
     let _ = abbrev; // the cover never emits index lines; kept for signature parity.
     let format = repo.format();
@@ -1114,7 +1128,7 @@ fn build_cover_letter(
             &head.commit.tree,
         )?;
         if options.stat {
-            write_patch_diffstat(&mut out, &entries, db, options)?;
+            write_patch_diffstat(&mut out, &entries, db, options, lazy_fetch)?;
             for entry in &entries {
                 write_diff_summary_entry(&mut out, entry)?;
             }
@@ -2376,6 +2390,7 @@ struct RenderContext<'a> {
     range_diff: Option<&'a [u8]>,
     /// Optional base/prerequisite metadata block.
     base_info: Option<&'a BaseInfo>,
+    lazy_fetch: bool,
 }
 
 /// Render one commit into a complete mbox patch byte buffer.
@@ -2400,6 +2415,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         notes_refs,
         range_diff,
         base_info,
+        lazy_fetch,
     } = ctx;
 
     let commit = &record.commit;
@@ -2554,7 +2570,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
             out.extend_from_slice(b"---\n");
             let notes = render_format_patch_notes(git_dir, format, notes_refs, &record.oid)?;
             out.extend_from_slice(&notes);
-            write_patch_diffstat(&mut out, &entries, db, options)?;
+            write_patch_diffstat(&mut out, &entries, db, options, lazy_fetch)?;
             for entry in &entries {
                 write_diff_summary_entry(&mut out, entry)?;
             }
@@ -2574,7 +2590,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
             write_diff_patch_entry(
                 &mut out,
                 entry,
-                format_patch_diff_options(db, format, options, abbrev),
+                format_patch_diff_options(db, format, options, abbrev, lazy_fetch),
             )?;
         }
     }
@@ -3698,6 +3714,7 @@ fn format_patch_diff_options<'a>(
     format: ObjectFormat,
     options: &'a FormatPatchOptions,
     abbrev: usize,
+    lazy_fetch: bool,
 ) -> crate::DiffRenderOptions<'a> {
     crate::DiffRenderOptions {
         line_indicators: sley_diff_merge::render::LineIndicators::default(),
@@ -3706,6 +3723,7 @@ fn format_patch_diff_options<'a>(
         anchors: &[],
         allow_textconv: false,
         db,
+        lazy_fetch,
         worktree_root: None,
         use_worktree_new: false,
         format,
@@ -3797,8 +3815,9 @@ fn write_patch_diffstat(
     entries: &[sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     options: &FormatPatchOptions,
+    lazy_fetch: bool,
 ) -> Result<()> {
-    let stat_entries = collect_diff_stat_entries(entries, db, None, false)?;
+    let stat_entries = collect_diff_stat_entries(entries, db, None, false, lazy_fetch)?;
     let mut widths = options.stat_widths;
     if widths.stat_width == 0 {
         // MAIL_DEFAULT_WRAP

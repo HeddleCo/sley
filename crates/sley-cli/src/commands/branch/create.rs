@@ -33,6 +33,7 @@ pub(super) fn run_branch_create_options(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    config: &GitConfig,
     options: BranchCreateOptions,
 ) -> Result<()> {
     if options.recurse_submodules {
@@ -53,7 +54,7 @@ pub(super) fn run_branch_create_options(
     match options.positionals.as_slice() {
         [] => print_branch_list(store, BranchListMode::Local),
         [branch] if options.force => {
-            let branch = force_update_branch(git_dir, format, store, branch, None)?;
+            let branch = force_update_branch(git_dir, format, store, config, branch, None)?;
             branch_create_set_tracking(git_dir, store, &branch, None, options.track, options.quiet)
         }
         [branch] => {
@@ -61,6 +62,7 @@ pub(super) fn run_branch_create_options(
                 git_dir,
                 format,
                 store,
+                config,
                 branch,
                 None,
                 options.create_reflog,
@@ -75,7 +77,7 @@ pub(super) fn run_branch_create_options(
             )
         }
         [branch, start] if options.force => {
-            let branch = force_update_branch(git_dir, format, store, branch, Some(start))?;
+            let branch = force_update_branch(git_dir, format, store, config, branch, Some(start))?;
             branch_create_set_tracking(
                 git_dir,
                 store,
@@ -90,6 +92,7 @@ pub(super) fn run_branch_create_options(
                 git_dir,
                 format,
                 store,
+                config,
                 branch,
                 Some(start),
                 options.create_reflog,
@@ -616,16 +619,18 @@ pub(crate) fn create_branch_from_start(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    config: &GitConfig,
     branch: &str,
     start: Option<&String>,
 ) -> Result<()> {
-    create_branch_from_start_with_reflog(git_dir, format, store, branch, start, false)
+    create_branch_from_start_with_reflog(git_dir, format, store, config, branch, start, false)
 }
 
 pub(super) fn create_branch_from_start_with_reflog(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    config: &GitConfig,
     branch: &str,
     start: Option<&String>,
     create_reflog: bool,
@@ -642,7 +647,7 @@ pub(super) fn create_branch_from_start_with_reflog(
         Some(ReflogEntry {
             old_oid: ObjectId::null(format),
             new_oid: start_oid,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: commit_identity_from_env("COMMITTER", config)?,
             message,
         })
     } else {

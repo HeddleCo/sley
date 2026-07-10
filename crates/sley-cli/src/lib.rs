@@ -270,14 +270,6 @@ pub(crate) fn collect_short_status_with_options(
 pub fn run(args: Vec<String>) -> Result<()> {
     sley_core::set_original_cwd(env::current_dir().ok());
     let global = apply_global_options(&args)?;
-    sley_core::trace2::touch();
-    sley_core::trace2::start(global.args);
-    trace2_emit_process_ancestry_at_depth(sley_core::trace2::depth(), &[]);
-    trace2_emit_def_params_once();
-    // `-c` / `--config-env` overrides are folded into the process
-    // `GIT_CONFIG_PARAMETERS` env var during option parsing, so the single
-    // `injected_config_parameters()` reader is the source of truth for every
-    // config read; no separate global-override store is needed.
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cli_session = session::CliSession::from_parsed_globals(
         cwd,
@@ -289,6 +281,14 @@ pub fn run(args: Vec<String>) -> Result<()> {
         global.lazy_fetch,
         global.pathspec_flags,
     );
+    sley_core::trace2::touch();
+    sley_core::trace2::start(global.args);
+    trace2_emit_process_ancestry_at_depth(sley_core::trace2::depth(), &[]);
+    trace2_emit_def_params_once(&cli_session);
+    // `-c` / `--config-env` overrides are folded into the process
+    // `GIT_CONFIG_PARAMETERS` env var during option parsing, so the single
+    // `injected_config_parameters()` reader is the source of truth for every
+    // config read; no separate global-override store is needed.
     // Keep a shared clone installed while unmigrated commands still read the
     // compatibility accessors. Migrated commands receive the invocation-local
     // session explicitly through dispatch.
@@ -297,7 +297,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     // before dispatching. This is the CLI-side repository setup that
     // `sley::Repository::discover` deliberately leaves to this layer.
     if env::var_os("GIT_TRACE_SETUP").is_some()
-        && let Some(setup_result) = setup::setup_git_directory()
+        && let Some(setup_result) = setup::setup_git_directory(&cli_session)
     {
         setup::trace_repo_setup(&setup_result);
     }

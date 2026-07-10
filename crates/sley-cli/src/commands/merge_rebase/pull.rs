@@ -343,9 +343,11 @@ fn worktree_blob_identity(format: ObjectFormat, path: &Path) -> Result<Option<(u
     )))
 }
 
-fn ensure_pull_can_merge() -> Result<()> {
-    let color_advice = effective_config_with_overrides()
-        .and_then(|config| config.get("color", None, "advice").map(str::to_string))
+fn ensure_pull_can_merge(config: &GitConfig) -> Result<()> {
+    let config = effective_config_with_overrides(config);
+    let color_advice = config
+        .get("color", None, "advice")
+        .map(str::to_string)
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("always"));
     let print_hint = |line: &str| {
         if color_advice {
@@ -618,6 +620,7 @@ fn pull_checkout_into_void(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     commit_oid: &ObjectId,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let object = db.read_object(commit_oid)?;
     let commit = Commit::parse_ref(format, &object.body)?;
@@ -675,7 +678,7 @@ fn pull_checkout_into_void(
         let content = if sley_index::is_gitlink(*mode) {
             Vec::new()
         } else {
-            merge_read_blob(db, oid)?
+            merge_read_blob(db, oid, lazy_fetch)?
         };
         merge_write_worktree_file(worktree_root, path, &content, *mode)?;
         index_entries.push(merge_index_entry(path, *mode, *oid, 0));
@@ -1039,7 +1042,14 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
             return Err(GitError::Exit(128));
         }
         let merge_oid = merge_records[0].oid;
-        pull_checkout_into_void(&git_dir, &worktree_root, &db, format, &merge_oid)?;
+        pull_checkout_into_void(
+            &git_dir,
+            &worktree_root,
+            &db,
+            format,
+            &merge_oid,
+            cli_session.lazy_fetch(),
+        )?;
         let target_ref = match store.read_ref("HEAD")? {
             Some(RefTarget::Symbolic(branch)) => branch,
             _ => "HEAD".to_string(),
@@ -1055,7 +1065,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
                 reflog: Some(ReflogEntry {
                     old_oid: zero_oid(format)?,
                     new_oid: merge_oid,
-                    committer: commit_identity_from_env("COMMITTER")?,
+                    committer: commit_identity_from_env("COMMITTER", &config)?,
                     message: b"initial pull".to_vec(),
                 }),
             });
@@ -1110,7 +1120,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         effective_rebase = PullRebase::False;
     }
     if opt_ff.is_none() && rebase_unspecified && !fast_forward {
-        ensure_pull_can_merge()?;
+        ensure_pull_can_merge(&config)?;
     }
     if fast_forward {
         let mut merge_args = Vec::new();
@@ -1154,7 +1164,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         } else {
             rebase_args.push("FETCH_HEAD".to_string());
         }
-        return commands::rebase::cmd_rebase(&rebase_args);
+        return commands::rebase::cmd_rebase(cli_session, &rebase_args);
     }
     let mut merge_args = Vec::new();
     if let Some(ff) = opt_ff {

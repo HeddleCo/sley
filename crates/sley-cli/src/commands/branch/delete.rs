@@ -175,6 +175,7 @@ pub(super) fn force_update_branch(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    config: &GitConfig,
     branch: &str,
     start: Option<&String>,
 ) -> Result<String> {
@@ -201,20 +202,20 @@ pub(super) fn force_update_branch(
             Some(ReflogEntry {
                 old_oid,
                 new_oid,
-                committer: commit_identity_from_env("COMMITTER")?,
+                committer: commit_identity_from_env("COMMITTER", config)?,
                 message: branch_reset_reflog_message(store, start)?,
             })
         }
         Some(_) if branch_should_write_reflog(git_dir, &name, false)? => Some(ReflogEntry {
             old_oid: zero_oid(format)?,
             new_oid,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: commit_identity_from_env("COMMITTER", config)?,
             message: branch_reset_reflog_message(store, start)?,
         }),
         None if branch_should_write_reflog(git_dir, &name, false)? => Some(ReflogEntry {
             old_oid: ObjectId::null(format),
             new_oid,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: commit_identity_from_env("COMMITTER", config)?,
             message: branch_create_reflog_message(store, start)?,
         }),
         _ => None,

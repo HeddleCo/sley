@@ -9,6 +9,7 @@ struct MergeCommandContext {
     repository: sley::Repository,
     refs: FileRefStore,
     config: GitConfig,
+    lazy_fetch: bool,
 }
 
 impl MergeCommandContext {
@@ -25,6 +26,7 @@ impl MergeCommandContext {
             repository,
             refs,
             config,
+            lazy_fetch: cli_session.lazy_fetch(),
         })
     }
 
@@ -68,6 +70,7 @@ fn write_merge_result_diffstat(
     old_tree: &ObjectId,
     new_tree: &ObjectId,
     mode: MergeDiffstat,
+    lazy_fetch: bool,
 ) -> Result<()> {
     if mode == MergeDiffstat::Off {
         return Ok(());
@@ -80,7 +83,7 @@ fn write_merge_result_diffstat(
         sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     let compact = mode == MergeDiffstat::Compact;
-    let stat_entries = collect_diff_stat_entries(&entries, db, None, false)?;
+    let stat_entries = collect_diff_stat_entries(&entries, db, None, false, lazy_fetch)?;
     write_diff_stat_materialized(
         stdout,
         &stat_entries,
@@ -90,6 +93,7 @@ fn write_merge_result_diffstat(
             color: false,
             quote_path_fully: true,
         },
+        None,
     )?;
     // The default `--stat` mode appends a `DIFF_FORMAT_SUMMARY` block (the
     // ` create mode`/` delete mode`/` rename`/` mode change` lines). The
@@ -173,12 +177,13 @@ fn merge_commit_and_advance(
     tree: ObjectId,
     message: Vec<u8>,
     options: &MergeOptions,
+    config: &GitConfig,
 ) -> Result<ObjectId> {
     let message = prepare_merge_commit_message_for_commit_with_rollback(
-        git_dir, format, head_oid, message, options,
+        git_dir, format, head_oid, message, options, config,
     )?;
-    let author = commit_identity_from_env("AUTHOR")?;
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let author = commit_identity_from_env("AUTHOR", config)?;
+    let committer = commit_identity_from_env("COMMITTER", config)?;
     let encoding = commit_encoding_header_from_config(git_dir);
     let signature = merge_commit_signature(
         git_dir,
@@ -221,7 +226,11 @@ fn merge_commit_and_advance(
         }),
     });
     tx.commit()?;
-    commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
+    commands::hooks::run_hook_at(
+        git_dir,
+        "reference-transaction",
+        commands::hooks::HookRun::default(),
+    )?;
     Ok(oid)
 }
 
@@ -240,12 +249,13 @@ fn merge_ours_commit_and_advance(
     target_label: &str,
     message: Vec<u8>,
     options: &MergeOptions,
+    config: &GitConfig,
 ) -> Result<ObjectId> {
     let message = prepare_merge_commit_message_for_commit_with_rollback(
-        git_dir, format, head_oid, message, options,
+        git_dir, format, head_oid, message, options, config,
     )?;
-    let author = commit_identity_from_env("AUTHOR")?;
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let author = commit_identity_from_env("AUTHOR", config)?;
+    let committer = commit_identity_from_env("COMMITTER", config)?;
     let encoding = commit_encoding_header_from_config(git_dir);
     let signature = merge_commit_signature(
         git_dir,
@@ -289,7 +299,11 @@ fn merge_ours_commit_and_advance(
         }),
     });
     tx.commit()?;
-    commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
+    commands::hooks::run_hook_at(
+        git_dir,
+        "reference-transaction",
+        commands::hooks::HookRun::default(),
+    )?;
     Ok(oid)
 }
 
@@ -524,6 +538,8 @@ fn merge_octopus(
         let theirs_map = sley_diff_merge::flatten_tree(db, format, &theirs_tree)?;
         let (results, conflicts) = three_way_merge_trees_with_favor(
             &db,
+            &context.config,
+            context.lazy_fetch,
             format,
             &base_map,
             &merged_map,
@@ -576,7 +592,7 @@ fn merge_octopus(
             reflog: Some(ReflogEntry {
                 old_oid: head_oid,
                 new_oid,
-                committer: commit_identity_from_env("COMMITTER")?,
+                committer: commit_identity_from_env("COMMITTER", &context.config)?,
                 message: merge_reflog_message(&reduced[0].0, "Fast-forward"),
             }),
         });
@@ -605,6 +621,7 @@ fn merge_octopus(
                 &head_tree,
                 &new_tree,
                 merge_diffstat_mode(options, &context.config),
+                context.lazy_fetch,
             )?;
             stdout.flush()?;
         }
@@ -630,7 +647,16 @@ fn merge_octopus(
     )?;
     let merged_tree = sley_worktree::write_tree_from_index(git_dir, format)?;
 
-    let message = build_merge_message(refs, git_dir, &db, format, options, &head_oid, &reduced)?;
+    let message = build_merge_message(
+        refs,
+        git_dir,
+        &db,
+        format,
+        options,
+        &head_oid,
+        &reduced,
+        &context.config,
+    )?;
 
     // Materialize the merged result into the worktree, touching only paths that
     // differ from HEAD (preserve untouched local mods, as in the two-parent path).
@@ -641,7 +667,7 @@ fn merge_octopus(
                 continue;
             }
             let (mode, oid) = entry;
-            let content = merge_worktree_content(&db, *mode, oid)?;
+            let content = merge_worktree_content(&db, *mode, oid, context.lazy_fetch)?;
             merge_write_worktree_file(&worktree_root, path, &content, *mode)?;
         }
         for path in head_map.keys() {
@@ -661,7 +687,7 @@ fn merge_octopus(
         if !options.quiet {
             println!("Squash commit -- not updating HEAD");
         }
-        commands::hooks::run_hook_l("post-merge", &["1"])?;
+        commands::hooks::run_hook_l_at(git_dir, "post-merge", &["1"])?;
         return Ok(());
     }
 
@@ -694,12 +720,13 @@ fn merge_octopus(
             &head_tree,
             &merged_tree,
             merge_diffstat_mode(options, &context.config),
+            context.lazy_fetch,
         )?;
         stdout.flush()?;
     }
 
-    let author = commit_identity_from_env("AUTHOR")?;
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let author = commit_identity_from_env("AUTHOR", &context.config)?;
+    let committer = commit_identity_from_env("COMMITTER", &context.config)?;
     let encoding = commit_encoding_header_from_config(git_dir);
     let mut write_db = context.repository.objects_mut();
     // git's `collect_parents`/`reduce_parents`: the parent set is the reduced
@@ -723,7 +750,7 @@ fn merge_octopus(
             parents,
             author,
             committer: committer.clone(),
-            message: prepare_merge_commit_message(git_dir, &message, options)?,
+            message: prepare_merge_commit_message(git_dir, &message, options, &context.config)?,
             encoding,
             signature: None,
         },
@@ -965,14 +992,11 @@ fn merge_target_early_branch(refs: &FileRefStore, target: &str) -> Result<Option
 
 /// git's `merge.suppressDest` default: omit the ` into <branch>` title suffix
 /// when the current branch is `main` or `master` (the built-in patterns).
-fn merge_dest_suppressed(branch: &str) -> bool {
-    merge_dest_suppressed_by_config(branch)
+fn merge_dest_suppressed(branch: &str, config: &GitConfig) -> bool {
+    merge_dest_suppressed_by_config(branch, config)
 }
 
-fn merge_dest_suppressed_by_config(branch: &str) -> bool {
-    let Some(config) = effective_config_with_overrides() else {
-        return branch == "main" || branch == "master";
-    };
+fn merge_dest_suppressed_by_config(branch: &str, config: &GitConfig) -> bool {
     let patterns: Vec<&str> = config
         .sections
         .iter()
@@ -1030,6 +1054,7 @@ fn merge_message_title(
     format: ObjectFormat,
     targets: &[String],
     into_name: Option<&str>,
+    config: &GitConfig,
 ) -> Result<String> {
     // FETCH_HEAD merges keep their fetch-record-derived description and never
     // gain an `into` suffix (git's autogenerated-from-FETCH_HEAD path).
@@ -1086,7 +1111,7 @@ fn merge_message_title(
         .map(str::to_string)
         .or_else(|| current_branch_short_name(refs).ok().flatten())
         .unwrap_or_else(|| "HEAD".to_string());
-    if !merge_dest_suppressed(&current_branch) {
+    if !merge_dest_suppressed(&current_branch, config) {
         title.push_str(&format!(" into {current_branch}"));
     }
     Ok(title)
@@ -1211,6 +1236,7 @@ fn build_merge_message(
     options: &MergeOptions,
     head_oid: &ObjectId,
     targets: &[(String, ObjectId)],
+    config: &GitConfig,
 ) -> Result<Vec<u8>> {
     let names: Vec<String> = targets.iter().map(|(name, _)| name.clone()).collect();
     // Message source precedence (git): -F file, then -m, else the autogenerated
@@ -1227,11 +1253,12 @@ fn build_merge_message(
                 format,
                 &names,
                 options.into_name.as_deref(),
+                config,
             )?
             .into_bytes(),
         }
     };
-    append_merge_target_tag_messages(&mut message, db, git_dir, format, &names)?;
+    append_merge_target_tag_messages(&mut message, db, git_dir, format, &names, config)?;
     if let Some(limit) = options.shortlog_len
         && limit > 0
     {
@@ -1255,6 +1282,7 @@ fn append_merge_target_tag_messages(
     git_dir: &Path,
     format: ObjectFormat,
     targets: &[String],
+    config: &GitConfig,
 ) -> Result<()> {
     let mut blocks = Vec::new();
     for target in targets {
@@ -1271,7 +1299,7 @@ fn append_merge_target_tag_messages(
             String::from_utf8_lossy(fmt_tag_message_without_signature(tag.message)).into_owned(),
         );
         if let Some(kind) = signature_kind {
-            append_synthetic_signature_note(&mut block, kind);
+            append_synthetic_signature_note(&mut block, kind, config);
         }
         blocks.push(block);
     }
@@ -1416,18 +1444,24 @@ fn prepare_merge_commit_message_for_commit(
     git_dir: &Path,
     message: Vec<u8>,
     options: &MergeOptions,
+    config: &GitConfig,
 ) -> Result<Vec<u8>> {
     let mut message = if options.signoff {
-        commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env()?)
+        commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env(config)?)
     } else {
         message
     };
     let editmsg = git_dir.join("COMMIT_EDITMSG");
     if !options.no_verify {
-        commands::hooks::run_hook("pre-merge-commit", commands::hooks::HookRun::default())?;
+        commands::hooks::run_hook_at(
+            git_dir,
+            "pre-merge-commit",
+            commands::hooks::HookRun::default(),
+        )?;
     }
     fs::write(&editmsg, &message)?;
     commands::commit::run_prepare_commit_msg_hook(
+        git_dir,
         &editmsg,
         commands::commit::PrepareCommitMsgSource::Merge,
         Vec::new(),
@@ -1435,7 +1469,7 @@ fn prepare_merge_commit_message_for_commit(
     )?;
     if !options.no_verify {
         let editmsg_arg = editmsg.to_string_lossy().into_owned();
-        commands::hooks::run_hook_l("commit-msg", &[editmsg_arg.as_str()])?;
+        commands::hooks::run_hook_l_at(git_dir, "commit-msg", &[editmsg_arg.as_str()])?;
     }
     message = fs::read(&editmsg)?;
     Ok(message)
@@ -1447,8 +1481,9 @@ fn prepare_merge_commit_message_for_commit_with_rollback(
     head_oid: &ObjectId,
     message: Vec<u8>,
     options: &MergeOptions,
+    config: &GitConfig,
 ) -> Result<Vec<u8>> {
-    match prepare_merge_commit_message_for_commit(git_dir, message, options) {
+    match prepare_merge_commit_message_for_commit(git_dir, message, options, config) {
         Ok(message) => Ok(message),
         Err(err) => {
             rollback_refused_merge_commit(git_dir, format, head_oid, options);
@@ -1626,14 +1661,18 @@ pub(crate) fn cmd_fmt_merge_msg(
     if let Some(message) = options.message {
         out.push_str(&message);
     } else if !origins.is_empty() {
-        out.push_str(&fmt_merge_msg_title_from_origins(&origins, &current_branch));
+        out.push_str(&fmt_merge_msg_title_from_origins(
+            &origins,
+            &current_branch,
+            &context.config,
+        ));
     }
-    append_fmt_merge_tag_messages(&mut out, &db, format, &origins)?;
+    append_fmt_merge_tag_messages(&mut out, &db, format, &origins, &context.config)?;
     if shortlog_len > 0 && !origins.is_empty() {
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
         }
-        let comment = fmt_merge_comment_string();
+        let comment = fmt_merge_comment_string(&context.config);
         out.push_str(&fmt_merge_log_shortlog(
             &db,
             format,
@@ -1902,7 +1941,11 @@ fn reduce_fmt_merge_origins(
     Ok(reduced)
 }
 
-fn fmt_merge_msg_title_from_origins(origins: &[FmtMergeOrigin], current_branch: &str) -> String {
+fn fmt_merge_msg_title_from_origins(
+    origins: &[FmtMergeOrigin],
+    current_branch: &str,
+    config: &GitConfig,
+) -> String {
     let mut by_src: Vec<(String, FmtSrcData)> = Vec::new();
     for origin in origins {
         let pos = by_src
@@ -1953,7 +1996,7 @@ fn fmt_merge_msg_title_from_origins(origins: &[FmtMergeOrigin], current_branch: 
             title.push_str(&format!(" of {src}"));
         }
     }
-    if !merge_dest_suppressed(current_branch) {
+    if !merge_dest_suppressed(current_branch, config) {
         title.push_str(&format!(" into {current_branch}"));
     }
     title.push('\n');
@@ -1976,6 +2019,7 @@ fn append_fmt_merge_tag_messages(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     origins: &[FmtMergeOrigin],
+    config: &GitConfig,
 ) -> Result<()> {
     let mut tag_blocks: Vec<(String, String)> = Vec::new();
     for origin in origins {
@@ -1988,7 +2032,7 @@ fn append_fmt_merge_tag_messages(
         let body = fmt_tag_message_without_signature(tag.message);
         let mut body = complete_line_string(String::from_utf8_lossy(body).into_owned());
         if let Some(kind) = signature_kind {
-            append_synthetic_signature_note(&mut body, kind);
+            append_synthetic_signature_note(&mut body, kind, config);
         }
         tag_blocks.push((origin.shortlog_name.clone(), body));
     }
@@ -2000,7 +2044,7 @@ fn append_fmt_merge_tag_messages(
         out.push_str(&tag_blocks[0].1);
         return Ok(());
     }
-    let comment = fmt_merge_comment_string();
+    let comment = fmt_merge_comment_string(config);
     for (idx, (name, block)) in tag_blocks.iter().enumerate() {
         if idx > 0 {
             out.push('\n');
@@ -2065,8 +2109,12 @@ fn append_blank_separator_bytes(out: &mut Vec<u8>) {
     out.push(b'\n');
 }
 
-fn append_synthetic_signature_note(out: &mut String, kind: SyntheticSignatureKind) {
-    let comment = fmt_merge_comment_string();
+fn append_synthetic_signature_note(
+    out: &mut String,
+    kind: SyntheticSignatureKind,
+    config: &GitConfig,
+) {
+    let comment = fmt_merge_comment_string(config);
     out.push('\n');
     if kind == SyntheticSignatureKind::Ssh {
         if out.contains("untrusted") {
@@ -2097,14 +2145,11 @@ fn append_synthetic_signature_note(out: &mut String, kind: SyntheticSignatureKin
     }
 }
 
-fn fmt_merge_comment_string() -> String {
-    effective_config_with_overrides()
-        .and_then(|config| {
-            config
-                .get("core", None, "commentchar")
-                .filter(|value| !value.is_empty() && *value != "auto")
-                .map(str::to_string)
-        })
+fn fmt_merge_comment_string(config: &GitConfig) -> String {
+    config
+        .get("core", None, "commentchar")
+        .filter(|value| !value.is_empty() && *value != "auto")
+        .map(str::to_string)
         .unwrap_or_else(|| "#".to_string())
 }
 
@@ -2134,10 +2179,10 @@ fn fmt_merge_log_shortlog(
         .into_iter()
         .map(|record| record.oid)
         .collect();
-    let me_author = commit_identity_from_env("AUTHOR")
+    let me_author = commit_identity_from_env("AUTHOR", config)
         .ok()
         .and_then(identity_name);
-    let me_committer = commit_identity_from_env("COMMITTER")
+    let me_committer = commit_identity_from_env("COMMITTER", config)
         .ok()
         .and_then(identity_name);
     for origin in origins {
@@ -2307,7 +2352,7 @@ fn parse_cleanup_mode(value: &str) -> Result<CommitCleanupMode> {
 /// `get_cleanup_mode(cleanup_arg, 0 < option_edit)`): an explicit
 /// `--cleanup` / `commit.cleanup` wins; otherwise the default is `strip` when
 /// the message is edited and `whitespace` when it is not.
-fn resolve_merge_cleanup_mode(options: &MergeOptions) -> CommitCleanupMode {
+fn resolve_merge_cleanup_mode(options: &MergeOptions, config: &GitConfig) -> CommitCleanupMode {
     if let Some(mode) = options.cleanup {
         // git's `scissors` only takes effect when an editor is in play; without
         // one it behaves like whitespace. The t-suite drives scissors with `-e`.
@@ -2317,8 +2362,7 @@ fn resolve_merge_cleanup_mode(options: &MergeOptions) -> CommitCleanupMode {
         return mode;
     }
     // Read commit.cleanup config when no CLI cleanup was given.
-    if let Some(config) = effective_config_with_overrides()
-        && let Some(raw) = config.get("commit", None, "cleanup")
+    if let Some(raw) = config.get("commit", None, "cleanup")
         && let Ok(mode) = parse_cleanup_mode(raw.trim())
     {
         if mode == CommitCleanupMode::Scissors && options.edit != Some(true) {
@@ -2337,8 +2381,9 @@ fn prepare_merge_commit_message(
     git_dir: &Path,
     message: &[u8],
     options: &MergeOptions,
+    config: &GitConfig,
 ) -> Result<Vec<u8>> {
-    let mode = resolve_merge_cleanup_mode(options);
+    let mode = resolve_merge_cleanup_mode(options, config);
     if options.edit == Some(true) {
         let path = git_dir.join("MERGE_MSG");
         fs::write(&path, complete_line_bytes(message.to_vec()))?;
@@ -2540,26 +2585,20 @@ fn current_branch_short_name(refs: &FileRefStore) -> Result<Option<String>> {
     }
 }
 
-/// The effective repository config with command-line `-c` / `--config-env` /
-/// `GIT_CONFIG_*` overrides layered on top (highest precedence), mirroring how
-/// git applies `-c` to every config read — not just `git config`. Returns `None`
-/// outside a repository.
-pub(crate) fn effective_config_with_overrides() -> Option<GitConfig> {
-    let mut config = identity_effective_config()?;
-    if let Ok(parameters) = crate::injected_config_parameters() {
-        config
-            .sections
-            .extend(sley_config::injected_config_sections(&parameters));
-    }
-    Some(config)
+/// Clone an explicitly loaded effective repository config for helpers that
+/// need owned materialization/filter configuration. The command context has
+/// already layered command-line `-c` / `--config-env` / `GIT_CONFIG_*`
+/// overrides at highest precedence.
+pub(crate) fn effective_config_with_overrides(config: &GitConfig) -> GitConfig {
+    config.clone()
 }
 
 /// Read `merge.directoryRenames` from the effective config, mapping it to the
 /// library's [`sley_diff_merge::DirectoryRenames`]. git's default (when unset or
 /// unrecognised) is `conflict`: directory renames are detected but each re-homed
 /// path is flagged rather than applied silently.
-pub(crate) fn directory_renames_config() -> sley_diff_merge::DirectoryRenames {
-    let config = effective_config_with_overrides().unwrap_or_default();
+pub(crate) fn directory_renames_config(config: &GitConfig) -> sley_diff_merge::DirectoryRenames {
+    let config = effective_config_with_overrides(config);
     directory_renames_from_config(&config)
 }
 
@@ -2582,8 +2621,8 @@ fn directory_renames_from_config(config: &GitConfig) -> sley_diff_merge::Directo
 /// `merge.renameLimit` overrides. Unset falls back to git's default of 1000
 /// (`diff_rename_limit_default`). A configured value of 0 (or negative) means
 /// unlimited.
-pub(crate) fn merge_rename_limit_config() -> usize {
-    let config = effective_config_with_overrides().unwrap_or_default();
+pub(crate) fn merge_rename_limit_config(config: &GitConfig) -> usize {
+    let config = effective_config_with_overrides(config);
     merge_rename_limit_from_config(&config)
 }
 
@@ -3055,15 +3094,15 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
                     if options.explicit_twohead_strategy {
                         eprintln!("fatal: merge program failed");
                         if merge_autostash {
-                            apply_merge_autostash(&git_dir, format);
+                            apply_merge_autostash(&git_dir, format, context.lazy_fetch);
                         }
                         return Err(GitError::Exit(2));
                     }
                     let result = merge_octopus(&context, &positional, &options);
                     if merge_autostash {
                         match &result {
-                            Ok(()) => apply_merge_autostash(&git_dir, format),
-                            Err(_) => apply_merge_autostash(&git_dir, format),
+                            Ok(()) => apply_merge_autostash(&git_dir, format, context.lazy_fetch),
+                            Err(_) => apply_merge_autostash(&git_dir, format, context.lazy_fetch),
                         }
                     }
                     return result;
@@ -3106,7 +3145,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             reflog: Some(ReflogEntry {
                 old_oid: zero_oid(format)?,
                 new_oid: other_oid,
-                committer: commit_identity_from_env("COMMITTER")?,
+                committer: commit_identity_from_env("COMMITTER", &context.config)?,
                 message: b"initial pull".to_vec(),
             }),
         });
@@ -3139,7 +3178,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             }
         }
         if merge_autostash {
-            apply_merge_autostash(&git_dir, format);
+            apply_merge_autostash(&git_dir, format, context.lazy_fetch);
         }
         return Ok(());
     }
@@ -3178,6 +3217,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             &options,
             &head_oid,
             &[(target.clone(), other_oid)],
+            &context.config,
         )?;
         if options.no_commit {
             write_merge_state(
@@ -3208,8 +3248,9 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             &other_oid,
             head_tree,
             &target,
-            prepare_merge_commit_message(&git_dir, &message, &options)?,
+            prepare_merge_commit_message(&git_dir, &message, &options, &context.config)?,
             &options,
+            &context.config,
         )?;
         reset_index_and_worktree_to_commit_for_merge(
             &worktree_root,
@@ -3218,9 +3259,9 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             &merged_oid,
             options.recurse_submodules,
         )?;
-        commands::hooks::run_hook_l("post-merge", &["0"])?;
+        commands::hooks::run_hook_l_at(&git_dir, "post-merge", &["0"])?;
         if merge_autostash {
-            apply_merge_autostash(&git_dir, format);
+            apply_merge_autostash(&git_dir, format, context.lazy_fetch);
         }
         return Ok(());
     }
@@ -3243,7 +3284,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             &other_tree,
         ) {
             if merge_autostash {
-                apply_merge_autostash(&git_dir, format);
+                apply_merge_autostash(&git_dir, format, context.lazy_fetch);
             }
             return Err(err);
         }
@@ -3272,12 +3313,13 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
                 &head_tree,
                 &other_tree,
                 merge_diffstat_mode(&options, &context.config),
+                context.lazy_fetch,
             )?;
             stdout.flush()?;
         }
-        commands::hooks::run_hook_l("post-merge", &["1"])?;
+        commands::hooks::run_hook_l_at(&git_dir, "post-merge", &["1"])?;
         if merge_autostash {
-            apply_merge_autostash(&git_dir, format);
+            apply_merge_autostash(&git_dir, format, context.lazy_fetch);
         }
         return Ok(());
     }
@@ -3297,7 +3339,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             &other_tree,
         ) {
             if merge_autostash {
-                apply_merge_autostash(&git_dir, format);
+                apply_merge_autostash(&git_dir, format, context.lazy_fetch);
             }
             return Err(err);
         }
@@ -3314,7 +3356,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             reflog: Some(ReflogEntry {
                 old_oid: head_oid,
                 new_oid: other_oid,
-                committer: commit_identity_from_env("COMMITTER")?,
+                committer: commit_identity_from_env("COMMITTER", &context.config)?,
                 message: merge_reflog_message(&target, "Fast-forward"),
             }),
         });
@@ -3326,7 +3368,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             &other_oid,
             options.recurse_submodules,
         )?;
-        commands::hooks::run_hook_l("post-merge", &["0"])?;
+        commands::hooks::run_hook_l_at(&git_dir, "post-merge", &["0"])?;
         if !options.quiet {
             let mut stdout = io::stdout();
             writeln!(
@@ -3343,11 +3385,12 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
                 &head_tree,
                 &other_tree,
                 merge_diffstat_mode(&options, &context.config),
+                context.lazy_fetch,
             )?;
             stdout.flush()?;
         }
         if merge_autostash {
-            apply_merge_autostash(&git_dir, format);
+            apply_merge_autostash(&git_dir, format, context.lazy_fetch);
         }
         return Ok(());
     }
@@ -3385,12 +3428,10 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
 
     // `merge.conflictStyle`: diff3/zdiff3 add the `|||||||` common-ancestor
     // section to conflict markers (git honours this for `git merge`).
-    let conflict_style = effective_config_with_overrides()
-        .and_then(|config| {
-            config
-                .get("merge", None, "conflictstyle")
-                .map(str::to_string)
-        })
+    let conflict_style = context
+        .config
+        .get("merge", None, "conflictstyle")
+        .map(str::to_string)
         .map(|value| match value.as_str() {
             "diff3" => sley_diff_merge::ConflictStyle::Diff3,
             "zdiff3" => sley_diff_merge::ConflictStyle::ZDiff3,
@@ -3422,6 +3463,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             rename_limit: merge_rename_limit_from_config(&context.config),
             directory_renames: directory_renames_from_config(&context.config),
+            lazy_fetch: context.lazy_fetch,
         },
         Some(&path_favor),
         None,
@@ -3452,6 +3494,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
         &options,
         &head_oid,
         &[(target.clone(), other_oid)],
+        &context.config,
     )?;
 
     if conflicts.is_empty() {
@@ -3502,7 +3545,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
                     if ours_map.get(path) == Some(entry) {
                         continue;
                     }
-                    let content = merge_worktree_content(&db, *mode, oid)?;
+                    let content = merge_worktree_content(&db, *mode, oid, context.lazy_fetch)?;
                     merge_write_worktree_file(&worktree_root, path, &content, *mode)?;
                 }
             }
@@ -3520,9 +3563,9 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
                 println!("Automatic merge went well; stopped before committing as requested");
                 println!("Squash commit -- not updating HEAD");
             }
-            commands::hooks::run_hook_l("post-merge", &["1"])?;
+            commands::hooks::run_hook_l_at(&git_dir, "post-merge", &["1"])?;
             if merge_autostash {
-                apply_merge_autostash(&git_dir, format);
+                apply_merge_autostash(&git_dir, format, context.lazy_fetch);
             }
             return Ok(());
         }
@@ -3565,6 +3608,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
                 &head_tree,
                 &merged_tree,
                 merge_diffstat_mode(&options, &context.config),
+                context.lazy_fetch,
             )?;
             stdout.flush()?;
         }
@@ -3588,8 +3632,9 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             &head_oid,
             &other_oid,
             merged_tree,
-            prepare_merge_commit_message(&git_dir, &message, &options)?,
+            prepare_merge_commit_message(&git_dir, &message, &options, &context.config)?,
             &options,
+            &context.config,
         )?;
         if options.edit == Some(true) {
             clear_in_progress_merge_state(&git_dir);
@@ -3614,9 +3659,9 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
         } else {
             refresh_merged_index_stat(&git_dir, &worktree_root, format)?;
         }
-        commands::hooks::run_hook_l("post-merge", &["0"])?;
+        commands::hooks::run_hook_l_at(&git_dir, "post-merge", &["0"])?;
         if merge_autostash {
-            apply_merge_autostash(&git_dir, format);
+            apply_merge_autostash(&git_dir, format, context.lazy_fetch);
         }
         return Ok(());
     }
@@ -3692,12 +3737,12 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
     // them would dirty the submodule checkout itself.
     let populated_ours_gitlink_prefixes =
         populated_gitlink_directory_prefixes(&worktree_root, &ours_map)?;
-    let materialization_config = effective_config_with_overrides().unwrap_or_default();
+    let materialization_config = effective_config_with_overrides(&context.config);
     for (path, result) in &results {
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = merge_worktree_content(&db, *mode, oid)?;
+                    let content = merge_worktree_content(&db, *mode, oid, context.lazy_fetch)?;
                     let (worktree_mode, content) = merge_materialized_content(
                         &worktree_root,
                         &git_dir,
@@ -3751,6 +3796,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
                         worktree_mode,
                         &content,
                         ours_map.get(path),
+                        context.lazy_fetch,
                     )? {
                         continue;
                     }
@@ -3812,8 +3858,10 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
 
     // The `# Conflicts:` trailer git appends to MERGE_MSG / SQUASH_MSG.
     let conflicts_block = merge_conflicts_block(&conflicts, false);
-    let merge_msg_conflicts_block =
-        merge_conflicts_block(&conflicts, merge_conflict_cleanup_scissors(&options));
+    let merge_msg_conflicts_block = merge_conflicts_block(
+        &conflicts,
+        merge_conflict_cleanup_scissors(&options, &context.config),
+    );
 
     // `--squash` with conflicts: git writes SQUASH_MSG (the squash commit list,
     // NO conflict trailer) and a separate MERGE_MSG carrying just the
@@ -4069,13 +4117,14 @@ pub(crate) fn cmd_merge_recursive(
                 rename_threshold,
                 rename_limit: merge_rename_limit_from_config(&context.config),
                 directory_renames: directory_renames_from_config(&context.config),
+                lazy_fetch: context.lazy_fetch,
             },
             Some(&path_favor),
         )?;
     resolve_trivial_submodule_conflicts(&worktree_root, format, &mut results, &mut conflicts)?;
 
     write_merge_recursive_index(&git_dir, format, &results)?;
-    apply_merge_recursive_worktree(&db, &worktree_root, &results, &ours_map)?;
+    apply_merge_recursive_worktree(&db, &worktree_root, &results, &ours_map, context.lazy_fetch)?;
 
     print_merge_info_messages(&info_messages);
     print_merge_conflict_messages(&worktree_root, format, &results);
@@ -4159,6 +4208,7 @@ fn apply_merge_recursive_worktree(
     worktree_root: &Path,
     results: &MergePathResults,
     ours_map: &MergeTreeMap,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let populated_ours_gitlink_prefixes =
         populated_gitlink_directory_prefixes(worktree_root, ours_map)?;
@@ -4166,7 +4216,7 @@ fn apply_merge_recursive_worktree(
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = merge_worktree_content(db, *mode, oid)?;
+                    let content = merge_worktree_content(db, *mode, oid, lazy_fetch)?;
                     if materialize_gitlink_child_conflict_file(
                         worktree_root,
                         path,
@@ -4197,6 +4247,7 @@ fn apply_merge_recursive_worktree(
                         *mode,
                         content,
                         ours_map.get(path),
+                        lazy_fetch,
                     )? {
                         continue;
                     }
@@ -4244,6 +4295,7 @@ fn conflict_worktree_matches_ours(
     intended_mode: u32,
     intended_content: &[u8],
     ours: Option<&(u32, ObjectId)>,
+    lazy_fetch: bool,
 ) -> Result<bool> {
     let Some((ours_mode, ours_oid)) = ours else {
         return Ok(false);
@@ -4251,7 +4303,7 @@ fn conflict_worktree_matches_ours(
     if *ours_mode != intended_mode || !merge_worktree_path_exists(worktree_root, path) {
         return Ok(false);
     }
-    let ours_content = merge_worktree_content(db, *ours_mode, ours_oid)?;
+    let ours_content = merge_worktree_content(db, *ours_mode, ours_oid, lazy_fetch)?;
     if ours_content != intended_content {
         return Ok(false);
     }
@@ -4723,17 +4775,14 @@ fn merge_conflicts_block(conflicts: &[Vec<u8>], scissors: bool) -> String {
     out
 }
 
-fn merge_conflict_cleanup_scissors(options: &MergeOptions) -> bool {
+fn merge_conflict_cleanup_scissors(options: &MergeOptions, config: &GitConfig) -> bool {
     if options.cleanup == Some(CommitCleanupMode::Scissors) {
         return true;
     }
 
-    effective_config_with_overrides()
-        .and_then(|config| {
-            config
-                .get("commit", None, "cleanup")
-                .map(|value| value.trim().eq_ignore_ascii_case("scissors"))
-        })
+    config
+        .get("commit", None, "cleanup")
+        .map(|value| value.trim().eq_ignore_ascii_case("scissors"))
         .unwrap_or(false)
 }
 
@@ -5183,9 +5232,15 @@ fn cmd_merge_abort(context: &MergeCommandContext) -> Result<()> {
 
     let worktree_root = context.worktree_root()?;
     let format = context.format();
-    reset_merge_to_head(git_dir, &worktree_root, format, context.db())?;
+    reset_merge_to_head(
+        git_dir,
+        &worktree_root,
+        format,
+        context.db(),
+        context.lazy_fetch,
+    )?;
     clear_in_progress_merge_state(git_dir);
-    apply_merge_autostash(git_dir, format);
+    apply_merge_autostash(git_dir, format, context.lazy_fetch);
     Ok(())
 }
 
@@ -5199,6 +5254,7 @@ fn reset_merge_to_head(
     worktree_root: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let head_oid = resolve_revision(git_dir, format, "HEAD")?;
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
@@ -5239,7 +5295,7 @@ fn reset_merge_to_head(
     for path in &touched {
         match head_map.get(path) {
             Some((mode, oid)) => {
-                let content = merge_worktree_content(&db, *mode, oid)?;
+                let content = merge_worktree_content(&db, *mode, oid, lazy_fetch)?;
                 merge_write_worktree_file(worktree_root, path, &content, *mode)?;
             }
             None => merge_remove_worktree_file(worktree_root, path)?,
@@ -5276,7 +5332,15 @@ fn cmd_merge_continue(context: &MergeCommandContext) -> Result<()> {
     let format = context.format();
     let message = read_merge_message_from_file_stripping_comments(&git_dir)?;
     let mut writer = context.repository.objects_mut();
-    conclude_in_progress_merge_with_writer(git_dir, format, message, false, &mut writer)
+    conclude_in_progress_merge_with_writer(
+        git_dir,
+        format,
+        message,
+        false,
+        &mut writer,
+        &context.config,
+        context.lazy_fetch,
+    )
 }
 
 pub(crate) fn conclude_in_progress_merge(
@@ -5284,10 +5348,20 @@ pub(crate) fn conclude_in_progress_merge(
     format: ObjectFormat,
     message: Vec<u8>,
     quiet: bool,
+    config: &GitConfig,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let mut writer = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    conclude_in_progress_merge_with_writer(git_dir, format, message, quiet, &mut writer)
+    conclude_in_progress_merge_with_writer(
+        git_dir,
+        format,
+        message,
+        quiet,
+        &mut writer,
+        config,
+        lazy_fetch,
+    )
 }
 
 fn conclude_in_progress_merge_with_writer(
@@ -5296,6 +5370,8 @@ fn conclude_in_progress_merge_with_writer(
     message: Vec<u8>,
     quiet: bool,
     writer: &mut FileObjectDatabase,
+    config: &GitConfig,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let merge_head_path = git_dir.join("MERGE_HEAD");
     if !merge_head_path.is_file() {
@@ -5318,8 +5394,8 @@ fn conclude_in_progress_merge_with_writer(
         ))
     })?;
     let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
-    let author = commit_identity_from_env("AUTHOR")?;
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let author = commit_identity_from_env("AUTHOR", config)?;
+    let committer = commit_identity_from_env("COMMITTER", config)?;
     let message = commit_cleanup_message(message, CommitCleanupMode::Whitespace, "#", false);
     let encoding = commit_encoding_header_from_config(git_dir);
     let commit_oid = sley_sequencer::create_commit(
@@ -5345,7 +5421,7 @@ fn conclude_in_progress_merge_with_writer(
     )?;
     commands::rerere::record_resolved_after_commit(git_dir, format)?;
     clear_in_progress_merge_state(git_dir);
-    apply_merge_autostash(git_dir, format);
+    apply_merge_autostash(git_dir, format, lazy_fetch);
     if !quiet {
         print_branch_commit_summary(writer, git_dir, format, &commit_oid, &message)?;
     }
@@ -5401,6 +5477,7 @@ pub(crate) fn print_commit_shortstat_between_trees(
     format: ObjectFormat,
     old_tree: &ObjectId,
     new_tree: &ObjectId,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let entries = sley_diff_merge::diff_name_status_trees_with_options(
         db,
@@ -5413,7 +5490,7 @@ pub(crate) fn print_commit_shortstat_between_trees(
         return Ok(());
     }
     let mut stdout = io::stdout();
-    let stat_entries = collect_diff_stat_entries(&entries, db, None, false)?;
+    let stat_entries = collect_diff_stat_entries(&entries, db, None, false, lazy_fetch)?;
     write_diff_shortstat_materialized(&mut stdout, &stat_entries)?;
     Ok(())
 }
@@ -5426,6 +5503,7 @@ pub(crate) fn conclude_rebase_step_via_commit(
     message: Vec<u8>,
     quiet: bool,
     allow_empty: bool,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let index = read_worktree_index(git_dir, format)?;
     let unmerged_paths = index_unmerged_paths(&index);
@@ -5469,7 +5547,7 @@ pub(crate) fn conclude_rebase_step_via_commit(
 
     if !quiet {
         print_branch_commit_summary(&db, git_dir, format, &commit_oid, &message)?;
-        print_commit_shortstat_between_trees(&db, format, &parent_tree, &tree)?;
+        print_commit_shortstat_between_trees(&db, format, &parent_tree, &tree, lazy_fetch)?;
     }
     Ok(())
 }
@@ -5538,12 +5616,14 @@ fn write_merge_autostash_marker(git_dir: &Path) -> Result<()> {
     }
 }
 
-pub(crate) fn apply_merge_autostash(git_dir: &Path, format: ObjectFormat) {
-    apply_or_save_merge_autostash(git_dir, format, true);
+pub(crate) fn apply_merge_autostash(git_dir: &Path, format: ObjectFormat, lazy_fetch: bool) {
+    apply_or_save_merge_autostash(git_dir, format, true, lazy_fetch);
 }
 
 pub(crate) fn save_merge_autostash(git_dir: &Path, format: ObjectFormat) {
-    apply_or_save_merge_autostash(git_dir, format, false);
+    // The save-only path never reads the stash object, so lazy-fetch policy is
+    // immaterial here.
+    apply_or_save_merge_autostash(git_dir, format, false, false);
 }
 
 fn save_squash_conflict_autostash(git_dir: &Path, format: ObjectFormat) {
@@ -5563,7 +5643,12 @@ fn save_squash_conflict_autostash(git_dir: &Path, format: ObjectFormat) {
     }
 }
 
-fn apply_or_save_merge_autostash(git_dir: &Path, format: ObjectFormat, attempt_apply: bool) {
+fn apply_or_save_merge_autostash(
+    git_dir: &Path,
+    format: ObjectFormat,
+    attempt_apply: bool,
+    lazy_fetch: bool,
+) {
     let path = git_dir.join("MERGE_AUTOSTASH");
     let Ok(text) = fs::read_to_string(&path) else {
         return;
@@ -5577,7 +5662,8 @@ fn apply_or_save_merge_autostash(git_dir: &Path, format: ObjectFormat, attempt_a
         return;
     };
     let applied = attempt_apply
-        && commands::stash::apply_stash_commit_quietly_at(git_dir, &oid).unwrap_or(false);
+        && commands::stash::apply_stash_commit_quietly_at(git_dir, &oid, lazy_fetch)
+            .unwrap_or(false);
     if applied {
         eprintln!("Applied autostash.");
         return;

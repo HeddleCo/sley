@@ -48,24 +48,6 @@ pub(crate) fn cli_session() -> Option<CliSession> {
     CLI_SESSION.lock().ok()?.clone()
 }
 
-pub(crate) fn with_local_repo_env_hidden_session<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let previous = CLI_SESSION.lock().ok().and_then(|mut slot| {
-        slot.as_mut().map(|session| {
-            let previous = session.local_repo_env_hidden;
-            session.local_repo_env_hidden = true;
-            previous
-        })
-    });
-    let result = f();
-    if let Some(previous) = previous
-        && let Ok(mut slot) = CLI_SESSION.lock()
-        && let Some(session) = slot.as_mut()
-    {
-        session.local_repo_env_hidden = previous;
-    }
-    result
-}
-
 /// Apply alias-expanded leading global options onto the active session.
 pub(crate) fn merge_global_overrides(
     session: &mut CliSession,
@@ -219,6 +201,21 @@ impl CliSession {
         child
     }
 
+    /// Build an invocation context pinned to an already-resolved repository.
+    /// Used by nested in-process engine calls that must not rediscover cwd.
+    pub(crate) fn for_repository_paths(cwd: PathBuf, git_dir: PathBuf) -> Self {
+        Self::from_parsed_globals(
+            cwd,
+            Some(git_dir),
+            None,
+            None,
+            false,
+            true,
+            true,
+            PathspecFlags::default(),
+        )
+    }
+
     pub(crate) fn pathspec_flags(&self) -> PathspecFlags {
         self.env.pathspec_flags
     }
@@ -256,6 +253,13 @@ impl CliSession {
         )
     }
 
+    pub(crate) fn common_git_dir(&self, git_dir: &Path) -> Result<PathBuf> {
+        crate::repo_paths::common_git_dir_for_git_dir_with_env(
+            git_dir,
+            !self.local_repo_env_hidden(),
+        )
+    }
+
     /// Resolved git directory for this session's cwd.
     pub(crate) fn git_dir(&self) -> Result<PathBuf> {
         let cwd = self.cwd.clone();
@@ -288,19 +292,6 @@ impl CliSession {
     pub(crate) fn cwd(&self) -> &Path {
         &self.cwd
     }
-}
-
-/// Resolve the git directory for the active session's cwd.
-pub(crate) fn cli_git_dir() -> Result<PathBuf> {
-    let cwd = cli_session()
-        .map(|session| session.cwd)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    cli_git_dir_from(cwd)
-}
-
-/// Resolve the git directory from `start`, honouring session overrides.
-pub(crate) fn cli_git_dir_from(start: impl AsRef<Path>) -> Result<PathBuf> {
-    discovery::resolve_git_dir(start)
 }
 
 /// Walk-up discovery without session overrides (local-path remotes).

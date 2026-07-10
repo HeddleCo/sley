@@ -11,7 +11,8 @@ pub(crate) fn cmd_for_each_ref(
     args: &[String],
 ) -> Result<()> {
     let git_dir = cli_session.git_dir()?;
-    for_each_ref_core(&git_dir, args, "git for-each-ref")
+    let config = identity_effective_config_for(cli_session).unwrap_or_default();
+    for_each_ref_core_with_config(&git_dir, args, "git for-each-ref", &config)
 }
 
 /// The `-h` usage banner, matching git's parse_options output byte-for-byte.
@@ -62,7 +63,12 @@ fn print_for_each_ref_usage(usage_cmd: &str) {
 /// The shared core of `git for-each-ref` and its clone `git refs list` (see
 /// builtin/refs.c::cmd_refs_list, which calls for_each_ref_core). The only
 /// per-command difference is the program name printed in the `-h` usage banner.
-pub(crate) fn for_each_ref_core(git_dir: &Path, args: &[String], usage_cmd: &str) -> Result<()> {
+pub(crate) fn for_each_ref_core_with_config(
+    git_dir: &Path,
+    args: &[String],
+    usage_cmd: &str,
+    effective_config: &GitConfig,
+) -> Result<()> {
     let git_dir = git_dir.to_path_buf();
     let mut format_spec = "%(objectname) %(objecttype)\t%(refname)".to_string();
     let mut count = None;
@@ -370,9 +376,9 @@ pub(crate) fn for_each_ref_core(git_dir: &Path, args: &[String], usage_cmd: &str
         // git resolves %(upstream)/%(push)/sort keys against the *full* config
         // layering (system + global + repo + includes + command-line `-c`
         // overrides), not just the repository file — e.g. `-c push.default=simple`
-        // must win over a repo-level `push.default`. identity_effective_config()
-        // builds exactly that layered view rooted at the current repo.
-        identity_effective_config().unwrap_or_default()
+        // must win over a repo-level `push.default`. The command entry point
+        // supplies that layered view from its explicit invocation session.
+        effective_config.clone()
     } else {
         GitConfig::default()
     };
@@ -380,7 +386,7 @@ pub(crate) fn for_each_ref_core(git_dir: &Path, args: &[String], usage_cmd: &str
     // mailmap.{file,blob} config. Avoid probing those paths for formats that
     // never request mailmap rewriting.
     let mailmap = if needs.mailmap {
-        commands::utility::Mailmap::load_default(&git_dir, format)?
+        commands::utility::Mailmap::load_default_with_config(&git_dir, format, effective_config)?
     } else {
         commands::utility::Mailmap::default()
     };

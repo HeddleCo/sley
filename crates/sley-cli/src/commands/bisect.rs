@@ -73,6 +73,8 @@ struct BisectRepo {
     worktree_root: Option<PathBuf>,
     format: ObjectFormat,
     db: FileObjectDatabase,
+    config: GitConfig,
+    lazy_fetch: bool,
 }
 
 impl BisectRepo {
@@ -81,11 +83,14 @@ impl BisectRepo {
         let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?;
         let format = repository_object_format(&git_dir)?;
         let db = crate::repository::open_object_database(&git_dir, format)?;
+        let config = read_repo_config(&git_dir)?;
         Ok(Self {
             git_dir,
             worktree_root,
             format,
             db,
+            config,
+            lazy_fetch: cli_session.lazy_fetch(),
         })
     }
 
@@ -1580,7 +1585,7 @@ fn bisect_checkout(
         let Some(worktree_root) = &repo.worktree_root else {
             return Ok(BISECT_FAILED);
         };
-        let committer = commit_identity_from_env("COMMITTER")?;
+        let committer = commit_identity_from_env("COMMITTER", &repo.config)?;
         let old = resolve_revision(&repo.git_dir, repo.format, "HEAD")
             .map(|oid| oid.to_hex())
             .unwrap_or_else(|_| "HEAD".to_string());
@@ -1962,7 +1967,7 @@ fn bisect_show_commit(repo: &BisectRepo, oid: &ObjectId, out: &mut dyn Write) ->
             sley_diff_merge::DiffNameStatusOptions::default(),
         )?,
     };
-    let stat_entries = collect_diff_stat_entries(&entries, &db, None, false)?;
+    let stat_entries = collect_diff_stat_entries(&entries, &db, None, false, repo.lazy_fetch)?;
     write_diff_stat_materialized(
         out,
         &stat_entries,
@@ -1972,6 +1977,7 @@ fn bisect_show_commit(repo: &BisectRepo, oid: &ObjectId, out: &mut dyn Write) ->
             color: false,
             quote_path_fully: true,
         },
+        None,
     )?;
     // `--summary`: creation/deletion/mode lines after the stat.
     for entry in &entries {

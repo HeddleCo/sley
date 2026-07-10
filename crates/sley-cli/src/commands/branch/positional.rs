@@ -5915,12 +5915,19 @@ pub(super) fn dispatch_branch_positional_args(
         [delete, no_delete, branch]
             if (delete == "-d" || delete == "--delete") && no_delete == "--no-delete" =>
         {
-            create_branch_from_start(git_dir, format, store, branch, None)
+            create_branch_from_start(git_dir, format, store, &context.config, branch, None)
         }
         [delete, no_delete, branch, start]
             if (delete == "-d" || delete == "--delete") && no_delete == "--no-delete" =>
         {
-            create_branch_from_start(git_dir, format, store, branch, Some(start))
+            create_branch_from_start(
+                git_dir,
+                format,
+                store,
+                &context.config,
+                branch,
+                Some(start),
+            )
         }
         [flag] if flag == "-f" || flag == "--force" => print_branch_list(store, BranchListMode::Local),
         [flag, branches @ ..] if flag == "-D" => {
@@ -5940,17 +5947,32 @@ pub(super) fn dispatch_branch_positional_args(
             delete_merged_branches(git_dir, format, context.objects(), store, branches, false)
         }
         [flag, branch] if flag == "-f" || flag == "--force" => {
-            force_update_branch(git_dir, format, store, branch, None).map(|_| ())
+            force_update_branch(git_dir, format, store, &context.config, branch, None).map(|_| ())
         }
         [flag, branch, start] if flag == "-f" || flag == "--force" => {
-            force_update_branch(git_dir, format, store, branch, Some(start)).map(|_| ())
+            force_update_branch(
+                git_dir,
+                format,
+                store,
+                &context.config,
+                branch,
+                Some(start),
+            )
+            .map(|_| ())
         }
         [branch] => {
-            create_branch_from_start(git_dir, format, store, branch, None)?;
+            create_branch_from_start(git_dir, format, store, &context.config, branch, None)?;
             branch_create_set_tracking(git_dir, store, branch, None, None, false)
         }
         [branch, start] => {
-            create_branch_from_start(git_dir, format, store, branch, Some(start))?;
+            create_branch_from_start(
+                git_dir,
+                format,
+                store,
+                &context.config,
+                branch,
+                Some(start),
+            )?;
             branch_create_set_tracking(git_dir, store, branch, Some(start), None, false)
         }
         _ => Err(GitError::Command(

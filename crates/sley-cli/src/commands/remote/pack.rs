@@ -3640,7 +3640,8 @@ fn run_pre_push_hook(
 ) -> Result<()> {
     let url = resolved_remote.to_string();
     let stdin = pre_push_stdin(git_dir, refspecs, push_commands)?;
-    commands::hooks::run_hook(
+    commands::hooks::run_hook_at(
+        git_dir,
         "pre-push",
         commands::hooks::HookRun {
             args: vec![remote.to_string(), url],
@@ -3660,7 +3661,8 @@ fn run_pre_push_hook_for_report(
 ) -> Result<()> {
     let url = resolved_remote.to_string();
     let stdin = pre_push_stdin_from_report(refs);
-    commands::hooks::run_hook(
+    commands::hooks::run_hook_at(
+        git_dir,
         "pre-push",
         commands::hooks::HookRun {
             args: vec![remote.to_string(), url],

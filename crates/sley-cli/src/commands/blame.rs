@@ -361,13 +361,26 @@ fn run_blame(
         // `cached_blob` produces. `--contents` is always a regular-file image.
         let (raw, mode) = match &options.contents_from {
             Some(spec) => (read_contents_file(cwd, spec)?, 0o100644),
-            None => read_worktree_image(db, format, &repo, &start_commit, &repo_path)?,
+            None => read_worktree_image(
+                db,
+                format,
+                &repo,
+                &start_commit,
+                &repo_path,
+                cli_session.lazy_fetch(),
+            )?,
         };
         let blob = textconv.convert(&repo_path, mode, raw)?;
         // The porcelain `previous` pointer is the real parent when it has the
         // path; a brand-new (only-staged) file has no such parent.
-        let previous = read_path_blob(db, format, &start_commit, &repo_path)?
-            .map(|_| (start_commit, repo_path.clone()));
+        let previous = read_path_blob(
+            db,
+            format,
+            &start_commit,
+            &repo_path,
+            cli_session.lazy_fetch(),
+        )?
+        .map(|_| (start_commit, repo_path.clone()));
         let (name, email) = if options.contents_from.is_some() {
             (
                 "External file (--contents)".to_string(),
@@ -395,7 +408,13 @@ fn run_blame(
     } else {
         // No fake commit: read the final image straight from the start rev's tree
         // and convert it through textconv, matching the committed-blob path.
-        match read_path_blob(db, format, &start_commit, &repo_path)? {
+        match read_path_blob(
+            db,
+            format,
+            &start_commit,
+            &repo_path,
+            cli_session.lazy_fetch(),
+        )? {
             Some((blob, mode)) => (textconv.convert(&repo_path, mode, blob)?, false, None),
             None => {
                 // git reports the repository-relative path here, not the literal
@@ -456,6 +475,7 @@ fn run_blame(
         &ignore_set,
         diff_algorithm,
         &grafts,
+        cli_session.lazy_fetch(),
     )?;
 
     // Resolve the -L ranges against the real line count, then render. The
@@ -1121,12 +1141,13 @@ fn read_path_blob(
     format: ObjectFormat,
     commit: &ObjectId,
     repo_path: &str,
+    lazy_fetch: bool,
 ) -> Result<Option<(Vec<u8>, u32)>> {
     let tree_oid = sley_rev::peel_to_tree(db, format, commit)?;
     let Some((blob_oid, mode)) = lookup_tree_path(db, format, &tree_oid, repo_path)? else {
         return Ok(None);
     };
-    let object = read_object_maybe_prefetch_promisor(db, &blob_oid)?;
+    let object = read_object_maybe_prefetch_promisor(db, &blob_oid, lazy_fetch)?;
     if object.object_type != ObjectType::Blob {
         return Ok(None);
     }
@@ -1139,6 +1160,7 @@ fn read_index_blob(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     repo_path: &str,
+    lazy_fetch: bool,
 ) -> Result<Option<(Vec<u8>, u32)>> {
     let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
         return Ok(None);
@@ -1148,7 +1170,7 @@ fn read_index_blob(
     }) else {
         return Ok(None);
     };
-    let object = read_object_maybe_prefetch_promisor(db, &entry.oid)?;
+    let object = read_object_maybe_prefetch_promisor(db, &entry.oid, lazy_fetch)?;
     if object.object_type != ObjectType::Blob {
         return Ok(None);
     }
@@ -1346,13 +1368,14 @@ fn read_worktree_image(
     repo: &RepositoryContext,
     start_commit: &ObjectId,
     repo_path: &str,
+    lazy_fetch: bool,
 ) -> Result<(Vec<u8>, u32)> {
     // `verify_working_tree_path`: an untracked path (absent from the start
     // commit's tree and from the index in *any* stage) is the "no such path"
     // fatal, even when a file by that name exists on disk. An unmerged path
     // (stages 1/2/3, no stage 0) still counts as known, so a conflicted file
     // blames against HEAD rather than erroring.
-    let committed = read_path_blob(db, format, start_commit, repo_path)?;
+    let committed = read_path_blob(db, format, start_commit, repo_path, lazy_fetch)?;
     let in_index = path_in_index_any_stage(repo.git_dir(), format, repo_path)?;
     if committed.is_none() && !in_index {
         eprintln!("fatal: no such path '{repo_path}' in HEAD");
@@ -1415,7 +1438,8 @@ fn read_worktree_image(
     }
     // The path is tracked but unreadable from the work tree (e.g. staged then
     // removed): fall back to the staged copy, then the committed blob.
-    if let Some((blob, mode)) = read_index_blob(repo.git_dir(), db, format, repo_path)? {
+    if let Some((blob, mode)) = read_index_blob(repo.git_dir(), db, format, repo_path, lazy_fetch)?
+    {
         return Ok((blob, mode));
     }
     if let Some((blob, mode)) = committed {
@@ -1540,6 +1564,7 @@ fn compute_blame(
     ignore_set: &HashSet<ObjectId>,
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
     grafts: &HashMap<ObjectId, Vec<ObjectId>>,
+    lazy_fetch: bool,
 ) -> Result<(Vec<LineBlame>, PreviousMap)> {
     let final_lines = sley_diff_merge::split_lines(final_blob);
     let line_count = final_lines.len();
@@ -1635,6 +1660,7 @@ fn compute_blame(
                 &origin.path,
                 &mut blob_cache,
                 textconv,
+                lazy_fetch,
             )?
         };
         let Some(child_blob) = child_blob else {
@@ -1672,7 +1698,7 @@ fn compute_blame(
                 break;
             }
             let Some(parent_origin) =
-                find_parent_origin(db, format, &origin, parent, copy_level > 1)?
+                find_parent_origin(db, format, &origin, parent, copy_level > 1, lazy_fetch)?
             else {
                 continue;
             };
@@ -1693,6 +1719,7 @@ fn compute_blame(
                 &parent_origin.path,
                 &mut blob_cache,
                 textconv,
+                lazy_fetch,
             )?;
             let Some(parent_blob) = parent_blob else {
                 // Path absent in this parent: it preserves nothing, so all
@@ -1732,7 +1759,7 @@ fn compute_blame(
                     break;
                 }
                 let Some(parent_origin) =
-                    find_parent_origin(db, format, &origin, parent, copy_level > 1)?
+                    find_parent_origin(db, format, &origin, parent, copy_level > 1, lazy_fetch)?
                 else {
                     continue;
                 };
@@ -1743,6 +1770,7 @@ fn compute_blame(
                     &parent_origin.path,
                     &mut blob_cache,
                     textconv,
+                    lazy_fetch,
                 )?;
                 let Some(parent_blob) = parent_blob else {
                     continue;
@@ -1774,6 +1802,7 @@ fn compute_blame(
                 &mut owned,
                 &final_lines,
                 textconv,
+                lazy_fetch,
             )?;
             for (copy_origin, entries) in copied {
                 queue_entries(&mut suspects, &mut queue, copy_origin, entries);
@@ -2131,8 +2160,9 @@ fn find_parent_origin(
     origin: &OriginKey,
     parent: &ObjectId,
     allow_whole_copy: bool,
+    lazy_fetch: bool,
 ) -> Result<Option<OriginKey>> {
-    if read_path_blob(db, format, parent, &origin.path)?.is_some() {
+    if read_path_blob(db, format, parent, &origin.path, lazy_fetch)?.is_some() {
         return Ok(Some(OriginKey {
             commit: *parent,
             path: origin.path.clone(),
@@ -2187,13 +2217,15 @@ fn find_copies_in_parents(
     owned: &mut Vec<BlameEntry>,
     final_lines: &[sley_diff_merge::DiffLine<'_>],
     textconv: &TextconvContext,
+    lazy_fetch: bool,
 ) -> Result<Vec<(OriginKey, Vec<BlameEntry>)>> {
     let mut copied_by_origin: Vec<(OriginKey, Vec<BlameEntry>)> = Vec::new();
     for parent in parents {
         if owned.is_empty() {
             break;
         }
-        let candidate_paths = copy_candidate_paths(db, format, origin, parent, copy_level)?;
+        let candidate_paths =
+            copy_candidate_paths(db, format, origin, parent, copy_level, lazy_fetch)?;
         for path in candidate_paths {
             if owned.is_empty() {
                 break;
@@ -2201,7 +2233,7 @@ fn find_copies_in_parents(
             if path == origin.path {
                 continue;
             }
-            let Some((raw, mode)) = read_path_blob(db, format, parent, &path)? else {
+            let Some((raw, mode)) = read_path_blob(db, format, parent, &path, lazy_fetch)? else {
                 continue;
             };
             let blob = textconv.convert(&path, mode, raw)?;
@@ -2240,10 +2272,12 @@ fn copy_candidate_paths(
     origin: &OriginKey,
     parent: &ObjectId,
     copy_level: u8,
+    lazy_fetch: bool,
 ) -> Result<Vec<String>> {
     let parent_tree = sley_rev::peel_to_tree(db, format, parent)?;
     let use_all = copy_level >= 3
-        || (copy_level >= 2 && read_path_blob(db, format, parent, &origin.path)?.is_none());
+        || (copy_level >= 2
+            && read_path_blob(db, format, parent, &origin.path, lazy_fetch)?.is_none());
     if use_all {
         let mut out = Vec::new();
         collect_tree_blob_paths(db, format, &parent_tree, Vec::new(), &mut out)?;
@@ -3022,6 +3056,7 @@ fn cached_blob(
     repo_path: &str,
     cache: &mut HashMap<(ObjectId, String), Option<Vec<u8>>>,
     textconv: &TextconvContext,
+    lazy_fetch: bool,
 ) -> Result<Option<Vec<u8>>> {
     let key = (*commit, repo_path.to_string());
     if let Some(hit) = cache.get(&key) {
@@ -3029,7 +3064,7 @@ fn cached_blob(
     }
     // The cache stores the *converted* form so textconv runs once per
     // (commit, path); upstream's fill_origin_blob caches likewise.
-    let blob = match read_path_blob(db, format, commit, repo_path)? {
+    let blob = match read_path_blob(db, format, commit, repo_path, lazy_fetch)? {
         Some((raw, mode)) => Some(textconv.convert(repo_path, mode, raw)?),
         None => None,
     };

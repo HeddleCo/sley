@@ -552,7 +552,7 @@ fn run_diff_files(cli_session: &crate::session::CliSession, o: DiffFilesOptions)
     let pathspec = if o.path_args.is_empty() {
         DiffPathspec::default()
     } else {
-        DiffPathspec::new(cwd, worktree_root, &o.path_args)?
+        DiffPathspec::new(cwd, worktree_root, &o.path_args, repo.pathspec_magic())?
     };
 
     let options = sley_diff_merge::DiffNameStatusOptions {
@@ -680,6 +680,8 @@ fn run_diff_files(cli_session: &crate::session::CliSession, o: DiffFilesOptions)
                 interhunk,
                 diff_algorithm,
                 indent_heuristic,
+                config: repo.config(),
+                lazy_fetch: cli_session.lazy_fetch(),
             },
         )?;
     }
@@ -702,6 +704,8 @@ struct DiffFilesRenderContext<'a> {
     interhunk: usize,
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
     indent_heuristic: bool,
+    config: &'a GitConfig,
+    lazy_fetch: bool,
 }
 
 fn render_diff_files_entries(
@@ -741,10 +745,16 @@ fn render_diff_files_entries(
     // --no-refresh`-restored file: shown `M` in raw/name-status, empty in stat)
     // must be excluded. The raw and name output keep the full set.
     let content_entries = if show_numstat || show_stat || show_shortstat {
-        collect_diff_stat_entries(entries, context.db, worktree_root, use_worktree_new)?
-            .into_iter()
-            .filter(diff_files_stat_entry_has_content_change)
-            .collect::<Vec<_>>()
+        collect_diff_stat_entries(
+            entries,
+            context.db,
+            worktree_root,
+            use_worktree_new,
+            context.lazy_fetch,
+        )?
+        .into_iter()
+        .filter(diff_files_stat_entry_has_content_change)
+        .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
@@ -776,6 +786,7 @@ fn render_diff_files_entries(
                     quote_path_fully: true,
                 },
                 widths: None,
+                config: Some(context.config),
             },
             after_stat: None,
             prefix_already_written: false,
@@ -789,6 +800,7 @@ fn render_diff_files_entries(
                 anchors: &[],
                 allow_textconv: false,
                 db: context.db,
+                lazy_fetch: context.lazy_fetch,
                 worktree_root,
                 use_worktree_new,
                 format: context.format,

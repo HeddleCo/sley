@@ -413,6 +413,7 @@ fn apply_stash_entry(
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
+    let config = read_repo_config(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let entries = store.read_reflog("refs/stash")?;
@@ -505,7 +506,15 @@ fn apply_stash_entry(
         base: options.label_base.as_deref().unwrap_or("Stash base"),
         style: stash_apply_conflict_style(&git_dir),
     };
-    let outcome = apply_stash_via_merge(&db, format, &stash_state, reinstate_index, &labels)?;
+    let outcome = apply_stash_via_merge(
+        &db,
+        format,
+        &stash_state,
+        reinstate_index,
+        &labels,
+        &config,
+        cli_session.lazy_fetch(),
+    )?;
 
     if let Some(untracked_oid) = stash_commit.parents.get(2) {
         let untracked_object = db.read_object(untracked_oid)?;
@@ -584,6 +593,8 @@ fn apply_stash_via_merge(
     state: &StashApplyState<'_>,
     reinstate_index: bool,
     labels: &StashApplyMergeLabels<'_>,
+    config: &GitConfig,
+    lazy_fetch: bool,
 ) -> Result<StashApplyOutcome> {
     stash_check_index_lock(state.git_dir)?;
     // `ours` (git's `c_tree`) is the current index written as a tree. Reject a
@@ -623,6 +634,8 @@ fn apply_stash_via_merge(
         } else {
             let (idx_results, idx_conflicts) = three_way_merge_trees(
                 db,
+                config,
+                lazy_fetch,
                 format,
                 &sley_diff_merge::flatten_tree(db, format, state.base_tree)?,
                 &ours_map,
@@ -650,6 +663,8 @@ fn apply_stash_via_merge(
     let theirs_map = sley_diff_merge::flatten_tree(db, format, state.stash_tree)?;
     let (results, conflicts) = three_way_merge_trees_styled(
         db,
+        config,
+        lazy_fetch,
         format,
         &base_map,
         &ours_map,
@@ -671,6 +686,7 @@ fn apply_stash_via_merge(
         format,
         &ours_map,
         &results,
+        lazy_fetch,
     )?;
 
     if !conflicts.is_empty() {
@@ -918,6 +934,7 @@ fn apply_stash_merge_results(
     format: ObjectFormat,
     ours_map: &MergeTreeMap,
     results: &BTreeMap<Vec<u8>, MergePathResult>,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let index_path = sley_worktree::repository_index_path(git_dir);
     let old_index = if index_path.exists() {
@@ -946,7 +963,7 @@ fn apply_stash_merge_results(
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = merge_read_blob(db, oid)?;
+                    let content = merge_read_blob(db, oid, lazy_fetch)?;
                     merge_write_worktree_file(worktree_root, path, &content, *mode)?;
                 }
             }
@@ -1540,6 +1557,7 @@ fn stash_push_patch(
     }
 
     let applied = match commands::add_interactive::cmd_stash_patch(
+        cli_session,
         pathspecs,
         unified_context,
         inter_hunk_context,
@@ -1623,8 +1641,9 @@ fn stash_record_selected_patch(
         .unwrap_or_else(|| "(no branch)".to_string());
     let head_name = format_log_oid(&head_oid, Some(7));
     let head_subject = commit_subject(&head_commit.message);
-    let author = stash_identity_from_env("AUTHOR")?;
-    let committer = stash_identity_from_env("COMMITTER")?;
+    let config = read_repo_config(git_dir).unwrap_or_default();
+    let author = stash_identity_from_env("AUTHOR", &config)?;
+    let committer = stash_identity_from_env("COMMITTER", &config)?;
     let index_commit = sley_sequencer::create_commit(
         &mut db,
         sley_sequencer::CommitCreate {
@@ -2049,6 +2068,7 @@ fn create_stash_commit(
         mode,
         pathspecs,
         quiet,
+        effective_pathspec_flags(cli_session),
     )
 }
 
@@ -2062,6 +2082,7 @@ fn create_stash_commit_at(
     mode: StashCreateMode,
     pathspecs: &[String],
     quiet: bool,
+    pathspec_magic: sley_worktree::PathspecMatchMagic,
 ) -> Result<Option<CreatedStash>> {
     let cwd = cwd.to_path_buf();
     let git_dir = git_dir.to_path_buf();
@@ -2098,7 +2119,13 @@ fn create_stash_commit_at(
     let pathspec = if pathspecs.is_empty() {
         None
     } else {
-        Some(LsFilesPathspec::new(&cwd, &worktree_root, true, pathspecs)?)
+        Some(LsFilesPathspec::new(
+            &cwd,
+            &worktree_root,
+            true,
+            pathspecs,
+            pathspec_magic,
+        )?)
     };
     let head_entries = sley_diff_merge::flatten_tree(&db, format, &head_commit.tree)?;
     let index_tree = stash_write_tree_from_entries(&mut db, &index_entries)?;
@@ -2188,8 +2215,9 @@ fn create_stash_commit_at(
         .unwrap_or_else(|| "(no branch)".to_string());
     let head_name = format_log_oid(&head_oid, Some(7));
     let head_subject = commit_subject(&head_commit.message);
-    let author = stash_identity_from_env("AUTHOR")?;
-    let committer = stash_identity_from_env("COMMITTER")?;
+    let config = read_repo_config(&git_dir).unwrap_or_default();
+    let author = stash_identity_from_env("AUTHOR", &config)?;
+    let committer = stash_identity_from_env("COMMITTER", &config)?;
     let index_commit = sley_sequencer::create_commit(
         &mut db,
         sley_sequencer::CommitCreate {
@@ -2281,11 +2309,11 @@ fn stash_check_index_lock_quiet(git_dir: &Path, quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn stash_identity_from_env(role: &str) -> Result<Vec<u8>> {
+fn stash_identity_from_env(role: &str, effective_config: &GitConfig) -> Result<Vec<u8>> {
     let env_name = env::var(format!("GIT_{role}_NAME")).ok();
     let env_email = env::var(format!("GIT_{role}_EMAIL")).ok();
     let mut config = if env_name.is_none() || env_email.is_none() {
-        IdentityConfig::Lazy(None)
+        IdentityConfig::Loaded(effective_config)
     } else {
         IdentityConfig::Skip
     };
@@ -3313,6 +3341,7 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
+    let config = read_repo_config(&common_git_dir)?;
     if !untracked_option_seen {
         include_untracked = stash_show_include_untracked_config_default(
             cli_session.cwd(),
@@ -3445,7 +3474,7 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
                 show_stat = true;
             }
             let stat_entries = if show_numstat || show_stat || compact_summary || show_shortstat {
-                collect_diff_stat_entries(&entries, &db, None, false)?
+                collect_diff_stat_entries(&entries, &db, None, false, cli_session.lazy_fetch())?
             } else {
                 Vec::new()
             };
@@ -3477,6 +3506,7 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
                         color: false,
                         quote_path_fully: true,
                     },
+                    Some(&config),
                 )?;
                 wrote_prefix_output |= !entries.is_empty();
             }
@@ -3502,6 +3532,7 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
                         anchors: &[],
                         allow_textconv: false,
                         db: &db,
+                        lazy_fetch: cli_session.lazy_fetch(),
                         worktree_root: None,
                         use_worktree_new: false,
                         format,
@@ -3655,9 +3686,22 @@ fn cmd_stash_list(cli_session: &crate::session::CliSession, args: &[String]) -> 
                 }
             };
             if options.combined_patch {
-                write_stash_list_combined_patch(&mut io::stdout(), &db, format, &commit)?;
+                write_stash_list_combined_patch(
+                    &mut io::stdout(),
+                    &db,
+                    format,
+                    &commit,
+                    cli_session.lazy_fetch(),
+                )?;
             } else {
-                write_stash_list_patch(&mut io::stdout(), &common_git_dir, &db, format, &commit)?;
+                write_stash_list_patch(
+                    &mut io::stdout(),
+                    &common_git_dir,
+                    &db,
+                    format,
+                    &commit,
+                    cli_session.lazy_fetch(),
+                )?;
             }
         }
     }
@@ -3953,6 +3997,7 @@ fn write_stash_list_patch(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     commit: &Commit,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let Some(base_oid) = commit.parents.first() else {
         return Ok(());
@@ -3976,6 +4021,7 @@ fn write_stash_list_patch(
             anchors: &[],
             allow_textconv: false,
             db,
+            lazy_fetch,
             worktree_root: None,
             use_worktree_new: false,
             format,
@@ -4010,6 +4056,7 @@ fn write_stash_list_combined_patch(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     commit: &Commit,
+    lazy_fetch: bool,
 ) -> Result<()> {
     if commit.parents.len() < 2 {
         return Ok(());
@@ -4040,9 +4087,9 @@ fn write_stash_list_combined_patch(
         let Some((_, index_oid)) = index_entry else {
             continue;
         };
-        let base_content = merge_read_blob(db, base_oid)?;
-        let index_content = merge_read_blob(db, index_oid)?;
-        let result_content = merge_read_blob(db, result_oid)?;
+        let base_content = merge_read_blob(db, base_oid, lazy_fetch)?;
+        let index_content = merge_read_blob(db, index_oid, lazy_fetch)?;
+        let result_content = merge_read_blob(db, result_oid, lazy_fetch)?;
         let mut body = Vec::new();
         if !sley_diff_merge::render::render_combined(
             &mut body,
@@ -4313,6 +4360,7 @@ pub(crate) fn create_stash_for_autostash_at(
         StashCreateMode::Worktree,
         &[],
         false,
+        sley_worktree::PathspecMatchMagic::default(),
     )?
     .map(|created| created.oid))
 }
@@ -4353,13 +4401,18 @@ pub(crate) fn apply_stash_commit_quietly(
     stash_oid: &ObjectId,
 ) -> Result<bool> {
     let git_dir = cli_session.git_dir()?;
-    apply_stash_commit_quietly_at(&git_dir, stash_oid)
+    apply_stash_commit_quietly_at(&git_dir, stash_oid, cli_session.lazy_fetch())
 }
 
-pub(crate) fn apply_stash_commit_quietly_at(git_dir: &Path, stash_oid: &ObjectId) -> Result<bool> {
+pub(crate) fn apply_stash_commit_quietly_at(
+    git_dir: &Path,
+    stash_oid: &ObjectId,
+    lazy_fetch: bool,
+) -> Result<bool> {
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
+    let config = read_repo_config(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let Ok(stash_object) = db.read_object(stash_oid) else {
         return Ok(false);
@@ -4408,7 +4461,15 @@ pub(crate) fn apply_stash_commit_quietly_at(git_dir: &Path, stash_oid: &ObjectId
         base: "Stash base",
         style: stash_apply_conflict_style(&git_dir),
     };
-    match apply_stash_via_merge(&db, format, &stash_state, false, &labels) {
+    match apply_stash_via_merge(
+        &db,
+        format,
+        &stash_state,
+        false,
+        &labels,
+        &config,
+        lazy_fetch,
+    ) {
         Ok(StashApplyOutcome::Clean) => {}
         Ok(StashApplyOutcome::Conflict) => return Ok(false),
         Err(_) => return Ok(false),

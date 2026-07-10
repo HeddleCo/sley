@@ -2119,7 +2119,13 @@ pub(crate) fn cmd_gc(cli_session: &crate::session::CliSession, args: &[String]) 
         if gc_lock_held(&common_git_dir)? && !options.force {
             return Ok(());
         }
-        if commands::hooks::run_hook("pre-auto-gc", commands::hooks::HookRun::default()).is_err() {
+        if commands::hooks::run_hook(
+            cli_session,
+            "pre-auto-gc",
+            commands::hooks::HookRun::default(),
+        )
+        .is_err()
+        {
             return Ok(());
         }
         if !options.quiet {
@@ -2323,11 +2329,14 @@ fn gc_run_locked(
             "--no-progress"
         };
         trace2_child_start(&["commit-graph", "write", "--reachable", progress]);
-        commands::plumbing::cmd_commit_graph(&[
-            "write".to_string(),
-            "--reachable".to_string(),
-            progress.to_string(),
-        ])?;
+        commands::plumbing::cmd_commit_graph(
+            cli_session,
+            &[
+                "write".to_string(),
+                "--reachable".to_string(),
+                progress.to_string(),
+            ],
+        )?;
     }
     if options.auto && gc_too_many_loose_objects(&common_git_dir, format, config)? {
         eprintln!(
@@ -3040,7 +3049,15 @@ fn cmd_maintenance_run(cli_session: &crate::session::CliSession, args: &[String]
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
     let selected = maintenance_select_tasks(&config, &tasks, schedule.as_deref())?;
-    maintenance_run_selected(&common_git_dir, &config, &selected, quiet, auto, detach)?;
+    maintenance_run_selected(
+        cli_session,
+        &common_git_dir,
+        &config,
+        &selected,
+        quiet,
+        auto,
+        detach,
+    )?;
     Ok(())
 }
 
@@ -3188,6 +3205,7 @@ fn maintenance_schedule_rank(value: &str) -> Result<u8> {
 }
 
 fn maintenance_run_selected(
+    cli_session: &crate::session::CliSession,
     common_git_dir: &Path,
     config: &GitConfig,
     tasks: &[String],
@@ -3216,13 +3234,14 @@ fn maintenance_run_selected(
         if auto && !maintenance_task_needed(common_git_dir, config, task)? {
             continue;
         }
-        maintenance_run_one(common_git_dir, config, task, quiet, auto)?;
+        maintenance_run_one(cli_session, common_git_dir, config, task, quiet, auto)?;
     }
     let _ = fs::remove_file(lock);
     Ok(())
 }
 
 fn maintenance_run_one(
+    cli_session: &crate::session::CliSession,
     common_git_dir: &Path,
     config: &GitConfig,
     task: &str,
@@ -3236,11 +3255,14 @@ fn maintenance_run_one(
             }
             let progress = if quiet { "--no-progress" } else { "--progress" };
             trace2_child_start(&["commit-graph", "write", "--split", "--reachable", progress]);
-            commands::plumbing::cmd_commit_graph(&[
-                "write".to_string(),
-                "--reachable".to_string(),
-                progress.to_string(),
-            ])
+            commands::plumbing::cmd_commit_graph(
+                cli_session,
+                &[
+                    "write".to_string(),
+                    "--reachable".to_string(),
+                    progress.to_string(),
+                ],
+            )
         }
         "pack-refs" => {
             if auto {
@@ -3926,20 +3948,26 @@ fn cmd_maintenance_register(
     let repo = env::current_dir()?.display().to_string();
 
     let _ = report_missing_maintenance_repo(&common_git_dir);
-    commands::config_cmd::cmd_config(&[
-        "set".to_string(),
-        "maintenance.auto".to_string(),
-        "false".to_string(),
-    ])?;
+    commands::config_cmd::cmd_config(
+        cli_session,
+        &[
+            "set".to_string(),
+            "maintenance.auto".to_string(),
+            "false".to_string(),
+        ],
+    )?;
     if read_repo_config(&common_git_dir)?
         .get("maintenance", None, "strategy")
         .is_none()
     {
-        commands::config_cmd::cmd_config(&[
-            "set".to_string(),
-            "maintenance.strategy".to_string(),
-            "incremental".to_string(),
-        ])?;
+        commands::config_cmd::cmd_config(
+            cli_session,
+            &[
+                "set".to_string(),
+                "maintenance.strategy".to_string(),
+                "incremental".to_string(),
+            ],
+        )?;
     }
 
     let file = config_file.unwrap_or(maintenance_global_config_path()?);

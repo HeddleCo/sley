@@ -3,9 +3,32 @@
 use crate::*;
 use sley::plumbing::sley_config;
 
-fn init_repo_is_implicitly_bare(cwd: &Path) -> Result<bool> {
+fn init_explicit_git_dir(cli_session: &crate::session::CliSession) -> Option<PathBuf> {
+    cli_session.git_dir_override().or_else(|| {
+        if cli_session.local_repo_env_hidden() {
+            None
+        } else {
+            env::var_os("GIT_DIR").map(PathBuf::from)
+        }
+    })
+}
+
+fn init_explicit_work_tree(cli_session: &crate::session::CliSession) -> Option<PathBuf> {
+    cli_session.work_tree_override().or_else(|| {
+        if cli_session.local_repo_env_hidden() {
+            None
+        } else {
+            env::var_os("GIT_WORK_TREE").map(PathBuf::from)
+        }
+    })
+}
+
+fn init_repo_is_implicitly_bare(
+    cli_session: &crate::session::CliSession,
+    cwd: &Path,
+) -> Result<bool> {
     // Determine the effective git directory git would inspect.
-    if let Some(git_dir) = environment_git_dir() {
+    if let Some(git_dir) = init_explicit_git_dir(cli_session) {
         return Ok(guess_repository_type(&git_dir, cwd));
     }
     // No GIT_DIR: git_dir defaults to ".git". Only a linked-worktree gitfile (whose
@@ -16,7 +39,7 @@ fn init_repo_is_implicitly_bare(cwd: &Path) -> Result<bool> {
         && let Some(target) = read_gitdir_file(&dot_git)?
         && target.join("commondir").is_file()
     {
-        let common = common_git_dir_for_git_dir(&target)?;
+        let common = cli_session.common_git_dir(&target)?;
         return Ok(guess_repository_type(&common, cwd));
     }
     // Otherwise git_dir is ".git", which guess_repository_type treats as non-bare.
@@ -46,14 +69,19 @@ fn guess_repository_type(git_dir: &Path, cwd: &Path) -> bool {
     true
 }
 
-pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<()> {
-    let mut bare = global_bare();
+pub(crate) fn cmd_init(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    global_config: &[GlobalConfigOverride],
+) -> Result<()> {
+    let session_bare = !cli_session.local_repo_env_hidden() && cli_session.bare();
+    let mut bare = session_bare;
     // git distinguishes an *explicitly requested* bare repo (`--bare`/global
     // `--bare`) from one merely *guessed* from the environment. The former pairs
     // with `--separate-git-dir` as "cannot be used together"; the latter as
     // "incompatible with bare repository". Track the explicit signal separately
     // from the `.git`-suffix path heuristic applied further down.
-    let mut bare_explicit = global_bare();
+    let mut bare_explicit = session_bare;
     let mut object_format = None::<String>;
     let mut ref_format = None::<Option<String>>;
     let mut initial_branch = None::<String>;
@@ -177,7 +205,7 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
         }
     }
 
-    let cwd = env::current_dir()?;
+    let cwd = cli_session.cwd().to_path_buf();
     let object_dir = env::var_os("GIT_OBJECT_DIRECTORY")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -188,8 +216,13 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
                 cwd.join(path)
             }
         });
-    let init_config_git_dir =
-        init_config_git_dir_for_lookup(&cwd, &path, bare, separate_git_dir.as_deref())?;
+    let init_config_git_dir = init_config_git_dir_for_lookup(
+        cli_session,
+        &cwd,
+        &path,
+        bare,
+        separate_git_dir.as_deref(),
+    )?;
 
     // Mirror refs.c `repo_default_branch_name`: an explicit `--initial-branch`
     // wins; otherwise `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME` (when non-empty),
@@ -253,7 +286,7 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
         // when bare was not explicit, then rejects `--separate-git-dir` against an
         // implicitly-bare repository (e.g. `GIT_DIR=.`, or inside a linked worktree
         // whose common repository is bare).
-        if init_repo_is_implicitly_bare(&cwd)? {
+        if init_repo_is_implicitly_bare(cli_session, &cwd)? {
             eprintln!("fatal: --separate-git-dir incompatible with bare repository");
             return Err(GitError::Exit(128));
         }
@@ -264,8 +297,8 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
     // directory, `--bare` pins GIT_DIR to that directory (overwriting the
     // environment when a directory argument was given); the effective git dir
     // then comes from GIT_DIR and its *string* form drives the bare guess.
-    let env_git_dir = explicit_git_dir();
-    let env_work_tree = explicit_work_tree();
+    let env_git_dir = init_explicit_git_dir(cli_session);
+    let env_work_tree = init_explicit_work_tree(cli_session);
     if env_work_tree.is_some() && (bare_explicit || env_git_dir.is_none()) {
         eprintln!(
             "fatal: GIT_WORK_TREE (or --work-tree=<directory>) not allowed without specifying GIT_DIR (or --git-dir=<directory>)"
@@ -288,7 +321,7 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
             && let Some(admin_dir) = read_gitdir_file(&dot_git)?
             && admin_dir.join("commondir").is_file()
         {
-            let common = common_git_dir_for_git_dir(&admin_dir)?;
+            let common = cli_session.common_git_dir(&admin_dir)?;
             if let Some(main_root) = common.parent() {
                 worktree = main_root.to_path_buf();
             }
@@ -434,6 +467,7 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
 }
 
 fn init_config_git_dir_for_lookup(
+    cli_session: &crate::session::CliSession,
     cwd: &Path,
     path: &Path,
     bare: bool,
@@ -442,12 +476,12 @@ fn init_config_git_dir_for_lookup(
     if let Some(raw) = separate_git_dir {
         return Ok(Some(resolve_cli_path(cwd, raw)));
     }
-    if let Some(raw) = explicit_git_dir() {
+    if let Some(raw) = init_explicit_git_dir(cli_session) {
         let git_dir = resolve_cli_path(cwd, raw.to_string_lossy().as_ref());
         if git_dir.is_file()
             && let Some(target) = read_gitdir_file(&git_dir)?
         {
-            return common_git_dir_for_git_dir(&target).map(Some);
+            return cli_session.common_git_dir(&target).map(Some);
         }
         return Ok(Some(git_dir));
     }
@@ -459,7 +493,7 @@ fn init_config_git_dir_for_lookup(
         if git_file.is_file()
             && let Some(git_dir) = read_gitdir_file(&git_file)?
         {
-            return common_git_dir_for_git_dir(&git_dir).map(Some);
+            return cli_session.common_git_dir(&git_dir).map(Some);
         }
         Ok(Some(git_file))
     }

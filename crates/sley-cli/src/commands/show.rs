@@ -214,6 +214,7 @@ struct ShowContext<'a> {
     decorations: &'a HashMap<ObjectId, Vec<String>>,
     diff_pathspec: Option<&'a DiffPathspec>,
     mailmap: RefCell<Option<commands::utility::Mailmap>>,
+    lazy_fetch: bool,
 }
 
 impl ShowContext<'_> {
@@ -504,6 +505,7 @@ pub(crate) fn cmd_show(cli_session: &crate::session::CliSession, args: &[String]
             repo.cwd(),
             worktree_root,
             &setup.pathspecs,
+            repo.pathspec_magic(),
         )?)
     };
 
@@ -533,6 +535,7 @@ pub(crate) fn cmd_show(cli_session: &crate::session::CliSession, args: &[String]
         decorations: &decorations,
         diff_pathspec: diff_pathspec.as_ref(),
         mailmap: RefCell::new(None),
+        lazy_fetch: cli_session.lazy_fetch(),
     };
     let grep_kind = log_grep_pattern_kind_from_config(
         config,
@@ -1214,7 +1217,14 @@ fn write_commit_trailer(
         return if combined_merge {
             write_show_combined(stdout, context, &layout, commit, entries)
         } else if layout.is_merge && !first_parent_merge {
-            write_merge_stat(stdout, context.db, context.config, options, entries)
+            write_merge_stat(
+                stdout,
+                context.db,
+                context.config,
+                options,
+                entries,
+                context.lazy_fetch,
+            )
         } else {
             write_commit_diff(
                 stdout,
@@ -1224,6 +1234,7 @@ fn write_commit_trailer(
                 context.config,
                 options,
                 entries,
+                context.lazy_fetch,
             )
         };
     }
@@ -1270,9 +1281,10 @@ fn write_merge_stat(
     config: &GitConfig,
     options: &ShowOptions,
     entries: &[sley_diff_merge::NameStatusEntry],
+    lazy_fetch: bool,
 ) -> Result<()> {
     let color = diff_color_enabled(config);
-    let stat_entries = collect_diff_stat_entries(entries, db, None, false)?;
+    let stat_entries = collect_diff_stat_entries(entries, db, None, false, lazy_fetch)?;
     if options.numstat {
         for entry in &stat_entries {
             write_diff_numstat_materialized_entry(stdout, entry.entry, entry.stats, false)?;
@@ -1319,7 +1331,7 @@ fn write_show_combined(
     let db = context.db;
     let stat_entries =
         if options.numstat || options.stat || options.compact_summary || options.shortstat {
-            collect_diff_stat_entries(entries, db, None, false)?
+            collect_diff_stat_entries(entries, db, None, false, context.lazy_fetch)?
         } else {
             Vec::new()
         };
@@ -1348,6 +1360,7 @@ fn write_show_combined(
         dst_prefix: "b/",
         patch_abbrev: options.patch_abbrev.unwrap_or(7).min(format.hex_len()),
         raw_abbrev: None,
+        lazy_fetch: context.lazy_fetch,
     };
 
     // `--name-only`/`--name-status` print the combined name (status) listing.
@@ -1373,7 +1386,14 @@ fn write_show_combined(
     // = !has_diff_extras()`).
     let stat_active = merge_renders_stat(options);
     if stat_active {
-        write_merge_stat(stdout, db, context.config, options, entries)?;
+        write_merge_stat(
+            stdout,
+            db,
+            context.config,
+            options,
+            entries,
+            context.lazy_fetch,
+        )?;
     }
     if options.has_diff_extras() && !options.patch_with_extra {
         return Ok(());
@@ -1470,6 +1490,7 @@ fn write_commit_diff(
     config: &GitConfig,
     options: &ShowOptions,
     entries: &[sley_diff_merge::NameStatusEntry],
+    lazy_fetch: bool,
 ) -> Result<()> {
     match options.diff_mode {
         ShowDiffMode::None => Ok(()),
@@ -1491,9 +1512,9 @@ fn write_commit_diff(
             }
             Ok(())
         }
-        ShowDiffMode::Patch => {
-            write_commit_diff_patch(stdout, git_dir, db, format, config, options, entries)
-        }
+        ShowDiffMode::Patch => write_commit_diff_patch(
+            stdout, git_dir, db, format, config, options, entries, lazy_fetch,
+        ),
     }
 }
 
@@ -1508,6 +1529,7 @@ fn write_commit_diff_patch(
     config: &GitConfig,
     options: &ShowOptions,
     entries: &[sley_diff_merge::NameStatusEntry],
+    lazy_fetch: bool,
 ) -> Result<()> {
     let repository_abbrev = repository_abbrev(git_dir, format)?;
     let raw_abbrev = repository_abbrev;
@@ -1525,7 +1547,7 @@ fn write_commit_diff_patch(
     let show_patch = options.shows_patch_body();
     let stat_entries =
         if options.numstat || options.stat || options.compact_summary || options.shortstat {
-            collect_diff_stat_entries(entries, db, None, false)?
+            collect_diff_stat_entries(entries, db, None, false, lazy_fetch)?
         } else {
             Vec::new()
         };
@@ -1579,6 +1601,7 @@ fn write_commit_diff_patch(
                         quote_path_fully: true,
                     },
                     widths: Some(stat_widths),
+                    config: None,
                 },
                 prefix_already_written: false,
                 after_stat: None,
@@ -1594,6 +1617,7 @@ fn write_commit_diff_patch(
                     anchors: &options.anchored,
                     allow_textconv: options.textconv != Some(false),
                     db,
+                    lazy_fetch,
                     worktree_root: None,
                     use_worktree_new: false,
                     format,
@@ -1653,6 +1677,7 @@ fn write_commit_diff_patch(
                         quote_path_fully: true,
                     },
                     widths: Some(stat_widths),
+                    config: None,
                 },
                 prefix_already_written: false,
                 after_stat: None,

@@ -189,6 +189,8 @@ fn run_git_replay(cli_session: &crate::session::CliSession, args: &[String]) -> 
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root =
         sley_worktree::worktree_root_for_git_dir(&git_dir)?.unwrap_or_else(|| cwd.clone());
+    let config = read_repo_config(&git_dir)?;
+    let config = crate::commands::merge_rebase::effective_config_with_overrides(&config);
     let ctx = ReplayCtx {
         action: if parsed.revert.is_some() {
             ReplayAction::Revert
@@ -199,6 +201,8 @@ fn run_git_replay(cli_session: &crate::session::CliSession, args: &[String]) -> 
         common_git_dir,
         worktree_root,
         format,
+        config,
+        lazy_fetch: cli_session.lazy_fetch(),
     };
     let plan = build_git_replay_plan(&ctx, parsed)?;
     let new_oid = replay_commits_to_base(&ctx, &plan)?;
@@ -324,7 +328,7 @@ fn build_git_replay_plan(ctx: &ReplayCtx, parsed: GitReplayArgs) -> Result<GitRe
     }
     let ref_action = match parsed.ref_action {
         Some(action) => action,
-        None => match config_value(&ctx.git_dir, "replay", "refAction").as_deref() {
+        None => match config_value(&ctx.config, "replay", "refAction").as_deref() {
             Some("print") => ReplayRefAction::Print,
             Some("update") | None => ReplayRefAction::Update,
             Some(value) => {
@@ -547,6 +551,8 @@ fn replay_one_commit_to(
     let ours_map = sley_diff_merge::flatten_tree(&db, ctx.format, &head_tree)?;
     let (results, conflicts) = three_way_merge_trees_styled(
         &db,
+        &ctx.config,
+        ctx.lazy_fetch,
         ctx.format,
         &base_map,
         &ours_map,
@@ -570,7 +576,7 @@ fn replay_one_commit_to(
     }
     let author = match action {
         ReplayAction::Pick => commit.author.clone(),
-        ReplayAction::Revert => commit_identity_from_env("AUTHOR")?,
+        ReplayAction::Revert => commit_identity_from_env("AUTHOR", &ctx.config)?,
     };
     let message = match action {
         ReplayAction::Pick => commit.message.clone(),
@@ -591,7 +597,7 @@ fn replay_one_commit_to(
             tree: new_tree,
             parents: vec![*head],
             author,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: commit_identity_from_env("COMMITTER", &ctx.config)?,
             message,
             encoding: commit.encoding.clone(),
             signature: None,
@@ -702,7 +708,7 @@ fn emit_or_update_replay_ref(
         reflog: Some(ReflogEntry {
             old_oid,
             new_oid: *new_oid,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: commit_identity_from_env("COMMITTER", &ctx.config)?,
             message: plan.reflog_message.clone(),
         }),
     });
@@ -922,6 +928,8 @@ struct ReplayCtx {
     common_git_dir: PathBuf,
     worktree_root: PathBuf,
     format: ObjectFormat,
+    config: GitConfig,
+    lazy_fetch: bool,
 }
 
 impl ReplayCtx {
@@ -948,12 +956,16 @@ fn run_replay(
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let config = read_repo_config(&git_dir)?;
+    let config = crate::commands::merge_rebase::effective_config_with_overrides(&config);
     let ctx = ReplayCtx {
         action,
         git_dir,
         common_git_dir,
         worktree_root,
         format,
+        config,
+        lazy_fetch: cli_session.lazy_fetch(),
     };
 
     let me = action.name();
@@ -1014,7 +1026,7 @@ fn run_replay(
     if action == ReplayAction::Revert && opts.commit_use_reference {
         // git also flips this from the revert.reference config.
     } else if action == ReplayAction::Revert
-        && config_bool(&ctx.git_dir, "revert", "reference").unwrap_or(false)
+        && config_bool(&ctx.config, "revert", "reference").unwrap_or(false)
     {
         opts.commit_use_reference = true;
     }
@@ -1037,8 +1049,8 @@ fn run_replay(
     sequencer_pick_revisions(&ctx, &opts, &parsed.rev_args)
 }
 
-fn config_bool(git_dir: &Path, section: &str, key: &str) -> Option<bool> {
-    let value = config_value(git_dir, section, key)?;
+fn config_bool(config: &GitConfig, section: &str, key: &str) -> Option<bool> {
+    let value = config_value(config, section, key)?;
     match value.to_ascii_lowercase().as_str() {
         "true" | "yes" | "on" | "1" | "" => Some(true),
         "false" | "no" | "off" | "0" => Some(false),
@@ -1047,14 +1059,14 @@ fn config_bool(git_dir: &Path, section: &str, key: &str) -> Option<bool> {
 }
 
 /// Effective-config lookup (repo + global/system + `-c`/env injection).
-fn config_value(git_dir: &Path, section: &str, key: &str) -> Option<String> {
-    if let Some(config) = crate::commands::merge_rebase::effective_config_with_overrides()
-        && let Some(value) = config.get(section, None, key)
-    {
-        return Some(value.to_string());
-    }
-    let config = read_repo_config(git_dir).ok()?;
+fn config_value(config: &GitConfig, section: &str, key: &str) -> Option<String> {
     config.get(section, None, key).map(str::to_string)
+}
+
+fn config_value_at_git_dir(git_dir: &Path, section: &str, key: &str) -> Option<String> {
+    let config = read_repo_config(git_dir).ok()?;
+    let config = crate::commands::merge_rebase::effective_config_with_overrides(&config);
+    config_value(&config, section, key)
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,7 +1279,7 @@ fn sequencer_pick_revisions(ctx: &ReplayCtx, opts: &ReplayOpts, rev_args: &[Stri
         ctx.git_dir.join("CHERRY_PICK_HEAD").exists() || ctx.git_dir.join("REVERT_HEAD").exists();
     if let Some(in_progress) = replay::in_progress_error(&ctx.git_dir, advise_skip) {
         eprintln!("error: {}", in_progress.error);
-        if config_bool(&ctx.git_dir, "advice", "sequencerInUse").unwrap_or(true) {
+        if config_bool(&ctx.config, "advice", "sequencerInUse").unwrap_or(true) {
             for line in in_progress.hint.lines() {
                 eprintln!("hint: {line}");
             }
@@ -1407,7 +1419,7 @@ fn do_pick_commit(
             "error: your local changes would be overwritten by {}.",
             action.name()
         );
-        if config_bool(&ctx.git_dir, "advice", "commitBeforeMerge").unwrap_or(true) {
+        if config_bool(&ctx.config, "advice", "commitBeforeMerge").unwrap_or(true) {
             eprintln!("hint: commit your changes or stash them to proceed.");
         }
         return Err(ReplayHalt::Fatal);
@@ -1483,7 +1495,7 @@ fn do_pick_commit(
         }
     };
     if opts.signoff {
-        let signoff = commit_signoff_from_env().map_err(print_fatal_error)?;
+        let signoff = commit_signoff_from_env(&ctx.config).map_err(print_fatal_error)?;
         message = append_signoff_before_comments(message, &signoff);
     }
 
@@ -1511,13 +1523,15 @@ fn do_pick_commit(
     let ours_map =
         sley_diff_merge::flatten_tree(&db, ctx.format, &index_tree).map_err(print_fatal_error)?;
 
-    let style = match config_value(&ctx.git_dir, "merge", "conflictstyle").as_deref() {
+    let style = match config_value(&ctx.config, "merge", "conflictstyle").as_deref() {
         Some("diff3") => sley_diff_merge::ConflictStyle::Diff3,
         Some("zdiff3") => sley_diff_merge::ConflictStyle::ZDiff3,
         _ => sley_diff_merge::ConflictStyle::Merge,
     };
     let (results, conflicts) = three_way_merge_trees_styled_with_strategy_options(
         &db,
+        &ctx.config,
+        ctx.lazy_fetch,
         ctx.format,
         &base_map,
         &ours_map,
@@ -1545,7 +1559,7 @@ fn do_pick_commit(
     let cleanup_mode = opts
         .default_msg_cleanup
         .clone()
-        .or_else(|| config_value(&ctx.git_dir, "commit", "cleanup"));
+        .or_else(|| config_value(&ctx.config, "commit", "cleanup"));
 
     if !conflicts.is_empty() {
         apply_merge_results_to_index_and_worktree(ctx, &db, &ours_map, &results)
@@ -1677,9 +1691,12 @@ fn do_pick_commit(
         ReplayAction::Pick => {
             commit_author_for_commit_encoding(&commit, &target_encoding).into_owned()
         }
-        ReplayAction::Revert => commit_identity_from_env("AUTHOR").map_err(print_fatal_error)?,
+        ReplayAction::Revert => {
+            commit_identity_from_env("AUTHOR", &ctx.config).map_err(print_fatal_error)?
+        }
     };
-    let committer = commit_identity_from_env("COMMITTER").map_err(print_fatal_error)?;
+    let committer =
+        commit_identity_from_env("COMMITTER", &ctx.config).map_err(print_fatal_error)?;
     let reflog_message = format!("{}: {subject}", action.name()).into_bytes();
     let new_oid = commit_and_advance_head(
         ctx,
@@ -1794,11 +1811,17 @@ fn prepare_replay_commit_message(
     } else {
         fs::write(&path, message)?;
     }
-    commands::commit::run_prepare_commit_msg_hook(&path, source, Vec::new(), set_no_editor_env)?;
+    commands::commit::run_prepare_commit_msg_hook(
+        &ctx.git_dir,
+        &path,
+        source,
+        Vec::new(),
+        set_no_editor_env,
+    )?;
     if edit {
         launch_editor(&ctx.git_dir, &path)?;
         let path_arg = path.to_string_lossy().into_owned();
-        commands::hooks::run_hook_l("commit-msg", &[path_arg.as_str()])?;
+        commands::hooks::run_hook_l_at(&ctx.git_dir, "commit-msg", &[path_arg.as_str()])?;
     }
     let edited = fs::read(&path)?;
     Ok(strip_comment_lines(&edited, comment_char(&ctx.git_dir)))
@@ -1807,7 +1830,7 @@ fn prepare_replay_commit_message(
 pub(crate) fn launch_editor(git_dir: &Path, path: &Path) -> Result<()> {
     let editor = env::var("GIT_EDITOR")
         .ok()
-        .or_else(|| config_value(git_dir, "core", "editor"))
+        .or_else(|| config_value_at_git_dir(git_dir, "core", "editor"))
         .or_else(|| {
             env::var("VISUAL")
                 .ok()
@@ -1834,7 +1857,7 @@ pub(crate) fn launch_editor(git_dir: &Path, path: &Path) -> Result<()> {
 }
 
 pub(crate) fn comment_char(git_dir: &Path) -> u8 {
-    match config_value(git_dir, "core", "commentChar").as_deref() {
+    match config_value_at_git_dir(git_dir, "core", "commentChar").as_deref() {
         Some(value) if value.eq_ignore_ascii_case("auto") => b'#',
         Some(value) => value.bytes().next().unwrap_or(b'#'),
         None => b'#',
@@ -2219,7 +2242,7 @@ fn apply_merge_results_to_index_and_worktree(
                     let content = if sley_index::is_gitlink(*mode) {
                         Vec::new()
                     } else {
-                        crate::commands::merge_rebase::merge_read_blob(db, oid)?
+                        crate::commands::merge_rebase::merge_read_blob(db, oid, ctx.lazy_fetch)?
                     };
                     crate::commands::merge_rebase::merge_write_worktree_file(
                         &ctx.worktree_root,
@@ -2314,7 +2337,7 @@ fn append_conflicts_hint(message: &mut Vec<u8>, conflicts: &[Vec<u8>], cleanup: 
 }
 
 fn print_conflict_advice(ctx: &ReplayCtx, opts: &ReplayOpts, help_msg: Option<&str>) {
-    if !config_bool(&ctx.git_dir, "advice", "mergeConflict").unwrap_or(true) {
+    if !config_bool(&ctx.config, "advice", "mergeConflict").unwrap_or(true) {
         return;
     }
     let lines: Vec<String> = if let Some(msg) = help_msg {
@@ -2360,7 +2383,7 @@ fn fast_forward_to(ctx: &ReplayCtx, target: &ObjectId, head: Option<&ObjectId>) 
         Some(RefTarget::Symbolic(branch)) => branch,
         _ => "HEAD".to_string(),
     };
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let committer = commit_identity_from_env("COMMITTER", &ctx.config)?;
     let old_oid = head.copied().unwrap_or_else(|| ObjectId::null(ctx.format));
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
@@ -2590,9 +2613,9 @@ fn continue_single_pick(ctx: &ReplayCtx, opts: &ReplayOpts) -> Result<()> {
         let commit = Commit::parse(ctx.format, &object.body)?;
         commit_author_for_commit_encoding(&commit, &target_encoding).into_owned()
     } else {
-        commit_identity_from_env("AUTHOR")?
+        commit_identity_from_env("AUTHOR", &ctx.config)?
     };
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let committer = commit_identity_from_env("COMMITTER", &ctx.config)?;
     let subject = commit_subject(&message);
     let new_oid = commit_and_advance_head(
         ctx,
@@ -2622,7 +2645,7 @@ fn sequencer_skip(ctx: &ReplayCtx) -> Result<()> {
         let head = ctx.head_oid();
         if !replay::rollback_is_safe(&ctx.git_dir, head.as_ref()) {
             eprintln!("error: there is nothing to skip");
-            if config_bool(&ctx.git_dir, "advice", "resolveConflict").unwrap_or(true) {
+            if config_bool(&ctx.config, "advice", "resolveConflict").unwrap_or(true) {
                 eprintln!("hint: have you committed already?");
                 eprintln!("hint: try \"git {} --continue\"", ctx.action.name());
             }
@@ -2705,11 +2728,25 @@ fn sequencer_rollback(ctx: &ReplayCtx) -> Result<()> {
 /// on-disk content diverges from the (stage-0) index. Conflicted paths are
 /// reset outright. Clears the in-progress branch state on success.
 fn reset_merge(ctx: &ReplayCtx, target: &ObjectId) -> Result<()> {
-    reset_merge_in(&ctx.git_dir, &ctx.worktree_root, ctx.format, Some(target))
+    reset_merge_in(
+        &ctx.git_dir,
+        &ctx.worktree_root,
+        ctx.format,
+        Some(target),
+        &ctx.config,
+        ctx.lazy_fetch,
+    )
 }
 
 fn reset_merge_target(ctx: &ReplayCtx, target: Option<&ObjectId>) -> Result<()> {
-    reset_merge_in(&ctx.git_dir, &ctx.worktree_root, ctx.format, target)
+    reset_merge_in(
+        &ctx.git_dir,
+        &ctx.worktree_root,
+        ctx.format,
+        target,
+        &ctx.config,
+        ctx.lazy_fetch,
+    )
 }
 
 pub(crate) fn reset_merge_in(
@@ -2717,6 +2754,8 @@ pub(crate) fn reset_merge_in(
     worktree_root: &Path,
     format: ObjectFormat,
     target: Option<&ObjectId>,
+    config: &GitConfig,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let target_map = match target {
@@ -2852,7 +2891,7 @@ pub(crate) fn reset_merge_in(
         let content = if sley_index::is_gitlink(*mode) {
             Vec::new()
         } else {
-            crate::commands::merge_rebase::merge_read_blob(&db, oid)?
+            crate::commands::merge_rebase::merge_read_blob(&db, oid, lazy_fetch)?
         };
         crate::commands::merge_rebase::merge_write_worktree_file(
             worktree_root,
@@ -2886,7 +2925,7 @@ pub(crate) fn reset_merge_in(
             Some(RefTarget::Symbolic(branch)) => branch,
             _ => "HEAD".to_string(),
         };
-        let committer = commit_identity_from_env("COMMITTER")?;
+        let committer = commit_identity_from_env("COMMITTER", config)?;
         let old_oid = current_head.unwrap_or_else(|| ObjectId::null(format));
         let mut tx = refs.transaction();
         tx.update(RefUpdate {

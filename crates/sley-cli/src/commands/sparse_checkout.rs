@@ -1280,7 +1280,7 @@ fn sparse_context(cli_session: &crate::session::CliSession) -> Result<SparseCont
     let cwd = cli_session.cwd();
     let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
-    let worktree_root = require_work_tree(&git_dir)?;
+    let worktree_root = require_work_tree(cli_session, &git_dir)?;
     let prefix = sparse_prefix(&worktree_root, cwd)?;
     Ok(SparseContext {
         git_dir,

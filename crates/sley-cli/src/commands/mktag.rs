@@ -108,7 +108,7 @@ pub(crate) fn cmd_mktag(cli_session: &session::CliSession, args: &[String]) -> R
 
     // The tagged object must exist and match the declared type. These checks are
     // reported without the fsck framing and use the canonical object id.
-    verify_tagged_object(&repo, &parsed)?;
+    verify_tagged_object(cli_session.replace_objects(), &repo, &parsed)?;
 
     // Write the payload verbatim and print the resulting object id.
     let oid = repo.write_object(EncodedObject::new(ObjectType::Tag, payload))?;
@@ -738,9 +738,13 @@ fn check_refname_component(component: &[u8]) -> bool {
 ///   * A missing/unreadable object: `fatal: could not read tagged object '<oid>'`.
 ///   * A type mismatch:
 ///     `fatal: object '<oid>' tagged as '<declared>', but is a '<actual>' type`.
-fn verify_tagged_object(repo: &sley::Repository, parsed: &ParsedTag) -> Result<()> {
+fn verify_tagged_object(
+    replace_objects: bool,
+    repo: &sley::Repository,
+    parsed: &ParsedTag,
+) -> Result<()> {
     let refs = repo.references();
-    let read_oid = apply_replace_object(&refs, &parsed.object_id)?;
+    let read_oid = apply_replace_object(replace_objects, &refs, &parsed.object_id)?;
     let object = match repo.read_object(&read_oid) {
         Ok(object) => object,
         Err(_) => {

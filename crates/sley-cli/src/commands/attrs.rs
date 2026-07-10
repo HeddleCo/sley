@@ -106,7 +106,7 @@ pub(crate) fn cmd_check_ignore(
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
-    let worktree_root = &require_work_tree(git_dir)?;
+    let worktree_root = &require_work_tree(cli_session, git_dir)?;
     let prefix = worktree_prefix(cwd, git_dir)?;
     let (tracked_paths, gitlink_paths) = if no_index {
         (BTreeSet::new(), Vec::new())
@@ -401,7 +401,7 @@ pub(crate) fn cmd_check_attr(
         String::new()
     };
     let attr_source = source
-        .or_else(global_attr_source)
+        .or_else(|| global_attr_source(cli_session))
         .or_else(|| std::env::var("GIT_ATTR_SOURCE").ok());
     let attr_tree_config = repo.config().get("attr", None, "tree").map(str::to_string);
     let source_tree = if let Some(source) = attr_source.as_deref() {

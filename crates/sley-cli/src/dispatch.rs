@@ -58,7 +58,7 @@ pub(crate) fn dispatch_with_aliases(
         let try_alias = !commands::alias::is_builtin_command(&command)
             || commands::alias::is_deprecated_command(&command);
         if try_alias {
-            match commands::alias::alias_lookup(&command)? {
+            match commands::alias::alias_lookup(&cli_session, &command)? {
                 commands::alias::AliasLookup::None => {}
                 commands::alias::AliasLookup::MissingValue(key) => {
                     eprintln!("error: missing value for '{key}'");
@@ -74,11 +74,12 @@ pub(crate) fn dispatch_with_aliases(
                         trace2_alias(&command, &[shell.to_string()]);
                         trace2_alias_cmd_name("_run_shell_alias_", expanded_aliases.len());
                         trace2_alias_child_command(
+                            &cli_session,
                             "version",
                             "_run_shell_alias_",
                             expanded_aliases.len(),
                         );
-                        return commands::alias::run_shell_alias(shell, &args[1..]);
+                        return commands::alias::run_shell_alias(&cli_session, shell, &args[1..]);
                     }
                     let mut expanded = commands::alias::split_alias_value(&alias_string);
                     trace2_alias(&command, &expanded);
@@ -100,6 +101,7 @@ pub(crate) fn dispatch_with_aliases(
                     if commands::alias::is_builtin_command(&real_command) {
                         trace2_alias_cmd_name("_run_git_alias_", expanded_aliases.len());
                         trace2_alias_child_command(
+                            &cli_session,
                             &real_command,
                             "_run_git_alias_",
                             expanded_aliases.len(),
@@ -123,7 +125,7 @@ pub(crate) fn dispatch_with_aliases(
         }
         // Not a built-in and not an alias: try it as an external `git-<cmd>`,
         // falling back to git's "not a git command" diagnostic.
-        return run_external_or_unknown(&command, &args);
+        return run_external_or_unknown(&cli_session, &command, &args);
     }
     // Backstop: exceeded the expansion-iteration limit without converging.
     eprintln!("fatal: alias loop detected");
@@ -158,7 +160,12 @@ fn trace2_alias_cmd_name(kind: &str, alias_depth: usize) {
     sley_core::trace2::cmd_name(kind, Some(&hierarchy));
 }
 
-fn trace2_alias_child_command(command: &str, alias_kind: &str, alias_depth: usize) {
+fn trace2_alias_child_command(
+    cli_session: &session::CliSession,
+    command: &str,
+    alias_kind: &str,
+    alias_depth: usize,
+) {
     let hierarchy = format!(
         "{}/{}",
         trace2_alias_hierarchy(alias_kind, alias_depth),
@@ -166,7 +173,7 @@ fn trace2_alias_child_command(command: &str, alias_kind: &str, alias_depth: usiz
     );
     crate::trace2_emit_process_ancestry_at_depth(1, &["git"]);
     sley_core::trace2::cmd_name_at_depth(1, command, Some(&hierarchy));
-    crate::trace2_emit_def_params_at_depth(1);
+    crate::trace2_emit_def_params_at_depth(cli_session, 1);
 }
 
 /// Re-parse leading global options on an expanded alias argv, applying them the
@@ -212,7 +219,11 @@ fn report_alias_loop(expanded_aliases: &[String], seen: usize) {
 /// Dispatch a non-built-in, non-alias command as an external `git-<cmd>`,
 /// emitting git's `trace: run_command:` line and falling back to the
 /// "not a git command" diagnostic when no such external exists.
-fn run_external_or_unknown(command: &str, args: &[String]) -> Result<()> {
+fn run_external_or_unknown(
+    cli_session: &session::CliSession,
+    command: &str,
+    args: &[String],
+) -> Result<()> {
     if commands::help::is_reserved_git_core_helper(command) {
         eprintln!(
             "fatal: 'git-{command}' is a Git core helper without a native Sley implementation"
@@ -224,7 +235,7 @@ fn run_external_or_unknown(command: &str, args: &[String]) -> Result<()> {
     argv.push(external.clone());
     argv.extend(args[1..].iter().cloned());
     trace2_run_dashed(command, 0);
-    trace2_external_child_metadata(command);
+    trace2_external_child_metadata(cli_session, command);
     if setup::git_trace_enabled() {
         let mut line = String::from("trace: run_command:");
         for arg in &argv {
@@ -252,13 +263,13 @@ fn run_external_or_unknown(command: &str, args: &[String]) -> Result<()> {
     commands::help::unknown_command(command, 1)
 }
 
-fn trace2_external_child_metadata(command: &str) {
+fn trace2_external_child_metadata(cli_session: &session::CliSession, command: &str) {
     let child_name = match command {
         "remote-http" | "remote-https" | "remote-ftp" | "remote-ftps" => "remote-curl",
         other => other,
     };
     sley_core::trace2::cmd_name_at_depth(1, child_name, None);
-    crate::trace2_emit_def_params_at_depth(1);
+    crate::trace2_emit_def_params_at_depth(cli_session, 1);
 }
 
 /// Locate an executable `git-<cmd>` on `PATH` (git's `locate_in_PATH`), or
@@ -341,14 +352,15 @@ fn dispatch_command(
         }
     }
     match command {
-        "help" => commands::help::cmd_help(&args[1..]),
+        "help" => commands::help::cmd_help(cli_session, &args[1..]),
         "--exec-path" => cmd_exec_path(),
         "--html-path" | "--man-path" | "--info-path" => cmd_info_path(),
-        value if value.starts_with("--list-cmds=") => {
-            commands::help::print_list_cmds(value.strip_prefix("--list-cmds=").unwrap_or_default())
-        }
-        "init" => commands::plumbing::cmd_init(&args[1..], global_config),
-        "add" => commands::plumbing::cmd_add(&args[1..]),
+        value if value.starts_with("--list-cmds=") => commands::help::print_list_cmds(
+            cli_session,
+            value.strip_prefix("--list-cmds=").unwrap_or_default(),
+        ),
+        "init" => commands::plumbing::cmd_init(cli_session, &args[1..], global_config),
+        "add" => commands::plumbing::cmd_add(cli_session, &args[1..]),
         "archive" => commands::plumbing::cmd_archive(cli_session, &args[1..]),
         "branch" => commands::branch::cmd_branch(cli_session, &args[1..]),
         "bundle" => commands::plumbing::cmd_bundle(cli_session, &args[1..]),
@@ -363,7 +375,7 @@ fn dispatch_command(
         "check-ref-format" => commands::utility::cmd_check_ref_format(&args[1..]),
         "clean" => commands::plumbing::cmd_clean(cli_session, &args[1..]),
         "clone" => commands::remote::cmd_clone(cli_session, &args[1..]),
-        "config" => commands::config_cmd::cmd_config(&args[1..]),
+        "config" => commands::config_cmd::cmd_config(cli_session, &args[1..]),
         "credential" => commands::credential::cmd_credential(cli_session, &args[1..]),
         "credential-store" => commands::credential::cmd_credential_store(&args[1..]),
         "credential-cache" => commands::credential::cmd_credential_cache(&args[1..]),
@@ -374,9 +386,9 @@ fn dispatch_command(
         "repack" => commands::pack::cmd_repack(cli_session, &args[1..]),
         "pack-redundant" => commands::pack::cmd_pack_redundant(cli_session, &args[1..]),
         "repo" => commands::utility::cmd_repo(cli_session, &args[1..]),
-        "apply" => commands::plumbing::cmd_apply(&args[1..]),
+        "apply" => commands::plumbing::cmd_apply(cli_session, &args[1..]),
         "commit" => commands::commit::cmd_commit(cli_session, &args[1..]),
-        "commit-graph" => commands::plumbing::cmd_commit_graph(&args[1..]),
+        "commit-graph" => commands::plumbing::cmd_commit_graph(cli_session, &args[1..]),
         "commit-tree" => commands::plumbing::cmd_commit_tree(cli_session, &args[1..]),
         "diff" => commands::diff::cmd_diff(cli_session, &args[1..]),
         "range-diff" => commands::range_diff::cmd_range_diff(cli_session, &args[1..]),
@@ -407,7 +419,7 @@ fn dispatch_command(
             }
         }
         "replay" => commands::replay::cmd_replay(cli_session, &args[1..]),
-        "rebase" => commands::rebase::cmd_rebase(&args[1..]),
+        "rebase" => commands::rebase::cmd_rebase(cli_session, &args[1..]),
         "cherry-pick" => commands::replay::cmd_cherry_pick(cli_session, &args[1..]),
         "revert" => commands::replay::cmd_revert(cli_session, &args[1..]),
         "mktree" => commands::index::cmd_mktree(cli_session, &args[1..]),
@@ -430,7 +442,7 @@ fn dispatch_command(
         "worktree" => commands::worktree::cmd_worktree(cli_session, &args[1..]),
         "update-index" => commands::index::cmd_update_index(cli_session, &args[1..]),
         "update-ref" => commands::refs::cmd_update_ref(cli_session, &args[1..]),
-        "rev-parse" => commands::rev_parse::cmd_rev_parse(&args[1..]),
+        "rev-parse" => commands::rev_parse::cmd_rev_parse(cli_session, &args[1..]),
         "rev-list" => commands::rev_list::cmd_rev_list(cli_session, &args[1..]),
         "reflog" => commands::refs::cmd_reflog(cli_session, &args[1..]),
         "remote" => commands::remote::cmd_remote(cli_session, &args[1..]),
@@ -452,7 +464,7 @@ fn dispatch_command(
         "testkit" => commands::utility::cmd_testkit(&args[1..]),
         "unpack-file" => commands::utility::cmd_unpack_file(cli_session, &args[1..]),
         "update-server-info" => commands::refs::cmd_update_server_info(cli_session, &args[1..]),
-        "var" => commands::utility::cmd_var(&args[1..]),
+        "var" => commands::utility::cmd_var(cli_session, &args[1..]),
         "verify-pack" => commands::pack::cmd_verify_pack(&args[1..]),
         "version" => commands::utility::cmd_version(&args[1..]),
         "-v" | "--version" => commands::utility::cmd_version(&[]),
@@ -465,7 +477,7 @@ fn dispatch_command(
         "shortlog" => commands::shortlog::cmd_shortlog(cli_session, &args[1..]),
         "grep" => commands::grep::cmd_grep(cli_session, &args[1..]),
         "last-modified" => commands::last_modified::cmd_last_modified(cli_session, &args[1..]),
-        "hook" => commands::hooks::cmd_hook(&args[1..]),
+        "hook" => commands::hooks::cmd_hook(cli_session, &args[1..]),
         "notes" => commands::notes::cmd_notes(cli_session, &args[1..]),
         "bisect" => commands::bisect::cmd_bisect(cli_session, &args[1..]),
         "sparse-checkout" => {
@@ -473,7 +485,7 @@ fn dispatch_command(
         }
         "format-patch" => commands::format_patch::cmd_format_patch(cli_session, &args[1..]),
         "format-rev" => commands::format_rev::cmd_format_rev(cli_session, &args[1..]),
-        "am" => commands::am::cmd_am(&args[1..]),
+        "am" => commands::am::cmd_am(cli_session, &args[1..]),
         "read-tree" => commands::read_tree::cmd_read_tree(cli_session, &args[1..]),
         "checkout-index" => commands::checkout_index::cmd_checkout_index(cli_session, &args[1..]),
         "diff-tree" => commands::diff_tree::cmd_diff_tree(cli_session, &args[1..]),
@@ -492,9 +504,13 @@ fn dispatch_command(
         "verify-tag" => commands::verify_tag::cmd_verify_tag(cli_session, &args[1..]),
         "mktag" => commands::mktag::cmd_mktag(cli_session, &args[1..]),
         "patch-id" => commands::patch_id::cmd_patch_id(cli_session, &args[1..]),
-        "interpret-trailers" => commands::interpret_trailers::cmd_interpret_trailers(&args[1..]),
+        "interpret-trailers" => {
+            commands::interpret_trailers::cmd_interpret_trailers(cli_session, &args[1..])
+        }
         "imap-send" => commands::utility::cmd_imap_send(&args[1..]),
-        other if other.starts_with("credential-") => run_external_or_unknown(other, args),
+        other if other.starts_with("credential-") => {
+            run_external_or_unknown(cli_session, other, args)
+        }
         _ => commands::help::unknown_command(command, 1),
     }
 }

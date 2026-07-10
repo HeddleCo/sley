@@ -2,7 +2,7 @@
 
 use crate::{
     common_git_dir_for_git_dir, explicit_git_dir, explicit_work_tree, global_config_value,
-    paths_refer_to_same_dir, resolve_cli_path, setup, sley_worktree,
+    resolve_cli_path, sley_worktree,
 };
 use sley::plumbing::sley_odb::repository_objects_dir;
 use sley::{GitConfig, GitError, ObjectFormat, Result};
@@ -222,33 +222,15 @@ pub(crate) fn worktree_root_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
             resolve_cli_path(&env::current_dir()?, work_tree.to_string_lossy().as_ref());
         return fs::canonicalize(work_tree).map_err(|err| GitError::Io(err.to_string()));
     }
-    if let Some(setup) = setup::setup_git_directory()
-        && let Some(worktree) = setup.worktree.as_ref()
-        && (explicit_git_dir().is_some()
-            || explicit_work_tree().is_some()
-            || setup_matches_git_dir(&setup, git_dir))
-    {
-        return Ok(worktree.clone());
+    // Repository-intrinsic layout handles core.worktree, linked worktrees, and
+    // the normal parent-of-.git case without consulting invocation globals.
+    if let Some(root) = sley_worktree::worktree_root_for_git_dir(git_dir)? {
+        return Ok(root);
     }
     if explicit_git_dir().is_some() {
         return env::current_dir().map_err(|err| GitError::Io(err.to_string()));
     }
-    // The rest (core.worktree, linked worktrees, parent-of-.git) is shared with
-    // the library; a bare repository (None) is unsupported here.
-    match sley_worktree::worktree_root_for_git_dir(git_dir)? {
-        Some(root) => Ok(root),
-        None => Err(GitError::Unsupported(
-            "update-index currently requires a non-bare worktree".into(),
-        )),
-    }
-}
-
-fn setup_matches_git_dir(setup: &setup::SetupResult, git_dir: &Path) -> bool {
-    let setup_git_dir = Path::new(&setup.git_dir);
-    let setup_git_dir = if setup_git_dir.is_absolute() {
-        setup_git_dir.to_path_buf()
-    } else {
-        setup.cwd.join(setup_git_dir)
-    };
-    paths_refer_to_same_dir(&setup_git_dir, git_dir)
+    Err(GitError::Unsupported(
+        "update-index currently requires a non-bare worktree".into(),
+    ))
 }

@@ -735,7 +735,7 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
                 return Err(GitError::Exit(128));
             }
         }
-        let tagger = commit_identity_from_env("COMMITTER")?;
+        let tagger = commit_identity_from_env("COMMITTER", &config)?;
         if signed {
             let key =
                 commands::signing::signing_key(Some(&config), signing_key.as_deref(), &tagger);
@@ -768,6 +768,7 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
             reflog_target: &target_oid,
             force,
             create_reflog,
+            config: &config,
         })?;
         if target_object.object_type == ObjectType::Tag
             && config
@@ -798,6 +799,7 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
             reflog_target: &target_oid,
             force,
             create_reflog,
+            config: &config,
         })?;
     }
     Ok(())
@@ -1085,6 +1087,7 @@ struct TagCreateOrUpdate<'a> {
     reflog_target: &'a ObjectId,
     force: bool,
     create_reflog: bool,
+    config: &'a GitConfig,
 }
 
 fn create_or_update_tag(options: TagCreateOrUpdate<'_>) -> Result<()> {
@@ -1097,6 +1100,7 @@ fn create_or_update_tag(options: TagCreateOrUpdate<'_>) -> Result<()> {
         reflog_target,
         force,
         create_reflog,
+        config,
     } = options;
     let name = validate_tag_creation_name(tag)?;
     if !force {
@@ -1116,6 +1120,7 @@ fn create_or_update_tag(options: TagCreateOrUpdate<'_>) -> Result<()> {
                 target,
                 reflog_target,
                 create_reflog,
+                config,
             )?,
         });
         tx.commit()?;
@@ -1139,6 +1144,7 @@ fn create_or_update_tag(options: TagCreateOrUpdate<'_>) -> Result<()> {
             target,
             reflog_target,
             create_reflog,
+            config,
         )?,
     });
     tx.commit()?;
@@ -1166,6 +1172,7 @@ fn tag_create_reflog_entry(
     new_oid: ObjectId,
     target: &ObjectId,
     create_reflog: bool,
+    config: &GitConfig,
 ) -> Result<Option<ReflogEntry>> {
     if !tag_should_write_reflog(git_dir, create_reflog)? {
         return Ok(None);
@@ -1173,7 +1180,7 @@ fn tag_create_reflog_entry(
     Ok(Some(ReflogEntry {
         old_oid,
         new_oid,
-        committer: tag_reflog_committer_identity()?,
+        committer: tag_reflog_committer_identity(config)?,
         message: tag_reflog_message(git_dir, format, target)?,
     }))
 }
@@ -1199,12 +1206,14 @@ fn tag_should_write_reflog(git_dir: &Path, create_reflog: bool) -> Result<bool> 
 /// set) — never the `@0` epoch default. git's reflog reader rejects a `0`
 /// timestamp as uninitialised (`for-each-reflog-ent` skips it), so emitting the
 /// current time is required for the entry to be readable.
-fn tag_reflog_committer_identity() -> Result<Vec<u8>> {
+fn tag_reflog_committer_identity(config: &GitConfig) -> Result<Vec<u8>> {
     match env::var("GIT_COMMITTER_DATE") {
-        Ok(date) if !date.is_empty() => commit_identity_from_env_with_date("COMMITTER", &date),
+        Ok(date) if !date.is_empty() => {
+            commit_identity_from_env_with_date("COMMITTER", &date, config)
+        }
         _ => {
             let now = current_unix_seconds();
-            commit_identity_from_env_with_date("COMMITTER", &format!("@{now} +0000"))
+            commit_identity_from_env_with_date("COMMITTER", &format!("@{now} +0000"), config)
         }
     }
 }

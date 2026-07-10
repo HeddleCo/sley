@@ -188,6 +188,8 @@ fn tree_path_entry(
 /// Options shared by the combined raw / patch writers.
 pub(crate) struct CombinedRenderCtx<'a> {
     pub db: &'a FileObjectDatabase,
+    /// Whether missing promisor objects may be fetched while rendering.
+    pub lazy_fetch: bool,
     pub format: ObjectFormat,
     /// `true` for `--cc` (dense simplification), `false` for `-c`.
     pub dense: bool,
@@ -321,14 +323,14 @@ pub(crate) fn write_combined_patch(
     // it as a blob would error or yield garbage.
     let result_blob = match &path.result_oid {
         Some(oid) if path.result_mode == 0o160000 => gitlink_diff_content(oid, false),
-        Some(oid) => read_blob(ctx.db, oid)?,
+        Some(oid) => read_blob(ctx.db, oid, ctx.lazy_fetch)?,
         None => Vec::new(),
     };
     let mut parent_blobs: Vec<Vec<u8>> = Vec::with_capacity(num_parent);
     for parent in &path.parents {
         parent_blobs.push(match &parent.oid {
             Some(oid) if parent.mode == 0o160000 => gitlink_diff_content(oid, false),
-            Some(oid) => read_blob(ctx.db, oid)?,
+            Some(oid) => read_blob(ctx.db, oid, ctx.lazy_fetch)?,
             None => Vec::new(),
         });
     }

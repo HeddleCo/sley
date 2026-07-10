@@ -6,10 +6,10 @@
 #![allow(clippy::expect_used)]
 
 use sley::plumbing::{sley_core, sley_odb, sley_rev};
-use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::sley_worktree;
 use sley::ObjectDatabase as FileObjectDatabase;
 use sley::RefStore as FileRefStore;
 use sley::{GitConfig, OpenOptions, Repository};
@@ -25,6 +25,7 @@ pub(crate) struct RepositoryContext {
     repository: Repository,
     config: GitConfig,
     refs: FileRefStore,
+    pathspec_magic: sley_worktree::PathspecMatchMagic,
     worktree_root: OnceLock<PathBuf>,
     abbrev: OnceLock<Option<usize>>,
 }
@@ -36,24 +37,16 @@ impl RepositoryContext {
             cli_session.git_dir()?,
             cli_session.cwd().to_path_buf(),
             cli_session.replace_objects(),
+            crate::effective_pathspec_flags(cli_session),
         )
     }
 
-    pub(crate) fn discover_current() -> Result<Self> {
-        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self::discover(cwd)
-    }
-
-    pub(crate) fn discover(cwd: impl AsRef<Path>) -> Result<Self> {
-        let cwd = cwd.as_ref().to_path_buf();
-        let git_dir = session::cli_git_dir_from(&cwd)?;
-        let replace_objects = session::cli_session()
-            .map(|session| session.replace_objects())
-            .unwrap_or(true);
-        Self::from_git_dir_and_cwd(git_dir, cwd, replace_objects)
-    }
-
-    fn from_git_dir_and_cwd(git_dir: PathBuf, cwd: PathBuf, replace_objects: bool) -> Result<Self> {
+    fn from_git_dir_and_cwd(
+        git_dir: PathBuf,
+        cwd: PathBuf,
+        replace_objects: bool,
+        pathspec_magic: sley_worktree::PathspecMatchMagic,
+    ) -> Result<Self> {
         let config = read_repo_config(&git_dir)?;
         let use_replace_refs = config
             .get_bool("core", None, "useReplaceRefs")
@@ -71,6 +64,7 @@ impl RepositoryContext {
             repository,
             config,
             refs,
+            pathspec_magic,
             worktree_root: OnceLock::new(),
             abbrev: OnceLock::new(),
         })
@@ -102,6 +96,10 @@ impl RepositoryContext {
 
     pub(crate) fn refs(&self) -> &FileRefStore {
         &self.refs
+    }
+
+    pub(crate) fn pathspec_magic(&self) -> sley_worktree::PathspecMatchMagic {
+        self.pathspec_magic
     }
 
     pub(crate) fn worktree_root(&self) -> Result<&Path> {

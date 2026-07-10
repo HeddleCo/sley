@@ -25,6 +25,7 @@ pub(crate) struct RemoteCommandContext {
     git_dir: PathBuf,
     format: ObjectFormat,
     refs: FileRefStore,
+    config: GitConfig,
 }
 
 impl RemoteCommandContext {
@@ -32,11 +33,13 @@ impl RemoteCommandContext {
         let git_dir = cli_session.git_dir()?;
         let format = repository_object_format(&git_dir)?;
         let refs = FileRefStore::new(&git_dir, format);
+        let config = identity_effective_config_for(cli_session).unwrap_or_default();
         Ok(Self {
             session: cli_session.clone(),
             git_dir,
             format,
             refs,
+            config,
         })
     }
 
@@ -50,6 +53,10 @@ impl RemoteCommandContext {
 
     fn refs(&self) -> &FileRefStore {
         &self.refs
+    }
+
+    fn config(&self) -> &GitConfig {
+        &self.config
     }
 
     fn session(&self) -> &crate::session::CliSession {
@@ -608,7 +615,7 @@ pub(crate) fn cmd_remote_rename(context: &RemoteCommandContext, args: &[String])
         trace2_remote_rename_progress();
     }
     if outcome.rename_tracking_refs {
-        match rename_remote_tracking_refs(git_dir, context.format(), old, new) {
+        match rename_remote_tracking_refs(git_dir, context.format(), context.config(), old, new) {
             Ok(()) => Ok(()),
             Err(_) => {
                 eprintln!("error: renaming remote references failed");
@@ -670,6 +677,7 @@ fn warn_remote_remove_skipped_local_branches(git_dir: &Path, format: ObjectForma
 fn rename_remote_tracking_refs(
     git_dir: &Path,
     format: ObjectFormat,
+    config: &GitConfig,
     old: &str,
     new: &str,
 ) -> Result<()> {
@@ -747,7 +755,7 @@ fn rename_remote_tracking_refs(
             entries.push(ReflogEntry {
                 old_oid: oid,
                 new_oid: oid,
-                committer: commit_identity_from_env("COMMITTER")?,
+                committer: commit_identity_from_env("COMMITTER", config)?,
                 message: format!("remote: renamed {old_name} to {new_name}").into_bytes(),
             });
         }

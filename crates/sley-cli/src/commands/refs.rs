@@ -83,10 +83,11 @@ pub(crate) fn cmd_reflog(cli_session: &crate::session::CliSession, args: &[Strin
     if args.len() == 1 && args[0] == "--all" {
         return cmd_reflog_all(cli_session);
     }
-    let options = setup_reflog_show_options(args)?;
     let cwd = cli_session.cwd();
     let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
+    let store = FileRefStore::new(&git_dir, format);
+    let options = setup_reflog_show_options(&store, &git_dir, format, args)?;
     let config = read_repo_config(&git_dir)?;
     let abbrev_commit = options.abbrev_commit.unwrap_or(true);
     let abbrev_len = if abbrev_commit {
@@ -94,7 +95,6 @@ pub(crate) fn cmd_reflog(cli_session: &crate::session::CliSession, args: &[Strin
     } else {
         None
     };
-    let store = FileRefStore::new(&git_dir, format);
     let mut entries = store.read_reflog(&options.reference)?;
     if !options.pathspecs.is_empty() && !reflog_show_pathspecs_match(cwd, &options.pathspecs) {
         return Ok(());
@@ -487,7 +487,9 @@ fn cmd_reflog_delete(cli_session: &crate::session::CliSession, args: &[String]) 
     let store = FileRefStore::new(&git_dir, format);
     let mut exit_code = 0;
     for spec in specs {
-        if let Err(GitError::Exit(code)) = delete_reflog_entry(&store, format, &spec, options) {
+        if let Err(GitError::Exit(code)) =
+            delete_reflog_entry(&store, &git_dir, format, &spec, options)
+        {
             exit_code = code;
         }
     }
@@ -516,11 +518,12 @@ fn reflog_delete_usage<T>() -> Result<T> {
 
 fn delete_reflog_entry(
     store: &FileRefStore,
+    git_dir: &Path,
     format: ObjectFormat,
     spec: &str,
     options: ReflogDeleteOptions,
 ) -> Result<()> {
-    let Some((reference, selector)) = parse_reflog_delete_spec(store, spec) else {
+    let Some((reference, selector)) = parse_reflog_delete_spec(store, git_dir, format, spec) else {
         eprintln!("error: not a reflog: {spec}");
         return Err(GitError::Exit(255));
     };
@@ -571,10 +574,15 @@ fn delete_reflog_entry(
     Ok(())
 }
 
-fn parse_reflog_delete_spec(store: &FileRefStore, spec: &str) -> Option<(String, usize)> {
+fn parse_reflog_delete_spec(
+    store: &FileRefStore,
+    git_dir: &Path,
+    format: ObjectFormat,
+    spec: &str,
+) -> Option<(String, usize)> {
     let spec = spec.strip_suffix('}')?;
     let (reference, selector) = spec.rsplit_once("@{")?;
-    let reference = resolve_reflog_name(store, reference).ok()?;
+    let reference = resolve_reflog_name(store, git_dir, format, reference).ok()?;
     let selector = selector.parse::<usize>().ok().or_else(|| {
         reflog_selector_by_date(store, &reference, selector)
             .ok()
@@ -636,6 +644,8 @@ fn cmd_reflog_drop(cli_session: &crate::session::CliSession, args: &[String]) ->
     }
 
     let git_dir = cli_session.git_dir()?;
+    let format = repository_object_format(&git_dir)?;
+    let store = FileRefStore::new(&git_dir, format);
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let logs_dir = common_git_dir.join("logs");
     if options.all {
@@ -651,7 +661,7 @@ fn cmd_reflog_drop(cli_session: &crate::session::CliSession, args: &[String]) ->
     let mut exit_code = 0;
     for reference in refs {
         let display = reference.clone();
-        let reference = reflog_reference_name(Some(&reference))?;
+        let reference = reflog_reference_name(&store, &git_dir, format, Some(&reference))?;
         let path = reflog_path_for_ref(&git_dir, &reference)?;
         let logs_dir = reflog_logs_dir_for_ref(&git_dir, &reference)?;
         if !path.is_file() {
@@ -716,12 +726,13 @@ fn cmd_reflog_write(cli_session: &crate::session::CliSession, args: &[String]) -
     validate_reflog_write_object(&db, &new_oid, &zero, "new")?;
 
     let store = FileRefStore::new(&git_dir, format);
+    let identity_config = identity_effective_config_for(cli_session).unwrap_or_default();
     store.append_reflog(
         reference,
         &ReflogEntry {
             old_oid,
             new_oid,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: commit_identity_from_env("COMMITTER", &identity_config)?,
             message: normalize_reflog_write_message(&args[3]),
         },
     )
@@ -869,7 +880,7 @@ fn expire_reflogs_at(
             eprintln!("error: reflog could not be found: '{original}'");
             return Err(GitError::Exit(255));
         }
-        let reference = resolve_reflog_name(&store, &original).map_err(|_| {
+        let reference = resolve_reflog_name(&store, git_dir, format, &original).map_err(|_| {
             eprintln!("error: reflog could not be found: '{original}'");
             GitError::Exit(255)
         })?;
@@ -1012,8 +1023,13 @@ fn expire_reflog_entries(
     Ok(())
 }
 
-fn resolve_reflog_name(store: &FileRefStore, name: &str) -> Result<String> {
-    let direct = reflog_reference_name(Some(name))?;
+fn resolve_reflog_name(
+    store: &FileRefStore,
+    git_dir: &Path,
+    format: ObjectFormat,
+    name: &str,
+) -> Result<String> {
+    let direct = reflog_reference_name(store, git_dir, format, Some(name))?;
     if !store.read_reflog(&direct)?.is_empty() {
         return Ok(direct);
     }
@@ -1492,6 +1508,7 @@ pub(crate) fn cmd_update_ref(
     }
     let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
+    let identity_config = identity_effective_config_for(cli_session).unwrap_or_default();
     let core_fsync = global_config_value("core.fsync")?;
     let core_fsync_method = global_config_value("core.fsyncMethod")?;
     let store = FileRefStore::new(&git_dir, format)
@@ -1515,6 +1532,7 @@ pub(crate) fn cmd_update_ref(
             create_reflog,
             batch_updates,
             message,
+            config: &identity_config,
             oid_cache: RefCell::new(HashMap::new()),
             object_type_cache: RefCell::new(HashMap::new()),
         };
@@ -1587,6 +1605,7 @@ pub(crate) fn cmd_update_ref(
             &store,
             &git_dir,
             format,
+            &identity_config,
             &effective.effective,
             expected_oid.as_ref(),
             &message,
@@ -1636,6 +1655,7 @@ pub(crate) fn cmd_update_ref(
             &store,
             &git_dir,
             format,
+            &identity_config,
             &name,
             None,
             &message,
@@ -1655,7 +1675,7 @@ pub(crate) fn cmd_update_ref(
     let reflog = writes_reflog.then(|| ReflogEntry {
         old_oid,
         new_oid,
-        committer: ref_reflog_committer(),
+        committer: ref_reflog_committer(&identity_config),
         message,
     });
     let tx_name = name.clone();
@@ -1772,6 +1792,7 @@ struct UpdateRefStdinContext<'a> {
     format: ObjectFormat,
     create_reflog: bool,
     message: Vec<u8>,
+    config: &'a GitConfig,
     batch_updates: bool,
     oid_cache: RefCell<HashMap<String, ObjectId>>,
     object_type_cache: RefCell<HashMap<ObjectId, ObjectType>>,
@@ -3413,7 +3434,7 @@ fn update_ref_stdin_commit_staged(
                 .then(|| ReflogEntry {
                     old_oid,
                     new_oid: write.new_oid,
-                    committer: ref_reflog_committer(),
+                    committer: ref_reflog_committer(context.config),
                     message: context.message.clone(),
                 });
                 tx.update(RefUpdate {
@@ -3738,7 +3759,7 @@ fn update_ref_stdin_symref_reflog(
     Ok(Some(ReflogEntry {
         old_oid,
         new_oid,
-        committer: ref_reflog_committer(),
+        committer: ref_reflog_committer(context.config),
         message: context.message.clone(),
     }))
 }
@@ -4235,7 +4256,7 @@ fn update_ref_stdin_write(
             .then(|| ReflogEntry {
                 old_oid,
                 new_oid: request.new_oid,
-                committer: ref_reflog_committer(),
+                committer: ref_reflog_committer(context.config),
                 message: context.message.clone(),
             });
     let hook = ReferenceTransactionHookRunner::new(context.git_dir);
@@ -4303,6 +4324,7 @@ fn update_ref_delete(
     store: &FileRefStore,
     git_dir: &Path,
     format: ObjectFormat,
+    config: &GitConfig,
     name: &str,
     expected: Option<&ObjectId>,
     message: &[u8],
@@ -4360,7 +4382,7 @@ fn update_ref_delete(
             &ReflogEntry {
                 old_oid: deleted_oid,
                 new_oid: zero_oid(format)?,
-                committer: ref_reflog_committer(),
+                committer: ref_reflog_committer(config),
                 message: message.to_vec(),
             },
         )?;
@@ -4464,12 +4486,12 @@ fn update_ref_should_write_reflog(git_dir: &Path, name: &str, create_reflog: boo
     Ok(update_ref_log_all_ref_updates_matches(name, "true"))
 }
 
-fn ref_reflog_committer() -> Vec<u8> {
+fn ref_reflog_committer(config: &GitConfig) -> Vec<u8> {
     let date = match env::var("GIT_COMMITTER_DATE") {
         Ok(date) if !date.is_empty() => date,
         _ => format!("@{} +0000", current_unix_seconds().max(1)),
     };
-    commit_identity_from_env_with_date("COMMITTER", &date).unwrap_or_else(|_| {
+    commit_identity_from_env_with_date("COMMITTER", &date, config).unwrap_or_else(|_| {
         let timestamp = current_unix_seconds().max(1);
         format!("Git Rs <sley@example.invalid> {timestamp} +0000").into_bytes()
     })
@@ -4984,7 +5006,15 @@ pub(crate) fn cmd_symbolic_ref(
             }
             Ok(())
         }
-        [name, target] => update_symbolic_ref(&git_dir, &store, format, name, target, message),
+        [name, target] => update_symbolic_ref(
+            &git_dir,
+            &store,
+            format,
+            &identity_effective_config_for(cli_session).unwrap_or_default(),
+            name,
+            target,
+            message,
+        ),
         _ => Err(GitError::Command(
             "symbolic-ref currently supports: symbolic-ref [--short] [--quiet] <name> or symbolic-ref <name> <ref>"
                 .into(),
@@ -4996,6 +5026,7 @@ fn update_symbolic_ref(
     git_dir: &Path,
     store: &FileRefStore,
     format: ObjectFormat,
+    config: &GitConfig,
     name: &str,
     target: &str,
     message: Vec<u8>,
@@ -5017,7 +5048,7 @@ fn update_symbolic_ref(
     let reflog = symbolic_ref_should_write_reflog(git_dir, name)?.then(|| ReflogEntry {
         old_oid,
         new_oid,
-        committer: ref_reflog_committer(),
+        committer: ref_reflog_committer(config),
         message,
     });
     let hook = ReferenceTransactionHookRunner::new(git_dir);
@@ -5186,7 +5217,13 @@ pub(crate) fn cmd_refs(cli_session: &crate::session::CliSession, args: &[String]
     match subcommand {
         "list" => {
             let git_dir = cli_session.git_dir()?;
-            commands::for_each_ref::for_each_ref_core(&git_dir, &args[1..], "git refs list")
+            let config = identity_effective_config_for(cli_session).unwrap_or_default();
+            commands::for_each_ref::for_each_ref_core_with_config(
+                &git_dir,
+                &args[1..],
+                "git refs list",
+                &config,
+            )
         }
         "exists" => cmd_refs_exists(cli_session, &args[1..]),
         "verify" => commands::refs_verify::cmd_refs_verify(cli_session, &args[1..]),

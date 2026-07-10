@@ -391,7 +391,7 @@ pub(crate) fn cmd_status(cli_session: &crate::session::CliSession, args: &[Strin
     let rename_config = resolve_status_rename_config(&config, cli_no_renames, cli_rename_score);
     // status needs a work tree; emit git's diagnostic (bare / no-worktree, or
     // the core.bare+core.worktree conflict) when one isn't available.
-    let worktree_root = require_work_tree(&git_dir)?;
+    let worktree_root = require_work_tree(cli_session, &git_dir)?;
     // Linked worktrees keep objects and replacements in the common directory;
     // use the Repository facade there. Ordinary worktrees keep one lightweight
     // ODB so large status does not pay facade setup before its borrowed scan.
@@ -419,7 +419,12 @@ pub(crate) fn cmd_status(cli_session: &crate::session::CliSession, args: &[Strin
         ignored_mode,
         untracked_mode,
     };
-    let pathspec = StatusPathspec::new(&cwd, &worktree_root, &path_args)?;
+    let pathspec = StatusPathspec::new(
+        &cwd,
+        &worktree_root,
+        &path_args,
+        effective_pathspec_flags(cli_session),
+    )?;
     if !porcelain_v2 && (z || short) {
         print_status_short_stream(
             &worktree_root,
@@ -451,7 +456,7 @@ pub(crate) fn cmd_status(cli_session: &crate::session::CliSession, args: &[Strin
             )?;
         }
         apply_status_split_index_config(&git_dir, format, &config)?;
-        commands::hooks::run_post_index_change_hook(false, false)?;
+        commands::hooks::run_post_index_change_hook(cli_session, false, false)?;
         return Ok(());
     }
     // Resolve the per-submodule ignore setting (command line > `.git/config` >
@@ -605,7 +610,7 @@ pub(crate) fn cmd_status(cli_session: &crate::session::CliSession, args: &[Strin
         )?;
     }
     apply_status_split_index_config(&git_dir, format, &config)?;
-    commands::hooks::run_post_index_change_hook(false, false)?;
+    commands::hooks::run_post_index_change_hook(cli_session, false, false)?;
     Ok(())
 }
 
@@ -939,7 +944,12 @@ struct StatusPathspec {
 }
 
 impl StatusPathspec {
-    fn new(cwd: &Path, worktree_root: &Path, path_args: &[String]) -> Result<Self> {
+    fn new(
+        cwd: &Path,
+        worktree_root: &Path,
+        path_args: &[String],
+        magic: sley_worktree::PathspecMatchMagic,
+    ) -> Result<Self> {
         let root = fs::canonicalize(worktree_root)?;
         let cwd = fs::canonicalize(cwd)?;
         // An explicit GIT_WORK_TREE may point away from the repository and the
@@ -959,7 +969,6 @@ impl StatusPathspec {
         };
         let cwd_depth = path_component_count(&prefix);
         let mut filters = Vec::new();
-        let magic = effective_pathspec_flags();
         for arg in path_args {
             let element = parse_normalized_pathspec_element(&prefix, arg, magic)?;
             let is_glob =

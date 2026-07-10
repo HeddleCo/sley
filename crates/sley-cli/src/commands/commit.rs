@@ -20,6 +20,7 @@ pub(crate) enum PrepareCommitMsgSource<'a> {
 }
 
 pub(crate) fn run_prepare_commit_msg_hook(
+    git_dir: &Path,
     editmsg: &Path,
     source: PrepareCommitMsgSource<'_>,
     mut env: Vec<(String, String)>,
@@ -40,7 +41,8 @@ pub(crate) fn run_prepare_commit_msg_hook(
     if set_no_editor_env {
         set_hook_env(&mut env, "GIT_EDITOR", ":");
     }
-    match commands::hooks::run_hook(
+    match commands::hooks::run_hook_at(
+        git_dir,
         "prepare-commit-msg",
         commands::hooks::HookRun {
             args,
@@ -925,11 +927,12 @@ pub(crate) fn cmd_commit(
         return cmd_commit_long_status_preview(cli_session, amend, commit_untracked);
     }
     if interactive && !patch {
-        commands::add_interactive::cmd_add_interactive(&pathspec_args)?;
+        commands::add_interactive::cmd_add_interactive(cli_session, &pathspec_args)?;
         refresh_commit_selection_cache_tree(cli_session)?;
     }
     if patch {
         commands::add_interactive::cmd_add_patch(
+            cli_session,
             &pathspec_args,
             unified_context,
             inter_hunk_context,
@@ -947,6 +950,9 @@ pub(crate) fn cmd_commit(
     let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let repo_config = read_repo_config(&git_dir).ok();
+    let identity_config = identity_effective_config_for(cli_session)
+        .or_else(|| repo_config.clone())
+        .unwrap_or_default();
     if !gpg_sign && !no_gpg_sign {
         gpg_sign = repo_config
             .as_ref()
@@ -1020,7 +1026,7 @@ pub(crate) fn cmd_commit(
         .unwrap_or_else(|| "UTF-8".to_string());
     let commit_encoding_header =
         (!encoding_is_utf8(&commit_encoding)).then(|| commit_encoding.clone().into_bytes());
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let committer = commit_identity_from_env("COMMITTER", &identity_config)?;
     let amended_old_oid = if amend {
         commands::merge_rebase::head_commit_oid(&FileRefStore::new(&git_dir, format))?
     } else {
@@ -1054,7 +1060,11 @@ pub(crate) fn cmd_commit(
         .map(|rev| read_squash_commit_message(&git_dir, format, rev, &commit_encoding))
         .transpose()?;
     let author = if reset_author {
-        build_commit_author_identity(author_override.as_deref(), author_date.as_deref())?
+        build_commit_author_identity(
+            author_override.as_deref(),
+            author_date.as_deref(),
+            &identity_config,
+        )?
     } else if let Some(commit) = &reused_commit {
         build_reused_commit_author_identity(
             &commit.author,
@@ -1068,7 +1078,11 @@ pub(crate) fn cmd_commit(
             author_date.as_deref(),
         )?
     } else {
-        build_commit_author_identity(author_override.as_deref(), author_date.as_deref())?
+        build_commit_author_identity(
+            author_override.as_deref(),
+            author_date.as_deref(),
+            &identity_config,
+        )?
     };
     let had_file_message = file_message.is_some();
     let template_message_source = file_message.is_none()
@@ -1183,15 +1197,22 @@ pub(crate) fn cmd_commit(
     }
     // Emptiness is judged before the signoff trailer is added (git aborts
     // `commit -m "" -s`).
-    let empty_before_signoff =
-        commit_message_is_empty(&commit_message_with_trailers(&message, &trailers));
+    let empty_before_signoff = commit_message_is_empty(&commit_message_with_trailers(
+        repo_config.as_ref(),
+        &message,
+        &trailers,
+    ));
     let mut message = if signoff {
-        commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env()?)
+        commands::replay::append_signoff_before_comments(
+            message,
+            &commit_signoff_from_env(&identity_config)?,
+        )
     } else {
         message
     };
     if !trailers.is_empty() {
-        message = commit_message_with_trailers(&message, &trailers).into_owned();
+        message =
+            commit_message_with_trailers(repo_config.as_ref(), &message, &trailers).into_owned();
     }
     // Editor flow: a commit without an explicit message source launches the
     // editor over COMMIT_EDITMSG (the in-merge / rebase conclude paths keep
@@ -1236,7 +1257,8 @@ pub(crate) fn cmd_commit(
         None
     };
     if let Some((_, tree_map)) = &partial_head_tree
-        && let Err(err) = stage_partial_commit_paths(&git_dir, format, &pathspec_args, tree_map)
+        && let Err(err) =
+            stage_partial_commit_paths(cli_session, &git_dir, format, &pathspec_args, tree_map)
     {
         if let Some(snapshot) = &partial_index_snapshot {
             let _ = restore_index_snapshot(&git_dir, snapshot);
@@ -1245,7 +1267,8 @@ pub(crate) fn cmd_commit(
     }
     let author_hook_env = commit_author_hook_env(&author)?;
     if !no_verify
-        && let Err(err) = commands::hooks::run_hook(
+        && let Err(err) = commands::hooks::run_hook_at(
+            &git_dir,
             "pre-commit",
             commands::hooks::HookRun {
                 env: author_hook_env.clone(),
@@ -1311,6 +1334,7 @@ pub(crate) fn cmd_commit(
             verbose as u8,
             &comment_char,
             &mut template,
+            cli_session.lazy_fetch(),
         )?;
     }
     fs::write(&editmsg, &template)?;
@@ -1335,6 +1359,7 @@ pub(crate) fn cmd_commit(
         PrepareCommitMsgSource::None
     };
     run_prepare_commit_msg_hook(
+        &git_dir,
         &editmsg,
         prepare_source,
         author_hook_env.clone(),
@@ -1351,7 +1376,8 @@ pub(crate) fn cmd_commit(
         return Err(GitError::Exit(1));
     }
     if !no_verify {
-        commands::hooks::run_hook(
+        commands::hooks::run_hook_at(
+            &git_dir,
             "commit-msg",
             commands::hooks::HookRun {
                 args: vec![editmsg_arg.clone()],
@@ -1386,10 +1412,18 @@ pub(crate) fn cmd_commit(
             message,
             quiet,
             allow_empty,
+            cli_session.lazy_fetch(),
         );
     }
     if in_merge {
-        return conclude_in_progress_merge(&git_dir, format, message, quiet);
+        return conclude_in_progress_merge(
+            &git_dir,
+            format,
+            message,
+            quiet,
+            &identity_config,
+            cli_session.lazy_fetch(),
+        );
     }
     if in_cherry_pick || in_revert {
         return conclude_replay_via_commit(
@@ -1401,6 +1435,8 @@ pub(crate) fn cmd_commit(
             author,
             author_override.is_none() && !reset_author,
             quiet,
+            &identity_config,
+            cli_session.lazy_fetch(),
         );
     }
     if !allow_empty_message && empty_before_signoff && !use_editor {
@@ -1464,6 +1500,7 @@ pub(crate) fn cmd_commit(
             head.iter().copied().collect()
         };
         return commit_partial_paths(
+            cli_session,
             &git_dir,
             format,
             &pathspec_args,
@@ -1555,8 +1592,8 @@ pub(crate) fn cmd_commit(
         sley_sequencer::commit_index(&git_dir, format, options)
     }?;
     commands::rerere::record_resolved_after_commit(&git_dir, format)?;
-    remove_commit_state_files(&git_dir);
-    commands::hooks::run_post_index_change_hook(false, false)?;
+    remove_commit_state_files(&git_dir, cli_session.lazy_fetch());
+    commands::hooks::run_post_index_change_hook_at(&git_dir, false, false)?;
     if let Some((summary_author, summary_committer, summary_message)) = summary {
         print_commit_summary(
             &git_dir,
@@ -1567,16 +1604,22 @@ pub(crate) fn cmd_commit(
             &summary_message,
             &summary_author,
             &summary_committer,
+            cli_session.lazy_fetch(),
         )?;
     }
-    commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
-    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
+    commands::hooks::run_hook_at(
+        &git_dir,
+        "reference-transaction",
+        commands::hooks::HookRun::default(),
+    )?;
+    commands::hooks::run_hook_at(&git_dir, "post-commit", commands::hooks::HookRun::default())?;
     run_auto_maintenance_after_commit(cli_session, &git_dir)?;
     if amend
         && !no_post_rewrite
         && let Some(old_oid) = amended_old_oid
     {
-        commands::hooks::run_hook(
+        commands::hooks::run_hook_at(
+            &git_dir,
             "post-rewrite",
             commands::hooks::HookRun {
                 args: vec!["amend".to_string()],
@@ -1632,6 +1675,7 @@ fn print_commit_summary(
     message: &[u8],
     author: &[u8],
     committer: &[u8],
+    lazy_fetch: bool,
 ) -> Result<()> {
     // HEAD branch name, or "detached HEAD" / "HEAD" when unresolvable.
     let head = match repo_current_branch_name(git_dir) {
@@ -1672,7 +1716,7 @@ fn print_commit_summary(
         sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     if !entries.is_empty() {
-        let stat_entries = collect_diff_stat_entries(&entries, db, None, false)?;
+        let stat_entries = collect_diff_stat_entries(&entries, db, None, false, lazy_fetch)?;
         write_diff_shortstat_materialized(&mut out, &stat_entries)?;
         for entry in &entries {
             write_commit_summary_entry(&mut out, entry)?;
@@ -1764,6 +1808,7 @@ fn write_commit_summary_entry(
 /// Commit messages are UTF-8 in practice; we losslessly round-trip via
 /// `from_utf8_lossy` so non-UTF-8 bytes don't crash the (text-oriented) engine.
 fn commit_message_with_trailers<'a>(
+    config: Option<&GitConfig>,
     message: &'a [u8],
     trailers: &[String],
 ) -> std::borrow::Cow<'a, [u8]> {
@@ -1772,7 +1817,8 @@ fn commit_message_with_trailers<'a>(
     }
     let text = String::from_utf8_lossy(message);
     std::borrow::Cow::Owned(
-        commands::interpret_trailers::apply_trailers_to_message(&text, trailers).into_bytes(),
+        commands::interpret_trailers::apply_trailers_to_message(config, &text, trailers)
+            .into_bytes(),
     )
 }
 
@@ -1790,6 +1836,8 @@ fn conclude_replay_via_commit(
     env_author: Vec<u8>,
     use_pick_author: bool,
     quiet: bool,
+    config: &GitConfig,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let refs = FileRefStore::new(git_dir, format);
@@ -1846,7 +1894,7 @@ fn conclude_replay_via_commit(
     } else {
         env_author
     };
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let committer = commit_identity_from_env("COMMITTER", config)?;
     let new_oid = sley_sequencer::create_commit(
         &mut FileObjectDatabase::from_git_dir(git_dir, format),
         sley_sequencer::CommitCreate {
@@ -1881,12 +1929,12 @@ fn conclude_replay_via_commit(
     });
     tx.commit()?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
-    remove_commit_state_files(git_dir);
-    commands::hooks::run_post_index_change_hook(false, false)?;
+    remove_commit_state_files(git_dir, lazy_fetch);
+    commands::hooks::run_post_index_change_hook_at(git_dir, false, false)?;
     if !quiet {
         println!("{new_oid}");
     }
-    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
+    commands::hooks::run_hook_at(git_dir, "post-commit", commands::hooks::HookRun::default())?;
     Ok(())
 }
 
@@ -1895,6 +1943,7 @@ fn conclude_replay_via_commit(
 /// the tracked entries beneath them), then record HEAD's tree with just those
 /// paths replaced. Mirrors git's `--only` default for tracked-file usage.
 fn commit_partial_paths(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     format: ObjectFormat,
     paths: &[String],
@@ -1911,7 +1960,7 @@ fn commit_partial_paths(
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let refs = FileRefStore::new(git_dir, format);
-    let rel_paths = stage_partial_commit_paths(git_dir, format, paths, &tree_map)?;
+    let rel_paths = stage_partial_commit_paths(cli_session, git_dir, format, paths, &tree_map)?;
     let index_path = sley_worktree::repository_index_path(git_dir);
     // Overlay the staged state of the matched paths onto HEAD's tree.
     let updated_index = Index::parse(&fs::read(&index_path)?, format)?;
@@ -1967,16 +2016,17 @@ fn commit_partial_paths(
     tx.commit()?;
     sley_worktree::refresh_repository_cache_tree(git_dir, format, &db)?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
-    remove_commit_state_files(git_dir);
+    remove_commit_state_files(git_dir, cli_session.lazy_fetch());
     if !quiet {
         println!("{new_oid}");
     }
-    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
+    commands::hooks::run_hook_at(git_dir, "post-commit", commands::hooks::HookRun::default())?;
     if amend
         && !no_post_rewrite
         && let Some(old_oid) = head
     {
-        commands::hooks::run_hook(
+        commands::hooks::run_hook_at(
+            git_dir,
             "post-rewrite",
             commands::hooks::HookRun {
                 args: vec!["amend".to_string()],
@@ -1989,6 +2039,7 @@ fn commit_partial_paths(
 }
 
 fn stage_partial_commit_paths(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     format: ObjectFormat,
     paths: &[String],
@@ -2027,7 +2078,7 @@ fn stage_partial_commit_paths(
         let element = sley_pathspec::parse_normalized_pathspec_element(
             &prefix,
             &parse_path,
-            effective_pathspec_flags(),
+            effective_pathspec_flags(cli_session),
         )?;
         have_include |= !element.is_exclude();
         pathspecs.push((path.as_str(), element, false));
@@ -2191,10 +2242,10 @@ fn restore_taken_index_snapshot(git_dir: &Path, snapshot: &Option<Option<Vec<u8>
     Ok(())
 }
 
-fn remove_commit_state_files(git_dir: &Path) {
+fn remove_commit_state_files(git_dir: &Path, lazy_fetch: bool) {
     let format = repository_object_format(git_dir).ok();
     if let Some(format) = format {
-        commands::merge_rebase::apply_merge_autostash(git_dir, format);
+        commands::merge_rebase::apply_merge_autostash(git_dir, format, lazy_fetch);
     }
     for name in [
         "MERGE_HEAD",
@@ -3036,6 +3087,7 @@ fn append_commit_verbose_diff(
     verbose: u8,
     comment_char: &str,
     out: &mut Vec<u8>,
+    lazy_fetch: bool,
 ) -> Result<()> {
     if !out.ends_with(b"\n") {
         out.push(b'\n');
@@ -3044,13 +3096,13 @@ fn append_commit_verbose_diff(
         append_scissors_cut_line(out, comment_char);
     }
     if verbose == 1 {
-        append_commit_diff_index_patch(git_dir, format, amend, "a/", "b/", false, out)?;
+        append_commit_diff_index_patch(git_dir, format, amend, "a/", "b/", false, out, lazy_fetch)?;
     } else {
         out.extend_from_slice(b"Changes to be committed:\n");
-        append_commit_diff_index_patch(git_dir, format, amend, "c/", "i/", false, out)?;
+        append_commit_diff_index_patch(git_dir, format, amend, "c/", "i/", false, out, lazy_fetch)?;
         out.extend_from_slice(b"--------------------------------------------------\n");
         out.extend_from_slice(b"Changes not staged for commit:\n");
-        append_commit_diff_index_patch(git_dir, format, amend, "i/", "w/", true, out)?;
+        append_commit_diff_index_patch(git_dir, format, amend, "i/", "w/", true, out, lazy_fetch)?;
     }
     Ok(())
 }
@@ -3063,6 +3115,7 @@ fn append_commit_diff_index_patch(
     dst_prefix: &str,
     worktree: bool,
     out: &mut Vec<u8>,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let worktree_root = worktree_root_for_git_dir(git_dir)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -3092,6 +3145,7 @@ fn append_commit_diff_index_patch(
                 anchors: &[],
                 allow_textconv: true,
                 db: &db,
+                lazy_fetch,
                 worktree_root: worktree.then_some(worktree_root.as_path()),
                 use_worktree_new: worktree,
                 format,
@@ -3398,7 +3452,11 @@ fn print_clean_commit_status(
     Ok(())
 }
 
-fn build_commit_author_identity(author: Option<&str>, date: Option<&str>) -> Result<Vec<u8>> {
+fn build_commit_author_identity(
+    author: Option<&str>,
+    date: Option<&str>,
+    effective_config: &GitConfig,
+) -> Result<Vec<u8>> {
     let (name, email) = if let Some(author) = author {
         parse_commit_author_bytes(&argv_bytes_from_string(author))?
     } else {
@@ -3407,7 +3465,7 @@ fn build_commit_author_identity(author: Option<&str>, date: Option<&str>) -> Res
         let env_name = env::var_os("GIT_AUTHOR_NAME").map(argv_bytes_from_os);
         let env_email = env::var_os("GIT_AUTHOR_EMAIL").map(argv_bytes_from_os);
         let mut config = if env_name.is_none() || env_email.is_none() {
-            IdentityConfig::Lazy(None)
+            IdentityConfig::Loaded(effective_config)
         } else {
             IdentityConfig::Skip
         };

@@ -13,13 +13,28 @@
 use sley::plumbing::sley_config;
 use std::env;
 use std::io::{self, BufRead, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use sley::GitConfig;
 use sley::{GitError, Result};
 
-use crate::worktree_root_for_git_dir;
+struct AddInteractiveContext {
+    git_dir: PathBuf,
+    config: GitConfig,
+}
+
+impl AddInteractiveContext {
+    fn open(cli_session: &crate::session::CliSession) -> Result<Self> {
+        let repository = cli_session.open_repository()?;
+        repository.workdir().ok_or_else(|| {
+            GitError::Unsupported("interactive add requires a repository worktree".into())
+        })?;
+        let git_dir = repository.git_dir().to_path_buf();
+        let config = crate::read_repo_config(&git_dir)?;
+        Ok(Self { git_dir, config })
+    }
+}
 
 /// Resolve the path to the running sley binary so the engine can re-invoke
 /// data-producing subcommands (diff, add, reset, apply) the same way git
@@ -74,12 +89,10 @@ struct InteractiveStyle {
 }
 
 impl InteractiveStyle {
-    fn load(git_dir: &Path) -> Self {
-        let config = crate::read_repo_config(git_dir).ok();
+    fn load(config: &GitConfig) -> Self {
         let get = |section: &str, subsection: Option<&str>, key: &str| -> Option<String> {
             config
-                .as_ref()
-                .and_then(|c| c.get(section, subsection, key))
+                .get(section, subsection, key)
                 .map(|v| v.trim().to_string())
         };
         let interactive = get("color", None, "interactive");
@@ -620,7 +633,11 @@ fn print_status_table(paths: &[String], style: &InteractiveStyle) {
     println!();
 }
 
-fn run_main_loop(paths: &[String], style: &InteractiveStyle) -> Result<()> {
+fn run_main_loop(
+    context: &AddInteractiveContext,
+    paths: &[String],
+    style: &InteractiveStyle,
+) -> Result<()> {
     let stdin = io::stdin();
     let mut handle = stdin.lock();
     print_status_table(paths, style);
@@ -645,7 +662,7 @@ fn run_main_loop(paths: &[String], style: &InteractiveStyle) -> Result<()> {
             Some(MenuCmd::Update) => run_update(&mut handle, paths, style)?,
             Some(MenuCmd::Revert) => run_revert(&mut handle, paths, style)?,
             Some(MenuCmd::AddUntracked) => run_add_untracked(&mut handle, paths, style)?,
-            Some(MenuCmd::Patch) => run_patch_menu(&mut handle, paths, style)?,
+            Some(MenuCmd::Patch) => run_patch_menu(context, &mut handle, paths, style)?,
             Some(MenuCmd::Diff) => run_diff(&mut handle, paths, style)?,
             Some(MenuCmd::Quit) => {
                 println!("Bye.");
@@ -849,6 +866,7 @@ fn run_diff(stdin: &mut impl BufRead, paths: &[String], style: &InteractiveStyle
 }
 
 fn run_patch_menu(
+    context: &AddInteractiveContext,
     stdin: &mut impl BufRead,
     paths: &[String],
     style: &InteractiveStyle,
@@ -866,8 +884,7 @@ fn run_patch_menu(
         _ => return Ok(()),
     };
     let selected_paths: Vec<String> = chosen.iter().map(|&i| items[i].path.clone()).collect();
-    let git_dir = crate::session::cli_git_dir()?;
-    let cfg = resolve_patch_config(&git_dir, None, None, true)?;
+    let cfg = resolve_patch_config(context, None, None, true)?;
     super::add_patch::run_add_patch(
         super::add_patch::PatchMode::Add,
         &selected_paths,
@@ -882,12 +899,13 @@ fn run_patch_menu(
 // ---------------------------------------------------------------------------
 
 /// `git add --interactive` / `git add -i [-- <pathspec>...]`.
-pub(crate) fn cmd_add_interactive(paths: &[String]) -> Result<()> {
-    // Ensure we are inside a repo (git errors otherwise via discover).
-    let git_dir = crate::session::cli_git_dir()?;
-    let _ = worktree_root_for_git_dir(&git_dir)?;
-    let style = InteractiveStyle::load(&git_dir);
-    run_main_loop(paths, &style)
+pub(crate) fn cmd_add_interactive(
+    cli_session: &crate::session::CliSession,
+    paths: &[String],
+) -> Result<()> {
+    let context = AddInteractiveContext::open(cli_session)?;
+    let style = InteractiveStyle::load(&context.config);
+    run_main_loop(&context, paths, &style)
 }
 
 /// `git add --patch [-U<n>] [--inter-hunk-context=<n>] [-- <pathspec>...]`.
@@ -896,14 +914,14 @@ pub(crate) fn cmd_add_interactive(paths: &[String]) -> Result<()> {
 /// add's own argv (`None` → fall back to config). They mirror `opts->context` /
 /// `opts->interhunkcontext` in add-patch.c, which override the config values.
 pub(crate) fn cmd_add_patch(
+    cli_session: &crate::session::CliSession,
     paths: &[String],
     context: Option<i64>,
     interhunk: Option<i64>,
     auto_advance: bool,
 ) -> Result<()> {
-    let git_dir = crate::session::cli_git_dir()?;
-    let _ = worktree_root_for_git_dir(&git_dir)?;
-    let cfg = resolve_patch_config(&git_dir, context, interhunk, auto_advance)?;
+    let add_context = AddInteractiveContext::open(cli_session)?;
+    let cfg = resolve_patch_config(&add_context, context, interhunk, auto_advance)?;
     let stdin = io::stdin();
     let mut handle = stdin.lock();
     super::add_patch::run_add_patch(
@@ -916,15 +934,15 @@ pub(crate) fn cmd_add_patch(
 }
 
 pub(crate) fn cmd_stash_patch(
+    cli_session: &crate::session::CliSession,
     paths: &[String],
     context: Option<i64>,
     interhunk: Option<i64>,
     auto_advance: bool,
     quiet: bool,
 ) -> Result<bool> {
-    let git_dir = crate::session::cli_git_dir()?;
-    let _ = worktree_root_for_git_dir(&git_dir)?;
-    let cfg = resolve_patch_config(&git_dir, context, interhunk, auto_advance)?;
+    let add_context = AddInteractiveContext::open(cli_session)?;
+    let cfg = resolve_patch_config(&add_context, context, interhunk, auto_advance)?;
     let stdin = io::stdin();
     let mut handle = stdin.lock();
     super::add_patch::run_stash_patch(paths, None, &mut handle, cfg, quiet)
@@ -935,17 +953,26 @@ pub(crate) fn cmd_stash_patch(
 /// / `diff.algorithm` config (rejecting negative context), then let an explicit
 /// `-U` / `--inter-hunk-context` from the command line override (also rejecting
 /// negatives). The die messages match git byte-for-byte (t3701 #88/#90/#91).
-pub(crate) fn resolve_patch_config(
-    git_dir: &std::path::Path,
+pub(crate) fn resolve_patch_config_for_session(
+    cli_session: &crate::session::CliSession,
     cli_context: Option<i64>,
     cli_interhunk: Option<i64>,
     auto_advance: bool,
 ) -> Result<super::add_patch::PatchConfig> {
-    let config = crate::read_repo_config(git_dir).ok();
+    let context = AddInteractiveContext::open(cli_session)?;
+    resolve_patch_config(&context, cli_context, cli_interhunk, auto_advance)
+}
+
+fn resolve_patch_config(
+    add_context: &AddInteractiveContext,
+    cli_context: Option<i64>,
+    cli_interhunk: Option<i64>,
+    auto_advance: bool,
+) -> Result<super::add_patch::PatchConfig> {
     let read_int = |key: &str| -> Option<i64> {
-        config
-            .as_ref()
-            .and_then(|c| c.get("diff", None, key))
+        add_context
+            .config
+            .get("diff", None, key)
             .and_then(|v| v.trim().parse::<i64>().ok())
     };
     // diff.context (config), validated non-negative.
@@ -978,22 +1005,23 @@ pub(crate) fn resolve_patch_config(
         }
         interhunk = Some(value);
     }
-    let diff_algorithm = config
-        .as_ref()
-        .and_then(|c| c.get("diff", None, "algorithm"))
+    let diff_algorithm = add_context
+        .config
+        .get("diff", None, "algorithm")
         .map(|v| v.trim().to_string());
-    let colors = patch_color_enabled(config.as_ref(), "diff")
-        .then(|| super::diff_words::DiffColors::enabled(config.as_ref()));
-    let interactive_enabled = patch_color_enabled(config.as_ref(), "interactive");
+    let config = Some(&add_context.config);
+    let colors =
+        patch_color_enabled(config, "diff").then(|| super::diff_words::DiffColors::enabled(config));
+    let interactive_enabled = patch_color_enabled(config, "interactive");
     let prompt_color = patch_color_slot(
-        config.as_ref(),
+        config,
         interactive_enabled,
         "interactive",
         "prompt",
         "\x1b[1;34m",
     );
     let header_color = patch_color_slot(
-        config.as_ref(),
+        config,
         interactive_enabled,
         "interactive",
         "header",
@@ -1005,9 +1033,9 @@ pub(crate) fn resolve_patch_config(
         String::new()
     };
     let diff_filter = colors.as_ref().and_then(|_| {
-        config
-            .as_ref()
-            .and_then(|c| c.get("interactive", None, "diffFilter"))
+        add_context
+            .config
+            .get("interactive", None, "diffFilter")
             .map(str::to_string)
     });
     Ok(super::add_patch::PatchConfig {
@@ -1020,6 +1048,7 @@ pub(crate) fn resolve_patch_config(
         header_color,
         reset_interactive,
         diff_filter,
+        git_dir: Some(add_context.git_dir.clone()),
     })
 }
 

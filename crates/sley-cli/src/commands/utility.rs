@@ -130,7 +130,7 @@ pub(crate) fn cmd_bugreport(
     match cli_session.git_dir() {
         Ok(_) => {
             for hook in commands::hooks::KNOWN_HOOKS {
-                if commands::hooks::hook_exists(hook)? {
+                if commands::hooks::hook_exists(cli_session, hook)? {
                     writeln!(report, "{hook}")?;
                 }
             }
@@ -405,14 +405,14 @@ fn print_version_build_options() {
     println!("default-hash: {}", ObjectFormat::Sha1.name());
 }
 
-pub(crate) fn cmd_var(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_var(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     match args {
         [name] if name == "-l" => {
-            var_list()?;
+            var_list(cli_session)?;
             Ok(())
         }
         [name] => {
-            for value in var_values(name)? {
+            for value in var_values(cli_session, name)? {
                 println!("{value}");
             }
             Ok(())
@@ -421,8 +421,8 @@ pub(crate) fn cmd_var(args: &[String]) -> Result<()> {
     }
 }
 
-fn var_list() -> Result<()> {
-    if let Some(config) = identity_effective_config() {
+fn var_list(cli_session: &crate::session::CliSession) -> Result<()> {
+    if let Some(config) = identity_effective_config_for(cli_session) {
         var_print_config(&config)?;
     }
     for param in injected_config_parameters()? {
@@ -447,7 +447,7 @@ fn var_list() -> Result<()> {
         "GIT_CONFIG_SYSTEM",
         "GIT_CONFIG_GLOBAL",
     ] {
-        if let Ok(values) = var_values(name) {
+        if let Ok(values) = var_values(cli_session, name) {
             for value in values {
                 println!("{name}={value}");
             }
@@ -470,14 +470,14 @@ fn var_print_config(config: &GitConfig) -> Result<()> {
     Ok(())
 }
 
-fn var_values(name: &str) -> Result<Vec<String>> {
+fn var_values(cli_session: &crate::session::CliSession, name: &str) -> Result<Vec<String>> {
     match name {
-        "GIT_AUTHOR_IDENT" => Ok(vec![var_identity("AUTHOR")?]),
-        "GIT_COMMITTER_IDENT" => Ok(vec![var_identity("COMMITTER")?]),
-        "GIT_EDITOR" => Ok(vec![var_editor(None)?]),
-        "GIT_SEQUENCE_EDITOR" => Ok(vec![var_editor(Some("sequence.editor"))?]),
-        "GIT_PAGER" => Ok(vec![var_pager()]),
-        "GIT_DEFAULT_BRANCH" => Ok(vec![var_default_branch()]),
+        "GIT_AUTHOR_IDENT" => Ok(vec![var_identity(cli_session, "AUTHOR")?]),
+        "GIT_COMMITTER_IDENT" => Ok(vec![var_identity(cli_session, "COMMITTER")?]),
+        "GIT_EDITOR" => Ok(vec![var_editor(cli_session, None)?]),
+        "GIT_SEQUENCE_EDITOR" => Ok(vec![var_editor(cli_session, Some("sequence.editor"))?]),
+        "GIT_PAGER" => Ok(vec![var_pager(cli_session)]),
+        "GIT_DEFAULT_BRANCH" => Ok(vec![var_default_branch(cli_session)]),
         "GIT_SHELL_PATH" => Ok(vec!["/bin/sh".into()]),
         "GIT_ATTR_SYSTEM" => var_path_values(var_attr_system_path()),
         "GIT_ATTR_GLOBAL" => var_path_values(var_attr_global_paths()),
@@ -487,24 +487,28 @@ fn var_values(name: &str) -> Result<Vec<String>> {
     }
 }
 
-fn var_identity(role: &str) -> Result<String> {
-    let identity = commit_identity_from_env(role)?;
+fn var_identity(cli_session: &crate::session::CliSession, role: &str) -> Result<String> {
+    let config = identity_effective_config_for(cli_session).unwrap_or_default();
+    let identity = commit_identity_from_env(role, &config)?;
     Ok(String::from_utf8_lossy(&identity).into_owned())
 }
 
-fn var_editor(specific_key: Option<&str>) -> Result<String> {
+fn var_editor(
+    cli_session: &crate::session::CliSession,
+    specific_key: Option<&str>,
+) -> Result<String> {
     if let Some(key) = specific_key {
         if let Ok(value) = env::var("GIT_SEQUENCE_EDITOR") {
             return Ok(value);
         }
-        if let Some(value) = var_effective_config_value(key) {
+        if let Some(value) = var_effective_config_value(cli_session, key) {
             return Ok(value);
         }
     }
     if let Ok(value) = env::var("GIT_EDITOR") {
         return Ok(value);
     }
-    if let Some(value) = var_effective_config_value("core.editor") {
+    if let Some(value) = var_effective_config_value(cli_session, "core.editor") {
         return Ok(value);
     }
     if let Ok(value) = env::var("VISUAL")
@@ -519,13 +523,13 @@ fn var_editor(specific_key: Option<&str>) -> Result<String> {
     Err(GitError::Exit(1))
 }
 
-fn var_pager() -> String {
+fn var_pager(cli_session: &crate::session::CliSession) -> String {
     // git's `git var GIT_PAGER` == `git_pager(repo, 1)`: `GIT_PAGER`, then
     // `core.pager`, then the `PAGER` env, then the compiled default (`less`). An
     // empty value or `cat` disables paging, which `var` reports as `cat`.
     let pager = match env::var("GIT_PAGER") {
         Ok(value) => value,
-        Err(_) => var_effective_config_value("core.pager")
+        Err(_) => var_effective_config_value(cli_session, "core.pager")
             .or_else(|| env::var("PAGER").ok())
             .unwrap_or_else(|| "less".into()),
     };
@@ -536,7 +540,7 @@ fn var_pager() -> String {
     }
 }
 
-fn var_default_branch() -> String {
+fn var_default_branch(cli_session: &crate::session::CliSession) -> String {
     // git's `repo_default_branch_name`: the test override env var wins over
     // the `init.defaultBranch` configuration.
     if let Ok(env) = env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME")
@@ -544,15 +548,19 @@ fn var_default_branch() -> String {
     {
         return env;
     }
-    var_effective_config_value("init.defaultBranch").unwrap_or_else(|| "master".into())
+    var_effective_config_value(cli_session, "init.defaultBranch").unwrap_or_else(|| "master".into())
 }
 
-fn var_effective_config_value(key: &str) -> Option<String> {
+fn var_effective_config_value(
+    cli_session: &crate::session::CliSession,
+    key: &str,
+) -> Option<String> {
     if let Ok(Some(value)) = global_config_value(key) {
         return Some(value);
     }
     let (section, key) = key.split_once('.')?;
-    identity_effective_config().and_then(|config| config.get(section, None, key).map(str::to_owned))
+    identity_effective_config_for(cli_session)
+        .and_then(|config| config.get(section, None, key).map(str::to_owned))
 }
 
 fn var_path_values(paths: Vec<PathBuf>) -> Result<Vec<String>> {
@@ -888,7 +896,12 @@ pub(crate) fn cmd_check_mailmap(
     }
 
     let repository = crate::repository::RepositoryContext::from_session(cli_session)?;
-    let mailmap = Mailmap::load(repository.git_dir(), repository.format(), &source_specs)?;
+    let mailmap = Mailmap::load(
+        repository.git_dir(),
+        repository.format(),
+        &source_specs,
+        repository.config(),
+    )?;
     for contact in contacts {
         println!("{}", mailmap.resolve_contact(&contact).display());
     }
@@ -958,7 +971,18 @@ impl Mailmap {
     /// config sources — the set git consults when resolving `%(...:mailmap)`
     /// atoms in for-each-ref / log / etc.
     pub(crate) fn load_default(git_dir: &Path, format: ObjectFormat) -> Result<Self> {
-        Self::load(git_dir, format, &[])
+        let config = read_repo_config(git_dir).unwrap_or_default();
+        Self::load_default_with_config(git_dir, format, &config)
+    }
+
+    /// Load repository mailmap sources using an already-resolved effective
+    /// config snapshot, avoiding invocation/session rediscovery.
+    pub(crate) fn load_default_with_config(
+        git_dir: &Path,
+        format: ObjectFormat,
+        config: &GitConfig,
+    ) -> Result<Self> {
+        Self::load(git_dir, format, &[], config)
     }
 
     /// Load the mailmap when there may be no repository (git's `read_mailmap`
@@ -969,11 +993,6 @@ impl Mailmap {
     pub(crate) fn load_cwd() -> Result<Self> {
         let mut mailmap = Self::default();
         mailmap.add_file(Path::new(".mailmap"))?;
-        if let Some(config) = identity_effective_config()
-            && let Some(path) = config.get("mailmap", None, "file")
-        {
-            mailmap.add_file(Path::new(&path))?;
-        }
         Ok(mailmap)
     }
 
@@ -1025,6 +1044,7 @@ impl Mailmap {
         git_dir: &Path,
         format: ObjectFormat,
         source_specs: &[MailmapSourceSpec],
+        config: &GitConfig,
     ) -> Result<Self> {
         // git's `read_mailmap` order (mailmap.c): `.mailmap` (worktree only) →
         // `mailmap.blob` → `mailmap.file` (last, so it overrides). A bare repo
@@ -1032,13 +1052,8 @@ impl Mailmap {
         let mut mailmap = Self::default();
         let worktree_root = worktree_root_for_git_dir(git_dir).ok();
         let is_bare = worktree_root.is_none();
-        let config = identity_effective_config();
-        let mailmap_file = config
-            .as_ref()
-            .and_then(|c| c.get("mailmap", None, "file").map(str::to_owned));
-        let mut mailmap_blob = config
-            .as_ref()
-            .and_then(|c| c.get("mailmap", None, "blob").map(str::to_owned));
+        let mailmap_file = config.get("mailmap", None, "file").map(str::to_owned);
+        let mut mailmap_blob = config.get("mailmap", None, "blob").map(str::to_owned);
         if mailmap_blob.is_none() && is_bare {
             mailmap_blob = Some("HEAD:.mailmap".to_string());
         }

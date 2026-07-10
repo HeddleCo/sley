@@ -1611,7 +1611,7 @@ fn fetch_one_source_with_outcome(
         refspecs,
         options.clone(),
     )? {
-        maybe_write_fetch_commit_graph(git_dir, config, &options)?;
+        maybe_write_fetch_commit_graph(command_context, git_dir, config, &options)?;
         return Ok(outcome);
     }
     if let Some((bundle_source, bundle)) = fetch_bundle_source(format, source, config)? {
@@ -1639,7 +1639,7 @@ fn fetch_one_source_with_outcome(
             &bundle,
             options.clone(),
         )?;
-        maybe_write_fetch_commit_graph(git_dir, config, &options)?;
+        maybe_write_fetch_commit_graph(command_context, git_dir, config, &options)?;
         return Ok(sley_remote::FetchOutcome::default());
     }
     let resolved = sley_remote::resolve_remote(resolution, source)?;
@@ -1675,11 +1675,12 @@ fn fetch_one_source_with_outcome(
         options.clone(),
         server_options,
     )?;
-    maybe_write_fetch_commit_graph(git_dir, config, &options)?;
+    maybe_write_fetch_commit_graph(command_context, git_dir, config, &options)?;
     Ok(outcome)
 }
 
 fn maybe_write_fetch_commit_graph(
+    command_context: &RemoteCommandContext,
     git_dir: &Path,
     config: &GitConfig,
     options: &FetchOptions,
@@ -1693,11 +1694,18 @@ fn maybe_write_fetch_commit_graph(
     {
         return Ok(());
     }
-    crate::commands::plumbing::cmd_commit_graph(&[
-        "write".to_string(),
-        "--reachable".to_string(),
-        "--split".to_string(),
-    ])
+    let nested_session = crate::session::CliSession::for_repository_paths(
+        command_context.cwd().to_path_buf(),
+        git_dir.to_path_buf(),
+    );
+    crate::commands::plumbing::cmd_commit_graph(
+        &nested_session,
+        &[
+            "write".to_string(),
+            "--reachable".to_string(),
+            "--split".to_string(),
+        ],
+    )
 }
 
 fn fetch_bundle_source(

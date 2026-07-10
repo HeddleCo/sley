@@ -71,7 +71,13 @@ pub(crate) fn cmd_range_diff(
         return Err(GitError::Exit(129));
     }
     let notes_refs = resolve_notes_refs(&repo, &options.notes)?;
-    let rendered = render_range_diff(&repo, &parsed, &options, &notes_refs)?;
+    let rendered = render_range_diff(
+        &repo,
+        &parsed,
+        &options,
+        &notes_refs,
+        cli_session.lazy_fetch(),
+    )?;
     io::stdout().write_all(&rendered)?;
     Ok(())
 }
@@ -100,6 +106,7 @@ pub(crate) fn render_format_patch_range_diff(
     new_range_args: &[String],
     pathspecs: &[String],
     notes_refs: &[String],
+    lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
     let mut options = default_options(repo)?;
     options.notes = NotesMode::None;
@@ -128,7 +135,7 @@ pub(crate) fn render_format_patch_range_diff(
         range2: new_range_args.to_vec(),
         pathspecs: pathspecs.to_vec(),
     };
-    render_range_diff(repo, &parsed, &options, notes_refs)
+    render_range_diff(repo, &parsed, &options, notes_refs, lazy_fetch)
 }
 
 fn range_tip(repo: &RepositoryContext, setup_args: &[String]) -> Result<ObjectId> {
@@ -156,9 +163,24 @@ fn render_range_diff(
     parsed: &ParsedRangeDiff,
     options: &RangeDiffOptions,
     notes_refs: &[String],
+    lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
-    let mut left = read_patches(repo, &parsed.range1, &parsed.pathspecs, options, notes_refs)?;
-    let mut right = read_patches(repo, &parsed.range2, &parsed.pathspecs, options, notes_refs)?;
+    let mut left = read_patches(
+        repo,
+        &parsed.range1,
+        &parsed.pathspecs,
+        options,
+        notes_refs,
+        lazy_fetch,
+    )?;
+    let mut right = read_patches(
+        repo,
+        &parsed.range2,
+        &parsed.pathspecs,
+        options,
+        notes_refs,
+        lazy_fetch,
+    )?;
     assign_correspondences(&mut left, &mut right, options.creation_factor);
     let mut out = Vec::new();
     output_range_diff(&mut out, repo, &mut left, &mut right, options)?;
@@ -393,6 +415,7 @@ fn read_patches(
     pathspecs: &[String],
     options: &RangeDiffOptions,
     notes_refs: &[String],
+    lazy_fetch: bool,
 ) -> Result<Vec<PatchRecord>> {
     let format = repo.format();
     let db = repo.objects();
@@ -452,8 +475,14 @@ fn read_patches(
 
     let mut out = Vec::with_capacity(selected.len());
     for (idx, record) in selected.iter().enumerate() {
-        let (patch, diff_offset, diff_size) =
-            build_patch_text(repo, record, &setup.pathspecs, options, notes_refs)?;
+        let (patch, diff_offset, diff_size) = build_patch_text(
+            repo,
+            record,
+            &setup.pathspecs,
+            options,
+            notes_refs,
+            lazy_fetch,
+        )?;
         out.push(PatchRecord {
             oid: record.oid,
             index: idx,
@@ -474,6 +503,7 @@ fn build_patch_text(
     pathspecs: &[String],
     options: &RangeDiffOptions,
     notes_refs: &[String],
+    lazy_fetch: bool,
 ) -> Result<(Vec<u8>, usize, i32)> {
     let db = repo.objects();
     let format = repo.format();
@@ -550,7 +580,12 @@ fn build_patch_text(
     let entries = if pathspecs.is_empty() {
         entries
     } else {
-        let pathspec = DiffPathspec::new(repo.cwd(), repo.worktree_root()?, pathspecs)?;
+        let pathspec = DiffPathspec::new(
+            repo.cwd(),
+            repo.worktree_root()?,
+            pathspecs,
+            repo.pathspec_magic(),
+        )?;
         apply_diff_pathspec(entries, &pathspec)
     };
     let mut diff_size = 0;
@@ -569,6 +604,7 @@ fn build_patch_text(
                 anchors: &[],
                 allow_textconv: false,
                 db,
+                lazy_fetch,
                 worktree_root: None,
                 use_worktree_new: false,
                 format,

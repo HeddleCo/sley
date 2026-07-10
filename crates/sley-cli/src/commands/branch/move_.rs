@@ -23,6 +23,7 @@ pub(super) struct BranchMoveOptions {
 pub(super) fn run_branch_move_options(
     git_dir: &Path,
     store: &FileRefStore,
+    config: &GitConfig,
     options: BranchMoveOptions,
 ) -> Result<()> {
     let (old_branch, new_branch) = branch_move_branches(store, options.kind, &options.branches)?;
@@ -113,7 +114,7 @@ pub(super) fn run_branch_move_options(
 
     match options.kind {
         BranchMoveKind::Rename => {
-            let committer = branch_reflog_committer_identity(store, &old_branch)?;
+            let committer = branch_reflog_committer_identity(store, config, &old_branch)?;
             let head_was_old = store.current_branch_ref()?.as_deref() == Some(old_ref.as_str());
             let old_oid = match store.read_ref(&old_ref)? {
                 Some(RefTarget::Direct(oid)) => oid,
@@ -137,7 +138,7 @@ pub(super) fn run_branch_move_options(
             let linked_update = update_all_worktree_heads(git_dir, &old_ref, &new_ref);
             if head_was_old {
                 let null_oid = ObjectId::null(repository_object_format(git_dir)?);
-                let committer = branch_reflog_committer_identity(store, &new_branch)?;
+                let committer = branch_reflog_committer_identity(store, config, &new_branch)?;
                 store.append_reflog(
                     "HEAD",
                     &ReflogEntry {
@@ -161,7 +162,7 @@ pub(super) fn run_branch_move_options(
             linked_update?;
         }
         BranchMoveKind::Copy => {
-            let committer = branch_reflog_committer_identity(store, &old_branch)?;
+            let committer = branch_reflog_committer_identity(store, config, &old_branch)?;
             if let Err(err) = sley_refs::branch::transfer_branch(
                 store,
                 sley_refs::branch::BranchTransferOptions {
@@ -267,10 +268,11 @@ pub(super) fn worktree_head_paths(git_dir: &Path, refname: &str) -> Result<Vec<P
 
 pub(super) fn branch_reflog_committer_identity(
     store: &FileRefStore,
+    config: &GitConfig,
     branch: &str,
 ) -> Result<Vec<u8>> {
     if env::var("GIT_COMMITTER_DATE").is_ok() {
-        return commit_identity_from_env("COMMITTER");
+        return commit_identity_from_env("COMMITTER", config);
     }
     let refname = branch_ref_name(branch)?;
     let max_existing = store

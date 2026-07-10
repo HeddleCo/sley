@@ -199,11 +199,12 @@ struct AmPatch {
 }
 
 /// Entry point for `git am`.
-pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&common_git_dir)?;
+pub(crate) fn cmd_am(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    let repository = cli_session.open_repository()?;
+    let git_dir = repository.git_dir().to_path_buf();
+    let common_git_dir = repository.common_dir().to_path_buf();
+    let format = repository.object_format();
+    let config = read_repo_config(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let state_dir = git_dir.join("rebase-apply");
 
@@ -261,14 +262,23 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
             let _ = fs::write(state_dir.join("interactive"), bool_flag(interactive));
         }
         return match resume {
-            "--abort" => am_abort(&git_dir, &worktree_root, format, &state_dir),
-            "--quit" => am_quit(&state_dir),
+            "--abort" => am_abort(&git_dir, &worktree_root, format, &state_dir, &config),
+            "--quit" => am_quit(
+                &git_dir,
+                &common_git_dir,
+                format,
+                &state_dir,
+                &config,
+                cli_session.lazy_fetch(),
+            ),
             "--skip" => am_skip(
                 &git_dir,
                 &common_git_dir,
                 &worktree_root,
                 format,
                 &state_dir,
+                &config,
+                cli_session.lazy_fetch(),
             ),
             "--continue" => am_continue(
                 &git_dir,
@@ -277,6 +287,8 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
                 format,
                 &state_dir,
                 overrides,
+                &config,
+                cli_session.lazy_fetch(),
             ),
             "--retry" => am_retry(
                 &git_dir,
@@ -285,6 +297,8 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
                 format,
                 &state_dir,
                 overrides,
+                &config,
+                cli_session.lazy_fetch(),
             ),
             _ => Ok(()),
         };
@@ -299,6 +313,8 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
             &worktree_root,
             format,
             &state_dir,
+            &config,
+            cli_session.lazy_fetch(),
         );
     }
 
@@ -306,7 +322,7 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
     // command-line flag (handled in setup_am_options) override. setup_am_options
     // leaves an unspecified flag at false, so OR the config default in only when
     // the user did not pass an explicit `--[no-]…` form.
-    apply_am_config_defaults(&git_dir, &option_args, &mut options);
+    apply_am_config_defaults(&config, &option_args, &mut options);
 
     // Starting a new run while one is unfinished is an error in git.
     if state_dir.exists() {
@@ -345,7 +361,7 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let refs = FileRefStore::new(&git_dir, format);
+    let refs = repository.references();
     let head_oid = head_commit_oid(&refs)?;
     let state_head_oid = head_oid.unwrap_or_else(|| ObjectId::null(format));
 
@@ -376,6 +392,8 @@ pub(crate) fn cmd_am(args: &[String]) -> Result<()> {
         &state_dir,
         1,
         AmResumeOverrides::default(),
+        &config,
+        cli_session.lazy_fetch(),
     )
 }
 
@@ -445,6 +463,8 @@ pub(crate) fn start_rebase_apply(
     worktree_root: &Path,
     format: ObjectFormat,
     params: RebaseApplyParams,
+    config: &GitConfig,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let state_dir = git_dir.join("rebase-apply");
     let target_encoding = commit_encoding_config(git_dir);
@@ -541,6 +561,8 @@ pub(crate) fn start_rebase_apply(
         &state_dir,
         1,
         AmResumeOverrides::default(),
+        config,
+        lazy_fetch,
     )
 }
 
@@ -557,6 +579,8 @@ pub(crate) fn rebase_apply_continue(
     common_git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
+    config: &GitConfig,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let state_dir = git_dir.join("rebase-apply");
     am_continue(
@@ -566,6 +590,8 @@ pub(crate) fn rebase_apply_continue(
         format,
         &state_dir,
         AmResumeOverrides::default(),
+        config,
+        lazy_fetch,
     )
 }
 
@@ -575,9 +601,19 @@ pub(crate) fn rebase_apply_skip(
     common_git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
+    config: &GitConfig,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let state_dir = git_dir.join("rebase-apply");
-    am_skip(git_dir, common_git_dir, worktree_root, format, &state_dir)
+    am_skip(
+        git_dir,
+        common_git_dir,
+        worktree_root,
+        format,
+        &state_dir,
+        config,
+        lazy_fetch,
+    )
 }
 
 /// `git rebase --apply --abort`: restore the original branch and drop state.
@@ -585,9 +621,11 @@ pub(crate) fn rebase_apply_abort(
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
+    config: &GitConfig,
+    _lazy_fetch: bool,
 ) -> Result<()> {
     let state_dir = git_dir.join("rebase-apply");
-    am_abort(git_dir, worktree_root, format, &state_dir)
+    am_abort(git_dir, worktree_root, format, &state_dir, config)
 }
 
 /// Parse the non-resume flags of `git am`.
@@ -753,15 +791,15 @@ fn setup_am_options(args: &[String]) -> Result<AmOptions> {
 /// command line did not explicitly set (an explicit `--[no-]message-id` /
 /// `--[no-]3way` wins over config, matching git's parse order: config first,
 /// then the command-line override).
-fn apply_am_config_defaults(git_dir: &Path, args: &[String], options: &mut AmOptions) {
+fn apply_am_config_defaults(config: &GitConfig, args: &[String], options: &mut AmOptions) {
     let has = |needles: &[&str]| args.iter().any(|a| needles.contains(&a.as_str()));
     if !has(&["-m", "--message-id", "--no-message-id"])
-        && let Some(value) = am_config_bool(git_dir, "messageid")
+        && let Some(value) = am_config_bool(config, "messageid")
     {
         options.message_id = value;
     }
     if !has(&["-3", "--3way", "--no-3way"])
-        && let Some(value) = am_config_bool(git_dir, "threeWay")
+        && let Some(value) = am_config_bool(config, "threeWay")
     {
         options.three_way = value;
     }
@@ -769,17 +807,8 @@ fn apply_am_config_defaults(git_dir: &Path, args: &[String], options: &mut AmOpt
 
 /// Read a boolean `am.<key>` value from the effective config (repo + global +
 /// `-c`/env overrides), returning `None` when unset or unparsable.
-fn am_config_bool(git_dir: &Path, key: &str) -> Option<bool> {
-    let value = if let Some(config) = commands::merge_rebase::effective_config_with_overrides()
-        && let Some(value) = config.get("am", None, key)
-    {
-        value.to_string()
-    } else {
-        commands::remote::read_repo_config(git_dir)
-            .ok()?
-            .get("am", None, key)?
-            .to_string()
-    };
+fn am_config_bool(config: &GitConfig, key: &str) -> Option<bool> {
+    let value = config.get("am", None, key)?.to_string();
     match value.to_ascii_lowercase().as_str() {
         "true" | "yes" | "on" | "1" | "" => Some(true),
         "false" | "no" | "off" | "0" => Some(false),
@@ -2522,6 +2551,8 @@ fn run_am_series(
     state_dir: &Path,
     start: usize,
     overrides: AmResumeOverrides,
+    config: &GitConfig,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let last = read_state_usize(state_dir, "last")?;
     let saved_quiet = read_state_bool(state_dir, "quiet");
@@ -2602,6 +2633,7 @@ fn run_am_series(
                         format,
                         &patch,
                         commit_opts,
+                        config,
                     )?;
                     record_rebase_rewrite(state_dir, format, number, &new_oid)?;
                     number += 1;
@@ -2621,6 +2653,7 @@ fn run_am_series(
         }
 
         match apply_one_patch(
+            config,
             git_dir,
             common_git_dir,
             worktree_root,
@@ -2632,6 +2665,7 @@ fn run_am_series(
             three_way,
             &apply_opts,
             quiet,
+            lazy_fetch,
         )? {
             ApplyResult::Committed => number += 1,
             ApplyResult::Conflict => {
@@ -2653,7 +2687,14 @@ fn run_am_series(
         }
     }
 
-    finish_am(state_dir)
+    finish_am(
+        git_dir,
+        common_git_dir,
+        format,
+        state_dir,
+        config,
+        lazy_fetch,
+    )
 }
 
 /// Build the commit message for a patch and run the `applypatch-msg` hook the
@@ -2680,7 +2721,7 @@ fn prepare_am_commit_message(
         let arg = final_commit.to_string_lossy().into_owned();
         // A failing applypatch-msg hook aborts the series; git exits 1 and leaves
         // the state dir in place so the user can fix the hook and resume.
-        if commands::hooks::run_hook_l("applypatch-msg", &[arg.as_str()]).is_err() {
+        if commands::hooks::run_hook_l_at(git_dir, "applypatch-msg", &[arg.as_str()]).is_err() {
             return Err(GitError::Exit(1));
         }
     }
@@ -2723,6 +2764,7 @@ fn am_index_is_dirty(
 /// 3-way leaves conflict markers in the worktree and a conflicted index.
 #[allow(clippy::too_many_arguments)]
 fn apply_one_patch(
+    config: &GitConfig,
     git_dir: &Path,
     common_git_dir: &Path,
     worktree_root: &Path,
@@ -2734,6 +2776,7 @@ fn apply_one_patch(
     three_way: bool,
     apply_opts: &AmApplyOpts,
     quiet: bool,
+    lazy_fetch: bool,
 ) -> Result<ApplyResult> {
     let mut file_patches = sley_diff_merge::parse_unified_patch_with_options(
         &patch.diff,
@@ -2780,6 +2823,7 @@ fn apply_one_patch(
             patch,
             &actions,
             commit_opts,
+            config,
         )?;
         record_rebase_rewrite(state_dir, format, number, &new_oid)?;
         return Ok(ApplyResult::Committed);
@@ -2802,6 +2846,7 @@ fn apply_one_patch(
                 patch,
                 &actions,
                 commit_opts,
+                config,
             )?;
             record_rebase_rewrite(state_dir, format, number, &new_oid)?;
             Ok(ApplyResult::Committed)
@@ -2812,6 +2857,7 @@ fn apply_one_patch(
                     println!("Using index info to reconstruct a base tree...");
                 }
                 return apply_three_way(
+                    config,
                     git_dir,
                     common_git_dir,
                     worktree_root,
@@ -2822,6 +2868,7 @@ fn apply_one_patch(
                     &file_patches,
                     commit_opts,
                     quiet,
+                    lazy_fetch,
                 );
             }
             for file in &file_patches {
@@ -3525,6 +3572,7 @@ fn stage_and_commit(
     patch: &AmPatch,
     actions: &[ApplyFileAction],
     commit_opts: AmCommitOpts,
+    config: &GitConfig,
 ) -> Result<ObjectId> {
     let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let mut index = read_repository_index(git_dir, format)?.unwrap_or(Index {
@@ -3579,6 +3627,7 @@ fn stage_and_commit(
         format,
         patch,
         commit_opts,
+        config,
     )
 }
 
@@ -3622,13 +3671,14 @@ fn create_am_commit(
     format: ObjectFormat,
     patch: &AmPatch,
     commit_opts: AmCommitOpts,
+    config: &GitConfig,
 ) -> Result<ObjectId> {
     let refs = FileRefStore::new(git_dir, format);
     let head_oid = head_commit_oid(&refs)?;
     let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
 
     let target_encoding = commit_encoding_config(git_dir);
-    let (author, committer) = am_commit_identities(patch, commit_opts, &target_encoding)?;
+    let (author, committer) = am_commit_identities(patch, commit_opts, &target_encoding, config)?;
     // The message has already been finalised (Message-ID appended + the
     // applypatch-msg hook run) in `prepare_am_commit_message`, BEFORE the patch
     // was applied — git's ordering. Here we only append the sign-off, which git
@@ -3639,7 +3689,7 @@ fn create_am_commit(
         patch.message.clone()
     };
     if commit_opts.signoff {
-        message = am_append_signoff(message, &commit_signoff_from_env()?);
+        message = am_append_signoff(message, &commit_signoff_from_env(config)?);
     }
     if encoding_is_utf8(&target_encoding) && commit_message_has_invalid_utf8(&message) {
         eprintln!("Warning: commit message did not conform to UTF-8.");
@@ -3647,7 +3697,12 @@ fn create_am_commit(
     // pre-applypatch runs after staging, before the commit; a failure aborts the
     // run (git exits 1). `--no-verify` skips it.
     if !commit_opts.no_verify
-        && commands::hooks::run_hook("pre-applypatch", commands::hooks::HookRun::default()).is_err()
+        && commands::hooks::run_hook_at(
+            git_dir,
+            "pre-applypatch",
+            commands::hooks::HookRun::default(),
+        )
+        .is_err()
     {
         return Err(GitError::Exit(1));
     }
@@ -3716,7 +3771,11 @@ fn create_am_commit(
     // git runs post-applypatch but ignores its exit status — it is purely
     // informational, run after the commit has already landed (builtin/am.c
     // calls `run_hooks` without checking the result). Swallow any failure.
-    let _ = commands::hooks::run_hook("post-applypatch", commands::hooks::HookRun::default());
+    let _ = commands::hooks::run_hook_at(
+        git_dir,
+        "post-applypatch",
+        commands::hooks::HookRun::default(),
+    );
     Ok(new_oid)
 }
 
@@ -3734,6 +3793,7 @@ fn am_commit_identities(
     patch: &AmPatch,
     opts: AmCommitOpts,
     target_encoding: &str,
+    config: &GitConfig,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     // The author date: the patch's Date:, the env author date, or "now".
     let author_date = if opts.ignore_date {
@@ -3754,9 +3814,9 @@ fn am_commit_identities(
         sley_sequencer::format_commit_identity_bytes(&author_name, &author_email, &author_date)?;
 
     let committer = if opts.committer_date_is_author_date {
-        commit_identity_from_env_with_date("COMMITTER", &author_date)?
+        commit_identity_from_env_with_date("COMMITTER", &author_date, config)?
     } else {
-        commit_identity_from_env("COMMITTER")?
+        commit_identity_from_env("COMMITTER", config)?
     };
     Ok((author, committer))
 }
@@ -3898,6 +3958,7 @@ fn is_trailer_line(line: &str) -> bool {
 /// worktree state ("ours"). Reuses the shared tree-merge engine.
 #[allow(clippy::too_many_arguments)]
 fn apply_three_way(
+    config: &GitConfig,
     git_dir: &Path,
     common_git_dir: &Path,
     worktree_root: &Path,
@@ -3908,6 +3969,7 @@ fn apply_three_way(
     file_patches: &[sley_diff_merge::FilePatch],
     commit_opts: AmCommitOpts,
     quiet: bool,
+    lazy_fetch: bool,
 ) -> Result<ApplyResult> {
     let refs = FileRefStore::new(git_dir, format);
     // The "ours" side of the 3-way is the current HEAD tree, or the empty tree
@@ -3973,7 +4035,7 @@ fn apply_three_way(
         let base_bytes = if file.is_new {
             Vec::new()
         } else if let Some(bytes) =
-            lookup_patch_base_blob(&db, &index_oids, &path, &old_path, &ours_map)?
+            lookup_patch_base_blob(&db, &index_oids, &path, &old_path, &ours_map, lazy_fetch)?
         {
             bytes
         } else {
@@ -4032,12 +4094,9 @@ fn apply_three_way(
     // ancestor" in diff3 conflict markers (builtin/am.c sets o.ancestor). Honour
     // merge.conflictStyle so `-c merge.conflictstyle=diff3` (and rebase --apply)
     // emit the `|||||||` ancestor section.
-    let conflict_style = commands::merge_rebase::effective_config_with_overrides()
-        .and_then(|config| {
-            config
-                .get("merge", None, "conflictstyle")
-                .map(str::to_string)
-        })
+    let conflict_style = config
+        .get("merge", None, "conflictstyle")
+        .map(str::to_string)
         .map(|value| match value.as_str() {
             "diff3" | "zdiff3" => sley_diff_merge::ConflictStyle::Diff3,
             _ => sley_diff_merge::ConflictStyle::Merge,
@@ -4063,7 +4122,7 @@ fn apply_three_way(
             commands::merge_rebase::RenameMergeConfig {
                 detect_renames: true,
                 rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-                rename_limit: commands::merge_rebase::merge_rename_limit_config(),
+                rename_limit: commands::merge_rebase::merge_rename_limit_config(config),
                 // The apply/am 3-way backend uses Git's constructed-fake-
                 // ancestor merge path, which does not perform implicit
                 // directory renames (the upstream suite records positive
@@ -4072,6 +4131,7 @@ fn apply_three_way(
                 // inference must be disabled so an unrelated x/a and x/b are
                 // not spuriously moved when the patch renames x/c to y/c.
                 directory_renames: sley_diff_merge::DirectoryRenames::False,
+                lazy_fetch,
             },
             None,
             Some(&path_marker_size),
@@ -4125,7 +4185,15 @@ fn apply_three_way(
         }
     }
 
-    write_merge_index_and_worktree(git_dir, worktree_root, format, &db, &ours_map, &results)?;
+    write_merge_index_and_worktree(
+        git_dir,
+        worktree_root,
+        format,
+        &db,
+        &ours_map,
+        &results,
+        lazy_fetch,
+    )?;
 
     if conflicts.is_empty() {
         let new_oid = create_am_commit(
@@ -4135,6 +4203,7 @@ fn apply_three_way(
             format,
             patch,
             commit_opts,
+            config,
         )?;
         record_rebase_rewrite(state_dir, format, number, &new_oid)?;
         Ok(ApplyResult::Committed)
@@ -4319,6 +4388,7 @@ fn lookup_patch_base_blob(
     path: &[u8],
     old_path: &[u8],
     ours_map: &MergeTreeMap,
+    lazy_fetch: bool,
 ) -> Result<Option<Vec<u8>>> {
     if let Some(prefix) = index_oids.get(path)
         && let Ok(ObjectPrefixResolution::Unique(oid)) = db.resolve_prefix(prefix)
@@ -4329,7 +4399,7 @@ fn lookup_patch_base_blob(
         }
     }
     if let Some((_, oid)) = ours_map.get(old_path).or_else(|| ours_map.get(path)) {
-        return Ok(Some(merge_read_blob(db, oid)?));
+        return Ok(Some(merge_read_blob(db, oid, lazy_fetch)?));
     }
     Ok(None)
 }
@@ -4343,6 +4413,7 @@ fn write_merge_index_and_worktree(
     db: &FileObjectDatabase,
     ours_map: &MergeTreeMap,
     results: &BTreeMap<Vec<u8>, MergePathResult>,
+    lazy_fetch: bool,
 ) -> Result<()> {
     // Materialize the worktree BEFORE building the index so resolved stage-0
     // entries can record the on-disk stat (git refreshes merged results via
@@ -4354,7 +4425,7 @@ fn write_merge_index_and_worktree(
                     let content = if sley_index::is_gitlink(*mode) {
                         Vec::new()
                     } else {
-                        merge_read_blob(db, oid)?
+                        merge_read_blob(db, oid, lazy_fetch)?
                     };
                     merge_write_worktree_file(worktree_root, path, &content, *mode)?;
                 }
@@ -4492,9 +4563,23 @@ fn display_state_dir(worktree_root: &Path, state_dir: &Path) -> String {
 /// state dir carries the rebase markers (`head-name`, `onto`, `orig-head`) this
 /// was a `git rebase --apply`, so we first return HEAD to the original branch and
 /// print the rebase success line before dropping state.
-fn finish_am(state_dir: &Path) -> Result<()> {
+fn finish_am(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    state_dir: &Path,
+    config: &GitConfig,
+    lazy_fetch: bool,
+) -> Result<()> {
     if state_dir.join("head-name").exists() {
-        finish_rebase_apply(state_dir)?;
+        finish_rebase_apply(
+            git_dir,
+            common_git_dir,
+            format,
+            state_dir,
+            config,
+            lazy_fetch,
+        )?;
     }
     if state_dir.exists() {
         fs::remove_dir_all(state_dir)?;
@@ -4538,12 +4623,13 @@ fn record_rebase_rewrite(
 /// `rebase-apply/rewritten` (`<old> <new>` per rewritten commit) on stdin —
 /// git's `run_post_rewrite_hook` in builtin/am.c, fired once the series finishes.
 /// A no-op when nothing was rewritten (an all-skipped or noop run).
-fn run_apply_post_rewrite_hook(state_dir: &Path) {
+fn run_apply_post_rewrite_hook(git_dir: &Path, state_dir: &Path) {
     let input = fs::read(state_dir.join("rewritten")).unwrap_or_default();
     if input.is_empty() {
         return;
     }
-    let _ = commands::hooks::run_hook(
+    let _ = commands::hooks::run_hook_at(
+        git_dir,
         "post-rewrite",
         commands::hooks::HookRun {
             args: vec!["rebase".to_string()],
@@ -4556,17 +4642,20 @@ fn run_apply_post_rewrite_hook(state_dir: &Path) {
 /// Move HEAD back to the original branch at the rebased tip and print the rebase
 /// success line, mirroring `git-rebase--am`'s `move_to_original_branch` + the
 /// "Successfully rebased and updated <branch>." message.
-fn finish_rebase_apply(state_dir: &Path) -> Result<()> {
+fn finish_rebase_apply(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    state_dir: &Path,
+    config: &GitConfig,
+    lazy_fetch: bool,
+) -> Result<()> {
     // git fires the post-rewrite hook at the end of the am loop (am.c:1928),
     // BEFORE the rebase caller moves HEAD back to the original branch. Match that
     // order: feed the accumulated `<old> <new>` map while the state dir still
     // exists (the caller removes it after this returns).
-    run_apply_post_rewrite_hook(state_dir);
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&common_git_dir)?;
-    let refs = FileRefStore::new(&git_dir, format);
+    run_apply_post_rewrite_hook(git_dir, state_dir);
+    let refs = FileRefStore::new(git_dir, format);
     let head = head_commit_oid(&refs)?
         .ok_or_else(|| GitError::Command("rebase --apply: cannot read HEAD".into()))?;
     let head_name = fs::read_to_string(state_dir.join("head-name"))
@@ -4585,7 +4674,7 @@ fn finish_rebase_apply(state_dir: &Path) -> Result<()> {
 
     let reflog_action = env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "rebase".to_string());
     let head_display = if head_name.starts_with("refs/heads/") {
-        let committer = commit_identity_from_env("COMMITTER")?;
+        let committer = commit_identity_from_env("COMMITTER", config)?;
         let mut tx = refs.transaction();
         tx.update(RefUpdate {
             name: head_name.clone(),
@@ -4623,7 +4712,7 @@ fn finish_rebase_apply(state_dir: &Path) -> Result<()> {
     // apply backend records its autostash in `rebase-apply/autostash`; the state
     // dir is removed by the caller's finish, so consume the file before then.
     let _ = head_display;
-    apply_rebase_autostash(&common_git_dir, state_dir)?;
+    apply_rebase_autostash(&common_git_dir, state_dir, lazy_fetch)?;
 
     Ok(())
 }
@@ -4632,14 +4721,15 @@ fn finish_rebase_apply(state_dir: &Path) -> Result<()> {
 /// `rebase-apply/autostash`. Mirrors `apply_autostash` in the merge backend
 /// (rebase.rs) but reachable from the am finish path. Prints "Applied
 /// autostash." on a clean apply, or stores the stash on conflict.
-fn apply_rebase_autostash(common_git_dir: &Path, state_dir: &Path) -> Result<()> {
+fn apply_rebase_autostash(common_git_dir: &Path, state_dir: &Path, lazy_fetch: bool) -> Result<()> {
     let autostash_path = state_dir.join("autostash");
     if let Ok(text) = fs::read_to_string(&autostash_path) {
         let _ = fs::remove_file(&autostash_path);
         let format = repository_object_format(common_git_dir)?;
         if let Ok(oid) = ObjectId::from_hex(format, text.trim()) {
-            let applied = commands::stash::apply_stash_commit_quietly_at(common_git_dir, &oid)
-                .unwrap_or(false);
+            let applied =
+                commands::stash::apply_stash_commit_quietly_at(common_git_dir, &oid, lazy_fetch)
+                    .unwrap_or(false);
             if applied {
                 eprintln!("Applied autostash.");
             } else if commands::stash::store_stash_commit_at(common_git_dir, &oid, "autostash")
@@ -4927,6 +5017,7 @@ fn am_abort(
     worktree_root: &Path,
     format: ObjectFormat,
     state_dir: &Path,
+    config: &GitConfig,
 ) -> Result<()> {
     am_require_in_progress(state_dir)?;
     // The rebase apply backend records the branch to return to in `head-name`
@@ -4954,7 +5045,7 @@ fn am_abort(
         {
             let refs = FileRefStore::new(git_dir, format);
             let current = head_commit_oid(&refs)?;
-            let committer = commit_identity_from_env("COMMITTER")?;
+            let committer = commit_identity_from_env("COMMITTER", config)?;
             let mut tx = refs.transaction();
             // git builtin/rebase.c abort: `<action> (abort): returning to
             // <head_name OR orig_head_sha>` — the branch ref when attached, the
@@ -5077,7 +5168,7 @@ fn am_abort(
 
     match &orig_head {
         Some(orig) => {
-            let committer = commit_identity_from_env("COMMITTER")?;
+            let committer = commit_identity_from_env("COMMITTER", config)?;
             let target_ref = match refs.read_ref("HEAD")? {
                 Some(RefTarget::Symbolic(branch)) => branch,
                 _ => "HEAD".to_string(),
@@ -5116,9 +5207,23 @@ fn am_abort(
 }
 
 /// `git am --quit`: leave HEAD and the worktree as-is, only drop the state.
-fn am_quit(state_dir: &Path) -> Result<()> {
+fn am_quit(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    state_dir: &Path,
+    config: &GitConfig,
+    lazy_fetch: bool,
+) -> Result<()> {
     am_require_in_progress(state_dir)?;
-    finish_am(state_dir)
+    finish_am(
+        git_dir,
+        common_git_dir,
+        format,
+        state_dir,
+        config,
+        lazy_fetch,
+    )
 }
 
 /// `git am --skip`: discard the current patch's partial state, reset the
@@ -5129,6 +5234,8 @@ fn am_skip(
     worktree_root: &Path,
     format: ObjectFormat,
     state_dir: &Path,
+    config: &GitConfig,
+    lazy_fetch: bool,
 ) -> Result<()> {
     am_require_in_progress(state_dir)?;
     // git's `am_skip` clears the in-progress rerere state for the skipped patch
@@ -5166,6 +5273,8 @@ fn am_skip(
         state_dir,
         next + 1,
         AmResumeOverrides::default(),
+        config,
+        lazy_fetch,
     )
 }
 
@@ -5178,6 +5287,8 @@ fn am_continue(
     format: ObjectFormat,
     state_dir: &Path,
     overrides: AmResumeOverrides,
+    config: &GitConfig,
+    lazy_fetch: bool,
 ) -> Result<()> {
     am_require_in_progress(state_dir)?;
     // Command-line options override the saved session options for the resumed
@@ -5253,6 +5364,8 @@ fn am_continue(
                     state_dir,
                     next + 1,
                     AmResumeOverrides::default(),
+                    config,
+                    lazy_fetch,
                 );
             }
         }
@@ -5265,6 +5378,7 @@ fn am_continue(
         format,
         &patch,
         commit_opts,
+        config,
     )?;
     record_rebase_rewrite(state_dir, format, next, &new_oid)?;
     // git's `am_resolve` runs rerere so a resolved conflict is recorded for
@@ -5279,6 +5393,8 @@ fn am_continue(
         state_dir,
         next + 1,
         AmResumeOverrides::default(),
+        config,
+        lazy_fetch,
     )
 }
 
@@ -5292,6 +5408,8 @@ fn am_retry(
     format: ObjectFormat,
     state_dir: &Path,
     overrides: AmResumeOverrides,
+    config: &GitConfig,
+    lazy_fetch: bool,
 ) -> Result<()> {
     am_require_in_progress(state_dir)?;
     let next = read_state_usize(state_dir, "next")?;
@@ -5303,6 +5421,8 @@ fn am_retry(
         state_dir,
         next,
         overrides,
+        config,
+        lazy_fetch,
     )
 }
 
@@ -5315,6 +5435,8 @@ fn am_continue_allow_empty(
     worktree_root: &Path,
     format: ObjectFormat,
     state_dir: &Path,
+    config: &GitConfig,
+    lazy_fetch: bool,
 ) -> Result<()> {
     am_require_in_progress(state_dir)?;
     let next = read_state_usize(state_dir, "next")?;
@@ -5338,6 +5460,8 @@ fn am_continue_allow_empty(
             format,
             state_dir,
             AmResumeOverrides::default(),
+            config,
+            lazy_fetch,
         );
     }
 
@@ -5352,6 +5476,8 @@ fn am_continue_allow_empty(
             format,
             state_dir,
             AmResumeOverrides::default(),
+            config,
+            lazy_fetch,
         );
     }
 
@@ -5368,6 +5494,7 @@ fn am_continue_allow_empty(
         format,
         &patch,
         commit_opts,
+        config,
     )?;
     record_rebase_rewrite(state_dir, format, next, &new_oid)?;
     if !quiet {
@@ -5381,6 +5508,8 @@ fn am_continue_allow_empty(
         state_dir,
         next + 1,
         AmResumeOverrides::default(),
+        config,
+        lazy_fetch,
     )
 }
 

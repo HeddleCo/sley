@@ -58,7 +58,7 @@ pub(crate) fn cmd_rerere(cli_session: &crate::session::CliSession, args: &[Strin
         None => repo_rerere(&git_dir, format, options.autoupdate).map(|_| ()),
         Some(RerereSubcommand::Status) => rerere_status(&git_dir),
         Some(RerereSubcommand::Remaining) => rerere_remaining(&git_dir, format),
-        Some(RerereSubcommand::Diff) => rerere_diff(&git_dir, format),
+        Some(RerereSubcommand::Diff) => rerere_diff(&git_dir, format, cli_session.lazy_fetch()),
         Some(RerereSubcommand::Clear) => rerere_clear(&git_dir),
         Some(RerereSubcommand::Forget) => rerere_forget(&git_dir, &options.paths),
         Some(RerereSubcommand::Gc) => rerere_gc(&git_dir),
@@ -142,31 +142,29 @@ fn rerere_usage_stdout<T>() -> Result<T> {
 }
 
 pub(crate) fn is_rerere_enabled(git_dir: &Path) -> bool {
-    if let Some(config) = commands::merge_rebase::effective_config_with_overrides()
-        && let Some(value) = config.get("rerere", None, "enabled")
-    {
+    let config = rerere_effective_config(git_dir);
+    is_rerere_enabled_with_config(git_dir, &config)
+}
+
+fn rerere_effective_config(git_dir: &Path) -> GitConfig {
+    let config = read_repo_config(git_dir).unwrap_or_default();
+    commands::merge_rebase::effective_config_with_overrides(&config)
+}
+
+fn is_rerere_enabled_with_config(git_dir: &Path, config: &GitConfig) -> bool {
+    if let Some(value) = config.get("rerere", None, "enabled") {
         return commands::merge_rebase::parse_maybe_bool(value.trim()).unwrap_or(false);
     }
     git_dir.join("rr-cache").is_dir()
 }
 
-fn rerere_autoupdate(git_dir: &Path, override_value: Option<bool>) -> bool {
+fn rerere_autoupdate_with_config(config: &GitConfig, override_value: Option<bool>) -> bool {
     if let Some(value) = override_value {
         return value;
     }
-    commands::merge_rebase::effective_config_with_overrides()
-        .and_then(|config| {
-            config
-                .get("rerere", None, "autoupdate")
-                .and_then(|value| commands::merge_rebase::parse_maybe_bool(value.trim()))
-        })
-        .or_else(|| {
-            read_repo_config(git_dir).ok().and_then(|config| {
-                config
-                    .get("rerere", None, "autoupdate")
-                    .and_then(|value| commands::merge_rebase::parse_maybe_bool(value.trim()))
-            })
-        })
+    config
+        .get("rerere", None, "autoupdate")
+        .and_then(|value| commands::merge_rebase::parse_maybe_bool(value.trim()))
         .unwrap_or(false)
 }
 
@@ -175,7 +173,8 @@ pub(crate) fn repo_rerere(
     format: ObjectFormat,
     autoupdate_override: Option<bool>,
 ) -> Result<bool> {
-    if !is_rerere_enabled(git_dir) {
+    let config = rerere_effective_config(git_dir);
+    if !is_rerere_enabled_with_config(git_dir, &config) {
         return Ok(false);
     }
     fs::create_dir_all(git_dir.join("rr-cache"))?;
@@ -227,6 +226,7 @@ pub(crate) fn repo_rerere(
         let mut entry = rr[entry_pos].clone();
         fs::create_dir_all(git_dir.join("rr-cache").join(&entry.hash))?;
         if do_rerere_one_path(
+            &config,
             git_dir,
             format,
             &worktree_root,
@@ -262,6 +262,7 @@ pub(crate) fn repo_rerere(
 }
 
 fn do_rerere_one_path(
+    config: &GitConfig,
     git_dir: &Path,
     format: ObjectFormat,
     worktree_root: &Path,
@@ -273,7 +274,7 @@ fn do_rerere_one_path(
     let cache_dir = rr_cache.join(&entry.hash);
     scan_variant_status(&cache_dir, entry.variant)?;
     if try_replay_resolution(git_dir, format, worktree_root, entry)? {
-        if rerere_autoupdate(git_dir, autoupdate_override) {
+        if rerere_autoupdate_with_config(&config, autoupdate_override) {
             stage_resolved_path(git_dir, format, worktree_root, &entry.path)?;
             eprintln!("Staged '{}' using previous resolution.", entry.path);
             entry.variant = u32::MAX;
@@ -908,7 +909,7 @@ fn worktree_path_still_has_conflicts(git_dir: &Path, path: &str) -> Result<bool>
     ))
 }
 
-fn rerere_diff(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+fn rerere_diff(git_dir: &Path, format: ObjectFormat, lazy_fetch: bool) -> Result<()> {
     if !is_rerere_enabled(git_dir) {
         return Ok(());
     }
@@ -946,6 +947,7 @@ fn rerere_diff(git_dir: &Path, format: ObjectFormat) -> Result<()> {
                 anchors: &[],
                 allow_textconv: false,
                 db: &db,
+                lazy_fetch,
                 worktree_root: None,
                 use_worktree_new: false,
                 format,
@@ -1029,8 +1031,10 @@ fn rerere_gc(git_dir: &Path) -> Result<()> {
     if !rr_cache.exists() {
         return Ok(());
     }
-    let resolved_expiry = rerere_expiry("rerereresolved", RERERE_RESOLVED_DAYS);
-    let unresolved_expiry = rerere_expiry("rerereunresolved", RERERE_UNRESOLVED_DAYS);
+    let config = read_repo_config(git_dir).unwrap_or_default();
+    let config = commands::merge_rebase::effective_config_with_overrides(&config);
+    let resolved_expiry = rerere_expiry(&config, "rerereresolved", RERERE_RESOLVED_DAYS);
+    let unresolved_expiry = rerere_expiry(&config, "rerereunresolved", RERERE_UNRESOLVED_DAYS);
     for entry in fs::read_dir(&rr_cache)? {
         let path = entry?.path();
         if !path.is_dir() {
@@ -1049,10 +1053,8 @@ fn rerere_gc(git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rerere_expiry(key: &str, days: u64) -> Duration {
-    if let Some(config) = commands::merge_rebase::effective_config_with_overrides()
-        && let Some(value) = config.get("gc", None, key)
-    {
+fn rerere_expiry(config: &GitConfig, key: &str, days: u64) -> Duration {
+    if let Some(value) = config.get("gc", None, key) {
         return parse_expiry_duration(value).unwrap_or(Duration::from_secs(days * 86400));
     }
     Duration::from_secs(days * 86400)

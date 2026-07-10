@@ -205,7 +205,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
     // a bare repository refuses with "this operation must be run in a work
     // tree". `--soft` (HEAD-only) and `--mixed` (index-only) are exempt.
     if matches!(mode, ResetMode::Hard | ResetMode::Merge | ResetMode::Keep) {
-        require_work_tree(&git_dir)?;
+        require_work_tree(cli_session, &git_dir)?;
     }
     let format = repository_object_format(&git_dir)?;
     let reset_config = read_repo_config(&git_dir)?;
@@ -251,7 +251,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             old_head,
             target_commit,
             target,
-            commit_identity_from_env("COMMITTER")?,
+            commit_identity_from_env("COMMITTER", &reset_config)?,
         )?;
         sley_sequencer::replay::remove_branch_state(&git_dir);
         return Ok(());
@@ -278,6 +278,8 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             &worktree_root,
             format,
             Some(&target_commit),
+            &reset_config,
+            cli_session.lazy_fetch(),
         )
         .map_err(|err| match err {
             GitError::Command(message) => {
@@ -355,7 +357,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             old_head,
             target_commit,
             target,
-            commit_identity_from_env("COMMITTER")?,
+            commit_identity_from_env("COMMITTER", &reset_config)?,
         )?;
         sley_sequencer::replay::remove_branch_state(&git_dir);
         return Ok(());
@@ -452,14 +454,14 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             )?;
         }
         apply_reset_sparse_checkout(&worktree_root, &git_dir, format)?;
-        commands::hooks::run_post_index_change_hook(true, false)?;
+        commands::hooks::run_post_index_change_hook(cli_session, true, false)?;
         update_reset_head_ref(
             &git_dir,
             format,
             old_head,
             target_commit,
             target,
-            commit_identity_from_env("COMMITTER")?,
+            commit_identity_from_env("COMMITTER", &reset_config)?,
         )?;
         if !quiet {
             print_reset_hard_head(&git_dir, format, &target_commit)?;
@@ -505,14 +507,14 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
         if refresh {
             refresh_reset_index(&worktree_root, &git_dir, format)?;
         }
-        commands::hooks::run_post_index_change_hook(false, true)?;
+        commands::hooks::run_post_index_change_hook(cli_session, false, true)?;
         update_reset_head_ref(
             &git_dir,
             format,
             old_head,
             target_commit,
             &positionals[0],
-            commit_identity_from_env("COMMITTER")?,
+            commit_identity_from_env("COMMITTER", &reset_config)?,
         )?;
         sley_sequencer::replay::remove_branch_state(&git_dir);
         if !quiet {
@@ -578,7 +580,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
         if refresh {
             refresh_reset_index(&worktree_root, &git_dir, format)?;
         }
-        commands::hooks::run_post_index_change_hook(false, true)?;
+        commands::hooks::run_post_index_change_hook(cli_session, false, true)?;
         sley_sequencer::replay::remove_branch_state(&git_dir);
         if !quiet {
             print_reset_unstaged_changes(&worktree_root, &git_dir, format)?;
@@ -682,7 +684,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
         if refresh {
             refresh_reset_index(&worktree_root, &git_dir, format)?;
         }
-        commands::hooks::run_post_index_change_hook(false, true)?;
+        commands::hooks::run_post_index_change_hook(cli_session, false, true)?;
         sley_sequencer::replay::remove_branch_state(&git_dir);
     }
     if !quiet {

@@ -141,6 +141,8 @@ pub(crate) struct PatchConfig {
     pub header_color: String,
     pub reset_interactive: String,
     pub diff_filter: Option<String>,
+    /// Session-resolved repository git directory used by manual hunk editing.
+    pub git_dir: Option<PathBuf>,
 }
 
 impl Default for PatchConfig {
@@ -155,6 +157,7 @@ impl Default for PatchConfig {
             header_color: String::new(),
             reset_interactive: String::new(),
             diff_filter: None,
+            git_dir: None,
         }
     }
 }
@@ -1315,7 +1318,7 @@ fn patch_update_file(
                             pending_err =
                                 Some(format!("Unknown command '{answer}' (use '?' for help)\n"));
                         } else {
-                            match edit_hunk_loop(fd, hunk_index, stdin) {
+                            match edit_hunk_loop(fd, hunk_index, stdin, cfg) {
                                 EditResult::Applied => {
                                     fd.hunks[hunk_index].use_hunk = HunkUse::Use;
                                     hunk_index = undecided_next.unwrap_or(nr);
@@ -1624,15 +1627,17 @@ enum EditResult {
 /// The `e` command: edit the current hunk in `$GIT_EDITOR`, recount its header,
 /// and validate it applies (re-prompting on failure). Mirrors add-patch.c's
 /// `edit_hunk_loop` + `edit_hunk_manually` + `run_apply_check`.
-fn edit_hunk_loop(fd: &mut FileDiff, hunk_index: usize, stdin: &mut impl BufRead) -> EditResult {
-    let git_dir = match env::current_dir()
-        .ok()
-        .and_then(|cwd| crate::session::cli_git_dir_from(&cwd).ok())
-    {
+fn edit_hunk_loop(
+    fd: &mut FileDiff,
+    hunk_index: usize,
+    stdin: &mut impl BufRead,
+    cfg: &PatchConfig,
+) -> EditResult {
+    let git_dir = match cfg.git_dir.as_ref() {
         Some(dir) => dir,
         None => return EditResult::Abandoned,
     };
-    let comment = super::replay::comment_char(&git_dir);
+    let comment = super::replay::comment_char(git_dir);
     let cc = comment as char;
 
     loop {
