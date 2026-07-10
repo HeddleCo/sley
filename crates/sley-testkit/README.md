@@ -47,3 +47,7 @@ Reference tests live in `crates/sley/tests/parity/`.
 - [`upstream`](src/lib.rs) — drive git's `t/*.sh` suite against the `sley` binary
 
 See `scripts/run-upstream-tests.sh` and `upstream-report*.csv` for enrolled script subsets and history.
+
+**Timing baseline (sley vs git on all 891 enrolled scripts):**
+[`UPSTREAM_TIMINGS.md`](UPSTREAM_TIMINGS.md) and
+`upstream-sley-vs-git-timings.csv` (raw: `upstream-timings-{sley,git}-20260710.csv`).

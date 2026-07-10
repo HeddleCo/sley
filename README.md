@@ -24,12 +24,13 @@ cargo run -p sley-cli --release -- log --oneline -20
 
 ## Benchmarks vs git
 
-sley is measured against system git on the same machine. Two harnesses:
+sley is measured against system/source git on the same machine:
 
 | Harness | Script | What it compares |
 |---------|--------|------------------|
 | Human common commands | `scripts/bench-human-common.py` | Timing + peak RSS for everyday porcelain |
 | Plumbing / pack fixtures | `scripts/bench-vs-git.sh` | Hyperfine means on synthetic pack/commit fixtures |
+| Upstream `t/*.sh` suite | `crates/sley-testkit/scripts/run-upstream-tests-waves.sh` | Wall time for all **891** enrolled scripts (sley and git) |
 | Criterion (library) | `cargo bench -p sley-bench` | Internal regression baselines (no git oracle) |
 
 ### Environment (latest run)
@@ -158,6 +159,58 @@ Results land in `bench-results/human-common/<timestamp>/` (`timing-summary.csv`,
 `memory-summary.csv`, `README.md`). Refresh the tables above from that run when
 you change hot paths.
 
+### Upstream `t/*.sh` suite (891 scripts) vs git
+
+Full enrolled parity subset from `.github/workflows/upstream-parity.yml`, run
+through the same waves harness against **sley** and against a **v2.55.0 source
+build of git** (`/tmp/git-src/git`). Full tables and CSVs:
+[`crates/sley-testkit/UPSTREAM_TIMINGS.md`](crates/sley-testkit/UPSTREAM_TIMINGS.md).
+
+| metric | sley | git |
+|--------|-----:|----:|
+| wall clock (8 waves) | 13m 13s | 12m 13s |
+| serial-equiv script time | 79.8 min | 74.4 min |
+| median script | **1.72 s** | 1.92 s |
+| mean script | 5.37 s | 5.01 s |
+| p90 / p99 | 12.4 / 57.2 s | 11.8 / 44.2 s |
+| scripts PASS / FAIL | 509 / 382 | 737 / 154 |
+| assertion pass rate | 92% | 93% |
+
+**Speedup** = `git_ms / sley_ms` (>1 ⇒ sley faster). Across 891 paired scripts:
+**487** sley ≥5% faster, **242** sley ≥5% slower, **162** within ±5%; median
+speedup **1.07×**. Overall serial time is ~7% higher for sley because a long
+tail (describe/tag/submodule/bitmaps) is much slower even though the median is
+ahead.
+
+| costliest (sley time) | git | sley | speedup |
+|-----------------------|----:|-----:|--------:|
+| `t1092-sparse-checkout-compatibility.sh` | 209.3s | 194.5s | **1.08×** |
+| `t5510-fetch.sh` | 100.4s | 89.9s | **1.12×** |
+| `t0027-auto-crlf.sh` | 71.9s | 85.8s | 0.84× |
+| `t5310-pack-bitmaps.sh` | 26.3s | 62.8s | 0.42× |
+| `t6120-describe.sh` | 11.5s | 60.0s | 0.19× |
+| `t7004-tag.sh` | 14.1s | 57.6s | 0.24× |
+
+| sley wins (highest speedup) | git | sley | speedup |
+|-----------------------------|----:|-----:|--------:|
+| `t5801-remote-helpers.sh` | 12.1s | 1.6s | **7.45×** |
+| `t9210-scalar.sh` | 8.5s | 1.5s | **5.63×** |
+| `t5502-quickfetch.sh` | 4.0s | 0.9s | **4.57×** |
+| `t7519-status-fsmonitor.sh` | 11.8s | 2.9s | **4.01×** |
+
+```sh
+# Re-run enrolled 891 scripts against sley (needs built git source tree)
+export GIT_SRC_DIR=/tmp/git-src
+export SLEY_BIN=$PWD/target/release/sley
+export SLEY_TESTS="$(scripts/extract-sley-tests-from-workflow.sh | tr '\n' ' ')"
+export SLEY_UPSTREAM_WAVES=8 SLEY_TEST_TIMEOUT=240
+crates/sley-testkit/scripts/run-upstream-tests-waves.sh
+
+# Same suite against real git (baseline): set SLEY_BIN to the git binary
+export SLEY_BIN=/tmp/git-src/git
+crates/sley-testkit/scripts/run-upstream-tests-waves.sh
+```
+
 ## Workspace layout
 
 | Area | Crates (selection) |
@@ -177,6 +230,7 @@ you change hot paths.
 | [`GOAL.md`](GOAL.md) | Long-term product goal |
 | [`GIT_PARITY_CHECKLIST.md`](GIT_PARITY_CHECKLIST.md) | Phase checklist including performance gates |
 | [`TRACKER.md`](TRACKER.md) | Living engineering tracker |
+| [`crates/sley-testkit/UPSTREAM_TIMINGS.md`](crates/sley-testkit/UPSTREAM_TIMINGS.md) | 891-script sley vs git timing baseline |
 | [`docs/adr/`](docs/adr/) | Architecture decisions |
 
 ## License
