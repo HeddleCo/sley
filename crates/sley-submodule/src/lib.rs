@@ -31,6 +31,7 @@
 
 pub mod config;
 pub mod move_head;
+pub mod operations;
 pub mod relative_url;
 pub mod update_strategy;
 
@@ -42,6 +43,10 @@ pub use config::{
 pub use move_head::{
     MoveHeadContext, MoveHeadFlags, MoveHeadVerdict, check_move_head, check_submodule_move_head,
     verify_clean_submodule,
+};
+pub use operations::{
+    ConfigMutation, InitCandidate, InitPlan, InitPlanError, InitRegistration, apply_init_plan,
+    plan_init,
 };
 pub use relative_url::{relative_url, resolve_relative_url};
 pub use update_strategy::determine_update_strategy;

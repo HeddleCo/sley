@@ -215,10 +215,7 @@ struct LineBlame {
     charge_seq: usize,
 }
 
-pub(crate) fn cmd_blame(
-    cli_session: &crate::session::CliSession,
-    args: &[String],
-) -> Result<()> {
+pub(crate) fn cmd_blame(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     run_blame(cli_session, args, false)
 }
 

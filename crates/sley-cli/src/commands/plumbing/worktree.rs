@@ -8,10 +8,7 @@ use super::add::{
     advise_on_updating_sparse_paths, normalize_add_absolute_path,
 };
 
-pub(crate) fn cmd_rm(
-    cli_session: &crate::session::CliSession,
-    args: &[String],
-) -> Result<()> {
+pub(crate) fn cmd_rm(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut paths = Vec::new();
     let mut recursive = false;
     let mut quiet = false;
@@ -173,10 +170,7 @@ pub(crate) fn cmd_rm(
     Ok(())
 }
 
-pub(crate) fn cmd_mv(
-    cli_session: &crate::session::CliSession,
-    args: &[String],
-) -> Result<()> {
+pub(crate) fn cmd_mv(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut paths = Vec::new();
     let mut force = false;
     let mut dry_run = false;

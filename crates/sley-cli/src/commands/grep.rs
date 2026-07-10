@@ -239,10 +239,7 @@ fn parse_grep_bool(value: Option<&str>) -> bool {
     }
 }
 
-pub(crate) fn cmd_grep(
-    cli_session: &crate::session::CliSession,
-    args: &[String],
-) -> Result<()> {
+pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut opts = GrepOptions::new();
     // `positionals` is the post-option token stream (pattern, revs, paths). A `--`
     // among them is preserved as the literal marker `\0DD\0` so the later rev/path

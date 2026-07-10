@@ -6350,10 +6350,7 @@ fn create_autostash(ctx: &Ctx, use_apply_backend: bool) -> Result<()> {
     if !dirty {
         return Ok(());
     }
-    let created = commands::stash::create_stash_for_autostash_at(
-        &ctx.git_dir,
-        &ctx.worktree_root,
-    )?;
+    let created = commands::stash::create_stash_for_autostash_at(&ctx.git_dir, &ctx.worktree_root)?;
     let Some(oid) = created else {
         eprintln!("fatal: Cannot autostash");
         return Err(GitError::Exit(128));
@@ -6421,10 +6418,8 @@ fn apply_save_autostash_text(ctx: &Ctx, text: &str, attempt_apply: bool) {
     let Ok(oid) = ObjectId::from_hex(ctx.format, &oid_text) else {
         return;
     };
-    let applied =
-        attempt_apply
-            && commands::stash::apply_stash_commit_quietly_at(&ctx.git_dir, &oid)
-                .unwrap_or(false);
+    let applied = attempt_apply
+        && commands::stash::apply_stash_commit_quietly_at(&ctx.git_dir, &oid).unwrap_or(false);
     if applied {
         eprintln!("Applied autostash.");
         return;

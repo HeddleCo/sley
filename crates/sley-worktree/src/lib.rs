@@ -36,6 +36,7 @@ use std::{env, fs};
 // the crate-root scope in via `use super::*` and is re-exported below so every
 // `sley_worktree::X` path (public API and intra-crate) resolves unchanged.
 // This is a pure code move: no function body was altered.
+pub mod admin;
 mod attributes;
 mod checkout;
 mod filter;

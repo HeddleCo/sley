@@ -160,10 +160,7 @@ enum ConfigOutcome {
 
 /// Read every value of the multi-valued config key from the effective config
 /// (system + global + repository + `-c`/`GIT_CONFIG_PARAMETERS` overrides).
-fn read_repo_paths(
-    cli_session: &crate::session::CliSession,
-    key: &str,
-) -> Result<ConfigOutcome> {
+fn read_repo_paths(cli_session: &crate::session::CliSession, key: &str) -> Result<ConfigOutcome> {
     let canonical = match sley_config::canonicalize_config_key(key) {
         Ok(canonical) => canonical,
         Err(_) => return Ok(ConfigOutcome::BadKey),

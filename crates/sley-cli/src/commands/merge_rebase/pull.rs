@@ -684,7 +684,7 @@ fn pull_checkout_into_void(
     Ok(())
 }
 
-pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     // git's `set_reflog_message`: record the pull invocation (`pull …`) as the
     // reflog action so a fast-forward merge writes `pull …: Fast-forward`. The
     // workspace forbids `std::env::set_var`, so the action is stashed in a
@@ -817,8 +817,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             }
         }
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
@@ -1075,7 +1074,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         // so a `--recurse-submodules` pull re-syncs a submodule worktree that an
         // earlier `--no-recurse-submodules` pull advanced the gitlink for without
         // checking out.
-        pull_update_submodules_after_merge(update_recurse_submodules, verbosity)?;
+        pull_update_submodules_after_merge(cli_session, update_recurse_submodules, verbosity)?;
         return Ok(());
     }
     let fast_forward = if merge_oids.len() == 1 {
@@ -1110,8 +1109,8 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             merge_args.push("--quiet".to_string());
         }
         merge_args.push("FETCH_HEAD".to_string());
-        cmd_merge(&merge_args)?;
-        pull_update_submodules_after_merge(update_recurse_submodules, verbosity)?;
+        cmd_merge(cli_session, &merge_args)?;
+        pull_update_submodules_after_merge(cli_session, update_recurse_submodules, verbosity)?;
         return Ok(());
     }
     if effective_rebase.enabled() {
@@ -1155,8 +1154,8 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     } else {
         merge_args.extend(merge_oids.iter().map(ToString::to_string));
     }
-    cmd_merge(&merge_args)?;
-    pull_update_submodules_after_merge(update_recurse_submodules, verbosity)?;
+    cmd_merge(cli_session, &merge_args)?;
+    pull_update_submodules_after_merge(cli_session, update_recurse_submodules, verbosity)?;
     Ok(())
 }
 
@@ -1167,7 +1166,11 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
 /// `--no-recurse-submodules` pull is brought back in sync on the next
 /// `--recurse-submodules` pull. Scoped to the merge paths; `pull --rebase`
 /// keeps its own (local-commit-preserving) submodule handling.
-fn pull_update_submodules_after_merge(recurse: bool, verbosity: i32) -> Result<()> {
+fn pull_update_submodules_after_merge(
+    cli_session: &crate::session::CliSession,
+    recurse: bool,
+    verbosity: i32,
+) -> Result<()> {
     if !recurse {
         return Ok(());
     }
@@ -1177,5 +1180,5 @@ fn pull_update_submodules_after_merge(recurse: bool, verbosity: i32) -> Result<(
     }
     args.push("update".to_string());
     args.push("--recursive".to_string());
-    commands::submodule::cmd_submodule(&args)
+    commands::submodule::cmd_submodule(cli_session, &args)
 }

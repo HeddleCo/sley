@@ -392,10 +392,10 @@ fn dispatch_command(
         "ls-tree" => commands::index::cmd_ls_tree(cli_session, &args[1..]),
         "log" => commands::log::cmd_log(&args[1..]),
         "whatchanged" => commands::log::cmd_whatchanged(&args[1..]),
-        "merge" => commands::merge_rebase::cmd_merge(&args[1..]),
+        "merge" => commands::merge_rebase::cmd_merge(cli_session, &args[1..]),
         "merge-base" => commands::merge_rebase::cmd_merge_base(cli_session, &args[1..]),
-        "merge-recursive" => commands::merge_rebase::cmd_merge_recursive(&args[1..]),
-        "fmt-merge-msg" => commands::merge_rebase::cmd_fmt_merge_msg(&args[1..]),
+        "merge-recursive" => commands::merge_rebase::cmd_merge_recursive(cli_session, &args[1..]),
+        "fmt-merge-msg" => commands::merge_rebase::cmd_fmt_merge_msg(cli_session, &args[1..]),
         "mergetool" => commands::mergetool::cmd_mergetool(cli_session, &args[1..]),
         "pull" => {
             // `-s`/`--strategy` pulls take a narrow dedicated path; the general
@@ -403,7 +403,7 @@ fn dispatch_command(
             if commands::pull_strategy::pull_has_strategy_option(&args[1..]) {
                 commands::pull_strategy::cmd_pull_with_strategy(cli_session, &args[1..])
             } else {
-                commands::merge_rebase::cmd_pull(&args[1..])
+                commands::merge_rebase::cmd_pull(cli_session, &args[1..])
             }
         }
         "replay" => commands::replay::cmd_replay(cli_session, &args[1..]),
@@ -443,17 +443,15 @@ fn dispatch_command(
         "show-index" => commands::utility::cmd_show_index(&args[1..]),
         "stripspace" => commands::utility::cmd_stripspace(&args[1..]),
         "stash" => commands::stash::cmd_stash(cli_session, &args[1..]),
-        "submodule" => commands::submodule::cmd_submodule(&args[1..]),
-        "submodule--helper" => commands::submodule::cmd_submodule_helper(&args[1..]),
+        "submodule" => commands::submodule::cmd_submodule(cli_session, &args[1..]),
+        "submodule--helper" => commands::submodule::cmd_submodule_helper(cli_session, &args[1..]),
         "symbolic-ref" => commands::refs::cmd_symbolic_ref(cli_session, &args[1..]),
         "status" => commands::status::cmd_status(cli_session, &args[1..]),
         "switch" => commands::checkout::cmd_switch(&args[1..]),
         "tag" => commands::tag::cmd_tag(cli_session, &args[1..]),
         "testkit" => commands::utility::cmd_testkit(&args[1..]),
         "unpack-file" => commands::utility::cmd_unpack_file(&args[1..]),
-        "update-server-info" => {
-            commands::refs::cmd_update_server_info(cli_session, &args[1..])
-        }
+        "update-server-info" => commands::refs::cmd_update_server_info(cli_session, &args[1..]),
         "var" => commands::utility::cmd_var(&args[1..]),
         "verify-pack" => commands::pack::cmd_verify_pack(&args[1..]),
         "version" => commands::utility::cmd_version(&args[1..]),

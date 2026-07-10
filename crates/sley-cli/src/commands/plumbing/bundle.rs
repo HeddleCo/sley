@@ -2,10 +2,7 @@
 
 use crate::*;
 
-pub(crate) fn cmd_bundle(
-    cli_session: &crate::session::CliSession,
-    args: &[String],
-) -> Result<()> {
+pub(crate) fn cmd_bundle(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let Some(subcommand) = args.first().map(String::as_str) else {
         print_bundle_usage();
         return Err(GitError::Exit(129));

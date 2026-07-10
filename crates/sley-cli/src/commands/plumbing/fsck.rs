@@ -7,10 +7,7 @@ use sley::plumbing::{
 
 use super::commit_graph::{OpenResult, open_commit_graph_bytes, verify_commit_graph_bytes};
 
-pub(crate) fn cmd_fsck(
-    cli_session: &crate::session::CliSession,
-    args: &[String],
-) -> Result<()> {
+pub(crate) fn cmd_fsck(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut progress = true;
     let mut report_dangling = true;
     let mut report_unreachable = false;

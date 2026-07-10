@@ -41,10 +41,7 @@ pub(super) enum ReplaceListFormat {
     Long,
 }
 
-pub(crate) fn cmd_replace(
-    cli_session: &crate::session::CliSession,
-    args: &[String],
-) -> Result<()> {
+pub(crate) fn cmd_replace(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let options = setup_replace_options(args)?;
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;

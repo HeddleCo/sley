@@ -91,17 +91,11 @@ pub(crate) fn cmd_cherry_pick(
     run_replay(cli_session, ReplayAction::Pick, args)
 }
 
-pub(crate) fn cmd_revert(
-    cli_session: &crate::session::CliSession,
-    args: &[String],
-) -> Result<()> {
+pub(crate) fn cmd_revert(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     run_replay(cli_session, ReplayAction::Revert, args)
 }
 
-pub(crate) fn cmd_replay(
-    cli_session: &crate::session::CliSession,
-    args: &[String],
-) -> Result<()> {
+pub(crate) fn cmd_replay(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     run_git_replay(cli_session, args)
 }
 

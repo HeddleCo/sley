@@ -183,17 +183,10 @@ where
         scan_options.untracked_mode = StatusUntrackedMode::All;
     }
     let mut entries = Vec::new();
-    stream_short_status_with_database(
-        worktree_root,
-        git_dir,
-        format,
-        db,
-        scan_options,
-        |row| {
-            entries.push(row.to_owned_entry());
-            Ok(StreamControl::Continue)
-        },
-    )?;
+    stream_short_status_with_database(worktree_root, git_dir, format, db, scan_options, |row| {
+        entries.push(row.to_owned_entry());
+        Ok(StreamControl::Continue)
+    })?;
     if options.path_filter_active {
         entries.retain(|entry| path_matches(&entry.path));
     }

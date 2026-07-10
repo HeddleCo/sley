@@ -379,10 +379,7 @@ const CHECK_RULES_HELP: &str = "usage: git sparse-checkout check-rules [-z] [--s
 /// input and output are NUL-delimited and input paths are taken verbatim;
 /// otherwise a leading-`"` line is C-unquoted on input and any matching path is
 /// re-quoted with git's `quote_c_style` on output.
-fn cmd_sparse_check_rules(
-    cli_session: &crate::session::CliSession,
-    args: &[String],
-) -> Result<()> {
+fn cmd_sparse_check_rules(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut cone = ConeFlag::Unset;
     let mut null_terminated = false;
     let mut rules_file: Option<String> = None;

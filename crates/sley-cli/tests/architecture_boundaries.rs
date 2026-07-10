@@ -9,12 +9,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAX_DIRECT_ODB_OPENINGS: usize = 196;
-const MAX_DIRECT_REF_STORE_OPENINGS: usize = 201;
+const MAX_DIRECT_ODB_OPENINGS: usize = 188;
+const MAX_DIRECT_REF_STORE_OPENINGS: usize = 194;
 const MAX_REPOSITORY_CONTEXT_DISCOVERIES: usize = 2;
 const MAX_COMPAT_SESSION_READS: usize = 13;
-const MAX_COMPAT_GIT_DIR_DISCOVERIES: usize = 19;
-const MAX_COMPAT_GIT_DIR_FROM_DISCOVERIES: usize = 76;
+const MAX_COMPAT_GIT_DIR_DISCOVERIES: usize = 18;
+const MAX_COMPAT_GIT_DIR_FROM_DISCOVERIES: usize = 42;
 
 const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
     "attrs.rs",
@@ -43,6 +43,8 @@ const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
     "merge_file.rs",
     "merge_tree.rs",
     "merge_rebase/merge_base.rs",
+    "merge_rebase/merge.rs",
+    "merge_rebase/pull.rs",
     "mergetool.rs",
     "mktag.rs",
     "name_rev.rs",
@@ -65,6 +67,7 @@ const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
     "shortlog.rs",
     "sparse_checkout.rs",
     "stash.rs",
+    "submodule.rs",
     "tag.rs",
     "trees.rs",
     "verify_commit.rs",

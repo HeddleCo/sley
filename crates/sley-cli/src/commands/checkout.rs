@@ -2301,10 +2301,7 @@ fn checkout_merge_autostash_branch_switch(
         return Ok(());
     }
 
-    let stash_oid = match commands::stash::create_stash_for_autostash_at(
-        git_dir,
-        worktree_root,
-    )? {
+    let stash_oid = match commands::stash::create_stash_for_autostash_at(git_dir, worktree_root)? {
         Some(oid) => oid,
         None => {
             eprintln!("fatal: Cannot autostash");

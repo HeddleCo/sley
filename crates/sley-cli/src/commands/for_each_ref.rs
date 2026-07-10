@@ -62,11 +62,7 @@ fn print_for_each_ref_usage(usage_cmd: &str) {
 /// The shared core of `git for-each-ref` and its clone `git refs list` (see
 /// builtin/refs.c::cmd_refs_list, which calls for_each_ref_core). The only
 /// per-command difference is the program name printed in the `-h` usage banner.
-pub(crate) fn for_each_ref_core(
-    git_dir: &Path,
-    args: &[String],
-    usage_cmd: &str,
-) -> Result<()> {
+pub(crate) fn for_each_ref_core(git_dir: &Path, args: &[String], usage_cmd: &str) -> Result<()> {
     let git_dir = git_dir.to_path_buf();
     let mut format_spec = "%(objectname) %(objecttype)\t%(refname)".to_string();
     let mut count = None;

@@ -14,10 +14,7 @@ usage: git reset [--mixed | --soft | --hard | --merge | --keep] [-q] [<commit>]
    or: git reset --patch [<tree-ish>] [--] [<pathspec>...]
 ";
 
-pub(crate) fn cmd_reset(
-    cli_session: &crate::session::CliSession,
-    args: &[String],
-) -> Result<()> {
+pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut positionals = Vec::new();
     let mut quiet = false;
     let mut recurse_submodules = None;
@@ -186,13 +183,13 @@ pub(crate) fn cmd_reset(
             ..commands::add_patch::PatchConfig::default()
         };
         cfg.reset_interactive = sley_config::read_repo_config(&cli_session.git_dir()?, None)
-                .ok()
-                .and_then(|config| {
-                    config
-                        .get("interactive", None, "reset")
-                        .map(ToString::to_string)
-                })
-                .unwrap_or_default();
+            .ok()
+            .and_then(|config| {
+                config
+                    .get("interactive", None, "reset")
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_default();
         return commands::add_patch::run_add_patch(
             commands::add_patch::PatchMode::Reset,
             &positionals,

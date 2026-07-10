@@ -99,7 +99,7 @@ fn load_credential_config_stack(
                 true,
                 &context,
             );
-            }
+        }
     }
     if let Ok(parameters) = injected_config_parameters() {
         let _ = stack.push_parameters_with_includes(&parameters, &context);

@@ -3,10 +3,7 @@
 use crate::*;
 use sley::plumbing::{sley_core, sley_index, sley_worktree};
 
-pub(crate) fn cmd_clean(
-    cli_session: &crate::session::CliSession,
-    args: &[String],
-) -> Result<()> {
+pub(crate) fn cmd_clean(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut dry_run = false;
     let mut force_count = 0u8;
     let mut force_was_mentioned = false;

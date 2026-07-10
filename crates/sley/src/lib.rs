@@ -1197,7 +1197,8 @@ fn resolve_git_dir(path: &Path) -> Result<PathBuf> {
 /// True if `path` looks like a git directory (has a `HEAD` file and either an
 /// `objects` directory or a `commondir` pointer).
 fn is_git_dir(path: &Path) -> bool {
-    path.join("HEAD").is_file()
+    std::fs::symlink_metadata(path.join("HEAD"))
+        .is_ok_and(|metadata| metadata.is_file() || metadata.file_type().is_symlink())
         && (path.join("objects").is_dir() || path.join("commondir").is_file())
 }
 
@@ -1260,6 +1261,20 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_worktree_git_dir_accepts_symbolic_ref_head_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let git_dir = temp.path().join("worktrees").join("linked");
+        fs::create_dir_all(&git_dir).expect("create linked worktree git dir");
+        fs::write(git_dir.join("commondir"), b"../..\n").expect("write commondir");
+        symlink("refs/heads/main", git_dir.join("HEAD")).expect("create symbolic-ref HEAD");
+
+        assert!(is_git_dir(&git_dir));
+    }
 
     /// A temporary directory that cleans itself up on drop.
     struct TempDir {

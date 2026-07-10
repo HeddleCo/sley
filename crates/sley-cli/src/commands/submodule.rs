@@ -442,15 +442,7 @@ fn cmd_submodule_update(
             }
             continue;
         };
-        match update_one_submodule(
-            &cwd,
-            &git_dir,
-            &worktree_root,
-            &config,
-            submodule,
-            &target_oid,
-            &options,
-        )? {
+        match update_one_submodule(&context, &config, submodule, &target_oid, &options)? {
             UpdateOutcome::Done => {}
             UpdateOutcome::NonFatalCheckoutError(err) => {
                 if first_error.is_none() {
@@ -480,17 +472,19 @@ enum UpdateOutcome {
 /// the whole class shares one strategy resolver + one dispatch.
 #[allow(clippy::too_many_arguments)]
 fn update_one_submodule(
-    cwd: &Path,
-    git_dir: &Path,
-    worktree_root: &Path,
+    context: &SuperprojectContext,
     config: &GitConfig,
     submodule: &SubmoduleConfigEntry,
     target_oid: &ObjectId,
     options: &SubmoduleUpdateOptions<'_>,
 ) -> Result<UpdateOutcome> {
-    let display =
-        submodule_displaypath(cwd, worktree_root, &submodule.path, &options.super_prefix)?;
-    let path = worktree_root.join(&submodule.path);
+    let display = submodule_displaypath(
+        &context.cwd,
+        &context.worktree_root,
+        &submodule.path,
+        &options.super_prefix,
+    )?;
+    let path = context.worktree_root.join(&submodule.path);
 
     // git's `prepare_to_clone_next_submodule`: an update=none submodule (from
     // .git/config OR .gitmodules) is skipped BEFORE the initialized check, with
@@ -531,7 +525,7 @@ fn update_one_submodule(
             submodule
                 .url
                 .as_deref()
-                .map(|url| resolve_submodule_init_url(worktree_root, config, url))
+                .map(|url| resolve_submodule_init_url(&context.worktree_root, config, url))
         });
     let Some(url) = url.filter(|url| !url.is_empty()) else {
         eprintln!(
@@ -541,14 +535,14 @@ fn update_one_submodule(
         return Err(GitError::Exit(128));
     };
 
-    if submodule_path_contains_symlink(worktree_root, &submodule.path)? {
+    if submodule_path_contains_symlink(&context.worktree_root, &submodule.path)? {
         eprintln!("fatal: refusing to update submodule path '{display}' through a symlink");
         return Err(GitError::Exit(128));
     }
 
     let just_populated = submodule_head(&path).is_err();
     if just_populated {
-        populate_submodule_worktree(git_dir, submodule, &path, &url, options)?;
+        populate_submodule_worktree(&context.git_dir, submodule, &path, &url, options)?;
     }
 
     // Resolve the effective update strategy via the single resolver. The typed
@@ -584,6 +578,7 @@ fn update_one_submodule(
     // `refs/remotes/<remote>/<branch>`.
     let target_oid = if options.remote {
         remote_target_oid(
+            context,
             &path,
             &sub_git_dir,
             sub_format,
@@ -785,6 +780,7 @@ fn propagate_submodule_alternate_config(
 /// (config override > `.gitmodules` branch > `HEAD`, with `.` = superproject's
 /// current branch) then `refs/remotes/<remote>/<branch>`.
 fn remote_target_oid(
+    context: &SuperprojectContext,
     path: &Path,
     sub_git_dir: &Path,
     sub_format: ObjectFormat,
@@ -794,7 +790,7 @@ fn remote_target_oid(
     display: &str,
 ) -> Result<ObjectId> {
     let remote = submodule_default_remote(sub_git_dir, sub_format)?;
-    let branch = resolve_remote_branch(config, submodule)?;
+    let branch = resolve_remote_branch(context, config, submodule)?;
     let remote_ref = format!("refs/remotes/{remote}/{branch}");
 
     if !options.nofetch {
@@ -834,11 +830,15 @@ fn self_sley_fetch(path: &Path, remote: &str) -> Result<std::process::ExitStatus
 /// git's `remote_submodule_branch`: `submodule.<name>.branch` from
 /// `.git/config`, falling back to the `.gitmodules` branch, then `HEAD`. A `.`
 /// value means "inherit the superproject's current branch".
-fn resolve_remote_branch(config: &GitConfig, submodule: &SubmoduleConfigEntry) -> Result<String> {
+fn resolve_remote_branch(
+    context: &SuperprojectContext,
+    config: &GitConfig,
+    submodule: &SubmoduleConfigEntry,
+) -> Result<String> {
     let branch = config
         .get("submodule", Some(&submodule.name), "branch")
         .map(str::to_string)
-        .or_else(|| submodule_gitmodules_branch(submodule));
+        .or_else(|| submodule_gitmodules_branch(context, submodule));
     let Some(branch) = branch else {
         return Ok("HEAD".to_string());
     };
@@ -846,10 +846,7 @@ fn resolve_remote_branch(config: &GitConfig, submodule: &SubmoduleConfigEntry) -
         return Ok(branch);
     }
     // `.` inherits the superproject's current branch.
-    let cwd = env::current_dir()?;
-    let super_git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let super_format = repository_object_format(&super_git_dir)?;
-    let store = FileRefStore::new(&super_git_dir, super_format);
+    let store = context.repo.references();
     if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")? {
         if let Some(name) = target.strip_prefix("refs/heads/") {
             return Ok(name.to_string());
@@ -864,11 +861,13 @@ fn resolve_remote_branch(config: &GitConfig, submodule: &SubmoduleConfigEntry) -
 
 /// Read the `.gitmodules` `branch` value for a submodule (the typed config
 /// reader does not surface it, so re-read it here).
-fn submodule_gitmodules_branch(submodule: &SubmoduleConfigEntry) -> Option<String> {
-    let cwd = env::current_dir().ok()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd).ok()?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir).ok()?;
-    let gitmodules = read_gitmodules_config(&worktree_root).ok().flatten()?;
+fn submodule_gitmodules_branch(
+    context: &SuperprojectContext,
+    submodule: &SubmoduleConfigEntry,
+) -> Option<String> {
+    let gitmodules = read_gitmodules_config(&context.worktree_root)
+        .ok()
+        .flatten()?;
     gitmodules
         .get("submodule", Some(&submodule.name), "branch")
         .map(str::to_string)
@@ -1335,63 +1334,40 @@ fn cmd_submodule_init(
     if paths.is_empty() && has_global_submodule_active(&config) {
         selected.retain(|submodule| submodule_is_active(&config, submodule));
     }
-    let mut changed = false;
-    for submodule in selected {
-        // git's `init_submodule` copies the url and the update setting in two
-        // INDEPENDENT guards — each is copied only when not already present in
-        // `.git/config`. (The old single-guard form skipped the update copy for
-        // an already-url-registered submodule; t7406 #29/#30/#35 re-init after
-        // editing `.gitmodules update`.)
-        // git's `init_submodule` sets the active flag in an INDEPENDENT guard:
-        // any submodule not already active (via `submodule.<name>.active` or the
-        // `submodule.active` pathspec) gets `submodule.<name>.active=true`, even
-        // when its url is already registered. (sley previously nested this in
-        // the url-copy guard, so a url-registered-but-inactive submodule — e.g.
-        // one excluded from a `clone --recurse-submodules=<pathspec>` — never
-        // got its active flag, breaking the `submodule.<name>.active` query and
-        // the active+no-url `submodule update` guard.)
-        if !submodule_is_active(&config, submodule) {
-            set_submodule_config_value(&mut config, &submodule.name, "active", "true");
-            changed = true;
+    let candidates = selected
+        .iter()
+        .map(|submodule| sley_submodule::InitCandidate {
+            name: submodule.name.clone(),
+            path: submodule.path.clone(),
+            url: submodule.url.clone(),
+            update: submodule.update.clone(),
+            currently_active: submodule_is_active(&config, submodule),
+        })
+        .collect::<Vec<_>>();
+    let plan = sley_submodule::plan_init(&config, &candidates, |url| {
+        resolve_submodule_init_url(worktree_root, &config, url)
+    });
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(sley_submodule::InitPlanError::MissingUrl { path }) => {
+            let display = submodule_displaypath(cwd, worktree_root, &path, &super_prefix)?;
+            eprintln!("fatal: No url found for submodule path '{display}' in .gitmodules");
+            return Err(GitError::Exit(128));
         }
-        if config
-            .get("submodule", Some(&submodule.name), "url")
-            .is_none()
-        {
-            let Some(url) = &submodule.url else {
-                let display =
-                    submodule_displaypath(&cwd, &worktree_root, &submodule.path, &super_prefix)?;
-                eprintln!("fatal: No url found for submodule path '{display}' in .gitmodules");
-                return Err(GitError::Exit(128));
-            };
-            let url = resolve_submodule_init_url(&worktree_root, &config, url);
-            set_submodule_config_value(&mut config, &submodule.name, "url", &url);
-            if !quiet {
-                let display =
-                    submodule_displaypath(&cwd, &worktree_root, &submodule.path, &super_prefix)?;
-                eprintln!(
-                    "Submodule '{}' ({}) registered for path '{}'",
-                    submodule.name, url, display
-                );
-            }
-            changed = true;
-        }
-
-        // Copy the `update` setting when unset. A `!command` from `.gitmodules`
-        // never reaches here (read_submodule_configs already fatal'd on it), so
-        // `submodule.update` only holds checkout/merge/rebase/none — copy it
-        // verbatim, matching git's `submodule_update_type_to_string` path.
-        if config
-            .get("submodule", Some(&submodule.name), "update")
-            .is_none()
-            && let Some(update) = &submodule.update
-        {
-            set_submodule_config_value(&mut config, &submodule.name, "update", update);
-            changed = true;
+    };
+    if !quiet {
+        for registration in &plan.registrations {
+            let display =
+                submodule_displaypath(cwd, worktree_root, &registration.path, &super_prefix)?;
+            eprintln!(
+                "Submodule '{}' ({}) registered for path '{}'",
+                registration.name, registration.url, display
+            );
         }
     }
-    if changed {
-        write_repo_config(&git_dir, &config)?;
+    if plan.changed() {
+        sley_submodule::apply_init_plan(&mut config, &plan);
+        write_repo_config(git_dir, &config)?;
     }
     Ok(())
 }
@@ -3278,7 +3254,7 @@ fn read_gitmodules_config(worktree_root: &Path) -> Result<Option<GitConfig>> {
         Err(_) => {}
     }
 
-    let Ok(git_dir) = crate::session::cli_git_dir_from(worktree_root) else {
+    let Some(git_dir) = worktree_git_dir(worktree_root) else {
         return Ok(None);
     };
     let Ok(format) = repository_object_format(&git_dir) else {
@@ -3762,9 +3738,12 @@ fn display_submodule_ref(name: &str) -> String {
 /// `git submodule--helper <subcommand>`: the plumbing entry point git's porcelain
 /// shells out to. Only the subcommands the upstream test-suite exercises directly
 /// are wired here; the porcelain verbs go through `cmd_submodule`.
-pub(crate) fn cmd_submodule_helper(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_submodule_helper(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     match args.first().map(String::as_str) {
-        Some("get-default-remote") => submodule_helper_get_default_remote(&args[1..]),
+        Some("get-default-remote") => submodule_helper_get_default_remote(cli_session, &args[1..]),
         Some(other) => {
             eprintln!("fatal: '{other}' is not a valid submodule--helper subcommand");
             Err(GitError::Exit(1))
@@ -3781,7 +3760,10 @@ pub(crate) fn cmd_submodule_helper(args: &[String]) -> Result<()> {
 /// url-first — a remote whose configured url matches the submodule's (relative-
 /// resolved) `.gitmodules` url wins — then falls back to `repo_default_remote`
 /// (the HEAD branch's remote, else the sole remote, else "origin").
-fn submodule_helper_get_default_remote(args: &[String]) -> Result<()> {
+fn submodule_helper_get_default_remote(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     const USAGE: &str = "usage: git submodule--helper get-default-remote <path>";
     let mut paths = Vec::new();
     let mut end_opts = false;
@@ -3806,9 +3788,10 @@ fn submodule_helper_get_default_remote(args: &[String]) -> Result<()> {
     }
     let path_arg = &paths[0];
 
-    let cwd = env::current_dir()?;
-    let super_git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&super_git_dir)?;
+    let context = SuperprojectContext::open(cli_session)?;
+    let cwd = &context.cwd;
+    let super_git_dir = &context.git_dir;
+    let worktree_root = &context.worktree_root;
 
     // git prepends the `prefix` (cwd relative to the worktree root) to a
     // relative path; `cwd.join(path_arg)` reaches the same worktree location.
@@ -3823,7 +3806,7 @@ fn submodule_helper_get_default_remote(args: &[String]) -> Result<()> {
     // superproject's `modules/<name>` git dir for a configured-but-unpopulated
     // submodule. Either failure is git's "could not get a repository handle".
     let sub_git_dir = resolve_submodule_repo_gitdir(&abs_path)
-        .or_else(|| modules_gitdir_for_worktree_path(&worktree_root, &super_git_dir, &abs_path));
+        .or_else(|| modules_gitdir_for_worktree_path(worktree_root, super_git_dir, &abs_path));
     let Some(sub_git_dir) = sub_git_dir else {
         eprintln!("fatal: could not get a repository handle for submodule '{path_arg}'");
         return Err(GitError::Exit(128));
@@ -3831,8 +3814,8 @@ fn submodule_helper_get_default_remote(args: &[String]) -> Result<()> {
     let sub_format = repository_object_format(&sub_git_dir)?;
     let sub_config = read_repo_config(&sub_git_dir)?;
     let remote_name = submodule_default_remote_name(
-        &worktree_root,
-        &super_git_dir,
+        worktree_root,
+        super_git_dir,
         &abs_path,
         &sub_git_dir,
         sub_format,

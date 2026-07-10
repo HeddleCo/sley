@@ -340,8 +340,8 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "-m", "one", "-m"],
             vec!["commit", "-t"],
         ] {
-            let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
+            let expected = run_output_with_identity(sley_testkit::oracle_git(), &root, &args);
+            let actual = run_output_with_identity(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
         let args = vec!["commit", "--cleanup=bad", "-m", "subject"];
@@ -514,8 +514,8 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "--amend=value", "-m", "subject"],
             vec!["commit", "--no-amend=value", "-m", "subject"],
         ] {
-            let expected = run_output(sley_testkit::oracle_git(), &root, &args);
-            let actual = run_output(sley_testkit::sley_bin!(), &root, &args);
+            let expected = run_output_with_identity(sley_testkit::oracle_git(), &root, &args);
+            let actual = run_output_with_identity(sley_testkit::sley_bin!(), &root, &args);
             assert_same_output(actual, expected, &args);
         }
     };

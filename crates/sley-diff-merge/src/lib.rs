@@ -6,6 +6,7 @@ mod line_diff;
 mod merge_trees;
 mod name;
 mod name_status;
+mod orchestration;
 mod patch;
 pub mod porcelain;
 pub mod range;
@@ -19,6 +20,7 @@ pub use format::*;
 pub use line_diff::*;
 pub use merge_trees::*;
 pub use name_status::*;
+pub use orchestration::*;
 pub use patch::*;
 
 #[cfg(test)]
