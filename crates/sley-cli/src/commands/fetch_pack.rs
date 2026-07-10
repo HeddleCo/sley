@@ -6,7 +6,7 @@
 //! per fetched ref. `--diag-url` is a faithful port of `connect.c`'s
 //! `parse_connect_url` diagnostics and never connects.
 
-use crate::commands::remote::ls_remote_git_dir;
+use crate::commands::remote::{RemoteCommandContext, ls_remote_git_dir};
 use crate::*;
 use sley::plumbing::sley_remote::{apply_shallow_info, compute_local_deepen, read_shallow};
 
@@ -131,7 +131,8 @@ pub(crate) fn cmd_fetch_pack(
 
     // Upstream fetch-pack is RUN_SETUP: repository discovery precedes
     // everything, including --diag-url.
-    let git_dir = cli_session.git_dir()?;
+    let remote_context = RemoteCommandContext::require_repository(cli_session)?;
+    let git_dir = remote_context.required_git_dir()?.to_path_buf();
     let format = repository_object_format(&git_dir)?;
 
     if flags.diag_url {
@@ -153,7 +154,7 @@ pub(crate) fn cmd_fetch_pack(
         }
     }
 
-    let remote_git_dir = ls_remote_git_dir(&dest)?;
+    let remote_git_dir = ls_remote_git_dir(&remote_context, &dest)?;
     let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
     let remote_format = repository_object_format(&remote_common_git_dir)?;
     if remote_format != format {

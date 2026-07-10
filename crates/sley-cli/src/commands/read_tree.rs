@@ -894,31 +894,16 @@ pub(crate) fn checkout_two_way_engine(
     recurse_submodules: bool,
     overwrite_untracked: bool,
 ) -> Result<()> {
-    use sley_unpack_trees::{MergeFn, UnpackTreesOptions, check_updates, unpack_trees};
-
     let previous_index = sley_worktree::read_repository_index(git_dir, format)?;
     let index = sley_worktree::read_current_unpack_index(git_dir, format)?;
 
     // git's `merge_working_tree`: `trees[0]` = the tree of the HEAD being left
     // (empty when HEAD is unborn), `trees[1]` = the tree being checked out.
     let old_leaves = match old_tree {
-        Some(oid) => sley_diff_merge::flatten_tree(db, format, oid)?,
-        None => sley_unpack_trees::FlatTree::new(),
+        Some(oid) => Some(sley_diff_merge::flatten_tree(db, format, oid)?),
+        None => None,
     };
     let new_leaves = sley_diff_merge::flatten_tree(db, format, new_tree)?;
-    let trees = vec![old_leaves, new_leaves];
-
-    let mut opts = UnpackTreesOptions::new(format);
-    opts.merge = true;
-    opts.update = true;
-    // `init_topts`: `o.initial_checkout = is_index_unborn(...)`. An unborn (empty)
-    // index has no staged deletion to honour, so twoway_merge takes a path from
-    // the new tree rather than its "deletion was staged" arm dropping it.
-    opts.initial_checkout = index.is_empty();
-    opts.index_only = false;
-    if overwrite_untracked {
-        opts.reset = sley_unpack_trees::ResetType::OverwriteUntracked;
-    }
 
     let mut wt = ReadTreeWorktree {
         submodules: load_superproject_submodules(worktree_root),
@@ -939,9 +924,12 @@ pub(crate) fn checkout_two_way_engine(
     // the first rejection (before `check_updates` touches the worktree), so a
     // failed checkout leaves the working tree exactly as it was — matching git's
     // "Aborting" guarantee.
-    let mut result = unpack_trees(&index, &trees, MergeFn::TwoWay, &opts, &wt)?;
-    refuse_if_unpack_result_removes_current_directory(worktree_root, &result)?;
-    check_updates(&mut result, &opts, &mut wt)?;
+    let mut options = sley_unpack_trees::CheckoutTransitionOptions::new(format);
+    options.overwrite_untracked = overwrite_untracked;
+    let plan =
+        sley_unpack_trees::plan_checkout_transition(&index, old_leaves, new_leaves, options, &wt)?;
+    refuse_if_unpack_result_removes_current_directory(worktree_root, plan.result())?;
+    let result = plan.apply(&mut wt)?;
 
     // Serialize the merged index. check_updates folded the post-write `lstat`
     // back into each freshly-written entry, so the stat info is accurate.
@@ -1706,7 +1694,8 @@ fn clone_submodule_for_checkout(
         resolved,
         sub_root.display().to_string(),
     ];
-    super::remote::cmd_clone(&args)?;
+    let clone_session = crate::session::CliSession::isolated_child(worktree_root.to_path_buf());
+    super::remote::cmd_clone(&clone_session, &args)?;
     connect_submodule_worktree(sub_root, sub_git_dir)?;
     Ok(())
 }

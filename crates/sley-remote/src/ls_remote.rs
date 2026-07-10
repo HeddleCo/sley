@@ -77,6 +77,21 @@ pub struct LsRemoteRecord {
     pub symref: Option<String>,
 }
 
+/// Fully resolved inputs for an advertisement listing.
+pub struct LsRemoteRequest<'a> {
+    pub source: &'a LsRemoteSource,
+    pub format: ObjectFormat,
+    pub filter: &'a LsRemoteFilter,
+    pub config: Option<&'a GitConfig>,
+}
+
+/// Structured advertisement result for embedders.
+#[derive(Debug, Clone)]
+pub struct LsRemoteOutcome {
+    pub records: Vec<LsRemoteRecord>,
+    pub format: ObjectFormat,
+}
+
 /// List the advertised refs for a resolved `source`.
 ///
 /// Performs the work the CLI's `ls_remote_http_records` and inline local
@@ -100,9 +115,34 @@ pub fn ls_remote(
     #[cfg_attr(not(feature = "http"), allow(unused_variables))]
     credentials: &mut dyn CredentialProvider,
 ) -> Result<(Vec<LsRemoteRecord>, ObjectFormat)> {
+    let outcome = ls_remote_with(
+        LsRemoteRequest {
+            source,
+            format,
+            filter,
+            config,
+        },
+        matches,
+        credentials,
+    )?;
+    Ok((outcome.records, outcome.format))
+}
+
+/// List advertisements using typed request/outcome values.
+pub fn ls_remote_with(
+    request: LsRemoteRequest<'_>,
+    matches: &dyn Fn(&str) -> bool,
+    credentials: &mut dyn CredentialProvider,
+) -> Result<LsRemoteOutcome> {
+    let LsRemoteRequest {
+        source,
+        format,
+        filter,
+        config,
+    } = request;
     crate::protocol::check_transport_allowed(scheme_for_ls_remote_source(source), config, None)
         .map_err(crate::protocol::transport_policy_git_error)?;
-    match source {
+    let (records, format) = match source {
         #[cfg(feature = "http")]
         LsRemoteSource::Http(remote) => {
             ls_remote_http(remote, format, filter, matches, credentials, config)
@@ -122,7 +162,8 @@ pub fn ls_remote(
         LsRemoteSource::Local { git_dir } => {
             ls_remote_local(git_dir, format, filter, matches, config)
         }
-    }
+    }?;
+    Ok(LsRemoteOutcome { records, format })
 }
 
 fn scheme_for_ls_remote_source(source: &LsRemoteSource) -> &'static str {

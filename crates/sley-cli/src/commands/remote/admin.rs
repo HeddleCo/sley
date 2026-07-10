@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 
 pub(crate) struct RemoteCommandContext {
+    session: crate::session::CliSession,
     git_dir: PathBuf,
     format: ObjectFormat,
     refs: FileRefStore,
@@ -32,6 +33,7 @@ impl RemoteCommandContext {
         let format = repository_object_format(&git_dir)?;
         let refs = FileRefStore::new(&git_dir, format);
         Ok(Self {
+            session: cli_session.clone(),
             git_dir,
             format,
             refs,
@@ -48,6 +50,14 @@ impl RemoteCommandContext {
 
     fn refs(&self) -> &FileRefStore {
         &self.refs
+    }
+
+    fn session(&self) -> &crate::session::CliSession {
+        &self.session
+    }
+
+    fn cwd(&self) -> &Path {
+        self.session.cwd()
     }
 }
 
@@ -302,9 +312,10 @@ pub(crate) fn cmd_remote_add(context: &RemoteCommandContext, args: &[String]) ->
     // the remote (builtin/remote.c `add()`), so the tracking refs exist before
     // `-m`'s master HEAD is set.
     if outcome.fetch {
-        cmd_fetch(&[name.to_string()])?;
+        cmd_fetch(context.session(), &[name.to_string()])?;
         if matches!(mirror, RemoteAddMirror::Fetch | RemoteAddMirror::Both)
-            && let Ok(branch) = discover_local_remote_head_branch(&config, name, git_dir)
+            && let Ok(branch) =
+                discover_local_remote_head_branch(&config, name, git_dir, context.cwd())
         {
             let mut tx = context.refs().transaction();
             tx.update(RefUpdate {
@@ -500,7 +511,7 @@ pub(crate) fn cmd_remote_update(
             fetch_args.push("-v".to_string());
         }
         fetch_args.push(remote);
-        cmd_fetch(&fetch_args)?;
+        cmd_fetch(context.session(), &fetch_args)?;
     }
     Ok(())
 }
@@ -535,7 +546,15 @@ pub(crate) fn cmd_remote_prune(context: &RemoteCommandContext, args: &[String]) 
     let mut stdout = io::stdout();
     for name in names {
         validate_remote_name(name)?;
-        prune_remote_tracking_refs(&mut stdout, &config, store, git_dir, name, dry_run)?;
+        prune_remote_tracking_refs(
+            &mut stdout,
+            &config,
+            store,
+            git_dir,
+            context.cwd(),
+            name,
+            dry_run,
+        )?;
     }
     Ok(())
 }
@@ -755,10 +774,11 @@ fn prune_remote_tracking_refs(
     config: &GitConfig,
     store: &FileRefStore,
     git_dir: &Path,
+    cwd: &Path,
     remote: &str,
     dry_run: bool,
 ) -> Result<()> {
-    let remote_git_dir = local_remote_git_dir(config, remote, git_dir)?;
+    let remote_git_dir = local_remote_git_dir(config, remote, git_dir, cwd)?;
     let remote_format = repository_object_format(&remote_git_dir)?;
     let remote_store = FileRefStore::new(&remote_git_dir, remote_format);
     let remote_refs = remote_store.list_refs()?;
@@ -934,7 +954,8 @@ pub(crate) fn cmd_remote_set_head(context: &RemoteCommandContext, args: &[String
         return sley_remote::apply_remote_head(store, &sley_remote::RemoteHeadPlan::delete(name));
     }
     if action == RemoteSetHeadAction::Auto {
-        let branch = match discover_local_remote_head_branch(&config, name, git_dir) {
+        let branch = match discover_local_remote_head_branch(&config, name, git_dir, context.cwd())
+        {
             Ok(branch) => branch,
             Err(_) => {
                 eprintln!("error: Cannot determine remote HEAD");
@@ -1040,8 +1061,9 @@ fn discover_local_remote_head_branch(
     config: &GitConfig,
     name: &str,
     git_dir: &Path,
+    cwd: &Path,
 ) -> Result<String> {
-    let remote_git_dir = local_remote_git_dir(config, name, git_dir)?;
+    let remote_git_dir = local_remote_git_dir(config, name, git_dir, cwd)?;
     let remote_format = repository_object_format(&remote_git_dir)?;
     let remote_store = FileRefStore::new(&remote_git_dir, remote_format);
     match remote_store.read_ref("HEAD")? {
@@ -1185,7 +1207,7 @@ pub(crate) fn cmd_remote_show(context: &RemoteCommandContext, args: &[String]) -
         if no_query {
             write_remote_show_no_query(&mut stdout, &config, &refs, name)?;
         } else {
-            write_remote_show_query(&mut stdout, &config, &refs, name, git_dir)?;
+            write_remote_show_query(&mut stdout, &config, &refs, name, git_dir, context.cwd())?;
         }
     }
     Ok(())
@@ -1197,11 +1219,12 @@ fn write_remote_show_query(
     refs: &[sley_refs::Ref],
     name: &str,
     git_dir: &Path,
+    cwd: &Path,
 ) -> Result<()> {
     let fetch_urls = remote_config_values_with_empty_clear(config, name, "url");
     let push_urls = remote_config_values_with_empty_clear(config, name, "pushurl");
     let display_url = fetch_urls.first().map(String::as_str).unwrap_or(name);
-    let remote_git_dir = local_remote_git_dir(config, name, git_dir)?;
+    let remote_git_dir = local_remote_git_dir(config, name, git_dir, cwd)?;
     let remote_format = repository_object_format(&remote_git_dir)?;
     let remote_store = FileRefStore::new(&remote_git_dir, remote_format);
     let remote_refs = remote_store.list_refs()?;

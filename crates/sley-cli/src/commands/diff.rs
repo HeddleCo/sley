@@ -711,6 +711,7 @@ fn run_external_diff_entries(
     entries: &[sley_diff_merge::NameStatusEntry],
     lookup_entries: &DiffRelativeLookupMap,
     db: &FileObjectDatabase,
+    cwd: &Path,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
     userdiff: &commands::userdiff::UserdiffResolver,
@@ -719,7 +720,7 @@ fn run_external_diff_entries(
 ) -> Result<Option<i32>> {
     let mut handled = false;
     let mut found_changes = false;
-    let git_prefix = external_diff_git_prefix(worktree_root);
+    let git_prefix = external_diff_git_prefix(cwd, worktree_root);
     let mut output_file = match options.output {
         Some(path) if !options.quiet => Some(
             fs::OpenOptions::new()
@@ -883,9 +884,8 @@ fn run_one_external_diff(
     Ok(status.code().unwrap_or(128))
 }
 
-fn external_diff_git_prefix(worktree_root: Option<&Path>) -> Option<String> {
+fn external_diff_git_prefix(cwd: &Path, worktree_root: Option<&Path>) -> Option<String> {
     let root = worktree_root?;
-    let cwd = env::current_dir().ok()?;
     let relative = cwd.strip_prefix(root).ok()?;
     if relative.as_os_str().is_empty() {
         return None;
@@ -1044,7 +1044,7 @@ fn diff_arg_looks_outside_worktree(path: &str) -> bool {
         .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
-pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let sley_rev::diff_options::DiffOptions {
         output_format,
         cached,
@@ -1173,7 +1173,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff pickaxe controls are not supported for this output mode".into(),
         ));
     }
-    if !find_object_values.is_empty() && crate::session::cli_git_dir().is_err() {
+    // Probe once because `diff --no-index` is valid outside a repository while
+    // every repository-backed mode must reuse one session-scoped facade.
+    let repository = RepositoryContext::from_session(cli_session);
+    let outside_repository = repository.is_err();
+    if !find_object_values.is_empty() && outside_repository {
         eprintln!("fatal: --find-object requires a git repository");
         return Err(GitError::Exit(128));
     }
@@ -1195,8 +1199,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff pickaxe regex matching is not supported".into(),
         ));
     }
-    let cwd = env::current_dir()?;
-    let outside_repository = crate::session::cli_git_dir_from(&cwd).is_err();
+    let cwd = cli_session.cwd().to_path_buf();
     let implicit_no_index = !no_index
         && diff_should_use_implicit_no_index(&path_args, &explicit_paths, outside_repository);
     if no_index || implicit_no_index {
@@ -1243,10 +1246,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 indent_heuristic: indent_heuristic.unwrap_or(true),
                 anchored: &anchored,
             },
+            repository.as_ref().ok(),
         );
     }
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let repo_config = read_repo_config(&git_dir).ok();
+    let repo = repository?;
+    let git_dir = repo.git_dir().to_path_buf();
+    let repo_config = Some(repo.config().clone());
     let suppress_blank_empty = repo_config
         .as_ref()
         .and_then(|config| config.get_bool("diff", None, "suppressblankempty"))
@@ -1264,8 +1269,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         .as_ref()
         .and_then(|config| config.get_bool("core", None, "quotepath"))
         .unwrap_or(true);
-    let format = repository_object_format(&git_dir)?;
-    if let Ok(config) = read_repo_config(&git_dir) {
+    let format = repo.format();
+    if let Some(config) = repo_config.as_ref() {
         if let Some(value) = config.get("diff", None, "colormoved")
             && let Err(err) = log_validate_color_moved(value)
         {
@@ -1281,8 +1286,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     }
     let color_moved_mode = match color_moved {
         Some(mode) => mode,
-        None => match read_repo_config(&git_dir)
-            .ok()
+        None => match repo_config
+            .as_ref()
             .and_then(|config| config.get("diff", None, "colormoved").map(str::to_owned))
         {
             Some(value) => sley_rev::diff_options::parse_color_moved_mode(&value)?,
@@ -1291,8 +1296,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     };
     let color_moved_ws = match color_moved_ws {
         Some(ws) => ws,
-        None => match read_repo_config(&git_dir)
-            .ok()
+        None => match repo_config
+            .as_ref()
             .and_then(|config| config.get("diff", None, "colormovedws").map(str::to_owned))
         {
             Some(value) => sley_rev::diff_options::parse_color_moved_ws(&value)?,
@@ -1332,7 +1337,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     });
     let submodule_format =
         diff_submodule_format.unwrap_or(sley_rev::diff_options::SubmoduleDiffFormat::Short);
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    // A writable-capable view is cheap and shares the facade's pack/decoded
+    // caches; existing diff helpers take a concrete ODB reference.
+    let db = repo.repository().objects_mut();
     if !head
         && !merge_base
         && explicit_paths.is_empty()
@@ -1494,23 +1501,29 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     };
     path_args.extend(explicit_paths);
     let find_objects = resolve_diff_find_objects(&git_dir, format, &find_object_values)?;
-    let no_output_mode = !raw
-        && !stat
-        && !compact_summary
-        && !numstat
-        && !shortstat
-        && !summary
-        && dirstat.is_none()
-        && !name_status
-        && !name_only;
-    let output_may_show_oids = !quiet && !no_patch && !name_only && !name_status;
-    let needs_raw_abbrev = output_may_show_oids && raw && raw_abbrev.is_none();
+    let render_selection = sley_diff_merge::porcelain::select_render_formats(
+        sley_diff_merge::porcelain::RenderSelectionOptions {
+            default_output: sley_diff_merge::porcelain::DefaultDiffOutput::Patch,
+            raw,
+            patch,
+            name_status,
+            name_only,
+            stat: stat || compact_summary,
+            numstat,
+            shortstat,
+            summary,
+            auxiliary_format: dirstat.is_some(),
+            suppress_output: no_patch,
+        },
+    );
+    let output_may_show_oids = !quiet && (render_selection.raw || render_selection.patch);
+    let needs_raw_abbrev = output_may_show_oids && render_selection.raw && raw_abbrev.is_none();
     let needs_patch_abbrev = output_may_show_oids
-        && (patch || no_output_mode)
+        && render_selection.patch
         && !patch_full_index
         && patch_abbrev.is_none();
     let repository_abbrev = if needs_raw_abbrev || needs_patch_abbrev {
-        repository_abbrev(&git_dir, format)?
+        repo.abbrev()?
     } else {
         None
     };
@@ -1529,9 +1542,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .min(format.hex_len())
     };
     let worktree_root = if cached {
-        worktree_root_for_git_dir(&git_dir).ok()
+        repo.worktree_root().ok().map(Path::to_path_buf)
     } else {
-        Some(worktree_root_for_git_dir(&git_dir)?)
+        Some(repo.worktree_root()?.to_path_buf())
     };
     if !cached
         && diff_trees.len() != 2
@@ -1542,8 +1555,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let pathspec = if path_args.is_empty() {
         DiffPathspec::default()
     } else {
-        let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-        DiffPathspec::new(&cwd, &worktree_root, &path_args)?
+        let worktree_root = match worktree_root.as_deref() {
+            Some(root) => root,
+            None => repo.worktree_root()?,
+        };
+        DiffPathspec::new(&cwd, worktree_root, &path_args)?
     };
     if diff_trees.len() == 3 {
         let has_differences = write_diff_combined_three_tree(
@@ -1746,8 +1762,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let (entries, dirty_submodules) = if skip_submodule_work {
         (entries, HashMap::new())
     } else {
-        let submodule_config =
-            submodule_diff_config(&git_dir, worktree_root.as_deref(), ignore_submodules_cli);
+        let submodule_config = submodule_diff_config_with_config(
+            &git_dir,
+            worktree_root.as_deref(),
+            ignore_submodules_cli,
+            repo_config.as_ref(),
+        );
         let mut entries = apply_submodule_ignore_filter(entries, &submodule_config);
         let dirty_submodules = match (use_worktree_new, worktree_root.as_deref()) {
             (true, Some(root)) => collect_dirty_submodules(
@@ -1917,10 +1937,10 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
-    let show_patch_for_external = !name_only && !name_status && (patch || no_output_mode);
-    if allow_external && show_patch_for_external && !no_patch {
-        let userdiff_attributes = worktree_root_for_git_dir(&git_dir)
-            .ok()
+    let show_patch_for_external = render_selection.patch;
+    if allow_external && show_patch_for_external {
+        let userdiff_attributes = worktree_root
+            .as_deref()
             .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
             .transpose()?;
         let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
@@ -1932,6 +1952,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             &entries,
             &relative_lookup_entries,
             &db,
+            &cwd,
             worktree_root.as_deref(),
             use_worktree_new,
             &userdiff,
@@ -1954,13 +1975,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     }
     if !quiet && !no_patch {
         let mut stdout = Vec::new();
-        let show_raw = raw && !name_only && !name_status;
-        let show_numstat = numstat && !name_only && !name_status;
-        let show_stat = (stat || compact_summary) && !name_only && !name_status;
-        let show_shortstat = shortstat && !name_only && !name_status;
-        let show_patch = !name_only && !name_status && (patch || no_output_mode);
-        let show_summary = summary && !name_only && !name_status;
-        let stat_entries = if show_numstat || show_stat || show_shortstat {
+        let show_raw = render_selection.raw;
+        let show_numstat = render_selection.numstat;
+        let show_stat = render_selection.stat;
+        let show_shortstat = render_selection.shortstat;
+        let show_patch = render_selection.patch;
+        let show_summary = render_selection.summary;
+        let stat_entries = if render_selection.needs_line_stats() {
             let mut stat_entries = if ignore_active {
                 collect_diff_stat_entries_with_ignore(
                     &entries,
@@ -2082,8 +2103,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             // `diff.<name>.*` config) for hunk headings. Attributes always come
             // from the real worktree, even when the content comparison is
             // `--cached`.
-            let userdiff_attributes = worktree_root_for_git_dir(&git_dir)
-                .ok()
+            let userdiff_attributes = worktree_root
+                .as_deref()
                 .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
                 .transpose()?;
             let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
@@ -2405,8 +2426,22 @@ fn write_diff_combined_three_tree(
     let no_output = options
         .output_format
         .contains(sley_rev::diff_options::DiffOutputFormat::NO_OUTPUT);
-    let no_output_mode = !raw && !name_status && !name_only && !patch && !no_output;
-    let show_patch = !name_status && !name_only && (patch || no_output_mode);
+    let selection = sley_diff_merge::porcelain::select_render_formats(
+        sley_diff_merge::porcelain::RenderSelectionOptions {
+            default_output: sley_diff_merge::porcelain::DefaultDiffOutput::Patch,
+            raw,
+            patch,
+            name_status,
+            name_only,
+            stat: false,
+            numstat: false,
+            shortstat: false,
+            summary: false,
+            auxiliary_format: false,
+            suppress_output: no_output,
+        },
+    );
+    let show_patch = selection.patch;
 
     let render_ctx = commands::combined::CombinedRenderCtx {
         db,
@@ -2422,17 +2457,17 @@ fn write_diff_combined_three_tree(
         raw_abbrev: options.raw_abbrev,
     };
     let mut out = Vec::new();
-    if raw && !name_status && !name_only {
+    if selection.raw {
         for path in &paths {
             commands::combined::write_combined_raw(&mut out, &render_ctx, path, options.z)?;
         }
     }
-    if name_status {
+    if selection.name_status {
         for path in &paths {
             commands::combined::write_combined_name_status(&mut out, path, options.z)?;
         }
     }
-    if name_only {
+    if selection.name_only {
         for path in &paths {
             if options.z {
                 out.write_all(&path.path)?;
@@ -2443,7 +2478,7 @@ fn write_diff_combined_three_tree(
         }
     }
     if show_patch {
-        if raw {
+        if selection.separates_patch_from_prefix() {
             writeln!(out)?;
         }
         for path in &paths {
@@ -3224,16 +3259,18 @@ enum NoIndexPathKind {
 /// `git diff --no-index <path> <path>`: compare two files outside (or beside)
 /// the object database. Attributes and `diff.*` config still apply when the
 /// command runs inside a repository. Exits 1 when the files differ.
-fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>) -> Result<()> {
+fn cmd_diff_no_index(
+    cwd: &Path,
+    paths: &[String],
+    params: DiffNoIndexParams<'_>,
+    repository: Option<&RepositoryContext>,
+) -> Result<()> {
     if paths.len() < 2 {
         eprintln!("usage: git diff --no-index [<options>] <path> <path>");
         return Err(GitError::Exit(129));
     }
-    let git_dir = crate::session::cli_git_dir_from(&cwd).ok();
-    let format = git_dir
-        .as_deref()
-        .map(repository_object_format)
-        .transpose()?
+    let format = repository
+        .map(RepositoryContext::format)
         .unwrap_or(ObjectFormat::Sha1);
     let mut entries = no_index_entries(&paths[0], &paths[1], &paths[2..], format)?;
     if params.reverse {
@@ -3244,16 +3281,12 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
     }
     // Repository context is optional: when present, .gitattributes drivers,
     // diff.<name>.* config, and color overrides all apply.
-    let config = git_dir
-        .as_deref()
-        .and_then(|dir| read_repo_config(dir).ok());
+    let config = repository.map(|repository| repository.config().clone());
     let (mut src_prefix, mut dst_prefix) = no_index_resolve_prefixes(config.as_ref(), &params);
     if params.reverse {
         std::mem::swap(&mut src_prefix, &mut dst_prefix);
     }
-    let worktree_root = git_dir
-        .as_deref()
-        .and_then(|dir| worktree_root_for_git_dir(dir).ok());
+    let worktree_root = repository.and_then(|repository| repository.worktree_root().ok());
     let colors = params
         .color
         .then(|| commands::diff_words::DiffColors::enabled(config.as_ref()));
@@ -3287,8 +3320,15 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
     });
     // A throwaway object database handle: content reads are overridden, so it
     // is never consulted.
-    let scratch_git_dir = git_dir.clone().unwrap_or_else(|| cwd.to_path_buf());
-    let db = FileObjectDatabase::from_git_dir(&scratch_git_dir, format);
+    let scratch_db;
+    let db = if let Some(repository) = repository {
+        repository.objects()
+    } else {
+        // Outside a repository the patch renderer still requires an ODB
+        // service, although no-index provides every content side explicitly.
+        scratch_db = FileObjectDatabase::from_git_dir(cwd, format);
+        &scratch_db
+    };
     let raw = params
         .output_format
         .contains(sley_rev::diff_options::DiffOutputFormat::RAW);
@@ -3307,14 +3347,29 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
     let no_output = params
         .output_format
         .contains(sley_rev::diff_options::DiffOutputFormat::NO_OUTPUT);
+    let selection = sley_diff_merge::porcelain::select_render_formats(
+        sley_diff_merge::porcelain::RenderSelectionOptions {
+            default_output: sley_diff_merge::porcelain::DefaultDiffOutput::Patch,
+            raw,
+            patch,
+            name_status,
+            name_only,
+            stat: false,
+            numstat,
+            shortstat: false,
+            summary: false,
+            auxiliary_format: false,
+            suppress_output: no_output,
+        },
+    );
     let userdiff_attributes = worktree_root
         .as_ref()
         .map(|root| sley_worktree::StandardAttributeMatcher::from_worktree_root(root))
         .transpose()?;
     let userdiff =
         commands::userdiff::UserdiffResolver::with_attributes(userdiff_attributes, config.clone());
-    let show_patch_for_external = !name_only && !name_status && (patch || (!raw && !no_output));
-    if params.allow_external && show_patch_for_external && !no_output {
+    let show_patch_for_external = selection.patch;
+    if params.allow_external && show_patch_for_external {
         let global_external = global_external_diff_command(config.as_ref());
         if let Some(code) = run_external_diff_no_index_entries(
             &entries,
@@ -3344,10 +3399,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             Some(width) => width.map(|width| width.min(format.hex_len())),
             None => Some(7),
         };
-        let repository_abbrev = git_dir
-            .as_deref()
-            .map(|dir| repository_abbrev(dir, format))
-            .transpose()?;
+        let repository_abbrev = repository.map(RepositoryContext::abbrev).transpose()?;
         let patch_abbrev = if params.patch_full_index {
             format.hex_len()
         } else if let Some(width) = params.patch_abbrev {
@@ -3359,7 +3411,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                 None => 7.min(format.hex_len()),
             }
         };
-        if raw && !name_status && !name_only {
+        if selection.raw {
             for entry in &entries {
                 write_diff_raw_entry(
                     &mut stdout,
@@ -3371,7 +3423,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                 )?;
             }
         }
-        if name_status {
+        if selection.name_status {
             for entry in &entries {
                 if params.z {
                     stdout.write_all(entry.entry.status.label().as_bytes())?;
@@ -3388,7 +3440,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                 }
             }
         }
-        if name_only {
+        if selection.name_only {
             for entry in &entries {
                 if params.z {
                     stdout.write_all(&entry.entry.path)?;
@@ -3398,19 +3450,22 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                 }
             }
         }
-        if numstat {
+        if selection.numstat {
             for entry in &entries {
                 let stats =
                     diff_line_stats(entry.old_content.as_deref(), entry.new_content.as_deref());
                 write_diff_numstat_materialized_entry(&mut stdout, &entry.entry, stats, params.z)?;
             }
         }
-        if raw || name_status || name_only || numstat || no_output {
+        if selection.raw
+            || selection.name_status
+            || selection.name_only
+            || selection.numstat
+            || no_output
+        {
             return Err(GitError::Exit(1));
         }
-        let show_patch =
-            patch || params.output_format == sley_rev::diff_options::DiffOutputFormat::empty();
-        if !show_patch {
+        if !selection.patch {
             return Err(GitError::Exit(1));
         }
         for entry in &entries {
@@ -3420,7 +3475,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                 binary: params.patch_binary,
                 anchors: params.anchored,
                 allow_textconv: true,
-                db: &db,
+                db,
                 worktree_root: None,
                 use_worktree_new: false,
                 format,

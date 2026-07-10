@@ -9,7 +9,7 @@ use crate::{
     commit_encoding, commit_subject, core_big_file_threshold, effective_pathspec_flags,
     global_lazy_fetch_enabled, log_reencode_message, normalize_absolute_cli_pathspec,
     repository_object_format, sley_config, sley_core, sley_diff_merge, sley_odb, sley_pretty,
-    sley_remote, sley_rev, sley_worktree, status_quote_path,
+    sley_remote, sley_rev, sley_worktree, status_quote_path, worktree_root_for_git_dir,
 };
 use sley::plumbing::sley_object::{Commit, EncodedObject, ObjectType};
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
@@ -346,9 +346,21 @@ pub(crate) fn submodule_diff_config(
     worktree_root: Option<&Path>,
     cli: Option<SubmoduleIgnoreMode>,
 ) -> SubmoduleDiffConfig {
-    let repo_config = read_repo_config(git_dir).ok();
+    submodule_diff_config_with_config(git_dir, worktree_root, cli, None)
+}
+
+pub(crate) fn submodule_diff_config_with_config(
+    git_dir: &Path,
+    worktree_root: Option<&Path>,
+    cli: Option<SubmoduleIgnoreMode>,
+    repo_config: Option<&GitConfig>,
+) -> SubmoduleDiffConfig {
+    let loaded_config = repo_config
+        .is_none()
+        .then(|| read_repo_config(git_dir).ok())
+        .flatten();
+    let repo_config = repo_config.or(loaded_config.as_ref());
     let base = repo_config
-        .as_ref()
         .and_then(|config| config.get("diff", None, "ignoresubmodules"))
         .and_then(parse_submodule_ignore_mode)
         .unwrap_or(SubmoduleIgnoreMode::Untracked);
@@ -375,7 +387,6 @@ pub(crate) fn submodule_diff_config(
                 continue;
             };
             let ignore = repo_config
-                .as_ref()
                 .and_then(|config| config.get("submodule", Some(name), "ignore"))
                 .or_else(|| value_of("ignore"));
             if let Some(mode) = ignore.and_then(parse_submodule_ignore_mode) {
@@ -2448,7 +2459,14 @@ fn prefetch_local_promisor_object(db: &FileObjectDatabase, oid: &ObjectId) -> Re
             }
             return Ok(false);
         }
-        let Ok(remote_git_dir) = commands::remote::ls_remote_git_dir(url) else {
+        let resolution_cwd =
+            worktree_root_for_git_dir(&git_dir).unwrap_or_else(|_| git_dir.clone());
+        let resolution = sley_remote::RemoteResolutionContext {
+            cwd: &resolution_cwd,
+            local_git_dir: Some(&git_dir),
+            config: Some(&config),
+        };
+        let Ok(remote_git_dir) = sley_remote::resolve_local_remote_git_dir(resolution, url) else {
             continue;
         };
         if sley_remote::install_fetch_pack_via_local_upload_pack(

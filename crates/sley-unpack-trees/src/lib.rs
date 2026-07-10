@@ -986,6 +986,81 @@ fn df_conflict_slot(tree: &FlatTree, path: &[u8]) -> bool {
     false
 }
 
+/// Checkout-specific controls for a two-tree index/worktree transition.
+///
+/// The engine derives `initial_checkout` from the supplied index and fixes the
+/// remaining unpack-trees mode to Git's checkout contract: merge and worktree
+/// updates enabled, index-only disabled, and the two-way merge primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckoutTransitionOptions {
+    /// Repository object format, used for the empty old tree of an unborn HEAD.
+    pub format: ObjectFormat,
+    /// Permit tracked and untracked paths in the way to be overwritten (`-f`).
+    pub overwrite_untracked: bool,
+}
+
+impl CheckoutTransitionOptions {
+    /// Construct safe, non-forcing checkout transition options.
+    pub fn new(format: ObjectFormat) -> Self {
+        Self {
+            format,
+            overwrite_untracked: false,
+        }
+    }
+}
+
+/// A validated checkout transition plan before its worktree writes are applied.
+///
+/// Consumers may inspect the pure merge result for additional repository-level
+/// safety checks, then call [`CheckoutTransitionPlan::apply`] exactly once.
+#[derive(Debug)]
+pub struct CheckoutTransitionPlan {
+    result: UnpackTreesResult,
+    unpack_options: UnpackTreesOptions,
+}
+
+impl CheckoutTransitionPlan {
+    /// Pure resulting index entries and planned worktree removals.
+    pub fn result(&self) -> &UnpackTreesResult {
+        &self.result
+    }
+
+    /// Apply planned removals and writes, returning the stat-refreshed result.
+    pub fn apply<W: WorktreeWriter>(mut self, writer: &mut W) -> Result<UnpackTreesResult> {
+        check_updates(&mut self.result, &self.unpack_options, writer)?;
+        Ok(self.result)
+    }
+}
+
+/// Plan Git's checkout/switch two-tree transition.
+///
+/// `old_tree` is absent for an unborn HEAD. The operation owns checkout's
+/// unpack-trees semantics rather than requiring each porcelain caller to
+/// reconstruct `MergeFn::TwoWay`, reset mode, initial-checkout detection, and
+/// update/index-only flags independently.
+pub fn plan_checkout_transition<P: WorktreeProbe + ?Sized>(
+    index: &FlatIndex,
+    old_tree: Option<FlatTree>,
+    new_tree: FlatTree,
+    options: CheckoutTransitionOptions,
+    probe: &P,
+) -> Result<CheckoutTransitionPlan> {
+    let mut unpack_options = UnpackTreesOptions::new(options.format);
+    unpack_options.merge = true;
+    unpack_options.update = true;
+    unpack_options.index_only = false;
+    unpack_options.initial_checkout = index.is_empty();
+    if options.overwrite_untracked {
+        unpack_options.reset = ResetType::OverwriteUntracked;
+    }
+    let trees = [old_tree.unwrap_or_default(), new_tree];
+    let result = unpack_trees(index, &trees, MergeFn::TwoWay, &unpack_options, probe)?;
+    Ok(CheckoutTransitionPlan {
+        result,
+        unpack_options,
+    })
+}
+
 /// Run git's `unpack_trees`: walk the union of paths across `index` and the
 /// supplied `trees`, dispatch each path's source slice to `merge_fn`, and
 /// accumulate the resulting index plus worktree removals.
@@ -1365,6 +1440,70 @@ mod tests {
             .expect("twoway merge");
         let paths: Vec<_> = res.entries.iter().map(|e| e.path.clone()).collect();
         assert_eq!(paths, vec![b"a".to_vec(), b"local".to_vec()]);
+    }
+
+    #[test]
+    fn checkout_transition_derives_initial_checkout_from_empty_index() {
+        let new = flat(&[(b"a", 1)]);
+        let plan = plan_checkout_transition(
+            &FlatIndex::new(),
+            None,
+            new,
+            CheckoutTransitionOptions::new(ObjectFormat::Sha1),
+            &NullWorktree,
+        )
+        .expect("plan unborn checkout");
+        assert_eq!(plan.result().entries.len(), 1);
+        assert_eq!(plan.result().entries[0].path, b"a");
+        assert!(plan.result().entries[0].wt_update);
+    }
+
+    #[test]
+    fn checkout_transition_honors_staged_deletion_in_existing_index() {
+        let index = idx(&[(b"local", 9)]);
+        let old = flat(&[(b"a", 1)]);
+        let new = flat(&[(b"a", 1)]);
+        let plan = plan_checkout_transition(
+            &index,
+            Some(old),
+            new,
+            CheckoutTransitionOptions::new(ObjectFormat::Sha1),
+            &NullWorktree,
+        )
+        .expect("plan checkout with staged deletion");
+        let paths = plan
+            .result()
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_slice())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![b"local".as_slice()]);
+    }
+
+    #[test]
+    fn checkout_transition_apply_refreshes_written_entry_stat() {
+        let index = idx(&[(b"a", 1)]);
+        let old = flat(&[(b"a", 1)]);
+        let new = flat(&[(b"a", 2)]);
+        let plan = plan_checkout_transition(
+            &index,
+            Some(old),
+            new,
+            CheckoutTransitionOptions::new(ObjectFormat::Sha1),
+            &NullWorktree,
+        )
+        .expect("plan checkout update");
+        let mut writer = RecordingWriter::default();
+        let result = plan.apply(&mut writer).expect("apply checkout update");
+        assert_eq!(writer.ops, vec![(b"a".to_vec(), "write")]);
+        assert_eq!(
+            result.entries[0].entry.stat,
+            Some(StatInfo {
+                size: 1,
+                mtime_seconds: 1001,
+                ..StatInfo::default()
+            })
+        );
     }
 
     #[test]

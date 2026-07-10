@@ -571,23 +571,26 @@ pub(crate) fn cmd_status(cli_session: &crate::session::CliSession, args: &[Strin
         // hunk bytes match `git diff` verbatim.
         if verbose == 1 {
             io::stdout().flush()?;
-            commands::diff::cmd_diff(&["--cached".to_string()])?;
+            commands::diff::cmd_diff(cli_session, &["--cached".to_string()])?;
         } else if verbose >= 2 {
             io::stdout().flush()?;
             println!("Changes to be committed:");
             io::stdout().flush()?;
-            commands::diff::cmd_diff(&[
-                "--cached".to_string(),
-                "--src-prefix=c/".to_string(),
-                "--dst-prefix=i/".to_string(),
-            ])?;
+            commands::diff::cmd_diff(
+                cli_session,
+                &[
+                    "--cached".to_string(),
+                    "--src-prefix=c/".to_string(),
+                    "--dst-prefix=i/".to_string(),
+                ],
+            )?;
             println!("--------------------------------------------------");
             println!("Changes not staged for commit:");
             io::stdout().flush()?;
-            commands::diff::cmd_diff(&[
-                "--src-prefix=i/".to_string(),
-                "--dst-prefix=w/".to_string(),
-            ])?;
+            commands::diff::cmd_diff(
+                cli_session,
+                &["--src-prefix=i/".to_string(), "--dst-prefix=w/".to_string()],
+            )?;
         }
     }
     if !pathspec.has_filters() && !show_ignored && explicit_untracked {

@@ -42,7 +42,10 @@ pub(crate) fn cmd_version(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_bugreport(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_bugreport(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut suffix = Some("report".to_string());
     let mut output_dir = PathBuf::new();
     let mut index = 0;
@@ -124,7 +127,7 @@ pub(crate) fn cmd_bugreport(args: &[String]) -> Result<()> {
     writeln!(report, "compiler info: rustc")?;
     writeln!(report, "zlib: available")?;
     report.write_all(b"\n\n[Enabled Hooks]\n")?;
-    match crate::session::cli_git_dir() {
+    match cli_session.git_dir() {
         Ok(_) => {
             for hook in commands::hooks::KNOWN_HOOKS {
                 if commands::hooks::hook_exists(hook)? {
@@ -140,9 +143,9 @@ pub(crate) fn cmd_bugreport(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_repo(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_repo(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     match args {
-        [subcommand, rest @ ..] if subcommand == "info" => cmd_repo_info(rest),
+        [subcommand, rest @ ..] if subcommand == "info" => cmd_repo_info(cli_session, rest),
         [subcommand, ..] => {
             eprintln!("error: unknown subcommand `{subcommand}`");
             repo_usage()
@@ -178,7 +181,7 @@ const REPO_INFO_KEYS: &[&str] = &[
     "references.format",
 ];
 
-fn cmd_repo_info(args: &[String]) -> Result<()> {
+fn cmd_repo_info(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let parsed = parse_repo_info_args(args)?;
     if parsed.keys {
         if parsed.all || !parsed.fields.is_empty() {
@@ -208,7 +211,7 @@ fn cmd_repo_info(args: &[String]) -> Result<()> {
     } else {
         parsed.fields
     };
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let info = repo_info_collect(&git_dir, &common_git_dir)?;
     let mut had_error = false;
@@ -710,22 +713,23 @@ fn pax_comment_commit_id(body: &[u8]) -> Option<String> {
     None
 }
 
-pub(crate) fn cmd_unpack_file(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_unpack_file(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let [name] = args else {
         eprintln!("usage: git unpack-file <blob>");
         return Err(GitError::Exit(129));
     };
-    let git_dir = crate::session::cli_git_dir()?;
-    let format = repository_object_format(&git_dir)?;
-    let oid = match resolve_revision(&git_dir, format, name) {
+    let repository = crate::repository::RepositoryContext::from_session(cli_session)?;
+    let oid = match repository.resolve_revision(name) {
         Ok(oid) => oid,
         Err(_) => {
             eprintln!("fatal: Not a valid object name {name}");
             return Err(GitError::Exit(128));
         }
     };
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let object = db.read_object(&oid)?;
+    let object = repository.objects().read_object(&oid)?;
     if object.object_type != ObjectType::Blob {
         eprintln!("fatal: unable to read blob object {oid}");
         return Err(GitError::Exit(128));
@@ -828,7 +832,10 @@ fn show_index_usage<T>() -> Result<T> {
     Err(GitError::Exit(129))
 }
 
-pub(crate) fn cmd_check_mailmap(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_check_mailmap(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut stdin = false;
     let mut source_specs = Vec::new();
     let mut contacts = Vec::new();
@@ -880,9 +887,8 @@ pub(crate) fn cmd_check_mailmap(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let git_dir = crate::session::cli_git_dir()?;
-    let format = repository_object_format(&git_dir)?;
-    let mailmap = Mailmap::load(&git_dir, format, &source_specs)?;
+    let repository = crate::repository::RepositoryContext::from_session(cli_session)?;
+    let mailmap = Mailmap::load(repository.git_dir(), repository.format(), &source_specs)?;
     for contact in contacts {
         println!("{}", mailmap.resolve_contact(&contact).display());
     }
@@ -1254,7 +1260,10 @@ fn parse_mailmap_contact(value: &str) -> MailmapContact {
     }
 }
 
-pub(crate) fn cmd_stripspace(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_stripspace(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut strip_comments = false;
     let mut comment_lines = false;
     for arg in args {
@@ -1276,7 +1285,7 @@ pub(crate) fn cmd_stripspace(args: &[String]) -> Result<()> {
         );
         return Err(GitError::Exit(129));
     }
-    let comment = stripspace_comment_string()?;
+    let comment = stripspace_comment_string(cli_session)?;
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
     let output = if comment_lines {
@@ -1290,10 +1299,9 @@ pub(crate) fn cmd_stripspace(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn stripspace_comment_string() -> Result<Vec<u8>> {
+fn stripspace_comment_string(cli_session: &crate::session::CliSession) -> Result<Vec<u8>> {
     let mut comment = None;
-    if let Ok(cwd) = env::current_dir()
-        && let Ok(git_dir) = crate::session::cli_git_dir_from(&cwd)
+    if let Ok(git_dir) = cli_session.git_dir()
         && let Ok(config) = read_repo_config(&git_dir)
         && let Some(value) = config.get("core", None, "commentchar")
         && value != "auto"

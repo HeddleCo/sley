@@ -14,13 +14,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub(crate) fn fetch_with_remote_helper(
+    context: &super::resolve::RemoteCommandContext,
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<Option<sley_remote::FetchOutcome>> {
-    let config = repo_config_with_transport_policy(git_dir)?;
+    let config = repo_config_with_transport_policy(context, git_dir)?;
     let Some(spec) = sley_remote::resolve_remote_helper(&config, source) else {
         return Ok(None);
     };

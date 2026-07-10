@@ -570,6 +570,7 @@ fn pull_remote_tracking_ref(config: &GitConfig, remote: &str, remote_ref: &str) 
 }
 
 fn pull_fetch(
+    context: &crate::commands::remote::RemoteCommandContext,
     git_dir: &Path,
     format: ObjectFormat,
     remote: &str,
@@ -577,6 +578,7 @@ fn pull_fetch(
     options: FetchOptions,
 ) -> Result<FetchOutcome> {
     if let Some(outcome) = crate::commands::remote::fetch_with_remote_helper(
+        context,
         git_dir,
         format,
         remote,
@@ -591,14 +593,22 @@ fn pull_fetch(
         fetch_bundle(git_dir, format, remote, refspecs, &bundle, options)?;
         return Ok(FetchOutcome::default());
     }
-    if fetch_source_is_http(remote)? {
-        fetch_http_repository_with_outcome(git_dir, format, remote, refspecs, options)
-    } else if fetch_source_is_ssh(remote)? {
-        fetch_ssh_repository_with_outcome(git_dir, format, remote, refspecs, options)
-    } else if fetch_source_is_git(remote)? {
-        fetch_git_repository_with_outcome(git_dir, format, remote, refspecs, options)
+    if fetch_source_is_http(context, remote)? {
+        fetch_http_repository_with_outcome(context, git_dir, format, remote, refspecs, options)
+    } else if fetch_source_is_ssh(context, remote)? {
+        fetch_ssh_repository_with_outcome(context, git_dir, format, remote, refspecs, options)
+    } else if fetch_source_is_git(context, remote)? {
+        fetch_git_repository_with_outcome(context, git_dir, format, remote, refspecs, options)
     } else {
-        fetch_local_repository_with_outcome(git_dir, format, remote, refspecs, options, &[])
+        fetch_local_repository_with_outcome(
+            context,
+            git_dir,
+            format,
+            remote,
+            refspecs,
+            options,
+            &[],
+        )
     }
 }
 
@@ -817,7 +827,9 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
             }
         }
     }
-    let git_dir = cli_session.git_dir()?;
+    let remote_context =
+        crate::commands::remote::RemoteCommandContext::require_repository(cli_session)?;
+    let git_dir = remote_context.required_git_dir()?.to_path_buf();
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
@@ -936,17 +948,23 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
     // pull-into-void decision keys off the *pre-fetch* state, so capture it now.
     let orig_head_unborn = orig_head.is_none();
     let before_fetch_refs = fetch_ref_snapshot(&git_dir, format)?;
-    let fetch_outcome =
-        match pull_fetch(&git_dir, format, &remote, &refspecs, fetch_options.clone()) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                if !merge_srcs.is_empty() && format!("{err}").contains("remote ref") {
-                    print_pull_no_such_ref_fetched(&merge_srcs);
-                    return Err(GitError::Exit(1));
-                }
-                return Err(err);
+    let fetch_outcome = match pull_fetch(
+        &remote_context,
+        &git_dir,
+        format,
+        &remote,
+        &refspecs,
+        fetch_options.clone(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            if !merge_srcs.is_empty() && format!("{err}").contains("remote ref") {
+                print_pull_no_such_ref_fetched(&merge_srcs);
+                return Err(GitError::Exit(1));
             }
-        };
+            return Err(err);
+        }
+    };
     if set_upstream {
         crate::commands::remote::fetch_set_upstream_from_outcome(
             &git_dir,
@@ -962,6 +980,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
+        runtime_cwd: remote_context.cwd(),
         git_dir: &git_dir,
         format,
         worktree_root: &worktree_root,

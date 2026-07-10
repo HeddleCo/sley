@@ -325,7 +325,10 @@ fn cmd_stash_branch(cli_session: &crate::session::CliSession, args: &[String]) -
         .parents
         .first()
         .ok_or_else(|| GitError::InvalidObject(format!("stash {stash_oid} has no parent")))?;
-    cmd_checkout(&["-b".to_string(), branch.clone(), base_oid.to_hex()])?;
+    cmd_checkout(
+        cli_session,
+        &["-b".to_string(), branch.clone(), base_oid.to_hex()],
+    )?;
     let applied = apply_stash_entry(
         cli_session,
         StashApplyOptions {

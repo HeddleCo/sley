@@ -130,14 +130,14 @@ pub use filter::{pack_filter_from_spec, pack_filter_from_spec_for_clone};
 
 mod fetch;
 pub use fetch::{
-    FetchOptions, FetchOutcome, FetchRequest, FetchServices, FetchSource, PruneRefsInput,
-    PrunedRef, RemoteHelperFetchRequest, append_reachable_auto_follow_tags,
+    FetchOptions, FetchOutcome, FetchRepositoryPlan, FetchRequest, FetchServices, FetchSource,
+    PruneRefsInput, PrunedRef, RemoteHelperFetchRequest, append_reachable_auto_follow_tags,
     apply_configured_fetch_prune_option, apply_configured_partial_clone_filter,
     apply_configured_remote_tag_option, fetch, fetch_head_source_description,
     fetch_refspec_excludes, fetch_refspecs_for_source, finalize_remote_helper_fetch,
     mark_tag_refspec_updates_not_for_merge, order_bundle_fetch_all_tags_updates,
-    prune_refs_from_advertisements, retain_missing_auto_follow_tags, write_default_fetch_head,
-    write_fetch_head, write_fetch_head_records,
+    plan_fetch_repository, prune_refs_from_advertisements, retain_missing_auto_follow_tags,
+    write_default_fetch_head, write_fetch_head, write_fetch_head_records,
 };
 
 mod pack;
@@ -160,7 +160,10 @@ pub use push::{
 };
 
 mod ls_remote;
-pub use ls_remote::{LsRemoteFilter, LsRemoteRecord, LsRemoteSource, ls_remote};
+pub use ls_remote::{
+    LsRemoteFilter, LsRemoteOutcome, LsRemoteRecord, LsRemoteRequest, LsRemoteSource, ls_remote,
+    ls_remote_with,
+};
 
 mod clone;
 pub use clone::{CloneOptions, CloneOutcome, CloneRequest, CloneServices, CloneSource, clone};
@@ -188,8 +191,10 @@ pub use protocol::{
 
 mod resolve;
 pub use resolve::{
-    fetch_source_for_url, fetch_url, push_destination_for_url, push_url, resolve_fetch_source,
-    resolve_push_destination, transport_kind_for_url,
+    RemoteResolutionContext, ResolvedRemote, discover_local_git_dir, fetch_source_for_url,
+    fetch_url, push_destination_for_url, push_url, resolve_configured_local_remote_git_dir,
+    resolve_fetch_source, resolve_local_remote_git_dir, resolve_push_destination, resolve_remote,
+    transport_kind_for_url,
 };
 
 /// The object format of the repository whose common `$GIT_DIR` is `common_git_dir`.

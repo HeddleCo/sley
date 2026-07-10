@@ -12,7 +12,7 @@ struct ArchiveExtraFile {
     mode: u32,
 }
 
-pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut format_name: Option<String> = None;
     let mut prefix = Vec::new();
     let mut output: Option<String> = None;
@@ -142,8 +142,12 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
         if treeish.is_some() || !pathspecs.is_empty() {
             return Err(GitError::Exit(128));
         }
-        let cwd = env::current_dir()?;
-        let config = archive_config_for_list(remote.as_deref(), &cwd).unwrap_or_default();
+        let config = archive_config_for_list(
+            remote.as_deref(),
+            cli_session.cwd(),
+            cli_session.git_dir().ok().as_deref(),
+        )
+        .unwrap_or_default();
         let stdout = io::stdout();
         let mut lock = stdout.lock();
         for name in archive_list_formats(&config, remote.is_some()) {
@@ -154,12 +158,12 @@ pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
     }
 
     let treeish = treeish.ok_or_else(|| GitError::Command("archive requires a tree-ish".into()))?;
-    let cwd = env::current_dir()?;
-    let local_git_dir = crate::session::cli_git_dir_from(&cwd).ok();
+    let cwd = cli_session.cwd().to_path_buf();
+    let local_git_dir = cli_session.git_dir().ok();
     let git_dir = if let Some(remote) = remote.as_deref() {
         archive_remote_git_dir(remote, &cwd, local_git_dir.as_deref())?
     } else {
-        crate::session::cli_git_dir_from(&cwd)?
+        cli_session.git_dir()?
     };
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
@@ -526,12 +530,17 @@ fn archive_match_extension(filename: &str, ext: &str) -> bool {
     &filename[prefix_len..] == ext
 }
 
-fn archive_config_for_list(remote: Option<&str>, cwd: &Path) -> Result<GitConfig> {
-    let local_git_dir = crate::session::cli_git_dir_from(&cwd).ok();
+fn archive_config_for_list(
+    remote: Option<&str>,
+    cwd: &Path,
+    local_git_dir: Option<&Path>,
+) -> Result<GitConfig> {
     let git_dir = if let Some(remote) = remote {
-        archive_remote_git_dir(remote, cwd, local_git_dir.as_deref())?
+        archive_remote_git_dir(remote, cwd, local_git_dir)?
     } else {
-        local_git_dir.ok_or_else(|| GitError::Command("not a git repository".into()))?
+        local_git_dir
+            .map(Path::to_path_buf)
+            .ok_or_else(|| GitError::Command("not a git repository".into()))?
     };
     read_repo_config(&git_dir)
 }
@@ -559,7 +568,7 @@ fn archive_remote_git_dir(
     } else {
         base.join(path)
     };
-    crate::session::cli_git_dir_from(&repo)
+    crate::session::cli_remote_git_dir_from(&repo)
 }
 
 fn archive_remote_looks_like_path(remote: &str) -> bool {

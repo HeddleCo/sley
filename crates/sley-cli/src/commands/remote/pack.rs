@@ -9,10 +9,10 @@ use super::config::read_repo_config_on_disk;
 use super::config::{read_repo_config, write_repo_config};
 use super::fetch::StdoutProgress;
 use super::fetch::{
-    check_transport_allowed_url, configured_server_options, default_fetch_remote,
-    ls_remote_resolved_url, repo_config_with_transport_policy, transport_policy_config_for_cwd,
+    check_transport_allowed_url, configured_server_options, repo_config_with_transport_policy,
+    transport_policy_config_for_context,
 };
-use super::resolve::ls_remote_git_dir;
+use super::resolve::{RemoteCommandContext, ls_remote_git_dir};
 use crate::commands::config_cmd::{
     ConfigKey, SimpleConfigRegex, config_set_value, parse_config_key,
 };
@@ -65,7 +65,10 @@ fn read_capped_packfile<R: Read>(reader: &mut R, max_input_size: Option<u64>) ->
     Ok(packfile)
 }
 
-pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_receive_pack(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut repository: Option<&String> = None;
     let mut stateless_rpc = false;
     let mut advertise_refs = false;
@@ -97,7 +100,8 @@ pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {
             "receive-pack currently supports: receive-pack <repository>".into(),
         ));
     };
-    let git_dir = common_git_dir_for_git_dir(&ls_remote_git_dir(repository)?)?;
+    let remote_context = RemoteCommandContext::from_session(cli_session);
+    let git_dir = common_git_dir_for_git_dir(&ls_remote_git_dir(&remote_context, repository)?)?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let mut features = sley_remote::receive_pack_features(format);
@@ -234,7 +238,10 @@ fn requested_protocol_version_from_environment() -> Option<ProtocolVersion> {
     })
 }
 
-pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_upload_pack(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     // Accept (and ignore) the upload-pack flags the transports pass through:
     // `git daemon` runs `upload-pack --strict <dir>`, the smart transports add
     // `--stateless-rpc`/`--advertise-refs`/`--timeout=<n>`. The repository is
@@ -265,7 +272,8 @@ pub(crate) fn cmd_upload_pack(args: &[String]) -> Result<()> {
             "upload-pack currently supports: upload-pack <repository>".into(),
         ));
     };
-    let git_dir = ls_remote_git_dir(repository)?;
+    let remote_context = RemoteCommandContext::from_session(cli_session);
+    let git_dir = ls_remote_git_dir(&remote_context, repository)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     validate_upload_pack_filter_config()?;
@@ -352,7 +360,10 @@ const SEND_PACK_USAGE: &str = "usage: git send-pack [--mirror] [--dry-run] [--fo
 /// directory (no remote-name resolution) and pushes bare refs as `<ref>:<ref>`
 /// (a leading `:` deletes). It renders the same status report as push but does
 /// not touch remote-tracking refs (it is a low-level transport, not porcelain).
-pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_send_pack(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     // `-h` is handled by git's option parser before any repository is opened, so
     // it works outside a git repo too (the `nongit` case in t5400).
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
@@ -360,8 +371,9 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(129));
     }
 
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let remote_context = RemoteCommandContext::require_repository(cli_session)?;
+    let cwd = remote_context.cwd().to_path_buf();
+    let git_dir = remote_context.required_git_dir()?.to_path_buf();
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
@@ -465,7 +477,7 @@ pub(crate) fn cmd_send_pack(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(129));
     }
 
-    let remote_git_dir = ls_remote_git_dir(dest)?;
+    let remote_git_dir = ls_remote_git_dir(&remote_context, dest)?;
     let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
 
     let mut refspecs: Vec<String> = if mirror {
@@ -572,9 +584,10 @@ fn reject_duplicate_push_destinations(refspecs: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    let remote_context = RemoteCommandContext::require_repository(cli_session)?;
+    let cwd = remote_context.cwd().to_path_buf();
+    let git_dir = remote_context.required_git_dir()?.to_path_buf();
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
@@ -779,7 +792,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         progress,
         thin,
     };
-    let config = transport_policy_config_for_cwd()?;
+    let config = transport_policy_config_for_context(&remote_context)?;
     let repo_config = read_repo_config(&git_dir).unwrap_or_default();
     let parent_remote_is_name = push_remote_name_exists(&repo_config, &remote);
     let mut recurse_submodules = resolve_push_recurse_submodules(&repo_config, recurse_submodules)?;
@@ -831,7 +844,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
                 sley_remote::PushDestination::Http(parsed_remote)
             }
             RemoteTransport::Local | RemoteTransport::File => {
-                let remote_git_dir = ls_remote_git_dir(&resolved_remote)?;
+                let remote_git_dir = ls_remote_git_dir(&remote_context, &resolved_remote)?;
                 let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
                 sley_remote::PushDestination::Local {
                     git_dir: remote_git_dir,
@@ -998,6 +1011,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             None => push_options_from_config(&repo_config)?,
         };
         run_push(
+            &remote_context,
             &git_dir,
             &common_git_dir,
             format,
@@ -2158,6 +2172,7 @@ fn push_command_was_forced(
 }
 
 fn run_push(
+    context: &RemoteCommandContext,
     git_dir: &Path,
     common_git_dir: &Path,
     format: ObjectFormat,
@@ -2170,7 +2185,7 @@ fn run_push(
     atomic: bool,
     push_options: &[String],
 ) -> Result<()> {
-    let config = repo_config_with_transport_policy(git_dir).unwrap_or_default();
+    let config = repo_config_with_transport_policy(context, git_dir).unwrap_or_default();
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(&config));
     let mut progress = StdoutProgress;
     let remote_options = sley_remote::PushOptions {

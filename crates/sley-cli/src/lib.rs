@@ -125,9 +125,9 @@ pub(crate) use diff_render::{
     prefetch_via_configured_upload_pack, promisor_remote_names, read_blob,
     read_object_maybe_prefetch_promisor, render_diff_entries, render_tree_to_tree_patch,
     repo_path_to_path, reverse_diff_entries, reverse_diff_entry, submodule_diff_config,
-    submodule_git_dir_for_path, validate_diff_rename_limit, write_diff_dirstat,
-    write_diff_numstat_materialized_entry, write_diff_patch_entry, write_diff_raw_entry,
-    write_diff_shortstat_materialized, write_diff_stat_materialized,
+    submodule_diff_config_with_config, submodule_git_dir_for_path, validate_diff_rename_limit,
+    write_diff_dirstat, write_diff_numstat_materialized_entry, write_diff_patch_entry,
+    write_diff_raw_entry, write_diff_shortstat_materialized, write_diff_stat_materialized,
     write_diff_stat_materialized_with_widths, write_diff_stat_summary_line,
     write_diff_summary_entry,
 };

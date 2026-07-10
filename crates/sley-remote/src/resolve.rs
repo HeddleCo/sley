@@ -8,12 +8,80 @@
 use std::path::{Path, PathBuf};
 
 use sley_config::GitConfig;
-use sley_config::remotes::{resolve_remote_fetch_url, resolve_remote_push_url};
+use sley_config::remotes::{
+    remote_config_values, remote_exists, resolve_remote_fetch_url, resolve_remote_push_url,
+};
 use sley_core::{GitError, Result};
 use sley_odb::repository_common_dir;
 use sley_transport::{RemoteTransport, RemoteUrl, parse_remote_url};
 
 use crate::{FetchSource, PushDestination, RemoteTransportKind};
+
+/// Explicit repository/process context for resolving a CLI remote without
+/// consulting global cwd or repository-discovery state.
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteResolutionContext<'a> {
+    /// Invocation working directory used for literal relative paths.
+    pub cwd: &'a Path,
+    /// Current repository git directory, when the invocation has one.
+    pub local_git_dir: Option<&'a Path>,
+    /// Effective current-repository configuration, including injected values.
+    pub config: Option<&'a GitConfig>,
+}
+
+/// A remote name/URL after config lookup and `insteadOf` rewriting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRemote {
+    pub url: String,
+    pub transport: RemoteTransport,
+}
+
+/// Resolve a remote name or literal URL using only explicit context.
+pub fn resolve_remote(
+    context: RemoteResolutionContext<'_>,
+    repository: &str,
+) -> Result<ResolvedRemote> {
+    let url = context
+        .config
+        .map(|config| resolve_remote_fetch_url(config, repository))
+        .unwrap_or_else(|| repository.to_string());
+    let transport = parse_remote_url(&url)?.transport;
+    Ok(ResolvedRemote { url, transport })
+}
+
+/// Resolve a remote name/path to a concrete local git directory.
+///
+/// This preserves Git's precedence: a configured remote name first, then the
+/// literal path relative to the invocation cwd, then an `insteadOf` rewrite.
+pub fn resolve_local_remote_git_dir(
+    context: RemoteResolutionContext<'_>,
+    repository: &str,
+) -> Result<PathBuf> {
+    if let (Some(git_dir), Some(config)) = (context.local_git_dir, context.config)
+        && remote_exists(config, repository)
+    {
+        return resolve_configured_local_remote_git_dir(config, repository, git_dir, context.cwd);
+    }
+    if let Ok(path) = local_repository_path_from_url(repository, context.cwd)
+        && let Ok(git_dir) = discover_local_git_dir(&path)
+    {
+        return Ok(git_dir);
+    }
+    let local_git_dir = context
+        .local_git_dir
+        .ok_or_else(|| GitError::repository_not_found("not a git repository"))?;
+    let config = context
+        .config
+        .ok_or_else(|| GitError::repository_not_found("not a git repository"))?;
+    let rewritten = resolve_remote_fetch_url(config, repository);
+    if rewritten != repository
+        && let Ok(path) = local_repository_path_from_url(&rewritten, context.cwd)
+        && let Ok(git_dir) = discover_local_git_dir(&path)
+    {
+        return Ok(git_dir);
+    }
+    resolve_configured_local_remote_git_dir(config, repository, local_git_dir, context.cwd)
+}
 
 /// Resolve the fetch URL for `remote` using `config` (name lookup + `insteadOf`).
 pub fn fetch_url(config: &GitConfig, remote: &str) -> String {
@@ -165,14 +233,141 @@ fn local_repository_path(parsed: &RemoteUrl, relative_base: &Path) -> Result<Pat
     })
 }
 
+pub fn resolve_configured_local_remote_git_dir(
+    config: &GitConfig,
+    name: &str,
+    git_dir: &Path,
+    cwd: &Path,
+) -> Result<PathBuf> {
+    let url = remote_config_values(config, name, "url")
+        .into_iter()
+        .next()
+        .ok_or_else(|| GitError::not_found(format!("remote {name} url")))?;
+    let url = resolve_remote_fetch_url(config, &url);
+    let parsed = parse_remote_url(&url)?;
+    let remote_path = match parsed.transport {
+        RemoteTransport::Local => {
+            let path = PathBuf::from(parsed.path);
+            if path.is_absolute() {
+                path
+            } else {
+                repository_relative_path_base(git_dir, cwd)?.join(path)
+            }
+        }
+        RemoteTransport::File => PathBuf::from(percent_decode_url_path(&parsed.path)?),
+        RemoteTransport::Ssh
+        | RemoteTransport::Ext
+        | RemoteTransport::Git
+        | RemoteTransport::Http
+        | RemoteTransport::Https => {
+            return Err(GitError::Unsupported(
+                "remote discovery for non-local transports".into(),
+            ));
+        }
+    };
+    discover_local_git_dir(&remote_path)
+}
+
+fn repository_relative_path_base(git_dir: &Path, cwd: &Path) -> Result<PathBuf> {
+    if git_dir.file_name().is_some_and(|name| name == ".git") {
+        return git_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| GitError::InvalidPath("git dir has no parent".into()));
+    }
+    Ok(cwd.to_path_buf())
+}
+
+fn local_repository_path_from_url(repository: &str, cwd: &Path) -> Result<PathBuf> {
+    let parsed = parse_remote_url(repository)?;
+    match parsed.transport {
+        RemoteTransport::Local => {
+            let path = PathBuf::from(parsed.path);
+            Ok(if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            })
+        }
+        RemoteTransport::File => Ok(PathBuf::from(percent_decode_url_path(&parsed.path)?)),
+        RemoteTransport::Ssh
+        | RemoteTransport::Ext
+        | RemoteTransport::Git
+        | RemoteTransport::Http
+        | RemoteTransport::Https => Err(GitError::Unsupported(
+            "local remote resolution requires a local repository".into(),
+        )),
+    }
+}
+
+pub fn discover_local_git_dir(path: &Path) -> Result<PathBuf> {
+    let dot_git_path = path_with_dot_git_suffix(path);
+    let candidates = [
+        path.join(".git"),
+        path.to_path_buf(),
+        dot_git_path.join(".git"),
+        dot_git_path,
+    ];
+    for candidate in candidates {
+        if is_git_dir(&candidate) {
+            return Ok(candidate);
+        }
+        if candidate.is_file()
+            && let Some(git_dir) = read_gitdir_link(&candidate)?
+            && is_git_dir(&git_dir)
+        {
+            return std::fs::canonicalize(git_dir).map_err(|err| GitError::Io(err.to_string()));
+        }
+    }
+    Err(GitError::repository_not_found("not a git repository"))
+}
+
+fn path_with_dot_git_suffix(path: &Path) -> PathBuf {
+    let mut suffixed = path.as_os_str().to_os_string();
+    suffixed.push(".git");
+    PathBuf::from(suffixed)
+}
+
+fn percent_decode_url_path(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(GitError::InvalidPath(format!(
+                    "invalid percent-encoded path {value:?}"
+                )));
+            }
+            let high = percent_hex_value(bytes[index + 1]).ok_or_else(|| {
+                GitError::InvalidPath(format!("invalid percent-encoded path {value:?}"))
+            })?;
+            let low = percent_hex_value(bytes[index + 2]).ok_or_else(|| {
+                GitError::InvalidPath(format!("invalid percent-encoded path {value:?}"))
+            })?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded)
+        .map_err(|_| GitError::InvalidPath(format!("invalid utf-8 file URL path {value:?}")))
+}
+
+fn percent_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Discover the git directory containing `start` (working tree or bare repo).
 fn discover_git_dir(start: &Path) -> Result<PathBuf> {
-    let absolute = if start.is_absolute() {
-        start.to_path_buf()
-    } else {
-        std::env::current_dir().map_err(GitError::from)?.join(start)
-    };
-    for candidate in absolute.ancestors() {
+    for candidate in start.ancestors() {
         let dot_git = candidate.join(".git");
         if dot_git.is_dir() {
             return Ok(dot_git);
@@ -215,6 +410,9 @@ fn read_gitdir_link(path: &Path) -> Result<Option<PathBuf>> {
 mod tests {
     use super::*;
     use sley_config::{ConfigEntry, ConfigSection, GitConfig};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn instead_of_rewrites_fetch_url() {
@@ -279,5 +477,44 @@ mod tests {
             push_destination_for_url(url, Path::new(".")).expect("push destination"),
             PushDestination::Git(_)
         ));
+    }
+
+    #[test]
+    fn local_resolution_uses_only_injected_cwd_and_config() {
+        let root = std::env::temp_dir().join(format!(
+            "sley-remote-resolve-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let local = root.join("local");
+        let git_dir = local.join(".git");
+        std::fs::create_dir_all(git_dir.join("objects")).expect("objects");
+        std::fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("HEAD");
+        let config = GitConfig {
+            preamble: Vec::new(),
+            suffix: Vec::new(),
+            sections: vec![ConfigSection::new(
+                "remote",
+                Some("origin".into()),
+                vec![ConfigEntry::new("url", Some("local".into()))],
+            )],
+        };
+        let caller_git_dir = root.join(".git");
+        let context = RemoteResolutionContext {
+            cwd: &root,
+            local_git_dir: Some(&caller_git_dir),
+            config: Some(&config),
+        };
+        assert_eq!(
+            resolve_local_remote_git_dir(context, "origin").expect("local remote"),
+            git_dir
+        );
+        assert_eq!(
+            resolve_remote(context, "origin")
+                .expect("resolved remote")
+                .url,
+            "local"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 }

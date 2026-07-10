@@ -9,22 +9,26 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAX_DIRECT_ODB_OPENINGS: usize = 188;
-const MAX_DIRECT_REF_STORE_OPENINGS: usize = 194;
-const MAX_REPOSITORY_CONTEXT_DISCOVERIES: usize = 2;
+const MAX_DIRECT_ODB_OPENINGS: usize = 179;
+const MAX_DIRECT_REF_STORE_OPENINGS: usize = 177;
+const MAX_REPOSITORY_CONTEXT_DISCOVERIES: usize = 1;
 const MAX_COMPAT_SESSION_READS: usize = 13;
-const MAX_COMPAT_GIT_DIR_DISCOVERIES: usize = 18;
-const MAX_COMPAT_GIT_DIR_FROM_DISCOVERIES: usize = 42;
+const MAX_COMPAT_GIT_DIR_DISCOVERIES: usize = 9;
+const MAX_COMPAT_GIT_DIR_FROM_DISCOVERIES: usize = 19;
 
 const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
     "attrs.rs",
+    "bisect.rs",
     "blame.rs",
     "cat_file.rs",
+    "checkout.rs",
     "checkout_index.rs",
     "commit.rs",
     "credential.rs",
     "describe.rs",
+    "diff.rs",
     "diff_files.rs",
+    "diff_index.rs",
     "diff_tree.rs",
     "diagnose.rs",
     "difftool.rs",
@@ -39,6 +43,7 @@ const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
     "hash_object.rs",
     "index.rs",
     "last_modified.rs",
+    "log.rs",
     "merge_index.rs",
     "merge_file.rs",
     "merge_tree.rs",
@@ -59,6 +64,13 @@ const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
     "refs_verify.rs",
     "reset.rs",
     "remote/admin.rs",
+    "remote/clone.rs",
+    "remote/fetch.rs",
+    "remote/helper.rs",
+    "remote/http_backend.rs",
+    "remote/ls_remote.rs",
+    "remote/pack.rs",
+    "remote/resolve.rs",
     "replay.rs",
     "rerere.rs",
     "rev_list.rs",
@@ -70,12 +82,14 @@ const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
     "submodule.rs",
     "tag.rs",
     "trees.rs",
+    "utility.rs",
     "verify_commit.rs",
     "verify_tag.rs",
     "worktree.rs",
 ];
 
 const EXPLICIT_SESSION_PLUMBING_COMMANDS: &[&str] = &[
+    "archive.rs",
     "bundle.rs",
     "clean.rs",
     "commit_tree.rs",

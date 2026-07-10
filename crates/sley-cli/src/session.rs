@@ -191,6 +191,34 @@ impl CliSession {
         self.local_repo_env_hidden
     }
 
+    /// Derive a child invocation which must not inherit the parent repository.
+    ///
+    /// Local transport and submodule-clone paths use this instead of mutating
+    /// the process-global compatibility session around an in-process command.
+    pub(crate) fn local_repo_env_hidden_child(&self) -> Self {
+        let mut child = self.clone();
+        child.local_repo_env_hidden = true;
+        child
+    }
+
+    /// Create an isolated child invocation rooted at `cwd` with no parent
+    /// repository overrides. Used by recursive engine callbacks which have an
+    /// explicit worktree path but no need to inherit the caller's repository.
+    pub(crate) fn isolated_child(cwd: PathBuf) -> Self {
+        let mut child = Self::from_parsed_globals(
+            cwd,
+            None,
+            None,
+            None,
+            false,
+            true,
+            true,
+            PathspecFlags::default(),
+        );
+        child.local_repo_env_hidden = true;
+        child
+    }
+
     pub(crate) fn pathspec_flags(&self) -> PathspecFlags {
         self.env.pathspec_flags
     }

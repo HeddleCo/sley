@@ -11,7 +11,7 @@ use super::pack::{
     trace_configured_local_protocol_version, trace_protocol_v2_ls_refs_request,
     trace2_local_transfer_negotiation, unique_abbrev,
 };
-use super::resolve::{local_remote_git_dir, ls_remote_git_dir};
+use super::resolve::{RemoteCommandContext, local_remote_git_dir, ls_remote_git_dir};
 use crate::commands::config_cmd::{
     ConfigKey, SimpleConfigRegex, config_set_value, parse_config_key,
 };
@@ -25,49 +25,27 @@ use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord};
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 
-/// The remote `git fetch` uses when given no remote argument, mirroring git's
-/// `remote_for_branch`: the current branch's `branch.<name>.remote` if set,
-/// otherwise the sole configured remote, otherwise `origin`.
-pub(super) fn default_fetch_remote(git_dir: &Path, format: ObjectFormat) -> Result<String> {
-    let config = read_repo_config(git_dir)?;
-    if let Some(current) = FileRefStore::new(git_dir, format).current_branch()?
-        && let Some(remote) = config.get("branch", Some(&current), "remote")
-    {
-        return Ok(remote.to_string());
-    }
-    let remotes = remote_names(&config);
-    Ok(match remotes.as_slice() {
-        [only] => only.clone(),
-        _ => "origin".to_string(),
-    })
-}
-
-/// The current branch's `branch.<name>.merge` values, but only when its
-/// `branch.<name>.remote` is `remote` — git's `add_merge_config` only honors the
-/// merge config when the branch's remote matches the remote being fetched.
-fn current_branch_merge_for_remote(
+fn fetch_repository_plan(
     git_dir: &Path,
     format: ObjectFormat,
-    remote: &str,
-) -> Vec<String> {
-    let Ok(config) = read_repo_config(git_dir) else {
-        return Vec::new();
-    };
-    let Ok(Some(current)) = FileRefStore::new(git_dir, format).current_branch() else {
-        return Vec::new();
-    };
-    if config.get("branch", Some(&current), "remote") != Some(remote) {
-        return Vec::new();
-    }
-    config
-        .get_all("branch", Some(&current), "merge")
-        .into_iter()
-        .flatten()
-        .map(str::to_string)
-        .collect()
+    config: &GitConfig,
+    requested_remote: Option<&str>,
+) -> Result<sley_remote::FetchRepositoryPlan> {
+    let current_branch = FileRefStore::new(git_dir, format).current_branch()?;
+    Ok(sley_remote::plan_fetch_repository(
+        config,
+        current_branch.as_deref(),
+        requested_remote,
+    ))
 }
 
-pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
+pub(super) fn default_fetch_remote(context: &RemoteCommandContext) -> Result<String> {
+    let git_dir = context.required_git_dir()?;
+    let format = repository_object_format(git_dir)?;
+    Ok(fetch_repository_plan(git_dir, format, context.required_config()?, None)?.remote)
+}
+
+pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut source = None::<String>;
     let mut refspecs = Vec::new();
     let mut options = FetchOptions {
@@ -395,15 +373,19 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         );
     }
     options.upload_pack_command = upload_pack_command.clone();
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
+    let context = RemoteCommandContext::require_repository(cli_session)?;
+    let repository = context.required_repository()?;
+    let cwd = context.cwd();
+    let git_dir = repository.git_dir();
+    let format = repository.object_format();
     // A bare repo with no working tree never has a "checked out" branch, so the
     // current-branch fetch refusal is keyed off whether a *non-bare* worktree
     // shares the symref (`find_shared_symref` skips bare worktrees) rather than a
     // blanket update-head-ok for every bare repo — otherwise a bare repo's linked
     // worktree branch could be overwritten by fetch (t5516 #120).
-    let config = read_repo_config(&git_dir)?;
+    let config = context.required_config()?;
+    let transport_config = repo_config_with_transport_policy(&context, git_dir)?;
+    let current_branch = repository.references().current_branch()?;
     let all_from_config = source.is_none()
         && fetch_all_remotes.is_none()
         && config.get_bool("fetch", None, "all").unwrap_or(false);
@@ -423,10 +405,14 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         }
         let remotes = fetch_all_remote_names(&config);
         fetch_multiple_remotes(FetchMultipleRequest {
-            git_dir: &git_dir,
+            git_dir,
             format,
-            worktree_root: &cwd,
-            config: &config,
+            worktree_root: cwd,
+            config,
+            current_branch: current_branch.as_deref(),
+            resolution: context.resolution(),
+            command_context: &context,
+            transport_config: &transport_config,
             remotes,
             refspecs: &refspecs,
             options: &options,
@@ -453,10 +439,14 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         names.extend(refspecs.drain(..));
         let remotes = resolve_remote_or_group_names(&config, &names)?;
         fetch_multiple_remotes(FetchMultipleRequest {
-            git_dir: &git_dir,
+            git_dir,
             format,
-            worktree_root: &cwd,
-            config: &config,
+            worktree_root: cwd,
+            config,
+            current_branch: current_branch.as_deref(),
+            resolution: context.resolution(),
+            command_context: &context,
+            transport_config: &transport_config,
             remotes,
             refspecs: &refspecs,
             options: &options,
@@ -477,17 +467,16 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     // With no remote argument, resolve the default the way git's
     // `remote_for_branch` does: the current branch's `branch.<name>.remote`,
     // else the sole configured remote, else `origin`.
-    let source = match source {
-        Some(source) => source,
-        None => default_fetch_remote(&git_dir, format)?,
-    };
+    let repository_plan =
+        sley_remote::plan_fetch_repository(config, current_branch.as_deref(), source.as_deref());
+    let source = repository_plan.remote;
     // When no refspecs are given on the command line and the current branch's
     // `branch.<name>.remote` is the remote we're fetching, git's get_ref_map adds
     // the branch's `branch.<name>.merge` ref(s) as the FETCH_HEAD for-merge
     // entries (`add_merge_config`). Resolve those so the configured-refspec fetch
     // marks them correctly (and `pull` can find its merge target).
     if refspecs.is_empty() && !prefetch {
-        options.merge_srcs = current_branch_merge_for_remote(&git_dir, format, &source);
+        options.merge_srcs = repository_plan.merge_srcs;
     }
     if unshallow {
         if options.depth.is_some() {
@@ -501,11 +490,10 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         options.depth = Some(sley_remote::INFINITE_DEPTH);
     }
     if !filter_option_explicit {
-        let config = read_repo_config(&git_dir)?;
-        sley_remote::apply_configured_partial_clone_filter(&config, &source, &mut options);
+        sley_remote::apply_configured_partial_clone_filter(config, &source, &mut options);
     }
     let effective_refspecs = if prefetch {
-        prefetch_refspecs(&config, &source, &refspecs)
+        prefetch_refspecs(config, &source, &refspecs)
     } else {
         refspecs.clone()
     };
@@ -513,34 +501,38 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         options.refmap = Some(Vec::new());
     }
     if fetch_raw_oid_refspecs(
-        &git_dir,
+        git_dir,
         format,
         &source,
         &effective_refspecs,
         &options,
         filter_spec.as_deref(),
+        context.resolution(),
+        &transport_config,
     )? {
         return Ok(());
     }
-    let before_fetch_refs = fetch_ref_snapshot(&git_dir, format)?;
+    let before_fetch_refs = fetch_ref_snapshot(git_dir, format)?;
     let refetch = options.refetch;
     let effective_server_options = if server_options_from_cli {
         server_options
     } else {
-        configured_server_options(&config, &source)?
+        configured_server_options(config, &source)?
     };
-    if server_options_from_cli && configured_legacy_protocol(Some(&config)) {
+    if server_options_from_cli && configured_legacy_protocol(Some(config)) {
         eprintln!("fatal: server options require protocol version 2 or later");
         eprintln!("fatal: see protocol.version in 'git help config' for more details");
         return Err(GitError::Exit(128));
     }
     let result = fetch_one_source_with_outcome(
-        &git_dir,
+        git_dir,
         format,
         &source,
         &effective_refspecs,
         options.clone(),
         &effective_server_options,
+        &context,
+        &transport_config,
     );
     if result.is_ok() && refetch {
         trace2_fetch_refetch_maintenance();
@@ -551,28 +543,33 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     // pack is only usable once the repo knows the remote can supply the omitted
     // objects on demand.
     if let Some(spec) = filter_spec.as_deref() {
-        register_promisor_remote(&git_dir, &source, spec)?;
+        register_promisor_remote(git_dir, &source, spec)?;
     }
     if set_upstream {
-        fetch_set_upstream_from_outcome(&git_dir, format, &source, &outcome)?;
+        fetch_set_upstream_from_outcome(git_dir, format, &source, &outcome)?;
     }
-    let config = read_repo_config(&git_dir)?;
-    trace2_local_transfer_negotiation(&config, upload_pack_command.as_deref());
+    let refreshed_config = filter_spec
+        .as_ref()
+        .map(|_| read_repo_config(git_dir))
+        .transpose()?;
+    let config = refreshed_config.as_ref().unwrap_or(config);
+    trace2_local_transfer_negotiation(config, upload_pack_command.as_deref());
     let recurse_submodules = resolve_fetch_recurse_submodules(
         &config,
         recurse_submodules_cli,
         recurse_submodules_default,
     );
     fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
-        git_dir: &git_dir,
+        git_dir,
         format,
-        worktree_root: &cwd,
-        config: &config,
+        worktree_root: cwd,
+        runtime_cwd: cwd,
+        config,
         recurse_submodules,
         default_recurse_submodules: recurse_submodules_default,
         source: &source,
         changed_gitlinks: changed_gitlinks_for_fetch(
-            &git_dir,
+            git_dir,
             format,
             &before_fetch_refs,
             &outcome,
@@ -589,6 +586,10 @@ struct FetchMultipleRequest<'a> {
     format: ObjectFormat,
     worktree_root: &'a Path,
     config: &'a GitConfig,
+    current_branch: Option<&'a str>,
+    resolution: sley_remote::RemoteResolutionContext<'a>,
+    command_context: &'a RemoteCommandContext,
+    transport_config: &'a GitConfig,
     remotes: Vec<String>,
     refspecs: &'a [String],
     options: &'a FetchOptions,
@@ -626,7 +627,8 @@ fn fetch_multiple_remotes(req: FetchMultipleRequest<'_>) -> Result<()> {
         }
         if req.refspecs.is_empty() && !req.prefetch {
             remote_options.merge_srcs =
-                current_branch_merge_for_remote(req.git_dir, req.format, &remote);
+                sley_remote::plan_fetch_repository(req.config, req.current_branch, Some(&remote))
+                    .merge_srcs;
         }
         let effective_refspecs = if req.prefetch {
             prefetch_refspecs(req.config, &remote, req.refspecs)
@@ -656,6 +658,8 @@ fn fetch_multiple_remotes(req: FetchMultipleRequest<'_>) -> Result<()> {
             &effective_refspecs,
             remote_options.clone(),
             &remote_server_options,
+            req.command_context,
+            req.transport_config,
         );
         let outcome = match result {
             Ok(outcome) => outcome,
@@ -674,6 +678,7 @@ fn fetch_multiple_remotes(req: FetchMultipleRequest<'_>) -> Result<()> {
             git_dir: req.git_dir,
             format: req.format,
             worktree_root: req.worktree_root,
+            runtime_cwd: req.resolution.cwd,
             config: req.config,
             recurse_submodules,
             default_recurse_submodules: req.recurse_submodules_default,
@@ -840,6 +845,7 @@ pub(crate) struct FetchSubmoduleRequest<'a> {
     pub(crate) git_dir: &'a Path,
     pub(crate) format: ObjectFormat,
     pub(crate) worktree_root: &'a Path,
+    pub(crate) runtime_cwd: &'a Path,
     pub(crate) config: &'a GitConfig,
     pub(crate) recurse_submodules: FetchRecurseSubmodules,
     pub(crate) default_recurse_submodules: FetchRecurseSubmodules,
@@ -862,10 +868,11 @@ struct CurrentDirGuard {
 }
 
 impl CurrentDirGuard {
-    fn enter(path: &Path) -> Result<Self> {
-        let previous = env::current_dir()?;
+    fn enter(path: &Path, previous: &Path) -> Result<Self> {
         env::set_current_dir(path)?;
-        Ok(Self { previous })
+        Ok(Self {
+            previous: previous.to_path_buf(),
+        })
     }
 }
 
@@ -915,6 +922,7 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
         };
         ensure_submodule_object_store(&sub_git_dir)?;
         let sub_format = repository_object_format(&sub_git_dir)?;
+        let nested_config = read_repo_config(&sub_git_dir)?;
         let changed_for_path = req
             .changed_gitlinks
             .iter()
@@ -939,7 +947,8 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
         }
         seen_submodules.insert(submodule.path.clone());
         trace_submodule_get_default_remote(&submodule.path);
-        let sub_source = default_fetch_remote(&sub_git_dir, sub_format)?;
+        let sub_plan = fetch_repository_plan(&sub_git_dir, sub_format, &nested_config, None)?;
+        let sub_source = sub_plan.remote;
         if !req.options.quiet {
             eprintln!(
                 "Fetching submodule {}{}",
@@ -949,14 +958,18 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
         let nested_prefix = format!("{}{}{}", req.submodule_prefix, submodule.path, "/");
         trace_submodule_fetch(&nested_prefix, &sub_source, &[]);
         let mut sub_options = req.options.clone();
-        sub_options.merge_srcs =
-            current_branch_merge_for_remote(&sub_git_dir, sub_format, &sub_source);
+        sub_options.merge_srcs = sub_plan.merge_srcs;
         let fetch_cwd = if submodule_root.is_dir() {
             submodule_root.as_path()
         } else {
             sub_git_dir.as_path()
         };
-        let _guard = CurrentDirGuard::enter(fetch_cwd)?;
+        let nested_transport_config =
+            transport_policy_config_for_paths(fetch_cwd, Some(&sub_git_dir))?;
+        let _guard = CurrentDirGuard::enter(fetch_cwd, req.runtime_cwd)?;
+        let nested_context =
+            RemoteCommandContext::from_explicit(fetch_cwd, &sub_git_dir, nested_config.clone());
+        let resolution = nested_context.resolution();
         let before_sub_refs = fetch_ref_snapshot(&sub_git_dir, sub_format)?;
         let outcome = fetch_one_source_with_outcome(
             &sub_git_dir,
@@ -965,6 +978,8 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
             &[],
             sub_options.clone(),
             &[],
+            &nested_context,
+            &nested_transport_config,
         )?;
         let missing_oids = changed_for_path
             .iter()
@@ -980,11 +995,12 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
                 &missing_oids,
                 &sub_options,
                 None,
+                resolution,
+                &nested_transport_config,
             )?;
         }
         let nested_changed_gitlinks =
             changed_gitlinks_for_fetch(&sub_git_dir, sub_format, &before_sub_refs, &outcome)?;
-        let nested_config = read_repo_config(&sub_git_dir)?;
         let nested_default_recurse_submodules = match mode {
             FetchRecurseSubmodules::Default => req.default_recurse_submodules,
             FetchRecurseSubmodules::OnDemand => FetchRecurseSubmodules::OnDemand,
@@ -1005,6 +1021,7 @@ pub(crate) fn fetch_populated_submodules_after_superproject(
             git_dir: &sub_git_dir,
             format: sub_format,
             worktree_root: &submodule_root,
+            runtime_cwd: fetch_cwd,
             config: &nested_config,
             recurse_submodules: nested_recurse_submodules,
             default_recurse_submodules: nested_default_recurse_submodules,
@@ -1052,11 +1069,13 @@ fn fetch_changed_submodule_after_superproject(
     };
     ensure_submodule_object_store(&sub_git_dir)?;
     let sub_format = repository_object_format(&sub_git_dir)?;
+    let nested_config = read_repo_config(&sub_git_dir)?;
     if submodule_has_commit(&sub_git_dir, sub_format, &changed.oid) {
         return Ok(());
     }
     trace_submodule_get_default_remote(&display_path);
-    let sub_source = default_fetch_remote(&sub_git_dir, sub_format)?;
+    let sub_plan = fetch_repository_plan(&sub_git_dir, sub_format, &nested_config, None)?;
+    let sub_source = sub_plan.remote;
     if !req.options.quiet {
         eprintln!(
             "Fetching submodule {}{} at commit {}",
@@ -1066,13 +1085,17 @@ fn fetch_changed_submodule_after_superproject(
         );
     }
     let mut sub_options = req.options.clone();
-    sub_options.merge_srcs = current_branch_merge_for_remote(&sub_git_dir, sub_format, &sub_source);
+    sub_options.merge_srcs = sub_plan.merge_srcs;
     let fetch_cwd = if submodule_root.is_dir() {
         submodule_root.as_path()
     } else {
         sub_git_dir.as_path()
     };
-    let _guard = CurrentDirGuard::enter(fetch_cwd)?;
+    let nested_transport_config = transport_policy_config_for_paths(fetch_cwd, Some(&sub_git_dir))?;
+    let _guard = CurrentDirGuard::enter(fetch_cwd, req.runtime_cwd)?;
+    let nested_context =
+        RemoteCommandContext::from_explicit(fetch_cwd, &sub_git_dir, nested_config.clone());
+    let resolution = nested_context.resolution();
     let before_sub_refs = fetch_ref_snapshot(&sub_git_dir, sub_format)?;
     let outcome = fetch_one_source_with_outcome(
         &sub_git_dir,
@@ -1081,6 +1104,8 @@ fn fetch_changed_submodule_after_superproject(
         &[],
         sub_options.clone(),
         &[],
+        &nested_context,
+        &nested_transport_config,
     )?;
     if !submodule_has_commit(&sub_git_dir, sub_format, &changed.oid) {
         let refspec = changed.oid.to_string();
@@ -1093,6 +1118,8 @@ fn fetch_changed_submodule_after_superproject(
             &[refspec],
             &sub_options,
             None,
+            resolution,
+            &nested_transport_config,
         )?;
     }
     let mut nested_changed_gitlinks =
@@ -1102,7 +1129,6 @@ fn fetch_changed_submodule_after_superproject(
             changed_gitlinks_for_commit(&sub_git_dir, sub_format, &changed.oid)?;
     }
     let nested_prefix = format!("{}{}/", req.submodule_prefix, display_path);
-    let nested_config = read_repo_config(&sub_git_dir)?;
     let nested_recurse_submodules = if req.recurse_submodules == FetchRecurseSubmodules::Default {
         resolve_fetch_recurse_submodules(&nested_config, FetchRecurseSubmodules::Default, mode)
     } else {
@@ -1112,6 +1138,7 @@ fn fetch_changed_submodule_after_superproject(
         git_dir: &sub_git_dir,
         format: sub_format,
         worktree_root: &submodule_root,
+        runtime_cwd: fetch_cwd,
         config: &nested_config,
         recurse_submodules: nested_recurse_submodules,
         default_recurse_submodules: mode,
@@ -1481,6 +1508,8 @@ fn fetch_raw_oid_refspecs(
     refspecs: &[String],
     options: &FetchOptions,
     filter_spec: Option<&str>,
+    resolution: sley_remote::RemoteResolutionContext<'_>,
+    config: &GitConfig,
 ) -> Result<bool> {
     if refspecs.is_empty() || refspecs.iter().any(|refspec| refspec.contains(':')) {
         return Ok(false);
@@ -1492,9 +1521,10 @@ fn fetch_raw_oid_refspecs(
         };
         wants.push(oid);
     }
-    let config = read_repo_config(git_dir)?;
-    let resolved_source = resolve_remote_fetch_url(&config, source);
-    let Ok(remote_git_dir) = ls_remote_git_dir(&resolved_source) else {
+    let resolved_source = resolve_remote_fetch_url(config, source);
+    let Ok(remote_git_dir) =
+        sley_remote::resolve_local_remote_git_dir(resolution, &resolved_source)
+    else {
         return Ok(false);
     };
     // A filtered fetch omits objects, so its pack is only valid as a promisor
@@ -1569,14 +1599,22 @@ fn fetch_one_source_with_outcome(
     refspecs: &[String],
     options: FetchOptions,
     server_options: &[String],
+    command_context: &RemoteCommandContext,
+    config: &GitConfig,
 ) -> Result<sley_remote::FetchOutcome> {
-    if let Some(outcome) =
-        super::helper::fetch_with_remote_helper(git_dir, format, source, refspecs, options.clone())?
-    {
-        maybe_write_fetch_commit_graph(git_dir, &options)?;
+    let resolution = command_context.resolution();
+    if let Some(outcome) = super::helper::fetch_with_remote_helper(
+        command_context,
+        git_dir,
+        format,
+        source,
+        refspecs,
+        options.clone(),
+    )? {
+        maybe_write_fetch_commit_graph(git_dir, config, &options)?;
         return Ok(outcome);
     }
-    if let Some((bundle_source, bundle)) = fetch_bundle_source(git_dir, format, source)? {
+    if let Some((bundle_source, bundle)) = fetch_bundle_source(format, source, config)? {
         // Bundle fetches have no shallow support, so a `--depth` is warned-and-
         // ignored here, matching the local-clone behavior.
         if options.depth.is_some() {
@@ -1584,8 +1622,7 @@ fn fetch_one_source_with_outcome(
         }
         let configured_refspecs;
         let bundle_refspecs = if refspecs.is_empty() {
-            let config = read_repo_config(git_dir)?;
-            configured_refspecs = remote_config_values(&config, source, "fetch");
+            configured_refspecs = remote_config_values(config, source, "fetch");
             if configured_refspecs.is_empty() {
                 refspecs
             } else {
@@ -1602,37 +1639,54 @@ fn fetch_one_source_with_outcome(
             &bundle,
             options.clone(),
         )?;
-        maybe_write_fetch_commit_graph(git_dir, &options)?;
+        maybe_write_fetch_commit_graph(git_dir, config, &options)?;
         return Ok(sley_remote::FetchOutcome::default());
     }
-    let config = transport_policy_config_for_cwd()?;
-    let resolved = ls_remote_resolved_url(source)?;
-    check_transport_allowed_url(&resolved, Some(&config))?;
-    let outcome = if fetch_source_is_http(source)? {
-        fetch_http_repository_with_outcome(git_dir, format, source, refspecs, options.clone())?
-    } else if fetch_source_is_ssh(source)? {
-        fetch_ssh_repository_with_outcome(git_dir, format, source, refspecs, options.clone())?
-    } else if fetch_source_is_git(source)? {
-        fetch_git_repository_with_outcome(git_dir, format, source, refspecs, options.clone())?
-    } else {
-        fetch_local_repository_with_outcome(
-            git_dir,
-            format,
-            source,
-            refspecs,
-            options.clone(),
-            server_options,
-        )?
+    let resolved = sley_remote::resolve_remote(resolution, source)?;
+    check_transport_allowed_url(&resolved.url, Some(config))?;
+    let fetch_source = match resolved.transport {
+        RemoteTransport::Http | RemoteTransport::Https => {
+            sley_remote::FetchSource::Http(parse_remote_url(&resolved.url)?)
+        }
+        RemoteTransport::Ssh | RemoteTransport::Ext => {
+            sley_remote::FetchSource::Ssh(parse_remote_url(&resolved.url)?)
+        }
+        RemoteTransport::Git => sley_remote::FetchSource::Git {
+            remote: parse_remote_url(&resolved.url)?,
+            protocol_v2: configured_protocol_version(Some(config)) == Some(ProtocolVersion::V2),
+        },
+        RemoteTransport::Local | RemoteTransport::File => {
+            let remote_git_dir = sley_remote::resolve_local_remote_git_dir(resolution, source)?;
+            let common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
+            sley_remote::FetchSource::Local {
+                git_dir: remote_git_dir,
+                common_git_dir,
+            }
+        }
     };
-    maybe_write_fetch_commit_graph(git_dir, &options)?;
+    let outcome = run_fetch(
+        resolution.cwd,
+        git_dir,
+        format,
+        config,
+        source,
+        &fetch_source,
+        refspecs,
+        options.clone(),
+        server_options,
+    )?;
+    maybe_write_fetch_commit_graph(git_dir, config, &options)?;
     Ok(outcome)
 }
 
-fn maybe_write_fetch_commit_graph(git_dir: &Path, options: &FetchOptions) -> Result<()> {
+fn maybe_write_fetch_commit_graph(
+    git_dir: &Path,
+    config: &GitConfig,
+    options: &FetchOptions,
+) -> Result<()> {
     if options.dry_run {
         return Ok(());
     }
-    let config = read_repo_config(git_dir)?;
     if !config
         .get_bool("fetch", None, "writecommitgraph")
         .unwrap_or(false)
@@ -1647,17 +1701,16 @@ fn maybe_write_fetch_commit_graph(git_dir: &Path, options: &FetchOptions) -> Res
 }
 
 fn fetch_bundle_source(
-    git_dir: &Path,
     format: ObjectFormat,
     source: &str,
+    config: &GitConfig,
 ) -> Result<Option<(String, Bundle)>> {
     if let Ok(input) = fs::read(source)
         && let Ok(bundle) = Bundle::parse(&input, format)
     {
         return Ok(Some((source.to_string(), bundle)));
     }
-    let config = read_repo_config(git_dir)?;
-    let resolved = resolve_remote_fetch_url(&config, source);
+    let resolved = resolve_remote_fetch_url(config, source);
     if resolved != source
         && let Ok(input) = fs::read(&resolved)
         && let Ok(bundle) = Bundle::parse(&input, format)
@@ -1804,16 +1857,19 @@ pub(crate) fn fetch_bundle(
 /// here; the fetch orchestration (ref-map, pack install, `FETCH_HEAD`, prune)
 /// lives in the library.
 pub(crate) fn fetch_local_repository(
+    context: &RemoteCommandContext,
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<()> {
-    fetch_local_repository_with_outcome(git_dir, format, source, refspecs, options, &[]).map(|_| ())
+    fetch_local_repository_with_outcome(context, git_dir, format, source, refspecs, options, &[])
+        .map(|_| ())
 }
 
 pub(crate) fn fetch_local_repository_with_outcome(
+    context: &RemoteCommandContext,
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
@@ -1821,14 +1877,15 @@ pub(crate) fn fetch_local_repository_with_outcome(
     options: FetchOptions,
     server_options: &[String],
 ) -> Result<sley_remote::FetchOutcome> {
-    let remote_git_dir = ls_remote_git_dir(source)?;
+    let remote_git_dir = ls_remote_git_dir(context, source)?;
     let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
-    let config = repo_config_with_transport_policy(git_dir)?;
+    let config = repo_config_with_transport_policy(context, git_dir)?;
     let fetch_source = sley_remote::FetchSource::Local {
         git_dir: remote_git_dir,
         common_git_dir: remote_common_git_dir,
     };
     run_fetch(
+        context.cwd(),
         git_dir,
         format,
         &config,
@@ -1856,6 +1913,7 @@ impl sley_remote::ProgressSink for StdoutProgress {
 /// outcome the way the CLI always has (prune notices are emitted through the sink
 /// during the call; nothing else is printed for fetch).
 pub(super) fn run_fetch(
+    cwd: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     config: &GitConfig,
@@ -1897,6 +1955,7 @@ pub(super) fn run_fetch(
         },
     )?;
     maybe_set_remote_head_on_fetch(
+        cwd,
         git_dir,
         format,
         config,
@@ -1998,6 +2057,7 @@ fn print_fetch_status(
 /// `never`. The default mode is `create` — set only if `<remote>/HEAD` does not
 /// already exist.
 fn maybe_set_remote_head_on_fetch(
+    cwd: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     config: &GitConfig,
@@ -2034,7 +2094,7 @@ fn maybe_set_remote_head_on_fetch(
     {
         return Ok(());
     }
-    if let Ok(remote_git_dir) = local_remote_git_dir(config, source, git_dir) {
+    if let Ok(remote_git_dir) = local_remote_git_dir(config, source, git_dir, cwd) {
         let remote_format = repository_object_format(&remote_git_dir)?;
         let remote_store = FileRefStore::new(&remote_git_dir, remote_format);
         if remote_store.read_ref(head_symref)?.is_none() {
@@ -2110,16 +2170,16 @@ fn report_followremotehead_warn(follow: &str, remote: &str, head_name: &str, exi
     }
 }
 
-pub(crate) fn fetch_source_is_ssh(source: &str) -> Result<bool> {
-    let resolved = ls_remote_resolved_url(source)?;
+pub(crate) fn fetch_source_is_ssh(context: &RemoteCommandContext, source: &str) -> Result<bool> {
+    let resolved = ls_remote_resolved_url(context, source)?;
     Ok(matches!(
         parse_remote_url(&resolved)?.transport,
         RemoteTransport::Ssh | RemoteTransport::Ext
     ))
 }
 
-pub(crate) fn fetch_source_is_git(source: &str) -> Result<bool> {
-    let resolved = ls_remote_resolved_url(source)?;
+pub(crate) fn fetch_source_is_git(context: &RemoteCommandContext, source: &str) -> Result<bool> {
+    let resolved = ls_remote_resolved_url(context, source)?;
     Ok(parse_remote_url(&resolved)?.transport == RemoteTransport::Git)
 }
 
@@ -2129,26 +2189,30 @@ pub(crate) fn fetch_source_is_git(source: &str) -> Result<bool> {
 /// orchestration (ref-map, pack install over `ssh`, `FETCH_HEAD`, prune) lives in
 /// the library, shared with the HTTP and local transports.
 pub(crate) fn fetch_ssh_repository(
+    context: &RemoteCommandContext,
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<()> {
-    fetch_ssh_repository_with_outcome(git_dir, format, source, refspecs, options).map(|_| ())
+    fetch_ssh_repository_with_outcome(context, git_dir, format, source, refspecs, options)
+        .map(|_| ())
 }
 
 pub(crate) fn fetch_ssh_repository_with_outcome(
+    context: &RemoteCommandContext,
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<sley_remote::FetchOutcome> {
-    let config = repo_config_with_transport_policy(git_dir)?;
-    let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
+    let config = repo_config_with_transport_policy(context, git_dir)?;
+    let remote = parse_remote_url(&ls_remote_resolved_url(context, source)?)?;
     let fetch_source = sley_remote::FetchSource::Ssh(remote);
     run_fetch(
+        context.cwd(),
         git_dir,
         format,
         &config,
@@ -2161,29 +2225,33 @@ pub(crate) fn fetch_ssh_repository_with_outcome(
 }
 
 pub(crate) fn fetch_git_repository(
+    context: &RemoteCommandContext,
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<()> {
-    fetch_git_repository_with_outcome(git_dir, format, source, refspecs, options).map(|_| ())
+    fetch_git_repository_with_outcome(context, git_dir, format, source, refspecs, options)
+        .map(|_| ())
 }
 
 pub(crate) fn fetch_git_repository_with_outcome(
+    context: &RemoteCommandContext,
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<sley_remote::FetchOutcome> {
-    let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
-    let config = read_repo_config(git_dir)?;
+    let remote = parse_remote_url(&ls_remote_resolved_url(context, source)?)?;
+    let config = repo_config_with_transport_policy(context, git_dir)?;
     let fetch_source = sley_remote::FetchSource::Git {
         remote,
         protocol_v2: configured_protocol_version(Some(&config)) == Some(ProtocolVersion::V2),
     };
     run_fetch(
+        context.cwd(),
         git_dir,
         format,
         &config,
@@ -2203,34 +2271,38 @@ pub(crate) fn fetch_git_repository_with_outcome(
 // build the right variant; URL/repo resolution, output formatting, and exit codes
 // stay here.
 
-pub(crate) fn fetch_source_is_http(source: &str) -> Result<bool> {
-    sley_remote::remote_url_is_http(&ls_remote_resolved_url(source)?)
+pub(crate) fn fetch_source_is_http(context: &RemoteCommandContext, source: &str) -> Result<bool> {
+    sley_remote::remote_url_is_http(&ls_remote_resolved_url(context, source)?)
 }
 
 /// Resolve the repository context and delegate a smart-HTTP(S) fetch to
 /// [`sley_remote::fetch`]. URL resolution and output formatting stay here; the
 /// fetch orchestration lives in the library.
 pub(super) fn fetch_http_repository(
+    context: &RemoteCommandContext,
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<()> {
-    fetch_http_repository_with_outcome(git_dir, format, source, refspecs, options).map(|_| ())
+    fetch_http_repository_with_outcome(context, git_dir, format, source, refspecs, options)
+        .map(|_| ())
 }
 
 pub(crate) fn fetch_http_repository_with_outcome(
+    context: &RemoteCommandContext,
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<sley_remote::FetchOutcome> {
-    let config = read_repo_config(git_dir)?;
-    let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
+    let config = repo_config_with_transport_policy(context, git_dir)?;
+    let remote = parse_remote_url(&ls_remote_resolved_url(context, source)?)?;
     let fetch_source = sley_remote::FetchSource::Http(remote);
     run_fetch(
+        context.cwd(),
         git_dir,
         format,
         &config,
@@ -2245,8 +2317,7 @@ pub(crate) fn fetch_http_repository_with_outcome(
 /// Pre-dispatch transport policy config for clone/fetch before a destination
 /// repository exists. Mirrors upstream `include_by_branch`: `onbranch:` must not
 /// match the cwd repository's checked-out branch while cloning into a new repo.
-pub(super) fn transport_policy_config_for_clone() -> Result<GitConfig> {
-    let cwd = env::current_dir()?;
+pub(super) fn transport_policy_config_for_clone(cwd: &Path) -> Result<GitConfig> {
     let context = sley_config::ConfigIncludeContext::new(None, None);
     let mut config =
         sley_config::load_pre_dispatch_config(None, &context).map_err(report_config_setup_error)?;
@@ -2265,13 +2336,15 @@ pub(super) fn transport_policy_config_for_clone() -> Result<GitConfig> {
 /// [`sley_remote::ls_remote`], returning `None` for non-HTTP transports. URL/
 /// config resolution and the ref-name pattern matching stay here; the
 /// advertisement listing and class filtering live in the library.
-pub(super) fn transport_policy_config_for_cwd() -> Result<GitConfig> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd).ok();
-    let common_git_dir = git_dir
-        .as_deref()
-        .and_then(|git_dir| common_git_dir_for_git_dir(git_dir).ok());
-    let context = match (&common_git_dir, &git_dir) {
+pub(super) fn transport_policy_config_for_context(
+    command_context: &RemoteCommandContext,
+) -> Result<GitConfig> {
+    transport_policy_config_for_paths(command_context.cwd(), command_context.git_dir())
+}
+
+fn transport_policy_config_for_paths(cwd: &Path, git_dir: Option<&Path>) -> Result<GitConfig> {
+    let common_git_dir = git_dir.and_then(|git_dir| common_git_dir_for_git_dir(git_dir).ok());
+    let context = match (&common_git_dir, git_dir) {
         (Some(common_git_dir), Some(git_dir)) => sley_config::ConfigIncludeContext::new(
             Some(common_git_dir.clone()),
             repo_current_branch_name(git_dir),
@@ -2291,18 +2364,23 @@ pub(super) fn transport_policy_config_for_cwd() -> Result<GitConfig> {
     Ok(config)
 }
 
-pub(super) fn repo_config_with_clone_transport_policy(git_dir: &Path) -> Result<GitConfig> {
-    let mut config = transport_policy_config_for_clone()?;
+pub(super) fn repo_config_with_clone_transport_policy(
+    git_dir: &Path,
+    cwd: &Path,
+) -> Result<GitConfig> {
+    let mut config = transport_policy_config_for_clone(cwd)?;
     let repo_config = read_repo_config(git_dir)?;
     config.sections.extend(repo_config.sections);
     Ok(config)
 }
 
-pub(super) fn repo_config_with_transport_policy(git_dir: &Path) -> Result<GitConfig> {
-    let mut config = transport_policy_config_for_cwd()?;
+pub(super) fn repo_config_with_transport_policy(
+    context: &RemoteCommandContext,
+    git_dir: &Path,
+) -> Result<GitConfig> {
+    let mut config = transport_policy_config_for_context(context)?;
     let repo_config = read_repo_config(git_dir)?;
-    let cwd = env::current_dir()?;
-    if let Ok(current_git_dir) = crate::session::cli_git_dir_from(&cwd) {
+    if let Some(current_git_dir) = context.git_dir() {
         let current_common = common_git_dir_for_git_dir(&current_git_dir)?;
         let requested_common = common_git_dir_for_git_dir(git_dir)?;
         if current_common == requested_common {
@@ -2321,15 +2399,11 @@ pub(super) fn repo_config_with_transport_policy(git_dir: &Path) -> Result<GitCon
     Ok(config)
 }
 
-pub(super) fn ls_remote_resolved_url(repository: &str) -> Result<String> {
-    let cwd = env::current_dir()?;
-    if let Some(config) = crate::session::cli_git_dir_from(&cwd)
-        .ok()
-        .and_then(|git_dir| read_repo_config(&git_dir).ok())
-    {
-        return Ok(resolve_remote_fetch_url(&config, repository));
-    }
-    Ok(repository.to_string())
+pub(super) fn ls_remote_resolved_url(
+    context: &RemoteCommandContext,
+    repository: &str,
+) -> Result<String> {
+    Ok(context.resolved_remote(repository)?.url)
 }
 
 pub(super) fn check_transport_allowed_url(url: &str, config: Option<&GitConfig>) -> Result<()> {

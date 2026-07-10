@@ -11,6 +11,114 @@ use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
 
+/// Default output family when the caller did not request an explicit format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultDiffOutput {
+    /// Porcelain `diff` defaults to a patch.
+    Patch,
+    /// Plumbing `diff-index` defaults to raw records.
+    Raw,
+}
+
+/// Requested output families before Git's precedence rules are applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderSelectionOptions {
+    /// Command-specific format used when no explicit family is requested.
+    pub default_output: DefaultDiffOutput,
+    /// Request raw records.
+    pub raw: bool,
+    /// Request patch output.
+    pub patch: bool,
+    /// Request status letters and paths.
+    pub name_status: bool,
+    /// Request paths only.
+    pub name_only: bool,
+    /// Request a diffstat table.
+    pub stat: bool,
+    /// Request numeric line statistics.
+    pub numstat: bool,
+    /// Request the aggregate short-stat line.
+    pub shortstat: bool,
+    /// Request create/delete/rename summary records.
+    pub summary: bool,
+    /// Another explicit format, such as dirstat, suppresses the default family.
+    pub auxiliary_format: bool,
+    /// `--no-patch` / an explicit no-output selection.
+    pub suppress_output: bool,
+}
+
+/// Resolved output-family plan shared by porcelain and plumbing commands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderSelection {
+    /// Emit raw records.
+    pub raw: bool,
+    /// Emit patch output.
+    pub patch: bool,
+    /// Emit status letters and paths.
+    pub name_status: bool,
+    /// Emit paths only.
+    pub name_only: bool,
+    /// Emit a diffstat table.
+    pub stat: bool,
+    /// Emit numeric line statistics.
+    pub numstat: bool,
+    /// Emit the aggregate short-stat line.
+    pub shortstat: bool,
+    /// Emit create/delete/rename summary records.
+    pub summary: bool,
+}
+
+impl RenderSelection {
+    /// Whether line statistics must be materialized before rendering.
+    #[must_use]
+    pub const fn needs_line_stats(self) -> bool {
+        self.stat || self.numstat || self.shortstat
+    }
+
+    /// Whether Git inserts a blank line before a following patch body.
+    #[must_use]
+    pub const fn separates_patch_from_prefix(self) -> bool {
+        self.patch && (self.raw || self.stat || self.numstat || self.shortstat || self.summary)
+    }
+}
+
+/// Resolve requested diff formats using Git's output-family precedence.
+///
+/// Name-only and name-status are exclusive presentation families and suppress
+/// raw/stat/summary/patch output. Otherwise the command-specific default is
+/// selected only when no explicit format (including an auxiliary family) was
+/// requested. An explicit no-output selection suppresses the default and patch.
+#[must_use]
+pub fn select_render_formats(options: RenderSelectionOptions) -> RenderSelection {
+    if options.name_only || options.name_status {
+        return RenderSelection {
+            name_status: options.name_status,
+            name_only: options.name_only,
+            ..RenderSelection::default()
+        };
+    }
+    let has_explicit_format = options.raw
+        || options.patch
+        || options.stat
+        || options.numstat
+        || options.shortstat
+        || options.summary
+        || options.auxiliary_format;
+    let use_default = !has_explicit_format && !options.suppress_output;
+    RenderSelection {
+        raw: options.raw || (use_default && options.default_output == DefaultDiffOutput::Raw),
+        patch: !options.suppress_output
+            && (options.patch
+                || (use_default && options.default_output == DefaultDiffOutput::Patch)),
+        name_status: false,
+        name_only: false,
+        stat: options.stat,
+        numstat: options.numstat,
+        shortstat: options.shortstat,
+        summary: options.summary,
+    }
+}
+
 /// Runtime services used while producing porcelain diff output.
 pub trait RenderServices {
     /// Return the terminal display width of a rendered path.
@@ -840,6 +948,73 @@ mod tests {
         assert_eq!(
             String::from_utf8(numstat).expect("numstat output should be UTF-8"),
             "2\t1\tsrc/lib.rs\n"
+        );
+    }
+
+    fn selection(default_output: DefaultDiffOutput) -> RenderSelectionOptions {
+        RenderSelectionOptions {
+            default_output,
+            raw: false,
+            patch: false,
+            name_status: false,
+            name_only: false,
+            stat: false,
+            numstat: false,
+            shortstat: false,
+            summary: false,
+            auxiliary_format: false,
+            suppress_output: false,
+        }
+    }
+
+    #[test]
+    fn render_selection_distinguishes_porcelain_and_plumbing_defaults() {
+        assert_eq!(
+            select_render_formats(selection(DefaultDiffOutput::Patch)),
+            RenderSelection {
+                patch: true,
+                ..RenderSelection::default()
+            }
+        );
+        assert_eq!(
+            select_render_formats(selection(DefaultDiffOutput::Raw)),
+            RenderSelection {
+                raw: true,
+                ..RenderSelection::default()
+            }
+        );
+    }
+
+    #[test]
+    fn name_formats_suppress_other_render_families() {
+        let mut options = selection(DefaultDiffOutput::Patch);
+        options.name_status = true;
+        options.raw = true;
+        options.patch = true;
+        options.stat = true;
+        assert_eq!(
+            select_render_formats(options),
+            RenderSelection {
+                name_status: true,
+                ..RenderSelection::default()
+            }
+        );
+    }
+
+    #[test]
+    fn render_selection_reports_stats_and_patch_separator_policy() {
+        let mut options = selection(DefaultDiffOutput::Patch);
+        options.patch = true;
+        options.numstat = true;
+        let selected = select_render_formats(options);
+        assert!(selected.needs_line_stats());
+        assert!(selected.separates_patch_from_prefix());
+
+        let mut suppressed = selection(DefaultDiffOutput::Patch);
+        suppressed.suppress_output = true;
+        assert_eq!(
+            select_render_formats(suppressed),
+            RenderSelection::default()
         );
     }
 }

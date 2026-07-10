@@ -554,14 +554,14 @@ impl sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatNoteResolver<'_,
     }
 }
 
-pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
-    cmd_log_impl(args, false)
+pub(crate) fn cmd_log(cli_session: &session::CliSession, args: &[String]) -> Result<()> {
+    cmd_log_impl(cli_session, args, false)
 }
 
 /// `git whatchanged --i-still-use-this`: log with raw diff output by default
 /// and `always_show_header = 0` semantics (commits whose diff comes out empty
 /// — e.g. merges — are omitted entirely).
-pub(crate) fn cmd_whatchanged(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_whatchanged(cli_session: &session::CliSession, args: &[String]) -> Result<()> {
     let mut acknowledged = false;
     let mut filtered = Vec::with_capacity(args.len());
     for arg in args {
@@ -577,7 +577,7 @@ pub(crate) fn cmd_whatchanged(args: &[String]) -> Result<()> {
         );
         return Err(GitError::Exit(128));
     }
-    cmd_log_impl(&filtered, true)
+    cmd_log_impl(cli_session, &filtered, true)
 }
 
 fn log_limited_commit_format_supported(compiled: &CompiledLogFormat) -> bool {
@@ -885,7 +885,11 @@ fn emit_plain_oneline_limited_commit(
     Ok(())
 }
 
-fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
+fn cmd_log_impl(
+    cli_session: &session::CliSession,
+    args: &[String],
+    whatchanged: bool,
+) -> Result<()> {
     let mut setup_args = Vec::new();
     let mut setup_not = false;
     let mut default_revision_given = false;
@@ -2200,12 +2204,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     if whatchanged && !diff_opts.any() {
         diff_opts.raw = true;
     }
-    let git_dir = crate::session::cli_git_dir()?;
-    let format = repository_object_format(&git_dir)?;
-    let config = read_repo_config(&git_dir)?;
-    let db = crate::repository::open_object_database(&git_dir, format)?;
+    let repository = crate::repository::RepositoryContext::from_session(cli_session)?;
+    let git_dir = repository.git_dir().to_path_buf();
+    let format = repository.format();
+    let config = repository.config().clone();
+    let db = repository.repository().objects_mut();
     let has_commit_grafts = !sley_rev::revlist::load_commit_grafts(&db, format).is_empty();
-    let cwd = env::current_dir()?;
+    let cwd = repository.cwd().to_path_buf();
     let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
     for rev in end_of_options_revs {
         if rev.starts_with('-') {
@@ -2512,7 +2517,6 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         let diff_pathspec = if pathspecs.is_empty() {
             None
         } else {
-            let cwd = env::current_dir()?;
             let worktree_root = worktree_root_for_git_dir(&git_dir)?;
             Some(DiffPathspec::new(&cwd, &worktree_root, &pathspecs)?)
         };
@@ -3124,7 +3128,6 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         let pickaxe_pathspec = if pathspecs.is_empty() {
             None
         } else {
-            let cwd = env::current_dir()?;
             let worktree_root = worktree_root_for_git_dir(&git_dir)?;
             Some(DiffPathspec::new(&cwd, &worktree_root, &pathspecs)?)
         };
@@ -3152,7 +3155,6 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         let filter_pathspec = if pathspecs.is_empty() {
             None
         } else {
-            let cwd = env::current_dir()?;
             let worktree_root = worktree_root_for_git_dir(&git_dir)?;
             Some(DiffPathspec::new(&cwd, &worktree_root, &pathspecs)?)
         };

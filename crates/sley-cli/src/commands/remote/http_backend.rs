@@ -11,9 +11,13 @@ use sley::plumbing::sley_remote::{
 use sley::{GitError, Result};
 use sley_protocol::write_pkt_line_payload;
 
+use super::resolve::RemoteCommandContext;
 use super::{cmd_receive_pack, cmd_upload_pack, ls_remote_git_dir, read_repo_config};
 
-pub(crate) fn cmd_http_backend(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_http_backend(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     if !args.is_empty() {
         return Err(GitError::usage("usage: git http-backend"));
     }
@@ -33,7 +37,8 @@ pub(crate) fn cmd_http_backend(args: &[String]) -> Result<()> {
         Err(err) => return cgi_error(404, "Not Found", &err.to_string()),
     };
 
-    let git_dir = match ls_remote_git_dir(&plan.repository.to_string_lossy()) {
+    let remote_context = RemoteCommandContext::from_session(cli_session);
+    let git_dir = match ls_remote_git_dir(&remote_context, &plan.repository.to_string_lossy()) {
         Ok(git_dir) => git_dir,
         Err(err) => return cgi_error(404, "Not Found", &err.to_string()),
     };
@@ -78,20 +83,27 @@ pub(crate) fn cmd_http_backend(args: &[String]) -> Result<()> {
                 stdout.flush()?;
             }
             run_service(
+                cli_session,
                 plan.service,
                 &["--http-backend-info-refs".into(), repository],
             )
         }
-        HttpBackendOperation::Rpc => {
-            run_service(plan.service, &["--stateless-rpc".into(), repository])
-        }
+        HttpBackendOperation::Rpc => run_service(
+            cli_session,
+            plan.service,
+            &["--stateless-rpc".into(), repository],
+        ),
     }
 }
 
-fn run_service(service: HttpBackendService, args: &[String]) -> Result<()> {
+fn run_service(
+    cli_session: &crate::session::CliSession,
+    service: HttpBackendService,
+    args: &[String],
+) -> Result<()> {
     match service {
-        HttpBackendService::UploadPack => cmd_upload_pack(args),
-        HttpBackendService::ReceivePack => cmd_receive_pack(args),
+        HttpBackendService::UploadPack => cmd_upload_pack(cli_session, args),
+        HttpBackendService::ReceivePack => cmd_receive_pack(cli_session, args),
     }
 }
 

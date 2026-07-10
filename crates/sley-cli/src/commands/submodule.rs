@@ -16,6 +16,7 @@ use submodule_options::{
 };
 
 struct SuperprojectContext {
+    session: crate::session::CliSession,
     cwd: PathBuf,
     repo: sley::Repository,
     git_dir: PathBuf,
@@ -30,6 +31,7 @@ impl SuperprojectContext {
         let format = repo.object_format();
         let worktree_root = require_work_tree(&git_dir)?;
         Ok(Self {
+            session: cli_session.clone(),
             cwd: cli_session.cwd().to_path_buf(),
             repo,
             git_dir,
@@ -346,7 +348,8 @@ fn cmd_submodule_add(
         clone_args.push(modules_git_dir.display().to_string());
         clone_args.push(real_repo.clone());
         clone_args.push(destination.display().to_string());
-        with_local_repo_env_hidden(|| super::remote::cmd_clone(&clone_args))?;
+        let clone_session = cli_session.local_repo_env_hidden_child();
+        super::remote::cmd_clone(&clone_session, &clone_args)?;
         if options.progress && !options.quiet {
             eprintln!("Receiving objects: 100% (done)");
         }
@@ -542,7 +545,14 @@ fn update_one_submodule(
 
     let just_populated = submodule_head(&path).is_err();
     if just_populated {
-        populate_submodule_worktree(&context.git_dir, submodule, &path, &url, options)?;
+        populate_submodule_worktree(
+            &context.session,
+            &context.git_dir,
+            submodule,
+            &path,
+            &url,
+            options,
+        )?;
     }
 
     // Resolve the effective update strategy via the single resolver. The typed
@@ -630,6 +640,7 @@ fn update_one_submodule(
 /// `.git/modules/<path>` git dir when one exists (upstream `clone_submodule`
 /// does the same after the worktree was removed), otherwise clone fresh.
 fn populate_submodule_worktree(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     submodule: &SubmoduleConfigEntry,
     path: &Path,
@@ -674,7 +685,8 @@ fn populate_submodule_worktree(
         clone_args.push(modules_git_dir.display().to_string());
         clone_args.push(url.to_string());
         clone_args.push(path.display().to_string());
-        with_local_repo_env_hidden(|| super::remote::cmd_clone(&clone_args))?;
+        let clone_session = cli_session.local_repo_env_hidden_child();
+        super::remote::cmd_clone(&clone_session, &clone_args)?;
         // Propagate the alternate config into the just-cloned submodule so its
         // OWN recursive update borrows for the next level down (nested case).
         propagate_submodule_alternate_config(git_dir, &modules_git_dir)?;

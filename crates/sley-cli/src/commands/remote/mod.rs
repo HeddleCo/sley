@@ -37,7 +37,7 @@ pub(crate) use http_backend::cmd_http_backend;
 pub(crate) use ls_remote::cmd_ls_remote;
 pub(crate) use pack::{cmd_push, cmd_receive_pack, cmd_send_pack, cmd_upload_pack};
 pub(crate) use remote_curl::cmd_remote_http;
-pub(crate) use resolve::ls_remote_git_dir;
+pub(crate) use resolve::{RemoteCommandContext, ls_remote_git_dir};
 
 pub(crate) const CLONE_UNBORN_BRANCH: &str = "__sley_clone_unborn__";
 

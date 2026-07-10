@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_config::GitConfig;
-use sley_config::remotes::{remote_config_values, remote_exists, rewrite_url_with_config};
+use sley_config::remotes::{
+    remote_config_values, remote_exists, remote_names, rewrite_url_with_config,
+};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result, redact_url_for_display};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, collect_reachable_object_ids,
@@ -194,6 +196,45 @@ pub struct FetchOutcome {
     pub head_symref: Option<String>,
     /// Whether `FETCH_HEAD` was written.
     pub wrote_fetch_head: bool,
+}
+
+/// Repository-derived defaults for one fetch invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchRepositoryPlan {
+    /// Explicit remote, or the current branch/sole-remote/`origin` default.
+    pub remote: String,
+    /// Current branch `branch.<name>.merge` values when its remote matches.
+    pub merge_srcs: Vec<String>,
+}
+
+/// Plan the repository-dependent fetch defaults from an injected config/ref
+/// snapshot. This performs no repository discovery or filesystem access.
+pub fn plan_fetch_repository(
+    config: &GitConfig,
+    current_branch: Option<&str>,
+    requested_remote: Option<&str>,
+) -> FetchRepositoryPlan {
+    let remote = requested_remote.map(str::to_string).unwrap_or_else(|| {
+        current_branch
+            .and_then(|branch| config.get("branch", Some(branch), "remote"))
+            .map(str::to_string)
+            .unwrap_or_else(|| match remote_names(config).as_slice() {
+                [only] => only.clone(),
+                _ => "origin".to_string(),
+            })
+    });
+    let merge_srcs = current_branch
+        .filter(|branch| config.get("branch", Some(branch), "remote") == Some(remote.as_str()))
+        .map(|branch| {
+            config
+                .get_all("branch", Some(branch), "merge")
+                .into_iter()
+                .flatten()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    FetchRepositoryPlan { remote, merge_srcs }
 }
 
 /// Fully resolved inputs for a [`fetch`] run.
@@ -2599,6 +2640,37 @@ mod tests {
     use crate::{NoCredentials, SilentProgress};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn repository_plan_uses_injected_branch_snapshot() {
+        let config = GitConfig {
+            preamble: Vec::new(),
+            suffix: Vec::new(),
+            sections: vec![
+                ConfigSection::new(
+                    "remote",
+                    Some("upstream".into()),
+                    vec![ConfigEntry::new("url", Some("../upstream".into()))],
+                ),
+                ConfigSection::new(
+                    "branch",
+                    Some("topic".into()),
+                    vec![
+                        ConfigEntry::new("remote", Some("upstream".into())),
+                        ConfigEntry::new("merge", Some("refs/heads/topic".into())),
+                        ConfigEntry::new("merge", Some("refs/heads/next".into())),
+                    ],
+                ),
+            ],
+        };
+        let plan = plan_fetch_repository(&config, Some("topic"), None);
+        assert_eq!(plan.remote, "upstream");
+        assert_eq!(plan.merge_srcs, ["refs/heads/topic", "refs/heads/next"]);
+
+        let explicit = plan_fetch_repository(&config, Some("topic"), Some("other"));
+        assert_eq!(explicit.remote, "other");
+        assert!(explicit.merge_srcs.is_empty());
+    }
 
     fn temp_repo(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
