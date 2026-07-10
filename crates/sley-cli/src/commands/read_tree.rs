@@ -118,7 +118,12 @@ pub(crate) fn cmd_read_tree(cli_session: &session::CliSession, args: &[String]) 
             if !parsed.dry_run {
                 sley_worktree::persist_read_tree_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
-                    apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
+                    apply_read_tree_sparse_checkout(
+                        repo.worktree_root()?,
+                        git_dir,
+                        format,
+                        repo.config(),
+                    )?;
                 }
             }
         }
@@ -132,9 +137,9 @@ pub(crate) fn cmd_read_tree(cli_session: &session::CliSession, args: &[String]) 
                 sley_worktree::ReadTreeTransitionMode::Overlay,
             )?;
             if apply_worktree {
-                let worktree_root = worktree_root_for_git_dir(git_dir)?;
+                let worktree_root = repo.worktree_root()?;
                 let reset_result = reset_worktree_to_entries(
-                    &worktree_root,
+                    worktree_root,
                     git_dir,
                     format,
                     db,
@@ -153,7 +158,7 @@ pub(crate) fn cmd_read_tree(cli_session: &session::CliSession, args: &[String]) 
                     // reported as a phantom modification (`ie_match_stat` compares
                     // size+mtime, not content).
                     let _ = sley_worktree::refresh_index_paths(
-                        &worktree_root,
+                        worktree_root,
                         git_dir,
                         format,
                         &[],
@@ -167,7 +172,12 @@ pub(crate) fn cmd_read_tree(cli_session: &session::CliSession, args: &[String]) 
             if !parsed.dry_run {
                 sley_worktree::persist_read_tree_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
-                    apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
+                    apply_read_tree_sparse_checkout(
+                        repo.worktree_root()?,
+                        git_dir,
+                        format,
+                        repo.config(),
+                    )?;
                 }
             }
         }
@@ -178,9 +188,9 @@ pub(crate) fn cmd_read_tree(cli_session: &session::CliSession, args: &[String]) 
                 sley_worktree::ReadTreeTransitionMode::Prefix(prefix.clone()),
             )?;
             if apply_worktree {
-                let worktree_root = worktree_root_for_git_dir(git_dir)?;
+                let worktree_root = repo.worktree_root()?;
                 update_worktree_for_entries(
-                    &worktree_root,
+                    worktree_root,
                     git_dir,
                     format,
                     db,
@@ -193,7 +203,12 @@ pub(crate) fn cmd_read_tree(cli_session: &session::CliSession, args: &[String]) 
             if !parsed.dry_run {
                 sley_worktree::persist_read_tree_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
-                    apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
+                    apply_read_tree_sparse_checkout(
+                        repo.worktree_root()?,
+                        git_dir,
+                        format,
+                        repo.config(),
+                    )?;
                 }
             }
         }
@@ -203,6 +218,11 @@ pub(crate) fn cmd_read_tree(cli_session: &session::CliSession, args: &[String]) 
             // oneway/twoway/threeway_merge). The engine computes the result
             // index and the worktree update plan; we apply the plan with `-u`.
             let entries = merge_trees(
+                if parsed.index_only {
+                    repo.worktree_root().ok()
+                } else {
+                    Some(repo.worktree_root()?)
+                },
                 git_dir,
                 format,
                 db,
@@ -215,7 +235,12 @@ pub(crate) fn cmd_read_tree(cli_session: &session::CliSession, args: &[String]) 
             if !parsed.dry_run {
                 sley_worktree::persist_read_tree_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
-                    apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
+                    apply_read_tree_sparse_checkout(
+                        repo.worktree_root()?,
+                        git_dir,
+                        format,
+                        repo.config(),
+                    )?;
                 }
             }
         }
@@ -262,6 +287,7 @@ fn map_read_tree_transition_result<T>(
 }
 
 fn apply_read_tree_sparse_checkout(
+    worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     config: &GitConfig,
@@ -309,8 +335,7 @@ fn apply_read_tree_sparse_checkout(
         patterns,
         sparse_index,
     };
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
-    sley_worktree::apply_sparse_checkout_with_mode(&worktree_root, git_dir, format, &sparse, mode)?;
+    sley_worktree::apply_sparse_checkout_with_mode(worktree_root, git_dir, format, &sparse, mode)?;
     Ok(())
 }
 
@@ -1004,6 +1029,7 @@ pub(crate) fn reset_index_and_worktree_to_commit(
 /// * 3+ trees — `threeway_merge`: trivial 3-way, recording stage 1/2/3 on a
 ///   non-trivial path. Extra leading trees are additional merge bases.
 fn merge_trees(
+    worktree_root: Option<&Path>,
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
@@ -1068,11 +1094,12 @@ fn merge_trees(
     // repository, where there is no worktree to require.
     opts.index_only = index_only;
 
-    let worktree_root = if index_only {
-        worktree_root_for_git_dir(git_dir).unwrap_or_else(|_| git_dir.to_path_buf())
-    } else {
-        worktree_root_for_git_dir(git_dir)?
-    };
+    let worktree_root = worktree_root
+        .map(Path::to_path_buf)
+        .or_else(|| index_only.then(|| git_dir.to_path_buf()))
+        .ok_or_else(|| {
+            GitError::Unsupported("read-tree currently requires a non-bare worktree".into())
+        })?;
     let mut wt = ReadTreeWorktree {
         submodules: load_superproject_submodules(&worktree_root),
         repo_config: read_repo_config(git_dir).unwrap_or_default(),

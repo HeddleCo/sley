@@ -4,7 +4,7 @@
 use crate::commands;
 use crate::{
     GitConfig, GitError, ObjectFormat, ObjectId, RefTarget, Result, parse_refspec, remote_exists,
-    remote_names, repository_objects_dir, resolve_revision, sley_rev, worktree_root_for_git_dir,
+    remote_names, repository_objects_dir, resolve_revision, sley_rev, sley_worktree,
     write_object_id_hex,
 };
 use sley::plumbing::sley_core::DateMode;
@@ -388,11 +388,17 @@ pub(crate) fn for_each_ref_loose_object_disk_size(
 
 pub(crate) fn for_each_ref_worktree_path(
     git_dir: &Path,
+    main_worktree_root: Option<&Path>,
     head_ref: Option<&str>,
     refname: &str,
 ) -> Result<Option<String>> {
+    let main_worktree_root = main_worktree_root.map(PathBuf::from).or_else(|| {
+        sley_worktree::worktree_root_for_git_dir(git_dir)
+            .ok()
+            .flatten()
+    });
     if head_ref == Some(refname)
-        && let Ok(worktree_root) = worktree_root_for_git_dir(git_dir)
+        && let Some(worktree_root) = main_worktree_root
     {
         return Ok(Some(
             fs::canonicalize(worktree_root)?
@@ -445,11 +451,17 @@ pub(crate) fn for_each_ref_worktree_path(
 /// name the ref it has checked out and where its working tree lives.
 pub(crate) fn for_each_ref_worktree_paths(
     git_dir: &Path,
+    main_worktree_root: Option<&Path>,
     head_ref: Option<&str>,
 ) -> Result<HashMap<String, String>> {
     let mut paths = HashMap::new();
+    let main_worktree_root = main_worktree_root.map(PathBuf::from).or_else(|| {
+        sley_worktree::worktree_root_for_git_dir(git_dir)
+            .ok()
+            .flatten()
+    });
     if let Some(head_ref) = head_ref
-        && let Ok(worktree_root) = worktree_root_for_git_dir(git_dir)
+        && let Some(worktree_root) = main_worktree_root
     {
         let canonical = fs::canonicalize(worktree_root)?;
         paths.insert(

@@ -2497,7 +2497,7 @@ fn prefetch_local_promisor_object(
             return Ok(false);
         }
         let resolution_cwd =
-            worktree_root_for_git_dir(&git_dir).unwrap_or_else(|_| git_dir.clone());
+            sley_worktree::worktree_root_for_git_dir(&git_dir)?.unwrap_or_else(|| git_dir.clone());
         let resolution = sley_remote::RemoteResolutionContext {
             cwd: &resolution_cwd,
             local_git_dir: Some(&git_dir),

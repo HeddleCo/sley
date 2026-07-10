@@ -295,6 +295,7 @@ impl HashObjectInvocation {
         // per-path attribute re-walk this cache was added to avoid (sley#25).
         let cache_attributes = self.read_stdin_paths || self.paths.len() > 1;
         let filter_context = HashObjectFilterContext::new(
+            cli_session,
             self.object_type,
             &self.filters,
             repo_git_dir.as_deref(),
@@ -444,6 +445,7 @@ struct HashObjectFilterContext {
 
 impl HashObjectFilterContext {
     fn new(
+        cli_session: &crate::session::CliSession,
         object_type: ObjectType,
         policy: &HashObjectFilterPolicy,
         git_dir: Option<&Path>,
@@ -455,7 +457,7 @@ impl HashObjectFilterContext {
         let Some(git_dir) = git_dir else {
             return Ok(None);
         };
-        let Ok(worktree_root) = worktree_root_for_git_dir(git_dir) else {
+        let Ok(worktree_root) = worktree_root_for_git_dir(cli_session, git_dir) else {
             return Ok(None);
         };
         let attributes = cache_attributes

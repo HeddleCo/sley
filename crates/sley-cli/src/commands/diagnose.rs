@@ -128,7 +128,7 @@ fn create_diagnostics_archive(
     let cwd = cli_session.cwd().to_path_buf();
     let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
-    let worktree = worktree_root_for_git_dir(&git_dir)
+    let worktree = worktree_root_for_git_dir(cli_session, &git_dir)
         .ok()
         .unwrap_or_else(|| cwd.clone());
 

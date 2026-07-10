@@ -205,7 +205,7 @@ pub(crate) fn cmd_am(cli_session: &crate::session::CliSession, args: &[String]) 
     let common_git_dir = repository.common_dir().to_path_buf();
     let format = repository.object_format();
     let config = read_repo_config(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     let state_dir = git_dir.join("rebase-apply");
 
     // Resume sub-operations are mutually exclusive and take no mbox arguments.
@@ -266,6 +266,7 @@ pub(crate) fn cmd_am(cli_session: &crate::session::CliSession, args: &[String]) 
             "--quit" => am_quit(
                 &git_dir,
                 &common_git_dir,
+                &worktree_root,
                 format,
                 &state_dir,
                 &config,
@@ -2690,6 +2691,7 @@ fn run_am_series(
     finish_am(
         git_dir,
         common_git_dir,
+        worktree_root,
         format,
         state_dir,
         config,
@@ -4218,7 +4220,12 @@ fn apply_three_way(
         // records the preimage and, when a matching resolution was recorded
         // earlier, replays it into the worktree (t4150 "am -3 works with
         // rerere"). A no-op unless rerere.enabled.
-        commands::rerere::repo_rerere(git_dir, format, read_am_rerere_autoupdate(state_dir))?;
+        commands::rerere::repo_rerere(
+            git_dir,
+            worktree_root,
+            format,
+            read_am_rerere_autoupdate(state_dir),
+        )?;
         eprintln!("error: Failed to merge in the changes.");
         Ok(ApplyResult::Conflict)
     }
@@ -4566,6 +4573,7 @@ fn display_state_dir(worktree_root: &Path, state_dir: &Path) -> String {
 fn finish_am(
     git_dir: &Path,
     common_git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     state_dir: &Path,
     config: &GitConfig,
@@ -4575,6 +4583,7 @@ fn finish_am(
         finish_rebase_apply(
             git_dir,
             common_git_dir,
+            worktree_root,
             format,
             state_dir,
             config,
@@ -4645,6 +4654,7 @@ fn run_apply_post_rewrite_hook(git_dir: &Path, state_dir: &Path) {
 fn finish_rebase_apply(
     git_dir: &Path,
     common_git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     state_dir: &Path,
     config: &GitConfig,
@@ -4712,7 +4722,7 @@ fn finish_rebase_apply(
     // apply backend records its autostash in `rebase-apply/autostash`; the state
     // dir is removed by the caller's finish, so consume the file before then.
     let _ = head_display;
-    apply_rebase_autostash(&common_git_dir, state_dir, lazy_fetch)?;
+    apply_rebase_autostash(&common_git_dir, worktree_root, state_dir, lazy_fetch)?;
 
     Ok(())
 }
@@ -4721,15 +4731,24 @@ fn finish_rebase_apply(
 /// `rebase-apply/autostash`. Mirrors `apply_autostash` in the merge backend
 /// (rebase.rs) but reachable from the am finish path. Prints "Applied
 /// autostash." on a clean apply, or stores the stash on conflict.
-fn apply_rebase_autostash(common_git_dir: &Path, state_dir: &Path, lazy_fetch: bool) -> Result<()> {
+fn apply_rebase_autostash(
+    common_git_dir: &Path,
+    worktree_root: &Path,
+    state_dir: &Path,
+    lazy_fetch: bool,
+) -> Result<()> {
     let autostash_path = state_dir.join("autostash");
     if let Ok(text) = fs::read_to_string(&autostash_path) {
         let _ = fs::remove_file(&autostash_path);
         let format = repository_object_format(common_git_dir)?;
         if let Ok(oid) = ObjectId::from_hex(format, text.trim()) {
-            let applied =
-                commands::stash::apply_stash_commit_quietly_at(common_git_dir, &oid, lazy_fetch)
-                    .unwrap_or(false);
+            let applied = commands::stash::apply_stash_commit_quietly_at(
+                common_git_dir,
+                worktree_root,
+                &oid,
+                lazy_fetch,
+            )
+            .unwrap_or(false);
             if applied {
                 eprintln!("Applied autostash.");
             } else if commands::stash::store_stash_commit_at(common_git_dir, &oid, "autostash")
@@ -5210,6 +5229,7 @@ fn am_abort(
 fn am_quit(
     git_dir: &Path,
     common_git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     state_dir: &Path,
     config: &GitConfig,
@@ -5219,6 +5239,7 @@ fn am_quit(
     finish_am(
         git_dir,
         common_git_dir,
+        worktree_root,
         format,
         state_dir,
         config,
@@ -5384,7 +5405,7 @@ fn am_continue(
     // git's `am_resolve` runs rerere so a resolved conflict is recorded for
     // future replay (t4150 "am -3 works with rerere"). A no-op unless rerere
     // is enabled and a MERGE_RR is in progress.
-    commands::rerere::record_resolved_after_commit(git_dir, format)?;
+    commands::rerere::record_resolved_after_commit(git_dir, worktree_root, format)?;
     run_am_series(
         git_dir,
         common_git_dir,

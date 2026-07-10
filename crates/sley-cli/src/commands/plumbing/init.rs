@@ -3,32 +3,12 @@
 use crate::*;
 use sley::plumbing::sley_config;
 
-fn init_explicit_git_dir(cli_session: &crate::session::CliSession) -> Option<PathBuf> {
-    cli_session.git_dir_override().or_else(|| {
-        if cli_session.local_repo_env_hidden() {
-            None
-        } else {
-            env::var_os("GIT_DIR").map(PathBuf::from)
-        }
-    })
-}
-
-fn init_explicit_work_tree(cli_session: &crate::session::CliSession) -> Option<PathBuf> {
-    cli_session.work_tree_override().or_else(|| {
-        if cli_session.local_repo_env_hidden() {
-            None
-        } else {
-            env::var_os("GIT_WORK_TREE").map(PathBuf::from)
-        }
-    })
-}
-
 fn init_repo_is_implicitly_bare(
     cli_session: &crate::session::CliSession,
     cwd: &Path,
 ) -> Result<bool> {
     // Determine the effective git directory git would inspect.
-    if let Some(git_dir) = init_explicit_git_dir(cli_session) {
+    if let Some(git_dir) = cli_session.explicit_git_dir() {
         return Ok(guess_repository_type(&git_dir, cwd));
     }
     // No GIT_DIR: git_dir defaults to ".git". Only a linked-worktree gitfile (whose
@@ -74,7 +54,7 @@ pub(crate) fn cmd_init(
     args: &[String],
     global_config: &[GlobalConfigOverride],
 ) -> Result<()> {
-    let session_bare = !cli_session.local_repo_env_hidden() && cli_session.bare();
+    let session_bare = cli_session.explicit_bare();
     let mut bare = session_bare;
     // git distinguishes an *explicitly requested* bare repo (`--bare`/global
     // `--bare`) from one merely *guessed* from the environment. The former pairs
@@ -297,8 +277,8 @@ pub(crate) fn cmd_init(
     // directory, `--bare` pins GIT_DIR to that directory (overwriting the
     // environment when a directory argument was given); the effective git dir
     // then comes from GIT_DIR and its *string* form drives the bare guess.
-    let env_git_dir = init_explicit_git_dir(cli_session);
-    let env_work_tree = init_explicit_work_tree(cli_session);
+    let env_git_dir = cli_session.explicit_git_dir();
+    let env_work_tree = cli_session.explicit_work_tree();
     if env_work_tree.is_some() && (bare_explicit || env_git_dir.is_none()) {
         eprintln!(
             "fatal: GIT_WORK_TREE (or --work-tree=<directory>) not allowed without specifying GIT_DIR (or --git-dir=<directory>)"
@@ -476,7 +456,7 @@ fn init_config_git_dir_for_lookup(
     if let Some(raw) = separate_git_dir {
         return Ok(Some(resolve_cli_path(cwd, raw)));
     }
-    if let Some(raw) = init_explicit_git_dir(cli_session) {
+    if let Some(raw) = cli_session.explicit_git_dir() {
         let git_dir = resolve_cli_path(cwd, raw.to_string_lossy().as_ref());
         if git_dir.is_file()
             && let Some(target) = read_gitdir_file(&git_dir)?

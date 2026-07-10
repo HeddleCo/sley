@@ -722,7 +722,7 @@ fn find_linked_worktree_admin(
 ) -> Result<LinkedWorktreeAdmin> {
     let target = resolve_cli_path(cwd, path);
     let canonical_target = fs::canonicalize(&target).ok();
-    if let Ok(main) = worktree_root_for_git_dir(common_git_dir)
+    if let Some(main) = sley_worktree::worktree_root_for_git_dir(common_git_dir)?
         && (canonical_target.as_deref() == fs::canonicalize(main).ok().as_deref()
             || target == common_git_dir)
     {
@@ -744,7 +744,7 @@ fn find_linked_worktree_admin_for_remove(
 ) -> Result<LinkedWorktreeAdmin> {
     let target = resolve_cli_path(cwd, path);
     let canonical_target = fs::canonicalize(&target).ok();
-    if let Ok(main) = worktree_root_for_git_dir(common_git_dir)
+    if let Some(main) = sley_worktree::worktree_root_for_git_dir(common_git_dir)?
         && canonical_target.as_deref() == fs::canonicalize(main).ok().as_deref()
     {
         eprintln!("fatal: '{path}' is a main working tree");
@@ -765,7 +765,7 @@ fn find_linked_worktree_admin_for_move(
 ) -> Result<LinkedWorktreeAdmin> {
     let target = resolve_cli_path(cwd, path);
     let canonical_target = fs::canonicalize(&target).ok();
-    if let Ok(main) = worktree_root_for_git_dir(common_git_dir)
+    if let Some(main) = sley_worktree::worktree_root_for_git_dir(common_git_dir)?
         && canonical_target.as_deref() == fs::canonicalize(main).ok().as_deref()
     {
         eprintln!("fatal: '{path}' is a main working tree");

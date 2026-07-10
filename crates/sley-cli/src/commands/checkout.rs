@@ -2353,6 +2353,7 @@ fn checkout_merge_autostash_branch_switch(
     if let Err(err) = checkout_twoway_dirty(context, Some(target), recurse_submodules, false) {
         let _ = commands::stash::apply_stash_commit_quietly_at(
             git_dir,
+            worktree_root,
             &stash_oid,
             cli_session.lazy_fetch(),
         );
@@ -2360,6 +2361,7 @@ fn checkout_merge_autostash_branch_switch(
     }
     let applied = commands::stash::apply_stash_commit_quietly_at(
         git_dir,
+        worktree_root,
         &stash_oid,
         cli_session.lazy_fetch(),
     )

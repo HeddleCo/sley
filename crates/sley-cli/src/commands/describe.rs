@@ -234,7 +234,7 @@ pub(crate) fn cmd_describe(
     }
 
     if commits.is_empty() {
-        let dirty_suffix = describe_dirty_suffix(git_dir, format, &options)?;
+        let dirty_suffix = describe_dirty_suffix(repo.worktree_root()?, git_dir, format, &options)?;
         let head = resolve_describe_commit(&repo, "HEAD")?;
         describe_one(
             git_dir,
@@ -1257,6 +1257,7 @@ fn describe_find_blob_path_inner(
 /// its mark only when the tracked working tree differs from the index/HEAD;
 /// untracked files do not count. Errors computing status fall back to `--broken`.
 fn describe_dirty_suffix(
+    worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     options: &DescribeOptions,
@@ -1264,9 +1265,8 @@ fn describe_dirty_suffix(
     if options.dirty.is_none() && options.broken.is_none() {
         return Ok(None);
     }
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
     let mut dirty = false;
-    match sley_worktree::stream_short_status(&worktree_root, git_dir, format, |entry| {
+    match sley_worktree::stream_short_status(worktree_root, git_dir, format, |entry| {
         let index_dirty = entry.index != b' ' && entry.index != b'?' && entry.index != b'!';
         let worktree_dirty =
             entry.worktree != b' ' && entry.worktree != b'?' && entry.worktree != b'!';

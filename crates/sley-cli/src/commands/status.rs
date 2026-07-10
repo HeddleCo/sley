@@ -508,6 +508,7 @@ pub(crate) fn cmd_status(cli_session: &crate::session::CliSession, args: &[Strin
     }
     if porcelain_v2 {
         print_status_porcelain_v2(
+            &worktree_root,
             &git_dir,
             format,
             db,
@@ -564,10 +565,18 @@ pub(crate) fn cmd_status(cli_session: &crate::session::CliSession, args: &[Strin
             untracked_suppressed: untracked_mode == sley_worktree::StatusUntrackedMode::None,
             comment_prefix,
             submodule_summary,
-            sparse_footer: status_sparse_footer(&git_dir, format)?,
+            sparse_footer: status_sparse_footer(&worktree_root, &git_dir, format)?,
             rename_config,
         };
-        print_status_long_with_column(&git_dir, format, db, entries, &display, column_untracked)?;
+        print_status_long_with_column(
+            &worktree_root,
+            &git_dir,
+            format,
+            db,
+            entries,
+            &display,
+            column_untracked,
+        )?;
         // `git status -v` appends the staged diff (HEAD vs index). `-vv` instead
         // frames both diffs with section headers and a 50-dash separator and
         // renders them with diff.mnemonicprefix=true (commit/index `c/`,`i/` for
@@ -1043,6 +1052,7 @@ impl StatusPathspec {
 }
 
 fn print_status_porcelain_v2(
+    worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
@@ -1072,33 +1082,18 @@ fn print_status_porcelain_v2(
         }
     }
     let zero = zero_oid(format)?;
-    let worktree_root = worktree_root_for_git_dir(git_dir).ok();
-    let entries = match worktree_root.as_ref() {
-        Some(worktree_root) => status_entries_with_renames_with_database(
-            worktree_root,
-            format,
-            db,
-            entries,
-            rename_config,
-        )?,
-        None => entries
-            .into_iter()
-            .map(|entry| StatusOutputEntry {
-                entry,
-                rename_from: None,
-            })
-            .collect(),
-    };
+    let entries = status_entries_with_renames_with_database(
+        worktree_root,
+        format,
+        db,
+        entries,
+        rename_config,
+    )?;
     // Conflicted paths render as `u` records, read straight from the index
     // stages (the short-status entries carry no per-stage modes/oids). These
     // paths are skipped in the 1/2/?/! stream below.
-    let unmerged = match worktree_root.as_ref() {
-        Some(worktree_root) => {
-            let trust_filemode = config.get_bool("core", None, "fileMode").unwrap_or(true);
-            status_unmerged_v2_records(git_dir, worktree_root, format, trust_filemode)?
-        }
-        None => BTreeMap::new(),
-    };
+    let trust_filemode = config.get_bool("core", None, "fileMode").unwrap_or(true);
+    let unmerged = status_unmerged_v2_records(git_dir, worktree_root, format, trust_filemode)?;
     let mut emitted_unmerged: BTreeSet<Vec<u8>> = BTreeSet::new();
     for output in entries {
         let entry = output.entry;
@@ -1789,18 +1784,21 @@ impl StatusLineSink {
 }
 
 pub(crate) fn print_status_long(
+    worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     entries: Vec<sley_worktree::ShortStatusEntry>,
     display: &StatusLongDisplay,
 ) -> Result<()> {
     let db = status_compat_database(git_dir, format);
-    let sink = build_status_long_sink_inner(git_dir, format, &db, entries, display, false)?;
+    let sink =
+        build_status_long_sink_inner(worktree_root, git_dir, format, &db, entries, display, false)?;
     sink.flush();
     Ok(())
 }
 
 fn print_status_long_with_column(
+    worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
@@ -1808,8 +1806,15 @@ fn print_status_long_with_column(
     display: &StatusLongDisplay,
     column_untracked: bool,
 ) -> Result<()> {
-    let sink =
-        build_status_long_sink_inner(git_dir, format, db, entries, display, column_untracked)?;
+    let sink = build_status_long_sink_inner(
+        worktree_root,
+        git_dir,
+        format,
+        db,
+        entries,
+        display,
+        column_untracked,
+    )?;
     sink.flush();
     Ok(())
 }
@@ -2310,13 +2315,14 @@ fn status_sequencer_action(git_dir: &Path) -> Option<SequencerAction> {
 /// Build (but do not emit) the buffered long-status output. Shared by the
 /// `git status` stdout path and the COMMIT_EDITMSG template builder.
 pub(crate) fn build_status_long_sink(
+    worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     entries: Vec<sley_worktree::ShortStatusEntry>,
     display: &StatusLongDisplay,
 ) -> Result<StatusLineSink> {
     let db = status_compat_database(git_dir, format);
-    build_status_long_sink_inner(git_dir, format, &db, entries, display, false)
+    build_status_long_sink_inner(worktree_root, git_dir, format, &db, entries, display, false)
 }
 
 /// Compatibility boundary for commit-template callers that have not yet been
@@ -2328,6 +2334,7 @@ fn status_compat_database(git_dir: &Path, format: ObjectFormat) -> FileObjectDat
 }
 
 fn build_status_long_sink_inner(
+    worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
@@ -2374,22 +2381,13 @@ fn build_status_long_sink_inner(
     let unmerged = status_unmerged_paths(git_dir, format)?;
     let unmerged_paths: BTreeSet<Vec<u8>> =
         unmerged.iter().map(|entry| entry.path.clone()).collect();
-    let entries = match worktree_root_for_git_dir(git_dir) {
-        Ok(worktree_root) => status_entries_with_renames_with_database(
-            &worktree_root,
-            format,
-            db,
-            entries,
-            rename_config,
-        )?,
-        Err(_) => entries
-            .into_iter()
-            .map(|entry| StatusOutputEntry {
-                entry,
-                rename_from: None,
-            })
-            .collect(),
-    };
+    let entries = status_entries_with_renames_with_database(
+        worktree_root,
+        format,
+        db,
+        entries,
+        rename_config,
+    )?;
     for output in entries {
         let entry = output.entry;
         if unmerged_paths.contains(&entry.path) {
@@ -2669,6 +2667,7 @@ fn build_status_long_sink_inner(
 }
 
 fn status_sparse_footer(
+    worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<Option<StatusSparseFooter>> {
@@ -2692,7 +2691,7 @@ fn status_sparse_footer(
             .iter()
             .any(|entry| entry.mode == sley_index::SPARSE_DIR_MODE && entry.is_skip_worktree())
     {
-        if !status_sparse_index_has_materialized_sparse_dir(git_dir, &index)? {
+        if !status_sparse_index_has_materialized_sparse_dir(worktree_root, &index)? {
             return Ok(Some(StatusSparseFooter::SparseIndex));
         }
         let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -2715,8 +2714,10 @@ fn status_sparse_footer(
     Ok(Some(StatusSparseFooter::Percentage(percent)))
 }
 
-fn status_sparse_index_has_materialized_sparse_dir(git_dir: &Path, index: &Index) -> Result<bool> {
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+fn status_sparse_index_has_materialized_sparse_dir(
+    worktree_root: &Path,
+    index: &Index,
+) -> Result<bool> {
     for entry in index
         .entries
         .iter()

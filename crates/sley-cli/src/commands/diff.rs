@@ -383,9 +383,12 @@ impl WhitespaceRuleResolver {
             },
             None => sley_diff_merge::ws::WS_DEFAULT_RULE,
         };
-        let matcher = worktree_root_for_git_dir(git_dir).ok().and_then(|root| {
-            sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok()
-        });
+        let matcher = sley_worktree::worktree_root_for_git_dir(git_dir)
+            .ok()
+            .flatten()
+            .and_then(|root| {
+                sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok()
+            });
         Ok(Self {
             config_rule,
             matcher,
@@ -1853,7 +1856,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
     let entries = if matches!(diff_relative, sley_rev::diff_options::DiffRelativeMode::Off) {
         entries
     } else {
-        let prefix = diff_relative_prefix(&diff_relative, &cwd, &git_dir)?;
+        let prefix = diff_relative_prefix(cli_session, &diff_relative, &cwd, &git_dir)?;
         let (entries, lookups) = apply_diff_relative(entries, &prefix);
         relative_lookup_entries = lookups;
         entries
@@ -2889,16 +2892,19 @@ fn diff_find_object_pickaxe_all_conflict_error() -> Result<()> {
 }
 
 fn diff_relative_prefix(
+    cli_session: &crate::session::CliSession,
     mode: &sley_rev::diff_options::DiffRelativeMode,
     cwd: &Path,
     git_dir: &Path,
 ) -> Result<Vec<u8>> {
     match mode {
         sley_rev::diff_options::DiffRelativeMode::Off => Ok(Vec::new()),
-        sley_rev::diff_options::DiffRelativeMode::Cwd => Ok(worktree_prefix(cwd, git_dir)?
-            .trim_end_matches('/')
-            .as_bytes()
-            .to_vec()),
+        sley_rev::diff_options::DiffRelativeMode::Cwd => {
+            Ok(worktree_prefix(cli_session, cwd, git_dir)?
+                .trim_end_matches('/')
+                .as_bytes()
+                .to_vec())
+        }
         sley_rev::diff_options::DiffRelativeMode::Prefix(prefix) => {
             Ok(diff_relative_prefix_arg(prefix).into_bytes())
         }

@@ -102,7 +102,7 @@ pub(crate) fn cmd_clean(cli_session: &crate::session::CliSession, args: &[String
         }
         return Err(GitError::Exit(128));
     }
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let pathspec = LsFilesPathspec::new(
         &cwd,

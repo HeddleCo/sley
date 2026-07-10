@@ -9,12 +9,14 @@ struct MergeCommandContext {
     repository: sley::Repository,
     refs: FileRefStore,
     config: GitConfig,
+    worktree_root: PathBuf,
     lazy_fetch: bool,
 }
 
 impl MergeCommandContext {
     fn open(cli_session: &crate::session::CliSession) -> Result<Self> {
         let repository = cli_session.open_repository()?;
+        let worktree_root = worktree_root_for_git_dir(cli_session, repository.git_dir())?;
         let refs = repository.references();
         let mut config = repository.config_snapshot()?;
         if let Ok(parameters) = crate::injected_config_parameters() {
@@ -26,6 +28,7 @@ impl MergeCommandContext {
             repository,
             refs,
             config,
+            worktree_root,
             lazy_fetch: cli_session.lazy_fetch(),
         })
     }
@@ -47,7 +50,7 @@ impl MergeCommandContext {
     }
 
     fn worktree_root(&self) -> Result<PathBuf> {
-        worktree_root_for_git_dir(self.git_dir())
+        Ok(self.worktree_root.clone())
     }
 }
 
@@ -170,6 +173,7 @@ impl MergeAttributeFavorResolver {
 /// detached HEAD) to it, writing a reflog entry.
 fn merge_commit_and_advance(
     git_dir: &Path,
+    worktree_root: &Path,
     refs: &FileRefStore,
     format: ObjectFormat,
     head_oid: &ObjectId,
@@ -180,7 +184,13 @@ fn merge_commit_and_advance(
     config: &GitConfig,
 ) -> Result<ObjectId> {
     let message = prepare_merge_commit_message_for_commit_with_rollback(
-        git_dir, format, head_oid, message, options, config,
+        git_dir,
+        worktree_root,
+        format,
+        head_oid,
+        message,
+        options,
+        config,
     )?;
     let author = commit_identity_from_env("AUTHOR", config)?;
     let committer = commit_identity_from_env("COMMITTER", config)?;
@@ -241,6 +251,7 @@ fn merge_commit_and_advance(
 #[allow(clippy::too_many_arguments)]
 fn merge_ours_commit_and_advance(
     git_dir: &Path,
+    worktree_root: &Path,
     refs: &FileRefStore,
     format: ObjectFormat,
     head_oid: &ObjectId,
@@ -252,7 +263,13 @@ fn merge_ours_commit_and_advance(
     config: &GitConfig,
 ) -> Result<ObjectId> {
     let message = prepare_merge_commit_message_for_commit_with_rollback(
-        git_dir, format, head_oid, message, options, config,
+        git_dir,
+        worktree_root,
+        format,
+        head_oid,
+        message,
+        options,
+        config,
     )?;
     let author = commit_identity_from_env("AUTHOR", config)?;
     let committer = commit_identity_from_env("COMMITTER", config)?;
@@ -1477,6 +1494,7 @@ fn prepare_merge_commit_message_for_commit(
 
 fn prepare_merge_commit_message_for_commit_with_rollback(
     git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     head_oid: &ObjectId,
     message: Vec<u8>,
@@ -1486,7 +1504,7 @@ fn prepare_merge_commit_message_for_commit_with_rollback(
     match prepare_merge_commit_message_for_commit(git_dir, message, options, config) {
         Ok(message) => Ok(message),
         Err(err) => {
-            rollback_refused_merge_commit(git_dir, format, head_oid, options);
+            rollback_refused_merge_commit(git_dir, worktree_root, format, head_oid, options);
             Err(err)
         }
     }
@@ -1494,19 +1512,18 @@ fn prepare_merge_commit_message_for_commit_with_rollback(
 
 fn rollback_refused_merge_commit(
     git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     head_oid: &ObjectId,
     options: &MergeOptions,
 ) {
-    if let Ok(worktree_root) = worktree_root_for_git_dir(git_dir) {
-        let _ = reset_index_and_worktree_to_commit_for_merge(
-            &worktree_root,
-            git_dir,
-            format,
-            head_oid,
-            options.recurse_submodules,
-        );
-    }
+    let _ = reset_index_and_worktree_to_commit_for_merge(
+        worktree_root,
+        git_dir,
+        format,
+        head_oid,
+        options.recurse_submodules,
+    );
     clear_in_progress_merge_state(git_dir);
 }
 
@@ -3094,15 +3111,30 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
                     if options.explicit_twohead_strategy {
                         eprintln!("fatal: merge program failed");
                         if merge_autostash {
-                            apply_merge_autostash(&git_dir, format, context.lazy_fetch);
+                            apply_merge_autostash(
+                                &git_dir,
+                                &worktree_root,
+                                format,
+                                context.lazy_fetch,
+                            );
                         }
                         return Err(GitError::Exit(2));
                     }
                     let result = merge_octopus(&context, &positional, &options);
                     if merge_autostash {
                         match &result {
-                            Ok(()) => apply_merge_autostash(&git_dir, format, context.lazy_fetch),
-                            Err(_) => apply_merge_autostash(&git_dir, format, context.lazy_fetch),
+                            Ok(()) => apply_merge_autostash(
+                                &git_dir,
+                                &worktree_root,
+                                format,
+                                context.lazy_fetch,
+                            ),
+                            Err(_) => apply_merge_autostash(
+                                &git_dir,
+                                &worktree_root,
+                                format,
+                                context.lazy_fetch,
+                            ),
                         }
                     }
                     return result;
@@ -3178,7 +3210,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             }
         }
         if merge_autostash {
-            apply_merge_autostash(&git_dir, format, context.lazy_fetch);
+            apply_merge_autostash(&git_dir, &worktree_root, format, context.lazy_fetch);
         }
         return Ok(());
     }
@@ -3242,6 +3274,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
         }
         let merged_oid = merge_ours_commit_and_advance(
             &git_dir,
+            &worktree_root,
             &refs,
             format,
             &head_oid,
@@ -3261,7 +3294,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
         )?;
         commands::hooks::run_hook_l_at(&git_dir, "post-merge", &["0"])?;
         if merge_autostash {
-            apply_merge_autostash(&git_dir, format, context.lazy_fetch);
+            apply_merge_autostash(&git_dir, &worktree_root, format, context.lazy_fetch);
         }
         return Ok(());
     }
@@ -3284,7 +3317,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             &other_tree,
         ) {
             if merge_autostash {
-                apply_merge_autostash(&git_dir, format, context.lazy_fetch);
+                apply_merge_autostash(&git_dir, &worktree_root, format, context.lazy_fetch);
             }
             return Err(err);
         }
@@ -3319,7 +3352,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
         }
         commands::hooks::run_hook_l_at(&git_dir, "post-merge", &["1"])?;
         if merge_autostash {
-            apply_merge_autostash(&git_dir, format, context.lazy_fetch);
+            apply_merge_autostash(&git_dir, &worktree_root, format, context.lazy_fetch);
         }
         return Ok(());
     }
@@ -3339,7 +3372,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             &other_tree,
         ) {
             if merge_autostash {
-                apply_merge_autostash(&git_dir, format, context.lazy_fetch);
+                apply_merge_autostash(&git_dir, &worktree_root, format, context.lazy_fetch);
             }
             return Err(err);
         }
@@ -3390,7 +3423,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             stdout.flush()?;
         }
         if merge_autostash {
-            apply_merge_autostash(&git_dir, format, context.lazy_fetch);
+            apply_merge_autostash(&git_dir, &worktree_root, format, context.lazy_fetch);
         }
         return Ok(());
     }
@@ -3565,7 +3598,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             }
             commands::hooks::run_hook_l_at(&git_dir, "post-merge", &["1"])?;
             if merge_autostash {
-                apply_merge_autostash(&git_dir, format, context.lazy_fetch);
+                apply_merge_autostash(&git_dir, &worktree_root, format, context.lazy_fetch);
             }
             return Ok(());
         }
@@ -3627,6 +3660,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
         }
         let merged_oid = merge_commit_and_advance(
             &git_dir,
+            &worktree_root,
             &refs,
             format,
             &head_oid,
@@ -3661,7 +3695,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
         }
         commands::hooks::run_hook_l_at(&git_dir, "post-merge", &["0"])?;
         if merge_autostash {
-            apply_merge_autostash(&git_dir, format, context.lazy_fetch);
+            apply_merge_autostash(&git_dir, &worktree_root, format, context.lazy_fetch);
         }
         return Ok(());
     }
@@ -3885,7 +3919,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
     merge_state_message.push(b'\n');
     merge_state_message.extend_from_slice(merge_msg_conflicts_block.as_bytes());
     write_merge_state(&git_dir, &[other_oid], merge_state_message, &options, None)?;
-    run_rerere_after_conflicted_merge(&git_dir, format, &options)?;
+    run_rerere_after_conflicted_merge(&git_dir, &worktree_root, format, &options)?;
     if merge_autostash {
         write_merge_autostash_marker(&git_dir)?;
     }
@@ -4788,6 +4822,7 @@ fn merge_conflict_cleanup_scissors(options: &MergeOptions, config: &GitConfig) -
 
 fn run_rerere_after_conflicted_merge(
     git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     options: &MergeOptions,
 ) -> Result<()> {
@@ -4800,7 +4835,8 @@ fn run_rerere_after_conflicted_merge(
     if !commands::rerere::is_rerere_enabled(git_dir) {
         return Ok(());
     }
-    commands::rerere::repo_rerere(git_dir, format, options.rerere_autoupdate).map(|_| ())
+    commands::rerere::repo_rerere(git_dir, worktree_root, format, options.rerere_autoupdate)
+        .map(|_| ())
 }
 
 /// git's pre-merge `verify_uptodate` guard. Returns an error (exit 2, matching
@@ -5240,7 +5276,7 @@ fn cmd_merge_abort(context: &MergeCommandContext) -> Result<()> {
         context.lazy_fetch,
     )?;
     clear_in_progress_merge_state(git_dir);
-    apply_merge_autostash(git_dir, format, context.lazy_fetch);
+    apply_merge_autostash(git_dir, &worktree_root, format, context.lazy_fetch);
     Ok(())
 }
 
@@ -5334,6 +5370,7 @@ fn cmd_merge_continue(context: &MergeCommandContext) -> Result<()> {
     let mut writer = context.repository.objects_mut();
     conclude_in_progress_merge_with_writer(
         git_dir,
+        &context.worktree_root,
         format,
         message,
         false,
@@ -5345,6 +5382,7 @@ fn cmd_merge_continue(context: &MergeCommandContext) -> Result<()> {
 
 pub(crate) fn conclude_in_progress_merge(
     git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     message: Vec<u8>,
     quiet: bool,
@@ -5355,6 +5393,7 @@ pub(crate) fn conclude_in_progress_merge(
     let mut writer = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     conclude_in_progress_merge_with_writer(
         git_dir,
+        worktree_root,
         format,
         message,
         quiet,
@@ -5366,6 +5405,7 @@ pub(crate) fn conclude_in_progress_merge(
 
 fn conclude_in_progress_merge_with_writer(
     git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     message: Vec<u8>,
     quiet: bool,
@@ -5419,9 +5459,9 @@ fn conclude_in_progress_merge_with_writer(
         merge_commit_reflog_message(&message),
         committer,
     )?;
-    commands::rerere::record_resolved_after_commit(git_dir, format)?;
+    commands::rerere::record_resolved_after_commit(git_dir, worktree_root, format)?;
     clear_in_progress_merge_state(git_dir);
-    apply_merge_autostash(git_dir, format, lazy_fetch);
+    apply_merge_autostash(git_dir, worktree_root, format, lazy_fetch);
     if !quiet {
         print_branch_commit_summary(writer, git_dir, format, &commit_oid, &message)?;
     }
@@ -5616,14 +5656,19 @@ fn write_merge_autostash_marker(git_dir: &Path) -> Result<()> {
     }
 }
 
-pub(crate) fn apply_merge_autostash(git_dir: &Path, format: ObjectFormat, lazy_fetch: bool) {
-    apply_or_save_merge_autostash(git_dir, format, true, lazy_fetch);
+pub(crate) fn apply_merge_autostash(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    lazy_fetch: bool,
+) {
+    apply_or_save_merge_autostash(git_dir, Some(worktree_root), format, true, lazy_fetch);
 }
 
 pub(crate) fn save_merge_autostash(git_dir: &Path, format: ObjectFormat) {
     // The save-only path never reads the stash object, so lazy-fetch policy is
     // immaterial here.
-    apply_or_save_merge_autostash(git_dir, format, false, false);
+    apply_or_save_merge_autostash(git_dir, None, format, false, false);
 }
 
 fn save_squash_conflict_autostash(git_dir: &Path, format: ObjectFormat) {
@@ -5645,6 +5690,7 @@ fn save_squash_conflict_autostash(git_dir: &Path, format: ObjectFormat) {
 
 fn apply_or_save_merge_autostash(
     git_dir: &Path,
+    worktree_root: Option<&Path>,
     format: ObjectFormat,
     attempt_apply: bool,
     lazy_fetch: bool,
@@ -5662,8 +5708,10 @@ fn apply_or_save_merge_autostash(
         return;
     };
     let applied = attempt_apply
-        && commands::stash::apply_stash_commit_quietly_at(git_dir, &oid, lazy_fetch)
-            .unwrap_or(false);
+        && worktree_root.is_some_and(|worktree_root| {
+            commands::stash::apply_stash_commit_quietly_at(git_dir, worktree_root, &oid, lazy_fetch)
+                .unwrap_or(false)
+        });
     if applied {
         eprintln!("Applied autostash.");
         return;

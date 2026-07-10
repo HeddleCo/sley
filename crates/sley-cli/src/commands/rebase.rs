@@ -428,7 +428,7 @@ impl Ctx {
         let repository = cli_session.open_repository()?;
         let git_dir = repository.git_dir().to_path_buf();
         let common_git_dir = repository.common_dir().to_path_buf();
-        let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+        let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
         let format = repository.object_format();
         let config = read_repo_config(&git_dir)?;
         let refs = repository.references();
@@ -3968,7 +3968,12 @@ fn do_merge(
                 println!("CONFLICT (content): Merge conflict in {display}");
             }
         }
-        let _ = commands::rerere::repo_rerere(&ctx.git_dir, ctx.format, opts.rerere_autoupdate);
+        let _ = commands::rerere::repo_rerere(
+            &ctx.git_dir,
+            &ctx.worktree_root,
+            ctx.format,
+            opts.rerere_autoupdate,
+        );
         print_conflict_hints();
         if let Some(record) = &original {
             return stop_with_patch(ctx, db, opts, record, item, 1, false);
@@ -4095,7 +4100,12 @@ fn pick_one_commit_with_custom_strategy(
 
     let status = run_custom_rebase_strategy(ctx, opts, strategy, base, head, record.oid)?;
     if status != 0 {
-        let _ = commands::rerere::repo_rerere(&ctx.git_dir, ctx.format, opts.rerere_autoupdate);
+        let _ = commands::rerere::repo_rerere(
+            &ctx.git_dir,
+            &ctx.worktree_root,
+            ctx.format,
+            opts.rerere_autoupdate,
+        );
         print_conflict_hints();
         return stop_with_patch(ctx, db, opts, record, item, status, false);
     }
@@ -4727,7 +4737,12 @@ fn pick_one_commit(
         // Record the conflict in the rerere database and, if a resolution is
         // known, replay it (staging it when rerere.autoUpdate / --rerere-
         // autoupdate is in effect).
-        let _ = commands::rerere::repo_rerere(&ctx.git_dir, ctx.format, opts.rerere_autoupdate);
+        let _ = commands::rerere::repo_rerere(
+            &ctx.git_dir,
+            &ctx.worktree_root,
+            ctx.format,
+            opts.rerere_autoupdate,
+        );
 
         eprintln!(
             "error: could not apply {}... {}",
@@ -5539,6 +5554,7 @@ fn machine_commit(
         );
         template.extend_from_slice(&commands::commit::render_commit_editor_status_for_rebase(
             &ctx.git_dir,
+            &ctx.worktree_root,
             ctx.format,
             &comment_string,
             commit.amend,
@@ -5668,7 +5684,11 @@ fn machine_commit(
 
     // Record any rerere resolution for the just-committed conflict (matches
     // git invoking rerere() on commit), so a later identical conflict replays.
-    let _ = commands::rerere::record_resolved_after_commit(&ctx.git_dir, ctx.format);
+    let _ = commands::rerere::record_resolved_after_commit(
+        &ctx.git_dir,
+        &ctx.worktree_root,
+        ctx.format,
+    );
 
     // Post-commit cleanup.
     let _ = fs::remove_file(ctx.git_dir.join("CHERRY_PICK_HEAD"));
@@ -6523,8 +6543,13 @@ fn apply_save_autostash_text(ctx: &Ctx, text: &str, attempt_apply: bool) {
         return;
     };
     let applied = attempt_apply
-        && commands::stash::apply_stash_commit_quietly_at(&ctx.git_dir, &oid, ctx.lazy_fetch)
-            .unwrap_or(false);
+        && commands::stash::apply_stash_commit_quietly_at(
+            &ctx.git_dir,
+            &ctx.worktree_root,
+            &oid,
+            ctx.lazy_fetch,
+        )
+        .unwrap_or(false);
     if applied {
         eprintln!("Applied autostash.");
         return;

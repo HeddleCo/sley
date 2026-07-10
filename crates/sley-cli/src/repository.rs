@@ -22,6 +22,7 @@ use crate::{
 
 pub(crate) struct RepositoryContext {
     cwd: PathBuf,
+    cli_session: session::CliSession,
     repository: Repository,
     config: GitConfig,
     refs: FileRefStore,
@@ -36,6 +37,7 @@ impl RepositoryContext {
         Self::from_git_dir_and_cwd(
             cli_session.git_dir()?,
             cli_session.cwd().to_path_buf(),
+            cli_session.clone(),
             cli_session.replace_objects(),
             crate::effective_pathspec_flags(cli_session),
         )
@@ -44,6 +46,7 @@ impl RepositoryContext {
     fn from_git_dir_and_cwd(
         git_dir: PathBuf,
         cwd: PathBuf,
+        cli_session: session::CliSession,
         replace_objects: bool,
         pathspec_magic: sley_worktree::PathspecMatchMagic,
     ) -> Result<Self> {
@@ -61,6 +64,7 @@ impl RepositoryContext {
         let refs = repository.references();
         Ok(Self {
             cwd,
+            cli_session,
             repository,
             config,
             refs,
@@ -106,7 +110,7 @@ impl RepositoryContext {
         if let Some(root) = self.worktree_root.get() {
             return Ok(root);
         }
-        let root = worktree_root_for_git_dir(self.repository.git_dir())?;
+        let root = worktree_root_for_git_dir(&self.cli_session, self.repository.git_dir())?;
         let _ = self.worktree_root.set(root);
         Ok(self
             .worktree_root

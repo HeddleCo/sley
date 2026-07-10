@@ -173,7 +173,7 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
         Vec::new()
     } else {
         match sley_worktree::worktree_root_for_git_dir(&git_dir)? {
-            Some(_) => worktree_prefix(&cwd, &git_dir)?.into_bytes(),
+            Some(_) => worktree_prefix(cli_session, &cwd, &git_dir)?.into_bytes(),
             None => Vec::new(),
         }
     };

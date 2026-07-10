@@ -31,16 +31,6 @@ use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord};
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 
-fn clone_explicit_work_tree(cli_session: &crate::session::CliSession) -> Option<PathBuf> {
-    cli_session.work_tree_override().or_else(|| {
-        if cli_session.local_repo_env_hidden() {
-            None
-        } else {
-            env::var_os("GIT_WORK_TREE").map(PathBuf::from)
-        }
-    })
-}
-
 pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut explicit_bare = None::<bool>;
@@ -561,7 +551,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
     let env_worktree = if bare {
         None
     } else {
-        clone_explicit_work_tree(cli_session).and_then(|value| {
+        cli_session.explicit_work_tree().and_then(|value| {
             if value.as_os_str().is_empty() {
                 None
             } else {

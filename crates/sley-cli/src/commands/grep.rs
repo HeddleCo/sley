@@ -649,7 +649,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
     })?;
     let expr = build_expr(&opts.tokens);
 
-    let worktree_root = match worktree_root_for_git_dir(git_dir) {
+    let worktree_root = match worktree_root_for_git_dir(cli_session, git_dir) {
         Ok(root) if root.is_dir() => Some(root),
         _ => None,
     };
@@ -1158,11 +1158,11 @@ fn grep_no_index(
     dashdash: &str,
     pager: Option<&RefCell<Vec<Vec<u8>>>>,
 ) -> Result<bool> {
-    let cwd = env::current_dir()?;
+    let cwd = cli_session.cwd().to_path_buf();
     let cwd_canon = fs::canonicalize(&cwd)?;
     let raw_paths = no_index_paths(positionals, dashdash)?;
     let worktree_root = if opts.untracked {
-        repo.and_then(|repo| worktree_root_for_git_dir(repo.git_dir()).ok())
+        repo.and_then(|repo| repo.worktree_root().ok().map(Path::to_path_buf))
     } else {
         None
     };

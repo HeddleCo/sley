@@ -474,7 +474,7 @@ fn compute_real_merge(
 
     let strategy = parse_strategy_favor(&options.strategy_options)?;
     let detect_renames = merge_tree_detect_renames(&git_dir);
-    let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir).ok();
     let explicit_attr_source =
         global_attr_source(cli_session).or_else(|| env::var("GIT_ATTR_SOURCE").ok());
     let attr_source_tree = explicit_attr_source

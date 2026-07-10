@@ -1193,7 +1193,7 @@ pub(crate) fn cmd_commit(
         None
     };
     if all {
-        commit_stage_tracked_changes(&git_dir, format)?;
+        commit_stage_tracked_changes(cli_session, &git_dir, format)?;
     }
     // Emptiness is judged before the signoff trailer is added (git aborts
     // `commit -m "" -s`).
@@ -1314,6 +1314,7 @@ pub(crate) fn cmd_commit(
         let author_date_interesting = author_date.is_some() || reuse_message.is_some() || amend;
         let block = build_commit_editor_template_block(&CommitTemplateBlock {
             git_dir: &git_dir,
+            worktree_root: &worktree_root_for_git_dir(cli_session, &git_dir)?,
             format,
             comment_char: &comment_char,
             cleanup_mode,
@@ -1328,6 +1329,7 @@ pub(crate) fn cmd_commit(
     }
     if use_editor && verbose > 0 {
         append_commit_verbose_diff(
+            cli_session,
             &git_dir,
             format,
             amend,
@@ -1418,6 +1420,7 @@ pub(crate) fn cmd_commit(
     if in_merge {
         return conclude_in_progress_merge(
             &git_dir,
+            &worktree_root_for_git_dir(cli_session, &git_dir)?,
             format,
             message,
             quiet,
@@ -1428,6 +1431,7 @@ pub(crate) fn cmd_commit(
     if in_cherry_pick || in_revert {
         return conclude_replay_via_commit(
             &git_dir,
+            &worktree_root_for_git_dir(cli_session, &git_dir)?,
             format,
             message,
             allow_empty,
@@ -1591,8 +1595,16 @@ pub(crate) fn cmd_commit(
     } else {
         sley_sequencer::commit_index(&git_dir, format, options)
     }?;
-    commands::rerere::record_resolved_after_commit(&git_dir, format)?;
-    remove_commit_state_files(&git_dir, cli_session.lazy_fetch());
+    commands::rerere::record_resolved_after_commit(
+        &git_dir,
+        &worktree_root_for_git_dir(cli_session, &git_dir)?,
+        format,
+    )?;
+    remove_commit_state_files(
+        &git_dir,
+        &worktree_root_for_git_dir(cli_session, &git_dir)?,
+        cli_session.lazy_fetch(),
+    );
     commands::hooks::run_post_index_change_hook_at(&git_dir, false, false)?;
     if let Some((summary_author, summary_committer, summary_message)) = summary {
         print_commit_summary(
@@ -1829,6 +1841,7 @@ fn commit_message_with_trailers<'a>(
 #[allow(clippy::too_many_arguments)]
 fn conclude_replay_via_commit(
     git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     message: Vec<u8>,
     allow_empty: bool,
@@ -1929,7 +1942,7 @@ fn conclude_replay_via_commit(
     });
     tx.commit()?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
-    remove_commit_state_files(git_dir, lazy_fetch);
+    remove_commit_state_files(git_dir, worktree_root, lazy_fetch);
     commands::hooks::run_post_index_change_hook_at(git_dir, false, false)?;
     if !quiet {
         println!("{new_oid}");
@@ -2016,7 +2029,11 @@ fn commit_partial_paths(
     tx.commit()?;
     sley_worktree::refresh_repository_cache_tree(git_dir, format, &db)?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
-    remove_commit_state_files(git_dir, cli_session.lazy_fetch());
+    remove_commit_state_files(
+        git_dir,
+        &worktree_root_for_git_dir(cli_session, git_dir)?,
+        cli_session.lazy_fetch(),
+    );
     if !quiet {
         println!("{new_oid}");
     }
@@ -2045,7 +2062,7 @@ fn stage_partial_commit_paths(
     paths: &[String],
     head_tree_map: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
 ) -> Result<Vec<Vec<u8>>> {
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, git_dir)?;
     let cwd = env::current_dir()?;
     let index_path = sley_worktree::repository_index_path(git_dir);
     let index = if index_path.exists() {
@@ -2242,10 +2259,10 @@ fn restore_taken_index_snapshot(git_dir: &Path, snapshot: &Option<Option<Vec<u8>
     Ok(())
 }
 
-fn remove_commit_state_files(git_dir: &Path, lazy_fetch: bool) {
+fn remove_commit_state_files(git_dir: &Path, worktree_root: &Path, lazy_fetch: bool) {
     let format = repository_object_format(git_dir).ok();
     if let Some(format) = format {
-        commands::merge_rebase::apply_merge_autostash(git_dir, format, lazy_fetch);
+        commands::merge_rebase::apply_merge_autostash(git_dir, worktree_root, format, lazy_fetch);
     }
     for name in [
         "MERGE_HEAD",
@@ -2406,7 +2423,7 @@ fn cmd_commit_long_status_preview(
     let cwd = cli_session.cwd().to_path_buf();
     let git_dir = cli_session.git_dir()?;
     let config = read_repo_config(&git_dir).map_err(report_config_setup_error)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     let format = repository_object_format(&git_dir)?;
     // `commit -u<mode>` wins over `status.showUntrackedFiles`; otherwise config
     // (then the normal default) applies.
@@ -2462,7 +2479,7 @@ fn cmd_commit_long_status_preview(
         // from `status.renames`/`diff.renames` config alone.
         rename_config: resolve_status_rename_config(&config, None, None),
     };
-    print_status_long(&git_dir, format, entries, &display)?;
+    print_status_long(&worktree_root, &git_dir, format, entries, &display)?;
     if committable {
         Ok(())
     } else {
@@ -2948,9 +2965,13 @@ fn parse_commit_identity_parts_bytes(identity: &[u8]) -> Result<(Vec<u8>, Vec<u8
     Ok((name, email, format!("{timestamp} {timezone}")))
 }
 
-fn commit_stage_tracked_changes(git_dir: &Path, format: ObjectFormat) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+fn commit_stage_tracked_changes(
+    cli_session: &crate::session::CliSession,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let cwd = cli_session.cwd().to_path_buf();
+    let worktree_root = worktree_root_for_git_dir(cli_session, git_dir)?;
     let actions = resolve_add_update_actions(
         &cwd,
         &worktree_root,
@@ -3081,6 +3102,7 @@ fn commit_template_lacks_edit_content(
 }
 
 fn append_commit_verbose_diff(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     format: ObjectFormat,
     amend: bool,
@@ -3096,18 +3118,49 @@ fn append_commit_verbose_diff(
         append_scissors_cut_line(out, comment_char);
     }
     if verbose == 1 {
-        append_commit_diff_index_patch(git_dir, format, amend, "a/", "b/", false, out, lazy_fetch)?;
+        append_commit_diff_index_patch(
+            cli_session,
+            git_dir,
+            format,
+            amend,
+            "a/",
+            "b/",
+            false,
+            out,
+            lazy_fetch,
+        )?;
     } else {
         out.extend_from_slice(b"Changes to be committed:\n");
-        append_commit_diff_index_patch(git_dir, format, amend, "c/", "i/", false, out, lazy_fetch)?;
+        append_commit_diff_index_patch(
+            cli_session,
+            git_dir,
+            format,
+            amend,
+            "c/",
+            "i/",
+            false,
+            out,
+            lazy_fetch,
+        )?;
         out.extend_from_slice(b"--------------------------------------------------\n");
         out.extend_from_slice(b"Changes not staged for commit:\n");
-        append_commit_diff_index_patch(git_dir, format, amend, "i/", "w/", true, out, lazy_fetch)?;
+        append_commit_diff_index_patch(
+            cli_session,
+            git_dir,
+            format,
+            amend,
+            "i/",
+            "w/",
+            true,
+            out,
+            lazy_fetch,
+        )?;
     }
     Ok(())
 }
 
 fn append_commit_diff_index_patch(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     format: ObjectFormat,
     amend: bool,
@@ -3117,7 +3170,7 @@ fn append_commit_diff_index_patch(
     out: &mut Vec<u8>,
     lazy_fetch: bool,
 ) -> Result<()> {
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, git_dir)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let base_tree = commit_verbose_base_tree(git_dir, format, amend)?;
     let entries = if worktree {
@@ -3199,6 +3252,7 @@ fn commit_verbose_base_tree(git_dir: &Path, format: ObjectFormat, amend: bool) -
 /// Inputs for [`build_commit_editor_template_block`].
 struct CommitTemplateBlock<'a> {
     git_dir: &'a Path,
+    worktree_root: &'a Path,
     format: ObjectFormat,
     comment_char: &'a str,
     cleanup_mode: CommitCleanupMode,
@@ -3222,6 +3276,7 @@ struct CommitTemplateBlock<'a> {
 fn build_commit_editor_template_block(input: &CommitTemplateBlock) -> Result<Vec<u8>> {
     let CommitTemplateBlock {
         git_dir,
+        worktree_root,
         format,
         comment_char,
         cleanup_mode,
@@ -3302,8 +3357,14 @@ fn build_commit_editor_template_block(input: &CommitTemplateBlock) -> Result<Vec
     out.push(b'\n');
 
     // The long working-tree status, every line commented.
-    let status =
-        render_commit_template_status(git_dir, format, comment_char, amend, untracked_override)?;
+    let status = render_commit_template_status(
+        git_dir,
+        worktree_root,
+        format,
+        comment_char,
+        amend,
+        untracked_override,
+    )?;
     out.extend_from_slice(&status);
     Ok(out)
 }
@@ -3373,13 +3434,13 @@ fn committer_ident_sufficiently_given() -> bool {
 /// `comment_char`) for the COMMIT_EDITMSG template.
 fn render_commit_template_status(
     git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     comment_char: &str,
     amend: bool,
     untracked_override: Option<sley_worktree::StatusUntrackedMode>,
 ) -> Result<Vec<u8>> {
     let config = read_repo_config(git_dir).map_err(report_config_setup_error)?;
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
     let untracked_mode = untracked_override.unwrap_or_else(|| {
         match config.get("status", None, "showUntrackedFiles") {
             Some("no") | Some("false") | Some("0") | Some("off") => {
@@ -3390,7 +3451,7 @@ fn render_commit_template_status(
         }
     });
     let mut entries = crate::collect_short_status_with_options(
-        &worktree_root,
+        worktree_root,
         git_dir,
         format,
         sley_worktree::ShortStatusOptions {
@@ -3427,7 +3488,7 @@ fn render_commit_template_status(
         sparse_footer: None,
         rename_config: resolve_status_rename_config(&config, None, None),
     };
-    let sink = build_status_long_sink(git_dir, format, entries, &display)?;
+    let sink = build_status_long_sink(worktree_root, git_dir, format, entries, &display)?;
     let mut buf: Vec<u8> = Vec::new();
     sink.write_to(&mut buf);
     Ok(buf)
@@ -3435,11 +3496,12 @@ fn render_commit_template_status(
 
 pub(crate) fn render_commit_editor_status_for_rebase(
     git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     comment_char: &str,
     amend: bool,
 ) -> Result<Vec<u8>> {
-    render_commit_template_status(git_dir, format, comment_char, amend, None)
+    render_commit_template_status(git_dir, worktree_root, format, comment_char, amend, None)
 }
 
 fn print_clean_commit_status(

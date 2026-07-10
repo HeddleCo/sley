@@ -253,7 +253,7 @@ fn configure_shell_alias_worktree_env(
     let Ok(git_dir) = cli_session.git_dir() else {
         return Ok(());
     };
-    let Ok(root) = worktree_root_for_git_dir(&git_dir) else {
+    let Ok(root) = worktree_root_for_git_dir(cli_session, &git_dir) else {
         return Ok(());
     };
     let root = canonical_or_self(root);

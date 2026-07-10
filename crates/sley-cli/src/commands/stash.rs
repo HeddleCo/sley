@@ -411,7 +411,7 @@ fn apply_stash_entry(
 ) -> Result<AppliedStash> {
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
@@ -1532,7 +1532,7 @@ fn stash_push_patch(
 ) -> Result<()> {
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     stash_check_index_lock_quiet(&git_dir, quiet)?;
     let index_path = sley_worktree::repository_index_path(&git_dir);
@@ -2059,8 +2059,10 @@ fn create_stash_commit(
     quiet: bool,
 ) -> Result<Option<CreatedStash>> {
     let git_dir = cli_session.git_dir()?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     create_stash_commit_at(
         &git_dir,
+        &worktree_root,
         cli_session.cwd(),
         args,
         include_untracked,
@@ -2075,6 +2077,7 @@ fn create_stash_commit(
 #[allow(clippy::too_many_arguments)]
 fn create_stash_commit_at(
     git_dir: &Path,
+    worktree_root: &Path,
     cwd: &Path,
     args: &[String],
     include_untracked: bool,
@@ -2087,7 +2090,7 @@ fn create_stash_commit_at(
     let cwd = cwd.to_path_buf();
     let git_dir = git_dir.to_path_buf();
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root.to_path_buf();
     let format = repository_object_format(&common_git_dir)?;
     stash_check_index_lock_quiet(&git_dir, quiet)?;
     let mut db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -4354,6 +4357,7 @@ pub(crate) fn create_stash_for_autostash_at(
     Ok(create_stash_commit_at(
         git_dir,
         cwd,
+        cwd,
         &["autostash".to_string()],
         false,
         false,
@@ -4401,16 +4405,22 @@ pub(crate) fn apply_stash_commit_quietly(
     stash_oid: &ObjectId,
 ) -> Result<bool> {
     let git_dir = cli_session.git_dir()?;
-    apply_stash_commit_quietly_at(&git_dir, stash_oid, cli_session.lazy_fetch())
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
+    apply_stash_commit_quietly_at(
+        &git_dir,
+        &worktree_root,
+        stash_oid,
+        cli_session.lazy_fetch(),
+    )
 }
 
 pub(crate) fn apply_stash_commit_quietly_at(
     git_dir: &Path,
+    worktree_root: &Path,
     stash_oid: &ObjectId,
     lazy_fetch: bool,
 ) -> Result<bool> {
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);

@@ -517,7 +517,8 @@ pub(crate) fn cmd_show(cli_session: &crate::session::CliSession, args: &[String]
         profile_start,
         &mut profile_last,
     );
-    let show_userdiff_attributes = worktree_root_for_git_dir(git_dir)
+    let show_userdiff_attributes = repo
+        .worktree_root()
         .ok()
         .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
         .transpose()?;
@@ -1559,8 +1560,8 @@ fn write_commit_diff_patch(
     let mut stat_widths = options.stat_widths;
     stat_widths.resolve_config(config);
     if show_patch {
-        let userdiff_attributes = worktree_root_for_git_dir(git_dir)
-            .ok()
+        let userdiff_attributes = sley_worktree::worktree_root_for_git_dir(git_dir)?
+            .as_deref()
             .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
             .transpose()?;
         let userdiff = commands::userdiff::UserdiffResolver::with_attributes(

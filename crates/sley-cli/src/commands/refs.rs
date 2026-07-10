@@ -5219,6 +5219,7 @@ pub(crate) fn cmd_refs(cli_session: &crate::session::CliSession, args: &[String]
             let git_dir = cli_session.git_dir()?;
             let config = identity_effective_config_for(cli_session).unwrap_or_default();
             commands::for_each_ref::for_each_ref_core_with_config(
+                cli_session,
                 &git_dir,
                 &args[1..],
                 "git refs list",
@@ -5315,7 +5316,7 @@ fn cmd_refs_migrate(cli_session: &crate::session::CliSession, args: &[String]) -
     if let Some(migration_dir) = outcome.dry_run_path {
         println!(
             "Finished dry-run migration of refs, the result can be found at '{}'",
-            refs_migrate_display_path(&git_dir, &common_git_dir, &migration_dir)
+            refs_migrate_display_path(cli_session, &git_dir, &common_git_dir, &migration_dir)
         );
     }
     Ok(())
@@ -5331,8 +5332,13 @@ fn parse_refs_migrate_ref_format(value: &str) -> Result<RefStorageFormat> {
     }
 }
 
-fn refs_migrate_display_path(git_dir: &Path, common_git_dir: &Path, path: &Path) -> String {
-    if let Ok(worktree) = worktree_root_for_git_dir(git_dir) {
+fn refs_migrate_display_path(
+    cli_session: &crate::session::CliSession,
+    git_dir: &Path,
+    common_git_dir: &Path,
+    path: &Path,
+) -> String {
+    if let Ok(worktree) = worktree_root_for_git_dir(cli_session, git_dir) {
         let dot_git = worktree.join(".git");
         if paths_refer_to_same_dir(common_git_dir, &dot_git)
             && let Ok(relative) = path.strip_prefix(common_git_dir)

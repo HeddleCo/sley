@@ -955,7 +955,7 @@ fn run_replay(
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let config = crate::commands::merge_rebase::effective_config_with_overrides(&config);
     let ctx = ReplayCtx {

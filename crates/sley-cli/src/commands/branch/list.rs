@@ -248,6 +248,7 @@ pub(super) fn run_branch_general_list_options(
     let worktree_paths = if options.color {
         Some(for_each_ref_worktree_paths(
             git_dir,
+            None,
             store.current_branch_ref()?.as_deref(),
         )?)
     } else {
@@ -432,7 +433,7 @@ pub(super) fn print_branch_list_colored(
     mode: BranchListMode,
 ) -> Result<()> {
     let current = store.current_branch_ref()?;
-    let worktree_paths = for_each_ref_worktree_paths(git_dir, current.as_deref())?;
+    let worktree_paths = for_each_ref_worktree_paths(git_dir, None, current.as_deref())?;
     print_branch_refs(
         store,
         branch_refs_for_mode(store, mode)?,
@@ -1242,7 +1243,7 @@ pub(super) fn print_branch_list_format_omit_empty_with_sort_color(
             continue;
         };
         let worktree_path =
-            for_each_ref_worktree_path(git_dir, head_ref.as_deref(), &reference.name)?;
+            for_each_ref_worktree_path(git_dir, None, head_ref.as_deref(), &reference.name)?;
         print_branch_format_reference(
             &mut stdout,
             &format_spec,
@@ -2144,7 +2145,7 @@ pub(super) fn print_branch_list_verbose(
         .map(|abbrev| abbrev.map(|width| width.min(format.hex_len())))
         .unwrap_or(repository_abbrev(git_dir, format)?);
     let objectname_candidates = cat_file_all_object_ids(git_dir, format)?;
-    let worktree_paths = for_each_ref_worktree_paths(git_dir, current.as_deref())?;
+    let worktree_paths = for_each_ref_worktree_paths(git_dir, None, current.as_deref())?;
     let mut rows = Vec::new();
     if matches!(options.mode, BranchListMode::Local | BranchListMode::All)
         && current.is_none()

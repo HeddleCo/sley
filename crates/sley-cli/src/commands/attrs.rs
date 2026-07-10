@@ -107,7 +107,7 @@ pub(crate) fn cmd_check_ignore(
     let git_dir = repo.git_dir();
     let format = repo.format();
     let worktree_root = &require_work_tree(cli_session, git_dir)?;
-    let prefix = worktree_prefix(cwd, git_dir)?;
+    let prefix = worktree_prefix(cli_session, cwd, git_dir)?;
     let (tracked_paths, gitlink_paths) = if no_index {
         (BTreeSet::new(), Vec::new())
     } else {
@@ -396,7 +396,7 @@ pub(crate) fn cmd_check_attr(
         .or(sley_worktree::worktree_root_for_git_dir(git_dir)?);
     let attr_root = worktree_root.as_deref().unwrap_or(git_dir);
     let prefix = if worktree_root.is_some() {
-        worktree_prefix(cwd, git_dir).unwrap_or_default()
+        worktree_prefix(cli_session, cwd, git_dir).unwrap_or_default()
     } else {
         String::new()
     };

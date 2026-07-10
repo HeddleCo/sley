@@ -1050,7 +1050,7 @@ impl Mailmap {
         // `mailmap.blob` → `mailmap.file` (last, so it overrides). A bare repo
         // skips `.mailmap` and defaults the blob to `HEAD:.mailmap`.
         let mut mailmap = Self::default();
-        let worktree_root = worktree_root_for_git_dir(git_dir).ok();
+        let worktree_root = sley_worktree::worktree_root_for_git_dir(git_dir)?;
         let is_bare = worktree_root.is_none();
         let mailmap_file = config.get("mailmap", None, "file").map(str::to_owned);
         let mut mailmap_blob = config.get("mailmap", None, "blob").map(str::to_owned);

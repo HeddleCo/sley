@@ -153,6 +153,33 @@ impl CliSession {
         self.env.work_tree.clone()
     }
 
+    /// Invocation-effective `GIT_DIR`, including the parsed CLI override.
+    pub(crate) fn explicit_git_dir(&self) -> Option<PathBuf> {
+        self.git_dir_override().or_else(|| {
+            if self.local_repo_env_hidden {
+                None
+            } else {
+                env::var_os("GIT_DIR").map(PathBuf::from)
+            }
+        })
+    }
+
+    /// Invocation-effective `GIT_WORK_TREE`, including the parsed CLI override.
+    pub(crate) fn explicit_work_tree(&self) -> Option<PathBuf> {
+        self.work_tree_override().or_else(|| {
+            if self.local_repo_env_hidden {
+                None
+            } else {
+                env::var_os("GIT_WORK_TREE").map(PathBuf::from)
+            }
+        })
+    }
+
+    /// Whether this invocation explicitly requested a bare repository.
+    pub(crate) fn explicit_bare(&self) -> bool {
+        !self.local_repo_env_hidden && self.bare()
+    }
+
     pub(crate) fn attr_source(&self) -> Option<String> {
         self.env.attr_source.clone()
     }
@@ -260,14 +287,28 @@ impl CliSession {
         )
     }
 
+    /// Resolve the worktree for `git_dir` using this invocation's location policy.
+    pub(crate) fn worktree_root_for_git_dir(&self, git_dir: &Path) -> Result<PathBuf> {
+        if let Some(work_tree) = self.explicit_work_tree() {
+            let work_tree =
+                discovery::resolve_cli_path(&self.cwd, work_tree.to_string_lossy().as_ref());
+            return fs::canonicalize(work_tree).map_err(|err| GitError::Io(err.to_string()));
+        }
+        if let Some(root) = crate::sley_worktree::worktree_root_for_git_dir(git_dir)? {
+            return Ok(root);
+        }
+        if self.explicit_git_dir().is_some() {
+            return Ok(self.cwd.clone());
+        }
+        Err(GitError::Unsupported(
+            "update-index currently requires a non-bare worktree".into(),
+        ))
+    }
+
     /// Resolved git directory for this session's cwd.
     pub(crate) fn git_dir(&self) -> Result<PathBuf> {
         let cwd = self.cwd.clone();
-        if !self.local_repo_env_hidden()
-            && let Some(git_dir) = self
-                .git_dir_override()
-                .or_else(|| env::var_os("GIT_DIR").map(PathBuf::from))
-        {
+        if let Some(git_dir) = self.explicit_git_dir() {
             if git_dir.as_os_str().is_empty() {
                 return Err(GitError::repository_not_found("not a git repository"));
             }
@@ -280,7 +321,7 @@ impl CliSession {
             }
             return Ok(resolved);
         }
-        if !self.local_repo_env_hidden() && self.bare() {
+        if self.explicit_bare() {
             if discovery::is_git_dir_candidate(&cwd) {
                 return fs::canonicalize(cwd).map_err(|err| GitError::Io(err.to_string()));
             }

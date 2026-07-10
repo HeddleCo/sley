@@ -331,11 +331,17 @@ struct LsTreePathContext {
 }
 
 impl LsTreePathContext {
-    fn new(cwd: &Path, git_dir: &Path, full_name: bool, full_tree: bool) -> Result<Self> {
+    fn new(
+        cli_session: &crate::session::CliSession,
+        cwd: &Path,
+        git_dir: &Path,
+        full_name: bool,
+        full_tree: bool,
+    ) -> Result<Self> {
         let prefix = if full_tree {
             String::new()
         } else {
-            worktree_prefix(cwd, git_dir)?
+            worktree_prefix(cli_session, cwd, git_dir)?
                 .trim_end_matches('/')
                 .to_string()
         };
@@ -823,7 +829,7 @@ pub(crate) fn cmd_ls_files(
     let repo = cli_session.open_repository()?;
     let git_dir = repo.git_dir().to_path_buf();
     let format = repo.object_format();
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     for path in &exclude_from {
         let absolute = if Path::new(path).is_absolute() {
             PathBuf::from(path)
@@ -2038,7 +2044,7 @@ pub(crate) fn cmd_ls_tree(cli_session: &crate::session::CliSession, args: &[Stri
         )));
     }
     let cwd = cli_session.cwd();
-    let path_context = LsTreePathContext::new(cwd, git_dir, full_name, full_tree)?;
+    let path_context = LsTreePathContext::new(cli_session, cwd, git_dir, full_name, full_tree)?;
     let options = TreePrintOptions {
         name_only: name_output,
         object_only,
@@ -2528,7 +2534,7 @@ pub(crate) fn cmd_update_index(
         || unresolve_only
         || test_untracked_cache
         || untracked_cache.is_some();
-    let worktree_root = match worktree_root_for_git_dir(&git_dir) {
+    let worktree_root = match worktree_root_for_git_dir(cli_session, &git_dir) {
         Ok(root) => root,
         Err(_) if !worktree_required => cwd.clone(),
         Err(err) => return Err(err),

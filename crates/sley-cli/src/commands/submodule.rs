@@ -700,7 +700,7 @@ fn populate_submodule_worktree(
         rewrite_submodule_gitdir_file(path, &modules_git_dir)?;
         set_submodule_core_worktree(path, &modules_git_dir)?;
     }
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, git_dir)?;
     record_submodule_gitdir_config_if_enabled(
         git_dir,
         &worktree_root,

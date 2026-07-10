@@ -941,6 +941,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
                 PushRecurseSubmodules::Check => {
                     check_submodule_push(
                         &git_dir,
+                        &worktree_root_for_git_dir(cli_session, &git_dir)?,
                         format,
                         remote_git_dir,
                         &remote,
@@ -953,6 +954,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
                     if !options.dry_run {
                         push_on_demand_submodules(
                             &git_dir,
+                            &worktree_root_for_git_dir(cli_session, &git_dir)?,
                             format,
                             &remote,
                             parent_remote_is_name,
@@ -967,6 +969,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
                     if !options.dry_run {
                         push_on_demand_submodules(
                             &git_dir,
+                            &worktree_root_for_git_dir(cli_session, &git_dir)?,
                             format,
                             &remote,
                             parent_remote_is_name,
@@ -1589,6 +1592,7 @@ struct PushSubmodule {
 
 fn check_submodule_push(
     git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     remote_git_dir: &Path,
     remote: &str,
@@ -1596,7 +1600,7 @@ fn check_submodule_push(
     refspecs: &[String],
     _config: &GitConfig,
 ) -> Result<()> {
-    let submodules = push_gitlink_submodules(git_dir, format)?;
+    let submodules = push_gitlink_submodules(git_dir, worktree_root, format)?;
     let by_path = submodules
         .iter()
         .enumerate()
@@ -1732,6 +1736,7 @@ fn collect_tree_gitlinks(
 
 fn push_on_demand_submodules(
     git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     remote: &str,
     parent_remote_is_name: bool,
@@ -1741,7 +1746,7 @@ fn push_on_demand_submodules(
     quiet: bool,
 ) -> Result<()> {
     let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
-    for submodule in push_gitlink_submodules(git_dir, format)? {
+    for submodule in push_gitlink_submodules(git_dir, worktree_root, format)? {
         ensure_push_submodule_commit(&submodule)?;
         let child_config = read_repo_config(&submodule.git_dir).unwrap_or_default();
         let Some(child_remote) =
@@ -1753,7 +1758,8 @@ fn push_on_demand_submodules(
             continue;
         }
         validate_submodule_push_refspecs(&submodule, refspecs)?;
-        let submodule_root = worktree_root_for_git_dir(&submodule.git_dir)?;
+        let submodule_root = sley_worktree::worktree_root_for_git_dir(&submodule.git_dir)?
+            .ok_or_else(|| GitError::Unsupported("submodule has no worktree".into()))?;
         let mut command = Proc::new(&exe);
         clear_repo_env_for_submodule_child(&mut command);
         command.env("SLEY_PUSH_RECURSING_SUBMODULE", "1");
@@ -1788,8 +1794,11 @@ fn push_on_demand_submodules(
     Ok(())
 }
 
-fn push_gitlink_submodules(git_dir: &Path, format: ObjectFormat) -> Result<Vec<PushSubmodule>> {
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+fn push_gitlink_submodules(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<PushSubmodule>> {
     let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
         return Ok(Vec::new());
     };

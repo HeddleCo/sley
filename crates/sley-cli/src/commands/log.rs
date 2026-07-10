@@ -2212,7 +2212,7 @@ fn cmd_log_impl(
     let db = repository.repository().objects_mut();
     let has_commit_grafts = !sley_rev::revlist::load_commit_grafts(&db, format).is_empty();
     let cwd = repository.cwd().to_path_buf();
-    let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
+    let worktree_root = repository.worktree_root().ok().map(Path::to_path_buf);
     for rev in end_of_options_revs {
         if rev.starts_with('-') {
             match resolve_revision(&git_dir, format, &rev) {
@@ -2495,8 +2495,8 @@ fn cmd_log_impl(
     // pickaxe filters. Plain commit-log output should not pay for it.
     let log_userdiff =
         if diff_opts.any() || diff_opts.merges_imply_patch || compiled_pickaxe.is_some() {
-            let attributes = worktree_root_for_git_dir(&git_dir)
-                .ok()
+            let attributes = worktree_root
+                .as_deref()
                 .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
                 .transpose()?;
             Some(commands::userdiff::UserdiffResolver::with_attributes(
@@ -2518,10 +2518,10 @@ fn cmd_log_impl(
         let diff_pathspec = if pathspecs.is_empty() {
             None
         } else {
-            let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+            let worktree_root = repository.worktree_root()?;
             Some(DiffPathspec::new(
                 &cwd,
-                &worktree_root,
+                worktree_root,
                 &pathspecs,
                 effective_pathspec_flags(cli_session),
             )?)
@@ -3136,10 +3136,10 @@ fn cmd_log_impl(
         let pickaxe_pathspec = if pathspecs.is_empty() {
             None
         } else {
-            let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+            let worktree_root = repository.worktree_root()?;
             Some(DiffPathspec::new(
                 &cwd,
-                &worktree_root,
+                worktree_root,
                 &pathspecs,
                 effective_pathspec_flags(cli_session),
             )?)
@@ -3168,10 +3168,10 @@ fn cmd_log_impl(
         let filter_pathspec = if pathspecs.is_empty() {
             None
         } else {
-            let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+            let worktree_root = repository.worktree_root()?;
             Some(DiffPathspec::new(
                 &cwd,
-                &worktree_root,
+                worktree_root,
                 &pathspecs,
                 effective_pathspec_flags(cli_session),
             )?)

@@ -342,7 +342,7 @@ fn run_blame(
     let repo_path = if bare {
         normalize_repo_path(&path)?
     } else {
-        blame_repo_relative_path(cwd, git_dir, &path)?
+        blame_repo_relative_path(cli_session, cwd, git_dir, &path)?
     };
 
     // Decide whether to build the fake working-tree / `--contents` commit, the
@@ -1045,17 +1045,22 @@ fn parse_abbrev_value(value: &str) -> Result<usize> {
 
 /// Convert the user-supplied (cwd-relative) path into a repository-root
 /// relative path. Outside-of-worktree paths are reported the way git does.
-fn blame_repo_relative_path(cwd: &Path, git_dir: &Path, path: &str) -> Result<String> {
+fn blame_repo_relative_path(
+    cli_session: &crate::session::CliSession,
+    cwd: &Path,
+    git_dir: &Path,
+    path: &str,
+) -> Result<String> {
     let input = Path::new(path);
     if input.is_absolute() {
-        let root = fs::canonicalize(worktree_root_for_git_dir(git_dir)?)?;
+        let root = fs::canonicalize(worktree_root_for_git_dir(cli_session, git_dir)?)?;
         let absolute = fs::canonicalize(input)?;
         let relative = absolute
             .strip_prefix(&root)
             .map_err(|_| GitError::InvalidPath(format!("{path} is outside the repository")))?;
         return normalize_repo_path(&relative.to_string_lossy());
     }
-    let prefix = worktree_prefix(cwd, git_dir)?;
+    let prefix = worktree_prefix(cli_session, cwd, git_dir)?;
     // Join the prefix and the argument, then normalize `.`/`..`/duplicate
     // separators so the result is a clean repo-relative path with forward
     // slashes (the form tree entries use).

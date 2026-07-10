@@ -14,30 +14,6 @@ enum RevParsePathFormat {
     Relative,
 }
 
-fn rev_parse_explicit_git_dir(cli_session: &crate::session::CliSession) -> Option<PathBuf> {
-    cli_session.git_dir_override().or_else(|| {
-        if cli_session.local_repo_env_hidden() {
-            None
-        } else {
-            env::var_os("GIT_DIR").map(PathBuf::from)
-        }
-    })
-}
-
-fn rev_parse_explicit_work_tree(cli_session: &crate::session::CliSession) -> Option<PathBuf> {
-    cli_session.work_tree_override().or_else(|| {
-        if cli_session.local_repo_env_hidden() {
-            None
-        } else {
-            env::var_os("GIT_WORK_TREE").map(PathBuf::from)
-        }
-    })
-}
-
-fn rev_parse_explicit_bare(cli_session: &crate::session::CliSession) -> bool {
-    !cli_session.local_repo_env_hidden() && cli_session.bare()
-}
-
 struct RevParseRepository<'a> {
     git_dir: &'a Path,
     format: ObjectFormat,
@@ -223,7 +199,7 @@ pub(crate) fn cmd_rev_parse(
                 if !is_inside_work_tree(cli_session, &cwd, &git_dir, setup.as_ref())? {
                     return rev_parse_requires_work_tree();
                 }
-                let root = rev_parse_worktree_root(&git_dir, setup.as_ref())?;
+                let root = rev_parse_worktree_root(cli_session, &git_dir, setup.as_ref())?;
                 match path_format {
                     RevParsePathFormat::Default | RevParsePathFormat::Absolute => {
                         println!("{}", root.display());
@@ -235,14 +211,20 @@ pub(crate) fn cmd_rev_parse(
             }
             "--show-prefix" => {
                 if is_inside_work_tree(cli_session, &cwd, &git_dir, setup.as_ref())? {
-                    println!("{}", worktree_prefix(&cwd, &git_dir, setup.as_ref())?);
+                    println!(
+                        "{}",
+                        worktree_prefix(cli_session, &cwd, &git_dir, setup.as_ref())?
+                    );
                 } else {
                     println!();
                 }
             }
             "--show-cdup" => {
                 if is_inside_work_tree(cli_session, &cwd, &git_dir, setup.as_ref())? {
-                    println!("{}", worktree_cdup(&cwd, &git_dir, setup.as_ref())?);
+                    println!(
+                        "{}",
+                        worktree_cdup(cli_session, &cwd, &git_dir, setup.as_ref())?
+                    );
                 } else if let Some(root) = setup.as_ref().and_then(|setup| setup.worktree.as_ref())
                 {
                     println!("{}", root.display());
@@ -436,13 +418,23 @@ pub(crate) fn cmd_rev_parse(
                     Err(err) => {
                         if !before_dashdash(dashdash, idx) && !rev.contains(':') {
                             if let Some(prefix) = output_prefix.as_deref() {
-                                if rev_parse_prefixed_path_exists(&git_dir, prefix, rev)? {
+                                if rev_parse_prefixed_path_exists(
+                                    cli_session,
+                                    &git_dir,
+                                    prefix,
+                                    rev,
+                                )? {
                                     println!("{}", rev_parse_prefix_filename(prefix, rev));
                                     seen_path_arg = true;
                                     idx += 1;
                                     continue;
                                 }
-                            } else if rev_parse_path_exists_on_disk(&cwd, &git_dir, rev)? {
+                            } else if rev_parse_path_exists_on_disk(
+                                cli_session,
+                                &cwd,
+                                &git_dir,
+                                rev,
+                            )? {
                                 println!("{rev}");
                                 seen_path_arg = true;
                                 idx += 1;
@@ -834,11 +826,16 @@ fn rev_parse_prefix_filename(prefix: &str, arg: &str) -> String {
 
 /// Existence probe for a disambiguated filename relative to an explicit prefix
 /// (`<worktree-root>/<prefix><path>`), mirroring git's `verify_filename()`.
-fn rev_parse_prefixed_path_exists(git_dir: &Path, prefix: &str, path: &str) -> Result<bool> {
+fn rev_parse_prefixed_path_exists(
+    cli_session: &crate::session::CliSession,
+    git_dir: &Path,
+    prefix: &str,
+    path: &str,
+) -> Result<bool> {
     if path.is_empty() {
         return Ok(false);
     }
-    let root = worktree_root_for_git_dir(git_dir)?;
+    let root = worktree_root_for_git_dir(cli_session, git_dir)?;
     Ok(root.join(format!("{prefix}{path}")).exists())
 }
 
@@ -863,7 +860,7 @@ fn rev_parse_normalize_relative_path(
         eprintln!("fatal: relative path syntax can't be used outside working tree");
         return Err(GitError::Exit(128));
     }
-    let root = fs::canonicalize(worktree_root_for_git_dir(git_dir)?)?;
+    let root = fs::canonicalize(worktree_root_for_git_dir(cli_session, git_dir)?)?;
     let cwd = fs::canonicalize(cwd)?;
     let mut normalized = cwd;
     for component in Path::new(path).components() {
@@ -1057,7 +1054,7 @@ fn rev_parse_tree_path_error(
         eprintln!("hint: Did you mean '{base}:{prefixed}' aka '{base}:./{original_path}'?");
         return Err(GitError::Exit(128));
     }
-    if rev_parse_path_exists_on_disk(cwd, git_dir, original_path)? {
+    if rev_parse_path_exists_on_disk(cli_session, cwd, git_dir, original_path)? {
         eprintln!("fatal: path '{path}' exists on disk, but not in '{base}'");
     } else {
         eprintln!("fatal: path '{path}' does not exist in '{base}'");
@@ -1090,7 +1087,7 @@ fn rev_parse_index_path_error(
         return Err(GitError::Exit(128));
     }
     let in_index = rev_parse_index_contains(git_dir, format, path)?;
-    let on_disk = rev_parse_path_exists_on_disk(cwd, git_dir, path)?;
+    let on_disk = rev_parse_path_exists_on_disk(cli_session, cwd, git_dir, path)?;
     match (on_disk, in_index) {
         (true, false) => eprintln!("fatal: path '{path}' exists on disk, but not in the index"),
         (false, false) => {
@@ -1106,7 +1103,12 @@ fn rev_parse_no_such_worktree_path(path: &str) {
     eprintln!("Use 'git <command> -- <path>...' to specify paths that do not exist locally.");
 }
 
-fn rev_parse_path_exists_on_disk(cwd: &Path, git_dir: &Path, path: &str) -> Result<bool> {
+fn rev_parse_path_exists_on_disk(
+    cli_session: &crate::session::CliSession,
+    cwd: &Path,
+    git_dir: &Path,
+    path: &str,
+) -> Result<bool> {
     if path.is_empty() {
         return Ok(false);
     }
@@ -1114,7 +1116,7 @@ fn rev_parse_path_exists_on_disk(cwd: &Path, git_dir: &Path, path: &str) -> Resu
     if direct.exists() {
         return Ok(true);
     }
-    if let Ok(root) = worktree_root_for_git_dir(git_dir) {
+    if let Ok(root) = worktree_root_for_git_dir(cli_session, git_dir) {
         return Ok(root.join(path).exists());
     }
     Ok(false)
@@ -1132,7 +1134,7 @@ fn rev_parse_prefixed_path(
     if !is_inside_work_tree(cli_session, cwd, git_dir, None)? {
         return Ok(None);
     }
-    let prefix = worktree_prefix(cwd, git_dir, None)?;
+    let prefix = worktree_prefix(cli_session, cwd, git_dir, None)?;
     if prefix.is_empty() {
         return Ok(None);
     }
@@ -1970,7 +1972,8 @@ fn validate_bare_rev_parse_setup(
     let Some(worktree) = setup.worktree.as_ref() else {
         return Ok(());
     };
-    if rev_parse_explicit_work_tree(cli_session)
+    if cli_session
+        .explicit_work_tree()
         .as_ref()
         .is_some_and(|worktree| worktree.is_absolute())
         && fs::canonicalize(worktree).is_err()
@@ -1981,25 +1984,35 @@ fn validate_bare_rev_parse_setup(
     Ok(())
 }
 
-fn rev_parse_worktree_root(git_dir: &Path, setup: Option<&setup::SetupResult>) -> Result<PathBuf> {
+fn rev_parse_worktree_root(
+    cli_session: &crate::session::CliSession,
+    git_dir: &Path,
+    setup: Option<&setup::SetupResult>,
+) -> Result<PathBuf> {
     if let Some(worktree) = setup.and_then(|setup| setup.worktree.as_ref()) {
         return Ok(worktree.clone());
     }
-    worktree_root_for_git_dir(git_dir)
+    worktree_root_for_git_dir(cli_session, git_dir)
 }
 
-fn worktree_cdup(cwd: &Path, git_dir: &Path, setup: Option<&setup::SetupResult>) -> Result<String> {
-    let prefix = worktree_prefix(cwd, git_dir, setup)?;
+fn worktree_cdup(
+    cli_session: &crate::session::CliSession,
+    cwd: &Path,
+    git_dir: &Path,
+    setup: Option<&setup::SetupResult>,
+) -> Result<String> {
+    let prefix = worktree_prefix(cli_session, cwd, git_dir, setup)?;
     let depth = prefix.split('/').filter(|part| !part.is_empty()).count();
     Ok("../".repeat(depth))
 }
 
 fn worktree_prefix(
+    cli_session: &crate::session::CliSession,
     cwd: &Path,
     git_dir: &Path,
     setup: Option<&setup::SetupResult>,
 ) -> Result<String> {
-    let root = fs::canonicalize(rev_parse_worktree_root(git_dir, setup)?)?;
+    let root = fs::canonicalize(rev_parse_worktree_root(cli_session, git_dir, setup)?)?;
     let cwd = fs::canonicalize(cwd)?;
     let prefix = cwd.strip_prefix(&root).map_err(|_| {
         GitError::InvalidPath(format!(
@@ -2032,10 +2045,10 @@ fn display_git_dir_default(
     cwd: &Path,
     git_dir: &Path,
 ) -> Result<String> {
-    if let Some(git_dir) = rev_parse_explicit_git_dir(cli_session) {
+    if let Some(git_dir) = cli_session.explicit_git_dir() {
         return Ok(git_dir.to_string_lossy().into_owned());
     }
-    if rev_parse_explicit_bare(cli_session) {
+    if cli_session.explicit_bare() {
         return Ok(fs::canonicalize(git_dir)?.display().to_string());
     }
     if fs::canonicalize(cwd)? == fs::canonicalize(git_dir)? {
@@ -2078,7 +2091,7 @@ fn display_git_common_dir_default(
     if git_dir.join("commondir").is_file() {
         return Ok(cli_session.common_git_dir(git_dir)?.display().to_string());
     }
-    if let Some(git_dir) = rev_parse_explicit_git_dir(cli_session) {
+    if let Some(git_dir) = cli_session.explicit_git_dir() {
         return Ok(git_dir.to_string_lossy().into_owned());
     }
     if git_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {
@@ -2092,11 +2105,11 @@ fn display_git_common_dir_default(
     if cwd.starts_with(&git_dir) {
         return Ok(git_dir.display().to_string());
     }
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     if cwd == fs::canonicalize(worktree_root)? {
         return Ok(".git".into());
     }
-    let prefix = worktree_prefix(&cwd, &git_dir, None)?;
+    let prefix = worktree_prefix(cli_session, &cwd, &git_dir, None)?;
     let depth = prefix.split('/').filter(|part| !part.is_empty()).count();
     Ok(format!("{}.git", "../".repeat(depth)))
 }
@@ -2361,7 +2374,7 @@ fn is_inside_work_tree(
     // it and emits "outside repository" instead of git's "relative path syntax
     // can't be used outside working tree" (t1506 "relative path when cwd is
     // outside worktree").
-    if let Some(work_tree) = rev_parse_explicit_work_tree(cli_session) {
+    if let Some(work_tree) = cli_session.explicit_work_tree() {
         let root = resolve_cli_path(cwd, work_tree.to_string_lossy().as_ref());
         return cwd_starts_with(cwd, &root);
     }
@@ -2371,7 +2384,7 @@ fn is_inside_work_tree(
     if is_bare_repository(cli_session, git_dir, None)? {
         return Ok(false);
     }
-    if worktree_root_for_git_dir(git_dir).is_err() {
+    if worktree_root_for_git_dir(cli_session, git_dir).is_err() {
         return Ok(false);
     }
     Ok(!is_inside_git_dir(cwd, git_dir, None)?)
@@ -2385,7 +2398,7 @@ fn is_bare_repository(
     if setup.is_some_and(|setup| setup.worktree.is_some()) {
         return Ok(false);
     }
-    if rev_parse_explicit_work_tree(cli_session).is_some() {
+    if cli_session.explicit_work_tree().is_some() {
         return Ok(false);
     }
     let config = git_dir.join("config");
@@ -2398,7 +2411,7 @@ fn is_bare_repository(
     // during *discovery* (walking up to find a repo). When the git dir was named
     // explicitly via `--git-dir`/`GIT_DIR`, git applies no name heuristic and
     // defaults to non-bare.
-    if rev_parse_explicit_git_dir(cli_session).is_some() {
+    if cli_session.explicit_git_dir().is_some() {
         return Ok(false);
     }
     Ok(git_dir.file_name().and_then(|name| name.to_str()) != Some(".git"))
@@ -2542,12 +2555,12 @@ fn ref_storage_config_display_path(
     git_dir: &Path,
     common_git_dir: &Path,
 ) -> String {
-    if rev_parse_explicit_git_dir(cli_session).is_some() {
+    if cli_session.explicit_git_dir().is_some() {
         return common_git_dir.join("config").display().to_string();
     }
     // Discovery anchors at the worktree toplevel. When the common dir is the
     // toplevel's `.git`, git prints the relative `.git/config`.
-    if let Ok(worktree_root) = worktree_root_for_git_dir(git_dir)
+    if let Ok(worktree_root) = worktree_root_for_git_dir(cli_session, git_dir)
         && let Ok(worktree_root) = fs::canonicalize(&worktree_root)
         && common_git_dir == worktree_root.join(".git")
     {
@@ -2611,9 +2624,9 @@ fn superproject_working_tree(git_dir: &Path) -> Result<Option<PathBuf>> {
         if super_git_dir.file_name().and_then(|name| name.to_str()) == Some(".git")
             && is_git_dir_candidate(super_git_dir)
         {
-            return Ok(Some(fs::canonicalize(worktree_root_for_git_dir(
-                super_git_dir,
-            )?)?));
+            if let Some(worktree_root) = sley_worktree::worktree_root_for_git_dir(super_git_dir)? {
+                return Ok(Some(fs::canonicalize(worktree_root)?));
+            }
         }
     }
     Ok(None)

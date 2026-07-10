@@ -413,6 +413,7 @@ impl CatFileCmdMode {
 struct RepositoryObjectView {
     git_dir: PathBuf,
     common_git_dir: PathBuf,
+    worktree_root: Option<PathBuf>,
     format: ObjectFormat,
     db: Arc<FileObjectDatabase>,
     refs: FileRefStore,
@@ -425,11 +426,13 @@ impl RepositoryObjectView {
         let git_dir = repository.git_dir().to_path_buf();
         let common_git_dir = repository.common_dir().to_path_buf();
         let format = repository.object_format();
+        let worktree_root = cli_session.worktree_root_for_git_dir(&git_dir).ok();
         Ok(Self {
             db: repository.objects(),
             refs: repository.references(),
             git_dir,
             common_git_dir,
+            worktree_root,
             format,
             lazy_fetch: cli_session.lazy_fetch(),
         })
@@ -441,6 +444,10 @@ impl RepositoryObjectView {
 
     fn git_dir(&self) -> &Path {
         &self.git_dir
+    }
+
+    fn worktree_root(&self) -> Option<&Path> {
+        self.worktree_root.as_deref()
     }
 
     fn format(&self) -> ObjectFormat {
@@ -1972,9 +1979,11 @@ fn cat_file_transform_blob(
             // other non-regular mode) streams raw.
             if commands::userdiff::mode_is_regular_file(file_mode) {
                 let config = read_repo_config(git_dir).unwrap_or_default();
-                let worktree_root = worktree_root_for_git_dir(git_dir)?;
+                let worktree_root = view.worktree_root().ok_or_else(|| {
+                    GitError::Unsupported("cat-file filters require a worktree".into())
+                })?;
                 sley_worktree::apply_smudge_filter(
-                    &worktree_root,
+                    worktree_root,
                     git_dir,
                     format,
                     &config,
@@ -1987,8 +1996,8 @@ fn cat_file_transform_blob(
         }
         CatFileCmdMode::Textconv => {
             let config = read_repo_config(git_dir).unwrap_or_default();
-            let attributes = worktree_root_for_git_dir(git_dir)
-                .ok()
+            let attributes = view
+                .worktree_root()
                 .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
                 .transpose()?;
             let resolver = commands::userdiff::UserdiffResolver::with_attributes(
@@ -2000,9 +2009,11 @@ fn cat_file_transform_blob(
                     // Upstream feeds textconv the *worktree* form of the blob
                     // (prep_temp_blob → convert_to_working_tree), so eol/smudge
                     // conversions are applied before the textconv program runs.
-                    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+                    let worktree_root = view.worktree_root().ok_or_else(|| {
+                        GitError::Unsupported("cat-file textconv requires a worktree".into())
+                    })?;
                     let smudged = sley_worktree::apply_smudge_filter(
-                        &worktree_root,
+                        worktree_root,
                         git_dir,
                         format,
                         &config,

@@ -899,7 +899,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         None
     };
     if effective_rebase.enabled() && effective_autostash != Some(true) {
-        let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+        let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
         ensure_pull_rebase_clean_without_autostash(&git_dir, &worktree_root, format)?;
     }
     let fetch_options = FetchOptions {
@@ -981,7 +981,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
     }
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
         runtime_cwd: remote_context.cwd(),
         git_dir: &git_dir,

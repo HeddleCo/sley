@@ -232,7 +232,7 @@ pub(crate) fn cmd_diff_tree(
                 let format = repository_object_format(&git_dir)?;
                 let config = read_repo_config(&git_dir)?;
                 let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-                let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
+                let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir).ok();
                 let setup = sley_rev::setup_revisions(
                     &setup_args,
                     &sley_rev::RevisionSetupContext {

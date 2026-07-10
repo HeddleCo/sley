@@ -256,7 +256,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
         sley_sequencer::replay::remove_branch_state(&git_dir);
         return Ok(());
     }
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     if mode == ResetMode::Merge {
         if pathspec_from_file_provided || has_separator_paths {
             eprintln!("fatal: Cannot do merge reset with paths.");

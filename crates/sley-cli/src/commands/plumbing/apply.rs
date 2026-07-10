@@ -2434,7 +2434,7 @@ fn apply_three_way_path(
         // records the preimage and replays any previously-recorded resolution
         // into the worktree. A no-op unless rerere.enabled.
         if !check && !cached {
-            commands::rerere::repo_rerere(git_dir, format, None)?;
+            commands::rerere::repo_rerere(git_dir, worktree_root, format, None)?;
         }
         // git exits non-zero, leaving conflict markers + a conflicted index.
         Err(GitError::Exit(1))

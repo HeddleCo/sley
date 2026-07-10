@@ -12,7 +12,7 @@ pub(crate) fn cmd_for_each_ref(
 ) -> Result<()> {
     let git_dir = cli_session.git_dir()?;
     let config = identity_effective_config_for(cli_session).unwrap_or_default();
-    for_each_ref_core_with_config(&git_dir, args, "git for-each-ref", &config)
+    for_each_ref_core_with_config(cli_session, &git_dir, args, "git for-each-ref", &config)
 }
 
 /// The `-h` usage banner, matching git's parse_options output byte-for-byte.
@@ -64,6 +64,7 @@ fn print_for_each_ref_usage(usage_cmd: &str) {
 /// builtin/refs.c::cmd_refs_list, which calls for_each_ref_core). The only
 /// per-command difference is the program name printed in the `-h` usage banner.
 pub(crate) fn for_each_ref_core_with_config(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     args: &[String],
     usage_cmd: &str,
@@ -366,9 +367,10 @@ pub(crate) fn for_each_ref_core_with_config(
         .transpose()?;
     let store = FileRefStore::new(&git_dir, format);
     let head_ref = store.current_branch_ref()?;
+    let main_worktree_root = worktree_root_for_git_dir(cli_session, &git_dir).ok();
     // Discover worktree paths once instead of re-scanning $GIT_DIR/worktrees per ref.
     let worktree_paths = if needs.worktree {
-        for_each_ref_worktree_paths(&git_dir, head_ref.as_deref())?
+        for_each_ref_worktree_paths(&git_dir, main_worktree_root.as_deref(), head_ref.as_deref())?
     } else {
         HashMap::new()
     };
@@ -422,6 +424,7 @@ pub(crate) fn for_each_ref_core_with_config(
             config: &config,
             db: &db,
             git_dir: &git_dir,
+            main_worktree_root: main_worktree_root.as_deref(),
             head_ref: head_ref.as_deref(),
             format,
         },
@@ -1417,6 +1420,7 @@ struct ForEachRefSortContext<'a> {
     config: &'a GitConfig,
     db: &'a FileObjectDatabase,
     git_dir: &'a Path,
+    main_worktree_root: Option<&'a Path>,
     head_ref: Option<&'a str>,
     format: ObjectFormat,
 }
@@ -1616,8 +1620,13 @@ fn for_each_ref_sort_key(
         ),
         ForEachRefSort::WorktreePath | ForEachRefSort::WorktreePathDescending => {
             ForEachRefSortKey::Text(
-                for_each_ref_worktree_path(context.git_dir, context.head_ref, &reference.name)?
-                    .unwrap_or_default(),
+                for_each_ref_worktree_path(
+                    context.git_dir,
+                    context.main_worktree_root,
+                    context.head_ref,
+                    &reference.name,
+                )?
+                .unwrap_or_default(),
             )
         }
         ForEachRefSort::Tag | ForEachRefSort::TagDescending => ForEachRefSortKey::Text(

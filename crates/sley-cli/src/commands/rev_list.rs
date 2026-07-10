@@ -420,8 +420,8 @@ pub(crate) fn cmd_rev_list(
     // runs instead.
     let has_commit_grafts = !sley_rev::revlist::load_commit_grafts(&db, format).is_empty();
     object_filter = object_filter.resolve(&git_dir, &db, format)?;
-    let cwd = env::current_dir()?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
+    let cwd = cli_session.cwd().to_path_buf();
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir).ok();
     let exclude_object_tips = if objects {
         rev_list_extract_non_commit_excludes(&mut setup_args, &git_dir, &db, format)?
     } else {

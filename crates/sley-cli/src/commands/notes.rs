@@ -121,7 +121,14 @@ pub(crate) fn cmd_notes(cli_session: &crate::session::CliSession, args: &[String
         "merge" => {
             refuse_outside("merge")?;
             refuse_non_ref("merge")?;
-            notes_merge_cmd(&git_dir, format, &notes_ref, sub_args, &effective_config)
+            notes_merge_cmd(
+                cli_session,
+                &git_dir,
+                format,
+                &notes_ref,
+                sub_args,
+                &effective_config,
+            )
         }
         "prune" => {
             refuse_outside("prune")?;
@@ -1441,6 +1448,7 @@ struct NotesMergeArgs {
 }
 
 fn notes_merge_cmd(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     format: ObjectFormat,
     notes_ref: &str,
@@ -1508,7 +1516,7 @@ fn notes_merge_cmd(
         }
         NotesMergeOutcome::Merged { .. } => Ok(()),
         NotesMergeOutcome::Conflicted { partial, conflicts } => {
-            ensure_no_shared_notes_merge(git_dir, local_ref.as_str())?;
+            ensure_no_shared_notes_merge(cli_session, git_dir, local_ref.as_str())?;
             write_notes_merge_conflicts(
                 git_dir,
                 format,
@@ -1729,8 +1737,12 @@ fn conflict_note_body(
     }
 }
 
-fn ensure_no_shared_notes_merge(git_dir: &Path, notes_ref: &str) -> Result<()> {
-    if let Some(path) = find_shared_notes_merge(git_dir, notes_ref)? {
+fn ensure_no_shared_notes_merge(
+    cli_session: &crate::session::CliSession,
+    git_dir: &Path,
+    notes_ref: &str,
+) -> Result<()> {
+    if let Some(path) = find_shared_notes_merge(cli_session, git_dir, notes_ref)? {
         eprintln!(
             "fatal: a notes merge into {notes_ref} is already in-progress at {}",
             path.display()
@@ -1740,7 +1752,11 @@ fn ensure_no_shared_notes_merge(git_dir: &Path, notes_ref: &str) -> Result<()> {
     Ok(())
 }
 
-fn find_shared_notes_merge(git_dir: &Path, notes_ref: &str) -> Result<Option<PathBuf>> {
+fn find_shared_notes_merge(
+    cli_session: &crate::session::CliSession,
+    git_dir: &Path,
+    notes_ref: &str,
+) -> Result<Option<PathBuf>> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     for state_git_dir in notes_merge_state_git_dirs(&common_git_dir)? {
         if paths_refer_to_same_dir(&state_git_dir, git_dir) {
@@ -1751,6 +1767,7 @@ fn find_shared_notes_merge(git_dir: &Path, notes_ref: &str) -> Result<Option<Pat
         };
         if active_ref == notes_ref {
             return Ok(Some(notes_merge_worktree_path(
+                cli_session,
                 &common_git_dir,
                 &state_git_dir,
             )));
@@ -1790,9 +1807,13 @@ fn read_notes_merge_ref_at(git_dir: &Path) -> Result<Option<String>> {
     ))
 }
 
-fn notes_merge_worktree_path(common_git_dir: &Path, state_git_dir: &Path) -> PathBuf {
+fn notes_merge_worktree_path(
+    cli_session: &crate::session::CliSession,
+    common_git_dir: &Path,
+    state_git_dir: &Path,
+) -> PathBuf {
     if paths_refer_to_same_dir(common_git_dir, state_git_dir)
-        && let Ok(root) = worktree_root_for_git_dir(common_git_dir)
+        && let Ok(root) = worktree_root_for_git_dir(cli_session, common_git_dir)
     {
         return root;
     }

@@ -120,8 +120,8 @@ pub(crate) fn cmd_fast_export(
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let store = FileRefStore::new(&git_dir, format);
     let config = read_repo_config(&git_dir)?;
-    let cwd = env::current_dir()?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
+    let cwd = cli_session.cwd().to_path_buf();
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir).ok();
 
     let (options, setup_args) = parse_fast_export_args(args)?;
     if options.import_marks.is_some() && options.import_marks_if_exists.is_some() {

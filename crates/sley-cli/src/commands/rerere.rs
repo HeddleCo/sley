@@ -54,11 +54,14 @@ pub(crate) fn cmd_rerere(cli_session: &crate::session::CliSession, args: &[Strin
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     match options.subcommand {
-        None => repo_rerere(&git_dir, format, options.autoupdate).map(|_| ()),
+        None => repo_rerere(&git_dir, &worktree_root, format, options.autoupdate).map(|_| ()),
         Some(RerereSubcommand::Status) => rerere_status(&git_dir),
-        Some(RerereSubcommand::Remaining) => rerere_remaining(&git_dir, format),
-        Some(RerereSubcommand::Diff) => rerere_diff(&git_dir, format, cli_session.lazy_fetch()),
+        Some(RerereSubcommand::Remaining) => rerere_remaining(&git_dir, &worktree_root, format),
+        Some(RerereSubcommand::Diff) => {
+            rerere_diff(&git_dir, &worktree_root, format, cli_session.lazy_fetch())
+        }
         Some(RerereSubcommand::Clear) => rerere_clear(&git_dir),
         Some(RerereSubcommand::Forget) => rerere_forget(&git_dir, &options.paths),
         Some(RerereSubcommand::Gc) => rerere_gc(&git_dir),
@@ -170,6 +173,7 @@ fn rerere_autoupdate_with_config(config: &GitConfig, override_value: Option<bool
 
 pub(crate) fn repo_rerere(
     git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     autoupdate_override: Option<bool>,
 ) -> Result<bool> {
@@ -178,7 +182,6 @@ pub(crate) fn repo_rerere(
         return Ok(false);
     }
     fs::create_dir_all(git_dir.join("rr-cache"))?;
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
     let mut rr = read_merge_rr(git_dir)?;
     let mut changed = false;
     let conflicts = find_rerere_conflicts(git_dir, format)?;
@@ -354,11 +357,15 @@ fn handle_resolved_path(
     Ok(true)
 }
 
-pub(crate) fn record_resolved_after_commit(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+pub(crate) fn record_resolved_after_commit(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
     if !is_rerere_enabled(git_dir) || !git_dir.join("MERGE_RR").is_file() {
         return Ok(());
     }
-    let _ = repo_rerere(git_dir, format, None)?;
+    let _ = repo_rerere(git_dir, worktree_root, format, None)?;
     Ok(())
 }
 
@@ -870,7 +877,7 @@ fn rerere_status(git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rerere_remaining(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+fn rerere_remaining(git_dir: &Path, worktree_root: &Path, format: ObjectFormat) -> Result<()> {
     if !is_rerere_enabled(git_dir) {
         return Ok(());
     }
@@ -881,7 +888,7 @@ fn rerere_remaining(git_dir: &Path, format: ObjectFormat) -> Result<()> {
             .iter()
             .any(|conflict| conflict.path == entry.path.as_bytes())
             && (!entry_has_postimage(git_dir, &entry)
-                || worktree_path_still_has_conflicts(git_dir, &entry.path)?)
+                || worktree_path_still_has_conflicts(worktree_root, &entry.path)?)
         {
             println!("{}", entry.path);
         }
@@ -898,8 +905,8 @@ fn entry_has_postimage(git_dir: &Path, entry: &MergeRrEntry) -> bool {
     .is_file()
 }
 
-fn worktree_path_still_has_conflicts(git_dir: &Path, path: &str) -> Result<bool> {
-    let full = worktree_root_for_git_dir(git_dir)?.join(path);
+fn worktree_path_still_has_conflicts(worktree_root: &Path, path: &str) -> Result<bool> {
+    let full = worktree_root.join(path);
     let Ok(content) = fs::read(full) else {
         return Ok(false);
     };
@@ -909,7 +916,12 @@ fn worktree_path_still_has_conflicts(git_dir: &Path, path: &str) -> Result<bool>
     ))
 }
 
-fn rerere_diff(git_dir: &Path, format: ObjectFormat, lazy_fetch: bool) -> Result<()> {
+fn rerere_diff(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    lazy_fetch: bool,
+) -> Result<()> {
     if !is_rerere_enabled(git_dir) {
         return Ok(());
     }
@@ -918,7 +930,7 @@ fn rerere_diff(git_dir: &Path, format: ObjectFormat, lazy_fetch: bool) -> Result
     for entry in read_merge_rr(git_dir)? {
         let cache_dir = git_dir.join("rr-cache").join(&entry.hash);
         let preimage = rerere_cache_file_path(&cache_dir, entry.variant, "preimage");
-        let full = worktree_root_for_git_dir(git_dir)?.join(&entry.path);
+        let full = worktree_root.join(&entry.path);
         let old = match fs::read(&preimage) {
             Ok(bytes) => bytes,
             Err(_) => continue,
